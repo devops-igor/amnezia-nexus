@@ -1,0 +1,217 @@
+{{ define "title_extra" }} — {{ _ "vpn_page_title" }}{{ end }}
+
+{{ define "content" }}
+<div class="section-title">
+    <span class="icon">🛡️</span>
+    {{ _ "vpn_page_title" }}
+</div>
+
+<!-- STATUS CARD -->
+<div class="card" style="margin-bottom: var(--space-lg);">
+    <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _ "vpn_status" }}</h3>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-md);">
+        <div>
+            <div class="form-label">{{ _ "vpn_listener" }}</div>
+            <span class="badge" id="vpn-listener-badge"><span class="badge-dot"></span> {{ _ "loading" }}</span>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_listen_port" }}</div>
+            <div style="font-weight: 600;" id="vpn-listen-port">—</div>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_subnet" }}</div>
+            <div style="font-weight: 600;" id="vpn-subnet">—</div>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_sessions" }}</div>
+            <div style="font-weight: 600;" id="vpn-sessions">—</div>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_active_tunnels" }}</div>
+            <div style="font-weight: 600;" id="vpn-active-tunnels">—</div>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_rx_total" }}</div>
+            <div style="font-weight: 600;" id="vpn-rx">—</div>
+        </div>
+        <div>
+            <div class="form-label">{{ _ "vpn_tx_total" }}</div>
+            <div style="font-weight: 600;" id="vpn-tx">—</div>
+        </div>
+    </div>
+</div>
+
+<!-- BACKENDS TABLE -->
+<div class="card">
+    <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _ "vpn_backends" }}</h3>
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>{{ _ "vpn_backend_server" }}</th>
+                    <th>{{ _ "vpn_backend_endpoint" }}</th>
+                    <th>{{ _ "vpn_status" }}</th>
+                    <th>{{ _ "vpn_latency" }}</th>
+                    <th>{{ _ "vpn_connections" }}</th>
+                    <th>{{ _ "actions" }}</th>
+                </tr>
+            </thead>
+            <tbody id="vpn-backends-tbody">
+                <tr id="vpn-backends-loading">
+                    <td colspan="6" style="text-align: center; color: var(--text-muted);">{{ _ "loading" }}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    /* ===== VPN admin dashboard: all dynamic data via textContent (XSS-safe).
+       CSRF mutations reuse the global getCsrfToken() helper from base.html. ===== */
+
+    function vpnStatusBadgeClass(status) {
+        switch (status) {
+            case 'active': return 'badge-success';
+            case 'degraded': return 'badge-warn';
+            case 'connecting': return 'badge-info';
+            default: return 'badge-secondary';
+        }
+    }
+
+    function vpnStatusLabel(status) {
+        switch (status) {
+            case 'active': return _('active');
+            case 'degraded': return _('vpn_degraded');
+            case 'connecting': return _('connecting');
+            case 'disabled': return _('disabled');
+            default: return String(status);
+        }
+    }
+
+    function vpnSetListenerBadge(running) {
+        const badge = document.getElementById('vpn-listener-badge');
+        badge.className = 'badge ' + (running ? 'badge-success' : 'badge-secondary');
+        badge.textContent = '';
+        const dot = document.createElement('span');
+        dot.className = 'badge-dot';
+        badge.appendChild(dot);
+        badge.appendChild(document.createTextNode(' ' + (running ? _('vpn_running') : _('vpn_stopped'))));
+    }
+
+    function vpnRenderBackendRow(b) {
+        const tr = document.createElement('tr');
+
+        const tdServer = document.createElement('td');
+        tdServer.textContent = '#' + (b.server_id || b.id || '—');
+        tr.appendChild(tdServer);
+
+        const tdEndpoint = document.createElement('td');
+        tdEndpoint.textContent = b.endpoint || '—';
+        tr.appendChild(tdEndpoint);
+
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + vpnStatusBadgeClass(b.status);
+        const dot = document.createElement('span');
+        dot.className = 'badge-dot';
+        badge.appendChild(dot);
+        badge.appendChild(document.createTextNode(' ' + vpnStatusLabel(b.status)));
+        tdStatus.appendChild(badge);
+        tr.appendChild(tdStatus);
+
+        const tdLatency = document.createElement('td');
+        tdLatency.textContent = (typeof b.latency_ms === 'number' && b.latency_ms > 0) ? (b.latency_ms + ' ms') : '—';
+        tr.appendChild(tdLatency);
+
+        const tdConns = document.createElement('td');
+        tdConns.textContent = String(b.active_connections || 0);
+        tr.appendChild(tdConns);
+
+        const tdActions = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const disabledBackend = b.status === 'disabled';
+        btn.className = 'btn btn-sm ' + (disabledBackend ? 'btn-primary' : 'btn-danger');
+        btn.textContent = disabledBackend ? _('vpn_enable') : _('vpn_disable');
+        btn.addEventListener('click', function () {
+            vpnToggleBackend(b.server_id || b.id, disabledBackend ? 'enable' : 'disable');
+        });
+        tdActions.appendChild(btn);
+        tr.appendChild(tdActions);
+
+        return tr;
+    }
+
+    async function vpnToggleBackend(serverId, action) {
+        if (action === 'disable' && !confirm(_('vpn_confirm_disable'))) return;
+        try {
+            const res = await fetch('/api/vpn/backends/' + encodeURIComponent(serverId) + '/' + action, {
+                method: 'POST',
+                headers: { 'X-CSRF-Token': getCsrfToken() },
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || (data.status && data.status !== 'ok')) {
+                throw new Error(data.error || data.message || _('error'));
+            }
+            showToast(action === 'enable' ? _('vpn_enable') + ' OK' : _('vpn_disable') + ' OK', 'success');
+            vpnLoadData();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function vpnLoadData() {
+        try {
+            const [statusRes, configRes, backendsRes] = await Promise.all([
+                fetch('/api/vpn/status'),
+                fetch('/api/vpn/config'),
+                fetch('/api/vpn/backends'),
+            ]);
+            if (!statusRes.ok || !backendsRes.ok) throw new Error(_('error'));
+
+            const status = await statusRes.json();
+            const cfg = configRes.ok ? await configRes.json() : {};
+            const backendData = await backendsRes.json();
+            const backends = backendData.backends || backendData.tunnels || [];
+
+            vpnSetListenerBadge(!!status.listener_running);
+            document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '—');
+            document.getElementById('vpn-subnet').textContent = cfg.subnet_cidr || '—';
+            document.getElementById('vpn-sessions').textContent = String(status.connected_sessions || 0);
+            document.getElementById('vpn-active-tunnels').textContent = String(status.active_tunnels || 0);
+            document.getElementById('vpn-rx').textContent = formatBytes(status.rx_bytes || 0);
+            document.getElementById('vpn-tx').textContent = formatBytes(status.tx_bytes || 0);
+
+            const tbody = document.getElementById('vpn-backends-tbody');
+            tbody.textContent = '';
+            if (!backends.length) {
+                const tr = document.createElement('tr');
+                const td = document.createElement('td');
+                td.colSpan = 6;
+                td.style.textAlign = 'center';
+                td.style.color = 'var(--text-muted)';
+                td.textContent = _('vpn_no_backends');
+                tr.appendChild(td);
+                tbody.appendChild(tr);
+                return;
+            }
+            for (const b of backends) {
+                tbody.appendChild(vpnRenderBackendRow(b));
+            }
+        } catch (err) {
+            const tbody = document.getElementById('vpn-backends-tbody');
+            tbody.textContent = '';
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 6;
+            td.style.textAlign = 'center';
+            td.style.color = 'var(--text-muted)';
+            td.textContent = _('error');
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', vpnLoadData);
+</script>
+{{ end }}

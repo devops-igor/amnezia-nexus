@@ -1,0 +1,632 @@
+{{ define "title_extra" }} - {{ _ "my_connections_title" }}{{ end }}
+
+{{ define "content" }}
+<section>
+    <!-- Network Health / Server Status Section -->
+    {{ if .servers }}
+    <div class="card" style="margin-bottom: var(--space-lg); padding: var(--space-md);">
+        <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); flex-wrap: wrap; gap: var(--space-xs);">
+            <div class="flex items-center gap-sm">
+                <span style="font-size: 1.25rem;">📡</span>
+                <div>
+                    <h2 style="margin: 0; font-size: 1rem; font-weight: 600;">{{ _ "network_health" }}</h2>
+                    <p style="margin: 0; font-size: 0.8125rem; color: var(--color-text-muted, #94a3b8);">{{ _ "network_health_desc" }}</p>
+                </div>
+            </div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-top: 0.75rem;">
+            {{ range $srv := .servers }}
+            <div style="background: var(--color-surface-hover, rgba(255,255,255,0.03)); padding: 0.6rem 0.8rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--color-border, rgba(255,255,255,0.08));">
+                <div class="flex items-center justify-between" style="margin-bottom: 0.25rem;">
+                    <span style="font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">🖥 {{ $srv.Name }}</span>
+                    {{ if eq (str $srv.Status) "online" }}
+                    <span class="badge badge-success" style="font-size: 0.7rem; padding: 2px 6px;" title="{{ _ "server_operational_desc" }}">
+                        <span class="badge-dot"></span> {{ _ "status_online" }}
+                    </span>
+                    {{ else if eq (str $srv.Status) "degraded" }}
+                    <span class="badge badge-warn" style="font-size: 0.7rem; padding: 2px 6px;" title="{{ _ "server_degraded_desc" }}">
+                        <span class="badge-dot"></span> {{ _ "status_degraded" }}
+                    </span>
+                    {{ else if eq (str $srv.Status) "offline" }}
+                    <span class="badge badge-danger" style="font-size: 0.7rem; padding: 2px 6px;" title="{{ _ "server_offline_desc" }}">
+                        <span class="badge-dot"></span> {{ _ "status_offline" }}
+                    </span>
+                    {{ else }}
+                    <span class="badge badge-secondary" style="font-size: 0.7rem; padding: 2px 6px;" title="{{ _ "server_pending_desc" }}">
+                        <span class="badge-dot"></span> {{ _ "status_pending" }}
+                    </span>
+                    {{ end }}
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-text-muted, #94a3b8);">
+                    {{ if eq (str $srv.Status) "online" }}
+                    <span>{{ _ "server_operational_desc" }}</span>
+                    {{ else if eq (str $srv.Status) "degraded" }}
+                    <span>{{ _ "server_degraded_desc" }}</span>
+                    {{ else if eq (str $srv.Status) "offline" }}
+                    <span>{{ _ "server_offline_desc" }}</span>
+                    {{ else }}
+                    <span>{{ _ "server_pending_desc" }}</span>
+                    {{ end }}
+                </div>
+            </div>
+            {{ end }}
+        </div>
+    </div>
+    {{ end }}
+
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); flex-wrap: wrap; gap: var(--space-md);">
+        <h1 class="section-title" style="margin-bottom:0;">
+            <span class="icon">🔗</span>
+            {{ _ "my_connections_title" }}
+        </h1>
+        <div class="flex items-center gap-sm">
+            <button class="btn btn-secondary btn-sm sort-toggle" id="sortToggle" onclick="toggleSortOrder()">
+                📊 {{ _ "sort_by_traffic" }}
+            </button>
+            <button class="btn btn-primary" onclick="openCreateConnectionModal()">
+                <span>+</span> {{ _ "create_connection" }}
+            </button>
+        </div>
+    </div>
+
+    <!-- Always render the list container so JS can insert into it without reload -->
+    <div class="clients-list{{ if not .connections }} hidden{{ end }}" id="myConnectionsList">
+        {{ range $c := .connections }}
+        <div class="client-item" data-conn-id="{{ $c.ID }}" data-id="{{ $c.ID }}">
+            <div class="client-info">
+                <div class="client-avatar">🔗</div>
+                <div>
+                    <div class="client-name">{{ if $c.Name }}{{ $c.Name }}{{ else }}VPN Connection{{ end }}</div>
+                    <div class="client-meta">
+                        <span>🖥 {{ if $c.ServerName }}{{ $c.ServerName }}{{ else }}Server #{{ $c.ServerID }}{{ end }}</span>
+                        <span class="badge badge-info" style="font-size:0.65rem;">
+                            {{ proto_title $c.Protocol }}
+                        </span>
+                        {{ if and (eq $c.Protocol "awg") $c.AWGMimicry }}
+                        <span class="badge badge-info" style="font-size:0.65rem;">🛡 {{ $c.AWGMimicry | upper }}</span>
+                        {{ end }}
+                        {{ if not $c.CreatedAt.IsZero }}
+                        <span>📅 {{ slice_str (format_time $c.CreatedAt) 0 10 }}</span>
+                        {{ end }}
+                        {{ if or $c.TrafficTotalRx $c.TrafficTotalTx }}
+                        <span class="traffic-badge" data-rx="{{ $c.TrafficTotalRx }}" data-tx="{{ $c.TrafficTotalTx }}">
+                            📊 ↓ <span class="rx"></span> ↑ <span class="tx"></span>
+                        </span>
+                        {{ end }}
+                    </div>
+                </div>
+            </div>
+            <div class="client-actions">
+                <button class="btn btn-secondary btn-sm" data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}" onclick="showRenameModal(this.dataset.cid, this.dataset.cname)">
+                    ✏️ {{ _ "rename" }}
+                </button>
+                <button class="btn btn-primary btn-sm"
+                    data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}" data-proto="{{ $c.Protocol }}"
+                    onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
+                    {{ _ "show_config" }}
+                </button>
+                <button class="btn btn-danger btn-sm"
+                    data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}"
+                    onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
+                    🗑️ {{ _ "delete" }}
+                </button>
+            </div>
+        </div>
+        {{ end }}
+    </div>
+
+    <!-- Always render the empty-state container so JS can hide it on first insert -->
+    <div class="empty-state{{ if .connections }} hidden{{ end }}" id="emptyState">
+        <div class="empty-icon">🔗</div>
+        <div class="empty-title">{{ _ "no_connections" }}</div>
+        <div class="empty-desc">{{ _ "no_connections_user_desc" }}</div>
+        <button class="btn btn-primary" onclick="openCreateConnectionModal()" style="margin-top: var(--space-md);">
+            <span>+</span> {{ _ "create_connection" }}
+        </button>
+    </div>
+</section>
+
+<!-- ===== Config Modal ===== -->
+<div class="modal-backdrop" id="configModal">
+    <div class="modal" style="max-width: 600px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="configModalTitle">{{ _ "config" }}</h2>
+            <button class="modal-close" onclick="closeModal('configModal')">×</button>
+        </div>
+
+        <div class="config-tabs">
+            <button class="config-tab active" onclick="switchConfigTab('conf')">{{ _ "config_tab" }}</button>
+            <button class="config-tab" onclick="switchConfigTab('vpn')">{{ _ "vpn_key_tab" }}</button>
+            <button class="config-tab" onclick="switchConfigTab('qr')">{{ _ "qr_code_tab" }}</button>
+            <button class="config-tab" id="my-tab-kit-btn" onclick="switchConfigTab('kit')">{{ _ "connection_kit" }}</button>
+        </div>
+
+        <div class="config-panel active" id="panel-conf">
+            <div class="config-display">
+                <div class="config-text" id="configText"></div>
+                <div class="config-actions">
+                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentConfig)" style="flex:1">
+                        {{ _ "copy_config" }}
+                    </button>
+                    <button class="btn btn-primary btn-sm"
+                        onclick="downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        {{ _ "download_conf" }}
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="config-panel" id="panel-kit">
+            <div class="form-hint" style="margin-bottom: var(--space-sm);">{{ _ "connection_kit_desc" }}</div>
+            <div id="myConnectionKitList" style="display: flex; flex-direction: column; gap: 0.75rem;"></div>
+        </div>
+
+        <div class="config-panel" id="panel-vpn">
+            <div class="vpn-link-box" id="vpnLinkText"></div>
+            <div class="config-actions" style="margin-top: var(--space-sm);">
+                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentVpnLink)" style="flex:1">
+                    {{ _ "copy_key" }}
+                </button>
+            </div>
+            <div class="form-hint" style="margin-top: var(--space-sm);">
+                {{ _ "vpn_link_hint" }}
+            </div>
+        </div>
+
+        <div class="config-panel" id="panel-qr">
+            <div class="qr-container">
+                <div id="qrCode"></div>
+                <div class="qr-hint" id="qrHint">{{ _ "qr_hint" }}</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Create Connection Modal ===== -->
+<div class="modal-backdrop" id="createConnModal">
+    <div class="modal" style="max-width: 500px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "create_connection" }}</h2>
+            <button class="modal-close" onclick="closeModal('createConnModal')">×</button>
+        </div>
+        <form id="createConnForm" onsubmit="event.preventDefault(); submitCreateConnection();">
+            <div class="form-group">
+                <label class="form-label" for="createServerSelect">{{ _ "create_conn_server_label" }}</label>
+                <select class="form-select" id="createServerSelect" required onchange="onServerSelected()">
+                    <option value="">- {{ _ "select" }} -</option>
+                    {{ range $srv := .servers }}
+                    <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}">{{ $srv.Name }}</option>
+                    {{ end }}
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="createProtoSelect">{{ _ "create_conn_protocol_label" }}</label>
+                <select class="form-select" id="createProtoSelect" required>
+                    <option value="">- {{ _ "select" }} -</option>
+                </select>
+            </div>
+            <div class="form-group" id="myAwgMimicryGroup" style="display:none;">
+                <label class="form-label" for="myAwgMimicry">{{ _ "awg_mimicry" }}</label>
+                <select class="form-select" id="myAwgMimicry">
+                    <option value="auto" selected>{{ _ "mimicry_auto" }}</option>
+                    <option value="tls">{{ _ "mimicry_tls" }}</option>
+                    <option value="quic">{{ _ "mimicry_quic" }}</option>
+                    <option value="dns">{{ _ "mimicry_dns" }}</option>
+                    <option value="sip">{{ _ "mimicry_sip" }}</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="createConnName">{{ _ "create_conn_name_label" }}</label>
+                <input class="form-input" type="text" id="createConnName" value="My Connection" required>
+            </div>
+            <div class="flex gap-sm" style="margin-top: var(--space-md);">
+                <button type="submit" class="btn btn-primary" id="createConnSubmit">{{ _ "create_conn_submit" }}</button>
+                <button type="button" class="btn btn-secondary" onclick="closeModal('createConnModal')">{{ _ "cancel" }}</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Rename Modal -->
+<div class="modal-backdrop" id="renameModal">
+    <div class="modal" style="max-width: 400px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "rename_connection" }}</h2>
+            <button class="modal-close" onclick="closeRenameModal()">×</button>
+        </div>
+        <div class="form-group" style="padding: var(--space-sm) 0;">
+            <label class="form-label" for="renameInput">{{ _ "rename_connection_placeholder" }}</label>
+            <input type="text" id="renameInput" class="form-input" maxlength="255"
+                   placeholder="{{ _ "rename_connection_placeholder" }}">
+        </div>
+        <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
+            <button class="btn btn-primary" onclick="submitRename()">{{ _ "save" }}</button>
+            <button class="btn btn-secondary" onclick="closeRenameModal()">{{ _ "cancel" }}</button>
+        </div>
+    </div>
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script>
+    let currentConfig = '';
+    let currentVpnLink = '';
+    let currentConfigName = 'connection';
+
+    const availableServers = {{ .servers | json }};
+    const initialConnections = {{ .connections | json }};
+
+    async function showMyConfig(connectionId, name, proto) {
+        try {
+            showToast(_('loading_connections'), 'info');
+            const result = await apiCall(`/api/connections/${connectionId}/config`, 'POST');
+
+            if (result.config) {
+                currentConfig = result.config;
+                currentVpnLink = result.vpn_link || '';
+                currentConfigName = name.replace(/\s+/g, '_');
+                document.getElementById('configModalTitle').textContent = `${_('config')} - ${name}`;
+                document.getElementById('configText').textContent = result.config;
+                document.getElementById('vpnLinkText').textContent = currentVpnLink;
+
+                const vpnTab = document.querySelectorAll('.config-tab')[1];
+                if (proto === 'telemt') {
+                    vpnTab.style.display = 'none';
+                } else {
+                    vpnTab.style.display = '';
+                }
+
+                if (proto === 'awg') {
+                    document.getElementById('my-tab-kit-btn').style.display = '';
+                    loadMyConnectionKit(connectionId, name);
+                } else {
+                    document.getElementById('my-tab-kit-btn').style.display = 'none';
+                }
+
+                document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
+
+                switchConfigTab('conf');
+                openModal('configModal');
+                generateQR(result.config);
+            }
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    async function loadMyConnectionKit(connectionId, name) {
+        const kitList = document.getElementById('myConnectionKitList');
+        if (!kitList) return;
+        kitList.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem;">Loading profiles...</div>';
+        try {
+            const res = await apiCall(`/api/connections/${connectionId}/kit`, 'POST');
+            if (res.kit) {
+                kitList.innerHTML = '';
+                for (const [protoKey, confText] of Object.entries(res.kit)) {
+                    const item = document.createElement('div');
+                    item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
+                    item.innerHTML = `
+                        <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
+                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${escapeHtml(protoKey)} Profile</span>
+                            <div class="flex gap-sm">
+                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">${_('copy_config')}</button>
+                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">${_('download_conf')}</button>
+                            </div>
+                        </div>
+                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${escapeHtml(confText)}</code></pre>
+                    `;
+                    item.querySelector('.btn-kit-copy').onclick = () => copyToClipboard(confText);
+                    item.querySelector('.btn-kit-dl').onclick = () => downloadFile(confText, `${name}_${protoKey}.conf`);
+                    kitList.appendChild(item);
+                }
+            }
+        } catch (err) {
+            kitList.innerHTML = `<div style="color: var(--color-danger, #ef4444); font-size: 0.85rem;">${err.message}</div>`;
+        }
+    }
+
+    function switchConfigTab(tab) {
+        document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
+        const tabs = document.querySelectorAll('.config-tab');
+        const panels = { conf: 'panel-conf', vpn: 'panel-vpn', qr: 'panel-qr', kit: 'panel-kit' };
+        const tabIdx = { conf: 0, vpn: 1, qr: 2, kit: 3 };
+        if (tabs[tabIdx[tab]]) tabs[tabIdx[tab]].classList.add('active');
+        if (document.getElementById(panels[tab])) document.getElementById(panels[tab]).classList.add('active');
+    }
+
+    function generateQR(text) {
+        const container = document.getElementById('qrCode');
+        container.innerHTML = '';
+        try {
+            new QRCode(container, {
+                text: text, width: 280, height: 280,
+                colorDark: '#000000', colorLight: '#ffffff',
+                correctLevel: QRCode.CorrectLevel.L
+            });
+        } catch (e) {
+            container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        }
+    }
+
+    function renderConnectionItem(conn, isTopConsumer) {
+        const protoDisplay = {
+            awg: 'AmneziaWG',
+            telemt: 'MTProxyL',
+            dns: 'AmneziaDNS'
+        };
+        const name = escapeHtml(conn.name || 'VPN Connection');
+        const serverName = escapeHtml(conn.server_name || ('Server #' + (conn.server_id || '')));
+        const protoLabel = escapeHtml(protoDisplay[conn.protocol] || (conn.protocol ? conn.protocol.toUpperCase() : ''));
+        const date = conn.created_at ? escapeHtml(conn.created_at.substring(0, 10)) : '';
+        const connId = escapeHtml(conn.id);
+        const totalRx = conn.traffic_total_rx || 0;
+        const totalTx = conn.traffic_total_tx || 0;
+        const trafficStr = totalRx > 0 || totalTx > 0
+            ? `<span class="traffic-badge">📊 ↓ ${formatBytes(totalRx)} ↑ ${formatBytes(totalTx)}</span>`
+            : '';
+        const mimicryBadge = (conn.protocol === 'awg' && conn.awg_mimicry)
+            ? `<span class="badge badge-info" style="font-size:0.65rem;">🛡 ${escapeHtml(conn.awg_mimicry.toUpperCase())}</span>`
+            : '';
+        const topClass = isTopConsumer ? ' top-consumer' : '';
+        return `
+        <div class="client-item${topClass}" data-conn-id="${connId}" data-id="${connId}">
+            <div class="client-info">
+                <div class="client-avatar">🔗</div>
+                <div>
+                    <div class="client-name">${name}</div>
+                    <div class="client-meta">
+                        <span>🖥 ${serverName}</span>
+                        <span class="badge badge-info" style="font-size:0.65rem;">
+                            ${protoLabel}
+                        </span>
+                        ${mimicryBadge}
+                        ${date ? `<span>📅 ${date}</span>` : ''}
+                        ${trafficStr}
+                    </div>
+                </div>
+            </div>
+            <div class="client-actions">
+                <button class="btn btn-secondary btn-sm"
+                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}"
+                    onclick="showRenameModal(this.dataset.cid, this.dataset.cname)">
+                    ✏️ ${_('rename')}
+                </button>
+                <button class="btn btn-primary btn-sm"
+                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}" data-proto="${escapeHtml(conn.protocol || '')}"
+                    onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
+                    ${_('show_config')}
+                </button>
+                <button class="btn btn-danger btn-sm"
+                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}"
+                    onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
+                    🗑️ ${_('delete')}
+                </button>
+            </div>
+        </div>`;
+    }
+
+    function openCreateConnectionModal() {
+        document.getElementById('createConnForm').reset();
+        const protoSelect = document.getElementById('createProtoSelect');
+        protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
+        closeModal('configModal');
+        openModal('createConnModal', '#createServerSelect');
+    }
+
+    function onServerSelected() {
+        const serverSelect = document.getElementById('createServerSelect');
+        const serverId = parseInt(serverSelect.value);
+        const protoSelect = document.getElementById('createProtoSelect');
+
+        protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
+
+        if (isNaN(serverId)) return;
+
+        const server = availableServers.find(s => s.id === serverId);
+        if (!server || !server.protocols) return;
+
+        const protocols = server.protocols;
+        const protoNames = {
+            awg: 'AmneziaWG',
+            telemt: 'MTProxyL (Telegram Proxy)',
+            dns: 'AmneziaDNS'
+        };
+
+        for (const [proto, info] of Object.entries(protocols)) {
+            if (info && info.installed) {
+                const opt = document.createElement('option');
+                opt.value = proto;
+                opt.textContent = protoNames[proto] || proto;
+                protoSelect.appendChild(opt);
+            }
+        }
+
+        document.getElementById('myAwgMimicryGroup').style.display = protoSelect.value === 'awg' ? '' : 'none';
+    }
+
+    document.getElementById('createProtoSelect').addEventListener('change', function() {
+        document.getElementById('myAwgMimicryGroup').style.display = this.value === 'awg' ? '' : 'none';
+    });
+
+    let sortBy = 'traffic';
+
+    function toggleSortOrder() {
+        sortBy = sortBy === 'traffic' ? 'date' : 'traffic';
+        const label = sortBy === 'traffic' ? _('sort_by_traffic') : _('sort_by_date');
+        document.getElementById('sortToggle').textContent = '📊 ' + label;
+        const connections = currentConnections || [];
+        renderConnectionsList(connections);
+    }
+
+    let currentConnections = initialConnections || [];
+
+    function renderConnectionsList(connections) {
+        currentConnections = connections || [];
+        const listEl = document.getElementById('myConnectionsList');
+        const emptyEl = document.getElementById('emptyState');
+
+        if (!currentConnections || currentConnections.length === 0) {
+            listEl.classList.add('hidden');
+            emptyEl.classList.remove('hidden');
+            return;
+        }
+
+        emptyEl.classList.add('hidden');
+        listEl.classList.remove('hidden');
+
+        const sorted = [...currentConnections].sort((a, b) => {
+            if (sortBy === 'traffic') {
+                const ta = a.traffic_total || 0;
+                const tb = b.traffic_total || 0;
+                return tb - ta;
+            }
+            const da = a.created_at ? new Date(a.created_at).getTime() : 0;
+            const db = b.created_at ? new Date(b.created_at).getTime() : 0;
+            return db - da;
+        });
+
+        const maxTrafficConn = sorted.length > 0
+            ? sorted.reduce((max, c) => (c.traffic_total || 0) > (max.traffic_total || 0) ? c : max)
+            : null;
+
+        listEl.innerHTML = sorted.map(c => renderConnectionItem(c, maxTrafficConn && c.id === maxTrafficConn.id)).join('');
+    }
+
+    async function refreshConnectionsList() {
+        try {
+            const result = await apiCall('/api/connections', 'GET');
+            renderConnectionsList(result.connections || []);
+            document.querySelectorAll('.traffic-badge[data-rx]').forEach(el => {
+                const rx = parseInt(el.dataset.rx || '0', 10);
+                const tx = parseInt(el.dataset.tx || '0', 10);
+                el.querySelector('.rx').textContent = formatBytes(rx);
+                el.querySelector('.tx').textContent = formatBytes(tx);
+            });
+        } catch (err) {
+            console.error('Failed to refresh connections:', err);
+        }
+    }
+
+    async function submitCreateConnection() {
+        const serverSelect = document.getElementById('createServerSelect');
+        const protoSelect = document.getElementById('createProtoSelect');
+        const nameInput = document.getElementById('createConnName');
+        const submitBtn = document.getElementById('createConnSubmit');
+
+        const serverId = parseInt(serverSelect.value);
+        const protocol = protoSelect.value;
+        const name = nameInput.value.trim() || 'My Connection';
+
+        if (isNaN(serverId) || !protocol) {
+            showToast('Please select server and protocol', 'error');
+            return;
+        }
+
+        const payload = {
+            server_id: serverId,
+            protocol: protocol,
+            name: name,
+        };
+
+        if (protocol === 'awg') {
+            payload.awg_mimicry = document.getElementById('myAwgMimicry').value || 'auto';
+        }
+
+        try {
+            submitBtn.disabled = true;
+            submitBtn.textContent = _('create_conn_creating');
+
+            const result = await apiCall('/api/connections/add', 'POST', payload);
+            closeModal('createConnModal');
+            showToast(_('create_conn_success'), 'success');
+
+            await refreshConnectionsList();
+
+            if (result.config) {
+                const conn = result.connection;
+                currentConfig = result.config;
+                currentVpnLink = result.vpn_link || '';
+                currentConfigName = (conn && conn.name || 'Connection').replace(/\s+/g, '_');
+                document.getElementById('configModalTitle').textContent = `${_('config')} - ${conn && conn.name || 'Connection'}`;
+                document.getElementById('configText').textContent = result.config;
+                document.getElementById('vpnLinkText').textContent = currentVpnLink;
+
+                const vpnTab = document.querySelectorAll('.config-tab')[1];
+                if (conn && conn.protocol === 'telemt') {
+                    vpnTab.style.display = 'none';
+                } else {
+                    vpnTab.style.display = '';
+                }
+
+                switchConfigTab('conf');
+                openModal('configModal');
+                generateQR(result.config);
+            }
+        } catch (err) {
+            showToast(`${_('create_conn_error')}: ` + err.message, 'error');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = _('create_conn_submit');
+        }
+    }
+
+    let renameConnectionId = null;
+
+    function showRenameModal(connId, currentName) {
+        renameConnectionId = connId;
+        const input = document.getElementById('renameInput');
+        input.value = currentName;
+        closeModal('configModal');
+        openModal('renameModal');
+        input.focus();
+        input.select();
+    }
+
+    function closeRenameModal() {
+        closeModal('renameModal');
+        renameConnectionId = null;
+    }
+
+    async function deleteConnection(connectionId, name) {
+        if (!confirm(_('delete_connection_confirm'))) return;
+        try {
+            await apiCall(`/api/connections/${connectionId}/delete`, 'POST');
+            const card = document.querySelector(`[data-conn-id="${CSS.escape(connectionId)}"]`);
+            if (card) card.remove();
+            await refreshConnectionsList();
+            showToast(_('connection_deleted'), 'success');
+        } catch (e) {
+            showToast(`${_('error')}: ` + e.message, 'error');
+        }
+    }
+
+    async function submitRename() {
+        const input = document.getElementById('renameInput');
+        const newName = input.value.trim();
+        if (!newName) {
+            showToast(_('rename_empty_name'), 'error');
+            return;
+        }
+        try {
+            await apiCall(`/api/connections/${renameConnectionId}/rename`, 'POST', { name: newName });
+            closeRenameModal();
+            showToast(_('connection_renamed'), 'success');
+            refreshConnectionsList();
+        } catch (e) {
+            showToast(`${_('rename_failed')}: ` + e.message, 'error');
+        }
+    }
+
+    function formatInitialTrafficBadges() {
+        document.querySelectorAll('.traffic-badge[data-rx]').forEach(el => {
+            const rx = parseInt(el.dataset.rx || '0', 10);
+            const tx = parseInt(el.dataset.tx || '0', 10);
+            el.querySelector('.rx').textContent = formatBytes(rx);
+            el.querySelector('.tx').textContent = formatBytes(tx);
+        });
+    }
+
+    formatInitialTrafficBadges();
+</script>
+{{ end }}
