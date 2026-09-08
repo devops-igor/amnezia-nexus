@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +34,80 @@ func main() {
 	if err := run(ctx); err != nil {
 		slog.Error("Application terminated with error", "err", err)
 		os.Exit(1)
+	}
+}
+
+// envVPNListenPort reports the VPN_LISTEN_PORT environment variable.
+//
+// config.Load() always populates cfg.VPNListenPort (51820 even when the env
+// var is unset), so "unset" cannot be distinguished from an explicit 51820
+// via cfg.VPNListenPort. This reads the env var directly so an unset or
+// invalid VPN_LISTEN_PORT leaves the DB-stored listen port in effect
+// (Issue #16 edge case) instead of pinning it to the 51820 default.
+func envVPNListenPort() (port int, ok bool) {
+	raw := strings.TrimSpace(os.Getenv("VPN_LISTEN_PORT"))
+	if raw == "" {
+		return 0, false
+	}
+	p, err := strconv.Atoi(raw)
+	if err != nil || p <= 0 || p > 65535 {
+		return 0, false
+	}
+	return p, true
+}
+
+// startVPNDataPlane wires VPN_LISTEN_PORT into the VPN service and starts
+// the VPN data plane.
+//
+// Issue #16: the env value is authoritative per boot — it is applied to the
+// service config BEFORE Start (so the listener binds the port compose maps)
+// and persisted via UpdateConfig, so subsequent boots read the persisted
+// value even if the env var is later removed. If the operator changes the
+// env, the next boot updates the persisted value again. An unset or invalid
+// env value leaves the DB config in effect. The wiring runs before Start,
+// so UpdateConfig never hits the running-listener rejection.
+//
+// When the TUN device is unavailable the panel continues in management-only
+// mode (API up, data plane down); other startup errors are fatal.
+func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Config) (bool, error) {
+	envPort, envPortSet := envVPNListenPort()
+	if envPortSet {
+		cfgVPN, err := vpnSvc.GetConfig(ctx)
+		if err != nil {
+			return false, fmt.Errorf("failed to load VPN config for VPN_LISTEN_PORT wiring: %w", err)
+		}
+		if cfgVPN.ListenPort != envPort {
+			wasPort := cfgVPN.ListenPort
+			cfgVPN.ListenPort = envPort
+			if err := vpnSvc.UpdateConfig(ctx, cfgVPN); err != nil {
+				return false, fmt.Errorf("failed to apply VPN_LISTEN_PORT=%d to VPN config: %w", envPort, err)
+			}
+			slog.Info("VPN listen port set from VPN_LISTEN_PORT env", "port", envPort, "was", wasPort)
+		}
+	}
+
+	if !cfg.VPNEnabled {
+		return false, nil
+	}
+
+	vpnSvc.RequireTunDevice()
+	stErr := vpnSvc.Start(ctx)
+	switch {
+	case stErr == nil:
+		// Log the port the service is actually configured to bind, not
+		// cfg.VPNListenPort (a hardcoded 51820 default when the env is
+		// unset — misleading, Issue #16).
+		boundPort := 0
+		if boundCfg, cfgErr := vpnSvc.GetConfig(ctx); cfgErr == nil && boundCfg != nil {
+			boundPort = boundCfg.ListenPort
+		}
+		slog.Info("VPN endpoint started", "listen_port", boundPort)
+		return true, nil
+	case errors.Is(stErr, endpoint.ErrTunUnavailable):
+		slog.Warn("VPN endpoint unavailable (no TUN device): running management-only", "err", stErr)
+		return false, nil
+	default:
+		return false, fmt.Errorf("failed to start VPN service: %w", stErr)
 	}
 }
 
@@ -125,19 +201,10 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to init VPN service: %w", err)
 	}
-	vpnStarted := false
-	if cfg.VPNEnabled {
-		vpnSvc.RequireTunDevice()
-		stErr := vpnSvc.Start(ctx)
-		switch {
-		case stErr == nil:
-			vpnStarted = true
-			slog.Info("VPN endpoint started", "listen_port", cfg.VPNListenPort)
-		case errors.Is(stErr, endpoint.ErrTunUnavailable):
-			slog.Warn("VPN endpoint unavailable (no TUN device): running management-only", "err", stErr)
-		default:
-			return fmt.Errorf("failed to start VPN service: %w", stErr)
-		}
+
+	vpnStarted, err := startVPNDataPlane(ctx, vpnSvc, cfg)
+	if err != nil {
+		return err
 	}
 
 	// 9. Initialize HTTP Router and Server

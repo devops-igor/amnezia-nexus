@@ -834,6 +834,22 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		}
 	}
 
+	// A listen-port change on a RUNNING listener cannot take effect: the
+	// UDP socket is already bound to the old port, so the bound socket and
+	// the persisted config would silently diverge (Issue #16). Mirror the
+	// obfuscation rejection above. The env wiring path in cmd/*/main.go
+	// runs BEFORE service Start, so it never hits this rejection.
+	if s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort {
+		if s.endpoint != nil && s.endpoint.IsRunning() {
+			log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
+			return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
+		}
+		if s.endpoint != nil {
+			s.endpoint.UpdateListenPort(cfg.ListenPort)
+			log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
+		}
+	}
+
 	s.cfg = cfg
 	if s.db != nil {
 		if err := s.db.SaveVPNConfig(ctx, cfg); err != nil {
