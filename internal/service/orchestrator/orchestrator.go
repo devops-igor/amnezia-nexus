@@ -37,7 +37,7 @@ type healthProbeKey struct {
 }
 
 // ProbeFunc defines the signature for Noise IK handshake UDP probes.
-type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
+type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
 
 // Orchestrator coordinates scheduled background maintenance and telemetry tasks.
 type Orchestrator struct {

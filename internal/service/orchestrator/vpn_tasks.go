@@ -53,6 +53,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			t.PublicKey,
 			t.PrivateKey,
 			"",
+			"",
 			health.DefaultH1,
 			health.DefaultH2,
 			health.DefaultS1,

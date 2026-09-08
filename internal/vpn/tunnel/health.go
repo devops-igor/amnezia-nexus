@@ -12,7 +12,7 @@ import (
 )
 
 // ProbeFunc is a function type for executing Noise IK handshake probes to a UDP endpoint.
-type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
+type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
 
 // HealthConfig defines tuning parameters for the backend health prober.
 type HealthConfig struct {
@@ -111,14 +111,14 @@ func (hp *HealthProber) Config() HealthConfig {
 	return hp.cfg
 }
 
-func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int64) (h1, h2 uint32, s1, s2 int, found bool) {
+func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int64) (h1, h2 uint32, s1, s2 int, hpKey string, found bool) {
 	server, err := db.GetServer(ctx, serverID)
 	if err != nil || server == nil || server.Protocols == nil {
-		return 0, 0, -1, -1, false
+		return 0, 0, -1, -1, "", false
 	}
 	awgInfo, ok := server.Protocols["awg"].(map[string]any)
 	if !ok || awgInfo == nil {
-		return 0, 0, -1, -1, false
+		return 0, 0, -1, -1, "", false
 	}
 	var paramsObj any
 	if p, ok := awgInfo["awg_params"]; ok && p != nil {
@@ -130,9 +130,9 @@ func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int6
 	}
 	bH1, bH2, bS1, bS2, ok := health.ExtractAWGExplicitParams(paramsObj)
 	if ok && (bH1 > 0 || bH2 > 0 || bS1 >= 0 || bS2 >= 0) {
-		return bH1, bH2, bS1, bS2, true
+		return bH1, bH2, bS1, bS2, health.ExtractHeaderProtectionKey(paramsObj), true
 	}
-	return 0, 0, -1, -1, false
+	return 0, 0, -1, -1, "", false
 }
 
 func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s1, s2 int, found bool) {
@@ -148,13 +148,13 @@ func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s
 
 // resolveTunnelParams returns H1, H2, S1, S2 for probing the specific backend tunnel,
 // checking the backend's installed params first, then stored VPNConfig, then prober defaults.
-func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64) (h1, h2 uint32, s1, s2 int) {
+func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64) (h1, h2 uint32, s1, s2 int, hpKey string) {
 	h1, h2, s1, s2 = hp.cfg.H1, hp.cfg.H2, hp.cfg.S1, hp.cfg.S2
 	if hp.db == nil {
-		return h1, h2, s1, s2
+		return h1, h2, s1, s2, ""
 	}
 
-	if bH1, bH2, bS1, bS2, ok := paramsFromBackendServer(ctx, hp.db, serverID); ok {
+	if bH1, bH2, bS1, bS2, bHPKey, ok := paramsFromBackendServer(ctx, hp.db, serverID); ok {
 		if bH1 > 0 {
 			h1 = bH1
 		}
@@ -167,7 +167,7 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 		if bS2 >= 0 {
 			s2 = bS2
 		}
-		return h1, h2, s1, s2
+		return h1, h2, s1, s2, bHPKey
 	}
 
 	if vH1, vH2, vS1, vS2, ok := paramsFromVPNConfig(ctx, hp.db); ok {
@@ -183,10 +183,10 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 		if vS2 >= 0 {
 			s2 = vS2
 		}
-		return h1, h2, s1, s2
+		return h1, h2, s1, s2, ""
 	}
 
-	return h1, h2, s1, s2
+	return h1, h2, s1, s2, ""
 }
 
 // ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
@@ -195,7 +195,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		return 0, errors.New("tunnel is nil")
 	}
 
-	h1, h2, s1, s2 := hp.resolveTunnelParams(ctx, tunnel.ServerID)
+	h1, h2, s1, s2, hpKey := hp.resolveTunnelParams(ctx, tunnel.ServerID)
 
 	rtt, err := hp.probeFn(
 		ctx,
@@ -203,6 +203,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		tunnel.PublicKey,
 		tunnel.PrivateKey,
 		"",
+		hpKey,
 		h1,
 		h2,
 		s1,
