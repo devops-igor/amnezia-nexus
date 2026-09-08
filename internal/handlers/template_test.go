@@ -722,6 +722,53 @@ func TestAdversarialTemplateSecurityAndResilience(t *testing.T) {
 		}
 	})
 
+	t.Run("Base Header Logo Link Role Dynamic", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			sess     *models.SessionData
+			wantHref string
+		}{
+			{
+				name:     "Admin User",
+				sess:     &models.SessionData{UserID: "admin-u", Role: models.RoleAdmin},
+				wantHref: `<a href="/" class="app-logo" style="text-decoration:none">`,
+			},
+			{
+				name:     "Support User",
+				sess:     &models.SessionData{UserID: "support-u", Role: models.RoleSupport},
+				wantHref: `<a href="/" class="app-logo" style="text-decoration:none">`,
+			},
+			{
+				name:     "Regular User",
+				sess:     &models.SessionData{UserID: "reg-u", Role: models.RoleUser},
+				wantHref: `<a href="/my" class="app-logo" style="text-decoration:none">`,
+			},
+			{
+				name:     "Unauthenticated User",
+				sess:     nil,
+				wantHref: `<a href="/my" class="app-logo" style="text-decoration:none">`,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				if tc.sess != nil {
+					req = req.WithContext(middleware.WithSession(req.Context(), tc.sess))
+				}
+				w := httptest.NewRecorder()
+				err := RenderTemplate(w, req, db, "base.html", nil)
+				if err != nil {
+					t.Fatalf("RenderTemplate failed: %v", err)
+				}
+				body := w.Body.String()
+				if !strings.Contains(body, tc.wantHref) {
+					t.Errorf("expected logo link %q in base.html output, body snippet:\n%s", tc.wantHref, body[:500])
+				}
+			})
+		}
+	})
+
 	t.Run("XSS Escaping In Templates", func(t *testing.T) {
 		xssPayload := `<script>alert("xss")</script>`
 		server := &models.Server{

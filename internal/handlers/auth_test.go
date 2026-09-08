@@ -243,6 +243,17 @@ func TestAuthHandlers(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
 		}
+
+		var res map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&res); err != nil {
+			t.Fatalf("failed to decode response JSON: %v", err)
+		}
+		if res["redirect"] != "/" {
+			t.Errorf("expected redirect '/', got %v", res["redirect"])
+		}
+		if res["role"] != string(models.RoleAdmin) {
+			t.Errorf("expected role 'admin', got %v", res["role"])
+		}
 	})
 
 	t.Run("APILoginHandler Success User", func(t *testing.T) {
@@ -256,6 +267,17 @@ func TestAuthHandlers(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var res map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&res); err != nil {
+			t.Fatalf("failed to decode response JSON: %v", err)
+		}
+		if res["redirect"] != "/my" {
+			t.Errorf("expected redirect '/my', got %v", res["redirect"])
+		}
+		if res["role"] != string(models.RoleUser) {
+			t.Errorf("expected role 'user', got %v", res["role"])
 		}
 	})
 

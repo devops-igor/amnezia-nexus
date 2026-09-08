@@ -360,6 +360,7 @@ func setupFullVPNRouter(h *Handlers) *chi.Mux {
 	r.Get("/api/vpn/tunnels", h.VPNTunnelsHandler)
 	r.Get("/api/vpn/config", h.VPNGetConfigHandler)
 	r.Post("/api/vpn/config", h.VPNUpdateConfigHandler)
+	r.Put("/api/vpn/config", h.VPNUpdateConfigHandler)
 	r.Get("/api/vpn/my-connection", h.VPNMyConnectionHandler)
 	r.Get("/api/vpn/my-config", h.VPNMyConfigHandler)
 	r.Post("/api/vpn/disconnect", h.VPNDisconnectHandler)
