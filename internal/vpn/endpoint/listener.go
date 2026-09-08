@@ -2,12 +2,12 @@ package endpoint
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	randv2 "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -178,7 +178,7 @@ type ClientPacketRouter func(peerKey string, packet []byte) error
 // the right socket address.
 type activePeerState struct {
 	peerKey     string
-	receiverIdx uint32
+	receiverIdx atomic.Uint32
 	sendCount   atomic.Uint64
 	lastSeen    atomic.Int64 // unix nanos
 }
@@ -307,6 +307,35 @@ func (el *Listener) SetPacketDevice(dev PacketDevice) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	el.tunDev = dev
+}
+
+// UpdateObfuscation swaps the AWG obfuscation parameters (H1..H4, S1..S4)
+// in the listener configuration. Callers must only invoke it while the
+// listener is stopped: the UDP read, handshake, and transport paths read
+// config fields without holding mu, so mutating a running listener would
+// race with packet processing. The VPN service enforces that contract by
+// propagating parameter changes to idle listeners and rejecting them while
+// the listener runs.
+func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 uint32, s1, s2, s3, s4 int) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.config.H1 = int(h1)
+	el.config.H2 = int(h2)
+	el.config.H3 = int(h3)
+	el.config.H4 = int(h4)
+	el.config.S1 = s1
+	el.config.S2 = s2
+	el.config.S3 = s3
+	el.config.S4 = s4
+}
+
+// ListenerConfigSnapshot returns a copy of the current listener
+// configuration so callers (and tests) can verify the listener agrees
+// with the persisted VPN configuration.
+func (el *Listener) ListenerConfigSnapshot() ListenerConfig {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	return el.config
 }
 
 // Start binds the UDP port and starts the background loops.
@@ -621,11 +650,12 @@ func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverId
 	}
 	st, ok := el.peersByAddr[sender.String()]
 	if !ok {
-		st = &activePeerState{peerKey: peerKey, receiverIdx: receiverIdx}
+		st = &activePeerState{peerKey: peerKey}
+		st.receiverIdx.Store(receiverIdx)
 		el.peersByAddr[sender.String()] = st
 	} else {
 		st.peerKey = peerKey
-		st.receiverIdx = receiverIdx
+		st.receiverIdx.Store(receiverIdx)
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
 	el.mu.Unlock()
@@ -696,6 +726,22 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
 
+	if len(packet) > 0 {
+		version := packet[0] >> 4
+		if version == 4 && len(packet) >= 20 {
+			totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+			if totalLen >= 20 && len(packet) > totalLen {
+				packet = packet[:totalLen]
+			}
+		} else if version == 6 && len(packet) >= 40 {
+			payloadLen := int(binary.BigEndian.Uint16(packet[4:6]))
+			totalLen := payloadLen + 40
+			if totalLen >= 40 && len(packet) > totalLen {
+				packet = packet[:totalLen]
+			}
+		}
+	}
+
 	el.mu.RLock()
 	router := el.router
 	el.mu.RUnlock()
@@ -757,18 +803,25 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		h4 = uint32(el.config.H4)
 	}
 
-	msg := make([]byte, 0, s4+transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
-	if s4 > 0 {
-		junk := make([]byte, s4)
-		if _, err := rand.Read(junk); err != nil {
-			return fmt.Errorf("failed to generate S4 padding: %w", err)
+	msg := make([]byte, s4, s4+transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
+	for i := 0; i < s4; i += 8 {
+		// #nosec G404 -- non-cryptographic obfuscation junk padding
+		val := randv2.Uint64()
+		rem := s4 - i
+		if rem > 8 {
+			rem = 8
 		}
-		msg = append(msg, junk...)
+		for b := 0; b < rem; b++ {
+			msg[i+b] = byte(val)
+			val >>= 8
+		}
 	}
+
+	receiverIdx := st.receiverIdx.Load()
 
 	var hdr [transportDataHeaderLen]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], h4) // AWG H4 transport data
-	binary.LittleEndian.PutUint32(hdr[4:8], st.receiverIdx)
+	binary.LittleEndian.PutUint32(hdr[4:8], receiverIdx)
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 	msg = append(msg, hdr[:]...)
 	msg = aead.Seal(msg, nonce[:], packet, nil)

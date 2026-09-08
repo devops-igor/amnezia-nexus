@@ -107,6 +107,66 @@ func TestVPNHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("VPNUpdateConfigHandler PUT PublicEndpoint", func(t *testing.T) {
+		// Read initial config
+		reqGet := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
+		wGet := httptest.NewRecorder()
+		r.ServeHTTP(wGet, reqGet)
+		if wGet.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", wGet.Code)
+		}
+		var initialCfg models.VPNConfig
+		_ = json.Unmarshal(wGet.Body.Bytes(), &initialCfg)
+		origH1 := initialCfg.H1
+		origS1 := initialCfg.S1
+
+		// 1. Update public_endpoint via PUT
+		putBody := []byte(`{"public_endpoint": "lb.amnezia.org:51820"}`)
+		reqPut := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBody))
+		wPut := httptest.NewRecorder()
+		r.ServeHTTP(wPut, reqPut)
+		if wPut.Code != http.StatusOK {
+			t.Fatalf("expected 200 on PUT, got %d: %s", wPut.Code, wPut.Body.String())
+		}
+
+		// Verify GET returns updated public_endpoint without corrupting H/S
+		reqGet2 := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
+		wGet2 := httptest.NewRecorder()
+		r.ServeHTTP(wGet2, reqGet2)
+		var updatedCfg models.VPNConfig
+		_ = json.Unmarshal(wGet2.Body.Bytes(), &updatedCfg)
+		if updatedCfg.PublicEndpoint != "lb.amnezia.org:51820" {
+			t.Errorf("expected public_endpoint = lb.amnezia.org:51820, got: %s", updatedCfg.PublicEndpoint)
+		}
+		if origH1 != 0 && updatedCfg.H1 != origH1 {
+			t.Errorf("expected H1 to be preserved (%d), got: %d", origH1, updatedCfg.H1)
+		}
+		if origS1 != 0 && updatedCfg.S1 != origS1 {
+			t.Errorf("expected S1 to be preserved (%d), got: %d", origS1, updatedCfg.S1)
+		}
+
+		// 2. Clear public_endpoint via PUT with empty string
+		putBodyClear := []byte(`{"public_endpoint": ""}`)
+		reqPutClear := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBodyClear))
+		wPutClear := httptest.NewRecorder()
+		r.ServeHTTP(wPutClear, reqPutClear)
+		if wPutClear.Code != http.StatusOK {
+			t.Fatalf("expected 200 on PUT clear, got %d: %s", wPutClear.Code, wPutClear.Body.String())
+		}
+
+		reqGet3 := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
+		wGet3 := httptest.NewRecorder()
+		r.ServeHTTP(wGet3, reqGet3)
+		var clearedCfg models.VPNConfig
+		_ = json.Unmarshal(wGet3.Body.Bytes(), &clearedCfg)
+		if clearedCfg.PublicEndpoint != "" {
+			t.Errorf("expected public_endpoint to be cleared, got: %s", clearedCfg.PublicEndpoint)
+		}
+		if origH1 != 0 && clearedCfg.H1 != origH1 {
+			t.Errorf("expected H1 to be preserved after clear (%d), got: %d", origH1, clearedCfg.H1)
+		}
+	})
+
 	t.Run("VPNMyConnectionHandler Unauth", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/vpn/my-connection", nil)
 		w := httptest.NewRecorder()
@@ -174,6 +234,57 @@ func TestVPNHandlers(t *testing.T) {
 
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("expected 404 when enabling non-existent server, got %d", w.Code)
+		}
+		var errResp map[string]any
+		_ = json.NewDecoder(w.Body).Decode(&errResp)
+		errCode, _ := errResp["error"].(string)
+		if errCode != "server_not_found" {
+			t.Errorf("expected error code 'server_not_found', got: %s", errCode)
+		}
+	})
+
+	t.Run("VPNEnableBackendHandler 500 Sanitization", func(t *testing.T) {
+		srv500 := &models.Server{
+			Name:    "VPN-Node-500",
+			Host:    "invalid-internal-host-999.internal.corp",
+			SSHPort: 22,
+			SSHUser: "root",
+			SSHPass: "pass",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"port":       float64(51820),
+					"public_key": "x9aB1234567890abcdef1234567890abcdef123456=",
+					"installed":  true,
+				},
+			},
+			CreatedAt: time.Now(),
+		}
+		sID500, err := db.CreateServer(ctx, srv500)
+		if err != nil {
+			t.Fatalf("failed to create test server for 500 test: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID500), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 for failed backend enable, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		var errResp map[string]any
+		_ = json.NewDecoder(w.Body).Decode(&errResp)
+		errCode, _ := errResp["error"].(string)
+		if errCode != "internal_error" {
+			t.Errorf("expected error code 'internal_error', got: %s", errCode)
+		}
+		detail, _ := errResp["detail"].(string)
+		if detail != "Failed to enable backend" {
+			t.Errorf("expected generic detail 'Failed to enable backend', got: %s", detail)
+		}
+
+		bodyStr := w.Body.String()
+		if strings.Contains(bodyStr, "invalid-internal-host") || strings.Contains(bodyStr, "UDP") || strings.Contains(bodyStr, "socket") {
+			t.Errorf("500 response leaked internal details: %s", bodyStr)
 		}
 	})
 
