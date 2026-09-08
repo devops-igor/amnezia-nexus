@@ -112,7 +112,7 @@ func tunCreateInterface(file *os.File, name string, mtu int) (*TunDevice, error)
 		ifr[ifReqNameLen] = byte(flags)
 		ifr[ifReqNameLen+1] = byte(flags >> 8)
 
-		// #nosec G115 -- ioctl with a fixed-size stack buffer, standard TUN pattern.
+		// #nosec G103,G115 -- ioctl with a fixed-size stack buffer, standard TUN pattern.
 		_, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, ioctlTunSetIFF, uintptr(unsafe.Pointer(&ifr[0])))
 		if errno == 0 {
 			// The kernel may have assigned a different name (or trimmed
@@ -160,7 +160,7 @@ func tunLinkUp(fd uintptr, name string) error {
 	ifr[ifReqNameLen] = byte(flags)
 	ifr[ifReqNameLen+1] = byte(flags >> 8)
 
-	// #nosec G115 -- ioctl with a fixed-size stack buffer, standard ifreq pattern.
+	// #nosec G103,G115 -- ioctl with a fixed-size stack buffer, standard ifreq pattern.
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(ctrl), ioctlSIOCSIFlags, uintptr(unsafe.Pointer(&ifr[0])))
 	if errno != 0 {
 		return fmt.Errorf("failed to set IFF_UP on %s: %w", name, errno)

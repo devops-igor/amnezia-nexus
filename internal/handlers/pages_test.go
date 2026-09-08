@@ -128,6 +128,27 @@ func TestPageHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("VPNPageHandler", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vpn", nil)
+		reqCtx := middleware.WithSession(req.Context(), adminSess)
+		w := httptest.NewRecorder()
+		h.VPNPageHandler(w, req.WithContext(reqCtx))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "vpn-listener-badge") {
+			t.Errorf("expected rendered vpn.html to contain 'vpn-listener-badge', got:\n%s", body)
+		}
+		if !strings.Contains(body, "vpn-backends-tbody") {
+			t.Errorf("expected rendered vpn.html to contain 'vpn-backends-tbody'")
+		}
+		if strings.Contains(body, "Template Not Found") {
+			t.Fatalf("CRITICAL REGRESSION: /vpn returned 'Template Not Found'")
+		}
+	})
+
 	t.Run("MyConnectionsPageHandler", func(t *testing.T) {
 		uConn := &models.User{
 			ID:       "u-my-1",

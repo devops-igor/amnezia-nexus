@@ -394,7 +394,7 @@ func TestTemplateEngineAndHelpers(t *testing.T) {
 		}
 	})
 
-	// Render all 11 HTML templates with realistic payloads
+	// Render all 12 HTML templates with realistic payloads
 	templates := []string{
 		"base.html",
 		"login.html",
@@ -407,6 +407,7 @@ func TestTemplateEngineAndHelpers(t *testing.T) {
 		"change_password.html",
 		"leaderboard.html",
 		"user_share.html",
+		"vpn.html",
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -595,6 +596,7 @@ func TestAdversarialTemplateSecurityAndResilience(t *testing.T) {
 		"change_password.html",
 		"leaderboard.html",
 		"user_share.html",
+		"vpn.html",
 	}
 
 	t.Run("Zero Panic On Nil Data", func(t *testing.T) {

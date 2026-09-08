@@ -114,13 +114,13 @@
                     <div class="form-group">
                         <label class="form-label">{{ _ "captcha" }}</label>
                         <div
-                            style="display: flex; margin-bottom: var(--space-xs); border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color);">
+                            style="display: flex; margin-bottom: var(--space-xs); border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); background: #f8fafc; align-items: center; justify-content: center; min-height: 65px;">
                             <img id="captchaImage" src="/api/auth/captcha" alt="Captcha"
-                                style="width: 100%; height: 65px; object-fit: cover; object-position: center; cursor: pointer; background: #fff;"
+                                style="max-width: 100%; height: 60px; object-fit: contain; cursor: pointer;"
                                 onclick="refreshCaptcha()" title="{{ _ "captcha_hint" }}">
                         </div>
                         <input class="form-input" type="text" id="captcha" placeholder="{{ _ "captcha_placeholder" }}"
-                            required>
+                            required autocomplete="off">
                     </div>
                     {{ end }}
 
@@ -278,8 +278,10 @@
                 const meta = document.querySelector('meta[name="csrf-token"]');
                 const csrfToken = meta ? meta.getAttribute('content') : (document.cookie.match(/csrftoken=([^;]+)/)?.[1] || '');
 
+                const captchaInput = document.getElementById('captcha');
                 const res = await fetch('/api/auth/login', {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-CSRF-Token': csrfToken,
@@ -287,12 +289,12 @@
                     body: JSON.stringify({
                         username: document.getElementById('username').value,
                         password: document.getElementById('password').value,
-                        captcha: document.getElementById('captcha') ? document.getElementById('captcha').value : null,
+                        captcha: captchaInput ? captchaInput.value.trim() : null,
                     }),
                 });
                 const data = await res.json();
                 if (!res.ok) {
-                    throw new Error(data.error || _('login_error'));
+                    throw new Error(data.detail || (data.error ? _(data.error) : null) || _('login_error'));
                 }
                 if (data.password_change_required) {
                     window.location.href = '/change-password?forced=1';
