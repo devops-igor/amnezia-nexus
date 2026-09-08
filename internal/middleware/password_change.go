@@ -39,7 +39,7 @@ func PasswordChangeRequired() func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			session := GetSession(r.Context())
-			if session != nil && session.PasswordChangeRequired {
+			if session != nil && session.IsAuthenticated() && session.PasswordChangeRequired {
 				if !isPathAllowedDuringPasswordChange(r.URL.Path) {
 					if isAPIRequest(r) {
 						WriteJSONErrorWithFlag(

@@ -18,3 +18,4 @@ coverage.out
 
 # Build output
 bin/
+.ssh

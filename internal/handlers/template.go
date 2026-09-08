@@ -108,6 +108,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"settings.html",
 		"leaderboard.html",
 		"user_share.html",
+		"vpn.html",
 	}
 
 	fresh := make(map[string]*template.Template)

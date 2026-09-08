@@ -165,6 +165,7 @@
   "nav_servers": "Serveurs",
   "nav_settings": "Paramètres",
   "nav_users": "Utilisateurs",
+  "nav_vpn": "VPN",
   "new_password_hint": "Nouveau mot de passe (laisser vide si inchangé)",
   "next_page": "Suivant →",
   "no_active_conns": "Aucune connexion active.",
