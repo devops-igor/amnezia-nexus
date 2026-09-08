@@ -10,6 +10,8 @@ DEV_HANDOVER.md
 TASK.md
 TASK_PROMPT*.md
 SESSION_SUMMARY*.md
+TASKS_OVERVIEW*.md
+*OVERVIEW*.md
 .agents/
 AGENTS.md
 .gitignore
