@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -140,6 +141,11 @@ AllowedIPs = 10.8.1.2/32
 	defer cancel()
 
 	cName := fmt.Sprintf("awg-probe-integration-%d", time.Now().UnixNano()%1000000)
+	// NOTE: we must NOT pipe the config via `docker run -d -i` stdin — docker detaches
+	// immediately and stdin closes before the shell reads it, leaving an EMPTY config
+	// file (verified empirically: 0-byte awg0.conf, daemon runs with defaults and drops
+	// every initiation). Instead: start the container bare, then write the config via
+	// `docker exec` with the content passed through the exec command's stdin.
 	runCmd := exec.CommandContext(ctx, "docker", "run", "-d",
 		"--privileged",
 		"--cap-add=NET_ADMIN",
@@ -148,29 +154,57 @@ AllowedIPs = 10.8.1.2/32
 		"--entrypoint", "/bin/sh",
 		"--name", cName,
 		awgContainerImage,
-		"-c", "mkdir -p /opt/amnezia/awg && cat > /opt/amnezia/awg/awg0.conf && awg-quick up /opt/amnezia/awg/awg0.conf && exec tail -f /dev/null",
+		"-c", "mkdir -p /opt/amnezia/awg && exec tail -f /dev/null",
 	)
-	// The config is piped into the container's stdin via docker run -i.
-	runCmd.Stdin = strings.NewReader(conf)
 	runOut, err := runCmd.CombinedOutput()
 	if err != nil {
-		// Container may have started but failed at startup: dump logs.
+		_ = exec.Command("docker", "rm", "-f", cName).Run()
+		t.Fatalf("failed to start %s container: %v: %s",
+			awgContainerImage, err, strings.TrimSpace(string(runOut)))
+	}
+	// Write the server config via docker exec (stdin stays attached for exec).
+	writeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", cName,
+		"sh", "-c", "cat > /opt/amnezia/awg/awg0.conf")
+	writeCmd.Stdin = strings.NewReader(conf)
+	if wOut, wErr := writeCmd.CombinedOutput(); wErr != nil {
+		_ = exec.Command("docker", "rm", "-f", cName).Run()
+		t.Fatalf("failed to write awg0.conf into container: %v: %s", wErr, strings.TrimSpace(string(wOut)))
+	}
+	// Sanity: the config must be non-empty before we bring the interface up.
+	var confSizeOut []byte
+	confSizeOut, err = exec.CommandContext(ctx, "docker", "exec", cName, "wc", "-c", "/opt/amnezia/awg/awg0.conf").CombinedOutput()
+	if err != nil || !strings.Contains(string(confSizeOut), fmt.Sprintf("%d", len(conf))) {
+		_ = exec.Command("docker", "rm", "-f", cName).Run()
+		t.Fatalf("awg0.conf size mismatch (want %d bytes): %s", len(conf), strings.TrimSpace(string(confSizeOut)))
+	}
+	upOut, upErr := exec.CommandContext(ctx, "docker", "exec", cName,
+		"sh", "-c", "awg-quick up /opt/amnezia/awg/awg0.conf").CombinedOutput()
+	if upErr != nil {
 		logs, _ := exec.Command("docker", "logs", cName).CombinedOutput()
 		_ = exec.Command("docker", "rm", "-f", cName).Run()
-		t.Fatalf("failed to start %s container: %v: %s\ncontainer logs: %s",
-			awgContainerImage, err, strings.TrimSpace(string(runOut)), strings.TrimSpace(string(logs)))
+		t.Fatalf("awg-quick up failed: %v: %s\ncontainer logs: %s",
+			upErr, strings.TrimSpace(string(upOut)), strings.TrimSpace(string(logs)))
 	}
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "rm", "-f", cName).Run()
 	})
 
 	// Wait until the awg0 interface is up inside the container.
+	// NOTE: readiness = the interface exists and reports a listening port.
+	// We deliberately do NOT wait for a "peer:" section in `awg show`:
+	// the userspace amneziawg-go implementation only prints peer blocks
+	// after a peer has completed a handshake, so requiring "peer:"
+	// pre-handshake deadlocks the test even though the listener is ready.
 	var awgShow string
+	ready := false
 	deadline := time.Now().Add(containerStartWait)
 	for time.Now().Before(deadline) {
 		out, err := exec.CommandContext(ctx, "docker", "exec", cName, "awg", "show", "awg0").CombinedOutput()
 		awgShow = string(out)
-		if err == nil && strings.Contains(awgShow, "peer:") {
+		if err == nil &&
+			strings.Contains(awgShow, "interface: awg0") &&
+			strings.Contains(awgShow, "listening port:") {
+			ready = true
 			break
 		}
 		select {
@@ -179,16 +213,24 @@ AllowedIPs = 10.8.1.2/32
 		case <-time.After(1 * time.Second):
 		}
 	}
-	if !strings.Contains(awgShow, "peer:") {
+	if !ready {
 		logs, _ := exec.Command("docker", "logs", cName).CombinedOutput()
-		t.Fatalf("awg0 interface or peer not ready after %v:\nawg show: %s\ncontainer logs: %s",
+		t.Fatalf("awg0 interface not ready after %v:\nawg show: %s\ncontainer logs: %s",
 			containerStartWait, strings.TrimSpace(awgShow), strings.TrimSpace(string(logs)))
 	}
 	t.Logf("container interface up:\n%s", awgShow)
 
 	// The probe identity is the private key whose public half the container
 	// registered — exactly what AddClient's caller-supplied-key path stores.
-	res, err := PerformAWGHandshake(ctx, "127.0.0.1", port, serverPub, proberPriv, "", nil, "", probeTimeout)
+	// Probe target: the docker host's bridge gateway. When this test runs inside a
+	// container (golang builder with the host docker socket mounted), "127.0.0.1" is
+	// the test container itself, NOT the host where -p maps the server's UDP port.
+	// The bridge gateway address reaches the host's mapped ports from any container.
+	probeHost := "127.0.0.1"
+	if ip := os.Getenv("AWG_PROBE_HOST"); ip != "" {
+		probeHost = ip
+	}
+	res, err := PerformAWGHandshake(ctx, probeHost, port, serverPub, proberPriv, "", nil, "", probeTimeout)
 	if err != nil {
 		t.Fatalf("PerformAWGHandshake against real amneziawg-go returned hard error: %v", err)
 	}
