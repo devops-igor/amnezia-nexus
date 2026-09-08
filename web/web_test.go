@@ -73,6 +73,7 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"change_password.html",
 		"leaderboard.html",
 		"user_share.html",
+		"vpn.html",
 	}
 
 	for _, tmpl := range requiredTemplates {
