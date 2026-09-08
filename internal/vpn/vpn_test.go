@@ -1396,6 +1396,211 @@ func TestConcurrentFirstRead_ConsistentParams(t *testing.T) {
 	}
 }
 
+// --- Issue #16: listen-port change safety (C2) ---
+
+func TestUpdateConfig_RejectsListenPortChangeWhileRunning(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	before, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	boundSnapshot := svc.endpoint.ListenerConfigSnapshot()
+
+	changed := *before
+	changed.ListenPort = before.ListenPort + 7
+	err = svc.UpdateConfig(ctx, &changed)
+	if err == nil {
+		_ = svc.Stop()
+		t.Fatal("expected error when changing listen_port while listener runs")
+	}
+	if !strings.Contains(err.Error(), "listen_port cannot be changed while the VPN listener is running") {
+		t.Fatalf("expected running-listener rejection error, got: %v", err)
+	}
+
+	// The running config and the bound listener must be untouched.
+	after, _ := svc.GetConfig(ctx)
+	if after.ListenPort != before.ListenPort {
+		t.Errorf("running config was mutated by rejected update: listen_port %d -> %d", before.ListenPort, after.ListenPort)
+	}
+	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != boundSnapshot.ListenPort {
+		t.Errorf("bound listener port was mutated by rejected update: %d -> %d", boundSnapshot.ListenPort, snap.ListenPort)
+	}
+	_ = svc.Stop()
+
+	// Once the listener is idle the same change is accepted...
+	if err := svc.UpdateConfig(ctx, &changed); err != nil {
+		t.Fatalf("UpdateConfig after Stop failed: %v", err)
+	}
+	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != changed.ListenPort {
+		t.Errorf("idle listener port not updated: want %d, got %d", changed.ListenPort, snap.ListenPort)
+	}
+	// ...and persisted, so the next boot binds the new port.
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.ListenPort != changed.ListenPort {
+		t.Errorf("persisted listen_port not updated: want %d, got %d", changed.ListenPort, stored.ListenPort)
+	}
+}
+
+func TestUpdateConfig_AllowsListenPortChangeWhenIdle(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	before, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+
+	changed := *before
+	changed.ListenPort = 31458
+	if err := svc.UpdateConfig(ctx, &changed); err != nil {
+		t.Fatalf("UpdateConfig with changed listen_port on idle service failed: %v", err)
+	}
+
+	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != 31458 {
+		t.Errorf("listener config not updated on idle service: want 31458, got %d", snap.ListenPort)
+	}
+
+	cfgAfter, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfgAfter.ListenPort != 31458 {
+		t.Errorf("service config listen_port: want 31458, got %d", cfgAfter.ListenPort)
+	}
+
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.ListenPort != 31458 {
+		t.Errorf("persisted listen_port: want 31458, got %d", stored.ListenPort)
+	}
+}
+
+// --- Issue #16: VPN_LISTEN_PORT env wiring (C1/C4) ---
+
+// TestVPNPortWiring_EnvPortWinsOnFirstBootThenPersists constructs the C1
+// wiring sequence that cmd/panel/main.go and cmd/server/main.go run before
+// vpnSvc.Start: GetConfig -> set port from env -> UpdateConfig. It asserts
+// the port is persisted to the DB config, propagated to the (idle)
+// listener, rendered into the client config endpoint, and read back
+// unchanged by a fresh service (the "subsequent boots read the persisted
+// value" leg of the precedence contract).
+func TestVPNPortWiring_EnvPortWinsOnFirstBootThenPersists(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	// C1 wiring sequence (env VPN_LISTEN_PORT=31458 differs from DB config).
+	const envPort = 31458
+	cfgVPN, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	wasPort := cfgVPN.ListenPort
+	if wasPort == envPort {
+		t.Fatalf("test premise: DB config already at env port %d", envPort)
+	}
+	cfgVPN.ListenPort = envPort
+	if err := svc.UpdateConfig(ctx, cfgVPN); err != nil {
+		t.Fatalf("UpdateConfig (env wiring) failed: %v", err)
+	}
+	t.Logf("wired VPN_LISTEN_PORT=%d (was %d)", envPort, wasPort)
+
+	// Persisted for subsequent boots.
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.ListenPort != envPort {
+		t.Errorf("persisted listen_port: want %d, got %d", envPort, stored.ListenPort)
+	}
+
+	// The (idle) listener will bind the wired port at Start.
+	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != envPort {
+		t.Errorf("listener config listen_port: want %d, got %d", envPort, snap.ListenPort)
+	}
+
+	// GenerateClientConfig renders the matching endpoint port.
+	t.Setenv("VPN_PUBLIC_ENDPOINT", "")
+	t.Setenv("PUBLIC_ENDPOINT", "")
+	t.Setenv("PUBLIC_IP", "")
+	uID, err := db.CreateUser(ctx, &models.User{Username: "portwire", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+	if !strings.Contains(cfgStr, "Endpoint = ") {
+		t.Fatalf("expected Endpoint directive in client config: %s", cfgStr)
+	}
+	if !strings.Contains(cfgStr, ":31458") {
+		t.Errorf("client config endpoint must carry the wired listen port :%d, got:\n%s", envPort, cfgStr)
+	}
+
+	// A fresh service over the same DB (next boot, env wiring already
+	// applied) reads the persisted port without any further update.
+	svc2, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService (second boot) failed: %v", err)
+	}
+	cfg2, err := svc2.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig (second boot) failed: %v", err)
+	}
+	if cfg2.ListenPort != envPort {
+		t.Errorf("second boot must read persisted port %d, got %d", envPort, cfg2.ListenPort)
+	}
+}
+
+// TestVPNPortWiring_SamePortIsNoop pins the main.go guard: when the env port
+// equals the DB config port, the wiring must not call UpdateConfig (no
+// rewrite, no spurious audit/persist churn).
+func TestVPNPortWiring_SamePortIsNoop(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	// The service boots with config and listener in agreement; main.go
+	// only calls UpdateConfig when the ports DIFFER, so equality must
+	// stay a no-op with the listener snapshot still matching.
+	cfgVPN, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != cfgVPN.ListenPort {
+		t.Errorf("listener diverges from config without any wiring: cfg=%d listener=%d", cfgVPN.ListenPort, snap.ListenPort)
+	}
+}
+
 func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

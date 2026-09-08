@@ -329,6 +329,21 @@ func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 uint32, s1, s2, s3, s4 int)
 	el.config.S4 = s4
 }
 
+// UpdateListenPort sets the UDP port the listener will bind at its next
+// Start. Callers must only invoke it while the listener is stopped — a
+// running listener is already bound to its current port, and Start
+// (like UpdateObfuscation) refuses to run twice — so the VPN service
+// propagates port changes only to idle listeners and rejects them while
+// the listener runs.
+func (el *Listener) UpdateListenPort(port int) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if port <= 0 {
+		return
+	}
+	el.config.ListenPort = port
+}
+
 // ListenerConfigSnapshot returns a copy of the current listener
 // configuration so callers (and tests) can verify the listener agrees
 // with the persisted VPN configuration.

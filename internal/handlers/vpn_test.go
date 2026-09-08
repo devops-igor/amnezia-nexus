@@ -454,6 +454,84 @@ func TestVPNHandlers(t *testing.T) {
 	})
 }
 
+// TestVPNUpdateConfigHandler_PUT_PublicEndpointMerge covers the
+// edit-public-endpoint path (Issue #16, C3): PUT /api/vpn/config through the
+// REAL handler (the mergeVPNConfig path), asserting 200, the persisted value
+// via GET, and that an update WITHOUT public_endpoint preserves the current
+// one (regression guard for the merge semantics the UI's edit-endpoint flow
+// relies on).
+func TestVPNUpdateConfigHandler_PUT_PublicEndpointMerge(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	r := setupFullVPNRouter(h)
+	ctx := context.Background()
+
+	getEndpoint := func() string {
+		t.Helper()
+		reqGet := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
+		wGet := httptest.NewRecorder()
+		r.ServeHTTP(wGet, reqGet)
+		if wGet.Code != http.StatusOK {
+			t.Fatalf("GET /api/vpn/config expected 200, got %d", wGet.Code)
+		}
+		var cfg models.VPNConfig
+		if err := json.Unmarshal(wGet.Body.Bytes(), &cfg); err != nil {
+			t.Fatalf("GET response is not valid VPNConfig JSON: %v", err)
+		}
+		return cfg.PublicEndpoint
+	}
+
+	// 1. PUT with public_endpoint: "host:port" -> 200, persisted value via GET.
+	putBody := []byte(`{"public_endpoint": "edit.example.net:31458"}`)
+	reqPut := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBody))
+	wPut := httptest.NewRecorder()
+	r.ServeHTTP(wPut, reqPut)
+	if wPut.Code != http.StatusOK {
+		t.Fatalf("PUT with public_endpoint expected 200, got %d: %s", wPut.Code, wPut.Body.String())
+	}
+	if got := getEndpoint(); got != "edit.example.net:31458" {
+		t.Errorf("public_endpoint not persisted after PUT: got %q", got)
+	}
+
+	// 2. Update WITHOUT a public_endpoint key -> 200, current endpoint
+	//    preserved by the merge (the UI sends partial payloads).
+	partial := models.VPNConfig{Algorithm: models.LBWeighted}
+	partialBody, err := json.Marshal(partial)
+	if err != nil {
+		t.Fatalf("marshal partial config: %v", err)
+	}
+	reqPut2 := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(partialBody))
+	wPut2 := httptest.NewRecorder()
+	r.ServeHTTP(wPut2, reqPut2)
+	if wPut2.Code != http.StatusOK {
+		t.Fatalf("PUT without public_endpoint expected 200, got %d: %s", wPut2.Code, wPut2.Body.String())
+	}
+	if got := getEndpoint(); got != "edit.example.net:31458" {
+		t.Errorf("public_endpoint lost by update without the key: got %q", got)
+	}
+
+	// 3. Update with an empty JSON object (no keys at all) -> also preserved.
+	emptyBody := []byte(`{}`)
+	reqPut3 := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(emptyBody))
+	wPut3 := httptest.NewRecorder()
+	r.ServeHTTP(wPut3, reqPut3)
+	if wPut3.Code != http.StatusOK {
+		t.Fatalf("PUT with empty object expected 200, got %d: %s", wPut3.Code, wPut3.Body.String())
+	}
+	if got := getEndpoint(); got != "edit.example.net:31458" {
+		t.Errorf("public_endpoint lost by empty-object PUT: got %q", got)
+	}
+
+	// The endpoint must also be in the persisted DB config row, not just
+	// the service's in-memory copy.
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.PublicEndpoint != "edit.example.net:31458" {
+		t.Errorf("persisted public_endpoint: want edit.example.net:31458, got %q", stored.PublicEndpoint)
+	}
+}
+
 func TestVPNEnableBackendHandler_DynamicFallback(t *testing.T) {
 	ctx := context.Background()
 	mockSSH := &testMockSSHClient{
