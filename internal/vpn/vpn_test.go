@@ -302,6 +302,11 @@ func TestVPNServiceConfigAndBackends(t *testing.T) {
 	if !strings.Contains(cfgStr, "Endpoint = ") {
 		t.Errorf("expected Endpoint directive in config: %s", cfgStr)
 	}
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if strings.Contains(cfgStr, k+" =") || strings.Contains(cfgStr, k+"=") {
+			t.Errorf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
+		}
+	}
 	if filename != "amnezia-portal-alice.conf" {
 		t.Errorf("unexpected filename: %s", filename)
 	}
@@ -773,6 +778,11 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 		!strings.Contains(cfgStr, "S1 = 45") ||
 		!strings.Contains(cfgStr, "S2 = 60") {
 		t.Fatalf("GenerateClientConfig did not render stored VPNConfig values: %s", cfgStr)
+	}
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if strings.Contains(cfgStr, k+" =") || strings.Contains(cfgStr, k+"=") {
+			t.Fatalf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
+		}
 	}
 
 	// 2. Parse config parameters
@@ -1383,5 +1393,46 @@ func TestConcurrentFirstRead_ConsistentParams(t *testing.T) {
 	}
 	if persisted.H1 == 0 {
 		t.Error("expected persisted H1 to be generated (non-zero)")
+	}
+}
+
+func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "charlie",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, filename, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	if filename != "amnezia-portal-charlie.conf" {
+		t.Errorf("unexpected filename: %s", filename)
+	}
+
+	// Issue #15: Load balancer client configs must be pure AWG 3+ and must NEVER contain I1..I5
+	for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if strings.Contains(cfgStr, key+" =") || strings.Contains(cfgStr, key+"=") {
+			t.Errorf("GenerateClientConfig must not output CPS param %s, config:\n%s", key, cfgStr)
+		}
+	}
+
+	// Ensure required AWG 3+ parameters are present
+	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"} {
+		if !strings.Contains(cfgStr, key+" =") {
+			t.Errorf("GenerateClientConfig missing required AWG parameter %s, config:\n%s", key, cfgStr)
+		}
 	}
 }
