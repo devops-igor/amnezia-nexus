@@ -1,0 +1,781 @@
+package endpoint
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+// PacketDevice abstracts physical Linux TUN devices and in-memory test devices.
+type PacketDevice interface {
+	Read(p []byte) (n int, err error)
+	Write(p []byte) (n int, err error)
+	Close() error
+	Name() string
+	MTU() int
+}
+
+// ChannelPacketDevice is an in-memory PacketDevice implementation using Go channels.
+type ChannelPacketDevice struct {
+	name   string
+	mtu    int
+	in     chan []byte
+	out    chan []byte
+	closed atomic.Bool
+	stopCh chan struct{}
+}
+
+// NewChannelPacketDevice creates a new in-memory channel packet device.
+func NewChannelPacketDevice(name string, mtu int, bufSize int) *ChannelPacketDevice {
+	if mtu <= 0 {
+		mtu = 1420
+	}
+	if bufSize <= 0 {
+		bufSize = 256
+	}
+	return &ChannelPacketDevice{
+		name:   name,
+		mtu:    mtu,
+		in:     make(chan []byte, bufSize),
+		out:    make(chan []byte, bufSize),
+		stopCh: make(chan struct{}),
+	}
+}
+
+func (c *ChannelPacketDevice) Read(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, errors.New("device closed")
+	}
+	select {
+	case <-c.stopCh:
+		return 0, errors.New("device closed")
+	case pkt, ok := <-c.in:
+		if !ok {
+			return 0, errors.New("device closed")
+		}
+		n := copy(p, pkt)
+		return n, nil
+	}
+}
+
+func (c *ChannelPacketDevice) Write(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, errors.New("device closed")
+	}
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	select {
+	case <-c.stopCh:
+		return 0, errors.New("device closed")
+	case c.out <- buf:
+		return len(p), nil
+	default:
+		return 0, errors.New("channel buffer full")
+	}
+}
+
+func (c *ChannelPacketDevice) InjectPacket(p []byte) error {
+	if c.closed.Load() {
+		return errors.New("device closed")
+	}
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	select {
+	case c.in <- buf:
+		return nil
+	default:
+		return errors.New("inbound queue full")
+	}
+}
+
+func (c *ChannelPacketDevice) ReceivePacket() ([]byte, error) {
+	if c.closed.Load() {
+		return nil, errors.New("device closed")
+	}
+	select {
+	case pkt, ok := <-c.out:
+		if !ok {
+			return nil, errors.New("device closed")
+		}
+		return pkt, nil
+	case <-c.stopCh:
+		return nil, errors.New("device closed")
+	}
+}
+
+func (c *ChannelPacketDevice) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		close(c.stopCh)
+	}
+	return nil
+}
+
+func (c *ChannelPacketDevice) Name() string { return c.name }
+func (c *ChannelPacketDevice) MTU() int     { return c.mtu }
+
+// ListenerConfig defines settings for the AWG endpoint listener.
+type ListenerConfig struct {
+	ListenPort  int
+	SubnetCIDR  string
+	MTU         int
+	PrivateKey  string
+	PublicKey   string
+	IdleTimeout time.Duration
+	// H1 is the AWG handshake initiation message type; 0 selects
+	// health.DefaultH1. Must match the AWG client parameters (JunkPacket
+	// message type) distributed to registered peers.
+	H1 int
+	// S1 is the junk prefix length before the initiation payload; 0 selects
+	// health.DefaultS1.
+	S1 int
+	// H2 is the AWG handshake response message type; 0 selects
+	// health.DefaultH2.
+	H2 int
+	// S2 is the junk prefix length before the response payload; 0 selects
+	// health.DefaultS2.
+	S2 int
+}
+
+// BackendSelector resolves the backend tunnel a newly authenticated peer's
+// session should be pinned to. It is the listener's integration point for
+// load-balancer-aware backend selection (sticky sessions / least-connections
+// / weighted round-robin); when unset the listener falls back to the static
+// DB lookup keyed by the peer's connection server ID.
+// IncomingPeerHandler handles the handshake accept path.
+type IncomingPeerHandler func(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error)
+
+// ClientPacketRouter routes a decrypted client→backend transport packet for
+// a peer (the VPN service wires it to forwarder.RouteClientToBackend).
+type ClientPacketRouter func(peerKey string, packet []byte) error
+
+// activePeerState tracks a peer's most recent UDP endpoint and transport
+// send counter so late transport datagrams and server→client sends can find
+// the right socket address.
+type activePeerState struct {
+	peerKey   string
+	sendCount atomic.Uint64
+	lastSeen  atomic.Int64 // unix nanos
+}
+
+// Listener manages the AWG endpoint UDP listener and peer lifecycle.
+type Listener struct {
+	mu                  sync.RWMutex
+	config              ListenerConfig
+	db                  *database.DB
+	auth                Authenticator
+	ipam                *IPAM
+	sessionMgr          *SessionManager
+	serverKeys          *ServerKeysManager
+	serverPriv          []byte
+	noiseKeys           map[string]*TransportKeys
+	peersByAddr         map[string]*activePeerState // sender UDP addr string -> peer state
+	udpConn             *net.UDPConn
+	tunDev              PacketDevice
+	running             bool
+	draining            bool
+	stopCh              chan struct{}
+	wg                  sync.WaitGroup
+	rxBytes             atomic.Int64
+	txBytes             atomic.Int64
+	incomingPeerHandler IncomingPeerHandler
+
+	router ClientPacketRouter
+}
+
+// NewListener initializes a new AWG endpoint listener. serverKeys provides the
+// endpoint's persistent Noise server keypair (see ServerKeysManager); when nil
+// one is created from db (ephemeral when db is also nil).
+func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *IPAM, sessionMgr *SessionManager, serverKeys *ServerKeysManager) (*Listener, error) {
+	if cfg.ListenPort <= 0 {
+		cfg.ListenPort = 51820
+	}
+	if cfg.SubnetCIDR == "" {
+		cfg.SubnetCIDR = "10.100.0.0/16"
+	}
+	if cfg.MTU <= 0 {
+		cfg.MTU = 1420
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 3 * time.Minute
+	}
+	if cfg.H1 == 0 {
+		// #nosec G115 -- constant conversion, value fits in int.
+		cfg.H1 = int(health.DefaultH1)
+	}
+	if cfg.S1 == 0 {
+		cfg.S1 = health.DefaultS1
+	}
+	if cfg.H2 == 0 {
+		// #nosec G115 -- constant conversion, value fits in int.
+		cfg.H2 = int(health.DefaultH2)
+	}
+	if cfg.S2 == 0 {
+		cfg.S2 = health.DefaultS2
+	}
+
+	if auth == nil && db != nil {
+		auth = NewDBAuthenticator(db)
+	}
+
+	if serverKeys == nil {
+		serverKeys = NewServerKeysManager(db)
+	}
+
+	if ipam == nil {
+		var err error
+		ipam, err = NewIPAM(cfg.SubnetCIDR)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize IPAM: %w", err)
+		}
+	}
+
+	if sessionMgr == nil {
+		sessionMgr = NewSessionManager(db, ipam)
+	}
+
+	return &Listener{
+		config:      cfg,
+		db:          db,
+		auth:        auth,
+		ipam:        ipam,
+		sessionMgr:  sessionMgr,
+		serverKeys:  serverKeys,
+		noiseKeys:   make(map[string]*TransportKeys),
+		peersByAddr: make(map[string]*activePeerState),
+		tunDev:      NewChannelPacketDevice("awg0", cfg.MTU, 512),
+		stopCh:      make(chan struct{}),
+	}, nil
+}
+
+// SetIncomingPeerHandler registers the handler for incoming peer handshakes.
+func (el *Listener) SetIncomingPeerHandler(fn IncomingPeerHandler) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.incomingPeerHandler = fn
+}
+
+// SetClientPacketRouter installs the router used to forward decrypted
+// client→backend transport packets (nil drops them instead).
+func (el *Listener) SetClientPacketRouter(fn ClientPacketRouter) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.router = fn
+}
+
+// SetPacketDevice overrides the default packet device (e.g. Linux TUN interface).
+func (el *Listener) SetPacketDevice(dev PacketDevice) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.tunDev = dev
+}
+
+// Start binds the UDP port and starts the background loops.
+func (el *Listener) Start(ctx context.Context) error {
+	el.mu.Lock()
+	if el.running {
+		el.mu.Unlock()
+		return errors.New("endpoint listener is already running")
+	}
+
+	addr := &net.UDPAddr{Port: el.config.ListenPort}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		el.mu.Unlock()
+		return fmt.Errorf("failed to bind UDP port %d: %w", el.config.ListenPort, err)
+	}
+
+	el.udpConn = conn
+	if el.tunDev == nil {
+		el.tunDev = NewChannelPacketDevice("awg0", el.config.MTU, 512)
+	} else if chDev, ok := el.tunDev.(*ChannelPacketDevice); ok && chDev.closed.Load() {
+		el.tunDev = NewChannelPacketDevice(chDev.Name(), chDev.MTU(), 512)
+	}
+	el.running = true
+	el.draining = false
+	el.stopCh = make(chan struct{})
+	el.mu.Unlock()
+
+	el.wg.Add(2)
+	go el.udpReadLoop(ctx)
+	go el.heartbeatLoop(ctx)
+
+	return nil
+}
+
+// Stop gracefully stops the UDP listener and worker loops.
+func (el *Listener) Stop() error {
+	el.mu.Lock()
+	if !el.running {
+		el.mu.Unlock()
+		return nil
+	}
+	el.running = false
+	close(el.stopCh)
+	if el.udpConn != nil {
+		_ = el.udpConn.Close()
+	}
+	if el.tunDev != nil {
+		_ = el.tunDev.Close()
+	}
+	el.mu.Unlock()
+
+	el.wg.Wait()
+	return nil
+}
+
+// Drain marks listener as draining and prepares active sessions for graceful disconnection.
+func (el *Listener) Drain(ctx context.Context, timeout time.Duration) error {
+	el.mu.Lock()
+	el.draining = true
+	el.mu.Unlock()
+
+	if el.sessionMgr != nil {
+		return el.sessionMgr.Drain(ctx, timeout)
+	}
+	return nil
+}
+
+// AuthenticateAndRegisterPeer authenticates peer credentials, leases an internal IP, and creates an active session.
+func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicKey string, backendTunnelID int64) (*models.VPNSession, error) {
+	el.mu.RLock()
+	if el.draining {
+		el.mu.RUnlock()
+		return nil, errors.New("listener is draining: new connections rejected")
+	}
+	auth := el.auth
+	ipam := el.ipam
+	sm := el.sessionMgr
+	el.mu.RUnlock()
+
+	if auth == nil || ipam == nil || sm == nil {
+		return nil, errors.New("endpoint listener subsystem not initialized")
+	}
+
+	user, _, err := auth.AuthenticatePeer(ctx, peerPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("peer authentication failed: %w", err)
+	}
+
+	assignedIP, err := ipam.Allocate(peerPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("ip allocation failed: %w", err)
+	}
+
+	sess, err := sm.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backendTunnelID)
+	if err != nil {
+		_ = ipam.Release(peerPublicKey)
+		return nil, fmt.Errorf("session creation failed: %w", err)
+	}
+
+	return sess, nil
+}
+
+// DisconnectPeer disconnects a peer and closes their session.
+func (el *Listener) DisconnectPeer(ctx context.Context, peerPublicKey string) error {
+	el.mu.RLock()
+	sm := el.sessionMgr
+	el.mu.RUnlock()
+
+	if sm == nil {
+		return nil
+	}
+
+	sess, ok := sm.GetSession(peerPublicKey)
+	if !ok {
+		return ErrPeerNotFound
+	}
+
+	return sm.CloseSession(ctx, sess.ID, "disconnected")
+}
+
+// GetListenAddr returns the bound UDP address or nil.
+func (el *Listener) GetListenAddr() net.Addr {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	if el.udpConn != nil {
+		return el.udpConn.LocalAddr()
+	}
+	return nil
+}
+
+// IsRunning returns true if the endpoint listener is active.
+func (el *Listener) IsRunning() bool {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	return el.running
+}
+
+// IsDraining returns true if the listener is in draining mode.
+func (el *Listener) IsDraining() bool {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	return el.draining
+}
+
+// GetStats returns current traffic bytes and active session counts.
+func (el *Listener) GetStats() (rx int64, tx int64, active int) {
+	rx = el.rxBytes.Load()
+	tx = el.txBytes.Load()
+	if el.sessionMgr != nil {
+		active = el.sessionMgr.ActiveCount()
+	}
+	return
+}
+
+// RecordTraffic records raw packet ingress/egress bytes.
+func (el *Listener) RecordTraffic(rx, tx int64) {
+	if rx > 0 {
+		el.rxBytes.Add(rx)
+	}
+	if tx > 0 {
+		el.txBytes.Add(tx)
+	}
+}
+
+// SessionManager returns the underlying session manager.
+func (el *Listener) SessionManager() *SessionManager {
+	return el.sessionMgr
+}
+
+// IPAM returns the underlying IP address manager.
+func (el *Listener) IPAM() *IPAM {
+	return el.ipam
+}
+
+// TransportKeysFor returns the Noise transport keys derived for a peer's most
+// recent successful handshake, if any. Data-plane forwarding (Batch 2) uses
+// these keys to decrypt/encrypt transport data.
+func (el *Listener) TransportKeysFor(peerKey string) (*TransportKeys, bool) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	keys, ok := el.noiseKeys[peerKey]
+	return keys, ok
+}
+
+// storeTransportKeys records the transport keys derived for a peer's active
+// handshake, replacing any previous keys from an earlier handshake.
+func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if el.noiseKeys == nil {
+		el.noiseKeys = make(map[string]*TransportKeys)
+	}
+	el.noiseKeys[peerKey] = keys
+}
+
+// serverPrivateKey resolves the endpoint's persistent Noise server private
+// key, loading or creating it via the ServerKeysManager on first use. It
+// returns nil when no keypair is available, in which case handshake
+// processing is skipped.
+func (el *Listener) serverPrivateKey(ctx context.Context) []byte {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.serverPriv != nil {
+		return el.serverPriv
+	}
+	if el.serverKeys == nil {
+		return nil
+	}
+	priv, _, err := el.serverKeys.EnsureKeypair(ctx)
+	if err != nil {
+		log.Printf("[vpn/endpoint] failed to load server keypair: %v", err)
+		return nil
+	}
+	privCopy := make([]byte, len(priv))
+	copy(privCopy, priv[:])
+	el.serverPriv = privCopy
+	return el.serverPriv
+}
+
+// handleDatagram classifies an inbound UDP datagram. Valid AWG handshake
+// initiations are authenticated against registered peers (peer identity is
+// the base64 client static public key), routed to a backend tunnel (via the
+// installed BackendSelector when present, otherwise the static DB lookup
+// keyed by the connection's server ID), given a session, and answered with a
+// Noise handshake response. Datagrams that fail initiation parsing are
+// treated as transport data: when they come from a sender address with a
+// recently completed handshake they are decrypted with the stored transport
+// keys and handed to the installed ClientPacketRouter; anything else is
+// dropped.
+func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender *net.UDPAddr) {
+	if len(datagram) < 4 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	serverPriv := el.serverPrivateKey(ctx)
+	if serverPriv == nil {
+		return
+	}
+
+	info, err := ParseInitiation(serverPriv, datagram, uint32(el.config.H1), el.config.S1) // #nosec G115 -- bounded AWG message-type constant
+	if err != nil {
+		// Not a valid handshake initiation for this endpoint: transport data
+		// for an established session (or garbage). Try the transport path.
+		el.handleTransportData(datagram, sender)
+		return
+	}
+
+	if el.IsDraining() {
+		log.Printf("[vpn/endpoint] dropping handshake from %s: listener is draining", sender)
+		return
+	}
+
+	peerKey := base64.StdEncoding.EncodeToString(info.ClientStaticPub)
+
+	el.mu.RLock()
+	handler := el.incomingPeerHandler
+	el.mu.RUnlock()
+
+	if handler == nil {
+		log.Printf("[vpn/endpoint] dropping handshake from %s: no incoming peer handler installed", sender)
+		return
+	}
+
+	_, _, err = handler(ctx, peerKey)
+	if err != nil {
+		log.Printf("[vpn/endpoint] handshake processing failed for peer %s: %v", peerKey, err)
+		return
+	}
+
+	resp, transportKeys, err := BuildResponse(serverPriv, info, uint32(el.config.H2), el.config.S2) // #nosec G115 -- bounded AWG message-type constant
+	if err != nil {
+		log.Printf("[vpn/endpoint] failed to build handshake response for peer %s: %v", peerKey, err)
+		return
+	}
+
+	if transportKeys != nil {
+		el.storeTransportKeys(peerKey, transportKeys)
+	}
+
+	// Remember the peer's UDP endpoint so subsequent transport-data
+	// datagrams from the same address can be decrypted and routed, and so
+	// SendToPeer can address them.
+	el.rememberPeer(sender, peerKey)
+
+	el.mu.RLock()
+	udpConn := el.udpConn
+	el.mu.RUnlock()
+	if udpConn == nil {
+		return
+	}
+	if _, err := udpConn.WriteToUDP(resp, sender); err != nil {
+		log.Printf("[vpn/endpoint] failed to write handshake response to %s: %v", sender, err)
+		return
+	}
+	el.txBytes.Add(int64(len(resp)))
+}
+
+// rememberPeer records the sender address of a peer that just completed a
+// handshake (single udpReadLoop caller; map writes guarded by mu).
+func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string) {
+	if sender == nil {
+		return
+	}
+	el.mu.Lock()
+	if el.peersByAddr == nil {
+		el.peersByAddr = make(map[string]*activePeerState)
+	}
+	st, ok := el.peersByAddr[sender.String()]
+	if !ok {
+		st = &activePeerState{peerKey: peerKey}
+		el.peersByAddr[sender.String()] = st
+	} else {
+		st.peerKey = peerKey
+	}
+	st.lastSeen.Store(time.Now().UnixNano())
+	el.mu.Unlock()
+}
+
+// peerByAddr looks up the peer state recorded for a sender address.
+func (el *Listener) peerByAddr(addr string) (*activePeerState, bool) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	st, ok := el.peersByAddr[addr]
+	return st, ok
+}
+
+// transportDataHeaderLen is the AWG/WireGuard transport-data header:
+// 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
+// the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
+const transportDataHeaderLen = 16
+
+// handleTransportData processes a datagram that failed handshake-initiation
+// parsing: if the sender address belongs to a peer with an established
+// session and stored transport keys, decrypt the AWG transport-data message
+// and hand the inner IP packet to the installed client packet router.
+// Anything else (unknown sender, garbage, keepalive from a stale address) is
+// silently dropped.
+func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
+	if sender == nil || len(datagram) < transportDataHeaderLen+chacha20poly1305.Overhead {
+		return
+	}
+	st, ok := el.peerByAddr(sender.String())
+	if !ok {
+		return
+	}
+	keys, ok := el.TransportKeysFor(st.peerKey)
+	if !ok || keys == nil || keys.RecvKey == nil {
+		return
+	}
+
+	// AWG transport data frame (WireGuard-style):
+	// [type(4 LE = 4)][receiver_idx(4 LE)][counter(8 LE)][encrypted packet]
+	msgType := binary.LittleEndian.Uint32(datagram[0:4])
+	if msgType != 4 {
+		return
+	}
+	counter := binary.LittleEndian.Uint64(datagram[8:16])
+
+	aead, err := chacha20poly1305.New(keys.RecvKey)
+	if err != nil {
+		return
+	}
+	// WireGuard nonce convention: 4 zero bytes + 8-byte little-endian counter.
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	packet, err := aead.Open(nil, nonce[:], datagram[transportDataHeaderLen:], nil)
+	if err != nil {
+		log.Printf("[vpn/endpoint] transport data decryption failed for peer %s", st.peerKey)
+		return
+	}
+	st.lastSeen.Store(time.Now().UnixNano())
+
+	el.mu.RLock()
+	router := el.router
+	el.mu.RUnlock()
+	if router == nil {
+		return
+	}
+	if err := router(st.peerKey, packet); err != nil {
+		// Congestion/backpressure is expected under load: drop silently at
+		// debug priority; anything else is a routing inconsistency worth a log.
+		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", st.peerKey, err)
+	}
+}
+
+// SendToPeer encrypts an IP packet for a peer with the stored transport
+// SendKey and writes it to the peer's last recorded UDP address. The send
+// counter is a fresh monotonic value per peer (nonce reuse is impossible for
+// a given key), but real AWG receiver-window anti-replay validation on the
+// client side is out of scope for this path.
+func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
+	keys, ok := el.TransportKeysFor(peerKey)
+	if !ok || keys == nil || keys.SendKey == nil {
+		return fmt.Errorf("no transport keys for peer %s", peerKey)
+	}
+
+	// Find the peer's last-seen UDP address.
+	addrStr := ""
+	var st *activePeerState
+	el.mu.RLock()
+	for a, cand := range el.peersByAddr {
+		if cand.peerKey == peerKey {
+			addrStr = a
+			st = cand
+		}
+	}
+	udpConn := el.udpConn
+	el.mu.RUnlock()
+	if st == nil || udpConn == nil {
+		return fmt.Errorf("no recorded address for peer %s", peerKey)
+	}
+	addr, err := net.ResolveUDPAddr("udp", addrStr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer address %s: %w", addrStr, err)
+	}
+
+	counter := st.sendCount.Add(1) - 1
+	aead, err := chacha20poly1305.New(keys.SendKey)
+	if err != nil {
+		return fmt.Errorf("failed to create transport AEAD: %w", err)
+	}
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+
+	msg := make([]byte, 0, transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
+	var hdr [transportDataHeaderLen]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], 4) // transport data
+	// receiver_idx: we do not track the client's session index on this
+	// minimal path; zero is accepted by the frame parser above.
+	binary.LittleEndian.PutUint32(hdr[4:8], 0)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+	msg = append(msg, hdr[:]...)
+	msg = aead.Seal(msg, nonce[:], packet, nil)
+
+	if _, err := udpConn.WriteToUDP(msg, addr); err != nil {
+		return fmt.Errorf("failed to write transport data to %s: %w", addr, err)
+	}
+	el.txBytes.Add(int64(len(msg)))
+	return nil
+}
+
+func (el *Listener) udpReadLoop(ctx context.Context) {
+	defer el.wg.Done()
+	buf := make([]byte, 2048)
+
+	for {
+		select {
+		case <-el.stopCh:
+			return
+		default:
+		}
+
+		if el.udpConn == nil {
+			return
+		}
+
+		_ = el.udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, addr, err := el.udpConn.ReadFrom(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			select {
+			case <-el.stopCh:
+				return
+			default:
+				continue
+			}
+		}
+
+		if n > 0 {
+			el.rxBytes.Add(int64(n))
+			if udpAddr, ok := addr.(*net.UDPAddr); ok {
+				el.handleDatagram(ctx, buf[:n], udpAddr)
+			}
+		}
+	}
+}
+
+func (el *Listener) heartbeatLoop(ctx context.Context) {
+	defer el.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-el.stopCh:
+			return
+		case <-ticker.C:
+			if el.sessionMgr != nil {
+				_, _ = el.sessionMgr.CheckTimeouts(ctx, el.config.IdleTimeout)
+			}
+		}
+	}
+}
