@@ -161,6 +161,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAuth)
 
+		r.Get("/", h.IndexPageHandler)
 		r.Get("/change-password", h.ChangePasswordPageHandler)
 		r.Get("/my", h.MyConnectionsPageHandler)
 
@@ -233,7 +234,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdminOrSupport)
 
-		r.Get("/", h.IndexPageHandler)
 		r.Get("/server/{server_id}", h.ServerPageHandler)
 		r.Get("/users", h.UsersPageHandler)
 		r.Get("/settings", h.SettingsPageHandler)
@@ -299,6 +299,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/tunnels", h.VPNTunnelsHandler)
 			r.Get("/config", h.VPNGetConfigHandler)
 			r.Post("/config", h.VPNUpdateConfigHandler)
+			r.Put("/config", h.VPNUpdateConfigHandler)
 			r.Post("/disconnect", h.VPNDisconnectHandler)
 		})
 	})
