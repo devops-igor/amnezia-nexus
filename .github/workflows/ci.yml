@@ -29,18 +29,19 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      # golangci-lint: the golangci-lint-action@v6 downloads prebuilt binaries
+      # (built with go1.24) that cannot parse this project's toolchain
+      # (go.mod: go 1.26.6) — and its install-mode: source input is NOT
+      # honored for pinned versions (verified: it still downloaded the
+      # prebuilt binary). So we build the linter from source ourselves with
+      # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
+      - name: Build golangci-lint from source
+        run: |
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          # golangci-lint v1.64.x prebuilt binaries are built with go1.24 and
-          # cannot parse this project's toolchain (go.mod: go 1.26.6):
-          # "can't load config: the Go language version (go1.24) used to build
-          # golangci-lint is lower than the targeted Go version (1.26.6)".
-          # install-mode: source builds the linter with the runner's own Go
-          # (1.26.x via actions/setup-go), matching how local dev runs lint.
-          version: v1.64.8
-          install-mode: source
-          args: --timeout=5m
+        run: golangci-lint run --timeout=5m ./...
 
       - name: Install Security Scanners
         run: |
