@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -63,6 +64,11 @@ func NewLeastConnectionsLoadBalancer() *loadbalancer.LeastConnectionsBalancer {
 	return loadbalancer.NewLeastConnectionsBalancer(loadbalancer.CapacityConfig{})
 }
 
+// AWGStatusProvider defines an interface for querying live AWG status on a server.
+type AWGStatusProvider interface {
+	GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error)
+}
+
 // Service orchestrates endpoint listener, backend tunnel pool, load balancing, and traffic forwarding.
 type Service struct {
 	mu            sync.RWMutex
@@ -82,6 +88,7 @@ type Service struct {
 	running       bool
 	portalPubKey  string
 	portalPrivKey string
+	awgProvider   AWGStatusProvider
 	// requireTun switches Start to the real Linux TUN data plane (production
 	// mode; cmd opts in via RequireTunDevice when VPN_ENABLED). tunOpener is
 	// the injectable device constructor used by tests to prove the
@@ -143,6 +150,14 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		SubnetCIDR:  cfg.SubnetCIDR,
 		MTU:         1420,
 		IdleTimeout: 3 * time.Minute,
+		H1:          int(cfg.H1),
+		S1:          cfg.S1,
+		H2:          int(cfg.H2),
+		S2:          cfg.S2,
+		H3:          int(cfg.H3),
+		S3:          cfg.S3,
+		H4:          int(cfg.H4),
+		S4:          cfg.S4,
 	}
 
 	epListener, err := endpoint.NewListener(listenerCfg, db, auth, ipam, sessionMgr, serverKeys)
@@ -175,6 +190,12 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	fwd := forwarder.NewForwarder(accountant, 512)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
+	if serverKeys != nil {
+		if privArr, pubArr, err := serverKeys.EnsureKeypair(context.Background()); err == nil {
+			pub = base64.StdEncoding.EncodeToString(pubArr[:])
+			priv = base64.StdEncoding.EncodeToString(privArr[:])
+		}
+	}
 
 	svc := &Service{
 		db:            db,
@@ -229,6 +250,13 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.prober = prober
+}
+
+// SetAWGStatusProvider sets the provider used to query live AWG status on backend servers.
+func (s *Service) SetAWGStatusProvider(provider AWGStatusProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.awgProvider = provider
 }
 
 // RequireTunDevice switches Start to the real Linux TUN data plane: when the
@@ -400,6 +428,26 @@ func (s *Service) GetBackends(ctx context.Context) ([]*models.BackendTunnel, err
 	return s.pool.ListTunnels(), nil
 }
 
+func parsePort(val any) int {
+	switch v := val.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		p, _ := strconv.Atoi(v)
+		return p
+	default:
+		if v != nil {
+			p, _ := strconv.Atoi(fmt.Sprint(v))
+			return p
+		}
+		return 0
+	}
+}
+
 // EnableBackend enables a backend server for load balancing by loading its
 // AWG protocol credentials from the database, registering (or refreshing) the
 // tunnel in the pool, attaching a backend UDP packet device to the forwarder,
@@ -423,52 +471,117 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("failed to load server %d: not found", serverID)
 	}
 
-	// AWG protocol credentials: the portal dials the backend's AWG listener.
-	var pub string
-	var port float64
-	if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
-		pub, _ = awgInfo["public_key"].(string)
-		port, _ = awgInfo["port"].(float64)
-	}
-	if pub == "" || port <= 0 {
-		return errors.New("server has no AWG protocol installed")
+	pub, port, err := s.resolveBackendCredentials(ctx, serverID, server)
+	if err != nil {
+		return err
 	}
 
-	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(int(port)))
+	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
 
 	tun, err := s.pool.AddTunnel(ctx, serverID, endpoint, pub)
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
 	}
 
-	if s.forwarder != nil {
-		dev, devErr := tunnel.NewUDPDevice(fmt.Sprintf("awg-be-%d", serverID), endpoint, 1420)
-		if devErr != nil {
-			return fmt.Errorf("failed to create backend UDP device for server %d: %w", serverID, devErr)
-		}
-		s.forwarder.AttachBackendDevice(tun.ID, dev)
-		if s.backendDevices == nil {
-			s.backendDevices = make(map[int64]*tunnel.UDPDevice)
-		}
-		s.backendDevices[tun.ID] = dev
-
-		// Spawn backend read loop to route packets back to clients
-		go func(backendID int64, device *tunnel.UDPDevice) {
-			buf := make([]byte, 2048)
-			for {
-				n, err := device.Read(buf)
-				if err != nil {
-					return
-				}
-				if n >= 20 && (buf[0]>>4) == 4 { // IPv4
-					destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
-					_ = s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP)
-				}
-			}
-		}(tun.ID, dev)
+	if err := s.attachBackendForwarder(serverID, tun.ID, endpoint); err != nil {
+		return err
 	}
 
 	return s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusActive, 10)
+}
+
+// resolveBackendCredentials retrieves AWG credentials for a backend, falling back to live discovery.
+func (s *Service) resolveBackendCredentials(ctx context.Context, serverID int64, server *models.Server) (string, int, error) {
+	var pub string
+	var port int
+	if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
+		pub, _ = awgInfo["public_key"].(string)
+		port = parsePort(awgInfo["port"])
+	}
+
+	if (pub == "" || port <= 0) && s.awgProvider != nil {
+		if livePub, livePort, ok := s.discoverLiveAWG(ctx, serverID, server); ok {
+			pub = livePub
+			port = livePort
+		}
+	}
+
+	if pub == "" || port <= 0 {
+		return "", 0, errors.New("server has no AWG protocol installed")
+	}
+
+	return pub, port, nil
+}
+
+// discoverLiveAWG attempts to query the running AWG container and persists discovered configuration to DB.
+func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *models.Server) (string, int, bool) {
+	status, err := s.awgProvider.GetServerStatus(ctx, server)
+	if err != nil || status == nil {
+		return "", 0, false
+	}
+	if running, _ := status["container_running"].(bool); !running {
+		return "", 0, false
+	}
+	livePub, _ := status["public_key"].(string)
+	livePort := parsePort(status["port"])
+	if livePub == "" || livePort <= 0 {
+		return "", 0, false
+	}
+
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	protoMap, _ := server.Protocols["awg"].(map[string]any)
+	if protoMap == nil {
+		protoMap = make(map[string]any)
+	}
+	protoMap["installed"] = true
+	protoMap["port"] = livePort
+	protoMap["public_key"] = livePub
+	if psk, ok := status["psk"].(string); ok && psk != "" {
+		protoMap["psk"] = psk
+	}
+	if awgParams, ok := status["awg_params"]; ok && awgParams != nil {
+		protoMap["awg_params"] = awgParams
+	}
+	if clientsCount, ok := status["clients_count"]; ok && clientsCount != nil {
+		protoMap["clients_count"] = clientsCount
+	}
+	server.Protocols["awg"] = protoMap
+	_ = s.db.UpdateServerProtocols(ctx, serverID, server.Protocols)
+
+	return livePub, livePort, true
+}
+
+func (s *Service) attachBackendForwarder(serverID int64, tunID int64, endpoint string) error {
+	if s.forwarder == nil {
+		return nil
+	}
+	dev, devErr := tunnel.NewUDPDevice(fmt.Sprintf("awg-be-%d", serverID), endpoint, 1420)
+	if devErr != nil {
+		return fmt.Errorf("failed to create backend UDP device for server %d: %w", serverID, devErr)
+	}
+	s.forwarder.AttachBackendDevice(tunID, dev)
+	if s.backendDevices == nil {
+		s.backendDevices = make(map[int64]*tunnel.UDPDevice)
+	}
+	s.backendDevices[tunID] = dev
+
+	// Spawn backend read loop to route packets back to clients
+	go func(backendID int64, device *tunnel.UDPDevice) {
+		buf := make([]byte, 2048)
+		for {
+			n, err := device.Read(buf)
+			if err != nil {
+				return
+			}
+			if n >= 20 && (buf[0]>>4) == 4 { // IPv4
+				destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
+				_ = s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP)
+			}
+		}
+	}(tunID, dev)
+	return nil
 }
 
 // DisableBackend disables a backend server and initiates connection draining.
@@ -796,11 +909,8 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 
 	endpointStr := fmt.Sprintf("%s:%d", endpointHost, listenPort)
 
-	// Use real AWG obfuscation parameters with quadrant headers & CPS signatures
-	awgParams, err := awg.GenerateAWGParams("standard")
-	if err != nil {
-		awgParams = awg.AWGParamsFromMap(nil)
-	}
+	// Use real AWG obfuscation parameters from stored VPNConfig
+	awgParams := awg.AWGParamsFromVPNConfig(cfg)
 
 	configStr := awg.RenderClientConfig(
 		clientPriv,

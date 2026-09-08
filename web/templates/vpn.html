@@ -43,7 +43,12 @@
 
 <!-- BACKENDS TABLE -->
 <div class="card">
-    <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _ "vpn_backends" }}</h3>
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-lg); flex-wrap: wrap; gap: var(--space-sm);">
+        <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_backends" }}</h3>
+        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" onclick="vpnOpenAddBackendModal()">
+            <span>➕</span> {{ _ "vpn_add_backend" }}
+        </button>
+    </div>
     <div class="table-container">
         <table class="data-table">
             <thead>
@@ -65,9 +70,74 @@
     </div>
 </div>
 
+<!-- ADD BACKEND MODAL -->
+<div class="modal-backdrop" id="addBackendModal">
+    <div class="modal" style="max-width: 520px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "vpn_add_backend" }}</h2>
+            <button type="button" class="modal-close" onclick="closeModal('addBackendModal')">×</button>
+        </div>
+        <form id="addBackendForm" onsubmit="event.preventDefault(); vpnSubmitAddBackend();">
+            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: var(--space-md);">
+                {{ _ "vpn_add_backend_hint" }}
+            </p>
+
+            <div class="form-group">
+                <label class="form-label" for="vpnServerSelect">{{ _ "vpn_select_server" }}</label>
+                <select class="form-select" id="vpnServerSelect" required onchange="vpnOnServerSelected()">
+                    <option value="">- {{ _ "select" }} -</option>
+                </select>
+            </div>
+
+            <div id="vpnServerDetails" style="display: none; margin-bottom: var(--space-md); padding: var(--space-sm) var(--space-md); background: var(--bg-tertiary, rgba(255,255,255,0.03)); border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-size: 0.85rem;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-xs);">
+                    <div><span style="color: var(--text-muted);">Host:</span> <strong id="vpnServerDetailHost">—</strong></div>
+                    <div><span style="color: var(--text-muted);">SSH:</span> <strong id="vpnServerDetailPort">—</strong></div>
+                    <div><span style="color: var(--text-muted);">Status:</span> <strong id="vpnServerDetailStatus">—</strong></div>
+                    <div><span style="color: var(--text-muted);">AWG:</span> <span class="badge" id="vpnServerDetailAwgBadge">—</span></div>
+                </div>
+                <div id="vpnServerDetailCheckRow" style="display: none; margin-top: var(--space-xs); padding-top: var(--space-xs); border-top: 1px dashed var(--border-color); align-items: center; justify-content: space-between;">
+                    <span style="color: var(--text-muted); font-size: 0.8rem;" id="vpnServerDetailCheckHint"></span>
+                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" onclick="vpnTriggerQuickCheck()" style="padding: 2px 8px; font-size: 0.8rem;">
+                        <span id="vpnQuickCheckBtnText">🔍 {{ _ "server_check" }}</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="vpnNoServersNotice" style="display: none; padding: var(--space-md); text-align: center; color: var(--text-muted); background: var(--bg-tertiary, rgba(255,255,255,0.03)); border-radius: var(--radius-sm); margin-bottom: var(--space-md);">
+                {{ _ "vpn_no_available_servers" }}
+            </div>
+
+            <div id="vpnModalError" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem; color: #ff6b6b; background: rgba(255,107,107,0.1); border: 1px solid rgba(255,107,107,0.2);">
+            </div>
+
+            <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('addBackendModal')">{{ _ "cancel" }}</button>
+                <button type="submit" class="btn btn-primary" id="vpnAddBackendSubmitBtn">
+                    {{ _ "vpn_enable_backend" }}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
     /* ===== VPN admin dashboard: all dynamic data via textContent (XSS-safe).
        CSRF mutations reuse the global getCsrfToken() helper from base.html. ===== */
+
+    let vpnCachedServers = [];
+    let vpnCurrentBackends = [];
+
+    function vpnServerHasAwg(srv) {
+        if (!srv || !srv.protocols) return false;
+        const awg = srv.protocols.awg;
+        if (!awg) return false;
+        if (typeof awg === 'boolean') return awg;
+        if (typeof awg === 'object') {
+            return !!(awg.installed || awg.public_key || (typeof awg.port === 'number' && awg.port > 0));
+        }
+        return false;
+    }
 
     function vpnStatusBadgeClass(status) {
         switch (status) {
@@ -149,14 +219,319 @@
                 method: 'POST',
                 headers: { 'X-CSRF-Token': getCsrfToken() },
             });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok || (data.status && data.status !== 'ok')) {
-                throw new Error(data.error || data.message || _('error'));
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = null;
+            }
+            if (!res.ok || (data && data.status && data.status !== 'ok')) {
+                const errMsg = (data && (data.detail || data.message || data.error)) ||
+                    `HTTP ${res.status} ${res.statusText || _('error')}`.trim();
+                throw new Error(errMsg);
             }
             showToast(action === 'enable' ? _('vpn_enable') + ' OK' : _('vpn_disable') + ' OK', 'success');
             vpnLoadData();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            const errMsg = err.message || _('error');
+            const errBox = document.getElementById('vpnModalError');
+            if (errBox) {
+                errBox.textContent = errMsg;
+                errBox.style.display = 'block';
+            }
+            showToast(errMsg, 'error');
+        }
+    }
+
+    function vpnResetAddModal() {
+        const select = document.getElementById('vpnServerSelect');
+        select.textContent = '';
+        const defOpt = document.createElement('option');
+        defOpt.value = '';
+        defOpt.textContent = '- ' + _('select') + ' -';
+        select.appendChild(defOpt);
+        select.disabled = false;
+
+        document.getElementById('vpnServerDetails').style.display = 'none';
+        document.getElementById('vpnNoServersNotice').style.display = 'none';
+        const errBox = document.getElementById('vpnModalError');
+        errBox.style.display = 'none';
+        errBox.textContent = '';
+
+        const submitBtn = document.getElementById('vpnAddBackendSubmitBtn');
+        submitBtn.disabled = false;
+        submitBtn.textContent = _('vpn_enable_backend');
+    }
+
+    async function vpnOpenAddBackendModal() {
+        vpnResetAddModal();
+        openModal('addBackendModal');
+
+        const select = document.getElementById('vpnServerSelect');
+        const loadingOpt = document.createElement('option');
+        loadingOpt.value = '';
+        loadingOpt.textContent = _('loading') + '...';
+        select.appendChild(loadingOpt);
+        select.disabled = true;
+
+        try {
+            const res = await fetch('/api/servers');
+            if (!res.ok) throw new Error(_('error'));
+            const servers = await res.json();
+            vpnCachedServers = Array.isArray(servers) ? servers : [];
+
+            select.textContent = '';
+            const defOpt = document.createElement('option');
+            defOpt.value = '';
+            defOpt.textContent = '- ' + _('select') + ' -';
+            select.appendChild(defOpt);
+
+            if (!vpnCachedServers.length) {
+                document.getElementById('vpnNoServersNotice').style.display = 'block';
+                select.disabled = true;
+                document.getElementById('vpnAddBackendSubmitBtn').disabled = true;
+                return;
+            }
+
+            select.disabled = false;
+
+            const existingBackendIds = new Set(
+                vpnCurrentBackends.map(function (b) { return String(b.server_id || b.id); })
+            );
+
+            let awgServerCount = 0;
+            for (const srv of vpnCachedServers) {
+                const hasAwg = vpnServerHasAwg(srv);
+                if (hasAwg) awgServerCount++;
+
+                const opt = document.createElement('option');
+                opt.value = String(srv.id);
+
+                const name = srv.name || ('Server #' + srv.id);
+                const hostPort = srv.host ? (srv.host + (srv.ssh_port ? ':' + srv.ssh_port : '')) : '';
+                const hasAnyProtocols = srv.protocols && Object.keys(srv.protocols).length > 0;
+                const awgTag = hasAwg ? ' [AWG]' : (' (' + (hasAnyProtocols ? _('no_protocols') : _('not_checked')) + ')');
+                const isBackend = existingBackendIds.has(String(srv.id));
+                const backendTag = isBackend ? ' — ' + _('active') : '';
+
+                opt.textContent = name + (hostPort ? ' (' + hostPort + ')' : '') + awgTag + backendTag;
+                select.appendChild(opt);
+            }
+
+            if (awgServerCount === 0) {
+                document.getElementById('vpnNoServersNotice').style.display = 'block';
+            }
+        } catch (err) {
+            select.textContent = '';
+            const errOpt = document.createElement('option');
+            errOpt.value = '';
+            errOpt.textContent = _('error');
+            select.appendChild(errOpt);
+            select.disabled = true;
+            const errBox = document.getElementById('vpnModalError');
+            errBox.textContent = err.message || _('error');
+            errBox.style.display = 'block';
+            document.getElementById('vpnAddBackendSubmitBtn').disabled = true;
+        }
+    }
+
+    function vpnOnServerSelected() {
+        const select = document.getElementById('vpnServerSelect');
+        const selectedId = select.value;
+        const detailsBox = document.getElementById('vpnServerDetails');
+        const errBox = document.getElementById('vpnModalError');
+        errBox.style.display = 'none';
+        errBox.textContent = '';
+
+        if (!selectedId) {
+            detailsBox.style.display = 'none';
+            return;
+        }
+
+        const srv = vpnCachedServers.find(function (s) { return String(s.id) === String(selectedId); });
+        if (!srv) {
+            detailsBox.style.display = 'none';
+            return;
+        }
+
+        detailsBox.style.display = 'block';
+        document.getElementById('vpnServerDetailHost').textContent = srv.host || '—';
+        document.getElementById('vpnServerDetailPort').textContent = String(srv.ssh_port || 22);
+        document.getElementById('vpnServerDetailStatus').textContent = srv.status || 'unknown';
+
+        const hasAwg = vpnServerHasAwg(srv);
+        const hasAnyProtocols = srv.protocols && Object.keys(srv.protocols).length > 0;
+        const awgBadge = document.getElementById('vpnServerDetailAwgBadge');
+        const checkRow = document.getElementById('vpnServerDetailCheckRow');
+        const checkHint = document.getElementById('vpnServerDetailCheckHint');
+
+        if (hasAwg) {
+            awgBadge.className = 'badge badge-success';
+            awgBadge.textContent = '';
+            const dot = document.createElement('span');
+            dot.className = 'badge-dot';
+            awgBadge.appendChild(dot);
+            awgBadge.appendChild(document.createTextNode(' AmneziaWG'));
+            if (checkRow) checkRow.style.display = 'none';
+            errBox.style.display = 'none';
+            errBox.textContent = '';
+        } else {
+            awgBadge.className = 'badge badge-warn';
+            awgBadge.textContent = '';
+            const dot = document.createElement('span');
+            dot.className = 'badge-dot';
+            awgBadge.appendChild(dot);
+            const badgeLabel = hasAnyProtocols ? _('no_protocols') : _('not_checked');
+            awgBadge.appendChild(document.createTextNode(' ' + badgeLabel));
+
+            if (checkRow) {
+                checkRow.style.display = 'flex';
+                checkHint.textContent = hasAnyProtocols ? _('vpn_server_no_awg_warning') : (_('not_checked') + ' — ' + _('server_check'));
+            }
+
+            errBox.textContent = _('vpn_server_no_awg_warning');
+            errBox.style.display = 'block';
+        }
+    }
+
+    async function vpnTriggerQuickCheck() {
+        const select = document.getElementById('vpnServerSelect');
+        const serverId = select.value;
+        if (!serverId) return;
+
+        const btn = document.getElementById('vpnQuickCheckBtn');
+        const btnText = document.getElementById('vpnQuickCheckBtnText');
+        const errBox = document.getElementById('vpnModalError');
+        const checkHint = document.getElementById('vpnServerDetailCheckHint');
+
+        if (btn) btn.disabled = true;
+        if (btnText) btnText.textContent = '⏳ ' + _('server_checking');
+        if (checkHint) checkHint.textContent = _('server_checking');
+
+        try {
+            const res = await fetch('/api/servers/' + encodeURIComponent(serverId) + '/check', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': getCsrfToken(),
+                },
+            });
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = null;
+            }
+            if (!res.ok) {
+                const errMsg = (data && (data.detail || data.message || data.error)) ||
+                    `HTTP ${res.status} ${res.statusText || _('check_error')}`.trim();
+                throw new Error(errMsg);
+            }
+
+            const srv = vpnCachedServers.find(function (s) { return String(s.id) === String(serverId); });
+            if (data && data.protocols && data.protocols.awg && data.protocols.awg.container_running) {
+                if (srv) {
+                    srv.protocols = srv.protocols || {};
+                    srv.protocols.awg = data.protocols.awg;
+                    const opt = select.querySelector('option[value="' + serverId + '"]');
+                    if (opt) {
+                        opt.textContent = opt.textContent.replace(' (' + _('no_protocols') + ')', ' [AWG]').replace(' (' + _('not_checked') + ')', ' [AWG]');
+                        if (!opt.textContent.includes('[AWG]')) {
+                            opt.textContent += ' [AWG]';
+                        }
+                    }
+                }
+                const noServers = document.getElementById('vpnNoServersNotice');
+                if (noServers) noServers.style.display = 'none';
+                vpnOnServerSelected();
+                showToast(_('check_done') + ': AmneziaWG OK', 'success');
+            } else {
+                if (checkHint) checkHint.textContent = _('vpn_server_no_awg_warning');
+                errBox.textContent = _('vpn_server_no_awg_warning');
+                errBox.style.display = 'block';
+                showToast(_('vpn_server_no_awg_warning'), 'warning');
+            }
+        } catch (err) {
+            const errMsg = err.message || _('check_error');
+            if (checkHint) checkHint.textContent = _('check_error') + ': ' + errMsg;
+            errBox.textContent = errMsg;
+            errBox.style.display = 'block';
+        } finally {
+            if (btn) btn.disabled = false;
+            if (btnText) btnText.textContent = '🔍 ' + _('server_check');
+        }
+    }
+
+    async function vpnSubmitAddBackend() {
+        const select = document.getElementById('vpnServerSelect');
+        const serverId = select.value;
+        const errBox = document.getElementById('vpnModalError');
+        errBox.style.display = 'none';
+        errBox.textContent = '';
+
+        if (!serverId) {
+            errBox.textContent = _('vpn_please_select_server');
+            errBox.style.display = 'block';
+            return;
+        }
+
+        const srv = vpnCachedServers.find(function (s) { return String(s.id) === String(serverId); });
+        if (srv && !vpnServerHasAwg(srv)) {
+            const submitBtn = document.getElementById('vpnAddBackendSubmitBtn');
+            submitBtn.disabled = true;
+            submitBtn.textContent = _('server_checking');
+            try {
+                const checkRes = await fetch('/api/servers/' + encodeURIComponent(serverId) + '/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+                });
+                const checkData = await checkRes.json().catch(() => ({}));
+                if (checkData.protocols && checkData.protocols.awg && checkData.protocols.awg.container_running) {
+                    srv.protocols = srv.protocols || {};
+                    srv.protocols.awg = checkData.protocols.awg;
+                    const noServers = document.getElementById('vpnNoServersNotice');
+                    if (noServers) noServers.style.display = 'none';
+                    vpnOnServerSelected();
+                }
+            } catch (_) {
+                // If check fails, allow backend enable to attempt dynamic fallback
+            }
+        }
+
+        const submitBtn = document.getElementById('vpnAddBackendSubmitBtn');
+        submitBtn.disabled = true;
+        submitBtn.textContent = _('loading') + '...';
+
+        try {
+            const res = await fetch('/api/vpn/backends/' + encodeURIComponent(serverId) + '/enable', {
+                method: 'POST',
+                headers: {
+                    'X-CSRF-Token': getCsrfToken(),
+                },
+            });
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = null;
+            }
+            if (!res.ok || (data && data.status && data.status !== 'ok')) {
+                const errMsg = (data && (data.detail || data.message || data.error)) ||
+                    `HTTP ${res.status} ${res.statusText || _('error')}`.trim();
+                throw new Error(errMsg);
+            }
+
+            showToast(_('vpn_backend_enabled_success'), 'success');
+            closeModal('addBackendModal');
+            vpnLoadData();
+        } catch (err) {
+            const errMsg = err.message || _('error');
+            errBox.textContent = errMsg;
+            errBox.style.display = 'block';
+            showToast(errMsg, 'error');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = _('vpn_enable_backend');
         }
     }
 
@@ -173,6 +548,7 @@
             const cfg = configRes.ok ? await configRes.json() : {};
             const backendData = await backendsRes.json();
             const backends = backendData.backends || backendData.tunnels || [];
+            vpnCurrentBackends = backends;
 
             vpnSetListenerBadge(!!status.listener_running);
             document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '—');

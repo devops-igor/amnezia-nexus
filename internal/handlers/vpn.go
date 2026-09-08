@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
@@ -56,7 +58,15 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	ctx := r.Context()
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.EnableBackend(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend")
+			if strings.Contains(err.Error(), "server has no AWG protocol installed") {
+				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
+				return
+			}
+			if strings.Contains(err.Error(), "not found") {
+				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
+				return
+			}
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend: "+err.Error())
 			return
 		}
 	}
@@ -76,7 +86,7 @@ func (h *Handlers) VPNDisableBackendHandler(w http.ResponseWriter, r *http.Reque
 	ctx := r.Context()
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DisableBackend(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to disable backend")
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to disable backend: "+err.Error())
 			return
 		}
 	}

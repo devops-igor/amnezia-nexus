@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -146,6 +147,18 @@ type ListenerConfig struct {
 	// S2 is the junk prefix length before the response payload; 0 selects
 	// health.DefaultS2.
 	S2 int
+	// H3 is the AWG underload / cookie reply message type; 0 selects
+	// health.DefaultH3.
+	H3 int
+	// S3 is the junk prefix length for cookie reply packets; 0 selects
+	// health.DefaultS3.
+	S3 int
+	// H4 is the AWG transport-data message type; 0 selects
+	// health.DefaultH4.
+	H4 int
+	// S4 is the junk padding length before the transport encrypted payload; 0 selects
+	// health.DefaultS4.
+	S4 int
 }
 
 // BackendSelector resolves the backend tunnel a newly authenticated peer's
@@ -164,9 +177,10 @@ type ClientPacketRouter func(peerKey string, packet []byte) error
 // send counter so late transport datagrams and server→client sends can find
 // the right socket address.
 type activePeerState struct {
-	peerKey   string
-	sendCount atomic.Uint64
-	lastSeen  atomic.Int64 // unix nanos
+	peerKey     string
+	receiverIdx uint32
+	sendCount   atomic.Uint64
+	lastSeen    atomic.Int64 // unix nanos
 }
 
 // Listener manages the AWG endpoint UDP listener and peer lifecycle.
@@ -223,6 +237,20 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 	}
 	if cfg.S2 == 0 {
 		cfg.S2 = health.DefaultS2
+	}
+	if cfg.H3 == 0 {
+		// #nosec G115 -- constant conversion, value fits in int.
+		cfg.H3 = int(health.DefaultH3)
+	}
+	if cfg.S3 == 0 {
+		cfg.S3 = health.DefaultS3
+	}
+	if cfg.H4 == 0 {
+		// #nosec G115 -- constant conversion, value fits in int.
+		cfg.H4 = int(health.DefaultH4)
+	}
+	if cfg.S4 == 0 {
+		cfg.S4 = health.DefaultS4
 	}
 
 	if auth == nil && db != nil {
@@ -566,7 +594,7 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 	// Remember the peer's UDP endpoint so subsequent transport-data
 	// datagrams from the same address can be decrypted and routed, and so
 	// SendToPeer can address them.
-	el.rememberPeer(sender, peerKey)
+	el.rememberPeer(sender, peerKey, info.SenderIndex)
 
 	el.mu.RLock()
 	udpConn := el.udpConn
@@ -581,9 +609,9 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 	el.txBytes.Add(int64(len(resp)))
 }
 
-// rememberPeer records the sender address of a peer that just completed a
+// rememberPeer records the sender address and client index of a peer that just completed a
 // handshake (single udpReadLoop caller; map writes guarded by mu).
-func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string) {
+func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
 	if sender == nil {
 		return
 	}
@@ -593,10 +621,11 @@ func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string) {
 	}
 	st, ok := el.peersByAddr[sender.String()]
 	if !ok {
-		st = &activePeerState{peerKey: peerKey}
+		st = &activePeerState{peerKey: peerKey, receiverIdx: receiverIdx}
 		el.peersByAddr[sender.String()] = st
 	} else {
 		st.peerKey = peerKey
+		st.receiverIdx = receiverIdx
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
 	el.mu.Unlock()
@@ -622,7 +651,17 @@ const transportDataHeaderLen = 16
 // Anything else (unknown sender, garbage, keepalive from a stale address) is
 // silently dropped.
 func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
-	if sender == nil || len(datagram) < transportDataHeaderLen+chacha20poly1305.Overhead {
+	s4 := el.config.S4
+	if s4 < 0 {
+		s4 = 0
+	}
+	h4 := health.DefaultH4
+	if el.config.H4 > 0 {
+		// #nosec G115 -- H4 is positive int, fits in uint32.
+		h4 = uint32(el.config.H4)
+	}
+
+	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
 		return
 	}
 	st, ok := el.peerByAddr(sender.String())
@@ -634,13 +673,14 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
 		return
 	}
 
-	// AWG transport data frame (WireGuard-style):
-	// [type(4 LE = 4)][receiver_idx(4 LE)][counter(8 LE)][encrypted packet]
-	msgType := binary.LittleEndian.Uint32(datagram[0:4])
-	if msgType != 4 {
+	// AWG transport data frame:
+	// [S4 padding][type(4 LE = H4)][receiver_idx(4 LE)][counter(8 LE)][encrypted packet]
+	payload := datagram[s4:]
+	msgType := binary.LittleEndian.Uint32(payload[0:4])
+	if msgType != h4 {
 		return
 	}
-	counter := binary.LittleEndian.Uint64(datagram[8:16])
+	counter := binary.LittleEndian.Uint64(payload[8:16])
 
 	aead, err := chacha20poly1305.New(keys.RecvKey)
 	if err != nil {
@@ -649,7 +689,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
 	// WireGuard nonce convention: 4 zero bytes + 8-byte little-endian counter.
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:12], counter)
-	packet, err := aead.Open(nil, nonce[:], datagram[transportDataHeaderLen:], nil)
+	packet, err := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
 	if err != nil {
 		log.Printf("[vpn/endpoint] transport data decryption failed for peer %s", st.peerKey)
 		return
@@ -670,10 +710,9 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
 }
 
 // SendToPeer encrypts an IP packet for a peer with the stored transport
-// SendKey and writes it to the peer's last recorded UDP address. The send
-// counter is a fresh monotonic value per peer (nonce reuse is impossible for
-// a given key), but real AWG receiver-window anti-replay validation on the
-// client side is out of scope for this path.
+// SendKey and writes it to the peer's last recorded UDP address using AWG
+// transport framing (S4 padding + H4 magic header). The send counter is a fresh
+// monotonic value per peer.
 func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	keys, ok := el.TransportKeysFor(peerKey)
 	if !ok || keys == nil || keys.SendKey == nil {
@@ -708,12 +747,28 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:12], counter)
 
-	msg := make([]byte, 0, transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
+	s4 := el.config.S4
+	if s4 < 0 {
+		s4 = 0
+	}
+	h4 := health.DefaultH4
+	if el.config.H4 > 0 {
+		// #nosec G115 -- H4 is positive int, fits in uint32.
+		h4 = uint32(el.config.H4)
+	}
+
+	msg := make([]byte, 0, s4+transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
+	if s4 > 0 {
+		junk := make([]byte, s4)
+		if _, err := rand.Read(junk); err != nil {
+			return fmt.Errorf("failed to generate S4 padding: %w", err)
+		}
+		msg = append(msg, junk...)
+	}
+
 	var hdr [transportDataHeaderLen]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], 4) // transport data
-	// receiver_idx: we do not track the client's session index on this
-	// minimal path; zero is accepted by the frame parser above.
-	binary.LittleEndian.PutUint32(hdr[4:8], 0)
+	binary.LittleEndian.PutUint32(hdr[0:4], h4) // AWG H4 transport data
+	binary.LittleEndian.PutUint32(hdr[4:8], st.receiverIdx)
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 	msg = append(msg, hdr[:]...)
 	msg = aead.Seal(msg, nonce[:], packet, nil)

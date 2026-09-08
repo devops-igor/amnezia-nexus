@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
@@ -134,36 +135,78 @@ func extractJunkPreambles(awgParams map[string]any) [][]byte {
 	return preambles
 }
 
-func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 uint32, s1, s2 int) {
-	h1 = DefaultH1
-	h2 = DefaultH2
-	s1 = DefaultS1
-	s2 = DefaultS2
+func getMapParamValue(awgParams any, keys ...string) (string, bool) {
+	switch m := awgParams.(type) {
+	case map[string]any:
+		for _, k := range keys {
+			for mk, v := range m {
+				if strings.EqualFold(mk, k) && v != nil && fmt.Sprint(v) != "" {
+					return fmt.Sprint(v), true
+				}
+			}
+		}
+	case map[string]string:
+		for _, k := range keys {
+			for mk, v := range m {
+				if strings.EqualFold(mk, k) && v != "" {
+					return v, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// ExtractAWGHeaderLimits extracts H1, H2, S1, S2 from an awgParams object (map[string]any or map[string]string),
+// falling back to the supplied default values if not found or zero.
+func ExtractAWGHeaderLimits(awgParams any, defaultH1, defaultH2 uint32, defaultS1, defaultS2 int) (h1, h2 uint32, s1, s2 int) {
+	h1 = defaultH1
+	h2 = defaultH2
+	s1 = defaultS1
+	s2 = defaultS2
+
+	if defaultH1 == 0 {
+		h1 = DefaultH1
+	}
+	if defaultH2 == 0 {
+		h2 = DefaultH2
+	}
+	if defaultS1 < 0 {
+		s1 = DefaultS1
+	}
+	if defaultS2 < 0 {
+		s2 = DefaultS2
+	}
 
 	if awgParams == nil {
 		return
 	}
-	if v, ok := awgParams["init_packet_magic_header"]; ok {
-		if num, err := strconv.ParseUint(fmt.Sprint(v), 10, 32); err == nil {
+
+	if v, ok := getMapParamValue(awgParams, "init_packet_magic_header", "h1"); ok {
+		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
 			h1 = uint32(num)
 		}
 	}
-	if v, ok := awgParams["response_packet_magic_header"]; ok {
-		if num, err := strconv.ParseUint(fmt.Sprint(v), 10, 32); err == nil {
+	if v, ok := getMapParamValue(awgParams, "response_packet_magic_header", "h2"); ok {
+		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
 			h2 = uint32(num)
 		}
 	}
-	if v, ok := awgParams["init_packet_junk_size"]; ok {
-		if num, err := strconv.Atoi(fmt.Sprint(v)); err == nil {
+	if v, ok := getMapParamValue(awgParams, "init_packet_junk_size", "s1"); ok {
+		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
 			s1 = num
 		}
 	}
-	if v, ok := awgParams["response_packet_junk_size"]; ok {
-		if num, err := strconv.Atoi(fmt.Sprint(v)); err == nil {
+	if v, ok := getMapParamValue(awgParams, "response_packet_junk_size", "s2"); ok {
+		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
 			s2 = num
 		}
 	}
 	return
+}
+
+func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 uint32, s1, s2 int) {
+	return ExtractAWGHeaderLimits(awgParams, DefaultH1, DefaultH2, DefaultS1, DefaultS2)
 }
 
 // PerformAWGHandshake executes a complete AWG reachability probe including preambles and CPS blobs.

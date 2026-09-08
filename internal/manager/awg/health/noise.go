@@ -25,8 +25,12 @@ var (
 const (
 	DefaultH1 = uint32(1020325451)
 	DefaultH2 = uint32(3288052141)
+	DefaultH3 = uint32(1766607858)
+	DefaultH4 = uint32(2528465083)
 	DefaultS1 = 15
 	DefaultS2 = 18
+	DefaultS3 = 20
+	DefaultS4 = 23
 )
 
 // NoiseClientState maintains state across Noise protocol handshake messages.

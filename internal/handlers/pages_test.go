@@ -144,6 +144,27 @@ func TestPageHandlers(t *testing.T) {
 		if !strings.Contains(body, "vpn-backends-tbody") {
 			t.Errorf("expected rendered vpn.html to contain 'vpn-backends-tbody'")
 		}
+		if !strings.Contains(body, "vpn-add-backend-btn") {
+			t.Errorf("expected rendered vpn.html to contain 'vpn-add-backend-btn'")
+		}
+		if !strings.Contains(body, "addBackendModal") {
+			t.Errorf("expected rendered vpn.html to contain 'addBackendModal'")
+		}
+		if !strings.Contains(body, "vpnServerSelect") {
+			t.Errorf("expected rendered vpn.html to contain 'vpnServerSelect'")
+		}
+		if !strings.Contains(body, "vpnAddBackendSubmitBtn") {
+			t.Errorf("expected rendered vpn.html to contain 'vpnAddBackendSubmitBtn'")
+		}
+		if !strings.Contains(body, "vpnOpenAddBackendModal") {
+			t.Errorf("expected rendered vpn.html to contain 'vpnOpenAddBackendModal'")
+		}
+		if !strings.Contains(body, "data.detail || data.message || data.error") {
+			t.Errorf("expected rendered vpn.html to extract detailed error messages")
+		}
+		if !strings.Contains(body, "HTTP ${res.status}") {
+			t.Errorf("expected rendered vpn.html to have HTTP status fallback for non-JSON errors")
+		}
 		if strings.Contains(body, "Template Not Found") {
 			t.Fatalf("CRITICAL REGRESSION: /vpn returned 'Template Not Found'")
 		}

@@ -1,7 +1,13 @@
 package vpn
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -9,9 +15,12 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
 func setupTestDB(t *testing.T) *database.DB {
@@ -440,5 +449,367 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 		if invalidListenerSvc.IsRunning() {
 			t.Errorf("expected IsRunning to be false after Start failure")
 		}
+	}
+}
+
+type mockAWGStatusProvider struct {
+	status map[string]any
+	err    error
+}
+
+func (m *mockAWGStatusProvider) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	return m.status, m.err
+}
+
+func TestEnableBackend_DynamicFallback(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Server with no AWG in DB, but awgProvider discovers it running
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "dynamic-awg-host",
+		Host:      "198.51.100.20",
+		Protocols: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	mockProv := &mockAWGStatusProvider{
+		status: map[string]any{
+			"container_running": true,
+			"port":              51820,
+			"public_key":        "dynamic-discovered-pubkey",
+			"psk":               "dynamic-psk",
+			"awg_params": map[string]string{
+				"H1": "1",
+			},
+		},
+	}
+	svc.SetAWGStatusProvider(mockProv)
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend with dynamic fallback failed: %v", err)
+	}
+
+	// Verify DB record was updated
+	srv, err := db.GetServerByID(ctx, srvID)
+	if err != nil {
+		t.Fatalf("GetServerByID failed: %v", err)
+	}
+	awgInfo, ok := srv.Protocols["awg"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected awg in srv.Protocols, got: %+v", srv.Protocols)
+	}
+	if installed, _ := awgInfo["installed"].(bool); !installed {
+		t.Errorf("expected installed true, got: %v", awgInfo["installed"])
+	}
+	if awgInfo["public_key"] != "dynamic-discovered-pubkey" {
+		t.Errorf("expected public_key dynamic-discovered-pubkey, got: %v", awgInfo["public_key"])
+	}
+	if fmt.Sprint(awgInfo["port"]) != "51820" {
+		t.Errorf("expected port 51820, got: %v", awgInfo["port"])
+	}
+
+	// Verify backend tunnel exists and is active
+	backends, err := svc.GetBackends(ctx)
+	if err != nil {
+		t.Fatalf("GetBackends failed: %v", err)
+	}
+	var found bool
+	for _, b := range backends {
+		if b.ServerID == srvID {
+			found = true
+			if b.Status != TunnelStatusActive {
+				t.Errorf("expected tunnel status active, got %s", b.Status)
+			}
+			if b.PublicKey != "dynamic-discovered-pubkey" {
+				t.Errorf("expected tunnel pubkey dynamic-discovered-pubkey, got %s", b.PublicKey)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected backend tunnel for server %d in backends list", srvID)
+	}
+
+	// 2. Server where AWG is NOT running
+	srvNoAWGID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "not-running-host",
+		Host:      "198.51.100.21",
+		Protocols: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	svc.SetAWGStatusProvider(&mockAWGStatusProvider{
+		status: map[string]any{
+			"container_running": false,
+		},
+	})
+	if err := svc.EnableBackend(ctx, srvNoAWGID); err == nil {
+		t.Error("expected EnableBackend to fail when container is not running")
+	}
+
+	// 3. Provider returns error
+	svc.SetAWGStatusProvider(&mockAWGStatusProvider{
+		err: errors.New("ssh connection failed"),
+	})
+	if err := svc.EnableBackend(ctx, srvNoAWGID); err == nil {
+		t.Error("expected EnableBackend to fail when provider returns error")
+	}
+}
+
+func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
+
+	vpnCfg := &models.VPNConfig{
+		Algorithm:  models.LBLeastConnections,
+		ListenPort: port,
+		SubnetCIDR: "10.100.0.0/24",
+		H1:         12345678,
+		H2:         23456789,
+		H3:         34567890,
+		H4:         45678901,
+		S1:         45,
+		S2:         60,
+		S3:         25,
+		S4:         15,
+	}
+	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	// Backend tunnel setup
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "US Backend", Host: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "us-backend-pubkey",
+		PrivateKey:    "us-backend-privkey",
+		Endpoint:      "127.0.0.1:51821",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "carol", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	vpnSvc, err := NewVPNService(db, vpnCfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("vpnSvc.Start failed: %v", err)
+	}
+	defer func() { _ = vpnSvc.Stop() }()
+
+	// 1. Generate client config & verify persistence/rendering of stored H/S
+	cfgStr, _, err := vpnSvc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+	if !strings.Contains(cfgStr, "H1 = 12345678") ||
+		!strings.Contains(cfgStr, "H2 = 23456789") ||
+		!strings.Contains(cfgStr, "H4 = 45678901") ||
+		!strings.Contains(cfgStr, "S1 = 45") ||
+		!strings.Contains(cfgStr, "S2 = 60") {
+		t.Fatalf("GenerateClientConfig did not render stored VPNConfig values: %s", cfgStr)
+	}
+
+	// 2. Parse config parameters
+	var clientPrivB64, serverPubB64 string
+	for _, line := range strings.Split(cfgStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PrivateKey =") {
+			clientPrivB64 = strings.TrimSpace(strings.TrimPrefix(trimmed, "PrivateKey ="))
+		} else if strings.HasPrefix(trimmed, "PublicKey =") {
+			serverPubB64 = strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey ="))
+		}
+	}
+	clientPrivBytes, err := base64.StdEncoding.DecodeString(clientPrivB64)
+	if err != nil || len(clientPrivBytes) != 32 {
+		t.Fatalf("invalid client priv key: %v", err)
+	}
+	serverPubBytes, err := base64.StdEncoding.DecodeString(serverPubB64)
+	if err != nil || len(serverPubBytes) != 32 {
+		t.Fatalf("invalid server pub key: %v", err)
+	}
+	clientPubBytes, err := curve25519.X25519(clientPrivBytes, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("X25519 failed: %v", err)
+	}
+	clientPubB64 := base64.StdEncoding.EncodeToString(clientPubBytes)
+
+	serverUDPAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+	clientConn, err := net.DialUDP("udp", nil, serverUDPAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	// 3. Handshake round-trip
+	initPacket, state, err := health.BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, nil, vpnCfg.H1, vpnCfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacket failed: %v", err)
+	}
+	if _, err := clientConn.Write(initPacket); err != nil {
+		t.Fatalf("Write initiation failed: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("Read handshake response failed: %v", err)
+	}
+	if !health.VerifyAWGResponsePacket(respBuf[:n], state, vpnCfg.H2, vpnCfg.S2) {
+		t.Fatal("VerifyAWGResponsePacket rejected server response")
+	}
+
+	// 4. AWG Transport Framing & Decryption Round-Trip
+	routedCh := make(chan []byte, 1)
+	vpnSvc.endpoint.SetClientPacketRouter(func(peerKey string, pkt []byte) error {
+		if peerKey == clientPubB64 {
+			routedCh <- pkt
+		}
+		return nil
+	})
+
+	respPayload := respBuf[vpnCfg.S2:n]
+	serverReceiverIdx := respPayload[4:8]
+	serverEPub := respPayload[12:44]
+
+	ss3, err := curve25519.X25519(state.ClientEPriv, serverEPub)
+	if err != nil {
+		t.Fatalf("ss3 DH failed: %v", err)
+	}
+	ck := health.KDF1(health.KDF1(state.CK, serverEPub), ss3)
+	ss4, err := curve25519.X25519(state.ClientPriv, serverEPub)
+	if err != nil {
+		t.Fatalf("ss4 DH failed: %v", err)
+	}
+	ck = health.KDF1(ck, ss4)
+	ck, _, _ = health.KDF3(ck, make([]byte, 32))
+	clientSendKey, clientRecvKey := health.KDF2(ck, nil)
+
+	// 4a. Client -> Endpoint: AWG Transport Frame (S4 padding + H4 header + counter 0)
+	aeadSend, err := chacha20poly1305.New(clientSendKey)
+	if err != nil {
+		t.Fatalf("aeadSend failed: %v", err)
+	}
+	testPayload := []byte("client-awg3-data-frame-content")
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], 0)
+
+	s4 := vpnCfg.S4
+	frameLen := s4 + 16
+	transportDatagram := make([]byte, frameLen)
+	if _, err := rand.Read(transportDatagram[:s4]); err != nil {
+		t.Fatalf("rand failed: %v", err)
+	}
+	binary.LittleEndian.PutUint32(transportDatagram[s4:s4+4], vpnCfg.H4)
+	copy(transportDatagram[s4+4:s4+8], serverReceiverIdx)
+	binary.LittleEndian.PutUint64(transportDatagram[s4+8:s4+16], 0)
+	transportDatagram = aeadSend.Seal(transportDatagram, nonce[:], testPayload, nil)
+
+	if _, err := clientConn.Write(transportDatagram); err != nil {
+		t.Fatalf("Write transport data failed: %v", err)
+	}
+
+	select {
+	case received := <-routedCh:
+		if !bytes.Equal(received, testPayload) {
+			t.Fatalf("routed packet mismatch: got %q, want %q", received, testPayload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for endpoint to decrypt and route transport packet")
+	}
+
+	// 4b. Endpoint -> Client: SendToPeer AWG Transport Frame
+	replyPayload := []byte("reply-from-endpoint-awg3")
+	if err := vpnSvc.endpoint.SendToPeer(clientPubB64, replyPayload); err != nil {
+		t.Fatalf("SendToPeer failed: %v", err)
+	}
+
+	clientRecvBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	nRecv, err := clientConn.Read(clientRecvBuf)
+	if err != nil {
+		t.Fatalf("Read SendToPeer packet failed: %v", err)
+	}
+	if nRecv < s4+16+len(replyPayload) {
+		t.Fatalf("received frame too short: %d", nRecv)
+	}
+	replyDatagram := clientRecvBuf[:nRecv]
+	replyPayloadPart := replyDatagram[s4:]
+	msgType := binary.LittleEndian.Uint32(replyPayloadPart[0:4])
+	if msgType != vpnCfg.H4 {
+		t.Fatalf("SendToPeer msgType mismatch: got %d, want %d", msgType, vpnCfg.H4)
+	}
+	counter := binary.LittleEndian.Uint64(replyPayloadPart[8:16])
+	aeadRecv, err := chacha20poly1305.New(clientRecvKey)
+	if err != nil {
+		t.Fatalf("aeadRecv failed: %v", err)
+	}
+	var recvNonce [12]byte
+	binary.LittleEndian.PutUint64(recvNonce[4:12], counter)
+	decryptedReply, err := aeadRecv.Open(nil, recvNonce[:], replyPayloadPart[16:], nil)
+	if err != nil {
+		t.Fatalf("failed to decrypt SendToPeer packet: %v", err)
+	}
+	if !bytes.Equal(decryptedReply, replyPayload) {
+		t.Fatalf("decrypted reply mismatch: got %q, want %q", decryptedReply, replyPayload)
+	}
+
+	// 4c. Negative Test: corrupted H4 transport frame is silently dropped, does not route
+	corruptDatagram := make([]byte, len(transportDatagram))
+	copy(corruptDatagram, transportDatagram)
+	binary.LittleEndian.PutUint32(corruptDatagram[s4:s4+4], 0xCAFEBABE)
+	if _, err := clientConn.Write(corruptDatagram); err != nil {
+		t.Fatalf("Write corrupt datagram failed: %v", err)
+	}
+	select {
+	case <-routedCh:
+		t.Fatal("corrupt H4 datagram was routed when it should have been dropped")
+	case <-time.After(150 * time.Millisecond):
+		// Expected silent drop
+	}
+
+	// 4d. Negative Test: handshake with mismatched H1 must fail cleanly (silent drop)
+	wrongH1Packet, _, err := health.BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, nil, 0x99999999, vpnCfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacket wrong H1 failed: %v", err)
+	}
+	if _, err := clientConn.Write(wrongH1Packet); err != nil {
+		t.Fatalf("Write wrong H1 packet failed: %v", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	wrongRespBuf := make([]byte, 2048)
+	if nWrong, err := clientConn.Read(wrongRespBuf); err == nil {
+		t.Fatalf("expected silent drop for wrong H1 handshake, got %d bytes response", nWrong)
 	}
 }

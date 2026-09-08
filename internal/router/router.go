@@ -55,6 +55,10 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 	reg.Register(mtproxylMgr)
 	reg.Register(dnsMgr)
 
+	if vpnSvc != nil {
+		vpnSvc.SetAWGStatusProvider(awgMgr)
+	}
+
 	h := handlers.NewHandlers(handlers.Dependencies{
 		Config:          cfg,
 		DB:              db,

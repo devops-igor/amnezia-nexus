@@ -81,6 +81,9 @@ func setupTestHandlersWithMockSSH(t *testing.T, client *testMockSSHClient) (*Han
 	h.registry.Register(h.awgMgr)
 	h.registry.Register(h.mtproxylMgr)
 	h.registry.Register(h.dnsMgr)
+	if h.vpnSvc != nil {
+		h.vpnSvc.SetAWGStatusProvider(h.awgMgr)
+	}
 	return h, db, cfg
 }
 

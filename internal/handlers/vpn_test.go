@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -146,23 +147,72 @@ func TestVPNHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("VPNEnableBackendHandler", func(t *testing.T) {
+	t.Run("VPNEnableBackendHandler Without AWG", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID), nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
-		if w.Code != http.StatusOK && w.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 200 or 500, got %d", w.Code)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 when enabling server without AWG, got %d", w.Code)
+		}
+		var errResp map[string]any
+		_ = json.NewDecoder(w.Body).Decode(&errResp)
+		errCode, _ := errResp["error"].(string)
+		if errCode != "awg_not_installed" {
+			t.Errorf("expected error code 'awg_not_installed', got: %s", errCode)
+		}
+		detail, _ := errResp["detail"].(string)
+		if !strings.Contains(detail, "AmneziaWG") {
+			t.Errorf("expected error detail to mention 'AmneziaWG', got: %s", detail)
 		}
 	})
 
-	t.Run("VPNDisableBackendHandler", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/disable", sID), nil)
+	t.Run("VPNEnableBackendHandler Server Not Found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/vpn/backends/99999/enable", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
-		if w.Code != http.StatusOK && w.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 200 or 500, got %d", w.Code)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 when enabling non-existent server, got %d", w.Code)
+		}
+	})
+
+	t.Run("VPNEnableBackendHandler With AWG Success", func(t *testing.T) {
+		srvWithAWG := &models.Server{
+			Name:    "VPN-Node-AWG-Success",
+			Host:    "127.0.0.1",
+			SSHPort: 22,
+			SSHUser: "root",
+			SSHPass: "pass",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"port":       float64(51820),
+					"public_key": "x9aB1234567890abcdef1234567890abcdef123456=",
+					"installed":  true,
+				},
+			},
+			CreatedAt: time.Now(),
+		}
+		sIDWithAWG, err := db.CreateServer(ctx, srvWithAWG)
+		if err != nil {
+			t.Fatalf("failed to create test server: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sIDWithAWG), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 when enabling valid AWG server, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		// Now disable it
+		reqDisable := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/disable", sIDWithAWG), nil)
+		wDisable := httptest.NewRecorder()
+		r.ServeHTTP(wDisable, reqDisable)
+
+		if wDisable.Code != http.StatusOK {
+			t.Fatalf("expected 200 when disabling backend, got %d", wDisable.Code)
 		}
 	})
 
@@ -291,4 +341,67 @@ func TestVPNHandlers(t *testing.T) {
 			t.Errorf("expected 200, got %d", wMCfg.Code)
 		}
 	})
+}
+
+func TestVPNEnableBackendHandler_DynamicFallback(t *testing.T) {
+	ctx := context.Background()
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "docker ps -a") && strings.Contains(cmd, "amnezia-awg") {
+				return "amnezia-awg\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-awg") {
+				return "Up 1 hour\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wg0.conf") || strings.Contains(cmd, "awg0.conf") {
+				return "[Interface]\nListenPort = 51820\nPrivateKey = server-priv\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wireguard_server_public_key.key") {
+				return "fallback-server-public-key\n", "", 0, nil
+			}
+			return "", "", 0, nil
+		},
+	}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+
+	srvNoAWG := &models.Server{
+		Name:      "VPN-Node-AWG-Fallback",
+		Host:      "127.0.0.1",
+		SSHPort:   22,
+		SSHUser:   "root",
+		SSHPass:   "pass",
+		Protocols: map[string]any{},
+		CreatedAt: time.Now(),
+	}
+	sIDFallback, err := db.CreateServer(ctx, srvNoAWG)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+	mockSSH.serverID = &sIDFallback
+
+	r := setupFullVPNRouter(h)
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sIDFallback), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 when enabling server with live fallback, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify database was updated
+	srv, err := db.GetServer(ctx, sIDFallback)
+	if err != nil {
+		t.Fatalf("failed to load server from db: %v", err)
+	}
+	awgData, ok := srv.Protocols["awg"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected awg protocol in server.Protocols, got: %+v", srv.Protocols)
+	}
+	if pubKey, _ := awgData["public_key"].(string); pubKey != "fallback-server-public-key" {
+		t.Errorf("expected public_key fallback-server-public-key, got %v", pubKey)
+	}
+	if portVal := fmt.Sprint(awgData["port"]); portVal != "51820" {
+		t.Errorf("expected port 51820, got %v", awgData["port"])
+	}
 }

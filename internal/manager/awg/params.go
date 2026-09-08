@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -263,6 +264,102 @@ func GenerateQuadrantHeaders() (h1, h2, h3, h4 uint32, err error) {
 	}
 
 	return headers[0], headers[1], headers[2], headers[3], nil
+}
+
+// GenerateStandardObfuscationValues generates standard-profile obfuscation parameters:
+// H1-H4 across non-overlapping quadrants, and standard-profile S1-S4 satisfying |s1 - s2| >= 10.
+func GenerateStandardObfuscationValues() (h1, h2, h3, h4 uint32, s1, s2, s3, s4 int, err error) {
+	h1, h2, h3, h4, err = GenerateQuadrantHeaders()
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, err
+	}
+
+	s1, err = randIntBetween(30, 80)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, err
+	}
+	s2, err = randIntBetween(30, 80)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, err
+	}
+	s3, err = randIntBetween(15, 32)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, err
+	}
+	s4, err = randIntBetween(10, 20)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, err
+	}
+
+	for attempts := 0; attempts < 100; attempts++ {
+		diff := s1 - s2
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff >= 10 {
+			break
+		}
+		s2, _ = randIntBetween(30, 80)
+	}
+	diff := s1 - s2
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < 10 {
+		if s1+10 <= 150 {
+			s2 = s1 + 10
+		} else {
+			s2 = s1 - 10
+		}
+	}
+	return h1, h2, h3, h4, s1, s2, s3, s4, nil
+}
+
+// AWGParamsFromVPNConfig converts stored models.VPNConfig parameters into *AWGParams.
+//
+//nolint:revive
+func AWGParamsFromVPNConfig(cfg *models.VPNConfig) *AWGParams {
+	p := AWGParamsFromMap(nil)
+	if cfg == nil {
+		return p
+	}
+
+	if cfg.H1 > 0 {
+		p.InitPacketMagicHeader = strconv.FormatUint(uint64(cfg.H1), 10)
+	}
+	if cfg.H2 > 0 {
+		p.ResponsePacketMagicHeader = strconv.FormatUint(uint64(cfg.H2), 10)
+	}
+	if cfg.H3 > 0 {
+		p.UnderloadPacketMagicHeader = strconv.FormatUint(uint64(cfg.H3), 10)
+	}
+	if cfg.H4 > 0 {
+		p.TransportPacketMagicHeader = strconv.FormatUint(uint64(cfg.H4), 10)
+	}
+	if cfg.S1 > 0 {
+		p.InitPacketJunkSize = strconv.Itoa(cfg.S1)
+	}
+	if cfg.S2 > 0 {
+		p.ResponsePacketJunkSize = strconv.Itoa(cfg.S2)
+	}
+	if cfg.S3 > 0 {
+		p.CookieReplyPacketJunkSize = strconv.Itoa(cfg.S3)
+	}
+	if cfg.S4 > 0 {
+		p.TransportPacketJunkSize = strconv.Itoa(cfg.S4)
+	}
+
+	// Also generate standard CPS mimicry packets for AWG 3+ clients
+	cpsPackets, err := cps.GenerateCPSPackets("standard", "")
+	if err == nil && cpsPackets != nil {
+		p.I1 = cpsPackets["i1"]
+		p.I2 = cpsPackets["i2"]
+		p.I3 = cpsPackets["i3"]
+		p.I4 = cpsPackets["i4"]
+		p.I5 = cpsPackets["i5"]
+	}
+
+	return p
 }
 
 // GenerateAWGParams generates randomized AWG obfuscation parameters based on the given profile.
