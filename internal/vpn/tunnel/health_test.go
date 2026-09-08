@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
@@ -131,5 +132,164 @@ func TestHealthProber(t *testing.T) {
 	}
 	if defProber.ProbeAll(ctx) != nil {
 		t.Errorf("expected nil ProbeAll for nil pool")
+	}
+}
+
+func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	// 1. Server with backend-installed params
+	s1ID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Server with AWG Params",
+		Host: "192.0.2.1",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed": true,
+				"awg_params": map[string]any{
+					"h1": 111111,
+					"h2": 222222,
+					"s1": 40,
+					"s2": 50,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer s1 failed: %v", err)
+	}
+
+	// 2. Server without AWG params, should fall back to VPNConfig
+	s2ID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Server without AWG Params",
+		Host:      "192.0.2.2",
+		Protocols: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer s2 failed: %v", err)
+	}
+
+	// 3. Save VPNConfig
+	vpnCfg := &models.VPNConfig{
+		H1: 333333,
+		H2: 444444,
+		S1: 60,
+		S2: 70,
+	}
+	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.H1 = 888888
+	cfg.H2 = 999999
+	cfg.S1 = 15
+	cfg.S2 = 18
+
+	var capturedH1, capturedH2 uint32
+	var capturedS1, capturedS2 int
+	var shouldFail bool
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		capturedH1, capturedH2 = h1, h2
+		capturedS1, capturedS2 = s1, s2
+		if shouldFail {
+			return 0, errors.New("handshake response verification failed: mismatched H1/S1")
+		}
+		return 30 * time.Millisecond, nil
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	// Verify resolveTunnelParams hierarchy for s1 (uses backend params)
+	h1, h2, s1, s2 := prober.resolveTunnelParams(ctx, s1ID)
+	if h1 != 111111 || h2 != 222222 || s1 != 40 || s2 != 50 {
+		t.Errorf("s1 params mismatch: got (%d, %d, %d, %d), want (111111, 222222, 40, 50)", h1, h2, s1, s2)
+	}
+
+	// Verify resolveTunnelParams hierarchy for s2 (falls back to VPNConfig)
+	h1, h2, s1, s2 = prober.resolveTunnelParams(ctx, s2ID)
+	if h1 != 333333 || h2 != 444444 || s1 != 60 || s2 != 70 {
+		t.Errorf("s2 params mismatch: got (%d, %d, %d, %d), want (333333, 444444, 60, 70)", h1, h2, s1, s2)
+	}
+
+	// Probe s1 tunnel: positive test
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.1:51820", "pub1")
+	if err != nil {
+		t.Fatalf("AddTunnel t1 failed: %v", err)
+	}
+	rtt, err := prober.ProbeTunnel(ctx, t1)
+	if err != nil || rtt != 30 {
+		t.Fatalf("ProbeTunnel t1 failed: rtt=%d, err=%v", rtt, err)
+	}
+	if capturedH1 != 111111 || capturedH2 != 222222 || capturedS1 != 40 || capturedS2 != 50 {
+		t.Errorf("probeFn received wrong params: (%d, %d, %d, %d)", capturedH1, capturedH2, capturedS1, capturedS2)
+	}
+
+	// Negative test: mismatched parameters cause probe failure
+	shouldFail = true
+	_, err = prober.ProbeTunnel(ctx, t1)
+	if err == nil {
+		t.Error("expected ProbeTunnel to fail when params are mismatched")
+	}
+	st, _ := pool.GetTunnel(s1ID)
+	if st.Status != "degraded" {
+		t.Errorf("expected tunnel to be degraded after probe failure, got %s", st.Status)
+	}
+}
+
+func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	// Server has AWG protocol installed, port, public_key, but NO awg_params keys inside
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Server with AWG installed but empty params",
+		Host: "192.0.2.100",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "dummy-pubkey",
+				"awg_params": map[string]any{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Stored VPNConfig has randomized portal parameters
+	vpnCfg := &models.VPNConfig{
+		H1: 777777,
+		H2: 888888,
+		S1: 35,
+		S2: 45,
+	}
+	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.H1 = 12345
+	cfg.H2 = 54321
+
+	prober := NewHealthProber(pool, db, cfg, nil)
+
+	// Explicitly verify paramsFromBackendServer returns found=false (Finding 2)
+	bH1, bH2, bS1, bS2, found := paramsFromBackendServer(ctx, db, sID)
+	if found {
+		t.Errorf("expected paramsFromBackendServer to return found=false for empty params, got found=true (%d, %d, %d, %d)", bH1, bH2, bS1, bS2)
+	}
+
+	// Verify resolveTunnelParams resolves from VPNConfig (777777), NOT legacy constant 1020325451
+	h1, h2, s1, s2 := prober.resolveTunnelParams(ctx, sID)
+	if h1 != 777777 || h2 != 888888 || s1 != 35 || s2 != 45 {
+		t.Errorf("resolveTunnelParams mismatch: got (%d, %d, %d, %d), want (777777, 888888, 35, 45)", h1, h2, s1, s2)
+	}
+	if h1 == health.DefaultH1 {
+		t.Errorf("resolveTunnelParams incorrectly used legacy constant %d instead of VPNConfig", health.DefaultH1)
 	}
 }

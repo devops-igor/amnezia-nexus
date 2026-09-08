@@ -303,6 +303,15 @@ type VPNConfig struct {
 	MaxPeersPerBackend int                    `json:"max_peers_per_backend"`
 	ServerPrivateKey   string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
 	ServerPublicKey    string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
+	PublicEndpoint     string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
+	H1                 uint32                 `json:"h1"`
+	H2                 uint32                 `json:"h2"`
+	H3                 uint32                 `json:"h3"`
+	H4                 uint32                 `json:"h4"`
+	S1                 int                    `json:"s1"`
+	S2                 int                    `json:"s2"`
+	S3                 int                    `json:"s3"`
+	S4                 int                    `json:"s4"`
 }
 
 // AppearanceSettings holds UI display configuration.
@@ -733,6 +742,7 @@ type MyAddConnectionRequest struct {
 	ServerID          int64   `json:"server_id"`
 	Protocol          string  `json:"protocol"`
 	Name              string  `json:"name"`
+	LoadBalanced      bool    `json:"load_balanced,omitempty"`
 	TelemtQuota       *string `json:"telemt_quota,omitempty"`
 	TelemtMaxIPs      *int    `json:"telemt_max_ips,omitempty"`
 	TelemtExpiry      *string `json:"telemt_expiry,omitempty"`
@@ -742,12 +752,19 @@ type MyAddConnectionRequest struct {
 }
 
 func (r *MyAddConnectionRequest) Validate() error {
-	if r.ServerID <= 0 {
-		return errors.New("server_id must be greater than 0")
-	}
 	r.Protocol = NormalizeProtocol(r.Protocol)
 	if !IsValidProtocol(r.Protocol) {
 		return fmt.Errorf("invalid protocol: %s", r.Protocol)
+	}
+	if r.LoadBalanced || r.ServerID == 0 {
+		if r.ServerID < 0 {
+			return errors.New("server_id must be greater than or equal to 0")
+		}
+		if r.Protocol != "awg" {
+			return errors.New("load-balanced connections only support awg protocol")
+		}
+	} else if r.ServerID <= 0 {
+		return errors.New("server_id must be greater than 0")
 	}
 	r.Name = strings.TrimSpace(r.Name)
 	if r.Name == "" || len(r.Name) > 255 {

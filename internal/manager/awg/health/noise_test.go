@@ -582,11 +582,163 @@ func TestNoiseIKPythonGoldenVectors(t *testing.T) {
 		t.Fatalf("VerifyAWGResponsePacket failed on Python golden response packet")
 	}
 
-	// Negative test: verify failure on corrupted golden packet
+	// Negative test: verify failure on corrupted golden packet (payload corrupted)
 	corruptedResp := make([]byte, len(goldenRespPacket))
 	copy(corruptedResp, goldenRespPacket)
 	corruptedResp[s2+44] ^= 0x01
 	if VerifyAWGResponsePacket(corruptedResp, clientState, h2, s2) {
 		t.Errorf("VerifyAWGResponsePacket should fail on corrupted golden packet")
+	}
+
+	// Negative test: verify failure on corrupted MAC1
+	corruptedMAC1 := make([]byte, len(goldenRespPacket))
+	copy(corruptedMAC1, goldenRespPacket)
+	corruptedMAC1[s2+60] ^= 0x01
+	if VerifyAWGResponsePacket(corruptedMAC1, clientState, h2, s2) {
+		t.Errorf("VerifyAWGResponsePacket should fail on corrupted MAC1")
+	}
+}
+
+func TestComputePublicKeyFromPrivate(t *testing.T) {
+	// 1. Valid keypair derivation
+	cPrivHex := "0202020202020202020202020202020202020202020202020202020202020202"
+	cPubHex := "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59"
+	cPriv, _ := hex.DecodeString(cPrivHex)
+	cPub, _ := hex.DecodeString(cPubHex)
+
+	cPrivB64 := base64.StdEncoding.EncodeToString(cPriv)
+	expectedCPubB64 := base64.StdEncoding.EncodeToString(cPub)
+
+	derivedPubB64, err := ComputePublicKeyFromPrivate(cPrivB64)
+	if err != nil {
+		t.Fatalf("ComputePublicKeyFromPrivate failed: %v", err)
+	}
+	if derivedPubB64 != expectedCPubB64 {
+		t.Errorf("ComputePublicKeyFromPrivate mismatch: got %s, want %s", derivedPubB64, expectedCPubB64)
+	}
+
+	// 2. Invalid inputs
+	if _, err := ComputePublicKeyFromPrivate(""); err == nil {
+		t.Errorf("expected error for empty private key")
+	}
+	if _, err := ComputePublicKeyFromPrivate("not-valid-base64!!!"); err == nil {
+		t.Errorf("expected error for invalid base64")
+	}
+	shortB64 := base64.StdEncoding.EncodeToString([]byte("too-short"))
+	if _, err := ComputePublicKeyFromPrivate(shortB64); err == nil {
+		t.Errorf("expected error for key with invalid length")
+	}
+}
+
+func TestVerifyAWGResponsePacket_MAC1Validation(t *testing.T) {
+	_, serverEPub := generateTestKeypair(t)
+	clientPriv, clientPub := generateTestKeypair(t)
+	psk := make([]byte, 32)
+	senderIdx := uint32(98765)
+
+	clientEPriv, clientEPub := generateTestKeypair(t)
+	ck := InitialChainKey[:]
+	ck = KDF1(ck, clientEPub)
+	ss1, _ := curve25519.X25519(clientEPriv, serverEPub)
+	ck, _ = KDF2(ck, ss1)
+	ss2, _ := curve25519.X25519(clientPriv, serverEPub)
+	ck, _ = KDF2(ck, ss2)
+
+	hSum := blake2s.Sum256(append(InitialHash[:], serverEPub...))
+	hSum = blake2s.Sum256(append(hSum[:], clientEPub...))
+	h := hSum[:]
+
+	respHSum := blake2s.Sum256(append(h, serverEPub...))
+	respH := respHSum[:]
+	respCK := KDF1(ck, serverEPub)
+
+	clientSS3, _ := curve25519.X25519(clientEPriv, serverEPub)
+	respCK = KDF1(respCK, clientSS3)
+
+	clientSS4, _ := curve25519.X25519(clientPriv, serverEPub)
+	respCK = KDF1(respCK, clientSS4)
+
+	var tau, key3 []byte
+	_, tau, key3 = KDF3(respCK, psk)
+	respHSum = blake2s.Sum256(append(respH, tau...))
+	respH = respHSum[:]
+
+	aead3, _ := chacha20poly1305.New(key3)
+	nonce0 := make([]byte, 12)
+	encryptedEmpty := aead3.Seal(nil, nonce0, []byte{}, respH)
+
+	respMsgType := make([]byte, 4)
+	binary.LittleEndian.PutUint32(respMsgType, DefaultH2)
+	serverSenderIdx := make([]byte, 4)
+	binary.LittleEndian.PutUint32(serverSenderIdx, 54321)
+	respReceiverIdx := make([]byte, 4)
+	binary.LittleEndian.PutUint32(respReceiverIdx, senderIdx)
+
+	var respMsgBody []byte
+	respMsgBody = append(respMsgBody, respMsgType...)
+	respMsgBody = append(respMsgBody, serverSenderIdx...)
+	respMsgBody = append(respMsgBody, respReceiverIdx...)
+	respMsgBody = append(respMsgBody, serverEPub...)
+	respMsgBody = append(respMsgBody, encryptedEmpty...)
+
+	mac1KeySum := blake2s.Sum256(append(LabelMAC1, clientPub...))
+	hMac1, _ := blake2s.New128(mac1KeySum[:])
+	hMac1.Write(respMsgBody)
+	respMac1 := hMac1.Sum(nil)
+	respMac2 := make([]byte, 16)
+
+	s2 := DefaultS2
+	var respPacket []byte
+	if s2 > 0 {
+		pad := make([]byte, s2)
+		respPacket = append(respPacket, pad...)
+	}
+	respPacket = append(respPacket, respMsgBody...)
+	respPacket = append(respPacket, respMac1...)
+	respPacket = append(respPacket, respMac2...)
+
+	state := &NoiseClientState{
+		H:           h,
+		CK:          ck,
+		ClientEPriv: clientEPriv,
+		ClientPriv:  clientPriv,
+		ServerPub:   serverEPub,
+		PSK:         psk,
+		SenderIndex: senderIdx,
+		MAC1Key:     mac1KeySum[:],
+	}
+
+	// 1. Valid response packet passes
+	if !VerifyAWGResponsePacket(respPacket, state, DefaultH2, s2) {
+		t.Fatalf("expected valid response packet to pass verification")
+	}
+
+	// 2. Corrupted MAC1 fails
+	corruptMAC1Packet := make([]byte, len(respPacket))
+	copy(corruptMAC1Packet, respPacket)
+	corruptMAC1Packet[s2+60] ^= 0x55
+	if VerifyAWGResponsePacket(corruptMAC1Packet, state, DefaultH2, s2) {
+		t.Errorf("expected verification to fail for corrupted MAC1")
+	}
+
+	// 3. Corrupted payload fails (rejected at MAC1 check before AEAD)
+	corruptPayloadPacket := make([]byte, len(respPacket))
+	copy(corruptPayloadPacket, respPacket)
+	corruptPayloadPacket[s2+5] ^= 0x55
+	if VerifyAWGResponsePacket(corruptPayloadPacket, state, DefaultH2, s2) {
+		t.Errorf("expected verification to fail for corrupted payload")
+	}
+
+	// 4. Truncated packet fails
+	if VerifyAWGResponsePacket(respPacket[:s2+50], state, DefaultH2, s2) {
+		t.Errorf("expected verification to fail for truncated packet")
+	}
+
+	// 5. Wrong receiver index fails
+	wrongIndexPacket := make([]byte, len(respPacket))
+	copy(wrongIndexPacket, respPacket)
+	binary.LittleEndian.PutUint32(wrongIndexPacket[s2+8:s2+12], senderIdx^0xFF)
+	if VerifyAWGResponsePacket(wrongIndexPacket, state, DefaultH2, s2) {
+		t.Errorf("expected verification to fail for wrong receiver index")
 	}
 }

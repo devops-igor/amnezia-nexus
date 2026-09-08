@@ -630,7 +630,9 @@
     async function updateReachability() {
         try {
             const data = await apiCall(`/api/servers/${SERVER_ID}/reachability`, 'GET');
-            const reach = data.reachability;
+            const reach = (data && typeof data.reachability === 'object' && data.reachability !== null)
+                ? data.reachability
+                : { reachable: !!data.reachable, latency_ms: data.latency_ms, last_checked: data.last_checked };
             const overallBadge = document.getElementById('reachabilityOverallBadge');
             const mimicryBadges = document.getElementById('mimicryHealthBadges');
             const awgMimicryBadges = document.getElementById('awg-mimicry-health');

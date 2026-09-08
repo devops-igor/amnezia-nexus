@@ -183,6 +183,71 @@ func TestRouterAuthProtectedRoutes(t *testing.T) {
 	}
 }
 
+func TestRouterIndexRouteAccess(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	ctx := context.Background()
+
+	_, _ = db.CreateUser(ctx, &models.User{
+		ID:        "user-regular",
+		Username:  "regular",
+		Role:      models.RoleUser,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	})
+	_, _ = db.CreateUser(ctx, &models.User{
+		ID:        "support-1",
+		Username:  "support1",
+		Role:      models.RoleSupport,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	})
+	r := NewRouter(cfg, db, nil)
+
+	// 1. Unauthenticated request to GET / -> 302 Found to /login
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/", nil)
+	wUnauth := httptest.NewRecorder()
+	r.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusFound || wUnauth.Header().Get("Location") != "/login" {
+		t.Errorf("expected 302 redirect to /login for unauthenticated GET /, got %d (%s)", wUnauth.Code, wUnauth.Header().Get("Location"))
+	}
+
+	// 2. Regular user request to GET / -> 302 Found to /my (Issue #11 fix)
+	reqUser := httptest.NewRequest(http.MethodGet, "/", nil)
+	ctxUser := middleware.WithSession(reqUser.Context(), &models.SessionData{
+		UserID: "user-regular",
+		Role:   models.RoleUser,
+	})
+	wUser := httptest.NewRecorder()
+	r.ServeHTTP(wUser, reqUser.WithContext(ctxUser))
+	if wUser.Code != http.StatusFound || wUser.Header().Get("Location") != "/my" {
+		t.Fatalf("expected 302 redirect to /my for regular user GET /, got %d (%s)", wUser.Code, wUser.Header().Get("Location"))
+	}
+
+	// 3. Admin user request to GET / -> 200 OK
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/", nil)
+	ctxAdmin := middleware.WithSession(reqAdmin.Context(), &models.SessionData{
+		UserID: "admin-id",
+		Role:   models.RoleAdmin,
+	})
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin.WithContext(ctxAdmin))
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin user GET /, got %d", wAdmin.Code)
+	}
+
+	// 4. Support user request to GET / -> 200 OK
+	reqSupport := httptest.NewRequest(http.MethodGet, "/", nil)
+	ctxSupport := middleware.WithSession(reqSupport.Context(), &models.SessionData{
+		UserID: "support-1",
+		Role:   models.RoleSupport,
+	})
+	wSupport := httptest.NewRecorder()
+	r.ServeHTTP(wSupport, reqSupport.WithContext(ctxSupport))
+	if wSupport.Code != http.StatusOK {
+		t.Fatalf("expected 200 for support user GET /, got %d", wSupport.Code)
+	}
+}
+
 func TestSetLangEndpoint(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
 	r := NewRouter(cfg, db, nil)

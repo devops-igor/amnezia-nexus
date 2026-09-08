@@ -316,6 +316,11 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}
+	// Obfuscation-parameter migration (generating H/S when unset and
+	// persisting them) intentionally does NOT happen here: the database
+	// package must not own obfuscation-parameter derivation. NewVPNService
+	// in internal/vpn owns the migration so a single component derives,
+	// persists, and distributes the parameters to listener and clients.
 	return &cfg, nil
 }
 

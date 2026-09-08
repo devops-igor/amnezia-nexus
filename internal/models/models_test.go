@@ -406,9 +406,25 @@ func TestAdditionalRequestModelsValidation(t *testing.T) {
 	if err := myAcValid.Validate(); err != nil {
 		t.Errorf("MyAddConnectionRequest.Validate failed: %v", err)
 	}
-	myAcInvalidID := MyAddConnectionRequest{ServerID: 0, Protocol: "awg", Name: "conn-1"}
-	if err := myAcInvalidID.Validate(); err == nil {
-		t.Errorf("MyAddConnectionRequest.Validate should fail for server_id <= 0")
+	myAcLBValid := MyAddConnectionRequest{ServerID: 0, Protocol: "awg", Name: "conn-lb"}
+	if err := myAcLBValid.Validate(); err != nil {
+		t.Errorf("MyAddConnectionRequest.Validate should allow server_id == 0 for awg: %v", err)
+	}
+	myAcLBFlagValid := MyAddConnectionRequest{ServerID: 0, Protocol: "awg", Name: "conn-lb-flag", LoadBalanced: true}
+	if err := myAcLBFlagValid.Validate(); err != nil {
+		t.Errorf("MyAddConnectionRequest.Validate should allow LoadBalanced == true: %v", err)
+	}
+	myAcLBInvalidProto := MyAddConnectionRequest{ServerID: 0, Protocol: "telemt", Name: "conn-lb-telemt"}
+	if err := myAcLBInvalidProto.Validate(); err == nil {
+		t.Errorf("MyAddConnectionRequest.Validate should fail for server_id == 0 with non-awg protocol")
+	}
+	myAcInvalidNegID := MyAddConnectionRequest{ServerID: -1, Protocol: "awg", Name: "conn-neg"}
+	if err := myAcInvalidNegID.Validate(); err == nil {
+		t.Errorf("MyAddConnectionRequest.Validate should fail for negative server_id")
+	}
+	myAcInvalidNegIDLB := MyAddConnectionRequest{ServerID: -1, Protocol: "awg", Name: "conn-neg-lb", LoadBalanced: true}
+	if err := myAcInvalidNegIDLB.Validate(); err == nil {
+		t.Errorf("MyAddConnectionRequest.Validate should fail for negative server_id with LoadBalanced=true")
 	}
 
 	// AddUserConnectionRequest

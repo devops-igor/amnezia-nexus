@@ -432,8 +432,8 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		reqEnable = reqEnable.WithContext(context.WithValue(reqEnable.Context(), chi.RouteCtxKey, rctxVPN))
 		wEnable := httptest.NewRecorder()
 		h.VPNEnableBackendHandler(wEnable, reqEnable)
-		if wEnable.Code != http.StatusInternalServerError {
-			t.Errorf("expected 500 for unregistered backend enable, got %d", wEnable.Code)
+		if wEnable.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for backend enable without AWG, got %d", wEnable.Code)
 		}
 
 		wDisable := httptest.NewRecorder()

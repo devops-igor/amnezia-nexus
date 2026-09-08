@@ -299,7 +299,7 @@
                 if (data.password_change_required) {
                     window.location.href = '/change-password?forced=1';
                 } else {
-                    window.location.href = '/';
+                    window.location.href = data.redirect || '/';
                 }
             } catch (err) {
                 errEl.textContent = err.message;
