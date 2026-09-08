@@ -78,7 +78,10 @@
                 <div>
                     <div class="client-name">{{ if $c.Name }}{{ $c.Name }}{{ else }}VPN Connection{{ end }}</div>
                     <div class="client-meta">
-                        <span>🖥 {{ if $c.ServerName }}{{ $c.ServerName }}{{ else }}Server #{{ $c.ServerID }}{{ end }}</span>
+                        <span>🖥 {{ if eq $c.ServerID 0 }}Cluster (Auto){{ else if $c.ServerName }}{{ $c.ServerName }}{{ else }}Server #{{ $c.ServerID }}{{ end }}</span>
+                        {{ if eq $c.ServerID 0 }}
+                        <span class="badge badge-success" style="font-size:0.65rem;">⚡ Load Balancer</span>
+                        {{ end }}
                         <span class="badge badge-info" style="font-size:0.65rem;">
                             {{ proto_title $c.Protocol }}
                         </span>
@@ -194,6 +197,9 @@
                 <label class="form-label" for="createServerSelect">{{ _ "create_conn_server_label" }}</label>
                 <select class="form-select" id="createServerSelect" required onchange="onServerSelected()">
                     <option value="">- {{ _ "select" }} -</option>
+                    {{ if .vpn_enabled }}
+                    <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true">⚡ Load Balancer (Auto-Select)</option>
+                    {{ end }}
                     {{ range $srv := .servers }}
                     <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}">{{ $srv.Name }}</option>
                     {{ end }}
@@ -355,8 +361,10 @@
             telemt: 'MTProxyL',
             dns: 'AmneziaDNS'
         };
+        const isLB = conn.server_id === 0;
         const name = escapeHtml(conn.name || 'VPN Connection');
-        const serverName = escapeHtml(conn.server_name || ('Server #' + (conn.server_id || '')));
+        const serverName = isLB ? 'Cluster (Auto)' : escapeHtml(conn.server_name || ('Server #' + (conn.server_id || '')));
+        const lbBadge = isLB ? '<span class="badge badge-success" style="font-size:0.65rem;">⚡ Load Balancer</span>' : '';
         const protoLabel = escapeHtml(protoDisplay[conn.protocol] || (conn.protocol ? conn.protocol.toUpperCase() : ''));
         const date = conn.created_at ? escapeHtml(conn.created_at.substring(0, 10)) : '';
         const connId = escapeHtml(conn.id);
@@ -377,6 +385,7 @@
                     <div class="client-name">${name}</div>
                     <div class="client-meta">
                         <span>🖥 ${serverName}</span>
+                        ${lbBadge}
                         <span class="badge badge-info" style="font-size:0.65rem;">
                             ${protoLabel}
                         </span>
@@ -423,10 +432,19 @@
 
         if (isNaN(serverId)) return;
 
-        const server = availableServers.find(s => s.id === serverId);
-        if (!server || !server.protocols) return;
+        const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
+        let protocols = null;
+        if (selectedOpt && selectedOpt.dataset.protocols) {
+            try {
+                protocols = JSON.parse(selectedOpt.dataset.protocols);
+            } catch (e) {}
+        }
+        if (!protocols) {
+            const server = availableServers.find(s => s.id === serverId);
+            if (server && server.protocols) protocols = server.protocols;
+        }
+        if (!protocols) return;
 
-        const protocols = server.protocols;
         const protoNames = {
             awg: 'AmneziaWG',
             telemt: 'MTProxyL (Telegram Proxy)',
@@ -440,6 +458,10 @@
                 opt.textContent = protoNames[proto] || proto;
                 protoSelect.appendChild(opt);
             }
+        }
+
+        if (protoSelect.options.length === 2) {
+            protoSelect.selectedIndex = 1;
         }
 
         document.getElementById('myAwgMimicryGroup').style.display = protoSelect.value === 'awg' ? '' : 'none';
@@ -528,6 +550,10 @@
             protocol: protocol,
             name: name,
         };
+
+        if (serverId === 0) {
+            payload.load_balanced = true;
+        }
 
         if (protocol === 'awg') {
             payload.awg_mimicry = document.getElementById('myAwgMimicry').value || 'auto';

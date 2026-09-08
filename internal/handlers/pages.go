@@ -138,14 +138,19 @@ func (h *Handlers) MyConnectionsPageHandler(w http.ResponseWriter, r *http.Reque
 	for i := range conns {
 		if sClean, ok := serversMap[conns[i].ServerID]; ok {
 			conns[i].ServerName = sClean.Name
+		} else if conns[i].ServerID == 0 {
+			conns[i].ServerName = "Load Balancer (Auto)"
 		} else if conns[i].ServerID > 0 {
 			conns[i].ServerName = fmt.Sprintf("Server #%d", conns[i].ServerID)
 		}
 	}
 
+	vpnEnabled := h.vpnSvc != nil
+
 	_ = RenderTemplate(w, r, h.db, "my_connections.html", map[string]any{
 		"connections": conns,
 		"servers":     sanitizedServers,
+		"vpn_enabled": vpnEnabled,
 	})
 }
 

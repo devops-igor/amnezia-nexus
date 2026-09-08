@@ -44,6 +44,20 @@ func TestPageHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("IndexPageHandler Support", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqCtx := middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "support-id",
+			Role:   models.RoleSupport,
+		})
+		w := httptest.NewRecorder()
+		h.IndexPageHandler(w, req.WithContext(reqCtx))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+	})
+
 	t.Run("IndexPageHandler User Redirect", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		reqCtx := middleware.WithSession(req.Context(), &models.SessionData{
@@ -55,6 +69,59 @@ func TestPageHandlers(t *testing.T) {
 
 		if w.Code != http.StatusFound || w.Header().Get("Location") != "/my" {
 			t.Fatalf("expected 302 redirect to /my, got %d", w.Code)
+		}
+	})
+
+	t.Run("IndexPageHandler Routing Integration", func(t *testing.T) {
+		r := chi.NewRouter()
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAuth)
+			r.Get("/", h.IndexPageHandler)
+		})
+
+		uReg := &models.User{
+			ID:       "u-reg-idx",
+			Username: "regidxuser",
+			Role:     models.RoleUser,
+			Enabled:  true,
+		}
+		_, _ = db.CreateUser(ctx, uReg)
+
+		uAdm := &models.User{
+			ID:       "u-adm-idx",
+			Username: "admidxuser",
+			Role:     models.RoleAdmin,
+			Enabled:  true,
+		}
+		_, _ = db.CreateUser(ctx, uAdm)
+
+		// Regular user GET / -> 302 Found to /my
+		reqUser := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqUserCtx := middleware.WithSession(reqUser.Context(), &models.SessionData{
+			UserID:   uReg.ID,
+			Username: uReg.Username,
+			Role:     models.RoleUser,
+		})
+		wUser := httptest.NewRecorder()
+		r.ServeHTTP(wUser, reqUser.WithContext(reqUserCtx))
+		if wUser.Code != http.StatusFound {
+			t.Fatalf("expected 302 for regular user GET /, got %d", wUser.Code)
+		}
+		if loc := wUser.Header().Get("Location"); loc != "/my" {
+			t.Fatalf("expected Location '/my', got %q", loc)
+		}
+
+		// Admin user GET / -> 200 OK
+		reqAdmin := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqAdminCtx := middleware.WithSession(reqAdmin.Context(), &models.SessionData{
+			UserID:   uAdm.ID,
+			Username: uAdm.Username,
+			Role:     models.RoleAdmin,
+		})
+		wAdmin := httptest.NewRecorder()
+		r.ServeHTTP(wAdmin, reqAdmin.WithContext(reqAdminCtx))
+		if wAdmin.Code != http.StatusOK {
+			t.Fatalf("expected 200 for admin user GET /, got %d", wAdmin.Code)
 		}
 	})
 
@@ -212,6 +279,52 @@ func TestPageHandlers(t *testing.T) {
 		}
 		if !strings.Contains(body, "Primary Wireguard") {
 			t.Fatalf("expected connection name %q in /my rendered HTML", "Primary Wireguard")
+		}
+
+		// Add a Load-Balanced connection (ServerID == 0)
+		lbConn := &models.UserConnection{
+			ID:        "conn-my-lb",
+			UserID:    uConn.ID,
+			ServerID:  0,
+			Protocol:  "awg",
+			ClientID:  "client-my-lb",
+			Name:      "Cluster Load Balancer",
+			CreatedAt: time.Now(),
+		}
+		_, _ = db.CreateConnection(ctx, lbConn)
+
+		// Authenticated with vpnSvc != nil
+		wLB := httptest.NewRecorder()
+		h.MyConnectionsPageHandler(wLB, req.WithContext(reqCtx))
+		if wLB.Code != http.StatusOK {
+			t.Fatalf("expected 200 for LB connections, got %d", wLB.Code)
+		}
+		bodyLB := wLB.Body.String()
+		if !strings.Contains(bodyLB, "Cluster (Auto)") {
+			t.Errorf("expected 'Cluster (Auto)' in /my rendered HTML, body:\n%s", bodyLB)
+		}
+		if !strings.Contains(bodyLB, "⚡ Load Balancer") {
+			t.Errorf("expected '⚡ Load Balancer' badge in /my rendered HTML")
+		}
+		if !strings.Contains(bodyLB, "⚡ Load Balancer (Auto-Select)") {
+			t.Errorf("expected '⚡ Load Balancer (Auto-Select)' option when vpn_enabled is true")
+		}
+		if !strings.Contains(bodyLB, `"server_name":"Load Balancer (Auto)"`) {
+			t.Errorf("expected 'Load Balancer (Auto)' server_name in JSON data")
+		}
+
+		// Authenticated with vpnSvc == nil
+		origVPNSvc := h.vpnSvc
+		h.vpnSvc = nil
+		wNoVPN := httptest.NewRecorder()
+		h.MyConnectionsPageHandler(wNoVPN, req.WithContext(reqCtx))
+		h.vpnSvc = origVPNSvc
+		if wNoVPN.Code != http.StatusOK {
+			t.Fatalf("expected 200 when vpn disabled, got %d", wNoVPN.Code)
+		}
+		bodyNoVPN := wNoVPN.Body.String()
+		if strings.Contains(bodyNoVPN, "data-is-lb=\"true\"") {
+			t.Errorf("expected Load Balancer option to be omitted when vpn_enabled is false")
 		}
 
 		// Unauthenticated

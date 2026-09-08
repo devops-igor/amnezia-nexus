@@ -15,6 +15,13 @@
             <span class="badge" id="vpn-listener-badge"><span class="badge-dot"></span> {{ _ "loading" }}</span>
         </div>
         <div>
+            <div class="form-label">{{ _ "vpn_public_endpoint" }}</div>
+            <div style="display: flex; align-items: center; gap: var(--space-xs);">
+                <div style="font-weight: 600;" id="vpn-public-endpoint">—</div>
+                <button type="button" class="btn btn-secondary btn-sm" id="vpn-edit-endpoint-btn" onclick="vpnOpenEditEndpointModal()" style="padding: 2px 6px; font-size: 0.75rem;" title="{{ _ "edit" }}">✏️</button>
+            </div>
+        </div>
+        <div>
             <div class="form-label">{{ _ "vpn_listen_port" }}</div>
             <div style="font-weight: 600;" id="vpn-listen-port">—</div>
         </div>
@@ -121,12 +128,100 @@
     </div>
 </div>
 
+<!-- EDIT PUBLIC ENDPOINT MODAL -->
+<div class="modal-backdrop" id="editEndpointModal">
+    <div class="modal" style="max-width: 520px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "vpn_edit_endpoint" }}</h2>
+            <button type="button" class="modal-close" onclick="closeModal('editEndpointModal')">×</button>
+        </div>
+        <form id="editEndpointForm" onsubmit="event.preventDefault(); vpnSubmitEditEndpoint();">
+            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: var(--space-md);">
+                {{ _ "vpn_public_endpoint_hint" }}
+            </p>
+
+            <div class="form-group">
+                <label class="form-label" for="vpnPublicEndpointInput">{{ _ "vpn_public_endpoint" }}</label>
+                <input type="text" class="form-input" id="vpnPublicEndpointInput" placeholder="vpn.example.com:51820">
+            </div>
+
+            <div id="vpnEndpointModalError" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem; color: #ff6b6b; background: rgba(255,107,107,0.1); border: 1px solid rgba(255,107,107,0.2);">
+            </div>
+
+            <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('editEndpointModal')">{{ _ "cancel" }}</button>
+                <button type="submit" class="btn btn-primary" id="vpnEditEndpointSubmitBtn">
+                    {{ _ "save" }}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
     /* ===== VPN admin dashboard: all dynamic data via textContent (XSS-safe).
        CSRF mutations reuse the global getCsrfToken() helper from base.html. ===== */
 
     let vpnCachedServers = [];
     let vpnCurrentBackends = [];
+    let vpnConfiguredPublicEndpoint = '';
+
+    function vpnOpenEditEndpointModal() {
+        const input = document.getElementById('vpnPublicEndpointInput');
+        input.value = vpnConfiguredPublicEndpoint || '';
+        const errBox = document.getElementById('vpnEndpointModalError');
+        if (errBox) {
+            errBox.style.display = 'none';
+            errBox.textContent = '';
+        }
+        openModal('editEndpointModal');
+    }
+
+    async function vpnSubmitEditEndpoint() {
+        const input = document.getElementById('vpnPublicEndpointInput');
+        const newEndpoint = input.value.trim();
+        const errBox = document.getElementById('vpnEndpointModalError');
+        if (errBox) {
+            errBox.style.display = 'none';
+            errBox.textContent = '';
+        }
+        const submitBtn = document.getElementById('vpnEditEndpointSubmitBtn');
+        submitBtn.disabled = true;
+
+        try {
+            const res = await fetch('/api/vpn/config', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': getCsrfToken(),
+                },
+                body: JSON.stringify({ public_endpoint: newEndpoint }),
+            });
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = null;
+            }
+            if (!res.ok || (data && data.status && data.status !== 'ok')) {
+                const errMsg = (data && (data.detail || data.message || data.error)) ||
+                    `HTTP ${res.status} ${res.statusText || _('error')}`.trim();
+                throw new Error(errMsg);
+            }
+            showToast(_('vpn_endpoint_updated_success'), 'success');
+            closeModal('editEndpointModal');
+            vpnLoadData();
+        } catch (err) {
+            const errMsg = err.message || _('error');
+            if (errBox) {
+                errBox.textContent = errMsg;
+                errBox.style.display = 'block';
+            }
+            showToast(errMsg, 'error');
+        } finally {
+            submitBtn.disabled = false;
+        }
+    }
 
     function vpnServerHasAwg(srv) {
         if (!srv || !srv.protocols) return false;
@@ -551,6 +646,17 @@
             vpnCurrentBackends = backends;
 
             vpnSetListenerBadge(!!status.listener_running);
+            vpnConfiguredPublicEndpoint = (cfg && cfg.public_endpoint) ? cfg.public_endpoint.trim() : '';
+            const epElem = document.getElementById('vpn-public-endpoint');
+            if (epElem) {
+                if (vpnConfiguredPublicEndpoint) {
+                    epElem.textContent = vpnConfiguredPublicEndpoint;
+                } else if (status && status.public_endpoint) {
+                    epElem.textContent = 'Unset (Auto-detect: ' + status.public_endpoint + ')';
+                } else {
+                    epElem.textContent = 'Unset (Auto-detect)';
+                }
+            }
             document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '—');
             document.getElementById('vpn-subnet').textContent = cfg.subnet_cidr || '—';
             document.getElementById('vpn-sessions').textContent = String(status.connected_sessions || 0);
