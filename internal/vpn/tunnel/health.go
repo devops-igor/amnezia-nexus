@@ -128,8 +128,8 @@ func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int6
 	} else {
 		paramsObj = awgInfo
 	}
-	bH1, bH2, bS1, bS2 := health.ExtractAWGHeaderLimits(paramsObj, 0, 0, -1, -1)
-	if bH1 > 0 || bH2 > 0 || bS1 >= 0 || bS2 >= 0 {
+	bH1, bH2, bS1, bS2, ok := health.ExtractAWGExplicitParams(paramsObj)
+	if ok && (bH1 > 0 || bH2 > 0 || bS1 >= 0 || bS2 >= 0) {
 		return bH1, bH2, bS1, bS2, true
 	}
 	return 0, 0, -1, -1, false
@@ -140,7 +140,7 @@ func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s
 	if err != nil || vpnCfg == nil {
 		return 0, 0, -1, -1, false
 	}
-	if vpnCfg.H1 > 0 || vpnCfg.H2 > 0 || vpnCfg.S1 > 0 || vpnCfg.S2 > 0 {
+	if vpnCfg.H1 > 0 || vpnCfg.H2 > 0 || vpnCfg.S1 >= 0 || vpnCfg.S2 >= 0 {
 		return vpnCfg.H1, vpnCfg.H2, vpnCfg.S1, vpnCfg.S2, true
 	}
 	return 0, 0, -1, -1, false
@@ -177,10 +177,10 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 		if vH2 > 0 {
 			h2 = vH2
 		}
-		if vS1 > 0 {
+		if vS1 >= 0 {
 			s1 = vS1
 		}
-		if vS2 > 0 {
+		if vS2 >= 0 {
 			s2 = vS2
 		}
 		return h1, h2, s1, s2

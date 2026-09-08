@@ -31,6 +31,24 @@ func TestGenerateCurve25519KeyPair(t *testing.T) {
 	if len(pub) == 0 || len(priv) == 0 {
 		t.Errorf("empty keys generated: pub=%s, priv=%s", pub, priv)
 	}
+
+	derivedPub, err := DeriveClientPublicKey(priv)
+	if err != nil {
+		t.Fatalf("DeriveClientPublicKey failed: %v", err)
+	}
+	if derivedPub != pub {
+		t.Errorf("DeriveClientPublicKey mismatch: got %s, want %s", derivedPub, pub)
+	}
+
+	tunnel := &models.BackendTunnel{PrivateKey: priv}
+	tPub, err := ClientPublicKey(tunnel)
+	if err != nil || tPub != pub {
+		t.Errorf("ClientPublicKey mismatch: got %s (err=%v), want %s", tPub, err, pub)
+	}
+
+	if _, err := ClientPublicKey(nil); err == nil {
+		t.Errorf("expected error for nil tunnel")
+	}
 }
 
 func TestTunnelPoolCRUD(t *testing.T) {
