@@ -2,7 +2,9 @@ package awg
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"golang.org/x/crypto/curve25519"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -578,5 +581,76 @@ func TestAWGManager_AddClient_NameAndClientNameFallback(t *testing.T) {
 	}
 	if res2["client_name"] != "Regular User" {
 		t.Errorf("expected client_name to be 'Regular User', got %v", res2["client_name"])
+	}
+}
+
+func TestAWGManager_PublicKeyFallbackFromPrivateKeyAndPortDiscovery(t *testing.T) {
+	ctx := context.Background()
+
+	// Generate known Curve25519 keypair
+	privBytes := make([]byte, 32)
+	for i := range privBytes {
+		privBytes[i] = byte(i + 1)
+	}
+	pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("X25519 failed: %v", err)
+	}
+	expectedPub := base64.StdEncoding.EncodeToString(pubBytes)
+	privB64 := base64.StdEncoding.EncodeToString(privBytes)
+
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		// Mock dynamic container discovery
+		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") && strings.Contains(cmd, "{{.Names}}") {
+			return "amnezia-awg2\n", "", 0, nil
+		}
+		// Public key file / wg show fails
+		if strings.Contains(cmd, "wireguard_server_public_key.key") || strings.Contains(cmd, "show awg0 public-key") {
+			return "", "", 1, errors.New("file not found")
+		}
+		// Return config with PrivateKey when catting awg0.conf
+		if strings.Contains(cmd, "cat") && strings.Contains(cmd, "awg0.conf") {
+			return fmt.Sprintf("[Interface]\nPrivateKey = %s\nListenPort = 51820\n", privB64), "", 0, nil
+		}
+		// Docker port discovery
+		if strings.Contains(cmd, "docker port") {
+			return "51820/udp -> 0.0.0.0:51822\n", "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 2, Host: "1.2.3.4"}
+
+	// 1. Verify Curve25519 public key derivation from PrivateKey
+	pubKey, err := mgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("GetServerPublicKey failed: %v", err)
+	}
+	if pubKey != expectedPub {
+		t.Errorf("derived public key mismatch: got %s, want %s", pubKey, expectedPub)
+	}
+
+	// 2. Verify fallback port discovery via extractContainerPort
+	port := mgr.extractContainerPort(ctx, client, "amnezia-awg2")
+	if port != 51822 {
+		t.Errorf("extractContainerPort mismatch: got %d, want 51822", port)
+	}
+
+	// Also verify inspect format fallback
+	clientInspect := newMockAWGSSHClient()
+	clientInspect.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker port") {
+			return "", "", 1, errors.New("no port mapping")
+		}
+		if strings.Contains(cmd, "docker inspect") {
+			return "51823\n", "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+	portInspect := mgr.extractContainerPort(ctx, clientInspect, "amnezia-awg2")
+	if portInspect != 51823 {
+		t.Errorf("extractContainerPort via inspect mismatch: got %d, want 51823", portInspect)
 	}
 }

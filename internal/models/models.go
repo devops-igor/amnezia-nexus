@@ -303,6 +303,14 @@ type VPNConfig struct {
 	MaxPeersPerBackend int                    `json:"max_peers_per_backend"`
 	ServerPrivateKey   string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
 	ServerPublicKey    string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
+	H1                 uint32                 `json:"h1"`
+	H2                 uint32                 `json:"h2"`
+	H3                 uint32                 `json:"h3"`
+	H4                 uint32                 `json:"h4"`
+	S1                 int                    `json:"s1"`
+	S2                 int                    `json:"s2"`
+	S3                 int                    `json:"s3"`
+	S4                 int                    `json:"s4"`
 }
 
 // AppearanceSettings holds UI display configuration.

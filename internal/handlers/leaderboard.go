@@ -37,13 +37,7 @@ func (h *Handlers) LeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 
 	sess := h.GetSession(r)
 	for i, e := range entries {
-		entryResponses[i] = models.LeaderboardEntryResponse{
-			Rank:     e.Rank,
-			Username: e.Username,
-			Download: e.Download,
-			Upload:   e.Upload,
-			Total:    e.Total,
-		}
+		entryResponses[i] = models.LeaderboardEntryResponse(e)
 		if sess != nil && sess.Username == e.Username {
 			rankVal := e.Rank
 			currentUserRank = &rankVal

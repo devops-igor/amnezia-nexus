@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1003,4 +1004,296 @@ func TestServerHandlers(t *testing.T) {
 			t.Errorf("expected host present for support, got %+v", supportServers[0])
 		}
 	})
+}
+
+func TestServerCheckHandler_PersistsDetectedAWG(t *testing.T) {
+	ctx := context.Background()
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "docker --version") {
+				return "Docker version 24.0.5, build cedb786", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker ps -a") && strings.Contains(cmd, "amnezia-awg") {
+				return "amnezia-awg\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-awg") {
+				return "Up 2 hours\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wg0.conf") || strings.Contains(cmd, "awg0.conf") {
+				return "[Interface]\nListenPort = 51820\nPrivateKey = server-priv-key\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wireguard_server_public_key.key") {
+				return "test-server-awg-public-key\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wireguard_psk.key") {
+				return "test-server-awg-psk\n", "", 0, nil
+			}
+			return "", "", 0, nil
+		},
+	}
+
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+
+	// Create server with empty protocols
+	srv := &models.Server{
+		Name:      "Unchecked-Server",
+		Host:      "192.168.1.150",
+		SSHPort:   22,
+		SSHUser:   "root",
+		SSHPass:   "pass123",
+		Protocols: map[string]any{},
+		CreatedAt: time.Now(),
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	mockSSH.serverID = &serverID
+
+	r := setupFullServerRouter(h)
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/check", serverID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from ServerCheckHandler, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify server record in DB now contains the detected AWG protocol
+	updatedServer, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("failed to load server from db: %v", err)
+	}
+	if updatedServer.Protocols == nil {
+		t.Fatal("expected Protocols map to not be nil")
+	}
+
+	awgData, ok := updatedServer.Protocols["awg"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected awg protocol in server.Protocols, got: %+v", updatedServer.Protocols)
+	}
+	if installed, _ := awgData["installed"].(bool); !installed {
+		t.Errorf("expected awg.installed = true, got: %v", awgData["installed"])
+	}
+	if pubKey, _ := awgData["public_key"].(string); pubKey != "test-server-awg-public-key" {
+		t.Errorf("expected awg.public_key = test-server-awg-public-key, got: %v", pubKey)
+	}
+	if psk, _ := awgData["psk"].(string); psk != "test-server-awg-psk" {
+		t.Errorf("expected awg.psk = test-server-awg-psk, got: %v", psk)
+	}
+	portVal := fmt.Sprint(awgData["port"])
+	if portVal != "51820" {
+		t.Errorf("expected awg.port = 51820, got: %v", awgData["port"])
+	}
+}
+
+func TestGetServerReachability_DefaultsPort22(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Port-Zero-Server",
+		Host:    "127.0.0.1",
+		SSHPort: 0, // Unset / default port
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	var dialedAddr string
+	h.dialTimeout = func(network, address string, timeout time.Duration) (net.Conn, error) {
+		dialedAddr = address
+		c1, c2 := net.Pipe()
+		_ = c2.Close()
+		return c1, nil
+	}
+
+	r := setupFullServerRouter(h)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/reachability", serverID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	expectedAddr := "127.0.0.1:22"
+	if dialedAddr != expectedAddr {
+		t.Errorf("expected probe to dial %q, dialed %q", expectedAddr, dialedAddr)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response json: %v", err)
+	}
+
+	if reachable, ok := resp["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable: true, got %+v", resp["reachable"])
+	}
+
+	st, err := db.GetServerStatus(ctx, serverID)
+	if err != nil || st != models.ReachabilityOnline {
+		t.Errorf("expected DB server status to be online, got: %s (err: %v)", st, err)
+	}
+}
+
+func TestGetServerReachability_RecoversFromOffline(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Offline-Recovery-Server",
+		Host:    "10.0.0.1",
+		SSHPort: 2222,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	// Mark as offline in DB initially
+	if err := db.UpdateServerReachability(ctx, serverID, models.ReachabilityOffline); err != nil {
+		t.Fatalf("failed to update reachability: %v", err)
+	}
+	initialStatus, _ := db.GetServerStatus(ctx, serverID)
+	if initialStatus != models.ReachabilityOffline {
+		t.Fatalf("expected initial status offline, got %s", initialStatus)
+	}
+
+	// Mock successful dial
+	h.dialTimeout = func(network, address string, timeout time.Duration) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		_ = c2.Close()
+		return c1, nil
+	}
+
+	r := setupFullServerRouter(h)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/reachability", serverID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal body: %v", err)
+	}
+
+	if reachable, ok := resp["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable: true on recovery, got %+v", resp["reachable"])
+	}
+
+	// Verify database status recovered to online
+	recoveredStatus, err := db.GetServerStatus(ctx, serverID)
+	if err != nil || recoveredStatus != models.ReachabilityOnline {
+		t.Errorf("expected DB status to recover to online, got: %s (err: %v)", recoveredStatus, err)
+	}
+}
+
+func TestGetServerReachability_RealListener(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	srv := &models.Server{
+		Name:    "Real-TCP-Server",
+		Host:    "127.0.0.1",
+		SSHPort: port,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	_ = db.UpdateServerReachability(ctx, serverID, models.ReachabilityOffline)
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	// Ensure dialTimeout is nil so it uses real net.DialTimeout
+	h.dialTimeout = nil
+
+	r := setupFullServerRouter(h)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/reachability", serverID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if reachable, ok := resp["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable: true, got %+v", resp["reachable"])
+	}
+
+	recoveredStatus, _ := db.GetServerStatus(ctx, serverID)
+	if recoveredStatus != models.ReachabilityOnline {
+		t.Errorf("expected recovered status online, got: %s", recoveredStatus)
+	}
+}
+
+func TestServerCheckHandler_SyncsReachabilityOnline(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Check-Sync-Server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	mockSSH.serverID = &serverID
+
+	// Mark server as offline initially
+	_ = db.UpdateServerReachability(ctx, serverID, models.ReachabilityOffline)
+	st, _ := db.GetServerStatus(ctx, serverID)
+	if st != models.ReachabilityOffline {
+		t.Fatalf("expected initial offline status, got %s", st)
+	}
+
+	r := setupFullServerRouter(h)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/check", serverID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify reachability in DB was synced to online
+	updatedStatus, err := db.GetServerStatus(ctx, serverID)
+	if err != nil || updatedStatus != models.ReachabilityOnline {
+		t.Errorf("expected status to be online after check, got: %s (err: %v)", updatedStatus, err)
+	}
 }

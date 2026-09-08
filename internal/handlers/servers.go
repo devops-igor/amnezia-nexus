@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"regexp"
@@ -325,28 +326,16 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
+
 	// Check docker
 	dockerOut, _, code, _ := client.RunCommand(ctx, "docker --version")
 	dockerInstalled := code == 0 && strings.Contains(strings.ToLower(dockerOut), "docker")
 
-	protocolsStatus := make(map[string]any)
-
-	// Check AWG
-	if h.awgMgr != nil {
-		if status, err := h.awgMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["awg"] = status
-		}
-	}
-	// Check MTProxyL
-	if h.mtproxylMgr != nil {
-		if status, err := h.mtproxylMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["telemt"] = status
-		}
-	}
-	// Check DNS
-	if h.dnsMgr != nil {
-		if status, err := h.dnsMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["dns"] = status
+	protocolsStatus := h.queryProtocolsStatus(ctx, server)
+	if syncDiscoveredProtocols(server, protocolsStatus) {
+		if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
+			slog.Warn("ServerCheckHandler: failed to persist detected protocols", "server_id", serverID, "err", err)
 		}
 	}
 
@@ -355,6 +344,79 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		DockerInstalled: dockerInstalled,
 		Protocols:       protocolsStatus,
 	})
+}
+
+// queryProtocolsStatus queries remote managers for protocol container status.
+func (h *Handlers) queryProtocolsStatus(ctx context.Context, server *models.Server) map[string]any {
+	protocolsStatus := make(map[string]any)
+	if h.awgMgr != nil {
+		if status, err := h.awgMgr.GetServerStatus(ctx, server); err == nil {
+			protocolsStatus["awg"] = status
+		}
+	}
+	if h.mtproxylMgr != nil {
+		if status, err := h.mtproxylMgr.GetServerStatus(ctx, server); err == nil {
+			protocolsStatus["telemt"] = status
+		}
+	}
+	if h.dnsMgr != nil {
+		if status, err := h.dnsMgr.GetServerStatus(ctx, server); err == nil {
+			protocolsStatus["dns"] = status
+		}
+	}
+	return protocolsStatus
+}
+
+// syncDiscoveredProtocols updates server.Protocols with running protocol configurations.
+func syncDiscoveredProtocols(server *models.Server, protocolsStatus map[string]any) bool {
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	updated := false
+
+	for proto, stAny := range protocolsStatus {
+		st, ok := stAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		if running, _ := st["container_running"].(bool); !running {
+			continue
+		}
+
+		protoMap, _ := server.Protocols[proto].(map[string]any)
+		if protoMap == nil {
+			protoMap = make(map[string]any)
+		}
+		protoMap["installed"] = true
+
+		if pVal, ok := st["port"]; ok && pVal != nil && fmt.Sprint(pVal) != "" {
+			if pInt, err := strconv.Atoi(fmt.Sprint(pVal)); err == nil && pInt > 0 {
+				protoMap["port"] = pInt
+			} else {
+				protoMap["port"] = pVal
+			}
+		}
+		if pubKey, ok := st["public_key"].(string); ok && pubKey != "" {
+			protoMap["public_key"] = pubKey
+		}
+		if psk, ok := st["psk"].(string); ok && psk != "" {
+			protoMap["psk"] = psk
+		}
+		if awgParams, ok := st["awg_params"]; ok && awgParams != nil {
+			protoMap["awg_params"] = awgParams
+		}
+		if clientsCount, ok := st["clients_count"]; ok && clientsCount != nil {
+			protoMap["clients_count"] = clientsCount
+		}
+		if dnsIP, ok := st["dns_ip"].(string); ok && dnsIP != "" {
+			protoMap["dns_ip"] = dnsIP
+		}
+
+		server.Protocols[proto] = protoMap
+		updated = true
+	}
+
+	return updated
 }
 
 // InstallProtocolHandler deploys a VPN protocol backend to the remote server.
@@ -654,31 +716,56 @@ func (h *Handlers) GetServerReachabilityHandler(w http.ResponseWriter, r *http.R
 	}
 
 	status, _ := h.db.GetServerStatus(ctx, serverID)
-	reachable := status == models.ReachabilityOnline || status == models.ReachabilityUnknown
 
-	// Measure real TCP latency to the server (SSH port) instead of reporting a constant.
+	sshPort := server.SSHPort
+	if sshPort <= 0 {
+		sshPort = 22
+	}
+
+	// Measure real TCP latency to the server (SSH port).
 	latencyMS := 0
-	if reachable {
-		start := time.Now()
-		// #nosec G704 -- connecting to managed server host for latency probe
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(server.Host, strconv.Itoa(server.SSHPort)), 3*time.Second)
-		if err == nil {
-			_ = conn.Close()
-			latencyMS = int(time.Since(start).Milliseconds())
-		} else {
-			// Probe target unreachable: downgrade unknown to offline.
-			if status == models.ReachabilityUnknown {
-				reachable = false
-			}
-			latencyMS = 0
+	reachable := false
+
+	dialFn := h.dialTimeout
+	if dialFn == nil {
+		dialFn = net.DialTimeout
+	}
+
+	start := time.Now()
+	// #nosec G704 -- connecting to managed server host for latency probe
+	conn, err := dialFn("tcp", net.JoinHostPort(server.Host, strconv.Itoa(sshPort)), 3*time.Second)
+	if err == nil {
+		_ = conn.Close()
+		latencyMS = int(time.Since(start).Milliseconds())
+		if latencyMS <= 0 {
+			latencyMS = 1
+		}
+		reachable = true
+		status = models.ReachabilityOnline
+		_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
+	} else {
+		reachable = false
+		latencyMS = 0
+		if status == models.ReachabilityUnknown {
+			status = models.ReachabilityOffline
 		}
 	}
 
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status":       "ok",
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	reachMap := map[string]any{
 		"reachable":    reachable,
-		"reachability": string(status),
 		"latency_ms":   latencyMS,
+		"status":       string(status),
+		"last_checked": nowStr,
+	}
+
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status":        "ok",
+		"reachable":     reachable,
+		"reachability":  reachMap,
+		"server_status": string(status),
+		"latency_ms":    latencyMS,
+		"last_checked":  nowStr,
 	})
 }
 

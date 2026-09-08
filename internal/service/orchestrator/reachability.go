@@ -79,8 +79,21 @@ func (o *Orchestrator) CheckServerReachability(ctx context.Context) (map[int64]m
 }
 
 func (o *Orchestrator) probeSingleServer(ctx context.Context, server *models.Server) map[string]any {
-	host := server.Host
+	if server == nil {
+		return map[string]any{
+			"reachable":    false,
+			"latency_ms":   0,
+			"protocol":     "tcp",
+			"last_checked": time.Now().UTC().Format(time.RFC3339),
+			"error":        "nil server pointer",
+		}
+	}
+
+	host := strings.TrimSpace(server.Host)
 	if host == "" {
+		if o.db != nil {
+			_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOffline)
+		}
 		return map[string]any{
 			"reachable":    false,
 			"latency_ms":   0,
@@ -235,16 +248,18 @@ func (o *Orchestrator) probeAWGHealth(ctx context.Context, server *models.Server
 	reachRes["auto_trials"] = autoTrials
 
 	if isReachable, _ := reachRes["reachable"].(bool); isReachable {
-		_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOnline)
+		if o.db != nil && server != nil {
+			_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOnline)
+		}
 		return reachRes, autoTrials, true
 	}
 	return reachRes, autoTrials, false
 }
 
 func (o *Orchestrator) probeTCPFallback(ctx context.Context, server *models.Server, host string, nowStr string, preservedAutoTrials map[string]map[string]any) map[string]any {
-	sshPort := server.SSHPort
-	if sshPort <= 0 {
-		sshPort = 22
+	sshPort := 22
+	if server != nil && server.SSHPort > 0 {
+		sshPort = server.SSHPort
 	}
 
 	addr := net.JoinHostPort(host, strconv.Itoa(sshPort))
@@ -263,7 +278,9 @@ func (o *Orchestrator) probeTCPFallback(ctx context.Context, server *models.Serv
 		if preservedAutoTrials != nil {
 			res["auto_trials"] = preservedAutoTrials
 		}
-		_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOffline)
+		if o.db != nil && server != nil {
+			_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOffline)
+		}
 		return res
 	}
 	_ = conn.Close()
@@ -283,6 +300,8 @@ func (o *Orchestrator) probeTCPFallback(ctx context.Context, server *models.Serv
 		res["auto_trials"] = preservedAutoTrials
 	}
 
-	_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOnline)
+	if o.db != nil && server != nil {
+		_ = o.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOnline)
+	}
 	return res
 }

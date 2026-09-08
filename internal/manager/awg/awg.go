@@ -2,6 +2,7 @@ package awg
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/tc"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"golang.org/x/crypto/curve25519"
 )
 
 var (
@@ -272,15 +274,53 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 	return nil
 }
 
-func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient) (string, error) {
-	out, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", m.containerName(), m.configPath()))
-	if err != nil || code != 0 {
-		return "", fmt.Errorf("failed to get server config (code %d): %s, %w", code, errOut, err)
+func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+	for _, name := range AWGContainerNames {
+		out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", name))
+		if err == nil && code == 0 {
+			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+				if strings.TrimSpace(line) == name {
+					return name
+				}
+			}
+		}
 	}
-	return out, nil
+	// Fallback to any running container with name starting with amnezia-awg
+	out, _, code, err := client.RunSudoCommand(ctx, "docker ps --filter name=amnezia-awg --format '{{.Names}}'")
+	if err == nil && code == 0 {
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "amnezia-awg") {
+				return trimmed
+			}
+		}
+	}
+	return m.containerName()
+}
+
+func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
+	names := containerNames
+	if len(names) == 0 || (len(names) == 1 && names[0] == "") {
+		resolved := m.resolveContainerName(ctx, client)
+		names = []string{resolved}
+		for _, name := range AWGContainerNames {
+			if name != resolved {
+				names = append(names, name)
+			}
+		}
+	}
+	for _, name := range names {
+		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/awg0.conf 2>/dev/null", name, m.configPath(), name)
+		out, _, code, err := client.RunSudoCommand(ctx, cmd)
+		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
+			return out, nil
+		}
+	}
+	return "", fmt.Errorf("failed to get server config from containers: %v", names)
 }
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
+	cName := m.resolveContainerName(ctx, client)
 	tmpPath := "/tmp/_amnz_edit_config.conf"
 	if err := client.UploadSudoFile(ctx, tmpPath, []byte(content), 0600); err != nil {
 		return err
@@ -289,19 +329,20 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", tmpPath))
 	}()
 
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, m.containerName(), m.configPath())
+	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, m.configPath())
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
 	}
 
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c '%s syncconf %s <(%s-quick strip %s)'",
-		m.containerName(), m.wgBinary(), m.interfaceName(), m.wgBinary(), m.configPath())
+		cName, m.wgBinary(), m.interfaceName(), m.wgBinary(), m.configPath())
 	_, _, _, _ = client.RunSudoCommand(ctx, syncCmd)
 	return nil
 }
 
 func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) ([]AWGClient, error) {
-	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", m.containerName(), m.clientsTablePath()))
+	cName := m.resolveContainerName(ctx, client)
+	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", cName, m.clientsTablePath()))
 	if code != 0 || strings.TrimSpace(out) == "" {
 		return []AWGClient{}, nil
 	}
@@ -309,6 +350,7 @@ func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) 
 }
 
 func (m *AWGManager) saveClientsTable(ctx context.Context, client ssh.SSHClient, clients []AWGClient) error {
+	cName := m.resolveContainerName(ctx, client)
 	jsonData, err := SerializeClientsTable(clients)
 	if err != nil {
 		return err
@@ -322,7 +364,7 @@ func (m *AWGManager) saveClientsTable(ctx context.Context, client ssh.SSHClient,
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", tmpPath))
 	}()
 
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, m.containerName(), m.clientsTablePath())
+	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, m.clientsTablePath())
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to copy clientsTable into container (code %d): %s, %w", code, errOut, err)
 	}
@@ -850,11 +892,21 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 	}
 
 	if running {
-		if conf, err := m.getServerConfig(ctx, client); err == nil {
+		cName := foundName
+		if cName == "" {
+			cName = m.resolveContainerName(ctx, client)
+		}
+		if conf, err := m.getServerConfig(ctx, client, cName); err == nil {
 			params, peers, _ := ParseServerConfig(conf)
 			status["port"] = params["port"]
 			status["awg_params"] = params
 			status["clients_count"] = len(peers)
+		}
+		// If port is missing or 0, fallback extraction from docker port or docker inspect
+		if p, ok := status["port"]; !ok || p == nil || fmt.Sprint(p) == "" || fmt.Sprint(p) == "0" {
+			if port := m.extractContainerPort(ctx, client, cName); port > 0 {
+				status["port"] = port
+			}
 		}
 		if pubKey, err := m.GetServerPublicKey(ctx, server); err == nil && pubKey != "" {
 			status["public_key"] = pubKey
@@ -867,6 +919,40 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 	return status, nil
 }
 
+// extractContainerPort attempts to discover the host UDP listening port of the container
+// via docker port and docker inspect.
+func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHClient, containerName string) int {
+	if containerName == "" {
+		containerName = m.resolveContainerName(ctx, client)
+	}
+	if containerName == "" {
+		return 0
+	}
+	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker port %s 2>/dev/null", containerName))
+	if err == nil && code == 0 && strings.TrimSpace(out) != "" {
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if idx := strings.LastIndex(line, ":"); idx != -1 {
+				portStr := strings.TrimSpace(line[idx+1:])
+				if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+					return p
+				}
+			}
+		}
+	}
+
+	inspectCmd := fmt.Sprintf("docker inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}} {{end}}' %s 2>/dev/null", containerName)
+	outInspect, _, codeInspect, errInspect := client.RunSudoCommand(ctx, inspectCmd)
+	if errInspect == nil && codeInspect == 0 && strings.TrimSpace(outInspect) != "" {
+		for _, part := range strings.Fields(outInspect) {
+			if p, err := strconv.Atoi(part); err == nil && p > 0 {
+				return p
+			}
+		}
+	}
+	return 0
+}
+
 // GetServerPublicKey returns the public key for AmneziaWG server.
 func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Server) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
@@ -874,13 +960,40 @@ func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Serv
 		return "", err
 	}
 
+	resolved := m.resolveContainerName(ctx, client)
+	names := []string{resolved}
 	for _, name := range AWGContainerNames {
-		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null", name, name, m.wgBinary())
+		if name != resolved {
+			names = append(names, name)
+		}
+	}
+
+	for _, name := range names {
+		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", name, name, m.wgBinary(), name)
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
 		}
 	}
+
+	// Also check if public key can be derived from PrivateKey in awg0.conf
+	if conf, err := m.getServerConfig(ctx, client, names...); err == nil && conf != "" {
+		for _, line := range strings.Split(conf, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToLower(trimmed), "privatekey") {
+				parts := strings.SplitN(trimmed, "=", 2)
+				if len(parts) == 2 {
+					privKeyBase64 := strings.TrimSpace(parts[1])
+					if privBytes, err := base64.StdEncoding.DecodeString(privKeyBase64); err == nil && len(privBytes) == 32 {
+						if pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint); err == nil {
+							return base64.StdEncoding.EncodeToString(pubBytes), nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return "", errors.New("failed to get AmneziaWG server public key")
 }
 
@@ -891,8 +1004,16 @@ func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (s
 		return "", err
 	}
 
+	resolved := m.resolveContainerName(ctx, client)
+	names := []string{resolved}
 	for _, name := range AWGContainerNames {
-		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key 2>/dev/null", name)
+		if name != resolved {
+			names = append(names, name)
+		}
+	}
+
+	for _, name := range names {
+		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/wireguard_psk.key 2>/dev/null", name, name)
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
