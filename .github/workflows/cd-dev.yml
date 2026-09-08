@@ -1,0 +1,96 @@
+name: Continuous Deployment (DEV)
+
+on:
+  workflow_run:
+    workflows: ["Docker Build & Push"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_mode:
+        description: 'Deployment execution mode (ssh or self-hosted)'
+        required: true
+        default: 'ssh'
+        type: choice
+        options:
+          - ssh
+          - self-hosted
+      image_tag:
+        description: 'Image tag to deploy (defaults to latest)'
+        required: false
+        default: 'latest'
+        type: string
+
+concurrency:
+  group: cd-dev-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-self-hosted:
+    name: Deploy via Self-Hosted Runner
+    runs-on: [self-hosted, linux, arm64, dev]
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.deploy_mode == 'self-hosted') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && vars.DEPLOY_MODE == 'self-hosted')
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Make Deployment Script Executable
+        run: chmod +x deploy/deploy-dev.sh
+
+      - name: Execute Deployment & Verification
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./deploy/deploy-dev.sh
+
+  deploy-ssh:
+    name: Deploy via SSH
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && (inputs.deploy_mode == 'ssh' || inputs.deploy_mode == '')) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && vars.DEPLOY_MODE != 'self-hosted')
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Copy Deployment Artifacts to DEV Server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_HOST }}
+          username: ${{ secrets.DEV_USER }}
+          key: ${{ secrets.DEV_SSH_KEY }}
+          port: ${{ secrets.DEV_PORT || 22 }}
+          source: "deploy/*"
+          target: "~/amnezia-deploy"
+          strip_components: 1
+
+      - name: Execute Deployment & Verification on DEV Server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.DEV_HOST }}
+          username: ${{ secrets.DEV_USER }}
+          key: ${{ secrets.DEV_SSH_KEY }}
+          port: ${{ secrets.DEV_PORT || 22 }}
+          envs: IMAGE_TAG,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+            DEPLOY_DIR="$HOME/amnezia-deploy"
+            if [ -d "$DEPLOY_DIR/deploy" ]; then
+              cd "$DEPLOY_DIR/deploy"
+            elif [ -d "$DEPLOY_DIR" ]; then
+              cd "$DEPLOY_DIR"
+            fi
+            chmod +x deploy-dev.sh
+            export IMAGE_TAG="${IMAGE_TAG}"
+            export GHCR_USER="${GHCR_USER}"
+            export GHCR_TOKEN="${GHCR_TOKEN}"
+            ./deploy-dev.sh

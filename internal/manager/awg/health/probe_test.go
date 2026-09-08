@@ -214,3 +214,85 @@ func TestRunAutoTrialProfiles(t *testing.T) {
 		t.Errorf("expected error for invalid psk")
 	}
 }
+
+func TestExtractAWGExplicitParams(t *testing.T) {
+	// 1. Nil map
+	_, _, _, _, found := ExtractAWGExplicitParams(nil)
+	if found {
+		t.Errorf("expected found=false for nil map")
+	}
+
+	// 2. Map with unrelated keys only (Finding 2 regression)
+	unrelated := map[string]any{
+		"installed":  true,
+		"port":       51820,
+		"public_key": "dummy-key",
+	}
+	_, _, _, _, found = ExtractAWGExplicitParams(unrelated)
+	if found {
+		t.Errorf("expected found=false for map with unrelated keys")
+	}
+
+	// 3. Map with explicit H1/H2/S1/S2
+	explicitMap := map[string]any{
+		"init_packet_magic_header":     "1111",
+		"response_packet_magic_header": "2222",
+		"init_packet_junk_size":        "30",
+		"response_packet_junk_size":    "40",
+	}
+	h1, h2, s1, s2, found := ExtractAWGExplicitParams(explicitMap)
+	if !found || h1 != 1111 || h2 != 2222 || s1 != 30 || s2 != 40 {
+		t.Errorf("expected explicit params (1111, 2222, 30, 40, true), got (%d, %d, %d, %d, %v)", h1, h2, s1, s2, found)
+	}
+
+	// 4. Short keys (h1, h2, s1, s2)
+	shortKeys := map[string]string{
+		"h1": "5555",
+		"h2": "6666",
+		"s1": "10",
+		"s2": "20",
+	}
+	h1, h2, s1, s2, found = ExtractAWGExplicitParams(shortKeys)
+	if !found || h1 != 5555 || h2 != 6666 || s1 != 10 || s2 != 20 {
+		t.Errorf("expected short keys params (5555, 6666, 10, 20, true), got (%d, %d, %d, %d, %v)", h1, h2, s1, s2, found)
+	}
+
+	// 5. Secondary AWG keys (h3, h4, jc, etc.)
+	secondaryMap := map[string]any{
+		"h3": 7777,
+	}
+	_, _, _, _, found = ExtractAWGExplicitParams(secondaryMap)
+	if !found {
+		t.Errorf("expected found=true for secondary AWG key h3")
+	}
+
+	jcMap := map[string]any{
+		"junk_packet_count": 4,
+	}
+	_, _, _, _, found = ExtractAWGExplicitParams(jcMap)
+	if !found {
+		t.Errorf("expected found=true for junk_packet_count")
+	}
+}
+
+func TestExtractAWGHeaderLimits_FallbackHierarchy(t *testing.T) {
+	// 1. When defaultH1 == 0 and map has no AWG keys, must NOT return legacy DefaultH1
+	emptyMap := map[string]any{"installed": true}
+	h1, h2, s1, s2 := ExtractAWGHeaderLimits(emptyMap, 0, 0, -1, -1)
+	if h1 != 0 || h2 != 0 || s1 != -1 || s2 != -1 {
+		t.Errorf("expected (0, 0, -1, -1) when defaultH1=0 and map has no keys, got (%d, %d, %d, %d)", h1, h2, s1, s2)
+	}
+
+	// 2. When defaultH1 > 0 is passed, falls back to supplied defaults
+	h1, h2, s1, s2 = ExtractAWGHeaderLimits(emptyMap, DefaultH1, DefaultH2, DefaultS1, DefaultS2)
+	if h1 != DefaultH1 || h2 != DefaultH2 || s1 != DefaultS1 || s2 != DefaultS2 {
+		t.Errorf("expected legacy defaults when supplied, got (%d, %d, %d, %d)", h1, h2, s1, s2)
+	}
+
+	// 3. When explicit parameters exist, they override defaults
+	params := map[string]any{"h1": "9999"}
+	h1, h2, s1, s2 = ExtractAWGHeaderLimits(params, 0, 0, -1, -1)
+	if h1 != 9999 || h2 != DefaultH2 || s1 != DefaultS1 || s2 != DefaultS2 {
+		t.Errorf("expected h1=9999 with DefaultH2 fallback, got (%d, %d, %d, %d)", h1, h2, s1, s2)
+	}
+}

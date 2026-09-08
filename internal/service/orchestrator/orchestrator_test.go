@@ -569,6 +569,64 @@ func TestOrchestrator_CheckServerReachability_TCPAndAWG(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_Reachability_AWGFallbackAndRecovery(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Live TCP listener representing the server's SSH port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	var livePort int
+	_, _ = fmt.Sscanf(portStr, "%d", &livePort)
+
+	// Server configured with AWG (invalid keys to trigger handshake failure)
+	// and live SSH port. Initially marked ReachabilityOffline.
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:    "AWG-Fallback-Server",
+		Host:    "127.0.0.1",
+		SSHPort: livePort,
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"port":       55424,
+				"public_key": "invalid-nonexistent-key-so-handshake-fails",
+			},
+		},
+	})
+	_ = db.UpdateServerReachability(ctx, sID, models.ReachabilityOffline)
+
+	stInit, _ := db.GetServerStatus(ctx, sID)
+	if stInit != models.ReachabilityOffline {
+		t.Fatalf("expected initial offline status, got %s", stInit)
+	}
+
+	orch := New(db, nil)
+	results, err := orch.CheckServerReachability(ctx)
+	if err != nil {
+		t.Fatalf("CheckServerReachability failed: %v", err)
+	}
+
+	res, ok := results[sID]
+	if !ok {
+		t.Fatalf("expected result for server %d", sID)
+	}
+	if res["reachable"] != true {
+		t.Errorf("expected server to recover via TCP probe: %+v", res)
+	}
+
+	// Status in SQLite DB should recover to ReachabilityOnline
+	recovered, err := db.GetServerStatus(ctx, sID)
+	if err != nil || recovered != models.ReachabilityOnline {
+		t.Errorf("expected DB status to recover to online, got: %s (err: %v)", recovered, err)
+	}
+}
+
 func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()

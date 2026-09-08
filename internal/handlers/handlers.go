@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
@@ -53,6 +55,7 @@ type Handlers struct {
 	mtproxylMgr   *mtproxyl.MTProxyLManager
 	dnsMgr        *dns.DNSManager
 	vpnSvc        *vpn.Service
+	dialTimeout   func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu       sync.Mutex
 	userConnMu    sync.Mutex
 	userConnLocks map[string]*sync.Mutex
@@ -100,6 +103,9 @@ func NewHandlers(deps Dependencies) *Handlers {
 	}
 	if h.dnsMgr != nil {
 		h.registry.Register(h.dnsMgr)
+	}
+	if h.vpnSvc != nil && h.awgMgr != nil {
+		h.vpnSvc.SetAWGStatusProvider(h.awgMgr)
 	}
 
 	return h

@@ -33,7 +33,7 @@
 
     <div class="app-container">
         <header class="app-header">
-            <a href="/" class="app-logo" style="text-decoration:none">
+            <a href="{{ if has_role .current_user "admin" "support" }}/{{ else }}/my{{ end }}" class="app-logo" style="text-decoration:none">
                 <div class="logo-icon">{{ if .site_settings.Logo }}{{ .site_settings.Logo }}{{ else }}🛡{{ end }}</div>
                 <div>
                     <div class="logo-text">{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Panel{{ end }}</div>

@@ -2,15 +2,22 @@ package vpn
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
+	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/forwarder"
@@ -20,11 +27,12 @@ import (
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
-	ListenerRunning   bool  `json:"listener_running"`
-	ActiveTunnels     int   `json:"active_tunnels"`
-	ConnectedSessions int   `json:"connected_sessions"`
-	RxBytes           int64 `json:"rx_bytes"`
-	TxBytes           int64 `json:"tx_bytes"`
+	ListenerRunning   bool   `json:"listener_running"`
+	ActiveTunnels     int    `json:"active_tunnels"`
+	ConnectedSessions int    `json:"connected_sessions"`
+	RxBytes           int64  `json:"rx_bytes"`
+	TxBytes           int64  `json:"tx_bytes"`
+	PublicEndpoint    string `json:"public_endpoint,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -46,6 +54,11 @@ const (
 	TunnelStatusDisabled   = "disabled"
 )
 
+var (
+	ErrAWGNotInstalled = errors.New("server has no AWG protocol installed")
+	ErrServerNotFound  = errors.New("server not found")
+)
+
 // BackendTunnel is an alias for models.BackendTunnel.
 type BackendTunnel = models.BackendTunnel
 
@@ -61,6 +74,11 @@ type LeastConnectionsLoadBalancer = loadbalancer.LeastConnectionsBalancer
 // NewLeastConnectionsLoadBalancer creates a least connections load balancer.
 func NewLeastConnectionsLoadBalancer() *loadbalancer.LeastConnectionsBalancer {
 	return loadbalancer.NewLeastConnectionsBalancer(loadbalancer.CapacityConfig{})
+}
+
+// AWGStatusProvider defines an interface for querying live AWG status on a server.
+type AWGStatusProvider interface {
+	GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error)
 }
 
 // Service orchestrates endpoint listener, backend tunnel pool, load balancing, and traffic forwarding.
@@ -82,16 +100,110 @@ type Service struct {
 	running       bool
 	portalPubKey  string
 	portalPrivKey string
+	awgProvider   AWGStatusProvider
 	// requireTun switches Start to the real Linux TUN data plane (production
 	// mode; cmd opts in via RequireTunDevice when VPN_ENABLED). tunOpener is
 	// the injectable device constructor used by tests to prove the
 	// management-mode (TUN-unavailable) contract hermetically. tunDev is the
 	// attached client-facing device; backendDevices holds the per-backend UDP
 	// devices created by EnableBackend.
-	requireTun     bool
-	tunOpener      func() (endpoint.PacketDevice, error)
-	tunDev         endpoint.PacketDevice
-	backendDevices map[int64]*tunnel.UDPDevice
+	requireTun       bool
+	tunOpener        func() (endpoint.PacketDevice, error)
+	tunDev           endpoint.PacketDevice
+	backendDevices   map[int64]*tunnel.UDPDevice
+	publicIPMu       sync.RWMutex
+	detectedPublicIP string
+}
+
+// obfuscationMigrationMu serializes first-read obfuscation migration
+// across concurrent NewVPNService calls so racing first starts converge
+// on one persisted parameter set instead of divergent ephemeral values
+// that would desync the listener from rendered client configs.
+var obfuscationMigrationMu sync.Mutex
+
+// ensureObfuscationParams migrates a config whose H1..H4/S1..S4 are
+// unset (legacy rows written before obfuscation parameters existed).
+// Under the migration lock it re-reads the persisted config — a
+// concurrent first start may have already persisted parameters, and
+// the persisted values win over any in-memory guess — generates
+// standard-profile parameters when still unset, and persists them
+// synchronously. Persistence failures are returned so startup fails
+// loudly instead of running with divergent ephemeral values.
+func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.VPNConfig) error {
+	if db == nil || cfg == nil || cfg.H1 != 0 {
+		return nil
+	}
+
+	obfuscationMigrationMu.Lock()
+	defer obfuscationMigrationMu.Unlock()
+
+	persisted, err := db.GetVPNConfig(ctx)
+	if err == nil && persisted != nil && persisted.H1 != 0 {
+		cfg.H1 = persisted.H1
+		cfg.H2 = persisted.H2
+		cfg.H3 = persisted.H3
+		cfg.H4 = persisted.H4
+		cfg.S1 = persisted.S1
+		cfg.S2 = persisted.S2
+		cfg.S3 = persisted.S3
+		cfg.S4 = persisted.S4
+		return nil
+	}
+
+	h1, h2, h3, h4, s1, s2, s3, s4, err := awg.GenerateStandardObfuscationValues()
+	if err != nil {
+		return fmt.Errorf("failed to generate obfuscation params: %w", err)
+	}
+	cfg.H1, cfg.H2, cfg.H3, cfg.H4 = h1, h2, h3, h4
+	cfg.S1, cfg.S2, cfg.S3, cfg.S4 = s1, s2, s3, s4
+
+	if persisted != nil {
+		persisted.H1, persisted.H2, persisted.H3, persisted.H4 = h1, h2, h3, h4
+		persisted.S1, persisted.S2, persisted.S3, persisted.S4 = s1, s2, s3, s4
+		if err := db.SaveVPNConfig(ctx, persisted); err != nil {
+			return fmt.Errorf("failed to persist obfuscation params: %w", err)
+		}
+	} else if err := db.SaveVPNConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to persist obfuscation params: %w", err)
+	}
+	return nil
+}
+
+// preserveObfuscationParams copies unset (zero) AWG obfuscation fields
+// from the current config into an incoming config so partial updates
+// cannot clobber the parameters already distributed to peers.
+func preserveObfuscationParams(from, to *models.VPNConfig) {
+	if to.H1 == 0 {
+		to.H1 = from.H1
+	}
+	if to.H2 == 0 {
+		to.H2 = from.H2
+	}
+	if to.H3 == 0 {
+		to.H3 = from.H3
+	}
+	if to.H4 == 0 {
+		to.H4 = from.H4
+	}
+	if to.S1 == 0 {
+		to.S1 = from.S1
+	}
+	if to.S2 == 0 {
+		to.S2 = from.S2
+	}
+	if to.S3 == 0 {
+		to.S3 = from.S3
+	}
+	if to.S4 == 0 {
+		to.S4 = from.S4
+	}
+}
+
+// obfuscationDiffers reports whether two configs disagree on any AWG
+// obfuscation parameter.
+func obfuscationDiffers(a, b *models.VPNConfig) bool {
+	return a.H1 != b.H1 || a.H2 != b.H2 || a.H3 != b.H3 || a.H4 != b.H4 ||
+		a.S1 != b.S1 || a.S2 != b.S2 || a.S3 != b.S3 || a.S4 != b.S4
 }
 
 // NewVPNService initializes the complete unified VPN subsystem.
@@ -124,6 +236,16 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		}
 	}
 
+	// Migrate legacy configs whose AWG obfuscation parameters are unset
+	// (H/S all zero) before any subsystem consumes them: the endpoint
+	// listener copies H/S into its config below and EnsureKeypair
+	// loadOrCreate persists the VPNConfig. Applies to caller-supplied
+	// configs too (callers pass nil today; the shim keeps non-nil
+	// callers safe).
+	if err := ensureObfuscationParams(context.Background(), db, cfg); err != nil {
+		return nil, err
+	}
+
 	ipam, err := endpoint.NewIPAM(cfg.SubnetCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init IPAM: %w", err)
@@ -143,6 +265,14 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		SubnetCIDR:  cfg.SubnetCIDR,
 		MTU:         1420,
 		IdleTimeout: 3 * time.Minute,
+		H1:          int(cfg.H1),
+		S1:          cfg.S1,
+		H2:          int(cfg.H2),
+		S2:          cfg.S2,
+		H3:          int(cfg.H3),
+		S3:          cfg.S3,
+		H4:          int(cfg.H4),
+		S4:          cfg.S4,
 	}
 
 	epListener, err := endpoint.NewListener(listenerCfg, db, auth, ipam, sessionMgr, serverKeys)
@@ -175,6 +305,26 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	fwd := forwarder.NewForwarder(accountant, 512)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
+	if serverKeys != nil {
+		privArr, pubArr, err := serverKeys.EnsureKeypair(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to ensure portal keypair: %w", err)
+		}
+		pub = base64.StdEncoding.EncodeToString(pubArr[:])
+		priv = base64.StdEncoding.EncodeToString(privArr[:])
+		// EnsureKeypair may have just created and persisted the portal
+		// identity into the stored VPNConfig via its own copy. Refresh the
+		// in-memory cfg identity fields so partial config updates copy the
+		// real persisted identity instead of empty strings (which would
+		// wipe the keypair on the next save and invalidate every rendered
+		// client config).
+		if db != nil {
+			if fresh, ferr := db.GetVPNConfig(context.Background()); ferr == nil && fresh != nil {
+				cfg.ServerPrivateKey = fresh.ServerPrivateKey
+				cfg.ServerPublicKey = fresh.ServerPublicKey
+			}
+		}
+	}
 
 	svc := &Service{
 		db:            db,
@@ -229,6 +379,13 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.prober = prober
+}
+
+// SetAWGStatusProvider sets the provider used to query live AWG status on backend servers.
+func (s *Service) SetAWGStatusProvider(provider AWGStatusProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.awgProvider = provider
 }
 
 // RequireTunDevice switches Start to the real Linux TUN data plane: when the
@@ -386,6 +543,12 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.TxBytes = tx
 	}
 
+	listenPort := 51820
+	if s.cfg != nil && s.cfg.ListenPort > 0 {
+		listenPort = s.cfg.ListenPort
+	}
+	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
+
 	return status, nil
 }
 
@@ -398,6 +561,26 @@ func (s *Service) GetBackends(ctx context.Context) ([]*models.BackendTunnel, err
 		return nil, errors.New("tunnel pool not initialized")
 	}
 	return s.pool.ListTunnels(), nil
+}
+
+func parsePort(val any) int {
+	switch v := val.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		p, _ := strconv.Atoi(v)
+		return p
+	default:
+		if v != nil {
+			p, _ := strconv.Atoi(fmt.Sprint(v))
+			return p
+		}
+		return 0
+	}
 }
 
 // EnableBackend enables a backend server for load balancing by loading its
@@ -420,55 +603,140 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("failed to load server %d: %w", serverID, err)
 	}
 	if server == nil {
-		return fmt.Errorf("failed to load server %d: not found", serverID)
+		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
 	}
 
-	// AWG protocol credentials: the portal dials the backend's AWG listener.
-	var pub string
-	var port float64
-	if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
-		pub, _ = awgInfo["public_key"].(string)
-		port, _ = awgInfo["port"].(float64)
-	}
-	if pub == "" || port <= 0 {
-		return errors.New("server has no AWG protocol installed")
+	pub, port, err := s.resolveBackendCredentials(ctx, serverID, server)
+	if err != nil {
+		return err
 	}
 
-	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(int(port)))
+	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
 
 	tun, err := s.pool.AddTunnel(ctx, serverID, endpoint, pub)
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
 	}
 
-	if s.forwarder != nil {
-		dev, devErr := tunnel.NewUDPDevice(fmt.Sprintf("awg-be-%d", serverID), endpoint, 1420)
-		if devErr != nil {
-			return fmt.Errorf("failed to create backend UDP device for server %d: %w", serverID, devErr)
+	// Register the prober client peer on the backend server so amneziawg-go accepts probe handshakes
+	if proberPub, err := health.ComputePublicKeyFromPrivate(tun.PrivateKey); err != nil {
+		log.Printf("[vpn] warning: failed to compute prober client public key for server %d: %v", serverID, err)
+	} else if s.awgProvider != nil {
+		type clientAdder interface {
+			AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
 		}
-		s.forwarder.AttachBackendDevice(tun.ID, dev)
-		if s.backendDevices == nil {
-			s.backendDevices = make(map[int64]*tunnel.UDPDevice)
-		}
-		s.backendDevices[tun.ID] = dev
-
-		// Spawn backend read loop to route packets back to clients
-		go func(backendID int64, device *tunnel.UDPDevice) {
-			buf := make([]byte, 2048)
-			for {
-				n, err := device.Read(buf)
-				if err != nil {
-					return
-				}
-				if n >= 20 && (buf[0]>>4) == 4 { // IPv4
-					destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
-					_ = s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP)
-				}
+		if adder, ok := s.awgProvider.(clientAdder); ok {
+			clientParams := map[string]any{
+				"clientName":        "Health Probe",
+				"name":              "Health Probe",
+				"public_key":        proberPub,
+				"client_public_key": proberPub,
 			}
-		}(tun.ID, dev)
+			if _, err := adder.AddClient(ctx, server, clientParams); err != nil {
+				log.Printf("[vpn] warning: failed to register health probe peer on backend server %d: %v", serverID, err)
+			}
+		}
+	}
+
+	if err := s.attachBackendForwarder(serverID, tun.ID, endpoint); err != nil {
+		return err
 	}
 
 	return s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusActive, 10)
+}
+
+// resolveBackendCredentials retrieves AWG credentials for a backend, falling back to live discovery.
+func (s *Service) resolveBackendCredentials(ctx context.Context, serverID int64, server *models.Server) (string, int, error) {
+	var pub string
+	var port int
+	if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
+		pub, _ = awgInfo["public_key"].(string)
+		port = parsePort(awgInfo["port"])
+	}
+
+	if (pub == "" || port <= 0) && s.awgProvider != nil {
+		if livePub, livePort, ok := s.discoverLiveAWG(ctx, serverID, server); ok {
+			pub = livePub
+			port = livePort
+		}
+	}
+
+	if pub == "" || port <= 0 {
+		return "", 0, ErrAWGNotInstalled
+	}
+
+	return pub, port, nil
+}
+
+// discoverLiveAWG attempts to query the running AWG container and persists discovered configuration to DB.
+func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *models.Server) (string, int, bool) {
+	status, err := s.awgProvider.GetServerStatus(ctx, server)
+	if err != nil || status == nil {
+		return "", 0, false
+	}
+	if running, _ := status["container_running"].(bool); !running {
+		return "", 0, false
+	}
+	livePub, _ := status["public_key"].(string)
+	livePort := parsePort(status["port"])
+	if livePub == "" || livePort <= 0 {
+		return "", 0, false
+	}
+
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	protoMap, _ := server.Protocols["awg"].(map[string]any)
+	if protoMap == nil {
+		protoMap = make(map[string]any)
+	}
+	protoMap["installed"] = true
+	protoMap["port"] = livePort
+	protoMap["public_key"] = livePub
+	if psk, ok := status["psk"].(string); ok && psk != "" {
+		protoMap["psk"] = psk
+	}
+	if awgParams, ok := status["awg_params"]; ok && awgParams != nil {
+		protoMap["awg_params"] = awgParams
+	}
+	if clientsCount, ok := status["clients_count"]; ok && clientsCount != nil {
+		protoMap["clients_count"] = clientsCount
+	}
+	server.Protocols["awg"] = protoMap
+	_ = s.db.UpdateServerProtocols(ctx, serverID, server.Protocols)
+
+	return livePub, livePort, true
+}
+
+func (s *Service) attachBackendForwarder(serverID int64, tunID int64, endpoint string) error {
+	if s.forwarder == nil {
+		return nil
+	}
+	dev, devErr := tunnel.NewUDPDevice(fmt.Sprintf("awg-be-%d", serverID), endpoint, 1420)
+	if devErr != nil {
+		return fmt.Errorf("failed to create backend UDP device for server %d: %w", serverID, devErr)
+	}
+	s.forwarder.AttachBackendDevice(tunID, dev)
+	if s.backendDevices == nil {
+		s.backendDevices = make(map[int64]*tunnel.UDPDevice)
+	}
+	s.backendDevices[tunID] = dev
+
+	// Spawn backend read loop to route packets back to clients
+	go func(backendID int64, device *tunnel.UDPDevice) {
+		buf := make([]byte, 2048)
+		for {
+			n, err := device.Read(buf)
+			if err != nil {
+				return
+			}
+			if n >= 20 && (buf[0]>>4) == 4 { // IPv4
+				destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
+				_ = s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP)
+			}
+		}
+	}(tunID, dev)
+	return nil
 }
 
 // DisableBackend disables a backend server and initiates connection draining.
@@ -533,6 +801,38 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Preserve obfuscation parameters the incoming config omits (zero
+	// H1..H4 / S1..S4) so partial updates cannot silently clobber the
+	// values already distributed to peers.
+	if s.cfg != nil {
+		preserveObfuscationParams(s.cfg, cfg)
+		// Preserve portal identity the incoming config omits (empty key
+		// fields): an update must never silently wipe the persisted
+		// keypair that distributed client configs rely on.
+		if cfg.ServerPrivateKey == "" {
+			cfg.ServerPrivateKey = s.cfg.ServerPrivateKey
+		}
+		if cfg.ServerPublicKey == "" {
+			cfg.ServerPublicKey = s.cfg.ServerPublicKey
+		}
+	}
+
+	// Any remaining difference is an explicit obfuscation change. An
+	// idle listener can be re-parameterized safely; a running listener
+	// cannot (its packet-processing paths read config fields without
+	// holding the listener lock), so reject the change explicitly
+	// instead of letting config and listener diverge silently.
+	if s.cfg != nil && obfuscationDiffers(s.cfg, cfg) {
+		if s.endpoint != nil && s.endpoint.IsRunning() {
+			log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
+			return errors.New("obfuscation parameters are immutable while listener is running")
+		}
+		if s.endpoint != nil {
+			s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4)
+			log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
+		}
+	}
 
 	s.cfg = cfg
 	if s.db != nil {
@@ -633,6 +933,30 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	if s.stickyMgr != nil {
 		s.stickyMgr.ClearAffinity(sess.UserID)
 		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+	}
+
+	return nil
+}
+
+// ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
+func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sessionMgr != nil && clientPub != "" {
+		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
+			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
+			if s.forwarder != nil {
+				s.forwarder.UnregisterSession(sess.PeerPublicKey)
+			}
+			if s.stickyMgr != nil {
+				s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+			}
+		}
+	}
+
+	if s.ipam != nil && clientPub != "" {
+		_ = s.ipam.Release(clientPub)
 	}
 
 	return nil
@@ -741,36 +1065,7 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	}
 
 	// Persist / update client connection in database so peer authentication succeeds
-	conns, err := db.GetConnectionsByUserID(ctx, userID)
-	var awgConn *models.UserConnection
-	if err == nil {
-		for i := range conns {
-			if models.NormalizeProtocol(conns[i].Protocol) == "awg" {
-				awgConn = &conns[i]
-				break
-			}
-		}
-	}
-
-	if awgConn != nil {
-		_, _ = db.UpdateConnection(ctx, awgConn.ID, map[string]any{
-			"client_id": clientPub,
-		})
-	} else {
-		var srvID int64
-		if servers, err := db.GetAllServers(ctx); err == nil && len(servers) > 0 {
-			srvID = servers[0].ID
-		}
-		newConn := &models.UserConnection{
-			UserID:     user.ID,
-			ServerID:   srvID,
-			Protocol:   "awg",
-			ClientID:   clientPub,
-			Name:       fmt.Sprintf("%s-awg", user.Username),
-			AWGMimicry: models.AWGMimicryAuto,
-		}
-		_, _ = db.CreateConnection(ctx, newConn)
-	}
+	matchOrCreateAWGConnection(ctx, db, user, clientPub)
 
 	assignedIP := "10.100.0.2"
 	if s.ipam != nil {
@@ -784,23 +1079,10 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 		listenPort = cfg.ListenPort
 	}
 
-	endpointHost := "127.0.0.1"
-	if servers, err := db.GetAllServers(ctx); err == nil && len(servers) > 0 {
-		for _, srv := range servers {
-			if srv.Host != "" {
-				endpointHost = srv.Host
-				break
-			}
-		}
-	}
+	endpointStr := s.resolveClientEndpoint(ctx, cfg, listenPort)
 
-	endpointStr := fmt.Sprintf("%s:%d", endpointHost, listenPort)
-
-	// Use real AWG obfuscation parameters with quadrant headers & CPS signatures
-	awgParams, err := awg.GenerateAWGParams("standard")
-	if err != nil {
-		awgParams = awg.AWGParamsFromMap(nil)
-	}
+	// Use real AWG obfuscation parameters from stored VPNConfig
+	awgParams := awg.AWGParamsFromVPNConfig(cfg)
 
 	configStr := awg.RenderClientConfig(
 		clientPriv,
@@ -816,6 +1098,201 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 
 	filename := fmt.Sprintf("amnezia-portal-%s.conf", user.Username)
 	return configStr, filename, nil
+}
+
+func matchOrCreateAWGConnection(ctx context.Context, db *database.DB, user *models.User, clientPub string) {
+	conns, err := db.GetConnectionsByUserID(ctx, user.ID)
+	var awgConn *models.UserConnection
+	if err == nil {
+		// Priority 1: Match pending connection created with empty ClientID
+		for i := range conns {
+			if models.NormalizeProtocol(conns[i].Protocol) == "awg" && conns[i].ClientID == "" {
+				awgConn = &conns[i]
+				break
+			}
+		}
+		// Priority 2: Match default portal connection
+		if awgConn == nil {
+			for i := range conns {
+				if conns[i].ServerID == 0 && conns[i].Name == fmt.Sprintf("%s-awg", user.Username) {
+					awgConn = &conns[i]
+					break
+				}
+			}
+		}
+		// Priority 3: Fallback for single-connection tests / legacy mode
+		if awgConn == nil && len(conns) == 1 && models.NormalizeProtocol(conns[0].Protocol) == "awg" {
+			awgConn = &conns[0]
+		}
+	}
+
+	if awgConn != nil {
+		_, _ = db.UpdateConnection(ctx, awgConn.ID, map[string]any{
+			"client_id": clientPub,
+		})
+	} else {
+		newConn := &models.UserConnection{
+			UserID:     user.ID,
+			ServerID:   0,
+			Protocol:   "awg",
+			ClientID:   clientPub,
+			Name:       fmt.Sprintf("%s-awg", user.Username),
+			AWGMimicry: models.AWGMimicryAuto,
+		}
+		_, _ = db.CreateConnection(ctx, newConn)
+	}
+}
+
+var externalIPDetector = detectExternalPublicIP
+
+func detectPortalHostIPFallback(ctx context.Context) string {
+	if externalIPDetector != nil {
+		if ip := externalIPDetector(ctx); ip != "" {
+			return ip
+		}
+	}
+	if ip := detectOutboundInterfaceIP(); ip != "" {
+		return ip
+	}
+	return "127.0.0.1"
+}
+
+func detectExternalPublicIP(ctx context.Context) string {
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	endpoints := []string{
+		"https://api.ipify.org",
+		"https://icanhazip.com",
+	}
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for _, ep := range endpoints {
+		req, err := http.NewRequestWithContext(lookupCtx, http.MethodGet, ep, nil)
+		if err != nil {
+			continue
+		}
+		// #nosec G107 -- fixed public IP detection endpoints
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		_ = resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ipStr := strings.TrimSpace(string(body))
+		if parsed := net.ParseIP(ipStr); parsed != nil {
+			return ipStr
+		}
+	}
+	return ""
+}
+
+func detectOutboundInterfaceIP() string {
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 500*time.Millisecond)
+	if err == nil {
+		defer conn.Close()
+		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil {
+			return udpAddr.IP.String()
+		}
+	}
+	return ""
+}
+
+func formatEndpoint(val string, defaultPort int) string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(val); err == nil {
+		return val
+	}
+	return net.JoinHostPort(val, strconv.Itoa(defaultPort))
+}
+
+func resolveClientEndpointInternal(ctx context.Context, s *Service, cfg *models.VPNConfig, listenPort int) string {
+	// 1. Configured cfg.PublicEndpoint
+	if cfg != nil && strings.TrimSpace(cfg.PublicEndpoint) != "" {
+		return formatEndpoint(cfg.PublicEndpoint, listenPort)
+	}
+
+	// 2. Environment variables: VPN_PUBLIC_ENDPOINT, PUBLIC_ENDPOINT, PUBLIC_IP
+	for _, envKey := range []string{"VPN_PUBLIC_ENDPOINT", "PUBLIC_ENDPOINT", "PUBLIC_IP"} {
+		if envVal := strings.TrimSpace(os.Getenv(envKey)); envVal != "" {
+			return formatEndpoint(envVal, listenPort)
+		}
+	}
+
+	// 3. Portal Host Auto-Detection (cached in memory on VPNService)
+	var hostIP string
+	if s != nil {
+		hostIP = s.detectPortalHostIP(ctx)
+	} else {
+		hostIP = detectPortalHostIPFallback(ctx)
+	}
+	if hostIP == "" {
+		hostIP = "127.0.0.1"
+	}
+	return net.JoinHostPort(hostIP, strconv.Itoa(listenPort))
+}
+
+func (s *Service) detectPortalHostIP(ctx context.Context) string {
+	if s != nil {
+		s.publicIPMu.RLock()
+		cached := s.detectedPublicIP
+		s.publicIPMu.RUnlock()
+		if cached != "" {
+			return cached
+		}
+	}
+
+	detected := detectPortalHostIPFallback(ctx)
+
+	if s != nil && detected != "" {
+		s.publicIPMu.Lock()
+		s.detectedPublicIP = detected
+		s.publicIPMu.Unlock()
+	}
+	return detected
+}
+
+func (s *Service) resolveClientEndpoint(ctx context.Context, cfg *models.VPNConfig, listenPort int) string {
+	return resolveClientEndpointInternal(ctx, s, cfg, listenPort)
+}
+
+// ResolveClientEndpoint resolves the public endpoint for the Load Balancer entry point.
+func (s *Service) ResolveClientEndpoint(ctx context.Context) string {
+	s.mu.RLock()
+	cfg := s.cfg
+	listenPort := 51820
+	if cfg != nil && cfg.ListenPort > 0 {
+		listenPort = cfg.ListenPort
+	}
+	s.mu.RUnlock()
+	return s.resolveClientEndpoint(ctx, cfg, listenPort)
+}
+
+// ExtractClientPublicKeyFromConfig parses a WireGuard/AWG config text to retrieve the client public key.
+func ExtractClientPublicKeyFromConfig(configStr string) string {
+	for _, line := range strings.Split(configStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PrivateKey") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				privKey := strings.TrimSpace(parts[1])
+				pubKey, err := tunnel.DeriveClientPublicKey(privKey)
+				if err == nil {
+					return pubKey
+				}
+			}
+		}
+	}
+	return ""
 }
 
 type peerVirtualDevice struct {

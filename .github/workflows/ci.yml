@@ -1,0 +1,110 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - 'feat/**'
+      - 'fix/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-security:
+    name: Lint & Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # NOTE: golangci-lint must be built with a Go version >= the project's
+          # toolchain (go.mod: go 1.26.6) or it fails with "can't load config".
+          # v1.64.6 is built with go1.24 and cannot parse go 1.26 targets.
+          version: latest
+          args: --timeout=5m
+
+      - name: Install Security Scanners
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run gosec Security Scanner
+        run: gosec -quiet ./...
+
+      - name: Run govulncheck Vulnerability Scanner
+        run: govulncheck ./...
+
+  test:
+    name: Automated Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run Tests with Race Detector
+        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+
+      - name: Upload Test Coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 14
+
+  build-matrix:
+    name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Compile Panel Binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.arch }}
+        run: |
+          mkdir -p bin
+          go build -trimpath -ldflags="-s -w" -o bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }} ./cmd/panel
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          retention-days: 7

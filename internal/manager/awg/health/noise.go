@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
@@ -25,8 +26,12 @@ var (
 const (
 	DefaultH1 = uint32(1020325451)
 	DefaultH2 = uint32(3288052141)
+	DefaultH3 = uint32(1766607858)
+	DefaultH4 = uint32(2528465083)
 	DefaultS1 = 15
 	DefaultS2 = 18
+	DefaultS3 = 20
+	DefaultS4 = 23
 )
 
 // NoiseClientState maintains state across Noise protocol handshake messages.
@@ -255,6 +260,22 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32
 	return packet, state, nil
 }
 
+// ComputePublicKeyFromPrivate computes the base64-encoded WireGuard/AmneziaWG public key from a base64-encoded private key.
+func ComputePublicKeyFromPrivate(clientPrivKey string) (string, error) {
+	privBytes, err := DecodeKey(clientPrivKey)
+	if err != nil {
+		return "", fmt.Errorf("invalid private key: %w", err)
+	}
+	if len(privBytes) != 32 {
+		return "", errors.New("client private key must be 32 bytes")
+	}
+	pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pubBytes), nil
+}
+
 // VerifyAWGResponsePacket verifies and authenticates an AmneziaWG Handshake Response packet.
 func VerifyAWGResponsePacket(respPacket []byte, state *NoiseClientState, h2 uint32, s2 int) bool {
 	if state == nil {
@@ -280,6 +301,42 @@ func VerifyAWGResponsePacket(respPacket []byte, state *NoiseClientState, h2 uint
 
 	receiverIdx := binary.LittleEndian.Uint32(payload[8:12])
 	if receiverIdx != state.SenderIndex {
+		return false
+	}
+
+	// Verify MAC1 over payload[0:60] using state.MAC1Key (blake2s hash with LabelMAC1 and client static pub key)
+	var mac1Key []byte
+	if len(state.ClientPriv) == 32 {
+		if clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint); err == nil {
+			k := blake2s.Sum256(append(LabelMAC1, clientPub...))
+			mac1Key = k[:]
+		}
+	}
+	if mac1Key == nil && len(state.MAC1Key) == 32 {
+		mac1Key = state.MAC1Key
+	}
+	if len(mac1Key) == 32 {
+		hMac1, err := blake2s.New128(mac1Key)
+		if err != nil {
+			return false
+		}
+		hMac1.Write(payload[0:60])
+		if !hmac.Equal(payload[60:76], hMac1.Sum(nil)) {
+			// If state.MAC1Key was explicitly provided and differs from derived key, check it as well
+			if len(state.MAC1Key) == 32 && !bytes.Equal(state.MAC1Key, mac1Key) {
+				hMac1Alt, err := blake2s.New128(state.MAC1Key)
+				if err != nil {
+					return false
+				}
+				hMac1Alt.Write(payload[0:60])
+				if !hmac.Equal(payload[60:76], hMac1Alt.Sum(nil)) {
+					return false
+				}
+			} else {
+				return false
+			}
+		}
+	} else {
 		return false
 	}
 

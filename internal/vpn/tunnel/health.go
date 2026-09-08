@@ -111,11 +111,91 @@ func (hp *HealthProber) Config() HealthConfig {
 	return hp.cfg
 }
 
+func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int64) (h1, h2 uint32, s1, s2 int, found bool) {
+	server, err := db.GetServer(ctx, serverID)
+	if err != nil || server == nil || server.Protocols == nil {
+		return 0, 0, -1, -1, false
+	}
+	awgInfo, ok := server.Protocols["awg"].(map[string]any)
+	if !ok || awgInfo == nil {
+		return 0, 0, -1, -1, false
+	}
+	var paramsObj any
+	if p, ok := awgInfo["awg_params"]; ok && p != nil {
+		paramsObj = p
+	} else if p, ok := awgInfo["params"]; ok && p != nil {
+		paramsObj = p
+	} else {
+		paramsObj = awgInfo
+	}
+	bH1, bH2, bS1, bS2, ok := health.ExtractAWGExplicitParams(paramsObj)
+	if ok && (bH1 > 0 || bH2 > 0 || bS1 >= 0 || bS2 >= 0) {
+		return bH1, bH2, bS1, bS2, true
+	}
+	return 0, 0, -1, -1, false
+}
+
+func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s1, s2 int, found bool) {
+	vpnCfg, err := db.GetVPNConfig(ctx)
+	if err != nil || vpnCfg == nil {
+		return 0, 0, -1, -1, false
+	}
+	if vpnCfg.H1 > 0 || vpnCfg.H2 > 0 || vpnCfg.S1 >= 0 || vpnCfg.S2 >= 0 {
+		return vpnCfg.H1, vpnCfg.H2, vpnCfg.S1, vpnCfg.S2, true
+	}
+	return 0, 0, -1, -1, false
+}
+
+// resolveTunnelParams returns H1, H2, S1, S2 for probing the specific backend tunnel,
+// checking the backend's installed params first, then stored VPNConfig, then prober defaults.
+func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64) (h1, h2 uint32, s1, s2 int) {
+	h1, h2, s1, s2 = hp.cfg.H1, hp.cfg.H2, hp.cfg.S1, hp.cfg.S2
+	if hp.db == nil {
+		return h1, h2, s1, s2
+	}
+
+	if bH1, bH2, bS1, bS2, ok := paramsFromBackendServer(ctx, hp.db, serverID); ok {
+		if bH1 > 0 {
+			h1 = bH1
+		}
+		if bH2 > 0 {
+			h2 = bH2
+		}
+		if bS1 >= 0 {
+			s1 = bS1
+		}
+		if bS2 >= 0 {
+			s2 = bS2
+		}
+		return h1, h2, s1, s2
+	}
+
+	if vH1, vH2, vS1, vS2, ok := paramsFromVPNConfig(ctx, hp.db); ok {
+		if vH1 > 0 {
+			h1 = vH1
+		}
+		if vH2 > 0 {
+			h2 = vH2
+		}
+		if vS1 >= 0 {
+			s1 = vS1
+		}
+		if vS2 >= 0 {
+			s2 = vS2
+		}
+		return h1, h2, s1, s2
+	}
+
+	return h1, h2, s1, s2
+}
+
 // ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
 func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
 	}
+
+	h1, h2, s1, s2 := hp.resolveTunnelParams(ctx, tunnel.ServerID)
 
 	rtt, err := hp.probeFn(
 		ctx,
@@ -123,10 +203,10 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		tunnel.PublicKey,
 		tunnel.PrivateKey,
 		"",
-		hp.cfg.H1,
-		hp.cfg.H2,
-		hp.cfg.S1,
-		hp.cfg.S2,
+		h1,
+		h2,
+		s1,
+		s2,
 		hp.cfg.Timeout,
 	)
 
