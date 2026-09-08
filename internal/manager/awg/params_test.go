@@ -123,3 +123,27 @@ func TestValidateAWGParams_Errors(t *testing.T) {
 		t.Errorf("expected error for invalid MTU")
 	}
 }
+
+func TestGenerateStandardObfuscationValues_Floor(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		h1, h2, h3, h4, s1, s2, s3, s4, err := GenerateStandardObfuscationValues()
+		if err != nil {
+			t.Fatalf("iteration %d: GenerateStandardObfuscationValues failed: %v", i, err)
+		}
+		if s1 < 12 {
+			t.Errorf("iteration %d: S1 = %d < 12", i, s1)
+		}
+		if s2 < 12 {
+			t.Errorf("iteration %d: S2 = %d < 12", i, s2)
+		}
+		if s3 < 12 {
+			t.Errorf("iteration %d: S3 = %d < 12", i, s3)
+		}
+		if s4 < 12 {
+			t.Errorf("iteration %d: S4 = %d < 12", i, s4)
+		}
+		if h1 == 0 || h2 == 0 || h3 == 0 || h4 == 0 {
+			t.Errorf("iteration %d: unexpected zero header value: h1=%d, h2=%d, h3=%d, h4=%d", i, h1, h2, h3, h4)
+		}
+	}
+}

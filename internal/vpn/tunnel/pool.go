@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"golang.org/x/crypto/curve25519"
 )
@@ -27,6 +28,19 @@ type Pool struct {
 	tunnelsByID       map[int64]*models.BackendTunnel
 	tunnelsByIfName   map[string]*models.BackendTunnel
 	closed            bool
+}
+
+// DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
+func DeriveClientPublicKey(privKey string) (string, error) {
+	return health.ComputePublicKeyFromPrivate(privKey)
+}
+
+// ClientPublicKey derives the prober client's public key from the BackendTunnel's PrivateKey.
+func ClientPublicKey(t *models.BackendTunnel) (string, error) {
+	if t == nil {
+		return "", errors.New("tunnel is nil")
+	}
+	return health.ComputePublicKeyFromPrivate(t.PrivateKey)
 }
 
 // NewPool initializes an in-process backend tunnel pool.
@@ -54,6 +68,11 @@ func GenerateCurve25519KeyPair() (pubKey string, privKey string, err error) {
 	pubKey = base64.StdEncoding.EncodeToString(pubBytes)
 	privKey = base64.StdEncoding.EncodeToString(privBytes)
 	return pubKey, privKey, nil
+}
+
+// PublicKeyFromPrivateKey computes the Base64-encoded Curve25519 public key from a Base64-encoded private key.
+func PublicKeyFromPrivateKey(privKeyBase64 string) (string, error) {
+	return DeriveClientPublicKey(privKeyBase64)
 }
 
 // SyncFromDB loads all backend tunnels from the database into the memory pool.
@@ -101,10 +120,17 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		if serverPubKey != "" {
 			existing.PublicKey = serverPubKey
 		}
+		if existing.PrivateKey == "" {
+			_, sk, err := GenerateCurve25519KeyPair()
+			if err == nil {
+				existing.PrivateKey = sk
+			}
+		}
 		if p.db != nil {
 			_ = p.db.UpdateBackendTunnel(ctx, existing.ID, map[string]any{
-				"endpoint":   endpoint,
-				"public_key": existing.PublicKey,
+				"endpoint":    endpoint,
+				"public_key":  existing.PublicKey,
+				"private_key": existing.PrivateKey,
 			})
 		}
 		return existing, nil

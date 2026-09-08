@@ -286,7 +286,7 @@ func GenerateStandardObfuscationValues() (h1, h2, h3, h4 uint32, s1, s2, s3, s4 
 	if err != nil {
 		return 0, 0, 0, 0, 0, 0, 0, 0, err
 	}
-	s4, err = randIntBetween(10, 20)
+	s4, err = randIntBetween(12, 24)
 	if err != nil {
 		return 0, 0, 0, 0, 0, 0, 0, 0, err
 	}
@@ -312,6 +312,21 @@ func GenerateStandardObfuscationValues() (h1, h2, h3, h4 uint32, s1, s2, s3, s4 
 			s2 = s1 - 10
 		}
 	}
+
+	// Ensure S1, S2, S3, S4 >= 12 unconditionally to satisfy the upstream AmneziaWG header protection floor constraint.
+	if s1 < 12 {
+		s1 = 12
+	}
+	if s2 < 12 {
+		s2 = 12
+	}
+	if s3 < 12 {
+		s3 = 12
+	}
+	if s4 < 12 {
+		s4 = 12
+	}
+
 	return h1, h2, h3, h4, s1, s2, s3, s4, nil
 }
 

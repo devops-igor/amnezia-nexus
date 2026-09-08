@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
@@ -235,5 +236,60 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 	st, _ := pool.GetTunnel(s1ID)
 	if st.Status != "degraded" {
 		t.Errorf("expected tunnel to be degraded after probe failure, got %s", st.Status)
+	}
+}
+
+func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	// Server has AWG protocol installed, port, public_key, but NO awg_params keys inside
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Server with AWG installed but empty params",
+		Host: "192.0.2.100",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "dummy-pubkey",
+				"awg_params": map[string]any{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Stored VPNConfig has randomized portal parameters
+	vpnCfg := &models.VPNConfig{
+		H1: 777777,
+		H2: 888888,
+		S1: 35,
+		S2: 45,
+	}
+	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.H1 = 12345
+	cfg.H2 = 54321
+
+	prober := NewHealthProber(pool, db, cfg, nil)
+
+	// Explicitly verify paramsFromBackendServer returns found=false (Finding 2)
+	bH1, bH2, bS1, bS2, found := paramsFromBackendServer(ctx, db, sID)
+	if found {
+		t.Errorf("expected paramsFromBackendServer to return found=false for empty params, got found=true (%d, %d, %d, %d)", bH1, bH2, bS1, bS2)
+	}
+
+	// Verify resolveTunnelParams resolves from VPNConfig (777777), NOT legacy constant 1020325451
+	h1, h2, s1, s2 := prober.resolveTunnelParams(ctx, sID)
+	if h1 != 777777 || h2 != 888888 || s1 != 35 || s2 != 45 {
+		t.Errorf("resolveTunnelParams mismatch: got (%d, %d, %d, %d), want (777777, 888888, 35, 45)", h1, h2, s1, s2)
+	}
+	if h1 == health.DefaultH1 {
+		t.Errorf("resolveTunnelParams incorrectly used legacy constant %d instead of VPNConfig", health.DefaultH1)
 	}
 }
