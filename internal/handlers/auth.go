@@ -95,6 +95,11 @@ func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 	imgBytes := generateCaptchaImage(captchaAnswer)
 	imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
 
+	// Ensure response is never cached
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
 	// If client specifically expects JSON response
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "application/json") {
@@ -349,11 +354,94 @@ func (h *Handlers) APIChangePasswordHandler(w http.ResponseWriter, r *http.Reque
 	h.JSONOK(w, map[string]any{"message": "Password updated"})
 }
 
+var digitBitmaps = [10][7]uint8{
+	// 0
+	{0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},
+	// 1
+	{0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
+	// 2
+	{0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},
+	// 3
+	{0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110},
+	// 4
+	{0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
+	// 5
+	{0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},
+	// 6
+	{0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110},
+	// 7
+	{0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
+	// 8
+	{0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
+	// 9
+	{0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110},
+}
+
+var captchaPalette = []color.RGBA{
+	{R: 24, G: 68, B: 154, A: 255},  // Navy Blue
+	{R: 180, G: 35, B: 24, A: 255},  // Crimson Red
+	{R: 21, G: 128, B: 61, A: 255},  // Forest Green
+	{R: 126, G: 34, B: 206, A: 255}, // Purple
+	{R: 194, G: 65, B: 12, A: 255},  // Amber / Orange
+	{R: 15, G: 118, B: 110, A: 255}, // Teal
+}
+
+func captchaRandInt(max int64) int64 {
+	if max <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(max))
+	if err != nil {
+		return 0
+	}
+	return n.Int64()
+}
+
+func drawCaptchaLine(img *image.RGBA, x0, y0, x1, y1 int, col color.Color) {
+	dx := x1 - x0
+	if dx < 0 {
+		dx = -dx
+	}
+	dy := y1 - y0
+	if dy < 0 {
+		dy = -dy
+	}
+	sx, sy := 1, 1
+	if x0 > x1 {
+		sx = -1
+	}
+	if y0 > y1 {
+		sy = -1
+	}
+	err := dx - dy
+	for {
+		if x0 >= 0 && x0 < img.Bounds().Dx() && y0 >= 0 && y0 < img.Bounds().Dy() {
+			img.Set(x0, y0, col)
+		}
+		if x0 == x1 && y0 == y1 {
+			break
+		}
+		e2 := 2 * err
+		if e2 > -dy {
+			err -= dy
+			x0 += sx
+		}
+		if e2 < dx {
+			err += dx
+			y0 += sy
+		}
+	}
+}
+
 func generateCaptchaDigits(n int) string {
 	digits := "0123456789"
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
-		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(digits))))
+		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(digits))))
+		if err != nil {
+			sb.WriteByte(digits[i%len(digits)])
+			continue
+		}
 		sb.WriteByte(digits[idx.Int64()])
 	}
 	return sb.String()
@@ -363,33 +451,71 @@ func generateCaptchaImage(text string) []byte {
 	width, height := 160, 60
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
-	// Background
-	bg := color.RGBA{R: 245, G: 247, B: 250, A: 255}
+	// Background: light clean fill
+	bg := color.RGBA{R: 248, G: 250, B: 252, A: 255}
 	draw.Draw(img, img.Bounds(), &image.Uniform{C: bg}, image.Point{}, draw.Src)
 
-	// Draw simple digit strokes
-	fg := color.RGBA{R: 40, G: 60, B: 110, A: 255}
-	dotColor := color.RGBA{R: 180, G: 190, B: 210, A: 255}
-
-	// Add noise dots
-	for x := 0; x < width; x += 6 {
-		for y := 0; y < height; y += 6 {
-			img.Set(x, y, dotColor)
-		}
+	// Add background noise dots
+	dotColor := color.RGBA{R: 203, G: 213, B: 225, A: 255}
+	for j := 0; j < 60; j++ {
+		nx := int(captchaRandInt(int64(width)))
+		ny := int(captchaRandInt(int64(height)))
+		img.Set(nx, ny, dotColor)
 	}
 
-	// Draw coarse representation of each character
-	charWidth := width / (len(text) + 1)
-	for i, c := range text {
-		startX := (i + 1) * charWidth
-		startY := height / 3
+	// Add subtle background interference lines
+	lineColor := color.RGBA{R: 203, G: 213, B: 225, A: 200}
+	for l := 0; l < 2; l++ {
+		y0 := int(captchaRandInt(int64(height)))
+		y1 := int(captchaRandInt(int64(height)))
+		drawCaptchaLine(img, 0, y0, width-1, y1, lineColor)
+	}
 
-		// Draw simple symbol representation
-		for dx := -4; dx <= 4; dx++ {
-			for dy := -8; dy <= 8; dy++ {
-				if (dx+dy+int(c))%3 == 0 {
-					img.Set(startX+dx, startY+dy, fg)
-					img.Set(startX+dx+1, startY+dy, fg)
+	// Draw characters using 5x7 bitmap font scaled 4x
+	scale := 4
+	n := len(text)
+	if n == 0 {
+		n = 4
+	}
+	digitWidth := 5 * scale
+	totalDigitWidth := n * digitWidth
+	remainingWidth := width - totalDigitWidth
+	gap := remainingWidth / (n + 1)
+	if gap < 2 {
+		gap = 2
+	}
+
+	baseY := (height - 7*scale) / 2
+
+	for i, c := range text {
+		startX := gap + i*(digitWidth+gap)
+		jitter := int(captchaRandInt(7)) - 3 // -3 to +3 pixels
+		startY := baseY + jitter
+
+		colorIdx := int(captchaRandInt(int64(len(captchaPalette))))
+		fg := captchaPalette[colorIdx]
+
+		var bitmap [7]uint8
+		if c >= '0' && c <= '9' {
+			bitmap = digitBitmaps[c-'0']
+		} else {
+			// Fallback: simple box outline for non-digits
+			bitmap = [7]uint8{0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111}
+		}
+
+		for row := 0; row < 7; row++ {
+			bits := bitmap[row]
+			for col := 0; col < 5; col++ {
+				if (bits>>(4-col))&1 == 1 {
+					for bx := 0; bx < scale; bx++ {
+						for by := 0; by < scale; by++ {
+							px := startX + col*scale + bx
+							py := startY + row*scale + by
+							if px >= 0 && px < width && py >= 0 && py < height {
+								img.Set(px, py, fg)
+							}
+						}
+					}
 				}
 			}
 		}

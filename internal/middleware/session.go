@@ -54,7 +54,7 @@ func Session(secretKey string) func(next http.Handler) http.Handler {
 			if err == nil && cookie.Value != "" {
 				if dataMap, err := security.DecodeSession(cookie.Value, secretKey); err == nil {
 					sessionData := models.SessionDataFromMap(dataMap)
-					if sessionData != nil && sessionData.IsAuthenticated() {
+					if sessionData != nil {
 						r = r.WithContext(WithSession(r.Context(), sessionData))
 					}
 				}

@@ -693,3 +693,86 @@ func TestLegacyMyConnectionsRoutesParity(t *testing.T) {
 		})
 	}
 }
+
+func TestRouterVPNPage(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	r := NewRouter(cfg, db, nil)
+
+	ctx := context.Background()
+	adminUser := &models.User{
+		ID:        "admin-vpn-test",
+		Username:  "adminvpn",
+		Role:      models.RoleAdmin,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	}
+	_, err := db.CreateUser(ctx, adminUser)
+	if err != nil {
+		t.Fatalf("failed to seed admin user: %v", err)
+	}
+
+	supportUser := &models.User{
+		ID:        "support-vpn-test",
+		Username:  "supportvpn",
+		Role:      models.RoleSupport,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	}
+	_, err = db.CreateUser(ctx, supportUser)
+	if err != nil {
+		t.Fatalf("failed to seed support user: %v", err)
+	}
+
+	// 1. Unauthenticated request -> redirects to /login
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/vpn", nil)
+	wUnauth := httptest.NewRecorder()
+	r.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusFound || wUnauth.Header().Get("Location") != "/login" {
+		t.Errorf("expected 302 redirect to /login for unauthenticated /vpn, got %d", wUnauth.Code)
+	}
+
+	// 2. Authenticated Admin request -> 200 OK with rendered VPN dashboard
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/vpn", nil)
+	adminCtx := middleware.WithSession(reqAdmin.Context(), &models.SessionData{
+		UserID:   adminUser.ID,
+		Username: adminUser.Username,
+		Role:     adminUser.Role,
+	})
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin.WithContext(adminCtx))
+
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin on /vpn, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
+	}
+	adminBody := wAdmin.Body.String()
+	if strings.Contains(adminBody, "Template Not Found") {
+		t.Fatalf("CRITICAL REGRESSION: /vpn rendered 'Template Not Found'")
+	}
+	if !strings.Contains(adminBody, "vpn-listener-badge") {
+		t.Errorf("expected /vpn body to contain 'vpn-listener-badge'")
+	}
+	if !strings.Contains(adminBody, "vpn-backends-tbody") {
+		t.Errorf("expected /vpn body to contain 'vpn-backends-tbody'")
+	}
+
+	// 3. Authenticated Support request -> 200 OK with rendered VPN dashboard
+	reqSupport := httptest.NewRequest(http.MethodGet, "/vpn", nil)
+	supportCtx := middleware.WithSession(reqSupport.Context(), &models.SessionData{
+		UserID:   supportUser.ID,
+		Username: supportUser.Username,
+		Role:     supportUser.Role,
+	})
+	wSupport := httptest.NewRecorder()
+	r.ServeHTTP(wSupport, reqSupport.WithContext(supportCtx))
+
+	if wSupport.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for support on /vpn, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
+	}
+	supportBody := wSupport.Body.String()
+	if strings.Contains(supportBody, "Template Not Found") {
+		t.Fatalf("CRITICAL REGRESSION: /vpn rendered 'Template Not Found' for support role")
+	}
+	if !strings.Contains(supportBody, "vpn-listener-badge") {
+		t.Errorf("expected /vpn body to contain 'vpn-listener-badge' for support role")
+	}
+}

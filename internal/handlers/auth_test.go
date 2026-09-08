@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,6 +123,18 @@ func TestAuthHandlers(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
 		}
+		if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-cache") {
+			t.Errorf("expected Cache-Control to contain no-cache, got %s", cc)
+		}
+
+		// Decode PNG image to verify valid PNG format and dimensions
+		img, err := png.Decode(w.Body)
+		if err != nil {
+			t.Fatalf("failed to decode captcha PNG: %v", err)
+		}
+		if img.Bounds().Dx() != 160 || img.Bounds().Dy() != 60 {
+			t.Errorf("expected 160x60 image, got %dx%d", img.Bounds().Dx(), img.Bounds().Dy())
+		}
 
 		reqImg := httptest.NewRequest(http.MethodGet, "/api/auth/captcha", nil)
 		reqImg.Header.Set("Accept", "image/png")
@@ -129,6 +142,92 @@ func TestAuthHandlers(t *testing.T) {
 		h.CaptchaHandler(wImg, reqImg)
 		if wImg.Code != http.StatusOK || wImg.Header().Get("Content-Type") != "image/png" {
 			t.Errorf("expected 200 image/png, got %d (%s)", wImg.Code, wImg.Header().Get("Content-Type"))
+		}
+
+		// JSON accept header request
+		reqJSON := httptest.NewRequest(http.MethodGet, "/api/auth/captcha", nil)
+		reqJSON.Header.Set("Accept", "application/json")
+		wJSON := httptest.NewRecorder()
+		h.CaptchaHandler(wJSON, reqJSON)
+		if wJSON.Code != http.StatusOK {
+			t.Errorf("expected 200 for JSON captcha, got %d", wJSON.Code)
+		}
+		var jsonResp map[string]any
+		if err := json.Unmarshal(wJSON.Body.Bytes(), &jsonResp); err != nil {
+			t.Fatalf("failed to decode JSON captcha response: %v", err)
+		}
+		if jsonResp["captcha_id"] == nil || jsonResp["image"] == nil {
+			t.Errorf("expected captcha_id and image in JSON response, got %+v", jsonResp)
+		}
+	})
+
+	t.Run("APILoginHandler End-To-End Captcha Cookie Verification", func(t *testing.T) {
+		_ = db.SetSetting(ctx, "captcha", models.CaptchaSettings{Enabled: true})
+		defer func() {
+			_ = db.SetSetting(ctx, "captcha", models.CaptchaSettings{Enabled: false})
+		}()
+
+		// 1. Request captcha to get session cookie
+		wCaptcha := httptest.NewRecorder()
+		reqCaptcha := httptest.NewRequest(http.MethodGet, "/api/auth/captcha", nil)
+		h.CaptchaHandler(wCaptcha, reqCaptcha)
+
+		var cookieVal string
+		for _, c := range wCaptcha.Result().Cookies() {
+			if c.Name == middleware.SessionCookieName {
+				cookieVal = c.Value
+				break
+			}
+		}
+		if cookieVal == "" {
+			t.Fatal("expected session cookie from CaptchaHandler, got none")
+		}
+
+		// Decode session cookie to read the expected captcha answer
+		dataMap, err := security.DecodeSession(cookieVal, cfg.SecretKey)
+		if err != nil {
+			t.Fatalf("failed to decode session cookie: %v", err)
+		}
+		expectedAnswer, _ := dataMap["captcha_answer"].(string)
+		if expectedAnswer == "" {
+			t.Fatal("expected captcha_answer in session cookie")
+		}
+
+		sessionMW := middleware.Session(cfg.SecretKey)
+
+		// 2. Submit wrong captcha
+		wrongAns := "wrong"
+		bodyWrong, _ := json.Marshal(models.LoginRequest{
+			Username: "admin",
+			Password: "AdminPass123!",
+			Captcha:  &wrongAns,
+		})
+		reqWrong := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(bodyWrong))
+		reqWrong.AddCookie(&http.Cookie{
+			Name:  middleware.SessionCookieName,
+			Value: cookieVal,
+		})
+		wWrong := httptest.NewRecorder()
+		sessionMW(http.HandlerFunc(h.APILoginHandler)).ServeHTTP(wWrong, reqWrong)
+		if wWrong.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for wrong captcha, got %d", wWrong.Code)
+		}
+
+		// 3. Submit correct captcha with session middleware
+		bodyOK, _ := json.Marshal(models.LoginRequest{
+			Username: "admin",
+			Password: "AdminPass123!",
+			Captcha:  &expectedAnswer,
+		})
+		reqOK := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(bodyOK))
+		reqOK.AddCookie(&http.Cookie{
+			Name:  middleware.SessionCookieName,
+			Value: cookieVal,
+		})
+		wOK := httptest.NewRecorder()
+		sessionMW(http.HandlerFunc(h.APILoginHandler)).ServeHTTP(wOK, reqOK)
+		if wOK.Code != http.StatusOK {
+			t.Errorf("expected 200 for correct captcha via session cookie, got %d (body: %s)", wOK.Code, wOK.Body.String())
 		}
 	})
 

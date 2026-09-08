@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-
-
 // backendSocket binds a local UDP socket standing in for a remote backend AWG
 // endpoint. Embedding *net.UDPConn gives the test direct Read/Write access
 // while Addr() exposes the bound address for NewUDPDevice's endpoint argument.
