@@ -32,7 +32,10 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.6
+          # NOTE: golangci-lint must be built with a Go version >= the project's
+          # toolchain (go.mod: go 1.26.6) or it fails with "can't load config".
+          # v1.64.6 is built with go1.24 and cannot parse go 1.26 targets.
+          version: latest
           args: --timeout=5m
 
       - name: Install Security Scanners
