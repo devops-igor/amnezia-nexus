@@ -157,52 +157,108 @@ func getMapParamValue(awgParams any, keys ...string) (string, bool) {
 	return "", false
 }
 
-// ExtractAWGHeaderLimits extracts H1, H2, S1, S2 from an awgParams object (map[string]any or map[string]string),
-// falling back to the supplied default values if not found or zero.
-func ExtractAWGHeaderLimits(awgParams any, defaultH1, defaultH2 uint32, defaultS1, defaultS2 int) (h1, h2 uint32, s1, s2 int) {
-	h1 = defaultH1
-	h2 = defaultH2
-	s1 = defaultS1
-	s2 = defaultS2
-
-	if defaultH1 == 0 {
-		h1 = DefaultH1
-	}
-	if defaultH2 == 0 {
-		h2 = DefaultH2
-	}
-	if defaultS1 < 0 {
-		s1 = DefaultS1
-	}
-	if defaultS2 < 0 {
-		s2 = DefaultS2
-	}
-
+// ExtractAWGExplicitParams extracts H1, H2, S1, S2 from an awgParams object (map[string]any or map[string]string).
+// It returns found=true ONLY if at least one explicit header limit or junk parameter key is present and parsed.
+func ExtractAWGExplicitParams(awgParams any) (h1, h2 uint32, s1, s2 int, found bool) {
+	s1 = -1
+	s2 = -1
 	if awgParams == nil {
-		return
+		return 0, 0, -1, -1, false
 	}
 
 	if v, ok := getMapParamValue(awgParams, "init_packet_magic_header", "h1"); ok {
 		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
 			h1 = uint32(num)
+			found = true
 		}
 	}
 	if v, ok := getMapParamValue(awgParams, "response_packet_magic_header", "h2"); ok {
 		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
 			h2 = uint32(num)
+			found = true
 		}
 	}
 	if v, ok := getMapParamValue(awgParams, "init_packet_junk_size", "s1"); ok {
 		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
 			s1 = num
+			found = true
 		}
 	}
 	if v, ok := getMapParamValue(awgParams, "response_packet_junk_size", "s2"); ok {
 		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
 			s2 = num
+			found = true
 		}
 	}
-	return
+
+	if !found {
+		// Check for other explicit AWG obfuscation keys
+		for _, k := range []string{
+			"underload_packet_magic_header", "h3",
+			"transport_packet_magic_header", "h4",
+			"underload_packet_junk_size", "s3",
+			"transport_packet_junk_size", "s4",
+			"junk_packet_count", "jc",
+			"junk_packet_min_size", "jmin",
+			"junk_packet_max_size", "jmax",
+		} {
+			if _, ok := getMapParamValue(awgParams, k); ok {
+				found = true
+				break
+			}
+		}
+	}
+
+	return h1, h2, s1, s2, found
+}
+
+// ExtractAWGHeaderLimits extracts H1, H2, S1, S2 from an awgParams object (map[string]any or map[string]string),
+// falling back to the supplied default values if not found or zero.
+// If defaultH1 == 0 and no explicit AWG parameter keys are present in awgParams,
+// it preserves zero/negative values rather than substituting legacy defaults.
+func ExtractAWGHeaderLimits(awgParams any, defaultH1, defaultH2 uint32, defaultS1, defaultS2 int) (h1, h2 uint32, s1, s2 int) {
+	expH1, expH2, expS1, expS2, found := ExtractAWGExplicitParams(awgParams)
+	if !found {
+		if defaultH1 == 0 {
+			return 0, 0, -1, -1
+		}
+		return defaultH1, defaultH2, defaultS1, defaultS2
+	}
+
+	h1 = expH1
+	h2 = expH2
+	s1 = expS1
+	s2 = expS2
+
+	if h1 == 0 {
+		if defaultH1 > 0 {
+			h1 = defaultH1
+		} else {
+			h1 = DefaultH1
+		}
+	}
+	if h2 == 0 {
+		if defaultH2 > 0 {
+			h2 = defaultH2
+		} else {
+			h2 = DefaultH2
+		}
+	}
+	if s1 < 0 {
+		if defaultS1 >= 0 {
+			s1 = defaultS1
+		} else {
+			s1 = DefaultS1
+		}
+	}
+	if s2 < 0 {
+		if defaultS2 >= 0 {
+			s2 = defaultS2
+		} else {
+			s2 = DefaultS2
+		}
+	}
+	return h1, h2, s1, s2
 }
 
 func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 uint32, s1, s2 int) {
