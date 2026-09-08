@@ -906,10 +906,20 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	clientName := resolveClientName(clientParams)
 
+	// Name-based probe detection (R2): a legacy "Health Probe" entry may exist
+	// with a server PSK from the old name-only registration path. Treat the
+	// name as probe identity so the upsert drops the PresharedKey line and
+	// forces psk="" — keeping the peer on the PSK-less identity both probers use.
+	clientNameIsProbe := strings.EqualFold(strings.TrimSpace(clientName), "Health Probe")
+
 	clientPubKey := probePeerPubKey(clientParams)
-	isProbePeer := clientPubKey != ""
+	isProbePeer := clientPubKey != "" || clientNameIsProbe
 	clientPrivKey := ""
-	if !isProbePeer {
+	if clientPubKey == "" {
+		// No caller-supplied key: generate a keypair. For probe-named clients
+		// this keeps the PSK-less probe policy while still yielding a valid
+		// peer identity (the name-only legacy fallback has no caller key, and
+		// a keyless [Peer] would be rejected by upsertPeerInConfig).
 		clientPrivKey, clientPubKey, err = GenerateWGKeypair()
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate client keypair: %w", err)
