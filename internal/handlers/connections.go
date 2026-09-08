@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
@@ -78,10 +79,26 @@ func (h *Handlers) UserGetMyConnectionsHandler(w http.ResponseWriter, r *http.Re
 	for i, c := range conns {
 		srvName := serversMap[c.ServerID]
 		if srvName == "" {
-			srvName = fmt.Sprintf("Server #%d", c.ServerID)
+			if c.ServerID == 0 {
+				srvName = "Load Balancer (Auto)"
+			} else {
+				srvName = fmt.Sprintf("Server #%d", c.ServerID)
+			}
 		}
 
-		srvStatus, srvReachable := h.serverReachabilityInfo(ctx, c.ServerID)
+		var srvStatus string
+		var srvReachable bool
+		if c.ServerID == 0 {
+			if h.vpnSvc != nil {
+				srvStatus = "online"
+				srvReachable = true
+			} else {
+				srvStatus = "offline"
+				srvReachable = false
+			}
+		} else {
+			srvStatus, srvReachable = h.serverReachabilityInfo(ctx, c.ServerID)
+		}
 
 		enriched[i] = map[string]any{
 			"id":               c.ID,
@@ -157,6 +174,12 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 	// 2. Limits and Rate Limiting (per-user overrides win over global settings)
 	userConns, _ := h.db.GetConnectionsByUserID(ctx, user.ID)
 	if !h.checkConnectionLimits(w, ctx, user, userConns) {
+		return
+	}
+
+	isLoadBalanced := req.ServerID == 0 || req.LoadBalanced
+	if isLoadBalanced {
+		h.addLoadBalancedConnection(w, r, user, sess, req, userConns)
 		return
 	}
 
@@ -241,6 +264,81 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// addLoadBalancedConnection provisions a load-balanced client connection targeting the portal VPN subsystem.
+func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Request, user *models.User, sess *models.SessionData, req models.MyAddConnectionRequest, userConns []models.UserConnection) {
+	if h.vpnSvc == nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
+		return
+	}
+
+	if h.hasDuplicateConnectionName(userConns, req.Name) {
+		h.JSON(w, http.StatusConflict, map[string]any{
+			"error":   "duplicate_name",
+			"message": "A connection with this name already exists.",
+		})
+		return
+	}
+
+	ctx := r.Context()
+	newConn := &models.UserConnection{
+		ID:         uuid.NewString(),
+		UserID:     user.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "",
+		Name:       req.Name,
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	if req.AWGMimicry != nil {
+		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
+	}
+	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+		return
+	}
+
+	configStr, _, err := h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+	if err != nil {
+		_, _ = h.db.DeleteConnection(ctx, newConn.ID)
+		h.JSONError(w, http.StatusInternalServerError, "vpn_config_error", "Failed to generate load-balanced configuration: "+err.Error())
+		return
+	}
+
+	clientPub := vpn.ExtractClientPublicKeyFromConfig(configStr)
+	if clientPub == "" {
+		if updated, err := h.db.GetConnection(ctx, newConn.ID); err == nil && updated != nil && updated.ClientID != "" {
+			clientPub = updated.ClientID
+		}
+	}
+	if clientPub == "" {
+		clientPub = uuid.NewString()
+	}
+
+	_, _ = h.db.UpdateConnection(ctx, newConn.ID, map[string]any{
+		"client_id": clientPub,
+		"server_id": int64(0),
+		"name":      req.Name,
+		"protocol":  "awg",
+	})
+	newConn.ClientID = clientPub
+	newConn.ServerID = 0
+	newConn.Protocol = "awg"
+	newConn.Name = req.Name
+
+	_ = h.db.LogConnectionCreation(ctx, user.ID)
+	h.audit(r, "connection.user_add", map[string]any{"user_id": user.ID, "server_id": int64(0), "protocol": "awg", "client_id": clientPub, "name": req.Name})
+
+	vpnLink := GenerateVPNLink(configStr)
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"client_id":  clientPub,
+		"config":     configStr,
+		"vpn_link":   vpnLink,
+		"connection": newConn,
+	})
+}
+
 func getConnectionID(r *http.Request) string {
 	if id := chi.URLParam(r, "connection_id"); id != "" {
 		return id
@@ -266,6 +364,28 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 	conn, err := h.db.GetConnection(ctx, connectionID)
 	if err != nil || conn == nil || conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+
+	if conn.ServerID == 0 {
+		if h.vpnSvc == nil {
+			h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
+			return
+		}
+		configStr, _, err := h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			return
+		}
+		vpnLink := GenerateVPNLink(configStr)
+		filename := fmt.Sprintf("%s.conf", conn.Name)
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"config":      configStr,
+			"filename":    filename,
+			"vpn_link":    vpnLink,
+			"awg_mimicry": conn.AWGMimicry,
+		})
 		return
 	}
 
@@ -320,22 +440,36 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	server, err := h.db.GetServer(ctx, conn.ServerID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
+	var configStr string
+	if conn.ServerID == 0 {
+		if h.vpnSvc == nil {
+			h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
+			return
+		}
+		var err error
+		configStr, _, err = h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			return
+		}
+	} else {
+		server, err := h.db.GetServer(ctx, conn.ServerID)
+		if err != nil || server == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
+			return
+		}
 
-	protoMgr, err := h.GetProtocolManager(conn.Protocol)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
-		return
-	}
+		protoMgr, err := h.GetProtocolManager(conn.Protocol)
+		if err != nil {
+			h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
+			return
+		}
 
-	configStr, err := protoMgr.GetClientConfig(ctx, server, conn.ClientID)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
-		return
+		configStr, err = protoMgr.GetClientConfig(ctx, server, conn.ClientID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			return
+		}
 	}
 
 	vpnLink := GenerateVPNLink(configStr)
@@ -433,10 +567,16 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	server, err := h.db.GetServer(ctx, conn.ServerID)
-	if err == nil && server != nil {
-		if protoMgr, err := h.GetProtocolManager(conn.Protocol); err == nil && protoMgr != nil {
-			_ = protoMgr.RemoveClient(ctx, server, conn.ClientID)
+	if conn.ServerID == 0 {
+		if h.vpnSvc != nil {
+			_ = h.vpnSvc.ReleaseClient(ctx, conn.ClientID)
+		}
+	} else {
+		server, err := h.db.GetServer(ctx, conn.ServerID)
+		if err == nil && server != nil {
+			if protoMgr, err := h.GetProtocolManager(conn.Protocol); err == nil && protoMgr != nil {
+				_ = protoMgr.RemoveClient(ctx, server, conn.ClientID)
+			}
 		}
 	}
 

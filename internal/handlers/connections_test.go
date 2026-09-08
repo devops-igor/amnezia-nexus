@@ -725,3 +725,269 @@ func TestConnectionLimit_ConcurrentAdds(t *testing.T) {
 		t.Errorf("expected %d successful adds, got %d (rejected: %d)", limit, successCount.Load(), limitHitCount.Load())
 	}
 }
+
+func TestUserAddConnectionHandler_LoadBalancedSuccess(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-succ-1",
+		Username:     "lbuser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	body, _ := json.Marshal(models.MyAddConnectionRequest{
+		ServerID:     0,
+		Protocol:     "awg",
+		Name:         "My Cluster Connection",
+		LoadBalanced: true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/connections/add", bytes.NewReader(body))
+	reqCtx := middleware.WithSession(req.Context(), sess)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req.WithContext(reqCtx))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Status     string                 `json:"status"`
+		ClientID   string                 `json:"client_id"`
+		Config     string                 `json:"config"`
+		VPNLink    string                 `json:"vpn_link"`
+		Connection *models.UserConnection `json:"connection"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Status != "ok" {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
+	}
+	if resp.ClientID == "" {
+		t.Errorf("expected non-empty client_id")
+	}
+	if !strings.Contains(resp.Config, "[Interface]") || !strings.Contains(resp.Config, "[Peer]") {
+		t.Errorf("expected valid AWG config with [Interface] and [Peer], got:\n%s", resp.Config)
+	}
+	if resp.VPNLink == "" {
+		t.Errorf("expected non-empty vpn_link")
+	}
+	if resp.Connection == nil {
+		t.Fatalf("expected connection object in response")
+	}
+	if resp.Connection.ServerID != 0 {
+		t.Errorf("expected connection ServerID == 0, got %d", resp.Connection.ServerID)
+	}
+	if resp.Connection.Protocol != "awg" {
+		t.Errorf("expected connection Protocol == 'awg', got %q", resp.Connection.Protocol)
+	}
+	if resp.Connection.Name != "My Cluster Connection" {
+		t.Errorf("expected connection Name == 'My Cluster Connection', got %q", resp.Connection.Name)
+	}
+
+	// Verify in DB
+	dbConn, err := db.GetConnection(ctx, resp.Connection.ID)
+	if err != nil || dbConn == nil {
+		t.Fatalf("expected connection in DB, got err=%v", err)
+	}
+	if dbConn.ServerID != 0 {
+		t.Errorf("expected DB connection ServerID == 0, got %d", dbConn.ServerID)
+	}
+	if dbConn.ClientID != resp.ClientID {
+		t.Errorf("expected DB connection ClientID == %q, got %q", resp.ClientID, dbConn.ClientID)
+	}
+}
+
+func TestUserAddConnectionHandler_LoadBalancedVPNUnavailable(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	h.vpnSvc = nil // VPN service offline
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-unavail-1",
+		Username:     "lbuser-unavail",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	body, _ := json.Marshal(models.MyAddConnectionRequest{
+		ServerID:     0,
+		Protocol:     "awg",
+		Name:         "LB Conn When Offline",
+		LoadBalanced: true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/connections/add", bytes.NewReader(body))
+	reqCtx := middleware.WithSession(req.Context(), sess)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req.WithContext(reqCtx))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "vpn_unavailable" {
+		t.Errorf("expected error 'vpn_unavailable', got %v", resp["error"])
+	}
+}
+
+func TestUserGetConnectionConfigHandler_LoadBalanced(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-cfg-1",
+		Username:     "lbcfguser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	conn := &models.UserConnection{
+		ID:         "conn-lb-cfg-1",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "test-client-pubkey",
+		Name:       "LB Conn Config Test",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/config", conn.ID), nil)
+	reqCtx := middleware.WithSession(req.Context(), sess)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req.WithContext(reqCtx))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Status   string `json:"status"`
+		Config   string `json:"config"`
+		Filename string `json:"filename"`
+		VPNLink  string `json:"vpn_link"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Status != "ok" {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
+	}
+	if !strings.Contains(resp.Config, "[Interface]") {
+		t.Errorf("expected config to contain [Interface], got:\n%s", resp.Config)
+	}
+	if resp.Filename != "LB Conn Config Test.conf" {
+		t.Errorf("expected filename 'LB Conn Config Test.conf', got %q", resp.Filename)
+	}
+	if resp.VPNLink == "" {
+		t.Errorf("expected non-empty vpn_link")
+	}
+
+	// Also test connection kit for ServerID == 0
+	reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", conn.ID), nil)
+	reqKitCtx := middleware.WithSession(reqKit.Context(), sess)
+	wKit := httptest.NewRecorder()
+	r.ServeHTTP(wKit, reqKit.WithContext(reqKitCtx))
+
+	if wKit.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for kit, got %d", wKit.Code)
+	}
+	if wKit.Header().Get("Content-Type") != "application/zip" {
+		t.Errorf("expected application/zip Content-Type, got %q", wKit.Header().Get("Content-Type"))
+	}
+	if len(wKit.Body.Bytes()) == 0 {
+		t.Errorf("expected non-empty zip bytes")
+	}
+}
+
+func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-del-1",
+		Username:     "lbdeluser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	conn := &models.UserConnection{
+		ID:        "conn-lb-del-1",
+		UserID:    u.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "test-del-client-pubkey",
+		Name:      "LB Conn To Delete",
+		CreatedAt: time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", conn.ID), nil)
+	reqCtx := middleware.WithSession(req.Context(), sess)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req.WithContext(reqCtx))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify deleted from DB
+	deleted, err := db.GetConnection(ctx, conn.ID)
+	if err != nil {
+		t.Fatalf("unexpected error getting connection: %v", err)
+	}
+	if deleted != nil {
+		t.Errorf("expected connection to be deleted from DB, but still found")
+	}
+}
