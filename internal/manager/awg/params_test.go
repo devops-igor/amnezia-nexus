@@ -3,7 +3,10 @@ package awg
 import (
 	"encoding/base64"
 	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
 func TestGenerateWGKeypair(t *testing.T) {
@@ -144,6 +147,59 @@ func TestGenerateStandardObfuscationValues_Floor(t *testing.T) {
 		}
 		if h1 == 0 || h2 == 0 || h3 == 0 || h4 == 0 {
 			t.Errorf("iteration %d: unexpected zero header value: h1=%d, h2=%d, h3=%d, h4=%d", i, h1, h2, h3, h4)
+		}
+	}
+}
+
+func TestAWGParamsFromVPNConfig_NoCPSPackets(t *testing.T) {
+	cfg := &models.VPNConfig{
+		H1: 12345678,
+		H2: 23456789,
+		H3: 34567890,
+		H4: 45678901,
+		S1: 45,
+		S2: 60,
+		S3: 25,
+		S4: 15,
+	}
+
+	params := AWGParamsFromVPNConfig(cfg)
+	if params == nil {
+		t.Fatal("AWGParamsFromVPNConfig returned nil")
+	}
+
+	if params.I1 != "" || params.I2 != "" || params.I3 != "" || params.I4 != "" || params.I5 != "" {
+		t.Errorf("AWGParamsFromVPNConfig must not contain CPS I1..I5 parameters: I1=%q, I2=%q, I3=%q, I4=%q, I5=%q",
+			params.I1, params.I2, params.I3, params.I4, params.I5)
+	}
+
+	// Verify pure AWG 3+ parameters are properly mapped
+	if params.InitPacketMagicHeader != "12345678" ||
+		params.ResponsePacketMagicHeader != "23456789" ||
+		params.UnderloadPacketMagicHeader != "34567890" ||
+		params.TransportPacketMagicHeader != "45678901" {
+		t.Errorf("unexpected magic headers in params: %+v", params)
+	}
+
+	if params.InitPacketJunkSize != "45" ||
+		params.ResponsePacketJunkSize != "60" ||
+		params.CookieReplyPacketJunkSize != "25" ||
+		params.TransportPacketJunkSize != "15" {
+		t.Errorf("unexpected junk sizes in params: %+v", params)
+	}
+
+	// Also verify nil cfg produces empty I1..I5
+	nilParams := AWGParamsFromVPNConfig(nil)
+	if nilParams.I1 != "" || nilParams.I2 != "" || nilParams.I3 != "" || nilParams.I4 != "" || nilParams.I5 != "" {
+		t.Errorf("nil cfg must produce empty I1..I5: I1=%q, I2=%q, I3=%q, I4=%q, I5=%q",
+			nilParams.I1, nilParams.I2, nilParams.I3, nilParams.I4, nilParams.I5)
+	}
+
+	// Verify RenderClientConfig with these params produces no I1-I5 lines
+	rendered := RenderClientConfig("priv", "10.0.0.2", "pub", "", "1.2.3.4:51820", "1.1.1.1", "1.0.0.1", "1420", params)
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if strings.Contains(rendered, k+" =") || strings.Contains(rendered, k+"=") {
+			t.Errorf("rendered config should not contain %s, got:\n%s", k, rendered)
 		}
 	}
 }
