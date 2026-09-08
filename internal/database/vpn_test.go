@@ -327,44 +327,69 @@ func TestVPNQueries(t *testing.T) {
 	}
 }
 
-func TestVPNConfig_MigrationOnRead(t *testing.T) {
+func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 	db, _ := setupTestDB(t)
 	ctx := context.Background()
 
-	// Seed legacy VPN config JSON without H/S fields directly
+	// Seed legacy VPN config JSON without H/S fields directly (the state
+	// left behind by pre-obfuscation panel versions).
 	legacyJSON := `{"algorithm":"least_connections","listen_port":51820,"subnet_cidr":"10.100.0.0/16","health_threshold_ms":500,"max_total_peers":1000,"max_peers_per_backend":250}`
 	if _, err := db.sqlDB.ExecContext(ctx, "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", "vpn_config", legacyJSON); err != nil {
 		t.Fatalf("failed to seed legacy vpn_config: %v", err)
 	}
 
-	// 1. First read: must generate H1-H4 and S1-S4 and persist them
+	// Layering contract (Issue #5 finding 8): GetVPNConfig must NOT
+	// migrate. It returns the stored values verbatim — obfuscation
+	// migration is owned by vpn.NewVPNService, so a single component
+	// derives, persists, and distributes the parameters.
 	cfg, err := db.GetVPNConfig(ctx)
 	if err != nil {
 		t.Fatalf("GetVPNConfig failed: %v", err)
 	}
-	if cfg.H1 == 0 || cfg.H2 == 0 || cfg.H3 == 0 || cfg.H4 == 0 {
-		t.Errorf("expected generated H1-H4 > 0, got H1=%d H2=%d H3=%d H4=%d", cfg.H1, cfg.H2, cfg.H3, cfg.H4)
+	if cfg.H1 != 0 || cfg.H2 != 0 || cfg.H3 != 0 || cfg.H4 != 0 {
+		t.Errorf("GetVPNConfig must not generate H values, got H1=%d H2=%d H3=%d H4=%d", cfg.H1, cfg.H2, cfg.H3, cfg.H4)
 	}
-	if cfg.S1 == 0 || cfg.S2 == 0 || cfg.S3 == 0 || cfg.S4 == 0 {
-		t.Errorf("expected generated S1-S4 > 0, got S1=%d S2=%d S3=%d S4=%d", cfg.S1, cfg.S2, cfg.S3, cfg.S4)
-	}
-	diff := cfg.S1 - cfg.S2
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff < 10 {
-		t.Errorf("expected |S1 - S2| >= 10, got S1=%d, S2=%d, diff=%d", cfg.S1, cfg.S2, diff)
+	if cfg.S1 != 0 || cfg.S2 != 0 || cfg.S3 != 0 || cfg.S4 != 0 {
+		t.Errorf("GetVPNConfig must not generate S values, got S1=%d S2=%d S3=%d S4=%d", cfg.S1, cfg.S2, cfg.S3, cfg.S4)
 	}
 
-	// 2. Second read: must return identical persisted values (no re-generation)
+	// Second read: still verbatim, no generation, no persistence side
+	// effect.
 	cfg2, err := db.GetVPNConfig(ctx)
 	if err != nil {
 		t.Fatalf("second GetVPNConfig failed: %v", err)
 	}
-	if cfg2.H1 != cfg.H1 || cfg2.H2 != cfg.H2 || cfg2.H3 != cfg.H3 || cfg2.H4 != cfg.H4 {
-		t.Errorf("persisted H values changed on second read: %+v vs %+v", cfg2, cfg)
+	if cfg2.H1 != 0 || cfg2.S1 != 0 {
+		t.Errorf("second read changed values: %+v", cfg2)
 	}
-	if cfg2.S1 != cfg.S1 || cfg2.S2 != cfg.S2 || cfg2.S3 != cfg.S3 || cfg2.S4 != cfg.S4 {
-		t.Errorf("persisted S values changed on second read: %+v vs %+v", cfg2, cfg)
+
+	// Explicit values round-trip untouched: the DB layer preserves
+	// whatever the migration owner persisted.
+	explicit := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      1000,
+		MaxPeersPerBackend: 250,
+		Weights:            map[int64]int{},
+		H1:                 111111111,
+		H2:                 222222222,
+		H3:                 333333333,
+		H4:                 444444444,
+		S1:                 31,
+		S2:                 41,
+		S3:                 21,
+		S4:                 16,
+	}
+	if err := db.SaveVPNConfig(ctx, explicit); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+	loaded, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig after explicit save failed: %v", err)
+	}
+	if loaded.H1 != 111111111 || loaded.S1 != 31 || loaded.S4 != 16 {
+		t.Errorf("explicit obfuscation values not round-tripped verbatim: %+v", loaded)
 	}
 }

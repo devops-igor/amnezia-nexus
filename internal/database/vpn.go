@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/security"
 )
@@ -317,20 +316,11 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}
-	if cfg.H1 == 0 {
-		h1, h2, h3, h4, s1, s2, s3, s4, err := awg.GenerateStandardObfuscationValues()
-		if err == nil {
-			cfg.H1 = h1
-			cfg.H2 = h2
-			cfg.H3 = h3
-			cfg.H4 = h4
-			cfg.S1 = s1
-			cfg.S2 = s2
-			cfg.S3 = s3
-			cfg.S4 = s4
-			_ = d.SaveVPNConfig(ctx, &cfg)
-		}
-	}
+	// Obfuscation-parameter migration (generating H/S when unset and
+	// persisting them) intentionally does NOT happen here: the database
+	// package must not own obfuscation-parameter derivation. NewVPNService
+	// in internal/vpn owns the migration so a single component derives,
+	// persists, and distributes the parameters to listener and clients.
 	return &cfg, nil
 }
 

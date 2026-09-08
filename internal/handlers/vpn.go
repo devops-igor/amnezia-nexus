@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
-	"strings"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
@@ -58,15 +61,17 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	ctx := r.Context()
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.EnableBackend(ctx, serverID); err != nil {
-			if strings.Contains(err.Error(), "server has no AWG protocol installed") {
+			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return
 			}
-			if strings.Contains(err.Error(), "not found") {
+			if errors.Is(err, vpn.ErrServerNotFound) {
 				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
 				return
 			}
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend: "+err.Error())
+			// #nosec G706 -- Internal server audit log for failed backend enable
+			log.Printf("[vpn/handlers] failed to enable backend %d: %v", serverID, err)
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend")
 			return
 		}
 	}
@@ -139,25 +144,86 @@ func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSON(w, http.StatusOK, cfg)
 }
 
+func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicEndpoint bool) {
+	if current == nil || cfg == nil {
+		return
+	}
+	if cfg.H1 == 0 && cfg.S1 == 0 {
+		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = current.H1, current.H2, current.H3, current.H4
+		cfg.S1, cfg.S2, cfg.S3, cfg.S4 = current.S1, current.S2, current.S3, current.S4
+		cfg.ServerPrivateKey = current.ServerPrivateKey
+		cfg.ServerPublicKey = current.ServerPublicKey
+	}
+	if !hasPublicEndpoint {
+		cfg.PublicEndpoint = current.PublicEndpoint
+	}
+	if cfg.Algorithm == "" {
+		cfg.Algorithm = current.Algorithm
+	}
+	if cfg.ListenPort == 0 {
+		cfg.ListenPort = current.ListenPort
+	}
+	if cfg.SubnetCIDR == "" {
+		cfg.SubnetCIDR = current.SubnetCIDR
+	}
+	if cfg.MaxTotalPeers == 0 {
+		cfg.MaxTotalPeers = current.MaxTotalPeers
+	}
+	if cfg.MaxPeersPerBackend == 0 {
+		cfg.MaxPeersPerBackend = current.MaxPeersPerBackend
+	}
+	if cfg.Weights == nil {
+		cfg.Weights = current.Weights
+	}
+	if cfg.HealthThresholdMS == 0 {
+		cfg.HealthThresholdMS = current.HealthThresholdMS
+	}
+}
+
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
 func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request) {
-	var cfg models.VPNConfig
-	if err := h.DecodeJSON(r, &cfg); err != nil {
+	if r.Body == nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
+		return
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
+	if err != nil || len(bodyBytes) == 0 {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return
+	}
+	defer r.Body.Close()
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return
 	}
 
+	var cfg models.VPNConfig
+	if err := json.Unmarshal(bodyBytes, &cfg); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return
+	}
+
+	_, hasPublicEndpoint := raw["public_endpoint"]
+
 	ctx := r.Context()
 	if h.vpnSvc != nil {
+		if current, err := h.vpnSvc.GetConfig(ctx); err == nil && current != nil {
+			mergeVPNConfig(current, &cfg, hasPublicEndpoint)
+		}
 		if err := h.vpnSvc.UpdateConfig(ctx, &cfg); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
 			return
 		}
 	} else if h.db != nil {
+		if current, err := h.db.GetVPNConfig(ctx); err == nil && current != nil {
+			mergeVPNConfig(current, &cfg, hasPublicEndpoint)
+		}
 		_ = h.db.SaveVPNConfig(ctx, &cfg)
 	}
 
-	h.audit(r, "vpn.config_update", map[string]any{"algorithm": string(cfg.Algorithm), "listen_port": cfg.ListenPort})
+	h.audit(r, "vpn.config_update", map[string]any{"algorithm": string(cfg.Algorithm), "listen_port": cfg.ListenPort, "public_endpoint": cfg.PublicEndpoint})
 	h.JSONOK(w)
 }
 
