@@ -1,0 +1,32 @@
+services:
+  amnezia-panel:
+    image: ${AMNEZIA_IMAGE:-ghcr.io/devops-igor/amnezia-nexus:latest}
+    container_name: amnezia-panel
+    restart: unless-stopped
+    user: root
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:5000"
+      - "51820:51820/udp"
+    volumes:
+      - panel-data:/app/data
+    environment:
+      - PORT=5000
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - VPN_ENABLED=true
+      - VPN_LISTEN_PORT=51820
+      - VPN_SUBNET=10.100.0.0/16
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:5000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  panel-data:
+    driver: local
