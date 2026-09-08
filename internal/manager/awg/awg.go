@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +19,22 @@ import (
 )
 
 var (
-	AWGContainerNames = []string{"amnezia-awg", "amnezia-awg2", "amnezia-awg-legacy"}
+	AWGContainerNames  = []string{"amnezia-awg", "amnezia-awg2", "amnezia-awg-legacy"}
+	containerNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 )
+
+const defaultContainerCacheTTL = 5 * time.Minute
+
+// IsValidContainerName validates a container name against strict regex:
+// must start with an alphanumeric character, followed by alphanumeric, dot, underscore, or hyphen.
+func IsValidContainerName(name string) bool {
+	return containerNameRegex.MatchString(name)
+}
+
+type containerCacheEntry struct {
+	name      string
+	expiresAt time.Time
+}
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {
@@ -30,14 +45,126 @@ type SSHProvider interface {
 //
 //nolint:revive
 type AWGManager struct {
-	sshPool SSHProvider
-	mu      sync.Mutex
+	sshPool        SSHProvider
+	mu             sync.Mutex
+	cacheMu        sync.RWMutex
+	containerCache map[string]containerCacheEntry
 }
 
 // NewAWGManager creates a new AWGManager instance.
 func NewAWGManager(pool SSHProvider) *AWGManager {
 	return &AWGManager{
-		sshPool: pool,
+		sshPool:        pool,
+		containerCache: make(map[string]containerCacheEntry),
+	}
+}
+
+func (m *AWGManager) getCachedContainer(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+	if m.containerCache == nil {
+		return "", false
+	}
+	entry, ok := m.containerCache[key]
+	if !ok {
+		return "", false
+	}
+	if time.Now().After(entry.expiresAt) {
+		return "", false
+	}
+	if !IsValidContainerName(entry.name) {
+		return "", false
+	}
+	return entry.name, true
+}
+
+func (m *AWGManager) setCachedContainer(key string, name string) {
+	if key == "" || !IsValidContainerName(name) {
+		return
+	}
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.containerCache == nil {
+		m.containerCache = make(map[string]containerCacheEntry)
+	}
+	m.containerCache[key] = containerCacheEntry{
+		name:      name,
+		expiresAt: time.Now().Add(defaultContainerCacheTTL),
+	}
+}
+
+func (m *AWGManager) getCachedContainerForClient(client ssh.SSHClient) (string, bool) {
+	if client == nil {
+		return "", false
+	}
+	if id := client.GetServerID(); id != nil && *id != 0 {
+		if val, ok := m.getCachedContainer(fmt.Sprintf("id:%d", *id)); ok {
+			return val, true
+		}
+	}
+	if host := client.GetHost(); host != "" {
+		if val, ok := m.getCachedContainer(fmt.Sprintf("host:%s:%d", host, client.GetPort())); ok {
+			return val, true
+		}
+		if val, ok := m.getCachedContainer(fmt.Sprintf("host:%s", host)); ok {
+			return val, true
+		}
+	}
+	return "", false
+}
+
+func (m *AWGManager) setCachedContainerForClient(client ssh.SSHClient, name string) {
+	if client == nil || !IsValidContainerName(name) {
+		return
+	}
+	if id := client.GetServerID(); id != nil && *id != 0 {
+		m.setCachedContainer(fmt.Sprintf("id:%d", *id), name)
+	}
+	if host := client.GetHost(); host != "" {
+		m.setCachedContainer(fmt.Sprintf("host:%s:%d", host, client.GetPort()), name)
+		m.setCachedContainer(fmt.Sprintf("host:%s", host), name)
+	}
+}
+
+func (m *AWGManager) setCachedContainerForServer(server *models.Server, name string) {
+	if server == nil || !IsValidContainerName(name) {
+		return
+	}
+	if server.ID != 0 {
+		m.setCachedContainer(fmt.Sprintf("id:%d", server.ID), name)
+	}
+	if server.Host != "" {
+		port := server.SSHPort
+		if port == 0 {
+			port = 22
+		}
+		m.setCachedContainer(fmt.Sprintf("host:%s:%d", server.Host, port), name)
+		m.setCachedContainer(fmt.Sprintf("host:%s", server.Host), name)
+	}
+}
+
+func (m *AWGManager) invalidateContainerCache(server *models.Server) {
+	if server == nil {
+		return
+	}
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.containerCache == nil {
+		return
+	}
+	if server.ID != 0 {
+		delete(m.containerCache, fmt.Sprintf("id:%d", server.ID))
+	}
+	if server.Host != "" {
+		port := server.SSHPort
+		if port == 0 {
+			port = 22
+		}
+		delete(m.containerCache, fmt.Sprintf("host:%s:%d", server.Host, port))
+		delete(m.containerCache, fmt.Sprintf("host:%s", server.Host))
 	}
 }
 
@@ -265,7 +392,12 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.invalidateContainerCache(server)
+
 	for _, name := range AWGContainerNames {
+		if !IsValidContainerName(name) {
+			continue
+		}
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", name))
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", name))
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rmi %s 2>/dev/null || true", name))
@@ -275,11 +407,20 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 }
 
 func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+	if cached, ok := m.getCachedContainerForClient(client); ok {
+		return cached
+	}
+
 	for _, name := range AWGContainerNames {
+		if !IsValidContainerName(name) {
+			continue
+		}
 		out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", name))
 		if err == nil && code == 0 {
 			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-				if strings.TrimSpace(line) == name {
+				trimmed := strings.TrimSpace(line)
+				if trimmed == name {
+					m.setCachedContainerForClient(client, name)
 					return name
 				}
 			}
@@ -290,26 +431,37 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 	if err == nil && code == 0 {
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "amnezia-awg") {
+			if strings.HasPrefix(trimmed, "amnezia-awg") && IsValidContainerName(trimmed) {
+				m.setCachedContainerForClient(client, trimmed)
 				return trimmed
 			}
 		}
 	}
-	return m.containerName()
+	safeDefault := m.containerName()
+	if !IsValidContainerName(safeDefault) {
+		safeDefault = "amnezia-awg"
+	}
+	return safeDefault
 }
 
 func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
 	names := containerNames
 	if len(names) == 0 || (len(names) == 1 && names[0] == "") {
 		resolved := m.resolveContainerName(ctx, client)
+		if !IsValidContainerName(resolved) {
+			resolved = m.containerName()
+		}
 		names = []string{resolved}
 		for _, name := range AWGContainerNames {
-			if name != resolved {
+			if name != resolved && IsValidContainerName(name) {
 				names = append(names, name)
 			}
 		}
 	}
 	for _, name := range names {
+		if !IsValidContainerName(name) {
+			continue
+		}
 		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/awg0.conf 2>/dev/null", name, m.configPath(), name)
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
@@ -321,6 +473,12 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
 	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	if !IsValidContainerName(cName) {
+		return errors.New("invalid container name")
+	}
 	tmpPath := "/tmp/_amnz_edit_config.conf"
 	if err := client.UploadSudoFile(ctx, tmpPath, []byte(content), 0600); err != nil {
 		return err
@@ -342,6 +500,12 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 
 func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) ([]AWGClient, error) {
 	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	if !IsValidContainerName(cName) {
+		return []AWGClient{}, errors.New("invalid container name")
+	}
 	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", cName, m.clientsTablePath()))
 	if code != 0 || strings.TrimSpace(out) == "" {
 		return []AWGClient{}, nil
@@ -351,6 +515,12 @@ func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) 
 
 func (m *AWGManager) saveClientsTable(ctx context.Context, client ssh.SSHClient, clients []AWGClient) error {
 	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	if !IsValidContainerName(cName) {
+		return errors.New("invalid container name")
+	}
 	jsonData, err := SerializeClientsTable(clients)
 	if err != nil {
 		return err
@@ -557,7 +727,174 @@ func parseSpeedLimits(clientParams map[string]any) (*int, *int) {
 	return speedDown, speedUp
 }
 
+// probePeerPubKey extracts a valid caller-supplied WireGuard public key from
+// clientParams (checked keys: "public_key", then "client_public_key").
+// A valid key is base64 that decodes to exactly 32 bytes. Returns "" when
+// absent or invalid, in which case AddClient generates a keypair as usual.
+func probePeerPubKey(clientParams map[string]any) string {
+	for _, k := range []string{"public_key", "client_public_key"} {
+		v, ok := clientParams[k]
+		if !ok || v == nil {
+			continue
+		}
+		s, isStr := v.(string)
+		if !isStr || s == "" {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(s)
+		if err != nil || len(decoded) != 32 {
+			continue
+		}
+		return s
+	}
+	return ""
+}
+
+// upsertPeerInConfig replaces the [Peer] section whose PublicKey matches
+// peerSection's PublicKey, or appends the section when no such peer exists.
+// [Peer] blocks whose PublicKey is listed in removePubKeys are dropped (stale
+// identity that was re-keyed under the same client name). Duplicate blocks for
+// the same PublicKey are collapsed. Non-peer content is preserved as-is.
+func upsertPeerInConfig(confText, peerSection string, removePubKeys ...string) (string, error) {
+	peerLines := strings.Split(strings.TrimSpace(peerSection), "\n")
+	newPub := ""
+	for _, line := range peerLines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PublicKey = ") {
+			newPub = strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey = "))
+			break
+		}
+	}
+	if newPub == "" {
+		return "", errors.New("peer section is missing a PublicKey line")
+	}
+
+	lines := strings.Split(strings.TrimRight(confText, "\n"), "\n")
+	var out []string
+	replaced := false
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "[Peer]" {
+			out = append(out, lines[i])
+			continue
+		}
+		// Collect the whole [Peer] block (up to the next section header).
+		j := i + 1
+		for j < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
+			j++
+		}
+		block := lines[i:j]
+		blockPub := ""
+		for _, bl := range block {
+			trimmed := strings.TrimSpace(bl)
+			if strings.HasPrefix(trimmed, "PublicKey = ") {
+				blockPub = strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey = "))
+				break
+			}
+		}
+		stale := false
+		for _, rk := range removePubKeys {
+			if rk != "" && rk != newPub && rk == blockPub {
+				stale = true
+				break
+			}
+		}
+		switch {
+		case stale:
+			// Drop the stale block entirely.
+		case blockPub == newPub:
+			if !replaced {
+				out = append(out, peerLines...)
+				replaced = true
+			}
+			// Duplicate legacy block for the same key: drop it.
+		default:
+			out = append(out, block...)
+		}
+		i = j - 1
+	}
+	if !replaced {
+		// Blank separator line before the appended peer, mirroring the
+		// formatting awg-quick conf files get from the portal.
+		withSep := append([]string{""}, peerLines...)
+		out = append(out, withSep...)
+	}
+	return strings.Join(out, "\n") + "\n", nil
+}
+
+// findExistingClient locates an existing clientsTable entry matching the peer
+// identity: by client ID (public key) first, then by client name. Returns the
+// entry index and its current client ID.
+func findExistingClient(clients []AWGClient, clientPubKey, clientName string) (int, string) {
+	for i := range clients {
+		if clients[i].ClientID == clientPubKey || clients[i].UserData.ClientName == clientName {
+			return i, clients[i].ClientID
+		}
+	}
+	return -1, ""
+}
+
+// peerSectionFor renders the [Peer] section to append to the server config.
+// Probe peers carry no PresharedKey line: the prober probes with psk="", so
+// both sides must derive IKpsk2 keys with a zero PSK.
+func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP string) string {
+	if isProbePeer {
+		return fmt.Sprintf("\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n", clientPubKey, clientIP)
+	}
+	return fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", clientPubKey, psk, clientIP)
+}
+
+// upsertClientEntry updates the clientsTable entry at existingIdx in place
+// (keeping IP and identity fields), or appends a new entry when idx < 0.
+func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, speedDown, speedUp *int) []AWGClient {
+	if existingIdx >= 0 {
+		clients[existingIdx].ClientID = clientPubKey
+		clients[existingIdx].UserData.ClientName = clientName
+		clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
+		clients[existingIdx].UserData.PSK = psk
+		clients[existingIdx].UserData.Enabled = true
+		return clients
+	}
+	return append(clients, AWGClient{
+		ClientID: clientPubKey,
+		UserData: AWGClientUserData{
+			ClientName:       clientName,
+			ClientPrivateKey: clientPrivKey,
+			ClientIP:         clientIP,
+			PSK:              psk,
+			Enabled:          true,
+			AWGMimicry:       mimicry,
+			SpeedLimitDown:   speedDown,
+			SpeedLimitUp:     speedUp,
+		},
+	})
+}
+
+// applyClientSpeedLimit applies TC speed limits when any limit is set.
+func applyClientSpeedLimit(ctx context.Context, client ssh.SSHClient, containerName, interfaceName, clientIP string, speedDown, speedUp *int) {
+	if speedDown == nil && speedUp == nil {
+		return
+	}
+	dVal, uVal := 0, 0
+	if speedDown != nil {
+		dVal = *speedDown
+	}
+	if speedUp != nil {
+		uVal = *speedUp
+	}
+	_ = tc.ApplySpeedLimit(ctx, client, containerName, interfaceName, clientIP, dVal, uVal)
+}
+
 // AddClient provisions a new client/peer in the AWG configuration.
+//
+// If clientParams carries a valid caller-supplied public key ("public_key" or
+// "client_public_key"), that key is registered as the peer identity and no
+// keypair is generated (probe peers: the prober signs with the key the portal
+// already holds, so no client private key is stored or returned). Probe peers
+// are registered WITHOUT a PresharedKey because the prober derives Noise keys
+// with an empty PSK; a registered PSK would break the IKpsk2 key derivation.
+// Registration is idempotent: an existing clientsTable entry for the same
+// identity (by client ID or client name) is updated in place, keeping its IP,
+// instead of appending a duplicate [Peer], which amneziawg rejects.
 func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -569,9 +906,14 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	clientName := resolveClientName(clientParams)
 
-	clientPrivKey, clientPubKey, err := GenerateWGKeypair()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate client keypair: %w", err)
+	clientPubKey := probePeerPubKey(clientParams)
+	isProbePeer := clientPubKey != ""
+	clientPrivKey := ""
+	if !isProbePeer {
+		clientPrivKey, clientPubKey, err = GenerateWGKeypair()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate client keypair: %w", err)
+		}
 	}
 
 	// Read server config
@@ -585,20 +927,42 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
 	gatewayIP := AWGDefaults["subnet_ip"]
 
-	clientIP, err := GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-	if err != nil {
-		return nil, err
-	}
-
 	serverParams, _, _ := ParseServerConfig(confText)
 	serverPubKeyOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key", m.containerName()))
 	serverPubKey := strings.TrimSpace(serverPubKeyOut)
-	pskOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key", m.containerName()))
-	psk := strings.TrimSpace(pskOut)
 
-	// Append [Peer] to server config
-	peerSection := fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", clientPubKey, psk, clientIP)
-	newConfig := strings.TrimRight(confText, "\n") + "\n" + peerSection
+	// Idempotency: reuse the existing entry (and its IP) when this identity is
+	// already registered instead of appending a duplicate peer.
+	clients, _ := m.getClientsTable(ctx, client)
+	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
+
+	var psk, clientIP string
+	if existingIdx >= 0 {
+		clientIP = clients[existingIdx].UserData.ClientIP
+	}
+	if clientIP == "" {
+		clientIP, err = GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Normal clients get the server's PresharedKey (read fresh each call, as
+	// before). Probe peers force psk="": the prober derives IKpsk2 keys with an
+	// empty PSK, so the peer must be registered without one (R2).
+	if !isProbePeer {
+		pskOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key", m.containerName()))
+		psk = strings.TrimSpace(pskOut)
+	}
+
+	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP)
+	var removePubKeys []string
+	if existingPubKey != "" && existingPubKey != clientPubKey {
+		removePubKeys = []string{existingPubKey}
+	}
+	newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
+	if err != nil {
+		return nil, err
+	}
 	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
 		return nil, err
 	}
@@ -611,35 +975,22 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		mimicry = fmt.Sprint(v)
 	}
 
-	// Save to clientsTable
-	clients, _ := m.getClientsTable(ctx, client)
-	newEntry := AWGClient{
-		ClientID: clientPubKey,
-		UserData: AWGClientUserData{
-			ClientName:       clientName,
-			ClientPrivateKey: clientPrivKey,
-			ClientIP:         clientIP,
-			PSK:              psk,
-			Enabled:          true,
-			AWGMimicry:       mimicry,
-			SpeedLimitDown:   speedDown,
-			SpeedLimitUp:     speedUp,
-		},
-	}
-	clients = append(clients, newEntry)
+	// Save to clientsTable (update in place when the identity already exists)
+	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp)
 	_ = m.saveClientsTable(ctx, client, clients)
 
-	// Apply speed limit via TC
-	if speedDown != nil || speedUp != nil {
-		dVal, uVal := 0, 0
-		if speedDown != nil {
-			dVal = *speedDown
-		}
-		if speedUp != nil {
-			uVal = *speedUp
-		}
-		_ = tc.ApplySpeedLimit(ctx, client, m.containerName(), m.interfaceName(), clientIP, dVal, uVal)
+	if isProbePeer {
+		// Probe peers need no client config, connection kit, or TC limits:
+		// nothing consumes a private key that does not exist.
+		return map[string]any{
+			"client_id":   clientPubKey,
+			"client_name": clientName,
+			"client_ip":   clientIP,
+		}, nil
 	}
+
+	// Apply speed limit via TC
+	applyClientSpeedLimit(ctx, client, m.containerName(), m.interfaceName(), clientIP, speedDown, speedUp)
 
 	// Render client config
 	parsedParams := AWGParamsFromMap(convertStringMapToAny(serverParams))
@@ -849,6 +1200,47 @@ func (m *AWGManager) ToggleClient(ctx context.Context, server *models.Server, cl
 	return m.saveClientsTable(ctx, client, clients)
 }
 
+// findExistingContainer checks known container names for existence.
+func (m *AWGManager) findExistingContainer(ctx context.Context, client ssh.SSHClient) (string, bool, error) {
+	for _, name := range AWGContainerNames {
+		if !IsValidContainerName(name) {
+			continue
+		}
+		outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", name))
+		if errAll != nil || codeAll != 0 {
+			return "", false, fmt.Errorf("docker ps -a failed checking %s (code %d): %s, %w", name, codeAll, errOutAll, errAll)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(outAll), "\n") {
+			if strings.TrimSpace(line) == name {
+				return name, true, nil
+			}
+		}
+	}
+	return "", false, nil
+}
+
+// enrichRunningServerStatus populates configuration and credential details for a running container.
+func (m *AWGManager) enrichRunningServerStatus(ctx context.Context, server *models.Server, client ssh.SSHClient, cName string, status map[string]any) {
+	if conf, err := m.getServerConfig(ctx, client, cName); err == nil {
+		params, peers, _ := ParseServerConfig(conf)
+		status["port"] = params["port"]
+		status["awg_params"] = params
+		status["clients_count"] = len(peers)
+	}
+	// If port is missing or 0, fallback extraction from docker port or docker inspect
+	if p, ok := status["port"]; !ok || p == nil || fmt.Sprint(p) == "" || fmt.Sprint(p) == "0" {
+		if port := m.extractContainerPort(ctx, client, cName); port > 0 {
+			status["port"] = port
+		}
+	}
+	if pubKey, err := m.GetServerPublicKey(ctx, server); err == nil && pubKey != "" {
+		status["public_key"] = pubKey
+	}
+	if psk, err := m.GetServerPSK(ctx, server); err == nil && psk != "" {
+		status["psk"] = psk
+	}
+}
+
 // GetServerStatus returns whether the container is running and configuration details across all valid container names.
 func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
 	client, err := m.getSSHClient(ctx, server)
@@ -856,28 +1248,16 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		return nil, err
 	}
 
-	var foundName string
-	var exists bool
-	var running bool
-
-	for _, name := range AWGContainerNames {
-		outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", name))
-		if errAll != nil || codeAll != 0 {
-			return nil, fmt.Errorf("docker ps -a failed checking %s (code %d): %s, %w", name, codeAll, errOutAll, errAll)
-		}
-		for _, line := range strings.Split(strings.TrimSpace(outAll), "\n") {
-			if strings.TrimSpace(line) == name {
-				exists = true
-				foundName = name
-				break
-			}
-		}
-		if exists {
-			break
-		}
+	foundName, exists, err := m.findExistingContainer(ctx, client)
+	if err != nil {
+		return nil, err
 	}
 
-	if exists && foundName != "" {
+	var running bool
+	if exists && foundName != "" && IsValidContainerName(foundName) {
+		m.setCachedContainerForServer(server, foundName)
+		m.setCachedContainerForClient(client, foundName)
+
 		outRun, errOutRun, codeRun, errRun := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Status}}'", foundName))
 		if errRun != nil || codeRun != 0 {
 			return nil, fmt.Errorf("docker ps failed checking %s (code %d): %s, %w", foundName, codeRun, errOutRun, errRun)
@@ -896,24 +1276,10 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		if cName == "" {
 			cName = m.resolveContainerName(ctx, client)
 		}
-		if conf, err := m.getServerConfig(ctx, client, cName); err == nil {
-			params, peers, _ := ParseServerConfig(conf)
-			status["port"] = params["port"]
-			status["awg_params"] = params
-			status["clients_count"] = len(peers)
+		if !IsValidContainerName(cName) {
+			cName = m.containerName()
 		}
-		// If port is missing or 0, fallback extraction from docker port or docker inspect
-		if p, ok := status["port"]; !ok || p == nil || fmt.Sprint(p) == "" || fmt.Sprint(p) == "0" {
-			if port := m.extractContainerPort(ctx, client, cName); port > 0 {
-				status["port"] = port
-			}
-		}
-		if pubKey, err := m.GetServerPublicKey(ctx, server); err == nil && pubKey != "" {
-			status["public_key"] = pubKey
-		}
-		if psk, err := m.GetServerPSK(ctx, server); err == nil && psk != "" {
-			status["psk"] = psk
-		}
+		m.enrichRunningServerStatus(ctx, server, client, cName, status)
 	}
 
 	return status, nil
@@ -925,7 +1291,10 @@ func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHCli
 	if containerName == "" {
 		containerName = m.resolveContainerName(ctx, client)
 	}
-	if containerName == "" {
+	if !IsValidContainerName(containerName) {
+		containerName = m.containerName()
+	}
+	if !IsValidContainerName(containerName) {
 		return 0
 	}
 	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker port %s 2>/dev/null", containerName))
@@ -961,14 +1330,20 @@ func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Serv
 	}
 
 	resolved := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(resolved) {
+		resolved = m.containerName()
+	}
 	names := []string{resolved}
 	for _, name := range AWGContainerNames {
-		if name != resolved {
+		if name != resolved && IsValidContainerName(name) {
 			names = append(names, name)
 		}
 	}
 
 	for _, name := range names {
+		if !IsValidContainerName(name) {
+			continue
+		}
 		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", name, name, m.wgBinary(), name)
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
@@ -1005,14 +1380,20 @@ func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (s
 	}
 
 	resolved := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(resolved) {
+		resolved = m.containerName()
+	}
 	names := []string{resolved}
 	for _, name := range AWGContainerNames {
-		if name != resolved {
+		if name != resolved && IsValidContainerName(name) {
 			names = append(names, name)
 		}
 	}
 
 	for _, name := range names {
+		if !IsValidContainerName(name) {
+			continue
+		}
 		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/wireguard_psk.key 2>/dev/null", name, name)
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
