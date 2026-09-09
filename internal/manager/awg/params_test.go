@@ -203,3 +203,49 @@ func TestAWGParamsFromVPNConfig_NoCPSPackets(t *testing.T) {
 		}
 	}
 }
+
+func TestAWGParamsFromVPNConfig_HeaderProtectionKey(t *testing.T) {
+	// Case 1: HeaderProtectionKey present with small S values (< 12) -> enforced to >= 12
+	cfg := &models.VPNConfig{
+		H1:                  1234,
+		H2:                  5678,
+		H3:                  9012,
+		H4:                  3456,
+		S1:                  4,
+		S2:                  8,
+		S3:                  6,
+		S4:                  10,
+		HeaderProtectionKey: "test-hp-key-base64",
+	}
+
+	params := AWGParamsFromVPNConfig(cfg)
+	if params.HeaderProtectionKey != "test-hp-key-base64" {
+		t.Errorf("expected HeaderProtectionKey %q, got %q", "test-hp-key-base64", params.HeaderProtectionKey)
+	}
+	if params.InitPacketJunkSize != "12" {
+		t.Errorf("expected S1 enforced to 12, got %s", params.InitPacketJunkSize)
+	}
+	if params.ResponsePacketJunkSize != "12" {
+		t.Errorf("expected S2 enforced to 12, got %s", params.ResponsePacketJunkSize)
+	}
+	if params.CookieReplyPacketJunkSize != "12" {
+		t.Errorf("expected S3 enforced to 12, got %s", params.CookieReplyPacketJunkSize)
+	}
+	if params.TransportPacketJunkSize != "12" {
+		t.Errorf("expected S4 enforced to 12, got %s", params.TransportPacketJunkSize)
+	}
+
+	// Case 2: S values already >= 12 -> preserved
+	cfg2 := &models.VPNConfig{
+		S1:                  20,
+		S2:                  30,
+		S3:                  40,
+		S4:                  50,
+		HeaderProtectionKey: "test-hp-key-2",
+	}
+	params2 := AWGParamsFromVPNConfig(cfg2)
+	if params2.InitPacketJunkSize != "20" || params2.ResponsePacketJunkSize != "30" ||
+		params2.CookieReplyPacketJunkSize != "40" || params2.TransportPacketJunkSize != "50" {
+		t.Errorf("expected S1..S4 preserved when >= 12: %+v", params2)
+	}
+}

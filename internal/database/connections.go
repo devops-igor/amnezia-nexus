@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,7 +18,7 @@ func (d *DB) GetAllConnections(ctx context.Context) ([]models.UserConnection, er
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections ORDER BY created_at`
@@ -45,7 +46,7 @@ func (d *DB) GetConnection(ctx context.Context, id string) (*models.UserConnecti
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections WHERE id = ?`
@@ -71,7 +72,7 @@ func (d *DB) GetConnectionsByUserID(ctx context.Context, userID string) ([]model
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections WHERE user_id = ? ORDER BY created_at`
@@ -104,7 +105,7 @@ func (d *DB) GetConnectionsByServerID(ctx context.Context, serverID int64) ([]mo
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections WHERE server_id = ? ORDER BY created_at`
@@ -133,7 +134,7 @@ func (d *DB) GetConnectionsByServerAndProtocol(ctx context.Context, serverID int
 	defer d.mu.RUnlock()
 
 	normalizedProto := models.NormalizeProtocol(proto)
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections WHERE server_id = ? AND protocol = ?`
@@ -161,7 +162,7 @@ func (d *DB) GetConnectionByToken(ctx context.Context, token string) (*models.Us
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections WHERE client_id = ? LIMIT 1`
@@ -210,11 +211,18 @@ func (d *DB) CreateConnection(ctx context.Context, c *models.UserConnection) (st
 	}
 	createdAtStr := formatTime(c.CreatedAt)
 
+	clientParamsJSON := "{}"
+	if c.ClientParams != nil {
+		if b, err := json.Marshal(c.ClientParams); err == nil {
+			clientParamsJSON = string(b)
+		}
+	}
+
 	query := `INSERT INTO user_connections (
-		id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+		id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := d.sqlDB.ExecContext(ctx, query,
 		c.ID,
@@ -224,6 +232,7 @@ func (d *DB) CreateConnection(ctx context.Context, c *models.UserConnection) (st
 		c.ClientID,
 		c.Name,
 		string(c.AWGMimicry),
+		clientParamsJSON,
 		c.LastRx,
 		c.LastTx,
 		c.TrafficDeltaRx,
@@ -272,6 +281,17 @@ func (d *DB) UpdateConnection(ctx context.Context, id string, updates map[string
 		if col == "protocol" {
 			if s, ok := val.(string); ok {
 				val = models.NormalizeProtocol(s)
+			}
+		}
+		if col == "client_params" {
+			if m, ok := val.(map[string]any); ok {
+				if b, err := json.Marshal(m); err == nil {
+					val = string(b)
+				}
+			} else if m, ok := val.(map[string]string); ok {
+				if b, err := json.Marshal(m); err == nil {
+					val = string(b)
+				}
 			}
 		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
@@ -485,7 +505,7 @@ func (d *DB) PruneConnectionLog(ctx context.Context, maxEntries int) error {
 
 func (d *DB) scanConnection(s scannable) (models.UserConnection, error) {
 	var c models.UserConnection
-	var clientID, name, mimicry, createdAt sql.NullString
+	var clientID, name, mimicry, clientParamsStr, createdAt sql.NullString
 
 	err := s.Scan(
 		&c.ID,
@@ -495,6 +515,7 @@ func (d *DB) scanConnection(s scannable) (models.UserConnection, error) {
 		&clientID,
 		&name,
 		&mimicry,
+		&clientParamsStr,
 		&c.LastRx,
 		&c.LastTx,
 		&c.TrafficDeltaRx,
@@ -517,6 +538,15 @@ func (d *DB) scanConnection(s scannable) (models.UserConnection, error) {
 	c.AWGMimicry = models.AWGMimicryProfile(mimicry.String)
 	if c.AWGMimicry == "" {
 		c.AWGMimicry = models.AWGMimicryAuto
+	}
+	if clientParamsStr.Valid && clientParamsStr.String != "" {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(clientParamsStr.String), &m); err == nil {
+			c.ClientParams = m
+		}
+	}
+	if c.ClientParams == nil {
+		c.ClientParams = make(map[string]any)
 	}
 	if createdAt.Valid && createdAt.String != "" {
 		c.CreatedAt = parseTime(createdAt.String)
