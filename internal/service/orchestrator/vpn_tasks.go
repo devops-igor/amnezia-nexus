@@ -38,12 +38,23 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		probeFn = health.ProbeAWGEndpoint
 	}
 
+	tunnelParams := o.resolveTunnelProbeParams(ctx, tunnels)
+
 	var degradedTunnels []int64
 	var healthyTunnels []*models.BackendTunnel
 
 	for _, t := range tunnels {
 		if strings.EqualFold(t.Status, "disabled") {
 			continue
+		}
+
+		// Resolve the server's actual obfuscation params (stored snake_case
+		// awg_params, canonical format) so the raw UDP probe matches what the
+		// backend expects. Falling back to defaults here was the root cause of
+		// healthy custom-obfuscation backends being marked degraded.
+		params, ok := tunnelParams[t.ID]
+		if !ok {
+			params = resolvedProbeParams{h1: health.DefaultH1, h2: health.DefaultH2, s1: health.DefaultS1, s2: health.DefaultS2}
 		}
 
 		tCopy := t
@@ -53,11 +64,11 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			t.PublicKey,
 			t.PrivateKey,
 			"",
-			"",
-			health.DefaultH1,
-			health.DefaultH2,
-			health.DefaultS1,
-			health.DefaultS2,
+			params.hpKey,
+			params.h1,
+			params.h2,
+			params.s1,
+			params.s2,
 			3*time.Second,
 		)
 
@@ -113,6 +124,81 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// resolvedProbeParams carries the obfuscation parameters used for a raw UDP
+// Noise IK probe against a backend tunnel.
+type resolvedProbeParams struct {
+	h1, h2 uint32
+	s1, s2 int
+	hpKey  string
+}
+
+// resolveTunnelProbeParams resolves per-tunnel obfuscation params from each
+// tunnel's backend server stored awg_params (snake_case canonical format),
+// so the orchestrator probe matches what the backend actually expects.
+// Tunnels whose params cannot be resolved are omitted; callers fall back to
+// the probe defaults. Mirrors the in-process prober's resolveTunnelParams.
+func (o *Orchestrator) resolveTunnelProbeParams(ctx context.Context, tunnels []models.BackendTunnel) map[int64]resolvedProbeParams {
+	out := make(map[int64]resolvedProbeParams, len(tunnels))
+	if o.db == nil {
+		return out
+	}
+
+	byServer := make(map[int64][]int64)
+	for _, t := range tunnels {
+		if t.ServerID > 0 {
+			byServer[t.ServerID] = append(byServer[t.ServerID], t.ID)
+		}
+	}
+	if len(byServer) == 0 {
+		return out
+	}
+
+	for serverID, tunnelIDs := range byServer {
+		server, err := o.db.GetServer(ctx, serverID)
+		if err != nil || server == nil || server.Protocols == nil {
+			if err != nil {
+				slog.Debug("Orchestrator probe param resolution: server read failed", "server_id", serverID, "err", err)
+			}
+			continue
+		}
+		awgInfo, ok := server.Protocols["awg"].(map[string]any)
+		if !ok || awgInfo == nil {
+			continue
+		}
+		var paramsObj any
+		if p, ok := awgInfo["awg_params"]; ok && p != nil {
+			paramsObj = p
+		} else if p, ok := awgInfo["params"]; ok && p != nil {
+			paramsObj = p
+		} else {
+			paramsObj = awgInfo
+		}
+
+		h1, h2, s1, s2, found := health.ExtractAWGExplicitParams(paramsObj)
+		if !found {
+			slog.Debug("Orchestrator probe param resolution: no explicit awg_params on server, using probe defaults", "server_id", serverID)
+			continue
+		}
+		res := resolvedProbeParams{h1: h1, h2: h2, s1: s1, s2: s2, hpKey: health.ExtractHeaderProtectionKey(paramsObj)}
+		if res.h1 == 0 {
+			res.h1 = health.DefaultH1
+		}
+		if res.h2 == 0 {
+			res.h2 = health.DefaultH2
+		}
+		if res.s1 < 0 {
+			res.s1 = health.DefaultS1
+		}
+		if res.s2 < 0 {
+			res.s2 = health.DefaultS2
+		}
+		for _, tid := range tunnelIDs {
+			out[tid] = res
+		}
+	}
+	return out
 }
 
 // RebalanceVPNSessions detects load imbalance across backend tunnels and reassigns sessions to lighter backends.

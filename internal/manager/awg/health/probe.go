@@ -99,7 +99,7 @@ func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string,
 // extractHeaderProtectionKey extracts the base64 header protection key from an
 // awgParams object (map[string]any or map[string]string). Returns "" when absent.
 func extractHeaderProtectionKey(awgParams any) string {
-	v, _ := getMapParamValue(awgParams, "header_protection_key", "hpkey")
+	v, _ := getMapParamValue(awgParams, "header_protection_key", "hpkey", "HeaderProtectionKey", "headerprotectionkey")
 	return v
 }
 
@@ -167,19 +167,24 @@ func extractJunkPreambles(awgParams map[string]any) [][]byte {
 }
 
 func getMapParamValue(awgParams any, keys ...string) (string, bool) {
+	normalizeKey := func(s string) string {
+		return strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(s, "_", ""), "-", ""))
+	}
 	switch m := awgParams.(type) {
 	case map[string]any:
 		for _, k := range keys {
+			nk := normalizeKey(k)
 			for mk, v := range m {
-				if strings.EqualFold(mk, k) && v != nil && fmt.Sprint(v) != "" {
+				if (strings.EqualFold(mk, k) || normalizeKey(mk) == nk) && v != nil && fmt.Sprint(v) != "" {
 					return fmt.Sprint(v), true
 				}
 			}
 		}
 	case map[string]string:
 		for _, k := range keys {
+			nk := normalizeKey(k)
 			for mk, v := range m {
-				if strings.EqualFold(mk, k) && v != "" {
+				if (strings.EqualFold(mk, k) || normalizeKey(mk) == nk) && v != "" {
 					return v, true
 				}
 			}
@@ -232,7 +237,7 @@ func ExtractAWGExplicitParams(awgParams any) (h1, h2 uint32, s1, s2 int, found b
 			"junk_packet_count", "jc",
 			"junk_packet_min_size", "jmin",
 			"junk_packet_max_size", "jmax",
-			"header_protection_key", "hpkey",
+			"header_protection_key", "hpkey", "HeaderProtectionKey",
 		} {
 			if _, ok := getMapParamValue(awgParams, k); ok {
 				found = true
