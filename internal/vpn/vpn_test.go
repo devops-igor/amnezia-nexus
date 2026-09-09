@@ -640,8 +640,8 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 		t.Fatalf("expected 1 added client, got %d", len(adder.addedClients))
 	}
 	clientParams := adder.addedClients[0]
-	if clientParams["clientName"] != "Health Probe" {
-		t.Errorf("expected clientName 'Health Probe', got: %v", clientParams["clientName"])
+	if clientParams["clientName"] != "Portal Data Plane" {
+		t.Errorf("expected clientName 'Portal Data Plane', got: %v", clientParams["clientName"])
 	}
 	proberPub, ok := clientParams["client_public_key"].(string)
 	if !ok || len(proberPub) == 0 {
