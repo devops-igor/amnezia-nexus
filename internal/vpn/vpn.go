@@ -357,6 +357,36 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
+	
+	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		svc.mu.RLock()
+		var serverID int64
+		for _, t := range svc.pool.ListTunnels() {
+			if t.PublicKey == serverPubKey {
+				serverID = t.ServerID
+				break
+			}
+		}
+		var dev *tunnel.AWGClientDevice
+		if serverID > 0 && svc.backendDevices != nil {
+			dev = svc.backendDevices[serverID]
+		}
+		svc.mu.RUnlock()
+
+		if dev != nil {
+			last := dev.LastHandshakeTime()
+			if !last.IsZero() && time.Since(last) < 3*time.Minute {
+				return 10 * time.Millisecond, nil
+			} else if !last.IsZero() && time.Since(last) >= 3*time.Minute {
+				return 0, errors.New("amneziawg-go handshake timeout")
+			}
+			// If LastHandshakeTime is zero, it might just be starting up. Let it continue so amneziawg-go handles it.
+			// Do not send UDP probes, which breaks amneziawg-go's session!
+			return 10 * time.Millisecond, nil
+		}
+		
+		return health.ProbeAWGEndpoint(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
+	})
 
 	return svc, nil
 }
