@@ -82,10 +82,17 @@ type sessionRoute struct {
 	assignedIP      string
 	backendTunnelID int64
 	clientQueue     chan []byte
-	limitDownBps    int64
-	limitUpBps      int64
-	tbDown          *TokenBucket
-	tbUp            *TokenBucket
+	// stopCh terminates this route's pumpClientQueue goroutine on session
+	// teardown; stopped guards exactly-once close. The client queue itself is
+	// deliberately NOT closed because RouteBackendToClient sends to it after
+	// releasing the read lock — closing it would race into a
+	// send-on-closed-channel panic.
+	stopCh       chan struct{}
+	stopped      bool
+	limitDownBps int64
+	limitUpBps   int64
+	tbDown       *TokenBucket
+	tbUp         *TokenBucket
 }
 
 // Forwarder manages packet routing and bidirectional relay between peer sessions and backend tunnels.
@@ -97,6 +104,8 @@ type Forwarder struct {
 	backendQueues    map[int64]chan []byte    // backendTunnelID -> queue
 	clientDevices    map[string]PacketDevice  // peerKey -> device
 	backendDevices   map[int64]PacketDevice   // backendTunnelID -> device
+	backendPumpStops map[int64]chan struct{}  // backendTunnelID -> pump stop channel
+	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
 	defaultClientDev PacketDevice             // default client packet device
 	bufSize          int
 	totalRxBytes     atomic.Int64
@@ -115,14 +124,16 @@ func NewForwarder(accountant *TrafficAccountant, bufSize ...int) *Forwarder {
 		qSize = bufSize[0]
 	}
 	return &Forwarder{
-		accountant:     accountant,
-		routesByPeer:   make(map[string]*sessionRoute),
-		routesByIP:     make(map[string]*sessionRoute),
-		backendQueues:  make(map[int64]chan []byte),
-		clientDevices:  make(map[string]PacketDevice),
-		backendDevices: make(map[int64]PacketDevice),
-		bufSize:        qSize,
-		stopCh:         make(chan struct{}),
+		accountant:       accountant,
+		routesByPeer:     make(map[string]*sessionRoute),
+		routesByIP:       make(map[string]*sessionRoute),
+		backendQueues:    make(map[int64]chan []byte),
+		clientDevices:    make(map[string]PacketDevice),
+		backendDevices:   make(map[int64]PacketDevice),
+		backendPumpStops: make(map[int64]chan struct{}),
+		backendPumpDones: make(map[int64]chan struct{}),
+		bufSize:          qSize,
+		stopCh:           make(chan struct{}),
 	}
 }
 
@@ -156,10 +167,17 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 		assignedIP:      assignedIP,
 		backendTunnelID: backendTunnelID,
 		clientQueue:     make(chan []byte, f.bufSize),
+		stopCh:          make(chan struct{}),
 		limitDownBps:    limitDownBps,
 		limitUpBps:      limitUpBps,
 		tbDown:          tbDown,
 		tbUp:            tbUp,
+	}
+
+	// A re-registration for the same peer replaces an existing route: stop
+	// the old route's pump before the maps are overwritten so it cannot leak.
+	if old, ok := f.routesByPeer[peerKey]; ok && old != nil {
+		f.stopRoutePumpLocked(old)
 	}
 
 	f.routesByPeer[peerKey] = route
@@ -170,6 +188,17 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	if f.pumpsRunning {
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(f.pumpsStopCh, route)
+	}
+}
+
+// stopRoutePumpLocked closes the route's per-session stop channel exactly
+// once. The channel is never nil-ed after close: a pump goroutine that starts
+// after teardown must still be able to observe the closed channel and exit.
+// Caller must hold f.mu (write).
+func (f *Forwarder) stopRoutePumpLocked(route *sessionRoute) {
+	if route != nil && route.stopCh != nil && !route.stopped {
+		close(route.stopCh)
+		route.stopped = true
 	}
 }
 
@@ -212,7 +241,8 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 	return route.limitDownBps, route.limitUpBps, nil
 }
 
-// UnregisterSession removes a peer session route and cleans up its channel.
+// UnregisterSession removes a peer session route, stops its pump goroutine,
+// and drains its queue so in-flight senders cannot block.
 func (f *Forwarder) UnregisterSession(peerKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -221,6 +251,20 @@ func (f *Forwarder) UnregisterSession(peerKey string) {
 		delete(f.routesByIP, route.assignedIP)
 		delete(f.routesByPeer, peerKey)
 		delete(f.clientDevices, peerKey)
+		// Terminate the per-session pump exactly once. The queue is NOT
+		// closed: RouteBackendToClient sends to it after releasing the lock,
+		// and closing would race into a send-on-closed panic. Instead the
+		// pump stops via stopCh and the buffered queue is drained here —
+		// late senders just fill the abandoned buffer and hit ErrQueueFull.
+		f.stopRoutePumpLocked(route)
+	drain:
+		for {
+			select {
+			case <-route.clientQueue:
+			default:
+				break drain
+			}
+		}
 	}
 }
 
@@ -356,7 +400,29 @@ func (f *Forwarder) AttachPeerDevice(peerKey string, dev PacketDevice) {
 // AttachBackendDevice attaches a backend tunnel packet device.
 func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice) {
 	f.mu.Lock()
+	var oldStopCh chan struct{}
+	var oldDoneCh chan struct{}
+	if stopCh, exists := f.backendPumpStops[backendTunnelID]; exists {
+		oldStopCh = stopCh
+		oldDoneCh = f.backendPumpDones[backendTunnelID]
+		delete(f.backendPumpStops, backendTunnelID)
+		delete(f.backendPumpDones, backendTunnelID)
+	}
+	f.mu.Unlock()
+
+	if oldStopCh != nil {
+		close(oldStopCh)
+		if oldDoneCh != nil {
+			select {
+			case <-oldDoneCh:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
 		f.backendQueues[backendTunnelID] = make(chan []byte, f.bufSize)
 	}
@@ -367,16 +433,38 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 	}
 
 	if f.pumpsRunning && dev != nil {
+		pumpStopCh := make(chan struct{})
+		pumpDoneCh := make(chan struct{})
+		f.backendPumpStops[backendTunnelID] = pumpStopCh
+		f.backendPumpDones[backendTunnelID] = pumpDoneCh
 		f.pumpsWg.Add(1)
-		go f.pumpBackendQueue(f.pumpsStopCh, backendTunnelID, f.backendQueues[backendTunnelID], dev)
+		go f.pumpBackendQueue(f.pumpsStopCh, pumpStopCh, pumpDoneCh, backendTunnelID, f.backendQueues[backendTunnelID], dev)
 	}
 }
 
-// DetachBackendDevice detaches a backend tunnel packet device.
+// DetachBackendDevice detaches a backend tunnel packet device and terminates its pump goroutine.
 func (f *Forwarder) DetachBackendDevice(backendTunnelID int64) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	delete(f.backendDevices, backendTunnelID)
+	var oldStopCh chan struct{}
+	var oldDoneCh chan struct{}
+	if stopCh, exists := f.backendPumpStops[backendTunnelID]; exists {
+		oldStopCh = stopCh
+		oldDoneCh = f.backendPumpDones[backendTunnelID]
+		delete(f.backendPumpStops, backendTunnelID)
+		delete(f.backendPumpDones, backendTunnelID)
+	}
+	f.mu.Unlock()
+
+	if oldStopCh != nil {
+		close(oldStopCh)
+		if oldDoneCh != nil {
+			select {
+			case <-oldDoneCh:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}
 }
 
 // StartPumps launches background packet pumps connecting forwarder queues to attached packet devices.
@@ -393,8 +481,12 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 	// Start pump for each backend device
 	for beID, dev := range f.backendDevices {
 		if q, ok := f.backendQueues[beID]; ok && dev != nil {
+			pumpStopCh := make(chan struct{})
+			pumpDoneCh := make(chan struct{})
+			f.backendPumpStops[beID] = pumpStopCh
+			f.backendPumpDones[beID] = pumpDoneCh
 			f.pumpsWg.Add(1)
-			go f.pumpBackendQueue(stopCh, beID, q, dev)
+			go f.pumpBackendQueue(stopCh, pumpStopCh, pumpDoneCh, beID, q, dev)
 		}
 	}
 
@@ -415,20 +507,38 @@ func (f *Forwarder) StopPumps() {
 	}
 	f.pumpsRunning = false
 	close(f.pumpsStopCh)
+	for beID, stopCh := range f.backendPumpStops {
+		close(stopCh)
+		delete(f.backendPumpStops, beID)
+		delete(f.backendPumpDones, beID)
+	}
 	f.mu.Unlock()
 
 	f.pumpsWg.Wait()
 }
 
-func (f *Forwarder) pumpBackendQueue(stopCh <-chan struct{}, backendTunnelID int64, queue chan []byte, dev PacketDevice) {
+func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh <-chan struct{}, doneCh chan struct{}, backendTunnelID int64, queue chan []byte, dev PacketDevice) {
 	defer f.pumpsWg.Done()
+	if doneCh != nil {
+		defer close(doneCh)
+	}
 	for {
 		select {
-		case <-stopCh:
+		case <-globalStopCh:
+			return
+		case <-perPumpStopCh:
 			return
 		case pkt, ok := <-queue:
 			if !ok {
 				return
+			}
+			// Verify this pump was not stopped while queue was ready
+			select {
+			case <-globalStopCh:
+				return
+			case <-perPumpStopCh:
+				return
+			default:
 			}
 			if dev != nil {
 				_, _ = dev.Write(pkt)
@@ -439,9 +549,17 @@ func (f *Forwarder) pumpBackendQueue(stopCh <-chan struct{}, backendTunnelID int
 
 func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute) {
 	defer f.pumpsWg.Done()
+	// routeStopCh: route.stopCh is created at registration and only closed
+	// (never nil-ed or replaced) by UnregisterSession under f.mu, so reading
+	// it here is race-free and a pump started after teardown still observes
+	// the closed channel and exits immediately.
+	routeStopCh := route.stopCh
+
 	for {
 		select {
 		case <-stopCh:
+			return
+		case <-routeStopCh:
 			return
 		case pkt, ok := <-route.clientQueue:
 			if !ok {

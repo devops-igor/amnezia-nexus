@@ -305,3 +305,112 @@ func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *test
 		}
 	}
 }
+
+func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Hook Failure Test Server",
+		Host:      "192.0.2.55",
+		Protocols: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+
+	// Mock probe function always succeeds with 15ms latency
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 15 * time.Millisecond, nil
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	tunnel, err := pool.AddTunnel(ctx, sID, "192.0.2.55:51820", "pubkey-hook-test")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	hookFails := true
+	prober.SetOnActiveHook(func(ctx context.Context, t *models.BackendTunnel) error {
+		if hookFails {
+			return errors.New("simulated hook failure: data-plane missing")
+		}
+		return nil
+	})
+
+	// Probe 1: hook fails -> failCounts = 1, status degraded
+	rtt, err := prober.ProbeTunnel(ctx, tunnel)
+	if err == nil {
+		t.Fatal("expected ProbeTunnel to fail when onActiveHook fails")
+	}
+	if rtt != 0 {
+		t.Errorf("expected rtt=0 on hook failure, got %d", rtt)
+	}
+	prober.mu.RLock()
+	fc1 := prober.failCounts[sID]
+	prober.mu.RUnlock()
+	if fc1 != 1 {
+		t.Fatalf("expected failCounts=1 after first failure, got %d", fc1)
+	}
+	st1, _ := pool.GetTunnel(sID)
+	if st1.Status != "degraded" {
+		t.Errorf("expected tunnel status 'degraded' after 1 hook failure, got %s", st1.Status)
+	}
+
+	// Probe 2: hook fails -> failCounts = 2, status degraded
+	_, err = prober.ProbeTunnel(ctx, tunnel)
+	if err == nil {
+		t.Fatal("expected ProbeTunnel to fail on second hook failure")
+	}
+	prober.mu.RLock()
+	fc2 := prober.failCounts[sID]
+	prober.mu.RUnlock()
+	if fc2 != 2 {
+		t.Fatalf("expected failCounts=2 after second failure, got %d", fc2)
+	}
+	st2, _ := pool.GetTunnel(sID)
+	if st2.Status != "degraded" {
+		t.Errorf("expected tunnel status 'degraded' after 2 hook failures, got %s", st2.Status)
+	}
+
+	// Probe 3: hook fails -> reaches FailureThreshold (3) -> failCounts = 3, status disabled
+	_, err = prober.ProbeTunnel(ctx, tunnel)
+	if err == nil {
+		t.Fatal("expected ProbeTunnel to fail on third hook failure")
+	}
+	prober.mu.RLock()
+	fc3 := prober.failCounts[sID]
+	prober.mu.RUnlock()
+	if fc3 != 3 {
+		t.Fatalf("expected failCounts=3 after third failure, got %d", fc3)
+	}
+	st3, _ := pool.GetTunnel(sID)
+	if st3.Status != "disabled" {
+		t.Errorf("expected tunnel status escalated to 'disabled' after %d hook failures, got %s", cfg.FailureThreshold, st3.Status)
+	}
+
+	// Recovery: hook succeeds -> failCounts resets to 0, status becomes active
+	hookFails = false
+	rtt, err = prober.ProbeTunnel(ctx, tunnel)
+	if err != nil {
+		t.Fatalf("expected ProbeTunnel to succeed on hook recovery, got: %v", err)
+	}
+	if rtt != 15 {
+		t.Errorf("expected rtt=15 on success, got %d", rtt)
+	}
+	prober.mu.RLock()
+	fcRec := prober.failCounts[sID]
+	prober.mu.RUnlock()
+	if fcRec != 0 {
+		t.Errorf("expected failCounts reset to 0 after recovery, got %d", fcRec)
+	}
+	stRec, _ := pool.GetTunnel(sID)
+	if stRec.Status != "active" {
+		t.Errorf("expected tunnel status 'active' after recovery, got %s", stRec.Status)
+	}
+}

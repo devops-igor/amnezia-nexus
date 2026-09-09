@@ -3,6 +3,7 @@ package loadbalancer
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
@@ -125,8 +126,31 @@ func TestStickySessionManager(t *testing.T) {
 	}
 
 	migrated, err := sticky.HandleFailover(ctx, t1ID, healthyPool)
-	if err != nil || migrated < 1 {
-		t.Fatalf("HandleFailover failed: migrated=%d, err=%v", migrated, err)
+	if err != nil {
+		t.Fatalf("HandleFailover failed: %v", err)
+	}
+	// HandleFailover emits records in a deterministic order (sorted by peer
+	// key): callers iterate the full set to redirect forwarder routes, so
+	// order itself carries no signal — but a stable order makes failover
+	// observable and repeatable. Two peers were affinitized to t1ID here:
+	// peer-a (moved to t1 in step 5) and peer-failover-1. Both must migrate
+	// to t2 (the only healthy tunnel in the pool). Find each record by peer
+	// key rather than asserting an index.
+	if len(migrated) != 2 {
+		t.Fatalf("expected 2 migrations (peer-a, peer-failover-1), got %d: %+v", len(migrated), migrated)
+	}
+	byPeer := make(map[string]FailoverMigration, len(migrated))
+	for _, m := range migrated {
+		byPeer[m.PeerPublicKey] = m
+	}
+	if m, ok := byPeer["peer-failover-1"]; !ok || m.NewBackendTunnelID != t2ID {
+		t.Errorf("expected migration peer-failover-1 -> %d, got %+v (all: %+v)", t2ID, m, migrated)
+	}
+	if m, ok := byPeer["peer-a"]; !ok || m.NewBackendTunnelID != t2ID {
+		t.Errorf("expected migration peer-a -> %d, got %+v (all: %+v)", t2ID, m, migrated)
+	}
+	if !sort.SliceIsSorted(migrated, func(i, j int) bool { return migrated[i].PeerPublicKey < migrated[j].PeerPublicKey }) {
+		t.Errorf("migration records not sorted by peer key: %+v", migrated)
 	}
 
 	// Verify DB session was updated to t2ID
