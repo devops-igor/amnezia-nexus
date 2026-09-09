@@ -348,7 +348,8 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 		profile = fmt.Sprint(p)
 	}
 
-	awgParams, err := GenerateAWGParams(profile)
+	hpOn, _ := parseBoolParam(params["awg_header_protection"])
+	awgParams, err := GenerateAWGParams(profile, hpOn)
 	if err != nil {
 		return fmt.Errorf("failed to generate AWG params: %w", err)
 	}
@@ -845,15 +846,39 @@ func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP string) string
 
 // upsertClientEntry updates the clientsTable entry at existingIdx in place
 // (keeping IP and identity fields), or appends a new entry when idx < 0.
-func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, speedDown, speedUp *int) []AWGClient {
+func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, speedDown, speedUp *int, contentPadding bool) []AWGClient {
 	if existingIdx >= 0 {
 		clients[existingIdx].ClientID = clientPubKey
 		clients[existingIdx].UserData.ClientName = clientName
 		clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
 		clients[existingIdx].UserData.PSK = psk
 		clients[existingIdx].UserData.Enabled = true
+		
+		if clients[existingIdx].UserData.RekeyAfterTime == nil {
+			rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
+			clients[existingIdx].UserData.RekeyAfterTime = rat
+			clients[existingIdx].UserData.RekeyTimeout = rt
+			clients[existingIdx].UserData.RejectAfterTime = rej
+			clients[existingIdx].UserData.KeepaliveTimeout = kt
+			clients[existingIdx].UserData.MaxHandshakeAttempts = mha
+			clients[existingIdx].UserData.PersistentKeepalive = pk
+		}
+		
+		if contentPadding && clients[existingIdx].UserData.ContentPaddingAddition == nil {
+			val := "16-64"
+			clients[existingIdx].UserData.ContentPaddingAddition = &val
+		}
+		
 		return clients
 	}
+	
+	rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
+	var cpAdd *string
+	if contentPadding {
+		val := "16-64"
+		cpAdd = &val
+	}
+	
 	return append(clients, AWGClient{
 		ClientID: clientPubKey,
 		UserData: AWGClientUserData{
@@ -865,6 +890,13 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			AWGMimicry:       mimicry,
 			SpeedLimitDown:   speedDown,
 			SpeedLimitUp:     speedUp,
+			RekeyAfterTime:       rat,
+			RekeyTimeout:         rt,
+			RejectAfterTime:      rej,
+			KeepaliveTimeout:     kt,
+			MaxHandshakeAttempts: mha,
+			PersistentKeepalive:  pk,
+			ContentPaddingAddition: cpAdd,
 		},
 	})
 }
@@ -984,9 +1016,11 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	if v, ok := clientParams["awg_mimicry"]; ok && fmt.Sprint(v) != "" {
 		mimicry = fmt.Sprint(v)
 	}
+	
+	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
 	// Save to clientsTable (update in place when the identity already exists)
-	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp)
+	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
 	_ = m.saveClientsTable(ctx, client, clients)
 
 	if isProbePeer {
@@ -1019,7 +1053,14 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		port = AWGDefaults["port"]
 	}
 	endpoint := fmt.Sprintf("%s:%s", server.Host, port)
-	clientConfig := RenderClientConfig(clientPrivKey, clientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams)
+	var ud *AWGClientUserData
+	for i := range clients {
+		if clients[i].ClientID == clientPubKey {
+			ud = &clients[i].UserData
+			break
+		}
+	}
+	clientConfig := RenderClientConfig(clientPrivKey, clientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams, ud)
 	connectionKit, _ := cps.GenerateConnectionKit(ctx, clientConfig, "", client)
 
 	return map[string]any{
@@ -1152,7 +1193,7 @@ func (m *AWGManager) GetClientConfig(ctx context.Context, server *models.Server,
 	}
 	endpoint := fmt.Sprintf("%s:%s", server.Host, port)
 
-	return RenderClientConfig(ud.ClientPrivateKey, ud.ClientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams), nil
+	return RenderClientConfig(ud.ClientPrivateKey, ud.ClientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams, &ud), nil
 }
 
 // ToggleClient enables or disables a client by adding or removing the [Peer] from the server config.

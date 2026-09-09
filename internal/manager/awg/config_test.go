@@ -53,7 +53,7 @@ func TestRenderClientConfig(t *testing.T) {
 		I1:                        "<b 0xdeadbeef>",
 	}
 
-	conf := RenderClientConfig("clientPrivKey", "10.8.1.2", "serverPubKey", "psk1", "1.2.3.4:55424", "94.140.14.14", "94.140.15.15", "1280", params)
+	conf := RenderClientConfig("clientPrivKey", "10.8.1.2", "serverPubKey", "psk1", "1.2.3.4:55424", "94.140.14.14", "94.140.15.15", "1280", params, nil)
 
 	if !strings.Contains(conf, "Address = 10.8.1.2/32") {
 		t.Errorf("missing client Address")
