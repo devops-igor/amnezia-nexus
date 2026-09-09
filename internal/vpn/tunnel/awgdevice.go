@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
@@ -247,3 +250,22 @@ func (d *AWGClientDevice) LocalAddr() net.Addr {
 func (d *AWGClientDevice) Name() string { return d.name }
 
 func (d *AWGClientDevice) MTU() int { return d.mtu }
+
+func (d *AWGClientDevice) LastHandshakeTime() time.Time {
+	out, err := d.dev.IpcGet()
+	if err != nil {
+		return time.Time{}
+	}
+	var sec, nsec int64
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "last_handshake_time_sec=") {
+			sec, _ = strconv.ParseInt(strings.TrimPrefix(line, "last_handshake_time_sec="), 10, 64)
+		} else if strings.HasPrefix(line, "last_handshake_time_nsec=") {
+			nsec, _ = strconv.ParseInt(strings.TrimPrefix(line, "last_handshake_time_nsec="), 10, 64)
+		}
+	}
+	if sec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, nsec)
+}
