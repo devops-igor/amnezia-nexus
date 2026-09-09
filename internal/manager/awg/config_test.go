@@ -64,6 +64,113 @@ func TestRenderClientConfig(t *testing.T) {
 	if !strings.Contains(conf, "Endpoint = 1.2.3.4:55424") {
 		t.Errorf("missing Endpoint in client config")
 	}
+	if !strings.Contains(conf, "PersistentKeepalive = 25") {
+		t.Errorf("expected default PersistentKeepalive = 25 when ud is nil")
+	}
+}
+
+func TestRenderClientConfig_AWG3_Compliance(t *testing.T) {
+	rat := 125
+	rt := 5
+	rej := 180
+	kt := 10
+	mha := 6
+	pk := 27
+	cpAdd := "16-64"
+
+	ud := &AWGClientUserData{
+		ClientName:             "testuser",
+		ClientPrivateKey:       "clientPrivKey123",
+		ClientIP:               "10.100.0.5",
+		Enabled:                true,
+		RekeyAfterTime:         &rat,
+		RekeyTimeout:           &rt,
+		RejectAfterTime:        &rej,
+		KeepaliveTimeout:       &kt,
+		MaxHandshakeAttempts:   &mha,
+		PersistentKeepalive:    &pk,
+		ContentPaddingAddition: &cpAdd,
+	}
+
+	params := &AWGParams{
+		JunkPacketCount:            "3",
+		JunkPacketMinSize:          "40",
+		JunkPacketMaxSize:          "70",
+		InitPacketJunkSize:         "16",
+		ResponsePacketJunkSize:     "16",
+		CookieReplyPacketJunkSize:  "16",
+		TransportPacketJunkSize:    "16",
+		InitPacketMagicHeader:      "11111",
+		ResponsePacketMagicHeader:  "22222",
+		UnderloadPacketMagicHeader: "33333",
+		TransportPacketMagicHeader: "44444",
+		HeaderProtectionKey:        "W1234567890abcdefghijklmnopqrstuvwxyzAB=",
+	}
+
+	conf := RenderClientConfig(
+		"clientPrivKey123",
+		"10.100.0.5",
+		"serverPub123",
+		"psk456",
+		"lb.example.com:51820",
+		"1.1.1.1",
+		"1.0.0.1",
+		"1420",
+		params,
+		ud,
+	)
+
+	// Verify [Interface] section directives
+	interfaceDirectives := []string{
+		"Address = 10.100.0.5/32",
+		"DNS = 1.1.1.1, 1.0.0.1",
+		"PrivateKey = clientPrivKey123",
+		"MTU = 1420",
+		"Jc = 3",
+		"Jmin = 40",
+		"Jmax = 70",
+		"S1 = 16",
+		"S2 = 16",
+		"S3 = 16",
+		"S4 = 16",
+		"H1 = 11111",
+		"H2 = 22222",
+		"H3 = 33333",
+		"H4 = 44444",
+		"HeaderProtectionKey = W1234567890abcdefghijklmnopqrstuvwxyzAB=",
+		"RekeyAfterTime = 125",
+		"RekeyTimeout = 5",
+		"RejectAfterTime = 180",
+		"KeepaliveTimeout = 10",
+		"MaxHandshakeAttempts = 6",
+		"ContentPaddingAddition = 16-64",
+	}
+
+	for _, d := range interfaceDirectives {
+		if !strings.Contains(conf, d) {
+			t.Errorf("RenderClientConfig missing [Interface] directive: %q\nFull config:\n%s", d, conf)
+		}
+	}
+
+	// Verify [Peer] section directives
+	peerDirectives := []string{
+		"PublicKey = serverPub123",
+		"PresharedKey = psk456",
+		"AllowedIPs = 0.0.0.0/0, ::/0",
+		"Endpoint = lb.example.com:51820",
+		"PersistentKeepalive = 27",
+	}
+
+	for _, d := range peerDirectives {
+		if !strings.Contains(conf, d) {
+			t.Errorf("RenderClientConfig missing [Peer] directive: %q\nFull config:\n%s", d, conf)
+		}
+	}
+
+	// Verify default PersistentKeepalive = 25 was replaced by randomized value 27
+	if strings.Contains(conf, "PersistentKeepalive = 25") {
+		t.Errorf("RenderClientConfig emitted default PersistentKeepalive = 25 instead of ud value 27")
+	}
 }
 
 func TestParseServerConfig(t *testing.T) {
