@@ -357,19 +357,19 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
-	
+
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		svc.mu.RLock()
-		var serverID int64
+		var tunID int64
 		for _, t := range svc.pool.ListTunnels() {
 			if t.PublicKey == serverPubKey {
-				serverID = t.ServerID
+				tunID = t.ID
 				break
 			}
 		}
 		var dev *tunnel.AWGClientDevice
-		if serverID > 0 && svc.backendDevices != nil {
-			dev = svc.backendDevices[serverID]
+		if tunID > 0 && svc.backendDevices != nil {
+			dev = svc.backendDevices[tunID]
 		}
 		svc.mu.RUnlock()
 
@@ -382,9 +382,19 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 			}
 			// If LastHandshakeTime is zero, it might just be starting up. Let it continue so amneziawg-go handles it.
 			// Do not send UDP probes, which breaks amneziawg-go's session!
+			// However, amneziawg-go requires a manual trigger packet to initiate the first handshake.
+			// Send a dummy IPv4 packet to 0.0.0.0 to trigger it.
+			dummyPacket := []byte{
+				0x45, 0x00, 0x00, 0x14, // Version/IHL, ToS, Total Length
+				0x00, 0x00, 0x40, 0x00, // Identification, Flags/Fragment Offset
+				0x40, 0x01, 0x00, 0x00, // TTL, Protocol (ICMP), Header Checksum
+				0x00, 0x00, 0x00, 0x00, // Source IP (0.0.0.0)
+				0x00, 0x00, 0x00, 0x00, // Dest IP (0.0.0.0)
+			}
+			_, _ = dev.Write(dummyPacket)
 			return 10 * time.Millisecond, nil
 		}
-		
+
 		return health.ProbeAWGEndpoint(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
 	})
 

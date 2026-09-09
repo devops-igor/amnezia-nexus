@@ -22,40 +22,40 @@ type AWGPeer struct {
 //
 //nolint:revive
 type AWGClientUserData struct {
-	ClientName        string  `json:"clientName"`
-	CreationDate      string  `json:"creationDate,omitempty"`
-	ClientPrivateKey  string  `json:"clientPrivateKey,omitempty"`
-	ClientIP          string  `json:"clientIp,omitempty"`
-	PSK               string  `json:"psk,omitempty"`
-	Enabled           bool    `json:"enabled"`
-	AWGMimicry        string  `json:"awg_mimicry,omitempty"`
-	SpeedLimitDown    *int    `json:"speed_limit_down,omitempty"`
-	SpeedLimitUp      *int    `json:"speed_limit_up,omitempty"`
-	LatestHandshake   string  `json:"latestHandshake,omitempty"`
-	DataReceived      string  `json:"dataReceived,omitempty"`
-	DataSent          string  `json:"dataSent,omitempty"`
-	DataReceivedBytes int64   `json:"dataReceivedBytes,omitempty"`
-	DataSentBytes     int64   `json:"dataSentBytes,omitempty"`
-	AllowedIPs        string  `json:"allowedIps,omitempty"`
-	ExternalClient    bool    `json:"externalClient,omitempty"`
-	TrialProfile      string  `json:"trial_profile,omitempty"`
-	TrialFor          string  `json:"trial_for,omitempty"`
-	TrialUserID       *string `json:"trial_user_id,omitempty"`
-	MainClientID      *string `json:"main_client_id,omitempty"`
-	TrialCreatedAt    string  `json:"trial_created_at,omitempty"`
-	ExpiresAt         string  `json:"expires_at,omitempty"`
-	RotatedAt         string  `json:"rotated_at,omitempty"`
-	I1                string  `json:"i1,omitempty"`
-	I2                string  `json:"i2,omitempty"`
-	I3                string  `json:"i3,omitempty"`
-	I4                string  `json:"i4,omitempty"`
-	I5                string  `json:"i5,omitempty"`
-	RekeyAfterTime       *int    `json:"rekey_after_time,omitempty"`
-	RekeyTimeout         *int    `json:"rekey_timeout,omitempty"`
-	RejectAfterTime      *int    `json:"reject_after_time,omitempty"`
-	KeepaliveTimeout     *int    `json:"keepalive_timeout,omitempty"`
-	MaxHandshakeAttempts *int    `json:"max_handshake_attempts,omitempty"`
-	PersistentKeepalive  *int    `json:"persistent_keepalive,omitempty"`
+	ClientName             string  `json:"clientName"`
+	CreationDate           string  `json:"creationDate,omitempty"`
+	ClientPrivateKey       string  `json:"clientPrivateKey,omitempty"`
+	ClientIP               string  `json:"clientIp,omitempty"`
+	PSK                    string  `json:"psk,omitempty"`
+	Enabled                bool    `json:"enabled"`
+	AWGMimicry             string  `json:"awg_mimicry,omitempty"`
+	SpeedLimitDown         *int    `json:"speed_limit_down,omitempty"`
+	SpeedLimitUp           *int    `json:"speed_limit_up,omitempty"`
+	LatestHandshake        string  `json:"latestHandshake,omitempty"`
+	DataReceived           string  `json:"dataReceived,omitempty"`
+	DataSent               string  `json:"dataSent,omitempty"`
+	DataReceivedBytes      int64   `json:"dataReceivedBytes,omitempty"`
+	DataSentBytes          int64   `json:"dataSentBytes,omitempty"`
+	AllowedIPs             string  `json:"allowedIps,omitempty"`
+	ExternalClient         bool    `json:"externalClient,omitempty"`
+	TrialProfile           string  `json:"trial_profile,omitempty"`
+	TrialFor               string  `json:"trial_for,omitempty"`
+	TrialUserID            *string `json:"trial_user_id,omitempty"`
+	MainClientID           *string `json:"main_client_id,omitempty"`
+	TrialCreatedAt         string  `json:"trial_created_at,omitempty"`
+	ExpiresAt              string  `json:"expires_at,omitempty"`
+	RotatedAt              string  `json:"rotated_at,omitempty"`
+	I1                     string  `json:"i1,omitempty"`
+	I2                     string  `json:"i2,omitempty"`
+	I3                     string  `json:"i3,omitempty"`
+	I4                     string  `json:"i4,omitempty"`
+	I5                     string  `json:"i5,omitempty"`
+	RekeyAfterTime         *int    `json:"rekey_after_time,omitempty"`
+	RekeyTimeout           *int    `json:"rekey_timeout,omitempty"`
+	RejectAfterTime        *int    `json:"reject_after_time,omitempty"`
+	KeepaliveTimeout       *int    `json:"keepalive_timeout,omitempty"`
+	MaxHandshakeAttempts   *int    `json:"max_handshake_attempts,omitempty"`
+	PersistentKeepalive    *int    `json:"persistent_keepalive,omitempty"`
 	ContentPaddingAddition *string `json:"content_padding_addition,omitempty"`
 }
 
@@ -169,7 +169,7 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 			lines = append(lines, fmt.Sprintf("%s = %s", item.key, item.val))
 		}
 	}
-	
+
 	if params.HeaderProtectionKey != "" {
 		lines = append(lines, fmt.Sprintf("HeaderProtectionKey = %s", params.HeaderProtectionKey))
 	}
