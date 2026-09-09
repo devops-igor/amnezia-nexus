@@ -69,7 +69,7 @@ func TestGenerateAWGParams(t *testing.T) {
 	profiles := []string{"lite", "standard", "pro"}
 
 	for _, profile := range profiles {
-		params, err := GenerateAWGParams(profile)
+		params, err := GenerateAWGParams(profile, false)
 		if err != nil {
 			t.Fatalf("GenerateAWGParams(%s) failed: %v", profile, err)
 		}
@@ -196,7 +196,7 @@ func TestAWGParamsFromVPNConfig_NoCPSPackets(t *testing.T) {
 	}
 
 	// Verify RenderClientConfig with these params produces no I1-I5 lines
-	rendered := RenderClientConfig("priv", "10.0.0.2", "pub", "", "1.2.3.4:51820", "1.1.1.1", "1.0.0.1", "1420", params)
+	rendered := RenderClientConfig("priv", "10.0.0.2", "pub", "", "1.2.3.4:51820", "1.1.1.1", "1.0.0.1", "1420", params, nil)
 	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
 		if strings.Contains(rendered, k+" =") || strings.Contains(rendered, k+"=") {
 			t.Errorf("rendered config should not contain %s, got:\n%s", k, rendered)

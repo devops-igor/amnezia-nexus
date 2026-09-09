@@ -50,6 +50,13 @@ type AWGClientUserData struct {
 	I3                string  `json:"i3,omitempty"`
 	I4                string  `json:"i4,omitempty"`
 	I5                string  `json:"i5,omitempty"`
+	RekeyAfterTime       *int    `json:"rekey_after_time,omitempty"`
+	RekeyTimeout         *int    `json:"rekey_timeout,omitempty"`
+	RejectAfterTime      *int    `json:"reject_after_time,omitempty"`
+	KeepaliveTimeout     *int    `json:"keepalive_timeout,omitempty"`
+	MaxHandshakeAttempts *int    `json:"max_handshake_attempts,omitempty"`
+	PersistentKeepalive  *int    `json:"persistent_keepalive,omitempty"`
+	ContentPaddingAddition *string `json:"content_padding_addition,omitempty"`
 }
 
 // AWGClient represents a client entry in the clients table.
@@ -113,7 +120,7 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 }
 
 // RenderClientConfig builds the WireGuard / AmneziaWG client configuration file text.
-func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey string, psk string, endpoint string, dns1, dns2 string, mtu string, params *AWGParams) string {
+func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey string, psk string, endpoint string, dns1, dns2 string, mtu string, params *AWGParams, ud *AWGClientUserData) string {
 	if mtu == "" {
 		mtu = "1280"
 	}
@@ -162,6 +169,31 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 			lines = append(lines, fmt.Sprintf("%s = %s", item.key, item.val))
 		}
 	}
+	
+	if params.HeaderProtectionKey != "" {
+		lines = append(lines, fmt.Sprintf("HeaderProtectionKey = %s", params.HeaderProtectionKey))
+	}
+
+	if ud != nil {
+		if ud.RekeyAfterTime != nil {
+			lines = append(lines, fmt.Sprintf("RekeyAfterTime = %d", *ud.RekeyAfterTime))
+		}
+		if ud.RekeyTimeout != nil {
+			lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", *ud.RekeyTimeout))
+		}
+		if ud.RejectAfterTime != nil {
+			lines = append(lines, fmt.Sprintf("RejectAfterTime = %d", *ud.RejectAfterTime))
+		}
+		if ud.KeepaliveTimeout != nil {
+			lines = append(lines, fmt.Sprintf("KeepaliveTimeout = %d", *ud.KeepaliveTimeout))
+		}
+		if ud.MaxHandshakeAttempts != nil {
+			lines = append(lines, fmt.Sprintf("MaxHandshakeAttempts = %d", *ud.MaxHandshakeAttempts))
+		}
+		if ud.ContentPaddingAddition != nil {
+			lines = append(lines, fmt.Sprintf("ContentPaddingAddition = %s", *ud.ContentPaddingAddition))
+		}
+	}
 
 	lines = append(lines,
 		"",
@@ -174,8 +206,12 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 	lines = append(lines,
 		"AllowedIPs = 0.0.0.0/0, ::/0",
 		fmt.Sprintf("Endpoint = %s", endpoint),
-		"PersistentKeepalive = 25",
 	)
+	if ud != nil && ud.PersistentKeepalive != nil {
+		lines = append(lines, fmt.Sprintf("PersistentKeepalive = %d", *ud.PersistentKeepalive))
+	} else {
+		lines = append(lines, "PersistentKeepalive = 25")
+	}
 
 	return strings.Join(lines, "\n") + "\n"
 }

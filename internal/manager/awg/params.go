@@ -63,6 +63,7 @@ type AWGParams struct {
 	I3                         string `json:"i3,omitempty"`
 	I4                         string `json:"i4,omitempty"`
 	I5                         string `json:"i5,omitempty"`
+	HeaderProtectionKey        string `json:"header_protection_key,omitempty"`
 }
 
 // ToMap converts AWGParams to a map of string key-values.
@@ -91,6 +92,9 @@ func (p *AWGParams) ToMap() map[string]string {
 		"i3":                            p.I3,
 		"i4":                            p.I4,
 		"i5":                            p.I5,
+	}
+	if p.HeaderProtectionKey != "" {
+		m["header_protection_key"] = p.HeaderProtectionKey
 	}
 	return m
 }
@@ -371,7 +375,7 @@ func AWGParamsFromVPNConfig(cfg *models.VPNConfig) *AWGParams {
 }
 
 // GenerateAWGParams generates randomized AWG obfuscation parameters based on the given profile.
-func GenerateAWGParams(profile string) (*AWGParams, error) {
+func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error) {
 	profile = strings.ToLower(strings.TrimSpace(profile))
 	if profile == "" {
 		profile = "standard"
@@ -484,6 +488,18 @@ func GenerateAWGParams(profile string) (*AWGParams, error) {
 	}
 
 	return params, nil
+}
+
+// GenerateClientTimingParams generates randomized timing params for a client.
+func GenerateClientTimingParams() (rekeyAfterTime, rekeyTimeout, rejectAfterTime, keepaliveTimeout, maxHandshakeAttempts, persistentKeepalive *int) {
+	rat, _ := randIntBetween(100, 140)
+	rt, _ := randIntBetween(4, 6)
+	rej, _ := randIntBetween(160, 200)
+	kt, _ := randIntBetween(8, 12)
+	mha, _ := randIntBetween(4, 8)
+	pk, _ := randIntBetween(22, 30)
+
+	return &rat, &rt, &rej, &kt, &mha, &pk
 }
 
 // ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection.
