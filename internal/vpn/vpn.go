@@ -1120,7 +1120,7 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 		"1.1.1.1",
 		"1.0.0.1",
 		"1420",
-		awgParams,
+		awgParams, nil,
 	)
 
 	filename := fmt.Sprintf("amnezia-portal-%s.conf", user.Username)
