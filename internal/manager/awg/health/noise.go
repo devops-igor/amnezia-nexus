@@ -2,6 +2,7 @@ package health
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
@@ -32,7 +34,34 @@ const (
 	DefaultS2 = 18
 	DefaultS3 = 20
 	DefaultS4 = 23
+
+	// MessageInitiationSize is the full AWG handshake initiation message size
+	// (116-byte body + 16-byte MAC1 + 16-byte MAC2).
+	MessageInitiationSize = 148
+	// MessageResponseSize is the full AWG handshake response message size
+	// (60-byte body + 16-byte MAC1 + 16-byte MAC2).
+	MessageResponseSize = 92
 )
+
+// HeaderCipherNonceSize is the nonce length used by the header protection cipher.
+const HeaderCipherNonceSize = 12
+
+// newHeaderProtectionCipher builds the unauthenticated ChaCha20 header protection
+// cipher (mirrors upstream HeaderProtectionCipher: chacha20.NewUnauthenticatedCipher
+// with the 32-byte HP key and a 12-byte salt). Returns nil when the HP key is unset.
+func newHeaderProtectionCipher(hpKey, salt []byte) cipher.Stream {
+	if len(hpKey) != 32 {
+		return nil
+	}
+	if len(salt) < HeaderCipherNonceSize {
+		return nil
+	}
+	c, err := chacha20.NewUnauthenticatedCipher(hpKey[:32], salt[:HeaderCipherNonceSize])
+	if err != nil {
+		return nil
+	}
+	return c
+}
 
 // NoiseClientState maintains state across Noise protocol handshake messages.
 type NoiseClientState struct {
@@ -258,6 +287,69 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32
 	}
 
 	return packet, state, nil
+}
+
+// BuildAWGInitiationPacketObfuscated builds an AmneziaWG Handshake Initiation packet
+// with header protection applied. The MAC1/MAC2 tags are computed over the plaintext
+// message body BEFORE obfuscation (upstream order: AddMacs then header protection).
+// The HP keystream is message-relative: it is seeded with the first
+// HeaderCipherNonceSize bytes of the packet (the junk prefix) but XORed starting at
+// keystream offset 0 onto packet[s1:s1+MessageInitiationSize]; any random trailer
+// beyond the message stays plaintext.
+func BuildAWGInitiationPacketObfuscated(serverPubKey, clientPrivKey, psk, hpKey []byte, h1 uint32, s1 int) ([]byte, *NoiseClientState, error) {
+	if len(hpKey) != 32 {
+		return nil, nil, errors.New("header protection key must be 32 bytes")
+	}
+	// Header protection requires every junk section to be >= HeaderCipherNonceSize
+	// (upstream uapi hard constraint) so the 12-byte nonce prefix cannot overlap
+	// the message body.
+	if s1 < HeaderCipherNonceSize {
+		s1 = HeaderCipherNonceSize
+	}
+
+	packet, state, err := BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk, h1, s1)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cip := newHeaderProtectionCipher(hpKey, packet)
+	if cip == nil {
+		return nil, nil, errors.New("failed to create header protection cipher")
+	}
+	end := s1 + MessageInitiationSize
+	cip.XORKeyStream(packet[s1:end], packet[s1:end])
+
+	return packet, state, nil
+}
+
+// VerifyAWGResponsePacketObfuscated verifies a header-protected AmneziaWG Handshake
+// Response packet. It copies the raw datagram (preserving junk-prefix positions),
+// de-obfuscates resp[s2:s2+MessageResponseSize] with the keystream seeded from the
+// first HeaderCipherNonceSize bytes of the packet (message-relative alignment,
+// keystream offset 0 == message offset 0), then delegates to VerifyAWGResponsePacket.
+func VerifyAWGResponsePacketObfuscated(respPacket []byte, state *NoiseClientState, hpKey []byte, h2 uint32, s2 int) bool {
+	if state == nil || len(hpKey) != 32 {
+		return false
+	}
+	// Mirror the initiator-side constraint: junk sections must be at least as
+	// long as the nonce so the keystream never overlaps the message.
+	if s2 < HeaderCipherNonceSize {
+		s2 = HeaderCipherNonceSize
+	}
+	if len(respPacket) < s2+MessageResponseSize {
+		return false
+	}
+
+	cip := newHeaderProtectionCipher(hpKey, respPacket)
+	if cip == nil {
+		return false
+	}
+	buf := make([]byte, len(respPacket))
+	copy(buf, respPacket)
+	end := s2 + MessageResponseSize
+	cip.XORKeyStream(buf[s2:end], buf[s2:end])
+
+	return VerifyAWGResponsePacket(buf, state, h2, s2)
 }
 
 // ComputePublicKeyFromPrivate computes the base64-encoded WireGuard/AmneziaWG public key from a base64-encoded private key.

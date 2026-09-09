@@ -147,7 +147,7 @@ func setupTestVPNService(t *testing.T, db *database.DB) (*Service, int64, int64,
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	}
 	vpnSvc.SetProbeFunc(mockProbe)
@@ -759,7 +759,7 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -1639,5 +1639,157 @@ func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
 		if !strings.Contains(cfgStr, key+" =") {
 			t.Errorf("GenerateClientConfig missing required AWG parameter %s, config:\n%s", key, cfgStr)
 		}
+	}
+}
+
+// --- Issue #18 R3: obfuscation migration must preserve listen_port ---
+
+// TestEnsureObfuscationParams_PreservesLegacyListenPort verifies directly that
+// the legacy-row migration (zero H1..H4/S1..S4) keeps an already-wired
+// listen_port instead of zeroing it (which GetVPNConfig's fill-down would
+// re-default, desyncing the running listener from rendered client configs).
+func TestEnsureObfuscationParams_PreservesLegacyListenPort(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Legacy row: obfuscation params zero, listen port already wired.
+	legacy := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         31458,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      1000,
+		MaxPeersPerBackend: 250,
+		Weights:            map[int64]int{},
+		// H1..H4 / S1..S4 deliberately zero -> triggers the migration.
+	}
+	if err := db.SaveVPNConfig(ctx, legacy); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	if err := ensureObfuscationParams(ctx, db, legacy); err != nil {
+		t.Fatalf("ensureObfuscationParams failed: %v", err)
+	}
+
+	if legacy.ListenPort != 31458 {
+		t.Errorf("migration must preserve in-memory listen_port, got %d", legacy.ListenPort)
+	}
+	if legacy.H1 == 0 || legacy.H2 == 0 || legacy.H3 == 0 || legacy.H4 == 0 {
+		t.Errorf("migration did not fill H params: %+v", legacy)
+	}
+	if legacy.S1 < 0 || legacy.S2 < 0 || legacy.S3 < 0 || legacy.S4 < 0 {
+		t.Errorf("migration produced invalid S params: %+v", legacy)
+	}
+
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.ListenPort != 31458 {
+		t.Errorf("persisted listen_port: want 31458, got %d", stored.ListenPort)
+	}
+	if stored.H1 == 0 {
+		t.Errorf("persisted config missing migrated obfuscation params: %+v", stored)
+	}
+}
+
+// TestBootWiring_ListenPortPersistsThroughMigration runs the full boot-wiring
+// sequence against a legacy DB row (zero obfuscation params): NewVPNService
+// triggers ensureObfuscationParams during boot, then the env-wiring sequence
+// (GetConfig -> set 31458 -> UpdateConfig) persists the port, and a FRESH
+// db.GetVPNConfig must return 31458 with the migrated params intact.
+func TestBootWiring_ListenPortPersistsThroughMigration(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	legacy := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      1000,
+		MaxPeersPerBackend: 250,
+		Weights:            map[int64]int{},
+		// H1..H4 / S1..S4 zero -> boot-time migration fills and persists them.
+	}
+	if err := db.SaveVPNConfig(ctx, legacy); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	// Env wiring sequence from cmd/*/main.go (runs before service Start).
+	cfgVPN, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfgVPN.H1 == 0 {
+		t.Fatalf("boot did not migrate legacy obfuscation params: %+v", cfgVPN)
+	}
+	cfgVPN.ListenPort = 31458
+	if err := svc.UpdateConfig(ctx, cfgVPN); err != nil {
+		t.Fatalf("UpdateConfig (env wiring) failed: %v", err)
+	}
+
+	// FRESH read from the DB (what the next boot consumes).
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.ListenPort != 31458 {
+		t.Errorf("fresh persisted listen_port: want 31458, got %d", stored.ListenPort)
+	}
+	if stored.H1 == 0 {
+		t.Errorf("fresh persisted config lost migrated obfuscation params: %+v", stored)
+	}
+}
+
+// TestRejectedUpdateConfigLeavesPersistedRowUntouched extends the
+// TestUpdateConfig_RejectsObfuscationChangeWhileRunning pattern to the
+// PERSISTED row: a rejected (immutable-while-running) UpdateConfig must leave
+// the stored config — including the wired listen_port — completely untouched.
+func TestRejectedUpdateConfigLeavesPersistedRowUntouched(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	before, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+
+	changed := *before
+	changed.H1 = 987654321
+	changed.S1 = 77
+	if err := svc.UpdateConfig(ctx, &changed); err == nil {
+		t.Fatal("expected error when changing obfuscation params while listener runs")
+	} else if !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("expected immutability error, got: %v", err)
+	}
+
+	after, _ := svc.GetConfig(ctx)
+	if after.H1 != before.H1 || after.S1 != before.S1 || after.ListenPort != before.ListenPort {
+		t.Errorf("running config mutated by rejected update: before(H1=%d S1=%d port=%d) after(H1=%d S1=%d port=%d)",
+			before.H1, before.S1, before.ListenPort, after.H1, after.S1, after.ListenPort)
+	}
+
+	persisted, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if persisted.H1 != before.H1 || persisted.S1 != before.S1 || persisted.ListenPort != before.ListenPort {
+		t.Errorf("persisted row mutated by rejected update: want(H1=%d S1=%d port=%d) got(H1=%d S1=%d port=%d)",
+			before.H1, before.S1, before.ListenPort, persisted.H1, persisted.S1, persisted.ListenPort)
 	}
 }

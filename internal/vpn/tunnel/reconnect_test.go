@@ -21,7 +21,7 @@ func TestReconnectManager(t *testing.T) {
 	var mockLatency time.Duration = 0
 	var mockErr error = errors.New("timeout")
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return mockLatency, mockErr
 	}
 

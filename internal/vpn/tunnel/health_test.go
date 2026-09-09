@@ -26,7 +26,7 @@ func TestHealthProber(t *testing.T) {
 	var mockLatency time.Duration = 25 * time.Millisecond
 	var mockErr error = nil
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return mockLatency, mockErr
 	}
 
@@ -191,7 +191,7 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 	var capturedS1, capturedS2 int
 	var shouldFail bool
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		capturedH1, capturedH2 = h1, h2
 		capturedS1, capturedS2 = s1, s2
 		if shouldFail {
@@ -203,15 +203,21 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
 
 	// Verify resolveTunnelParams hierarchy for s1 (uses backend params)
-	h1, h2, s1, s2 := prober.resolveTunnelParams(ctx, s1ID)
+	h1, h2, s1, s2, hpKeyResolved := prober.resolveTunnelParams(ctx, s1ID)
 	if h1 != 111111 || h2 != 222222 || s1 != 40 || s2 != 50 {
 		t.Errorf("s1 params mismatch: got (%d, %d, %d, %d), want (111111, 222222, 40, 50)", h1, h2, s1, s2)
 	}
+	if hpKeyResolved != "" {
+		t.Errorf("s1 hpKey mismatch: got %q, want empty", hpKeyResolved)
+	}
 
 	// Verify resolveTunnelParams hierarchy for s2 (falls back to VPNConfig)
-	h1, h2, s1, s2 = prober.resolveTunnelParams(ctx, s2ID)
+	h1, h2, s1, s2, hpKeyResolved = prober.resolveTunnelParams(ctx, s2ID)
 	if h1 != 333333 || h2 != 444444 || s1 != 60 || s2 != 70 {
 		t.Errorf("s2 params mismatch: got (%d, %d, %d, %d), want (333333, 444444, 60, 70)", h1, h2, s1, s2)
+	}
+	if hpKeyResolved != "" {
+		t.Errorf("s2 hpKey mismatch: got %q, want empty", hpKeyResolved)
 	}
 
 	// Probe s1 tunnel: positive test
@@ -279,17 +285,23 @@ func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *test
 	prober := NewHealthProber(pool, db, cfg, nil)
 
 	// Explicitly verify paramsFromBackendServer returns found=false (Finding 2)
-	bH1, bH2, bS1, bS2, found := paramsFromBackendServer(ctx, db, sID)
+	bH1, bH2, bS1, bS2, bHPKey, found := paramsFromBackendServer(ctx, db, sID)
 	if found {
 		t.Errorf("expected paramsFromBackendServer to return found=false for empty params, got found=true (%d, %d, %d, %d)", bH1, bH2, bS1, bS2)
+		if bHPKey != "" {
+			t.Errorf("expected empty hpKey from paramsFromBackendServer for empty params, got %q", bHPKey)
+		}
 	}
 
 	// Verify resolveTunnelParams resolves from VPNConfig (777777), NOT legacy constant 1020325451
-	h1, h2, s1, s2 := prober.resolveTunnelParams(ctx, sID)
+	h1, h2, s1, s2, hpKeyResolved := prober.resolveTunnelParams(ctx, sID)
 	if h1 != 777777 || h2 != 888888 || s1 != 35 || s2 != 45 {
 		t.Errorf("resolveTunnelParams mismatch: got (%d, %d, %d, %d), want (777777, 888888, 35, 45)", h1, h2, s1, s2)
 	}
 	if h1 == health.DefaultH1 {
 		t.Errorf("resolveTunnelParams incorrectly used legacy constant %d instead of VPNConfig", health.DefaultH1)
+		if hpKeyResolved != "" {
+			t.Errorf("resolveTunnelParams hpKey mismatch: got %q, want empty", hpKeyResolved)
+		}
 	}
 }

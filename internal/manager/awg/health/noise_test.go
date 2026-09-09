@@ -355,7 +355,7 @@ func TestMockUDPEndpointProbe(t *testing.T) {
 	clientPrivB64 := base64.StdEncoding.EncodeToString(clientPriv)
 	pskB64 := base64.StdEncoding.EncodeToString(psk)
 
-	rtt, err := ProbeAWGEndpoint(context.Background(), addr, serverPubB64, clientPrivB64, pskB64, h1, h2, s1, s2, 2*time.Second)
+	rtt, err := ProbeAWGEndpoint(context.Background(), addr, serverPubB64, clientPrivB64, pskB64, "", h1, h2, s1, s2, 2*time.Second)
 	if err != nil {
 		t.Fatalf("ProbeAWGEndpoint failed: %v", err)
 	}
