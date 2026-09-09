@@ -837,9 +837,12 @@ func findExistingClient(clients []AWGClient, clientPubKey, clientName string) (i
 // peerSectionFor renders the [Peer] section to append to the server config.
 // Probe peers carry no PresharedKey line: the prober probes with psk="", so
 // both sides must derive IKpsk2 keys with a zero PSK.
-func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP string) string {
+func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP, allowedIPs string) string {
 	if isProbePeer {
-		return fmt.Sprintf("\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n", clientPubKey, clientIP)
+		if allowedIPs == "" {
+			allowedIPs = clientIP + "/32"
+		}
+		return fmt.Sprintf("\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n", clientPubKey, allowedIPs)
 	}
 	return fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", clientPubKey, psk, clientIP)
 }
@@ -996,7 +999,11 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		psk = strings.TrimSpace(pskOut)
 	}
 
-	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP)
+	allowedIPs := ""
+	if aip, ok := clientParams["allowed_ips"]; ok && aip != nil {
+		allowedIPs = fmt.Sprint(aip)
+	}
+	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP, allowedIPs)
 	var removePubKeys []string
 	if existingPubKey != "" && existingPubKey != clientPubKey {
 		removePubKeys = []string{existingPubKey}
