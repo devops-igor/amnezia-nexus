@@ -211,6 +211,7 @@ type UserConnection struct {
 	ClientID       string            `json:"client_id" db:"client_id"`
 	Name           string            `json:"name" db:"name"`
 	AWGMimicry     AWGMimicryProfile `json:"awg_mimicry" db:"awg_mimicry"`
+	ClientParams   map[string]any    `json:"client_params,omitempty" db:"client_params"`
 	LastRx         int64             `json:"last_rx" db:"last_rx"`
 	LastTx         int64             `json:"last_tx" db:"last_tx"`
 	TrafficDeltaRx int64             `json:"traffic_delta_rx" db:"traffic_delta_rx"`
@@ -294,24 +295,26 @@ type VPNSession struct {
 
 // VPNConfig stores dynamic configuration for the in-process VPN subsystem.
 type VPNConfig struct {
-	Algorithm          LoadBalancingAlgorithm `json:"algorithm"`
-	Weights            map[int64]int          `json:"weights"` // server_id -> weight (1-100)
-	HealthThresholdMS  int                    `json:"health_threshold_ms"`
-	ListenPort         int                    `json:"listen_port"`
-	SubnetCIDR         string                 `json:"subnet_cidr"`
-	MaxTotalPeers      int                    `json:"max_total_peers"`
-	MaxPeersPerBackend int                    `json:"max_peers_per_backend"`
-	ServerPrivateKey   string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
-	ServerPublicKey    string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
-	PublicEndpoint     string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
-	H1                 uint32                 `json:"h1"`
-	H2                 uint32                 `json:"h2"`
-	H3                 uint32                 `json:"h3"`
-	H4                 uint32                 `json:"h4"`
-	S1                 int                    `json:"s1"`
-	S2                 int                    `json:"s2"`
-	S3                 int                    `json:"s3"`
-	S4                 int                    `json:"s4"`
+	Algorithm              LoadBalancingAlgorithm `json:"algorithm"`
+	Weights                map[int64]int          `json:"weights"` // server_id -> weight (1-100)
+	HealthThresholdMS      int                    `json:"health_threshold_ms"`
+	ListenPort             int                    `json:"listen_port"`
+	SubnetCIDR             string                 `json:"subnet_cidr"`
+	MaxTotalPeers          int                    `json:"max_total_peers"`
+	MaxPeersPerBackend     int                    `json:"max_peers_per_backend"`
+	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
+	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
+	PublicEndpoint         string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
+	H1                     uint32                 `json:"h1"`
+	H2                     uint32                 `json:"h2"`
+	H3                     uint32                 `json:"h3"`
+	H4                     uint32                 `json:"h4"`
+	S1                     int                    `json:"s1"`
+	S2                     int                    `json:"s2"`
+	S3                     int                    `json:"s3"`
+	S4                     int                    `json:"s4"`
+	HeaderProtectionKey    string                 `json:"header_protection_key,omitempty"`
+	ContentPaddingAddition string                 `json:"content_padding_addition,omitempty"`
 }
 
 // AppearanceSettings holds UI display configuration.

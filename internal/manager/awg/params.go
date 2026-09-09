@@ -368,6 +368,20 @@ func AWGParamsFromVPNConfig(cfg *models.VPNConfig) *AWGParams {
 		p.TransportPacketJunkSize = strconv.Itoa(cfg.S4)
 	}
 
+	if cfg.HeaderProtectionKey != "" {
+		p.HeaderProtectionKey = cfg.HeaderProtectionKey
+		ensureMinJunk := func(valStr *string, minVal int) {
+			num, err := strconv.Atoi(*valStr)
+			if err != nil || num < minVal {
+				*valStr = strconv.Itoa(minVal)
+			}
+		}
+		ensureMinJunk(&p.InitPacketJunkSize, 12)
+		ensureMinJunk(&p.ResponsePacketJunkSize, 12)
+		ensureMinJunk(&p.CookieReplyPacketJunkSize, 12)
+		ensureMinJunk(&p.TransportPacketJunkSize, 12)
+	}
+
 	// Note: Pure AWG 3+ parameters (H1..H4, S1..S4, Jc, Jmin, Jmax) are used for Load Balancer.
 	// CPS mimicry packets (I1..I5) are NOT used in LB mode because the Go noise endpoint
 	// expects standard AWG 3+ initiation headers and does not implement CPS packet framing.

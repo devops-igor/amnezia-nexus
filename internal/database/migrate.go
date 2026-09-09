@@ -152,7 +152,7 @@ func (d *DB) loadUsers(ctx context.Context) ([]map[string]any, error) {
 }
 
 func (d *DB) loadConnections(ctx context.Context) ([]map[string]any, error) {
-	connRows, err := d.sqlDB.QueryContext(ctx, `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+	connRows, err := d.sqlDB.QueryContext(ctx, `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 		traffic_total_rx, traffic_total_tx, traffic_total, created_at
 		FROM user_connections ORDER BY created_at`)
@@ -175,6 +175,7 @@ func (d *DB) loadConnections(ctx context.Context) ([]map[string]any, error) {
 			"client_id":        c.ClientID,
 			"name":             c.Name,
 			"awg_mimicry":      string(c.AWGMimicry),
+			"client_params":    c.ClientParams,
 			"last_rx":          c.LastRx,
 			"last_tx":          c.LastTx,
 			"traffic_delta_rx": c.TrafficDeltaRx,
@@ -510,14 +511,24 @@ func (d *DB) saveConnections(ctx context.Context, tx *sql.Tx, conns []map[string
 			createdAtStr = time.Now().Format(time.RFC3339)
 		}
 
+		clientParamsVal := c["client_params"]
+		clientParamsJSON := "{}"
+		if clientParamsVal != nil {
+			if s, ok := clientParamsVal.(string); ok && s != "" {
+				clientParamsJSON = s
+			} else if b, err := json.Marshal(clientParamsVal); err == nil {
+				clientParamsJSON = string(b)
+			}
+		}
+
 		query := `INSERT INTO user_connections (
-			id, user_id, server_id, protocol, client_id, name, awg_mimicry,
+			id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
 			last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
 			traffic_total_rx, traffic_total_tx, traffic_total, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 		_, err := tx.ExecContext(ctx, query,
-			id, userID, serverID, protocol, clientID, name, mimicry,
+			id, userID, serverID, protocol, clientID, name, mimicry, clientParamsJSON,
 			lastRx, lastTx, deltaRx, deltaTx, totRx, totTx, tot, createdAtStr,
 		)
 		if err != nil {

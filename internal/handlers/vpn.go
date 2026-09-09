@@ -178,6 +178,12 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if cfg.HealthThresholdMS == 0 {
 		cfg.HealthThresholdMS = current.HealthThresholdMS
 	}
+	if cfg.HeaderProtectionKey == "" {
+		cfg.HeaderProtectionKey = current.HeaderProtectionKey
+	}
+	if cfg.ContentPaddingAddition == "" {
+		cfg.ContentPaddingAddition = current.ContentPaddingAddition
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
