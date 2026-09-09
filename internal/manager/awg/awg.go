@@ -300,17 +300,17 @@ echo "%s" > /opt/amnezia/awg/wireguard_psk.key
 	_, _, _, _ = client.RunSudoCommand(ctx, "docker cp /tmp/_amnz_awg0.conf amnezia-awg:/opt/amnezia/awg/awg0.conf")
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_awg0.conf")
 
-	startScript := fmt.Sprintf(`#!/bin/bash
+	startScript := `#!/bin/bash
 awg-quick down /opt/amnezia/awg/awg0.conf 2>/dev/null || true
 if [ -f /opt/amnezia/awg/awg0.conf ]; then awg-quick up /opt/amnezia/awg/awg0.conf; fi
 iptables -A INPUT -i awg0 -j ACCEPT
 iptables -A FORWARD -i awg0 -j ACCEPT
 iptables -A OUTPUT -o awg0 -j ACCEPT
-iptables -A FORWARD -i awg0 -o eth0 -s %s/%s -j ACCEPT
+iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -t nat -A POSTROUTING -s %s/%s -o eth0 -j MASQUERADE
+iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 tail -f /dev/null
-`, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"])
+`
 
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_start.sh", []byte(startScript), 0755); err != nil {
 		return err
@@ -443,6 +443,36 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 		safeDefault = "amnezia-awg"
 	}
 	return safeDefault
+}
+
+// ensureBackendNATRule installs (idempotently) the interface-scoped NAT
+// masquerade rule and the interface-scoped FORWARD accept rule inside the
+// backend's AWG container. Portal data-plane traffic arrives on awg0 with
+// source IPs from the portal IPAM subnet (e.g. 10.100.0.0/16), so subnet- or
+// source-scoped rules do not match it and un-masqueraded packets are dropped
+// upstream. This remediation is needed for backends provisioned before the
+// start.sh template was fixed; it runs inside the existing container and never
+// restarts or re-creates it.
+func (m *AWGManager) ensureBackendNATRule(ctx context.Context, client ssh.SSHClient) error {
+	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		return fmt.Errorf("cannot ensure NAT rule: invalid container name %q", cName)
+	}
+	rules := []string{
+		"iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
+		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT",
+	}
+	for _, rule := range rules {
+		cmd := fmt.Sprintf("docker exec %s bash -c '%s'", cName, rule)
+		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
+		if err != nil {
+			return fmt.Errorf("failed to ensure NAT/FORWARD rule in container %s: %w", cName, err)
+		}
+		if code != 0 {
+			return fmt.Errorf("failed to ensure NAT/FORWARD rule in container %s (code %d): %s", cName, code, errOut)
+		}
+	}
+	return nil
 }
 
 func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
@@ -1029,6 +1059,16 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	// Save to clientsTable (update in place when the identity already exists)
 	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
 	_ = m.saveClientsTable(ctx, client, clients)
+
+	// Live remediation (issue #27): ensure the interface-scoped NAT masquerade
+	// and FORWARD rules exist so portal data-plane traffic (non-local source
+	// subnets like 10.100.0.0/16) is forwarded and masqueraded. This covers
+	// backends provisioned with the old subnet-scoped start.sh without
+	// restarting or re-creating the container. Fail loudly: without the rule,
+	// all load-balanced client traffic is dropped upstream.
+	if err := m.ensureBackendNATRule(ctx, client); err != nil {
+		return nil, fmt.Errorf("failed to ensure backend NAT rules: %w", err)
+	}
 
 	if isProbePeer {
 		// Probe peers need no client config, connection kit, or TC limits:
