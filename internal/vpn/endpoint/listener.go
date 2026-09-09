@@ -206,6 +206,9 @@ type Listener struct {
 	incomingPeerHandler IncomingPeerHandler
 
 	router ClientPacketRouter
+	// reaperHook runs on the heartbeat goroutine for each idle-timed-out
+	// session (see SessionReaperHook); guarded by mu, set before Start.
+	reaperHook SessionReaperHook
 }
 
 // NewListener initializes a new AWG endpoint listener. serverKeys provides the
@@ -886,6 +889,20 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 	}
 }
 
+// SessionReaperHook is invoked by heartbeatLoop with each session it reaps
+// for idleness, so the VPN service can release forwarder routes, tunnel pool
+// connection counts, and sticky affinity — the same cleanup an explicit
+// DisconnectSession performs. Without it, every idle timeout leaks those.
+type SessionReaperHook func(ctx context.Context, sess *models.VPNSession)
+
+// SetSessionReaperHook registers the idle-timeout cleanup callback. Must be
+// called before Start; the hook runs on the heartbeat goroutine.
+func (el *Listener) SetSessionReaperHook(fn SessionReaperHook) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.reaperHook = fn
+}
+
 func (el *Listener) heartbeatLoop(ctx context.Context) {
 	defer el.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
@@ -897,7 +914,30 @@ func (el *Listener) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if el.sessionMgr != nil {
-				_, _ = el.sessionMgr.CheckTimeouts(ctx, el.config.IdleTimeout)
+				timedOut, err := el.sessionMgr.CheckTimeouts(ctx, el.config.IdleTimeout)
+				if err != nil {
+					log.Printf("[vpn] idle-timeout sweep failed: %v", err)
+					continue
+				}
+				if len(timedOut) == 0 {
+					continue
+				}
+				el.mu.RLock()
+				hook := el.reaperHook
+				el.mu.RUnlock()
+				for _, sess := range timedOut {
+					if hook != nil {
+						func() {
+							defer func() {
+								// A panicking hook must not kill the heartbeat loop.
+								if r := recover(); r != nil {
+									log.Printf("[vpn] recovered from session reaper hook panic: %v", r)
+								}
+							}()
+							hook(ctx, sess)
+						}()
+					}
+				}
 			}
 		}
 	}

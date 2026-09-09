@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/tunnel"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
@@ -579,6 +583,7 @@ type mockAWGManagerWithClientAdder struct {
 	addedClients   []map[string]any
 	addClientErr   error
 	addClientCalls int
+	onAddClient    func()
 }
 
 func (m *mockAWGManagerWithClientAdder) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
@@ -588,6 +593,9 @@ func (m *mockAWGManagerWithClientAdder) GetServerStatus(ctx context.Context, ser
 func (m *mockAWGManagerWithClientAdder) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
 	m.addClientCalls++
 	m.addedClients = append(m.addedClients, clientParams)
+	if m.onAddClient != nil {
+		m.onAddClient()
+	}
 	if m.addClientErr != nil {
 		return nil, m.addClientErr
 	}
@@ -662,7 +670,7 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 	}
 }
 
-func TestEnableBackend_AddClientErrorDoesNotBlockEnable(t *testing.T) {
+func TestEnableBackend_AddClientErrorFailsLoudly(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)
 	if err != nil {
@@ -690,9 +698,9 @@ func TestEnableBackend_AddClientErrorDoesNotBlockEnable(t *testing.T) {
 	}
 	svc.SetAWGStatusProvider(adder)
 
-	// EnableBackend should log a warning and proceed without failing
-	if err := svc.EnableBackend(ctx, srvID); err != nil {
-		t.Fatalf("EnableBackend should succeed even when AddClient fails, got: %v", err)
+	// EnableBackend must fail loudly when AddClient fails, and not mark the tunnel active
+	if err := svc.EnableBackend(ctx, srvID); err == nil {
+		t.Fatal("expected EnableBackend to fail when AddClient fails, got nil")
 	}
 
 	if adder.addClientCalls != 1 {
@@ -700,8 +708,65 @@ func TestEnableBackend_AddClientErrorDoesNotBlockEnable(t *testing.T) {
 	}
 
 	tun, err := svc.pool.GetTunnel(srvID)
-	if err != nil || tun == nil || tun.Status != "active" {
-		t.Errorf("expected active tunnel in pool, got %+v (err=%v)", tun, err)
+	if err != nil || tun == nil {
+		t.Fatalf("expected tunnel in pool, got %+v (err=%v)", tun, err)
+	}
+	if tun.Status == "active" {
+		t.Errorf("expected tunnel not to be active after failed registration, got %s", tun.Status)
+	}
+	if tun.Status != "degraded" {
+		t.Errorf("expected tunnel to be degraded after failed registration, got %s", tun.Status)
+	}
+}
+
+func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "lock-scope-server",
+		Host: "198.51.100.44",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "server-lock-pubkey",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	adderCalled := false
+	lockWasFree := false
+	adder := &mockAWGManagerWithClientAdder{
+		onAddClient: func() {
+			adderCalled = true
+			// If svc.mu was held with Lock(), calling IsRunning() or GetStatus()
+			// (which acquire svc.mu.RLock()) would cause an immediate deadlock.
+			_ = svc.IsRunning()
+			st, err := svc.GetStatus(ctx)
+			if err == nil && st != nil {
+				lockWasFree = true
+			}
+		},
+	}
+	svc.SetAWGStatusProvider(adder)
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	if !adderCalled {
+		t.Error("expected AddClient to be called")
+	}
+	if !lockWasFree {
+		t.Error("expected service lock to be free during AddClient network call")
 	}
 }
 
@@ -1791,5 +1856,1142 @@ func TestRejectedUpdateConfigLeavesPersistedRowUntouched(t *testing.T) {
 	if persisted.H1 != before.H1 || persisted.S1 != before.S1 || persisted.ListenPort != before.ListenPort {
 		t.Errorf("persisted row mutated by rejected update: want(H1=%d S1=%d port=%d) got(H1=%d S1=%d port=%d)",
 			before.H1, before.S1, before.ListenPort, persisted.H1, persisted.S1, persisted.ListenPort)
+	}
+}
+
+func createTestServerAndKey(t *testing.T, db *database.DB, name, host string) (int64, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	pub, priv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("GenerateCurve25519KeyPair failed: %v", err)
+	}
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: name,
+		Host: host,
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": pub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	return sID, pub, priv
+}
+
+type testBackendDevice struct {
+	*tunnel.AWGClientDevice
+	createdAt       time.Time
+	lastHandshakeFn func() time.Time
+	dropCount       atomic.Uint64
+	inPacketsCh     chan []byte
+}
+
+func (m *testBackendDevice) CreatedAt() time.Time {
+	if !m.createdAt.IsZero() {
+		return m.createdAt
+	}
+	return m.AWGClientDevice.CreatedAt()
+}
+
+func (m *testBackendDevice) LastHandshakeTime() time.Time {
+	if m.lastHandshakeFn != nil {
+		return m.lastHandshakeFn()
+	}
+	return m.AWGClientDevice.LastHandshakeTime()
+}
+
+func (m *testBackendDevice) DroppedPackets() uint64 {
+	base := uint64(0)
+	if m.AWGClientDevice != nil {
+		base = m.AWGClientDevice.DroppedPackets()
+	}
+	return base + m.dropCount.Load()
+}
+
+func (m *testBackendDevice) Write(p []byte) (int, error) {
+	if m.inPacketsCh != nil {
+		buf := make([]byte, len(p))
+		copy(buf, p)
+		select {
+		case m.inPacketsCh <- buf:
+		default:
+		}
+	}
+	if m.AWGClientDevice != nil {
+		return m.AWGClientDevice.Write(p)
+	}
+	return len(p), nil
+}
+
+func TestProbeFunc_MatchByTunID(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "TunID Match Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-tun-id", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	recent := time.Now().Add(-10 * time.Second)
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+		lastHandshakeFn: func() time.Time { return recent },
+	}
+
+	// Set device with matching tun.ID
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	rtt, err := svc.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected ProbeTunnel to succeed when device matches tun.ID, got: %v", err)
+	}
+	if rtt != 10 {
+		t.Errorf("expected 10ms latency for device-backed tunnel, got %d", rtt)
+	}
+
+	// Remove matching device by setting with wrong ID
+	svc.mu.Lock()
+	delete(svc.backendDevices, tun.ID)
+	svc.backendDevices[99999] = dev
+	svc.mu.Unlock()
+
+	// Prober now cannot find device by tun.ID and falls through to ProbeAWGEndpoint
+	// which fails on unlistening endpoint 127.0.0.1:51820
+	_, err = svc.ProbeTunnel(ctx, tun)
+	if err == nil {
+		t.Error("expected ProbeTunnel to fail or fall through when device key does not match tun.ID, got nil")
+	}
+}
+
+func TestProbeFunc_ZeroHandshake_Within90sGrace_SendsTrigger(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Grace Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-grace", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	inCh := make(chan []byte, 10)
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+		lastHandshakeFn: func() time.Time { return time.Time{} },
+		createdAt:       time.Now().Add(-30 * time.Second),
+		inPacketsCh:     inCh,
+	}
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	rtt, err := svc.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected zero-handshake within 90s grace to succeed, got: %v", err)
+	}
+	if rtt != 10 {
+		t.Errorf("expected 10ms latency, got %d", rtt)
+	}
+
+	// Assert dummy trigger packet was written to the device's vtun.inPackets
+	select {
+	case pkt := <-inCh:
+		if len(pkt) < 20 {
+			t.Fatalf("expected IPv4 packet >= 20 bytes, got %d bytes", len(pkt))
+		}
+		if (pkt[0] >> 4) != 4 {
+			t.Errorf("expected IPv4 version 4, got %d", pkt[0]>>4)
+		}
+		// Destination IP bytes 16..19 should be 0.0.0.0
+		destIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19]).String()
+		if destIP != "0.0.0.0" {
+			t.Errorf("expected trigger packet dest IP 0.0.0.0, got %s", destIP)
+		}
+	default:
+		t.Fatal("expected dummy trigger packet in vtun inPackets, none found")
+	}
+}
+
+func TestProbeFunc_ZeroHandshake_Past90sGrace_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Grace Timeout Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-grace-timeout", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	// Zero handshake, created 95s ago (>= 90s cutoff)
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+		lastHandshakeFn: func() time.Time { return time.Time{} },
+		createdAt:       time.Now().Add(-95 * time.Second),
+	}
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	_, err = svc.ProbeTunnel(ctx, tun)
+	if err == nil {
+		t.Fatal("expected error for zero-handshake past 90s grace, got nil")
+	}
+	if !strings.Contains(err.Error(), "initial handshake not completed within") {
+		t.Errorf("expected initial handshake timeout error, got: %v", err)
+	}
+}
+
+func TestProbeFunc_StaleHandshake_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Stale Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-stale", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	// Handshake 4 minutes ago (>= 3m cutoff)
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+		lastHandshakeFn: func() time.Time { return time.Now().Add(-4 * time.Minute) },
+	}
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	_, err = svc.ProbeTunnel(ctx, tun)
+	if err == nil {
+		t.Fatal("expected error for stale handshake >3m, got nil")
+	}
+	if !strings.Contains(err.Error(), "amneziawg-go handshake timeout") {
+		t.Errorf("expected amneziawg-go handshake timeout error, got: %v", err)
+	}
+}
+
+func TestProbeFunc_RecentHandshake_ReturnsSuccess(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Recent Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-recent", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	// Handshake 45s ago (< 3m cutoff)
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+		lastHandshakeFn: func() time.Time { return time.Now().Add(-45 * time.Second) },
+	}
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	rtt, err := svc.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected recent handshake <3m to succeed, got: %v", err)
+	}
+	if rtt != 10 {
+		t.Errorf("expected 10ms latency, got %d", rtt)
+	}
+}
+
+func TestAttachBackendForwarder_IdempotentClosesOldDevice(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Idempotent Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("first attachBackendForwarder failed: %v", err)
+	}
+
+	dev1 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev1 == nil {
+		t.Fatal("expected dev1 to be attached, got nil")
+	}
+	if dev1.IsClosed() {
+		t.Error("expected dev1 to be open initially")
+	}
+
+	// Re-attach device for the same tunnel ID
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("second attachBackendForwarder failed: %v", err)
+	}
+
+	dev2 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev2 == nil {
+		t.Fatal("expected dev2 to be attached, got nil")
+	}
+	if dev2 == dev1 {
+		t.Error("expected new device instance to replace dev1")
+	}
+	if !dev1.IsClosed() {
+		t.Error("expected old dev1 to be closed after re-attaching")
+	}
+	if dev2.IsClosed() {
+		t.Error("expected new dev2 to remain open")
+	}
+
+	// Reading from old closed device returns error, ensuring read goroutine terminates
+	buf := make([]byte, 100)
+	_, readErr := dev1.Read(buf)
+	if readErr == nil {
+		t.Error("expected read on closed dev1 to fail, got nil")
+	}
+
+	_ = dev2.Close()
+}
+
+func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pub1, priv1, _ := tunnel.GenerateCurve25519KeyPair()
+	pub2, priv2, _ := tunnel.GenerateCurve25519KeyPair()
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Restore Srv 1",
+		Host: "198.51.100.51",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": pub1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer 1 failed: %v", err)
+	}
+
+	s2ID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Restore Srv 2",
+		Host: "198.51.100.52",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": pub2,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer 2 failed: %v", err)
+	}
+
+	// Create active tunnel for server 1
+	now := time.Now().UTC()
+	tun1 := &models.BackendTunnel{
+		ServerID:      s1ID,
+		InterfaceName: fmt.Sprintf("awg-be-%d", s1ID),
+		PublicKey:     pub1,
+		PrivateKey:    priv1,
+		Endpoint:      "198.51.100.51:51820",
+		Status:        TunnelStatusActive,
+		CreatedAt:     now,
+	}
+	tun1ID, err := db.CreateBackendTunnel(ctx, tun1)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 1 failed: %v", err)
+	}
+	tun1.ID = tun1ID
+
+	// Create disabled tunnel for server 2
+	tun2 := &models.BackendTunnel{
+		ServerID:      s2ID,
+		InterfaceName: fmt.Sprintf("awg-be-%d", s2ID),
+		PublicKey:     pub2,
+		PrivateKey:    priv2,
+		Endpoint:      "198.51.100.52:51820",
+		Status:        TunnelStatusDisabled,
+		CreatedAt:     now,
+	}
+	tun2ID, err := db.CreateBackendTunnel(ctx, tun2)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 2 failed: %v", err)
+	}
+	tun2.ID = tun2ID
+
+	// Start fresh Service
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	// Avoid 3-second network probe timeouts on unreachable test endpoints during background health loop
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// Active tunnel 1 should have its backend device restored
+	dev1 := svc.GetBackendDeviceForTest(tun1ID)
+	if dev1 == nil {
+		t.Errorf("expected backend device for active tunnel %d to be restored on Start, got nil", tun1ID)
+	}
+
+	// Disabled tunnel 2 should NOT have a backend device attached
+	dev2 := svc.GetBackendDeviceForTest(tun2ID)
+	if dev2 != nil {
+		t.Errorf("expected no backend device for disabled tunnel %d on Start, got %+v", tun2ID, dev2)
+	}
+
+	// Active tunnel status remains active
+	restoredTun1, err := svc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel 1 failed: %v", err)
+	}
+	if restoredTun1.Status != TunnelStatusActive {
+		t.Errorf("expected tunnel 1 status 'active', got %s", restoredTun1.Status)
+	}
+}
+
+func TestStart_RestoresBackendDevices_DegradesOnAttachFailure(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Degrade Srv", "198.51.100.99")
+
+	now := time.Now().UTC()
+	tun := &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: fmt.Sprintf("awg-be-%d", sID),
+		PublicKey:     pub,
+		PrivateKey:    priv,
+		Endpoint:      "198.51.100.99:999999", // invalid port causes attach to fail
+		Status:        TunnelStatusActive,
+		CreatedAt:     now,
+	}
+	tunID, err := db.CreateBackendTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// Device should not be present
+	dev := svc.GetBackendDeviceForTest(tunID)
+	if dev != nil {
+		t.Errorf("expected nil device when restore fails, got %+v", dev)
+	}
+
+	// Tunnel status should be marked degraded so it does not report active without a data plane
+	tStatus, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tStatus.Status != TunnelStatusDegraded {
+		t.Errorf("expected tunnel status 'degraded' after attach failure, got %s", tStatus.Status)
+	}
+}
+
+func TestService_GetStatus_ExposesDroppedPackets(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "Drops Srv", "127.0.0.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "127.0.0.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	realDev, err := tunnel.NewAWGClientDevice("test-drops", tun.Endpoint, priv, pub, 1340, nil)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer realDev.Close()
+
+	dev := &testBackendDevice{
+		AWGClientDevice: realDev,
+	}
+	svc.SetBackendDeviceForTest(tun.ID, dev)
+
+	// Initially 0 drops
+	st, err := svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if st.DroppedPackets != 0 {
+		t.Errorf("expected 0 dropped packets initially, got %d", st.DroppedPackets)
+	}
+	if svc.TotalDroppedPackets() != 0 {
+		t.Errorf("expected 0 total dropped packets, got %d", svc.TotalDroppedPackets())
+	}
+
+	// Simulate 42 drops
+	dev.dropCount.Add(42)
+
+	st, err = svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if st.DroppedPackets != 42 {
+		t.Errorf("expected 42 dropped packets in status, got %d", st.DroppedPackets)
+	}
+	if svc.TotalDroppedPackets() != 42 {
+		t.Errorf("expected 42 total dropped packets from helper, got %d", svc.TotalDroppedPackets())
+	}
+
+	// Simulate 100 more drops to trigger rate-limited log
+	dev.dropCount.Add(100)
+	st, err = svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if st.DroppedPackets != 142 {
+		t.Errorf("expected 142 dropped packets in status, got %d", st.DroppedPackets)
+	}
+}
+
+func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Degraded Srv",
+		Host: "198.51.100.77",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": pub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Create DEGRADED tunnel
+	now := time.Now().UTC()
+	tun := &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: fmt.Sprintf("awg-be-%d", sID),
+		PublicKey:     pub,
+		PrivateKey:    priv,
+		Endpoint:      "198.51.100.77:51820",
+		Status:        TunnelStatusDegraded,
+		CreatedAt:     now,
+	}
+	tunID, err := db.CreateBackendTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	tun.ID = tunID
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// Degraded tunnel should have its backend device restored
+	dev := svc.GetBackendDeviceForTest(tunID)
+	if dev == nil {
+		t.Fatalf("expected backend device for degraded tunnel %d to be restored on Start, got nil", tunID)
+	}
+	if dev.IsClosed() {
+		t.Error("expected restored device to be open")
+	}
+
+	// Tunnel status should remain degraded before probe
+	restoredTun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if restoredTun.Status != TunnelStatusDegraded {
+		t.Errorf("expected tunnel status to remain 'degraded' before probe, got %s", restoredTun.Status)
+	}
+
+	// Probe the tunnel - now succeeds and transitions to active
+	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
+	if err != nil {
+		t.Fatalf("ProbeTunnel failed: %v", err)
+	}
+	if rtt <= 0 {
+		t.Errorf("expected positive rtt, got %d", rtt)
+	}
+
+	probedTun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if probedTun.Status != TunnelStatusActive {
+		t.Errorf("expected tunnel status to become 'active' after probe, got %s", probedTun.Status)
+	}
+}
+
+func TestHealthProber_DegradedTunnel_FailsActivationWithoutDevice(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, pub, priv := createTestServerAndKey(t, db, "NoDev Srv", "198.51.100.88")
+
+	tun := &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: fmt.Sprintf("awg-be-%d", sID),
+		PublicKey:     pub,
+		PrivateKey:    priv,
+		Endpoint:      "198.51.100.88:999999", // invalid port so attach fails
+		Status:        TunnelStatusDegraded,
+		CreatedAt:     time.Now().UTC(),
+	}
+	tunID, err := db.CreateBackendTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	tun.ID = tunID
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	// Stub probeFunc to return success
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+
+	// Add tunnel to pool
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	// Device is nil
+	if dev := svc.GetBackendDeviceForTest(tunID); dev != nil {
+		t.Fatalf("expected nil device, got %+v", dev)
+	}
+
+	// Probe the tunnel
+	_, _ = svc.ProbeTunnel(ctx, tun)
+
+	// Status must REMAIN degraded because data plane could not be attached
+	tunAfter, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfter.Status != TunnelStatusDegraded {
+		t.Errorf("expected tunnel without data plane device to stay degraded, but got %s", tunAfter.Status)
+	}
+}
+
+type testMockPacketDev struct {
+	mu       sync.Mutex
+	pkts     [][]byte
+	notifyCh chan struct{}
+}
+
+func (m *testMockPacketDev) Read(p []byte) (int, error) {
+	return 0, nil
+}
+
+func (m *testMockPacketDev) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	m.pkts = append(m.pkts, buf)
+	m.mu.Unlock()
+	select {
+	case m.notifyCh <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (m *testMockPacketDev) Close() error {
+	return nil
+}
+
+func (m *testMockPacketDev) getPackets() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]byte, len(m.pkts))
+	for i, b := range m.pkts {
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		out[i] = cp
+	}
+	return out
+}
+
+func TestAttachBackendForwarder_ReattachStopsOldPumpRegression(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	// Start forwarder pumps
+	svc.forwarder.Start(ctx)
+	svc.forwarder.StartPumps(ctx)
+	defer func() { _ = svc.forwarder.Stop() }()
+
+	backendID := int64(999)
+	peerKey := "peer-pump-regression"
+	svc.forwarder.RegisterSession("sess-p", "conn-p", peerKey, "10.100.0.99", backendID)
+
+	dev1 := &testMockPacketDev{notifyCh: make(chan struct{}, 300)}
+	dev2 := &testMockPacketDev{notifyCh: make(chan struct{}, 300)}
+
+	// First attach
+	svc.forwarder.AttachBackendDevice(backendID, dev1)
+
+	// Route initial packet to dev1
+	if err := svc.forwarder.RouteClientToBackend(peerKey, []byte("pkt-1")); err != nil {
+		t.Fatalf("RouteClientToBackend pkt-1 failed: %v", err)
+	}
+
+	select {
+	case <-dev1.notifyCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for initial packet on dev1")
+	}
+
+	if len(dev1.getPackets()) != 1 {
+		t.Fatalf("expected 1 packet on dev1 before re-attach, got %d", len(dev1.getPackets()))
+	}
+
+	// Re-attach: Detach old device, Attach new device (mirrors attachBackendForwarder lifecycle)
+	svc.forwarder.DetachBackendDevice(backendID)
+	svc.forwarder.AttachBackendDevice(backendID, dev2)
+
+	// Route 200 packets
+	totalPackets := 200
+	for i := 0; i < totalPackets; i++ {
+		if err := svc.forwarder.RouteClientToBackend(peerKey, []byte(fmt.Sprintf("pkt-%d", i))); err != nil {
+			t.Fatalf("RouteClientToBackend failed at %d: %v", i, err)
+		}
+	}
+
+	// Wait for packets to arrive on dev2
+	deadline := time.Now().Add(2 * time.Second)
+	for len(dev2.getPackets()) < totalPackets && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	dev1After := len(dev1.getPackets()) - 1 // minus initial packet
+	dev2Count := len(dev2.getPackets())
+
+	// Assert old device receives ZERO packets after re-attach
+	if dev1After != 0 {
+		t.Errorf("expected old device dev1 to receive 0 packets after re-attach, but got %d (pump leaked)", dev1After)
+	}
+	// Assert new device receives 100% of packets
+	if dev2Count != totalPackets {
+		t.Errorf("expected new device dev2 to receive %d packets (100%%), but got %d", totalPackets, dev2Count)
+	}
+}
+
+// --- Issue #25: Full AmneziaWG 3.0 Compliance for Load Balancer Client Configs ---
+
+func parseDirectiveInt(t *testing.T, configStr, directive string) int {
+	t.Helper()
+	for _, line := range strings.Split(configStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, directive+" =") || strings.HasPrefix(line, directive+"=") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				valStr := strings.TrimSpace(parts[1])
+				v, err := strconv.Atoi(valStr)
+				if err != nil {
+					t.Fatalf("failed to parse integer for %s: %v in line %s", directive, err, line)
+				}
+				return v
+			}
+		}
+	}
+	t.Fatalf("directive %s not found in config:\n%s", directive, configStr)
+	return 0
+}
+
+func parseDirectiveString(t *testing.T, configStr, directive string) string {
+	t.Helper()
+	for _, line := range strings.Split(configStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, directive+" =") || strings.HasPrefix(line, directive+"=") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	t.Fatalf("directive %s not found in config:\n%s", directive, configStr)
+	return ""
+}
+
+func TestGenerateUserClientConfig_AWG3_Compliance(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "dave",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, filename, err := svc.GenerateUserClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateUserClientConfig failed: %v", err)
+	}
+
+	if filename != "amnezia-portal-dave.conf" {
+		t.Errorf("unexpected filename: %s, want amnezia-portal-dave.conf", filename)
+	}
+
+	// Verify required sections
+	if !strings.Contains(cfgStr, "[Interface]") || !strings.Contains(cfgStr, "[Peer]") {
+		t.Fatalf("missing required sections in generated config:\n%s", cfgStr)
+	}
+
+	// Verify AWG 3.0 timing parameters
+	rat := parseDirectiveInt(t, cfgStr, "RekeyAfterTime")
+	if rat < 100 || rat > 140 {
+		t.Errorf("RekeyAfterTime %d not in required range [100, 140]", rat)
+	}
+
+	rt := parseDirectiveInt(t, cfgStr, "RekeyTimeout")
+	if rt < 4 || rt > 6 {
+		t.Errorf("RekeyTimeout %d not in required range [4, 6]", rt)
+	}
+	if rt >= rat {
+		t.Errorf("RekeyTimeout %d must be strictly less than RekeyAfterTime %d", rt, rat)
+	}
+
+	rej := parseDirectiveInt(t, cfgStr, "RejectAfterTime")
+	if rej < 160 || rej > 200 {
+		t.Errorf("RejectAfterTime %d not in required range [160, 200]", rej)
+	}
+
+	kt := parseDirectiveInt(t, cfgStr, "KeepaliveTimeout")
+	if kt < 8 || kt > 12 {
+		t.Errorf("KeepaliveTimeout %d not in required range [8, 12]", kt)
+	}
+
+	mha := parseDirectiveInt(t, cfgStr, "MaxHandshakeAttempts")
+	if mha < 4 || mha > 8 {
+		t.Errorf("MaxHandshakeAttempts %d not in required range [4, 8]", mha)
+	}
+
+	pk := parseDirectiveInt(t, cfgStr, "PersistentKeepalive")
+	if pk < 22 || pk > 30 {
+		t.Errorf("PersistentKeepalive %d not in required range [22, 30]", pk)
+	}
+
+	// Verify standard AWG obfuscation parameters
+	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"} {
+		if !strings.Contains(cfgStr, key+" =") {
+			t.Errorf("missing required AWG parameter %s in config:\n%s", key, cfgStr)
+		}
+	}
+
+	// Verify NO CPS packets (Issue #15)
+	for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if strings.Contains(cfgStr, key+" =") || strings.Contains(cfgStr, key+"=") {
+			t.Errorf("Load Balancer client config must not contain %s, got:\n%s", key, cfgStr)
+		}
+	}
+}
+
+func TestGenerateUserClientConfig_StabilityAcrossRefetches(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "alice_stable",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfg1, _, err := svc.GenerateUserClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("first GenerateUserClientConfig failed: %v", err)
+	}
+
+	cfg2, _, err := svc.GenerateUserClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("second GenerateUserClientConfig failed: %v", err)
+	}
+
+	cfg3, _, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("third GenerateClientConfig failed: %v", err)
+	}
+
+	// Verify stability across all 3 fetches
+	directives := []string{
+		"RekeyAfterTime",
+		"RekeyTimeout",
+		"RejectAfterTime",
+		"KeepaliveTimeout",
+		"MaxHandshakeAttempts",
+		"PersistentKeepalive",
+		"PrivateKey",
+	}
+
+	for _, d := range directives {
+		val1 := parseDirectiveString(t, cfg1, d)
+		val2 := parseDirectiveString(t, cfg2, d)
+		val3 := parseDirectiveString(t, cfg3, d)
+
+		if val1 != val2 {
+			t.Errorf("directive %s differs between fetch 1 (%s) and fetch 2 (%s)", d, val1, val2)
+		}
+		if val1 != val3 {
+			t.Errorf("directive %s differs between fetch 1 (%s) and fetch 3 (%s)", d, val1, val3)
+		}
+	}
+
+	// Verify connection record in database has ClientParams persisted
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(conns) == 0 {
+		t.Fatalf("failed to retrieve connections from db: %v", err)
+	}
+	conn := conns[0]
+	if len(conn.ClientParams) == 0 {
+		t.Fatalf("expected ClientParams on user connection, got empty: %+v", conn)
+	}
+
+	ratDB, _ := conn.ClientParams["rekey_after_time"].(float64)
+	ratCfg := parseDirectiveInt(t, cfg1, "RekeyAfterTime")
+	if int(ratDB) != ratCfg {
+		t.Errorf("persisted RekeyAfterTime in DB (%v) does not match config (%d)", ratDB, ratCfg)
+	}
+}
+
+func TestGenerateUserClientConfig_FingerprintDiversity(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID1, err := db.CreateUser(ctx, &models.User{Username: "client_alice", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser alice failed: %v", err)
+	}
+	uID2, err := db.CreateUser(ctx, &models.User{Username: "client_bob", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser bob failed: %v", err)
+	}
+
+	cfgAlice, _, err := svc.GenerateUserClientConfig(ctx, uID1)
+	if err != nil {
+		t.Fatalf("GenerateUserClientConfig alice failed: %v", err)
+	}
+	cfgBob, _, err := svc.GenerateUserClientConfig(ctx, uID2)
+	if err != nil {
+		t.Fatalf("GenerateUserClientConfig bob failed: %v", err)
+	}
+
+	// Compare timing parameters
+	paramsAlice := []int{
+		parseDirectiveInt(t, cfgAlice, "RekeyAfterTime"),
+		parseDirectiveInt(t, cfgAlice, "RekeyTimeout"),
+		parseDirectiveInt(t, cfgAlice, "RejectAfterTime"),
+		parseDirectiveInt(t, cfgAlice, "KeepaliveTimeout"),
+		parseDirectiveInt(t, cfgAlice, "MaxHandshakeAttempts"),
+		parseDirectiveInt(t, cfgAlice, "PersistentKeepalive"),
+	}
+
+	paramsBob := []int{
+		parseDirectiveInt(t, cfgBob, "RekeyAfterTime"),
+		parseDirectiveInt(t, cfgBob, "RekeyTimeout"),
+		parseDirectiveInt(t, cfgBob, "RejectAfterTime"),
+		parseDirectiveInt(t, cfgBob, "KeepaliveTimeout"),
+		parseDirectiveInt(t, cfgBob, "MaxHandshakeAttempts"),
+		parseDirectiveInt(t, cfgBob, "PersistentKeepalive"),
+	}
+
+	identicalParams := true
+	for i := range paramsAlice {
+		if paramsAlice[i] != paramsBob[i] {
+			identicalParams = false
+			break
+		}
+	}
+
+	if identicalParams {
+		t.Errorf("fingerprint diversity failure: Alice and Bob generated identical timing parameters: %+v", paramsAlice)
+	}
+
+	privAlice := parseDirectiveString(t, cfgAlice, "PrivateKey")
+	privBob := parseDirectiveString(t, cfgBob, "PrivateKey")
+	if privAlice == privBob {
+		t.Errorf("Alice and Bob generated identical PrivateKey: %s", privAlice)
+	}
+}
+
+func TestGenerateUserClientConfig_HeaderProtectionAndContentPadding(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	cfg, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+
+	cfg.HeaderProtectionKey = "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU="
+	cfg.ContentPaddingAddition = "16-64"
+	cfg.S1 = 4
+	cfg.S2 = 6
+	cfg.S3 = 8
+	cfg.S4 = 10
+	if err := svc.UpdateConfig(ctx, cfg); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "eve",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, _, err := svc.GenerateUserClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateUserClientConfig failed: %v", err)
+	}
+
+	// Verify HeaderProtectionKey rendered in [Interface]
+	hpk := parseDirectiveString(t, cfgStr, "HeaderProtectionKey")
+	if hpk != "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=" {
+		t.Errorf("unexpected HeaderProtectionKey: %s", hpk)
+	}
+
+	// Verify S1..S4 >= 12 enforced due to HeaderProtectionKey
+	for _, sName := range []string{"S1", "S2", "S3", "S4"} {
+		sVal := parseDirectiveInt(t, cfgStr, sName)
+		if sVal < 12 {
+			t.Errorf("%s = %d; expected >= 12 enforced when HeaderProtectionKey is active", sName, sVal)
+		}
+	}
+
+	// Verify ContentPaddingAddition rendered in [Interface]
+	cpAdd := parseDirectiveString(t, cfgStr, "ContentPaddingAddition")
+	if cpAdd != "16-64" {
+		t.Errorf("unexpected ContentPaddingAddition: %s, want 16-64", cpAdd)
+	}
+
+	// Refetch and ensure ContentPaddingAddition remains stable
+	cfgStr2, _, err := svc.GenerateUserClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("second GenerateUserClientConfig failed: %v", err)
+	}
+	cpAdd2 := parseDirectiveString(t, cfgStr2, "ContentPaddingAddition")
+	if cpAdd2 != "16-64" {
+		t.Errorf("refetched ContentPaddingAddition: %s, want 16-64", cpAdd2)
 	}
 }

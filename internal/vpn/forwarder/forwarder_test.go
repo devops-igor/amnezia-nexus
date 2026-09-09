@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -371,5 +372,75 @@ func TestTokenBucketDirect(t *testing.T) {
 	}
 	if tb.Allow(200) {
 		t.Errorf("expected false on Allow(200) when only 100 left")
+	}
+}
+
+func TestForwarder_ReattachStopsOldPumpAndDeliversToNewDevice(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	accountant := NewTrafficAccountant(nil, 0)
+	fwd := NewForwarder(accountant, 500)
+	fwd.Start(ctx)
+	fwd.StartPumps(ctx)
+	defer func() { _ = fwd.Stop() }()
+
+	backendID := int64(42)
+	peerKey := "peer-test-reattach"
+	assignedIP := "10.100.0.42"
+
+	fwd.RegisterSession("sess-42", "conn-42", peerKey, assignedIP, backendID)
+
+	oldDev := newMockPacketDev()
+	fwd.AttachBackendDevice(backendID, oldDev)
+
+	// Route 1 initial packet to verify oldDev receives packets before re-attach
+	if err := fwd.RouteClientToBackend(peerKey, []byte("pkt-before-reattach")); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+
+	select {
+	case <-oldDev.notifyCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for oldDev initial packet")
+	}
+
+	if len(oldDev.getPackets()) != 1 {
+		t.Fatalf("expected 1 packet on oldDev before reattach, got %d", len(oldDev.getPackets()))
+	}
+
+	// Re-attach: Detach old device, Attach new device (mirrors attachBackendForwarder lifecycle)
+	newDev := newMockPacketDev()
+	fwd.DetachBackendDevice(backendID)
+	fwd.AttachBackendDevice(backendID, newDev)
+
+	// Send 200 packets to backend queue
+	totalPackets := 200
+	for i := 0; i < totalPackets; i++ {
+		if err := fwd.RouteClientToBackend(peerKey, []byte(fmt.Sprintf("pkt-%d", i))); err != nil {
+			t.Fatalf("RouteClientToBackend packet %d failed: %v", i, err)
+		}
+	}
+
+	// Wait until newDev has received all 200 packets or timeout
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(newDev.getPackets()) == totalPackets {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	oldPktsAfterReattach := len(oldDev.getPackets()) - 1 // minus initial packet before reattach
+	newPkts := len(newDev.getPackets())
+
+	// Assert old device receives ZERO packets after reattach
+	if oldPktsAfterReattach != 0 {
+		t.Errorf("expected old device to receive 0 packets after re-attach, but it received %d (packets stolen by old pump)", oldPktsAfterReattach)
+	}
+
+	// Assert new device receives 100% of packets after reattach
+	if newPkts != totalPackets {
+		t.Errorf("expected new device to receive %d packets (100%%), but it received %d", totalPackets, newPkts)
 	}
 }
