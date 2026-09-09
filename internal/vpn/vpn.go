@@ -110,7 +110,7 @@ type Service struct {
 	requireTun       bool
 	tunOpener        func() (endpoint.PacketDevice, error)
 	tunDev           endpoint.PacketDevice
-	backendDevices   map[int64]*tunnel.UDPDevice
+	backendDevices   map[int64]*tunnel.AWGClientDevice
 	publicIPMu       sync.RWMutex
 	detectedPublicIP string
 }
@@ -617,7 +617,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
 	}
 
-	pub, port, err := s.resolveBackendCredentials(ctx, serverID, server)
+	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
 	if err != nil {
 		return err
 	}
@@ -630,6 +630,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	// Register the prober client peer on the backend server so amneziawg-go accepts probe handshakes
+	// We also use allowed_ips=0.0.0.0/0 so the portal can route arbitrary traffic.
 	if proberPub, err := health.ComputePublicKeyFromPrivate(tun.PrivateKey); err != nil {
 		log.Printf("[vpn] warning: failed to compute prober client public key for server %d: %v", serverID, err)
 	} else if s.awgProvider != nil {
@@ -638,18 +639,19 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		}
 		if adder, ok := s.awgProvider.(clientAdder); ok {
 			clientParams := map[string]any{
-				"clientName":        "Health Probe",
-				"name":              "Health Probe",
+				"clientName":        "Portal Data Plane",
+				"name":              "Portal Data Plane",
 				"public_key":        proberPub,
 				"client_public_key": proberPub,
+				"allowed_ips":       "0.0.0.0/0",
 			}
 			if _, err := adder.AddClient(ctx, server, clientParams); err != nil {
-				log.Printf("[vpn] warning: failed to register health probe peer on backend server %d: %v", serverID, err)
+				log.Printf("[vpn] warning: failed to register portal data plane peer on backend server %d: %v", serverID, err)
 			}
 		}
 	}
 
-	if err := s.attachBackendForwarder(serverID, tun.ID, endpoint); err != nil {
+	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
 		return err
 	}
 
@@ -657,26 +659,31 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 }
 
 // resolveBackendCredentials retrieves AWG credentials for a backend, falling back to live discovery.
-func (s *Service) resolveBackendCredentials(ctx context.Context, serverID int64, server *models.Server) (string, int, error) {
+func (s *Service) resolveBackendCredentials(ctx context.Context, serverID int64, server *models.Server) (string, int, map[string]any, error) {
 	var pub string
 	var port int
+	var awgParams map[string]any
 	if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
 		pub, _ = awgInfo["public_key"].(string)
 		port = parsePort(awgInfo["port"])
+		awgParams, _ = awgInfo["awg_params"].(map[string]any)
 	}
 
 	if (pub == "" || port <= 0) && s.awgProvider != nil {
 		if livePub, livePort, ok := s.discoverLiveAWG(ctx, serverID, server); ok {
 			pub = livePub
 			port = livePort
+			if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
+				awgParams, _ = awgInfo["awg_params"].(map[string]any)
+			}
 		}
 	}
 
 	if pub == "" || port <= 0 {
-		return "", 0, ErrAWGNotInstalled
+		return "", 0, nil, ErrAWGNotInstalled
 	}
 
-	return pub, port, nil
+	return pub, port, awgParams, nil
 }
 
 // discoverLiveAWG attempts to query the running AWG container and persists discovered configuration to DB.
@@ -719,22 +726,22 @@ func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *m
 	return livePub, livePort, true
 }
 
-func (s *Service) attachBackendForwarder(serverID int64, tunID int64, endpoint string) error {
+func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any) error {
 	if s.forwarder == nil {
 		return nil
 	}
-	dev, devErr := tunnel.NewUDPDevice(fmt.Sprintf("awg-be-%d", serverID), endpoint, 1420)
+	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, 1340, awgParams)
 	if devErr != nil {
-		return fmt.Errorf("failed to create backend UDP device for server %d: %w", serverID, devErr)
+		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}
-	s.forwarder.AttachBackendDevice(tunID, dev)
+	s.forwarder.AttachBackendDevice(tun.ID, dev)
 	if s.backendDevices == nil {
-		s.backendDevices = make(map[int64]*tunnel.UDPDevice)
+		s.backendDevices = make(map[int64]*tunnel.AWGClientDevice)
 	}
-	s.backendDevices[tunID] = dev
+	s.backendDevices[tun.ID] = dev
 
 	// Spawn backend read loop to route packets back to clients
-	go func(backendID int64, device *tunnel.UDPDevice) {
+	go func(backendID int64, device *tunnel.AWGClientDevice) {
 		buf := make([]byte, 2048)
 		for {
 			n, err := device.Read(buf)
@@ -746,7 +753,7 @@ func (s *Service) attachBackendForwarder(serverID int64, tunID int64, endpoint s
 				_ = s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP)
 			}
 		}
-	}(tunID, dev)
+	}(tun.ID, dev)
 	return nil
 }
 
