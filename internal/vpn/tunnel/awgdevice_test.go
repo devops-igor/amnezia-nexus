@@ -22,7 +22,7 @@ func TestAWGClientDevice_ReadWrite(t *testing.T) {
 	}
 
 	testPkt := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
-	
+
 	// Inject a packet into the device (from forwarder)
 	n, err := dev.Write(testPkt)
 	if err != nil {
@@ -34,7 +34,6 @@ func TestAWGClientDevice_ReadWrite(t *testing.T) {
 
 	// Read from vtun's inPackets (as amneziawg-go would via Read)
 
-	
 	dev.vtun.events <- 1 // Avoid block
 
 	// Wait for packet

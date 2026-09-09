@@ -21,13 +21,13 @@ import (
 
 // AWGClientDevice implements PacketDevice for connecting the portal to a backend AWG server.
 type AWGClientDevice struct {
-	name       string
-	mtu        int
-	vtun       *VirtualTUN
-	dev        *device.Device
-	doneCh     chan struct{}
-	closed     atomic.Bool
-	once       sync.Once
+	name   string
+	mtu    int
+	vtun   *VirtualTUN
+	dev    *device.Device
+	doneCh chan struct{}
+	closed atomic.Bool
+	once   sync.Once
 }
 
 // VirtualTUN implements tun.Device in-memory for amneziawg-go.
@@ -82,9 +82,9 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 	return n, nil
 }
 
-func (t *VirtualTUN) MTU() (int, error)             { return t.mtu, nil }
-func (t *VirtualTUN) Name() (string, error)         { return t.name, nil }
-func (t *VirtualTUN) Events() <-chan tun.Event      { return t.events }
+func (t *VirtualTUN) MTU() (int, error)        { return t.mtu, nil }
+func (t *VirtualTUN) Name() (string, error)    { return t.name, nil }
+func (t *VirtualTUN) Events() <-chan tun.Event { return t.events }
 func (t *VirtualTUN) Close() error {
 	t.once.Do(func() {
 		close(t.closed)
@@ -149,20 +149,38 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 
 	var cfg string
 	cfg += fmt.Sprintf("private_key=%s\n", privHex)
-	
+
 	jc, jmin, jmax, s1, s2, h1, h2, h3, h4 := 1, 0, 0, 0, 0, 1, 2, 3, 4
 	if awgParams != nil {
-		if v, ok := awgParams["Jc"]; ok { jc = toInt(v) }
-		if v, ok := awgParams["Jmin"]; ok { jmin = toInt(v) }
-		if v, ok := awgParams["Jmax"]; ok { jmax = toInt(v) }
-		if v, ok := awgParams["S1"]; ok { s1 = toInt(v) }
-		if v, ok := awgParams["S2"]; ok { s2 = toInt(v) }
-		if v, ok := awgParams["H1"]; ok { h1 = toInt(v) }
-		if v, ok := awgParams["H2"]; ok { h2 = toInt(v) }
-		if v, ok := awgParams["H3"]; ok { h3 = toInt(v) }
-		if v, ok := awgParams["H4"]; ok { h4 = toInt(v) }
+		if v, ok := awgParams["Jc"]; ok {
+			jc = toInt(v)
+		}
+		if v, ok := awgParams["Jmin"]; ok {
+			jmin = toInt(v)
+		}
+		if v, ok := awgParams["Jmax"]; ok {
+			jmax = toInt(v)
+		}
+		if v, ok := awgParams["S1"]; ok {
+			s1 = toInt(v)
+		}
+		if v, ok := awgParams["S2"]; ok {
+			s2 = toInt(v)
+		}
+		if v, ok := awgParams["H1"]; ok {
+			h1 = toInt(v)
+		}
+		if v, ok := awgParams["H2"]; ok {
+			h2 = toInt(v)
+		}
+		if v, ok := awgParams["H3"]; ok {
+			h3 = toInt(v)
+		}
+		if v, ok := awgParams["H4"]; ok {
+			h4 = toInt(v)
+		}
 	}
-	
+
 	cfg += fmt.Sprintf("jc=%d\n", jc)
 	cfg += fmt.Sprintf("jmin=%d\n", jmin)
 	cfg += fmt.Sprintf("jmax=%d\n", jmax)
@@ -172,7 +190,7 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 	cfg += fmt.Sprintf("h2=%d\n", h2)
 	cfg += fmt.Sprintf("h3=%d\n", h3)
 	cfg += fmt.Sprintf("h4=%d\n", h4)
-	
+
 	cfg += fmt.Sprintf("public_key=%s\n", pubHex)
 	cfg += fmt.Sprintf("endpoint=%s\n", endpoint)
 	cfg += "allowed_ip=0.0.0.0/0\n"
@@ -200,7 +218,7 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 		dev:    dev,
 		doneCh: make(chan struct{}),
 	}
-	
+
 	return d, nil
 }
 
@@ -242,9 +260,9 @@ func (d *AWGClientDevice) Close() error {
 	return nil
 }
 
-func (d *AWGClientDevice) LocalAddr() net.Addr { 
+func (d *AWGClientDevice) LocalAddr() net.Addr {
 	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	return addr 
+	return addr
 }
 
 func (d *AWGClientDevice) Name() string { return d.name }

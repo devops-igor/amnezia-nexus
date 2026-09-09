@@ -856,7 +856,7 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 		clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
 		clients[existingIdx].UserData.PSK = psk
 		clients[existingIdx].UserData.Enabled = true
-		
+
 		if clients[existingIdx].UserData.RekeyAfterTime == nil {
 			rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
 			clients[existingIdx].UserData.RekeyAfterTime = rat
@@ -866,39 +866,39 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			clients[existingIdx].UserData.MaxHandshakeAttempts = mha
 			clients[existingIdx].UserData.PersistentKeepalive = pk
 		}
-		
+
 		if contentPadding && clients[existingIdx].UserData.ContentPaddingAddition == nil {
 			val := "16-64"
 			clients[existingIdx].UserData.ContentPaddingAddition = &val
 		}
-		
+
 		return clients
 	}
-	
+
 	rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
 	var cpAdd *string
 	if contentPadding {
 		val := "16-64"
 		cpAdd = &val
 	}
-	
+
 	return append(clients, AWGClient{
 		ClientID: clientPubKey,
 		UserData: AWGClientUserData{
-			ClientName:       clientName,
-			ClientPrivateKey: clientPrivKey,
-			ClientIP:         clientIP,
-			PSK:              psk,
-			Enabled:          true,
-			AWGMimicry:       mimicry,
-			SpeedLimitDown:   speedDown,
-			SpeedLimitUp:     speedUp,
-			RekeyAfterTime:       rat,
-			RekeyTimeout:         rt,
-			RejectAfterTime:      rej,
-			KeepaliveTimeout:     kt,
-			MaxHandshakeAttempts: mha,
-			PersistentKeepalive:  pk,
+			ClientName:             clientName,
+			ClientPrivateKey:       clientPrivKey,
+			ClientIP:               clientIP,
+			PSK:                    psk,
+			Enabled:                true,
+			AWGMimicry:             mimicry,
+			SpeedLimitDown:         speedDown,
+			SpeedLimitUp:           speedUp,
+			RekeyAfterTime:         rat,
+			RekeyTimeout:           rt,
+			RejectAfterTime:        rej,
+			KeepaliveTimeout:       kt,
+			MaxHandshakeAttempts:   mha,
+			PersistentKeepalive:    pk,
 			ContentPaddingAddition: cpAdd,
 		},
 	})
@@ -1023,7 +1023,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	if v, ok := clientParams["awg_mimicry"]; ok && fmt.Sprint(v) != "" {
 		mimicry = fmt.Sprint(v)
 	}
-	
+
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
 	// Save to clientsTable (update in place when the identity already exists)
