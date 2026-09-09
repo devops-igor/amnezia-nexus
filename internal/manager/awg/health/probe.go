@@ -15,7 +15,7 @@ import (
 )
 
 // ProbeAWGEndpoint performs a pure-Go UDP Noise IK handshake probe and measures RTT latency.
-func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
@@ -41,7 +41,21 @@ func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string,
 		}
 	}
 
-	initPacket, state, err := BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, pskBytes, h1, s1)
+	var hpKeyBytes []byte
+	if hpKey != "" {
+		hpKeyBytes, err = DecodeKey(hpKey)
+		if err != nil {
+			return 0, fmt.Errorf("invalid header protection key: %w", err)
+		}
+	}
+
+	var initPacket []byte
+	var state *NoiseClientState
+	if hpKeyBytes != nil {
+		initPacket, state, err = BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, pskBytes, hpKeyBytes, h1, s1)
+	} else {
+		initPacket, state, err = BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, pskBytes, h1, s1)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to build initiation packet: %w", err)
 	}
@@ -71,11 +85,28 @@ func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string,
 	}
 
 	rtt := time.Since(tStart)
-	if !VerifyAWGResponsePacket(buf[:n], state, h2, s2) {
+	if hpKeyBytes != nil {
+		if !VerifyAWGResponsePacketObfuscated(buf[:n], state, hpKeyBytes, h2, s2) {
+			return 0, errors.New("handshake response verification failed")
+		}
+	} else if !VerifyAWGResponsePacket(buf[:n], state, h2, s2) {
 		return 0, errors.New("handshake response verification failed")
 	}
 
 	return rtt, nil
+}
+
+// extractHeaderProtectionKey extracts the base64 header protection key from an
+// awgParams object (map[string]any or map[string]string). Returns "" when absent.
+func extractHeaderProtectionKey(awgParams any) string {
+	v, _ := getMapParamValue(awgParams, "header_protection_key", "hpkey")
+	return v
+}
+
+// ExtractHeaderProtectionKey is the exported form of extractHeaderProtectionKey,
+// used by callers that resolve probe parameters from backend server configs.
+func ExtractHeaderProtectionKey(awgParams any) string {
+	return extractHeaderProtectionKey(awgParams)
 }
 
 func extractPreambles(ctx context.Context, mimicryProfile string, awgParams map[string]any) [][]byte {
@@ -201,6 +232,7 @@ func ExtractAWGExplicitParams(awgParams any) (h1, h2 uint32, s1, s2 int, found b
 			"junk_packet_count", "jc",
 			"junk_packet_min_size", "jmin",
 			"junk_packet_max_size", "jmax",
+			"header_protection_key", "hpkey",
 		} {
 			if _, ok := getMapParamValue(awgParams, k); ok {
 				found = true
@@ -266,7 +298,7 @@ func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 uint32, s1, s2 int
 }
 
 // PerformAWGHandshake executes a complete AWG reachability probe including preambles and CPS blobs.
-func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKey string, clientPrivKey string, psk string, awgParams map[string]any, mimicryProfile string, timeout time.Duration) (map[string]any, error) {
+func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKey string, clientPrivKey string, psk string, hpKey string, awgParams map[string]any, mimicryProfile string, timeout time.Duration) (map[string]any, error) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
@@ -377,12 +409,12 @@ func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKe
 }
 
 // RunAutoTrialProfiles tests reachability across all 4 AWG mimicry profiles.
-func RunAutoTrialProfiles(ctx context.Context, host string, port int, serverPubKey string, clientPrivKey string, psk string, awgParams map[string]any, timeout time.Duration) (map[string]map[string]any, error) {
+func RunAutoTrialProfiles(ctx context.Context, host string, port int, serverPubKey string, clientPrivKey string, psk string, hpKey string, awgParams map[string]any, timeout time.Duration) (map[string]map[string]any, error) {
 	profiles := []string{"tls", "quic", "dns", "sip"}
 	results := make(map[string]map[string]any)
 
 	for _, proto := range profiles {
-		res, err := PerformAWGHandshake(ctx, host, port, serverPubKey, clientPrivKey, psk, awgParams, proto, timeout)
+		res, err := PerformAWGHandshake(ctx, host, port, serverPubKey, clientPrivKey, psk, hpKey, awgParams, proto, timeout)
 		if err != nil {
 			results[proto] = map[string]any{
 				"reachable":          false,

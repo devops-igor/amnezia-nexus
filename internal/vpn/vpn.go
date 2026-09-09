@@ -129,6 +129,10 @@ var obfuscationMigrationMu sync.Mutex
 // standard-profile parameters when still unset, and persists them
 // synchronously. Persistence failures are returned so startup fails
 // loudly instead of running with divergent ephemeral values.
+// The ListenPort is propagated through every save branch (R3): the
+// migration must never persist a zeroed listen_port, which GetVPNConfig's
+// fill-down would re-default to the default port and desync the running listener
+// from rendered client configs. Ports <= 0 fall back to DefaultListenPort.
 func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.VPNConfig) error {
 	if db == nil || cfg == nil || cfg.H1 != 0 {
 		return nil
@@ -157,9 +161,16 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 	cfg.H1, cfg.H2, cfg.H3, cfg.H4 = h1, h2, h3, h4
 	cfg.S1, cfg.S2, cfg.S3, cfg.S4 = s1, s2, s3, s4
 
+	if cfg.ListenPort <= 0 {
+		cfg.ListenPort = 51820
+	}
+
 	if persisted != nil {
 		persisted.H1, persisted.H2, persisted.H3, persisted.H4 = h1, h2, h3, h4
 		persisted.S1, persisted.S2, persisted.S3, persisted.S4 = s1, s2, s3, s4
+		// R3: propagate the caller's (already validated) listen port so the
+		// migration save cannot zero out a previously wired port.
+		persisted.ListenPort = cfg.ListenPort
 		if err := db.SaveVPNConfig(ctx, persisted); err != nil {
 			return fmt.Errorf("failed to persist obfuscation params: %w", err)
 		}

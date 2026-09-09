@@ -152,7 +152,7 @@ func TestPerformAWGHandshake(t *testing.T) {
 		"junk_packet_max_size":         "20",
 	}
 
-	res, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", params, "quic", 2*time.Second)
+	res, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", "", params, "quic", 2*time.Second)
 	if err != nil {
 		t.Fatalf("PerformAWGHandshake returned error: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestPerformAWGHandshake(t *testing.T) {
 	}
 
 	// Test with invalid endpoint
-	resDead, _ := PerformAWGHandshake(ctx, "127.0.0.1", 1, serverPubB64, "", "", params, "", 200*time.Millisecond)
+	resDead, _ := PerformAWGHandshake(ctx, "127.0.0.1", 1, serverPubB64, "", "", "", params, "", 200*time.Millisecond)
 	if reachable, ok := resDead["reachable"].(bool); !ok || reachable {
 		t.Errorf("expected unreachable for closed port, got: %v", resDead)
 	}
@@ -188,7 +188,7 @@ func TestRunAutoTrialProfiles(t *testing.T) {
 		"response_packet_junk_size":    strconv.Itoa(s2),
 	}
 
-	results, err := RunAutoTrialProfiles(ctx, host, port, serverPubB64, "", "", params, 2*time.Second)
+	results, err := RunAutoTrialProfiles(ctx, host, port, serverPubB64, "", "", "", params, 2*time.Second)
 	if err != nil {
 		t.Fatalf("RunAutoTrialProfiles failed: %v", err)
 	}
@@ -204,13 +204,13 @@ func TestRunAutoTrialProfiles(t *testing.T) {
 	}
 
 	// Test invalid key errors
-	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", "invalid-key", "", "", 0, 0, 0, 0, 0); err == nil {
+	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", "invalid-key", "", "", "", 0, 0, 0, 0, 0); err == nil {
 		t.Errorf("expected error for invalid server key")
 	}
-	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", serverPubB64, "invalid-key", "", 0, 0, 0, 0, 0); err == nil {
+	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", serverPubB64, "invalid-key", "", "", 0, 0, 0, 0, 0); err == nil {
 		t.Errorf("expected error for invalid client key")
 	}
-	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", serverPubB64, "", "invalid-key", 0, 0, 0, 0, 0); err == nil {
+	if _, err := ProbeAWGEndpoint(ctx, "127.0.0.1:55424", serverPubB64, "", "invalid-key", "", 0, 0, 0, 0, 0); err == nil {
 		t.Errorf("expected error for invalid psk")
 	}
 }

@@ -233,3 +233,147 @@ func TestAWGManager_AddClient_ProbePubKeyMatchesPrivate_R3(t *testing.T) {
 		t.Fatalf("derived prober pubkey %s != registered %s", derived, proberPub)
 	}
 }
+
+// TestAWGManager_AddClient_RegistrationPathsConverge_R2 pins the Issue #18 R2
+// unification contract against the same mock SSH server: the tunnel prober's
+// caller-key registration (EnableBackend passes public_key/client_public_key)
+// and the reachability prober's provisioned-key registration (the orchestrator
+// derives the public key from the private key it probes with) must land the
+// IDENTICAL probe peer — same PublicKey, no PresharedKey line — so both probers
+// share one PSK-less peer identity on every server. A fresh private key (the
+// reachability no-cache path) must likewise land a PSK-less peer.
+func TestAWGManager_AddClient_RegistrationPathsConverge_R2(t *testing.T) {
+	ctx := context.Background()
+	sshClient := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: sshClient})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	proberPriv, proberPub := testProberKeypair(t)
+
+	// --- Path 1: EnableBackend's caller-key registration. ---
+	resA, err := mgr.AddClient(ctx, server, map[string]any{
+		"clientName":        "Health Probe",
+		"name":              "Health Probe",
+		"public_key":        proberPub,
+		"client_public_key": proberPub,
+	})
+	if err != nil {
+		t.Fatalf("AddClient (EnableBackend caller-key path) failed: %v", err)
+	}
+	if resA["client_id"] != proberPub {
+		t.Fatalf("caller-key path client_id = %v, want %s", resA["client_id"], proberPub)
+	}
+
+	confA := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	peerA := peerBlockFor(t, confA, proberPub)
+	if peerA == "" {
+		t.Fatalf("caller-key path produced no [Peer] with PublicKey = %s\nconfig:\n%s", proberPub, confA)
+	}
+	if strings.Contains(peerA, "PresharedKey") {
+		t.Fatalf("caller-key [Peer] must not contain a PresharedKey line:\n%s", peerA)
+	}
+	ipA := ""
+	for _, line := range strings.Split(peerA, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "AllowedIPs = ") {
+			ipA = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "AllowedIPs = "))
+		}
+	}
+	if ipA == "" {
+		t.Fatalf("could not extract caller-key peer IP from:\n%s", peerA)
+	}
+
+	// --- Path 2: reachability's provisioned-key registration. ---
+	// The orchestrator derives the public key from the private key the prober
+	// signs with (provisionHealthProbeClientWithPublicKey), so the derived key
+	// must equal the caller-registered identity by construction.
+	derived, err := health.ComputePublicKeyFromPrivate(proberPriv)
+	if err != nil {
+		t.Fatalf("ComputePublicKeyFromPrivate failed: %v", err)
+	}
+	if derived != proberPub {
+		t.Fatalf("provisioned-key path derives %s, want the registered %s", derived, proberPub)
+	}
+
+	resB, err := mgr.AddClient(ctx, server, map[string]any{
+		"clientName":        "Health Probe",
+		"name":              "Health Probe",
+		"public_key":        derived,
+		"client_public_key": derived,
+	})
+	if err != nil {
+		t.Fatalf("AddClient (reachability provisioned-key path) failed: %v", err)
+	}
+	if resB["client_id"] != proberPub {
+		t.Fatalf("provisioned-key path client_id = %v, want the identical peer %s", resB["client_id"], proberPub)
+	}
+
+	confB := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	peerB := peerBlockFor(t, confB, proberPub)
+	if peerB == "" {
+		t.Fatalf("provisioned-key path produced no [Peer] with PublicKey = %s\nconfig:\n%s", proberPub, confB)
+	}
+	if strings.Contains(peerB, "PresharedKey") {
+		t.Fatalf("provisioned-key [Peer] must not contain a PresharedKey line:\n%s", peerB)
+	}
+	if !strings.Contains(peerB, "AllowedIPs = "+ipA) {
+		t.Fatalf("provisioned-key registration must keep the caller-key peer (AllowedIPs = %s), got:\n%s", ipA, peerB)
+	}
+	if n := strings.Count(confB, "PublicKey = "+proberPub); n != 1 {
+		t.Fatalf("expected exactly 1 [Peer] for the probe identity after both paths, got %d\nconfig:\n%s", n, confB)
+	}
+
+	// clientsTable: one probe entry, the shared identity, no private key.
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	probeEntries := 0
+	for _, c := range clients {
+		if ud, ok := c["userData"].(map[string]any); ok && ud["clientName"] == "Health Probe" {
+			probeEntries++
+			if cid, _ := c["clientId"].(string); cid != proberPub {
+				t.Errorf("probe clientsTable identity = %q, want the shared %s", cid, proberPub)
+			}
+			if priv, _ := ud["clientPrivateKey"].(string); priv != "" {
+				t.Errorf("probe peer must not store a client private key, got %q", priv)
+			}
+		}
+	}
+	if probeEntries != 1 {
+		t.Fatalf("expected exactly 1 'Health Probe' clientsTable entry after both paths, got %d", probeEntries)
+	}
+
+	// --- Fresh-priv leg: reachability's no-cache provisioning path. ---
+	// A brand-new server where only the reachability prober registers (a
+	// freshly generated private key, derived public key) must also land a
+	// PSK-less peer.
+	freshPriv, freshPub, err := GenerateWGKeypair()
+	if err != nil {
+		t.Fatalf("GenerateWGKeypair failed: %v", err)
+	}
+	sshClient2 := newMockAWGSSHClient()
+	mgr2 := NewAWGManager(&mockAWGSSHProvider{client: sshClient2})
+	server2 := &models.Server{ID: 2, Host: "5.6.7.8"}
+
+	resC, err := mgr2.AddClient(ctx, server2, map[string]any{
+		"clientName":        "Health Probe",
+		"name":              "Health Probe",
+		"public_key":        freshPub,
+		"client_public_key": freshPub,
+	})
+	if err != nil {
+		t.Fatalf("AddClient (fresh-priv reachability path) failed: %v", err)
+	}
+	if resC["client_id"] != freshPub {
+		t.Fatalf("fresh-priv path client_id = %v, want derived %s", resC["client_id"], freshPub)
+	}
+	_ = freshPriv
+	confC := string(sshClient2.files["/opt/amnezia/awg/awg0.conf"])
+	peerC := peerBlockFor(t, confC, freshPub)
+	if peerC == "" {
+		t.Fatalf("fresh-priv path produced no [Peer] with PublicKey = %s\nconfig:\n%s", freshPub, confC)
+	}
+	if strings.Contains(peerC, "PresharedKey") {
+		t.Fatalf("fresh-priv [Peer] must not contain a PresharedKey line:\n%s", peerC)
+	}
+}
