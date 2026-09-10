@@ -16,6 +16,10 @@ import (
 )
 
 func startMockAWGServer(t *testing.T, h1, h2 uint32, s1, s2 int) (net.PacketConn, []byte, string, int) {
+	return startMockAWGServerWithHP(t, nil, h1, h2, s1, s2)
+}
+
+func startMockAWGServerWithHP(t *testing.T, hpKey []byte, h1, h2 uint32, s1, s2 int) (net.PacketConn, []byte, string, int) {
 	serverPriv, serverPub := generateTestKeypair(t)
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -34,6 +38,13 @@ func startMockAWGServer(t *testing.T, h1, h2 uint32, s1, s2 int) (net.PacketConn
 			}
 			if n < s1+116 {
 				continue
+			}
+
+			if len(hpKey) == 32 {
+				cip := newHeaderProtectionCipher(hpKey, buf[:n])
+				if cip != nil && n >= s1+MessageInitiationSize {
+					cip.XORKeyStream(buf[s1:s1+MessageInitiationSize], buf[s1:s1+MessageInitiationSize])
+				}
 			}
 
 			msgBody := buf[s1 : s1+116]
@@ -122,6 +133,13 @@ func startMockAWGServer(t *testing.T, h1, h2 uint32, s1, s2 int) (net.PacketConn
 			respPacket = append(respPacket, respMac1...)
 			respPacket = append(respPacket, respMac2...)
 
+			if len(hpKey) == 32 {
+				cip := newHeaderProtectionCipher(hpKey, respPacket)
+				if cip != nil && len(respPacket) >= s2+MessageResponseSize {
+					cip.XORKeyStream(respPacket[s2:s2+MessageResponseSize], respPacket[s2:s2+MessageResponseSize])
+				}
+			}
+
 			_, _ = pc.WriteTo(respPacket, clientAddr)
 		}
 	}()
@@ -165,6 +183,66 @@ func TestPerformAWGHandshake(t *testing.T) {
 	resDead, _ := PerformAWGHandshake(ctx, "127.0.0.1", 1, serverPubB64, "", "", "", params, "", 200*time.Millisecond)
 	if reachable, ok := resDead["reachable"].(bool); !ok || reachable {
 		t.Errorf("expected unreachable for closed port, got: %v", resDead)
+	}
+}
+
+func TestPerformAWGHandshake_HeaderProtection(t *testing.T) {
+	ctx := context.Background()
+	h1 := DefaultH1
+	h2 := DefaultH2
+	s1 := DefaultS1
+	s2 := DefaultS2
+
+	hpKey := []byte("01234567890123456789012345678901")
+	hpKeyB64 := base64.StdEncoding.EncodeToString(hpKey)
+
+	pc, serverPub, host, port := startMockAWGServerWithHP(t, hpKey, h1, h2, s1, s2)
+	defer func() {
+		_ = pc.Close()
+	}()
+
+	serverPubB64 := base64.StdEncoding.EncodeToString(serverPub)
+	params := map[string]any{
+		"init_packet_magic_header":     strconv.FormatUint(uint64(h1), 10),
+		"response_packet_magic_header": strconv.FormatUint(uint64(h2), 10),
+		"init_packet_junk_size":        strconv.Itoa(s1),
+		"response_packet_junk_size":    strconv.Itoa(s2),
+		"header_protection_key":        hpKeyB64,
+	}
+
+	// 1. Explicit hpKey argument
+	res, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", hpKeyB64, params, "quic", 2*time.Second)
+	if err != nil {
+		t.Fatalf("PerformAWGHandshake with explicit hpKey returned error: %v", err)
+	}
+	if reachable, ok := res["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable to be true with explicit hpKey, got %v (err=%v)", reachable, res["error"])
+	}
+	if completed, ok := res["handshake_complete"].(bool); !ok || !completed {
+		t.Errorf("expected handshake_complete to be true with explicit hpKey")
+	}
+
+	// 2. hpKey resolved from awgParams when hpKey argument is empty
+	resParams, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", "", params, "", 2*time.Second)
+	if err != nil {
+		t.Fatalf("PerformAWGHandshake with awgParams hpKey returned error: %v", err)
+	}
+	if reachable, ok := resParams["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable to be true with awgParams hpKey, got %v (err=%v)", reachable, resParams["error"])
+	}
+
+	// 3. Probing with empty hpKey against HP-enabled server fails verification or times out
+	resNoHP, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", "", nil, "", 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("PerformAWGHandshake returned hard error: %v", err)
+	}
+	if reachable, ok := resNoHP["reachable"].(bool); ok && reachable {
+		t.Errorf("expected unreachable when probing HP server without hpKey")
+	}
+
+	// 4. Invalid base64 hpKey returns hard error
+	if _, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", "invalid-b64!!!", params, "", 200*time.Millisecond); err == nil {
+		t.Errorf("expected error for invalid base64 hpKey")
 	}
 }
 
