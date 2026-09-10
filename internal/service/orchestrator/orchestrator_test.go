@@ -844,22 +844,30 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 		Status:        "disabled",
 	})
 
-	// Add 10 sessions on tunnel 1, 2 sessions on tunnel 2 (avg = 6, threshold = 8 -> 4 excess)
+	// Add 10 sessions on tunnel 1, 2 sessions on tunnel 2.
+	// avg = 6, corrected threshold = max(1, int(6*1.4)) = 8 -> excess = 10-8 = 2.
+	// NOTE: users must exist — vpn_sessions.user_id has a FK constraint, and
+	// CreateVPNSession errors are deliberately ignored here, so a missing user
+	// would silently skip every insert (this test passed vacuously before #44).
+	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "rebal_u1", Role: models.RoleUser})
+	u2ID, _ := db.CreateUser(ctx, &models.User{Username: "rebal_u2", Role: models.RoleUser})
 	for i := 1; i <= 10; i++ {
 		_ = db.CreateVPNSession(ctx, &models.VPNSession{
 			ID:              fmt.Sprintf("sess-t1-%d", i),
-			UserID:          "u1",
+			UserID:          u1ID,
 			BackendTunnelID: tID1,
 			PeerPublicKey:   fmt.Sprintf("peer-t1-%d", i),
+			AssignedIP:      fmt.Sprintf("10.100.101.%d", i),
 			Status:          "connected",
 		})
 	}
 	for i := 1; i <= 2; i++ {
 		_ = db.CreateVPNSession(ctx, &models.VPNSession{
 			ID:              fmt.Sprintf("sess-t2-%d", i),
-			UserID:          "u2",
+			UserID:          u2ID,
 			BackendTunnelID: tID2,
 			PeerPublicKey:   fmt.Sprintf("peer-t2-%d", i),
+			AssignedIP:      fmt.Sprintf("10.100.102.%d", i),
 			Status:          "connected",
 		})
 	}
@@ -882,9 +890,17 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 		t.Fatalf("RebalanceVPNSessions failed: %v", err)
 	}
 
+	// Issue #44: exactly threshold-excess sessions drain (12 total, avg=6,
+	// threshold=8, tunnel1 count=10 -> 2 moves), so 10 remain connected.
 	activeSess, _ := db.GetActiveVPNSessions(ctx)
-	if len(activeSess) >= 12 {
-		t.Errorf("expected some sessions to be marked draining, got %d active", len(activeSess))
+	if len(activeSess) != 10 {
+		t.Errorf("expected 10 connected sessions after rebalance, got %d", len(activeSess))
+	}
+	// Issue #44 R4: in-place UPDATE — total row count must be unchanged.
+	t1Rows, _ := db.GetVPNSessionsByUserID(ctx, u1ID)
+	t2Rows, _ := db.GetVPNSessionsByUserID(ctx, u2ID)
+	if len(t1Rows)+len(t2Rows) != 12 {
+		t.Errorf("expected 12 total session rows after in-place rebalance, got %d", len(t1Rows)+len(t2Rows))
 	}
 	// Check that a drained session had its backend tunnel ID updated to tID2
 	sess1, _ := db.GetVPNSessionByID(ctx, "sess-t1-1")
