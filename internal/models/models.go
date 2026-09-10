@@ -306,6 +306,7 @@ type VPNConfig struct {
 	SubnetCIDR             string                 `json:"subnet_cidr"`
 	MaxTotalPeers          int                    `json:"max_total_peers"`
 	MaxPeersPerBackend     int                    `json:"max_peers_per_backend"`
+	MinRebalanceSessions   int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
 	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
 	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
 	PublicEndpoint         string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
