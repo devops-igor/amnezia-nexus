@@ -150,8 +150,8 @@ func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s
 	if err != nil || vpnCfg == nil {
 		return 0, 0, -1, -1, false
 	}
-	if vpnCfg.H1 > 0 || vpnCfg.H2 > 0 || vpnCfg.S1 >= 0 || vpnCfg.S2 >= 0 {
-		return vpnCfg.H1, vpnCfg.H2, vpnCfg.S1, vpnCfg.S2, true
+	if !vpnCfg.H1.IsZero() || !vpnCfg.H2.IsZero() || vpnCfg.S1 >= 0 || vpnCfg.S2 >= 0 {
+		return vpnCfg.H1.PickOne(), vpnCfg.H2.PickOne(), vpnCfg.S1, vpnCfg.S2, true
 	}
 	return 0, 0, -1, -1, false
 }

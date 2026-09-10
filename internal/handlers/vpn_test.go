@@ -138,8 +138,8 @@ func TestVPNHandlers(t *testing.T) {
 		if updatedCfg.PublicEndpoint != "lb.amnezia.org:51820" {
 			t.Errorf("expected public_endpoint = lb.amnezia.org:51820, got: %s", updatedCfg.PublicEndpoint)
 		}
-		if origH1 != 0 && updatedCfg.H1 != origH1 {
-			t.Errorf("expected H1 to be preserved (%d), got: %d", origH1, updatedCfg.H1)
+		if !origH1.IsZero() && updatedCfg.H1 != origH1 {
+			t.Errorf("expected H1 to be preserved (%s), got: %s", origH1, updatedCfg.H1)
 		}
 		if origS1 != 0 && updatedCfg.S1 != origS1 {
 			t.Errorf("expected S1 to be preserved (%d), got: %d", origS1, updatedCfg.S1)
@@ -162,8 +162,8 @@ func TestVPNHandlers(t *testing.T) {
 		if clearedCfg.PublicEndpoint != "" {
 			t.Errorf("expected public_endpoint to be cleared, got: %s", clearedCfg.PublicEndpoint)
 		}
-		if origH1 != 0 && clearedCfg.H1 != origH1 {
-			t.Errorf("expected H1 to be preserved after clear (%d), got: %d", origH1, clearedCfg.H1)
+		if !origH1.IsZero() && clearedCfg.H1 != origH1 {
+			t.Errorf("expected H1 to be preserved after clear (%s), got: %s", origH1, clearedCfg.H1)
 		}
 	})
 

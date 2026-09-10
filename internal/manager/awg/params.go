@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -229,71 +230,288 @@ func randUint32Between(min, max uint32) (uint32, error) {
 	return min + uint32(n.Uint64()), nil
 }
 
+// HeaderRange is an alias for models.HeaderRange.
+type HeaderRange = models.HeaderRange
+
+// Uint32Range is an alias for models.Uint32Range.
+type Uint32Range = models.Uint32Range
+
+var (
+	// NewHeaderRange is an alias for models.NewHeaderRange.
+	NewHeaderRange = models.NewHeaderRange
+	// DegenerateHeaderRange is an alias for models.DegenerateHeaderRange.
+	DegenerateHeaderRange = models.DegenerateHeaderRange
+	// ParseHeaderRange is an alias for models.ParseHeaderRange.
+	ParseHeaderRange = models.ParseHeaderRange
+)
+
+const (
+	maxQuadrantVal uint32 = math.MaxInt32      // 2147483647
+	quadrantSize   uint32 = maxQuadrantVal / 4 // 536870911
+)
+
+// QuadrantBounds returns the [lo, hi] bounds for the 0-indexed quadrant (0 to 3).
+func QuadrantBounds(q int) (lo, hi uint32) {
+	switch q {
+	case 0:
+		return 5, quadrantSize
+	case 1:
+		return 5 + quadrantSize, 2 * quadrantSize
+	case 2:
+		return 5 + 2*quadrantSize, 3 * quadrantSize
+	case 3:
+		return 5 + 3*quadrantSize, maxQuadrantVal
+	default:
+		return 0, 0
+	}
+}
+
+// GenerateQuadrantHeader generates a HeaderRange strictly within quadrant q (0 to 3) with span >= 1000.
+func GenerateQuadrantHeader(q int) (HeaderRange, error) {
+	qLo, qHi := QuadrantBounds(q)
+	a, err := randUint32Between(qLo, qHi-1000)
+	if err != nil {
+		return HeaderRange{}, err
+	}
+	maxSpan := uint32(50000)
+	if qHi-a < maxSpan {
+		maxSpan = qHi - a
+	}
+	span, err := randUint32Between(1000, maxSpan)
+	if err != nil {
+		return HeaderRange{}, err
+	}
+	return NewHeaderRange(a, a+span), nil
+}
+
 // GenerateQuadrantHeaders generates H1-H4 across non-overlapping quadrants of [5, 2^31 - 1] with min span >= 1000.
-func GenerateQuadrantHeaders() (h1, h2, h3, h4 uint32, err error) {
-	const maxVal uint32 = math.MaxInt32 // 2147483647
-	const qSize uint32 = maxVal / 4     // 536870911
+func GenerateQuadrantHeaders() (h1, h2, h3, h4 HeaderRange, err error) {
+	h1, err = GenerateQuadrantHeader(0)
+	if err != nil {
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, err
+	}
+	h2, err = GenerateQuadrantHeader(1)
+	if err != nil {
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, err
+	}
+	h3, err = GenerateQuadrantHeader(2)
+	if err != nil {
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, err
+	}
+	h4, err = GenerateQuadrantHeader(3)
+	if err != nil {
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, err
+	}
+	return h1, h2, h3, h4, nil
+}
 
-	headers := make([]uint32, 4)
-	for i := 0; i < 4; i++ {
-		lo := uint32(5 + uint32(i)*qSize)
-		hi := uint32(i+1) * qSize
-		if i < 3 {
-			hi++
+// ValidateQuadrantDisjointness verifies that all non-zero header ranges are mutually disjoint.
+func ValidateQuadrantDisjointness(h1, h2, h3, h4 HeaderRange) error {
+	headers := []struct {
+		name string
+		rng  HeaderRange
+	}{
+		{"H1", h1},
+		{"H2", h2},
+		{"H3", h3},
+		{"H4", h4},
+	}
+	for i := 0; i < len(headers); i++ {
+		if headers[i].rng.IsZero() {
+			continue
 		}
-
-		a, err := randUint32Between(lo, hi)
-		if err != nil {
-			return 0, 0, 0, 0, err
-		}
-		b, err := randUint32Between(lo, hi)
-		if err != nil {
-			return 0, 0, 0, 0, err
-		}
-
-		if a > b {
-			a, b = b, a
-		}
-		if b-a < 1000 {
-			if a+1000 <= hi {
-				b = a + 1000
-			} else {
-				b = hi
+		for j := i + 1; j < len(headers); j++ {
+			if headers[j].rng.IsZero() {
+				continue
+			}
+			if headers[i].rng.Overlap(headers[j].rng) {
+				return fmt.Errorf("header ranges %s (%s) and %s (%s) overlap",
+					headers[i].name, headers[i].rng.String(),
+					headers[j].name, headers[j].rng.String())
 			}
 		}
+	}
+	return nil
+}
 
-		headers[i], err = randUint32Between(a, b)
-		if err != nil {
-			return 0, 0, 0, 0, err
+// AdjustGeneratedHeaderToAvoid adjusts newly generated range *gen to ensure it does not
+// overlap with any of the existing ranges, without mutating any of the existing ranges.
+func AdjustGeneratedHeaderToAvoid(gen *HeaderRange, existing ...HeaderRange) {
+	if gen == nil || gen.IsZero() {
+		return
+	}
+	for _, ext := range existing {
+		if ext.IsZero() || !gen.Overlap(ext) {
+			continue
+		}
+		// If gen overlaps ext:
+		// Attempt shifting gen above ext.Hi if possible within uint32 domain
+		if uint64(ext.Hi)+1001 <= uint64(math.MaxUint32) {
+			newLo := ext.Hi + 1
+			span := gen.Hi - gen.Lo
+			if span < 1000 {
+				span = 1000
+			}
+			if uint64(newLo)+uint64(span) <= uint64(math.MaxUint32) {
+				gen.Lo = newLo
+				gen.Hi = newLo + span
+				continue
+			}
+		}
+		// Otherwise attempt shifting gen below ext.Lo
+		if ext.Lo > 1001 {
+			newHi := ext.Lo - 1
+			span := gen.Hi - gen.Lo
+			if span < 1000 {
+				span = 1000
+			}
+			if newHi >= span+5 {
+				gen.Hi = newHi
+				gen.Lo = newHi - span
+			}
+		}
+	}
+}
+
+// NeedsHeaderUpgrade reports whether hr is uninitialized, degenerate (Lo == Hi), or has span < 1000.
+func NeedsHeaderUpgrade(hr HeaderRange) bool {
+	return hr.IsZero() || hr.IsDegenerate() || (hr.Hi-hr.Lo < 1000)
+}
+
+// ExpandDegenerateHeader expands a degenerate header value hr (or sub-1000 range)
+// within its quadrant q (0..3) to a range [lo, hi] with span >= 1000 such that
+// lo <= hr.Lo <= hr.Hi <= hi.
+// If hr is zero, or if hr does not fall entirely within QuadrantBounds(q), an error is returned.
+func ExpandDegenerateHeader(hr HeaderRange, q int) (HeaderRange, error) {
+	if hr.IsZero() {
+		return HeaderRange{}, errors.New("cannot expand zero header range")
+	}
+	qLo, qHi := QuadrantBounds(q)
+	if hr.Lo < qLo || hr.Hi > qHi {
+		return HeaderRange{}, fmt.Errorf("header %s outside quadrant %d [%d, %d]", hr.String(), q, qLo, qHi)
+	}
+
+	// If already a valid range with span >= 1000 within the quadrant, return as-is.
+	if !hr.IsDegenerate() && hr.Hi-hr.Lo >= 1000 {
+		return hr, nil
+	}
+
+	maxSpan := uint32(50000)
+	if qHi-qLo < maxSpan {
+		maxSpan = qHi - qLo
+	}
+	span, err := randUint32Between(1000, maxSpan)
+	if err != nil {
+		return HeaderRange{}, err
+	}
+
+	// We require:
+	// 1. lo <= hr.Lo
+	// 2. hr.Hi <= lo + span (i.e. lo >= hr.Hi - span)
+	// 3. qLo <= lo
+	// 4. lo + span <= qHi (i.e. lo <= qHi - span)
+	minLo := qLo
+	if hr.Hi > span && hr.Hi-span > minLo {
+		minLo = hr.Hi - span
+	}
+	maxLo := hr.Lo
+	if qHi-span < maxLo {
+		maxLo = qHi - span
+	}
+
+	if minLo > maxLo {
+		if hr.Lo+span <= qHi {
+			return NewHeaderRange(hr.Lo, hr.Lo+span), nil
+		}
+		if hr.Hi >= span && hr.Hi-span >= qLo {
+			return NewHeaderRange(hr.Hi-span, hr.Hi), nil
+		}
+		return HeaderRange{}, fmt.Errorf("unable to fit span %d around %s in quadrant %d", span, hr.String(), q)
+	}
+
+	lo, err := randUint32Between(minLo, maxLo)
+	if err != nil {
+		return HeaderRange{}, err
+	}
+	hi := lo + span
+	return NewHeaderRange(lo, hi), nil
+}
+
+// UpgradeDegenerateHeaders checks if any of h1..h4 are degenerate or sub-1000 ranges,
+// and upgrades them to ranges with span >= 1000 in their respective quadrants [0..3].
+// If possible, each degenerate header is expanded in place within its quadrant so that
+// the original value is contained in the new range (preserving backward compatibility
+// for clients configured with the legacy single value).
+// If any header cannot be safely expanded within its quadrant without overlap,
+// fresh non-overlapping quadrant ranges are generated via GenerateQuadrantHeaders().
+// Returns the resulting ranges, a boolean indicating whether any headers were changed, and any error.
+func UpgradeDegenerateHeaders(h1, h2, h3, h4 HeaderRange) (HeaderRange, HeaderRange, HeaderRange, HeaderRange, bool, error) {
+	if !NeedsHeaderUpgrade(h1) && !NeedsHeaderUpgrade(h2) && !NeedsHeaderUpgrade(h3) && !NeedsHeaderUpgrade(h4) {
+		if err := ValidateQuadrantDisjointness(h1, h2, h3, h4); err == nil {
+			return h1, h2, h3, h4, false, nil
 		}
 	}
 
-	return headers[0], headers[1], headers[2], headers[3], nil
+	headers := []HeaderRange{h1, h2, h3, h4}
+	newHeaders := make([]HeaderRange, 4)
+	canExpandAll := true
+
+	for q := 0; q < 4; q++ {
+		hr := headers[q]
+		if hr.IsZero() {
+			gen, err := GenerateQuadrantHeader(q)
+			if err != nil {
+				canExpandAll = false
+				break
+			}
+			newHeaders[q] = gen
+		} else {
+			expanded, err := ExpandDegenerateHeader(hr, q)
+			if err != nil {
+				canExpandAll = false
+				break
+			}
+			newHeaders[q] = expanded
+		}
+	}
+
+	if canExpandAll {
+		if err := ValidateQuadrantDisjointness(newHeaders[0], newHeaders[1], newHeaders[2], newHeaders[3]); err == nil {
+			return newHeaders[0], newHeaders[1], newHeaders[2], newHeaders[3], true, nil
+		}
+	}
+
+	// Fallback: generate fresh non-overlapping quadrant ranges.
+	genH1, genH2, genH3, genH4, err := GenerateQuadrantHeaders()
+	if err != nil {
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, false, err
+	}
+	return genH1, genH2, genH3, genH4, true, nil
 }
 
 // GenerateStandardObfuscationValues generates standard-profile obfuscation parameters:
 // H1-H4 across non-overlapping quadrants, and standard-profile S1-S4 satisfying |s1 - s2| >= 10.
-func GenerateStandardObfuscationValues() (h1, h2, h3, h4 uint32, s1, s2, s3, s4 int, err error) {
+func GenerateStandardObfuscationValues() (h1, h2, h3, h4 HeaderRange, s1, s2, s3, s4 int, err error) {
 	h1, h2, h3, h4, err = GenerateQuadrantHeaders()
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, err
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, 0, 0, 0, 0, err
 	}
 
 	s1, err = randIntBetween(30, 80)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, err
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, 0, 0, 0, 0, err
 	}
 	s2, err = randIntBetween(30, 80)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, err
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, 0, 0, 0, 0, err
 	}
 	s3, err = randIntBetween(15, 32)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, err
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, 0, 0, 0, 0, err
 	}
 	s4, err = randIntBetween(12, 24)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, err
+		return HeaderRange{}, HeaderRange{}, HeaderRange{}, HeaderRange{}, 0, 0, 0, 0, err
 	}
 
 	for attempts := 0; attempts < 100; attempts++ {
@@ -344,17 +562,17 @@ func AWGParamsFromVPNConfig(cfg *models.VPNConfig) *AWGParams {
 		return p
 	}
 
-	if cfg.H1 > 0 {
-		p.InitPacketMagicHeader = strconv.FormatUint(uint64(cfg.H1), 10)
+	if !cfg.H1.IsZero() {
+		p.InitPacketMagicHeader = cfg.H1.String()
 	}
-	if cfg.H2 > 0 {
-		p.ResponsePacketMagicHeader = strconv.FormatUint(uint64(cfg.H2), 10)
+	if !cfg.H2.IsZero() {
+		p.ResponsePacketMagicHeader = cfg.H2.String()
 	}
-	if cfg.H3 > 0 {
-		p.UnderloadPacketMagicHeader = strconv.FormatUint(uint64(cfg.H3), 10)
+	if !cfg.H3.IsZero() {
+		p.UnderloadPacketMagicHeader = cfg.H3.String()
 	}
-	if cfg.H4 > 0 {
-		p.TransportPacketMagicHeader = strconv.FormatUint(uint64(cfg.H4), 10)
+	if !cfg.H4.IsZero() {
+		p.TransportPacketMagicHeader = cfg.H4.String()
 	}
 	if cfg.S1 > 0 {
 		p.InitPacketJunkSize = strconv.Itoa(cfg.S1)
@@ -491,10 +709,10 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 		ResponsePacketJunkSize:     strconv.Itoa(s2),
 		CookieReplyPacketJunkSize:  strconv.Itoa(s3),
 		TransportPacketJunkSize:    strconv.Itoa(s4),
-		InitPacketMagicHeader:      strconv.FormatUint(uint64(h1), 10),
-		ResponsePacketMagicHeader:  strconv.FormatUint(uint64(h2), 10),
-		UnderloadPacketMagicHeader: strconv.FormatUint(uint64(h3), 10),
-		TransportPacketMagicHeader: strconv.FormatUint(uint64(h4), 10),
+		InitPacketMagicHeader:      h1.String(),
+		ResponsePacketMagicHeader:  h2.String(),
+		UnderloadPacketMagicHeader: h3.String(),
+		TransportPacketMagicHeader: h4.String(),
 		I1:                         cpsPackets["i1"],
 		I2:                         cpsPackets["i2"],
 		I3:                         cpsPackets["i3"],
@@ -827,10 +1045,6 @@ func ValidateAWGParams(params map[string]string) error {
 		"response_packet_junk_size":     {1, 1000},
 		"cookie_reply_packet_junk_size": {1, 1000},
 		"transport_packet_junk_size":    {1, 1000},
-		"init_packet_magic_header":      {5, 4294967295},
-		"response_packet_magic_header":  {5, 4294967295},
-		"underload_packet_magic_header": {5, 4294967295},
-		"transport_packet_magic_header": {5, 4294967295},
 	}
 
 	for k, bounds := range numericBounds {
@@ -844,6 +1058,26 @@ func ValidateAWGParams(params map[string]string) error {
 		}
 		if num < bounds[0] || num > bounds[1] {
 			return fmt.Errorf("param %s must be between %d and %d, got: %d", k, bounds[0], bounds[1], num)
+		}
+	}
+
+	magicHeaders := []string{
+		"init_packet_magic_header",
+		"response_packet_magic_header",
+		"underload_packet_magic_header",
+		"transport_packet_magic_header",
+	}
+	for _, k := range magicHeaders {
+		val, ok := params[k]
+		if !ok || val == "" {
+			continue
+		}
+		hr, err := models.ParseHeaderRange(val)
+		if err != nil {
+			return fmt.Errorf("param %s must be a valid header range, got: %s: %w", k, val, err)
+		}
+		if hr.Lo < 5 || uint64(hr.Hi) > 4294967295 {
+			return fmt.Errorf("param %s must be between 5 and 4294967295, got: %s", k, val)
 		}
 	}
 

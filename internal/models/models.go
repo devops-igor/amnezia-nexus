@@ -305,10 +305,10 @@ type VPNConfig struct {
 	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
 	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
 	PublicEndpoint         string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
-	H1                     uint32                 `json:"h1"`
-	H2                     uint32                 `json:"h2"`
-	H3                     uint32                 `json:"h3"`
-	H4                     uint32                 `json:"h4"`
+	H1                     HeaderRange            `json:"h1"`
+	H2                     HeaderRange            `json:"h2"`
+	H3                     HeaderRange            `json:"h3"`
+	H4                     HeaderRange            `json:"h4"`
 	S1                     int                    `json:"s1"`
 	S2                     int                    `json:"s2"`
 	S3                     int                    `json:"s3"`

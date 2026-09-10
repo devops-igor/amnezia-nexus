@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,22 +49,22 @@ func TestGenerateQuadrantHeaders(t *testing.T) {
 			t.Fatalf("GenerateQuadrantHeaders failed: %v", err)
 		}
 
-		if h1 < 5 || h2 <= h1 || h3 <= h2 || h4 <= h3 {
-			t.Errorf("quadrant headers not strictly increasing: %d, %d, %d, %d", h1, h2, h3, h4)
+		if err := ValidateQuadrantDisjointness(h1, h2, h3, h4); err != nil {
+			t.Fatalf("disjointness failure: %v", err)
 		}
 
-		const qSize uint32 = 2147483647 / 4
-		if h1 > qSize+1 {
-			t.Errorf("h1 out of quadrant 1: %d", h1)
+		if h1.Lo < 5 || h2.Lo <= h1.Hi || h3.Lo <= h2.Hi || h4.Lo <= h3.Hi {
+			t.Errorf("quadrant headers not strictly increasing: %s, %s, %s, %s", h1, h2, h3, h4)
 		}
-		if h2 < qSize || h2 > 2*qSize+1 {
-			t.Errorf("h2 out of quadrant 2: %d", h2)
-		}
-		if h3 < 2*qSize || h3 > 3*qSize+1 {
-			t.Errorf("h3 out of quadrant 3: %d", h3)
-		}
-		if h4 < 3*qSize {
-			t.Errorf("h4 out of quadrant 4: %d", h4)
+
+		for idx, h := range []HeaderRange{h1, h2, h3, h4} {
+			if h.Hi-h.Lo < 1000 {
+				t.Errorf("header %d span < 1000: %s (span=%d)", idx+1, h, h.Hi-h.Lo)
+			}
+			qLo, qHi := QuadrantBounds(idx)
+			if h.Lo < qLo || h.Hi > qHi {
+				t.Errorf("header %d out of quadrant bounds [%d, %d]: %s", idx+1, qLo, qHi, h)
+			}
 		}
 	}
 }
@@ -148,18 +149,21 @@ func TestGenerateStandardObfuscationValues_Floor(t *testing.T) {
 		if s4 < 12 {
 			t.Errorf("iteration %d: S4 = %d < 12", i, s4)
 		}
-		if h1 == 0 || h2 == 0 || h3 == 0 || h4 == 0 {
-			t.Errorf("iteration %d: unexpected zero header value: h1=%d, h2=%d, h3=%d, h4=%d", i, h1, h2, h3, h4)
+		if h1.IsZero() || h2.IsZero() || h3.IsZero() || h4.IsZero() {
+			t.Errorf("iteration %d: unexpected zero header value: h1=%s, h2=%s, h3=%s, h4=%s", i, h1, h2, h3, h4)
+		}
+		if err := ValidateQuadrantDisjointness(h1, h2, h3, h4); err != nil {
+			t.Errorf("iteration %d: disjointness check failed: %v", i, err)
 		}
 	}
 }
 
 func TestAWGParamsFromVPNConfig_NoCPSPackets(t *testing.T) {
 	cfg := &models.VPNConfig{
-		H1: 12345678,
-		H2: 23456789,
-		H3: 34567890,
-		H4: 45678901,
+		H1: models.DegenerateHeaderRange(12345678),
+		H2: models.DegenerateHeaderRange(23456789),
+		H3: models.DegenerateHeaderRange(34567890),
+		H4: models.DegenerateHeaderRange(45678901),
 		S1: 45,
 		S2: 60,
 		S3: 25,
@@ -210,10 +214,10 @@ func TestAWGParamsFromVPNConfig_NoCPSPackets(t *testing.T) {
 func TestAWGParamsFromVPNConfig_HeaderProtectionKey(t *testing.T) {
 	// Case 1: HeaderProtectionKey present with small S values (< 12) -> enforced to >= 12
 	cfg := &models.VPNConfig{
-		H1:                  1234,
-		H2:                  5678,
-		H3:                  9012,
-		H4:                  3456,
+		H1:                  models.DegenerateHeaderRange(1234),
+		H2:                  models.DegenerateHeaderRange(5678),
+		H3:                  models.DegenerateHeaderRange(9012),
+		H4:                  models.DegenerateHeaderRange(3456),
 		S1:                  4,
 		S2:                  8,
 		S3:                  6,
@@ -517,5 +521,245 @@ func TestTimingRange_UpstreamUintRangeRoundTrip(t *testing.T) {
 		if ur.ToString() != str {
 			t.Errorf("ToString mismatch for %q: upstream %q != local %q", str, ur.ToString(), str)
 		}
+	}
+}
+
+func TestHeaderRange_UpstreamUintRangeRoundTrip(t *testing.T) {
+	testRanges := []HeaderRange{
+		NewHeaderRange(1000, 2000),
+		NewHeaderRange(5, 536870911),
+		NewHeaderRange(2000000000, math.MaxInt32),
+		DegenerateHeaderRange(125),
+		DegenerateHeaderRange(5),
+		DegenerateHeaderRange(math.MaxUint32),
+	}
+
+	for _, hr := range testRanges {
+		str := hr.String()
+
+		var ur device.UintRange
+		if err := ur.FromString(str); err != nil {
+			t.Fatalf("upstream device.UintRange failed to parse %q: %v", str, err)
+		}
+
+		if ur.Lo() != hr.Lo {
+			t.Errorf("Lo mismatch for %q: upstream %d != local %d", str, ur.Lo(), hr.Lo)
+		}
+		if ur.Hi() != hr.Hi {
+			t.Errorf("Hi mismatch for %q: upstream %d != local %d", str, ur.Hi(), hr.Hi)
+		}
+		if ur.ToString() != str {
+			t.Errorf("ToString mismatch for %q: upstream %q != local %q", str, ur.ToString(), str)
+		}
+	}
+}
+
+func TestHeaderRange_DegenerateBackCompat(t *testing.T) {
+	singleVal := "12345678"
+	hr, err := models.ParseHeaderRange(singleVal)
+	if err != nil {
+		t.Fatalf("failed to parse single value: %v", err)
+	}
+	if !hr.IsDegenerate() {
+		t.Errorf("expected degenerate range, got lo=%d, hi=%d", hr.Lo, hr.Hi)
+	}
+	if hr.Lo != 12345678 || hr.Hi != 12345678 {
+		t.Errorf("expected 12345678, got lo=%d, hi=%d", hr.Lo, hr.Hi)
+	}
+	if hr.String() != singleVal {
+		t.Errorf("expected String() to return byte-identical %q, got %q", singleVal, hr.String())
+	}
+}
+
+func TestQuadrantDisjointness_AndPartialBackfill(t *testing.T) {
+	// 1. Verify disjointness holds on standard quadrant generation
+	h1, h2, h3, h4, err := GenerateQuadrantHeaders()
+	if err != nil {
+		t.Fatalf("GenerateQuadrantHeaders failed: %v", err)
+	}
+	if err := ValidateQuadrantDisjointness(h1, h2, h3, h4); err != nil {
+		t.Fatalf("expected disjoint ranges, got error: %v", err)
+	}
+
+	// 2. Overlap detection
+	overlapH1 := NewHeaderRange(1000, 2000)
+	overlapH2 := NewHeaderRange(1500, 3000)
+	if err := ValidateQuadrantDisjointness(overlapH1, overlapH2, HeaderRange{}, HeaderRange{}); err == nil {
+		t.Errorf("expected overlap error between %s and %s", overlapH1, overlapH2)
+	}
+
+	// 3. Partial backfill adjustment without mutating stored values
+	storedH2 := DegenerateHeaderRange(5000)
+	originalStored := storedH2
+	newH1 := NewHeaderRange(4500, 5500) // overlaps storedH2
+
+	AdjustGeneratedHeaderToAvoid(&newH1, storedH2)
+
+	// Invariant: stored values must NEVER be mutated
+	if storedH2 != originalStored {
+		t.Fatalf("stored range was mutated! before: %v, after: %v", originalStored, storedH2)
+	}
+
+	// Invariant: adjusted newH1 must not overlap storedH2
+	if newH1.Overlap(storedH2) {
+		t.Errorf("adjusted range %s still overlaps %s", newH1, storedH2)
+	}
+	if newH1.Hi-newH1.Lo < 1000 {
+		t.Errorf("adjusted range span < 1000: %s (span=%d)", newH1, newH1.Hi-newH1.Lo)
+	}
+}
+
+func TestNeedsHeaderUpgrade(t *testing.T) {
+	if !NeedsHeaderUpgrade(HeaderRange{}) {
+		t.Error("expected zero HeaderRange to need upgrade")
+	}
+	if !NeedsHeaderUpgrade(DegenerateHeaderRange(12345)) {
+		t.Error("expected degenerate HeaderRange to need upgrade")
+	}
+	if !NeedsHeaderUpgrade(NewHeaderRange(1000, 1500)) { // span 500 < 1000
+		t.Error("expected sub-1000 span HeaderRange to need upgrade")
+	}
+	if NeedsHeaderUpgrade(NewHeaderRange(1000, 2000)) { // span 1000
+		t.Error("expected span >= 1000 HeaderRange not to need upgrade")
+	}
+}
+
+func TestExpandDegenerateHeader(t *testing.T) {
+	// Zero range error
+	if _, err := ExpandDegenerateHeader(HeaderRange{}, 0); err == nil {
+		t.Error("expected error expanding zero HeaderRange")
+	}
+
+	// Out of quadrant bounds
+	if _, err := ExpandDegenerateHeader(DegenerateHeaderRange(999999999), 0); err == nil {
+		t.Error("expected error expanding value outside quadrant 0")
+	}
+
+	// DEV values in their respective quadrants:
+	devVals := []struct {
+		val uint32
+		q   int
+	}{
+		{359398951, 0},
+		{944086617, 1},
+		{1418011628, 2},
+		{1749149601, 3},
+	}
+
+	for _, tc := range devVals {
+		expanded, err := ExpandDegenerateHeader(DegenerateHeaderRange(tc.val), tc.q)
+		if err != nil {
+			t.Fatalf("failed to expand %d in quadrant %d: %v", tc.val, tc.q, err)
+		}
+		if expanded.IsDegenerate() {
+			t.Errorf("expanded range is still degenerate: %s", expanded)
+		}
+		if expanded.Hi-expanded.Lo < 1000 {
+			t.Errorf("expanded range span < 1000: %s (span=%d)", expanded, expanded.Hi-expanded.Lo)
+		}
+		if !expanded.Contains(tc.val) {
+			t.Errorf("expanded range %s does not contain legacy value %d", expanded, tc.val)
+		}
+		qLo, qHi := QuadrantBounds(tc.q)
+		if expanded.Lo < qLo || expanded.Hi > qHi {
+			t.Errorf("expanded range %s falls outside quadrant %d bounds [%d, %d]", expanded, tc.q, qLo, qHi)
+		}
+	}
+
+	// Boundary condition: lowest value in quadrant 0
+	low0, err := ExpandDegenerateHeader(DegenerateHeaderRange(5), 0)
+	if err != nil {
+		t.Fatalf("failed to expand low bound 5 in quadrant 0: %v", err)
+	}
+	if !low0.Contains(5) || low0.Lo < 5 || low0.Hi-low0.Lo < 1000 {
+		t.Errorf("unexpected expansion for low bound 5: %s", low0)
+	}
+
+	// Boundary condition: highest value in quadrant 3
+	_, q3Hi := QuadrantBounds(3)
+	high3, err := ExpandDegenerateHeader(DegenerateHeaderRange(q3Hi), 3)
+	if err != nil {
+		t.Fatalf("failed to expand high bound in quadrant 3: %v", err)
+	}
+	if !high3.Contains(q3Hi) || high3.Hi > q3Hi || high3.Hi-high3.Lo < 1000 {
+		t.Errorf("unexpected expansion for high bound %d: %s", q3Hi, high3)
+	}
+}
+
+func TestUpgradeDegenerateHeaders(t *testing.T) {
+	// 1. DEV environment degenerate headers
+	h1 := DegenerateHeaderRange(359398951)
+	h2 := DegenerateHeaderRange(944086617)
+	h3 := DegenerateHeaderRange(1418011628)
+	h4 := DegenerateHeaderRange(1749149601)
+
+	up1, up2, up3, up4, upgraded, err := UpgradeDegenerateHeaders(h1, h2, h3, h4)
+	if err != nil {
+		t.Fatalf("UpgradeDegenerateHeaders failed: %v", err)
+	}
+	if !upgraded {
+		t.Fatal("expected upgraded = true for degenerate headers")
+	}
+
+	for idx, tc := range []struct {
+		rng HeaderRange
+		val uint32
+		q   int
+	}{
+		{up1, 359398951, 0},
+		{up2, 944086617, 1},
+		{up3, 1418011628, 2},
+		{up4, 1749149601, 3},
+	} {
+		if tc.rng.IsDegenerate() {
+			t.Errorf("H%d is still degenerate: %s", idx+1, tc.rng)
+		}
+		if tc.rng.Hi-tc.rng.Lo < 1000 {
+			t.Errorf("H%d span < 1000: %s", idx+1, tc.rng)
+		}
+		if !tc.rng.Contains(tc.val) {
+			t.Errorf("H%d %s does not contain legacy value %d", idx+1, tc.rng, tc.val)
+		}
+		qLo, qHi := QuadrantBounds(tc.q)
+		if tc.rng.Lo < qLo || tc.rng.Hi > qHi {
+			t.Errorf("H%d %s outside quadrant %d [%d, %d]", idx+1, tc.rng, tc.q, qLo, qHi)
+		}
+	}
+
+	if err := ValidateQuadrantDisjointness(up1, up2, up3, up4); err != nil {
+		t.Errorf("upgraded ranges are not pairwise disjoint: %v", err)
+	}
+
+	// 2. Already valid ranges are returned unmodified with upgraded = false
+	same1, same2, same3, same4, upgraded2, err := UpgradeDegenerateHeaders(up1, up2, up3, up4)
+	if err != nil {
+		t.Fatalf("UpgradeDegenerateHeaders on valid ranges failed: %v", err)
+	}
+	if upgraded2 {
+		t.Error("expected upgraded = false when ranges are already valid and disjoint")
+	}
+	if same1 != up1 || same2 != up2 || same3 != up3 || same4 != up4 {
+		t.Errorf("ranges were unexpectedly mutated: got (%s, %s, %s, %s), want (%s, %s, %s, %s)",
+			same1, same2, same3, same4, up1, up2, up3, up4)
+	}
+
+	// 3. Fallback when existing values cannot cleanly expand in quadrants (e.g. all in quadrant 0)
+	badH1 := DegenerateHeaderRange(12345)
+	badH2 := DegenerateHeaderRange(23456)
+	badH3 := DegenerateHeaderRange(34567)
+	badH4 := DegenerateHeaderRange(45678)
+
+	fb1, fb2, fb3, fb4, fbUpgraded, err := UpgradeDegenerateHeaders(badH1, badH2, badH3, badH4)
+	if err != nil {
+		t.Fatalf("UpgradeDegenerateHeaders fallback failed: %v", err)
+	}
+	if !fbUpgraded {
+		t.Error("expected upgraded = true on fallback")
+	}
+	if fb1.IsDegenerate() || fb2.IsDegenerate() || fb3.IsDegenerate() || fb4.IsDegenerate() {
+		t.Error("fallback produced degenerate headers")
+	}
+	if err := ValidateQuadrantDisjointness(fb1, fb2, fb3, fb4); err != nil {
+		t.Errorf("fallback headers are not pairwise disjoint: %v", err)
 	}
 }

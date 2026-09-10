@@ -19,6 +19,8 @@ import (
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
+
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
 var (
@@ -148,7 +150,7 @@ func DecodeKey(keyVal any) ([]byte, error) {
 }
 
 // BuildAWGInitiationPacket creates an AmneziaWG Handshake Initiation packet and state.
-func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32, s1 int) ([]byte, *NoiseClientState, error) {
+func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 any, s1 int) ([]byte, *NoiseClientState, error) {
 	if len(serverPubKey) != 32 {
 		return nil, nil, errors.New("server public key must be 32 bytes")
 	}
@@ -173,9 +175,12 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32
 		return nil, nil, errors.New("psk must be 32 bytes")
 	}
 
-	if h1 == 0 {
-		h1 = DefaultH1
+	h1Range, err := models.ParseHeaderRange(h1)
+	if err != nil || h1Range.IsZero() {
+		h1Range = models.DegenerateHeaderRange(DefaultH1)
 	}
+	h1Val := h1Range.PickOne()
+
 	if s1 < 0 {
 		s1 = DefaultS1
 	}
@@ -256,7 +261,7 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32
 	senderIdx := uint32(idxBig.Int64())
 
 	msgTypeBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(msgTypeBytes, h1)
+	binary.LittleEndian.PutUint32(msgTypeBytes, h1Val)
 
 	senderIdxBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(senderIdxBytes, senderIdx)
@@ -313,7 +318,7 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 uint32
 // HeaderCipherNonceSize bytes of the packet (the junk prefix) but XORed starting at
 // keystream offset 0 onto packet[s1:s1+MessageInitiationSize]; any random trailer
 // beyond the message stays plaintext.
-func BuildAWGInitiationPacketObfuscated(serverPubKey, clientPrivKey, psk, hpKey []byte, h1 uint32, s1 int) ([]byte, *NoiseClientState, error) {
+func BuildAWGInitiationPacketObfuscated(serverPubKey, clientPrivKey, psk, hpKey []byte, h1 any, s1 int) ([]byte, *NoiseClientState, error) {
 	if len(hpKey) != 32 {
 		return nil, nil, errors.New("header protection key must be 32 bytes")
 	}
@@ -344,7 +349,7 @@ func BuildAWGInitiationPacketObfuscated(serverPubKey, clientPrivKey, psk, hpKey 
 // de-obfuscates resp[s2:s2+MessageResponseSize] with the keystream seeded from the
 // first HeaderCipherNonceSize bytes of the packet (message-relative alignment,
 // keystream offset 0 == message offset 0), then delegates to VerifyAWGResponsePacket.
-func VerifyAWGResponsePacketObfuscated(respPacket []byte, state *NoiseClientState, hpKey []byte, h2 uint32, s2 int) bool {
+func VerifyAWGResponsePacketObfuscated(respPacket []byte, state *NoiseClientState, hpKey []byte, h2 any, s2 int) bool {
 	if state == nil || len(hpKey) != 32 {
 		return false
 	}
@@ -386,12 +391,13 @@ func ComputePublicKeyFromPrivate(clientPrivKey string) (string, error) {
 }
 
 // VerifyAWGResponsePacket verifies and authenticates an AmneziaWG Handshake Response packet.
-func VerifyAWGResponsePacket(respPacket []byte, state *NoiseClientState, h2 uint32, s2 int) bool {
+func VerifyAWGResponsePacket(respPacket []byte, state *NoiseClientState, h2 any, s2 int) bool {
 	if state == nil {
 		return false
 	}
-	if h2 == 0 {
-		h2 = DefaultH2
+	h2Range, err := models.ParseHeaderRange(h2)
+	if err != nil || h2Range.IsZero() {
+		h2Range = models.DegenerateHeaderRange(DefaultH2)
 	}
 	if s2 < 0 {
 		s2 = DefaultS2
@@ -404,7 +410,7 @@ func VerifyAWGResponsePacket(respPacket []byte, state *NoiseClientState, h2 uint
 
 	payload := respPacket[s2:]
 	msgType := binary.LittleEndian.Uint32(payload[0:4])
-	if msgType != h2 && msgType != 2 {
+	if !h2Range.Contains(msgType) && msgType != 2 {
 		return false
 	}
 
