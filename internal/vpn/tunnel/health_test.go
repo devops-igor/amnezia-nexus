@@ -81,16 +81,29 @@ func TestHealthProber(t *testing.T) {
 		t.Errorf("expected disabled on second failure, got %s", t1Status.Status)
 	}
 
-	// 5. Recovery probe (success restores active)
+	// 5. Health-auto-disabled tunnel: a successful probe must NOT resurrect it
+	// (issues #28/#43). ProbeTunnel refuses and the status stays disabled;
+	// recovery requires an explicit manual re-enable (EnableBackend), which is
+	// simulated here by resetting the status to degraded.
 	mockErr = nil
 	mockLatency = 15 * time.Millisecond
+	lat, err = prober.ProbeTunnel(ctx, t1)
+	if !errors.Is(err, ErrTunnelDisabled) {
+		t.Fatalf("expected ErrTunnelDisabled for health-auto-disabled tunnel, got lat=%d err=%v", lat, err)
+	}
+	t1Status, _ = pool.GetTunnel(s1ID)
+	if t1Status.Status != "disabled" {
+		t.Fatalf("expected status to remain disabled, got %s", t1Status.Status)
+	}
+	// Manual re-enable path (as EnableBackend does).
+	_ = pool.SetTunnelStatus(ctx, s1ID, "degraded", 0)
 	lat, err = prober.ProbeTunnel(ctx, t1)
 	if err != nil || lat != 15 {
 		t.Fatalf("ProbeTunnel recovery failed: lat=%d, err=%v", lat, err)
 	}
 	t1Status, _ = pool.GetTunnel(s1ID)
 	if t1Status.Status != "active" || t1Status.LatencyMS != 15 {
-		t.Errorf("expected active after recovery, got %s", t1Status.Status)
+		t.Errorf("status mismatch: status=%s, lat=%d", t1Status.Status, t1Status.LatencyMS)
 	}
 
 	// 6. Nil tunnel
@@ -394,8 +407,14 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Errorf("expected tunnel status escalated to 'disabled' after %d hook failures, got %s", cfg.FailureThreshold, st3.Status)
 	}
 
-	// Recovery: hook succeeds -> failCounts resets to 0, status becomes active
+	// Recovery: a health-auto-disabled tunnel requires manual re-enable
+	// (issues #28/#43); the prober must refuse while disabled.
 	hookFails = false
+	if _, err := prober.ProbeTunnel(ctx, tunnel); !errors.Is(err, ErrTunnelDisabled) {
+		t.Fatalf("expected ErrTunnelDisabled while health-auto-disabled, got %v", err)
+	}
+	// Manual re-enable path (as EnableBackend does).
+	_ = pool.SetTunnelStatus(ctx, sID, "degraded", 0)
 	rtt, err = prober.ProbeTunnel(ctx, tunnel)
 	if err != nil {
 		t.Fatalf("expected ProbeTunnel to succeed on hook recovery, got: %v", err)

@@ -610,12 +610,14 @@ func (m *mockAWGManagerWithClientAdder) AddClient(ctx context.Context, server *m
 }
 
 // TestEnableBackend_RegistersProberPeerOnBackend asserts the WIRING only:
-// EnableBackend passes the tunnel-derived prober pubkey to AddClient. It uses
-// a MOCK AddClient, so it cannot verify what the real manager does with those
-// params (round-2 review: a mock asserting its own inputs is a false positive).
-// The real-path coverage — [Peer] PublicKey == caller-supplied key, no
-// PresharedKey, idempotent re-registration — lives in
-// awg_probe_rework_test.go (TestAWGManager_AddClient_ProbePeerUsesCallerKey_R3),
+// EnableBackend registers BOTH portal peers on the backend via AddClient —
+// the DATA device peer (identity derive(PrivateKey), allowed_ips 0.0.0.0/0)
+// first, then the dedicated probe peer (identity derive(ProbePrivateKey),
+// no allowed_ips key). It uses a MOCK AddClient, so it cannot verify what the
+// real manager does with those params (round-2 review: a mock asserting its
+// own inputs is a false positive). The real-path coverage — [Peer] PublicKey
+// == caller-supplied key, no PresharedKey, idempotent re-registration — lives
+// in awg_probe_rework_test.go (TestAWGManager_AddClient_ProbePeerUsesCallerKey_R3),
 // and the real-container acceptance test lives in
 // awg_container_integration_test.go (TestAWGRealContainer_HandshakeWithPSKLessProbePeer).
 func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
@@ -648,32 +650,66 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 		t.Fatalf("EnableBackend failed: %v", err)
 	}
 
-	if adder.addClientCalls != 1 {
-		t.Fatalf("expected 1 AddClient call, got %d", adder.addClientCalls)
+	// Issue #43 key separation: exactly two registrations — DATA plane first,
+	// health probe second.
+	if adder.addClientCalls != 2 {
+		t.Fatalf("expected 2 AddClient calls, got %d", adder.addClientCalls)
 	}
-	if len(adder.addedClients) != 1 {
-		t.Fatalf("expected 1 added client, got %d", len(adder.addedClients))
+	if len(adder.addedClients) != 2 {
+		t.Fatalf("expected 2 added clients, got %d", len(adder.addedClients))
 	}
-	clientParams := adder.addedClients[0]
-	if clientParams["clientName"] != "Portal Data Plane" {
-		t.Errorf("expected clientName 'Portal Data Plane', got: %v", clientParams["clientName"])
+	dataParams := adder.addedClients[0]
+	probeParams := adder.addedClients[1]
+
+	if dataParams["clientName"] != "Portal Data Plane" {
+		t.Errorf("expected first clientName 'Portal Data Plane', got: %v", dataParams["clientName"])
 	}
-	proberPub, ok := clientParams["client_public_key"].(string)
-	if !ok || len(proberPub) == 0 {
-		t.Fatalf("missing or empty client_public_key in clientParams: %+v", clientParams)
+	if probeParams["clientName"] != "Portal Health Probe" {
+		t.Errorf("expected second clientName 'Portal Health Probe', got: %v", probeParams["clientName"])
 	}
 
-	// Verify proberPub matches the tunnel's PrivateKey derived public key
 	tun, err := svc.pool.GetTunnel(srvID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	derivedPub, err := health.ComputePublicKeyFromPrivate(tun.PrivateKey)
-	if err != nil {
-		t.Fatalf("ComputePublicKeyFromPrivate failed: %v", err)
+
+	// DATA peer: identity = derive(PrivateKey), allowed_ips 0.0.0.0/0.
+	dataPub, ok := dataParams["client_public_key"].(string)
+	if !ok || len(dataPub) == 0 {
+		t.Fatalf("missing or empty client_public_key in data params: %+v", dataParams)
 	}
-	if proberPub != derivedPub {
-		t.Errorf("registered prober public key %s does not match tunnel derived pubkey %s", proberPub, derivedPub)
+	derivedDataPub, err := health.ComputePublicKeyFromPrivate(tun.PrivateKey)
+	if err != nil {
+		t.Fatalf("ComputePublicKeyFromPrivate (data) failed: %v", err)
+	}
+	if dataPub != derivedDataPub {
+		t.Errorf("registered data public key %s does not match tunnel-derived data pubkey %s", dataPub, derivedDataPub)
+	}
+	if aip, ok := dataParams["allowed_ips"]; !ok || aip != "0.0.0.0/0" {
+		t.Errorf("expected data peer allowed_ips '0.0.0.0/0', got: %v", dataParams["allowed_ips"])
+	}
+
+	// PROBE peer: identity = derive(ProbePrivateKey), distinct from data key,
+	// and NO allowed_ips key at all (manager defaults it to clientIP/32).
+	probePub, ok := probeParams["client_public_key"].(string)
+	if !ok || len(probePub) == 0 {
+		t.Fatalf("missing or empty client_public_key in probe params: %+v", probeParams)
+	}
+	if tun.ProbePrivateKey == "" {
+		t.Fatalf("tunnel must carry a dedicated probe private key after EnableBackend")
+	}
+	derivedProbePub, err := health.ComputePublicKeyFromPrivate(tun.ProbePrivateKey)
+	if err != nil {
+		t.Fatalf("ComputePublicKeyFromPrivate (probe) failed: %v", err)
+	}
+	if probePub != derivedProbePub {
+		t.Errorf("registered probe public key %s does not match tunnel-derived probe pubkey %s", probePub, derivedProbePub)
+	}
+	if probePub == dataPub {
+		t.Errorf("probe public key must differ from data public key (key separation is the whole fix)")
+	}
+	if aip, present := probeParams["allowed_ips"]; present {
+		t.Errorf("probe peer must carry NO allowed_ips key (defaults to clientIP/32), got: %v", aip)
 	}
 }
 
@@ -1977,28 +2013,27 @@ func TestProbeFunc_MatchByTunID(t *testing.T) {
 		lastHandshakeFn: func() time.Time { return recent },
 	}
 
-	// Set device with matching tun.ID
-	svc.SetBackendDeviceForTest(tun.ID, dev)
-
+	// Set device with matching tun.ID. Issue #43: the fake-success fast path
+	// was REMOVED — ProbeTunnel now ALWAYS runs the real Noise IK probe with
+	// the dedicated probe key, regardless of device handshake freshness.
 	rtt, err := svc.ProbeTunnel(ctx, tun)
-	if err != nil {
-		t.Fatalf("expected ProbeTunnel to succeed when device matches tun.ID, got: %v", err)
-	}
-	if rtt != 10 {
-		t.Errorf("expected 10ms latency for device-backed tunnel, got %d", rtt)
+	if err == nil {
+		t.Fatalf("expected real-probe error against unlistening endpoint (fast path removed), got nil rtt=%d", rtt)
 	}
 
-	// Remove matching device by setting with wrong ID
+	// Remove matching device by setting with wrong ID; prober falls through to
+	// ProbeAWGEndpoint identically (still unlistening endpoint).
 	svc.mu.Lock()
+	if svc.backendDevices == nil {
+		svc.backendDevices = make(map[int64]BackendDevice)
+	}
 	delete(svc.backendDevices, tun.ID)
 	svc.backendDevices[99999] = dev
 	svc.mu.Unlock()
 
-	// Prober now cannot find device by tun.ID and falls through to ProbeAWGEndpoint
-	// which fails on unlistening endpoint 127.0.0.1:51820
 	_, err = svc.ProbeTunnel(ctx, tun)
 	if err == nil {
-		t.Error("expected ProbeTunnel to fail or fall through when device key does not match tun.ID, got nil")
+		t.Error("expected ProbeTunnel to fail when device key does not match tun.ID, got nil")
 	}
 }
 
@@ -2032,30 +2067,11 @@ func TestProbeFunc_ZeroHandshake_Within90sGrace_SendsTrigger(t *testing.T) {
 	}
 	svc.SetBackendDeviceForTest(tun.ID, dev)
 
-	rtt, err := svc.ProbeTunnel(ctx, tun)
-	if err != nil {
-		t.Fatalf("expected zero-handshake within 90s grace to succeed, got: %v", err)
-	}
-	if rtt != 10 {
-		t.Errorf("expected 10ms latency, got %d", rtt)
-	}
-
-	// Assert dummy trigger packet was written to the device's vtun.inPackets
-	select {
-	case pkt := <-inCh:
-		if len(pkt) < 20 {
-			t.Fatalf("expected IPv4 packet >= 20 bytes, got %d bytes", len(pkt))
-		}
-		if (pkt[0] >> 4) != 4 {
-			t.Errorf("expected IPv4 version 4, got %d", pkt[0]>>4)
-		}
-		// Destination IP bytes 16..19 should be 0.0.0.0
-		destIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19]).String()
-		if destIP != "0.0.0.0" {
-			t.Errorf("expected trigger packet dest IP 0.0.0.0, got %s", destIP)
-		}
-	default:
-		t.Fatal("expected dummy trigger packet in vtun inPackets, none found")
+	// Issue #43: fake-success fast path removed. ProbeTunnel now always runs
+	// the real Noise IK probe with the dedicated probe key — no dummy trigger
+	// packet, no synthetic 10ms RTT. Against an unlistening endpoint it fails.
+	if _, err := svc.ProbeTunnel(ctx, tun); err == nil {
+		t.Fatal("expected real-probe error against unlistening endpoint, got nil")
 	}
 }
 
@@ -2088,12 +2104,15 @@ func TestProbeFunc_ZeroHandshake_Past90sGrace_ReturnsError(t *testing.T) {
 	}
 	svc.SetBackendDeviceForTest(tun.ID, dev)
 
+	// Issue #43: real Noise IK probe always runs; against an unlistening
+	// endpoint it fails with the probe transport error (device-based timeout
+	// messages no longer apply).
 	_, err = svc.ProbeTunnel(ctx, tun)
 	if err == nil {
-		t.Fatal("expected error for zero-handshake past 90s grace, got nil")
+		t.Fatal("expected real-probe error against unlistening endpoint, got nil")
 	}
-	if !strings.Contains(err.Error(), "initial handshake not completed within") {
-		t.Errorf("expected initial handshake timeout error, got: %v", err)
+	if !strings.Contains(err.Error(), "failed to receive handshake response") {
+		t.Errorf("expected handshake response transport error, got: %v", err)
 	}
 }
 
@@ -2118,7 +2137,8 @@ func TestProbeFunc_StaleHandshake_ReturnsError(t *testing.T) {
 	}
 	defer realDev.Close()
 
-	// Handshake 4 minutes ago (>= 3m cutoff)
+	// Handshake 4 minutes ago (>= 3m cutoff). Issue #43: real Noise IK probe
+	// always runs; the device-handshake-age fast paths are gone.
 	dev := &testBackendDevice{
 		AWGClientDevice: realDev,
 		lastHandshakeFn: func() time.Time { return time.Now().Add(-4 * time.Minute) },
@@ -2127,10 +2147,10 @@ func TestProbeFunc_StaleHandshake_ReturnsError(t *testing.T) {
 
 	_, err = svc.ProbeTunnel(ctx, tun)
 	if err == nil {
-		t.Fatal("expected error for stale handshake >3m, got nil")
+		t.Fatal("expected real-probe error against unlistening endpoint, got nil")
 	}
-	if !strings.Contains(err.Error(), "amneziawg-go handshake timeout") {
-		t.Errorf("expected amneziawg-go handshake timeout error, got: %v", err)
+	if !strings.Contains(err.Error(), "failed to receive handshake response") {
+		t.Errorf("expected handshake response transport error, got: %v", err)
 	}
 }
 
@@ -2155,19 +2175,18 @@ func TestProbeFunc_RecentHandshake_ReturnsSuccess(t *testing.T) {
 	}
 	defer realDev.Close()
 
-	// Handshake 45s ago (< 3m cutoff)
+	// Handshake 45s ago (< 3m cutoff). Issue #43: the fake-success fast path
+	// was removed — freshness of the data device's handshake no longer
+	// fabricates a probe result; the real Noise IK probe with the dedicated
+	// probe key always runs. Against an unlistening endpoint it must fail.
 	dev := &testBackendDevice{
 		AWGClientDevice: realDev,
 		lastHandshakeFn: func() time.Time { return time.Now().Add(-45 * time.Second) },
 	}
 	svc.SetBackendDeviceForTest(tun.ID, dev)
 
-	rtt, err := svc.ProbeTunnel(ctx, tun)
-	if err != nil {
-		t.Fatalf("expected recent handshake <3m to succeed, got: %v", err)
-	}
-	if rtt != 10 {
-		t.Errorf("expected 10ms latency, got %d", rtt)
+	if _, err := svc.ProbeTunnel(ctx, tun); err == nil {
+		t.Fatal("expected real-probe error against unlistening endpoint (fresh device handshake must NOT short-circuit), got nil")
 	}
 }
 

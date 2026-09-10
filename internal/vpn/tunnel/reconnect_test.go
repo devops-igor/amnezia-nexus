@@ -104,6 +104,10 @@ func TestReconnectManager(t *testing.T) {
 	// 8. Reconnect with success
 	mockErr = nil
 	mockLatency = 20 * time.Millisecond
+	// The tunnel is health-auto-disabled at this point; CheckAndReconnect must
+	// never resurrect disabled tunnels (issues #28/#43), so re-enable manually
+	// (as EnableBackend does) before the reconnect attempt can succeed.
+	_ = pool.SetTunnelStatus(ctx, s1ID, "degraded", 0)
 	// Reset retries by allowing unlimited retries safely
 	rCfgUnlimited := rCfg
 	rCfgUnlimited.MaxRetries = 0
