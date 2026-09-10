@@ -94,6 +94,10 @@ type InitiationInfo struct {
 	CK []byte
 	// TimestampUnix is the decrypted TAI64N timestamp in Unix seconds.
 	TimestampUnix int64
+	// HeaderProtected indicates whether the initiation had AWG 3.x header protection applied.
+	HeaderProtected bool
+	// HPKey is the 32-byte header protection key used to unmask this initiation.
+	HPKey []byte
 }
 
 // TransportKeys holds the final Noise transport keys derived after a
@@ -131,10 +135,12 @@ func nonceZero() []byte {
 // datagram received by the server role. serverPriv is the endpoint's Noise
 // server private key (see ServerKeysManager); h1 and s1 are the AWG message
 // type and junk prefix length the endpoint is configured with (zero/negative
-// select the health package defaults). On success it returns the decrypted
-// peer identity and the Noise hash/chain-key state needed to build the
-// response.
-func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int) (*InitiationInfo, error) {
+// select the health package defaults). Optional hpKeys provides the header
+// protection key: when present and 32 bytes, ParseInitiation attempts unmasking
+// the initiation packet using the 12-byte junk prefix nonce; if unmasking
+// succeeds, it returns an InitiationInfo marked as HeaderProtected.
+// Plaintext initiations are accepted for backward compatibility.
+func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int, hpKeys ...[]byte) (*InitiationInfo, error) {
 	if len(serverPriv) != 32 {
 		return nil, errors.New("server private key must be 32 bytes")
 	}
@@ -148,10 +154,61 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int) (*In
 		return nil, ErrDatagramTooShort
 	}
 
+	serverPub, err := curve25519.X25519(serverPriv, curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive server public key: %w", err)
+	}
+
+	var hpKey []byte
+	if len(hpKeys) > 0 && len(hpKeys[0]) == 32 {
+		hpKey = hpKeys[0]
+	}
+
+	// 1. If HP key is provided and S1 >= 12, try unmasking with Header Protection.
+	if len(hpKey) == 32 && s1 >= health.HeaderCipherNonceSize {
+		unmasked := make([]byte, initiationWireLen)
+		copy(unmasked, datagram[s1:s1+initiationWireLen])
+		cip := health.NewHeaderProtectionCipher(hpKey, datagram)
+		if cip != nil {
+			cip.XORKeyStream(unmasked, unmasked)
+			obfMsgType := binary.LittleEndian.Uint32(unmasked[0:4])
+			plainMsgType := binary.LittleEndian.Uint32(datagram[s1 : s1+4])
+
+			if obfMsgType == h1 {
+				info, obfErr := parseInitiationBody(serverPriv, serverPub, unmasked, true, hpKey)
+				if obfErr == nil {
+					return info, nil
+				}
+				// If obfuscated body parsing failed, check if plaintext matches H1
+				if plainMsgType == h1 {
+					if infoPlain, plainErr := parseInitiationBody(serverPriv, serverPub, datagram[s1:], false, nil); plainErr == nil {
+						return infoPlain, nil
+					}
+				}
+				return nil, obfErr
+			} else if plainMsgType == h1 {
+				// Obfuscated type didn't match H1, but plaintext did: backward-compat plaintext client.
+				return parseInitiationBody(serverPriv, serverPub, datagram[s1:], false, nil)
+			}
+			return nil, ErrNotInitiation
+		}
+	}
+
+	// 2. Plaintext path (HP disabled or S1 < 12).
 	payload := datagram[s1:]
 	msgType := binary.LittleEndian.Uint32(payload[0:4])
 	if msgType != h1 {
 		return nil, ErrNotInitiation
+	}
+	return parseInitiationBody(serverPriv, serverPub, payload, false, nil)
+}
+
+// parseInitiationBody parses the 116-byte initiation body + MAC1/MAC2 payload
+// (wire length 148), verifies MAC1 against serverPub, performs the Noise DH
+// exchanges, decrypts the client static key and TAI64N timestamp, and checks anti-replay.
+func parseInitiationBody(serverPriv, serverPub []byte, payload []byte, headerProtected bool, hpKey []byte) (*InitiationInfo, error) {
+	if len(payload) < initiationWireLen {
+		return nil, ErrDatagramTooShort
 	}
 	senderIdx := binary.LittleEndian.Uint32(payload[4:8])
 
@@ -163,10 +220,6 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int) (*In
 
 	// MAC1 is keyed with the SERVER's public key (mirror of the client-side
 	// derivation in BuildAWGInitiationPacket) and covers the unencrypted body.
-	serverPub, err := curve25519.X25519(serverPriv, curve25519.Basepoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to derive server public key: %w", err)
-	}
 	mac1KeySum := blake2s.Sum256(concat(health.LabelMAC1, serverPub))
 	mac1Hasher, err := blake2s.New128(mac1KeySum[:])
 	if err != nil {
@@ -239,6 +292,8 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int) (*In
 		H:               h,
 		CK:              ck,
 		TimestampUnix:   unixSec,
+		HeaderProtected: headerProtected,
+		HPKey:           hpKey,
 	}, nil
 }
 
@@ -253,14 +308,74 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int) (*In
 // PSK policy: panel client registrations do not carry a preshared key, so the
 // Noise IKpsk2 preshared key is 32 zero bytes on both sides — matching
 // BuildAWGInitiationPacket's psk==nil handling and the client state it stores.
-func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int) (resp []byte, sessionKeys *TransportKeys, err error) {
-	if info == nil {
-		return nil, nil, ErrInvalidHandshakeState
+//
+// If info was parsed with Header Protection (info.HeaderProtected), HP masking
+// is applied to the response packet (keystream message-relative, nonce = S2 prefix[:12]),
+// matching the health.VerifyAWGResponsePacketObfuscated client verifier.
+func computeResponseKeys(info *InitiationInfo) (serverEPub, encryptedEmpty []byte, transportKeys *TransportKeys, err error) {
+	serverEPriv := make([]byte, 32)
+	if _, err := rand.Read(serverEPriv); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate server ephemeral key: %w", err)
 	}
-	if len(info.H) != 32 || len(info.CK) != 32 {
-		return nil, nil, ErrInvalidHandshakeState
+	serverEPub, err = curve25519.X25519(serverEPriv, curve25519.Basepoint)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to compute server ephemeral public key: %w", err)
 	}
-	if len(info.ClientStaticPub) != 32 || len(info.ClientEPub) != 32 {
+
+	h := mixHash(info.H, serverEPub)
+	ck := health.KDF1(info.CK, serverEPub)
+
+	ss3, err := curve25519.X25519(serverEPriv, info.ClientEPub)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("first response DH exchange failed: %w", err)
+	}
+	ck = health.KDF1(ck, ss3)
+
+	ss4, err := curve25519.X25519(serverEPriv, info.ClientStaticPub)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("second response DH exchange failed: %w", err)
+	}
+	ck = health.KDF1(ck, ss4)
+
+	psk := make([]byte, 32)
+	ck, tau, key3 := health.KDF3(ck, psk)
+	h = mixHash(h, tau)
+
+	aead3, err := chacha20poly1305.New(key3)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create aead3: %w", err)
+	}
+	encryptedEmpty = aead3.Seal(nil, nonceZero(), nil, h)
+	if len(encryptedEmpty) != 16 {
+		return nil, nil, nil, fmt.Errorf("unexpected encrypted empty payload length: %d", len(encryptedEmpty))
+	}
+
+	recvKey, sendKey := health.KDF2(ck, nil)
+	transportKeys = &TransportKeys{SendKey: sendKey, RecvKey: recvKey}
+	return serverEPub, encryptedEmpty, transportKeys, nil
+}
+
+func applyResponseHeaderProtection(resp []byte, s2 int, info *InitiationInfo, hpKeys [][]byte) error {
+	if !info.HeaderProtected {
+		return nil
+	}
+	hpKey := info.HPKey
+	if len(hpKey) != 32 && len(hpKeys) > 0 && len(hpKeys[0]) == 32 {
+		hpKey = hpKeys[0]
+	}
+	if len(hpKey) == 32 && s2 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(hpKey, resp)
+		if cip == nil {
+			return errors.New("failed to create header protection cipher for response")
+		}
+		end := s2 + health.MessageResponseSize
+		cip.XORKeyStream(resp[s2:end], resp[s2:end])
+	}
+	return nil
+}
+
+func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int, hpKeys ...[]byte) (resp []byte, sessionKeys *TransportKeys, err error) {
+	if info == nil || len(info.H) != 32 || len(info.CK) != 32 || len(info.ClientStaticPub) != 32 || len(info.ClientEPub) != 32 {
 		return nil, nil, ErrInvalidHandshakeState
 	}
 	if h2 == 0 {
@@ -270,50 +385,10 @@ func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int) (
 		s2 = health.DefaultS2
 	}
 
-	// Server ephemeral keypair.
-	serverEPriv := make([]byte, 32)
-	if _, err := rand.Read(serverEPriv); err != nil {
-		return nil, nil, fmt.Errorf("failed to generate server ephemeral key: %w", err)
-	}
-	serverEPub, err := curve25519.X25519(serverEPriv, curve25519.Basepoint)
+	serverEPub, encryptedEmpty, transportKeys, err := computeResponseKeys(info)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to compute server ephemeral public key: %w", err)
+		return nil, nil, err
 	}
-
-	// Noise chain continuation (mirror of VerifyAWGResponsePacket).
-	h := mixHash(info.H, serverEPub)
-	ck := health.KDF1(info.CK, serverEPub)
-
-	ss3, err := curve25519.X25519(serverEPriv, info.ClientEPub)
-	if err != nil {
-		return nil, nil, fmt.Errorf("first response DH exchange failed: %w", err)
-	}
-	ck = health.KDF1(ck, ss3)
-
-	ss4, err := curve25519.X25519(serverEPriv, info.ClientStaticPub)
-	if err != nil {
-		return nil, nil, fmt.Errorf("second response DH exchange failed: %w", err)
-	}
-	ck = health.KDF1(ck, ss4)
-
-	// No-PSK policy: 32 zero bytes (see function godoc).
-	psk := make([]byte, 32)
-	ck, tau, key3 := health.KDF3(ck, psk)
-	h = mixHash(h, tau)
-
-	aead3, err := chacha20poly1305.New(key3)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create aead3: %w", err)
-	}
-	encryptedEmpty := aead3.Seal(nil, nonceZero(), nil, h)
-	if len(encryptedEmpty) != 16 {
-		return nil, nil, fmt.Errorf("unexpected encrypted empty payload length: %d", len(encryptedEmpty))
-	}
-
-	// Final transport keys. Server is the responder: it sends with tempK2 and
-	// receives with tempK1.
-	recvKey, sendKey := health.KDF2(ck, nil)
-	transportKeys := &TransportKeys{SendKey: sendKey, RecvKey: recvKey}
 
 	// Assemble the 60-byte response body.
 	var idxBuf [4]byte
@@ -357,6 +432,10 @@ func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int) (
 	resp = append(resp, body...)
 	resp = append(resp, mac1...)
 	resp = append(resp, make([]byte, 16)...) // MAC2
+
+	if err := applyResponseHeaderProtection(resp, s2, info, hpKeys); err != nil {
+		return nil, nil, err
+	}
 
 	return resp, transportKeys, nil
 }

@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS user_connections (
     client_id TEXT,
     name TEXT,
     awg_mimicry TEXT DEFAULT 'auto',
+    client_params TEXT DEFAULT '{}',
     last_rx INTEGER DEFAULT 0,
     last_tx INTEGER DEFAULT 0,
     traffic_delta_rx INTEGER DEFAULT 0,

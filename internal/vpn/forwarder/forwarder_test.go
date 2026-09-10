@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -371,5 +372,176 @@ func TestTokenBucketDirect(t *testing.T) {
 	}
 	if tb.Allow(200) {
 		t.Errorf("expected false on Allow(200) when only 100 left")
+	}
+}
+
+func TestForwarder_ReattachStopsOldPumpAndDeliversToNewDevice(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	accountant := NewTrafficAccountant(nil, 0)
+	fwd := NewForwarder(accountant, 500)
+	fwd.Start(ctx)
+	fwd.StartPumps(ctx)
+	defer func() { _ = fwd.Stop() }()
+
+	backendID := int64(42)
+	peerKey := "peer-test-reattach"
+	assignedIP := "10.100.0.42"
+
+	fwd.RegisterSession("sess-42", "conn-42", peerKey, assignedIP, backendID)
+
+	oldDev := newMockPacketDev()
+	fwd.AttachBackendDevice(backendID, oldDev)
+
+	// Route 1 initial packet to verify oldDev receives packets before re-attach
+	if err := fwd.RouteClientToBackend(peerKey, []byte("pkt-before-reattach")); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+
+	select {
+	case <-oldDev.notifyCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for oldDev initial packet")
+	}
+
+	if len(oldDev.getPackets()) != 1 {
+		t.Fatalf("expected 1 packet on oldDev before reattach, got %d", len(oldDev.getPackets()))
+	}
+
+	// Re-attach: Detach old device, Attach new device (mirrors attachBackendForwarder lifecycle)
+	newDev := newMockPacketDev()
+	fwd.DetachBackendDevice(backendID)
+	fwd.AttachBackendDevice(backendID, newDev)
+
+	// Send 200 packets to backend queue
+	totalPackets := 200
+	for i := 0; i < totalPackets; i++ {
+		if err := fwd.RouteClientToBackend(peerKey, []byte(fmt.Sprintf("pkt-%d", i))); err != nil {
+			t.Fatalf("RouteClientToBackend packet %d failed: %v", i, err)
+		}
+	}
+
+	// Wait until newDev has received all 200 packets or timeout
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(newDev.getPackets()) == totalPackets {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	oldPktsAfterReattach := len(oldDev.getPackets()) - 1 // minus initial packet before reattach
+	newPkts := len(newDev.getPackets())
+
+	// Assert old device receives ZERO packets after reattach
+	if oldPktsAfterReattach != 0 {
+		t.Errorf("expected old device to receive 0 packets after re-attach, but it received %d (packets stolen by old pump)", oldPktsAfterReattach)
+	}
+
+	// Assert new device receives 100% of packets after reattach
+	if newPkts != totalPackets {
+		t.Errorf("expected new device to receive %d packets (100%%), but it received %d", totalPackets, newPkts)
+	}
+}
+
+func TestForwarderDynamicSourceIPLearning(t *testing.T) {
+	accountant := NewTrafficAccountant(nil, 0)
+	fwd := NewForwarder(accountant, 10)
+
+	sessID := "sess-dyn-1"
+	connID := "conn-dyn-1"
+	peerKey := "peer-dyn-1"
+	initialIP := "10.100.0.17"
+	learnedIP := "10.100.0.4"
+	backendID := int64(10)
+
+	fwd.RegisterSession(sessID, connID, peerKey, initialIP, backendID)
+
+	clientChan, ok := fwd.GetClientPacketChannel(peerKey)
+	if !ok || clientChan == nil {
+		t.Fatalf("expected client packet channel")
+	}
+	beChan, ok := fwd.GetBackendPacketChannel(backendID)
+	if !ok || beChan == nil {
+		t.Fatalf("expected backend packet channel")
+	}
+
+	returnPkt := []byte("dns-reply-packet")
+
+	// 1. Return packet to learnedIP (10.100.0.4) initially fails because only 10.100.0.17 is registered
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != ErrSessionNotRegistered {
+		t.Fatalf("expected ErrSessionNotRegistered for learnedIP before learning, got: %v", err)
+	}
+
+	// 2. Return packet to initialIP (10.100.0.17) succeeds
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); err != nil {
+		t.Fatalf("RouteBackendToClient for initialIP failed: %v", err)
+	}
+	select {
+	case <-clientChan:
+	default:
+		t.Fatalf("expected packet on client queue for initialIP")
+	}
+
+	// 3. Client sends IPv4 packet with src: 10.100.0.4, dst: 1.1.1.1
+	ipv4Header := make([]byte, 28) // 20 bytes IP + 8 bytes UDP
+	ipv4Header[0] = 0x45           // IPv4, IHL=5
+	// Source IP: 10.100.0.4
+	ipv4Header[12] = 10
+	ipv4Header[13] = 100
+	ipv4Header[14] = 0
+	ipv4Header[15] = 4
+	// Dest IP: 1.1.1.1
+	ipv4Header[16] = 1
+	ipv4Header[17] = 1
+	ipv4Header[18] = 1
+	ipv4Header[19] = 1
+
+	if err := fwd.RouteClientToBackend(peerKey, ipv4Header); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+
+	select {
+	case <-beChan:
+	default:
+		t.Fatalf("expected packet on backend queue")
+	}
+
+	// 4. Now return packet to learnedIP (10.100.0.4) MUST SUCCEED!
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != nil {
+		t.Fatalf("RouteBackendToClient for learnedIP failed after dynamic learning: %v", err)
+	}
+	select {
+	case received := <-clientChan:
+		if string(received) != string(returnPkt) {
+			t.Fatalf("received packet mismatch: %s", string(received))
+		}
+	default:
+		t.Fatalf("expected return packet on client queue after dynamic learning")
+	}
+
+	// 5. Old IP (10.100.0.17) is no longer registered
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); err != ErrSessionNotRegistered {
+		t.Fatalf("expected ErrSessionNotRegistered for old initialIP, got: %v", err)
+	}
+
+	// 6. Test edge case: 0.0.0.0 src IP does not override learned IP
+	zeroIPPkt := make([]byte, 20)
+	zeroIPPkt[0] = 0x45
+	// src: 0.0.0.0
+	if err := fwd.RouteClientToBackend(peerKey, zeroIPPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for zero IP failed: %v", err)
+	}
+	// Verify learnedIP is still active
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != nil {
+		t.Fatalf("RouteBackendToClient for learnedIP failed after 0.0.0.0 packet: %v", err)
+	}
+	<-clientChan
+
+	// 7. Unregister session cleanly unregisters learnedIP
+	fwd.UnregisterSession(peerKey)
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != ErrSessionNotRegistered {
+		t.Fatalf("expected ErrSessionNotRegistered after unregister, got: %v", err)
 	}
 }

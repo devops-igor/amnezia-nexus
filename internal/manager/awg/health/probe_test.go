@@ -296,3 +296,37 @@ func TestExtractAWGHeaderLimits_FallbackHierarchy(t *testing.T) {
 		t.Errorf("expected h1=9999 with DefaultH2 fallback, got (%d, %d, %d, %d)", h1, h2, s1, s2)
 	}
 }
+
+func TestExtractHeaderProtectionKey_CasingAndStyles(t *testing.T) {
+	expectedKey := "BSX9ZtdoVp6sTwS+ziidJqp/aBjHrp1+xSOzc3+Z36Y="
+
+	// 1. PascalCase HeaderProtectionKey (live server format)
+	m1 := map[string]any{"HeaderProtectionKey": expectedKey}
+	if k := ExtractHeaderProtectionKey(m1); k != expectedKey {
+		t.Errorf("expected %q for PascalCase HeaderProtectionKey, got %q", expectedKey, k)
+	}
+
+	// 2. snake_case header_protection_key
+	m2 := map[string]any{"header_protection_key": expectedKey}
+	if k := ExtractHeaderProtectionKey(m2); k != expectedKey {
+		t.Errorf("expected %q for snake_case header_protection_key, got %q", expectedKey, k)
+	}
+
+	// 3. short key hpkey
+	m3 := map[string]any{"hpkey": expectedKey}
+	if k := ExtractHeaderProtectionKey(m3); k != expectedKey {
+		t.Errorf("expected %q for short key hpkey, got %q", expectedKey, k)
+	}
+
+	// 4. map[string]string variant
+	m4 := map[string]string{"HeaderProtectionKey": expectedKey}
+	if k := ExtractHeaderProtectionKey(m4); k != expectedKey {
+		t.Errorf("expected %q for map[string]string HeaderProtectionKey, got %q", expectedKey, k)
+	}
+
+	// 5. ExtractAWGExplicitParams detects HeaderProtectionKey
+	_, _, _, _, found := ExtractAWGExplicitParams(m1)
+	if !found {
+		t.Errorf("expected ExtractAWGExplicitParams to return found=true for HeaderProtectionKey")
+	}
+}

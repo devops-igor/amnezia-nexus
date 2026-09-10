@@ -393,3 +393,89 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 		t.Errorf("explicit obfuscation values not round-tripped verbatim: %+v", loaded)
 	}
 }
+
+func TestCreateVPNSession_AssignedIPConflictResolution(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.10.10.1"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	u1ID, err := db.CreateUser(ctx, &models.User{Username: "user_alice"})
+	if err != nil {
+		t.Fatalf("CreateUser alice failed: %v", err)
+	}
+	u2ID, err := db.CreateUser(ctx, &models.User{Username: "user_bob"})
+	if err != nil {
+		t.Fatalf("CreateUser bob failed: %v", err)
+	}
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be",
+		PublicKey:     "pubkey",
+		PrivateKey:    "privkey",
+		Endpoint:      "10.10.10.1:51820",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	sharedIP := "10.100.0.50"
+
+	// 1. Alice connects and holds sharedIP
+	sessAlice := &models.VPNSession{
+		ID:              "sess-alice",
+		UserID:          u1ID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "alice-pubkey",
+		AssignedIP:      sharedIP,
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sessAlice); err != nil {
+		t.Fatalf("CreateVPNSession alice failed: %v", err)
+	}
+
+	// 2. Bob connects with the same IP (re-leased by IPAM).
+	// Must NOT fail with SQLite UNIQUE constraint failed: vpn_sessions.assigned_ip (2067).
+	sessBob := &models.VPNSession{
+		ID:              "sess-bob",
+		UserID:          u2ID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "bob-pubkey",
+		AssignedIP:      sharedIP,
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sessBob); err != nil {
+		t.Fatalf("CreateVPNSession bob failed on re-leased IP collision: %v", err)
+	}
+
+	// 3. Verify Bob now holds the IP in DB and Alice's session was cleanly removed
+	bobRetrieved, err := db.GetVPNSessionByPeerKey(ctx, "bob-pubkey")
+	if err != nil || bobRetrieved == nil {
+		t.Fatalf("failed to retrieve bob's session: %v", err)
+	}
+	if bobRetrieved.AssignedIP != sharedIP {
+		t.Errorf("expected assigned IP %s, got %s", sharedIP, bobRetrieved.AssignedIP)
+	}
+
+	aliceRetrieved, err := db.GetVPNSessionByPeerKey(ctx, "alice-pubkey")
+	if err != nil {
+		t.Fatalf("error checking alice's session: %v", err)
+	}
+	if aliceRetrieved != nil {
+		t.Errorf("expected alice's stale session to be removed, but found: %+v", aliceRetrieved)
+	}
+
+	// 4. Verify CloseVPNSession removes bob's session
+	if err := db.CloseVPNSession(ctx, bobRetrieved.ID); err != nil {
+		t.Fatalf("CloseVPNSession failed: %v", err)
+	}
+	bobAfterClose, err := db.GetVPNSessionByID(ctx, bobRetrieved.ID)
+	if err != nil {
+		t.Fatalf("error querying closed session: %v", err)
+	}
+	if bobAfterClose != nil {
+		t.Errorf("expected session to be deleted after CloseVPNSession, got: %+v", bobAfterClose)
+	}
+}

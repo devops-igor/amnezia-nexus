@@ -83,6 +83,7 @@ var (
 		"client_id":        true,
 		"name":             true,
 		"awg_mimicry":      true,
+		"client_params":    true,
 		"last_rx":          true,
 		"last_tx":          true,
 		"traffic_delta_rx": true,
@@ -209,7 +210,42 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migratePlaintextSSLKeys(ctx); err != nil {
 		return err
 	}
-	return d.migrateUniqueUsernameIndex(ctx)
+	if err := d.migrateUniqueUsernameIndex(ctx); err != nil {
+		return err
+	}
+	return d.migrateUserConnectionsClientParams(ctx)
+}
+
+func (d *DB) migrateUserConnectionsClientParams(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(user_connections)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect user_connections schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasClientParams := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "client_params") {
+			hasClientParams = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasClientParams {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE user_connections ADD COLUMN client_params TEXT DEFAULT '{}'"); err != nil {
+			return fmt.Errorf("failed to add client_params column: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) migrateUniqueUsernameIndex(ctx context.Context) error {

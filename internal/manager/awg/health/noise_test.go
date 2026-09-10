@@ -62,12 +62,22 @@ func TestDecodeKey(t *testing.T) {
 		t.Errorf("DecodeKey(b64) failed: %v", err)
 	}
 
+	hexKey := hex.EncodeToString(raw)
+	decHex, err := DecodeKey(hexKey)
+	if err != nil || string(decHex) != string(raw) {
+		t.Errorf("DecodeKey(hexKey) failed: %v", err)
+	}
+
 	if _, err := DecodeKey("invalid-base64!!!"); err == nil {
 		t.Errorf("expected error for invalid base64")
 	}
 
 	if _, err := DecodeKey([]byte("short")); err == nil {
 		t.Errorf("expected error for short byte key")
+	}
+
+	if _, err := DecodeKey("shorthex"); err == nil {
+		t.Errorf("expected error for short hex key")
 	}
 }
 
