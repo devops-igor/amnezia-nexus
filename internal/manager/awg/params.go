@@ -3,6 +3,7 @@ package awg
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -368,6 +369,20 @@ func AWGParamsFromVPNConfig(cfg *models.VPNConfig) *AWGParams {
 		p.TransportPacketJunkSize = strconv.Itoa(cfg.S4)
 	}
 
+	if cfg.HeaderProtectionKey != "" {
+		p.HeaderProtectionKey = cfg.HeaderProtectionKey
+		ensureMinJunk := func(valStr *string, minVal int) {
+			num, err := strconv.Atoi(*valStr)
+			if err != nil || num < minVal {
+				*valStr = strconv.Itoa(minVal)
+			}
+		}
+		ensureMinJunk(&p.InitPacketJunkSize, 12)
+		ensureMinJunk(&p.ResponsePacketJunkSize, 12)
+		ensureMinJunk(&p.CookieReplyPacketJunkSize, 12)
+		ensureMinJunk(&p.TransportPacketJunkSize, 12)
+	}
+
 	// Note: Pure AWG 3+ parameters (H1..H4, S1..S4, Jc, Jmin, Jmax) are used for Load Balancer.
 	// CPS mimicry packets (I1..I5) are NOT used in LB mode because the Go noise endpoint
 	// expects standard AWG 3+ initiation headers and does not implement CPS packet framing.
@@ -490,16 +505,316 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 	return params, nil
 }
 
-// GenerateClientTimingParams generates randomized timing params for a client.
-func GenerateClientTimingParams() (rekeyAfterTime, rekeyTimeout, rejectAfterTime, keepaliveTimeout, maxHandshakeAttempts, persistentKeepalive *int) {
-	rat, _ := randIntBetween(100, 140)
-	rt, _ := randIntBetween(4, 6)
-	rej, _ := randIntBetween(160, 200)
-	kt, _ := randIntBetween(8, 12)
-	mha, _ := randIntBetween(4, 8)
-	pk, _ := randIntBetween(22, 30)
+// TimingRange represents an AmneziaWG timing parameter range [Lo, Hi].
+// When Lo == Hi, it represents a degenerate range (a single value).
+type TimingRange struct {
+	Lo int `json:"lo"`
+	Hi int `json:"hi"`
+}
 
-	return &rat, &rt, &rej, &kt, &mha, &pk
+// NewTimingRange creates a new TimingRange ensuring Lo <= Hi.
+func NewTimingRange(lo, hi int) *TimingRange {
+	if hi < lo {
+		lo, hi = hi, lo
+	}
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// DegenerateTimingRange creates a new TimingRange representing a single value (Lo == Hi).
+func DegenerateTimingRange(n int) *TimingRange {
+	return &TimingRange{Lo: n, Hi: n}
+}
+
+// String returns "lo-hi" for true ranges, or "lo" for degenerate ranges.
+func (r *TimingRange) String() string {
+	if r == nil {
+		return ""
+	}
+	if r.Lo == r.Hi {
+		return strconv.Itoa(r.Lo)
+	}
+	return fmt.Sprintf("%d-%d", r.Lo, r.Hi)
+}
+
+// IsDegenerate returns true if the range represents a single value (Lo == Hi).
+func (r *TimingRange) IsDegenerate() bool {
+	if r == nil {
+		return false
+	}
+	return r.Lo == r.Hi
+}
+
+// MarshalJSON marshals TimingRange as a JSON string ("lo-hi" or "lo").
+func (r TimingRange) MarshalJSON() ([]byte, error) {
+	return json.Marshal(r.String())
+}
+
+// UnmarshalJSON unmarshals a JSON number (bare int), a JSON string ("lo-hi" or "lo"),
+// or a JSON object ({"lo": X, "hi": Y}) into TimingRange.
+func (r *TimingRange) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "null" {
+		return nil
+	}
+
+	// 1. Quoted string: "100-140" or "125"
+	if strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
+		var str string
+		if err := json.Unmarshal(data, &str); err != nil {
+			return err
+		}
+		parsed, err := ParseTimingRange(str)
+		if err != nil {
+			return err
+		}
+		if parsed != nil {
+			*r = *parsed
+		}
+		return nil
+	}
+
+	// 2. Bare integer or float number: 125 or 125.0
+	// Upstream amneziawg-go parses timing values as uint32 (device/noise-types.go
+	// FromString -> strconv.ParseUint(..., 32)), so anything outside [0, MaxUint32]
+	// can never be consumed downstream and must be rejected here, not silently
+	// wrapped by an int() conversion (e.g. float64 1e300 -> math.MinInt).
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		if n < 0 || n > math.MaxUint32 {
+			return fmt.Errorf("timing range value out of range: %d", n)
+		}
+		*r = TimingRange{Lo: int(n), Hi: int(n)}
+		return nil
+	}
+	var f float64
+	if err := json.Unmarshal(data, &f); err == nil {
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > math.MaxUint32 {
+			return fmt.Errorf("timing range value out of range: %f", f)
+		}
+		*r = TimingRange{Lo: int(f), Hi: int(f)}
+		return nil
+	}
+
+	// 3. Object: {"lo": 100, "hi": 140}
+	var obj struct {
+		Lo int `json:"lo"`
+		Hi int `json:"hi"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil && (obj.Lo != 0 || obj.Hi != 0) {
+		if obj.Hi < obj.Lo {
+			obj.Lo, obj.Hi = obj.Hi, obj.Lo
+		}
+		*r = TimingRange{Lo: obj.Lo, Hi: obj.Hi}
+		return nil
+	}
+
+	// 4. Fallback: ParseTimingRange on raw string
+	parsed, err := ParseTimingRange(s)
+	if err != nil {
+		return err
+	}
+	if parsed != nil {
+		*r = *parsed
+	}
+	return nil
+}
+
+func parseNumericTimingRange(v any) (*TimingRange, bool, error) {
+	switch val := v.(type) {
+	case int:
+		if val < 0 {
+			return nil, true, fmt.Errorf("timing range value must be non-negative: %d", val)
+		}
+		return DegenerateTimingRange(val), true, nil
+	case int64:
+		if val < 0 || val > math.MaxInt {
+			return nil, true, fmt.Errorf("timing range value out of range: %d", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	case int32:
+		if val < 0 {
+			return nil, true, fmt.Errorf("timing range value must be non-negative: %d", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	case uint:
+		if uint64(val) > math.MaxInt {
+			return nil, true, fmt.Errorf("timing range value out of range: %d", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	case uint32:
+		return DegenerateTimingRange(int(val)), true, nil
+	case uint64:
+		if val > math.MaxInt {
+			return nil, true, fmt.Errorf("timing range value out of range: %d", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	case float64:
+		if val < 0 || val > math.MaxInt {
+			return nil, true, fmt.Errorf("timing range value out of range: %f", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	case float32:
+		if val < 0 || float64(val) > math.MaxInt {
+			return nil, true, fmt.Errorf("timing range value out of range: %f", val)
+		}
+		return DegenerateTimingRange(int(val)), true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func parseStringTimingRange(val string) (*TimingRange, error) {
+	str := strings.TrimSpace(val)
+	if str == "" {
+		return nil, nil
+	}
+	str = strings.Trim(str, "\"")
+	parts := strings.Split(str, "-")
+	if len(parts) == 1 {
+		n, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid timing range %q: %w", val, err)
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("timing range value must be non-negative, got %d", n)
+		}
+		return DegenerateTimingRange(n), nil
+	} else if len(parts) == 2 {
+		lo, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid timing range %q: %w", val, err)
+		}
+		hi, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid timing range %q: %w", val, err)
+		}
+		if lo < 0 || hi < 0 {
+			return nil, fmt.Errorf("timing range values must be non-negative, got %q", val)
+		}
+		if hi < lo {
+			return nil, fmt.Errorf("invalid timing range %q: hi (%d) < lo (%d)", val, hi, lo)
+		}
+		return &TimingRange{Lo: lo, Hi: hi}, nil
+	}
+	return nil, fmt.Errorf("invalid timing range %q: too many hyphens", val)
+}
+
+// ParseTimingRange parses a timing range from any supported type:
+// string ("100-140" or "125"), int, int64, float64, *TimingRange, TimingRange.
+func ParseTimingRange(v any) (*TimingRange, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch val := v.(type) {
+	case TimingRange:
+		return NewTimingRange(val.Lo, val.Hi), nil
+	case *TimingRange:
+		if val == nil {
+			return nil, nil
+		}
+		return NewTimingRange(val.Lo, val.Hi), nil
+	case string:
+		return parseStringTimingRange(val)
+	default:
+		tr, handled, err := parseNumericTimingRange(v)
+		if handled {
+			return tr, err
+		}
+		return nil, fmt.Errorf("unsupported type %T for timing range", v)
+	}
+}
+
+// GenerateRekeyAfterTime generates a randomized RekeyAfterTime range within AWG 3.1 floors [100, 140].
+func GenerateRekeyAfterTime() *TimingRange {
+	lo, _ := randIntBetween(100, 115)
+	hi, _ := randIntBetween(125, 140)
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// GenerateRekeyTimeout generates a randomized RekeyTimeout range within AWG 3.1 floors [4, 6].
+func GenerateRekeyTimeout() *TimingRange {
+	lo, _ := randIntBetween(4, 5)
+	hi, _ := randIntBetween(5, 6)
+	if lo >= hi {
+		hi = lo + 1
+		if hi > 6 {
+			lo = 4
+			hi = 6
+		}
+	}
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// GenerateRejectAfterTime generates a randomized RejectAfterTime range within AWG 3.1 floors [160, 200].
+func GenerateRejectAfterTime() *TimingRange {
+	lo, _ := randIntBetween(160, 175)
+	hi, _ := randIntBetween(185, 200)
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// GenerateKeepaliveTimeout generates a randomized KeepaliveTimeout range within AWG 3.1 floors [8, 12].
+func GenerateKeepaliveTimeout() *TimingRange {
+	lo, _ := randIntBetween(8, 9)
+	hi, _ := randIntBetween(11, 12)
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// GenerateMaxHandshakeAttempts generates a randomized MaxHandshakeAttempts range within AWG 3.1 floors [4, 8].
+func GenerateMaxHandshakeAttempts() *TimingRange {
+	lo, _ := randIntBetween(4, 5)
+	hi, _ := randIntBetween(7, 8)
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// GeneratePersistentKeepalive generates a randomized PersistentKeepalive range within AWG 3.1 floors [22, 30].
+func GeneratePersistentKeepalive() *TimingRange {
+	lo, _ := randIntBetween(22, 25)
+	hi, _ := randIntBetween(27, 30)
+	return &TimingRange{Lo: lo, Hi: hi}
+}
+
+// EnforceTimingOrdering enforces strict ordering invariants between timing parameters:
+// 1. rekey_timeout range must be strictly below rekey_after_time range (rt.Hi < rat.Lo, no overlap).
+// 2. rekey_after_time range must be strictly below reject_after_time range (rat.Hi < rej.Lo).
+func EnforceTimingOrdering(rt, rat, rej *TimingRange) {
+	if rt != nil && rat != nil {
+		if rt.Hi >= rat.Lo {
+			if rat.Lo > 2 {
+				rt.Hi = rat.Lo - 1
+				if rt.Lo > rt.Hi {
+					rt.Lo = rt.Hi
+				}
+			} else {
+				rat.Lo = rt.Hi + 1
+				if rat.Hi < rat.Lo {
+					rat.Hi = rat.Lo
+				}
+			}
+		}
+	}
+	if rat != nil && rej != nil {
+		if rej.Lo <= rat.Hi {
+			rej.Lo = rat.Hi + 1
+			if rej.Hi < rej.Lo {
+				rej.Hi = rej.Lo
+			}
+		}
+	}
+}
+
+// GenerateClientTimingParams generates randomized timing params for a client as ranges
+// with AWG 3.1-sane floors and strict ordering invariants enforced.
+func GenerateClientTimingParams() (rekeyAfterTime, rekeyTimeout, rejectAfterTime, keepaliveTimeout, maxHandshakeAttempts, persistentKeepalive *TimingRange) {
+	rat := GenerateRekeyAfterTime()
+	rt := GenerateRekeyTimeout()
+	rej := GenerateRejectAfterTime()
+	kt := GenerateKeepaliveTimeout()
+	mha := GenerateMaxHandshakeAttempts()
+	pk := GeneratePersistentKeepalive()
+
+	EnforceTimingOrdering(rt, rat, rej)
+
+	return rat, rt, rej, kt, mha, pk
 }
 
 // ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection.

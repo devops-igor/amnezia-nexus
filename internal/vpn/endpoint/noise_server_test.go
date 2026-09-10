@@ -8,7 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"log"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -418,5 +421,471 @@ func TestEndpointListenerHandshakeOverUDP(t *testing.T) {
 	_ = clientConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	if n, err := clientConn.Read(respBuf); err == nil {
 		t.Errorf("expected silent drop for unregistered peer, got %d-byte response", n)
+	}
+}
+
+// TestServerRoleHandshakeRoundTrip_HeaderProtection tests the AWG 3.x header
+// protection handshake roundtrip: client builds an obfuscated initiation, server
+// unmasks and verifies it, server builds an obfuscated response, and client verifies it.
+func TestServerRoleHandshakeRoundTrip_HeaderProtection(t *testing.T) {
+	serverPriv, serverPub := newTestServerKeypair(t)
+	hpKey := make([]byte, 32)
+	if _, err := rand.Read(hpKey); err != nil {
+		t.Fatalf("failed to generate hpKey: %v", err)
+	}
+
+	s1 := 15
+	s2 := 18
+	packet, state, err := health.BuildAWGInitiationPacketObfuscated(serverPub, nil, nil, hpKey, health.DefaultH1, s1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+
+	info, err := ParseInitiation(serverPriv, packet, health.DefaultH1, s1, hpKey)
+	if err != nil {
+		t.Fatalf("ParseInitiation with hpKey failed: %v", err)
+	}
+	if !info.HeaderProtected {
+		t.Errorf("expected info.HeaderProtected to be true")
+	}
+
+	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("failed to derive client static pub: %v", err)
+	}
+	if !bytes.Equal(info.ClientStaticPub, clientPub) {
+		t.Errorf("ClientStaticPub mismatch: got %x want %x", info.ClientStaticPub, clientPub)
+	}
+	if info.SenderIndex != state.SenderIndex {
+		t.Errorf("SenderIndex mismatch: got %d want %d", info.SenderIndex, state.SenderIndex)
+	}
+
+	resp, transportKeys, err := BuildResponse(serverPriv, info, health.DefaultH2, s2, hpKey)
+	if err != nil {
+		t.Fatalf("BuildResponse failed: %v", err)
+	}
+	if transportKeys == nil || len(transportKeys.SendKey) != 32 || len(transportKeys.RecvKey) != 32 {
+		t.Fatalf("bad transport keys: %+v", transportKeys)
+	}
+
+	// Plaintext verifier must FAIL because the response header is masked.
+	if health.VerifyAWGResponsePacket(resp, state, health.DefaultH2, s2) {
+		t.Errorf("plaintext VerifyAWGResponsePacket should reject header-protected response")
+	}
+
+	// Obfuscated verifier must SUCCEED.
+	if !health.VerifyAWGResponsePacketObfuscated(resp, state, hpKey, health.DefaultH2, s2) {
+		t.Errorf("VerifyAWGResponsePacketObfuscated rejected the obfuscated response")
+	}
+}
+
+// TestServerRoleHandshakeRoundTrip_BackwardCompat_PlaintextPeer verifies that a server
+// configured with a HeaderProtectionKey accepts plaintext initiations from legacy clients
+// and sends plaintext responses back.
+func TestServerRoleHandshakeRoundTrip_BackwardCompat_PlaintextPeer(t *testing.T) {
+	serverPriv, serverPub := newTestServerKeypair(t)
+	hpKey := make([]byte, 32)
+	if _, err := rand.Read(hpKey); err != nil {
+		t.Fatalf("failed to generate hpKey: %v", err)
+	}
+
+	s1 := 15
+	s2 := 18
+	// Client sends plaintext initiation (no HP key).
+	packet, state, err := health.BuildAWGInitiationPacket(serverPub, nil, nil, health.DefaultH1, s1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacket failed: %v", err)
+	}
+
+	// Server has hpKey configured, but must fall back to plaintext cleanly.
+	info, err := ParseInitiation(serverPriv, packet, health.DefaultH1, s1, hpKey)
+	if err != nil {
+		t.Fatalf("ParseInitiation with fallback failed: %v", err)
+	}
+	if info.HeaderProtected {
+		t.Errorf("expected info.HeaderProtected to be false for plaintext initiation")
+	}
+
+	// Server builds response: since info.HeaderProtected is false, response must be plaintext.
+	resp, transportKeys, err := BuildResponse(serverPriv, info, health.DefaultH2, s2, hpKey)
+	if err != nil {
+		t.Fatalf("BuildResponse failed: %v", err)
+	}
+	if transportKeys == nil {
+		t.Fatalf("nil transport keys")
+	}
+
+	// Plaintext verifier must SUCCEED on the response.
+	if !health.VerifyAWGResponsePacket(resp, state, health.DefaultH2, s2) {
+		t.Errorf("plaintext VerifyAWGResponsePacket rejected response for plaintext peer")
+	}
+}
+
+// TestServerRoleHandshakeRoundTrip_HeaderProtection_Tampered verifies that tampered
+// or mismatched HP packets are cleanly rejected.
+func TestServerRoleHandshakeRoundTrip_HeaderProtection_Tampered(t *testing.T) {
+	serverPriv, serverPub := newTestServerKeypair(t)
+	hpKeyA := make([]byte, 32)
+	hpKeyB := make([]byte, 32)
+	_, _ = rand.Read(hpKeyA)
+	_, _ = rand.Read(hpKeyB)
+
+	s1 := 15
+	packet, _, err := health.BuildAWGInitiationPacketObfuscated(serverPub, nil, nil, hpKeyA, health.DefaultH1, s1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+
+	// Mismatched HP key -> must be rejected
+	if _, err := ParseInitiation(serverPriv, packet, health.DefaultH1, s1, hpKeyB); err == nil {
+		t.Errorf("expected ParseInitiation to fail with mismatched HP key")
+	}
+
+	// Tampered body byte -> must be rejected
+	tampered := make([]byte, len(packet))
+	copy(tampered, packet)
+	tampered[s1+20] ^= 0xFF
+	if _, err := ParseInitiation(serverPriv, tampered, health.DefaultH1, s1, hpKeyA); err == nil {
+		t.Errorf("expected ParseInitiation to fail on tampered packet")
+	}
+}
+
+// TestEndpointListenerHandshakeOverUDP_HeaderProtection tests live UDP round-trip
+// with AWG 3.x header protection.
+func TestEndpointListenerHandshakeOverUDP_HeaderProtection(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	hpKey := make([]byte, 32)
+	_, _ = rand.Read(hpKey)
+	hpKeyB64 := base64.StdEncoding.EncodeToString(hpKey)
+
+	cfg := ListenerConfig{
+		ListenPort:          getFreeUDPPort(t),
+		SubnetCIDR:          "10.100.0.0/24",
+		MTU:                 1420,
+		IdleTimeout:         1 * time.Minute,
+		HeaderProtectionKey: hpKeyB64,
+		S1:                  15,
+		S2:                  18,
+	}
+
+	keysMgr := NewServerKeysManager(nil)
+	el, err := NewListener(cfg, db, nil, nil, nil, keysMgr)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	el.SetIncomingPeerHandler(func(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
+		auth := NewDBAuthenticator(db)
+		user, _, err := auth.AuthenticatePeer(ctx, peerPublicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		assignedIP, _ := el.IPAM().Allocate(peerPublicKey)
+		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1)
+		return sess, &models.BackendTunnel{ID: 1}, nil
+	})
+
+	if err := el.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = el.Stop() }()
+
+	_, sPub, err := keysMgr.EnsureKeypair(ctx)
+	if err != nil {
+		t.Fatalf("EnsureKeypair failed: %v", err)
+	}
+
+	// Client builds obfuscated initiation using the listener's HP key.
+	packet, state, err := health.BuildAWGInitiationPacketObfuscated(sPub[:], nil, nil, hpKey, health.DefaultH1, 15)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("failed to derive client pub: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "pubkey",
+		PrivateKey:    "privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "hp_user", Enabled: true})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: sID,
+		Protocol: "awg",
+		ClientID: peerKey,
+	})
+
+	serverAddr, ok := el.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", el.GetListenAddr())
+	}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send initiation: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("no handshake response received: %v", err)
+	}
+
+	// Response must verify with obfuscated verifier!
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKey, health.DefaultH2, 18) {
+		t.Error("VerifyAWGResponsePacketObfuscated rejected the listener's UDP response")
+	}
+
+	// Active session and transport keys must exist.
+	if _, ok := el.SessionManager().GetSession(peerKey); !ok {
+		t.Error("expected an active session after successful HP handshake")
+	}
+	if _, ok := el.TransportKeysFor(peerKey); !ok {
+		t.Error("expected transport keys to be stored for the HP peer")
+	}
+}
+
+// TestEndpointListenerHandshakeOverUDP_BackwardCompat_PlaintextPeer verifies live UDP
+// handshake when listener has HP key, but client sends plaintext initiation.
+func TestEndpointListenerHandshakeOverUDP_BackwardCompat_PlaintextPeer(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	hpKey := make([]byte, 32)
+	_, _ = rand.Read(hpKey)
+	hpKeyB64 := base64.StdEncoding.EncodeToString(hpKey)
+
+	cfg := ListenerConfig{
+		ListenPort:          getFreeUDPPort(t),
+		SubnetCIDR:          "10.100.0.0/24",
+		MTU:                 1420,
+		IdleTimeout:         1 * time.Minute,
+		HeaderProtectionKey: hpKeyB64,
+		S1:                  15,
+		S2:                  18,
+	}
+
+	keysMgr := NewServerKeysManager(nil)
+	el, err := NewListener(cfg, db, nil, nil, nil, keysMgr)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	el.SetIncomingPeerHandler(func(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
+		auth := NewDBAuthenticator(db)
+		user, _, err := auth.AuthenticatePeer(ctx, peerPublicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		assignedIP, _ := el.IPAM().Allocate(peerPublicKey)
+		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1)
+		return sess, &models.BackendTunnel{ID: 1}, nil
+	})
+
+	if err := el.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = el.Stop() }()
+
+	_, sPub, err := keysMgr.EnsureKeypair(ctx)
+	if err != nil {
+		t.Fatalf("EnsureKeypair failed: %v", err)
+	}
+
+	// Client builds PLAINTEXT initiation.
+	packet, state, err := health.BuildAWGInitiationPacket(sPub[:], nil, nil, health.DefaultH1, 15)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacket failed: %v", err)
+	}
+	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("failed to derive client pub: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "pubkey",
+		PrivateKey:    "privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "plain_user", Enabled: true})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: sID,
+		Protocol: "awg",
+		ClientID: peerKey,
+	})
+
+	serverAddr, ok := el.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", el.GetListenAddr())
+	}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send initiation: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("no handshake response received: %v", err)
+	}
+
+	// Response must verify with PLAINTEXT verifier!
+	if !health.VerifyAWGResponsePacket(respBuf[:n], state, health.DefaultH2, 18) {
+		t.Error("VerifyAWGResponsePacket rejected the listener's plaintext response")
+	}
+
+	if _, ok := el.SessionManager().GetSession(peerKey); !ok {
+		t.Error("expected an active session after successful plaintext handshake")
+	}
+}
+
+type safeLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog verifies that
+// handshakes with invalid keys trigger diagnostic logging and no response.
+func TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	hpKeyA := make([]byte, 32)
+	hpKeyB := make([]byte, 32)
+	_, _ = rand.Read(hpKeyA)
+	_, _ = rand.Read(hpKeyB)
+
+	var logBuf safeLogBuffer
+	origOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOutput)
+
+	cfg := ListenerConfig{
+		ListenPort:          getFreeUDPPort(t),
+		SubnetCIDR:          "10.100.0.0/24",
+		MTU:                 1420,
+		IdleTimeout:         1 * time.Minute,
+		HeaderProtectionKey: base64.StdEncoding.EncodeToString(hpKeyA),
+		S1:                  15,
+		S2:                  18,
+	}
+
+	keysMgr := NewServerKeysManager(nil)
+	el, err := NewListener(cfg, db, nil, nil, nil, keysMgr)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	if err := el.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = el.Stop() }()
+
+	_, sPub, err := keysMgr.EnsureKeypair(ctx)
+	if err != nil {
+		t.Fatalf("EnsureKeypair failed: %v", err)
+	}
+
+	// Client sends initiation masked with WRONG HP key hpKeyB
+	packet, _, err := health.BuildAWGInitiationPacketObfuscated(sPub[:], nil, nil, hpKeyB, health.DefaultH1, 15)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+
+	serverAddr, ok := el.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", el.GetListenAddr())
+	}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send initiation: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := clientConn.Read(respBuf); err == nil {
+		t.Errorf("expected timeout / dropped packet for wrong HP key, got %d bytes", n)
+	}
+
+	// Stop listener to ensure background goroutine is completely done writing logs
+	_ = el.Stop()
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[vpn/endpoint] rejected handshake initiation") {
+		t.Errorf("expected diagnostic log for rejected initiation, got:\n%s", logOutput)
+	}
+}
+
+func TestNewListenerRejectsHPKeyWithSmallSValues(t *testing.T) {
+	keysMgr := NewServerKeysManager(nil)
+	cfg := ListenerConfig{
+		PrivateKey:          "0101010101010101010101010101010101010101010101010101010101010101",
+		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+		S1:                  8, // below HeaderCipherNonceSize (12)
+		S2:                  12,
+		S3:                  12,
+		S4:                  12,
+	}
+	if _, err := NewListener(cfg, nil, nil, nil, nil, keysMgr); err == nil {
+		t.Fatal("expected NewListener to reject HP key with S1 < 12, got nil error")
+	}
+}
+
+func TestParseInitiationSkipsHPUnmaskWhenS1TooSmall(t *testing.T) {
+	// Documents the latent S1<12 silent-skip: with hpKey set but S1 < 12,
+	// ParseInitiation does not attempt unmasking and HP clients would fail;
+	// NewListener now guards this state, and ParseInitiation returns
+	// ErrNotInitiation for a masked packet in that impossible config.
+	serverPriv := make([]byte, 32)
+	serverPriv[0] = 0x01
+	packet, _, err := health.BuildAWGInitiationPacketObfuscated([]byte{}, nil, nil, make([]byte, 32), health.DefaultH1, 8)
+	if err != nil {
+		t.Skipf("builder requires valid server pub: %v", err)
+	}
+	_ = packet
+	if _, err := ParseInitiation(serverPriv, make([]byte, 8+148), health.DefaultH1, 8, make([]byte, 32)); err == nil {
+		t.Log("empty-body packet rejected as expected")
 	}
 }

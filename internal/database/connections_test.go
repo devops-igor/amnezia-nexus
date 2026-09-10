@@ -263,3 +263,86 @@ func TestConnectionsNullScanning(t *testing.T) {
 		t.Errorf("expected default/empty fields in cNull, got: %+v", cNull)
 	}
 }
+
+func TestConnections_ClientParamsPersistence(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "S1", Host: "1.1.1.1"})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "param_user"})
+
+	initialParams := map[string]any{
+		"rekey_after_time":     float64(125),
+		"rekey_timeout":        float64(5),
+		"reject_after_time":    float64(180),
+		"keepalive_timeout":    float64(10),
+		"persistent_keepalive": float64(26),
+		"client_private_key":   "privKeyABC",
+	}
+
+	conn := &models.UserConnection{
+		ID:           "conn-params-1",
+		UserID:       uID,
+		ServerID:     sID,
+		Protocol:     "awg",
+		ClientID:     "client-token-xyz",
+		Name:         "param_user-awg",
+		ClientParams: initialParams,
+	}
+
+	id, err := db.CreateConnection(ctx, conn)
+	if err != nil || id != "conn-params-1" {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	// Retrieve by ID
+	fetched, err := db.GetConnection(ctx, "conn-params-1")
+	if err != nil || fetched == nil {
+		t.Fatalf("GetConnection failed: %v", err)
+	}
+	if len(fetched.ClientParams) != 6 {
+		t.Fatalf("expected 6 params, got %d: %+v", len(fetched.ClientParams), fetched.ClientParams)
+	}
+	if v, ok := fetched.ClientParams["persistent_keepalive"].(float64); !ok || v != 26 {
+		t.Errorf("expected persistent_keepalive 26, got %v", fetched.ClientParams["persistent_keepalive"])
+	}
+	if v, ok := fetched.ClientParams["client_private_key"].(string); !ok || v != "privKeyABC" {
+		t.Errorf("expected client_private_key 'privKeyABC', got %v", fetched.ClientParams["client_private_key"])
+	}
+
+	// Retrieve by Token
+	byToken, err := db.GetConnectionByToken(ctx, "client-token-xyz")
+	if err != nil || byToken == nil {
+		t.Fatalf("GetConnectionByToken failed: %v", err)
+	}
+	if byToken.ID != "conn-params-1" {
+		t.Errorf("expected conn-params-1, got %s", byToken.ID)
+	}
+	if v, ok := byToken.ClientParams["rekey_after_time"].(float64); !ok || v != 125 {
+		t.Errorf("expected rekey_after_time 125, got %v", byToken.ClientParams["rekey_after_time"])
+	}
+
+	// Update ClientParams
+	updatedParams := map[string]any{
+		"rekey_after_time":     float64(130),
+		"persistent_keepalive": float64(28),
+		"client_private_key":   "privKeyDEF",
+	}
+	ok, err := db.UpdateConnection(ctx, "conn-params-1", map[string]any{
+		"client_params": updatedParams,
+	})
+	if err != nil || !ok {
+		t.Fatalf("UpdateConnection failed: %v", err)
+	}
+
+	afterUpdate, err := db.GetConnection(ctx, "conn-params-1")
+	if err != nil || afterUpdate == nil {
+		t.Fatalf("GetConnection after update failed: %v", err)
+	}
+	if v, ok := afterUpdate.ClientParams["persistent_keepalive"].(float64); !ok || v != 28 {
+		t.Errorf("expected updated persistent_keepalive 28, got %v", afterUpdate.ClientParams["persistent_keepalive"])
+	}
+	if v, ok := afterUpdate.ClientParams["client_private_key"].(string); !ok || v != "privKeyDEF" {
+		t.Errorf("expected updated client_private_key 'privKeyDEF', got %v", afterUpdate.ClientParams["client_private_key"])
+	}
+}

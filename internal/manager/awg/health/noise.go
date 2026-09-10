@@ -7,10 +7,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
 	"math/big"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/blake2s"
@@ -46,10 +48,10 @@ const (
 // HeaderCipherNonceSize is the nonce length used by the header protection cipher.
 const HeaderCipherNonceSize = 12
 
-// newHeaderProtectionCipher builds the unauthenticated ChaCha20 header protection
+// NewHeaderProtectionCipher builds the unauthenticated ChaCha20 header protection
 // cipher (mirrors upstream HeaderProtectionCipher: chacha20.NewUnauthenticatedCipher
 // with the 32-byte HP key and a 12-byte salt). Returns nil when the HP key is unset.
-func newHeaderProtectionCipher(hpKey, salt []byte) cipher.Stream {
+func NewHeaderProtectionCipher(hpKey, salt []byte) cipher.Stream {
 	if len(hpKey) != 32 {
 		return nil
 	}
@@ -61,6 +63,11 @@ func newHeaderProtectionCipher(hpKey, salt []byte) cipher.Stream {
 		return nil
 	}
 	return c
+}
+
+// newHeaderProtectionCipher is an internal alias for NewHeaderProtectionCipher.
+func newHeaderProtectionCipher(hpKey, salt []byte) cipher.Stream {
+	return NewHeaderProtectionCipher(hpKey, salt)
 }
 
 // NoiseClientState maintains state across Noise protocol handshake messages.
@@ -108,7 +115,7 @@ func KDF3(key, data []byte) (t1, t2, t3 []byte) {
 	return t1, t2, t3
 }
 
-// DecodeKey decodes base64 string or returns 32 raw key bytes.
+// DecodeKey decodes base64 or hex string or returns 32 raw key bytes.
 func DecodeKey(keyVal any) ([]byte, error) {
 	switch v := keyVal.(type) {
 	case []byte:
@@ -117,14 +124,24 @@ func DecodeKey(keyVal any) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("byte key must be 32 bytes, got %d", len(v))
 	case string:
+		v = strings.TrimSpace(v)
+		// If 64 hex characters, try hex decoding first.
+		if len(v) == 64 {
+			if decoded, err := hex.DecodeString(v); err == nil && len(decoded) == 32 {
+				return decoded, nil
+			}
+		}
 		decoded, err := base64.StdEncoding.DecodeString(v)
+		if err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
+		if decodedHex, errHex := hex.DecodeString(v); errHex == nil && len(decodedHex) == 32 {
+			return decodedHex, nil
+		}
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode base64 key: %w", err)
+			return nil, fmt.Errorf("failed to decode base64 or hex key: %w", err)
 		}
-		if len(decoded) != 32 {
-			return nil, fmt.Errorf("decoded base64 key must be 32 bytes, got %d", len(decoded))
-		}
-		return decoded, nil
+		return nil, fmt.Errorf("decoded base64 key must be 32 bytes, got %d", len(decoded))
 	default:
 		return nil, errors.New("unsupported key type")
 	}

@@ -358,6 +358,12 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	connectedAtStr := formatTime(s.ConnectedAt)
 	lastSeenStr := formatTime(s.LastSeen)
 
+	if s.AssignedIP != "" {
+		if _, err := d.sqlDB.ExecContext(ctx, `DELETE FROM vpn_sessions WHERE assigned_ip = ? AND peer_public_key != ?`, s.AssignedIP, s.PeerPublicKey); err != nil {
+			return fmt.Errorf("failed to clear conflicting assigned_ip in vpn_sessions: %w", err)
+		}
+	}
+
 	query := `INSERT INTO vpn_sessions (
 		id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
 		connected_at, last_seen, rx_bytes, tx_bytes, status
@@ -445,6 +451,12 @@ func (d *DB) DeleteVPNSession(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("failed to delete vpn session %s: %w", sessionID, err)
 	}
 	return nil
+}
+
+// CloseVPNSession removes a closed or timed-out VPN session from the database,
+// releasing its assigned_ip to prevent SQLite UNIQUE constraint collisions on IP re-lease.
+func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
+	return d.DeleteVPNSession(ctx, sessionID)
 }
 
 // Helper scanners

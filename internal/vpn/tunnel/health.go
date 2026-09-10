@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -42,15 +43,16 @@ func DefaultHealthConfig() HealthConfig {
 
 // HealthProber periodically performs Noise IK handshake probes against backend tunnels.
 type HealthProber struct {
-	mu         sync.RWMutex
-	pool       *Pool
-	db         *database.DB
-	cfg        HealthConfig
-	probeFn    ProbeFunc
-	failCounts map[int64]int
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
-	running    bool
+	mu           sync.RWMutex
+	pool         *Pool
+	db           *database.DB
+	cfg          HealthConfig
+	probeFn      ProbeFunc
+	onActiveHook func(ctx context.Context, tunnel *models.BackendTunnel) error
+	failCounts   map[int64]int
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	running      bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -102,6 +104,14 @@ func (hp *HealthProber) SetProbeFunc(fn ProbeFunc) {
 	if fn != nil {
 		hp.probeFn = fn
 	}
+}
+
+// SetOnActiveHook registers a hook called before transitioning a tunnel to active status.
+// If the hook returns an error, the tunnel status remains degraded.
+func (hp *HealthProber) SetOnActiveHook(fn func(ctx context.Context, tunnel *models.BackendTunnel) error) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.onActiveHook = fn
 }
 
 // Config returns a copy of the prober configuration.
@@ -216,10 +226,9 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		latencyMS = 1
 	}
 
-	hp.mu.Lock()
-	defer hp.mu.Unlock()
-
 	if err != nil {
+		hp.mu.Lock()
+		defer hp.mu.Unlock()
 		hp.failCounts[tunnel.ServerID]++
 		failures := hp.failCounts[tunnel.ServerID]
 
@@ -235,12 +244,40 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	}
 
 	// Probe succeeded
-	hp.failCounts[tunnel.ServerID] = 0
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
 	}
 
+	// If transitioning to active, verify data-plane readiness via hook
+	if status == "active" {
+		hp.mu.RLock()
+		hook := hp.onActiveHook
+		hp.mu.RUnlock()
+		if hook != nil {
+			if hookErr := hook(ctx, tunnel); hookErr != nil {
+				hp.mu.Lock()
+				defer hp.mu.Unlock()
+				hp.failCounts[tunnel.ServerID]++
+				failures := hp.failCounts[tunnel.ServerID]
+
+				hookStatus := "degraded"
+				if failures >= hp.cfg.FailureThreshold {
+					hookStatus = "disabled"
+				}
+
+				if hp.pool != nil {
+					_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, hookStatus, 0)
+				}
+				return 0, fmt.Errorf("data-plane readiness check failed: %w", hookErr)
+			}
+		}
+	}
+
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+
+	hp.failCounts[tunnel.ServerID] = 0
 	if hp.pool != nil {
 		_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, latencyMS)
 	}
