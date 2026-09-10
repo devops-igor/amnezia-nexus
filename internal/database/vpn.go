@@ -317,6 +317,9 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if cfg.Algorithm == "" {
 		cfg.Algorithm = models.LBLeastConnections
 	}
+	if cfg.MinRebalanceSessions <= 0 {
+		cfg.MinRebalanceSessions = 8
+	}
 	if cfg.ListenPort == 0 {
 		cfg.ListenPort = 51820
 	}
@@ -429,6 +432,28 @@ func (d *DB) UpdateVPNSessionTraffic(ctx context.Context, sessionID string, rx, 
 	_, err := d.sqlDB.ExecContext(ctx, query, rx, tx, nowStr, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to update vpn session traffic %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// UpdateVPNSessionBackendTunnel reassigns a connected session to another backend
+// tunnel in place, marking it "draining" (issue #44 R5: rebalancing is DB-only by
+// design — the forwarder's live route is not migrated, so the session must leave
+// the connected set and cannot be ping-ponged by the next cycle). The WHERE
+// clause pins the update to rows still in 'connected' status, so a session that
+// disconnected mid-rebalance is never resurrected; the session ID, connected_at,
+// and traffic counters are all preserved.
+func (d *DB) UpdateVPNSessionBackendTunnel(ctx context.Context, sessionID string, backendTunnelID int64) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := "UPDATE vpn_sessions SET backend_tunnel_id = ?, status = 'draining' WHERE id = ? AND status = 'connected'"
+	res, err := d.sqlDB.ExecContext(ctx, query, backendTunnelID, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to update vpn session %s backend tunnel: %w", sessionID, err)
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return fmt.Errorf("vpn session %s not found or no longer connected", sessionID)
 	}
 	return nil
 }
