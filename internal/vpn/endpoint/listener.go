@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -134,6 +135,8 @@ type ListenerConfig struct {
 	PrivateKey  string
 	PublicKey   string
 	IdleTimeout time.Duration
+	// HeaderProtectionKey is the AWG 3.x header protection key (hex or base64).
+	HeaderProtectionKey string
 	// H1 is the AWG handshake initiation message type; 0 selects
 	// health.DefaultH1. Must match the AWG client parameters (JunkPacket
 	// message type) distributed to registered peers.
@@ -187,6 +190,7 @@ type activePeerState struct {
 type Listener struct {
 	mu                  sync.RWMutex
 	config              ListenerConfig
+	hpKey               []byte
 	db                  *database.DB
 	auth                Authenticator
 	ipam                *IPAM
@@ -209,6 +213,12 @@ type Listener struct {
 	// reaperHook runs on the heartbeat goroutine for each idle-timed-out
 	// session (see SessionReaperHook); guarded by mu, set before Start.
 	reaperHook SessionReaperHook
+
+	// rejectLogUntil throttles handshake-rejection log lines (log-flood
+	// defense against a garbage-packet source that fails MAC1): at most one
+	// rejection log per second. Read/written only by the single read-loop
+	// goroutine.
+	rejectLogUntil atomic.Int64
 }
 
 // NewListener initializes a new AWG endpoint listener. serverKeys provides the
@@ -276,8 +286,29 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 		sessionMgr = NewSessionManager(db, ipam)
 	}
 
+	if cfg.HeaderProtectionKey != "" {
+		for i, s := range []*int{&cfg.S1, &cfg.S2, &cfg.S3, &cfg.S4} {
+			if *s < health.HeaderCipherNonceSize {
+				// Mirrors upstream uapi.go:852-857: header protection is
+				// unusable with S<N below the cipher nonce size — HP clients
+				// would be silently rejected with no distinguishing log.
+				return nil, fmt.Errorf("S%d must be >= %d to use headerProtection", i+1, health.HeaderCipherNonceSize)
+			}
+		}
+	}
+
+	var hpKeyBytes []byte
+	if cfg.HeaderProtectionKey != "" {
+		var err error
+		hpKeyBytes, err = health.DecodeKey(cfg.HeaderProtectionKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode header protection key: %w", err)
+		}
+	}
+
 	return &Listener{
 		config:      cfg,
+		hpKey:       hpKeyBytes,
 		db:          db,
 		auth:        auth,
 		ipam:        ipam,
@@ -330,6 +361,30 @@ func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 uint32, s1, s2, s3, s4 int)
 	el.config.S2 = s2
 	el.config.S3 = s3
 	el.config.S4 = s4
+}
+
+// UpdateHeaderProtectionKey updates the AWG header protection key in the
+// listener configuration. Callers must only invoke it while the listener is stopped.
+func (el *Listener) UpdateHeaderProtectionKey(hpKey string) error {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.config.HeaderProtectionKey = hpKey
+	if hpKey == "" {
+		el.hpKey = nil
+		return nil
+	}
+	keyBytes, err := health.DecodeKey(hpKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode header protection key: %w", err)
+	}
+	el.hpKey = keyBytes
+	return nil
+}
+
+func (el *Listener) headerProtectionKey() []byte {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	return el.hpKey
 }
 
 // UpdateListenPort sets the UDP port the listener will bind at its next
@@ -598,11 +653,22 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	info, err := ParseInitiation(serverPriv, datagram, uint32(el.config.H1), el.config.S1) // #nosec G115 -- bounded AWG message-type constant
+	info, err := ParseInitiation(serverPriv, datagram, uint32(el.config.H1), el.config.S1, el.hpKey) // #nosec G115 -- bounded AWG message-type constant
 	if err != nil {
 		// Not a valid handshake initiation for this endpoint: transport data
 		// for an established session (or garbage). Try the transport path.
-		el.handleTransportData(datagram, sender)
+		if !el.handleTransportData(datagram, sender) {
+			if !errors.Is(err, ErrDatagramTooShort) {
+				// Throttle rejection logs: a garbage flood that fails MAC1
+				// would otherwise produce one log line per packet.
+				// (Read-loop goroutine only: plain read/put is safe.)
+				now := time.Now().Unix()
+				if el.rejectLogUntil.Load() <= now {
+					el.rejectLogUntil.Store(now + 1)
+					log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
+				}
+			}
+		}
 		return
 	}
 
@@ -624,11 +690,11 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 
 	_, _, err = handler(ctx, peerKey)
 	if err != nil {
-		log.Printf("[vpn/endpoint] handshake processing failed for peer %s: %v", peerKey, err)
+		log.Printf("[vpn/endpoint] handshake processing failed for peer %s from %s: %v", peerKey, sender, err)
 		return
 	}
 
-	resp, transportKeys, err := BuildResponse(serverPriv, info, uint32(el.config.H2), el.config.S2) // #nosec G115 -- bounded AWG message-type constant
+	resp, transportKeys, err := BuildResponse(serverPriv, info, uint32(el.config.H2), el.config.S2, el.hpKey) // #nosec G115 -- bounded AWG message-type constant
 	if err != nil {
 		log.Printf("[vpn/endpoint] failed to build handshake response for peer %s: %v", peerKey, err)
 		return
@@ -698,7 +764,7 @@ const transportDataHeaderLen = 16
 // and hand the inner IP packet to the installed client packet router.
 // Anything else (unknown sender, garbage, keepalive from a stale address) is
 // silently dropped.
-func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
+func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bool {
 	s4 := el.config.S4
 	if s4 < 0 {
 		s4 = 0
@@ -710,67 +776,108 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) {
 	}
 
 	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
-		return
+		return false
 	}
 	st, ok := el.peerByAddr(sender.String())
 	if !ok {
-		return
+		return false
 	}
 	keys, ok := el.TransportKeysFor(st.peerKey)
 	if !ok || keys == nil || keys.RecvKey == nil {
-		return
+		return false
 	}
-
-	// AWG transport data frame:
-	// [S4 padding][type(4 LE = H4)][receiver_idx(4 LE)][counter(8 LE)][encrypted packet]
-	payload := datagram[s4:]
-	msgType := binary.LittleEndian.Uint32(payload[0:4])
-	if msgType != h4 {
-		return
-	}
-	counter := binary.LittleEndian.Uint64(payload[8:16])
 
 	aead, err := chacha20poly1305.New(keys.RecvKey)
 	if err != nil {
-		return
+		return false
 	}
-	// WireGuard nonce convention: 4 zero bytes + 8-byte little-endian counter.
-	var nonce [chacha20poly1305.NonceSize]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], counter)
-	packet, err := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
-	if err != nil {
-		log.Printf("[vpn/endpoint] transport data decryption failed for peer %s", st.peerKey)
-		return
+
+	payload := datagram[s4:]
+	hpKey := el.headerProtectionKey()
+
+	packet, decErr := decryptTransportPayload(aead, datagram, payload, hpKey, s4, h4)
+	if packet == nil {
+		if decErr != nil {
+			log.Printf("[vpn/endpoint] transport data decryption failed for peer %s: %v", st.peerKey, decErr)
+		}
+		return false
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
 
-	if len(packet) > 0 {
-		version := packet[0] >> 4
-		if version == 4 && len(packet) >= 20 {
-			totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
-			if totalLen >= 20 && len(packet) > totalLen {
-				packet = packet[:totalLen]
-			}
-		} else if version == 6 && len(packet) >= 40 {
-			payloadLen := int(binary.BigEndian.Uint16(packet[4:6]))
-			totalLen := payloadLen + 40
-			if totalLen >= 40 && len(packet) > totalLen {
-				packet = packet[:totalLen]
-			}
-		}
-	}
+	packet = trimIPPacketPadding(packet)
 
 	el.mu.RLock()
 	router := el.router
 	el.mu.RUnlock()
 	if router == nil {
-		return
+		return true
 	}
 	if err := router(st.peerKey, packet); err != nil {
 		// Congestion/backpressure is expected under load: drop silently at
 		// debug priority; anything else is a routing inconsistency worth a log.
 		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", st.peerKey, err)
 	}
+	return true
+}
+
+// decryptTransportPayload attempts Header Protection unmasking and AEAD decryption,
+// falling back to plaintext H4 matching if HP unmasking does not match or fails.
+func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 uint32) ([]byte, error) {
+	var packet []byte
+	var decErr error
+
+	// 1. If HP key is 32 bytes and s4 >= 12, attempt to unmask the 16-byte header:
+	// [msgType 4B][receiverIdx 4B][counter 8B] using ChaCha20 keyed by el.hpKey with nonce = datagram[:12].
+	if len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(hpKey, datagram[:health.HeaderCipherNonceSize])
+		if cip != nil {
+			var hdr [transportDataHeaderLen]byte
+			copy(hdr[:], payload[:transportDataHeaderLen])
+			cip.XORKeyStream(hdr[:], hdr[:])
+			if binary.LittleEndian.Uint32(hdr[0:4]) == h4 {
+				counter := binary.LittleEndian.Uint64(hdr[8:16])
+				var nonce [chacha20poly1305.NonceSize]byte
+				binary.LittleEndian.PutUint64(nonce[4:12], counter)
+				packet, decErr = aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+			}
+		}
+	}
+
+	// 2. Dual-mode fallback: if HP unmasking was not applicable, unmasked header did not match H4,
+	// or unmasked AEAD decryption failed, check if plaintext header matches H4.
+	if packet == nil {
+		plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
+		if plainMsgType == h4 {
+			counter := binary.LittleEndian.Uint64(payload[8:16])
+			var nonce [chacha20poly1305.NonceSize]byte
+			binary.LittleEndian.PutUint64(nonce[4:12], counter)
+			packet, decErr = aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+		}
+	}
+
+	return packet, decErr
+}
+
+// trimIPPacketPadding strips trailing content padding by inspecting the IPv4 Total Length
+// or IPv6 Payload Length header fields.
+func trimIPPacketPadding(packet []byte) []byte {
+	if len(packet) == 0 {
+		return packet
+	}
+	version := packet[0] >> 4
+	if version == 4 && len(packet) >= 20 {
+		totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+		if totalLen >= 20 && len(packet) > totalLen {
+			return packet[:totalLen]
+		}
+	} else if version == 6 && len(packet) >= 40 {
+		payloadLen := int(binary.BigEndian.Uint16(packet[4:6]))
+		totalLen := payloadLen + 40
+		if totalLen >= 40 && len(packet) > totalLen {
+			return packet[:totalLen]
+		}
+	}
+	return packet
 }
 
 // SendToPeer encrypts an IP packet for a peer with the stored transport
@@ -794,6 +901,7 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		}
 	}
 	udpConn := el.udpConn
+	hpKey := el.hpKey
 	el.mu.RUnlock()
 	if st == nil || udpConn == nil {
 		return fmt.Errorf("no recorded address for peer %s", peerKey)
@@ -843,6 +951,15 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 	msg = append(msg, hdr[:]...)
 	msg = aead.Seal(msg, nonce[:], packet, nil)
+
+	// If HP key is 32 bytes and s4 >= 12, apply ChaCha20 cipher (key hpKey, nonce msg[:12])
+	// to mask the 16-byte header msg[s4 : s4+16] in-place.
+	if len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(hpKey, msg[:health.HeaderCipherNonceSize])
+		if cip != nil {
+			cip.XORKeyStream(msg[s4:s4+transportDataHeaderLen], msg[s4:s4+transportDataHeaderLen])
+		}
+	}
 
 	if _, err := udpConn.WriteToUDP(msg, addr); err != nil {
 		return fmt.Errorf("failed to write transport data to %s: %w", addr, err)

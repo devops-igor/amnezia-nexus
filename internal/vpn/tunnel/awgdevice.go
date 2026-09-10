@@ -262,6 +262,11 @@ func renderAWGDeviceOptions(b *strings.Builder, awgParams map[string]any) {
 	if cpa, ok := lookupAWGParamStr(awgParams, "content_padding_addition", "contentpaddingaddition"); ok {
 		fmt.Fprintf(b, "content_padding_addition=%s\n", cpa)
 	}
+	for _, timingKey := range []string{"rekey_after_time", "rekey_timeout", "reject_after_time", "keepalive_timeout", "max_handshake_attempts"} {
+		if val, ok := lookupAWGParamStr(awgParams, timingKey); ok {
+			fmt.Fprintf(b, "%s=%s\n", timingKey, val)
+		}
+	}
 }
 
 func renderAWGPeerConfig(b *strings.Builder, publicKeyHex, endpoint string, awgParams map[string]any) {
@@ -273,7 +278,11 @@ func renderAWGPeerConfig(b *strings.Builder, publicKeyHex, endpoint string, awgP
 	}
 	fmt.Fprintf(b, "endpoint=%s\n", endpoint)
 	b.WriteString("allowed_ip=0.0.0.0/0\n")
-	b.WriteString("persistent_keepalive_interval=25\n")
+	pka := "25"
+	if val, ok := lookupAWGParamStr(awgParams, "persistent_keepalive_interval", "persistent_keepalive", "persistentkeepalive", "PersistentKeepalive"); ok {
+		pka = val
+	}
+	fmt.Fprintf(b, "persistent_keepalive_interval=%s\n", pka)
 }
 
 // buildAWGIPCConfig renders the amneziawg-go IpcSet device configuration,

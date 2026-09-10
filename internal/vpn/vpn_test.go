@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
@@ -976,11 +977,24 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	}
 	replyDatagram := clientRecvBuf[:nRecv]
 	replyPayloadPart := replyDatagram[s4:]
-	msgType := binary.LittleEndian.Uint32(replyPayloadPart[0:4])
+	var counter uint64
+	var msgType uint32
+	if hpKey, _ := health.DecodeKey(vpnCfg.HeaderProtectionKey); len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(hpKey, replyDatagram[:health.HeaderCipherNonceSize])
+		if cip != nil {
+			var unmaskedHdr [16]byte
+			cip.XORKeyStream(unmaskedHdr[:], replyPayloadPart[:16])
+			msgType = binary.LittleEndian.Uint32(unmaskedHdr[0:4])
+			counter = binary.LittleEndian.Uint64(unmaskedHdr[8:16])
+		}
+	}
+	if msgType == 0 {
+		msgType = binary.LittleEndian.Uint32(replyPayloadPart[0:4])
+		counter = binary.LittleEndian.Uint64(replyPayloadPart[8:16])
+	}
 	if msgType != vpnCfg.H4 {
 		t.Fatalf("SendToPeer msgType mismatch: got %d, want %d", msgType, vpnCfg.H4)
 	}
-	counter := binary.LittleEndian.Uint64(replyPayloadPart[8:16])
 	aeadRecv, err := chacha20poly1305.New(clientRecvKey)
 	if err != nil {
 		t.Fatalf("aeadRecv failed: %v", err)
@@ -2710,6 +2724,16 @@ func parseDirectiveString(t *testing.T, configStr, directive string) string {
 	return ""
 }
 
+func parseDirectiveRange(t *testing.T, configStr, directive string) *awg.TimingRange {
+	t.Helper()
+	str := parseDirectiveString(t, configStr, directive)
+	tr, err := awg.ParseTimingRange(str)
+	if err != nil {
+		t.Fatalf("failed to parse timing range for %s: %v in value %q", directive, err, str)
+	}
+	return tr
+}
+
 func TestGenerateUserClientConfig_AWG3_Compliance(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -2741,38 +2765,38 @@ func TestGenerateUserClientConfig_AWG3_Compliance(t *testing.T) {
 		t.Fatalf("missing required sections in generated config:\n%s", cfgStr)
 	}
 
-	// Verify AWG 3.0 timing parameters
-	rat := parseDirectiveInt(t, cfgStr, "RekeyAfterTime")
-	if rat < 100 || rat > 140 {
-		t.Errorf("RekeyAfterTime %d not in required range [100, 140]", rat)
+	// Verify AWG 3.1 timing parameters
+	rat := parseDirectiveRange(t, cfgStr, "RekeyAfterTime")
+	if rat.Lo < 100 || rat.Hi > 140 {
+		t.Errorf("RekeyAfterTime %s not in required range [100, 140]", rat.String())
 	}
 
-	rt := parseDirectiveInt(t, cfgStr, "RekeyTimeout")
-	if rt < 4 || rt > 6 {
-		t.Errorf("RekeyTimeout %d not in required range [4, 6]", rt)
+	rt := parseDirectiveRange(t, cfgStr, "RekeyTimeout")
+	if rt.Lo < 4 || rt.Hi > 6 {
+		t.Errorf("RekeyTimeout %s not in required range [4, 6]", rt.String())
 	}
-	if rt >= rat {
-		t.Errorf("RekeyTimeout %d must be strictly less than RekeyAfterTime %d", rt, rat)
-	}
-
-	rej := parseDirectiveInt(t, cfgStr, "RejectAfterTime")
-	if rej < 160 || rej > 200 {
-		t.Errorf("RejectAfterTime %d not in required range [160, 200]", rej)
+	if rt.Hi >= rat.Lo {
+		t.Errorf("RekeyTimeout %s must be strictly less than RekeyAfterTime %s", rt.String(), rat.String())
 	}
 
-	kt := parseDirectiveInt(t, cfgStr, "KeepaliveTimeout")
-	if kt < 8 || kt > 12 {
-		t.Errorf("KeepaliveTimeout %d not in required range [8, 12]", kt)
+	rej := parseDirectiveRange(t, cfgStr, "RejectAfterTime")
+	if rej.Lo < 160 || rej.Hi > 200 {
+		t.Errorf("RejectAfterTime %s not in required range [160, 200]", rej.String())
 	}
 
-	mha := parseDirectiveInt(t, cfgStr, "MaxHandshakeAttempts")
-	if mha < 4 || mha > 8 {
-		t.Errorf("MaxHandshakeAttempts %d not in required range [4, 8]", mha)
+	kt := parseDirectiveRange(t, cfgStr, "KeepaliveTimeout")
+	if kt.Lo < 8 || kt.Hi > 12 {
+		t.Errorf("KeepaliveTimeout %s not in required range [8, 12]", kt.String())
 	}
 
-	pk := parseDirectiveInt(t, cfgStr, "PersistentKeepalive")
-	if pk < 22 || pk > 30 {
-		t.Errorf("PersistentKeepalive %d not in required range [22, 30]", pk)
+	mha := parseDirectiveRange(t, cfgStr, "MaxHandshakeAttempts")
+	if mha.Lo < 4 || mha.Hi > 8 {
+		t.Errorf("MaxHandshakeAttempts %s not in required range [4, 8]", mha.String())
+	}
+
+	pk := parseDirectiveRange(t, cfgStr, "PersistentKeepalive")
+	if pk.Lo < 22 || pk.Hi > 30 {
+		t.Errorf("PersistentKeepalive %s not in required range [22, 30]", pk.String())
 	}
 
 	// Verify standard AWG obfuscation parameters
@@ -2856,10 +2880,10 @@ func TestGenerateUserClientConfig_StabilityAcrossRefetches(t *testing.T) {
 		t.Fatalf("expected ClientParams on user connection, got empty: %+v", conn)
 	}
 
-	ratDB, _ := conn.ClientParams["rekey_after_time"].(float64)
-	ratCfg := parseDirectiveInt(t, cfg1, "RekeyAfterTime")
-	if int(ratDB) != ratCfg {
-		t.Errorf("persisted RekeyAfterTime in DB (%v) does not match config (%d)", ratDB, ratCfg)
+	ratDB := fmt.Sprint(conn.ClientParams["rekey_after_time"])
+	ratCfg := parseDirectiveString(t, cfg1, "RekeyAfterTime")
+	if ratDB != ratCfg {
+		t.Errorf("persisted RekeyAfterTime in DB (%v) does not match config (%s)", ratDB, ratCfg)
 	}
 }
 
@@ -2891,22 +2915,22 @@ func TestGenerateUserClientConfig_FingerprintDiversity(t *testing.T) {
 	}
 
 	// Compare timing parameters
-	paramsAlice := []int{
-		parseDirectiveInt(t, cfgAlice, "RekeyAfterTime"),
-		parseDirectiveInt(t, cfgAlice, "RekeyTimeout"),
-		parseDirectiveInt(t, cfgAlice, "RejectAfterTime"),
-		parseDirectiveInt(t, cfgAlice, "KeepaliveTimeout"),
-		parseDirectiveInt(t, cfgAlice, "MaxHandshakeAttempts"),
-		parseDirectiveInt(t, cfgAlice, "PersistentKeepalive"),
+	paramsAlice := []string{
+		parseDirectiveString(t, cfgAlice, "RekeyAfterTime"),
+		parseDirectiveString(t, cfgAlice, "RekeyTimeout"),
+		parseDirectiveString(t, cfgAlice, "RejectAfterTime"),
+		parseDirectiveString(t, cfgAlice, "KeepaliveTimeout"),
+		parseDirectiveString(t, cfgAlice, "MaxHandshakeAttempts"),
+		parseDirectiveString(t, cfgAlice, "PersistentKeepalive"),
 	}
 
-	paramsBob := []int{
-		parseDirectiveInt(t, cfgBob, "RekeyAfterTime"),
-		parseDirectiveInt(t, cfgBob, "RekeyTimeout"),
-		parseDirectiveInt(t, cfgBob, "RejectAfterTime"),
-		parseDirectiveInt(t, cfgBob, "KeepaliveTimeout"),
-		parseDirectiveInt(t, cfgBob, "MaxHandshakeAttempts"),
-		parseDirectiveInt(t, cfgBob, "PersistentKeepalive"),
+	paramsBob := []string{
+		parseDirectiveString(t, cfgBob, "RekeyAfterTime"),
+		parseDirectiveString(t, cfgBob, "RekeyTimeout"),
+		parseDirectiveString(t, cfgBob, "RejectAfterTime"),
+		parseDirectiveString(t, cfgBob, "KeepaliveTimeout"),
+		parseDirectiveString(t, cfgBob, "MaxHandshakeAttempts"),
+		parseDirectiveString(t, cfgBob, "PersistentKeepalive"),
 	}
 
 	identicalParams := true
@@ -2926,6 +2950,279 @@ func TestGenerateUserClientConfig_FingerprintDiversity(t *testing.T) {
 	if privAlice == privBob {
 		t.Errorf("Alice and Bob generated identical PrivateKey: %s", privAlice)
 	}
+}
+
+func TestConfigImmutabilityContract(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("StoredSingleInts_ByteIdentical_NoReRandomization", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user_single_ints", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+
+		// Seed pre-existing connection with single ints (float64 as unmarshaled from JSON)
+		conn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			ClientID: "pubkey-user-single",
+			Name:     "user_single_ints-awg",
+			ClientParams: map[string]any{
+				"client_private_key":     "privkey-user-single",
+				"rekey_after_time":       float64(125),
+				"rekey_timeout":          float64(5),
+				"reject_after_time":      float64(180),
+				"keepalive_timeout":      float64(10),
+				"max_handshake_attempts": float64(6),
+				"persistent_keepalive":   float64(26),
+			},
+		}
+		if _, err := db.CreateConnection(ctx, conn); err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		// First render
+		cfg1, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+		}
+
+		// Second render
+		cfg2, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+		}
+
+		// Byte-identical regression check
+		if cfg1 != cfg2 {
+			t.Fatalf("REGRESSION: config not byte-identical across renders for same UserConnection!\nCfg1:\n%s\nCfg2:\n%s", cfg1, cfg2)
+		}
+
+		// Stored single ints must be rendered unchanged as degenerate "N" (not re-randomized!)
+		if !strings.Contains(cfg1, "RekeyAfterTime = 125\n") {
+			t.Errorf("expected RekeyAfterTime = 125 preserved unchanged, got:\n%s", cfg1)
+		}
+		if !strings.Contains(cfg1, "RekeyTimeout = 5\n") {
+			t.Errorf("expected RekeyTimeout = 5 preserved unchanged, got:\n%s", cfg1)
+		}
+		if !strings.Contains(cfg1, "PersistentKeepalive = 26\n") {
+			t.Errorf("expected PersistentKeepalive = 26 preserved unchanged, got:\n%s", cfg1)
+		}
+	})
+
+	t.Run("StoredRanges_ByteIdentical", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user_stored_ranges", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+
+		// Seed pre-existing connection with ranges
+		conn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			ClientID: "pubkey-user-range",
+			Name:     "user_stored_ranges-awg",
+			ClientParams: map[string]any{
+				"client_private_key":     "privkey-user-range",
+				"rekey_after_time":       "105-135",
+				"rekey_timeout":          "4-6",
+				"reject_after_time":      "165-195",
+				"keepalive_timeout":      "9-11",
+				"max_handshake_attempts": "5-7",
+				"persistent_keepalive":   "23-28",
+			},
+		}
+		if _, err := db.CreateConnection(ctx, conn); err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		cfg1, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+		}
+		cfg2, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+		}
+
+		if cfg1 != cfg2 {
+			t.Fatalf("REGRESSION: config not byte-identical across renders for stored ranges!\nCfg1:\n%s\nCfg2:\n%s", cfg1, cfg2)
+		}
+
+		if !strings.Contains(cfg1, "RekeyAfterTime = 105-135\n") {
+			t.Errorf("expected RekeyAfterTime = 105-135, got:\n%s", cfg1)
+		}
+		if !strings.Contains(cfg1, "PersistentKeepalive = 23-28\n") {
+			t.Errorf("expected PersistentKeepalive = 23-28, got:\n%s", cfg1)
+		}
+	})
+
+	t.Run("PartiallyMissingParam_IndividualFallback_ByteIdentical", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user_partial", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+
+		// Seed pre-existing connection missing rekey_after_time, but having rekey_timeout=5
+		conn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			ClientID: "pubkey-user-partial",
+			Name:     "user_partial-awg",
+			ClientParams: map[string]any{
+				"client_private_key":     "privkey-user-partial",
+				"rekey_timeout":          float64(5),
+				"reject_after_time":      float64(180),
+				"keepalive_timeout":      float64(10),
+				"max_handshake_attempts": float64(6),
+				"persistent_keepalive":   float64(26),
+				// rekey_after_time is intentionally missing!
+			},
+		}
+		if _, err := db.CreateConnection(ctx, conn); err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		cfg1, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+		}
+		cfg2, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+		}
+
+		if cfg1 != cfg2 {
+			t.Fatalf("REGRESSION: config not byte-identical across renders for partially missing params!\nCfg1:\n%s\nCfg2:\n%s", cfg1, cfg2)
+		}
+
+		// Partner rekey_timeout MUST NOT have been re-rolled
+		if !strings.Contains(cfg1, "RekeyTimeout = 5\n") {
+			t.Errorf("stored partner RekeyTimeout = 5 was re-rolled wholesale! Cfg:\n%s", cfg1)
+		}
+
+		// Missing rekey_after_time was individually backfilled as a range
+		rat := parseDirectiveRange(t, cfg1, "RekeyAfterTime")
+		if rat == nil || rat.Lo < 100 || rat.Hi > 140 {
+			t.Errorf("expected individually backfilled RekeyAfterTime in [100, 140], got %v", rat)
+		}
+	})
+
+	t.Run("OrderingInvariantClamping_BackfilledParam", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user_clamp", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+
+		// Seed pre-existing connection with an unusually low stored rekey_after_time = 5,
+		// and missing rekey_timeout. Backfilled rekey_timeout must be clamped strictly < 5.
+		conn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			ClientID: "pubkey-user-clamp",
+			Name:     "user_clamp-awg",
+			ClientParams: map[string]any{
+				"client_private_key":     "privkey-user-clamp",
+				"rekey_after_time":       float64(5),
+				"reject_after_time":      float64(180),
+				"keepalive_timeout":      float64(10),
+				"max_handshake_attempts": float64(6),
+				"persistent_keepalive":   float64(26),
+				// rekey_timeout is missing
+			},
+		}
+		if _, err := db.CreateConnection(ctx, conn); err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		cfg1, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+		}
+		cfg2, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+		}
+
+		if cfg1 != cfg2 {
+			t.Fatalf("REGRESSION: config not byte-identical across renders with clamped partner!\nCfg1:\n%s\nCfg2:\n%s", cfg1, cfg2)
+		}
+
+		rt := parseDirectiveRange(t, cfg1, "RekeyTimeout")
+		rat := parseDirectiveRange(t, cfg1, "RekeyAfterTime")
+
+		if rt.Hi >= rat.Lo {
+			t.Errorf("ordering invariant failed: backfilled rt.Hi (%d) must be < stored rat.Lo (%d)", rt.Hi, rat.Lo)
+		}
+		if rat.Lo != 5 || rat.Hi != 5 {
+			t.Errorf("stored partner rat changed: %+v", rat)
+		}
+	})
+
+	t.Run("BrandNewUser_ByteIdenticalAcrossRenders", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user_brand_new", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+
+		cfg1, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+		}
+		cfg2, _, err := svc.GenerateClientConfig(ctx, uID)
+		if err != nil {
+			t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+		}
+
+		if cfg1 != cfg2 {
+			t.Fatalf("REGRESSION: brand new user config not byte-identical across renders!\nCfg1:\n%s\nCfg2:\n%s", cfg1, cfg2)
+		}
+
+		// Verify all 6 are emitted as ranges "lo-hi"
+		for _, directive := range []string{
+			"RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+			"KeepaliveTimeout", "MaxHandshakeAttempts", "PersistentKeepalive",
+		} {
+			val := parseDirectiveString(t, cfg1, directive)
+			if !strings.Contains(val, "-") {
+				t.Errorf("new user %s should be range 'lo-hi', got %q", directive, val)
+			}
+		}
+	})
 }
 
 func TestGenerateUserClientConfig_HeaderProtectionAndContentPadding(t *testing.T) {
@@ -2993,5 +3290,539 @@ func TestGenerateUserClientConfig_HeaderProtectionAndContentPadding(t *testing.T
 	cpAdd2 := parseDirectiveString(t, cfgStr2, "ContentPaddingAddition")
 	if cpAdd2 != "16-64" {
 		t.Errorf("refetched ContentPaddingAddition: %s, want 16-64", cpAdd2)
+	}
+}
+
+func TestEnsureObfuscationParams_HeaderProtectionKeyMigration(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Legacy config with H1..H4 already populated (e.g. Issue #5/#25 migration),
+	// but HeaderProtectionKey is empty and S values are < 12.
+	legacy := &models.VPNConfig{
+		Algorithm:           models.LBLeastConnections,
+		ListenPort:          31458,
+		SubnetCIDR:          "10.100.0.0/16",
+		HealthThresholdMS:   500,
+		MaxTotalPeers:       1000,
+		MaxPeersPerBackend:  250,
+		Weights:             map[int64]int{},
+		H1:                  12345,
+		H2:                  23456,
+		H3:                  34567,
+		H4:                  45678,
+		S1:                  5,
+		S2:                  7,
+		S3:                  9,
+		S4:                  11,
+		HeaderProtectionKey: "",
+	}
+	if err := db.SaveVPNConfig(ctx, legacy); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	if err := ensureObfuscationParams(ctx, db, legacy); err != nil {
+		t.Fatalf("ensureObfuscationParams failed: %v", err)
+	}
+
+	if legacy.HeaderProtectionKey == "" {
+		t.Fatalf("expected HeaderProtectionKey to be generated, got empty string")
+	}
+	rawKey, err := health.DecodeKey(legacy.HeaderProtectionKey)
+	if err != nil || len(rawKey) != 32 {
+		t.Fatalf("generated HeaderProtectionKey is not valid 32-byte key: %v", err)
+	}
+
+	// Floor constraint S1..S4 >= 12 must be enforced
+	if legacy.S1 < 12 || legacy.S2 < 12 || legacy.S3 < 12 || legacy.S4 < 12 {
+		t.Errorf("expected S1..S4 >= 12, got S1=%d S2=%d S3=%d S4=%d", legacy.S1, legacy.S2, legacy.S3, legacy.S4)
+	}
+	// H values must be preserved
+	if legacy.H1 != 12345 || legacy.H2 != 23456 || legacy.H3 != 34567 || legacy.H4 != 45678 {
+		t.Errorf("H parameters were not preserved: %+v", legacy)
+	}
+
+	// Verify persistence in DB
+	persisted, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if persisted.HeaderProtectionKey != legacy.HeaderProtectionKey {
+		t.Errorf("persisted HeaderProtectionKey mismatch: got %q, want %q", persisted.HeaderProtectionKey, legacy.HeaderProtectionKey)
+	}
+	if persisted.S1 < 12 || persisted.S2 < 12 || persisted.S3 < 12 || persisted.S4 < 12 {
+		t.Errorf("persisted S1..S4 < 12: %+v", persisted)
+	}
+}
+
+func TestGenerateClientConfig_PortalOwnHPKey_DoesNotBleedBackend(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Backend server has its own HeaderProtectionKey in DB.
+	backendHPKey := "YmFja2VuZC1zZXJ2ZXItaGVhZGVyLXByb3RlY3Rpb24="
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Backend-Server-1",
+		Host: "192.168.1.50",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"awg_params": map[string]any{
+					"HeaderProtectionKey": backendHPKey,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Portal VPNConfig has its OWN HeaderProtectionKey.
+	portalHPKey := "cG9ydGFsLW93bi1oZWFkZXItcHJvdGVjdGlvbi1rZXk="
+	portalCfg := &models.VPNConfig{
+		Algorithm:           models.LBLeastConnections,
+		ListenPort:          31458,
+		SubnetCIDR:          "10.100.0.0/16",
+		HealthThresholdMS:   500,
+		MaxTotalPeers:       1000,
+		MaxPeersPerBackend:  250,
+		Weights:             map[int64]int{sID: 100},
+		H1:                  1000,
+		H2:                  2000,
+		H3:                  3000,
+		H4:                  4000,
+		S1:                  15,
+		S2:                  25,
+		S3:                  15,
+		S4:                  15,
+		HeaderProtectionKey: portalHPKey,
+	}
+	if err := db.SaveVPNConfig(ctx, portalCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, portalCfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "client_alice",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	// Must render portal's HP key
+	renderedHPKey := parseDirectiveString(t, cfgStr, "HeaderProtectionKey")
+	if renderedHPKey != portalHPKey {
+		t.Errorf("expected portal HP key %q, got %q", portalHPKey, renderedHPKey)
+	}
+
+	// Must NOT contain backend server's HP key
+	if strings.Contains(cfgStr, backendHPKey) {
+		t.Errorf("client config bled backend server's HeaderProtectionKey: %s", cfgStr)
+	}
+}
+
+func TestGenerateClientConfig_ListenerKeyAgreement_ObfuscatedHandshake(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Test Backend",
+		Host: "127.0.0.1",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"public_key": "backend-pubkey-123456789012345678",
+				"port":       51821,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "backend-pubkey-123456789012345678",
+		PrivateKey:    "backend-privkey-12345678901234567",
+		Endpoint:      "127.0.0.1:51821",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "client_bob",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	clientHPKeyStr := parseDirectiveString(t, cfgStr, "HeaderProtectionKey")
+	listenerSnapshot := svc.endpoint.ListenerConfigSnapshot()
+	if clientHPKeyStr == "" {
+		t.Fatalf("client config missing HeaderProtectionKey")
+	}
+	if clientHPKeyStr != listenerSnapshot.HeaderProtectionKey {
+		t.Fatalf("key disagreement: client rendered %q, listener snapshot has %q", clientHPKeyStr, listenerSnapshot.HeaderProtectionKey)
+	}
+
+	hpKeyBytes, err := health.DecodeKey(clientHPKeyStr)
+	if err != nil {
+		t.Fatalf("failed to decode client HP key: %v", err)
+	}
+
+	// Parse server public key from [Peer] section
+	peerPubKeyStr := parseDirectiveString(t, cfgStr, "PublicKey")
+	peerPubBytes, err := base64.StdEncoding.DecodeString(peerPubKeyStr)
+	if err != nil {
+		t.Fatalf("failed to decode server public key: %v", err)
+	}
+
+	// Parse client private key from [Interface] section
+	clientPrivKeyStr := parseDirectiveString(t, cfgStr, "PrivateKey")
+	clientPrivBytes, err := base64.StdEncoding.DecodeString(clientPrivKeyStr)
+	if err != nil {
+		t.Fatalf("failed to decode client private key: %v", err)
+	}
+
+	h1 := uint32(parseDirectiveInt(t, cfgStr, "H1"))
+	s1 := parseDirectiveInt(t, cfgStr, "S1")
+	h2 := uint32(parseDirectiveInt(t, cfgStr, "H2"))
+	s2 := parseDirectiveInt(t, cfgStr, "S2")
+
+	// Construct obfuscated initiation with the client config parameters
+	packet, state, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, h1, s1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+
+	serverAddr, ok := svc.endpoint.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", svc.endpoint.GetListenAddr())
+	}
+
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send initiation: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("handshake failed: no response from listener: %v", err)
+	}
+
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKeyBytes, h2, s2) {
+		t.Errorf("VerifyAWGResponsePacketObfuscated rejected listener's handshake response")
+	}
+}
+
+func TestUpdateConfig_EnforcesMinSValues(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	baseCfg := &models.VPNConfig{
+		Algorithm:           models.LBLeastConnections,
+		HealthThresholdMS:   500,
+		ListenPort:          51820,
+		SubnetCIDR:          "10.100.0.0/16",
+		MaxTotalPeers:       500,
+		MaxPeersPerBackend:  100,
+		Weights:             map[int64]int{},
+		H1:                  111111,
+		H2:                  222222,
+		H3:                  333333,
+		H4:                  444444,
+		S1:                  40,
+		S2:                  50,
+		S3:                  30,
+		S4:                  20,
+		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+	}
+	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	// Partial update with a small NON-ZERO S3: preserveObfuscationParams
+	// only fills zero fields, so without enforceMinSValues this would reach
+	// the listener with HP key set and S3 < 12 (impossible-state bug).
+	update := &models.VPNConfig{
+		Algorithm:          models.LBRoundRobin,
+		HealthThresholdMS:  500,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+		Weights:            map[int64]int{},
+		S3:                 4,
+	}
+	if err := svc.UpdateConfig(ctx, update); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if update.S3 < 12 {
+		t.Errorf("expected S3 clamped to >= 12, got %d", update.S3)
+	}
+	// Preserved fields must remain.
+	if update.H1 != 111111 || update.S1 != 40 {
+		t.Errorf("expected preserved H1/S1, got H1=%d S1=%d", update.H1, update.S1)
+	}
+	if update.HeaderProtectionKey == "" {
+		t.Error("expected HeaderProtectionKey preserved on partial update")
+	}
+}
+
+func extractAddressFromConfig(t *testing.T, cfgStr string) string {
+	t.Helper()
+	for _, line := range strings.Split(cfgStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Address") {
+			parts := strings.Split(line, "=")
+			if len(parts) == 2 {
+				val := strings.TrimSpace(parts[1])
+				ipPart := strings.Split(val, "/")[0]
+				return strings.TrimSpace(ipPart)
+			}
+		}
+	}
+	t.Fatalf("Address line not found in config:\n%s", cfgStr)
+	return ""
+}
+
+func TestGenerateClientConfig_IPAMPersistence(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+
+	// 1. Generate client config for user
+	cfg1, _, err := vpnSvc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig 1 failed: %v", err)
+	}
+
+	addr1 := extractAddressFromConfig(t, cfg1)
+	if addr1 == "" {
+		t.Fatalf("empty Address extracted from config")
+	}
+
+	// 2. Verify assigned_ip is persisted in user_connections
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(conns) == 0 {
+		t.Fatalf("failed to fetch user connections: %v", err)
+	}
+	awgConn := conns[0]
+	if awgConn.ClientParams == nil {
+		t.Fatalf("expected client_params to be populated")
+	}
+	persistedIP, ok := awgConn.ClientParams["assigned_ip"].(string)
+	if !ok || persistedIP != addr1 {
+		t.Fatalf("persisted assigned_ip mismatch: got %v, want %s", awgConn.ClientParams["assigned_ip"], addr1)
+	}
+
+	// 3. Repeat call to GenerateClientConfig must return identical IP
+	cfg2, _, err := vpnSvc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig 2 failed: %v", err)
+	}
+	addr2 := extractAddressFromConfig(t, cfg2)
+	if addr2 != addr1 {
+		t.Fatalf("repeat GenerateClientConfig changed IP: %s != %s", addr2, addr1)
+	}
+}
+
+func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc1, s1ID, s2ID, uID, _ := setupTestVPNService(t, db)
+
+	// 1. Generate client config
+	cfg1, _, err := vpnSvc1.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig on vpnSvc1 failed: %v", err)
+	}
+	addr1 := extractAddressFromConfig(t, cfg1)
+
+	// Fetch peer public key persisted during config generation
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(conns) == 0 {
+		t.Fatalf("failed to fetch connections: %v", err)
+	}
+	clientPub := conns[0].ClientID
+
+	// 2. Simulate server restart: create a new VPNService instance with fresh in-memory IPAM
+	tempConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	testPort := 51820
+	if err == nil {
+		testPort = tempConn.LocalAddr().(*net.UDPAddr).Port
+		_ = tempConn.Close()
+	}
+
+	cfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         testPort,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+		Weights:            map[int64]int{s1ID: 50, s2ID: 50},
+	}
+	vpnSvc2, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatalf("NewVPNService for vpnSvc2 failed: %v", err)
+	}
+	vpnSvc2.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := vpnSvc2.Start(ctx); err != nil {
+		t.Fatalf("vpnSvc2.Start failed: %v", err)
+	}
+	defer func() { _ = vpnSvc2.Stop() }()
+
+	// 3. Connect peer on vpnSvc2: HandleIncomingPeer must retrieve stored assigned_ip and reserve it in fresh IPAM
+	sess, _, err := vpnSvc2.HandleIncomingPeer(ctx, clientPub)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed on restarted service: %v", err)
+	}
+	if sess.AssignedIP != addr1 {
+		t.Fatalf("HandleIncomingPeer assigned IP mismatch after restart: got %s, want %s", sess.AssignedIP, addr1)
+	}
+	if !vpnSvc2.ipam.IsAllocated(net.ParseIP(addr1)) {
+		t.Fatalf("IP %s was not marked allocated in restarted IPAM pool", addr1)
+	}
+
+	// 4. GenerateClientConfig on vpnSvc2 also preserves addr1
+	cfgRestart, _, err := vpnSvc2.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed on restarted service: %v", err)
+	}
+	addrRestart := extractAddressFromConfig(t, cfgRestart)
+	if addrRestart != addr1 {
+		t.Fatalf("GenerateClientConfig on restarted service gave %s, want %s", addrRestart, addr1)
+	}
+}
+
+func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("vpnSvc.Start failed: %v", err)
+	}
+	defer func() { _ = vpnSvc.Stop() }()
+
+	// 1. Peer without prior assigned_ip: allocates new IP and saves to DB client_params
+	u2ID, err := db.CreateUser(ctx, &models.User{
+		Username: "bob",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	peerKeyBob := "bob-awg-peer-key-test"
+	bobConn := &models.UserConnection{
+		UserID:   u2ID,
+		ServerID: s1ID,
+		Protocol: "awg",
+		ClientID: peerKeyBob,
+		Name:     "bob-device",
+	}
+	if _, err := db.CreateConnection(ctx, bobConn); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	sessBob, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyBob)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer for bob failed: %v", err)
+	}
+	if sessBob.AssignedIP == "" {
+		t.Fatalf("expected non-empty assigned IP for bob")
+	}
+
+	bobConns, err := db.GetConnectionsByUserID(ctx, u2ID)
+	if err != nil || len(bobConns) == 0 {
+		t.Fatalf("failed to get bob conns: %v", err)
+	}
+	if bobConns[0].ClientParams == nil || bobConns[0].ClientParams["assigned_ip"] != sessBob.AssignedIP {
+		t.Fatalf("expected bob connection client_params assigned_ip to be %s, got: %+v",
+			sessBob.AssignedIP, bobConns[0].ClientParams)
+	}
+
+	// 2. Peer with assigned_ip colliding with stale lease in IPAM:
+	// Setup user Charlie with assigned_ip: 10.100.0.50
+	u3ID, err := db.CreateUser(ctx, &models.User{
+		Username: "charlie",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	peerKeyCharlie := "charlie-awg-peer-key-test"
+	targetIP := "10.100.0.50"
+	charlieConn := &models.UserConnection{
+		UserID:   u3ID,
+		ServerID: s1ID,
+		Protocol: "awg",
+		ClientID: peerKeyCharlie,
+		Name:     "charlie-device",
+		ClientParams: map[string]any{
+			"assigned_ip": targetIP,
+		},
+	}
+	if _, err := db.CreateConnection(ctx, charlieConn); err != nil {
+		t.Fatalf("CreateConnection for charlie failed: %v", err)
+	}
+
+	// Simulate stale allocation: reserve 10.100.0.50 to a dummy peer in IPAM
+	if err := vpnSvc.ipam.Reserve(net.ParseIP(targetIP), "dummy-stale-peer"); err != nil {
+		t.Fatalf("failed to setup dummy stale lease: %v", err)
+	}
+
+	// HandleIncomingPeer for Charlie must detect collision, release stale allocation, and reserve targetIP for Charlie
+	sessCharlie, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer for charlie failed on collision: %v", err)
+	}
+	if sessCharlie.AssignedIP != targetIP {
+		t.Fatalf("expected charlie to receive %s after resolving collision, got %s", targetIP, sessCharlie.AssignedIP)
 	}
 }

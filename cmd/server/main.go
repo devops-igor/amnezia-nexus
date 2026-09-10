@@ -201,6 +201,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to init VPN service: %w", err)
 	}
+	vpnSvc.SetAWGStatusProvider(awgMgr)
 
 	vpnStarted, err := startVPNDataPlane(ctx, vpnSvc, cfg)
 	if err != nil {

@@ -158,7 +158,7 @@ func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, st
 	sess.LastSeen = time.Now().UTC()
 
 	if sm.db != nil {
-		_ = sm.db.CreateVPNSession(ctx, sess)
+		_ = sm.db.CloseVPNSession(ctx, sess.ID)
 	}
 
 	if sm.ipam != nil {
@@ -191,7 +191,7 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 	for _, sess := range timedOut {
 		sess.Status = "disconnected"
 		if sm.db != nil {
-			_ = sm.db.CreateVPNSession(ctx, sess)
+			_ = sm.db.CloseVPNSession(ctx, sess.ID)
 		}
 		if sm.ipam != nil {
 			_ = sm.ipam.Release(sess.PeerPublicKey)

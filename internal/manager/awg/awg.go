@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -303,12 +304,20 @@ echo "%s" > /opt/amnezia/awg/wireguard_psk.key
 	startScript := `#!/bin/bash
 awg-quick down /opt/amnezia/awg/awg0.conf 2>/dev/null || true
 if [ -f /opt/amnezia/awg/awg0.conf ]; then awg-quick up /opt/amnezia/awg/awg0.conf; fi
+ip route replace 10.100.0.0/16 dev awg0 2>/dev/null || ip route add 10.100.0.0/16 dev awg0 2>/dev/null || true
+sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
+sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true
 iptables -A INPUT -i awg0 -j ACCEPT
 iptables -A FORWARD -i awg0 -j ACCEPT
 iptables -A OUTPUT -o awg0 -j ACCEPT
 iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT
+iptables -C FORWARD -s 10.100.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.100.0.0/16 -j ACCEPT
+iptables -C FORWARD -d 10.100.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.100.0.0/16 -j ACCEPT
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s 10.100.0.0/16 -o eth0 -j MASQUERADE
+iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s 10.100.0.0/16 -o eth1 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.100.0.0/16 -j MASQUERADE
 tail -f /dev/null
 `
 
@@ -445,34 +454,83 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 	return safeDefault
 }
 
-// ensureBackendNATRule installs (idempotently) the interface-scoped NAT
-// masquerade rule and the interface-scoped FORWARD accept rule inside the
-// backend's AWG container. Portal data-plane traffic arrives on awg0 with
-// source IPs from the portal IPAM subnet (e.g. 10.100.0.0/16), so subnet- or
-// source-scoped rules do not match it and un-masqueraded packets are dropped
-// upstream. This remediation is needed for backends provisioned before the
-// start.sh template was fixed; it runs inside the existing container and never
-// restarts or re-creates it.
-func (m *AWGManager) ensureBackendNATRule(ctx context.Context, client ssh.SSHClient) error {
+// ensureBackendRoutingAndNAT installs the return route for the portal client subnet,
+// interface-scoped and subnet-scoped NAT masquerade rules, FORWARD rules, and loose
+// reverse path filtering inside the backend's AWG container. Portal data-plane traffic
+// arrives on awg0 with source IPs from the portal IPAM subnet (e.g. 10.100.0.0/16);
+// without the return route, reply traffic is routed out eth0 default gateway and Martian
+// packet filtering on awg0 drops incoming traffic.
+func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.SSHClient, subnet string) error {
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
-		return fmt.Errorf("cannot ensure NAT rule: invalid container name %q", cName)
+		return fmt.Errorf("cannot ensure backend routing and NAT: invalid container name %q", cName)
 	}
+
+	subnet = strings.TrimSpace(subnet)
+	if subnet == "" {
+		subnet = "10.100.0.0/16"
+	}
+	if _, _, err := net.ParseCIDR(subnet); err != nil {
+		return fmt.Errorf("invalid subnet CIDR %q: %w", subnet, err)
+	}
+
 	rules := []string{
+		fmt.Sprintf("ip route replace %s dev awg0 2>/dev/null || ip route add %s dev awg0 2>/dev/null || true", subnet, subnet),
+		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s %s -o eth0 -j MASQUERADE", subnet, subnet),
+		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s %s -o eth1 -j MASQUERADE 2>/dev/null || true", subnet, subnet),
+		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s %s -j MASQUERADE", subnet, subnet),
 		"iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
+		"iptables -t nat -C POSTROUTING -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE 2>/dev/null || true",
+		fmt.Sprintf("iptables -C FORWARD -s %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -s %s -j ACCEPT", subnet, subnet),
+		fmt.Sprintf("iptables -C FORWARD -d %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -d %s -j ACCEPT", subnet, subnet),
 		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT",
+		"iptables -C FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || true",
+		"sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null; sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true",
 	}
+
 	for _, rule := range rules {
 		cmd := fmt.Sprintf("docker exec %s bash -c '%s'", cName, rule)
 		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
 		if err != nil {
-			return fmt.Errorf("failed to ensure NAT/FORWARD rule in container %s: %w", cName, err)
+			return fmt.Errorf("failed to apply backend routing/NAT rule in container %s: %w", cName, err)
 		}
 		if code != 0 {
-			return fmt.Errorf("failed to ensure NAT/FORWARD rule in container %s (code %d): %s", cName, code, errOut)
+			return fmt.Errorf("failed to apply backend routing/NAT rule in container %s (code %d): %s", cName, code, errOut)
 		}
 	}
+
+	// Host-level defense-in-depth:
+	bridgeDev := "amn0"
+	if out, _, code, err := client.RunSudoCommand(ctx, "ip link show amn0 2>/dev/null || ip link show docker0 2>/dev/null || true"); err == nil && code == 0 {
+		if strings.Contains(out, "docker0") && !strings.Contains(out, "amn0") {
+			bridgeDev = "docker0"
+		}
+	}
+	hostRule := fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || true", subnet, bridgeDev, subnet, bridgeDev)
+	_, errOut, code, err := client.RunSudoCommand(ctx, hostRule)
+	if err != nil {
+		return fmt.Errorf("failed to apply host-level NAT defense rule: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("failed to apply host-level NAT defense rule (code %d): %s", code, errOut)
+	}
+
 	return nil
+}
+
+// EnsureBackendRoutingAndNAT resolves the server's SSH client and applies return routes,
+// NAT masquerade, and reverse path filtering for the portal subnet inside the container.
+func (m *AWGManager) EnsureBackendRoutingAndNAT(ctx context.Context, server *models.Server, subnet string) error {
+	client, err := m.getSSHClient(ctx, server)
+	if err != nil {
+		return fmt.Errorf("failed to get SSH client for server %d: %w", server.ID, err)
+	}
+	return m.ensureBackendRoutingAndNAT(ctx, client, subnet)
+}
+
+// ensureBackendNATRule is a backward-compatible wrapper calling ensureBackendRoutingAndNAT with default subnet.
+func (m *AWGManager) ensureBackendNATRule(ctx context.Context, client ssh.SSHClient) error {
+	return m.ensureBackendRoutingAndNAT(ctx, client, "")
 }
 
 func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
@@ -887,15 +945,26 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 		clients[existingIdx].UserData.PSK = psk
 		clients[existingIdx].UserData.Enabled = true
 
-		if clients[existingIdx].UserData.RekeyAfterTime == nil {
-			rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
-			clients[existingIdx].UserData.RekeyAfterTime = rat
-			clients[existingIdx].UserData.RekeyTimeout = rt
-			clients[existingIdx].UserData.RejectAfterTime = rej
-			clients[existingIdx].UserData.KeepaliveTimeout = kt
-			clients[existingIdx].UserData.MaxHandshakeAttempts = mha
-			clients[existingIdx].UserData.PersistentKeepalive = pk
+		ud := &clients[existingIdx].UserData
+		if ud.RekeyAfterTime == nil {
+			ud.RekeyAfterTime = GenerateRekeyAfterTime()
 		}
+		if ud.RekeyTimeout == nil {
+			ud.RekeyTimeout = GenerateRekeyTimeout()
+		}
+		if ud.RejectAfterTime == nil {
+			ud.RejectAfterTime = GenerateRejectAfterTime()
+		}
+		if ud.KeepaliveTimeout == nil {
+			ud.KeepaliveTimeout = GenerateKeepaliveTimeout()
+		}
+		if ud.MaxHandshakeAttempts == nil {
+			ud.MaxHandshakeAttempts = GenerateMaxHandshakeAttempts()
+		}
+		if ud.PersistentKeepalive == nil {
+			ud.PersistentKeepalive = GeneratePersistentKeepalive()
+		}
+		EnforceTimingOrdering(ud.RekeyTimeout, ud.RekeyAfterTime, ud.RejectAfterTime)
 
 		if contentPadding && clients[existingIdx].UserData.ContentPaddingAddition == nil {
 			val := "16-64"
@@ -1060,11 +1129,11 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
 	_ = m.saveClientsTable(ctx, client, clients)
 
-	// Live remediation (issue #27): ensure the interface-scoped NAT masquerade
+	// Live remediation (issues #27, #36): ensure the return route, NAT masquerade,
 	// and FORWARD rules exist so portal data-plane traffic (non-local source
 	// subnets like 10.100.0.0/16) is forwarded and masqueraded. This covers
 	// backends provisioned with the old subnet-scoped start.sh without
-	// restarting or re-creating the container. Fail loudly: without the rule,
+	// restarting or re-creating the container. Fail loudly: without the rules,
 	// all load-balanced client traffic is dropped upstream.
 	if err := m.ensureBackendNATRule(ctx, client); err != nil {
 		return nil, fmt.Errorf("failed to ensure backend NAT rules: %w", err)

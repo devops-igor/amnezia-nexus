@@ -3,6 +3,7 @@ package forwarder
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -288,21 +289,60 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 
 // RouteClientToBackend routes a packet from a client peer toward their assigned backend tunnel.
 func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
+	var srcIP string
+	if len(packet) >= 20 && (packet[0]>>4) == 4 {
+		srcIP = net.IPv4(packet[12], packet[13], packet[14], packet[15]).String()
+	}
+
 	f.mu.RLock()
 	route, ok := f.routesByPeer[peerKey]
 	if !ok {
 		f.mu.RUnlock()
 		return ErrSessionNotRegistered
 	}
-	beQueue, ok := f.backendQueues[route.backendTunnelID]
-	if !ok {
+
+	var (
+		beQueue chan []byte
+		sID     string
+		cID     string
+		tbUp    *TokenBucket
+	)
+
+	if srcIP != "" && srcIP != "0.0.0.0" && route.assignedIP != srcIP {
 		f.mu.RUnlock()
-		return ErrBackendNotFound
+		f.mu.Lock()
+		route, ok = f.routesByPeer[peerKey]
+		if !ok {
+			f.mu.Unlock()
+			return ErrSessionNotRegistered
+		}
+		if route.assignedIP != srcIP {
+			if route.assignedIP != "" {
+				delete(f.routesByIP, route.assignedIP)
+			}
+			f.routesByIP[srcIP] = route
+			route.assignedIP = srcIP
+		}
+		beQueue, ok = f.backendQueues[route.backendTunnelID]
+		if !ok {
+			f.mu.Unlock()
+			return ErrBackendNotFound
+		}
+		sID = route.sessionID
+		cID = route.connectionID
+		tbUp = route.tbUp
+		f.mu.Unlock()
+	} else {
+		beQueue, ok = f.backendQueues[route.backendTunnelID]
+		if !ok {
+			f.mu.RUnlock()
+			return ErrBackendNotFound
+		}
+		sID = route.sessionID
+		cID = route.connectionID
+		tbUp = route.tbUp
+		f.mu.RUnlock()
 	}
-	sID := route.sessionID
-	cID := route.connectionID
-	tbUp := route.tbUp
-	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
 	if tbUp != nil && !tbUp.Allow(pktLen) {
