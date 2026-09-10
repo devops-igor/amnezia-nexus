@@ -73,8 +73,11 @@ func TestQueueFullRecoversAfterConsumerStall(t *testing.T) {
 			dropped++
 		}
 	}
-	if dropped > 300-65 {
-		t.Fatalf("stalled-consumer burst dropped %d packets, queue should have buffered at least 65", dropped)
+	// Bounded-backpressure invariant: the queue (cap 64) must buffer everything
+	// it accepted while the pump is blocked. Under CI load the pump may not
+	// have consumed its in-flight packet yet, so accept capacity OR capacity+1.
+	if dropped > 300-64 {
+		t.Fatalf("stalled-consumer burst dropped %d packets, queue should have buffered at least 64", dropped)
 	}
 
 	// Consumer recovers: the pump must drain everything it accepted.

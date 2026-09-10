@@ -266,11 +266,15 @@ type ConnectionLogEntry struct {
 
 // BackendTunnel represents an in-process AWG tunnel to a backend VPN server.
 type BackendTunnel struct {
-	ID                int64      `json:"id" db:"id"`
-	ServerID          int64      `json:"server_id" db:"server_id"`
-	InterfaceName     string     `json:"interface_name" db:"interface_name"`
-	PublicKey         string     `json:"public_key" db:"public_key"`
-	PrivateKey        string     `json:"-" db:"private_key"` // Encrypted at rest
+	ID            int64  `json:"id" db:"id"`
+	ServerID      int64  `json:"server_id" db:"server_id"`
+	InterfaceName string `json:"interface_name" db:"interface_name"`
+	PublicKey     string `json:"public_key" db:"public_key"`
+	PrivateKey    string `json:"-" db:"private_key"` // Encrypted at rest
+	// ProbePrivateKey is the dedicated health-probe client key, distinct from
+	// PrivateKey (the data device identity). Sharing one key made the backend
+	// roam the peer's return endpoint to whichever socket sent last (issue #43).
+	ProbePrivateKey   string     `json:"-" db:"probe_private_key"` // Encrypted at rest
 	Endpoint          string     `json:"endpoint" db:"endpoint"`
 	Status            string     `json:"status" db:"status"` // connecting, active, degraded, disabled
 	LastHealthCheck   *time.Time `json:"last_health_check,omitempty" db:"last_health_check"`

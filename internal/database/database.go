@@ -99,6 +99,7 @@ var (
 		"interface_name":     true,
 		"public_key":         true,
 		"private_key":        true,
+		"probe_private_key":  true,
 		"endpoint":           true,
 		"status":             true,
 		"last_health_check":  true,
@@ -213,7 +214,47 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateUniqueUsernameIndex(ctx); err != nil {
 		return err
 	}
-	return d.migrateUserConnectionsClientParams(ctx)
+	if err := d.migrateUserConnectionsClientParams(ctx); err != nil {
+		return err
+	}
+	return d.migrateBackendTunnelsProbePrivateKey(ctx)
+}
+
+// migrateBackendTunnelsProbePrivateKey adds the probe_private_key column to
+// backend_tunnels on databases created before the dedicated health-probe key
+// existed (issue #43). Existing rows start empty and are backfilled by the
+// VPN service at startup (EnsureBackendProbeKeys), which also re-registers
+// the probe peer on the backend server.
+func (d *DB) migrateBackendTunnelsProbePrivateKey(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasProbeKey := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "probe_private_key") {
+			hasProbeKey = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasProbeKey {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN probe_private_key TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add probe_private_key column: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) migrateUserConnectionsClientParams(ctx context.Context) error {
