@@ -187,3 +187,78 @@ func TestBuildAWGIPCConfig_CaseAndUnderscoreInsensitive(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildAWGIPCConfig_TimingRanges verifies that AWG 3.1 timing parameters
+// (both ranges and single values) are correctly rendered into device and peer sections.
+func TestBuildAWGIPCConfig_TimingRanges(t *testing.T) {
+	params := map[string]any{
+		"rekey_after_time":       "100-140",
+		"rekey_timeout":          "4-6",
+		"reject_after_time":      "160-200",
+		"keepalive_timeout":      "8-12",
+		"max_handshake_attempts": "4-8",
+		"persistent_keepalive":   "22-30",
+	}
+
+	cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "10.0.0.1:51820", params)
+
+	expectedDevice := []string{
+		"rekey_after_time=100-140\n",
+		"rekey_timeout=4-6\n",
+		"reject_after_time=160-200\n",
+		"keepalive_timeout=8-12\n",
+		"max_handshake_attempts=4-8\n",
+	}
+	for _, exp := range expectedDevice {
+		if !strings.Contains(cfg, exp) {
+			t.Errorf("expected device section to contain %q, got:\n%s", exp, cfg)
+		}
+	}
+
+	// Device options must appear before public_key
+	pubIdx := strings.Index(cfg, "public_key=")
+	for _, exp := range expectedDevice {
+		idx := strings.Index(cfg, exp)
+		if idx < 0 || idx > pubIdx {
+			t.Errorf("%q must appear before public_key (idx=%d, pubIdx=%d)", exp, idx, pubIdx)
+		}
+	}
+
+	// Peer section must contain persistent_keepalive_interval with range
+	expPKA := "persistent_keepalive_interval=22-30\n"
+	if !strings.Contains(cfg, expPKA) {
+		t.Errorf("expected peer section to contain %q, got:\n%s", expPKA, cfg)
+	}
+	pkaIdx := strings.Index(cfg, expPKA)
+	if pkaIdx < pubIdx {
+		t.Errorf("%q must appear after public_key (pkaIdx=%d, pubIdx=%d)", expPKA, pkaIdx, pubIdx)
+	}
+}
+
+// TestBuildAWGIPCConfig_TimingRangesDegenerateSingle verifies backward compatibility
+// with single-value timing params.
+func TestBuildAWGIPCConfig_TimingRangesDegenerateSingle(t *testing.T) {
+	params := map[string]any{
+		"rekey_after_time":              125,
+		"rekey_timeout":                 5,
+		"reject_after_time":             180,
+		"keepalive_timeout":             10,
+		"max_handshake_attempts":        6,
+		"persistent_keepalive_interval": 27,
+	}
+
+	cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "10.0.0.1:51820", params)
+
+	for _, exp := range []string{
+		"rekey_after_time=125\n",
+		"rekey_timeout=5\n",
+		"reject_after_time=180\n",
+		"keepalive_timeout=10\n",
+		"max_handshake_attempts=6\n",
+		"persistent_keepalive_interval=27\n",
+	} {
+		if !strings.Contains(cfg, exp) {
+			t.Errorf("expected config to contain %q, got:\n%s", exp, cfg)
+		}
+	}
+}

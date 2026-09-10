@@ -70,12 +70,12 @@ func TestRenderClientConfig(t *testing.T) {
 }
 
 func TestRenderClientConfig_AWG3_Compliance(t *testing.T) {
-	rat := 125
-	rt := 5
-	rej := 180
-	kt := 10
-	mha := 6
-	pk := 27
+	rat := DegenerateTimingRange(125)
+	rt := DegenerateTimingRange(5)
+	rej := DegenerateTimingRange(180)
+	kt := DegenerateTimingRange(10)
+	mha := DegenerateTimingRange(6)
+	pk := DegenerateTimingRange(27)
 	cpAdd := "16-64"
 
 	ud := &AWGClientUserData{
@@ -83,12 +83,12 @@ func TestRenderClientConfig_AWG3_Compliance(t *testing.T) {
 		ClientPrivateKey:       "clientPrivKey123",
 		ClientIP:               "10.100.0.5",
 		Enabled:                true,
-		RekeyAfterTime:         &rat,
-		RekeyTimeout:           &rt,
-		RejectAfterTime:        &rej,
-		KeepaliveTimeout:       &kt,
-		MaxHandshakeAttempts:   &mha,
-		PersistentKeepalive:    &pk,
+		RekeyAfterTime:         rat,
+		RekeyTimeout:           rt,
+		RejectAfterTime:        rej,
+		KeepaliveTimeout:       kt,
+		MaxHandshakeAttempts:   mha,
+		PersistentKeepalive:    pk,
 		ContentPaddingAddition: &cpAdd,
 	}
 
@@ -170,6 +170,56 @@ func TestRenderClientConfig_AWG3_Compliance(t *testing.T) {
 	// Verify default PersistentKeepalive = 25 was replaced by randomized value 27
 	if strings.Contains(conf, "PersistentKeepalive = 25") {
 		t.Errorf("RenderClientConfig emitted default PersistentKeepalive = 25 instead of ud value 27")
+	}
+}
+
+func TestRenderClientConfig_TimingRanges(t *testing.T) {
+	rat := NewTimingRange(100, 140)
+	rt := NewTimingRange(4, 6)
+	rej := NewTimingRange(160, 200)
+	kt := NewTimingRange(8, 12)
+	mha := NewTimingRange(4, 8)
+	pk := NewTimingRange(22, 30)
+
+	ud := &AWGClientUserData{
+		ClientName:           "testuser-range",
+		ClientPrivateKey:     "clientPrivKeyRange",
+		ClientIP:             "10.100.0.6",
+		Enabled:              true,
+		RekeyAfterTime:       rat,
+		RekeyTimeout:         rt,
+		RejectAfterTime:      rej,
+		KeepaliveTimeout:     kt,
+		MaxHandshakeAttempts: mha,
+		PersistentKeepalive:  pk,
+	}
+
+	conf := RenderClientConfig(
+		"clientPrivKeyRange",
+		"10.100.0.6",
+		"serverPub123",
+		"psk456",
+		"lb.example.com:51820",
+		"1.1.1.1",
+		"1.0.0.1",
+		"1420",
+		nil,
+		ud,
+	)
+
+	expectedDirectives := []string{
+		"RekeyAfterTime = 100-140",
+		"RekeyTimeout = 4-6",
+		"RejectAfterTime = 160-200",
+		"KeepaliveTimeout = 8-12",
+		"MaxHandshakeAttempts = 4-8",
+		"PersistentKeepalive = 22-30",
+	}
+
+	for _, d := range expectedDirectives {
+		if !strings.Contains(conf, d) {
+			t.Errorf("RenderClientConfig missing timing range directive: %q\nFull config:\n%s", d, conf)
+		}
 	}
 }
 
@@ -267,5 +317,90 @@ func TestClientsTableSerialization(t *testing.T) {
 	parsedLegacy, err := ParseClientsTable(legacyJSON)
 	if err != nil || len(parsedLegacy) != 1 || parsedLegacy[0].UserData.ClientName != "LegacyUser" {
 		t.Errorf("failed to parse legacy JSON format: %v, %+v", err, parsedLegacy)
+	}
+}
+
+func TestClientsTable_TimingParametersBackwardCompat(t *testing.T) {
+	// 1. JSON with stored bare integers (legacy / existing production format)
+	legacyIntsJSON := `[
+		{
+			"clientId": "pubkey-legacy",
+			"userData": {
+				"clientName": "LegacyClient",
+				"enabled": true,
+				"rekey_after_time": 125,
+				"rekey_timeout": 5,
+				"reject_after_time": 180,
+				"keepalive_timeout": 10,
+				"max_handshake_attempts": 6,
+				"persistent_keepalive": 25
+			}
+		}
+	]`
+
+	parsedLegacy, err := ParseClientsTable(legacyIntsJSON)
+	if err != nil {
+		t.Fatalf("ParseClientsTable with bare ints failed: %v", err)
+	}
+	if len(parsedLegacy) != 1 {
+		t.Fatalf("expected 1 client, got %d", len(parsedLegacy))
+	}
+	udLegacy := parsedLegacy[0].UserData
+	if udLegacy.RekeyAfterTime == nil || udLegacy.RekeyAfterTime.Lo != 125 || udLegacy.RekeyAfterTime.Hi != 125 || !udLegacy.RekeyAfterTime.IsDegenerate() {
+		t.Errorf("expected degenerate RekeyAfterTime 125, got %+v", udLegacy.RekeyAfterTime)
+	}
+	if udLegacy.RekeyTimeout == nil || udLegacy.RekeyTimeout.Lo != 5 || udLegacy.RekeyTimeout.Hi != 5 {
+		t.Errorf("expected degenerate RekeyTimeout 5, got %+v", udLegacy.RekeyTimeout)
+	}
+	if udLegacy.PersistentKeepalive == nil || udLegacy.PersistentKeepalive.Lo != 25 || udLegacy.PersistentKeepalive.Hi != 25 {
+		t.Errorf("expected degenerate PersistentKeepalive 25, got %+v", udLegacy.PersistentKeepalive)
+	}
+
+	// 2. JSON with stored range strings (AWG 3.1 format)
+	rangeJSON := `[
+		{
+			"clientId": "pubkey-range",
+			"userData": {
+				"clientName": "RangeClient",
+				"enabled": true,
+				"rekey_after_time": "100-140",
+				"rekey_timeout": "4-6",
+				"reject_after_time": "160-200",
+				"keepalive_timeout": "8-12",
+				"max_handshake_attempts": "4-8",
+				"persistent_keepalive": "22-30"
+			}
+		}
+	]`
+
+	parsedRange, err := ParseClientsTable(rangeJSON)
+	if err != nil {
+		t.Fatalf("ParseClientsTable with ranges failed: %v", err)
+	}
+	if len(parsedRange) != 1 {
+		t.Fatalf("expected 1 client, got %d", len(parsedRange))
+	}
+	udRange := parsedRange[0].UserData
+	if udRange.RekeyAfterTime == nil || udRange.RekeyAfterTime.Lo != 100 || udRange.RekeyAfterTime.Hi != 140 || udRange.RekeyAfterTime.IsDegenerate() {
+		t.Errorf("expected range RekeyAfterTime [100, 140], got %+v", udRange.RekeyAfterTime)
+	}
+	if udRange.RekeyTimeout == nil || udRange.RekeyTimeout.Lo != 4 || udRange.RekeyTimeout.Hi != 6 {
+		t.Errorf("expected range RekeyTimeout [4, 6], got %+v", udRange.RekeyTimeout)
+	}
+	if udRange.PersistentKeepalive == nil || udRange.PersistentKeepalive.Lo != 22 || udRange.PersistentKeepalive.Hi != 30 {
+		t.Errorf("expected range PersistentKeepalive [22, 30], got %+v", udRange.PersistentKeepalive)
+	}
+
+	// 3. Serialize and re-parse roundtrip
+	serialized, err := SerializeClientsTable(parsedRange)
+	if err != nil {
+		t.Fatalf("SerializeClientsTable failed: %v", err)
+	}
+	reparsed, err := ParseClientsTable(serialized)
+	if err != nil {
+		t.Fatalf("re-parsing serialized clientsTable failed: %v", err)
+	}
+	if reparsed[0].UserData.RekeyAfterTime.String() != "100-140" {
+		t.Errorf("expected RekeyAfterTime '100-140', got %q", reparsed[0].UserData.RekeyAfterTime.String())
 	}
 }

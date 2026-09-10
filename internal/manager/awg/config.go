@@ -22,41 +22,41 @@ type AWGPeer struct {
 //
 //nolint:revive
 type AWGClientUserData struct {
-	ClientName             string  `json:"clientName"`
-	CreationDate           string  `json:"creationDate,omitempty"`
-	ClientPrivateKey       string  `json:"clientPrivateKey,omitempty"`
-	ClientIP               string  `json:"clientIp,omitempty"`
-	PSK                    string  `json:"psk,omitempty"`
-	Enabled                bool    `json:"enabled"`
-	AWGMimicry             string  `json:"awg_mimicry,omitempty"`
-	SpeedLimitDown         *int    `json:"speed_limit_down,omitempty"`
-	SpeedLimitUp           *int    `json:"speed_limit_up,omitempty"`
-	LatestHandshake        string  `json:"latestHandshake,omitempty"`
-	DataReceived           string  `json:"dataReceived,omitempty"`
-	DataSent               string  `json:"dataSent,omitempty"`
-	DataReceivedBytes      int64   `json:"dataReceivedBytes,omitempty"`
-	DataSentBytes          int64   `json:"dataSentBytes,omitempty"`
-	AllowedIPs             string  `json:"allowedIps,omitempty"`
-	ExternalClient         bool    `json:"externalClient,omitempty"`
-	TrialProfile           string  `json:"trial_profile,omitempty"`
-	TrialFor               string  `json:"trial_for,omitempty"`
-	TrialUserID            *string `json:"trial_user_id,omitempty"`
-	MainClientID           *string `json:"main_client_id,omitempty"`
-	TrialCreatedAt         string  `json:"trial_created_at,omitempty"`
-	ExpiresAt              string  `json:"expires_at,omitempty"`
-	RotatedAt              string  `json:"rotated_at,omitempty"`
-	I1                     string  `json:"i1,omitempty"`
-	I2                     string  `json:"i2,omitempty"`
-	I3                     string  `json:"i3,omitempty"`
-	I4                     string  `json:"i4,omitempty"`
-	I5                     string  `json:"i5,omitempty"`
-	RekeyAfterTime         *int    `json:"rekey_after_time,omitempty"`
-	RekeyTimeout           *int    `json:"rekey_timeout,omitempty"`
-	RejectAfterTime        *int    `json:"reject_after_time,omitempty"`
-	KeepaliveTimeout       *int    `json:"keepalive_timeout,omitempty"`
-	MaxHandshakeAttempts   *int    `json:"max_handshake_attempts,omitempty"`
-	PersistentKeepalive    *int    `json:"persistent_keepalive,omitempty"`
-	ContentPaddingAddition *string `json:"content_padding_addition,omitempty"`
+	ClientName             string       `json:"clientName"`
+	CreationDate           string       `json:"creationDate,omitempty"`
+	ClientPrivateKey       string       `json:"clientPrivateKey,omitempty"`
+	ClientIP               string       `json:"clientIp,omitempty"`
+	PSK                    string       `json:"psk,omitempty"`
+	Enabled                bool         `json:"enabled"`
+	AWGMimicry             string       `json:"awg_mimicry,omitempty"`
+	SpeedLimitDown         *int         `json:"speed_limit_down,omitempty"`
+	SpeedLimitUp           *int         `json:"speed_limit_up,omitempty"`
+	LatestHandshake        string       `json:"latestHandshake,omitempty"`
+	DataReceived           string       `json:"dataReceived,omitempty"`
+	DataSent               string       `json:"dataSent,omitempty"`
+	DataReceivedBytes      int64        `json:"dataReceivedBytes,omitempty"`
+	DataSentBytes          int64        `json:"dataSentBytes,omitempty"`
+	AllowedIPs             string       `json:"allowedIps,omitempty"`
+	ExternalClient         bool         `json:"externalClient,omitempty"`
+	TrialProfile           string       `json:"trial_profile,omitempty"`
+	TrialFor               string       `json:"trial_for,omitempty"`
+	TrialUserID            *string      `json:"trial_user_id,omitempty"`
+	MainClientID           *string      `json:"main_client_id,omitempty"`
+	TrialCreatedAt         string       `json:"trial_created_at,omitempty"`
+	ExpiresAt              string       `json:"expires_at,omitempty"`
+	RotatedAt              string       `json:"rotated_at,omitempty"`
+	I1                     string       `json:"i1,omitempty"`
+	I2                     string       `json:"i2,omitempty"`
+	I3                     string       `json:"i3,omitempty"`
+	I4                     string       `json:"i4,omitempty"`
+	I5                     string       `json:"i5,omitempty"`
+	RekeyAfterTime         *TimingRange `json:"rekey_after_time,omitempty"`
+	RekeyTimeout           *TimingRange `json:"rekey_timeout,omitempty"`
+	RejectAfterTime        *TimingRange `json:"reject_after_time,omitempty"`
+	KeepaliveTimeout       *TimingRange `json:"keepalive_timeout,omitempty"`
+	MaxHandshakeAttempts   *TimingRange `json:"max_handshake_attempts,omitempty"`
+	PersistentKeepalive    *TimingRange `json:"persistent_keepalive,omitempty"`
+	ContentPaddingAddition *string      `json:"content_padding_addition,omitempty"`
 }
 
 // AWGClient represents a client entry in the clients table.
@@ -176,19 +176,19 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 
 	if ud != nil {
 		if ud.RekeyAfterTime != nil {
-			lines = append(lines, fmt.Sprintf("RekeyAfterTime = %d", *ud.RekeyAfterTime))
+			lines = append(lines, fmt.Sprintf("RekeyAfterTime = %s", ud.RekeyAfterTime.String()))
 		}
 		if ud.RekeyTimeout != nil {
-			lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", *ud.RekeyTimeout))
+			lines = append(lines, fmt.Sprintf("RekeyTimeout = %s", ud.RekeyTimeout.String()))
 		}
 		if ud.RejectAfterTime != nil {
-			lines = append(lines, fmt.Sprintf("RejectAfterTime = %d", *ud.RejectAfterTime))
+			lines = append(lines, fmt.Sprintf("RejectAfterTime = %s", ud.RejectAfterTime.String()))
 		}
 		if ud.KeepaliveTimeout != nil {
-			lines = append(lines, fmt.Sprintf("KeepaliveTimeout = %d", *ud.KeepaliveTimeout))
+			lines = append(lines, fmt.Sprintf("KeepaliveTimeout = %s", ud.KeepaliveTimeout.String()))
 		}
 		if ud.MaxHandshakeAttempts != nil {
-			lines = append(lines, fmt.Sprintf("MaxHandshakeAttempts = %d", *ud.MaxHandshakeAttempts))
+			lines = append(lines, fmt.Sprintf("MaxHandshakeAttempts = %s", ud.MaxHandshakeAttempts.String()))
 		}
 		if ud.ContentPaddingAddition != nil {
 			lines = append(lines, fmt.Sprintf("ContentPaddingAddition = %s", *ud.ContentPaddingAddition))
@@ -208,7 +208,7 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 		fmt.Sprintf("Endpoint = %s", endpoint),
 	)
 	if ud != nil && ud.PersistentKeepalive != nil {
-		lines = append(lines, fmt.Sprintf("PersistentKeepalive = %d", *ud.PersistentKeepalive))
+		lines = append(lines, fmt.Sprintf("PersistentKeepalive = %s", ud.PersistentKeepalive.String()))
 	} else {
 		lines = append(lines, "PersistentKeepalive = 25")
 	}
