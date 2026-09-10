@@ -274,6 +274,8 @@ func setupFullServerRouter(h *Handlers) *chi.Mux {
 	r := chi.NewRouter()
 	r.Post("/api/servers/add", h.AddServerHandler)
 	r.Post("/api/servers/confirm-fingerprint", h.ConfirmFingerprintHandler)
+	r.Post("/api/servers/{server_id}/rename", h.RenameServerHandler)
+	r.Patch("/api/servers/{server_id}/rename", h.RenameServerHandler)
 	r.Post("/api/servers/{server_id}/delete", h.DeleteServerHandler)
 	r.Post("/api/servers/{server_id}/reboot", h.RebootServerHandler)
 	r.Post("/api/servers/{server_id}/clear", h.ClearServerHandler)

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +16,6 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"strings"
 )
 
 const testSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -839,5 +840,104 @@ func TestRouterVPNPage(t *testing.T) {
 	}
 	if !strings.Contains(supportBody, "vpn-listener-badge") {
 		t.Errorf("expected /vpn body to contain 'vpn-listener-badge' for support role")
+	}
+}
+
+func TestRouterServerRename(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	r := NewRouter(cfg, db, nil)
+	ctx := context.Background()
+
+	adminUser := &models.User{
+		ID:        "admin-rename-test",
+		Username:  "adminrename",
+		Role:      models.RoleAdmin,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	}
+	_, err := db.CreateUser(ctx, adminUser)
+	if err != nil {
+		t.Fatalf("failed to seed admin user: %v", err)
+	}
+
+	regUser := &models.User{
+		ID:        "user-rename-test",
+		Username:  "userrename",
+		Role:      models.RoleUser,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	}
+	_, err = db.CreateUser(ctx, regUser)
+	if err != nil {
+		t.Fatalf("failed to seed regular user: %v", err)
+	}
+
+	srv := &models.Server{
+		Name:    "Router-Test-Server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to seed server: %v", err)
+	}
+
+	adminCtx := middleware.WithSession(ctx, &models.SessionData{
+		UserID:   adminUser.ID,
+		Username: adminUser.Username,
+		Role:     adminUser.Role,
+	})
+	adminCtx = middleware.WithCSRFToken(adminCtx, "csrf-token-test")
+
+	userCtx := middleware.WithSession(ctx, &models.SessionData{
+		UserID:   regUser.ID,
+		Username: regUser.Username,
+		Role:     regUser.Role,
+	})
+	userCtx = middleware.WithCSRFToken(userCtx, "csrf-token-test")
+
+	// 1. Regular user gets 403 Forbidden on POST
+	reqUser := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), strings.NewReader(`{"name":"Hacked"}`)).WithContext(userCtx)
+	reqUser.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-test"})
+	reqUser.Header.Set(middleware.CSRFHeaderName, "csrf-token-test")
+	reqUser.Header.Set("Content-Type", "application/json")
+	wUser := httptest.NewRecorder()
+	r.ServeHTTP(wUser, reqUser)
+	if wUser.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for regular user, got %d", wUser.Code)
+	}
+
+	// 2. Regular user gets 403 Forbidden on PATCH
+	reqUserPatch := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/rename", serverID), strings.NewReader(`{"name":"Hacked"}`)).WithContext(userCtx)
+	reqUserPatch.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-test"})
+	reqUserPatch.Header.Set(middleware.CSRFHeaderName, "csrf-token-test")
+	reqUserPatch.Header.Set("Content-Type", "application/json")
+	wUserPatch := httptest.NewRecorder()
+	r.ServeHTTP(wUserPatch, reqUserPatch)
+	if wUserPatch.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for regular user on PATCH, got %d", wUserPatch.Code)
+	}
+
+	// 3. Admin gets 200 OK on POST
+	reqAdmin := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), strings.NewReader(`{"name":"Admin-Renamed-Server"}`)).WithContext(adminCtx)
+	reqAdmin.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-test"})
+	reqAdmin.Header.Set(middleware.CSRFHeaderName, "csrf-token-test")
+	reqAdmin.Header.Set("Content-Type", "application/json")
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin)
+	if wAdmin.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for admin rename, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
+	}
+
+	// 4. Admin gets 200 OK on PATCH
+	reqAdminPatch := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/rename", serverID), strings.NewReader(`{"name":"Admin-Patched-Server"}`)).WithContext(adminCtx)
+	reqAdminPatch.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-test"})
+	reqAdminPatch.Header.Set(middleware.CSRFHeaderName, "csrf-token-test")
+	reqAdminPatch.Header.Set("Content-Type", "application/json")
+	wAdminPatch := httptest.NewRecorder()
+	r.ServeHTTP(wAdminPatch, reqAdminPatch)
+	if wAdminPatch.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for admin patch rename, got %d (body: %s)", wAdminPatch.Code, wAdminPatch.Body.String())
 	}
 }
