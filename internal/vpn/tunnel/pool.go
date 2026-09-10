@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -35,8 +36,27 @@ func DeriveClientPublicKey(privKey string) (string, error) {
 	return health.ComputePublicKeyFromPrivate(privKey)
 }
 
-// ClientPublicKey derives the prober client's public key from the BackendTunnel's PrivateKey.
+// ClientPublicKey derives the prober client's public key from the BackendTunnel's
+// dedicated probe key (issue #43). It is the identity the health prober presents
+// to the backend and is intentionally distinct from the data device key derived
+// from PrivateKey.
 func ClientPublicKey(t *models.BackendTunnel) (string, error) {
+	if t == nil {
+		return "", errors.New("tunnel is nil")
+	}
+	if t.ProbePrivateKey != "" {
+		return health.ComputePublicKeyFromPrivate(t.ProbePrivateKey)
+	}
+	// Legacy tunnels without a probe key fall back to the data key so callers
+	// still get a usable identity; EnsureBackendProbeKeys upgrades them.
+	return health.ComputePublicKeyFromPrivate(t.PrivateKey)
+}
+
+// DataDevicePublicKey derives the backend DATA device's public key from the
+// tunnel's PrivateKey. This is the identity that must be registered on the
+// backend server with AllowedIPs covering the portal client subnet so the
+// backend accepts data traffic and routes replies back to the data device.
+func DataDevicePublicKey(t *models.BackendTunnel) (string, error) {
 	if t == nil {
 		return "", errors.New("tunnel is nil")
 	}
@@ -91,6 +111,19 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 
 	for i := range tunnels {
 		t := tunnels[i]
+		if t.ProbePrivateKey == "" {
+			// Legacy row from before the dedicated probe key existed
+			// (issue #43): backfill in memory; EnableBackend's peer
+			// registration persists it and provisions the probe peer.
+			if _, sk, err := GenerateCurve25519KeyPair(); err == nil {
+				t.ProbePrivateKey = sk
+				if p.db != nil {
+					_ = p.db.UpdateBackendTunnel(ctx, t.ID, map[string]any{
+						"probe_private_key": sk,
+					})
+				}
+			}
+		}
 		p.tunnelsByServerID[t.ServerID] = &t
 		p.tunnelsByID[t.ID] = &t
 		p.tunnelsByIfName[t.InterfaceName] = &t
@@ -126,11 +159,21 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 				existing.PrivateKey = sk
 			}
 		}
+		if existing.ProbePrivateKey == "" {
+			// Dedicated health-probe identity (issue #43): must differ from
+			// PrivateKey so the prober's socket cannot steal the data peer's
+			// return endpoint on the backend.
+			_, sk, err := GenerateCurve25519KeyPair()
+			if err == nil {
+				existing.ProbePrivateKey = sk
+			}
+		}
 		if p.db != nil {
 			_ = p.db.UpdateBackendTunnel(ctx, existing.ID, map[string]any{
-				"endpoint":    endpoint,
-				"public_key":  existing.PublicKey,
-				"private_key": existing.PrivateKey,
+				"endpoint":          endpoint,
+				"public_key":        existing.PublicKey,
+				"private_key":       existing.PrivateKey,
+				"probe_private_key": existing.ProbePrivateKey,
 			})
 		}
 		return existing, nil
@@ -153,6 +196,12 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		privKey = sk
 	}
 
+	probePrivPub, probePrivKey, err := GenerateCurve25519KeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate probe keypair: %w", err)
+	}
+	_ = probePrivPub // pub recomputed from priv via ClientPublicKey; kept for symmetry
+
 	ifName := fmt.Sprintf("awg-be-%d", serverID)
 	now := time.Now().UTC()
 
@@ -161,6 +210,7 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		InterfaceName:     ifName,
 		PublicKey:         pubKey,
 		PrivateKey:        privKey,
+		ProbePrivateKey:   probePrivKey,
 		Endpoint:          endpoint,
 		Status:            "active",
 		LastHealthCheck:   &now,
@@ -292,7 +342,15 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 	tunnel.LastHealthCheck = &now
 
 	if p.db != nil {
-		_ = p.db.UpdateBackendTunnelStatus(ctx, tunnel.ID, status, latencyMS)
+		if err := p.db.UpdateBackendTunnelStatus(ctx, tunnel.ID, status, latencyMS); err != nil {
+			// In-memory state is already updated; persist the failure so
+			// status divergence between pool and DB is observable.
+			slog.Error("failed to persist backend tunnel status",
+				"tunnel_id", tunnel.ID,
+				"server_id", tunnel.ServerID,
+				"status", status,
+				"error", err)
+		}
 	}
 
 	return nil

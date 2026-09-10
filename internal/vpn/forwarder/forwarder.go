@@ -3,6 +3,7 @@ package forwarder
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -117,6 +118,12 @@ type Forwarder struct {
 	totalTxBytes     atomic.Int64
 	dropsQueueFull   atomic.Uint64 // return packets dropped: per-route queue full
 	dropsTotal       atomic.Uint64 // return-path drops counted so far (queue full)
+	// writeErrLogUntil throttles return-path device Write-error log lines to
+	// at most one per second (issue #43: a failed dev.Write on the client
+	// queue -> client device leg, e.g. "no transport keys for peer", used to
+	// vanish silently). CAS-based on a monotonic deadline, same pattern as
+	// the endpoint listener's rejectLogUntil; safe under concurrent pumps.
+	writeErrLogUntil atomic.Int64
 	running          bool
 	stopCh           chan struct{}
 	pumpsRunning     bool
@@ -707,7 +714,18 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			f.mu.RUnlock()
 
 			if dev != nil {
-				_, _ = dev.Write(pkt)
+				if _, err := dev.Write(pkt); err != nil {
+					// Issue #43: a failing return-leg device write (e.g.
+					// "no transport keys for peer") must surface somewhere.
+					// Throttle to ~1 line/second like the queue-full drop
+					// counters; the packet itself is dropped either way.
+					now := time.Now().Unix()
+					if f.writeErrLogUntil.Load() <= now {
+						f.writeErrLogUntil.Store(now + 1)
+						log.Printf("[vpn/forwarder] return-path device write error (throttled 1/s): peer=%s session=%s: %v",
+							route.peerKey, route.sessionID, err)
+					}
+				}
 			}
 		}
 	}
