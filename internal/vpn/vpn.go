@@ -35,7 +35,15 @@ type Status struct {
 	RxBytes           int64  `json:"rx_bytes"`
 	TxBytes           int64  `json:"tx_bytes"`
 	DroppedPackets    uint64 `json:"dropped_packets"`
-	PublicEndpoint    string `json:"public_endpoint,omitempty"`
+	// Issue #39 telemetry: return-path drops inside the forwarder (queue
+	// full / total) and rejected handshake initiations at the listener.
+	// A rising forwarder_drops_total with stable traffic means a stalled
+	// downstream path; a rising handshake_rejections means client (rekey)
+	// initiations are being classified as not-a-handshake.
+	ForwarderDropsQueueFull uint64 `json:"forwarder_drops_queue_full"`
+	ForwarderDropsTotal     uint64 `json:"forwarder_drops_total"`
+	HandshakeRejections     uint64 `json:"handshake_rejections"`
+	PublicEndpoint          string `json:"public_endpoint,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -131,6 +139,11 @@ type Service struct {
 	lastLoggedDrops  atomic.Uint64
 	publicIPMu       sync.RWMutex
 	detectedPublicIP string
+	// dropLogUntil throttles the backend read loop's queue-full drop log
+	// (log-flood defense; issue #39 produced 7687 lines in 2 h). Shared
+	// across the per-backend read loops: all accesses are atomic, so the
+	// worst case is one log line per second in aggregate.
+	dropLogUntil atomic.Int64
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -888,6 +901,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		rx, tx, _ := s.forwarder.GetStats()
 		status.RxBytes = rx
 		status.TxBytes = tx
+		status.ForwarderDropsQueueFull, status.ForwarderDropsTotal = s.forwarder.DropStats()
+	}
+	if s.endpoint != nil {
+		status.HandshakeRejections = s.endpoint.HandshakeRejections()
 	}
 
 	var totalDrops uint64
@@ -1158,7 +1175,16 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			if n >= 20 && (buf[0]>>4) == 4 { // IPv4
 				destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
 				if err := s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP); err != nil {
-					log.Printf("[vpn/forwarder] dropped backend return packet to %s: %v", destIP, err)
+					// Throttle drop logs: a stalled route would otherwise
+					// produce one log line per packet (issue #39: 7687
+					// "packet queue is full" lines in 2 h). Counters are
+					// exposed via Forwarder.DropStats / the stats API, so
+					// rate-limiting the log loses no information.
+					now := time.Now().Unix()
+					if s.dropLogUntil.Load() <= now {
+						s.dropLogUntil.Store(now + 1)
+						log.Printf("[vpn/forwarder] dropped backend return packet to %s: %v", destIP, err)
+					}
 				}
 			}
 		}

@@ -219,6 +219,14 @@ type Listener struct {
 	// rejection log per second. Read/written only by the single read-loop
 	// goroutine.
 	rejectLogUntil atomic.Int64
+
+	// handshakeRejects counts inbound datagrams that failed handshake-
+	// initiation parsing AND were not transport data for an established
+	// session (handleDatagram's rejection branch). Exposed via
+	// HandshakeRejections so silent rekey rejections (issue #39 defect 2:
+	// legit rekeys rejected as "not an AWG handshake initiation") become
+	// observable in stats instead of only in throttled logs.
+	handshakeRejects atomic.Uint64
 }
 
 // NewListener initializes a new AWG endpoint listener. serverKeys provides the
@@ -617,6 +625,18 @@ func (el *Listener) IsDraining() bool {
 	return el.draining
 }
 
+// HandshakeRejections returns the number of inbound datagrams rejected by
+// handshake-initiation parsing and not consumed as transport data. It is the
+// observability signal for issue #39 defect 2: a rising count means legit
+// client (rekey) initiations are being classified as not-a-handshake. Nil
+// receiver is safe and returns 0.
+func (el *Listener) HandshakeRejections() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.handshakeRejects.Load()
+}
+
 // GetStats returns current traffic bytes and active session counts.
 func (el *Listener) GetStats() (rx int64, tx int64, active int) {
 	rx = el.rxBytes.Load()
@@ -721,6 +741,10 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		// Not a valid handshake initiation for this endpoint: transport data
 		// for an established session (or garbage). Try the transport path.
 		if !el.handleTransportData(datagram, sender) {
+			// Count every rejection that is not transport data — including
+			// too-short datagrams — so the counter reflects the true
+			// rejection volume seen on the wire (issue #39 defect 2).
+			el.handshakeRejects.Add(1)
 			if !errors.Is(err, ErrDatagramTooShort) {
 				// Throttle rejection logs: a garbage flood that fails MAC1
 				// would otherwise produce one log line per packet.
