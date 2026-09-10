@@ -515,6 +515,22 @@ type ConfirmFingerprintRequest struct {
 	Fingerprint string `json:"fingerprint"`
 }
 
+// RenameServerRequest defines server rename payload.
+type RenameServerRequest struct {
+	Name string `json:"name"`
+}
+
+func (r *RenameServerRequest) Validate() error {
+	r.Name = strings.TrimSpace(r.Name)
+	if strings.Contains(r.Name, "\x00") {
+		return errors.New("name cannot contain null bytes")
+	}
+	if r.Name == "" || len(r.Name) > 255 {
+		return errors.New("name must be between 1 and 255 characters")
+	}
+	return nil
+}
+
 // InstallProtocolRequest defines protocol deployment options on a server.
 type InstallProtocolRequest struct {
 	Protocol       string                 `json:"protocol"`

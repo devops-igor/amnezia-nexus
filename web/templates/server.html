@@ -21,7 +21,10 @@
         <div class="flex items-center gap-md">
             <div class="server-icon" style="width:56px; height:56px; font-size:1.6rem;">🖥</div>
             <div>
-                <h1 style="font-size:1.4rem; font-weight:700;">{{ .server.Name }}</h1>
+                <div class="flex items-center gap-sm">
+                    <h1 id="serverNameTitle" style="font-size:1.4rem; font-weight:700; margin:0;">{{ .server.Name }}</h1>
+                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openRenameServerModal({{ .server.ID }}, '{{ .server.Name }}')" title="{{ _ "rename_server" }}">✏️</button>
+                </div>
                 <div class="font-mono text-muted text-sm">{{ .server.Host }}:{{ .server.SSHPort }} • {{ .server.SSHUser }}</div>
             </div>
         </div>
@@ -557,6 +560,26 @@
         </div>
         <div class="modal-footer">
             <button type="button" class="btn btn-primary" onclick="closeModal('autoTrialModal')">{{ _ "done" }}</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Server Modal -->
+<div class="modal-backdrop" id="renameServerModal">
+    <div class="modal" style="max-width: 400px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "rename_server" }}</h2>
+            <button class="modal-close" onclick="closeRenameServerModal()">×</button>
+        </div>
+        <div class="form-group" style="padding: var(--space-sm) 0;">
+            <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
+            <input type="text" id="renameServerInput" class="form-input" maxlength="255"
+                   placeholder="{{ _ "rename_server_placeholder" }}"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitRenameServer();}">
+        </div>
+        <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
+            <button class="btn btn-primary" onclick="submitRenameServer()">{{ _ "save" }}</button>
+            <button class="btn btn-secondary" onclick="closeRenameServerModal()">{{ _ "cancel" }}</button>
         </div>
     </div>
 </div>
@@ -1714,6 +1737,49 @@
         } finally {
             btn.disabled = false;
             btn.textContent = _('apply_to_all');
+        }
+    }
+
+    let renameServerId = null;
+
+    function openRenameServerModal(serverId, currentName) {
+        renameServerId = serverId;
+        const titleEl = document.getElementById('serverNameTitle');
+        const name = titleEl ? titleEl.textContent.trim() : (currentName || '');
+        const input = document.getElementById('renameServerInput');
+        if (input) {
+            input.value = name;
+        }
+        openModal('renameServerModal');
+        if (input) {
+            setTimeout(() => input.focus(), 50);
+        }
+    }
+
+    function closeRenameServerModal() {
+        closeModal('renameServerModal');
+        renameServerId = null;
+    }
+
+    async function submitRenameServer() {
+        if (!renameServerId) return;
+        const input = document.getElementById('renameServerInput');
+        const newName = input ? input.value.trim() : '';
+        if (!newName) {
+            showToast(_('validation_failed') || 'Name cannot be empty', 'error');
+            return;
+        }
+        try {
+            const res = await apiCall(`/api/servers/${renameServerId}/rename`, 'POST', { name: newName });
+            showToast(_('server_renamed') || 'Server renamed', 'success');
+            closeRenameServerModal();
+            const titleEl = document.getElementById('serverNameTitle');
+            if (titleEl) {
+                titleEl.textContent = newName;
+            }
+            document.title = document.title.replace(/— .*$/, `— ${newName}`);
+        } catch (err) {
+            showToast(err.message, 'error');
         }
     }
 
