@@ -161,8 +161,7 @@ func startIdentityAWGServer(t *testing.T, serverPrivB64 string, s1 int) (net.Pac
 			if xerr != nil {
 				continue
 			}
-			var k1 []byte
-			ck, k1 = health.KDF2(ck, ss1)
+			_, k1 := health.KDF2(ck, ss1) // k1 unused: mock decrypts static only
 			aead1, aerr := chacha20poly1305.New(k1)
 			if aerr != nil {
 				continue
