@@ -38,6 +38,8 @@
   "backup_title": "备份与恢复",
   "build_container": "构建容器...",
   "cancel": "取消",
+  "confirm": "确认",
+  "confirm_action": "确认操作",
   "cannot_delete_self": "您无法删除自己的账户",
   "captcha": "验证码",
   "captcha_hint": "点击刷新验证码",

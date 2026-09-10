@@ -727,6 +727,14 @@ a:hover {
     opacity: 1;
 }
 
+.btn:hover {
+    transform: translateY(-1px);
+}
+
+.btn:active {
+    transform: translateY(0) scale(0.98);
+}
+
 .btn-primary {
     background: var(--accent-gradient);
     color: #fff;
@@ -739,7 +747,7 @@ a:hover {
 }
 
 .btn-primary:active {
-    transform: translateY(0);
+    transform: translateY(0) scale(0.98);
 }
 
 .btn-secondary {
@@ -1041,7 +1049,7 @@ button:focus-visible,
     justify-content: center;
     opacity: 0;
     visibility: hidden;
-    transition: all var(--transition-base);
+    transition: opacity var(--transition-base), visibility var(--transition-base);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
 }
@@ -1061,12 +1069,14 @@ button:focus-visible,
     overflow-y: auto;
     padding: var(--space-xl);
     box-shadow: var(--shadow-lg);
-    transform: translateY(20px) scale(0.97);
-    transition: transform var(--transition-base);
+    transform: translateY(16px) scale(0.96);
+    opacity: 0;
+    transition: transform var(--transition-base), opacity var(--transition-base);
 }
 
 .modal-backdrop.active .modal {
     transform: translateY(0) scale(1);
+    opacity: 1;
 }
 
 .modal-header {
@@ -1357,19 +1367,38 @@ button:focus-visible,
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
+    pointer-events: none;
+}
+
+[dir="rtl"] .toast-container {
+    right: auto;
+    left: var(--space-lg);
 }
 
 .toast {
-    padding: var(--space-md) var(--space-lg);
+    pointer-events: auto;
+    padding: 12px 18px;
     border-radius: var(--radius-md);
-    font-size: 0.85rem;
+    font-size: 0.875rem;
     font-weight: 500;
-    box-shadow: var(--shadow-lg);
-    animation: toast-in 0.3s ease-out;
+    box-shadow: var(--shadow-lg), 0 0 0 1px rgba(255, 255, 255, 0.05);
+    animation: toast-in 0.35s cubic-bezier(0.16, 1, 0.3, 1);
     display: flex;
     align-items: center;
     gap: var(--space-sm);
-    max-width: 400px;
+    max-width: 420px;
+    transition: opacity var(--transition-base), transform var(--transition-base);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.toast.toast-exit {
+    opacity: 0;
+    transform: translateX(100%);
+}
+
+[dir="rtl"] .toast.toast-exit {
+    transform: translateX(-100%);
 }
 
 .toast-success {
@@ -1382,6 +1411,12 @@ button:focus-visible,
     background: #2d1212;
     border: 1px solid var(--danger-border);
     color: var(--danger);
+}
+
+.toast-warning {
+    background: #2a1e0b;
+    border: 1px solid var(--warning-border);
+    color: var(--warning);
 }
 
 .toast-info {
@@ -1399,6 +1434,66 @@ button:focus-visible,
     to {
         transform: translateX(0);
         opacity: 1;
+    }
+}
+
+/* ===== Shimmer Skeletons & Loading States ===== */
+@keyframes shimmer {
+    0% {
+        background-position: -200% 0;
+    }
+    100% {
+        background-position: 200% 0;
+    }
+}
+
+.skeleton {
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.04) 25%, rgba(255, 255, 255, 0.1) 37%, rgba(255, 255, 255, 0.04) 63%);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s ease-in-out infinite;
+    border-radius: var(--radius-sm);
+}
+
+[data-theme="light"] .skeleton {
+    background: linear-gradient(90deg, rgba(0, 0, 0, 0.05) 25%, rgba(0, 0, 0, 0.12) 37%, rgba(0, 0, 0, 0.05) 63%);
+    background-size: 200% 100%;
+}
+
+.skeleton-text {
+    height: 1em;
+    border-radius: var(--radius-sm);
+    margin-bottom: var(--space-xs);
+    width: 100%;
+}
+
+.skeleton-card {
+    border-radius: var(--radius-lg);
+    min-height: 120px;
+    border: 1px solid var(--border-color);
+}
+
+.skeleton-avatar,
+.skeleton-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-full);
+    flex-shrink: 0;
+}
+
+/* ===== Micro-interactions ===== */
+.copied {
+    animation: copy-pulse 0.3s ease-in-out;
+}
+
+@keyframes copy-pulse {
+    0% {
+        transform: scale(1);
+    }
+    50% {
+        transform: scale(1.08);
+    }
+    100% {
+        transform: scale(1);
     }
 }
 
@@ -1427,10 +1522,10 @@ button:focus-visible,
     width: 40px;
     height: 100%;
     background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3));
-    animation: shimmer 1.5s infinite;
+    animation: progress-shimmer 1.5s infinite;
 }
 
-@keyframes shimmer {
+@keyframes progress-shimmer {
     0% {
         transform: translateX(-40px);
     }

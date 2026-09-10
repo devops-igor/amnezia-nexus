@@ -62,6 +62,8 @@
   "config_unavailable": "Configuration unavailable",
   "config_unavailable_desc": "This client was created via the native Amnezia app.\\nThe private key is stored only on the user's device and cannot be recovered by the server.",
   "confirm_new_password": "Confirm New Password",
+  "confirm": "Confirm",
+  "confirm_action": "Confirm Action",
   "conn_linked": "Connection linked",
   "conn_name_panel": "Connection name (in panel)",
   "connect": "Connect",
