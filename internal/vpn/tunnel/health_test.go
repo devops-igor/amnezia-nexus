@@ -26,7 +26,7 @@ func TestHealthProber(t *testing.T) {
 	var mockLatency time.Duration = 25 * time.Millisecond
 	var mockErr error = nil
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return mockLatency, mockErr
 	}
 
@@ -200,11 +200,11 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 	cfg.S1 = 15
 	cfg.S2 = 18
 
-	var capturedH1, capturedH2 uint32
+	var capturedH1, capturedH2 any
 	var capturedS1, capturedS2 int
 	var shouldFail bool
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		capturedH1, capturedH2 = h1, h2
 		capturedS1, capturedS2 = s1, s2
 		if shouldFail {
@@ -215,10 +215,11 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
 
-	// Verify resolveTunnelParams hierarchy for s1 (uses backend params)
+	// Verify resolveTunnelParams hierarchy for s1 (uses backend params).
+	// Issue #49: single-value params now arrive as degenerate HeaderRanges.
 	h1, h2, s1, s2, hpKeyResolved := prober.resolveTunnelParams(ctx, s1ID)
-	if h1 != 111111 || h2 != 222222 || s1 != 40 || s2 != 50 {
-		t.Errorf("s1 params mismatch: got (%d, %d, %d, %d), want (111111, 222222, 40, 50)", h1, h2, s1, s2)
+	if h1 != models.DegenerateHeaderRange(111111) || h2 != models.DegenerateHeaderRange(222222) || s1 != 40 || s2 != 50 {
+		t.Errorf("s1 params mismatch: got (%v, %v, %d, %d), want (111111, 222222, 40, 50)", h1, h2, s1, s2)
 	}
 	if hpKeyResolved != "" {
 		t.Errorf("s1 hpKey mismatch: got %q, want empty", hpKeyResolved)
@@ -226,8 +227,8 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 
 	// Verify resolveTunnelParams hierarchy for s2 (falls back to VPNConfig)
 	h1, h2, s1, s2, hpKeyResolved = prober.resolveTunnelParams(ctx, s2ID)
-	if h1 != 333333 || h2 != 444444 || s1 != 60 || s2 != 70 {
-		t.Errorf("s2 params mismatch: got (%d, %d, %d, %d), want (333333, 444444, 60, 70)", h1, h2, s1, s2)
+	if h1 != models.DegenerateHeaderRange(333333) || h2 != models.DegenerateHeaderRange(444444) || s1 != 60 || s2 != 70 {
+		t.Errorf("s2 params mismatch: got (%v, %v, %d, %d), want (333333, 444444, 60, 70)", h1, h2, s1, s2)
 	}
 	if hpKeyResolved != "" {
 		t.Errorf("s2 hpKey mismatch: got %q, want empty", hpKeyResolved)
@@ -242,8 +243,8 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 	if err != nil || rtt != 30 {
 		t.Fatalf("ProbeTunnel t1 failed: rtt=%d, err=%v", rtt, err)
 	}
-	if capturedH1 != 111111 || capturedH2 != 222222 || capturedS1 != 40 || capturedS2 != 50 {
-		t.Errorf("probeFn received wrong params: (%d, %d, %d, %d)", capturedH1, capturedH2, capturedS1, capturedS2)
+	if capturedH1 != models.DegenerateHeaderRange(111111) || capturedH2 != models.DegenerateHeaderRange(222222) || capturedS1 != 40 || capturedS2 != 50 {
+		t.Errorf("probeFn received wrong params: (%v, %v, %d, %d)", capturedH1, capturedH2, capturedS1, capturedS2)
 	}
 
 	// Negative test: mismatched parameters cause probe failure
@@ -306,12 +307,13 @@ func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *test
 		}
 	}
 
-	// Verify resolveTunnelParams resolves from VPNConfig (777777), NOT legacy constant 1020325451
+	// Verify resolveTunnelParams resolves from VPNConfig (777777), NOT legacy constant 1020325451.
+	// Issue #49: VPNConfig values now arrive as degenerate HeaderRanges.
 	h1, h2, s1, s2, hpKeyResolved := prober.resolveTunnelParams(ctx, sID)
-	if h1 != 777777 || h2 != 888888 || s1 != 35 || s2 != 45 {
-		t.Errorf("resolveTunnelParams mismatch: got (%d, %d, %d, %d), want (777777, 888888, 35, 45)", h1, h2, s1, s2)
+	if h1 != models.DegenerateHeaderRange(777777) || h2 != models.DegenerateHeaderRange(888888) || s1 != 35 || s2 != 45 {
+		t.Errorf("resolveTunnelParams mismatch: got (%v, %v, %d, %d), want (777777, 888888, 35, 45)", h1, h2, s1, s2)
 	}
-	if h1 == health.DefaultH1 {
+	if h1 == any(models.DegenerateHeaderRange(health.DefaultH1)) {
 		t.Errorf("resolveTunnelParams incorrectly used legacy constant %d instead of VPNConfig", health.DefaultH1)
 		if hpKeyResolved != "" {
 			t.Errorf("resolveTunnelParams hpKey mismatch: got %q, want empty", hpKeyResolved)
@@ -337,7 +339,7 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 	cfg.FailureThreshold = 3
 
 	// Mock probe function always succeeds with 15ms latency
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 15 * time.Millisecond, nil
 	}
 

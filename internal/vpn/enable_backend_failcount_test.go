@@ -32,7 +32,7 @@ func TestEnableBackendResetsHealthFailCount(t *testing.T) {
 	})
 
 	probeShouldFail := true
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		if probeShouldFail {
 			return 0, errors.New("simulated handshake timeout")
 		}

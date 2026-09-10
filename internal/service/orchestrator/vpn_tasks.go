@@ -35,7 +35,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 
 	probeFn := o.probeFn
 	if probeFn == nil {
-		probeFn = health.ProbeAWGEndpoint
+		probeFn = health.ProbeAWGEndpointRange
 	}
 
 	tunnelParams := o.resolveTunnelProbeParams(ctx, tunnels)
@@ -54,7 +54,12 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		// healthy custom-obfuscation backends being marked degraded.
 		params, ok := tunnelParams[t.ID]
 		if !ok {
-			params = resolvedProbeParams{h1: health.DefaultH1, h2: health.DefaultH2, s1: health.DefaultS1, s2: health.DefaultS2}
+			params = resolvedProbeParams{
+				h1: models.DegenerateHeaderRange(health.DefaultH1),
+				h2: models.DegenerateHeaderRange(health.DefaultH2),
+				s1: health.DefaultS1,
+				s2: health.DefaultS2,
+			}
 		}
 
 		tCopy := t
@@ -127,9 +132,11 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 }
 
 // resolvedProbeParams carries the obfuscation parameters used for a raw UDP
-// Noise IK probe against a backend tunnel.
+// Noise IK probe against a backend tunnel. h1/h2 carry models.HeaderRange
+// (full AWG 3.1 ranges, issue #49); they are typed `any` to match ProbeFunc,
+// which ProbeAWGEndpointRange accepts alongside uint32.
 type resolvedProbeParams struct {
-	h1, h2 uint32
+	h1, h2 any
 	s1, s2 int
 	hpKey  string
 }
@@ -176,22 +183,27 @@ func (o *Orchestrator) resolveTunnelProbeParams(ctx context.Context, tunnels []m
 			paramsObj = awgInfo
 		}
 
-		h1, h2, s1, s2, found := health.ExtractAWGExplicitParams(paramsObj)
+		// Issue #49: extract H1/H2 as full HeaderRanges (AWG 3.1). The
+		// previous ExtractAWGExplicitParams path truncated ranges to their
+		// lowest bound, so range-configured backends failed response
+		// verification almost always.
+		rH1, rH2, rS1, rS2 := health.ExtractAWGHeaderRanges(paramsObj, health.DefaultH1, health.DefaultH2, health.DefaultS1, health.DefaultS2)
+		_, _, _, _, found := health.ExtractAWGExplicitParams(paramsObj)
 		if !found {
 			slog.Debug("Orchestrator probe param resolution: no explicit awg_params on server, using probe defaults", "server_id", serverID)
 			continue
 		}
-		res := resolvedProbeParams{h1: h1, h2: h2, s1: s1, s2: s2, hpKey: health.ExtractHeaderProtectionKey(paramsObj)}
-		if res.h1 == 0 {
-			res.h1 = health.DefaultH1
+		res := resolvedProbeParams{h1: rH1, h2: rH2, s1: rS1, s2: rS2, hpKey: health.ExtractHeaderProtectionKey(paramsObj)}
+		if rH1.IsZero() {
+			res.h1 = models.DegenerateHeaderRange(health.DefaultH1)
 		}
-		if res.h2 == 0 {
-			res.h2 = health.DefaultH2
+		if rH2.IsZero() {
+			res.h2 = models.DegenerateHeaderRange(health.DefaultH2)
 		}
-		if res.s1 < 0 {
+		if rS1 < 0 {
 			res.s1 = health.DefaultS1
 		}
-		if res.s2 < 0 {
+		if rS2 < 0 {
 			res.s2 = health.DefaultS2
 		}
 		for _, tid := range tunnelIDs {
