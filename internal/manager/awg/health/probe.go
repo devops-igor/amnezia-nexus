@@ -461,7 +461,24 @@ func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKe
 		pskBytes, _ = DecodeKey(psk)
 	}
 
-	initPacket, state, err := BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, pskBytes, h1, s1)
+	if hpKey == "" && awgParams != nil {
+		hpKey = extractHeaderProtectionKey(awgParams)
+	}
+	var hpKeyBytes []byte
+	if hpKey != "" {
+		hpKeyBytes, err = DecodeKey(hpKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid header protection key: %w", err)
+		}
+	}
+
+	var initPacket []byte
+	var state *NoiseClientState
+	if hpKeyBytes != nil {
+		initPacket, state, err = BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, pskBytes, hpKeyBytes, h1, s1)
+	} else {
+		initPacket, state, err = BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, pskBytes, h1, s1)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +515,14 @@ func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKe
 		latencyMs = 1
 	}
 
-	if !VerifyAWGResponsePacket(buf[:n], state, h2, s2) {
+	var verified bool
+	if hpKeyBytes != nil {
+		verified = VerifyAWGResponsePacketObfuscated(buf[:n], state, hpKeyBytes, h2, s2)
+	} else {
+		verified = VerifyAWGResponsePacket(buf[:n], state, h2, s2)
+	}
+
+	if !verified {
 		return map[string]any{
 			"reachable":          false,
 			"latency_ms":         latencyMs,

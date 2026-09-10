@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -253,7 +252,7 @@ AllowedIPs = 10.8.1.2/32
 // it reports a listening port. Returns the container name (registered for
 // cleanup) and skips the test when Docker is unavailable or the image cannot
 // be pulled. Boot sequence notes live on TestAWGRealContainer_HandshakeWithPSKLessProbePeer.
-func bootAWGContainer(t *testing.T, conf string) (cName string, ctx context.Context) {
+func bootAWGContainer(t *testing.T, conf string, port int) (cName string, ctx context.Context) {
 	t.Helper()
 	if !dockerDaemonReachable() {
 		t.Skip("docker daemon unreachable — skipping real-amneziawg-go integration test")
@@ -277,6 +276,7 @@ func bootAWGContainer(t *testing.T, conf string) (cName string, ctx context.Cont
 		"--privileged",
 		"--cap-add=NET_ADMIN",
 		"--device", "/dev/net/tun",
+		"-p", fmt.Sprintf("%d:%d/udp", port, port),
 		"--entrypoint", "/bin/sh",
 		"--name", cName,
 		awgContainerImage,
@@ -361,8 +361,8 @@ func awgProbeHost() string {
 
 // TestAWGRealContainer_HandshakeWithHeaderProtectionKey is the Issue #18 R5
 // acceptance criterion: the probe's header-protection support works against a
-// REAL amneziawg-go. The server conf declares a HeaderProtectionKey (32B key,
-// base64-decoded then hex-encoded for the conf, as amneziawg expects) plus
+// REAL amneziawg-go. The server conf declares a HeaderProtectionKey (standard
+// 32-byte base64 string, as WireGuard/amneziawg-tools expects) plus
 // S1..S4 = 15 (>= 12 junk sizes the header protection constraint requires).
 // The probe is issued with the same key in the portal's base64 form — the
 // exact shape ExtractHeaderProtectionKey returns from stored awg_params — so
@@ -381,14 +381,13 @@ func TestAWGRealContainer_HandshakeWithHeaderProtectionKey(t *testing.T) {
 	serverPriv, serverPub := generateIntegrationKeypair(t)
 	proberPriv, proberPub := generateIntegrationKeypair(t)
 
-	// The header-protection key: 32 random bytes, base64 (portal/awg_params
-	// form) and hex (server conf form) of the SAME key.
+	// The header-protection key: 32 random bytes, base64-encoded as expected
+	// by WireGuard and AmneziaWG configuration files and the probe.
 	hpRaw := make([]byte, 32)
 	if _, err := rand.Read(hpRaw); err != nil {
 		t.Fatalf("rand hp key: %v", err)
 	}
 	hpKeyB64 := base64.StdEncoding.EncodeToString(hpRaw)
-	hpKeyHex := hex.EncodeToString(hpRaw)
 
 	port := freeUDPPort(t)
 
@@ -420,30 +419,42 @@ AllowedIPs = 10.8.1.2/32
 		serverPriv, port,
 		sVal, sVal, sVal, sVal,
 		DefaultH1, DefaultH2, DefaultH3, DefaultH4,
-		hpKeyHex,
+		hpKeyB64,
 		proberPub,
 	)
 
 	// The probe must consume the header-protection key in the SAME shape the
 	// reachability/tunnel probers pass it: ExtractHeaderProtectionKey over the
 	// stored awg_params object returns the base64 form.
-	awgParams := map[string]any{"header_protection_key": hpKeyB64}
+	awgParams := map[string]any{
+		"header_protection_key":        hpKeyB64,
+		"init_packet_junk_size":        sVal,
+		"response_packet_junk_size":    sVal,
+		"init_packet_magic_header":     DefaultH1,
+		"response_packet_magic_header": DefaultH2,
+	}
 	probeHPKey := ExtractHeaderProtectionKey(awgParams)
 	if probeHPKey != hpKeyB64 {
 		t.Fatalf("ExtractHeaderProtectionKey lost the hp key: got %q, want %q", probeHPKey, hpKeyB64)
 	}
 
-	_, ctx := bootAWGContainer(t, conf)
+	cName, ctx := bootAWGContainer(t, conf, port)
 
 	res, err := PerformAWGHandshake(ctx, awgProbeHost(), port, serverPub, proberPriv, "", probeHPKey, awgParams, "", probeTimeout)
 	if err != nil {
-		t.Fatalf("PerformAWGHandshake (with header protection) returned hard error: %v", err)
+		logs, _ := exec.Command("docker", "logs", cName).CombinedOutput()
+		t.Fatalf("PerformAWGHandshake (with header protection) returned hard error: %v\ncontainer logs: %s",
+			err, strings.TrimSpace(string(logs)))
 	}
 	if res["handshake_complete"] != true {
-		t.Fatalf("real amneziawg-go handshake with header protection incomplete: %+v", res)
+		logs, _ := exec.Command("docker", "logs", cName).CombinedOutput()
+		t.Fatalf("real amneziawg-go handshake with header protection incomplete: %+v\ncontainer logs: %s",
+			res, strings.TrimSpace(string(logs)))
 	}
 	if res["reachable"] != true {
-		t.Fatalf("real amneziawg-go endpoint with header protection not reachable per probe result: %+v", res)
+		logs, _ := exec.Command("docker", "logs", cName).CombinedOutput()
+		t.Fatalf("real amneziawg-go endpoint with header protection not reachable per probe result: %+v\ncontainer logs: %s",
+			res, strings.TrimSpace(string(logs)))
 	}
 	if errMsg, _ := res["error"].(string); errMsg != "" {
 		t.Fatalf("probe reported error despite completed handshake: %s (%+v)", errMsg, res)
