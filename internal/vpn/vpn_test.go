@@ -313,9 +313,12 @@ func TestVPNServiceConfigAndBackends(t *testing.T) {
 	if !strings.Contains(cfgStr, "Endpoint = ") {
 		t.Errorf("expected Endpoint directive in config: %s", cfgStr)
 	}
-	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
-		if strings.Contains(cfgStr, k+" =") || strings.Contains(cfgStr, k+"=") {
-			t.Errorf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
+	for _, line := range strings.Split(cfgStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+			if strings.HasPrefix(trimmed, k+" =") || strings.HasPrefix(trimmed, k+"=") {
+				t.Errorf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
+			}
 		}
 	}
 	if filename != "amnezia-portal-alice.conf" {
@@ -888,18 +891,10 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 		!strings.Contains(cfgStr, "S2 = 60") {
 		t.Fatalf("GenerateClientConfig did not render stored VPNConfig values: %s", cfgStr)
 	}
-	// Match config KEYS exactly: a naive strings.Contains(cfgStr, "I4=")
-	// false-positives on base64 content — a freshly generated private key
-	// whose base64 padding happens to end in "I4=" (final byte 142) failed
-	// the whole -race gate ~1 run in 256.
 	for _, line := range strings.Split(cfgStr, "\n") {
-		key, _, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
+		trimmed := strings.TrimSpace(line)
 		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
-			if key == k {
+			if strings.HasPrefix(trimmed, k+" =") || strings.HasPrefix(trimmed, k+"=") {
 				t.Fatalf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
 			}
 		}
