@@ -298,6 +298,12 @@ func TestVPNServiceConfigAndBackends(t *testing.T) {
 	if !strings.Contains(cfgStr, "[Interface]") || !strings.Contains(cfgStr, "[Peer]") {
 		t.Errorf("invalid config generated: %s", cfgStr)
 	}
+	if !strings.Contains(cfgStr, "DNS = 94.140.14.14, 94.140.15.15") {
+		t.Errorf("expected AdGuard DNS (94.140.14.14, 94.140.15.15) in client config, got:\n%s", cfgStr)
+	}
+	if strings.Contains(cfgStr, "1.1.1.1") || strings.Contains(cfgStr, "1.0.0.1") {
+		t.Errorf("client config must not contain Cloudflare DNS (1.1.1.1, 1.0.0.1), got:\n%s", cfgStr)
+	}
 	if !strings.Contains(cfgStr, "Jc =") || !strings.Contains(cfgStr, "S1 =") || !strings.Contains(cfgStr, "H1 =") {
 		t.Errorf("expected AWG obfuscation parameters in config: %s", cfgStr)
 	}
@@ -4339,5 +4345,45 @@ func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
 	}
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n2], state2, hpKeyBytes, upgradedCfg.H2, upgradedCfg.S2) {
 		t.Errorf("response verification failed for range client")
+	}
+}
+
+// TestGenerateClientConfig_DNSDefaults verifies Issue #42: GenerateClientConfig emits
+// AdGuard DNS (94.140.14.14, 94.140.15.15) instead of Cloudflare DNS (1.1.1.1, 1.0.0.1).
+func TestGenerateClientConfig_DNSDefaults(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "dns-test-user",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cfgStr, filename, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	if filename != "amnezia-portal-dns-test-user.conf" {
+		t.Errorf("unexpected filename: %s", filename)
+	}
+
+	expectedDNS := "DNS = 94.140.14.14, 94.140.15.15"
+	if !strings.Contains(cfgStr, expectedDNS) {
+		t.Errorf("GenerateClientConfig must emit %q, got:\n%s", expectedDNS, cfgStr)
+	}
+
+	for _, badDNS := range []string{"1.1.1.1", "1.0.0.1"} {
+		if strings.Contains(cfgStr, badDNS) {
+			t.Errorf("GenerateClientConfig must not contain deprecated DNS %s, config:\n%s", badDNS, cfgStr)
+		}
 	}
 }
