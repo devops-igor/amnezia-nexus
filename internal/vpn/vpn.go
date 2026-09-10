@@ -1895,8 +1895,8 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 		portalPub,
 		"", // psk
 		endpointStr,
-		"1.1.1.1",
-		"1.0.0.1",
+		awg.AWGDefaults["dns1"],
+		awg.AWGDefaults["dns2"],
 		"1420",
 		awgParams,
 		ud,
