@@ -137,28 +137,28 @@ type ListenerConfig struct {
 	IdleTimeout time.Duration
 	// HeaderProtectionKey is the AWG 3.x header protection key (hex or base64).
 	HeaderProtectionKey string
-	// H1 is the AWG handshake initiation message type; 0 selects
+	// H1 is the AWG handshake initiation message type range; zero/empty selects
 	// health.DefaultH1. Must match the AWG client parameters (JunkPacket
 	// message type) distributed to registered peers.
-	H1 int
+	H1 models.HeaderRange
 	// S1 is the junk prefix length before the initiation payload; 0 selects
 	// health.DefaultS1.
 	S1 int
-	// H2 is the AWG handshake response message type; 0 selects
+	// H2 is the AWG handshake response message type range; zero/empty selects
 	// health.DefaultH2.
-	H2 int
+	H2 models.HeaderRange
 	// S2 is the junk prefix length before the response payload; 0 selects
 	// health.DefaultS2.
 	S2 int
-	// H3 is the AWG underload / cookie reply message type; 0 selects
+	// H3 is the AWG underload / cookie reply message type range; zero/empty selects
 	// health.DefaultH3.
-	H3 int
+	H3 models.HeaderRange
 	// S3 is the junk prefix length for cookie reply packets; 0 selects
 	// health.DefaultS3.
 	S3 int
-	// H4 is the AWG transport-data message type; 0 selects
+	// H4 is the AWG transport-data message type range; zero/empty selects
 	// health.DefaultH4.
-	H4 int
+	H4 models.HeaderRange
 	// S4 is the junk padding length before the transport encrypted payload; 0 selects
 	// health.DefaultS4.
 	S4 int
@@ -237,30 +237,26 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 3 * time.Minute
 	}
-	if cfg.H1 == 0 {
-		// #nosec G115 -- constant conversion, value fits in int.
-		cfg.H1 = int(health.DefaultH1)
+	if cfg.H1.IsZero() {
+		cfg.H1 = models.DegenerateHeaderRange(health.DefaultH1)
 	}
 	if cfg.S1 == 0 {
 		cfg.S1 = health.DefaultS1
 	}
-	if cfg.H2 == 0 {
-		// #nosec G115 -- constant conversion, value fits in int.
-		cfg.H2 = int(health.DefaultH2)
+	if cfg.H2.IsZero() {
+		cfg.H2 = models.DegenerateHeaderRange(health.DefaultH2)
 	}
 	if cfg.S2 == 0 {
 		cfg.S2 = health.DefaultS2
 	}
-	if cfg.H3 == 0 {
-		// #nosec G115 -- constant conversion, value fits in int.
-		cfg.H3 = int(health.DefaultH3)
+	if cfg.H3.IsZero() {
+		cfg.H3 = models.DegenerateHeaderRange(health.DefaultH3)
 	}
 	if cfg.S3 == 0 {
 		cfg.S3 = health.DefaultS3
 	}
-	if cfg.H4 == 0 {
-		// #nosec G115 -- constant conversion, value fits in int.
-		cfg.H4 = int(health.DefaultH4)
+	if cfg.H4.IsZero() {
+		cfg.H4 = models.DegenerateHeaderRange(health.DefaultH4)
 	}
 	if cfg.S4 == 0 {
 		cfg.S4 = health.DefaultS4
@@ -350,17 +346,68 @@ func (el *Listener) SetPacketDevice(dev PacketDevice) {
 // race with packet processing. The VPN service enforces that contract by
 // propagating parameter changes to idle listeners and rejecting them while
 // the listener runs.
-func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 uint32, s1, s2, s3, s4 int) {
+func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 any, s1, s2, s3, s4 int) error {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	el.config.H1 = int(h1)
-	el.config.H2 = int(h2)
-	el.config.H3 = int(h3)
-	el.config.H4 = int(h4)
+	if el.running {
+		return errors.New("cannot update obfuscation parameters while listener is running")
+	}
+
+	hr1, err := models.ParseHeaderRange(h1)
+	if err != nil {
+		return fmt.Errorf("invalid H1: %w", err)
+	}
+	hr2, err := models.ParseHeaderRange(h2)
+	if err != nil {
+		return fmt.Errorf("invalid H2: %w", err)
+	}
+	hr3, err := models.ParseHeaderRange(h3)
+	if err != nil {
+		return fmt.Errorf("invalid H3: %w", err)
+	}
+	hr4, err := models.ParseHeaderRange(h4)
+	if err != nil {
+		return fmt.Errorf("invalid H4: %w", err)
+	}
+
+	if hr1.IsZero() {
+		hr1 = models.DegenerateHeaderRange(health.DefaultH1)
+	}
+	if hr2.IsZero() {
+		hr2 = models.DegenerateHeaderRange(health.DefaultH2)
+	}
+	if hr3.IsZero() {
+		hr3 = models.DegenerateHeaderRange(health.DefaultH3)
+	}
+	if hr4.IsZero() {
+		hr4 = models.DegenerateHeaderRange(health.DefaultH4)
+	}
+
+	// Clamp S values to at least 12 when HP is active
+	if len(el.hpKey) == 32 {
+		if s1 < health.HeaderCipherNonceSize {
+			s1 = health.HeaderCipherNonceSize
+		}
+		if s2 < health.HeaderCipherNonceSize {
+			s2 = health.HeaderCipherNonceSize
+		}
+		if s3 < health.HeaderCipherNonceSize {
+			s3 = health.HeaderCipherNonceSize
+		}
+		if s4 < health.HeaderCipherNonceSize {
+			s4 = health.HeaderCipherNonceSize
+		}
+	}
+
+	el.config.H1 = hr1
+	el.config.H2 = hr2
+	el.config.H3 = hr3
+	el.config.H4 = hr4
 	el.config.S1 = s1
 	el.config.S2 = s2
 	el.config.S3 = s3
 	el.config.S4 = s4
+	return nil
 }
 
 // UpdateHeaderProtectionKey updates the AWG header protection key in the
@@ -368,6 +415,9 @@ func (el *Listener) UpdateObfuscation(h1, h2, h3, h4 uint32, s1, s2, s3, s4 int)
 func (el *Listener) UpdateHeaderProtectionKey(hpKey string) error {
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	if el.running {
+		return errors.New("cannot update header protection key while listener is running")
+	}
 	el.config.HeaderProtectionKey = hpKey
 	if hpKey == "" {
 		el.hpKey = nil
@@ -378,6 +428,19 @@ func (el *Listener) UpdateHeaderProtectionKey(hpKey string) error {
 		return fmt.Errorf("failed to decode header protection key: %w", err)
 	}
 	el.hpKey = keyBytes
+	// Clamp S values to at least 12 when HP is active
+	if el.config.S1 < health.HeaderCipherNonceSize {
+		el.config.S1 = health.HeaderCipherNonceSize
+	}
+	if el.config.S2 < health.HeaderCipherNonceSize {
+		el.config.S2 = health.HeaderCipherNonceSize
+	}
+	if el.config.S3 < health.HeaderCipherNonceSize {
+		el.config.S3 = health.HeaderCipherNonceSize
+	}
+	if el.config.S4 < health.HeaderCipherNonceSize {
+		el.config.S4 = health.HeaderCipherNonceSize
+	}
 	return nil
 }
 
@@ -653,7 +716,7 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	info, err := ParseInitiation(serverPriv, datagram, uint32(el.config.H1), el.config.S1, el.hpKey) // #nosec G115 -- bounded AWG message-type constant
+	info, err := ParseInitiation(serverPriv, datagram, el.config.H1, el.config.S1, el.hpKey)
 	if err != nil {
 		// Not a valid handshake initiation for this endpoint: transport data
 		// for an established session (or garbage). Try the transport path.
@@ -694,7 +757,7 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	resp, transportKeys, err := BuildResponse(serverPriv, info, uint32(el.config.H2), el.config.S2, el.hpKey) // #nosec G115 -- bounded AWG message-type constant
+	resp, transportKeys, err := BuildResponse(serverPriv, info, el.config.H2, el.config.S2, el.hpKey)
 	if err != nil {
 		log.Printf("[vpn/endpoint] failed to build handshake response for peer %s: %v", peerKey, err)
 		return
@@ -769,10 +832,9 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	if s4 < 0 {
 		s4 = 0
 	}
-	h4 := health.DefaultH4
-	if el.config.H4 > 0 {
-		// #nosec G115 -- H4 is positive int, fits in uint32.
-		h4 = uint32(el.config.H4)
+	h4 := el.config.H4
+	if h4.IsZero() {
+		h4 = models.DegenerateHeaderRange(health.DefaultH4)
 	}
 
 	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
@@ -822,7 +884,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 
 // decryptTransportPayload attempts Header Protection unmasking and AEAD decryption,
 // falling back to plaintext H4 matching if HP unmasking does not match or fails.
-func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 uint32) ([]byte, error) {
+func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) ([]byte, error) {
 	var packet []byte
 	var decErr error
 
@@ -834,7 +896,7 @@ func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, 
 			var hdr [transportDataHeaderLen]byte
 			copy(hdr[:], payload[:transportDataHeaderLen])
 			cip.XORKeyStream(hdr[:], hdr[:])
-			if binary.LittleEndian.Uint32(hdr[0:4]) == h4 {
+			if h4.Contains(binary.LittleEndian.Uint32(hdr[0:4])) {
 				counter := binary.LittleEndian.Uint64(hdr[8:16])
 				var nonce [chacha20poly1305.NonceSize]byte
 				binary.LittleEndian.PutUint64(nonce[4:12], counter)
@@ -847,7 +909,7 @@ func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, 
 	// or unmasked AEAD decryption failed, check if plaintext header matches H4.
 	if packet == nil {
 		plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
-		if plainMsgType == h4 {
+		if h4.Contains(plainMsgType) {
 			counter := binary.LittleEndian.Uint64(payload[8:16])
 			var nonce [chacha20poly1305.NonceSize]byte
 			binary.LittleEndian.PutUint64(nonce[4:12], counter)
@@ -923,10 +985,9 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	if s4 < 0 {
 		s4 = 0
 	}
-	h4 := health.DefaultH4
-	if el.config.H4 > 0 {
-		// #nosec G115 -- H4 is positive int, fits in uint32.
-		h4 = uint32(el.config.H4)
+	h4Val := el.config.H4.PickOne()
+	if h4Val == 0 {
+		h4Val = health.DefaultH4
 	}
 
 	msg := make([]byte, s4, s4+transportDataHeaderLen+len(packet)+chacha20poly1305.Overhead)
@@ -946,7 +1007,7 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	receiverIdx := st.receiverIdx.Load()
 
 	var hdr [transportDataHeaderLen]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], h4) // AWG H4 transport data
+	binary.LittleEndian.PutUint32(hdr[0:4], h4Val) // AWG H4 transport data
 	binary.LittleEndian.PutUint32(hdr[4:8], receiverIdx)
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 	msg = append(msg, hdr[:]...)
