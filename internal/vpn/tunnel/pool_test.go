@@ -203,3 +203,105 @@ func TestTunnelPoolStatusAndConnections(t *testing.T) {
 		t.Errorf("expected ErrPoolClosed on closed pool, got %v", err)
 	}
 }
+
+// TestProbeKeySeparationFromDataKey is the issue-#43 pool-level invariant:
+// the dedicated probe identity must differ from the data device identity for
+// every tunnel, and ClientPublicKey/DataDevicePublicKey must derive them from
+// the corresponding private keys.
+func TestProbeKeySeparationFromDataKey(t *testing.T) {
+	priv := "W5vHyr9JHfc+7H5cRgeNSA4XaWKY9zpaBAIu67DJmWU="
+	tun := &models.BackendTunnel{
+		PrivateKey:      priv,
+		ProbePrivateKey: priv, // legacy collision — must be detected
+	}
+
+	probePub, err := ClientPublicKey(tun)
+	if err != nil {
+		t.Fatalf("ClientPublicKey failed: %v", err)
+	}
+	dataPub, err := DataDevicePublicKey(tun)
+	if err != nil {
+		t.Fatalf("DataDevicePublicKey failed: %v", err)
+	}
+	if probePub != dataPub {
+		t.Fatalf("expected identical derivation for identical keys, got %s vs %s", probePub, dataPub)
+	}
+
+	// Now a properly separated tunnel: identities must diverge.
+	pub, sk, err := GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("GenerateCurve25519KeyPair failed: %v", err)
+	}
+	tun.ProbePrivateKey = sk
+	probePub, err = ClientPublicKey(tun)
+	if err != nil {
+		t.Fatalf("ClientPublicKey failed: %v", err)
+	}
+	if probePub != pub {
+		t.Errorf("ClientPublicKey = %s, want derive(ProbePrivateKey) = %s", probePub, pub)
+	}
+	dataPub, err = DataDevicePublicKey(tun)
+	if err != nil {
+		t.Fatalf("DataDevicePublicKey failed: %v", err)
+	}
+	if probePub == dataPub {
+		t.Error("probe identity must differ from data identity when keys differ")
+	}
+	if probePub == priv || dataPub == priv {
+		t.Error("derived public keys must never equal a private key")
+	}
+}
+
+// TestProbeKeySurvivesAddTunnelAndSyncRoundTrip proves the dedicated probe key
+// survives the full persistence cycle (issue #43): AddTunnel generates it,
+// UpdateBackendTunnel encrypts it at rest (Fernet), and a fresh pool's
+// SyncFromDB decrypts back to the exact same key — not a regeneration.
+func TestProbeKeySurvivesAddTunnelAndSyncRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "probe-rt-server", Host: "203.0.113.9"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "203.0.113.9:51820", "server-pub")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+	if tun.ProbePrivateKey == "" {
+		t.Fatal("AddTunnel must generate a dedicated probe private key")
+	}
+	if tun.ProbePrivateKey == tun.PrivateKey {
+		t.Fatal("probe key must differ from data private key at creation")
+	}
+	probeKeyAtCreation := tun.ProbePrivateKey
+
+	// Simulate an EnableBackend-on-existing round: AddTunnel again for the
+	// same server must keep the tunnel AND its probe key stable.
+	tun2, err := pool.AddTunnel(ctx, sID, "203.0.113.9:51820", "server-pub")
+	if err != nil {
+		t.Fatalf("second AddTunnel failed: %v", err)
+	}
+	if tun2.ProbePrivateKey != probeKeyAtCreation {
+		t.Error("AddTunnel on existing tunnel must not rotate the probe key")
+	}
+
+	// AddTunnel persists probe_private_key; a fresh pool must decrypt the
+	// exact same key back from the DB (Fernet round-trip, no regeneration).
+	freshPool := NewPool(db)
+	if err := freshPool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+	restored, err := freshPool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel on fresh pool failed: %v", err)
+	}
+	if restored.ProbePrivateKey != probeKeyAtCreation {
+		t.Errorf("probe key not stable across DB round-trip:\n  at creation: %s\n  after sync:  %s", probeKeyAtCreation, restored.ProbePrivateKey)
+	}
+	if restored.ProbePrivateKey == restored.PrivateKey {
+		t.Error("restored probe key must still differ from the data private key")
+	}
+}

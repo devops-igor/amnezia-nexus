@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -11,6 +12,10 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
+
+// ErrTunnelDisabled is returned when an operation is refused because the
+// tunnel is administratively disabled.
+var ErrTunnelDisabled = errors.New("tunnel is administratively disabled")
 
 // ProbeFunc is a function type for executing Noise IK handshake probes to a UDP endpoint.
 type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
@@ -200,18 +205,36 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 }
 
 // ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
+// Administratively disabled tunnels are never probed and never have their status written:
+// a healthy handshake would otherwise resurrect the tunnel (status write + onActiveHook
+// device re-attach) and steer live sessions onto a blackhole, which is the root cause of
+// issues #28/#43.
 func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
 	}
+	if tunnel.Status == "disabled" {
+		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", tunnel.ID, "server_id", tunnel.ServerID)
+		return 0, ErrTunnelDisabled
+	}
 
 	h1, h2, s1, s2, hpKey := hp.resolveTunnelParams(ctx, tunnel.ServerID)
+
+	// Issue #43: probe from the tunnel's DEDICATED probe key, not the data
+	// device key. The backend roams a peer's return endpoint to whichever
+	// socket sent last; a probe sharing the data identity would redirect all
+	// return traffic to the ephemeral prober socket, starving the data device.
+	probePrivKey := tunnel.ProbePrivateKey
+	if probePrivKey == "" {
+		// Legacy tunnel not yet upgraded by EnsureBackendProbeKeys.
+		probePrivKey = tunnel.PrivateKey
+	}
 
 	rtt, err := hp.probeFn(
 		ctx,
 		tunnel.Endpoint,
 		tunnel.PublicKey,
-		tunnel.PrivateKey,
+		probePrivKey,
 		"",
 		hpKey,
 		h1,
@@ -297,6 +320,11 @@ func (hp *HealthProber) ProbeAll(ctx context.Context) map[int64]error {
 	var wg sync.WaitGroup
 
 	for _, t := range tunnels {
+		if t.Status == "disabled" {
+			// Administratively disabled tunnels are excluded from health
+			// probing entirely: probing them can only resurrect them.
+			continue
+		}
 		tunnel := t
 		wg.Add(1)
 		go func() {
