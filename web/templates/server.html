@@ -8,6 +8,40 @@
         flex-wrap: nowrap !important;
         gap: var(--space-xs) !important;
         align-items: center;
+        justify-content: flex-end;
+    }
+    .nav-tab {
+        background: none;
+        border: none;
+        padding: 10px 16px;
+        font-size: 0.95rem;
+        color: var(--text-muted);
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        font-weight: 500;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        transition: var(--transition-fast);
+    }
+    .nav-tab:hover {
+        color: var(--text-primary);
+    }
+    .nav-tab.active {
+        color: var(--text-primary);
+        border-bottom-color: var(--accent);
+        font-weight: 600;
+    }
+    .conn-name-cell {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+    }
+    .traffic-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 0.8rem;
     }
 </style>
 {{ end }}
@@ -19,11 +53,15 @@
 <div class="card" style="margin-bottom: var(--space-xl);">
     <div class="flex items-center justify-between" style="flex-wrap: wrap; gap: var(--space-md);">
         <div class="flex items-center gap-md">
-            <div class="server-icon" style="width:56px; height:56px; font-size:1.6rem;">🖥</div>
+            <div class="server-icon" style="width:56px; height:56px;">
+                <svg class="icon" style="width:28px;height:28px;color:#fff;"><use href="#icon-server"></use></svg>
+            </div>
             <div>
                 <div class="flex items-center gap-sm">
                     <h1 id="serverNameTitle" style="font-size:1.4rem; font-weight:700; margin:0;">{{ .server.Name }}</h1>
-                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openRenameServerModal({{ .server.ID }}, '{{ .server.Name }}')" title="{{ _ "rename_server" }}">✏️</button>
+                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openRenameServerModal({{ .server.ID }}, '{{ .server.Name }}')" title="{{ _ "rename_server" }}">
+                        <svg class="icon"><use href="#icon-pencil"></use></svg>
+                    </button>
                 </div>
                 <div class="font-mono text-muted text-sm">{{ .server.Host }}:{{ .server.SSHPort }} • {{ .server.SSHUser }}</div>
             </div>
@@ -31,6 +69,7 @@
         <div class="flex gap-sm items-center">
             <div class="flex gap-sm items-center" id="serverStats" style="display:none;"></div>
             <button class="btn btn-secondary btn-sm" onclick="checkServer()" id="checkBtn">
+                <svg class="icon" id="checkIcon"><use href="#icon-refresh"></use></svg>
                 <span id="checkBtnText">{{ _ "server_check" }}</span>
                 <div class="spinner hidden" id="checkSpinner"></div>
             </button>
@@ -44,21 +83,31 @@
     <div id="networkHealthWidget" class="mt-md" style="padding-top: var(--space-sm); border-top: 1px solid var(--border-color, rgba(255,255,255,0.08));">
         <div class="flex items-center justify-between" style="flex-wrap: wrap; gap: var(--space-sm);">
             <div class="flex items-center gap-sm">
-                <span style="font-size: 1rem;">📡</span>
+                <svg class="icon" style="width:16px;height:16px;color:var(--text-muted);"><use href="#icon-activity"></use></svg>
                 <span style="font-size: 0.8125rem; font-weight: 600; color: var(--text-muted, #94a3b8);">{{ _ "server_status" }}:</span>
                 <span id="reachabilityOverallBadge">
                     {{ if .reachability }}
                     {{ if .reachability.Reachable }}
-                    <span class="badge badge-success" style="font-size: 0.7rem; padding: 2px 6px;">
+                    {{ if ge .reachability.LatencyMs 150 }}
+                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;">
+                        <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
+                    </span>
+                    {{ else if ge .reachability.LatencyMs 50 }}
+                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;">
                         <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
                     </span>
                     {{ else }}
-                    <span class="badge badge-danger" style="font-size: 0.7rem; padding: 2px 6px;">
+                    <span class="badge badge-success" style="font-size: 0.75rem; padding: 2px 8px;">
+                        <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
+                    </span>
+                    {{ end }}
+                    {{ else }}
+                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;">
                         <span class="badge-dot"></span> {{ _ "unreachable" }}
                     </span>
                     {{ end }}
                     {{ else }}
-                    <span class="badge badge-warn" style="font-size: 0.7rem; padding: 2px 6px;">
+                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;">
                         <span class="badge-dot"></span> {{ _ "pending" }}
                     </span>
                     {{ end }}
@@ -75,19 +124,16 @@
 <!-- Protocol Installation Section -->
 <div class="flex items-center gap-md"
     style="margin-bottom: var(--space-xl); border-bottom: 1px solid var(--border-color); padding-bottom: 2px;">
-    <button class="nav-tab active" id="tab-protocols" onclick="switchCategory('protocols')"
-        style="background: none; border: none; padding: 10px 16px; font-size: 1rem; color: var(--text-primary); cursor: pointer; border-bottom: 2px solid var(--accent); font-weight: 600;">
-        <span class="icon">🔐</span> {{ _ "protocols" }} <span id="protocols-count"
-            style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/2</span>
+    <button class="nav-tab active" id="tab-protocols" onclick="switchCategory('protocols')">
+        <svg class="icon"><use href="#icon-shield"></use></svg> {{ _ "protocols" }}
+        <span id="protocols-count" style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/2</span>
     </button>
-    <button class="nav-tab" id="tab-services" onclick="switchCategory('services')"
-        style="background: none; border: none; padding: 10px 16px; font-size: 1rem; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent;">
-        <span class="icon">🛠</span> {{ _ "services" }} <span id="services-count"
-            style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/1</span>
+    <button class="nav-tab" id="tab-services" onclick="switchCategory('services')">
+        <svg class="icon"><use href="#icon-network"></use></svg> {{ _ "services" }}
+        <span id="services-count" style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/1</span>
     </button>
-    <button class="nav-tab" id="tab-management" onclick="switchCategory('management')"
-        style="background: none; border: none; padding: 10px 16px; font-size: 1rem; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent;">
-        <span class="icon">⚙️</span> {{ _ "management" }}
+    <button class="nav-tab" id="tab-management" onclick="switchCategory('management')">
+        <svg class="icon"><use href="#icon-settings"></use></svg> {{ _ "management" }}
     </button>
 </div>
 
@@ -95,7 +141,9 @@
     <!-- AmneziaWG Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">✨</div>
+            <div class="protocol-icon">
+                <svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-shield"></use></svg>
+            </div>
             <div class="flex gap-sm" id="awg-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">AmneziaWG</div>
@@ -120,7 +168,9 @@
     <!-- MTProxyL Card -->
     <div class="card card-hover protocol-card protocol-telemt" id="proto-telemt">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">✈</div>
+            <div class="protocol-icon">
+                <svg class="icon" style="width:24px;height:24px;color:var(--info);"><use href="#icon-network"></use></svg>
+            </div>
             <div class="flex gap-sm" id="telemt-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">MTProxyL (Telegram Proxy)</div>
@@ -146,7 +196,9 @@
     <!-- DNS Card -->
     <div class="card card-hover protocol-card protocol-dns" id="proto-dns">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">🔍</div>
+            <div class="protocol-icon">
+                <svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-search"></use></svg>
+            </div>
             <div class="flex gap-sm" id="dns-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">AmneziaDNS</div>
@@ -176,16 +228,16 @@
         </div>
         <div class="flex" style="flex-direction: column; gap: var(--space-sm);">
             <button class="btn btn-secondary" onclick="checkServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <span style="font-size: 1.2rem; margin-right: 8px;">🔄</span> {{ _ "check_server_services" }}
+                <svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "check_server_services" }}
             </button>
             <button class="btn btn-secondary" onclick="rebootServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <span style="font-size: 1.2rem; margin-right: 8px;">♻️</span> {{ _ "reboot_server" }}
+                <svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "reboot_server" }}
             </button>
             <button class="btn btn-danger" onclick="clearServer()" style="justify-content: flex-start; padding: 12px 20px; background: rgba(239, 68, 68, 0.05);">
-                <span style="font-size: 1.2rem; margin-right: 8px;">🗑️</span> {{ _ "clear_server" }}
+                <svg class="icon" style="margin-right: 8px;"><use href="#icon-trash"></use></svg> {{ _ "clear_server" }}
             </button>
             <button class="btn btn-danger" onclick="removeServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <span style="font-size: 1.2rem; margin-right: 8px;">❌</span> {{ _ "remove_server" }}
+                <svg class="icon" style="margin-right: 8px;"><use href="#icon-x"></use></svg> {{ _ "remove_server" }}
             </button>
         </div>
     </div>
@@ -232,11 +284,11 @@
     </div>
 </div>
 
-<!-- Connections Section (renamed from Clients) -->
+<!-- Connections Section -->
 <div class="clients-section" id="connectionsSection" style="display:none;">
     <div class="clients-header">
         <h2 class="section-title" style="margin-bottom:0;">
-            <span class="icon">🔗</span>
+            <svg class="icon"><use href="#icon-network"></use></svg>
             {{ _ "connections" }}
         </h2>
         <div class="flex gap-sm items-center">
@@ -246,7 +298,7 @@
                 <option value="telemt">MTProxyL</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="openAddConnectionModal()">
-                <span>＋</span> {{ _ "add" }}
+                <svg class="icon"><use href="#icon-plus"></use></svg> {{ _ "add" }}
             </button>
         </div>
     </div>
@@ -257,11 +309,26 @@
             <span>{{ _ "loading_connections" }}</span>
         </div>
         <div id="connectionsEmpty" class="empty-state hidden" style="padding: var(--space-xl) 0;">
-            <div class="empty-icon">🔗</div>
+            <div class="empty-icon"><svg class="icon" style="width:40px;height:40px;"><use href="#icon-network"></use></svg></div>
             <div class="empty-title">{{ _ "no_connections" }}</div>
             <div class="empty-desc">{{ _ "no_connections_desc" }}</div>
         </div>
-        <div class="clients-list" id="connectionsListInner"></div>
+        <div class="table-container" id="connectionsTableContainer" style="display:none;">
+            <table class="table interactive-table" id="connectionsTable">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort-type="string">{{ _ "name" }}</th>
+                        <th class="sortable" data-sort-type="string">IP / Endpoint</th>
+                        <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
+                        <th class="sortable" data-sort-type="bytes">Rx / Tx</th>
+                        <th class="sortable" data-sort-type="numeric">{{ _ "speed_limit_down" }}</th>
+                        <th data-sortable="false" style="text-align: right;">{{ _ "actions" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="connectionsTableBody">
+                </tbody>
+            </table>
+        </div>
     </div>
 </div>
 
@@ -270,7 +337,9 @@
     <div class="modal">
         <div class="modal-header">
             <h2 class="modal-title" id="installModalTitle">{{ _ "install_protocol" }}</h2>
-            <button class="modal-close" onclick="closeModal('installModal')">×</button>
+            <button class="modal-close" onclick="closeModal('installModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
 
         <div id="installForm">
@@ -352,7 +421,9 @@
     <div class="modal">
         <div class="modal-header">
             <h2 class="modal-title" id="addConnectionModalTitle">{{ _ "add_connection" }}</h2>
-            <button class="modal-close" onclick="closeModal('addConnectionModal')">×</button>
+            <button class="modal-close" onclick="closeModal('addConnectionModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
 
         <div class="form-group" id="connectionNameGroup">
@@ -432,7 +503,9 @@
     <div class="modal" style="max-width: 400px;">
         <div class="modal-header">
             <h2 class="modal-title">{{ _ "edit_speed_limit" }}</h2>
-            <button class="modal-close" onclick="closeModal('editSpeedLimitModal')">×</button>
+            <button class="modal-close" onclick="closeModal('editSpeedLimitModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
         <div style="padding: var(--space-md) 0;">
             <div class="form-group">
@@ -459,7 +532,9 @@
     <div class="modal" style="max-width: 600px;">
         <div class="modal-header">
             <h2 class="modal-title" id="configModalTitle">{{ _ "config" }}</h2>
-            <button class="modal-close" onclick="closeModal('configModal')">×</button>
+            <button class="modal-close" onclick="closeModal('configModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
 
         <!-- Tabs -->
@@ -475,12 +550,12 @@
             <div class="config-display">
                 <div class="config-text" id="configText"></div>
                 <div class="config-actions">
-                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentConfig)" style="flex:1">
-                        {{ _ "copy" }}
+                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
+                        <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
                     </button>
                     <button class="btn btn-primary btn-sm"
-                        onclick="downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
-                        {{ _ "download_conf" }}
+                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
                     </button>
                 </div>
             </div>
@@ -496,8 +571,8 @@
         <div class="config-panel" id="panel-vpn">
             <div class="vpn-link-box" id="vpnLinkText"></div>
             <div class="config-actions" style="margin-top: var(--space-sm);">
-                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentVpnLink)" style="flex:1">
-                    {{ _ "copy_key" }}
+                <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentVpnLink, this)" style="flex:1">
+                    <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_key" }}
                 </button>
             </div>
             <div class="form-hint" style="margin-top: var(--space-sm);">
@@ -510,6 +585,14 @@
             <div class="qr-container">
                 <div id="qrCode"></div>
                 <div class="qr-hint" id="qrHint">{{ _ "qr_hint" }}</div>
+                <div class="config-actions" style="margin-top: var(--space-md); width: 100%; max-width: 280px;">
+                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
+                        <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
+                    </button>
+                    <button class="btn btn-primary btn-sm" onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -520,7 +603,9 @@
     <div class="modal" style="max-width:680px;">
         <div class="modal-header">
             <h2 class="modal-title" id="serverConfigModalTitle">{{ _ "server_config" }}</h2>
-            <button class="modal-close" onclick="closeModal('serverConfigModal')">×</button>
+            <button class="modal-close" onclick="closeModal('serverConfigModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
         <div class="config-display" style="margin-top:var(--space-md);">
             <input type="hidden" id="serverConfigProto" value="" />
@@ -528,13 +613,13 @@
                 style="width:100%; height:40vh; resize:vertical; font-family:monospace; white-space:pre; padding:var(--space-sm);"></textarea>
             <div class="config-actions" style="margin-top:var(--space-sm);">
                 <button class="btn btn-secondary btn-sm"
-                    onclick="copyToClipboard(document.getElementById('serverConfigText').value)" style="flex:1">
-                    {{ _ "copy" }}
+                    onclick="UI.copy(document.getElementById('serverConfigText').value, this)" style="flex:1">
+                    <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
                 </button>
                 <button class="btn btn-secondary btn-sm"
-                    onclick="downloadFile(document.getElementById('serverConfigText').value, serverConfigFilename)"
+                    onclick="UI.downloadFile(document.getElementById('serverConfigText').value, serverConfigFilename)"
                     style="flex:1">
-                    {{ _ "download" }}
+                    <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }}
                 </button>
                 <button class="btn btn-primary btn-sm" onclick="saveServerConfig()" style="flex:1"
                     id="saveServerConfigBtn">
@@ -549,8 +634,13 @@
 <div class="modal-backdrop" id="autoTrialModal">
     <div class="modal" style="max-width: 600px;">
         <div class="modal-header">
-            <h2 class="modal-title" id="autoTrialModalTitle">🎯 {{ _ "start_auto_trial" }}</h2>
-            <button class="modal-close" onclick="closeModal('autoTrialModal')">×</button>
+            <h2 class="modal-title" id="autoTrialModalTitle">
+                <svg class="icon" style="margin-right:6px;"><use href="#icon-shield"></use></svg>
+                {{ _ "start_auto_trial" }}
+            </h2>
+            <button class="modal-close" onclick="closeModal('autoTrialModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
         <div style="margin-bottom: var(--space-md);">
             <div class="form-hint" style="margin-bottom: var(--space-md);">
@@ -568,8 +658,13 @@
 <div class="modal-backdrop" id="renameServerModal">
     <div class="modal" style="max-width: 400px;">
         <div class="modal-header">
-            <h2 class="modal-title">{{ _ "rename_server" }}</h2>
-            <button class="modal-close" onclick="closeRenameServerModal()">×</button>
+            <h2 class="modal-title">
+                <svg class="icon"><use href="#icon-pencil"></use></svg>
+                {{ _ "rename_server" }}
+            </h2>
+            <button class="modal-close" onclick="closeRenameServerModal()" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
@@ -593,34 +688,26 @@
     let currentVpnLink = '';
     let currentConfigName = 'connection';
     let installedProtocols = {};
+    let connectionsTableInstance = null;
 
     function switchCategory(cat) {
         const grids = ['protocols-grid', 'services-grid', 'management-grid'];
         const tabs = ['tab-protocols', 'tab-services', 'tab-management'];
         
         grids.forEach(g => {
-            if (document.getElementById(g)) document.getElementById(g).classList.add('hidden');
+            const el = document.getElementById(g);
+            if (el) el.classList.add('hidden');
         });
         tabs.forEach(t => {
             const el = document.getElementById(t);
-            if (el) {
-                el.classList.remove('active');
-                el.style.borderBottomColor = 'transparent';
-                el.style.color = 'var(--text-muted)';
-                el.style.fontWeight = '400';
-            }
+            if (el) el.classList.remove('active');
         });
 
         const activeGrid = document.getElementById(cat + '-grid');
         const activeTab = document.getElementById('tab-' + cat);
         
         if (activeGrid) activeGrid.classList.remove('hidden');
-        if (activeTab) {
-            activeTab.classList.add('active');
-            activeTab.style.borderBottomColor = 'var(--accent)';
-            activeTab.style.color = 'var(--text-primary)';
-            activeTab.style.fontWeight = '600';
-        }
+        if (activeTab) activeTab.classList.add('active');
     }
 
     function getProtoTitle(proto) {
@@ -635,14 +722,15 @@
     // ========== Server Stats ==========
     async function loadServerStats() {
         try {
-            const stats = await apiCall(`/api/servers/${SERVER_ID}/stats`, 'POST');
+            const stats = await API.post(`/api/servers/${SERVER_ID}/stats`, null, { silent: true });
             const el = document.getElementById('serverStats');
+            if (!el) return;
             el.style.display = '';
             el.innerHTML = `
-                <span class="stat-pill" title="CPU">⚡ ${stats.cpu || 0}%</span>
-                <span class="stat-pill" title="RAM: ${formatBytes(stats.ram_used)} / ${formatBytes(stats.ram_total)}">🧠 ${stats.ram_percent || 0}%</span>
-                <span class="stat-pill" title="Disk: ${formatBytes(stats.disk_used)} / ${formatBytes(stats.disk_total)}">💾 ${stats.disk_percent || 0}%</span>
-                <span class="stat-pill" title="Network">🌐 ↓${formatBytes(stats.net_rx)} ↑${formatBytes(stats.net_tx)}</span>
+                <span class="stat-pill" title="CPU"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-activity"></use></svg> CPU: ${stats.cpu || 0}%</span>
+                <span class="stat-pill" title="RAM: ${UI.formatBytes(stats.ram_used)} / ${UI.formatBytes(stats.ram_total)}"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-server"></use></svg> RAM: ${stats.ram_percent || 0}%</span>
+                <span class="stat-pill" title="Disk: ${UI.formatBytes(stats.disk_used)} / ${UI.formatBytes(stats.disk_total)}"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-server"></use></svg> Disk: ${stats.disk_percent || 0}%</span>
+                <span class="stat-pill" title="Network"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-network"></use></svg> ↓${UI.formatBytes(stats.net_rx)} ↑${UI.formatBytes(stats.net_tx)}</span>
             `;
         } catch (err) {
             console.warn('Stats load failed:', err);
@@ -652,7 +740,7 @@
     // ========== Reachability & Network Health ==========
     async function updateReachability() {
         try {
-            const data = await apiCall(`/api/servers/${SERVER_ID}/reachability`, 'GET');
+            const data = await API.get(`/api/servers/${SERVER_ID}/reachability`, { silent: true });
             const reach = (data && typeof data.reachability === 'object' && data.reachability !== null)
                 ? data.reachability
                 : { reachable: !!data.reachable, latency_ms: data.latency_ms, last_checked: data.last_checked };
@@ -664,7 +752,7 @@
             if (!overallBadge) return;
 
             if (!reach) {
-                overallBadge.innerHTML = `<span class="badge badge-warn" style="font-size: 0.7rem; padding: 2px 6px;"><span class="badge-dot"></span> ${_('pending')}</span>`;
+                overallBadge.innerHTML = `<span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> ${_('pending')}</span>`;
                 if (mimicryBadges) mimicryBadges.innerHTML = '';
                 if (awgMimicryBadges) awgMimicryBadges.innerHTML = '';
                 if (lastCheckedEl) lastCheckedEl.textContent = '';
@@ -673,9 +761,17 @@
 
             if (reach.reachable) {
                 const latency = (reach.latency_ms !== null && reach.latency_ms !== undefined) ? `${reach.latency_ms}ms` : _('reachable');
-                overallBadge.innerHTML = `<span class="badge badge-success" style="font-size: 0.7rem; padding: 2px 6px;"><span class="badge-dot"></span> ${escapeHtml(latency)}</span>`;
+                let badgeClass = 'badge-success';
+                if (reach.latency_ms !== null && reach.latency_ms !== undefined) {
+                    if (reach.latency_ms >= 150) {
+                        badgeClass = 'badge-danger';
+                    } else if (reach.latency_ms >= 50) {
+                        badgeClass = 'badge-warn';
+                    }
+                }
+                overallBadge.innerHTML = `<span class="badge ${badgeClass}" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> ${UI.escapeHtml(latency)}</span>`;
             } else {
-                overallBadge.innerHTML = `<span class="badge badge-danger" style="font-size: 0.7rem; padding: 2px 6px;"><span class="badge-dot"></span> ${_('unreachable')}</span>`;
+                overallBadge.innerHTML = `<span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> ${_('unreachable')}</span>`;
             }
 
             if (lastCheckedEl && reach.last_checked) {
@@ -692,11 +788,16 @@
                     const label = p.toUpperCase();
                     if (trial && trial.reachable) {
                         const lat = (trial.latency_ms !== null && trial.latency_ms !== undefined) ? ` (${trial.latency_ms}ms)` : '';
-                        badgesHtml += `<span class="badge badge-success" id="mimicry-badge-${escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px;" title="${escapeHtml(label)}: ${_('reachable')}${escapeHtml(lat)}"><span class="badge-dot"></span> ${escapeHtml(label)}</span>`;
+                        let trialBadgeClass = 'badge-success';
+                        if (trial.latency_ms !== null && trial.latency_ms !== undefined) {
+                            if (trial.latency_ms >= 150) trialBadgeClass = 'badge-danger';
+                            else if (trial.latency_ms >= 50) trialBadgeClass = 'badge-warn';
+                        }
+                        badgesHtml += `<span class="badge ${trialBadgeClass}" id="mimicry-badge-${UI.escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px;" title="${UI.escapeHtml(label)}: ${_('reachable')}${UI.escapeHtml(lat)}"><span class="badge-dot"></span> ${UI.escapeHtml(label)}</span>`;
                     } else if (trial && !trial.reachable) {
-                        badgesHtml += `<span class="badge badge-danger" id="mimicry-badge-${escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px;" title="${escapeHtml(label)}: ${_('unreachable')}"><span class="badge-dot"></span> ${escapeHtml(label)}</span>`;
+                        badgesHtml += `<span class="badge badge-danger" id="mimicry-badge-${UI.escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px;" title="${UI.escapeHtml(label)}: ${_('unreachable')}"><span class="badge-dot"></span> ${UI.escapeHtml(label)}</span>`;
                     } else {
-                        badgesHtml += `<span class="badge badge-warn" id="mimicry-badge-${escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px; opacity: 0.7;" title="${escapeHtml(label)}: ${_('pending')}"><span class="badge-dot"></span> ${escapeHtml(label)}</span>`;
+                        badgesHtml += `<span class="badge badge-warn" id="mimicry-badge-${UI.escapeHtml(p)}" style="font-size: 0.7rem; padding: 2px 6px; opacity: 0.7;" title="${UI.escapeHtml(label)}: ${_('pending')}"><span class="badge-dot"></span> ${UI.escapeHtml(label)}</span>`;
                     }
                 }
                 if (mimicryBadges) mimicryBadges.innerHTML = badgesHtml;
@@ -712,11 +813,13 @@
         const btn = document.getElementById('checkBtn');
         const text = document.getElementById('checkBtnText');
         const spinner = document.getElementById('checkSpinner');
+        const icon = document.getElementById('checkIcon');
         btn.disabled = true;
         text.textContent = _('server_checking');
         spinner.classList.remove('hidden');
+        if (icon) icon.classList.add('hidden');
         try {
-            const data = await apiCall(`/api/servers/${SERVER_ID}/check`, 'POST');
+            const data = await API.post(`/api/servers/${SERVER_ID}/check`);
             const statusDiv = document.getElementById('serverStatus');
             const badges = document.getElementById('statusBadges');
             statusDiv.classList.remove('hidden');
@@ -765,9 +868,9 @@
             }
             updateStatusCounts(data.protocols || {});
             updateReachability();
-            showToast(_('check_done'), 'success');
+            UI.toast(_('check_done'), 'success');
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
             const statusDiv = document.getElementById('serverStatus');
             const badges = document.getElementById('statusBadges');
             statusDiv.classList.remove('hidden');
@@ -776,6 +879,7 @@
             btn.disabled = false;
             text.textContent = _('server_check');
             spinner.classList.add('hidden');
+            if (icon) icon.classList.remove('hidden');
         }
     }
 
@@ -828,16 +932,16 @@
                         grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_mtu')}</span><span class="protocol-info-value">${p.mtu}</span></div>`;
                     }
                     const jParts = [];
-                    if (p.junk_packet_count) jParts.push(`Jc=${escapeHtml(String(p.junk_packet_count))}`);
-                    if (p.junk_packet_min_size) jParts.push(`Jmin=${escapeHtml(String(p.junk_packet_min_size))}`);
-                    if (p.junk_packet_max_size) jParts.push(`Jmax=${escapeHtml(String(p.junk_packet_max_size))}`);
+                    if (p.junk_packet_count) jParts.push(`Jc=${UI.escapeHtml(String(p.junk_packet_count))}`);
+                    if (p.junk_packet_min_size) jParts.push(`Jmin=${UI.escapeHtml(String(p.junk_packet_min_size))}`);
+                    if (p.junk_packet_max_size) jParts.push(`Jmax=${UI.escapeHtml(String(p.junk_packet_max_size))}`);
                     if (jParts.length) {
                         grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_packets')}</span><span class="protocol-info-value">${jParts.join(' ')}</span></div>`;
                     }
                     const sParts = [];
                     const sLabels = {init_packet_junk_size:'S1', response_packet_junk_size:'S2', cookie_reply_packet_junk_size:'S3', transport_packet_junk_size:'S4'};
                     for (const [key, label] of Object.entries(sLabels)) {
-                        if (p[key]) sParts.push(`${label}=${escapeHtml(String(p[key]))}`);
+                        if (p[key]) sParts.push(`${label}=${UI.escapeHtml(String(p[key]))}`);
                     }
                     if (sParts.length) {
                         grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_sizes')}</span><span class="protocol-info-value">${sParts.join(' ')}</span></div>`;
@@ -845,7 +949,7 @@
                     const hLabels = {init_packet_magic_header:'H1', response_packet_magic_header:'H2', underload_packet_magic_header:'H3', transport_packet_magic_header:'H4'};
                     const hParts = [];
                     for (const [key, label] of Object.entries(hLabels)) {
-                        if (p[key]) hParts.push(`${label}=${escapeHtml(String(p[key]))}`);
+                        if (p[key]) hParts.push(`${label}=${UI.escapeHtml(String(p[key]))}`);
                     }
                     if (hParts.length) {
                         grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_magic_headers')}</span><span class="protocol-info-value">${hParts.join(' ')}</span></div>`;
@@ -855,12 +959,18 @@
             }
             if (proto === 'dns') {
                 actionsEl.innerHTML = `
-                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')" style="flex:1">${_('uninstall')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')" style="flex:1">
+                        <svg class="icon"><use href="#icon-trash"></use></svg> ${_('uninstall')}
+                    </button>
                 `;
             } else {
                 actionsEl.innerHTML = `
-                    <button class="btn btn-secondary btn-sm" onclick="selectProtocolForConns('${proto}')" style="flex:1">${_('connections')}</button>
-                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>
+                    <button class="btn btn-secondary btn-sm" onclick="selectProtocolForConns('${proto}')" style="flex:1">
+                        <svg class="icon"><use href="#icon-network"></use></svg> ${_('connections')}
+                    </button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">
+                        <svg class="icon"><use href="#icon-trash"></use></svg> ${_('uninstall')}
+                    </button>
                 `;
                 showConnectionsSection();
             }
@@ -869,12 +979,18 @@
                 ctrlEl.style.cssText = '';
                 if (proto === 'dns') {
                     ctrlEl.innerHTML = `
-                        <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
+                        <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">
+                            <svg class="icon"><use href="#icon-x"></use></svg> ${_('stop_btn')}
+                        </button>
                     `;
                 } else {
                     ctrlEl.innerHTML = `
-                        <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
-                        <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
+                        <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">
+                            <svg class="icon"><use href="#icon-settings"></use></svg> ${_('config_btn')}
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">
+                            <svg class="icon"><use href="#icon-x"></use></svg> ${_('stop_btn')}
+                        </button>
                     `;
                 }
             }
@@ -883,12 +999,18 @@
             statusEl.innerHTML = `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`;
             if (proto === 'dns') {
                 actionsEl.innerHTML = `
-                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')" style="flex:1">${_('uninstall')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')" style="flex:1">
+                        <svg class="icon"><use href="#icon-trash"></use></svg> ${_('uninstall')}
+                    </button>
                 `;
             } else {
                 actionsEl.innerHTML = `
-                    <button class="btn btn-primary btn-sm" onclick="openInstallModal('${proto}')" style="flex:1">${_('reinstall')}</button>
-                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>
+                    <button class="btn btn-primary btn-sm" onclick="openInstallModal('${proto}')" style="flex:1">
+                        <svg class="icon"><use href="#icon-refresh"></use></svg> ${_('reinstall')}
+                    </button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">
+                        <svg class="icon"><use href="#icon-trash"></use></svg> ${_('uninstall')}
+                    </button>
                 `;
             }
             // Show control buttons (start + config)
@@ -896,12 +1018,18 @@
                 ctrlEl.style.cssText = '';
                 if (proto === 'dns') {
                     ctrlEl.innerHTML = `
-                        <button class="btn btn-primary btn-sm" onclick="toggleContainer('${proto}', false)" title="${_('start_container_confirm').replace('{}', '')}">${_('start_btn')}</button>
+                        <button class="btn btn-primary btn-sm" onclick="toggleContainer('${proto}', false)" title="${_('start_container_confirm').replace('{}', '')}">
+                            <svg class="icon"><use href="#icon-refresh"></use></svg> ${_('start_btn')}
+                        </button>
                     `;
                 } else {
                     ctrlEl.innerHTML = `
-                        <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
-                        <button class="btn btn-primary btn-sm" onclick="toggleContainer('${proto}', false)" title="${_('start_container_confirm').replace('{}', '')}">${_('start_btn')}</button>
+                        <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">
+                            <svg class="icon"><use href="#icon-settings"></use></svg> ${_('config_btn')}
+                        </button>
+                        <button class="btn btn-primary btn-sm" onclick="toggleContainer('${proto}', false)" title="${_('start_container_confirm').replace('{}', '')}">
+                            <svg class="icon"><use href="#icon-refresh"></use></svg> ${_('start_btn')}
+                        </button>
                     `;
                 }
             }
@@ -909,7 +1037,9 @@
             installedProtocols[proto] = false;
             statusEl.innerHTML = `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('not_installed')}</span>`;
             actionsEl.innerHTML = `
-                <button class="btn btn-primary btn-sm" onclick="openInstallModal('${proto}')" style="flex:1">${_('install')}</button>
+                <button class="btn btn-primary btn-sm" onclick="openInstallModal('${proto}')" style="flex:1">
+                    <svg class="icon"><use href="#icon-plus"></use></svg> ${_('install')}
+                </button>
             `;
             if (ctrlEl) {
                 ctrlEl.style.cssText = 'display:none!important;';
@@ -922,14 +1052,20 @@
     async function toggleContainer(proto, isRunning) {
         const name = getProtoTitle(proto);
         const action = isRunning ? _('stopping') : _('starting');
-        if (!confirm(`${isRunning ? _('stop_container_confirm') : _('start_container_confirm')}`.replace('{}', name))) return;
+        const confirmed = await UI.confirm({
+            title: isRunning ? (_('stop_btn') || 'Stop') : (_('start_btn') || 'Start'),
+            message: `${isRunning ? _('stop_container_confirm') : _('start_container_confirm')}`.replace('{}', name),
+            confirmVariant: isRunning ? 'danger' : 'primary'
+        });
+        if (!confirmed) return;
+
         try {
-            showToast(`${action} ${name}...`, 'info');
-            const res = await apiCall(`/api/servers/${SERVER_ID}/container/toggle`, 'POST', { protocol: proto });
-            showToast(`${name} ${res.action === 'stopped' ? _('stopped') : _('started')}`, 'success');
+            UI.toast(`${action} ${name}...`, 'info');
+            const res = await API.post(`/api/servers/${SERVER_ID}/container/toggle`, { protocol: proto });
+            UI.toast(`${name} ${res.action === 'stopped' ? _('stopped') : _('started')}`, 'success');
             setTimeout(() => checkServer(), 1500);
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -937,15 +1073,15 @@
     async function showServerConfig(proto) {
         const name = getProtoTitle(proto);
         try {
-            showToast(_('loading'), 'info');
-            const res = await apiCall(`/api/servers/${SERVER_ID}/server_config`, 'POST', { protocol: proto });
+            UI.toast(_('loading'), 'info');
+            const res = await API.post(`/api/servers/${SERVER_ID}/server_config`, { protocol: proto });
             document.getElementById('serverConfigModalTitle').textContent = `${_('server_config')} — ${name}`;
             document.getElementById('serverConfigProto').value = proto;
             document.getElementById('serverConfigText').value = res.config || '';
             serverConfigFilename = `server_${proto}.conf`;
             openModal('serverConfigModal');
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -959,14 +1095,14 @@
         btn.textContent = _('saving');
 
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/server_config/save`, 'POST', {
+            await API.post(`/api/servers/${SERVER_ID}/server_config/save`, {
                 protocol: proto,
                 config: newConfig
             });
-            showToast(_('success'), 'success');
+            UI.toast(_('success'), 'success');
             closeModal('serverConfigModal');
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         } finally {
             btn.disabled = false;
             btn.textContent = oldText;
@@ -1082,7 +1218,7 @@
                     }
                 }
             }
-            const result = await apiCall(`/api/servers/${SERVER_ID}/install`, 'POST', params);
+            const result = await API.post(`/api/servers/${SERVER_ID}/install`, params);
             clearInterval(progressInterval);
             fillEl.style.width = '100%';
             if (result.log) {
@@ -1091,27 +1227,32 @@
                 });
             }
             logEl.scrollTop = logEl.scrollHeight;
-            showToast(_('install_success'), 'success');
+            UI.toast(_('install_success'), 'success');
             document.getElementById('installDone').style.display = '';
         } catch (err) {
             fillEl.style.width = '100%';
             fillEl.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
             logEl.innerHTML += `<div class="log-line error">✕ ${_('error')}: ${err.message}</div>`;
             logEl.scrollTop = logEl.scrollHeight;
-            showToast(_('install_error') + err.message, 'error');
+            UI.toast(_('install_error') + err.message, 'error');
             document.getElementById('installDone').style.display = '';
         }
     }
 
     async function uninstallProtocol(proto) {
         const name = getProtoTitle(proto);
-        if (!confirm(_('uninstall_confirm').replace('{}', name))) return;
+        const confirmed = await UI.confirm({
+            title: _('uninstall') || 'Uninstall Protocol',
+            message: _('uninstall_confirm').replace('{}', name),
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/uninstall`, 'POST', { protocol: proto });
-            showToast(`${name} ${_('stopped')}`, 'success');
+            await API.post(`/api/servers/${SERVER_ID}/uninstall`, { protocol: proto });
+            UI.toast(`${name} ${_('stopped')}`, 'success');
             setTimeout(() => window.location.reload(), 800);
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -1127,7 +1268,8 @@
         const proto = document.getElementById('connProtoSelect').value;
         const loading = document.getElementById('connectionsLoading');
         const emptyEl = document.getElementById('connectionsEmpty');
-        const listEl = document.getElementById('connectionsListInner');
+        const tableContainer = document.getElementById('connectionsTableContainer');
+        const tableBody = document.getElementById('connectionsTableBody');
 
         if (!proto) {
             loading.style.display = 'none';
@@ -1136,12 +1278,14 @@
 
         loading.style.display = '';
         emptyEl.classList.add('hidden');
-        listEl.innerHTML = '';
+        if (tableContainer) tableContainer.style.display = 'none';
+        tableBody.innerHTML = '';
         try {
-            const data = await apiCall(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
+            const data = await API.get(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
             loading.style.display = 'none';
             if (!data.clients || data.clients.length === 0) {
                 emptyEl.classList.remove('hidden');
+                if (tableContainer) tableContainer.style.display = 'none';
                 return;
             }
             window.connectionsStore = {};
@@ -1162,82 +1306,163 @@
                 const initial = name.charAt(0).toUpperCase();
                 const enabled = (client.enabled !== undefined) ? client.enabled : (userData.enabled !== false);
                 const assignedUser = client.assigned_user || '';
+                const clientIp = client.clientIp || userData.clientIp || client.clientId || '—';
 
+                // Metadata tags below name
                 let metaHtml = '';
-                if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
+                if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;"><svg class="icon" style="width:10px;height:10px;"><use href="#icon-user"></use></svg> ${UI.escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
 
-                if (proto === 'telemt') {
-                    if (userData.total_octets) metaHtml += `<span class="traffic-badge">📊 ${escapeHtml(formatBytes(userData.total_octets))}</span>`;
-                    if (userData.current_connections !== undefined) metaHtml += `<span>🔌 ${escapeHtml(String(userData.current_connections))} conns</span>`;
-                    if (userData.active_ips) metaHtml += `<span>📍 ${escapeHtml(String(userData.active_ips))} IPs</span>`;
-                    if (userData.quota) metaHtml += `<span class="badge" style="font-size:0.65rem;">Quota: ${escapeHtml(formatBytes(userData.quota))}</span>`;
-                    if (userData.expiry) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${escapeHtml(formatDate(userData.expiry))}</span>`;
+                // Status & Mimicry column
+                let statusHtml = '';
+                if (enabled) {
+                    statusHtml += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('active') || 'Active'}</span>`;
+                    if (handshake) {
+                        statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🤝 ${UI.escapeHtml(handshake)}</span>`;
+                    }
                 } else {
-                    if (handshake) metaHtml += `<span>🤝 ${escapeHtml(handshake)}</span>`;
-                    if (received) metaHtml += `<span class="traffic-badge traffic-down">↓ ${escapeHtml(received)}</span>`;
-                    if (sent) metaHtml += `<span class="traffic-badge traffic-up">↑ ${escapeHtml(sent)}</span>`;
-                }
-
-                if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
-
-                if (proto === 'awg' && (userData.speed_limit_down || userData.speed_limit_up)) {
-                    const down = userData.speed_limit_down;
-                    const up = userData.speed_limit_up;
-                    const parts = [];
-                    if (down) parts.push(`↓${down}`);
-                    if (up) parts.push(`↑${up}`);
-                    if (parts.length) metaHtml += `<span class="badge badge-warn" style="font-size:0.65rem;">⚡${parts.join(' ')} Mbps</span>`;
+                    statusHtml += `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`;
                 }
 
                 if (proto === 'awg') {
                     const mimicry = userData.awg_mimicry || 'auto';
                     if (mimicry === 'auto') {
-                        metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">🛡 ${_('mimicry_auto')}</span>`;
+                        statusHtml += ` <span class="badge badge-info" style="font-size:0.65rem;">🛡 ${_('mimicry_auto')}</span>`;
                     } else {
-                        metaHtml += `<span class="badge badge-success" style="font-size:0.65rem;">🔒 ${_('profile_locked').replace('{}', escapeHtml(mimicry.toUpperCase()))}</span>`;
+                        statusHtml += ` <span class="badge badge-success" style="font-size:0.65rem;">🔒 ${UI.escapeHtml(mimicry.toUpperCase())}</span>`;
+                    }
+                } else if (proto === 'telemt') {
+                    if (userData.current_connections !== undefined) {
+                        statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🔌 ${UI.escapeHtml(String(userData.current_connections))} conns</span>`;
                     }
                 }
 
-                const disabledStyle = enabled ? '' : 'opacity:0.5;';
-                const toggleIcon = enabled ? '🔵' : '⚫';
+                // Traffic Rx/Tx column
+                let trafficHtml = '';
+                let numericBytes = 0;
+                if (proto === 'telemt') {
+                    const octets = userData.total_octets || 0;
+                    numericBytes = octets;
+                    trafficHtml = `<span class="traffic-badge">📊 ${UI.escapeHtml(UI.formatBytes(octets))}</span>`;
+                } else {
+                    trafficHtml = `
+                        <div class="traffic-cell">
+                            <span class="traffic-badge traffic-down">↓ ${UI.escapeHtml(received || '0 B')}</span>
+                            <span class="traffic-badge traffic-up">↑ ${UI.escapeHtml(sent || '0 B')}</span>
+                        </div>
+                    `;
+                }
+
+                // Speed limit column
+                let speedHtml = '';
+                let speedNumeric = 0;
+                if (proto === 'awg' && (userData.speed_limit_down || userData.speed_limit_up)) {
+                    const down = userData.speed_limit_down;
+                    const up = userData.speed_limit_up;
+                    speedNumeric = Math.max(down || 0, up || 0);
+                    const parts = [];
+                    if (down) parts.push(`↓${down}`);
+                    if (up) parts.push(`↑${up}`);
+                    speedHtml = `<span class="badge badge-warn" style="font-size:0.7rem;">⚡ ${parts.join(' ')} Mbps</span>`;
+                } else if (proto === 'telemt' && userData.quota) {
+                    speedHtml = `<span class="badge" style="font-size:0.7rem;">Quota: ${UI.escapeHtml(UI.formatBytes(userData.quota))}</span>`;
+                } else {
+                    speedHtml = `<span class="text-muted" style="font-size:0.8rem;">—</span>`;
+                }
+
                 const toggleTitle = enabled ? _('stop') : _('starting');
+                const awgSpeedBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="openEditSpeedLimitModal(this.dataset.cid)" title="${_('edit_speed_limit')}"><svg class="icon"><use href="#icon-settings"></use></svg></button>` : '';
+                const awgTrialBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" onclick="startAutoTrial(this.dataset.cid, this.dataset.cname)" title="${_('start_auto_trial')}"><svg class="icon"><use href="#icon-shield"></use></svg></button>` : '';
+                const awgRotateBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="rotateClientMimicry(this.dataset.cid)" title="${_('rotate_profile')}"><svg class="icon"><use href="#icon-refresh"></use></svg></button>` : '';
 
-                const awgSpeedBtn = proto === 'awg' ? `<button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" onclick="openEditSpeedLimitModal(this.dataset.cid)" title="${_('edit_speed_limit')}">⚡</button>` : '';
-                const awgTrialBtn = proto === 'awg' ? `<button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" data-cname="${escapeHtml(name)}" onclick="startAutoTrial(this.dataset.cid, this.dataset.cname)" title="${_('start_auto_trial')}">🎯</button>` : '';
-                const awgRotateBtn = proto === 'awg' ? `<button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" onclick="rotateClientMimicry(this.dataset.cid)" title="${_('rotate_profile')}">🔄</button>` : '';
+                const tr = document.createElement('tr');
+                tr.setAttribute('data-status', enabled ? 'active' : 'stopped');
+                if (!enabled) tr.style.opacity = '0.6';
 
-                listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}">
-                        <div class="client-info">
-                            <div class="client-avatar">${escapeHtml(initial)}</div>
+                tr.innerHTML = `
+                    <td>
+                        <div class="conn-name-cell">
+                            <div class="client-avatar">${UI.escapeHtml(initial)}</div>
                             <div>
-                                <div class="client-name">${escapeHtml(name)}</div>
-                                <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
+                                <div style="font-weight:600; color:var(--text-primary);">${UI.escapeHtml(name)}</div>
+                                <div class="flex gap-xs items-center" style="font-size:0.75rem; color:var(--text-muted); margin-top:2px;">
+                                    ${metaHtml}
+                                </div>
                             </div>
                         </div>
+                    </td>
+                    <td>
+                        <code style="font-size:0.8rem; font-family:var(--font-mono, monospace);">${UI.escapeHtml(clientIp)}</code>
+                    </td>
+                    <td>${statusHtml}</td>
+                    <td data-sort-val="${numericBytes}">${trafficHtml}</td>
+                    <td data-sort-val="${speedNumeric}">${speedHtml}</td>
+                    <td data-searchable="false" style="text-align: right;">
                         <div class="client-actions">
-                            <button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" data-cname="${escapeHtml(name)}" data-haskey="${!!userData.clientPrivateKey || proto === 'telemt'}" onclick="showConnectionConfig(this.dataset.cid, this.dataset.cname, this.dataset.haskey === 'true')" title="${_('config')}">📄</button>
+                            <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" onclick="copyConnectionConfig(this.dataset.cid, this.dataset.cname, this)" title="${_('copy')}">
+                                <svg class="icon"><use href="#icon-copy"></use></svg>
+                            </button>
+                            <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" data-haskey="${!!userData.clientPrivateKey || proto === 'telemt'}" onclick="showConnectionConfig(this.dataset.cid, this.dataset.cname, this.dataset.haskey === 'true')" title="${_('config')}">
+                                <svg class="icon"><use href="#icon-key"></use></svg>
+                            </button>
                             ${awgSpeedBtn}
                             ${awgTrialBtn}
                             ${awgRotateBtn}
-                            ${proto === 'telemt' ? `<button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}">✏️</button>` : ''}
-                            <button class="btn btn-secondary btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">${toggleIcon}</button>
-                            <button class="btn btn-danger btn-sm btn-icon" data-cid="${escapeHtml(client.clientId)}" onclick="removeConnection(this.dataset.cid)" title="${_('delete')}">🗑</button>
+                            ${proto === 'telemt' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>` : ''}
+                            <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
+                                <span class="badge-dot" style="background:${enabled ? 'var(--success)' : 'var(--text-muted)'}; width:10px; height:10px; display:inline-block;"></span>
+                            </button>
+                            <button class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" data-cid="${UI.escapeHtml(client.clientId)}" onclick="removeConnection(this.dataset.cid)" title="${_('delete')}">
+                                <svg class="icon"><use href="#icon-trash"></use></svg>
+                            </button>
                         </div>
-                    </div>
+                    </td>
                 `;
+                tableBody.appendChild(tr);
             });
+
+            if (tableContainer) tableContainer.style.display = '';
+
+            if (connectionsTableInstance) {
+                connectionsTableInstance.refresh();
+            } else {
+                connectionsTableInstance = new NexusTable('#connectionsTable', {
+                    searchable: true,
+                    sortable: true,
+                    paginate: true,
+                    pageSize: 10,
+                    searchPlaceholder: _('search') || 'Search connections...',
+                    emptyMessage: _('no_matching_records') || 'No matching connections found'
+                });
+            }
         } catch (err) {
             loading.style.display = 'none';
-            showToast(_('loading_connections_error') + ': ' + err.message, 'error');
+            UI.toast(_('loading_connections_error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function copyConnectionConfig(clientId, connName, btnEl) {
+        const proto = document.getElementById('connProtoSelect').value;
+        try {
+            UI.toast(_('loading'), 'info');
+            const result = await API.post(`/api/servers/${SERVER_ID}/connections/config`, {
+                protocol: proto,
+                client_id: clientId,
+            });
+            if (result && result.config) {
+                await UI.copy(result.config, btnEl);
+            } else {
+                UI.toast(_('config_unavailable') || 'Config unavailable', 'warning');
+            }
+        } catch (err) {
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
     async function startAutoTrial(clientId, connName) {
         try {
-            showToast(_('loading'), 'info');
-            const res = await apiCall(`/api/servers/${SERVER_ID}/connections/kit`, 'POST', {
+            UI.toast(_('loading'), 'info');
+            const res = await API.post(`/api/servers/${SERVER_ID}/connections/kit`, {
                 protocol: 'awg',
                 client_id: clientId,
             });
@@ -1251,35 +1476,40 @@
                         item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
                         item.innerHTML = `
                             <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
-                                <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${escapeHtml(protoKey)} Profile</span>
+                                <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${UI.escapeHtml(protoKey)} Profile</span>
                                 <div class="flex gap-sm">
-                                    <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">${_('copy')}</button>
-                                    <button type="button" class="btn btn-primary btn-sm btn-kit-dl">${_('download')}</button>
+                                    <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">
+                                        <svg class="icon"><use href="#icon-copy"></use></svg> ${_('copy')}
+                                    </button>
+                                    <button type="button" class="btn btn-primary btn-sm btn-kit-dl">
+                                        <svg class="icon"><use href="#icon-download"></use></svg> ${_('download')}
+                                    </button>
                                 </div>
                             </div>
-                            <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${escapeHtml(confText)}</code></pre>
+                            <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${UI.escapeHtml(confText)}</code></pre>
                         `;
-                        item.querySelector('.btn-kit-copy').onclick = () => copyToClipboard(confText);
-                        item.querySelector('.btn-kit-dl').onclick = () => downloadFile(confText, `${connName || 'trial'}_${protoKey}.conf`);
+                        const copyBtn = item.querySelector('.btn-kit-copy');
+                        copyBtn.onclick = () => UI.copy(confText, copyBtn);
+                        item.querySelector('.btn-kit-dl').onclick = () => UI.downloadFile(confText, `${connName || 'trial'}_${protoKey}.conf`);
                         trialList.appendChild(item);
                     }
                 }
-                document.getElementById('autoTrialModalTitle').textContent = `🎯 ${_('start_auto_trial')} — ${escapeHtml(connName || 'Connection')}`;
+                document.getElementById('autoTrialModalTitle').innerHTML = `<svg class="icon" style="margin-right:6px;"><use href="#icon-shield"></use></svg> ${_('start_auto_trial')} — ${UI.escapeHtml(connName || 'Connection')}`;
                 openModal('autoTrialModal');
             }
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
     async function rotateClientMimicry(clientId) {
         try {
-            showToast(_('loading'), 'info');
-            const res = await apiCall(`/api/servers/${SERVER_ID}/connections/${clientId}/rotate-mimicry`, 'POST');
-            showToast(`Rotated to ${(res.rotation && res.rotation.awg_mimicry ? res.rotation.awg_mimicry : 'next').toUpperCase()}`, 'success');
+            UI.toast(_('loading'), 'info');
+            const res = await API.post(`/api/servers/${SERVER_ID}/connections/${clientId}/rotate-mimicry`);
+            UI.toast(`Rotated to ${(res.rotation && res.rotation.awg_mimicry ? res.rotation.awg_mimicry : 'next').toUpperCase()}`, 'success');
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -1320,12 +1550,12 @@
                 params.telemt_max_ips = parseInt(document.getElementById('telemtMaxIps').value) || null;
                 params.telemt_expiry = document.getElementById('telemtExpiry').value || null;
             }
-            const result = await apiCall(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, 'POST', params);
+            const result = await API.post(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, params);
             if (isEditingConn) {
-                showToast(_('connection_updated'), 'success');
+                UI.toast(_('connection_updated'), 'success');
                 closeModal('addConnectionModal');
             } else {
-                showToast(_('connection_created').replace('{}', connName || 'Connection'), 'success');
+                UI.toast(_('connection_created').replace('{}', connName || 'Connection'), 'success');
                 closeModal('addConnectionModal');
                 document.getElementById('connectionName').value = '';
                 if (result.config) {
@@ -1351,7 +1581,7 @@
             }
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         } finally {
             btn.disabled = false;
             text.textContent = isEditingConn ? _('save') : _('create');
@@ -1408,7 +1638,7 @@
         } else {
             telemtOpts.style.display = 'none';
         }
-        openModal('addConnectionModal');
+        openModal('addConnectionModal', '#connectionName');
     }
 
     function editConnection(clientId) {
@@ -1420,16 +1650,22 @@
     }
 
     async function removeConnection(clientId) {
-        if (!confirm(_('delete_connection_confirm'))) return;
+        const confirmed = await UI.confirm({
+            title: _('delete') || 'Delete Connection',
+            message: _('delete_connection_confirm') || 'Are you sure you want to delete this connection?',
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
+
         const proto = document.getElementById('connProtoSelect').value;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/connections/remove`, 'POST', {
+            await API.post(`/api/servers/${SERVER_ID}/connections/remove`, {
                 protocol: proto, client_id: clientId,
             });
-            showToast(_('connection_deleted'), 'success');
+            UI.toast(_('connection_deleted'), 'success');
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -1438,7 +1674,7 @@
         if (!kitList) return;
         kitList.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem;">Loading profiles...</div>';
         try {
-            const res = await apiCall(`/api/servers/${SERVER_ID}/connections/kit`, 'POST', {
+            const res = await API.post(`/api/servers/${SERVER_ID}/connections/kit`, {
                 protocol: 'awg', client_id: clientId
             });
             if (res.kit) {
@@ -1448,16 +1684,21 @@
                     item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
                     item.innerHTML = `
                         <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
-                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${escapeHtml(protoKey)} Profile</span>
+                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${UI.escapeHtml(protoKey)} Profile</span>
                             <div class="flex gap-sm">
-                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">${_('copy')}</button>
-                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">${_('download')}</button>
+                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">
+                                    <svg class="icon"><use href="#icon-copy"></use></svg> ${_('copy')}
+                                </button>
+                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">
+                                    <svg class="icon"><use href="#icon-download"></use></svg> ${_('download')}
+                                </button>
                             </div>
                         </div>
-                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${escapeHtml(confText)}</code></pre>
+                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${UI.escapeHtml(confText)}</code></pre>
                     `;
-                    item.querySelector('.btn-kit-copy').onclick = () => copyToClipboard(confText);
-                    item.querySelector('.btn-kit-dl').onclick = () => downloadFile(confText, `${connName}_${protoKey}.conf`);
+                    const copyBtn = item.querySelector('.btn-kit-copy');
+                    copyBtn.onclick = () => UI.copy(confText, copyBtn);
+                    item.querySelector('.btn-kit-dl').onclick = () => UI.downloadFile(confText, `${connName}_${protoKey}.conf`);
                     kitList.appendChild(item);
                 }
             }
@@ -1488,7 +1729,7 @@
             currentConfig = '';
             currentVpnLink = '';
             currentConfigName = connName.replace(/\s+/g, '_');
-            document.getElementById('configText').innerHTML = `<div style="padding:var(--space-md);background:var(--bg-primary);border-radius:var(--radius-md);border:1px solid var(--border-color);"><div style="font-size:1.4rem;margin-bottom:var(--space-sm);">⚠️</div><div style="font-weight:600;margin-bottom:var(--space-sm);">${_('config_unavailable')}</div><div style="font-size:0.85rem;color:var(--text-muted);line-height:1.6;">${_('config_unavailable_desc').replace(/\\n/g, '<br>')}<br><br><strong>${_('client_public_key')}</strong><br><code style="word-break:break-all;font-size:0.78rem;">${escapeHtml(clientId)}</code></div></div>`;
+            document.getElementById('configText').innerHTML = `<div style="padding:var(--space-md);background:var(--bg-primary);border-radius:var(--radius-md);border:1px solid var(--border-color);"><div style="font-size:1.4rem;margin-bottom:var(--space-sm);">⚠️</div><div style="font-weight:600;margin-bottom:var(--space-sm);">${_('config_unavailable')}</div><div style="font-size:0.85rem;color:var(--text-muted);line-height:1.6;">${_('config_unavailable_desc').replace(/\\n/g, '<br>')}<br><br><strong>${_('client_public_key')}</strong><br><code style="word-break:break-all;font-size:0.78rem;">${UI.escapeHtml(clientId)}</code></div></div>`;
             document.getElementById('vpnLinkText').textContent = '';
             document.getElementById('panel-vpn').style.display = 'none';
             document.getElementById('panel-qr').style.display = 'none';
@@ -1501,8 +1742,8 @@
         }
 
         try {
-            showToast(_('loading'), 'info');
-            const result = await apiCall(`/api/servers/${SERVER_ID}/connections/config`, 'POST', {
+            UI.toast(_('loading'), 'info');
+            const result = await API.post(`/api/servers/${SERVER_ID}/connections/config`, {
                 protocol: proto, client_id: clientId,
             });
             if (result.config) {
@@ -1517,21 +1758,21 @@
                 generateQR(result.config);
             }
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
     async function toggleConnection(clientId, enable) {
         const proto = document.getElementById('connProtoSelect').value;
         try {
-            showToast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabling') : _('disabling')) + '...', 'info');
-            await apiCall(`/api/servers/${SERVER_ID}/connections/toggle`, 'POST', {
+            UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabling') : _('disabling')) + '...', 'info');
+            await API.post(`/api/servers/${SERVER_ID}/connections/toggle`, {
                 protocol: proto, client_id: clientId, enable: enable,
             });
-            showToast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabled') : _('disabled')), 'success');
+            UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabled') : _('disabled')), 'success');
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -1569,35 +1810,56 @@
     }
 
     async function rebootServer() {
-        if (!confirm('Are you sure you want to reboot the server? Disconnections will occur.')) return;
+        const confirmed = await UI.confirm({
+            title: _('reboot_server') || 'Reboot Server',
+            message: 'Are you sure you want to reboot the server? Disconnections will occur.',
+            confirmText: 'Reboot',
+            confirmVariant: 'warning'
+        });
+        if (!confirmed) return;
+
         try {
-            showToast('Rebooting server...', 'info');
-            await apiCall(`/api/servers/${SERVER_ID}/reboot`, 'POST');
-            showToast('Server is rebooting', 'success');
+            UI.toast('Rebooting server...', 'info');
+            await API.post(`/api/servers/${SERVER_ID}/reboot`);
+            UI.toast('Server is rebooting', 'success');
         } catch (err) {
-            showToast('Error: ' + err.message, 'error');
+            UI.toast('Error: ' + err.message, 'error');
         }
     }
 
     async function clearServer() {
-        if (!confirm("⚠️ WARNING: This will completely delete all Amnezia configurations, containers, and data from /opt/amnezia on the server! Are you absolutely sure?")) return;
+        const confirmed = await UI.confirm({
+            title: _('clear_server') || 'Clear Server',
+            message: '⚠️ WARNING: This will completely delete all Amnezia configurations, containers, and data from /opt/amnezia on the server! Are you absolutely sure?',
+            confirmText: 'Clear Server Data',
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
+
         try {
-            showToast('Clearing server from Amnezia software...', 'info');
-            await apiCall(`/api/servers/${SERVER_ID}/clear`, 'POST');
-            showToast('Server cleared successfully!', 'success');
+            UI.toast('Clearing server from Amnezia software...', 'info');
+            await API.post(`/api/servers/${SERVER_ID}/clear`);
+            UI.toast('Server cleared successfully!', 'success');
             setTimeout(() => location.reload(), 1500);
         } catch (err) {
-            showToast('Error: ' + err.message, 'error');
+            UI.toast('Error: ' + err.message, 'error');
         }
     }
 
     async function removeServer() {
-        if (!confirm("Are you sure you want to remove this server from the panel? (The server itself will not be erased).")) return;
+        const confirmed = await UI.confirm({
+            title: _('remove_server') || 'Remove Server',
+            message: 'Are you sure you want to remove this server from the panel? (The server itself will not be erased).',
+            confirmText: 'Remove',
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
+
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/delete`, 'POST');
+            await API.post(`/api/servers/${SERVER_ID}/delete`);
             window.location.href = '/';
         } catch (err) {
-            showToast('Error: ' + err.message, 'error');
+            UI.toast('Error: ' + err.message, 'error');
         }
     }
 
@@ -1617,7 +1879,7 @@
         const userData = window.connectionsStore[clientId] || {};
         document.getElementById('editSpeedLimitDown').value = userData.speed_limit_down || '';
         document.getElementById('editSpeedLimitUp').value = userData.speed_limit_up || '';
-        openModal('editSpeedLimitModal');
+        openModal('editSpeedLimitModal', '#editSpeedLimitDown');
     }
 
     async function saveSpeedLimits() {
@@ -1627,38 +1889,38 @@
         const speed_down = (downVal !== '' && downVal !== null) ? parseInt(downVal) : null;
         const speed_up = (upVal !== '' && upVal !== null) ? parseInt(upVal) : null;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/connections/speed-limit`, 'PATCH', {
+            await API.patch(`/api/servers/${SERVER_ID}/connections/speed-limit`, {
                 client_id: editingSpeedLimitClientId,
                 speed_limit_down: speed_down,
                 speed_limit_up: speed_up,
             });
-            showToast(_('connection_updated'), 'success');
+            UI.toast(_('connection_updated'), 'success');
             closeModal('editSpeedLimitModal');
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
     async function clearSpeedLimits() {
         if (!editingSpeedLimitClientId) return;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/connections/speed-limit`, 'PATCH', {
+            await API.patch(`/api/servers/${SERVER_ID}/connections/speed-limit`, {
                 client_id: editingSpeedLimitClientId,
                 speed_limit_down: null,
                 speed_limit_up: null,
             });
-            showToast(_('connection_updated'), 'success');
+            UI.toast(_('connection_updated'), 'success');
             closeModal('editSpeedLimitModal');
             loadConnections();
         } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
+            UI.toast(_('error') + ': ' + err.message, 'error');
         }
     }
 
     async function loadAwgSpeedLimitConfig() {
         try {
-            const data = await apiCall(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, 'GET');
+            const data = await API.get(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, { silent: true });
             document.getElementById('globalSpeedLimitDown').value = (data.global_speed_limit_down != null) ? data.global_speed_limit_down : '';
             document.getElementById('globalSpeedLimitUp').value = (data.global_speed_limit_up != null) ? data.global_speed_limit_up : '';
             document.getElementById('defaultSpeedLimitDown').value = (data.default_speed_limit_down != null) ? data.default_speed_limit_down : '';
@@ -1687,13 +1949,15 @@
         btn.textContent = '...';
         
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, 'PATCH', payload);
+            await API.patch(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, payload);
             statusEl.textContent = _('speed_limit_config_saved');
             statusEl.style.color = 'var(--success)';
+            UI.toast(_('speed_limit_config_saved'), 'success');
             setTimeout(() => { statusEl.textContent = ''; }, 3000);
         } catch (err) {
             statusEl.textContent = _('speed_limit_config_error');
             statusEl.style.color = 'var(--danger)';
+            UI.toast(_('speed_limit_config_error') + ': ' + err.message, 'error');
             setTimeout(() => { statusEl.textContent = ''; }, 5000);
         } finally {
             btn.disabled = false;
@@ -1708,11 +1972,18 @@
         if (defaultDown === '' && defaultUp === '') {
             document.getElementById('awgSpeedLimitStatus').textContent = _('apply_to_all_error');
             document.getElementById('awgSpeedLimitStatus').style.color = 'var(--danger)';
+            UI.toast(_('apply_to_all_error'), 'error');
             return;
         }
         
         const msg = _('apply_to_all_confirm').replace('{down}', defaultDown || '∞').replace('{up}', defaultUp || '∞');
-        if (!confirm(msg)) return;
+        const confirmed = await UI.confirm({
+            title: _('apply_to_all') || 'Apply to All',
+            message: msg,
+            confirmText: 'Apply',
+            confirmVariant: 'primary'
+        });
+        if (!confirmed) return;
         
         const btn = document.getElementById('applyDefaultSpeedLimitBtn');
         const statusEl = document.getElementById('awgSpeedLimitStatus');
@@ -1720,7 +1991,7 @@
         btn.textContent = '...';
         
         try {
-            const result = await apiCall(`/api/servers/${SERVER_ID}/awg/apply-default-speed-limits`, 'POST', {});
+            const result = await API.post(`/api/servers/${SERVER_ID}/awg/apply-default-speed-limits`, {});
             if (result.errors && result.errors.length > 0) {
                 statusEl.textContent = _('apply_to_all_partial').replace('{applied}', result.applied).replace('{errors}', result.errors.length);
                 statusEl.style.color = 'var(--warning)';
@@ -1728,11 +1999,13 @@
                 statusEl.textContent = _('apply_to_all_success').replace('{count}', result.applied);
                 statusEl.style.color = 'var(--success)';
             }
+            UI.toast(_('apply_to_all_success').replace('{count}', result.applied || 0), 'success');
             setTimeout(() => { statusEl.textContent = ''; }, 5000);
             loadConnections();
         } catch (err) {
             statusEl.textContent = _('apply_to_all_error');
             statusEl.style.color = 'var(--danger)';
+            UI.toast(_('apply_to_all_error') + ': ' + err.message, 'error');
             setTimeout(() => { statusEl.textContent = ''; }, 5000);
         } finally {
             btn.disabled = false;
@@ -1750,10 +2023,7 @@
         if (input) {
             input.value = name;
         }
-        openModal('renameServerModal');
-        if (input) {
-            setTimeout(() => input.focus(), 50);
-        }
+        openModal('renameServerModal', '#renameServerInput');
     }
 
     function closeRenameServerModal() {
@@ -1766,12 +2036,12 @@
         const input = document.getElementById('renameServerInput');
         const newName = input ? input.value.trim() : '';
         if (!newName) {
-            showToast(_('validation_failed') || 'Name cannot be empty', 'error');
+            UI.toast(_('validation_failed') || 'Name cannot be empty', 'error');
             return;
         }
         try {
-            const res = await apiCall(`/api/servers/${renameServerId}/rename`, 'POST', { name: newName });
-            showToast(_('server_renamed') || 'Server renamed', 'success');
+            await API.post(`/api/servers/${renameServerId}/rename`, { name: newName });
+            UI.toast(_('server_renamed') || 'Server renamed', 'success');
             closeRenameServerModal();
             const titleEl = document.getElementById('serverNameTitle');
             if (titleEl) {
@@ -1779,7 +2049,7 @@
             }
             document.title = document.title.replace(/— .*$/, `— ${newName}`);
         } catch (err) {
-            showToast(err.message, 'error');
+            UI.toast(err.message, 'error');
         }
     }
 

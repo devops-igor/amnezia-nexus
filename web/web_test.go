@@ -459,3 +459,93 @@ func TestPhase3TablesAndTelemetryEngine(t *testing.T) {
 		}
 	}
 }
+
+func TestPhase4DashboardAndServerModernization(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	// 1. Assert index.html modernizations
+	indexData, err := fs.ReadFile(templatesFS, "index.html")
+	if err != nil {
+		t.Fatalf("failed to read index.html: %v", err)
+	}
+	indexStr := string(indexData)
+
+	requiredIndexTokens := []string{
+		"href=\"#icon-server\"",
+		"href=\"#icon-plus\"",
+		"href=\"#icon-pencil\"",
+		"href=\"#icon-trash\"",
+		"href=\"#icon-shield\"",
+		"href=\"#icon-search\"",
+		"table-toolbar",
+		"table-search-box",
+		"table-search-input",
+		"filterServers",
+		"serverSearchEmpty",
+		"UI.confirm",
+		"API.post",
+		"UI.toast",
+	}
+	for _, token := range requiredIndexTokens {
+		if !strings.Contains(indexStr, token) {
+			t.Errorf("index.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure raw confirm() is not used in index.html
+	if strings.Contains(indexStr, "if (!confirm(") || strings.Contains(indexStr, "if(!confirm(") {
+		t.Errorf("index.html should not use raw confirm(), must use UI.confirm")
+	}
+
+	// 2. Assert server.html modernizations
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	requiredServerTokens := []string{
+		"href=\"#icon-server\"",
+		"href=\"#icon-pencil\"",
+		"href=\"#icon-refresh\"",
+		"href=\"#icon-activity\"",
+		"href=\"#icon-network\"",
+		"href=\"#icon-shield\"",
+		"href=\"#icon-settings\"",
+		"href=\"#icon-copy\"",
+		"href=\"#icon-key\"",
+		"href=\"#icon-trash\"",
+		"UI.confirm",
+		"UI.copy",
+		"UI.downloadFile",
+		"UI.toast",
+		"API.get",
+		"API.post",
+		"API.patch",
+		"NexusTable",
+		"connectionsTable",
+		"connectionsTableContainer",
+		"data-sort-type",
+		"data-searchable",
+		"reachabilityOverallBadge",
+	}
+	for _, token := range requiredServerTokens {
+		if !strings.Contains(serverStr, token) {
+			t.Errorf("server.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure raw confirm(), apiCall(), showToast() are not used in server.html
+	if strings.Contains(serverStr, "if (!confirm(") || strings.Contains(serverStr, "if(!confirm(") {
+		t.Errorf("server.html should not use raw confirm(), must use UI.confirm")
+	}
+	if strings.Contains(serverStr, "apiCall(") {
+		t.Errorf("server.html should not use apiCall(), must use API client")
+	}
+	if strings.Contains(serverStr, "showToast(") {
+		t.Errorf("server.html should not use showToast(), must use UI.toast")
+	}
+}
