@@ -1024,6 +1024,20 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return err
 	}
 
+	// Issue #50: clear the prober's consecutive-failure counter so the
+	// re-enabled backend gets the full FailureThreshold grace period; without
+	// this the first jittery probe after re-enable instantly re-disables it.
+	//
+	// Lock ordering — s.mu -> hp.mu is safe: the prober's own mutex is a leaf.
+	// Every hp.mu holder (ProbeTunnel, Start/Stop, the Set* setters) touches
+	// only prober fields plus pool (pool.mu); pool methods never call back
+	// into Service; and the onActiveHook fires with hp.mu already released,
+	// so no code path acquires hp.mu -> s.mu. This ordering already exists in
+	// SetHealthProber and SetProbeFunc.
+	if s.prober != nil {
+		s.prober.ResetFailCount(serverID)
+	}
+
 	return pool.SetTunnelStatus(ctx, serverID, TunnelStatusActive, 10)
 }
 
