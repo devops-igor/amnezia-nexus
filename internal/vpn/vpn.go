@@ -533,45 +533,15 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		svc.mu.RLock()
-		var tunID int64
-		for _, t := range svc.pool.ListTunnels() {
-			if t.PublicKey == serverPubKey {
-				tunID = t.ID
-				break
-			}
-		}
-		var dev BackendDevice
-		if tunID > 0 && svc.backendDevices != nil {
-			dev = svc.backendDevices[tunID]
-		}
-		svc.mu.RUnlock()
-
-		if dev != nil {
-			last := dev.LastHandshakeTime()
-			if !last.IsZero() && time.Since(last) < 3*time.Minute {
-				return 10 * time.Millisecond, nil
-			} else if !last.IsZero() && time.Since(last) >= 3*time.Minute {
-				return 0, errors.New("amneziawg-go handshake timeout")
-			}
-			// If LastHandshakeTime is zero, check startup grace period (90s cutoff).
-			// If within grace period: amneziawg-go requires a manual trigger packet to initiate the first handshake.
-			// Send a dummy IPv4 packet to 0.0.0.0 to trigger it and report success.
-			// If past grace period: report handshake timeout.
-			if time.Since(dev.CreatedAt()) >= 90*time.Second {
-				return 0, fmt.Errorf("amneziawg-go handshake timeout: initial handshake not completed within %v", 90*time.Second)
-			}
-			dummyPacket := []byte{
-				0x45, 0x00, 0x00, 0x14, // Version/IHL, ToS, Total Length
-				0x00, 0x00, 0x40, 0x00, // Identification, Flags/Fragment Offset
-				0x40, 0x01, 0x00, 0x00, // TTL, Protocol (ICMP), Header Checksum
-				0x00, 0x00, 0x00, 0x00, // Source IP (0.0.0.0)
-				0x00, 0x00, 0x00, 0x00, // Dest IP (0.0.0.0)
-			}
-			_, _ = dev.Write(dummyPacket)
-			return 10 * time.Millisecond, nil
-		}
-
+		// Issue #43 (session 8): the previous closure short-circuited here
+		// whenever a data device was attached, synthesizing a fake 10ms
+		// success (or a fake handshake timeout) from LastHandshakeTime alone
+		// — without sending anything. The real Noise IK prober (the only
+		// user of the dedicated probe key) was unreachable, so the backend's
+		// probe peer never handshook. The prober now runs the real
+		// health.ProbeAWGEndpoint on EVERY cycle regardless of data-device
+		// handshake age; the 10s cadence is trivial load. If a fast path is
+		// ever reintroduced it must still SEND the probe.
 		return health.ProbeAWGEndpoint(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
 	})
 
@@ -768,6 +738,12 @@ func (s *Service) Start(ctx context.Context) error {
 			s.mu.Unlock()
 			return fmt.Errorf("failed to sync tunnels from DB: %w", err)
 		}
+
+		// Issue #43 startup migration: backfill dedicated probe keys for
+		// legacy tunnels and (re-)register both portal peers on each backend
+		// BEFORE data planes are restored, so devices and probes come up
+		// with their correct identities. Best-effort; logs on failure.
+		s.EnsureBackendProbeKeys(ctx)
 
 		// Restore backend data-plane devices for active tunnels
 		s.restoreBackendDevices(ctx)
@@ -1017,29 +993,21 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
 	}
 
-	// Register the prober client peer on the backend server so amneziawg-go accepts probe handshakes
-	// We also use allowed_ips=0.0.0.0/0 so the portal can route arbitrary traffic.
+	// Register the portal peers on the backend server (issue #43):
+	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) — the DATA
+	//     device key with AllowedIPs 0.0.0.0/0 so the backend accepts data
+	//     traffic from the portal subnet and routes replies to the data device.
+	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) — a
+	//     dedicated probe key so prober handshakes never roam the data peer's
+	//     return endpoint (per-peer endpoint roaming: last sender wins).
+	// AddClient is an idempotent upsert on the caller-supplied key, so repeat
+	// registrations refresh in place; a legacy shared-key peer registered under
+	// the data identity keeps its client_ip entry and is re-pointed at the
+	// data-device identity.
 	if awgProv != nil {
-		type clientAdder interface {
-			AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
-		}
-		if adder, ok := awgProv.(clientAdder); ok {
-			proberPub, err := health.ComputePublicKeyFromPrivate(tun.PrivateKey)
-			if err != nil {
-				_ = pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
-				return fmt.Errorf("failed to compute prober client public key for server %d: %w", serverID, err)
-			}
-			clientParams := map[string]any{
-				"clientName":        "Portal Data Plane",
-				"name":              "Portal Data Plane",
-				"public_key":        proberPub,
-				"client_public_key": proberPub,
-				"allowed_ips":       "0.0.0.0/0",
-			}
-			if _, err := adder.AddClient(ctx, server, clientParams); err != nil {
-				_ = pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
-				return fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", serverID, err)
-			}
+		if err := s.registerBackendPortalPeers(ctx, server, tun); err != nil {
+			_ = pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
+			return err
 		}
 	}
 
@@ -1057,6 +1025,153 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	return pool.SetTunnelStatus(ctx, serverID, TunnelStatusActive, 10)
+}
+
+// registerBackendPortalPeers registers the portal's two identities on the
+// backend server (issue #43 key separation):
+//
+//  1. "Portal Data Plane" — the DATA device identity derive(tun.PrivateKey)
+//     with AllowedIPs 0.0.0.0/0, so the backend accepts data traffic from any
+//     portal client subnet and routes replies to the data device. The legacy
+//     name is kept deliberately: backends provisioned before the split already
+//     hold a peer of this name keyed by the same data identity, so the
+//     manager's upsert refreshes it in place instead of appending a duplicate
+//     [Peer] (which amneziawg would reject).
+//
+//  2. "Portal Health Probe" — the dedicated probe identity
+//     derive(tun.ProbePrivateKey) with NO allowed_ips key, so the manager's
+//     peerSectionFor defaults it to clientIP/32. The probe peer must NEVER own
+//     0.0.0.0/0: its only traffic is the prober's handshake/keepalive
+//     exchange, and a wide AllowedIPs would let probe packets shadow the data
+//     plane.
+//
+// The DATA peer is registered FIRST so a mid-way failure cannot leave a
+// backend with a probe peer but no data peer. On any failure the error is
+// wrapped with the server ID and the caller degrades the tunnel.
+func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models.Server, tun *models.BackendTunnel) error {
+	s.mu.RLock()
+	awgProv := s.awgProvider
+	db := s.db
+	s.mu.RUnlock()
+
+	adder, ok := awgProv.(interface {
+		AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
+	})
+	if !ok {
+		// Provider without AddClient capability (e.g. status-only
+		// implementations): there is no peer-registration path on this
+		// backend, so skip silently — same semantics as before #43.
+		return nil
+	}
+
+	dataPub, err := tunnel.DataDevicePublicKey(tun)
+	if err != nil {
+		return fmt.Errorf("failed to derive data device public key for server %d: %w", server.ID, err)
+	}
+	probePub, err := tunnel.ClientPublicKey(tun)
+	if err != nil {
+		return fmt.Errorf("failed to derive probe public key for server %d: %w", server.ID, err)
+	}
+	if tun.ProbePrivateKey == "" || probePub == dataPub {
+		return fmt.Errorf("probe key for backend tunnel %d on server %d is missing or collides with the data key", tun.ID, server.ID)
+	}
+
+	dataParams := map[string]any{
+		"clientName":        "Portal Data Plane",
+		"name":              "Portal Data Plane",
+		"public_key":        dataPub,
+		"client_public_key": dataPub,
+		"allowed_ips":       "0.0.0.0/0",
+	}
+	if _, err := adder.AddClient(ctx, server, dataParams); err != nil {
+		return fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err)
+	}
+
+	probeParams := map[string]any{
+		"clientName":        "Portal Health Probe",
+		"name":              "Portal Health Probe",
+		"public_key":        probePub,
+		"client_public_key": probePub,
+		// No allowed_ips key: peerSectionFor defaults to clientIP/32. The
+		// probe peer must never be granted 0.0.0.0/0.
+	}
+	if _, err := adder.AddClient(ctx, server, probeParams); err != nil {
+		return fmt.Errorf("failed to register portal health probe peer on backend server %d: %w", server.ID, err)
+	}
+
+	// Persist the probe key so the identity is stable across restarts
+	// (Fernet-encrypted at rest by the database layer).
+	if db != nil {
+		if err := db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"probe_private_key": tun.ProbePrivateKey}); err != nil {
+			return fmt.Errorf("failed to persist probe private key for backend tunnel %d (server %d): %w", tun.ID, server.ID, err)
+		}
+	}
+	return nil
+}
+
+// EnsureBackendProbeKeys is the issue-#43 startup migration: every tunnel in
+// the pool must carry a dedicated probe key and have both portal peers
+// registered on its backend server. Pool.SyncFromDB backfills keys missing
+// from legacy rows in memory; this pass guarantees persistence and provisions
+// the probe peer. Registration is idempotent (AddClient upserts by the
+// caller-supplied public key), so running it on every boot for every
+// non-disabled tunnel is safe and self-healing — it also re-points any legacy
+// shared-key probe peer and drops stale PSK variants.
+//
+// Best-effort by design: an unreachable backend is logged and left as-is; the
+// health prober and the next EnableBackend/startup pass retry later.
+func (s *Service) EnsureBackendProbeKeys(ctx context.Context) {
+	s.mu.RLock()
+	pool := s.pool
+	s.mu.RUnlock()
+	if pool == nil {
+		return
+	}
+
+	for _, tun := range pool.ListTunnels() {
+		if tun.Status == TunnelStatusDisabled {
+			continue
+		}
+
+		// SyncFromDB already backfills missing keys; this defensive second
+		// pass keeps the migration correct if it ever runs against a pool
+		// populated by another path.
+		if tun.ProbePrivateKey == "" {
+			_, sk, err := tunnel.GenerateCurve25519KeyPair()
+			if err != nil {
+				log.Printf("[vpn] warning: probe-key migration for tunnel %d (server %d): failed to generate keypair: %v", tun.ID, tun.ServerID, err)
+				continue
+			}
+			tun.ProbePrivateKey = sk
+			s.mu.RLock()
+			db := s.db
+			s.mu.RUnlock()
+			if db != nil {
+				if err := db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"probe_private_key": sk}); err != nil {
+					log.Printf("[vpn] warning: probe-key migration for tunnel %d (server %d): persist failed: %v", tun.ID, tun.ServerID, err)
+					continue
+				}
+			}
+		}
+
+		s.mu.RLock()
+		awgProv := s.awgProvider
+		db := s.db
+		s.mu.RUnlock()
+		if awgProv == nil || db == nil {
+			continue
+		}
+		server, err := db.GetServerByID(ctx, tun.ServerID)
+		if err != nil || server == nil {
+			log.Printf("[vpn] warning: probe-peer migration for tunnel %d: server %d not loadable: %v", tun.ID, tun.ServerID, err)
+			continue
+		}
+		regCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := s.registerBackendPortalPeers(regCtx, server, tun); err != nil {
+			log.Printf("[vpn] warning: probe-peer migration for tunnel %d (server %d) failed, leaving tunnel as-is: %v", tun.ID, tun.ServerID, err)
+		}
+		cancel()
+	}
 }
 
 // resolveBackendCredentials retrieves AWG credentials for a backend, falling back to live discovery.
@@ -1165,7 +1280,7 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	s.backendDevices[tun.ID] = dev
 
 	// Spawn backend read loop to route packets back to clients
-	go func(backendID int64, device BackendDevice) {
+	go func(backendID int64, serverID int64, device BackendDevice) {
 		buf := make([]byte, 2048)
 		for {
 			n, err := device.Read(buf)
@@ -1183,12 +1298,13 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 					now := time.Now().Unix()
 					if s.dropLogUntil.Load() <= now {
 						s.dropLogUntil.Store(now + 1)
-						log.Printf("[vpn/forwarder] dropped backend return packet to %s: %v", destIP, err)
+						log.Printf("[vpn/forwarder] dropped backend return packet to %s (backend_tunnel_id=%d server_id=%d): %v",
+							destIP, backendID, serverID, err)
 					}
 				}
 			}
 		}
-	}(tun.ID, dev)
+	}(tun.ID, tun.ServerID, dev)
 
 	// Trigger backend routing and NAT remediation asynchronously in the background
 	// so tunnel attachment and data-plane startup are never blocked by SSH latency.

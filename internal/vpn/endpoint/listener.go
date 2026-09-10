@@ -976,12 +976,20 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		return fmt.Errorf("no transport keys for peer %s", peerKey)
 	}
 
-	// Find the peer's last-seen UDP address.
+	// Find the peer's most-recently-seen UDP address. A peer that rehandshakes
+	// from a new socket port leaves its older entry in peersByAddr; map
+	// iteration order must not decide which address receives traffic
+	// (issue #43: replies vanished when the stale entry won the pick).
 	addrStr := ""
 	var st *activePeerState
+	var newest int64 = -1
 	el.mu.RLock()
 	for a, cand := range el.peersByAddr {
-		if cand.peerKey == peerKey {
+		if cand.peerKey != peerKey {
+			continue
+		}
+		if ls := cand.lastSeen.Load(); ls > newest {
+			newest = ls
 			addrStr = a
 			st = cand
 		}

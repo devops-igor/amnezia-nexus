@@ -18,7 +18,7 @@ func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, err
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, server_id, interface_name, public_key, private_key, endpoint,
+	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
 		status, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels ORDER BY id`
 
@@ -50,7 +50,7 @@ func (d *DB) GetBackendTunnel(ctx context.Context, id int64) (*models.BackendTun
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, server_id, interface_name, public_key, private_key, endpoint,
+	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
 		status, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE id = ?`
 
@@ -84,6 +84,15 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encPrivKey = ep
 	}
 
+	encProbeKey := t.ProbePrivateKey
+	if encProbeKey != "" && !security.LooksLikeFernetToken(encProbeKey) {
+		ep, err := security.EncryptCredential(encProbeKey, d.secretKey)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encrypt backend tunnel probe private key: %w", err)
+		}
+		encProbeKey = ep
+	}
+
 	if t.Status == "" {
 		t.Status = "connecting"
 	}
@@ -94,15 +103,16 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	healthCheckStr := formatTimePtr(t.LastHealthCheck)
 
 	query := `INSERT INTO backend_tunnels (
-		server_id, interface_name, public_key, private_key, endpoint,
+		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
 		status, last_health_check, latency_ms, active_connections, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
 		t.ServerID,
 		t.InterfaceName,
 		t.PublicKey,
 		encPrivKey,
+		encProbeKey,
 		t.Endpoint,
 		t.Status,
 		healthCheckStr,
@@ -147,6 +157,15 @@ func (d *DB) UpdateBackendTunnel(ctx context.Context, id int64, updates map[stri
 				enc, err := security.EncryptCredential(s, d.secretKey)
 				if err != nil {
 					return fmt.Errorf("failed to encrypt private key: %w", err)
+				}
+				val = enc
+			}
+		}
+		if col == "probe_private_key" {
+			if s, ok := val.(string); ok && s != "" && !security.LooksLikeFernetToken(s) {
+				enc, err := security.EncryptCredential(s, d.secretKey)
+				if err != nil {
+					return fmt.Errorf("failed to encrypt probe private key: %w", err)
 				}
 				val = enc
 			}
@@ -207,7 +226,7 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := `SELECT id, server_id, interface_name, public_key, private_key, endpoint,
+	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
 		status, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE server_id = ?`
 
@@ -463,7 +482,7 @@ func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 
 func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	var t models.BackendTunnel
-	var privKey, healthCheck, createdAt sql.NullString
+	var privKey, probeKey, healthCheck, createdAt sql.NullString
 
 	err := s.Scan(
 		&t.ID,
@@ -471,6 +490,7 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 		&t.InterfaceName,
 		&t.PublicKey,
 		&privKey,
+		&probeKey,
 		&t.Endpoint,
 		&t.Status,
 		&healthCheck,
@@ -484,6 +504,9 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 
 	if privKey.Valid && privKey.String != "" {
 		t.PrivateKey = security.DecryptCredentialSafe(privKey.String, d.secretKey)
+	}
+	if probeKey.Valid && probeKey.String != "" {
+		t.ProbePrivateKey = security.DecryptCredentialSafe(probeKey.String, d.secretKey)
 	}
 	if healthCheck.Valid && healthCheck.String != "" {
 		ht := parseTime(healthCheck.String)
