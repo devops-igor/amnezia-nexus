@@ -2509,7 +2509,11 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	var probeShouldSucceed atomic.Bool
 	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if !probeShouldSucceed.Load() {
+			return 0, errors.New("probe temporarily disabled during startup")
+		}
 		return 10 * time.Millisecond, nil
 	})
 	if err := svc.Start(ctx); err != nil {
@@ -2536,6 +2540,7 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 	}
 
 	// Probe the tunnel - now succeeds and transitions to active
+	probeShouldSucceed.Store(true)
 	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
 	if err != nil {
 		t.Fatalf("ProbeTunnel failed: %v", err)
