@@ -17,7 +17,7 @@
             <div class="server-meta">
                 <div class="server-icon">🖥</div>
                 <div>
-                    <div class="server-name">{{ $server.Name }}</div>
+                    <div class="server-name" id="server-name-{{ $server.ID }}">{{ $server.Name }}</div>
                     <div class="server-host">{{ $server.Host }}:{{ $server.SSHPort }}</div>
                 </div>
             </div>
@@ -44,6 +44,10 @@
                 <a href="/server/{{ $server.ID }}" class="btn btn-secondary btn-sm" style="flex:1">
                     {{ _ "manage" }}
                 </a>
+                <button class="btn btn-secondary btn-sm btn-icon" onclick="openRenameServerModal({{ $server.ID }}, '{{ $server.Name }}')"
+                    title="{{ _ "rename_server" }}">
+                    ✏️
+                </button>
                 <button class="btn btn-danger btn-sm btn-icon" onclick="deleteServer({{ $server.ID }})"
                     title="{{ _ "delete" }}">
                     🗑
@@ -128,6 +132,26 @@
         </form>
     </div>
 </div>
+
+<!-- Rename Server Modal -->
+<div class="modal-backdrop" id="renameServerModal">
+    <div class="modal" style="max-width: 400px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _ "rename_server" }}</h2>
+            <button class="modal-close" onclick="closeRenameServerModal()">×</button>
+        </div>
+        <div class="form-group" style="padding: var(--space-sm) 0;">
+            <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
+            <input type="text" id="renameServerInput" class="form-input" maxlength="255"
+                   placeholder="{{ _ "rename_server_placeholder" }}"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitRenameServer();}">
+        </div>
+        <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
+            <button class="btn btn-primary" onclick="submitRenameServer()">{{ _ "save" }}</button>
+            <button class="btn btn-secondary" onclick="closeRenameServerModal()">{{ _ "cancel" }}</button>
+        </div>
+    </div>
+</div>
 {{ end }}
 
 {{ define "scripts" }}
@@ -210,6 +234,50 @@
             await apiCall(`/api/servers/${serverId}/delete`, 'POST');
             showToast(_('server_deleted'), 'success');
             setTimeout(() => window.location.reload(), 500);
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+
+    let renameServerId = null;
+
+    function openRenameServerModal(serverId, currentName) {
+        renameServerId = serverId;
+        const nameEl = document.getElementById(`server-name-${serverId}`);
+        const name = nameEl ? nameEl.textContent.trim() : (currentName || '');
+        const input = document.getElementById('renameServerInput');
+        if (input) {
+            input.value = name;
+        }
+        openModal('renameServerModal');
+        if (input) {
+            setTimeout(() => input.focus(), 50);
+        }
+    }
+
+    function closeRenameServerModal() {
+        closeModal('renameServerModal');
+        renameServerId = null;
+    }
+
+    async function submitRenameServer() {
+        if (!renameServerId) return;
+        const input = document.getElementById('renameServerInput');
+        const newName = input ? input.value.trim() : '';
+        if (!newName) {
+            showToast(_('validation_failed') || 'Name cannot be empty', 'error');
+            return;
+        }
+        try {
+            const res = await apiCall(`/api/servers/${renameServerId}/rename`, 'POST', { name: newName });
+            showToast(_('server_renamed') || 'Server renamed', 'success');
+            closeRenameServerModal();
+            const nameEl = document.getElementById(`server-name-${renameServerId}`);
+            if (nameEl) {
+                nameEl.textContent = newName;
+            } else {
+                setTimeout(() => window.location.reload(), 300);
+            }
         } catch (err) {
             showToast(err.message, 'error');
         }

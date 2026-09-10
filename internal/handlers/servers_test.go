@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/go-chi/chi/v5"
 )
 
 func TestServerHandlers(t *testing.T) {
@@ -1296,4 +1298,201 @@ func TestServerCheckHandler_SyncsReachabilityOnline(t *testing.T) {
 	if err != nil || updatedStatus != models.ReachabilityOnline {
 		t.Errorf("expected status to be online after check, got: %s (err: %v)", updatedStatus, err)
 	}
+}
+
+func TestRenameServerHandler(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Original-Server-Name",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	// Capture slog audit output
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+	})
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+	t.Run("Happy path - POST rename", func(t *testing.T) {
+		logBuf.Reset()
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "Renamed-Server-1"})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["name"] != "Renamed-Server-1" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		// Verify DB record updated
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Name != "Renamed-Server-1" {
+			t.Errorf("expected server name 'Renamed-Server-1', got %q", dbSrv.Name)
+		}
+
+		// Verify audit log
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "server.rename") || !strings.Contains(logStr, "Original-Server-Name") || !strings.Contains(logStr, "Renamed-Server-1") {
+			t.Errorf("audit log missing expected rename event, got: %s", logStr)
+		}
+	})
+
+	t.Run("Happy path - PATCH rename with whitespace trim", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "  Renamed-Server-2  "})
+		req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["name"] != "Renamed-Server-2" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Name != "Renamed-Server-2" {
+			t.Errorf("expected server name 'Renamed-Server-2', got %q", dbSrv.Name)
+		}
+	})
+
+	t.Run("Validation failure - empty name", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: ""})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - whitespace only name", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "   \t\n  "})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - null byte in name", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "bad\x00name"})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - name > 255 chars", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: strings.Repeat("x", 256)})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Invalid JSON body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), strings.NewReader("{not-valid-json"))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Invalid server ID parameter", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "Valid Name"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/invalid-id/rename", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Not found - non-existent server ID", func(t *testing.T) {
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "Valid Name"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/999999/rename", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 Not Found, got %d", w.Code)
+		}
+	})
+
+	t.Run("Unauthorized - regular user role via RequireAdminOrSupport middleware", func(t *testing.T) {
+		protRouter := chi.NewRouter()
+		protRouter.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAdminOrSupport)
+			r.Post("/api/servers/{server_id}/rename", h.RenameServerHandler)
+			r.Patch("/api/servers/{server_id}/rename", h.RenameServerHandler)
+		})
+
+		body, _ := json.Marshal(models.RenameServerRequest{Name: "Unauthorized Rename"})
+
+		// Regular user -> 403 Forbidden
+		reqUser := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(body))
+		userCtx := middleware.WithSession(reqUser.Context(), &models.SessionData{UserID: "u-regular", Role: models.RoleUser})
+		wUser := httptest.NewRecorder()
+		protRouter.ServeHTTP(wUser, reqUser.WithContext(userCtx))
+
+		if wUser.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for regular user, got %d", wUser.Code)
+		}
+
+		// Support user -> 200 OK
+		bodySupport, _ := json.Marshal(models.RenameServerRequest{Name: "Support-Renamed-Server"})
+		reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/rename", serverID), bytes.NewReader(bodySupport))
+		supportCtx := middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: "u-support", Role: models.RoleSupport})
+		wSupport := httptest.NewRecorder()
+		protRouter.ServeHTTP(wSupport, reqSupport.WithContext(supportCtx))
+
+		if wSupport.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for support user, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
+		}
+	})
 }

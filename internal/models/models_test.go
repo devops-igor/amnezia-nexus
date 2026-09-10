@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -493,5 +494,76 @@ func TestContainerAndConfigPathMapping(t *testing.T) {
 	}
 	if _, ok := ConfigPathForProtocol("../../etc/shadow"); ok {
 		t.Errorf("ConfigPathForProtocol should reject path-injection input")
+	}
+}
+
+func TestRenameServerRequest_Validate(t *testing.T) {
+	tests := []struct {
+		name     string
+		req      RenameServerRequest
+		wantErr  bool
+		errMsg   string
+		wantName string
+	}{
+		{
+			name:     "valid name",
+			req:      RenameServerRequest{Name: "US-East-1"},
+			wantErr:  false,
+			wantName: "US-East-1",
+		},
+		{
+			name:     "valid name with whitespace trimming",
+			req:      RenameServerRequest{Name: "  Frankfurt Node 2   "},
+			wantErr:  false,
+			wantName: "Frankfurt Node 2",
+		},
+		{
+			name:    "empty name",
+			req:     RenameServerRequest{Name: ""},
+			wantErr: true,
+			errMsg:  "name must be between 1 and 255 characters",
+		},
+		{
+			name:    "whitespace only name",
+			req:     RenameServerRequest{Name: "   \t\n  "},
+			wantErr: true,
+			errMsg:  "name must be between 1 and 255 characters",
+		},
+		{
+			name:    "null byte in name",
+			req:     RenameServerRequest{Name: "server\x00malicious"},
+			wantErr: true,
+			errMsg:  "name cannot contain null bytes",
+		},
+		{
+			name:     "maximum length 255 chars",
+			req:      RenameServerRequest{Name: strings.Repeat("a", 255)},
+			wantErr:  false,
+			wantName: strings.Repeat("a", 255),
+		},
+		{
+			name:    "exceeds 255 chars",
+			req:     RenameServerRequest{Name: strings.Repeat("a", 256)},
+			wantErr: true,
+			errMsg:  "name must be between 1 and 255 characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error message containing %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if tt.req.Name != tt.wantName {
+					t.Errorf("expected trimmed name %q, got %q", tt.wantName, tt.req.Name)
+				}
+			}
+		})
 	}
 }
