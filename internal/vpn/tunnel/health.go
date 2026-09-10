@@ -18,7 +18,9 @@ import (
 var ErrTunnelDisabled = errors.New("tunnel is administratively disabled")
 
 // ProbeFunc is a function type for executing Noise IK handshake probes to a UDP endpoint.
-type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
+// h1 and h2 accept models.HeaderRange (AWG 3.1 header ranges, issue #49) or
+// uint32 (legacy single-value headers); ProbeAWGEndpointRange handles both.
+type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error)
 
 // HealthConfig defines tuning parameters for the backend health prober.
 type HealthConfig struct {
@@ -87,7 +89,7 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		cfg.S2 = health.DefaultS2
 	}
 
-	pFn := health.ProbeAWGEndpoint
+	pFn := health.ProbeAWGEndpointRange
 	if len(probeFn) > 0 && probeFn[0] != nil {
 		pFn = probeFn[0]
 	}
@@ -141,14 +143,14 @@ func (hp *HealthProber) Config() HealthConfig {
 	return hp.cfg
 }
 
-func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int64) (h1, h2 uint32, s1, s2 int, hpKey string, found bool) {
+func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int64) (h1, h2 models.HeaderRange, s1, s2 int, hpKey string, found bool) {
 	server, err := db.GetServer(ctx, serverID)
 	if err != nil || server == nil || server.Protocols == nil {
-		return 0, 0, -1, -1, "", false
+		return models.HeaderRange{}, models.HeaderRange{}, -1, -1, "", false
 	}
 	awgInfo, ok := server.Protocols["awg"].(map[string]any)
 	if !ok || awgInfo == nil {
-		return 0, 0, -1, -1, "", false
+		return models.HeaderRange{}, models.HeaderRange{}, -1, -1, "", false
 	}
 	var paramsObj any
 	if p, ok := awgInfo["awg_params"]; ok && p != nil {
@@ -158,37 +160,46 @@ func paramsFromBackendServer(ctx context.Context, db *database.DB, serverID int6
 	} else {
 		paramsObj = awgInfo
 	}
-	bH1, bH2, bS1, bS2, ok := health.ExtractAWGExplicitParams(paramsObj)
-	if ok && (bH1 > 0 || bH2 > 0 || bS1 >= 0 || bS2 >= 0) {
-		return bH1, bH2, bS1, bS2, health.ExtractHeaderProtectionKey(paramsObj), true
+	// Issue #49: extract H1/H2 as full HeaderRanges (AWG 3.1). The previous
+	// ExtractAWGExplicitParams path truncated ranges to their lowest bound,
+	// so range-configured backends failed response verification ~99.998% of
+	// the time and were degraded then disabled after 3 cycles.
+	rH1, rH2, rS1, rS2 := health.ExtractAWGHeaderRanges(paramsObj, health.DefaultH1, health.DefaultH2, health.DefaultS1, health.DefaultS2)
+	_, _, _, _, explicit := health.ExtractAWGExplicitParams(paramsObj)
+	if explicit {
+		return rH1, rH2, rS1, rS2, health.ExtractHeaderProtectionKey(paramsObj), true
 	}
-	return 0, 0, -1, -1, "", false
+	return models.HeaderRange{}, models.HeaderRange{}, -1, -1, "", false
 }
 
-func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 uint32, s1, s2 int, found bool) {
+func paramsFromVPNConfig(ctx context.Context, db *database.DB) (h1, h2 models.HeaderRange, s1, s2 int, found bool) {
 	vpnCfg, err := db.GetVPNConfig(ctx)
 	if err != nil || vpnCfg == nil {
-		return 0, 0, -1, -1, false
+		return models.HeaderRange{}, models.HeaderRange{}, -1, -1, false
 	}
+	// Issue #49: forward the stored ranges verbatim (PickOne belongs to the
+	// prober's initiation builder, not to resolution).
 	if !vpnCfg.H1.IsZero() || !vpnCfg.H2.IsZero() || vpnCfg.S1 >= 0 || vpnCfg.S2 >= 0 {
-		return vpnCfg.H1.PickOne(), vpnCfg.H2.PickOne(), vpnCfg.S1, vpnCfg.S2, true
+		return vpnCfg.H1, vpnCfg.H2, vpnCfg.S1, vpnCfg.S2, true
 	}
-	return 0, 0, -1, -1, false
+	return models.HeaderRange{}, models.HeaderRange{}, -1, -1, false
 }
 
 // resolveTunnelParams returns H1, H2, S1, S2 for probing the specific backend tunnel,
 // checking the backend's installed params first, then stored VPNConfig, then prober defaults.
-func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64) (h1, h2 uint32, s1, s2 int, hpKey string) {
+// h1 and h2 carry models.HeaderRange (full AWG 3.1 ranges, issue #49); they are typed
+// `any` to match ProbeFunc, which ProbeAWGEndpointRange accepts alongside uint32.
+func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64) (h1, h2 any, s1, s2 int, hpKey string) {
 	h1, h2, s1, s2 = hp.cfg.H1, hp.cfg.H2, hp.cfg.S1, hp.cfg.S2
 	if hp.db == nil {
 		return h1, h2, s1, s2, ""
 	}
 
 	if bH1, bH2, bS1, bS2, bHPKey, ok := paramsFromBackendServer(ctx, hp.db, serverID); ok {
-		if bH1 > 0 {
+		if !bH1.IsZero() {
 			h1 = bH1
 		}
-		if bH2 > 0 {
+		if !bH2.IsZero() {
 			h2 = bH2
 		}
 		if bS1 >= 0 {
@@ -201,10 +212,10 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 	}
 
 	if vH1, vH2, vS1, vS2, ok := paramsFromVPNConfig(ctx, hp.db); ok {
-		if vH1 > 0 {
+		if !vH1.IsZero() {
 			h1 = vH1
 		}
-		if vH2 > 0 {
+		if !vH2.IsZero() {
 			h2 = vH2
 		}
 		if vS1 >= 0 {

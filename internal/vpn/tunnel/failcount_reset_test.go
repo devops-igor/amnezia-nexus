@@ -30,7 +30,7 @@ func TestHealthProber_ResetFailCount(t *testing.T) {
 	}
 
 	probeShouldFail := true
-	mockProbe := func(_ context.Context, _ string, _ string, _ string, _ string, _ string, _ uint32, _ uint32, _ int, _ int, _ time.Duration) (time.Duration, error) {
+	mockProbe := func(_ context.Context, _ string, _ string, _ string, _ string, _ string, _ any, _ any, _ int, _ int, _ time.Duration) (time.Duration, error) {
 		if probeShouldFail {
 			return 0, errors.New("simulated handshake timeout")
 		}

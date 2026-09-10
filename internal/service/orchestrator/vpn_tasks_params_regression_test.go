@@ -62,11 +62,11 @@ func TestOrchestrator_CheckBackendTunnelHealth_UsesStoredSnakeCaseParams(t *test
 
 	var mu sync.Mutex
 	var gotHPKey string
-	var gotH1, gotH2 uint32
+	var gotH1, gotH2 any
 	var gotS1, gotS2 int
 
 	probeCalled := make(chan struct{}, 1)
-	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		mu.Lock()
 		gotHPKey, gotH1, gotH2, gotS1, gotS2 = hpKey, h1, h2, s1, s2
 		mu.Unlock()
@@ -89,8 +89,10 @@ func TestOrchestrator_CheckBackendTunnelHealth_UsesStoredSnakeCaseParams(t *test
 
 	mu.Lock()
 	defer mu.Unlock()
-	if gotH1 != 1 || gotH2 != 2 {
-		t.Errorf("expected probe h1/h2 = 1/2 from stored awg_params, got %d/%d", gotH1, gotH2)
+	// Issue #49: params now propagate as models.HeaderRange. The stored
+	// snake_case values "1"/"2" arrive as degenerate ranges [1,1] / [2,2].
+	if gotH1 != any(models.DegenerateHeaderRange(1)) || gotH2 != any(models.DegenerateHeaderRange(2)) {
+		t.Errorf("expected probe h1/h2 = degenerate ranges 1/2 from stored awg_params, got %v/%v", gotH1, gotH2)
 	}
 	if gotS1 != 12 || gotS2 != 12 {
 		t.Errorf("expected probe s1/s2 = 12/12 from stored awg_params, got %d/%d", gotS1, gotS2)
@@ -133,10 +135,10 @@ func TestOrchestrator_CheckBackendTunnelHealth_DefaultParamsWhenNoAwgParams(t *t
 	}
 
 	var mu sync.Mutex
-	var gotH1, gotH2 uint32
+	var gotH1, gotH2 any
 	var gotS1, gotS2 int
 	probeCalled := make(chan struct{}, 1)
-	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		mu.Lock()
 		gotH1, gotH2, gotS1, gotS2 = h1, h2, s1, s2
 		mu.Unlock()
@@ -158,8 +160,9 @@ func TestOrchestrator_CheckBackendTunnelHealth_DefaultParamsWhenNoAwgParams(t *t
 
 	mu.Lock()
 	defer mu.Unlock()
-	if gotH1 != health.DefaultH1 || gotH2 != health.DefaultH2 {
-		t.Errorf("expected default h1/h2 %d/%d, got %d/%d", health.DefaultH1, health.DefaultH2, gotH1, gotH2)
+	// Issue #49: default fallback now arrives as degenerate HeaderRange.
+	if gotH1 != any(models.DegenerateHeaderRange(health.DefaultH1)) || gotH2 != any(models.DegenerateHeaderRange(health.DefaultH2)) {
+		t.Errorf("expected default h1/h2 %d/%d, got %v/%v", health.DefaultH1, health.DefaultH2, gotH1, gotH2)
 	}
 	if gotS1 != health.DefaultS1 || gotS2 != health.DefaultS2 {
 		t.Errorf("expected default s1/s2 %d/%d, got %d/%d", health.DefaultS1, health.DefaultS2, gotS1, gotS2)
