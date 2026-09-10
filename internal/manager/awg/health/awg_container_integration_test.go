@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -361,8 +360,8 @@ func awgProbeHost() string {
 
 // TestAWGRealContainer_HandshakeWithHeaderProtectionKey is the Issue #18 R5
 // acceptance criterion: the probe's header-protection support works against a
-// REAL amneziawg-go. The server conf declares a HeaderProtectionKey (32B key,
-// base64-decoded then hex-encoded for the conf, as amneziawg expects) plus
+// REAL amneziawg-go. The server conf declares a HeaderProtectionKey (standard
+// 32-byte base64 string, as WireGuard/amneziawg-tools expects) plus
 // S1..S4 = 15 (>= 12 junk sizes the header protection constraint requires).
 // The probe is issued with the same key in the portal's base64 form — the
 // exact shape ExtractHeaderProtectionKey returns from stored awg_params — so
@@ -381,14 +380,13 @@ func TestAWGRealContainer_HandshakeWithHeaderProtectionKey(t *testing.T) {
 	serverPriv, serverPub := generateIntegrationKeypair(t)
 	proberPriv, proberPub := generateIntegrationKeypair(t)
 
-	// The header-protection key: 32 random bytes, base64 (portal/awg_params
-	// form) and hex (server conf form) of the SAME key.
+	// The header-protection key: 32 random bytes, base64-encoded as expected
+	// by WireGuard and AmneziaWG configuration files and the probe.
 	hpRaw := make([]byte, 32)
 	if _, err := rand.Read(hpRaw); err != nil {
 		t.Fatalf("rand hp key: %v", err)
 	}
 	hpKeyB64 := base64.StdEncoding.EncodeToString(hpRaw)
-	hpKeyHex := hex.EncodeToString(hpRaw)
 
 	port := freeUDPPort(t)
 
@@ -420,7 +418,7 @@ AllowedIPs = 10.8.1.2/32
 		serverPriv, port,
 		sVal, sVal, sVal, sVal,
 		DefaultH1, DefaultH2, DefaultH3, DefaultH4,
-		hpKeyHex,
+		hpKeyB64,
 		proberPub,
 	)
 
