@@ -532,7 +532,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		_ = svc.DisconnectSession(ctx, sess.ID)
 	})
 
-	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		// Issue #43 (session 8): the previous closure short-circuited here
 		// whenever a data device was attached, synthesizing a fake 10ms
 		// success (or a fake handshake timeout) from LastHandshakeTime alone
@@ -542,7 +542,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		// health.ProbeAWGEndpoint on EVERY cycle regardless of data-device
 		// handshake age; the 10s cadence is trivial load. If a fast path is
 		// ever reintroduced it must still SEND the probe.
-		return health.ProbeAWGEndpoint(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
+		// Issue #49: forwards through ProbeAWGEndpointRange, which accepts
+		// full AWG 3.1 header ranges (models.HeaderRange) as well as uint32.
+		return health.ProbeAWGEndpointRange(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
 	})
 
 	svc.prober.SetOnActiveHook(func(ctx context.Context, t *models.BackendTunnel) error {

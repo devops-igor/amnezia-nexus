@@ -37,7 +37,9 @@ type healthProbeKey struct {
 }
 
 // ProbeFunc defines the signature for Noise IK handshake UDP probes.
-type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error)
+// h1 and h2 accept models.HeaderRange (AWG 3.1 header ranges, issue #49) or
+// uint32 (legacy single-value headers); ProbeAWGEndpointRange handles both.
+type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error)
 
 // Orchestrator coordinates scheduled background maintenance and telemetry tasks.
 type Orchestrator struct {
@@ -132,7 +134,7 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		registry:          registry,
 		userOps:           defaultUserOps,
 		remnawaveSyncer:   defaultSyncer,
-		probeFn:           health.ProbeAWGEndpoint,
+		probeFn:           health.ProbeAWGEndpointRange,
 		bootDelay:         60 * time.Second,
 		interval:          600 * time.Second,
 		maxConcurrency:    10,
