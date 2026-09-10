@@ -94,6 +94,10 @@ type sessionRoute struct {
 	limitUpBps   int64
 	tbDown       *TokenBucket
 	tbUp         *TokenBucket
+	// pumpStarted records that a pumpClientQueue goroutine owns this route's
+	// queue. StartPumps uses it (under f.mu) to give pumpless routes a pump;
+	// the flag prevents a double start for the same route generation.
+	pumpStarted bool
 }
 
 // Forwarder manages packet routing and bidirectional relay between peer sessions and backend tunnels.
@@ -111,11 +115,20 @@ type Forwarder struct {
 	bufSize          int
 	totalRxBytes     atomic.Int64
 	totalTxBytes     atomic.Int64
+	dropsQueueFull   atomic.Uint64 // return packets dropped: per-route queue full
+	dropsTotal       atomic.Uint64 // return-path drops counted so far (queue full)
 	running          bool
 	stopCh           chan struct{}
 	pumpsRunning     bool
 	pumpsStopCh      chan struct{}
 	pumpsWg          sync.WaitGroup
+	// Generation accounting for teardown races (issue #39): each
+	// registration for a peer key earns one teardown; an UnregisterSession
+	// that arrives while a NEWER registration holds the route (late reaper /
+	// API teardown of a superseded rekey generation) is consumed as stale
+	// instead of killing the live route. Guarded by mu.
+	peerRegs   map[string]uint64 // peerKey -> registrations seen
+	peerUnregs map[string]uint64 // peerKey -> stale teardown requests consumed
 }
 
 // NewForwarder creates a new Forwarder.
@@ -133,6 +146,8 @@ func NewForwarder(accountant *TrafficAccountant, bufSize ...int) *Forwarder {
 		backendDevices:   make(map[int64]PacketDevice),
 		backendPumpStops: make(map[int64]chan struct{}),
 		backendPumpDones: make(map[int64]chan struct{}),
+		peerRegs:         make(map[string]uint64),
+		peerUnregs:       make(map[string]uint64),
 		bufSize:          qSize,
 		stopCh:           make(chan struct{}),
 	}
@@ -180,6 +195,11 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	if old, ok := f.routesByPeer[peerKey]; ok && old != nil {
 		f.stopRoutePumpLocked(old)
 	}
+	// Each registration earns exactly one teardown (generation accounting,
+	// issue #39): if a teardown for a SUPERSEDED registration of this peer
+	// arrives before this one, it was consumed as stale against the older
+	// balance — see UnregisterSession.
+	f.peerRegs[peerKey]++
 
 	f.routesByPeer[peerKey] = route
 	if assignedIP != "" {
@@ -187,6 +207,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	}
 
 	if f.pumpsRunning {
+		route.pumpStarted = true
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(f.pumpsStopCh, route)
 	}
@@ -200,6 +221,7 @@ func (f *Forwarder) stopRoutePumpLocked(route *sessionRoute) {
 	if route != nil && route.stopCh != nil && !route.stopped {
 		close(route.stopCh)
 		route.stopped = true
+		route.pumpStarted = false
 	}
 }
 
@@ -244,12 +266,56 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 
 // UnregisterSession removes a peer session route, stops its pump goroutine,
 // and drains its queue so in-flight senders cannot block.
+//
+// A teardown request is matched against the per-peer registration balance
+// (issue #39): each RegisterSession earns exactly one teardown. When the
+// route currently in the maps is a NEWER generation than the teardown
+// (rekey/reconnect re-registration happened first, then the OLD session's
+// reaper/API teardown arrived late), the request is consumed as stale and
+// the live route survives. Route state is only torn down when a currently
+// held teardown credit is spent on it.
 func (f *Forwarder) UnregisterSession(peerKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.peerUnregs == nil {
+		f.peerUnregs = make(map[string]uint64)
+	}
+	if f.peerRegs == nil {
+		f.peerRegs = make(map[string]uint64)
+	}
+	// Teardown requests are served strictly in registration order: the
+	// k-th request for a peer belongs to the k-th registration. Three
+	// cases (issue #39):
+	//   unregs+1 > regs: no such generation (unknown peer, or the balance
+	//     was already exhausted) — pure no-op, never counts against a
+	//     future registration.
+	//   unregs+1 < regs: the route was re-registered in the meantime
+	//     (client rekey/reconnect registers the NEW session before the
+	//     OLD session's reaper/API teardown arrives) — the request
+	//     targets a superseded generation: consume as stale so it can
+	//     never kill the live route.
+	//   unregs+1 == regs: request for the current generation — tear down.
+	switch n := f.peerUnregs[peerKey] + 1; {
+	case n > f.peerRegs[peerKey]:
+		return
+	case n < f.peerRegs[peerKey]:
+		f.peerUnregs[peerKey]++
+		return
+	default:
+		f.peerUnregs[peerKey]++
+	}
+
 	if route, ok := f.routesByPeer[peerKey]; ok {
-		delete(f.routesByIP, route.assignedIP)
+		// Generation-bounded delete: only remove the routesByIP entry if it
+		// still points at THIS route. A late unregister of an OLD session
+		// (reaper/API race after a client rekey or reconnect re-registered
+		// the same peer/IP) must not delete the NEW route — before this
+		// guard it did, and the session then showed CONNECTED while every
+		// return packet got ErrSessionNotRegistered forever (issue #39).
+		if cur, ok := f.routesByIP[route.assignedIP]; ok && cur == route {
+			delete(f.routesByIP, route.assignedIP)
+		}
 		delete(f.routesByPeer, peerKey)
 		delete(f.clientDevices, peerKey)
 		// Terminate the per-session pump exactly once. The queue is NOT
@@ -396,6 +462,11 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	case clientQueue <- pktCopy:
 		return nil
 	default:
+		// Bounded backpressure: the packet is dropped, but every drop is
+		// counted so the stats API can surface a stalled downstream path
+		// (issue #39) instead of only a log line.
+		f.dropsQueueFull.Add(1)
+		f.dropsTotal.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -530,12 +601,28 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 		}
 	}
 
-	// Start pump for each client route
+	// Start pump for each client route; self-heal pumpless routes. A route
+	// registered while pumps were not running (or whose pump was stopped by
+	// a StopPumps/StartPumps cycle) is adopted here so no route can stay
+	// permanently pumpless — the issue #39 failure mode where a queue sat
+	// full for hours with the route registered.
 	for _, route := range f.routesByPeer {
+		if route.pumpStarted {
+			continue
+		}
+		route.pumpStarted = true
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(stopCh, route)
 	}
 	f.mu.Unlock()
+}
+
+// DropStats returns the number of return packets dropped because a route's
+// client queue was full, and the total number of return-path drops. Both are
+// exposed via the stats API so a stalled downstream path is visible without
+// tailing logs (issue #39).
+func (f *Forwarder) DropStats() (queueFull, total uint64) {
+	return f.dropsQueueFull.Load(), f.dropsTotal.Load()
 }
 
 // StopPumps terminates background packet pump routines.
@@ -551,6 +638,13 @@ func (f *Forwarder) StopPumps() {
 		close(stopCh)
 		delete(f.backendPumpStops, beID)
 		delete(f.backendPumpDones, beID)
+	}
+	// Every client-route pump exits via the closed global stop channel;
+	// clear their ownership flags so a subsequent StartPumps adopts all
+	// routes again (the operator-visible Stop/Start recovery path for a
+	// stalled downstream data plane, issue #39).
+	for _, route := range f.routesByPeer {
+		route.pumpStarted = false
 	}
 	f.mu.Unlock()
 
