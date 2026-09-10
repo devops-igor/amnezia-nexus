@@ -202,6 +202,17 @@ func (o *Orchestrator) resolveTunnelProbeParams(ctx context.Context, tunnels []m
 }
 
 // RebalanceVPNSessions detects load imbalance across backend tunnels and reassigns sessions to lighter backends.
+//
+// Guards against meaningless churn at low load: below the minimum-load gate
+// (MinRebalanceSessions sessions AND average >= 1.0 per active tunnel) no
+// rebalancing happens at all. Only sessions whose count exceeds the corrected
+// overflow threshold are drained, and moves are in-place UPDATEs that preserve
+// the session ID (UpdateVPNSessionBackendTunnel).
+//
+// DB-only by design (issue #44, R5): the forwarder's live route for a moved
+// session is NOT migrated — route migration is future scope. A moved session is
+// therefore recorded as "draining", which also keeps it out of
+// GetActiveVPNSessions so the next cycle cannot ping-pong it back.
 func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 	if o.db == nil {
 		return errors.New("database is not configured")
@@ -232,58 +243,100 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 		return nil
 	}
 
+	// R3: only connected sessions are eligible. GetActiveVPNSessions already
+	// filters status='connected'; skip defensively on iteration anyway.
+	eligible := make([]models.VPNSession, 0, len(sessions))
+	for _, s := range sessions {
+		if s.Status == "connected" {
+			eligible = append(eligible, s)
+		}
+	}
+
+	// R1 minimum-load gate: below it, rebalancing is pure churn and misleading
+	// "overloaded" logs (with 1 session / 2 tunnels the legacy code drained the
+	// only session). No log here on purpose — this is the normal quiet path.
+	vpnCfg, err := o.db.GetVPNConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load VPN config for rebalance gate: %w", err)
+	}
+	avg := float64(len(eligible)) / float64(len(activeTunnels))
+	if len(eligible) < vpnCfg.MinRebalanceSessions || avg < 1.0 {
+		return nil
+	}
+
 	counts := make(map[int64]int)
 	sessionsByTunnel := make(map[int64][]models.VPNSession)
-	for _, s := range sessions {
+	for _, s := range eligible {
 		if s.BackendTunnelID > 0 {
 			counts[s.BackendTunnelID]++
 			sessionsByTunnel[s.BackendTunnelID] = append(sessionsByTunnel[s.BackendTunnelID], s)
 		}
 	}
 
-	avg := float64(len(sessions)) / float64(len(activeTunnels))
-	threshold := int(avg * 1.4) // >40% above average
+	// R2 corrected threshold: max(1, int(avg*1.4)) instead of the legacy
+	// int(avg*1.4), which collapsed to 0 whenever avg < 1 and made any tunnel
+	// with a single session look "overloaded". A tunnel drains only when its
+	// count exceeds BOTH the 40%-above-average threshold and avg+1.
+	threshold := int(avg * 1.4)
+	if threshold < 1 {
+		threshold = 1
+	}
 
 	for _, t := range activeTunnels {
 		count := counts[t.ID]
-		if count > threshold && count > int(avg) {
-			excess := count - int(avg)
-			sessList := sessionsByTunnel[t.ID]
-			drained := 0
-
-			for i := 0; i < len(sessList) && drained < excess; i++ {
-				// Find lighter active backend tunnel
-				var targetTunnelID int64
-				minCount := 999999
-				for _, cand := range activeTunnels {
-					if cand.ID != t.ID && counts[cand.ID] < minCount {
-						minCount = counts[cand.ID]
-						targetTunnelID = cand.ID
-					}
-				}
-
-				s := sessList[i]
-				s.Status = "draining"
-				if targetTunnelID > 0 {
-					s.BackendTunnelID = targetTunnelID
-					counts[targetTunnelID]++
-					counts[t.ID]--
-				}
-				if err := o.db.CreateVPNSession(ctx, &s); err == nil {
-					drained++
-				}
-			}
-
-			slog.Info("Rebalanced overloaded backend tunnel",
-				"tunnel_id", t.ID,
-				"session_count", count,
-				"average", avg,
-				"drained_sessions", drained,
-			)
+		if count <= threshold || count <= int(avg)+1 {
+			continue
 		}
+		excess := count - threshold
+		drained := o.drainTunnelExcess(ctx, sessionsByTunnel[t.ID], activeTunnels, t.ID, counts, excess)
+
+		slog.Info("Rebalanced overloaded backend tunnel",
+			"tunnel_id", t.ID,
+			"session_count", count,
+			"average", avg,
+			"drained_sessions", drained,
+		)
 	}
 
 	return nil
+}
+
+// drainTunnelExcess moves up to `excess` sessions from the overloaded tunnel
+// (sourceID) to the currently lightest other active tunnel, using in-place
+// UPDATEs (R4) that mark rows "draining" (R5). Returns the number moved.
+// counts is updated in place so successive callers see consistent numbers.
+func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.VPNSession, activeTunnels []models.BackendTunnel, sourceID int64, counts map[int64]int, excess int) int {
+	drained := 0
+	for i := 0; i < len(sessList) && drained < excess; i++ {
+		// Find lighter active backend tunnel
+		var targetTunnelID int64
+		minCount := 999999
+		for _, cand := range activeTunnels {
+			if cand.ID != sourceID && counts[cand.ID] < minCount {
+				minCount = counts[cand.ID]
+				targetTunnelID = cand.ID
+			}
+		}
+
+		s := sessList[i]
+		if targetTunnelID > 0 {
+			// R4: in-place UPDATE instead of the legacy CreateVPNSession
+			// re-insert (which produced duplicate/history rows per shuffle).
+			// ID and connected_at stay untouched; the row is marked
+			// "draining" by UpdateVPNSessionBackendTunnel (R5).
+			if err := o.db.UpdateVPNSessionBackendTunnel(ctx, s.ID, targetTunnelID); err == nil {
+				counts[targetTunnelID]++
+				counts[sourceID]--
+				drained++
+			} else {
+				slog.Warn("Rebalance skipped session no longer connected",
+					"session_id", s.ID,
+					"err", err,
+				)
+			}
+		}
+	}
+	return drained
 }
 
 // SyncRemnaWave delegates to the configured RemnaWave syncer.
