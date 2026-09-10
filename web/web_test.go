@@ -49,6 +49,8 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 	staticFiles := []string{
 		"css/style.css",
 		"js/qrcode.min.js",
+		"js/api.js",
+		"js/ui.js",
 		"favicon.svg",
 	}
 	for _, file := range staticFiles {
@@ -193,6 +195,115 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 	for _, elem := range requiredBaseElements {
 		if !strings.Contains(base, elem) {
 			t.Errorf("base.html missing required responsive shell element %q", elem)
+		}
+	}
+}
+
+func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	// 1. Assert api.js presence and key API methods
+	apiData, err := fs.ReadFile(staticFS, "js/api.js")
+	if err != nil {
+		t.Fatalf("failed to read js/api.js: %v", err)
+	}
+	if len(apiData) == 0 {
+		t.Errorf("js/api.js is empty")
+	}
+	apiStr := string(apiData)
+	requiredAPISignatures := []string{
+		"root.API",
+		"X-CSRF-Token",
+		"password_change_required",
+		"request(url",
+		"get(url",
+		"post(url",
+		"patch(url",
+		"delete: del",
+		"root.apiCall",
+	}
+	for _, sig := range requiredAPISignatures {
+		if !strings.Contains(apiStr, sig) {
+			t.Errorf("js/api.js missing required signature %q", sig)
+		}
+	}
+
+	// 2. Assert ui.js presence and key UI components
+	uiData, err := fs.ReadFile(staticFS, "js/ui.js")
+	if err != nil {
+		t.Fatalf("failed to read js/ui.js: %v", err)
+	}
+	if len(uiData) == 0 {
+		t.Errorf("js/ui.js is empty")
+	}
+	uiStr := string(uiData)
+	requiredUISignatures := []string{
+		"root.UI",
+		"toast: toast",
+		"modal:",
+		"openModal",
+		"closeModal",
+		"copy: copy",
+		"confirm: confirm",
+		"nexusConfirmModal",
+		"formatBytes",
+		"downloadFile",
+		"escapeHtml",
+		"escapeJs",
+	}
+	for _, sig := range requiredUISignatures {
+		if !strings.Contains(uiStr, sig) {
+			t.Errorf("js/ui.js missing required signature %q", sig)
+		}
+	}
+
+	// 3. Assert style.css skeleton shimmer and micro-interactions
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	requiredCSS := []string{
+		"@keyframes shimmer",
+		".skeleton",
+		".skeleton-text",
+		".skeleton-card",
+		".skeleton-avatar",
+		".copied",
+		".toast",
+		".toast-exit",
+	}
+	for _, item := range requiredCSS {
+		if !strings.Contains(cssStr, item) {
+			t.Errorf("style.css missing required skeleton or micro-interaction token %q", item)
+		}
+	}
+
+	// 4. Assert base.html integration
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	baseData, err := fs.ReadFile(templatesFS, "base.html")
+	if err != nil {
+		t.Fatalf("failed to read base.html: %v", err)
+	}
+	baseStr := string(baseData)
+	requiredIntegrations := []string{
+		"src=\"/static/js/api.js\"",
+		"src=\"/static/js/ui.js\"",
+		"id=\"nexusConfirmModal\"",
+		"id=\"nexusConfirmTitle\"",
+		"id=\"nexusConfirmBody\"",
+		"id=\"nexusConfirmOkBtn\"",
+		"id=\"nexusConfirmCancelBtn\"",
+	}
+	for _, item := range requiredIntegrations {
+		if !strings.Contains(baseStr, item) {
+			t.Errorf("base.html missing required component integration %q", item)
 		}
 	}
 }

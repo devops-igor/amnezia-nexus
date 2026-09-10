@@ -11,6 +11,8 @@
     <link rel="stylesheet" href="/static/css/style.css">
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t) }()</script>
     <script src="/static/js/qrcode.min.js"></script>
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/ui.js"></script>
     {{ block "head_extra" . }}{{ end }}
     <style>
         .lang-check {
@@ -375,35 +377,26 @@
         </div>
     </div>
 
+    <!-- ===== Reusable Confirmation Modal ===== -->
+    <div class="modal-backdrop" id="nexusConfirmModal">
+        <div class="modal" style="max-width: 440px;">
+            <div class="modal-header">
+                <h2 class="modal-title" id="nexusConfirmTitle">{{ _ "confirm_action" }}</h2>
+                <button class="modal-close" type="button" aria-label="Close" id="nexusConfirmCloseBtn" onclick="UI.modal.close('nexusConfirmModal')">×</button>
+            </div>
+            <div id="nexusConfirmBody" style="font-size: 0.95rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: var(--space-lg); word-break: break-word;">
+            </div>
+            <div class="modal-footer" style="display: flex; gap: var(--space-sm); justify-content: flex-end;">
+                <button type="button" class="btn btn-secondary" id="nexusConfirmCancelBtn" onclick="UI.modal.close('nexusConfirmModal')">{{ _ "cancel" }}</button>
+                <button type="button" class="btn btn-danger" id="nexusConfirmOkBtn">{{ _ "confirm" }}</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        /* ===== XSS Prevention: Global escape functions ===== */
-        function escapeHtml(str) {
-            if (str === null || str === undefined) return '';
-            return String(str)
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#39;');
-        }
-
-        function escapeJs(str) {
-            if (str === null || str === undefined) return '';
-            return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-        }
-
+        /* ===== Translation Setup ===== */
         window.I18N = {{ .translations_json | safe_js }};
         window._ = function (key) { return window.I18N[key] || key; };
-
-        /* ===== CSRF Token for AJAX requests ===== */
-        window.getCsrfToken = function() {
-            // Try meta tag first (more reliable)
-            const meta = document.querySelector('meta[name="csrf-token"]');
-            if (meta) return meta.getAttribute('content');
-            // Fallback to cookie
-            const match = document.cookie.match(/csrftoken=([^;]+)/);
-            return match ? match[1] : '';
-        };
 
         /* ===== Mobile Drawer Toggle ===== */
         window.toggleMobileDrawer = function(forceState) {
@@ -473,199 +466,6 @@
                 else if (href !== '/' && path.startsWith(href)) link.classList.add('active');
             });
         })();
-
-        /* ===== Toast Notifications ===== */
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toastContainer');
-            if (!container) return;
-            const toast = document.createElement('div');
-            toast.className = `toast toast-${type}`;
-
-            const icons = { success: '✓', error: '✕', info: 'ℹ' };
-            const iconSpan = document.createElement('span');
-            iconSpan.textContent = icons[type] || 'ℹ';
-            const msgSpan = document.createElement('span');
-            msgSpan.textContent = String(message || '');
-
-            toast.appendChild(iconSpan);
-            toast.appendChild(document.createTextNode(' '));
-            toast.appendChild(msgSpan);
-
-            container.appendChild(toast);
-            setTimeout(() => {
-                toast.style.opacity = '0';
-                toast.style.transform = 'translateX(100%)';
-                toast.style.transition = 'all 0.3s ease';
-                setTimeout(() => toast.remove(), 300);
-            }, 4000);
-        }
-
-        /* ===== Modal Management ===== */
-        let previousActiveElement = null;
-
-        function openModal(id, focusSelector = null) {
-            const modal = document.getElementById(id);
-            if (modal) {
-                previousActiveElement = document.activeElement;
-                modal.classList.add('active');
-                document.body.style.overflow = 'hidden';
-                // Auto-focus first input/select or specified selector
-                const focusTarget = focusSelector
-                    ? modal.querySelector(focusSelector)
-                    : modal.querySelector('input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])');
-                if (focusTarget) {
-                    setTimeout(() => focusTarget.focus(), 100);
-                }
-            }
-        }
-
-        function closeModal(id) {
-            const modal = document.getElementById(id);
-            if (modal) {
-                modal.classList.remove('active');
-                document.body.style.overflow = '';
-                // Restore focus to previously focused element
-                if (previousActiveElement && previousActiveElement.focus) {
-                    previousActiveElement.focus();
-                }
-            }
-        }
-
-        /* Close modal on backdrop click */
-        document.addEventListener('click', (e) => {
-            if (e.target.classList.contains('modal-backdrop') && e.target.classList.contains('active')) {
-                e.target.classList.remove('active');
-                document.body.style.overflow = '';
-            }
-        });
-
-        /* Close modal or drawer on Escape */
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                document.querySelectorAll('.modal-backdrop.active').forEach(m => {
-                    m.classList.remove('active');
-                });
-                document.body.style.overflow = '';
-                if (typeof window.toggleMobileDrawer === 'function') {
-                    window.toggleMobileDrawer(false);
-                }
-            }
-        });
-
-        /* Focus trap: keep Tab within active modal */
-        document.addEventListener('keydown', (e) => {
-            if (e.key !== 'Tab') return;
-            const activeModal = document.querySelector('.modal-backdrop.active');
-            if (!activeModal) return;
-            const focusable = activeModal.querySelectorAll(
-                'input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-            );
-            if (focusable.length === 0) return;
-            const first = focusable[0];
-            const last = focusable[focusable.length - 1];
-            if (e.shiftKey && document.activeElement === first) {
-                e.preventDefault();
-                last.focus();
-            } else if (!e.shiftKey && document.activeElement === last) {
-                e.preventDefault();
-                first.focus();
-            }
-        });
-
-        /* ===== API Helper ===== */
-        async function apiCall(url, method = 'GET', body = null) {
-            const opts = {
-                method,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-CSRF-Token': window.getCsrfToken(),
-                },
-            };
-            if (body) opts.body = JSON.stringify(body);
-
-            const res = await fetch(url, opts);
-
-            if (res.status === 401 || res.status === 403) {
-                // Check if this is a password_change_required response before redirecting to login
-                try {
-                    const clone = res.clone();
-                    const body = await clone.json();
-                    if (body.password_change_required) {
-                        window.location.href = '/change-password?forced=1';
-                        throw new Error('Password change required');
-                    }
-                } catch (parseErr) {
-                    // Response body wasn't JSON or wasn't password_change_required — proceed to redirect
-                }
-                window.location.href = '/login';
-                throw new Error('Session expired');
-            }
-
-            let data;
-            let contentType = res.headers.get('content-type') || '';
-
-            try {
-                // Check if response is JSON before parsing
-                if (contentType.includes('application/json')) {
-                    data = await res.json();
-                } else {
-                    // For non-JSON responses (e.g., HTML error pages from reverse proxy)
-                    const text = await res.text();
-                    // Try to parse as JSON anyway (might still be valid JSON)
-                    try {
-                        data = JSON.parse(text);
-                    } catch {
-                        // If it's HTML or plain text, extract meaningful error
-                        const match = text.match(/<title>([^<]+)<\/title>/i);
-                        const errorMsg = match ? match[1].trim() : text.substring(0, 200);
-                        data = { error: errorMsg };
-                    }
-                }
-            } catch (e) {
-                throw new Error('Failed to parse server response');
-            }
-
-            if (!res.ok) {
-                throw new Error(data.error || data.message || `HTTP ${res.status}: ${res.statusText}`);
-            }
-            return data;
-        }
-
-        /* ===== Copy to clipboard ===== */
-        async function copyToClipboard(text) {
-            try {
-                await navigator.clipboard.writeText(text);
-                showToast(_('copied_to_clipboard'), 'success');
-            } catch {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                ta.remove();
-                showToast(_('copied_to_clipboard'), 'success');
-            }
-        }
-
-        /* ===== Download file ===== */
-        function downloadFile(content, filename) {
-            const blob = new Blob([content], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.click();
-            URL.revokeObjectURL(url);
-        }
-
-        function formatBytes(bytes) {
-            if (!bytes || Number.isNaN(bytes) || bytes < 0) return '0 B';
-            bytes = Math.max(0, bytes);
-            const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-            const k = 1024;
-            const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
-        }
     </script>
 
     {{ block "scripts" . }}{{ end }}

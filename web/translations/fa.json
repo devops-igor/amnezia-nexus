@@ -38,6 +38,8 @@
   "backup_title": "پشتیبان‌گیری و بازیابی",
   "build_container": "ساخت کانتینر...",
   "cancel": "لغو",
+  "confirm": "تأیید",
+  "confirm_action": "تأیید اقدام",
   "cannot_delete_self": "شما نمی‌توانید خودتان را حذف کنید",
   "captcha": "کد امنیتی",
   "captcha_hint": "برای نوسازی تصویر کلیک کنید",

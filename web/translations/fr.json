@@ -38,6 +38,8 @@
   "backup_title": "Sauvegarde et Restauration",
   "build_container": "Construction du conteneur...",
   "cancel": "Annuler",
+  "confirm": "Confirmer",
+  "confirm_action": "Confirmer l'action",
   "cannot_delete_self": "Vous ne pouvez pas vous supprimer",
   "captcha": "Captcha",
   "captcha_hint": "Cliquez pour rafraîchir",
