@@ -119,6 +119,21 @@ func (hp *HealthProber) SetOnActiveHook(fn func(ctx context.Context, tunnel *mod
 	hp.onActiveHook = fn
 }
 
+// ResetFailCount clears the consecutive-failure counter for a backend server
+// (issue #50). EnableBackend calls it when an administrator manually re-enables
+// a health-auto-disabled tunnel: without the reset the counter stays at or
+// above FailureThreshold, so the first failed probe after re-enable would
+// instantly re-disable the backend instead of granting the full grace period.
+// Nil-receiver safe, matching SetProbeFunc's guard style.
+func (hp *HealthProber) ResetFailCount(serverID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.failCounts[serverID] = 0
+}
+
 // Config returns a copy of the prober configuration.
 func (hp *HealthProber) Config() HealthConfig {
 	hp.mu.RLock()
