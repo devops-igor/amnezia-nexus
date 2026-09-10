@@ -218,7 +218,7 @@ func TestHandleTransportData_PayloadContentPaddingTrimming(t *testing.T) {
 		MTU:         1420,
 		IdleTimeout: 1 * time.Minute,
 		S4:          12,
-		H4:          int(health.DefaultH4),
+		H4:          models.DegenerateHeaderRange(health.DefaultH4),
 	}
 
 	el, err := NewListener(cfg, db, nil, nil, nil, nil)
@@ -284,7 +284,7 @@ func TestHandleTransportData_PayloadContentPaddingTrimming(t *testing.T) {
 
 	s4Junk := make([]byte, cfg.S4)
 	var hdr [transportDataHeaderLen]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(cfg.H4))
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
 	binary.LittleEndian.PutUint32(hdr[4:8], 0) // receiver index
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 
@@ -429,7 +429,7 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 		MTU:                 1420,
 		IdleTimeout:         1 * time.Minute,
 		S4:                  16,
-		H4:                  int(health.DefaultH4),
+		H4:                  models.DegenerateHeaderRange(health.DefaultH4),
 		HeaderProtectionKey: hpKeyB64,
 	}
 
@@ -490,7 +490,7 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 		s4Junk[i] = byte(i + 7)
 	}
 	var hdr [transportDataHeaderLen]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(cfg.H4))
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
 	binary.LittleEndian.PutUint32(hdr[4:8], 54321) // receiver index
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 
@@ -521,7 +521,7 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 	binary.LittleEndian.PutUint64(nonce[4:12], counter)
 	ciphertextPlain := aead.Seal(nil, nonce[:], testPayloadPlain, nil)
 
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(cfg.H4))
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
 	binary.LittleEndian.PutUint32(hdr[4:8], 54321)
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 
@@ -571,7 +571,7 @@ func TestSendToPeer_HeaderProtection_Masked(t *testing.T) {
 		MTU:                 1420,
 		IdleTimeout:         1 * time.Minute,
 		S4:                  16,
-		H4:                  int(health.DefaultH4),
+		H4:                  models.DegenerateHeaderRange(health.DefaultH4),
 		HeaderProtectionKey: hpKeyB64,
 	}
 
@@ -629,7 +629,7 @@ func TestSendToPeer_HeaderProtection_Masked(t *testing.T) {
 
 	// 1. Raw header bytes must NOT match plaintext H4 because it must be masked!
 	rawMsgType := binary.LittleEndian.Uint32(datagram[s4 : s4+4])
-	if rawMsgType == uint32(cfg.H4) {
+	if rawMsgType == cfg.H4.Lo {
 		t.Fatal("SendToPeer sent unmasked H4 header when HP key is configured")
 	}
 
@@ -642,8 +642,8 @@ func TestSendToPeer_HeaderProtection_Masked(t *testing.T) {
 	cip.XORKeyStream(unmaskedHdr, datagram[s4:s4+transportDataHeaderLen])
 
 	unmaskedMsgType := binary.LittleEndian.Uint32(unmaskedHdr[0:4])
-	if unmaskedMsgType != uint32(cfg.H4) {
-		t.Fatalf("unmasked msgType mismatch: got %d, want %d", unmaskedMsgType, cfg.H4)
+	if unmaskedMsgType != cfg.H4.Lo {
+		t.Fatalf("unmasked msgType mismatch: got %d, want %d", unmaskedMsgType, cfg.H4.Lo)
 	}
 	unmaskedReceiverIdx := binary.LittleEndian.Uint32(unmaskedHdr[4:8])
 	if unmaskedReceiverIdx != clientReceiverIdx {
@@ -682,7 +682,7 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 		MTU:                 1420,
 		IdleTimeout:         1 * time.Minute,
 		S4:                  18,
-		H4:                  int(health.DefaultH4),
+		H4:                  models.DegenerateHeaderRange(health.DefaultH4),
 		HeaderProtectionKey: hpKeyB64,
 	}
 
@@ -753,7 +753,7 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 		s4Junk[i] = byte(i + 13)
 	}
 	var hdr [transportDataHeaderLen]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(cfg.H4))
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
 	binary.LittleEndian.PutUint32(hdr[4:8], 0)
 	binary.LittleEndian.PutUint64(hdr[8:16], counter)
 
@@ -764,39 +764,42 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 	maskedHdr := make([]byte, transportDataHeaderLen)
 	cip.XORKeyStream(maskedHdr, hdr[:])
 
-	packetOut := append(s4Junk, maskedHdr...)
-	packetOut = append(packetOut, ciphertext...)
+	datagram := append(s4Junk, maskedHdr...)
+	datagram = append(datagram, ciphertext...)
 
-	if _, err := clientConn.Write(packetOut); err != nil {
-		t.Fatalf("client write failed: %v", err)
+	if _, err := clientConn.Write(datagram); err != nil {
+		t.Fatalf("clientConn.Write failed: %v", err)
 	}
 
 	select {
-	case received := <-routedCh:
-		if !bytes.Equal(received, clientPayload) {
-			t.Fatalf("routed packet mismatch: got %q, want %q", received, clientPayload)
+	case routed := <-routedCh:
+		if !bytes.Equal(routed, clientPayload) {
+			t.Fatalf("routed packet mismatch: got %q, want %q", routed, clientPayload)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for routed packet from masked transport datagram")
+		t.Fatal("timed out waiting for client packet to be routed")
 	}
 
-	// Step B: Listener -> Client (SendToPeer Masked Response)
+	// Step B: Listener -> Client (Masked Transport Data via SendToPeer)
 	serverReply := []byte("endpoint-to-client-pong-over-hp")
 	if err := el.SendToPeer(peerKey, serverReply); err != nil {
 		t.Fatalf("SendToPeer failed: %v", err)
 	}
 
-	recvBuf := make([]byte, 2048)
+	replyBuf := make([]byte, 2048)
 	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := clientConn.Read(recvBuf)
+	n, err := clientConn.Read(replyBuf)
 	if err != nil {
-		t.Fatalf("client read failed: %v", err)
+		t.Fatalf("failed to read reply from SendToPeer: %v", err)
 	}
 
-	datagramIn := recvBuf[:n]
 	s4 := cfg.S4
+	expectedMinLen := s4 + transportDataHeaderLen + len(serverReply) + chacha20poly1305.Overhead
+	if n < expectedMinLen {
+		t.Fatalf("received packet too short: got %d, want >= %d", n, expectedMinLen)
+	}
 
-	// Unmask header using HP key
+	datagramIn := replyBuf[:n]
 	recvCip := health.NewHeaderProtectionCipher(hpKeyBytes, datagramIn[:health.HeaderCipherNonceSize])
 	if recvCip == nil {
 		t.Fatal("failed to create client unmask cipher")
@@ -805,8 +808,8 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 	recvCip.XORKeyStream(unmaskedInHdr, datagramIn[s4:s4+transportDataHeaderLen])
 
 	inMsgType := binary.LittleEndian.Uint32(unmaskedInHdr[0:4])
-	if inMsgType != uint32(cfg.H4) {
-		t.Fatalf("inbound msgType mismatch: got %d, want %d", inMsgType, cfg.H4)
+	if inMsgType != cfg.H4.Lo {
+		t.Fatalf("inbound msgType mismatch: got %d, want %d", inMsgType, cfg.H4.Lo)
 	}
 	inReceiverIdx := binary.LittleEndian.Uint32(unmaskedInHdr[4:8])
 	if inReceiverIdx != clientReceiverIdx {

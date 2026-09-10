@@ -172,8 +172,8 @@ func TestHealthProber_ResolveTunnelParamsAndNegativeMismatch(t *testing.T) {
 
 	// 3. Save VPNConfig
 	vpnCfg := &models.VPNConfig{
-		H1: 333333,
-		H2: 444444,
+		H1: models.DegenerateHeaderRange(333333),
+		H2: models.DegenerateHeaderRange(444444),
 		S1: 60,
 		S2: 70,
 	}
@@ -269,8 +269,8 @@ func TestHealthProber_InstalledServerEmptyAWGParams_FallsBackToVPNConfig(t *test
 
 	// Stored VPNConfig has randomized portal parameters
 	vpnCfg := &models.VPNConfig{
-		H1: 777777,
-		H2: 888888,
+		H1: models.DegenerateHeaderRange(777777),
+		H2: models.DegenerateHeaderRange(888888),
 		S1: 35,
 		S2: 45,
 	}

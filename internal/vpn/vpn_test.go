@@ -783,17 +783,18 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	_ = pc.Close()
 
 	vpnCfg := &models.VPNConfig{
-		Algorithm:  models.LBLeastConnections,
-		ListenPort: port,
-		SubnetCIDR: "10.100.0.0/24",
-		H1:         12345678,
-		H2:         23456789,
-		H3:         34567890,
-		H4:         45678901,
-		S1:         45,
-		S2:         60,
-		S3:         25,
-		S4:         15,
+		Algorithm:           models.LBLeastConnections,
+		ListenPort:          port,
+		SubnetCIDR:          "10.100.0.0/24",
+		H1:                  models.NewHeaderRange(12345678, 12347000),
+		H2:                  models.NewHeaderRange(600000000, 600010000),
+		H3:                  models.NewHeaderRange(1200000000, 1200010000),
+		H4:                  models.NewHeaderRange(1800000000, 1800010000),
+		S1:                  45,
+		S2:                  60,
+		S3:                  25,
+		S4:                  15,
+		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
 	}
 	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
 		t.Fatalf("SaveVPNConfig failed: %v", err)
@@ -838,9 +839,9 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateClientConfig failed: %v", err)
 	}
-	if !strings.Contains(cfgStr, "H1 = 12345678") ||
-		!strings.Contains(cfgStr, "H2 = 23456789") ||
-		!strings.Contains(cfgStr, "H4 = 45678901") ||
+	if !strings.Contains(cfgStr, "H1 = 12345678-12347000") ||
+		!strings.Contains(cfgStr, "H2 = 600000000-600010000") ||
+		!strings.Contains(cfgStr, "H4 = 1800000000-1800010000") ||
 		!strings.Contains(cfgStr, "S1 = 45") ||
 		!strings.Contains(cfgStr, "S2 = 60") {
 		t.Fatalf("GenerateClientConfig did not render stored VPNConfig values: %s", cfgStr)
@@ -942,7 +943,7 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	if _, err := rand.Read(transportDatagram[:s4]); err != nil {
 		t.Fatalf("rand failed: %v", err)
 	}
-	binary.LittleEndian.PutUint32(transportDatagram[s4:s4+4], vpnCfg.H4)
+	binary.LittleEndian.PutUint32(transportDatagram[s4:s4+4], vpnCfg.H4.PickOne())
 	copy(transportDatagram[s4+4:s4+8], serverReceiverIdx)
 	binary.LittleEndian.PutUint64(transportDatagram[s4+8:s4+16], 0)
 	transportDatagram = aeadSend.Seal(transportDatagram, nonce[:], testPayload, nil)
@@ -992,8 +993,8 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 		msgType = binary.LittleEndian.Uint32(replyPayloadPart[0:4])
 		counter = binary.LittleEndian.Uint64(replyPayloadPart[8:16])
 	}
-	if msgType != vpnCfg.H4 {
-		t.Fatalf("SendToPeer msgType mismatch: got %d, want %d", msgType, vpnCfg.H4)
+	if !vpnCfg.H4.Contains(msgType) {
+		t.Fatalf("SendToPeer msgType mismatch: got %d, want in %s", msgType, vpnCfg.H4)
 	}
 	aeadRecv, err := chacha20poly1305.New(clientRecvKey)
 	if err != nil {
@@ -1082,23 +1083,24 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 	ctx := context.Background()
 
 	baseCfg := &models.VPNConfig{
-		Algorithm:          models.LBLeastConnections,
-		HealthThresholdMS:  500,
-		ListenPort:         51820,
-		SubnetCIDR:         "10.100.0.0/16",
-		MaxTotalPeers:      500,
-		MaxPeersPerBackend: 100,
-		Weights:            map[int64]int{},
-		H1:                 111111,
-		H2:                 222222,
-		H3:                 333333,
-		H4:                 444444,
-		S1:                 40,
-		S2:                 50,
-		S3:                 30,
-		S4:                 20,
-		ServerPrivateKey:   "kept-priv",
-		ServerPublicKey:    "kept-pub",
+		Algorithm:           models.LBLeastConnections,
+		HealthThresholdMS:   500,
+		ListenPort:          51820,
+		SubnetCIDR:          "10.100.0.0/16",
+		MaxTotalPeers:       500,
+		MaxPeersPerBackend:  100,
+		Weights:             map[int64]int{},
+		H1:                  models.NewHeaderRange(111111, 115000),
+		H2:                  models.NewHeaderRange(600000000, 600005000),
+		H3:                  models.NewHeaderRange(1200000000, 1200005000),
+		H4:                  models.NewHeaderRange(1800000000, 1800005000),
+		S1:                  40,
+		S2:                  50,
+		S3:                  30,
+		S4:                  20,
+		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+		ServerPrivateKey:    "kept-priv",
+		ServerPublicKey:     "kept-pub",
 	}
 	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
 		t.Fatalf("SaveVPNConfig failed: %v", err)
@@ -1139,7 +1141,7 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
-	if svcCfg.H1 != 111111 || svcCfg.H2 != 222222 || svcCfg.H3 != 333333 || svcCfg.H4 != 444444 {
+	if svcCfg.H1 != models.NewHeaderRange(111111, 115000) || svcCfg.H2 != models.NewHeaderRange(600000000, 600005000) || svcCfg.H3 != models.NewHeaderRange(1200000000, 1200005000) || svcCfg.H4 != models.NewHeaderRange(1800000000, 1800005000) {
 		t.Errorf("service cfg H values clobbered by partial update: %+v", svcCfg)
 	}
 	if svcCfg.S1 != 40 || svcCfg.S2 != 50 || svcCfg.S3 != 30 || svcCfg.S4 != 20 {
@@ -1154,7 +1156,7 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVPNConfig failed: %v", err)
 	}
-	if stored.H1 != 111111 || stored.H2 != 222222 || stored.H3 != 333333 || stored.H4 != 444444 {
+	if stored.H1 != models.NewHeaderRange(111111, 115000) || stored.H2 != models.NewHeaderRange(600000000, 600005000) || stored.H3 != models.NewHeaderRange(1200000000, 1200005000) || stored.H4 != models.NewHeaderRange(1800000000, 1800005000) {
 		t.Errorf("stored H values clobbered by partial update: %+v", stored)
 	}
 	if stored.S1 != 40 || stored.S2 != 50 || stored.S3 != 30 || stored.S4 != 20 {
@@ -1166,7 +1168,7 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 
 	// The listener must agree with the persisted config.
 	lc := svc.endpoint.ListenerConfigSnapshot()
-	if lc.H1 != 111111 || lc.S1 != 40 || lc.H4 != 444444 || lc.S4 != 20 {
+	if lc.H1 != models.NewHeaderRange(111111, 115000) || lc.S1 != 40 || lc.H4 != models.NewHeaderRange(1800000000, 1800005000) || lc.S4 != 20 {
 		t.Errorf("listener config diverges from stored config: %+v", lc)
 	}
 }
@@ -1187,7 +1189,7 @@ func TestUpdateConfig_RejectsObfuscationChangeWhileRunning(t *testing.T) {
 	before, _ := svc.GetConfig(ctx)
 
 	changed := *before
-	changed.H1 = 987654321
+	changed.H1 = models.DegenerateHeaderRange(987654321)
 	changed.S1 = 77
 	if err := svc.UpdateConfig(ctx, &changed); err == nil {
 		t.Fatal("expected error when changing obfuscation params while listener runs")
@@ -1197,7 +1199,7 @@ func TestUpdateConfig_RejectsObfuscationChangeWhileRunning(t *testing.T) {
 
 	after, _ := svc.GetConfig(ctx)
 	if after.H1 != before.H1 {
-		t.Errorf("running config was mutated by rejected update: H1 %d -> %d", before.H1, after.H1)
+		t.Errorf("running config was mutated by rejected update: H1 %s -> %s", before.H1, after.H1)
 	}
 }
 
@@ -1213,10 +1215,10 @@ func TestUpdateConfig_PropagatesObfuscationChangeToIdleListener(t *testing.T) {
 	before, _ := svc.GetConfig(ctx)
 
 	changed := *before
-	changed.H1 = 123456789
-	changed.H2 = 234567891
-	changed.H3 = 345678912
-	changed.H4 = 456789123
+	changed.H1 = models.DegenerateHeaderRange(123456789)
+	changed.H2 = models.DegenerateHeaderRange(234567891)
+	changed.H3 = models.DegenerateHeaderRange(345678912)
+	changed.H4 = models.DegenerateHeaderRange(456789123)
 	changed.S1 = 33
 	changed.S2 = 44
 	changed.S3 = 55
@@ -1226,7 +1228,7 @@ func TestUpdateConfig_PropagatesObfuscationChangeToIdleListener(t *testing.T) {
 	}
 
 	lc := svc.endpoint.ListenerConfigSnapshot()
-	if lc.H1 != 123456789 || lc.H2 != 234567891 || lc.H3 != 345678912 || lc.H4 != 456789123 {
+	if lc.H1 != models.DegenerateHeaderRange(123456789) || lc.H2 != models.DegenerateHeaderRange(234567891) || lc.H3 != models.DegenerateHeaderRange(345678912) || lc.H4 != models.DegenerateHeaderRange(456789123) {
 		t.Errorf("listener config not updated on idle service: %+v", lc)
 	}
 	if lc.S1 != 33 || lc.S2 != 44 || lc.S3 != 55 || lc.S4 != 66 {
@@ -1428,7 +1430,7 @@ func TestConcurrentFirstRead_ConsistentParams(t *testing.T) {
 	// migration path concurrently.
 
 	const goroutines = 2
-	results := make(chan uint32, goroutines)
+	results := make(chan models.HeaderRange, goroutines)
 	errs := make(chan error, goroutines)
 
 	for i := 0; i < goroutines; i++ {
@@ -1448,7 +1450,7 @@ func TestConcurrentFirstRead_ConsistentParams(t *testing.T) {
 		}()
 	}
 
-	var h1s []uint32
+	var h1s []models.HeaderRange
 	for i := 0; i < goroutines; i++ {
 		select {
 		case err := <-errs:
@@ -1468,9 +1470,9 @@ func TestConcurrentFirstRead_ConsistentParams(t *testing.T) {
 		t.Fatalf("GetVPNConfig failed: %v", err)
 	}
 	if persisted.H1 != h1s[0] {
-		t.Errorf("persisted H1 %d does not match service H1 %d", persisted.H1, h1s[0])
+		t.Errorf("persisted H1 %s does not match service H1 %s", persisted.H1, h1s[0])
 	}
-	if persisted.H1 == 0 {
+	if persisted.H1.IsZero() {
 		t.Error("expected persisted H1 to be generated (non-zero)")
 	}
 }
@@ -1753,7 +1755,7 @@ func TestEnsureObfuscationParams_PreservesLegacyListenPort(t *testing.T) {
 	if legacy.ListenPort != 31458 {
 		t.Errorf("migration must preserve in-memory listen_port, got %d", legacy.ListenPort)
 	}
-	if legacy.H1 == 0 || legacy.H2 == 0 || legacy.H3 == 0 || legacy.H4 == 0 {
+	if legacy.H1.IsZero() || legacy.H2.IsZero() || legacy.H3.IsZero() || legacy.H4.IsZero() {
 		t.Errorf("migration did not fill H params: %+v", legacy)
 	}
 	if legacy.S1 < 0 || legacy.S2 < 0 || legacy.S3 < 0 || legacy.S4 < 0 {
@@ -1767,7 +1769,7 @@ func TestEnsureObfuscationParams_PreservesLegacyListenPort(t *testing.T) {
 	if stored.ListenPort != 31458 {
 		t.Errorf("persisted listen_port: want 31458, got %d", stored.ListenPort)
 	}
-	if stored.H1 == 0 {
+	if stored.H1.IsZero() {
 		t.Errorf("persisted config missing migrated obfuscation params: %+v", stored)
 	}
 }
@@ -1805,7 +1807,7 @@ func TestBootWiring_ListenPortPersistsThroughMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
-	if cfgVPN.H1 == 0 {
+	if cfgVPN.H1.IsZero() {
 		t.Fatalf("boot did not migrate legacy obfuscation params: %+v", cfgVPN)
 	}
 	cfgVPN.ListenPort = 31458
@@ -1821,7 +1823,7 @@ func TestBootWiring_ListenPortPersistsThroughMigration(t *testing.T) {
 	if stored.ListenPort != 31458 {
 		t.Errorf("fresh persisted listen_port: want 31458, got %d", stored.ListenPort)
 	}
-	if stored.H1 == 0 {
+	if stored.H1.IsZero() {
 		t.Errorf("fresh persisted config lost migrated obfuscation params: %+v", stored)
 	}
 }
@@ -1849,7 +1851,7 @@ func TestRejectedUpdateConfigLeavesPersistedRowUntouched(t *testing.T) {
 	}
 
 	changed := *before
-	changed.H1 = 987654321
+	changed.H1 = models.DegenerateHeaderRange(987654321)
 	changed.S1 = 77
 	if err := svc.UpdateConfig(ctx, &changed); err == nil {
 		t.Fatal("expected error when changing obfuscation params while listener runs")
@@ -1859,7 +1861,7 @@ func TestRejectedUpdateConfigLeavesPersistedRowUntouched(t *testing.T) {
 
 	after, _ := svc.GetConfig(ctx)
 	if after.H1 != before.H1 || after.S1 != before.S1 || after.ListenPort != before.ListenPort {
-		t.Errorf("running config mutated by rejected update: before(H1=%d S1=%d port=%d) after(H1=%d S1=%d port=%d)",
+		t.Errorf("running config mutated by rejected update: before(H1=%s S1=%d port=%d) after(H1=%s S1=%d port=%d)",
 			before.H1, before.S1, before.ListenPort, after.H1, after.S1, after.ListenPort)
 	}
 
@@ -1868,7 +1870,7 @@ func TestRejectedUpdateConfigLeavesPersistedRowUntouched(t *testing.T) {
 		t.Fatalf("GetVPNConfig failed: %v", err)
 	}
 	if persisted.H1 != before.H1 || persisted.S1 != before.S1 || persisted.ListenPort != before.ListenPort {
-		t.Errorf("persisted row mutated by rejected update: want(H1=%d S1=%d port=%d) got(H1=%d S1=%d port=%d)",
+		t.Errorf("persisted row mutated by rejected update: want(H1=%s S1=%d port=%d) got(H1=%s S1=%d port=%d)",
 			before.H1, before.S1, before.ListenPort, persisted.H1, persisted.S1, persisted.ListenPort)
 	}
 }
@@ -3297,7 +3299,7 @@ func TestEnsureObfuscationParams_HeaderProtectionKeyMigration(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// Legacy config with H1..H4 already populated (e.g. Issue #5/#25 migration),
+	// Legacy config with H1..H4 already populated with degenerate headers (DEV environment scenario),
 	// but HeaderProtectionKey is empty and S values are < 12.
 	legacy := &models.VPNConfig{
 		Algorithm:           models.LBLeastConnections,
@@ -3307,10 +3309,10 @@ func TestEnsureObfuscationParams_HeaderProtectionKeyMigration(t *testing.T) {
 		MaxTotalPeers:       1000,
 		MaxPeersPerBackend:  250,
 		Weights:             map[int64]int{},
-		H1:                  12345,
-		H2:                  23456,
-		H3:                  34567,
-		H4:                  45678,
+		H1:                  models.DegenerateHeaderRange(359398951),
+		H2:                  models.DegenerateHeaderRange(944086617),
+		H3:                  models.DegenerateHeaderRange(1418011628),
+		H4:                  models.DegenerateHeaderRange(1749149601),
 		S1:                  5,
 		S2:                  7,
 		S3:                  9,
@@ -3337,9 +3339,21 @@ func TestEnsureObfuscationParams_HeaderProtectionKeyMigration(t *testing.T) {
 	if legacy.S1 < 12 || legacy.S2 < 12 || legacy.S3 < 12 || legacy.S4 < 12 {
 		t.Errorf("expected S1..S4 >= 12, got S1=%d S2=%d S3=%d S4=%d", legacy.S1, legacy.S2, legacy.S3, legacy.S4)
 	}
-	// H values must be preserved
-	if legacy.H1 != 12345 || legacy.H2 != 23456 || legacy.H3 != 34567 || legacy.H4 != 45678 {
-		t.Errorf("H parameters were not preserved: %+v", legacy)
+	// Degenerate headers must be upgraded to ranges (span >= 1000) containing the legacy values
+	if legacy.H1.IsDegenerate() || legacy.H1.Hi-legacy.H1.Lo < 1000 || !legacy.H1.Contains(359398951) {
+		t.Errorf("H1 not cleanly upgraded to range containing 359398951: %s", legacy.H1.String())
+	}
+	if legacy.H2.IsDegenerate() || legacy.H2.Hi-legacy.H2.Lo < 1000 || !legacy.H2.Contains(944086617) {
+		t.Errorf("H2 not cleanly upgraded to range containing 944086617: %s", legacy.H2.String())
+	}
+	if legacy.H3.IsDegenerate() || legacy.H3.Hi-legacy.H3.Lo < 1000 || !legacy.H3.Contains(1418011628) {
+		t.Errorf("H3 not cleanly upgraded to range containing 1418011628: %s", legacy.H3.String())
+	}
+	if legacy.H4.IsDegenerate() || legacy.H4.Hi-legacy.H4.Lo < 1000 || !legacy.H4.Contains(1749149601) {
+		t.Errorf("H4 not cleanly upgraded to range containing 1749149601: %s", legacy.H4.String())
+	}
+	if err := awg.ValidateQuadrantDisjointness(legacy.H1, legacy.H2, legacy.H3, legacy.H4); err != nil {
+		t.Errorf("upgraded header ranges are not disjoint: %v", err)
 	}
 
 	// Verify persistence in DB
@@ -3352,6 +3366,9 @@ func TestEnsureObfuscationParams_HeaderProtectionKeyMigration(t *testing.T) {
 	}
 	if persisted.S1 < 12 || persisted.S2 < 12 || persisted.S3 < 12 || persisted.S4 < 12 {
 		t.Errorf("persisted S1..S4 < 12: %+v", persisted)
+	}
+	if persisted.H1 != legacy.H1 || persisted.H2 != legacy.H2 || persisted.H3 != legacy.H3 || persisted.H4 != legacy.H4 {
+		t.Errorf("persisted H values do not match upgraded ranges: %+v", persisted)
 	}
 }
 
@@ -3386,10 +3403,10 @@ func TestGenerateClientConfig_PortalOwnHPKey_DoesNotBleedBackend(t *testing.T) {
 		MaxTotalPeers:       1000,
 		MaxPeersPerBackend:  250,
 		Weights:             map[int64]int{sID: 100},
-		H1:                  1000,
-		H2:                  2000,
-		H3:                  3000,
-		H4:                  4000,
+		H1:                  models.DegenerateHeaderRange(1000),
+		H2:                  models.DegenerateHeaderRange(2000),
+		H3:                  models.DegenerateHeaderRange(3000),
+		H4:                  models.DegenerateHeaderRange(4000),
 		S1:                  15,
 		S2:                  25,
 		S3:                  15,
@@ -3512,9 +3529,9 @@ func TestGenerateClientConfig_ListenerKeyAgreement_ObfuscatedHandshake(t *testin
 		t.Fatalf("failed to decode client private key: %v", err)
 	}
 
-	h1 := uint32(parseDirectiveInt(t, cfgStr, "H1"))
+	h1 := parseDirectiveString(t, cfgStr, "H1")
 	s1 := parseDirectiveInt(t, cfgStr, "S1")
-	h2 := uint32(parseDirectiveInt(t, cfgStr, "H2"))
+	h2 := parseDirectiveString(t, cfgStr, "H2")
 	s2 := parseDirectiveInt(t, cfgStr, "S2")
 
 	// Construct obfuscated initiation with the client config parameters
@@ -3562,10 +3579,10 @@ func TestUpdateConfig_EnforcesMinSValues(t *testing.T) {
 		MaxTotalPeers:       500,
 		MaxPeersPerBackend:  100,
 		Weights:             map[int64]int{},
-		H1:                  111111,
-		H2:                  222222,
-		H3:                  333333,
-		H4:                  444444,
+		H1:                  models.NewHeaderRange(111111, 115000),
+		H2:                  models.NewHeaderRange(600000000, 600005000),
+		H3:                  models.NewHeaderRange(1200000000, 1200005000),
+		H4:                  models.NewHeaderRange(1800000000, 1800005000),
 		S1:                  40,
 		S2:                  50,
 		S3:                  30,
@@ -3601,8 +3618,8 @@ func TestUpdateConfig_EnforcesMinSValues(t *testing.T) {
 		t.Errorf("expected S3 clamped to >= 12, got %d", update.S3)
 	}
 	// Preserved fields must remain.
-	if update.H1 != 111111 || update.S1 != 40 {
-		t.Errorf("expected preserved H1/S1, got H1=%d S1=%d", update.H1, update.S1)
+	if update.H1 != models.NewHeaderRange(111111, 115000) || update.S1 != 40 {
+		t.Errorf("expected preserved H1/S1, got H1=%s S1=%d", update.H1, update.S1)
 	}
 	if update.HeaderProtectionKey == "" {
 		t.Error("expected HeaderProtectionKey preserved on partial update")
@@ -3824,5 +3841,484 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	}
 	if sessCharlie.AssignedIP != targetIP {
 		t.Fatalf("expected charlie to receive %s after resolving collision, got %s", targetIP, sessCharlie.AssignedIP)
+	}
+}
+
+func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
+
+	hpKeyB64 := "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+	vpnCfg := &models.VPNConfig{
+		Algorithm:           models.LBLeastConnections,
+		ListenPort:          port,
+		SubnetCIDR:          "10.100.0.0/24",
+		H1:                  models.NewHeaderRange(1000000, 1005000),
+		H2:                  models.NewHeaderRange(2000000, 2005000),
+		H3:                  models.NewHeaderRange(3000000, 3005000),
+		H4:                  models.NewHeaderRange(4000000, 4005000),
+		S1:                  50,
+		S2:                  60,
+		S3:                  30,
+		S4:                  20,
+		HeaderProtectionKey: hpKeyB64,
+	}
+	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	// Backend server setup
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "US Backend", Host: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-range",
+		PublicKey:     "dummy-be-pubkey-123456789012345678",
+		PrivateKey:    "dummy-be-privkey-1234567890123456",
+		Endpoint:      "127.0.0.1:51825",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 5 * time.Millisecond, nil
+	})
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("vpnSvc.Start failed: %v", err)
+	}
+	defer func() { _ = vpnSvc.Stop() }()
+
+	// Client credentials
+	clientPrivBytes := make([]byte, 32)
+	if _, err := rand.Read(clientPrivBytes); err != nil {
+		t.Fatalf("rand failed: %v", err)
+	}
+	clientPubBytes, err := curve25519.X25519(clientPrivBytes, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("curve25519 failed: %v", err)
+	}
+	clientPubB64 := base64.StdEncoding.EncodeToString(clientPubBytes)
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "range_client", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: sID,
+		Protocol: "awg",
+		ClientID: clientPubB64,
+		Name:     "device-range",
+	}); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	snap := vpnSvc.endpoint.ListenerConfigSnapshot()
+	liveCfg, err := vpnSvc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	serverPubB64 := liveCfg.ServerPublicKey
+	serverPubBytes, err := base64.StdEncoding.DecodeString(serverPubB64)
+	if err != nil {
+		t.Fatalf("DecodeString serverPub failed: %v", err)
+	}
+
+	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	hpKeyBytes, _ := health.DecodeKey(hpKeyB64)
+
+	// Test 1: Initiation with msgType outside H1 range must be rejected
+	badH1 := uint32(999999)
+	badInit, _, err := health.BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, nil, hpKeyBytes, badH1, snap.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated badH1 failed: %v", err)
+	}
+	if _, err := clientConn.Write(badInit); err != nil {
+		t.Fatalf("Write badInit failed: %v", err)
+	}
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	if _, err := clientConn.Read(respBuf); err == nil {
+		t.Fatal("expected no response for out-of-range H1 initiation, but got response")
+	}
+
+	// Test 2: Initiation with msgType within H1 range [1000000, 1005000] must succeed
+	validH1 := uint32(1002500)
+	validInit, state, err := health.BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, nil, hpKeyBytes, validH1, snap.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated validH1 failed: %v", err)
+	}
+	if _, err := clientConn.Write(validInit); err != nil {
+		t.Fatalf("Write validInit failed: %v", err)
+	}
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("Read handshake response failed: %v", err)
+	}
+
+	// Verify server response packet matches H2 range
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKeyBytes, snap.H2, snap.S2) {
+		t.Fatal("VerifyAWGResponsePacketObfuscated rejected server response for H2 range")
+	}
+
+	// Test 3: Transport framing per-packet acceptance
+	routedCh := make(chan []byte, 10)
+	vpnSvc.endpoint.SetClientPacketRouter(func(peerKey string, pkt []byte) error {
+		if peerKey == clientPubB64 {
+			routedCh <- pkt
+		}
+		return nil
+	})
+
+	// Derive session keys
+	respPayload := respBuf[snap.S2:n]
+	cipResp := health.NewHeaderProtectionCipher(hpKeyBytes, respBuf[:health.HeaderCipherNonceSize])
+	unmaskedResp := make([]byte, 92)
+	cipResp.XORKeyStream(unmaskedResp, respPayload[:92])
+	serverReceiverIdx := unmaskedResp[4:8]
+	serverEPub := unmaskedResp[12:44]
+
+	ss3, err := curve25519.X25519(state.ClientEPriv, serverEPub)
+	if err != nil {
+		t.Fatalf("ss3 failed: %v", err)
+	}
+	ck := health.KDF1(health.KDF1(state.CK, serverEPub), ss3)
+	ss4, err := curve25519.X25519(state.ClientPriv, serverEPub)
+	if err != nil {
+		t.Fatalf("ss4 failed: %v", err)
+	}
+	ck = health.KDF1(ck, ss4)
+	ck, _, _ = health.KDF3(ck, make([]byte, 32))
+	clientSendKey, _ := health.KDF2(ck, nil)
+
+	aeadSend, err := chacha20poly1305.New(clientSendKey)
+	if err != nil {
+		t.Fatalf("aeadSend failed: %v", err)
+	}
+
+	// 3a. Send datagram with msgType = 4001234 (within H4 range [4000000, 4005000])
+	s4 := snap.S4
+	frameLen := s4 + 16
+	datagram1 := make([]byte, frameLen)
+	_, _ = rand.Read(datagram1[:s4])
+	binary.LittleEndian.PutUint32(datagram1[s4:s4+4], 4001234)
+	copy(datagram1[s4+4:s4+8], serverReceiverIdx)
+	binary.LittleEndian.PutUint64(datagram1[s4+8:s4+16], 0)
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], 0)
+	payload1 := []byte("packet-within-h4-range")
+	datagram1 = aeadSend.Seal(datagram1, nonce[:], payload1, nil)
+	// Apply header protection
+	cipData := health.NewHeaderProtectionCipher(hpKeyBytes, datagram1[:health.HeaderCipherNonceSize])
+	cipData.XORKeyStream(datagram1[s4:s4+16], datagram1[s4:s4+16])
+
+	if _, err := clientConn.Write(datagram1); err != nil {
+		t.Fatalf("Write datagram1 failed: %v", err)
+	}
+
+	select {
+	case received := <-routedCh:
+		if !bytes.Equal(received, payload1) {
+			t.Fatalf("routed mismatch: got %q, want %q", received, payload1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for valid H4 transport packet to be accepted")
+	}
+
+	// 3b. Send datagram with msgType = 5000000 (OUTSIDE H4 range)
+	datagramBad := make([]byte, frameLen)
+	_, _ = rand.Read(datagramBad[:s4])
+	binary.LittleEndian.PutUint32(datagramBad[s4:s4+4], 5000000)
+	copy(datagramBad[s4+4:s4+8], serverReceiverIdx)
+	binary.LittleEndian.PutUint64(datagramBad[s4+8:s4+16], 1)
+	binary.LittleEndian.PutUint64(nonce[4:12], 1)
+	payloadBad := []byte("packet-outside-h4-range")
+	datagramBad = aeadSend.Seal(datagramBad, nonce[:], payloadBad, nil)
+	cipBad := health.NewHeaderProtectionCipher(hpKeyBytes, datagramBad[:health.HeaderCipherNonceSize])
+	cipBad.XORKeyStream(datagramBad[s4:s4+16], datagramBad[s4:s4+16])
+
+	if _, err := clientConn.Write(datagramBad); err != nil {
+		t.Fatalf("Write datagramBad failed: %v", err)
+	}
+
+	select {
+	case received := <-routedCh:
+		t.Fatalf("out-of-range H4 packet was unexpectedly accepted: %q", received)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: dropped!
+	}
+
+	// Test 4: SendToPeer per-packet type randomization
+	observedH4 := make(map[uint32]bool)
+	for i := 0; i < 15; i++ {
+		msg := []byte(fmt.Sprintf("probe-send-to-peer-%d", i))
+		if err := vpnSvc.endpoint.SendToPeer(clientPubB64, msg); err != nil {
+			t.Fatalf("SendToPeer failed on iteration %d: %v", i, err)
+		}
+		buf := make([]byte, 2048)
+		_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		nRecv, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("Read SendToPeer %d failed: %v", i, err)
+		}
+		packet := buf[:nRecv]
+		cipOut := health.NewHeaderProtectionCipher(hpKeyBytes, packet[:health.HeaderCipherNonceSize])
+		unmasked := make([]byte, 16)
+		cipOut.XORKeyStream(unmasked, packet[s4:s4+16])
+		msgType := binary.LittleEndian.Uint32(unmasked[0:4])
+
+		if !snap.H4.Contains(msgType) {
+			t.Fatalf("SendToPeer emitted msgType %d outside H4 range %s", msgType, snap.H4)
+		}
+		observedH4[msgType] = true
+	}
+
+	if len(observedH4) < 2 {
+		t.Errorf("expected per-packet H4 randomization across 15 sends, but observed only %d distinct types", len(observedH4))
+	}
+}
+
+func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed legacy database with DEV environment single values and pre-existing HeaderProtectionKey
+	legacyH1 := uint32(359398951)
+	legacyH2 := uint32(944086617)
+	legacyH3 := uint32(1418011628)
+	legacyH4 := uint32(1749149601)
+	existingHPKey := "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
+
+	legacyCfg := &models.VPNConfig{
+		Algorithm:           models.LBLeastConnections,
+		ListenPort:          port,
+		SubnetCIDR:          "10.100.0.0/16",
+		HealthThresholdMS:   500,
+		MaxTotalPeers:       1000,
+		MaxPeersPerBackend:  250,
+		Weights:             map[int64]int{},
+		H1:                  models.DegenerateHeaderRange(legacyH1),
+		H2:                  models.DegenerateHeaderRange(legacyH2),
+		H3:                  models.DegenerateHeaderRange(legacyH3),
+		H4:                  models.DegenerateHeaderRange(legacyH4),
+		S1:                  45,
+		S2:                  60,
+		S3:                  25,
+		S4:                  15,
+		HeaderProtectionKey: existingHPKey,
+	}
+	if err := db.SaveVPNConfig(ctx, legacyCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name: "Test Backend",
+		Host: "127.0.0.1",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"public_key": "backend-pubkey-123456789012345678",
+				"port":       51821,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "backend-pubkey-123456789012345678",
+		PrivateKey:    "backend-privkey-12345678901234567",
+		Endpoint:      "127.0.0.1:51821",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	// Starting NewVPNService runs ensureObfuscationParams
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	upgradedCfg, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+
+	// 1. Assert headers are upgraded to ranges with span >= 1000
+	for idx, tc := range []struct {
+		rng models.HeaderRange
+		val uint32
+		q   int
+	}{
+		{upgradedCfg.H1, legacyH1, 0},
+		{upgradedCfg.H2, legacyH2, 1},
+		{upgradedCfg.H3, legacyH3, 2},
+		{upgradedCfg.H4, legacyH4, 3},
+	} {
+		if tc.rng.IsDegenerate() {
+			t.Errorf("H%d remained degenerate: %s", idx+1, tc.rng)
+		}
+		if tc.rng.Hi-tc.rng.Lo < 1000 {
+			t.Errorf("H%d span < 1000: %s (span=%d)", idx+1, tc.rng, tc.rng.Hi-tc.rng.Lo)
+		}
+		// Invariant: original legacy single value MUST be contained within the upgraded range
+		if !tc.rng.Contains(tc.val) {
+			t.Errorf("H%d range %s does not contain legacy value %d", idx+1, tc.rng, tc.val)
+		}
+		qLo, qHi := awg.QuadrantBounds(tc.q)
+		if tc.rng.Lo < qLo || tc.rng.Hi > qHi {
+			t.Errorf("H%d range %s outside quadrant %d [%d, %d]", idx+1, tc.rng, tc.q, qLo, qHi)
+		}
+	}
+
+	// 2. Assert pairwise disjointness
+	if err := awg.ValidateQuadrantDisjointness(upgradedCfg.H1, upgradedCfg.H2, upgradedCfg.H3, upgradedCfg.H4); err != nil {
+		t.Fatalf("upgraded ranges are not pairwise disjoint: %v", err)
+	}
+
+	// 3. Assert upgraded config is persisted to SQLite DB
+	persisted, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if persisted.H1 != upgradedCfg.H1 || persisted.H2 != upgradedCfg.H2 ||
+		persisted.H3 != upgradedCfg.H3 || persisted.H4 != upgradedCfg.H4 {
+		t.Errorf("persisted config differs from in-memory upgraded config: %+v vs %+v", persisted, upgradedCfg)
+	}
+	if persisted.H1.IsDegenerate() || persisted.H1.Hi-persisted.H1.Lo < 1000 {
+		t.Errorf("persisted H1 is not upgraded range: %s", persisted.H1)
+	}
+
+	// 4. Assert GenerateClientConfig emits range strings "lo-hi" for H1-H4
+	uID, err := db.CreateUser(ctx, &models.User{Username: "legacy_user", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	expectedH1 := fmt.Sprintf("H1 = %d-%d", upgradedCfg.H1.Lo, upgradedCfg.H1.Hi)
+	expectedH2 := fmt.Sprintf("H2 = %d-%d", upgradedCfg.H2.Lo, upgradedCfg.H2.Hi)
+	expectedH3 := fmt.Sprintf("H3 = %d-%d", upgradedCfg.H3.Lo, upgradedCfg.H3.Hi)
+	expectedH4 := fmt.Sprintf("H4 = %d-%d", upgradedCfg.H4.Lo, upgradedCfg.H4.Hi)
+
+	if !strings.Contains(cfgStr, expectedH1) {
+		t.Errorf("client config missing range %q, got config:\n%s", expectedH1, cfgStr)
+	}
+	if !strings.Contains(cfgStr, expectedH2) {
+		t.Errorf("client config missing range %q, got config:\n%s", expectedH2, cfgStr)
+	}
+	if !strings.Contains(cfgStr, expectedH3) {
+		t.Errorf("client config missing range %q, got config:\n%s", expectedH3, cfgStr)
+	}
+	if !strings.Contains(cfgStr, expectedH4) {
+		t.Errorf("client config missing range %q, got config:\n%s", expectedH4, cfgStr)
+	}
+
+	// Must NOT contain single values
+	singleH1 := fmt.Sprintf("H1 = %d\n", legacyH1)
+	if strings.Contains(cfgStr, singleH1) {
+		t.Errorf("client config emitted single value %q instead of range", singleH1)
+	}
+
+	// 5. Listener Compatibility: verify listener accepts both legacy single value AND new range values
+	lc := svc.endpoint.ListenerConfigSnapshot()
+	if lc.H1 != upgradedCfg.H1 {
+		t.Fatalf("listener snapshot H1 %s does not match upgraded %s", lc.H1, upgradedCfg.H1)
+	}
+
+	hpKeyBytes, err := health.DecodeKey(existingHPKey)
+	if err != nil {
+		t.Fatalf("DecodeKey failed: %v", err)
+	}
+	peerPubKeyStr := parseDirectiveString(t, cfgStr, "PublicKey")
+	peerPubBytes, _ := base64.StdEncoding.DecodeString(peerPubKeyStr)
+	clientPrivKeyStr := parseDirectiveString(t, cfgStr, "PrivateKey")
+	clientPrivBytes, _ := base64.StdEncoding.DecodeString(clientPrivKeyStr)
+
+	// Send handshake using legacy single value (359398951)
+	legacyPkt, state1, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, legacyH1, upgradedCfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated legacy failed: %v", err)
+	}
+
+	serverAddr := svc.endpoint.GetListenAddr().(*net.UDPAddr)
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(legacyPkt); err != nil {
+		t.Fatalf("failed to send legacy initiation: %v", err)
+	}
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("legacy client handshake failed: listener did not respond: %v", err)
+	}
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state1, hpKeyBytes, upgradedCfg.H2, upgradedCfg.S2) {
+		t.Errorf("response verification failed for legacy client")
+	}
+
+	// Send handshake using a random value picked within the upgraded range
+	pickedH1 := upgradedCfg.H1.PickOne()
+	newPkt, state2, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, pickedH1, upgradedCfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated range failed: %v", err)
+	}
+	if _, err := clientConn.Write(newPkt); err != nil {
+		t.Fatalf("failed to send range initiation: %v", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n2, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("range client handshake failed: listener did not respond: %v", err)
+	}
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n2], state2, hpKeyBytes, upgradedCfg.H2, upgradedCfg.S2) {
+		t.Errorf("response verification failed for range client")
 	}
 }

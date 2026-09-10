@@ -12,10 +12,16 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
 // ProbeAWGEndpoint performs a pure-Go UDP Noise IK handshake probe and measures RTT latency.
 func ProbeAWGEndpoint(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	return ProbeAWGEndpointRange(ctx, endpoint, serverPubKey, clientPrivKey, psk, hpKey, h1, h2, s1, s2, timeout)
+}
+
+// ProbeAWGEndpointRange performs a pure-Go UDP Noise IK handshake probe with HeaderRange or uint32 headers and measures RTT latency.
+func ProbeAWGEndpointRange(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
@@ -203,14 +209,14 @@ func ExtractAWGExplicitParams(awgParams any) (h1, h2 uint32, s1, s2 int, found b
 	}
 
 	if v, ok := getMapParamValue(awgParams, "init_packet_magic_header", "h1"); ok {
-		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
-			h1 = uint32(num)
+		if hr, err := models.ParseHeaderRange(v); err == nil && !hr.IsZero() {
+			h1 = hr.Lo
 			found = true
 		}
 	}
 	if v, ok := getMapParamValue(awgParams, "response_packet_magic_header", "h2"); ok {
-		if num, err := strconv.ParseUint(v, 10, 32); err == nil && num > 0 {
-			h2 = uint32(num)
+		if hr, err := models.ParseHeaderRange(v); err == nil && !hr.IsZero() {
+			h2 = hr.Lo
 			found = true
 		}
 	}
@@ -247,6 +253,108 @@ func ExtractAWGExplicitParams(awgParams any) (h1, h2 uint32, s1, s2 int, found b
 	}
 
 	return h1, h2, s1, s2, found
+}
+
+// ExtractAWGExplicitRanges extracts H1, H2 as HeaderRange, and S1, S2 from an awgParams object (map[string]any or map[string]string).
+func ExtractAWGExplicitRanges(awgParams any) (h1, h2 models.HeaderRange, s1, s2 int, found bool) {
+	s1 = -1
+	s2 = -1
+	if awgParams == nil {
+		return models.HeaderRange{}, models.HeaderRange{}, -1, -1, false
+	}
+
+	if v, ok := getMapParamValue(awgParams, "init_packet_magic_header", "h1"); ok {
+		if hr, err := models.ParseHeaderRange(v); err == nil && !hr.IsZero() {
+			h1 = hr
+			found = true
+		}
+	}
+	if v, ok := getMapParamValue(awgParams, "response_packet_magic_header", "h2"); ok {
+		if hr, err := models.ParseHeaderRange(v); err == nil && !hr.IsZero() {
+			h2 = hr
+			found = true
+		}
+	}
+	if v, ok := getMapParamValue(awgParams, "init_packet_junk_size", "s1"); ok {
+		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
+			s1 = num
+			found = true
+		}
+	}
+	if v, ok := getMapParamValue(awgParams, "response_packet_junk_size", "s2"); ok {
+		if num, err := strconv.Atoi(v); err == nil && num >= 0 {
+			s2 = num
+			found = true
+		}
+	}
+
+	if !found {
+		for _, k := range []string{
+			"underload_packet_magic_header", "h3",
+			"transport_packet_magic_header", "h4",
+			"underload_packet_junk_size", "s3",
+			"transport_packet_junk_size", "s4",
+			"junk_packet_count", "jc",
+			"junk_packet_min_size", "jmin",
+			"junk_packet_max_size", "jmax",
+			"header_protection_key", "hpkey", "HeaderProtectionKey",
+		} {
+			if _, ok := getMapParamValue(awgParams, k); ok {
+				found = true
+				break
+			}
+		}
+	}
+
+	return h1, h2, s1, s2, found
+}
+
+// ExtractAWGHeaderRanges extracts H1, H2 as HeaderRange, and S1, S2 from an awgParams object.
+func ExtractAWGHeaderRanges(awgParams any, defaultH1, defaultH2 any, defaultS1, defaultS2 int) (h1, h2 models.HeaderRange, s1, s2 int) {
+	expH1, expH2, expS1, expS2, found := ExtractAWGExplicitRanges(awgParams)
+	d1, _ := models.ParseHeaderRange(defaultH1)
+	d2, _ := models.ParseHeaderRange(defaultH2)
+	if !found {
+		if d1.IsZero() {
+			return models.HeaderRange{}, models.HeaderRange{}, -1, -1
+		}
+		return d1, d2, defaultS1, defaultS2
+	}
+
+	h1 = expH1
+	h2 = expH2
+	s1 = expS1
+	s2 = expS2
+
+	if h1.IsZero() {
+		if !d1.IsZero() {
+			h1 = d1
+		} else {
+			h1 = models.DegenerateHeaderRange(DefaultH1)
+		}
+	}
+	if h2.IsZero() {
+		if !d2.IsZero() {
+			h2 = d2
+		} else {
+			h2 = models.DegenerateHeaderRange(DefaultH2)
+		}
+	}
+	if s1 < 0 {
+		if defaultS1 >= 0 {
+			s1 = defaultS1
+		} else {
+			s1 = DefaultS1
+		}
+	}
+	if s2 < 0 {
+		if defaultS2 >= 0 {
+			s2 = defaultS2
+		} else {
+			s2 = DefaultS2
+		}
+	}
+	return h1, h2, s1, s2
 }
 
 // ExtractAWGHeaderLimits extracts H1, H2, S1, S2 from an awgParams object (map[string]any or map[string]string),
@@ -298,8 +406,8 @@ func ExtractAWGHeaderLimits(awgParams any, defaultH1, defaultH2 uint32, defaultS
 	return h1, h2, s1, s2
 }
 
-func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 uint32, s1, s2 int) {
-	return ExtractAWGHeaderLimits(awgParams, DefaultH1, DefaultH2, DefaultS1, DefaultS2)
+func extractAWGHeaderLimits(awgParams map[string]any) (h1, h2 models.HeaderRange, s1, s2 int) {
+	return ExtractAWGHeaderRanges(awgParams, DefaultH1, DefaultH2, DefaultS1, DefaultS2)
 }
 
 // PerformAWGHandshake executes a complete AWG reachability probe including preambles and CPS blobs.

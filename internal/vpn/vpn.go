@@ -182,9 +182,29 @@ func enforceMinSValues(cfg *models.VPNConfig) bool {
 	return changed
 }
 
+func isObfuscationConfigComplete(cfg *models.VPNConfig) bool {
+	if cfg == nil {
+		return true
+	}
+	if cfg.HeaderProtectionKey == "" {
+		return false
+	}
+	if cfg.S1 < 12 || cfg.S2 < 12 || cfg.S3 < 12 || cfg.S4 < 12 {
+		return false
+	}
+	if awg.NeedsHeaderUpgrade(cfg.H1) || awg.NeedsHeaderUpgrade(cfg.H2) ||
+		awg.NeedsHeaderUpgrade(cfg.H3) || awg.NeedsHeaderUpgrade(cfg.H4) {
+		return false
+	}
+	if err := awg.ValidateQuadrantDisjointness(cfg.H1, cfg.H2, cfg.H3, cfg.H4); err != nil {
+		return false
+	}
+	return true
+}
+
 func generateMissingObfuscation(cfg *models.VPNConfig) (bool, error) {
 	var generated bool
-	if cfg.H1 == 0 {
+	if cfg.H1.IsZero() && cfg.H2.IsZero() && cfg.H3.IsZero() && cfg.H4.IsZero() {
 		h1, h2, h3, h4, s1, s2, s3, s4, err := awg.GenerateStandardObfuscationValues()
 		if err != nil {
 			return false, fmt.Errorf("failed to generate obfuscation params: %w", err)
@@ -192,6 +212,21 @@ func generateMissingObfuscation(cfg *models.VPNConfig) (bool, error) {
 		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = h1, h2, h3, h4
 		cfg.S1, cfg.S2, cfg.S3, cfg.S4 = s1, s2, s3, s4
 		generated = true
+	} else if awg.NeedsHeaderUpgrade(cfg.H1) || awg.NeedsHeaderUpgrade(cfg.H2) ||
+		awg.NeedsHeaderUpgrade(cfg.H3) || awg.NeedsHeaderUpgrade(cfg.H4) ||
+		awg.ValidateQuadrantDisjointness(cfg.H1, cfg.H2, cfg.H3, cfg.H4) != nil {
+		h1, h2, h3, h4, upgraded, err := awg.UpgradeDegenerateHeaders(cfg.H1, cfg.H2, cfg.H3, cfg.H4)
+		if err != nil {
+			return false, fmt.Errorf("failed to upgrade obfuscation headers: %w", err)
+		}
+		if upgraded {
+			cfg.H1, cfg.H2, cfg.H3, cfg.H4 = h1, h2, h3, h4
+			generated = true
+		}
+		if cfg.S1 == 0 && cfg.S2 == 0 && cfg.S3 == 0 && cfg.S4 == 0 {
+			cfg.S1, cfg.S2, cfg.S3, cfg.S4 = 50, 70, 20, 15
+			generated = true
+		}
 	}
 	if cfg.HeaderProtectionKey == "" {
 		hpk, err := generatePortalHeaderProtectionKey()
@@ -205,22 +240,23 @@ func generateMissingObfuscation(cfg *models.VPNConfig) (bool, error) {
 }
 
 // ensureObfuscationParams migrates a VPNConfig that lacks AWG obfuscation
-// values or HeaderProtectionKey. Checks the DB first under a mutex — a
-// concurrent first start may have already persisted parameters, and
-// the persisted values win over any in-memory guess — generates
+// values, contains legacy degenerate headers (lo == hi), or lacks HeaderProtectionKey.
+// Checks the DB first under a mutex — a concurrent first start may have already
+// persisted parameters, and the persisted values win over any in-memory guess — generates
 // standard-profile parameters and portal HeaderProtectionKey when still unset,
-// and persists them synchronously. Persistence failures are returned so
-// startup fails loudly instead of running with divergent ephemeral values.
-// The ListenPort is propagated through every save branch (R3): the
-// migration must never persist a zeroed listen_port, which GetVPNConfig's
+// upgrades degenerate headers to ranges with span >= 1000, and persists them synchronously.
+// Persistence failures are returned so startup fails loudly instead of running with
+// divergent ephemeral values. The ListenPort is propagated through every save branch (R3):
+// the migration must never persist a zeroed listen_port, which GetVPNConfig's
 // fill-down would re-default to the default port and desync the running listener
 // from rendered client configs. Ports <= 0 fall back to DefaultListenPort.
 func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return nil
 	}
-	// If both H1 and HeaderProtectionKey are already set, nothing to migrate.
-	if cfg.H1 != 0 && cfg.HeaderProtectionKey != "" {
+	// If all obfuscation parameters (header ranges, min S values, and HeaderProtectionKey)
+	// are already valid and complete, nothing to migrate.
+	if isObfuscationConfigComplete(cfg) {
 		return nil
 	}
 
@@ -237,7 +273,13 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 
 	persisted, err := db.GetVPNConfig(ctx)
 	if err == nil && persisted != nil {
-		if persisted.H1 != 0 && cfg.H1 == 0 {
+		if isObfuscationConfigComplete(persisted) {
+			cfg.H1, cfg.H2, cfg.H3, cfg.H4 = persisted.H1, persisted.H2, persisted.H3, persisted.H4
+			cfg.S1, cfg.S2, cfg.S3, cfg.S4 = persisted.S1, persisted.S2, persisted.S3, persisted.S4
+			cfg.HeaderProtectionKey = persisted.HeaderProtectionKey
+			return nil
+		}
+		if !persisted.H1.IsZero() && cfg.H1.IsZero() {
 			cfg.H1, cfg.H2, cfg.H3, cfg.H4 = persisted.H1, persisted.H2, persisted.H3, persisted.H4
 			cfg.S1, cfg.S2, cfg.S3, cfg.S4 = persisted.S1, persisted.S2, persisted.S3, persisted.S4
 		}
@@ -246,7 +288,7 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 		}
 	}
 
-	if cfg.H1 != 0 && cfg.HeaderProtectionKey != "" {
+	if isObfuscationConfigComplete(cfg) {
 		return nil
 	}
 
@@ -285,16 +327,16 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 // from the current config into an incoming config so partial updates
 // cannot clobber the parameters already distributed to peers.
 func preserveObfuscationParams(from, to *models.VPNConfig) {
-	if to.H1 == 0 {
+	if to.H1.IsZero() {
 		to.H1 = from.H1
 	}
-	if to.H2 == 0 {
+	if to.H2.IsZero() {
 		to.H2 = from.H2
 	}
-	if to.H3 == 0 {
+	if to.H3.IsZero() {
 		to.H3 = from.H3
 	}
-	if to.H4 == 0 {
+	if to.H4.IsZero() {
 		to.H4 = from.H4
 	}
 	if to.S1 == 0 {
@@ -385,13 +427,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		MTU:                 1420,
 		IdleTimeout:         3 * time.Minute,
 		HeaderProtectionKey: cfg.HeaderProtectionKey,
-		H1:                  int(cfg.H1),
+		H1:                  cfg.H1,
 		S1:                  cfg.S1,
-		H2:                  int(cfg.H2),
+		H2:                  cfg.H2,
 		S2:                  cfg.S2,
-		H3:                  int(cfg.H3),
+		H3:                  cfg.H3,
 		S3:                  cfg.S3,
-		H4:                  int(cfg.H4),
+		H4:                  cfg.H4,
 		S4:                  cfg.S4,
 	}
 
@@ -1318,8 +1360,12 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 			return errors.New("obfuscation parameters are immutable while listener is running")
 		}
 		if s.endpoint != nil {
-			s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4)
-			_ = s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey)
+			if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
+				return err
+			}
+			if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
+				return err
+			}
 			log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
 		}
 	}

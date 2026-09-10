@@ -346,8 +346,8 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVPNConfig failed: %v", err)
 	}
-	if cfg.H1 != 0 || cfg.H2 != 0 || cfg.H3 != 0 || cfg.H4 != 0 {
-		t.Errorf("GetVPNConfig must not generate H values, got H1=%d H2=%d H3=%d H4=%d", cfg.H1, cfg.H2, cfg.H3, cfg.H4)
+	if !cfg.H1.IsZero() || !cfg.H2.IsZero() || !cfg.H3.IsZero() || !cfg.H4.IsZero() {
+		t.Errorf("GetVPNConfig must not generate H values, got H1=%s H2=%s H3=%s H4=%s", cfg.H1, cfg.H2, cfg.H3, cfg.H4)
 	}
 	if cfg.S1 != 0 || cfg.S2 != 0 || cfg.S3 != 0 || cfg.S4 != 0 {
 		t.Errorf("GetVPNConfig must not generate S values, got S1=%d S2=%d S3=%d S4=%d", cfg.S1, cfg.S2, cfg.S3, cfg.S4)
@@ -359,7 +359,7 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second GetVPNConfig failed: %v", err)
 	}
-	if cfg2.H1 != 0 || cfg2.S1 != 0 {
+	if !cfg2.H1.IsZero() || cfg2.S1 != 0 {
 		t.Errorf("second read changed values: %+v", cfg2)
 	}
 
@@ -373,10 +373,10 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 		MaxTotalPeers:      1000,
 		MaxPeersPerBackend: 250,
 		Weights:            map[int64]int{},
-		H1:                 111111111,
-		H2:                 222222222,
-		H3:                 333333333,
-		H4:                 444444444,
+		H1:                 models.DegenerateHeaderRange(111111111),
+		H2:                 models.DegenerateHeaderRange(222222222),
+		H3:                 models.DegenerateHeaderRange(333333333),
+		H4:                 models.NewHeaderRange(400000000, 444444444),
 		S1:                 31,
 		S2:                 41,
 		S3:                 21,
@@ -389,7 +389,7 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVPNConfig after explicit save failed: %v", err)
 	}
-	if loaded.H1 != 111111111 || loaded.S1 != 31 || loaded.S4 != 16 {
+	if loaded.H1 != models.DegenerateHeaderRange(111111111) || loaded.H4 != models.NewHeaderRange(400000000, 444444444) || loaded.S1 != 31 || loaded.S4 != 16 {
 		t.Errorf("explicit obfuscation values not round-tripped verbatim: %+v", loaded)
 	}
 }

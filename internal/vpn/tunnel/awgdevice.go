@@ -237,14 +237,27 @@ func renderAWGObfuscationParams(b *strings.Builder, awgParams map[string]any) {
 	s2 := lookupAWGParamInt(awgParams, 0, "response_packet_junk_size", "s2")
 	s3 := lookupAWGParamInt(awgParams, 0, "cookie_reply_packet_junk_size", "underload_packet_junk_size", "s3")
 	s4 := lookupAWGParamInt(awgParams, 0, "transport_packet_junk_size", "s4")
-	h1 := lookupAWGParamInt(awgParams, 1, "init_packet_magic_header", "h1")
-	h2 := lookupAWGParamInt(awgParams, 2, "response_packet_magic_header", "h2")
-	h3 := lookupAWGParamInt(awgParams, 3, "underload_packet_magic_header", "cookie_reply_packet_magic_header", "h3")
-	h4 := lookupAWGParamInt(awgParams, 4, "transport_packet_magic_header", "h4")
+
+	h1 := "1"
+	if val, ok := lookupAWGParamStr(awgParams, "init_packet_magic_header", "h1"); ok {
+		h1 = val
+	}
+	h2 := "2"
+	if val, ok := lookupAWGParamStr(awgParams, "response_packet_magic_header", "h2"); ok {
+		h2 = val
+	}
+	h3 := "3"
+	if val, ok := lookupAWGParamStr(awgParams, "underload_packet_magic_header", "cookie_reply_packet_magic_header", "h3"); ok {
+		h3 = val
+	}
+	h4 := "4"
+	if val, ok := lookupAWGParamStr(awgParams, "transport_packet_magic_header", "h4"); ok {
+		h4 = val
+	}
 
 	fmt.Fprintf(b, "jc=%d\njmin=%d\njmax=%d\n", jc, jmin, jmax)
 	fmt.Fprintf(b, "s1=%d\ns2=%d\ns3=%d\ns4=%d\n", s1, s2, s3, s4)
-	fmt.Fprintf(b, "h1=%d\nh2=%d\nh3=%d\nh4=%d\n", h1, h2, h3, h4)
+	fmt.Fprintf(b, "h1=%s\nh2=%s\nh3=%s\nh4=%s\n", h1, h2, h3, h4)
 }
 
 func renderAWGDeviceOptions(b *strings.Builder, awgParams map[string]any) {
