@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -140,12 +141,13 @@ func nonceZero() []byte {
 // the initiation packet using the 12-byte junk prefix nonce; if unmasking
 // succeeds, it returns an InitiationInfo marked as HeaderProtected.
 // Plaintext initiations are accepted for backward compatibility.
-func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int, hpKeys ...[]byte) (*InitiationInfo, error) {
+func ParseInitiation(serverPriv []byte, datagram []byte, h1 any, s1 int, hpKeys ...[]byte) (*InitiationInfo, error) {
 	if len(serverPriv) != 32 {
 		return nil, errors.New("server private key must be 32 bytes")
 	}
-	if h1 == 0 {
-		h1 = health.DefaultH1
+	h1Range, err := models.ParseHeaderRange(h1)
+	if err != nil || h1Range.IsZero() {
+		h1Range = models.DegenerateHeaderRange(health.DefaultH1)
 	}
 	if s1 < 0 {
 		s1 = health.DefaultS1
@@ -174,19 +176,19 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int, hpKe
 			obfMsgType := binary.LittleEndian.Uint32(unmasked[0:4])
 			plainMsgType := binary.LittleEndian.Uint32(datagram[s1 : s1+4])
 
-			if obfMsgType == h1 {
+			if h1Range.Contains(obfMsgType) {
 				info, obfErr := parseInitiationBody(serverPriv, serverPub, unmasked, true, hpKey)
 				if obfErr == nil {
 					return info, nil
 				}
-				// If obfuscated body parsing failed, check if plaintext matches H1
-				if plainMsgType == h1 {
+				// If obfuscated body parsing failed, check if plaintext matches H1 range
+				if h1Range.Contains(plainMsgType) {
 					if infoPlain, plainErr := parseInitiationBody(serverPriv, serverPub, datagram[s1:], false, nil); plainErr == nil {
 						return infoPlain, nil
 					}
 				}
 				return nil, obfErr
-			} else if plainMsgType == h1 {
+			} else if h1Range.Contains(plainMsgType) {
 				// Obfuscated type didn't match H1, but plaintext did: backward-compat plaintext client.
 				return parseInitiationBody(serverPriv, serverPub, datagram[s1:], false, nil)
 			}
@@ -197,7 +199,7 @@ func ParseInitiation(serverPriv []byte, datagram []byte, h1 uint32, s1 int, hpKe
 	// 2. Plaintext path (HP disabled or S1 < 12).
 	payload := datagram[s1:]
 	msgType := binary.LittleEndian.Uint32(payload[0:4])
-	if msgType != h1 {
+	if !h1Range.Contains(msgType) {
 		return nil, ErrNotInitiation
 	}
 	return parseInitiationBody(serverPriv, serverPub, payload, false, nil)
@@ -374,12 +376,17 @@ func applyResponseHeaderProtection(resp []byte, s2 int, info *InitiationInfo, hp
 	return nil
 }
 
-func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int, hpKeys ...[]byte) (resp []byte, sessionKeys *TransportKeys, err error) {
+func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 any, s2 int, hpKeys ...[]byte) (resp []byte, sessionKeys *TransportKeys, err error) {
 	if info == nil || len(info.H) != 32 || len(info.CK) != 32 || len(info.ClientStaticPub) != 32 || len(info.ClientEPub) != 32 {
 		return nil, nil, ErrInvalidHandshakeState
 	}
-	if h2 == 0 {
-		h2 = health.DefaultH2
+	var h2Val uint32
+	h2Range, err := models.ParseHeaderRange(h2)
+	if err == nil && !h2Range.IsZero() {
+		h2Val = h2Range.PickOne()
+	}
+	if h2Val == 0 {
+		h2Val = health.DefaultH2
 	}
 	if s2 < 0 {
 		s2 = health.DefaultS2
@@ -398,7 +405,7 @@ func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 uint32, s2 int, h
 	}
 
 	body := make([]byte, 0, responseBodyLen)
-	binary.LittleEndian.PutUint32(idxBuf[:], h2)
+	binary.LittleEndian.PutUint32(idxBuf[:], h2Val)
 	body = append(body, idxBuf[:]...)
 	// sender index: the 4 random bytes are already a little-endian uint32 on
 	// the wire by construction.

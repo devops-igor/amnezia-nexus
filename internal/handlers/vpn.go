@@ -148,7 +148,7 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if current == nil || cfg == nil {
 		return
 	}
-	if cfg.H1 == 0 && cfg.S1 == 0 {
+	if cfg.H1.IsZero() && cfg.S1 == 0 {
 		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = current.H1, current.H2, current.H3, current.H4
 		cfg.S1, cfg.S2, cfg.S3, cfg.S4 = current.S1, current.S2, current.S3, current.S4
 		cfg.ServerPrivateKey = current.ServerPrivateKey
