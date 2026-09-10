@@ -152,7 +152,7 @@ func setupTestVPNService(t *testing.T, db *database.DB) (*Service, int64, int64,
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 
-	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	}
 	vpnSvc.SetProbeFunc(mockProbe)
@@ -868,7 +868,7 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -2328,7 +2328,7 @@ func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 	// Avoid 3-second network probe timeouts on unreachable test endpoints during background health loop
-	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
 	if err := svc.Start(ctx); err != nil {
@@ -2510,7 +2510,7 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 	var probeShouldSucceed atomic.Bool
-	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		if !probeShouldSucceed.Load() {
 			return 0, errors.New("probe temporarily disabled during startup")
 		}
@@ -2584,7 +2584,7 @@ func TestHealthProber_DegradedTunnel_FailsActivationWithoutDevice(t *testing.T) 
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 	// Stub probeFunc to return success
-	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
 
@@ -3510,7 +3510,7 @@ func TestGenerateClientConfig_ListenerKeyAgreement_ObfuscatedHandshake(t *testin
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
 	if err := svc.Start(ctx); err != nil {
@@ -3756,7 +3756,7 @@ func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService for vpnSvc2 failed: %v", err)
 	}
-	vpnSvc2.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	vpnSvc2.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
 	if err := vpnSvc2.Start(ctx); err != nil {
@@ -3925,7 +3925,7 @@ func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 5 * time.Millisecond, nil
 	})
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -4201,7 +4201,7 @@ func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 uint32, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
 	if err := svc.Start(ctx); err != nil {

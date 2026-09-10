@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -145,6 +148,208 @@ func startMockAWGServerWithHP(t *testing.T, hpKey []byte, h1, h2 uint32, s1, s2 
 	}()
 
 	return pc, serverPub, host, port
+}
+
+// startMockAWGServerRange is the AWG 3.1 variant of startMockAWGServer
+// (issue #49): the backend carries H1/H2 RANGES and, like a real AWG 3.1
+// server, picks a RANDOM response header value within its H2 range for each
+// handshake response. Initiation validation accepts any h1 within the H1
+// range; response verification on the client must therefore use full-range
+// membership, not a degenerate [Lo, Lo] range.
+func startMockAWGServerRange(t *testing.T, h1Range, h2Range models.HeaderRange, s1, s2 int) (net.PacketConn, []byte, *h2Recorder, string, int) {
+	serverPriv, serverPub := generateTestKeypair(t)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen UDP: %v", err)
+	}
+
+	host, portStr, _ := net.SplitHostPort(pc.LocalAddr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	// sentH2 records every response header value the mock actually sent, so
+	// tests can assert the responder genuinely varied its H2 across the range.
+	sentH2 := &h2Recorder{}
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, clientAddr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < s1+116 {
+				continue
+			}
+
+			msgBody := buf[s1 : s1+116]
+			msgType := binary.LittleEndian.Uint32(msgBody[0:4])
+			if !h1Range.Contains(msgType) {
+				continue
+			}
+			senderIdx := binary.LittleEndian.Uint32(msgBody[4:8])
+			clientEPub := msgBody[8:40]
+			encryptedStatic := msgBody[40:88]
+			encryptedTimestamp := msgBody[88:116]
+
+			serverHSum := blake2s.Sum256(append(InitialHash[:], serverPub...))
+			serverH := serverHSum[:]
+			serverCK := InitialChainKey[:]
+
+			serverHSum = blake2s.Sum256(append(serverH, clientEPub...))
+			serverH = serverHSum[:]
+			serverCK = KDF1(serverCK, clientEPub)
+
+			serverSS1, _ := curve25519.X25519(serverPriv, clientEPub)
+			var serverKey1 []byte
+			serverCK, serverKey1 = KDF2(serverCK, serverSS1)
+
+			serverAead1, _ := chacha20poly1305.New(serverKey1)
+			nonce0 := make([]byte, 12)
+			clientStaticPub, _ := serverAead1.Open(nil, nonce0, encryptedStatic, serverH)
+			serverHSum = blake2s.Sum256(append(serverH, encryptedStatic...))
+			serverH = serverHSum[:]
+
+			serverSS2, _ := curve25519.X25519(serverPriv, clientStaticPub)
+			var serverKey2 []byte
+			serverCK, serverKey2 = KDF2(serverCK, serverSS2)
+
+			serverAead2, _ := chacha20poly1305.New(serverKey2)
+			_, _ = serverAead2.Open(nil, nonce0, encryptedTimestamp, serverH)
+			serverHSum = blake2s.Sum256(append(serverH, encryptedTimestamp...))
+			serverH = serverHSum[:]
+
+			serverEPriv, serverEPub := generateTestKeypair(t)
+			serverHSum = blake2s.Sum256(append(serverH, serverEPub...))
+			serverH = serverHSum[:]
+			serverCK = KDF1(serverCK, serverEPub)
+
+			serverSS3, _ := curve25519.X25519(serverEPriv, clientEPub)
+			serverCK = KDF1(serverCK, serverSS3)
+
+			serverSS4, _ := curve25519.X25519(serverEPriv, clientStaticPub)
+			serverCK = KDF1(serverCK, serverSS4)
+
+			var serverTau, serverKey3 []byte
+			_, serverTau, serverKey3 = KDF3(serverCK, make([]byte, 32))
+			serverHSum = blake2s.Sum256(append(serverH, serverTau...))
+			serverH = serverHSum[:]
+
+			serverAead3, _ := chacha20poly1305.New(serverKey3)
+			encryptedEmpty := serverAead3.Seal(nil, nonce0, []byte{}, serverH)
+
+			// The AWG 3.1 behavior that triggers issue #49: each response
+			// uses a random header value drawn from the backend's H2 range.
+			respH2 := h2Range.PickOne()
+			sentH2.add(respH2)
+			respMsgType := make([]byte, 4)
+			binary.LittleEndian.PutUint32(respMsgType, respH2)
+			serverSenderIdx := make([]byte, 4)
+			binary.LittleEndian.PutUint32(serverSenderIdx, 12345)
+			respReceiverIdx := make([]byte, 4)
+			binary.LittleEndian.PutUint32(respReceiverIdx, senderIdx)
+
+			var respMsgBody []byte
+			respMsgBody = append(respMsgBody, respMsgType...)
+			respMsgBody = append(respMsgBody, serverSenderIdx...)
+			respMsgBody = append(respMsgBody, respReceiverIdx...)
+			respMsgBody = append(respMsgBody, serverEPub...)
+			respMsgBody = append(respMsgBody, encryptedEmpty...)
+
+			mac1KeySum := blake2s.Sum256(append(LabelMAC1, clientStaticPub...))
+			hMac1, _ := blake2s.New128(mac1KeySum[:])
+			hMac1.Write(respMsgBody)
+			respMac1 := hMac1.Sum(nil)
+			respMac2 := make([]byte, 16)
+
+			var respPacket []byte
+			if s2 > 0 {
+				pad := make([]byte, s2)
+				_, _ = rand.Read(pad)
+				respPacket = append(respPacket, pad...)
+			}
+			respPacket = append(respPacket, respMsgBody...)
+			respPacket = append(respPacket, respMac1...)
+			respPacket = append(respPacket, respMac2...)
+
+			_, _ = pc.WriteTo(respPacket, clientAddr)
+		}
+	}()
+
+	return pc, serverPub, sentH2, host, port
+}
+
+// h2Recorder is a concurrency-safe log of the response header values the mock
+// responder sent. The responder goroutine runs until the PacketConn is closed,
+// so a channel+close pattern would race with in-flight sends; a mutex-guarded
+// snapshot avoids that entirely.
+type h2Recorder struct {
+	mu sync.Mutex
+	vs []uint32
+}
+
+func (r *h2Recorder) add(v uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.vs = append(r.vs, v)
+}
+
+func (r *h2Recorder) all() []uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]uint32, len(r.vs))
+	copy(out, r.vs)
+	return out
+}
+
+// TestProbeAWGEndpointRange_VerifiesAcrossFullH2Range pins the issue #49
+// failure mode: an AWG 3.1 backend carries H1/H2 RANGES and picks a random
+// response header from its H2 range per handshake. The prober must verify the
+// response against the FULL range (h2Range.Contains), not a degenerate
+// [Lo, Lo] range — the old truncation rejected ~99.998% of responses here.
+func TestProbeAWGEndpointRange_VerifiesAcrossFullH2Range(t *testing.T) {
+	ctx := context.Background()
+
+	// Exact live AWG 3.1 ranges from the issue #49 report (Server 6).
+	h1Range := models.HeaderRange{Lo: 196955274, Hi: 196979834}
+	h2Range := models.HeaderRange{Lo: 718486018, Hi: 718530126}
+	span := uint64(h2Range.Hi-h2Range.Lo) + 1
+	s1 := DefaultS1
+	s2 := DefaultS2
+
+	pc, serverPub, sentH2, _, port := startMockAWGServerRange(t, h1Range, h2Range, s1, s2)
+	defer func() { _ = pc.Close() }()
+
+	serverPubB64 := base64.StdEncoding.EncodeToString(serverPub)
+
+	const iterations = 20
+	verified := 0
+	for i := 0; i < iterations; i++ {
+		rtt, err := ProbeAWGEndpointRange(ctx, fmt.Sprintf("127.0.0.1:%d", port), serverPubB64, "", "", "",
+			h1Range, h2Range, s1, s2, 2*time.Second)
+		if err != nil {
+			t.Fatalf("iteration %d/%d: probe failed against full-range H2 backend: %v", i+1, iterations, err)
+		}
+		if rtt <= 0 {
+			t.Errorf("iteration %d: expected positive RTT, got %v", i+1, rtt)
+		}
+		verified++
+	}
+
+	// The mock must have genuinely varied its response headers across the
+	// range (otherwise this test proves nothing about range membership).
+	distinct := make(map[uint32]struct{})
+	for _, v := range sentH2.all() {
+		if !h2Range.Contains(v) {
+			t.Fatalf("mock sent out-of-range response header %d", v)
+		}
+		distinct[v] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("mock sent the same response header for all %d probes; range randomization broken", iterations)
+	}
+
+	t.Logf("verified %d/%d probes; mock used %d distinct H2 values across a span of %d",
+		verified, iterations, len(distinct), span)
 }
 
 func TestPerformAWGHandshake(t *testing.T) {
