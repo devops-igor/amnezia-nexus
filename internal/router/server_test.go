@@ -19,6 +19,7 @@ import (
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
@@ -191,5 +192,70 @@ func TestServerDynamicTLS(t *testing.T) {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		t.Errorf("Shutdown failed: %v", err)
+	}
+}
+
+// TestServerCookiePolicyTracksTLS verifies the #83 wiring: NewServer installs
+// the process-wide cookie policy, Secure stays false until a TLS certificate
+// is loaded, ReloadTLS transitions the flag, and the policy is reachable by
+// the session middleware.
+func TestServerCookiePolicyTracksTLS(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "cookie_policy_test.db")
+	db, err := database.Open(dbPath, testSecretKey)
+	if err != nil {
+		t.Fatalf("failed to open test db: %v", err)
+	}
+	defer db.Close()
+
+	certPEM, keyPEM := generateTestCertPEM(t)
+	sslSettings := models.SSLSettings{
+		Enabled:   true,
+		Domain:    "localhost",
+		CertText:  certPEM,
+		KeyText:   keyPEM,
+		PanelPort: 5443,
+	}
+	ctx := context.Background()
+	if err := db.UpdateSetting(ctx, "ssl", sslSettings); err != nil {
+		t.Fatalf("failed to update ssl setting: %v", err)
+	}
+
+	cfg := &config.Config{
+		Host:      "127.0.0.1",
+		Port:      0,
+		SecretKey: testSecretKey,
+	}
+
+	r := NewRouter(cfg, db, nil)
+	srv := NewServer(cfg, r, db)
+
+	policy := srv.cookiePolicy
+	if policy == nil {
+		t.Fatal("NewServer must install a cookie policy")
+	}
+	if middleware.CurrentSessionCookiePolicy() != policy {
+		t.Fatal("cookie policy must be installed process-wide for the middleware")
+	}
+	if policy.Source() != middleware.CookieSecureFromTLS {
+		t.Errorf("expected source tls, got %q", policy.Source())
+	}
+	if policy.Secure() {
+		t.Errorf("expected Secure=false before any certificate is loaded")
+	}
+
+	cert, err := srv.LoadTLSCertificate(ctx)
+	if err != nil || cert == nil {
+		t.Fatalf("LoadTLSCertificate failed: %v", err)
+	}
+
+	srv.ReloadTLS(cert)
+	if !policy.Secure() {
+		t.Errorf("expected Secure=true after ReloadTLS with certificate")
+	}
+
+	srv.ReloadTLS(nil)
+	if policy.Secure() {
+		t.Errorf("expected Secure=false after ReloadTLS(nil)")
 	}
 }

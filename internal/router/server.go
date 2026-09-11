@@ -14,6 +14,7 @@ import (
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 )
 
@@ -26,6 +27,9 @@ type Server struct {
 	db         *database.DB
 	listener   net.Listener
 	mu         sync.Mutex
+	// cookiePolicy is the process-wide owner of session-cookie Secure state.
+	// It is cached here so Start/ReloadTLS can update it on TLS transitions.
+	cookiePolicy *middleware.SessionCookiePolicy
 }
 
 // NewServer constructs an HTTP server configured with the router, listening address, and database.
@@ -63,7 +67,32 @@ func NewServer(cfg *config.Config, handler http.Handler, db ...*database.DB) *Se
 		},
 	}
 
+	// Install the process-wide session cookie policy. The Secure flag derives
+	// from live TLS certificate state (refreshed on load/reload); the explicit
+	// COOKIE_INSECURE=1 dev override forces it off with a startup warning.
+	insecureOverride := cfg != nil && cfg.CookieInsecure
+	srv.cookiePolicy = middleware.LoadSessionCookiePolicy(
+		context.Background(),
+		insecureOverride,
+		srv.tlsCertPresent,
+	)
+
 	return srv
+}
+
+// tlsCertPresent reports whether a TLS certificate is currently loaded.
+// It serves as the SessionCookiePolicy's view of the live TLS state; the
+// atomic load never blocks.
+func (s *Server) tlsCertPresent(context.Context) (bool, error) {
+	return s.tlsCert.Load() != nil, nil
+}
+
+// updateCookiePolicyFromTLS syncs the cookie policy's Secure flag with the
+// current TLS certificate state.
+func (s *Server) updateCookiePolicyFromTLS(present bool) {
+	if s.cookiePolicy != nil {
+		s.cookiePolicy.SetTLSCertPresent(present)
+	}
 }
 
 // LoadTLSCertificate reads SSL settings from the database and constructs a TLS certificate.
@@ -101,8 +130,11 @@ func (s *Server) LoadTLSCertificate(ctx context.Context) (*tls.Certificate, erro
 }
 
 // ReloadTLS dynamically updates the active TLS certificate in memory.
+// The session cookie policy is refreshed so new cookies immediately reflect
+// the current TLS state (Secure on when a certificate is present).
 func (s *Server) ReloadTLS(cert *tls.Certificate) {
 	s.tlsCert.Store(cert)
+	s.updateCookiePolicyFromTLS(cert != nil)
 }
 
 // Start runs the HTTP / HTTPS server listener.
@@ -117,6 +149,8 @@ func (s *Server) Start() error {
 
 	if cert != nil {
 		s.tlsCert.Store(cert)
+		s.updateCookiePolicyFromTLS(true)
+		slog.Info("Session cookies now use Secure=true (TLS certificate active)")
 
 		s.tlsConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -155,6 +189,13 @@ func (s *Server) Start() error {
 	}
 
 	// Plain HTTP mode
+	s.updateCookiePolicyFromTLS(false)
+	slog.Warn("No TLS certificate loaded; session cookies will be issued WITHOUT the Secure flag. Configure TLS in settings to protect session cookies.")
+
+	if s.cookiePolicy != nil && s.cookiePolicy.Source() == middleware.CookieSecureFromOverride {
+		slog.Warn("COOKIE_INSECURE=1 is active: session cookie Secure flag FORCED OFF even when TLS is available. This is a development-only setting; do not use in production.")
+	}
+
 	ln, err := net.Listen("tcp", s.httpServer.Addr)
 	if err != nil {
 		return err

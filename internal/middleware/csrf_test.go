@@ -104,6 +104,83 @@ func TestCSRFMiddleware(t *testing.T) {
 	}
 }
 
+// TestCSRFRejectsTrace verifies TRACE is explicitly rejected with 405 at the
+// middleware level (defense-in-depth), independent of router method matching.
+func TestCSRFRejectsTrace(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("handler must not run for TRACE requests")
+		w.WriteHeader(http.StatusOK)
+	})
+	csrfMiddleware := CSRF(false)(okHandler)
+
+	req := httptest.NewRequest(http.MethodTrace, "/api/health", nil)
+	// Even with a valid CSRF cookie present, TRACE is rejected outright.
+	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: "some-token"})
+	req.Header.Set(CSRFHeaderName, "some-token")
+	w := httptest.NewRecorder()
+	csrfMiddleware.ServeHTTP(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for TRACE, got %d", w.Code)
+	}
+}
+
+// TestIsSafeHTTPMethod: safe set is exactly GET, HEAD, OPTIONS — TRACE and
+// everything else must be excluded.
+func TestIsSafeHTTPMethod(t *testing.T) {
+	safe := map[string]bool{
+		http.MethodGet:     true,
+		http.MethodHead:    true,
+		http.MethodOptions: true,
+	}
+	unsafe := []string{
+		http.MethodTrace,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodConnect,
+		"PROPFIND",
+		"",
+	}
+	for m, want := range safe {
+		if got := isSafeHTTPMethod(m); got != want {
+			t.Errorf("isSafeHTTPMethod(%q) = %v, want %v", m, got, want)
+		}
+	}
+	for _, m := range unsafe {
+		if isSafeHTTPMethod(m) {
+			t.Errorf("isSafeHTTPMethod(%q) = true, must be false", m)
+		}
+	}
+	if isTraceMethod(http.MethodTrace) != true || isTraceMethod(http.MethodGet) != false {
+		t.Errorf("isTraceMethod boundary broken")
+	}
+}
+
+// TestRejectTraceMiddleware: the standalone middleware also blocks TRACE with
+// 405 and passes everything else through.
+func TestRejectTraceMiddleware(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	traceBlocked := RejectTrace(okHandler)
+
+	reqTrace := httptest.NewRequest(http.MethodTrace, "/anything", nil)
+	wTrace := httptest.NewRecorder()
+	traceBlocked.ServeHTTP(wTrace, reqTrace)
+	if wTrace.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for TRACE, got %d", wTrace.Code)
+	}
+
+	reqGet := httptest.NewRequest(http.MethodGet, "/anything", nil)
+	wGet := httptest.NewRecorder()
+	traceBlocked.ServeHTTP(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Errorf("expected 200 for GET through RejectTrace, got %d", wGet.Code)
+	}
+}
+
 func TestIsCSRFExempt(t *testing.T) {
 	if !IsCSRFExempt(http.MethodGet, "/api/servers") {
 		t.Errorf("GET should always be exempt")
