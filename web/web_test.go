@@ -30,6 +30,11 @@ func TestEmbeddedTranslations(t *testing.T) {
 		if len(parsed) == 0 {
 			t.Errorf("embedded translation %s parsed to empty map", langFile)
 		}
+		for _, key := range []string{"vpn_delete", "vpn_confirm_delete"} {
+			if _, ok := parsed[key]; !ok {
+				t.Errorf("embedded translation %s missing key %q", langFile, key)
+			}
+		}
 	}
 }
 
@@ -547,5 +552,112 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 	}
 	if strings.Contains(serverStr, "showToast(") {
 		t.Errorf("server.html should not use showToast(), must use UI.toast")
+	}
+}
+
+func TestPhase5VPNAndUsersModernization(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	// 1. Assert vpn.html modernizations
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	requiredVPNTokens := []string{
+		"href=\"#icon-shield\"",
+		"href=\"#icon-network\"",
+		"href=\"#icon-server\"",
+		"href=\"#icon-plus\"",
+		"href=\"#icon-pencil\"",
+		"href=\"#icon-trash\"",
+		"href=\"#icon-activity\"",
+		"href=\"#icon-x\"",
+		"UI.confirm",
+		"UI.toast",
+		"API.get",
+		"API.post",
+		"API.delete",
+		"API.request",
+		"NexusTable",
+		"NexusTelemetry.poll",
+		"Telemetry.formatBytes",
+		"vpnBackendsTable",
+		"vpnTableContainer",
+		"data-sort-type",
+		"vpn-listener-badge",
+		"vpn-public-endpoint",
+		"vpn_delete",
+		"vpn_confirm_delete",
+	}
+	for _, token := range requiredVPNTokens {
+		if !strings.Contains(vpnStr, token) {
+			t.Errorf("vpn.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html
+	if strings.Contains(vpnStr, "if (!confirm(") || strings.Contains(vpnStr, "if(!confirm(") {
+		t.Errorf("vpn.html should not use raw confirm(), must use UI.confirm")
+	}
+	if strings.Contains(vpnStr, "apiCall(") {
+		t.Errorf("vpn.html should not use apiCall(), must use API client")
+	}
+	if strings.Contains(vpnStr, "showToast(") {
+		t.Errorf("vpn.html should not use showToast(), must use UI.toast")
+	}
+
+	// 2. Assert users.html modernizations
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	requiredUsersTokens := []string{
+		"href=\"#icon-users\"",
+		"href=\"#icon-user\"",
+		"href=\"#icon-plus\"",
+		"href=\"#icon-pencil\"",
+		"href=\"#icon-trash\"",
+		"href=\"#icon-search\"",
+		"href=\"#icon-key\"",
+		"href=\"#icon-network\"",
+		"href=\"#icon-x\"",
+		"href=\"#icon-copy\"",
+		"table-toolbar",
+		"table-search-box",
+		"table-search-input",
+		"table-filter-chips",
+		"filter-chip",
+		"roleFilterChips",
+		"UI.confirm",
+		"UI.copy",
+		"UI.toast",
+		"API.get",
+		"API.post",
+		"NexusTable",
+		"userConnsTable",
+		"Telemetry.formatBytes",
+	}
+	for _, token := range requiredUsersTokens {
+		if !strings.Contains(usersStr, token) {
+			t.Errorf("users.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from users.html
+	if strings.Contains(usersStr, "if (!confirm(") || strings.Contains(usersStr, "if(!confirm(") {
+		t.Errorf("users.html should not use raw confirm(), must use UI.confirm")
+	}
+	if strings.Contains(usersStr, "apiCall(") {
+		t.Errorf("users.html should not use apiCall(), must use API client")
+	}
+	if strings.Contains(usersStr, "showToast(") {
+		t.Errorf("users.html should not use showToast(), must use UI.toast")
 	}
 }
