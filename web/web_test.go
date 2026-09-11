@@ -163,6 +163,7 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		"id=\"icon-network\"",
 		"id=\"icon-settings\"",
 		"id=\"icon-key\"",
+		"id=\"icon-plug\"",
 		"id=\"icon-trophy\"",
 		"id=\"icon-sun\"",
 		"id=\"icon-moon\"",
@@ -198,6 +199,7 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		"id=\"drawerBackdrop\"",
 		"class=\"mobile-bottom-bar\"",
 		"toggleMobileDrawer",
+		"href=\"#icon-plug\"",
 	}
 	for _, elem := range requiredBaseElements {
 		if !strings.Contains(base, elem) {
@@ -683,6 +685,7 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 		"href=\"#icon-activity\"",
 		"href=\"#icon-server\"",
 		"href=\"#icon-key\"",
+		"href=\"#icon-plug\"",
 		"href=\"#icon-shield\"",
 		"href=\"#icon-download\"",
 		"href=\"#icon-copy\"",
@@ -1029,5 +1032,59 @@ func TestLoadBalancerHighlightAndAwgPreselection(t *testing.T) {
 				t.Errorf("%s missing or empty required key %q", langFile, k)
 			}
 		}
+	}
+}
+
+func TestModernClientDashboardPage(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	// 1. Assert icons.html and base.html contain icon-plug symbol definition
+	iconsData, err := fs.ReadFile(templatesFS, "icons.html")
+	if err != nil {
+		t.Fatalf("failed to read icons.html: %v", err)
+	}
+	if !strings.Contains(string(iconsData), `id="icon-plug"`) {
+		t.Errorf("icons.html missing id=\"icon-plug\" symbol")
+	}
+
+	baseData, err := fs.ReadFile(templatesFS, "base.html")
+	if err != nil {
+		t.Fatalf("failed to read base.html: %v", err)
+	}
+	baseStr := string(baseData)
+	if !strings.Contains(baseStr, `id="icon-plug"`) {
+		t.Errorf("base.html missing embedded id=\"icon-plug\" symbol")
+	}
+
+	// 2. Assert navigation links to /my use icon-plug
+	if !strings.Contains(baseStr, `<span class="nav-icon"><svg class="icon"><use href="#icon-plug"></use></svg></span>`) {
+		t.Errorf("base.html sidebar /my link missing href=\"#icon-plug\"")
+	}
+	if !strings.Contains(baseStr, `<a href="/my" class="bottom-bar-link {{ if eq .active_page "my_connections" }}active{{ end }}">`+"\n"+`                <svg class="icon"><use href="#icon-plug"></use></svg>`) {
+		t.Errorf("base.html mobile bottom bar /my link missing href=\"#icon-plug\"")
+	}
+
+	// 3. Assert my_connections.html uses icon-plug for header and connection avatars
+	myConnData, err := fs.ReadFile(templatesFS, "my_connections.html")
+	if err != nil {
+		t.Fatalf("failed to read my_connections.html: %v", err)
+	}
+	myConnStr := string(myConnData)
+	if !strings.Contains(myConnStr, `href="#icon-plug"`) {
+		t.Errorf("my_connections.html missing href=\"#icon-plug\"")
+	}
+	if !strings.Contains(myConnStr, `<span class="icon"><svg class="icon"><use href="#icon-plug"></use></svg></span>`) {
+		t.Errorf("my_connections.html header title missing href=\"#icon-plug\"")
+	}
+	if !strings.Contains(myConnStr, `<div class="client-avatar">`+"\n"+`                    <svg class="icon"><use href="#icon-plug"></use></svg>`) {
+		t.Errorf("my_connections.html card avatar missing href=\"#icon-plug\"")
+	}
+
+	// 4. Assert cryptographic keys retain icon-key
+	if !strings.Contains(myConnStr, `href="#icon-key"`) {
+		t.Errorf("my_connections.html should retain href=\"#icon-key\" for cryptographic keys")
 	}
 }

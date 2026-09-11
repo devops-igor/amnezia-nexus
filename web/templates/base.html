@@ -69,6 +69,13 @@
                 <circle cx="12" cy="12" r="3"></circle>
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
             </symbol>
+            <!-- Plug / Connection -->
+            <symbol id="icon-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22v-5"></path>
+                <path d="M9 8V2"></path>
+                <path d="M15 8V2"></path>
+                <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"></path>
+            </symbol>
             <symbol id="icon-key" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 2l-2 2m-1.5 1.5L13 10"></path>
                 <circle cx="7.5" cy="15.5" r="5.5"></circle>
@@ -295,7 +302,7 @@
 
                     <div class="nav-section-label">CLIENT</div>
                     <a href="/my" class="sidebar-nav-link nav-link {{ if eq .active_page "my_connections" }}active{{ end }}">
-                        <span class="nav-icon"><svg class="icon"><use href="#icon-key"></use></svg></span>
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-plug"></use></svg></span>
                         <span class="nav-label">{{ _ "nav_connections" }}</span>
                     </a>
                     <a href="/leaderboard" class="sidebar-nav-link nav-link {{ if eq .active_page "leaderboard" }}active{{ end }}">
@@ -305,7 +312,7 @@
                 {{ else }}
                     <div class="nav-section-label">ACCESS</div>
                     <a href="/my" class="sidebar-nav-link nav-link">
-                        <span class="nav-icon"><svg class="icon"><use href="#icon-key"></use></svg></span>
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-plug"></use></svg></span>
                         <span class="nav-label">{{ _ "nav_connections" }}</span>
                     </a>
                     <a href="/login" class="sidebar-nav-link nav-link">
@@ -380,7 +387,7 @@
             </a>
             {{ end }}
             <a href="/my" class="bottom-bar-link {{ if eq .active_page "my_connections" }}active{{ end }}">
-                <svg class="icon"><use href="#icon-key"></use></svg>
+                <svg class="icon"><use href="#icon-plug"></use></svg>
                 <span>{{ _ "nav_connections" }}</span>
             </a>
             <a href="/leaderboard" class="bottom-bar-link {{ if eq .active_page "leaderboard" }}active{{ end }}">
@@ -389,7 +396,7 @@
             </a>
         {{ else }}
             <a href="/my" class="bottom-bar-link">
-                <svg class="icon"><use href="#icon-key"></use></svg>
+                <svg class="icon"><use href="#icon-plug"></use></svg>
                 <span>{{ _ "nav_connections" }}</span>
             </a>
             <a href="/login" class="bottom-bar-link">
