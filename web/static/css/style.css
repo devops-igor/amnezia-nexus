@@ -1242,6 +1242,8 @@ button:focus-visible,
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
+    width: 100%;
+    min-width: 100%;
 }
 
 .client-item {
@@ -3180,6 +3182,49 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     background: rgba(34, 197, 94, 0.1) !important;
 }
 
+/* ===== Modernized Users Section (Issue #113) ===== */
+#usersContainer {
+    width: 100%;
+    min-width: 100%;
+}
 
+#usersGrid {
+    width: 100%;
+    min-width: 100%;
+}
 
+#userConnsTable {
+    width: 100%;
+    min-width: 100%;
+}
 
+.user-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.user-card:hover {
+    border-color: var(--border-hover);
+}
+
+.user-avatar-circle {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: var(--accent);
+    flex-shrink: 0;
+}
