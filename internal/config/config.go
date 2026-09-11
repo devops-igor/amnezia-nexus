@@ -40,6 +40,7 @@ type Config struct {
 	TrustedCIDRs   []*net.IPNet
 	TrustedIPs     []net.IP
 	LogLevel       string
+	CookieInsecure bool
 	VPNEnabled     bool
 	VPNListenPort  int
 	VPNSubnet      string
@@ -174,6 +175,16 @@ func LoadConfig() (*AppConfig, error) {
 		logLevel = "INFO"
 	}
 
+	// Dev-only opt-in to disable the Secure flag on session cookies. Any of
+	// "1", "true", "TRUE", ... counts; only TLS-bearing production deployments
+	// should ever leave this unset.
+	cookieInsecure := false
+	if raw := strings.TrimSpace(os.Getenv("COOKIE_INSECURE")); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil && parsed {
+			cookieInsecure = true
+		}
+	}
+
 	vpnEnabled := strings.EqualFold(os.Getenv("VPN_ENABLED"), "true") || os.Getenv("VPN_ENABLED") == "1"
 
 	vpnListenPort := 51820
@@ -205,6 +216,7 @@ func LoadConfig() (*AppConfig, error) {
 		TrustedCIDRs:   trustedCIDRs,
 		TrustedIPs:     trustedIPs,
 		LogLevel:       logLevel,
+		CookieInsecure: cookieInsecure,
 		VPNEnabled:     vpnEnabled,
 		VPNListenPort:  vpnListenPort,
 		VPNSubnet:      vpnSubnet,

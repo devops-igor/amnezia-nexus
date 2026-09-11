@@ -65,7 +65,10 @@ func Session(secretKey string) func(next http.Handler) http.Handler {
 }
 
 // SetSessionCookie serializes and signs session data into an HTTP cookie.
-func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secretKey string, secure bool, maxAge int) error {
+// The Secure attribute is decided by the process-wide SessionCookiePolicy
+// (TLS-derived, with an explicit dev-only override) — callers must not pass
+// a per-call value.
+func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secretKey string, maxAge int) error {
 	if maxAge <= 0 {
 		maxAge = DefaultSessionMaxAge
 	}
@@ -75,7 +78,9 @@ func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secret
 		return err
 	}
 
-	// #nosec G124 -- Session cookie configured with SameSite and configurable Secure flag
+	// #nosec G124 -- Secure flag comes from the centralized SessionCookiePolicy,
+	// which derives it from live TLS certificate state (or the explicit
+	// COOKIE_INSECURE=1 dev override), never from a per-call parameter.
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    encoded,
@@ -83,15 +88,17 @@ func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secret
 		MaxAge:   maxAge,
 		Expires:  time.Now().Add(time.Duration(maxAge) * time.Second),
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   CurrentSessionCookiePolicy().Secure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 	return nil
 }
 
-// ClearSessionCookie invalidates the active session cookie.
+// ClearSessionCookie invalidates the active session cookie. The Secure flag
+// mirrors SetSessionCookie so the expired cookie is removed from both the
+// secure and non-secure storage of the active deployment.
 func ClearSessionCookie(w http.ResponseWriter) {
-	// #nosec G124 -- Clearing session cookie
+	// #nosec G124 -- Clearing session cookie; Secure mirrors SessionCookiePolicy
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    "",
@@ -99,6 +106,7 @@ func ClearSessionCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
+		Secure:   CurrentSessionCookiePolicy().Secure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 }

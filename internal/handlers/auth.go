@@ -89,7 +89,7 @@ func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 		sess = &models.SessionData{}
 	}
 	sess.CaptchaAnswer = captchaAnswer
-	_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, false, 3600)
+	_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
 
 	// Generate image
 	imgBytes := generateCaptchaImage(captchaAnswer)
@@ -152,7 +152,7 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 			// Clear captcha answer to prevent replay
 			if sess != nil {
 				sess.CaptchaAnswer = ""
-				_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, false, 3600)
+				_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
 			}
 			h.JSONError(w, http.StatusBadRequest, "invalid_captcha", h.Translate(r, "invalid_captcha"))
 			return
@@ -161,7 +161,7 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 		// Clear captcha answer after successful verification
 		if sess != nil {
 			sess.CaptchaAnswer = ""
-			_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, false, 3600)
+			_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
 		}
 	}
 
@@ -195,7 +195,7 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 		ShareAuthenticated:     make(map[string]bool),
 	}
 
-	if err := middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, false, middleware.DefaultSessionMaxAge); err != nil {
+	if err := middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to create session")
 		return
 	}
@@ -287,7 +287,7 @@ func (h *Handlers) APISetupHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.cfg != nil && h.cfg.SecretKey != "" {
-		_ = middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, false, middleware.DefaultSessionMaxAge)
+		_ = middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
 	}
 
 	h.JSON(w, http.StatusOK, map[string]any{
@@ -346,7 +346,7 @@ func (h *Handlers) APIChangePasswordHandler(w http.ResponseWriter, r *http.Reque
 	// Update session cookie with password_change_required = false
 	sess.PasswordChangeRequired = false
 	if h.cfg != nil && h.cfg.SecretKey != "" {
-		_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, false, middleware.DefaultSessionMaxAge)
+		_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
 	}
 
 	h.audit(r, "auth.change_password", map[string]any{"user_id": user.ID, "username": user.Username})
