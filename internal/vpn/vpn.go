@@ -525,6 +525,47 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
+	// Issue #78: session replacement (client rekey/reconnect) must migrate the
+	// pool connection counter off the old backend — without this every rekey
+	// leaked +1 on the old backend's ActiveConnections gauge (the original
+	// connect incremented it in HandleIncomingPeer; the replacement path never
+	// decremented, and a later DisconnectSession(oldID) found nothing because
+	// the SessionManager had already dropped the old ID and closed the DB row).
+	// The hook uses the same pool primitives as the clean-disconnect
+	// mirror-decrement paths (DisconnectUser/DisconnectSession/ReleaseClient).
+	// SessionManager owns the ordering: CreateSession removes the old session
+	// (and closes its DB row) BEFORE persisting the new one, and fires this
+	// hook only after the new session is fully registered. The hook runs while
+	// SessionManager.mu is held, so it must only touch the pool counter and
+	// forwarder/sticky state — it must never re-enter the session manager.
+	// Old and new backends may differ when the reconnect re-selected a backend.
+	sessionMgr.SetReplacementHook(func(ctx context.Context, old, new *models.VPNSession) {
+		if old == nil {
+			return
+		}
+		if new == nil {
+			// Replacement failed to persist: no counter migration happened,
+			// so the +1 leak stays observable via the reconcile logs instead
+			// of silently guessing a counter state that was never applied.
+			log.Printf("[vpn] session replacement for peer %s failed before the new session was registered; pool counter for backend %d not migrated (watch periodic reconcile)",
+				old.PeerPublicKey, old.BackendTunnelID)
+			return
+		}
+		// Mirror HandleIncomingPeer's increment on the same primitives used by
+		// DisconnectUser/DisconnectSession/ReleaseClient for the decrement.
+		svc.pool.DecrementConnections(old.BackendTunnelID)
+		if new.BackendTunnelID != old.BackendTunnelID {
+			svc.pool.IncrementConnections(new.BackendTunnelID)
+		}
+		if svc.forwarder != nil {
+			if err := svc.forwarder.UpdateSessionBackend(old.PeerPublicKey, new.BackendTunnelID); err != nil && !errors.Is(err, forwarder.ErrSessionNotRegistered) {
+				log.Printf("[vpn] session replacement route redirect for peer %s -> backend %d: %v", old.PeerPublicKey, new.BackendTunnelID, err)
+			}
+		}
+		if svc.stickyMgr != nil {
+			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
+		}
+	})
 	// Idle-timeout reaper: run the same teardown as an explicit disconnect
 	// (forwarder route, pool counter, sticky affinity) for each reaped
 	// session. Without this, idle timeouts leak all three (the reaper used
@@ -821,6 +862,11 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Issue #78: hourly periodic reconcile of the active_connections gauge.
+	// Safety net for residual counter drift; gauge-only semantics — it never
+	// touches sessions, so it cannot fight the idle-timeout reaper.
+	s.StartGaugeReconciler(ctx)
+
 	return nil
 }
 
@@ -880,6 +926,45 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if !anyDrift && unknown == 0 {
 		log.Printf("[vpn] connection gauge reconciliation: no drift detected across %d tunnel(s)", len(tunnels))
 	}
+}
+
+// ConnectionGaugeReconcileInterval is the cadence of the periodic gauge
+// reconciliation (issue #78 decision: hourly — short enough that drift never
+// lives longer than one interval, cheap enough to be a single indexed DB
+// read over the vpn_sessions table per hour).
+const ConnectionGaugeReconcileInterval = time.Hour
+
+// StartGaugeReconciler launches the hourly periodic reconcile of the
+// active_connections gauge (issue #78 short-term safety net). It reuses the
+// existing, tested reconcileConnectionCounts primitive unchanged — no new
+// counting logic — so the gauge is the ONLY thing it corrects: it never
+// creates, closes, or resurrects sessions, and therefore cannot fight the
+// session reaper. Reaper interaction: the reaper's teardown closes real
+// session rows synchronously via DisconnectSession before the gauge can be
+// stale; the reconcile simply recomputes the gauge FROM the (now-correct)
+// session table, so ordering against reaper passes is irrelevant. The only
+// race window is a session lifecycle event landing mid-reconcile, which is
+// the same read-modify-write over pool snapshots Start already relies on and
+// self-corrects on the next pass. Drift (before -> after per backend) is
+// logged inside reconcileConnectionCounts, making the residual leak rate
+// observable in production.
+func (s *Service) StartGaugeReconciler(ctx context.Context) {
+	if s.pool == nil || s.db == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(ConnectionGaugeReconcileInterval)
+		defer ticker.Stop()
+		log.Printf("[vpn] periodic connection-gauge reconciler started (interval %s)", ConnectionGaugeReconcileInterval)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.reconcileConnectionCounts(ctx)
+			}
+		}
+	}()
 }
 
 // Stop gracefully shuts down the VPN subsystem.
@@ -1516,13 +1601,25 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	// Trigger failover for active sessions on this backend
 	if s.stickyMgr != nil {
 		activeTunnels := s.pool.GetActiveTunnels()
-		migrations, err := s.stickyMgr.HandleFailover(ctx, tunnel.ID, activeTunnels)
+		// Issue #85: HandleFailover returns a result with successful
+		// migrations AND explicitly reported skipped peers — every peer left
+		// on the disabled backend is logged here so stranding is visible.
+		failover, err := s.stickyMgr.HandleFailover(ctx, tunnel.ID, activeTunnels)
 		if err != nil {
 			log.Printf("[vpn] failover for backend %d found no healthy target: %v", serverID, err)
+		}
+		if failover != nil {
+			for _, sk := range failover.Skipped {
+				log.Printf("[vpn] failover for backend %d: peer %s (user %s) NOT migrated: %s", serverID, sk.PeerPublicKey, sk.UserID, sk.Reason)
+			}
 		}
 		// Redirect live traffic: the detached backend's device is closed, so
 		// any session still routed to it would silently drop packets. The
 		// sticky maps alone do not move the forwarder's per-session route.
+		var migrations []loadbalancer.FailoverMigration
+		if failover != nil {
+			migrations = failover.Migrations
+		}
 		for _, m := range migrations {
 			if s.forwarder != nil {
 				if err := s.forwarder.UpdateSessionBackend(m.PeerPublicKey, m.NewBackendTunnelID); err != nil {
