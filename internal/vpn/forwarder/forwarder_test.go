@@ -55,7 +55,7 @@ func (m *mockPacketDev) getPackets() [][]byte {
 
 func TestForwarderBasicRouting(t *testing.T) {
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 5)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 5)
 
 	sessID := "sess-fwd-1"
 	connID := "conn-fwd-1"
@@ -124,7 +124,7 @@ func TestForwarderBasicRouting(t *testing.T) {
 func TestForwarderEdgeCasesAndLifecycle(t *testing.T) {
 	ctx := context.Background()
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 5)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 5)
 
 	sessID := "sess-fwd-2"
 	connID := "conn-fwd-2"
@@ -162,7 +162,7 @@ func TestForwarderEdgeCasesAndLifecycle(t *testing.T) {
 	}
 
 	// Queue Full test
-	fwdSmall := NewForwarder(accountant, 1)
+	fwdSmall := NewForwarder(accountant, "10.100.0.0/16", 1)
 	fwdSmall.RegisterSession("s2", "c2", "peer2", "10.100.0.11", 300)
 	_ = fwdSmall.RouteClientToBackend("peer2", []byte("p1"))
 	if err := fwdSmall.RouteClientToBackend("peer2", []byte("p2")); err != ErrQueueFull {
@@ -194,7 +194,7 @@ func TestForwarderEdgeCasesAndLifecycle(t *testing.T) {
 
 func TestForwarderRateLimitingThrottling(t *testing.T) {
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 10)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 10)
 
 	sessID := "sess-rl-1"
 	connID := "conn-rl-1"
@@ -268,7 +268,7 @@ func TestForwarderPacketPumps(t *testing.T) {
 	defer cancel()
 
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 10)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 10)
 
 	clientDev := newMockPacketDev()
 	backendDev := newMockPacketDev()
@@ -380,7 +380,7 @@ func TestForwarder_ReattachStopsOldPumpAndDeliversToNewDevice(t *testing.T) {
 	defer cancel()
 
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 500)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 500)
 	fwd.Start(ctx)
 	fwd.StartPumps(ctx)
 	defer func() { _ = fwd.Stop() }()
@@ -447,7 +447,7 @@ func TestForwarder_ReattachStopsOldPumpAndDeliversToNewDevice(t *testing.T) {
 
 func TestForwarderDynamicSourceIPLearning(t *testing.T) {
 	accountant := NewTrafficAccountant(nil, 0)
-	fwd := NewForwarder(accountant, 10)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 10)
 
 	sessID := "sess-dyn-1"
 	connID := "conn-dyn-1"

@@ -15,6 +15,13 @@ var (
 	ErrBackendNotFound      = errors.New("backend queue not found")
 	ErrQueueFull            = errors.New("packet queue is full")
 	ErrRateLimitExceeded    = errors.New("rate limit exceeded")
+	// ErrSpoofedSourceIP is returned by RouteClientToBackend when the inner
+	// packet's claimed source IP fails the rebind ownership guard (issue
+	// #89): outside the portal subnet, currently assigned to another route,
+	// or otherwise not a legitimate self-heal target. The packet is dropped
+	// and the spoofedRebinds counter is incremented; callers (the endpoint
+	// router) treat it as a drop, not a protocol error.
+	ErrSpoofedSourceIP = errors.New("spoofed inner source IP: rebind rejected")
 )
 
 // PacketDevice abstracts physical Linux TUN / network interfaces and in-memory test devices.
@@ -114,10 +121,22 @@ type Forwarder struct {
 	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
 	defaultClientDev PacketDevice             // default client packet device
 	bufSize          int
-	totalRxBytes     atomic.Int64
-	totalTxBytes     atomic.Int64
-	dropsQueueFull   atomic.Uint64 // return packets dropped: per-route queue full
-	dropsTotal       atomic.Uint64 // return-path drops counted so far (queue full)
+	// portalSubnet is the VPN's own client address pool (same CIDR the IPAM
+	// allocates from). It bounds the srcIP self-heal rebind in
+	// RouteClientToBackend (issue #89): only IPs INSIDE this subnet can ever
+	// trigger a rebind, and only while unassigned. A claimed srcIP outside
+	// the subnet (or unparseable) is always treated as spoofed and dropped —
+	// an inner packet source outside the portal pool can only be a spoof.
+	portalSubnet   *net.IPNet
+	totalRxBytes   atomic.Int64
+	totalTxBytes   atomic.Int64
+	dropsQueueFull atomic.Uint64 // return packets dropped: per-route queue full
+	dropsTotal     atomic.Uint64 // return-path drops counted so far (queue full)
+	// spoofedRebinds counts client→backend packets whose claimed inner
+	// source IP failed the rebind ownership guard (issue #89): outside the
+	// portal subnet or already assigned to another route. Such packets are
+	// dropped (never forwarded, never rebound). Exposed via SpoofedRebinds.
+	spoofedRebinds atomic.Uint64
 	// writeErrLogUntil throttles return-path device Write-error log lines to
 	// at most one per second (issue #43: a failed dev.Write on the client
 	// queue -> client device leg, e.g. "no transport keys for peer", used to
@@ -139,13 +158,29 @@ type Forwarder struct {
 }
 
 // NewForwarder creates a new Forwarder.
-func NewForwarder(accountant *TrafficAccountant, bufSize ...int) *Forwarder {
+//
+// portalSubnetCIDR is the VPN client pool CIDR (the same source IPAM is
+// constructed from, e.g. VPNConfig.SubnetCIDR). It gates the srcIP rebind
+// self-heal (issue #89): rebinds are only accepted for IPs inside this
+// subnet that are currently unassigned. An empty or invalid CIDR disables
+// ALL rebinds (fail-closed) — self-heal silently stops working but the
+// hijack primitive stays closed.
+func NewForwarder(accountant *TrafficAccountant, portalSubnetCIDR string, bufSize ...int) *Forwarder {
 	qSize := 256
 	if len(bufSize) > 0 && bufSize[0] > 0 {
 		qSize = bufSize[0]
 	}
+	var portalSubnet *net.IPNet
+	if portalSubnetCIDR != "" {
+		if _, ipNet, err := net.ParseCIDR(portalSubnetCIDR); err == nil {
+			portalSubnet = ipNet
+		} else {
+			log.Printf("[vpn/forwarder] invalid portal subnet CIDR %q: srcIP rebind self-heal disabled", portalSubnetCIDR)
+		}
+	}
 	return &Forwarder{
 		accountant:       accountant,
+		portalSubnet:     portalSubnet,
 		routesByPeer:     make(map[string]*sessionRoute),
 		routesByIP:       make(map[string]*sessionRoute),
 		backendQueues:    make(map[int64]chan []byte),
@@ -390,6 +425,25 @@ func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
 			return ErrSessionNotRegistered
 		}
 		if route.assignedIP != srcIP {
+			// Issue #89: the claimed srcIP comes from the INNER packet and
+			// is attacker-controlled. Only accept the rebind when BOTH hold:
+			//   1. srcIP is inside the portal client subnet (an inner source
+			//      outside the pool can only be a spoof), AND
+			//   2. srcIP is currently UNASSIGNED — checking under THIS write
+			//      lock (routesByIP is only mutated under f.mu, so the
+			//      check-and-insert here is atomic with respect to every
+			//      other registration/unregister/rebind).
+			// Anything else — including another peer's live assigned IP — is
+			// a spoofed rebind attempt: drop the packet and count it. Before
+			// this guard, a peer could claim a victim's (guessable,
+			// sequentially allocated) IP and hijack the victim's downstream
+			// traffic by stealing its routesByIP entry.
+			spoofed := !f.inPortalSubnet(srcIP) || f.routesByIP[srcIP] != nil
+			if spoofed {
+				f.spoofedRebinds.Add(1)
+				f.mu.Unlock()
+				return ErrSpoofedSourceIP
+			}
 			if route.assignedIP != "" {
 				delete(f.routesByIP, route.assignedIP)
 			}
@@ -630,6 +684,30 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 // tailing logs (issue #39).
 func (f *Forwarder) DropStats() (queueFull, total uint64) {
 	return f.dropsQueueFull.Load(), f.dropsTotal.Load()
+}
+
+// inPortalSubnet reports whether ip belongs to the portal client pool.
+// Unparseable IPs and an unknown subnet both answer false (fail-closed).
+// Callers must hold f.mu (write) or accept a racy-but-constant read: the
+// field is set once at construction and never mutated.
+func (f *Forwarder) inPortalSubnet(ip string) bool {
+	if f.portalSubnet == nil {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return f.portalSubnet.Contains(parsed)
+}
+
+// SpoofedRebinds returns the number of client→backend packets whose claimed
+// inner source IP failed the rebind ownership guard (issue #89) and were
+// dropped: source outside the portal subnet, or currently assigned to
+// another route. Nonzero values are a strong signal of tenant-isolation
+// abuse (or severe NAT misconfiguration) and are safe to alert on.
+func (f *Forwarder) SpoofedRebinds() uint64 {
+	return f.spoofedRebinds.Load()
 }
 
 // StopPumps terminates background packet pump routines.

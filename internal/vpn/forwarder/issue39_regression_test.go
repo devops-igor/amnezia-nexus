@@ -52,7 +52,7 @@ func ipv4Packet(dst [4]byte) []byte {
 // route remained registered means the pump was permanently gone or wedged —
 // with a live pump this test's invariant (full drain after recovery) holds.
 func TestQueueFullRecoversAfterConsumerStall(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	defer f.StopPumps()
 
 	dev := newGatedDevice()
@@ -105,7 +105,7 @@ func TestQueueFullRecoversAfterConsumerStall(t *testing.T) {
 // UnregisterSession deleted the re-registered route: return traffic then got
 // ErrSessionNotRegistered forever (session shows CONNECTED, pages time out).
 func TestReregisteredRouteSurvivesLateUnregister(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	defer f.StopPumps()
 
 	dev := newGatedDevice()
@@ -140,7 +140,7 @@ func TestReregisteredRouteSurvivesLateUnregister(t *testing.T) {
 // (now absent) IP must be rejected as unregistered — never silently buffered
 // into a stale route that would replay them into the wrong session.
 func TestStaleRouteCannotCaptureReturnTraffic(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	defer f.StopPumps()
 
 	oldDev, newDev := newGatedDevice(), newGatedDevice()
@@ -190,7 +190,7 @@ func TestStaleRouteCannotCaptureReturnTraffic(t *testing.T) {
 // f.pumpsRunning was already true; the Service.Start() ordering hole left
 // such routes permanently pumpless — queue full for hours at a time.)
 func TestRouteRegisteredBeforeStartPumpsGetsPump(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	defer f.StopPumps()
 
 	dev := newGatedDevice()
@@ -220,7 +220,7 @@ func TestRouteRegisteredBeforeStartPumpsGetsPump(t *testing.T) {
 // must pump again. This is the operator-visible healing path for a stalled
 // downstream data plane without restarting the panel process.
 func TestStalledRouteRecoversAfterStopStartPumps(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	defer f.StopPumps()
 
 	dev := newGatedDevice()
