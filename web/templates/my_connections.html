@@ -226,12 +226,18 @@
                 <select class="form-select" id="createServerSelect" required onchange="onServerSelected()">
                     <option value="">- {{ _ "select" }} -</option>
                     {{ if .vpn_enabled }}
-                    <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true">Load Balancer (Auto-Select)</option>
+                    <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true" selected>⚡ {{ _ "load_balancer_auto" }} ({{ _ "recommended" }})</option>
                     {{ end }}
                     {{ range $srv := .servers }}
                     <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}">{{ $srv.Name }}</option>
                     {{ end }}
                 </select>
+                <div id="lbHighlightCallout" class="lb-selection-callout" style="display: {{ if .vpn_enabled }}flex{{ else }}none{{ end }};">
+                    <svg class="icon"><use href="#icon-zap"></use></svg>
+                    <div>
+                        <strong>{{ _ "recommended" }}:</strong> {{ _ "load_balancer_recommended_hint" }}
+                    </div>
+                </div>
             </div>
             <div class="form-group">
                 <label class="form-label" for="createProtoSelect">{{ _ "create_conn_protocol_label" }}</label>
@@ -482,8 +488,14 @@
 
     function openCreateConnectionModal() {
         document.getElementById('createConnForm').reset();
-        const protoSelect = document.getElementById('createProtoSelect');
-        protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
+        const serverSelect = document.getElementById('createServerSelect');
+        const lbOption = serverSelect.querySelector('option[value="0"]');
+        if (lbOption) {
+            serverSelect.value = '0';
+        } else if (serverSelect.options.length > 1) {
+            serverSelect.selectedIndex = 1;
+        }
+        onServerSelected();
         UI.modal.close('configModal');
         UI.modal.open('createConnModal', '#createServerSelect');
     }
@@ -492,10 +504,18 @@
         const serverSelect = document.getElementById('createServerSelect');
         const serverId = parseInt(serverSelect.value);
         const protoSelect = document.getElementById('createProtoSelect');
+        const lbCallout = document.getElementById('lbHighlightCallout');
+
+        if (lbCallout) {
+            lbCallout.style.display = serverSelect.value === '0' ? 'flex' : 'none';
+        }
 
         protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
 
-        if (isNaN(serverId)) return;
+        if (isNaN(serverId)) {
+            document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            return;
+        }
 
         const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
         let protocols = null;
@@ -508,7 +528,10 @@
             const server = availableServers.find(s => s.id === serverId);
             if (server && server.protocols) protocols = server.protocols;
         }
-        if (!protocols) return;
+        if (!protocols) {
+            document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            return;
+        }
 
         const protoNames = {
             awg: 'AmneziaWG',
@@ -525,7 +548,10 @@
             }
         }
 
-        if (protoSelect.options.length === 2) {
+        const hasAwg = Array.from(protoSelect.options).some(o => o.value === 'awg');
+        if (hasAwg) {
+            protoSelect.value = 'awg';
+        } else if (protoSelect.options.length === 2) {
             protoSelect.selectedIndex = 1;
         }
 

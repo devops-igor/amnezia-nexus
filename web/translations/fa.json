@@ -420,5 +420,8 @@
   "telegram_bot_token_label": "توکن ربات",
   "telegram_chat_id_label": "شناسه چت ادمین",
   "telegram_bot_hint": "دریافت هشدارهای امنیتی و اعلان‌های عملیاتی مستقیماً در تلگرام",
-  "search_connections": "جستجوی اتصالات..."
+  "search_connections": "جستجوی اتصالات...",
+  "load_balancer_auto": "توزیع‌کننده بار (انتخاب خودکار)",
+  "recommended": "پیشنهادی",
+  "load_balancer_recommended_hint": "به صورت خودکار ترافیک را به سریع‌ترین و پایدارترین سرور هدایت می‌کند."
 }

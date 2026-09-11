@@ -457,5 +457,8 @@
   "telegram_bot_token_label": "Токен бота",
   "telegram_chat_id_label": "ID чата администратора",
   "telegram_bot_hint": "Получайте оперативные уведомления и оповещения безопасности прямо в Telegram",
-  "search_connections": "Поиск подключений..."
+  "search_connections": "Поиск подключений...",
+  "load_balancer_auto": "Балансировщик (Автовыбор)",
+  "recommended": "Рекомендуется",
+  "load_balancer_recommended_hint": "Автоматически направляет трафик на наиболее быстрый и стабильный сервер."
 }
