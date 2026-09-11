@@ -1277,6 +1277,9 @@ func TestIssue101VPNModernization(t *testing.T) {
 			t.Errorf("style.css missing required class definition %q", cls)
 		}
 	}
+	if !strings.Contains(cssStr, ".interactive-table") || !strings.Contains(cssStr, "width: 100%") {
+		t.Errorf("style.css missing .interactive-table with width: 100%%")
+	}
 
 	// 9. Assert presence of new VPN keys across all 5 translations
 	newVPNTranslationKeys := []string{
@@ -1303,6 +1306,14 @@ func TestIssue101VPNModernization(t *testing.T) {
 			val, ok := dict[k]
 			if !ok || strings.TrimSpace(val) == "" {
 				t.Errorf("%s missing or empty required VPN key %q", langFile, k)
+			}
+		}
+		if langFile == "en.json" {
+			if dict["vpn_unset_auto"] != "Auto-detect" {
+				t.Errorf("en.json vpn_unset_auto = %q, want %q", dict["vpn_unset_auto"], "Auto-detect")
+			}
+			if dict["vpn_unset_auto_detected"] != "Auto: %s" {
+				t.Errorf("en.json vpn_unset_auto_detected = %q, want %q", dict["vpn_unset_auto_detected"], "Auto: %s")
 			}
 		}
 	}
@@ -1394,5 +1405,86 @@ func TestIssue101ShowConfigIconRework(t *testing.T) {
 		if strings.Contains(string(tmplData), `href="#icon-key"`) {
 			t.Errorf("template %s contains forbidden href=\"#icon-key\"", entry.Name())
 		}
+	}
+}
+
+func TestIssue101VPNPolishRework(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Live telemetry green dot spacing in vpn.html and style.css .gap-xs
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+	if !strings.Contains(vpnStr, `style="gap: var(--space-sm);"`) {
+		t.Errorf("vpn.html missing style=\"gap: var(--space-sm);\" for live telemetry dot spacing")
+	}
+
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	if !strings.Contains(cssStr, ".gap-xs {") || !strings.Contains(cssStr, "gap: var(--space-xs);") {
+		t.Errorf("style.css missing .gap-xs utility class")
+	}
+
+	// 2. Public Endpoint text simplification
+	expectedAutoTranslations := map[string][2]string{
+		"en.json": {"Auto-detect", "Auto: %s"},
+		"ru.json": {"Автоопределение", "Авто: %s"},
+		"fr.json": {"Détection auto", "Auto : %s"},
+		"fa.json": {"تشخیص خودکار", "خودکار: %s"},
+		"zh.json": {"自动检测", "自动：%s"},
+	}
+	for langFile, expected := range expectedAutoTranslations {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		if dict["vpn_unset_auto"] != expected[0] {
+			t.Errorf("%s vpn_unset_auto = %q, want %q", langFile, dict["vpn_unset_auto"], expected[0])
+		}
+		if dict["vpn_unset_auto_detected"] != expected[1] {
+			t.Errorf("%s vpn_unset_auto_detected = %q, want %q", langFile, dict["vpn_unset_auto_detected"], expected[1])
+		}
+	}
+
+	// Assert vpn.html JS fallback uses simplified strings
+	if !strings.Contains(vpnStr, `'Auto: %s'`) {
+		t.Errorf("vpn.html missing 'Auto: %%s' fallback")
+	}
+	if !strings.Contains(vpnStr, `'Auto-detect'`) {
+		t.Errorf("vpn.html missing 'Auto-detect' fallback")
+	}
+
+	// 3. VPN Backends table width 100%
+	if !strings.Contains(cssStr, ".interactive-table {\n    width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .interactive-table with width: 100%% and border-collapse: collapse")
+	}
+	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .table-container table with width: 100%% and border-collapse: collapse")
+	}
+	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
+		t.Errorf("vpn.html missing #vpnTableContainer")
+	}
+	if !strings.Contains(vpnStr, `class="table interactive-table" id="vpnBackendsTable"`) {
+		t.Errorf("vpn.html missing table.interactive-table#vpnBackendsTable")
 	}
 }
