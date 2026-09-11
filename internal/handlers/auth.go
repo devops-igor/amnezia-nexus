@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-web-ui-go/internal/captcha"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
@@ -74,7 +75,18 @@ func (h *Handlers) SetLangHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, ref, http.StatusFound)
 }
 
-// CaptchaHandler generates a new visual CAPTCHA challenge.
+// captchaStore returns the process-wide server-side captcha store, creating
+// it on first use (issue #84: answers never leave the server).
+func (h *Handlers) captchaStore() *captcha.Store {
+	h.captchaOnce.Do(func() {
+		h.captchaSt = captcha.NewStore()
+	})
+	return h.captchaSt
+}
+
+// CaptchaHandler generates a new visual CAPTCHA challenge. The answer is
+// stored server-side; only an opaque captcha_id reaches the client session
+// cookie (issue #84).
 func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 	if h.cfg == nil || h.cfg.SecretKey == "" {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Session signing key not configured")
@@ -83,13 +95,22 @@ func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 
 	captchaAnswer := generateCaptchaDigits(4)
 
-	// Store answer in session
+	captchaID, err := h.captchaStore().New(captchaAnswer)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to create captcha")
+		return
+	}
+
+	// Store only the opaque id in the session; the answer never leaves the server.
 	sess := h.GetSession(r)
 	if sess == nil {
 		sess = &models.SessionData{}
 	}
-	sess.CaptchaAnswer = captchaAnswer
-	_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
+	sess.CaptchaID = captchaID
+	if err := middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to store captcha session")
+		return
+	}
 
 	// Generate image
 	imgBytes := generateCaptchaImage(captchaAnswer)
@@ -143,25 +164,32 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	if captchaCfg.Enabled {
 		sess := h.GetSession(r)
-		expected := ""
+		captchaID := ""
 		if sess != nil {
-			expected = sess.CaptchaAnswer
+			captchaID = sess.CaptchaID
 		}
 
-		if expected == "" || req.Captcha == nil || !strings.EqualFold(strings.TrimSpace(*req.Captcha), expected) {
-			// Clear captcha answer to prevent replay
-			if sess != nil {
-				sess.CaptchaAnswer = ""
-				_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
+		// One-time-use: any verify attempt consumes the server-side entry
+		// (issue #84). Unknown, expired or already-used ids are rejected.
+		submitted := ""
+		if req.Captcha != nil {
+			submitted = strings.TrimSpace(*req.Captcha)
+		}
+		if captchaID == "" || submitted == "" || !h.captchaStore().Verify(captchaID, submitted) {
+			// Drop the consumed captcha id from the session so a stale
+			// cookie cannot be replayed against a new challenge.
+			if sess != nil && sess.CaptchaID != "" {
+				sess.CaptchaID = ""
+				_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600)
 			}
 			h.JSONError(w, http.StatusBadRequest, "invalid_captcha", h.Translate(r, "invalid_captcha"))
 			return
 		}
 
-		// Clear captcha answer after successful verification
+		// Captcha verified; clear the id from the session.
 		if sess != nil {
-			sess.CaptchaAnswer = ""
-			_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 3600)
+			sess.CaptchaID = ""
+			_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600)
 		}
 	}
 
@@ -195,7 +223,7 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 		ShareAuthenticated:     make(map[string]bool),
 	}
 
-	if err := middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge); err != nil {
+	if err := middleware.SetSessionCookieForRequest(w, r, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to create session")
 		return
 	}
@@ -287,7 +315,7 @@ func (h *Handlers) APISetupHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.cfg != nil && h.cfg.SecretKey != "" {
-		_ = middleware.SetSessionCookie(w, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
+		_ = middleware.SetSessionCookieForRequest(w, r, sessionData, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
 	}
 
 	h.JSON(w, http.StatusOK, map[string]any{
@@ -346,7 +374,7 @@ func (h *Handlers) APIChangePasswordHandler(w http.ResponseWriter, r *http.Reque
 	// Update session cookie with password_change_required = false
 	sess.PasswordChangeRequired = false
 	if h.cfg != nil && h.cfg.SecretKey != "" {
-		_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
+		_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
 	}
 
 	h.audit(r, "auth.change_password", map[string]any{"user_id": user.ID, "username": user.Username})
