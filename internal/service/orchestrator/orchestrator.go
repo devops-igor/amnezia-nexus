@@ -11,18 +11,12 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/remnawave"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/service/userops"
 )
 
 // ProtocolResolver resolves a ProtocolManager by protocol name.
 type ProtocolResolver interface {
 	Get(proto string) (manager.ProtocolManager, bool)
-}
-
-// RemnaWaveSyncer defines the interface for RemnaWave synchronization.
-type RemnaWaveSyncer interface {
-	Sync(ctx context.Context) (int, string, error)
 }
 
 // UserOpsService defines the interface for mass user operations.
@@ -43,14 +37,13 @@ type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, c
 
 // Orchestrator coordinates scheduled background maintenance and telemetry tasks.
 type Orchestrator struct {
-	db              *database.DB
-	registry        ProtocolResolver
-	userOps         UserOpsService
-	remnawaveSyncer RemnaWaveSyncer
-	probeFn         ProbeFunc
-	bootDelay       time.Duration
-	interval        time.Duration
-	maxConcurrency  int
+	db             *database.DB
+	registry       ProtocolResolver
+	userOps        UserOpsService
+	probeFn        ProbeFunc
+	bootDelay      time.Duration
+	interval       time.Duration
+	maxConcurrency int
 
 	mu                sync.RWMutex
 	reachabilityCache map[int64]map[string]any
@@ -103,13 +96,6 @@ func WithMaxConcurrency(maxConcurrency int) Option {
 	}
 }
 
-// WithRemnaWaveSyncer configures a custom RemnaWave syncer.
-func WithRemnaWaveSyncer(syncer RemnaWaveSyncer) Option {
-	return func(o *Orchestrator) {
-		o.remnawaveSyncer = syncer
-	}
-}
-
 // WithUserOps configures custom UserOpsService.
 func WithUserOps(ops UserOpsService) Option {
 	return func(o *Orchestrator) {
@@ -124,16 +110,10 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		defaultUserOps = userops.NewUserOpsService(db, registry)
 	}
 
-	var defaultSyncer RemnaWaveSyncer
-	if db != nil {
-		defaultSyncer = remnawave.NewSyncer(db, nil, defaultUserOps)
-	}
-
 	o := &Orchestrator{
 		db:                db,
 		registry:          registry,
 		userOps:           defaultUserOps,
-		remnawaveSyncer:   defaultSyncer,
 		probeFn:           health.ProbeAWGEndpointRange,
 		bootDelay:         60 * time.Second,
 		interval:          600 * time.Second,
@@ -257,7 +237,6 @@ func (o *Orchestrator) RunAll(ctx context.Context) error {
 		{"check_auto_trial_handshakes", o.CheckAutoTrialHandshakes},
 		{"check_backend_tunnel_health", o.CheckBackendTunnelHealth},
 		{"rebalance_vpn_sessions", o.RebalanceVPNSessions},
-		{"sync_remnawave", o.SyncRemnaWave},
 	}
 
 	var combinedErrors []error

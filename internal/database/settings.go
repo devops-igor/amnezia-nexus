@@ -197,15 +197,6 @@ func (d *DB) SaveSSLSettings(ctx context.Context, ssl *models.SSLSettings) error
 	return d.SetSetting(ctx, "ssl", ssl)
 }
 
-// GetRemnaWaveSettings retrieves RemnaWave sync configuration.
-func (d *DB) GetRemnaWaveSettings(ctx context.Context) (*models.SyncSettings, error) {
-	var sync models.SyncSettings
-	if err := d.GetSetting(ctx, "sync", &sync); err != nil {
-		return nil, err
-	}
-	return &sync, nil
-}
-
 // GetSchemaVersion retrieves the recorded schema version integer.
 func (d *DB) GetSchemaVersion(ctx context.Context) (int, error) {
 	d.mu.RLock()

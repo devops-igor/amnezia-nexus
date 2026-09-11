@@ -58,11 +58,6 @@ func TestServicePackageDelegates(t *testing.T) {
 		t.Fatal("expected userops instance")
 	}
 
-	syncer := NewRemnaWaveSyncer(nil, nil, nil)
-	if syncer == nil {
-		t.Fatal("expected syncer instance")
-	}
-
 	mock := NewMockBackgroundService("test-svc")
 	if mock.Name() != "test-svc" {
 		t.Errorf("expected test-svc, got %s", mock.Name())

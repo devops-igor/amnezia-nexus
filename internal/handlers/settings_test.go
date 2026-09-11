@@ -46,7 +46,6 @@ func TestSettingsHandlers(t *testing.T) {
 	t.Run("SaveSettingsHandler", func(t *testing.T) {
 		body, _ := json.Marshal(models.SaveSettingsRequest{
 			Appearance: models.AppearanceSettings{Title: "Amnezia Pro"},
-			Sync:       models.SyncSettings{RemnawaveSync: false},
 			Captcha:    models.CaptchaSettings{Enabled: false},
 			SSL:        models.SSLSettings{},
 			Limits:     models.ConnectionLimits{MaxConnectionsPerUser: 15},
@@ -60,31 +59,9 @@ func TestSettingsHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("SyncNowHandler", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/settings/sync_now", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		var resp map[string]any
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if resp["status"] != "success" {
-			t.Errorf("expected status success, got %v", resp["status"])
-		}
-		if resp["count"] != float64(0) {
-			t.Errorf("expected count 0, got %v", resp["count"])
-		}
-	})
-
 	t.Run("SaveSettingsHandler With Telegram", func(t *testing.T) {
 		body, _ := json.Marshal(map[string]any{
 			"appearance": map[string]any{"title": "TG Panel"},
-			"sync":       map[string]any{"remnawave_sync": false},
 			"captcha":    map[string]any{"enabled": false},
 			"ssl":        map[string]any{},
 			"limits":     map[string]any{"max_connections_per_user": 20},
@@ -102,67 +79,6 @@ func TestSettingsHandlers(t *testing.T) {
 		_ = db.GetSetting(ctx, "telegram", &tg)
 		if tg == nil || tg["bot_token"] != "123:abc" {
 			t.Errorf("expected telegram settings persisted, got %v", tg)
-		}
-	})
-
-	t.Run("SyncNowHandler With Pending Users", func(t *testing.T) {
-		// Seed a RemnaWave-linked user
-		rwUUID := "rw-pending-2"
-		uRW := &models.User{
-			ID:            "rw-pending-u2",
-			Username:      "rwpending2",
-			PasswordHash:  "hash",
-			Role:          models.RoleUser,
-			Enabled:       true,
-			RemnaWaveUUID: &rwUUID,
-			CreatedAt:     time.Now(),
-		}
-		_, _ = db.CreateUser(ctx, uRW)
-
-		req := httptest.NewRequest(http.MethodPost, "/api/settings/sync_now", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		var resp map[string]any
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if resp["status"] != "success" {
-			t.Errorf("expected status success, got %v", resp["status"])
-		}
-	})
-
-	t.Run("SyncDeleteHandler", func(t *testing.T) {
-		rwUUID := "remnawave-uuid-1"
-		u := &models.User{
-			ID:            "u-rw-1",
-			Username:      "rwuser",
-			PasswordHash:  "hash",
-			Role:          models.RoleUser,
-			RemnaWaveUUID: &rwUUID,
-		}
-		_, _ = db.CreateUser(ctx, u)
-
-		req := httptest.NewRequest(http.MethodPost, "/api/settings/sync_delete", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		var resp map[string]any
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if resp["status"] != "success" {
-			t.Errorf("expected status success, got %v", resp["status"])
-		}
-		if resp["count"] != float64(2) {
-			t.Errorf("expected count 2, got %v", resp["count"])
 		}
 	})
 
@@ -221,7 +137,6 @@ func TestSettingsHandlers(t *testing.T) {
 					"telegramId":             "9999",
 					"description":            "restored desc",
 					"share_token":            "stoken",
-					"remnawave_uuid":         "rw-123",
 					"created_at":             nowStr,
 					"traffic_limit":          float64(5000),
 					"traffic_reset_strategy": "monthly",
@@ -341,7 +256,6 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 
 	origKey := "PRIVATE_KEY_PLAINTEXT_SECRET"
 	origCert := "CERTIFICATE_PLAINTEXT_DATA"
-	origAPIKey := "rw_live_secret_apikey_12345"
 	origBotToken := "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 
 	_ = db.SetSetting(ctx, "ssl", models.SSLSettings{
@@ -349,11 +263,6 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 		Domain:   "panel.example.com",
 		KeyText:  origKey,
 		CertText: origCert,
-	})
-	_ = db.SetSetting(ctx, "sync", models.SyncSettings{
-		RemnawaveURL:    "https://remna.example.com",
-		RemnawaveAPIKey: origAPIKey,
-		RemnawaveSync:   true,
 	})
 	_ = db.SetSetting(ctx, "telegram", map[string]any{
 		"bot_token": origBotToken,
@@ -379,11 +288,6 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 		t.Fatalf("expected SSL KeyText/CertText to be empty string in GET response, got %v, %v", sslMap["key_text"], sslMap["cert_text"])
 	}
 
-	syncMap, _ := getResp["sync"].(map[string]any)
-	if syncMap["remnawave_api_key"] != "********" {
-		t.Fatalf("expected RemnawaveAPIKey to be masked as ********, got %v", syncMap["remnawave_api_key"])
-	}
-
 	tgMap, _ := getResp["telegram"].(map[string]any)
 	if tgMap["bot_token"] != "********" {
 		t.Fatalf("expected telegram bot_token to be masked as ********, got %v", tgMap["bot_token"])
@@ -392,7 +296,6 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 	// 2. POST /api/settings/save with the masked payload (simulating frontend roundtrip)
 	saveReqBody := map[string]any{
 		"appearance": map[string]any{"title": "Updated Title"},
-		"sync":       syncMap,
 		"captcha":    map[string]any{"enabled": false},
 		"ssl":        sslMap,
 		"limits":     map[string]any{"max_connections_per_user": 20},
@@ -416,12 +319,6 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 	}
 	if savedSSL.CertText != origCert {
 		t.Errorf("expected SSL CertText preserved %q, got %q", origCert, savedSSL.CertText)
-	}
-
-	var savedSync models.SyncSettings
-	_ = db.GetSetting(ctx, "sync", &savedSync)
-	if savedSync.RemnawaveAPIKey != origAPIKey {
-		t.Errorf("expected RemnawaveAPIKey preserved %q, got %q", origAPIKey, savedSync.RemnawaveAPIKey)
 	}
 
 	var savedTG map[string]any

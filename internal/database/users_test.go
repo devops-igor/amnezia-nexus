@@ -41,11 +41,6 @@ func TestUsersEmptyAndNotFound(t *testing.T) {
 	if err != nil || uByShareToken != nil {
 		t.Errorf("GetUserByShareToken(invalid) = (%v, %v), want (nil, nil)", uByShareToken, err)
 	}
-
-	uByRemna, err := db.GetUserByRemnaWaveUUID(ctx, "invalid-remna-uuid")
-	if err != nil || uByRemna != nil {
-		t.Errorf("GetUserByRemnaWaveUUID(invalid) = (%v, %v), want (nil, nil)", uByRemna, err)
-	}
 }
 
 func TestUsersCreateAndRetrieve(t *testing.T) {
@@ -57,7 +52,6 @@ func TestUsersCreateAndRetrieve(t *testing.T) {
 	descStr := "Main administrator account"
 	tokenStr := "share-token-alice-12345"
 	passHashStr := "$2b$12$sharepasswordhash"
-	remnaStr := "remna-uuid-alice-98765"
 	monthResetStr := "2026-08-01T00:00:00Z"
 	lastResetStr := "2026-08-01T00:00:00Z"
 	expDate := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -84,7 +78,6 @@ func TestUsersCreateAndRetrieve(t *testing.T) {
 		ShareEnabled:           true,
 		ShareToken:             &tokenStr,
 		SharePasswordHash:      &passHashStr,
-		RemnaWaveUUID:          &remnaStr,
 		CreatedAt:              time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		LastResetAt:            &lastResetStr,
 		ExpirationDate:         &expDate,
@@ -110,11 +103,6 @@ func TestUsersCreateAndRetrieve(t *testing.T) {
 	byShare, err := db.GetUserByShareToken(ctx, tokenStr)
 	if err != nil || byShare == nil || byShare.ID != id1 {
 		t.Errorf("GetUserByShareToken failed: %+v, err=%v", byShare, err)
-	}
-
-	byRemna, err := db.GetUserByRemnaWaveUUID(ctx, remnaStr)
-	if err != nil || byRemna == nil || byRemna.ID != id1 {
-		t.Errorf("GetUserByRemnaWaveUUID failed: %+v, err=%v", byRemna, err)
 	}
 
 	u2 := &models.User{Username: "bob_default"}
