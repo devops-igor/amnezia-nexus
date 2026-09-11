@@ -125,10 +125,17 @@ func TestStickySessionManager(t *testing.T) {
 		{ID: t2ID, Status: "active", ActiveConnections: 0},
 	}
 
-	migrated, err := sticky.HandleFailover(ctx, t1ID, healthyPool)
+	failover, err := sticky.HandleFailover(ctx, t1ID, healthyPool)
 	if err != nil {
 		t.Fatalf("HandleFailover failed: %v", err)
 	}
+	if failover == nil {
+		t.Fatal("HandleFailover returned nil result without error")
+	}
+	if len(failover.Skipped) != 0 {
+		t.Errorf("expected no skipped peers, got %+v", failover.Skipped)
+	}
+	migrated := failover.Migrations
 	// HandleFailover emits records in a deterministic order (sorted by peer
 	// key): callers iterate the full set to redirect forwarder routes, so
 	// order itself carries no signal — but a stable order makes failover

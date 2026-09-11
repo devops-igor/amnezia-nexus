@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,14 +19,46 @@ var (
 	ErrSessionNotFound = errors.New("vpn session not found")
 )
 
+// ReplacementHook is invoked when CreateSession replaces an existing session
+// for the same peer (client rekey/reconnect). old is the removed session; new
+// is the replacement, or nil when the replacement itself failed to persist.
+// The VPN service registers a hook that migrates the pool connection counter
+// off the old backend (issue #78): without it every rekey leaked +1 on the
+// old backend's ActiveConnections gauge.
+type ReplacementHook func(ctx context.Context, old, new *models.VPNSession)
+
+// SessionMetrics instruments the session-lifecycle paths so counter-leak
+// paths are distinguishable in production (issue #78 direction item 2):
+// replacements_total counts session replacements, and the paired
+// counter-migration / teardown-error counters show whether each replacement
+// actually moved the pool gauge or left drift behind.
+type SessionMetrics struct {
+	ReplacementsTotal                 atomic.Int64
+	ReplacementCounterMigrationsTotal atomic.Int64
+	ReplacementDBTeardownErrorsTotal  atomic.Int64
+	ReplacementsPersistFailedTotal    atomic.Int64
+}
+
+// snapshot returns a plain map copy of the counters for stats exposure.
+func (m *SessionMetrics) snapshot() map[string]int64 {
+	return map[string]int64{
+		"replacements_total":                   m.ReplacementsTotal.Load(),
+		"replacement_counter_migrations_total": m.ReplacementCounterMigrationsTotal.Load(),
+		"replacement_db_teardown_errors_total": m.ReplacementDBTeardownErrorsTotal.Load(),
+		"replacements_persist_failed_total":    m.ReplacementsPersistFailedTotal.Load(),
+	}
+}
+
 // SessionManager tracks active VPN peer sessions in memory and SQLite.
 type SessionManager struct {
-	mu             sync.RWMutex
-	db             *database.DB
-	ipam           *IPAM
-	sessionsByPeer map[string]*models.VPNSession // peerPublicKey -> session
-	sessionsByID   map[string]*models.VPNSession // sessionID -> session
-	activeCount    atomic.Int64
+	mu              sync.RWMutex
+	db              *database.DB
+	ipam            *IPAM
+	sessionsByPeer  map[string]*models.VPNSession // peerPublicKey -> session
+	sessionsByID    map[string]*models.VPNSession // sessionID -> session
+	activeCount     atomic.Int64
+	metrics         SessionMetrics
+	replacementHook ReplacementHook
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -38,7 +71,29 @@ func NewSessionManager(db *database.DB, ipam *IPAM) *SessionManager {
 	}
 }
 
-// CreateSession allocates a new VPN session and persists it.
+// SetReplacementHook registers the session-replacement callback (issue #78).
+// Must be called before Start accepts traffic; the hook runs while sm.mu is
+// held, so it must only touch the pool counter and DB — never re-enter the
+// session manager.
+func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
+	sm.mu.Lock()
+	sm.replacementHook = fn
+	sm.mu.Unlock()
+}
+
+// MetricsSnapshot returns a copy of the session lifecycle counters so the
+// leak paths (issue #78) stay distinguishable in production telemetry.
+func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
+	return sm.metrics.snapshot()
+}
+
+// CreateSession allocates a new VPN session and persists it. When a session
+// already exists for the same peer (client rekey/reconnect), the old session
+// is fully replaced: removed from memory, its DB row closed, and the
+// replacement hook fires so the caller can migrate the pool counter and
+// redirect live routes (issue #78 — every rekey previously leaked +1 on the
+// old backend's ActiveConnections gauge because neither the pool decrement
+// nor a teardown for the old ID ever ran).
 func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64) (*models.VPNSession, error) {
 	if userID == "" || peerPublicKey == "" || assignedIP == "" {
 		return nil, errors.New("missing required session fields")
@@ -47,11 +102,30 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// If session already exists for this peer, close it before creating a new one
+	// If session already exists for this peer, close it before creating a new
+	// one. The DB row is deleted here (same primitive the clean-disconnect
+	// path uses) so no orphan row for a dead session ID survives — a later
+	// DisconnectSession(oldID) would otherwise return ErrSessionNotFound and
+	// its mirror-decrement would never run.
+	var replaced *models.VPNSession
 	if oldSess, ok := sm.sessionsByPeer[peerPublicKey]; ok {
+		replaced = oldSess
 		delete(sm.sessionsByID, oldSess.ID)
 		delete(sm.sessionsByPeer, peerPublicKey)
 		sm.activeCount.Add(-1)
+		sm.metrics.ReplacementsTotal.Add(1)
+		if sm.db != nil {
+			// Same teardown primitive as CloseSession: the row must go, or
+			// the gauge reconcile (issue #54/#78) would keep counting it.
+			if err := sm.db.CloseVPNSession(ctx, oldSess.ID); err != nil {
+				sm.metrics.ReplacementDBTeardownErrorsTotal.Add(1)
+				log.Printf("[endpoint] warning: session replacement teardown for peer %s: failed to close old DB session %s: %v", peerPublicKey, oldSess.ID, err)
+			}
+		}
+		// NOTE: the old session's IPAM allocation is intentionally NOT
+		// released here — the replacement reuses the same peer IP (the
+		// caller re-resolved the allocation just before CreateSession), so
+		// releasing would drop a still-valid reservation.
 	}
 
 	uuidBytes := make([]byte, 16)
@@ -77,6 +151,14 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 
 	if sm.db != nil {
 		if err := sm.db.CreateVPNSession(ctx, sess); err != nil {
+			if replaced != nil {
+				// The replacement is lost; keep the leak observable — the
+				// caller's pool counter for the old backend is still holding
+				// the previous session's count and the hook below will not
+				// run with a usable new session.
+				sm.metrics.ReplacementsPersistFailedTotal.Add(1)
+				log.Printf("[endpoint] error: session replacement for peer %s: failed to persist replacement session: %v", peerPublicKey, err)
+			}
 			return nil, fmt.Errorf("failed to persist vpn session: %w", err)
 		}
 	}
@@ -84,6 +166,15 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	sm.sessionsByPeer[peerPublicKey] = sess
 	sm.sessionsByID[sessionID] = sess
 	sm.activeCount.Add(1)
+
+	// Fire the replacement hook AFTER the new session is fully registered so
+	// the caller sees a consistent old→new transition. The hook migrates the
+	// pool connection counter (decrement old backend, increment new) and
+	// updates forwarder/sticky state; it must not re-enter this manager.
+	if replaced != nil && sm.replacementHook != nil {
+		sm.metrics.ReplacementCounterMigrationsTotal.Add(1)
+		sm.replacementHook(ctx, replaced, sess)
+	}
 
 	return sess, nil
 }
