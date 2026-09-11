@@ -416,15 +416,7 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("Sync Delete and VPN Controls", func(t *testing.T) {
-		// Sync delete with no deleted users
-		reqSyncDel := httptest.NewRequest(http.MethodPost, "/api/settings/sync_delete", nil)
-		wSyncDel := httptest.NewRecorder()
-		h.SyncDeleteHandler(wSyncDel, reqSyncDel)
-		if wSyncDel.Code != http.StatusOK {
-			t.Errorf("expected 200 for sync delete, got %d", wSyncDel.Code)
-		}
-
+	t.Run("VPN Controls", func(t *testing.T) {
 		// VPN enable/disable backend on unregistered backend
 		rctxVPN := chi.NewRouteContext()
 		rctxVPN.URLParams.Add("server_id", fmt.Sprintf("%d", sID))

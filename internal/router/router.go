@@ -313,8 +313,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Route("/api/settings", func(r chi.Router) {
 			r.Get("/", h.GetSettingsHandler)
 			r.Post("/save", h.SaveSettingsHandler)
-			r.Post("/sync_now", h.SyncNowHandler)
-			r.Post("/sync_delete", h.SyncDeleteHandler)
 			r.Get("/backup/download", h.DownloadBackupHandler)
 			r.Post("/backup/restore", h.RestoreBackupHandler)
 		})

@@ -102,7 +102,7 @@ func (d *DB) loadUsers(ctx context.Context) ([]map[string]any, error) {
 	uRows, err := d.sqlDB.QueryContext(ctx, `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users ORDER BY created_at`)
 	if err != nil {
@@ -137,7 +137,6 @@ func (d *DB) loadUsers(ctx context.Context) ([]map[string]any, error) {
 			"share_enabled":            u.ShareEnabled,
 			"share_token":              u.ShareToken,
 			"share_password_hash":      u.SharePasswordHash,
-			"remnawave_uuid":           u.RemnaWaveUUID,
 			"created_at":               formatTime(u.CreatedAt),
 			"last_reset_at":            u.LastResetAt,
 			"expiration_date":          formatTimePtr(u.ExpirationDate),
@@ -426,7 +425,6 @@ func (d *DB) saveUsers(ctx context.Context, tx *sql.Tx, users []map[string]any) 
 		}
 		shareToken, _ := u["share_token"].(string)
 		sharePass, _ := u["share_password_hash"].(string)
-		remnaUUID, _ := u["remnawave_uuid"].(string)
 
 		createdAtStr, _ := u["created_at"].(string)
 		if createdAtStr == "" {
@@ -465,16 +463,16 @@ func (d *DB) saveUsers(ctx context.Context, tx *sql.Tx, users []map[string]any) 
 			id, username, email, telegramId, description, password_hash, role, enabled,
 			traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 			monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-			share_enabled, share_token, share_password_hash, remnawave_uuid,
+			share_enabled, share_token, share_password_hash,
 			created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 		_, err := tx.ExecContext(ctx, query,
 			id, username, nullString(email), nullString(telID), nullString(desc),
 			pwdHash, role, enabledInt, trafficLimit, trafficUsed, trafficTotal,
 			trafficTotalRx, trafficTotalTx, monthlyRx, monthlyTx, monthlyResetAt,
 			strategy, shareEnabledInt, nullString(shareToken), nullString(sharePass),
-			nullString(remnaUUID), createdAtStr, lastResetStr, nullString(expDateStr),
+			createdAtStr, lastResetStr, nullString(expDateStr),
 			nullString(expiresAtStr), mimicry, pwdChangeInt, limitsJSON,
 		)
 		if err != nil {

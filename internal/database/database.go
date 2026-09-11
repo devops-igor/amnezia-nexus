@@ -25,7 +25,6 @@ var SchemaSQL string
 var DefaultSettings = map[string]string{
 	"schema_version": `"1"`,
 	"appearance":     `{"title":"Amnezia","logo":"🛡","subtitle":"Web Panel","language":"en"}`,
-	"sync":           `{"remnawave_url":"","remnawave_api_key":"","remnawave_sync":false,"remnawave_sync_users":false,"remnawave_create_conns":false,"remnawave_server_id":0,"remnawave_protocol":"awg"}`,
 	"captcha":        `{"enabled":false}`,
 	"telegram":       `{}`,
 	"ssl":            `{"enabled":false,"domain":"","cert_path":"","key_path":"","cert_text":"","key_text":"","panel_port":5000}`,
@@ -36,14 +35,15 @@ var DefaultSettings = map[string]string{
 // Column allowlists for update methods to prevent SQL injection
 var (
 	allowedServerColumns = map[string]bool{
-		"name":       true,
-		"host":       true,
-		"ssh_user":   true,
-		"ssh_port":   true,
-		"ssh_pass":   true,
-		"ssh_key":    true,
-		"protocols":  true,
-		"created_at": true,
+		"name":        true,
+		"host":        true,
+		"ssh_user":    true,
+		"ssh_port":    true,
+		"ssh_pass":    true,
+		"ssh_key":     true,
+		"protocols":   true,
+		"server_info": true,
+		"created_at":  true,
 	}
 
 	allowedUserColumns = map[string]bool{
@@ -66,7 +66,6 @@ var (
 		"share_enabled":            true,
 		"share_token":              true,
 		"share_password_hash":      true,
-		"remnawave_uuid":           true,
 		"created_at":               true,
 		"last_reset_at":            true,
 		"expiration_date":          true,

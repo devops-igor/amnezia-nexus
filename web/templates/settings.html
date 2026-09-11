@@ -93,34 +93,7 @@
             </form>
         </div>
 
-        <!-- BLOCK 4: API Docs -->
-        <div class="card settings-section-card">
-            <div class="settings-card-header">
-                <svg class="icon"><use href="#icon-book"></use></svg>
-                <h3 class="card-title">{{ _ "api_docs_title" }}</h3>
-            </div>
-            <div style="display: flex; flex-direction: column; gap: var(--space-md);">
-                <a href="/docs" target="_blank" class="btn btn-secondary"
-                    style="justify-content: flex-start; text-decoration: none; gap: var(--space-md); padding: var(--space-md);">
-                    <svg class="icon" style="width: 1.4rem; height: 1.4rem; color: var(--accent); flex-shrink: 0;"><use href="#icon-book"></use></svg>
-                    <div style="text-align: start;">
-                        <div style="font-weight: 600;">Swagger UI</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "api_docs_hint" }}</div>
-                    </div>
-                </a>
-                <a href="/redoc" target="_blank" class="btn btn-secondary"
-                    style="justify-content: flex-start; text-decoration: none; gap: var(--space-md); padding: var(--space-md);">
-                    <svg class="icon" style="width: 1.4rem; height: 1.4rem; color: var(--accent); flex-shrink: 0;"><use href="#icon-file-text"></use></svg>
-                    <div style="text-align: start;">
-                        <div style="font-weight: 600;">ReDoc</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "api_docs_hint" }}</div>
-                    </div>
-                </a>
-            </div>
-            <p class="form-hint" style="margin-top: var(--space-md);">{{ _ "api_docs_hint" }}</p>
-        </div>
-
-        <!-- BLOCK 5: SSL / HTTPS -->
+        <!-- BLOCK 4: SSL / HTTPS -->
         <div class="card settings-section-card">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-lock"></use></svg>
@@ -177,113 +150,7 @@
 
     <!-- RIGHT COLUMN -->
     <div style="display: flex; flex-direction: column; gap: var(--space-lg);">
-        <!-- BLOCK 6: Import Users & Sync -->
-        <div class="card settings-section-card">
-            <div class="settings-card-header">
-                <svg class="icon"><use href="#icon-refresh"></use></svg>
-                <h3 class="card-title">{{ _ "import_users_title" }}</h3>
-            </div>
-            <form id="syncForm">
-                {{ $syncSettings := get .settings "sync" }}
-                <div class="form-group" style="margin-bottom: var(--space-lg);">
-                    <label class="form-label">{{ _ "import_source_label" }}</label>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--space-sm);">
-                        <label class="switch-container">
-                            <input type="checkbox" name="remnawave_sync" id="remnawave_sync" {{ if get $syncSettings "remnawave_sync" }}checked{{ end }}>
-                            <span class="switch-label-text">Remnawave</span>
-                        </label>
-                        <label class="switch-container" style="cursor: not-allowed; opacity: 0.5;">
-                            <input type="checkbox" disabled>
-                            <span class="switch-label-text">Marzban</span>
-                        </label>
-                        <label class="switch-container" style="cursor: not-allowed; opacity: 0.5;">
-                            <input type="checkbox" disabled>
-                            <span class="switch-label-text">3x-ui</span>
-                        </label>
-                        <label class="switch-container" style="cursor: not-allowed; opacity: 0.5;">
-                            <input type="checkbox" disabled>
-                            <span class="switch-label-text">Hiddify</span>
-                        </label>
-                        <label class="switch-container" style="cursor: not-allowed; opacity: 0.5;">
-                            <input type="checkbox" disabled>
-                            <span class="switch-label-text">LDAP</span>
-                        </label>
-                    </div>
-                </div>
-
-                <div id="remnawaveFields"
-                    style="{{ if not (get $syncSettings "remnawave_sync") }}display:none;{{ end }} border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
-                    <div class="form-group">
-                        <label class="form-label" for="remnawave_url">{{ _ "remnawave_url_label" }}</label>
-                        <input type="url" class="form-input" id="remnawave_url" name="remnawave_url"
-                            value="{{ get $syncSettings "remnawave_url" "" }}" placeholder="https://vpn.example.com">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" for="remnawave_api_key">{{ _ "api_key_label" }}</label>
-                        <input type="password" class="form-input" id="remnawave_api_key" name="remnawave_api_key"
-                            value="{{ get $syncSettings "remnawave_api_key" "" }}" placeholder="Your secret key">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="switch-container" style="margin-bottom: var(--space-xs);">
-                            <span class="switch">
-                                <input type="checkbox" name="remnawave_sync_users" id="remnawave_sync_users" {{ if get $syncSettings "remnawave_sync_users" }}checked{{ end }}>
-                                <span class="switch-slider"></span>
-                            </span>
-                            <span class="switch-label-text">{{ _ "enable_sync" }}</span>
-                        </label>
-                        <div class="form-hint" style="margin-left: calc(44px + var(--space-md)); margin-bottom: var(--space-sm);">
-                            {{ _ "sync_hint" }}
-                        </div>
-                        <div style="display: flex; gap: var(--space-sm); margin-left: calc(44px + var(--space-md)); flex-wrap: wrap;">
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="syncRemnawaveNow()" id="syncNowBtn">
-                                <svg class="icon"><use href="#icon-refresh"></use></svg>
-                                <span id="syncNowBtnText">{{ _ "sync_now_btn" }}</span>
-                                <div class="spinner hidden" id="syncNowSpinner" style="width:14px; height:14px;"></div>
-                            </button>
-                            <button type="button" class="btn btn-danger btn-sm" onclick="deleteSyncRemnawave()" id="syncDelBtn">
-                                <svg class="icon"><use href="#icon-trash"></use></svg>
-                                <span id="syncDelBtnText">{{ _ "delete_sync_btn" }}</span>
-                                <div class="spinner hidden" id="syncDelSpinner" style="width:14px; height:14px;"></div>
-                            </button>
-                        </div>
-                    </div>
-
-                    <div class="form-group" style="margin-top: var(--space-md);">
-                        <label class="switch-container">
-                            <span class="switch">
-                                <input type="checkbox" name="remnawave_create_conns" id="syncCreateConns" {{ if get $syncSettings "remnawave_create_conns" }}checked{{ end }}>
-                                <span class="switch-slider"></span>
-                            </span>
-                            <span class="switch-label-text">{{ _ "auto_create_conns" }}</span>
-                        </label>
-                    </div>
-
-                    <div id="autoConnFields"
-                        style="{{ if not (get $syncSettings "remnawave_create_conns") }}display:none;{{ end }} background: var(--bg-surface); padding: var(--space-md); border-radius: var(--radius-md); border: 1px solid var(--border-color); margin-top: var(--space-sm);">
-                        <div class="form-group">
-                            <label class="form-label" for="syncServerSelect">{{ _ "sync_server_label" }}</label>
-                            <select class="form-select" id="syncServerSelect" name="remnawave_server_id" onchange="updateProtocolsForSync()">
-                                {{ $currentSyncServerID := get $syncSettings "remnawave_server_id" 0 }}
-                                {{ range $s := .servers }}
-                                <option value="{{ $s.ID }}" {{ if int_eq $currentSyncServerID $s.ID }}selected{{ end }}>{{ if $s.Name }}{{ $s.Name }}{{ else }}{{ $s.Host }}{{ end }}</option>
-                                {{ end }}
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="syncProtocolSelect">{{ _ "protocol_label" }}</label>
-                            <select class="form-select" name="remnawave_protocol" id="syncProtocolSelect">
-                                {{ $currentSyncProto := get $syncSettings "remnawave_protocol" "awg" }}
-                                <option value="awg" {{ if eq $currentSyncProto "awg" }}selected{{ end }}>AmneziaWG</option>
-                                <option value="telemt" {{ if eq $currentSyncProto "telemt" }}selected{{ end }}>MTProxyL</option>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-            </form>
-        </div>
-
-        <!-- BLOCK 7: Connection Limits -->
+        <!-- BLOCK 5: Connection Limits -->
         <div class="card settings-section-card">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-link"></use></svg>
@@ -315,7 +182,7 @@
             </form>
         </div>
 
-        <!-- BLOCK 8: Backup & Restore -->
+        <!-- BLOCK 6: Backup & Restore -->
         <div class="card settings-section-card">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-database"></use></svg>
@@ -357,49 +224,6 @@
 </div>
 
 <script>
-    const serversData = {{ .servers | json }};
-
-    function updateProtocolsForSync() {
-        const serverSelect = document.getElementById('syncServerSelect');
-        if (!serverSelect) return;
-        const serverId = parseInt(serverSelect.value, 10);
-        const protoSelect = document.getElementById('syncProtocolSelect');
-        if (!protoSelect) return;
-        protoSelect.innerHTML = '';
-
-        if (isNaN(serverId)) return;
-
-        const server = serversData.find(s => s.id === serverId);
-        const protocols = server ? (server.protocols || {}) : {};
-        let count = 0;
-
-        for (const [key, info] of Object.entries(protocols)) {
-            if (info && info.installed) {
-                const opt = document.createElement('option');
-                opt.value = key;
-                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'telemt' ? 'MTProxyL' : (key === 'dns' ? 'AmneziaDNS' : key.toUpperCase()));
-                protoSelect.appendChild(opt);
-                count++;
-            }
-        }
-
-        if (count === 0) {
-            const opt = document.createElement('option');
-            opt.textContent = _('no_protocols');
-            opt.disabled = true;
-            protoSelect.appendChild(opt);
-        }
-    }
-
-    document.getElementById('remnawave_sync').addEventListener('change', (e) => {
-        document.getElementById('remnawaveFields').style.display = e.target.checked ? 'block' : 'none';
-    });
-
-    document.getElementById('syncCreateConns').addEventListener('change', (e) => {
-        document.getElementById('autoConnFields').style.display = e.target.checked ? 'block' : 'none';
-        if (e.target.checked) updateProtocolsForSync();
-    });
-
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
     });
@@ -412,64 +236,6 @@
         });
     }
 
-    async function syncRemnawaveNow() {
-        const btn = document.getElementById('syncNowBtn');
-        const text = document.getElementById('syncNowBtnText');
-        const spinner = document.getElementById('syncNowSpinner');
-
-        btn.disabled = true;
-        text.textContent = _('sync_running');
-        spinner.classList.remove('hidden');
-
-        try {
-            const data = await API.post('/api/settings/sync_now');
-            if (data.status === 'success') {
-                UI.toast(_('sync_success').replace('{}', data.count), 'success');
-                setTimeout(() => window.location.reload(), 1500);
-            } else {
-                throw new Error(data.message || 'Error occurred');
-            }
-        } catch (err) {
-            UI.toast(`${_('error')}: ` + (err.message || err), 'error');
-        } finally {
-            btn.disabled = false;
-            text.textContent = _('sync_now_btn');
-            spinner.classList.add('hidden');
-        }
-    }
-
-    async function deleteSyncRemnawave() {
-        const confirmed = await UI.confirm({
-            title: _('delete_sync_btn'),
-            message: _('delete_sync_confirm'),
-            confirmText: _('delete'),
-            confirmVariant: 'danger'
-        });
-        if (!confirmed) return;
-
-        const btn = document.getElementById('syncDelBtn');
-        const text = document.getElementById('syncDelBtnText');
-        const spinner = document.getElementById('syncDelSpinner');
-
-        btn.disabled = true;
-        text.textContent = _('deleting');
-        spinner.classList.remove('hidden');
-
-        try {
-            const data = await API.post('/api/settings/sync_delete');
-            if (data.status === 'success') {
-                UI.toast(_('sync_deleted').replace('{}', data.count), 'success');
-                setTimeout(() => window.location.reload(), 1500);
-            }
-        } catch (err) {
-            UI.toast(`${_('error')}: ` + (err.message || err), 'error');
-        } finally {
-            btn.disabled = false;
-            text.textContent = _('delete_sync_btn');
-            spinner.classList.add('hidden');
-        }
-    }
-
     async function saveSettings() {
         const btn = document.getElementById('saveBtn');
         const text = document.getElementById('saveBtnText');
@@ -478,23 +244,12 @@
         spinner.classList.remove('hidden');
 
         const appForm = document.getElementById('appearanceForm');
-        const syncForm = document.getElementById('syncForm');
 
         const appearance = {
             title: appForm.title.value,
             logo: appForm.logo.value,
             subtitle: appForm.subtitle.value,
             language: document.getElementById('appearance_language').value
-        };
-
-        const sync = {
-            remnawave_url: syncForm.remnawave_url.value,
-            remnawave_api_key: syncForm.remnawave_api_key.value,
-            remnawave_sync: syncForm.remnawave_sync.checked,
-            remnawave_sync_users: syncForm.remnawave_sync_users.checked,
-            remnawave_create_conns: syncForm.remnawave_create_conns.checked,
-            remnawave_server_id: parseInt(syncForm.remnawave_server_id.value) || 0,
-            remnawave_protocol: syncForm.remnawave_protocol.value || "awg"
         };
 
         const captcha = {
@@ -526,7 +281,7 @@
         };
 
         try {
-            await API.post('/api/settings/save', { appearance, sync, captcha, ssl, limits, telegram });
+            await API.post('/api/settings/save', { appearance, captcha, ssl, limits, telegram });
             UI.toast(_('settings_saved'), 'success');
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -579,11 +334,6 @@
             spinner.classList.add('hidden');
             e.target.value = '';
         }
-    }
-
-    // Init protocols on load
-    if (document.getElementById('syncCreateConns') && document.getElementById('syncCreateConns').checked) {
-        updateProtocolsForSync();
     }
 </script>
 {{ end }}
