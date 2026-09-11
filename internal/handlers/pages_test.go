@@ -395,6 +395,20 @@ func TestPageHandlers(t *testing.T) {
 		if !strings.Contains(monthlyBody, currMonthLabel) {
 			t.Fatalf("expected monthly label %q in leaderboard render", currMonthLabel)
 		}
+
+		// 3. Last-month period render (no snapshot -> empty state, but label rendered)
+		reqLastMonth := httptest.NewRequest(http.MethodGet, "/leaderboard?period=last-month", nil)
+		wLastMonth := httptest.NewRecorder()
+		h.LeaderboardPageHandler(wLastMonth, reqLastMonth)
+		if wLastMonth.Code != http.StatusOK {
+			t.Fatalf("expected 200 for last-month leaderboard, got %d", wLastMonth.Code)
+		}
+		lastMonthBody := wLastMonth.Body.String()
+		prevDate := time.Date(time.Now().Year(), time.Now().Month(), 1, 0, 0, 0, 0, time.Now().Location()).AddDate(0, -1, 0)
+		lastMonthLabel := prevDate.Format("January 2006")
+		if !strings.Contains(lastMonthBody, lastMonthLabel) {
+			t.Fatalf("expected last-month label %q in leaderboard render", lastMonthLabel)
+		}
 	})
 
 	t.Run("SetupPageHandler", func(t *testing.T) {
