@@ -4413,3 +4413,249 @@ func TestGenerateClientConfig_DNSDefaults(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateClientConfigForConnection(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "targeted-user",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	otherUID, err := db.CreateUser(ctx, &models.User{
+		Username: "other-user",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	conn := &models.UserConnection{
+		ID:         "conn-targeted-1",
+		UserID:     uID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "",
+		Name:       "Targeted Laptop",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	// 1. Success on targeted connection
+	cfgStr, filename, err := svc.GenerateClientConfigForConnection(ctx, uID, conn.ID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfigForConnection failed: %v", err)
+	}
+	if filename != "Targeted Laptop.conf" {
+		t.Errorf("expected filename 'Targeted Laptop.conf', got %q", filename)
+	}
+	if !strings.Contains(cfgStr, "[Interface]") {
+		t.Errorf("expected config to contain [Interface], got:\n%s", cfgStr)
+	}
+
+	// Verify DB was updated with client_id and client_params
+	updated, err := db.GetConnection(ctx, conn.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("GetConnection failed: %v", err)
+	}
+	if updated.ClientID == "" {
+		t.Errorf("expected ClientID to be populated")
+	}
+	if updated.ClientParams == nil || updated.ClientParams["client_private_key"] == nil {
+		t.Errorf("expected ClientParams with client_private_key")
+	}
+
+	// Subsequent call returns identical config and preserves ClientID
+	cfgStr2, filename2, err := svc.GenerateClientConfigForConnection(ctx, uID, conn.ID)
+	if err != nil {
+		t.Fatalf("second GenerateClientConfigForConnection failed: %v", err)
+	}
+	if cfgStr2 != cfgStr {
+		t.Errorf("expected second call to generate identical config")
+	}
+	if filename2 != filename {
+		t.Errorf("expected identical filename")
+	}
+
+	// Verify no phantom connection created
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID failed: %v", err)
+	}
+	if len(conns) != 1 {
+		t.Fatalf("expected exactly 1 connection, got %d", len(conns))
+	}
+
+	// 2. Error on non-existent connection
+	if _, _, err := svc.GenerateClientConfigForConnection(ctx, uID, "non-existent"); err == nil {
+		t.Errorf("expected error for non-existent connection")
+	}
+
+	// 3. Error on connection belonging to another user
+	if _, _, err := svc.GenerateClientConfigForConnection(ctx, otherUID, conn.ID); err == nil {
+		t.Errorf("expected error for connection belonging to another user")
+	}
+
+	// 4. Error on ServerID != 0
+	serverConn := &models.UserConnection{
+		ID:        "conn-server-1",
+		UserID:    uID,
+		ServerID:  1,
+		Protocol:  "awg",
+		ClientID:  "server-client-pubkey",
+		Name:      "Server Connection",
+		CreatedAt: time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, serverConn); err != nil {
+		t.Fatalf("CreateConnection serverConn failed: %v", err)
+	}
+	if _, _, err := svc.GenerateClientConfigForConnection(ctx, uID, serverConn.ID); err == nil {
+		t.Errorf("expected error for connection with ServerID != 0")
+	}
+
+	// 5. Error on non-awg protocol
+	vlessConn := &models.UserConnection{
+		ID:        "conn-vless-1",
+		UserID:    uID,
+		ServerID:  0,
+		Protocol:  "vless",
+		ClientID:  "vless-key",
+		Name:      "VLESS Connection",
+		CreatedAt: time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, vlessConn); err != nil {
+		t.Fatalf("CreateConnection vlessConn failed: %v", err)
+	}
+	if _, _, err := svc.GenerateClientConfigForConnection(ctx, uID, vlessConn.ID); err == nil {
+		t.Errorf("expected error for non-awg protocol")
+	}
+}
+
+func TestGenerateClientConfig_NoPhantomOnExistingConnections(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "custconn-user",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// Create custom-named connection
+	conn := &models.UserConnection{
+		ID:         "conn-custom-phone",
+		UserID:     uID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "pubkey-phone",
+		Name:       "My Phone",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	// Call GenerateClientConfig(ctx, uID)
+	cfgStr, filename, err := svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+	if !strings.Contains(cfgStr, "[Interface]") {
+		t.Errorf("expected config to contain [Interface]")
+	}
+	if filename != "amnezia-portal-custconn-user.conf" {
+		t.Errorf("expected filename 'amnezia-portal-custconn-user.conf', got %q", filename)
+	}
+
+	// Verify no phantom connection created
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID failed: %v", err)
+	}
+	if len(conns) != 1 {
+		t.Fatalf("expected exactly 1 connection in DB, got %d", len(conns))
+	}
+	if conns[0].Name != "My Phone" {
+		t.Errorf("expected connection Name 'My Phone', got %q", conns[0].Name)
+	}
+}
+
+func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "remote-only-user",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// User has 2 remote server connections (ServerID > 0)
+	conn1 := &models.UserConnection{
+		ID:        "conn-remote-1",
+		UserID:    uID,
+		ServerID:  1,
+		Protocol:  "awg",
+		ClientID:  "pubkey-remote-1",
+		Name:      "Server 1",
+		CreatedAt: time.Now(),
+	}
+	conn2 := &models.UserConnection{
+		ID:        "conn-remote-2",
+		UserID:    uID,
+		ServerID:  2,
+		Protocol:  "vless",
+		ClientID:  "uuid-remote-2",
+		Name:      "Server 2",
+		CreatedAt: time.Now().Add(time.Second),
+	}
+	_, _ = db.CreateConnection(ctx, conn1)
+	_, _ = db.CreateConnection(ctx, conn2)
+
+	// Call GenerateClientConfig(ctx, uID)
+	_, _, err = svc.GenerateClientConfig(ctx, uID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+
+	// Verify no phantom connection was created
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID failed: %v", err)
+	}
+	if len(conns) != 2 {
+		t.Fatalf("expected exactly 2 connections in DB, got %d", len(conns))
+	}
+	for _, c := range conns {
+		if c.Name == "remote-only-user-awg" {
+			t.Errorf("phantom connection remote-only-user-awg was created in DB")
+		}
+	}
+}

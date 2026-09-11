@@ -298,7 +298,7 @@ func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	configStr, _, err := h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, sess.UserID, newConn.ID)
 	if err != nil {
 		_, _ = h.db.DeleteConnection(ctx, newConn.ID)
 		h.JSONError(w, http.StatusInternalServerError, "vpn_config_error", "Failed to generate load-balanced configuration: "+err.Error())
@@ -325,6 +325,9 @@ func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Requ
 	newConn.ServerID = 0
 	newConn.Protocol = "awg"
 	newConn.Name = req.Name
+	if updated, err := h.db.GetConnection(ctx, newConn.ID); err == nil && updated != nil {
+		newConn.ClientParams = updated.ClientParams
+	}
 
 	_ = h.db.LogConnectionCreation(ctx, user.ID)
 	h.audit(r, "connection.user_add", map[string]any{"user_id": user.ID, "server_id": int64(0), "protocol": "awg", "client_id": clientPub, "name": req.Name})
@@ -372,7 +375,7 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 			h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
 			return
 		}
-		configStr, _, err := h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+		configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, sess.UserID, conn.ID)
 		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
 			return
@@ -447,7 +450,7 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 		var err error
-		configStr, _, err = h.vpnSvc.GenerateClientConfig(ctx, sess.UserID)
+		configStr, _, err = h.vpnSvc.GenerateClientConfigForConnection(ctx, sess.UserID, conn.ID)
 		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
 			return
