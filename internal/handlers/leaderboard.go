@@ -20,7 +20,7 @@ func (h *Handlers) LeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 		label := now.Format("January 2006")
 		monthlyLabel = &label
 	} else if period == "last-month" {
-		lastMonth := now.AddDate(0, -1, 0)
+		lastMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
 		label := lastMonth.Format("January 2006")
 		monthlyLabel = &label
 	}
