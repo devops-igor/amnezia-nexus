@@ -162,6 +162,7 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		"id=\"icon-users\"",
 		"id=\"icon-network\"",
 		"id=\"icon-settings\"",
+		"id=\"icon-lock\"",
 		"id=\"icon-key\"",
 		"id=\"icon-plug\"",
 		"id=\"icon-trophy\"",
@@ -523,7 +524,7 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 		"href=\"#icon-shield\"",
 		"href=\"#icon-settings\"",
 		"href=\"#icon-copy\"",
-		"href=\"#icon-key\"",
+		"href=\"#icon-file-text\"",
 		"href=\"#icon-trash\"",
 		"UI.confirm",
 		"UI.copy",
@@ -627,7 +628,7 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"href=\"#icon-pencil\"",
 		"href=\"#icon-trash\"",
 		"href=\"#icon-search\"",
-		"href=\"#icon-key\"",
+		"href=\"#icon-file-text\"",
 		"href=\"#icon-network\"",
 		"href=\"#icon-x\"",
 		"href=\"#icon-copy\"",
@@ -684,7 +685,7 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 	requiredMyConnTokens := []string{
 		"href=\"#icon-activity\"",
 		"href=\"#icon-server\"",
-		"href=\"#icon-key\"",
+		"href=\"#icon-lock\"",
 		"href=\"#icon-plug\"",
 		"href=\"#icon-shield\"",
 		"href=\"#icon-download\"",
@@ -1083,9 +1084,12 @@ func TestModernClientDashboardPage(t *testing.T) {
 		t.Errorf("my_connections.html card avatar missing href=\"#icon-plug\"")
 	}
 
-	// 4. Assert cryptographic keys retain icon-key
-	if !strings.Contains(myConnStr, `href="#icon-key"`) {
-		t.Errorf("my_connections.html should retain href=\"#icon-key\" for cryptographic keys")
+	// 4. Assert vpn_key_tab uses icon-lock instead of broken icon-key
+	if !strings.Contains(myConnStr, `href="#icon-lock"`) {
+		t.Errorf("my_connections.html should contain href=\"#icon-lock\" for vpn_key_tab")
+	}
+	if strings.Contains(myConnStr, `href="#icon-key"`) {
+		t.Errorf("my_connections.html must not contain href=\"#icon-key\"")
 	}
 }
 
@@ -1300,6 +1304,95 @@ func TestIssue101VPNModernization(t *testing.T) {
 			if !ok || strings.TrimSpace(val) == "" {
 				t.Errorf("%s missing or empty required VPN key %q", langFile, k)
 			}
+		}
+	}
+}
+
+func TestIssue101ShowConfigIconRework(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	// 1. my_connections.html: Show config buttons must use #icon-file-text, vpn_key_tab must use #icon-lock
+	myConnData, err := fs.ReadFile(templatesFS, "my_connections.html")
+	if err != nil {
+		t.Fatalf("failed to read my_connections.html: %v", err)
+	}
+	myConnStr := string(myConnData)
+
+	expectedStaticShowConfig := `<svg class="icon"><use href="#icon-file-text"></use></svg> {{ _ "show_config" }}`
+	if !strings.Contains(myConnStr, expectedStaticShowConfig) {
+		t.Errorf("my_connections.html missing static show_config button with #icon-file-text")
+	}
+	oldStaticShowConfig := `<svg class="icon"><use href="#icon-key"></use></svg> {{ _ "show_config" }}`
+	if strings.Contains(myConnStr, oldStaticShowConfig) {
+		t.Errorf("my_connections.html still contains old static show_config button with #icon-key")
+	}
+
+	expectedDynamicShowConfig := `<svg class="icon"><use href="#icon-file-text"></use></svg> ${_('show_config')}`
+	if !strings.Contains(myConnStr, expectedDynamicShowConfig) {
+		t.Errorf("my_connections.html missing dynamic show_config button with #icon-file-text")
+	}
+	oldDynamicShowConfig := `<svg class="icon"><use href="#icon-key"></use></svg> ${_('show_config')}`
+	if strings.Contains(myConnStr, oldDynamicShowConfig) {
+		t.Errorf("my_connections.html still contains old dynamic show_config button with #icon-key")
+	}
+
+	expectedKeyTab := `<svg class="icon" style="width:14px;height:14px;"><use href="#icon-lock"></use></svg> {{ _ "vpn_key_tab" }}`
+	if !strings.Contains(myConnStr, expectedKeyTab) {
+		t.Errorf("my_connections.html must use #icon-lock for vpn_key_tab")
+	}
+	if strings.Contains(myConnStr, `href="#icon-key"`) {
+		t.Errorf("my_connections.html must not contain href=\"#icon-key\"")
+	}
+
+	// 2. users.html: No #icon-key, all config and share headers/buttons use #icon-file-text
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	if strings.Contains(usersStr, `href="#icon-key"`) {
+		t.Errorf("users.html must not contain href=\"#icon-key\"")
+	}
+	if !strings.Contains(usersStr, `href="#icon-file-text"`) {
+		t.Errorf("users.html must contain href=\"#icon-file-text\"")
+	}
+	if !strings.Contains(usersStr, `showUserConnectionConfig`) {
+		t.Errorf("users.html missing showUserConnectionConfig")
+	}
+
+	// 3. server.html: No #icon-key, connections config button uses #icon-file-text
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	if strings.Contains(serverStr, `href="#icon-key"`) {
+		t.Errorf("server.html must not contain href=\"#icon-key\"")
+	}
+	if !strings.Contains(serverStr, `href="#icon-file-text"`) {
+		t.Errorf("server.html must contain href=\"#icon-file-text\" for client config button")
+	}
+
+	// 4. Assert zero templates contain href="#icon-key"
+	entries, err := fs.ReadDir(templatesFS, ".")
+	if err != nil {
+		t.Fatalf("failed to list templates: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".html") {
+			continue
+		}
+		tmplData, err := fs.ReadFile(templatesFS, entry.Name())
+		if err != nil {
+			t.Fatalf("failed to read template %s: %v", entry.Name(), err)
+		}
+		if strings.Contains(string(tmplData), `href="#icon-key"`) {
+			t.Errorf("template %s contains forbidden href=\"#icon-key\"", entry.Name())
 		}
 	}
 }

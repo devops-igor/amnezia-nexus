@@ -123,7 +123,7 @@
                 <button class="btn btn-primary btn-sm"
                     data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}" data-proto="{{ $c.Protocol }}"
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
-                    <svg class="icon"><use href="#icon-key"></use></svg> {{ _ "show_config" }}
+                    <svg class="icon"><use href="#icon-file-text"></use></svg> {{ _ "show_config" }}
                 </button>
                 <button class="btn btn-danger btn-sm"
                     data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}"
@@ -159,7 +159,7 @@
                 <svg class="icon" style="width:14px;height:14px;"><use href="#icon-file-text"></use></svg> {{ _ "config_tab" }}
             </button>
             <button class="config-tab" onclick="switchConfigTab('vpn')">
-                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-key"></use></svg> {{ _ "vpn_key_tab" }}
+                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-lock"></use></svg> {{ _ "vpn_key_tab" }}
             </button>
             <button class="config-tab" onclick="switchConfigTab('qr')">
                 <svg class="icon" style="width:14px;height:14px;"><use href="#icon-qr"></use></svg> {{ _ "qr_code_tab" }}
@@ -475,7 +475,7 @@
                 <button class="btn btn-primary btn-sm"
                     data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}" data-proto="${UI.escapeHtml(conn.protocol || '')}"
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
-                    <svg class="icon"><use href="#icon-key"></use></svg> ${_('show_config')}
+                    <svg class="icon"><use href="#icon-file-text"></use></svg> ${_('show_config')}
                 </button>
                 <button class="btn btn-danger btn-sm"
                     data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}"
