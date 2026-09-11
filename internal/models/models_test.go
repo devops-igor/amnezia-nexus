@@ -322,7 +322,7 @@ func TestSessionDataMethods(t *testing.T) {
 		Username:               "john",
 		Role:                   RoleUser,
 		PasswordChangeRequired: true,
-		CaptchaAnswer:          "ABCD",
+		CaptchaID:              "captcha-abc123",
 		ShareAuthenticated:     map[string]bool{"token1": true},
 		Extra:                  map[string]any{"custom": "val"},
 	}
@@ -338,12 +338,12 @@ func TestSessionDataMethods(t *testing.T) {
 	}
 
 	m := userSession.ToMap()
-	if m["user_id"] != "user-1" || m["role"] != "user" || m["captcha_answer"] != "ABCD" {
+	if m["user_id"] != "user-1" || m["role"] != "user" || m["captcha_id"] != "captcha-abc123" {
 		t.Errorf("ToMap serialized incorrectly: %+v", m)
 	}
 
 	parsed := SessionDataFromMap(m)
-	if parsed.UserID != "user-1" || parsed.Role != RoleUser || !parsed.PasswordChangeRequired || parsed.CaptchaAnswer != "ABCD" {
+	if parsed.UserID != "user-1" || parsed.Role != RoleUser || !parsed.PasswordChangeRequired || parsed.CaptchaID != "captcha-abc123" {
 		t.Errorf("SessionDataFromMap parsed incorrectly: %+v", parsed)
 	}
 	if !parsed.ShareAuthenticated["token1"] {

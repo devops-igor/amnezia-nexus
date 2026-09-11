@@ -183,19 +183,40 @@ func TestAuthHandlers(t *testing.T) {
 			t.Fatal("expected session cookie from CaptchaHandler, got none")
 		}
 
-		// Decode session cookie to read the expected captcha answer
+		// Decode session cookie: it must carry an opaque captcha_id and must NOT
+		// reveal the captcha answer (issue #84).
 		dataMap, err := security.DecodeSession(cookieVal, cfg.SecretKey)
 		if err != nil {
 			t.Fatalf("failed to decode session cookie: %v", err)
 		}
-		expectedAnswer, _ := dataMap["captcha_answer"].(string)
-		if expectedAnswer == "" {
-			t.Fatal("expected captcha_answer in session cookie")
+		if dataMap == nil {
+			t.Fatal("expected decodable session cookie")
+		}
+		if _, hasAnswer := dataMap["captcha_answer"]; hasAnswer {
+			t.Errorf("session cookie must NOT contain captcha_answer, got %v", dataMap["captcha_answer"])
+		}
+		for k, v := range dataMap {
+			if str, ok := v.(string); ok && len(str) == 4 {
+				isDigits := true
+				for _, ch := range str {
+					if ch < '0' || ch > '9' {
+						isDigits = false
+						break
+					}
+				}
+				if isDigits && k != "captcha_id" {
+					t.Errorf("cookie field %q looks like a captcha answer (%q); answer must stay server-side", k, str)
+				}
+			}
+		}
+		captchaID, _ := dataMap["captcha_id"].(string)
+		if captchaID == "" {
+			t.Fatal("expected opaque captcha_id in session cookie")
 		}
 
 		sessionMW := middleware.Session(cfg.SecretKey)
 
-		// 2. Submit wrong captcha
+		// 2. Submit wrong captcha (consumes the one-time-use entry)
 		wrongAns := "wrong"
 		bodyWrong, _ := json.Marshal(models.LoginRequest{
 			Username: "admin",
@@ -213,16 +234,33 @@ func TestAuthHandlers(t *testing.T) {
 			t.Errorf("expected 400 for wrong captcha, got %d", wWrong.Code)
 		}
 
-		// 3. Submit correct captcha with session middleware
+		// 3. The consumed captcha id must not verify again even with a
+		// correct answer (one-time-use). We cannot know the real answer
+		// (it never left the server), so verify via the store directly.
+		if h.captchaStore().Verify(captchaID, "") {
+			t.Errorf("consumed captcha id should not verify")
+		}
+
+		// 4. Fresh challenge: full happy path via session cookie.
+		imgBytes := generateCaptchaDigits(4)
+		freshID, err := h.captchaStore().New(imgBytes)
+		if err != nil {
+			t.Fatalf("failed to store fresh captcha: %v", err)
+		}
+		freshSess := &models.SessionData{CaptchaID: freshID}
+		freshCookie, err := security.EncodeSession(freshSess.ToMap(), cfg.SecretKey)
+		if err != nil {
+			t.Fatalf("failed to encode fresh session: %v", err)
+		}
 		bodyOK, _ := json.Marshal(models.LoginRequest{
 			Username: "admin",
 			Password: "AdminPass123!",
-			Captcha:  &expectedAnswer,
+			Captcha:  &imgBytes,
 		})
 		reqOK := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(bodyOK))
 		reqOK.AddCookie(&http.Cookie{
 			Name:  middleware.SessionCookieName,
-			Value: cookieVal,
+			Value: freshCookie,
 		})
 		wOK := httptest.NewRecorder()
 		sessionMW(http.HandlerFunc(h.APILoginHandler)).ServeHTTP(wOK, reqOK)
@@ -316,8 +354,12 @@ func TestAuthHandlers(t *testing.T) {
 		}()
 
 		captcha := "1234"
+		captchaID, err := h.captchaStore().New(captcha)
+		if err != nil {
+			t.Fatalf("failed to store captcha: %v", err)
+		}
 		sess := &models.SessionData{
-			CaptchaAnswer: captcha,
+			CaptchaID: captchaID,
 		}
 
 		// Wrong captcha
@@ -335,8 +377,12 @@ func TestAuthHandlers(t *testing.T) {
 			t.Errorf("expected 400 for wrong captcha, got %d", w.Code)
 		}
 
-		// Correct captcha
-		sess.CaptchaAnswer = captcha
+		// Correct captcha (fresh entry: the wrong attempt above consumed the first one)
+		captchaID2, err := h.captchaStore().New("1234")
+		if err != nil {
+			t.Fatalf("failed to store second captcha: %v", err)
+		}
+		sess.CaptchaID = captchaID2
 		bodyOK, _ := json.Marshal(models.LoginRequest{
 			Username: "admin",
 			Password: "AdminPass123!",
