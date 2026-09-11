@@ -760,6 +760,13 @@ func (s *Service) Start(ctx context.Context) error {
 		_ = s.sessionMgr.SyncFromDB(ctx)
 	}
 
+	// 2b. Reconcile the active_connections gauge from the authoritative
+	// session table (issue #54): the persisted counter drifts when older
+	// deploys kill sessions without decrementing it, and the drift survives
+	// restarts, distorting least-conn routing. Best-effort: startup must
+	// not fail if reconciliation errors.
+	s.reconcileConnectionCounts(ctx)
+
 	// 3. Start forwarder & accountant
 	if s.forwarder != nil {
 		s.forwarder.Start(ctx)
@@ -815,6 +822,64 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// reconcileConnectionCounts recomputes the active_connections gauge of every
+// tunnel in the pool from the authoritative vpn_sessions table (issue #54).
+// The gauge is a LIVE count of status='connected' sessions per backend
+// tunnel; it drifts when historical deploys kill sessions without
+// decrementing it, and since it is persisted in backend_tunnels the drift
+// survives restarts and distorts least-conn balancing. It runs once during
+// Start after both DB syncs have completed and BEFORE the forwarder and
+// endpoint accept traffic, so this read-modify-write over pool snapshots is
+// safe: no live IncrementConnections/DecrementConnections traffic can race
+// it at that point. On any error it logs and returns so the panel still
+// comes up.
+func (s *Service) reconcileConnectionCounts(ctx context.Context) {
+	if s.pool == nil || s.db == nil {
+		return
+	}
+
+	sessions, err := s.db.GetActiveVPNSessions(ctx)
+	if err != nil {
+		log.Printf("[vpn] warning: connection gauge reconciliation skipped, cannot read active sessions: %v", err)
+		return
+	}
+
+	desired := make(map[int64]int)
+	for i := range sessions {
+		desired[sessions[i].BackendTunnelID]++
+	}
+
+	tunnels := s.pool.ListTunnels()
+	anyDrift := false
+	for _, tun := range tunnels {
+		want := desired[tun.ID]
+		if tun.ActiveConnections == want {
+			continue
+		}
+		anyDrift = true
+		if err := s.pool.SetConnectionCount(ctx, tun.ID, want); err != nil {
+			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
+			continue
+		}
+		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
+	}
+
+	// Sessions whose BackendTunnelID is not in the pool: count them as the
+	// total minus everything accounted for by known tunnels.
+	knownCount := 0
+	for _, tun := range tunnels {
+		knownCount += desired[tun.ID]
+	}
+	unknown := len(sessions) - knownCount
+	if unknown > 0 {
+		log.Printf("[vpn] warning: %d connected session(s) reference backend tunnels outside the pool; left for existing failover/sweeper logic", unknown)
+	}
+
+	if !anyDrift && unknown == 0 {
+		log.Printf("[vpn] connection gauge reconciliation: no drift detected across %d tunnel(s)", len(tunnels))
+	}
 }
 
 // Stop gracefully shuts down the VPN subsystem.
