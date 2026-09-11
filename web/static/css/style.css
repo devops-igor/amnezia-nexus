@@ -2154,6 +2154,7 @@ body,
 
 .table-container table {
     width: 100%;
+    min-width: 100%;
     border-collapse: collapse;
 }
 
@@ -3126,6 +3127,7 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
 /* Modernized Interactive Table Polish */
 .interactive-table {
     width: 100%;
+    min-width: 100%;
     border-collapse: collapse;
 }
 
