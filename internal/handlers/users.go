@@ -18,9 +18,29 @@ import (
 	"github.com/google/uuid"
 )
 
+func matchUser(u *models.User, search, roleFilter string) bool {
+	if roleFilter != "" && roleFilter != "all" && strings.ToLower(string(u.Role)) != roleFilter {
+		return false
+	}
+	if search == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(u.Username), search) {
+		return true
+	}
+	if u.Email != nil && strings.Contains(strings.ToLower(*u.Email), search) {
+		return true
+	}
+	if u.TelegramID != nil && strings.Contains(strings.ToLower(*u.TelegramID), search) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(u.Role)), search)
+}
+
 // ListUsersHandler returns a paginated and filtered list of users.
 func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
+	roleFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("role")))
 	page := 1
 	if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 0 {
 		page = p
@@ -45,19 +65,9 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 	filtered := make([]models.User, 0)
 	for _, u := range allUsers {
-		if search != "" {
-			match := strings.Contains(strings.ToLower(u.Username), search)
-			if !match && u.Email != nil {
-				match = strings.Contains(strings.ToLower(*u.Email), search)
-			}
-			if !match && u.TelegramID != nil {
-				match = strings.Contains(strings.ToLower(*u.TelegramID), search)
-			}
-			if !match {
-				continue
-			}
+		if matchUser(&u, search, roleFilter) {
+			filtered = append(filtered, u)
 		}
-		filtered = append(filtered, u)
 	}
 
 	total := len(filtered)
