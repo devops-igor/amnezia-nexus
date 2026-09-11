@@ -1413,11 +1413,21 @@ func TestGenerateClientConfig_AutoDetectFallbackAndCaching(t *testing.T) {
 	t.Setenv("PUBLIC_ENDPOINT", "")
 	t.Setenv("PUBLIC_IP", "")
 
-	// Mock external detector to fail, testing UDP route/localhost fallback
+	// Mock external detector to fail and force the UDP-dial fallback onto a
+	// private (container-local) address: per issue #71 the fallback must
+	// reject non-public results and land on 127.0.0.1 instead of caching
+	// the private IP for the process lifetime.
 	origDetector := externalIPDetector
-	defer func() { externalIPDetector = origDetector }()
+	origDial := outboundDial
+	defer func() {
+		externalIPDetector = origDetector
+		outboundDial = origDial
+	}()
 	externalIPDetector = func(ctx context.Context) string {
 		return ""
+	}
+	outboundDial = func(network, address string, timeout time.Duration) (net.Conn, error) {
+		return &fakeUDPConn{addr: &net.UDPAddr{IP: net.IPv4(172, 19, 0, 3), Port: 51820}}, nil
 	}
 
 	cfg, _ := svc.GetConfig(ctx)
@@ -1429,16 +1439,21 @@ func TestGenerateClientConfig_AutoDetectFallbackAndCaching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateClientConfig failed: %v", err)
 	}
-	if !strings.Contains(cfgStr, ":51820") {
-		t.Errorf("expected endpoint with :51820, got: %s", cfgStr)
+	// Issue #71: the private UDP-dial result must be rejected, so the
+	// endpoint falls back to the loopback default instead of the
+	// container-local address.
+	if !strings.Contains(cfgStr, "127.0.0.1:51820") {
+		t.Errorf("expected fallback endpoint 127.0.0.1:51820, got: %s", cfgStr)
 	}
 
-	// Verify cached on svc
+	// Verify the non-public result is NOT cached on svc (issue #71: only
+	// validated public IPs are cached, so the next resolve retries
+	// detection instead of pinning 172.19.0.3 for the process lifetime).
 	svc.publicIPMu.RLock()
 	cached := svc.detectedPublicIP
 	svc.publicIPMu.RUnlock()
-	if cached == "" {
-		t.Errorf("expected detectedPublicIP to be cached on Service, but was empty")
+	if cached != "" {
+		t.Errorf("expected detectedPublicIP to remain empty for non-public detection, got: %q", cached)
 	}
 }
 
