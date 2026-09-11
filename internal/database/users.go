@@ -545,6 +545,19 @@ func (d *DB) ResetMonthlyTraffic(ctx context.Context) (int, error) {
 
 // GetLeaderboard aggregates and returns ranked users based on traffic totals.
 func (d *DB) GetLeaderboard(ctx context.Context, period string) ([]models.LeaderboardEntry, error) {
+	if period == "last-month" {
+		now := time.Now()
+		prev := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
+		entries, err := d.GetLeaderboardSnapshot(ctx, prev.Year(), int(prev.Month()))
+		if err != nil {
+			return nil, err
+		}
+		if entries == nil {
+			return []models.LeaderboardEntry{}, nil
+		}
+		return entries, nil
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -581,6 +594,10 @@ func (d *DB) GetLeaderboard(ctx context.Context, period string) ([]models.Leader
 		e.Rank = rank
 		rank++
 		entries = append(entries, e)
+	}
+
+	if entries == nil {
+		entries = []models.LeaderboardEntry{}
 	}
 
 	return entries, rows.Err()
