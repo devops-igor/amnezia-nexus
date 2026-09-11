@@ -2152,6 +2152,43 @@ func resolveClientConfigParameters(awgConn *models.UserConnection, cpEnabled boo
 	return res, nil
 }
 
+// GenerateClientConfigForConnection generates or retrieves client configuration for a specific connection ID.
+func (s *Service) GenerateClientConfigForConnection(ctx context.Context, userID string, connectionID string) (string, string, error) {
+	s.mu.RLock()
+	db := s.db
+	cfg := s.cfg
+	portalPub := s.portalPubKey
+	s.mu.RUnlock()
+
+	if db == nil {
+		return "", "", errors.New("database not available")
+	}
+
+	user, err := db.GetUser(ctx, userID)
+	if err != nil || user == nil {
+		return "", "", fmt.Errorf("user not found: %w", err)
+	}
+
+	conn, err := db.GetConnection(ctx, connectionID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get connection: %w", err)
+	}
+	if conn == nil {
+		return "", "", errors.New("connection not found")
+	}
+	if conn.UserID != userID {
+		return "", "", errors.New("unauthorized: connection does not belong to user")
+	}
+	if conn.ServerID != 0 {
+		return "", "", fmt.Errorf("connection %s is not a load balancer connection (server_id=%d)", connectionID, conn.ServerID)
+	}
+	if conn.Protocol != "" && models.NormalizeProtocol(conn.Protocol) != "awg" {
+		return "", "", fmt.Errorf("unsupported protocol %q for load balancer connection", conn.Protocol)
+	}
+
+	return s.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, conn, true)
+}
+
 // GenerateClientConfig builds an AWG client configuration for connecting to this portal VPN endpoint.
 func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (string, string, error) {
 	s.mu.RLock()
@@ -2169,6 +2206,19 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 		return "", "", fmt.Errorf("user not found: %w", err)
 	}
 
+	awgConn := findAWGConnection(ctx, db, user)
+	return s.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, awgConn, false)
+}
+
+func (s *Service) renderClientConfigForConnection(
+	ctx context.Context,
+	db *database.DB,
+	cfg *models.VPNConfig,
+	portalPub string,
+	user *models.User,
+	awgConn *models.UserConnection,
+	isExplicit bool,
+) (string, string, error) {
 	listenPort := 51820
 	if cfg != nil && cfg.ListenPort > 0 {
 		listenPort = cfg.ListenPort
@@ -2179,7 +2229,6 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	resolveHeaderProtectionKey(ctx, db, cfg, awgParams)
 	cpEnabled, cpVal := resolveContentPadding(ctx, db, cfg)
 
-	awgConn := findAWGConnection(ctx, db, user)
 	p, err := resolveClientConfigParameters(awgConn, cpEnabled, cpVal)
 	if err != nil {
 		return "", "", err
@@ -2189,7 +2238,19 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	assignedIP := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
 	clientParams["assigned_ip"] = assignedIP
 
-	saveOrUpdateAWGConnection(ctx, db, user, awgConn, p.clientPub, clientParams)
+	if isExplicit && awgConn != nil {
+		updates := map[string]any{
+			"client_id":     p.clientPub,
+			"client_params": clientParams,
+		}
+		if _, err := db.UpdateConnection(ctx, awgConn.ID, updates); err != nil {
+			return "", "", fmt.Errorf("failed to update connection: %w", err)
+		}
+		awgConn.ClientID = p.clientPub
+		awgConn.ClientParams = clientParams
+	} else {
+		saveOrUpdateAWGConnection(ctx, db, user, awgConn, p.clientPub, clientParams)
+	}
 
 	ud := &awg.AWGClientUserData{
 		ClientName:             user.Username,
@@ -2219,6 +2280,9 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	)
 
 	filename := fmt.Sprintf("amnezia-portal-%s.conf", user.Username)
+	if isExplicit && awgConn != nil && awgConn.Name != "" {
+		filename = fmt.Sprintf("%s.conf", awgConn.Name)
+	}
 	return configStr, filename, nil
 }
 
@@ -2304,7 +2368,7 @@ func findAWGConnection(ctx context.Context, db *database.DB, user *models.User) 
 
 	// Priority 1: Match pending connection created with empty ClientID
 	for i := range conns {
-		if models.NormalizeProtocol(conns[i].Protocol) == "awg" && conns[i].ClientID == "" {
+		if conns[i].ServerID == 0 && (conns[i].Protocol == "" || models.NormalizeProtocol(conns[i].Protocol) == "awg") && conns[i].ClientID == "" {
 			return &conns[i]
 		}
 	}
@@ -2314,7 +2378,20 @@ func findAWGConnection(ctx context.Context, db *database.DB, user *models.User) 
 			return &conns[i]
 		}
 	}
-	// Priority 3: Fallback for single-connection tests / legacy mode
+	// Priority 3: Pick the most recently created load balancer connection
+	var latestLB *models.UserConnection
+	for i := range conns {
+		if conns[i].ServerID == 0 && (conns[i].Protocol == "" || models.NormalizeProtocol(conns[i].Protocol) == "awg") {
+			if latestLB == nil || conns[i].CreatedAt.After(latestLB.CreatedAt) {
+				latestLB = &conns[i]
+			}
+		}
+	}
+	if latestLB != nil {
+		return latestLB
+	}
+
+	// Priority 4: Fallback for single-connection tests / legacy mode
 	if len(conns) == 1 && models.NormalizeProtocol(conns[0].Protocol) == "awg" {
 		return &conns[0]
 	}
@@ -2330,18 +2407,25 @@ func saveOrUpdateAWGConnection(ctx context.Context, db *database.DB, user *model
 			updates["client_params"] = clientParams
 		}
 		_, _ = db.UpdateConnection(ctx, awgConn.ID, updates)
-	} else {
-		newConn := &models.UserConnection{
-			UserID:       user.ID,
-			ServerID:     0,
-			Protocol:     "awg",
-			ClientID:     clientPub,
-			Name:         fmt.Sprintf("%s-awg", user.Username),
-			AWGMimicry:   models.AWGMimicryAuto,
-			ClientParams: clientParams,
-		}
-		_, _ = db.CreateConnection(ctx, newConn)
+		return
 	}
+
+	conns, err := db.GetConnectionsByUserID(ctx, user.ID)
+	if err == nil && len(conns) > 0 {
+		// User already has connections; do not silently auto-create phantom <username>-awg connection.
+		return
+	}
+
+	newConn := &models.UserConnection{
+		UserID:       user.ID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     clientPub,
+		Name:         fmt.Sprintf("%s-awg", user.Username),
+		AWGMimicry:   models.AWGMimicryAuto,
+		ClientParams: clientParams,
+	}
+	_, _ = db.CreateConnection(ctx, newConn)
 }
 
 func getTimingParam(m map[string]any, key string) *awg.TimingRange {
