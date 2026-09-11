@@ -30,7 +30,7 @@ func (c *captureDevice) count() int {
 
 func startPumpedForwarder(t *testing.T) (*Forwarder, *captureDevice, *captureDevice) {
 	t.Helper()
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	old, neu := &captureDevice{}, &captureDevice{}
 	f.AttachBackendDevice(1, old)
 	f.AttachBackendDevice(2, neu)
@@ -132,7 +132,7 @@ func TestUpdateSessionBackend_MigratesLiveTraffic(t *testing.T) {
 // teardown must not close the client queue, because RouteBackendToClient
 // sends to it after releasing the read lock.
 func TestSessionRouteStopChannelNeverClosedQueue(t *testing.T) {
-	f := NewForwarder(nil, 64)
+	f := NewForwarder(nil, "10.100.0.0/16", 64)
 	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.0.0.5", 1)
 	route := f.routesByPeer["peer-a"]
 	f.UnregisterSession("peer-a")

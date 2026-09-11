@@ -87,7 +87,7 @@ func TestLegacyServiceAndBalancer(t *testing.T) {
 	}
 }
 
-func setupTestVPNService(t *testing.T, db *database.DB) (*Service, int64, int64, string, string) {
+func setupTestVPNService(t *testing.T, db *database.DB, cfgMutators ...func(*models.VPNConfig)) (*Service, int64, int64, string, string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -145,6 +145,9 @@ func setupTestVPNService(t *testing.T, db *database.DB) (*Service, int64, int64,
 		MaxTotalPeers:      500,
 		MaxPeersPerBackend: 100,
 		Weights:            map[int64]int{s1ID: 50, s2ID: 50},
+	}
+	for _, mutate := range cfgMutators {
+		mutate(cfg)
 	}
 
 	vpnSvc, err := NewVPNService(db, cfg)

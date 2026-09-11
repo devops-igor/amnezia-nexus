@@ -111,6 +111,16 @@ type BackendDevice interface {
 }
 
 // Service orchestrates endpoint listener, backend tunnel pool, load balancing, and traffic forwarding.
+//
+// Capacity serialization invariant (issue #86): mu is the single mutex under
+// which every production mutator of the pool's ActiveConnections gauge
+// runs — HandleIncomingPeer's select+increment, disconnect decrements, and
+// failover backend moves. The rekey ReplacementHook mutates the gauge under
+// SessionManager.mu, but only transitively from HandleIncomingPeer's
+// CreateSession call, so it runs nested under this mutex too (lock order
+// mu → SessionManager.mu, never reversed). Keep it that way: the
+// check-then-allocate capacity decision is only safe under this
+// serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
 	mu            sync.RWMutex
 	db            *database.DB
@@ -481,7 +491,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	stickyMgr := loadbalancer.NewStickySessionManager(db, lb, caps)
 
 	accountant := forwarder.NewTrafficAccountant(db, 2*time.Second)
-	fwd := forwarder.NewForwarder(accountant, 512)
+	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, 512)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -538,6 +548,15 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// hook only after the new session is fully registered. The hook runs while
 	// SessionManager.mu is held, so it must only touch the pool counter and
 	// forwarder/sticky state — it must never re-enter the session manager.
+	// Capacity serialization note (issue #86): the hook's pool counter
+	// migration therefore participates in the capacity invariant only
+	// transitively — CreateSession's only production call site today is
+	// HandleIncomingPeer, which holds s.mu for the whole select →
+	// CreateSession → increment sequence, so the hook in fact runs nested
+	// under BOTH locks (s.mu → sm.mu; the reverse order is never taken).
+	// If a CreateSession call site outside s.mu is ever added, the hook
+	// escapes the capacity serialization regime and the contract on
+	// tunnel.Pool.IncrementConnections must be re-evaluated.
 	// Old and new backends may differ when the reconnect re-selected a backend.
 	sessionMgr.SetReplacementHook(func(ctx context.Context, old, new *models.VPNSession) {
 		if old == nil {
@@ -1964,6 +1983,17 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 }
 
 // HandleIncomingPeer authenticates a connecting peer, selects a backend tunnel, and registers forwarding routes.
+//
+// Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
+// select → CreateSession → IncrementConnections sequence below, making the
+// check-then-allocate capacity decision (GetActiveTunnels snapshot →
+// selectTunnelForPeer/FilterHealthy → IncrementConnections) atomic. This is
+// the invariant that keeps ActiveConnections from exceeding
+// MaxPeersPerBackend: the gauge itself is only pool-mutex-atomic, so any
+// future caller that mutates pool counters outside s.mu (or outside the
+// rekey hook's nested sm.mu regime — the hook's only production call site
+// today is the CreateSession call here, so it runs nested under s.mu too;
+// full contract on tunnel.Pool.IncrementConnections) reopens the race.
 func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

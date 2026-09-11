@@ -357,6 +357,38 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 }
 
 // IncrementConnections increments active connection count on a tunnel.
+//
+// Serialization contract (issue #86): the pool guarantees only atomic,
+// internally consistent gauge updates (this method takes p.mu); it does NOT
+// enforce MaxPeersPerBackend and it cannot. The check-then-allocate capacity
+// decision (FilterHealthy reads t.ActiveConnections here, the caller
+// increments afterwards) is only a safe pattern because every production
+// mutator of ActiveConnections serializes under the VPN Service's single
+// mutex s.mu (internal/vpn/vpn.go), with one documented exception below.
+// Callers outside that regime (tests, future refactorings such as the
+// planned vpn.go split) MUST either hold the same serializing lock or make
+// select+increment atomic another way (e.g. a reservation counter);
+// incrementing from two unserialized goroutines after two FilterHealthy
+// reads can exceed MaxPeersPerBackend by 1.
+//
+// Production callers:
+//   - HandleIncomingPeer — increment, under s.mu (the only select+increment
+//     path).
+//   - DisconnectSession / DisconnectUser / ReleaseClient and failover
+//     backend moves — decrements/increments, under s.mu.
+//   - Rekey ReplacementHook (SetReplacementHook in vpn.go) — decrement of
+//     the old backend plus a conditional increment of the new one. The hook
+//     fires from the tail of SessionManager.CreateSession while
+//     SessionManager.mu is held (it must not re-enter the manager). Today's
+//     ONLY production call site of CreateSession is HandleIncomingPeer,
+//     which holds s.mu for the whole select → CreateSession → increment
+//     sequence — so the hook in fact runs nested under BOTH locks
+//     (s.mu → sm.mu, a fixed lock order; no path takes them in reverse).
+//     If a second CreateSession call site outside s.mu is ever added, the
+//     hook path would no longer be under s.mu; the contract for such a
+//     caller is that its replacements must still be serialized per peer
+//     (the SessionManager guarantees that under sm.mu) and must not be able
+//     to push more increments than live sessions onto one backend.
 func (p *Pool) IncrementConnections(tunnelID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -372,6 +404,17 @@ func (p *Pool) IncrementConnections(tunnelID int64) {
 }
 
 // DecrementConnections decrements active connection count on a tunnel.
+//
+// Serialization contract (issue #86): mirror of IncrementConnections — the
+// gauge update itself is atomic under p.mu, but callers must hold the VPN
+// Service's s.mu so a concurrent select+increment cannot interleave with
+// the decrement and overshoot MaxPeersPerBackend (the rekey ReplacementHook
+// decrement satisfies this transitively: it fires under SessionManager.mu
+// from CreateSession, whose only production call site is HandleIncomingPeer
+// holding s.mu — see IncrementConnections). The floor at 0 keeps a
+// mis-serialized caller from driving the gauge negative; the capacity
+// invariant itself depends on the caller-side serialization, not on this
+// method.
 func (p *Pool) DecrementConnections(tunnelID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -395,6 +438,14 @@ func (p *Pool) DecrementConnections(tunnelID int64) {
 // On a DB persist failure the in-memory gauge is left updated while the DB
 // keeps the old value — the same divergence-on-error behavior as
 // IncrementConnections/DecrementConnections.
+//
+// Serialization contract (issue #86): the reconcile loop that calls this
+// runs during startup, before Start accepts traffic, so no live
+// IncrementConnections/DecrementConnections traffic can race it — the
+// guarantee is ordering, not a shared lock (see the reconcile call site in
+// vpn.go). If reconciliation is ever made re-entrant at runtime, the caller
+// must hold the VPN Service's s.mu exactly like the runtime mutator
+// callers; the gauge write itself is atomic under p.mu either way.
 func (p *Pool) SetConnectionCount(ctx context.Context, tunnelID int64, count int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
