@@ -360,7 +360,7 @@
     <div class="modal" style="max-width: 600px;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
-                <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-key"></use></svg>
+                <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-file-text"></use></svg>
                 <h2 class="modal-title" id="configModalTitle">{{ _ "config" }}</h2>
             </div>
             <button type="button" class="modal-close" onclick="closeModal('configModal')" aria-label="{{ _ "cancel" }}">
@@ -593,7 +593,7 @@
                                     data-enabled="${u.share_enabled ? 'true' : 'false'}"
                                     data-haspassword="${u.has_share_password ? 'true' : 'false'}"
                                     title="${_('share_access')}">
-                                <svg class="icon"><use href="#icon-key"></use></svg>
+                                <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
                             ${u.id !== currentUserID ? `
                                 <button class="btn btn-ghost btn-sm btn-icon" onclick="toggleUser(this.dataset)"
@@ -939,7 +939,7 @@
                             </button>
                             <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('config')}"
                                     onclick="showUserConnectionConfig(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
-                                <svg class="icon"><use href="#icon-key"></use></svg>
+                                <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
                             <button type="button" class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" title="${_('delete')}"
                                     onclick="unlinkUserConnection(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
@@ -1057,7 +1057,7 @@
     <div class="modal" style="max-width: 500px;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
-                <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-key"></use></svg>
+                <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-file-text"></use></svg>
                 <h2 class="modal-title" id="shareModalTitle">{{ _ "share_access" }}</h2>
             </div>
             <button type="button" class="modal-close" onclick="closeModal('shareUserModal')" aria-label="{{ _ "cancel" }}">

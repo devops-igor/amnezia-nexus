@@ -112,7 +112,8 @@
         toolbarSelector: null,
         emptyMessage: 'No matching records found',
         searchPlaceholder: 'Search...',
-        statusAttribute: 'data-status'
+        statusAttribute: 'data-status',
+        statusFilters: null
     };
 
     /**
@@ -316,37 +317,71 @@
                 }
             }
 
-            if (!this.options.searchable && !this.options.filterSelector) {
+            if (!this.options.searchable && !this.options.filterSelector && !this.options.statusFilters) {
                 return;
             }
 
-            // Check if toolbar already exists before table
+            // Check if toolbar already exists before table or container
             let toolbar = this.options.toolbarSelector ? document.querySelector(this.options.toolbarSelector) : null;
             if (!toolbar && this.container) {
-                const prev = this.table.previousElementSibling;
+                const prev = (this.container.classList && this.container.classList.contains('table-container') ? this.container : this.table).previousElementSibling;
                 if (prev && prev.classList.contains('table-toolbar')) {
                     toolbar = prev;
                 }
             }
 
-            if (!toolbar && this.options.searchable && !this.searchInputEl) {
+            if (!toolbar && (this.options.searchable || this.options.statusFilters) && !this.searchInputEl) {
                 toolbar = document.createElement('div');
                 toolbar.className = 'table-toolbar';
 
-                const searchWrapper = document.createElement('div');
-                searchWrapper.className = 'table-search-box';
+                if (this.options.searchable) {
+                    const searchWrapper = document.createElement('div');
+                    searchWrapper.className = 'table-search-box';
 
-                searchWrapper.innerHTML = `
-                    <svg class="table-search-icon" aria-hidden="true"><use href="#icon-search"></use></svg>
-                    <input type="text" class="table-search-input" placeholder="${this.options.searchPlaceholder}" aria-label="${this.options.searchPlaceholder}">
-                    <button type="button" class="table-search-clear" aria-label="Clear search" style="display: none;">&times;</button>
-                `;
+                    searchWrapper.innerHTML = `
+                        <svg class="table-search-icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+                        <input type="text" class="table-search-input" placeholder="${this.options.searchPlaceholder}" aria-label="${this.options.searchPlaceholder}">
+                        <button type="button" class="table-search-clear" aria-label="Clear search" style="display: none;">&times;</button>
+                    `;
 
-                toolbar.appendChild(searchWrapper);
-                this.table.parentNode.insertBefore(toolbar, this.table);
+                    toolbar.appendChild(searchWrapper);
+                }
 
-                this.searchInputEl = searchWrapper.querySelector('.table-search-input');
-                this.searchClearBtn = searchWrapper.querySelector('.table-search-clear');
+                if (this.options.statusFilters && Array.isArray(this.options.statusFilters) && this.options.statusFilters.length > 0) {
+                    const chipsWrapper = document.createElement('div');
+                    chipsWrapper.className = 'table-filter-chips';
+                    chipsWrapper.setAttribute('role', 'radiogroup');
+                    chipsWrapper.setAttribute('aria-label', 'Status Filter');
+
+                    this.options.statusFilters.forEach((status, idx) => {
+                        const btn = document.createElement('button');
+                        btn.type = 'button';
+                        const isDefaultActive = idx === 0 || status === 'all';
+                        btn.className = 'filter-chip' + (isDefaultActive ? ' active' : '');
+                        btn.setAttribute('data-status', status);
+
+                        let label = status.charAt(0).toUpperCase() + status.slice(1);
+                        if (typeof window._ === 'function') {
+                            if (status === 'all') label = window._('all') || label;
+                            else if (status === 'active') label = window._('active') || label;
+                            else if (status === 'degraded') label = window._('vpn_degraded') || label;
+                            else if (status === 'disabled') label = window._('disabled') || label;
+                        }
+                        btn.textContent = label;
+                        chipsWrapper.appendChild(btn);
+                    });
+
+                    toolbar.appendChild(chipsWrapper);
+                }
+
+                if (this.container && this.container.classList && this.container.classList.contains('table-container') && this.container.parentNode) {
+                    this.container.parentNode.insertBefore(toolbar, this.container);
+                } else if (this.table.parentNode) {
+                    this.table.parentNode.insertBefore(toolbar, this.table);
+                }
+
+                this.searchInputEl = toolbar.querySelector('.table-search-input');
+                this.searchClearBtn = toolbar.querySelector('.table-search-clear');
 
                 if (this.searchInputEl) {
                     this.searchInputEl.addEventListener('input', (e) => {
@@ -425,7 +460,9 @@
             if (!pagination) {
                 pagination = document.createElement('div');
                 pagination.className = 'table-pagination';
-                if (this.table.parentNode) {
+                if (this.container && this.container.classList && this.container.classList.contains('table-container') && this.container.parentNode) {
+                    this.container.parentNode.insertBefore(pagination, this.container.nextSibling);
+                } else if (this.table.parentNode) {
                     this.table.parentNode.insertBefore(pagination, this.table.nextSibling);
                 }
             }
