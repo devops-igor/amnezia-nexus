@@ -139,6 +139,17 @@ async function switchPeriod(period) {
         const tbody = document.getElementById('leaderboard-tbody');
         const tableContainer2 = document.getElementById('table-container');
 
+        // Update monthly label
+        const monthlyLabelEl = document.getElementById('monthly-label');
+        if (monthlyLabelEl) {
+            if (data.monthly_label) {
+                monthlyLabelEl.textContent = data.monthly_label;
+                monthlyLabelEl.style.display = 'inline';
+            } else {
+                monthlyLabelEl.style.display = 'none';
+            }
+        }
+
         if (data.entries && data.entries.length > 0) {
             if (tableContainer2) {
                 tableContainer2.style.display = 'block';
@@ -171,17 +182,6 @@ async function switchPeriod(period) {
                 if (yourRankCard && rankVal) {
                     yourRankCard.style.display = 'flex';
                     rankVal.textContent = '#' + data.current_user_rank;
-                }
-            }
-
-            // Update monthly label
-            const monthlyLabelEl = document.getElementById('monthly-label');
-            if (monthlyLabelEl) {
-                if (data.monthly_label) {
-                    monthlyLabelEl.textContent = data.monthly_label;
-                    monthlyLabelEl.style.display = 'inline';
-                } else {
-                    monthlyLabelEl.style.display = 'none';
                 }
             }
         } else {
