@@ -61,7 +61,7 @@
                 <span class="text-muted">&uarr; {{ _ "vpn_tx_total" }}:</span> <strong id="vpn-tx">—</strong>
             </div>
         </div>
-        <div class="stat-card-sub flex items-center gap-xs">
+        <div class="stat-card-sub flex items-center" style="gap: var(--space-sm);">
             <span class="badge-dot" style="background: var(--success); width: 6px; height: 6px;"></span>
             <span>{{ _ "vpn_telemetry_live" }}</span>
         </div>
@@ -734,10 +734,10 @@
                 if (vpnConfiguredPublicEndpoint) {
                     epElem.textContent = vpnConfiguredPublicEndpoint;
                 } else if (status && status.public_endpoint) {
-                    const tpl = _('vpn_unset_auto_detected') || 'Unset (Auto-detect: %s)';
+                    const tpl = _('vpn_unset_auto_detected') || 'Auto: %s';
                     epElem.textContent = tpl.replace('%s', status.public_endpoint);
                 } else {
-                    epElem.textContent = _('vpn_unset_auto') || 'Unset (Auto-detect)';
+                    epElem.textContent = _('vpn_unset_auto') || 'Auto-detect';
                 }
             }
             document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '—');
