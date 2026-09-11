@@ -95,6 +95,12 @@ func TestSessionMiddleware(t *testing.T) {
 }
 
 func TestSetAndClearSessionCookie(t *testing.T) {
+	// Install a policy with a TLS certificate present: cookies must be Secure.
+	policy := NewSessionCookiePolicy(false)
+	policy.SetTLSCertPresent(true)
+	InstallSessionCookiePolicy(policy)
+	defer InstallSessionCookiePolicy(nil)
+
 	w := httptest.NewRecorder()
 	sessionData := &models.SessionData{
 		UserID:   "u-1",
@@ -102,7 +108,7 @@ func TestSetAndClearSessionCookie(t *testing.T) {
 		Role:     models.RoleUser,
 	}
 
-	if err := SetSessionCookie(w, sessionData, testSecretKey, true, 3600); err != nil {
+	if err := SetSessionCookie(w, sessionData, testSecretKey, 3600); err != nil {
 		t.Fatalf("SetSessionCookie failed: %v", err)
 	}
 
@@ -114,12 +120,15 @@ func TestSetAndClearSessionCookie(t *testing.T) {
 		t.Errorf("expected cookie to be HttpOnly and Secure")
 	}
 
-	// Clear cookie
+	// Clear cookie (Secure flag mirrors the policy)
 	wClear := httptest.NewRecorder()
 	ClearSessionCookie(wClear)
 	clearCookies := wClear.Result().Cookies()
 	if len(clearCookies) != 1 || clearCookies[0].MaxAge != -1 || clearCookies[0].Value != "" {
 		t.Errorf("ClearSessionCookie failed, got %+v", clearCookies)
+	}
+	if !clearCookies[0].Secure {
+		t.Errorf("expected clear cookie Secure flag to mirror policy (true)")
 	}
 }
 
