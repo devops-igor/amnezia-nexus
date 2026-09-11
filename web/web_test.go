@@ -1475,16 +1475,66 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 	}
 
 	// 3. VPN Backends table width 100%
-	if !strings.Contains(cssStr, ".interactive-table {\n    width: 100%;\n    border-collapse: collapse;\n}") {
-		t.Errorf("style.css missing .interactive-table with width: 100%% and border-collapse: collapse")
+	if !strings.Contains(cssStr, ".interactive-table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .interactive-table with width: 100%%, min-width: 100%%, and border-collapse: collapse")
 	}
-	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    border-collapse: collapse;\n}") {
-		t.Errorf("style.css missing .table-container table with width: 100%% and border-collapse: collapse")
+	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .table-container table with width: 100%%, min-width: 100%%, and border-collapse: collapse")
 	}
 	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
 		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 	if !strings.Contains(vpnStr, `class="table interactive-table" id="vpnBackendsTable"`) {
 		t.Errorf("vpn.html missing table.interactive-table#vpnBackendsTable")
+	}
+}
+
+func TestIssue109VPNTableFullWidth(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	// 1. Assert style.css rules for .interactive-table and .table-container table
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	if !strings.Contains(cssStr, ".interactive-table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .interactive-table with width: 100%% and min-width: 100%%")
+	}
+	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
+		t.Errorf("style.css missing .table-container table with width: 100%% and min-width: 100%%")
+	}
+
+	// 2. Assert vpn.html contains table#vpnBackendsTable with 100% width and min-width
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable" style="width: 100%; min-width: 100%;">`) {
+		t.Errorf("vpn.html missing table#vpnBackendsTable with style=\"width: 100%%; min-width: 100%%;\"")
+	}
+	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
+		t.Errorf("vpn.html missing #vpnTableContainer")
+	}
+
+	// 3. Assert stylesheet cache-busting (?v=1.1.0) across all shell and auth templates
+	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
+	for _, tmpl := range templatesToCheck {
+		tmplData, err := fs.ReadFile(templatesFS, tmpl)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", tmpl, err)
+		}
+		tmplStr := string(tmplData)
+		if !strings.Contains(tmplStr, `href="/static/css/style.css?v=1.1.0"`) {
+			t.Errorf("%s missing stylesheet cache busting query param ?v=1.1.0", tmpl)
+		}
 	}
 }
