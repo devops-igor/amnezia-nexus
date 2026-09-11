@@ -69,10 +69,10 @@ func TestSessionMiddleware(t *testing.T) {
 		t.Errorf("expected nil session for missing cookie, got %+v", extractedSession)
 	}
 
-	// Case 4: Unauthenticated session cookie (e.g., CAPTCHA answer)
+	// Case 4: Unauthenticated session cookie (e.g., captcha id)
 	extractedSession = nil
 	guestSession := &models.SessionData{
-		CaptchaAnswer: "5678",
+		CaptchaID: "captcha-5678",
 	}
 	encodedGuestCookie, err := security.EncodeSession(guestSession.ToMap(), testSecretKey)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestSessionMiddleware(t *testing.T) {
 	w = httptest.NewRecorder()
 	middlewareFunc(testHandler).ServeHTTP(w, req)
 
-	if extractedSession == nil || extractedSession.CaptchaAnswer != "5678" {
+	if extractedSession == nil || extractedSession.CaptchaID != "captcha-5678" {
 		t.Errorf("expected guest session with captcha answer to be extracted, got %+v", extractedSession)
 	}
 	if extractedSession.IsAuthenticated() {

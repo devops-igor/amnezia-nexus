@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-web-ui-go/internal/captcha"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/manager"
@@ -57,6 +58,8 @@ type Handlers struct {
 	vpnSvc        *vpn.Service
 	dialTimeout   func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu       sync.Mutex
+	captchaOnce   sync.Once
+	captchaSt     *captcha.Store
 	userConnMu    sync.Mutex
 	userConnLocks map[string]*sync.Mutex
 }

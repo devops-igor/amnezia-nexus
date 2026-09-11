@@ -216,6 +216,24 @@ You can customize Nexus using the following environment variables in your `docke
 | **`DATA_DIR`** | `/app/data` | Directory where persistent files (database, secret key, backups) live. |
 | **`DB_PATH`** | `<DATA_DIR>/panel.db` | Specific file path for the SQLite database. |
 
+### Deployment: Secure cookies behind a TLS-terminating proxy
+
+When the panel runs behind a TLS-terminating reverse proxy (e.g. BunkerWeb,
+nginx, Caddy) that forwards plain HTTP to the panel, set `TRUSTED_PROXIES` to
+the proxy's network CIDR or IP:
+
+```bash
+TRUSTED_PROXIES=10.0.0.0/8        # or the exact proxy IP, e.g. 172.18.0.1
+```
+
+With this set, requests forwarded by the trusted proxy with
+`X-Forwarded-Proto: https` are treated as secure client connections and session
+cookies are issued with the `Secure` attribute — even though the panel's own
+socket is plain HTTP. Requests from any other peer carrying
+`X-Forwarded-Proto` are **not** trusted. When the panel terminates TLS itself,
+cookies are `Secure` automatically (no extra configuration), and
+`COOKIE_INSECURE=1` (development only) unconditionally disables `Secure`.
+
 ---
 
 ## Setting Up Your VPN

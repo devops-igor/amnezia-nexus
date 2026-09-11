@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"sync"
@@ -136,6 +137,7 @@ func (rl *RateLimiter) Allow(ip string) (bool, time.Duration) {
 }
 
 // Middleware wraps an http.Handler with rate limiting enforcement based on client IP.
+// Rejections are logged (observable) with the client IP, path and Retry-After.
 func (rl *RateLimiter) Middleware() func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -151,6 +153,13 @@ func (rl *RateLimiter) Middleware() func(next http.Handler) http.Handler {
 					retrySec = 1
 				}
 				w.Header().Set("Retry-After", fmt.Sprintf("%d", retrySec))
+				slog.Warn("rate limit exceeded",
+					"event", "rate_limit_exceeded",
+					"ip", clientIP,
+					"path", r.URL.Path,
+					"method", r.Method,
+					"retry_after_seconds", retrySec,
+				)
 				WriteJSONError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Too many requests, please try again later")
 				return
 			}

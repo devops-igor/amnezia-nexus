@@ -65,10 +65,24 @@ func Session(secretKey string) func(next http.Handler) http.Handler {
 }
 
 // SetSessionCookie serializes and signs session data into an HTTP cookie.
-// The Secure attribute is decided by the process-wide SessionCookiePolicy
-// (TLS-derived, with an explicit dev-only override) — callers must not pass
-// a per-call value.
+// The Secure attribute comes from the per-request secure-connection context
+// flag when present (see middleware.SecureConn: direct TLS, or a trusted
+// proxy with X-Forwarded-Proto: https). When no flag is in the context
+// (tests, non-HTTP callers) it falls back to the process-wide
+// SessionCookiePolicy. COOKIE_INSECURE=1 overrides everything and always
+// forces Secure off — callers must not pass a per-call value.
 func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secretKey string, maxAge int) error {
+	return setSessionCookie(w, session, secretKey, maxAge, nil)
+}
+
+// SetSessionCookieForRequest is the request-aware variant: it consults the
+// per-request secure-connection flag first and falls back to the process-wide
+// policy. Handlers with an *http.Request should prefer this form.
+func SetSessionCookieForRequest(w http.ResponseWriter, r *http.Request, session *models.SessionData, secretKey string, maxAge int) error {
+	return setSessionCookie(w, session, secretKey, maxAge, r)
+}
+
+func setSessionCookie(w http.ResponseWriter, session *models.SessionData, secretKey string, maxAge int, r *http.Request) error {
 	if maxAge <= 0 {
 		maxAge = DefaultSessionMaxAge
 	}
@@ -78,9 +92,16 @@ func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secret
 		return err
 	}
 
-	// #nosec G124 -- Secure flag comes from the centralized SessionCookiePolicy,
-	// which derives it from live TLS certificate state (or the explicit
-	// COOKIE_INSECURE=1 dev override), never from a per-call parameter.
+	secure := CurrentSessionCookiePolicy().Secure()
+	if r != nil {
+		if perRequest, ok := IsSecureConn(r.Context()); ok && CurrentSessionCookiePolicy().Source() != CookieSecureFromOverride {
+			secure = perRequest
+		}
+	}
+
+	// #nosec G124 -- Secure flag comes from the per-request secure-connection
+	// context (issue #100) or the centralized SessionCookiePolicy; the
+	// COOKIE_INSECURE=1 dev override always wins, never a per-call parameter.
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    encoded,
@@ -88,7 +109,7 @@ func SetSessionCookie(w http.ResponseWriter, session *models.SessionData, secret
 		MaxAge:   maxAge,
 		Expires:  time.Now().Add(time.Duration(maxAge) * time.Second),
 		HttpOnly: true,
-		Secure:   CurrentSessionCookiePolicy().Secure(),
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	return nil
