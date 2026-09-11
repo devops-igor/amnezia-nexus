@@ -42,7 +42,7 @@ func (e *errDevice) writeCount() int {
 // error on the return path vanished, leaving missing-reply incidents
 // undiagnosable.
 func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
-	f := NewForwarder(nil, 8)
+	f := NewForwarder(nil, "10.100.0.0/16", 8)
 	defer f.StopPumps()
 
 	dev := &errDevice{err: errors.New("no transport keys for peer")}
