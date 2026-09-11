@@ -30,17 +30,17 @@
         </div>
 
         <!-- Role Filter Chips -->
-        <div class="table-filter-chips" id="roleFilterChips" role="radiogroup" aria-label="Role Filter">
-            <button type="button" class="filter-chip active" data-role="all" onclick="setRoleFilter('all')">All</button>
-            <button type="button" class="filter-chip" data-role="admin" onclick="setRoleFilter('admin')">Admin</button>
-            <button type="button" class="filter-chip" data-role="support" onclick="setRoleFilter('support')">Support</button>
-            <button type="button" class="filter-chip" data-role="user" onclick="setRoleFilter('user')">User</button>
+        <div class="table-filter-chips" id="roleFilterChips" role="radiogroup" aria-label="{{ _ "role_filter" }}">
+            <button type="button" class="filter-chip active" data-role="all" onclick="setRoleFilter('all')">{{ _ "all" }}</button>
+            <button type="button" class="filter-chip" data-role="admin" onclick="setRoleFilter('admin')">{{ _ "role_admin" }}</button>
+            <button type="button" class="filter-chip" data-role="support" onclick="setRoleFilter('support')">{{ _ "role_support" }}</button>
+            <button type="button" class="filter-chip" data-role="user" onclick="setRoleFilter('user')">{{ _ "role_user" }}</button>
         </div>
     </div>
 
-    <div id="usersContainer" class="hidden">
+    <div id="usersContainer" class="hidden" style="width: 100%; min-width: 100%;">
         <div class="clients-list" id="usersGrid"
-            style="display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: var(--space-md);">
+            style="display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: var(--space-md); width: 100%; min-width: 100%;">
             <!-- Users will be loaded here via JS -->
         </div>
 
@@ -52,23 +52,23 @@
         </div>
     </div>
 
-    <div id="usersLoading" style="text-align: center; padding: 4rem;">
-        <div class="spinner" style="width: 40px; height: 40px; margin: 0 auto;"></div>
-        <p style="margin-top: 1rem; color: var(--text-muted);">{{ _ "loading_users" }}</p>
+    <div id="usersLoading" style="text-align: center; padding: var(--space-2xl) var(--space-md);">
+        <div class="spinner" style="width: 36px; height: 36px; margin: 0 auto var(--space-sm);"></div>
+        <p style="margin: 0; color: var(--text-muted); font-size: 0.875rem;">{{ _ "loading_users" }}</p>
     </div>
 
-    <div id="usersEmpty" class="empty-state hidden">
-        <div class="empty-icon">
-            <svg class="icon" style="width: 48px; height: 48px;"><use href="#icon-user"></use></svg>
+    <div id="usersEmpty" class="empty-state hidden" style="padding: var(--space-2xl) var(--space-md); text-align: center;">
+        <div class="empty-icon" style="margin-bottom: var(--space-md);">
+            <svg class="icon text-muted" style="width: 48px; height: 48px;"><use href="#icon-user"></use></svg>
         </div>
-        <div class="empty-title">{{ _ "nothing_found" }}</div>
-        <div class="empty-desc">{{ _ "search_empty_desc" }}</div>
+        <div class="empty-title" style="font-weight: 600; font-size: 1.1rem; margin-bottom: var(--space-xs);">{{ _ "nothing_found" }}</div>
+        <div class="empty-desc" style="color: var(--text-muted); font-size: 0.875rem;">{{ _ "search_empty_desc" }}</div>
     </div>
 </section>
 
 <!-- ===== Add User Modal ===== -->
 <div class="modal-backdrop" id="addUserModal">
-    <div class="modal">
+    <div class="modal" style="max-width: 540px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-plus"></use></svg>
@@ -189,7 +189,7 @@
 
 <!-- ===== Edit User Modal ===== -->
 <div class="modal-backdrop" id="editUserModal">
-    <div class="modal">
+    <div class="modal" style="max-width: 520px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-pencil"></use></svg>
@@ -201,6 +201,13 @@
         </div>
         <form id="editUserForm" onsubmit="event.preventDefault(); saveEditUser();">
             <input type="hidden" id="editUserId">
+            <input type="hidden" id="editUsername">
+            <input type="hidden" id="editTelegramId">
+            <input type="hidden" id="editEmail">
+            <input type="hidden" id="editTrafficLimit">
+            <input type="hidden" id="editTrafficResetStrategy">
+            <input type="hidden" id="editExpirationDate">
+            <input type="hidden" id="editDescription">
             <div class="form-group">
                 <label class="form-label" for="editUserTG">{{ _ "edit_user_tg" }}</label>
                 <input type="text" class="form-input" id="editUserTG" placeholder="@username or ID">
@@ -237,13 +244,11 @@
                 <label class="form-label" for="editUserPass">{{ _ "new_password_hint" }}</label>
                 <input type="password" class="form-input" id="editUserPass" placeholder="••••••••">
             </div>
-            <div class="flex justify-end" style="margin-top: var(--space-lg);">
-                <button type="button" class="btn btn-secondary" onclick="closeModal('editUserModal')"
-                    style="margin-right: var(--space-sm);">{{ _ "cancel" }}</button>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('editUserModal')">{{ _ "cancel" }}</button>
                 <button type="submit" class="btn btn-primary" id="saveEditBtn">
-                    <div id="saveEditSpinner" class="spinner hidden"
-                        style="width: 14px; height: 14px; border-width: 2px;"></div>
                     <span id="saveEditBtnText">{{ _ "save" }}</span>
+                    <div id="saveEditSpinner" class="spinner hidden"></div>
                 </button>
             </div>
         </form>
@@ -252,7 +257,7 @@
 
 <!-- ===== Add Connection for User Modal ===== -->
 <div class="modal-backdrop" id="addUserConnModal">
-    <div class="modal">
+    <div class="modal" style="max-width: 520px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-network"></use></svg>
@@ -263,67 +268,71 @@
             </button>
         </div>
 
-        <div class="form-group">
-            <label class="form-label" for="ucMode">{{ _ "op_type_label" }}</label>
-            <select class="form-select" id="ucMode" onchange="toggleUCMode()">
-                <option value="new">{{ _ "create_new_conn" }}</option>
-                <option value="existing">{{ _ "link_existing_conn" }}</option>
-            </select>
-        </div>
+        <form id="addUserConnForm" onsubmit="event.preventDefault(); doAddUserConnection();">
+            <input type="hidden" id="ucUserId">
 
-        <div class="form-group" id="ucServerGroup">
-            <label class="form-label" for="ucServer">{{ _ "server_label" }}</label>
-            <select class="form-select" id="ucServer">
-                {{ range $idx, $s := .servers }}
-                <option value="{{ $idx }}">{{ $s.Name }} ({{ $s.Host }})</option>
-                {{ end }}
-            </select>
-        </div>
+            <div class="form-group">
+                <label class="form-label" for="ucMode">{{ _ "op_type_label" }}</label>
+                <select class="form-select" id="ucMode" onchange="toggleUCMode()">
+                    <option value="new">{{ _ "create_new_conn" }}</option>
+                    <option value="existing">{{ _ "link_existing_conn" }}</option>
+                </select>
+            </div>
 
-        <div class="form-group" id="ucProtoGroup">
-            <label class="form-label" for="ucProtocol">{{ _ "protocol_label" }}</label>
-            <select class="form-select" id="ucProtocol">
-                <!-- Dynamic -->
-            </select>
-        </div>
+            <div class="form-group" id="ucServerGroup">
+                <label class="form-label" for="ucServer">{{ _ "server_label" }}</label>
+                <select class="form-select" id="ucServer">
+                    {{ range $idx, $s := .servers }}
+                    <option value="{{ $idx }}">{{ $s.Name }} ({{ $s.Host }})</option>
+                    {{ end }}
+                </select>
+            </div>
 
-        <div class="form-group" id="ucExistingClientGroup" style="display:none;">
-            <label class="form-label" for="ucExistingClient">{{ _ "select_existing_conn" }}</label>
-            <select class="form-select" id="ucExistingClient">
-                <option value="">{{ _ "loading" }}</option>
-            </select>
-            <div class="form-hint">{{ _ "existing_conn_hint" }}</div>
-        </div>
+            <div class="form-group" id="ucProtoGroup">
+                <label class="form-label" for="ucProtocol">{{ _ "protocol_label" }}</label>
+                <select class="form-select" id="ucProtocol">
+                    <!-- Dynamic -->
+                </select>
+            </div>
 
-        <div class="form-group" id="ucNameGroup">
-            <label class="form-label" for="ucName">{{ _ "conn_name_panel" }}</label>
-            <input class="form-input" type="text" id="ucName" placeholder="{{ _ "connection_name_placeholder" }}">
-        </div>
+            <div class="form-group" id="ucExistingClientGroup" style="display:none;">
+                <label class="form-label" for="ucExistingClient">{{ _ "select_existing_conn" }}</label>
+                <select class="form-select" id="ucExistingClient">
+                    <option value="">{{ _ "loading" }}</option>
+                </select>
+                <div class="form-hint">{{ _ "existing_conn_hint" }}</div>
+            </div>
 
-        <div class="form-group" id="ucAwgMimicryGroup" style="display:none;">
-            <label class="form-label" for="ucAwgMimicry">{{ _ "awg_mimicry" }}</label>
-            <select class="form-select" id="ucAwgMimicry">
-                <option value="auto" selected>{{ _ "mimicry_auto" }}</option>
-                <option value="tls">{{ _ "mimicry_tls" }}</option>
-                <option value="quic">{{ _ "mimicry_quic" }}</option>
-                <option value="dns">{{ _ "mimicry_dns" }}</option>
-                <option value="sip">{{ _ "mimicry_sip" }}</option>
-            </select>
-        </div>
+            <div class="form-group" id="ucNameGroup">
+                <label class="form-label" for="ucName">{{ _ "conn_name_panel" }}</label>
+                <input class="form-input" type="text" id="ucName" placeholder="{{ _ "connection_name_placeholder" }}">
+            </div>
 
-        <div class="modal-footer">
-            <button type="button" class="btn btn-secondary" onclick="closeModal('addUserConnModal')">{{ _ "cancel" }}</button>
-            <button type="button" class="btn btn-primary" onclick="doAddUserConnection()" id="ucAddBtn">
-                <span id="ucAddBtnText">{{ _ "add" }}</span>
-                <div class="spinner hidden" id="ucAddSpinner"></div>
-            </button>
-        </div>
+            <div class="form-group" id="ucAwgMimicryGroup" style="display:none;">
+                <label class="form-label" for="ucAwgMimicry">{{ _ "awg_mimicry" }}</label>
+                <select class="form-select" id="ucAwgMimicry">
+                    <option value="auto" selected>{{ _ "mimicry_auto" }}</option>
+                    <option value="tls">{{ _ "mimicry_tls" }}</option>
+                    <option value="quic">{{ _ "mimicry_quic" }}</option>
+                    <option value="dns">{{ _ "mimicry_dns" }}</option>
+                    <option value="sip">{{ _ "mimicry_sip" }}</option>
+                </select>
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('addUserConnModal')">{{ _ "cancel" }}</button>
+                <button type="button" class="btn btn-primary" onclick="doAddUserConnection()" id="ucAddBtn">
+                    <span id="ucAddBtnText">{{ _ "add" }}</span>
+                    <div class="spinner hidden" id="ucAddSpinner"></div>
+                </button>
+            </div>
+        </form>
     </div>
 </div>
 
 <!-- ===== User Connections Modal (NexusTable interactive table) ===== -->
 <div class="modal-backdrop" id="userConnsModal">
-    <div class="modal" style="max-width: 720px;">
+    <div class="modal" style="max-width: 760px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-network"></use></svg>
@@ -334,7 +343,7 @@
             </button>
         </div>
         <div class="table-container" id="userConnsTableContainer" style="max-height: 480px; overflow-y: auto;">
-            <table class="table interactive-table" id="userConnsTable">
+            <table class="table interactive-table" id="userConnsTable" style="width: 100%; min-width: 100%;">
                 <thead>
                     <tr>
                         <th class="sortable" data-sort-type="string">{{ _ "name" }}</th>
@@ -348,16 +357,17 @@
                 </tbody>
             </table>
         </div>
-        <div id="userConnsEmpty" class="empty-state hidden" style="padding: var(--space-xl);">
-            <div class="empty-icon"><svg class="icon" style="width: 36px; height: 36px;"><use href="#icon-network"></use></svg></div>
-            <div class="empty-title">{{ _ "no_connections" }}</div>
+        <div id="userConnsEmpty" class="empty-state hidden" style="padding: var(--space-2xl) var(--space-md); text-align: center;">
+            <div class="empty-icon" style="margin-bottom: var(--space-md);"><svg class="icon text-muted" style="width: 40px; height: 40px;"><use href="#icon-network"></use></svg></div>
+            <div class="empty-title" style="font-weight: 600; font-size: 1.05rem; margin-bottom: var(--space-xs);">{{ _ "no_connections" }}</div>
+            <div class="empty-desc" style="color: var(--text-muted); font-size: 0.85rem;">{{ _ "no_connections_user_desc" }}</div>
         </div>
     </div>
 </div>
 
 <!-- ===== Config Modal ===== -->
 <div class="modal-backdrop" id="configModal">
-    <div class="modal" style="max-width: 600px;">
+    <div class="modal" style="max-width: 600px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-file-text"></use></svg>
@@ -400,6 +410,7 @@
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
                 <div id="qrCode"></div>
+                <div id="configQrCode" style="display:none;"></div>
             </div>
         </div>
     </div>
@@ -495,27 +506,27 @@
                     if (pct > 100) pct = 100;
                     let barColor = pct > 90 ? 'var(--danger)' : (pct > 70 ? 'var(--warning)' : 'var(--accent)');
                     trafficHtml = `
-                        <div style="margin-top: 8px; font-size: 0.75rem;">
+                        <div style="margin-top: var(--space-sm); font-size: 0.75rem;">
                             <div style="display:flex; justify-content:space-between; color:var(--text-muted); margin-bottom: 4px;">
-                                <span>${_('traffic')}: ${Telemetry.formatBytes(u.traffic_used)}</span>
+                                <span>${_('traffic')}: <strong>${Telemetry.formatBytes(u.traffic_used)}</strong></span>
                                 <span>${_('out_of')} ${Telemetry.formatBytes(u.traffic_limit)}</span>
                             </div>
-                            <div style="width: 100%; height: 6px; background: var(--bg-surface); border-radius: 3px; overflow: hidden; border: 1px solid var(--border-color);">
-                                <div style="background-color: ${barColor}; height: 100%; width: ${pct}%; transition: width 0.3s ease; border-radius: 2px;"></div>
+                            <div style="width: 100%; height: 6px; background: var(--bg-surface); border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-color);">
+                                <div style="background-color: ${barColor}; height: 100%; width: ${pct}%; transition: width 0.3s ease; border-radius: var(--radius-sm);"></div>
                             </div>
                         </div>
                     `;
                 } else if (u.traffic_used > 0) {
                     trafficHtml = `
-                        <div style="margin-top: 8px; font-size: 0.75rem; color:var(--text-muted);">
-                            <span>${_('traffic')}: ${Telemetry.formatBytes(u.traffic_used)}</span>
+                        <div style="margin-top: var(--space-sm); font-size: 0.75rem; color:var(--text-muted);">
+                            <span>${_('traffic')}: <strong>${Telemetry.formatBytes(u.traffic_used)}</strong></span>
                         </div>
                     `;
                 }
 
                 // Total traffic
                 const totalTrafficHtml = u.traffic_total > 0
-                    ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.7; margin-top: 2px;">📈 ${_('traffic_used_total')}: ${Telemetry.formatBytes(u.traffic_total)}</div>`
+                    ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.75; margin-top: 2px;">📈 ${_('traffic_used_total')}: ${Telemetry.formatBytes(u.traffic_total)}</div>`
                     : '';
 
                 // Expiration
@@ -524,55 +535,57 @@
                 if (exp) {
                     const isExpired = new Date(exp) < new Date();
                     expHtml = `
-                        <div class="client-meta" style="font-size: 0.7rem; margin-top: 2px;">
+                        <div class="client-meta" style="font-size: 0.75rem; margin-top: 4px;">
                             <span class="badge ${isExpired ? 'badge-danger' : 'badge-info'}" style="font-size: 0.65rem;">
-                                ${isExpired ? 'Expired' : 'Expires'}: ${new Date(exp).toLocaleDateString()}
+                                ${isExpired ? _('expired') : _('expires')}: ${new Date(exp).toLocaleDateString()}
                             </span>
                         </div>
                     `;
                 }
 
                 const strategyHtml = (u.traffic_reset_strategy && u.traffic_reset_strategy !== 'never')
-                    ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.7;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>`
+                    ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.75; margin-top: 2px;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>`
                     : '';
 
                 return `
-                    <div class="card client-item" id="user-${UI.escapeHtml(u.id)}" style="${u.enabled ? '' : 'opacity:0.6;'} padding: var(--space-md); margin-bottom: 0;">
-                        <div class="client-info" style="gap: var(--space-md);">
-                            <div class="client-avatar" style="width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--bg-surface); border: 1px solid var(--border-color); font-weight: 700; font-size: 1.1rem; color: var(--accent);">
+                    <div class="card client-item user-card" id="user-${UI.escapeHtml(u.id)}" style="${u.enabled ? '' : 'opacity:0.65;'} padding: var(--space-md); margin-bottom: 0; display: flex; flex-direction: column; justify-content: space-between; border-radius: var(--radius-md); border: 1px solid var(--border-color); background: var(--bg-card);">
+                        <div class="client-info" style="gap: var(--space-md); align-items: flex-start;">
+                            <div class="client-avatar user-avatar-circle" style="width: 44px; height: 44px; min-width: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--bg-surface); border: 1px solid var(--border-color); font-weight: 700; font-size: 1.1rem; color: var(--accent); flex-shrink: 0;">
                                 ${initial}
                             </div>
                             <div style="flex: 1; min-width: 0;">
                                 <div class="client-name" style="display: flex; align-items: center; gap: var(--space-xs); flex-wrap: wrap;">
-                                    <span style="font-weight: 600; font-size: 1rem;">${UI.escapeHtml(u.username)}</span>
+                                    <span style="font-weight: 600; font-size: 1rem; color: var(--text-primary);">${UI.escapeHtml(u.username)}</span>
                                     <span class="badge ${roleClass}" style="font-size:0.65rem;">${roleLabel}</span>
                                     <span class="badge badge-secondary" style="font-size:0.65rem;">${sourceLabel}</span>
                                     ${enabledBadge}
                                 </div>
-                                <div class="client-meta" style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: 4px; font-size: 0.8rem; color: var(--text-muted);">
-                                    <span style="cursor:pointer; color:var(--accent); text-decoration: underline; display: inline-flex; align-items: center; gap: 4px;"
+                                <div class="client-meta" style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-xs); font-size: 0.8rem; color: var(--text-muted); align-items: center;">
+                                    <span style="cursor:pointer; color:var(--accent); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; font-weight: 500;"
                                           data-uid="${UI.escapeHtml(u.id)}" data-uname="${UI.escapeHtml(u.username)}"
-                                          onclick="viewUserConnections(this.dataset.uid, this.dataset.uname)">
+                                          onclick="viewUserConnections(this.dataset.uid, this.dataset.uname)"
+                                          title="${_('connections')}">
                                         <svg class="icon" style="width:13px;height:13px;"><use href="#icon-network"></use></svg>
                                         ${u.connections_count || 0} ${_('connections')}
                                     </span>
-                                    ${u.created_at ? `<span><svg class="icon" style="width:12px;height:12px;vertical-align:-1px;"><use href="#icon-activity"></use></svg> ${u.created_at.substring(0, 10)}</span>` : ''}
-                                    ${u.telegramId ? `<span>@${UI.escapeHtml(u.telegramId.replace(/^@/, ''))}</span>` : ''}
-                                    ${u.email ? `<span>${UI.escapeHtml(u.email)}</span>` : ''}
+                                    ${u.created_at ? `<span style="display: inline-flex; align-items: center; gap: 4px;"><svg class="icon text-muted" style="width:12px;height:12px;"><use href="#icon-activity"></use></svg> ${u.created_at.substring(0, 10)}</span>` : ''}
+                                    ${u.telegramId ? `<span style="display: inline-flex; align-items: center; gap: 4px;"><svg class="icon text-muted" style="width:12px;height:12px;"><use href="#icon-send"></use></svg> @${UI.escapeHtml(u.telegramId.replace(/^@/, ''))}</span>` : ''}
+                                    ${u.email ? `<span style="display: inline-flex; align-items: center; gap: 4px;">✉️ ${UI.escapeHtml(u.email)}</span>` : ''}
                                 </div>
-                                ${u.description ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.8; margin-top: 4px;">${UI.escapeHtml(u.description)}</div>` : ''}
+                                ${u.description ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.85; margin-top: var(--space-xs); color: var(--text-secondary);">${UI.escapeHtml(u.description)}</div>` : ''}
                                 ${trafficHtml}
                                 ${totalTrafficHtml}
                                 ${expHtml}
                                 ${strategyHtml}
                             </div>
                         </div>
-                        <div class="client-actions" style="display: flex; gap: var(--space-xs); align-items: center; justify-content: flex-end; flex-wrap: wrap; margin-top: var(--space-sm); padding-top: var(--space-sm); border-top: 1px solid var(--border-color);">
+                        <div class="client-actions" style="display: flex; gap: var(--space-xs); align-items: center; justify-content: flex-end; flex-wrap: wrap; margin-top: var(--space-md); padding-top: var(--space-sm); border-top: 1px solid var(--border-color);">
                             ${currentIsAdmin ? `
                             <button class="btn btn-ghost btn-sm btn-icon"
                                     data-uid="${UI.escapeHtml(u.id)}" data-uname="${UI.escapeHtml(u.username)}"
                                     onclick="openAddConnectionForUser(this.dataset.uid, this.dataset.uname)"
-                                    title="${_('add_connection')}">
+                                    title="${_('add_connection')}"
+                                    aria-label="${_('add_connection')}">
                                 <svg class="icon"><use href="#icon-plus"></use></svg>
                             </button>
                             <button class="btn btn-ghost btn-sm btn-icon"
@@ -585,23 +598,31 @@
                                     data-limit="${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}"
                                     data-strategy="${UI.escapeHtml(u.traffic_reset_strategy || 'never')}"
                                     data-expiration="${UI.escapeHtml(u.expires_at || u.expiration_date || '')}"
-                                    title="${_('edit')}">
+                                    title="${_('edit')}"
+                                    aria-label="${_('edit')}">
                                 <svg class="icon"><use href="#icon-pencil"></use></svg>
                             </button>
                             <button class="btn btn-ghost btn-sm btn-icon" onclick="openShareModal(this.dataset)"
                                     data-id="${UI.escapeHtml(u.id)}" data-username="${UI.escapeHtml(u.username)}" data-token="${UI.escapeHtml(u.share_token || '')}"
                                     data-enabled="${u.share_enabled ? 'true' : 'false'}"
                                     data-haspassword="${u.has_share_password ? 'true' : 'false'}"
-                                    title="${_('share_access')}">
+                                    title="${_('share_access')}"
+                                    aria-label="${_('share_access')}">
                                 <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
                             ${u.id !== currentUserID ? `
-                                <button class="btn btn-ghost btn-sm btn-icon" onclick="toggleUser(this.dataset)"
+                                <button class="btn btn-ghost btn-sm btn-icon ${u.enabled ? '' : 'btn-success-hover'}" onclick="toggleUser(this.dataset)"
                                         data-id="${UI.escapeHtml(u.id)}" data-enable="${u.enabled ? 'false' : 'true'}"
-                                        title="${u.enabled ? _('stop_btn') : _('start_btn')}">
-                                    <span class="badge-dot" style="background:${u.enabled ? 'var(--success)' : 'var(--text-muted)'}; width:10px; height:10px; display:inline-block;"></span>
+                                        title="${u.enabled ? _('user_disable') : _('user_enable')}"
+                                        aria-label="${u.enabled ? _('user_disable') : _('user_enable')}">
+                                    ${u.enabled
+                                        ? `<svg class="icon text-muted"><use href="#icon-pause"></use></svg>`
+                                        : `<svg class="icon" style="color: var(--success);"><use href="#icon-play"></use></svg>`}
                                 </button>
-                                <button class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" onclick="deleteUser(this.dataset.id)" data-id="${UI.escapeHtml(u.id)}" title="${_('delete')}">
+                                <button class="btn btn-ghost btn-sm btn-icon btn-danger-hover" style="color:var(--danger);" onclick="deleteUser(this.dataset.id)"
+                                        data-id="${UI.escapeHtml(u.id)}"
+                                        title="${_('delete')}"
+                                        aria-label="${_('delete')}">
                                     <svg class="icon"><use href="#icon-trash"></use></svg>
                                 </button>
                             ` : ''}
@@ -786,6 +807,7 @@
 
     function openAddConnectionForUser(userId, username) {
         currentUserId = userId;
+        if (document.getElementById('ucUserId')) document.getElementById('ucUserId').value = userId;
         document.getElementById('addUserConnTitle').textContent = `${_('add_connection')} — ${username}`;
         document.getElementById('ucName').value = `${username}_vpn`;
         document.getElementById('ucMode').value = 'new';
@@ -933,15 +955,15 @@
                     </td>
                     <td style="text-align: right;">
                         <div class="flex items-center justify-end gap-xs">
-                            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('copy_config')}"
+                            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('copy_config')}" aria-label="${_('copy_config')}"
                                     onclick="copyUserConnectionDirect(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', this)">
                                 <svg class="icon"><use href="#icon-copy"></use></svg>
                             </button>
-                            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('config')}"
+                            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('config')}" aria-label="${_('config')}"
                                     onclick="showUserConnectionConfig(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
                                 <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
-                            <button type="button" class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" title="${_('delete')}"
+                            <button type="button" class="btn btn-ghost btn-sm btn-icon btn-danger-hover" style="color:var(--danger);" title="${_('delete')}" aria-label="${_('delete')}"
                                     onclick="unlinkUserConnection(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
                                 <svg class="icon"><use href="#icon-trash"></use></svg>
                             </button>
@@ -1054,7 +1076,7 @@
 
 <!-- ===== Share User Modal ===== -->
 <div class="modal-backdrop" id="shareUserModal">
-    <div class="modal" style="max-width: 500px;">
+    <div class="modal" style="max-width: 520px; max-height: 85vh; overflow-y: auto;">
         <div class="modal-header">
             <div class="flex items-center gap-sm">
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-file-text"></use></svg>
@@ -1065,39 +1087,44 @@
             </button>
         </div>
 
-        <div class="form-group">
-            <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
-                <input type="checkbox" id="shareEnabled" onchange="updateShareSetup()"> {{ _ "enable_public_access" }}
-            </label>
-        </div>
+        <form id="shareForm" onsubmit="event.preventDefault(); saveShareSetup();">
+            <input type="hidden" id="shareUserId">
+            <input type="hidden" id="shareUsername">
 
-        <div id="shareSetupFields" style="display:none;">
             <div class="form-group">
-                <label class="form-label" for="sharePassword">{{ _ "share_password_label" }}</label>
-                <input class="form-input" type="password" id="sharePassword" placeholder="{{ _ "new_password_hint" }}">
-                <div class="form-hint">{{ _ "share_password_hint" }}</div>
+                <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                    <input type="checkbox" id="shareEnabled" onchange="updateShareSetup()"> {{ _ "enable_public_access" }}
+                </label>
             </div>
 
-            <div class="form-group">
-                <label class="form-label" for="shareLink">{{ _ "public_link_label" }}</label>
-                <div class="flex gap-sm">
-                    <input class="form-input" type="text" id="shareLink" readonly
-                        style="background: var(--bg-primary);">
-                    <button type="button" class="btn btn-secondary btn-icon" onclick="copyShareLink(this)" title="{{ _ "copy" }}">
-                        <svg class="icon"><use href="#icon-copy"></use></svg>
-                    </button>
+            <div id="shareSetupFields" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label" for="sharePassword">{{ _ "share_password_label" }}</label>
+                    <input class="form-input" type="password" id="sharePassword" placeholder="{{ _ "new_password_hint" }}">
+                    <div class="form-hint">{{ _ "share_password_hint" }}</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="shareLink">{{ _ "public_link_label" }}</label>
+                    <div class="flex gap-sm">
+                        <input class="form-input" type="text" id="shareLink" readonly
+                            style="background: var(--bg-primary);">
+                        <input type="hidden" id="shareLinkInput">
+                        <button type="button" class="btn btn-secondary btn-icon" onclick="copyShareLink(this)" title="{{ _ "copy" }}" aria-label="{{ _ "copy" }}">
+                            <svg class="icon"><use href="#icon-copy"></use></svg>
+                        </button>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <div class="divider"></div>
-        <div style="display: flex; gap: var(--space-md); justify-content: flex-end;">
-            <button type="button" class="btn btn-secondary" onclick="closeModal('shareUserModal')">{{ _ "cancel" }}</button>
-            <button type="button" class="btn btn-primary" onclick="saveShareSetup()" id="saveShareBtn">
-                <span id="saveShareBtnText">{{ _ "save" }}</span>
-                <div class="spinner hidden" id="saveShareSpinner"></div>
-            </button>
-        </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('shareUserModal')">{{ _ "cancel" }}</button>
+                <button type="submit" class="btn btn-primary" onclick="saveShareSetup()" id="saveShareBtn">
+                    <span id="saveShareBtnText">{{ _ "save" }}</span>
+                    <div class="spinner hidden" id="saveShareSpinner"></div>
+                </button>
+            </div>
+        </form>
     </div>
 </div>
 
@@ -1107,12 +1134,19 @@
     function openEditUser(data) {
         document.getElementById('editUserId').value = data.id;
         document.getElementById('editUserTitle').textContent = data.username;
+        if (document.getElementById('editUsername')) document.getElementById('editUsername').value = data.username;
         document.getElementById('editUserTG').value = data.tg || '';
+        if (document.getElementById('editTelegramId')) document.getElementById('editTelegramId').value = data.tg || '';
         document.getElementById('editUserEmail').value = data.email || '';
+        if (document.getElementById('editEmail')) document.getElementById('editEmail').value = data.email || '';
         document.getElementById('editUserDesc').value = data.desc || '';
+        if (document.getElementById('editDescription')) document.getElementById('editDescription').value = data.desc || '';
         document.getElementById('editUserLimit').value = data.limit || '0';
+        if (document.getElementById('editTrafficLimit')) document.getElementById('editTrafficLimit').value = data.limit || '0';
         document.getElementById('editUserTrafficResetStrategy').value = data.strategy || 'never';
+        if (document.getElementById('editTrafficResetStrategy')) document.getElementById('editTrafficResetStrategy').value = data.strategy || 'never';
         document.getElementById('editUserExpiration').value = data.expiration || '';
+        if (document.getElementById('editExpirationDate')) document.getElementById('editExpirationDate').value = data.expiration || '';
         document.getElementById('editUserPass').value = '';
         openModal('editUserModal');
     }
@@ -1155,6 +1189,8 @@
     function openShareModal(dataset) {
         currentSharedUser = dataset.id;
         document.getElementById('shareModalTitle').textContent = `${_('share_access')} — ${dataset.username}`;
+        if (document.getElementById('shareUserId')) document.getElementById('shareUserId').value = dataset.id;
+        if (document.getElementById('shareUsername')) document.getElementById('shareUsername').value = dataset.username;
         document.getElementById('shareEnabled').checked = dataset.enabled === 'true';
         document.getElementById('sharePassword').value = '';
 
@@ -1164,6 +1200,7 @@
         }
         const link = window.location.origin + '/share/' + token;
         document.getElementById('shareLink').value = link;
+        if (document.getElementById('shareLinkInput')) document.getElementById('shareLinkInput').value = link;
 
         updateShareSetup();
         openModal('shareUserModal');
