@@ -50,19 +50,50 @@ func IsCSRFExempt(method string, path string) bool {
 }
 
 // isSafeHTTPMethod returns true for read-only HTTP methods.
+// TRACE is deliberately absent: it must never be CSRF-exempt. See
+// isTraceMethod.
 func isSafeHTTPMethod(method string) bool {
 	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, "TRACE":
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return true
 	default:
 		return false
 	}
 }
 
-// CSRF creates double-submit cookie CSRF validation middleware.
+// isTraceMethod reports whether the request uses the TRACE method. TRACE
+// requests are rejected outright (405) even though no TRACE handler is
+// registered: defense-in-depth, so the rejection does not depend on router
+// method matching.
+func isTraceMethod(method string) bool {
+	return method == http.MethodTrace
+}
+
+// RejectTrace blocks TRACE requests at the middleware layer with 405
+// Method Not Allowed. It is applied inside CSRF so every routed request is
+// covered regardless of router behavior.
+func RejectTrace(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isTraceMethod(r.Method) {
+			WriteJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "TRACE method is not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CSRF creates double-submit cookie CSRF validation middleware. It also
+// rejects TRACE requests with 405 before any other processing (defense in
+// depth; TRACE is not in the safe-method set).
 func CSRF(secure bool) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Defense-in-depth: TRACE never reaches the CSRF safe-method check.
+			if isTraceMethod(r.Method) {
+				WriteJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "TRACE method is not allowed")
+				return
+			}
+
 			cookie, err := r.Cookie(CSRFCookieName)
 			var token string
 
