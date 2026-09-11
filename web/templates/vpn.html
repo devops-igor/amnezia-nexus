@@ -7,63 +7,70 @@
 </div>
 
 <!-- VPN STATUS & METRIC CARDS -->
-<div class="stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-lg);">
-    <div class="card stat-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-        <div class="flex items-center justify-between" style="margin-bottom: var(--space-sm);">
-            <span class="form-label" style="margin-bottom: 0;">{{ _ "vpn_listener" }}</span>
+<div class="stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-lg);">
+    <!-- Listener Card -->
+    <div class="card stat-card">
+        <div class="stat-card-header">
+            <span class="stat-card-title">{{ _ "vpn_listener" }}</span>
             <svg class="icon text-muted" style="width: 18px; height: 18px;"><use href="#icon-network"></use></svg>
         </div>
-        <div style="margin-bottom: var(--space-xs);">
+        <div class="stat-card-value">
             <span class="badge" id="vpn-listener-badge"><span class="badge-dot"></span> {{ _ "loading" }}</span>
         </div>
-        <div class="text-sm text-muted font-mono" style="margin-top: 4px;">
-            <span>Port: <strong id="vpn-listen-port">—</strong></span> •
-            <span>Subnet: <strong id="vpn-subnet">—</strong></span>
+        <div class="stat-card-sub font-mono">
+            <span>{{ _ "vpn_port" }}: <strong id="vpn-listen-port">—</strong></span> &bull;
+            <span>{{ _ "vpn_subnet" }}: <strong id="vpn-subnet">—</strong></span>
         </div>
     </div>
 
-    <div class="card stat-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-        <div class="flex items-center justify-between" style="margin-bottom: var(--space-sm);">
-            <span class="form-label" style="margin-bottom: 0;">{{ _ "vpn_public_endpoint" }}</span>
-            <button type="button" class="btn btn-ghost btn-sm btn-icon" id="vpn-edit-endpoint-btn" onclick="vpnOpenEditEndpointModal()" title="{{ _ "edit" }}" style="padding: 2px;">
+    <!-- Public Endpoint Card -->
+    <div class="card stat-card">
+        <div class="stat-card-header">
+            <span class="stat-card-title">{{ _ "vpn_public_endpoint" }}</span>
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" id="vpn-edit-endpoint-btn" onclick="vpnOpenEditEndpointModal()" title="{{ _ "vpn_edit_endpoint" }}" aria-label="{{ _ "vpn_edit_endpoint" }}">
                 <svg class="icon"><use href="#icon-pencil"></use></svg>
             </button>
         </div>
-        <div style="font-weight: 700; font-size: 1.05rem; word-break: break-all;" id="vpn-public-endpoint">—</div>
-        <div class="text-sm text-muted" style="margin-top: 4px;">Entry point for LB traffic</div>
+        <div class="stat-card-value font-mono" style="font-size: 1.05rem;" id="vpn-public-endpoint">—</div>
+        <div class="stat-card-sub">{{ _ "vpn_entry_point_hint" }}</div>
     </div>
 
-    <div class="card stat-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-        <div class="flex items-center justify-between" style="margin-bottom: var(--space-sm);">
-            <span class="form-label" style="margin-bottom: 0;">{{ _ "vpn_sessions" }}</span>
+    <!-- Connected Sessions Card -->
+    <div class="card stat-card">
+        <div class="stat-card-header">
+            <span class="stat-card-title">{{ _ "vpn_sessions" }}</span>
             <svg class="icon text-muted" style="width: 18px; height: 18px;"><use href="#icon-users"></use></svg>
         </div>
-        <div style="font-size: 1.6rem; font-weight: 700; line-height: 1.2;" id="vpn-sessions">—</div>
-        <div class="text-sm text-muted" style="margin-top: 4px;">
+        <div class="stat-card-value" id="vpn-sessions">—</div>
+        <div class="stat-card-sub">
             <span>{{ _ "vpn_active_tunnels" }}: <strong id="vpn-active-tunnels">—</strong></span>
         </div>
     </div>
 
-    <div class="card stat-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-        <div class="flex items-center justify-between" style="margin-bottom: var(--space-sm);">
-            <span class="form-label" style="margin-bottom: 0;">Bandwidth</span>
+    <!-- Bandwidth Card -->
+    <div class="card stat-card">
+        <div class="stat-card-header">
+            <span class="stat-card-title">{{ _ "vpn_bandwidth" }}</span>
             <svg class="icon text-muted" style="width: 18px; height: 18px;"><use href="#icon-activity"></use></svg>
         </div>
-        <div style="display: flex; flex-direction: column; gap: 4px;">
-            <div style="font-size: 0.875rem;">
-                <span class="text-muted">↓ {{ _ "vpn_rx_total" }}:</span> <strong id="vpn-rx">—</strong>
+        <div style="display: flex; flex-direction: column; gap: 4px; margin: var(--space-xs) 0;">
+            <div style="font-size: 0.9rem;">
+                <span class="text-muted">&darr; {{ _ "vpn_rx_total" }}:</span> <strong id="vpn-rx">—</strong>
             </div>
-            <div style="font-size: 0.875rem;">
-                <span class="text-muted">↑ {{ _ "vpn_tx_total" }}:</span> <strong id="vpn-tx">—</strong>
+            <div style="font-size: 0.9rem;">
+                <span class="text-muted">&uarr; {{ _ "vpn_tx_total" }}:</span> <strong id="vpn-tx">—</strong>
             </div>
         </div>
-        <div class="text-sm text-muted" style="margin-top: 4px;">Telemetry live</div>
+        <div class="stat-card-sub flex items-center gap-xs">
+            <span class="badge-dot" style="background: var(--success); width: 6px; height: 6px;"></span>
+            <span>{{ _ "vpn_telemetry_live" }}</span>
+        </div>
     </div>
 </div>
 
 <!-- BACKENDS TABLE -->
 <div class="card">
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); flex-wrap: wrap; gap: var(--space-sm);">
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
         <div class="flex items-center gap-sm">
             <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-server"></use></svg>
             <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_backends" }}</h3>
@@ -88,9 +95,9 @@
             </thead>
             <tbody id="vpn-backends-tbody">
                 <tr id="vpn-backends-loading" class="table-loading-row">
-                    <td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--space-xl);">
+                    <td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
                         <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
-                        {{ _ "loading" }}
+                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
                     </td>
                 </tr>
             </tbody>
@@ -122,16 +129,29 @@
                 </select>
             </div>
 
-            <div id="vpnServerDetails" style="display: none; margin-bottom: var(--space-md); padding: var(--space-sm) var(--space-md); background: var(--bg-tertiary, rgba(255,255,255,0.03)); border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-size: 0.85rem;">
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-xs);">
-                    <div><span style="color: var(--text-muted);">Host:</span> <strong id="vpnServerDetailHost">—</strong></div>
-                    <div><span style="color: var(--text-muted);">SSH:</span> <strong id="vpnServerDetailPort">—</strong></div>
-                    <div><span style="color: var(--text-muted);">Status:</span> <strong id="vpnServerDetailStatus">—</strong></div>
-                    <div><span style="color: var(--text-muted);">AWG:</span> <span class="badge" id="vpnServerDetailAwgBadge">—</span></div>
+            <!-- Server Details Card -->
+            <div id="vpnServerDetails" class="info-card" style="display: none; margin-bottom: var(--space-md);">
+                <div class="info-card-grid">
+                    <div class="info-card-item">
+                        <span class="info-card-label">Host</span>
+                        <span class="info-card-value font-mono" id="vpnServerDetailHost">—</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">SSH Port</span>
+                        <span class="info-card-value font-mono" id="vpnServerDetailPort">—</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">Status</span>
+                        <span class="info-card-value" id="vpnServerDetailStatus">—</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">AmneziaWG</span>
+                        <span id="vpnServerDetailAwgBadge" class="badge">—</span>
+                    </div>
                 </div>
-                <div id="vpnServerDetailCheckRow" style="display: none; margin-top: var(--space-xs); padding-top: var(--space-xs); border-top: 1px dashed var(--border-color); align-items: center; justify-content: space-between;">
+                <div id="vpnServerDetailCheckRow" style="display: none; margin-top: var(--space-sm); padding-top: var(--space-sm); border-top: 1px dashed var(--border-color); align-items: center; justify-content: space-between; gap: var(--space-sm);">
                     <span style="color: var(--text-muted); font-size: 0.8rem;" id="vpnServerDetailCheckHint"></span>
-                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" onclick="vpnTriggerQuickCheck()" style="padding: 2px 8px; font-size: 0.8rem;">
+                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" onclick="vpnTriggerQuickCheck()" style="padding: 2px 10px; font-size: 0.8rem; flex-shrink: 0;">
                         <svg class="icon" id="vpnQuickCheckIcon" style="width:14px;height:14px;"><use href="#icon-refresh"></use></svg>
                         <span id="vpnQuickCheckBtnText">{{ _ "server_check" }}</span>
                         <div class="spinner hidden" id="vpnQuickCheckSpinner" style="width:12px;height:12px;border-width:2px;"></div>
@@ -139,12 +159,11 @@
                 </div>
             </div>
 
-            <div id="vpnNoServersNotice" style="display: none; padding: var(--space-md); text-align: center; color: var(--text-muted); background: var(--bg-tertiary, rgba(255,255,255,0.03)); border-radius: var(--radius-sm); margin-bottom: var(--space-md);">
+            <div id="vpnNoServersNotice" style="display: none; padding: var(--space-md); text-align: center; color: var(--text-muted); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-md); margin-bottom: var(--space-md); font-size: 0.875rem;">
                 {{ _ "vpn_no_available_servers" }}
             </div>
 
-            <div id="vpnModalError" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem; color: #ff6b6b; background: rgba(255,107,107,0.1); border: 1px solid rgba(255,107,107,0.2);">
-            </div>
+            <div id="vpnModalError" class="modal-notice-error" style="display: none;"></div>
 
             <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
                 <button type="button" class="btn btn-secondary" onclick="closeModal('addBackendModal')">{{ _ "cancel" }}</button>
@@ -175,11 +194,10 @@
 
             <div class="form-group">
                 <label class="form-label" for="vpnPublicEndpointInput">{{ _ "vpn_public_endpoint" }}</label>
-                <input type="text" class="form-input" id="vpnPublicEndpointInput" placeholder="vpn.example.com:51820">
+                <input type="text" class="form-input font-mono" id="vpnPublicEndpointInput" placeholder="vpn.example.com:51820">
             </div>
 
-            <div id="vpnEndpointModalError" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem; color: #ff6b6b; background: rgba(255,107,107,0.1); border: 1px solid rgba(255,107,107,0.2);">
-            </div>
+            <div id="vpnEndpointModalError" class="modal-notice-error" style="display: none;"></div>
 
             <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
                 <button type="button" class="btn btn-secondary" onclick="closeModal('editEndpointModal')">{{ _ "cancel" }}</button>
@@ -301,15 +319,20 @@
         const srvMatch = vpnCachedServers.find(function (s) { return String(s.id) === String(srvId); });
         const srvName = srvMatch ? srvMatch.name : ('Server #' + srvId);
         tdServer.innerHTML = `
-            <div class="flex items-center gap-xs">
-                <svg class="icon text-muted" style="width:14px;height:14px;"><use href="#icon-server"></use></svg>
-                <span style="font-weight:600;">${UI.escapeHtml(srvName)}</span>
-                <span class="text-muted font-mono" style="font-size:0.75rem;">(#${UI.escapeHtml(String(srvId))})</span>
+            <div class="flex items-center gap-sm">
+                <div style="width: 30px; height: 30px; border-radius: var(--radius-sm); background: var(--bg-surface); border: 1px solid var(--border-color); display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+                    <svg class="icon text-muted" style="width: 15px; height: 15px;"><use href="#icon-server"></use></svg>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 2px;">
+                    <span style="font-weight: 600; color: var(--text-primary); line-height: 1.2;">${UI.escapeHtml(srvName)}</span>
+                    <span class="font-mono text-muted" style="font-size: 0.75rem; line-height: 1;">#${UI.escapeHtml(String(srvId))}</span>
+                </div>
             </div>
         `;
         tr.appendChild(tdServer);
 
         const tdEndpoint = document.createElement('td');
+        tdEndpoint.className = 'font-mono text-sm';
         tdEndpoint.textContent = b.endpoint || '—';
         tr.appendChild(tdEndpoint);
 
@@ -325,13 +348,35 @@
         tr.appendChild(tdStatus);
 
         const tdLatency = document.createElement('td');
-        tdLatency.setAttribute('data-sort-val', String(b.latency_ms || 0));
-        tdLatency.textContent = (typeof b.latency_ms === 'number' && b.latency_ms > 0) ? (b.latency_ms + ' ms') : '—';
+        const lat = (typeof b.latency_ms === 'number') ? b.latency_ms : null;
+        tdLatency.setAttribute('data-sort-val', String(lat !== null ? lat : -1));
+        if (lat !== null && lat > 0) {
+            let tierClass = 'latency-good';
+            if (lat > 150) {
+                tierClass = 'latency-poor';
+            } else if (lat >= 50) {
+                tierClass = 'latency-fair';
+            }
+            tdLatency.innerHTML = `
+                <span class="latency-pill ${tierClass}">
+                    <span class="latency-dot"></span>
+                    ${lat} ms
+                </span>
+            `;
+        } else {
+            tdLatency.innerHTML = `<span class="text-muted">—</span>`;
+        }
         tr.appendChild(tdLatency);
 
         const tdConns = document.createElement('td');
-        tdConns.setAttribute('data-sort-val', String(b.active_connections || 0));
-        tdConns.textContent = String(b.active_connections || 0);
+        const conns = Number(b.active_connections || 0);
+        tdConns.setAttribute('data-sort-val', String(conns));
+        tdConns.innerHTML = `
+            <span class="flex items-center gap-xs" style="font-size: 0.875rem; font-variant-numeric: tabular-nums;">
+                <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-users"></use></svg>
+                <strong>${conns}</strong>
+            </span>
+        `;
         tr.appendChild(tdConns);
 
         const tdActions = document.createElement('td');
@@ -346,11 +391,12 @@
         const disabledBackend = b.status === 'disabled';
         const toggleBtn = document.createElement('button');
         toggleBtn.type = 'button';
-        toggleBtn.className = 'btn btn-ghost btn-sm btn-icon';
+        toggleBtn.className = 'btn btn-ghost btn-sm btn-icon' + (disabledBackend ? ' btn-success-hover' : '');
         toggleBtn.title = disabledBackend ? _('vpn_enable') : _('vpn_disable');
+        toggleBtn.setAttribute('aria-label', disabledBackend ? _('vpn_enable') : _('vpn_disable'));
         toggleBtn.innerHTML = disabledBackend
-            ? `<svg class="icon" style="color:var(--success);"><use href="#icon-refresh"></use></svg>`
-            : `<span class="badge-dot" style="background:var(--warning);width:8px;height:8px;display:inline-block;" title="${_('vpn_disable')}"></span>`;
+            ? `<svg class="icon" style="color: var(--success);"><use href="#icon-play"></use></svg>`
+            : `<svg class="icon text-muted"><use href="#icon-pause"></use></svg>`;
         toggleBtn.addEventListener('click', function () {
             vpnToggleBackend(srvId, disabledBackend ? 'enable' : 'disable');
         });
@@ -359,9 +405,10 @@
         // Delete backend
         const delBtn = document.createElement('button');
         delBtn.type = 'button';
-        delBtn.className = 'btn btn-ghost btn-sm btn-icon';
+        delBtn.className = 'btn btn-ghost btn-sm btn-icon btn-danger-hover';
         delBtn.style.color = 'var(--danger)';
-        delBtn.title = _('vpn_delete') || _('delete') || 'Delete';
+        delBtn.title = _('vpn_delete');
+        delBtn.setAttribute('aria-label', _('vpn_delete'));
         delBtn.innerHTML = `<svg class="icon"><use href="#icon-trash"></use></svg>`;
         delBtn.addEventListener('click', function () {
             vpnDeleteBackend(srvId);
@@ -687,9 +734,10 @@
                 if (vpnConfiguredPublicEndpoint) {
                     epElem.textContent = vpnConfiguredPublicEndpoint;
                 } else if (status && status.public_endpoint) {
-                    epElem.textContent = 'Unset (Auto-detect: ' + status.public_endpoint + ')';
+                    const tpl = _('vpn_unset_auto_detected') || 'Unset (Auto-detect: %s)';
+                    epElem.textContent = tpl.replace('%s', status.public_endpoint);
                 } else {
-                    epElem.textContent = 'Unset (Auto-detect)';
+                    epElem.textContent = _('vpn_unset_auto') || 'Unset (Auto-detect)';
                 }
             }
             document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '—');
@@ -706,10 +754,21 @@
                 tr.className = 'table-empty-state';
                 const td = document.createElement('td');
                 td.colSpan = 6;
+                td.style.padding = 'var(--space-2xl) var(--space-md)';
                 td.style.textAlign = 'center';
-                td.style.color = 'var(--text-muted)';
-                td.style.padding = 'var(--space-xl)';
-                td.textContent = _('vpn_no_backends');
+                td.innerHTML = `
+                    <div class="empty-state" style="padding: 0;">
+                        <div class="empty-icon" style="margin-bottom: var(--space-sm);">
+                            <svg class="icon text-muted" style="width: 48px; height: 48px;"><use href="#icon-server"></use></svg>
+                        </div>
+                        <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${UI.escapeHtml(_('vpn_no_backends'))}</div>
+                        <div class="empty-desc" style="font-size: 0.875rem; color: var(--text-muted); max-width: 420px; margin: 0 auto var(--space-md);">${UI.escapeHtml(_('vpn_no_backends_desc'))}</div>
+                        <button type="button" class="btn btn-primary btn-sm" onclick="vpnOpenAddBackendModal()">
+                            <svg class="icon"><use href="#icon-plus"></use></svg>
+                            <span>${UI.escapeHtml(_('vpn_add_backend'))}</span>
+                        </button>
+                    </div>
+                `;
                 tr.appendChild(td);
                 tbody.appendChild(tr);
                 if (vpnTableInstance) vpnTableInstance.refresh();
@@ -728,7 +787,9 @@
                     sortable: true,
                     paginate: true,
                     pageSize: 10,
-                    searchPlaceholder: _('search_placeholder') || 'Search backends...',
+                    statusFilters: ['all', 'active', 'degraded', 'disabled'],
+                    statusAttribute: 'data-status',
+                    searchPlaceholder: _('vpn_search_backends') || _('search_placeholder') || 'Search backends...',
                     emptyMessage: _('vpn_no_backends') || 'No backends configured'
                 });
             }
