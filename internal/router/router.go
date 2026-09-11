@@ -30,11 +30,13 @@ type HealthResponse = handlers.HealthResponse
 
 // Options holds dependencies, handlers, and limiters for the HTTP router.
 type Options struct {
-	Config       *config.Config
-	DB           *database.DB
-	Handlers     *handlers.Handlers
-	LoginLimiter *middleware.RateLimiter
-	APILimiter   *middleware.RateLimiter
+	Config           *config.Config
+	DB               *database.DB
+	Handlers         *handlers.Handlers
+	LoginLimiter     *middleware.RateLimiter
+	APILimiter       *middleware.RateLimiter
+	CaptchaLimiter   *middleware.RateLimiter
+	ShareAuthLimiter *middleware.RateLimiter
 }
 
 // NewRouter sets up the Chi HTTP router, standard middleware stack, and all route groups.
@@ -95,6 +97,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Use(chimiddleware.RequestID)
 	if cfg != nil {
 		r.Use(middleware.RealIP(cfg.TrustedCIDRs, cfg.TrustedIPs))
+		// Issue #100: per-request secure-connection flag. Direct TLS, or a
+		// trusted proxy (same trust gate as RealIP) with
+		// X-Forwarded-Proto: https, marks the client connection secure for
+		// session-cookie purposes. COOKIE_INSECURE=1 still wins.
+		r.Use(middleware.SecureConn(middleware.NewRealIPResolver(strings.Join(cfg.TrustedProxies, ","))))
 	}
 	r.Use(chimiddleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -133,6 +140,24 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			apiLimiter = middleware.NewRateLimiterPerMinute(60, 60)
 		}
 	}
+	// Issue #84: rate limits for the previously unprotected captcha and
+	// share-auth endpoints (per client IP, token bucket via middleware.RateLimit).
+	captchaLimiter := opts.CaptchaLimiter
+	if captchaLimiter == nil {
+		if isE2E {
+			captchaLimiter = middleware.NewRateLimiterPerMinute(100000, 100000)
+		} else {
+			captchaLimiter = middleware.NewRateLimiterPerMinute(20, 20)
+		}
+	}
+	shareAuthLimiter := opts.ShareAuthLimiter
+	if shareAuthLimiter == nil {
+		if isE2E {
+			shareAuthLimiter = middleware.NewRateLimiterPerMinute(100000, 100000)
+		} else {
+			shareAuthLimiter = middleware.NewRateLimiterPerMinute(8, 8)
+		}
+	}
 
 	// 2. Static Assets Serving
 	serveStatic(r)
@@ -151,7 +176,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 
 	// 5. Auth API Group
 	r.Route("/api/auth", func(r chi.Router) {
-		r.Get("/captcha", h.CaptchaHandler)
+		r.With(middleware.RateLimit(captchaLimiter)).Get("/captcha", h.CaptchaHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/login", h.APILoginHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/setup", h.APISetupHandler)
 		r.With(middleware.RequireAuth).Post("/change-password", h.APIChangePasswordHandler)
@@ -311,7 +336,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 
 	// 8. Public / Share API Group
 	r.Get("/api/leaderboard", h.LeaderboardHandler)
-	r.Post("/api/share/{token}/auth", h.ShareAuthHandler)
+	r.With(middleware.RateLimit(shareAuthLimiter)).Post("/api/share/{token}/auth", h.ShareAuthHandler)
 	r.Get("/api/share/{token}/connections", h.GetShareConnectionsHandler)
 	r.Post("/api/share/{token}/config/{connection_id}", h.GetShareConnectionConfigHandler)
 

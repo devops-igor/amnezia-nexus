@@ -82,7 +82,7 @@ func (h *Handlers) ShareAuthHandler(w http.ResponseWriter, r *http.Request) {
 	sess.ShareAuthenticated[token] = true
 
 	if h.cfg != nil && h.cfg.SecretKey != "" {
-		_ = middleware.SetSessionCookie(w, sess, h.cfg.SecretKey, 86400)
+		_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 86400)
 	}
 
 	h.JSON(w, http.StatusOK, map[string]any{"status": "success"})

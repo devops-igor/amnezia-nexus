@@ -602,13 +602,15 @@ func (r *AddUserRequest) Validate() error {
 
 // SessionData represents authenticated session information stored in signed cookies and request context.
 type SessionData struct {
-	UserID                 string          `json:"user_id,omitempty"`
-	Username               string          `json:"username,omitempty"`
-	Role                   UserRole        `json:"role,omitempty"`
-	PasswordChangeRequired bool            `json:"password_change_required,omitempty"`
-	CaptchaAnswer          string          `json:"captcha_answer,omitempty"`
-	ShareAuthenticated     map[string]bool `json:"share_authenticated,omitempty"`
-	Extra                  map[string]any  `json:"extra,omitempty"`
+	UserID                 string   `json:"user_id,omitempty"`
+	Username               string   `json:"username,omitempty"`
+	Role                   UserRole `json:"role,omitempty"`
+	PasswordChangeRequired bool     `json:"password_change_required,omitempty"`
+	// CaptchaID is the opaque id of the server-side captcha challenge
+	// (issue #84). The answer itself never leaves the server.
+	CaptchaID          string          `json:"captcha_id,omitempty"`
+	ShareAuthenticated map[string]bool `json:"share_authenticated,omitempty"`
+	Extra              map[string]any  `json:"extra,omitempty"`
 }
 
 // IsAuthenticated returns true if the session contains a valid user ID.
@@ -644,8 +646,8 @@ func (s *SessionData) ToMap() map[string]any {
 	if s.PasswordChangeRequired {
 		m["password_change_required"] = true
 	}
-	if s.CaptchaAnswer != "" {
-		m["captcha_answer"] = s.CaptchaAnswer
+	if s.CaptchaID != "" {
+		m["captcha_id"] = s.CaptchaID
 	}
 	if len(s.ShareAuthenticated) > 0 {
 		m["share_authenticated"] = s.ShareAuthenticated
@@ -683,9 +685,9 @@ func SessionDataFromMap(m map[string]any) *SessionData {
 			if b, ok := v.(bool); ok {
 				s.PasswordChangeRequired = b
 			}
-		case "captcha_answer":
+		case "captcha_id":
 			if str, ok := v.(string); ok {
-				s.CaptchaAnswer = str
+				s.CaptchaID = str
 			}
 		case "share_authenticated":
 			if sm, ok := v.(map[string]bool); ok {
