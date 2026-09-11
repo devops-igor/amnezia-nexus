@@ -94,3 +94,83 @@ func TestLeaderboardSnapshotPruning(t *testing.T) {
 		t.Errorf("expected 1 snapshot remaining after pruning, got %d", len(historyAfterDelete))
 	}
 }
+
+func TestGetLeaderboard_LastMonth(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. When DB is empty, GetLeaderboard("last-month") must return non-nil empty slice
+	entriesEmpty, err := db.GetLeaderboard(ctx, "last-month")
+	if err != nil {
+		t.Fatalf("GetLeaderboard(last-month) on empty DB failed: %v", err)
+	}
+	if entriesEmpty == nil {
+		t.Fatalf("GetLeaderboard(last-month) returned nil slice, want non-nil empty slice")
+	}
+	if len(entriesEmpty) != 0 {
+		t.Fatalf("GetLeaderboard(last-month) returned %d entries, want 0", len(entriesEmpty))
+	}
+
+	// 2. Create users with traffic in users table (all-time & monthly)
+	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "alice", Enabled: true, TrafficResetStrategy: models.ResetStrategyMonthly})
+	u2ID, _ := db.CreateUser(ctx, &models.User{Username: "bob", Enabled: true, TrafficResetStrategy: models.ResetStrategyMonthly})
+	_ = db.UpdateUserTraffic(ctx, u1ID, 100000, 200000) // total = 300,000
+	_ = db.UpdateUserTraffic(ctx, u2ID, 50000, 50000)   // total = 100,000
+
+	// Verify all-time returns both users
+	allTime, err := db.GetLeaderboard(ctx, "all-time")
+	if err != nil || len(allTime) != 2 {
+		t.Fatalf("GetLeaderboard(all-time) failed: len=%d, err=%v", len(allTime), err)
+	}
+
+	// Verify monthly returns both users
+	monthly, err := db.GetLeaderboard(ctx, "monthly")
+	if err != nil || len(monthly) != 2 {
+		t.Fatalf("GetLeaderboard(monthly) failed: len=%d, err=%v", len(monthly), err)
+	}
+
+	// But without a snapshot for last month, "last-month" MUST return empty slice (not all-time traffic!)
+	lastMonthNoSnap, err := db.GetLeaderboard(ctx, "last-month")
+	if err != nil {
+		t.Fatalf("GetLeaderboard(last-month) with users but no snapshot failed: %v", err)
+	}
+	if lastMonthNoSnap == nil {
+		t.Fatalf("GetLeaderboard(last-month) returned nil slice, want non-nil empty slice")
+	}
+	if len(lastMonthNoSnap) != 0 {
+		t.Fatalf("GetLeaderboard(last-month) returned %d entries from all-time traffic, want 0 (no snapshot)", len(lastMonthNoSnap))
+	}
+
+	// 3. Now insert a snapshot for the prior calendar month directly into leaderboard_snapshots
+	now := time.Now()
+	prev := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
+	prevYear, prevMonth := prev.Year(), int(prev.Month())
+
+	query := `INSERT INTO leaderboard_snapshots (year, month, username, rank, download, upload, total, snapshot_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	// Bob was rank 1 last month with 45000, Alice was rank 2 with 25000
+	_, err = db.ExecContext(ctx, query, prevYear, prevMonth, "bob", 1, 20000, 25000, 45000, now.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert snapshot entry: %v", err)
+	}
+	_, err = db.ExecContext(ctx, query, prevYear, prevMonth, "alice", 2, 10000, 15000, 25000, now.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert snapshot entry: %v", err)
+	}
+
+	// 4. Query GetLeaderboard("last-month") - must return the snapshot data
+	lastMonthWithSnap, err := db.GetLeaderboard(ctx, "last-month")
+	if err != nil {
+		t.Fatalf("GetLeaderboard(last-month) failed: %v", err)
+	}
+	if len(lastMonthWithSnap) != 2 {
+		t.Fatalf("GetLeaderboard(last-month) expected 2 entries from snapshot, got %d", len(lastMonthWithSnap))
+	}
+
+	if lastMonthWithSnap[0].Username != "bob" || lastMonthWithSnap[0].Rank != 1 || lastMonthWithSnap[0].Total != 45000 {
+		t.Errorf("expected bob rank 1 total 45000, got: %+v", lastMonthWithSnap[0])
+	}
+	if lastMonthWithSnap[1].Username != "alice" || lastMonthWithSnap[1].Rank != 2 || lastMonthWithSnap[1].Total != 25000 {
+		t.Errorf("expected alice rank 2 total 25000, got: %+v", lastMonthWithSnap[1])
+	}
+}
