@@ -127,12 +127,12 @@
                 }
             }
 
-            if (typeof window !== 'undefined') {
+            if (typeof window !== 'undefined' && !url.includes('/api/auth/login') && window.location.pathname !== '/login') {
                 window.location.href = '/login';
+                const err = new Error('Session expired');
+                err.status = res.status;
+                throw err;
             }
-            const err = new Error('Session expired');
-            err.status = res.status;
-            throw err;
         }
 
         let data;
