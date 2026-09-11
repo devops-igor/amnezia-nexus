@@ -17,14 +17,12 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var appearance models.AppearanceSettings
-	var syncCfg models.SyncSettings
 	var captchaCfg models.CaptchaSettings
 	var sslCfg models.SSLSettings
 	var limitsCfg models.ConnectionLimits
 	telegramCfg := make(map[string]any)
 
 	_ = h.db.GetSetting(ctx, "appearance", &appearance)
-	_ = h.db.GetSetting(ctx, "sync", &syncCfg)
 	_ = h.db.GetSetting(ctx, "captcha", &captchaCfg)
 	_ = h.db.GetSetting(ctx, "telegram", &telegramCfg)
 	_ = h.db.GetSetting(ctx, "ssl", &sslCfg)
@@ -33,11 +31,6 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	// Strip sensitive private keys & certificate text from API response
 	sslCfg.KeyText = ""
 	sslCfg.CertText = ""
-
-	// Mask sync API key if configured
-	if syncCfg.RemnawaveAPIKey != "" {
-		syncCfg.RemnawaveAPIKey = "********"
-	}
 
 	// Mask telegram bot tokens if present
 	if bt, ok := telegramCfg["bot_token"].(string); ok && bt != "" {
@@ -49,7 +42,6 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.JSON(w, http.StatusOK, map[string]any{
 		"appearance": appearance,
-		"sync":       syncCfg,
 		"captcha":    captchaCfg,
 		"telegram":   telegramCfg,
 		"ssl":        sslCfg,
@@ -68,14 +60,7 @@ func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSe
 		req.SSL.CertText = existingSSL.CertText
 	}
 
-	// 2. Sync: Preserve existing RemnawaveAPIKey if incoming is empty or masked
-	var existingSync models.SyncSettings
-	_ = h.db.GetSetting(ctx, "sync", &existingSync)
-	if req.Sync.RemnawaveAPIKey == "" || req.Sync.RemnawaveAPIKey == "********" {
-		req.Sync.RemnawaveAPIKey = existingSync.RemnawaveAPIKey
-	}
-
-	// 3. Telegram: Preserve existing bot_token / token if incoming is empty or masked
+	// 2. Telegram: Preserve existing bot_token / token if incoming is empty or masked
 	if req.Telegram != nil {
 		existingTelegram := make(map[string]any)
 		_ = h.db.GetSetting(ctx, "telegram", &existingTelegram)
@@ -94,9 +79,6 @@ func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSe
 
 func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettingsRequest) error {
 	if err := h.db.SetSetting(ctx, "appearance", req.Appearance); err != nil {
-		return err
-	}
-	if err := h.db.SetSetting(ctx, "sync", req.Sync); err != nil {
 		return err
 	}
 	if err := h.db.SetSetting(ctx, "captcha", req.Captcha); err != nil {
@@ -131,63 +113,6 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.audit(r, "settings.save", nil)
 	h.JSON(w, http.StatusOK, map[string]any{"status": "success"})
-}
-
-// SyncNowHandler triggers immediate synchronization with external RemnaWave instance.
-// TODO(issue-380): Implement actual RemnaWave API sync integration in Phase 6 (external services).
-// This is currently a stub that reports the count of RemnaWave-linked users pending sync.
-func (h *Handlers) SyncNowHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pending := 0
-	if h.db != nil {
-		if users, err := h.db.GetAllUsers(ctx); err == nil {
-			for _, u := range users {
-				if u.RemnaWaveUUID != nil && *u.RemnaWaveUUID != "" {
-					pending++
-				}
-			}
-		}
-	}
-
-	h.audit(r, "settings.sync_now", map[string]any{"pending_users": pending})
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status":       "success",
-		"count":        0,
-		"synced_users": 0,
-		"message":      "RemnaWave sync is scheduled for Phase 6 integration; no users synced yet",
-	})
-}
-
-// SyncDeleteHandler removes all users and connections synced from RemnaWave.
-func (h *Handlers) SyncDeleteHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	users, err := h.db.GetAllUsers(ctx)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get users")
-		return
-	}
-
-	deletedCount := 0
-	for _, u := range users {
-		if u.RemnaWaveUUID != nil && *u.RemnaWaveUUID != "" {
-			if _, err := h.db.DeleteConnectionsByUser(ctx, u.ID); err != nil {
-				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user connections")
-				return
-			}
-			if _, err := h.db.DeleteUser(ctx, u.ID); err != nil {
-				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user")
-				return
-			}
-			deletedCount++
-		}
-	}
-
-	h.audit(r, "settings.sync_delete", map[string]any{"deleted_users": deletedCount})
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status":  "success",
-		"count":   deletedCount,
-		"deleted": deletedCount,
-	})
 }
 
 // DownloadBackupHandler exports complete panel database state as a JSON backup.
@@ -231,7 +156,6 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 			"traffic_reset_strategy": u.TrafficResetStrategy,
 			"share_enabled":          u.ShareEnabled,
 			"share_token":            u.ShareToken,
-			"remnawave_uuid":         u.RemnaWaveUUID,
 			"created_at":             u.CreatedAt,
 			"awg_mimicry":            u.AWGMimicry,
 		}
@@ -537,9 +461,6 @@ func (h *Handlers) userFromBackupMap(uMap map[string]any) *models.User {
 	}
 	if shareToken := strVal(uMap["share_token"]); shareToken != "" {
 		u.ShareToken = &shareToken
-	}
-	if rwUUID := strVal(uMap["remnawave_uuid"]); rwUUID != "" {
-		u.RemnaWaveUUID = &rwUUID
 	}
 	if created := strVal(uMap["created_at"]); created != "" {
 		if t, err := time.Parse(time.RFC3339, created); err == nil {

@@ -296,37 +296,6 @@ func TestUsersHandlers(t *testing.T) {
 			t.Errorf("expected to find user by telegram search")
 		}
 
-		// Remnawave source
-		rwUUID := "rw-list-1"
-		rw := &models.User{
-			ID:            "rw-u-1",
-			Username:      "rwuser",
-			PasswordHash:  "hash",
-			Role:          models.RoleUser,
-			Enabled:       true,
-			RemnaWaveUUID: &rwUUID,
-			ExpirationDate: func() *time.Time {
-				t := time.Now().Add(24 * time.Hour)
-				return &t
-			}(),
-			ExpiresAt: func() *time.Time {
-				t := time.Now().Add(48 * time.Hour)
-				return &t
-			}(),
-			CreatedAt: time.Now(),
-		}
-		_, _ = db.CreateUser(ctx, rw)
-
-		reqRW := httptest.NewRequest(http.MethodGet, "/api/users?search=rwuser", nil)
-		wRW := httptest.NewRecorder()
-		r.ServeHTTP(wRW, reqRW)
-		if wRW.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", wRW.Code)
-		}
-		if !strings.Contains(wRW.Body.String(), "Remnawave") {
-			t.Errorf("expected Remnawave source in user list")
-		}
-
 		// Pagination - page 2 with size 1
 		reqPage := httptest.NewRequest(http.MethodGet, "/api/users?page=2&size=1", nil)
 		wPage := httptest.NewRecorder()

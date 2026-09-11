@@ -7,7 +7,6 @@ import (
 	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/service/orchestrator"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/service/reconciliation"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/remnawave"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/service/supervisor"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/service/userops"
 )
@@ -45,14 +44,6 @@ type UserOpsService = userops.Service
 // NewUserOpsService creates a new UserOpsService.
 func NewUserOpsService(db *database.DB, registry userops.ProtocolResolver) *UserOpsService {
 	return userops.NewUserOpsService(db, registry)
-}
-
-// RemnaWaveSyncer handles synchronization with RemnaWave.
-type RemnaWaveSyncer = remnawave.Syncer
-
-// NewRemnaWaveSyncer creates a new RemnaWave user syncer.
-func NewRemnaWaveSyncer(db *database.DB, client remnawave.HTTPClient, ops remnawave.MassOperationExecutor) *RemnaWaveSyncer {
-	return remnawave.NewSyncer(db, client, ops)
 }
 
 // MockBackgroundService provides a stub service for testing supervisor orchestration.

@@ -84,9 +84,6 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	userItems := make([]models.UserItemResponse, len(items))
 	for i, u := range items {
 		source := "Local"
-		if u.RemnaWaveUUID != nil && *u.RemnaWaveUUID != "" {
-			source = "Remnawave"
-		}
 
 		var expStr, expiresStr *string
 		if u.ExpirationDate != nil {

@@ -161,7 +161,6 @@ func TestLoadDataAndSaveDataBasic(t *testing.T) {
 	uDesc := "Full Alice"
 	uShareToken := "full-share-token"
 	uSharePass := "$2b$12$hash"
-	uRemna := "remna-full-uuid"
 	uMonthReset := "2026-08-01T00:00:00Z"
 	uLastReset := "2026-08-01T00:00:00Z"
 	uExp := time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC)
@@ -186,7 +185,6 @@ func TestLoadDataAndSaveDataBasic(t *testing.T) {
 		ShareEnabled:           true,
 		ShareToken:             &uShareToken,
 		SharePasswordHash:      &uSharePass,
-		RemnaWaveUUID:          &uRemna,
 		CreatedAt:              time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		LastResetAt:            &uLastReset,
 		ExpirationDate:         &uExp,

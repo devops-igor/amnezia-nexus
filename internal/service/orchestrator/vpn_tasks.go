@@ -350,19 +350,3 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 	}
 	return drained
 }
-
-// SyncRemnaWave delegates to the configured RemnaWave syncer.
-func (o *Orchestrator) SyncRemnaWave(ctx context.Context) error {
-	if o.remnawaveSyncer == nil {
-		return nil
-	}
-
-	count, msg, err := o.remnawaveSyncer.Sync(ctx)
-	if err != nil {
-		slog.Warn("RemnaWave periodic sync encountered error", "err", err)
-		return err
-	}
-
-	slog.Info("RemnaWave periodic sync completed", "synced_users", count, "msg", msg)
-	return nil
-}

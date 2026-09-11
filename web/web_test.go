@@ -790,10 +790,8 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 	requiredSettingsTokens := []string{
 		"href=\"#icon-settings\"",
 		"href=\"#icon-shield\"",
-		"href=\"#icon-book\"",
 		"href=\"#icon-lock\"",
 		"href=\"#icon-send\"",
-		"href=\"#icon-refresh\"",
 		"href=\"#icon-link\"",
 		"href=\"#icon-database\"",
 		"href=\"#icon-download\"",
@@ -1724,6 +1722,109 @@ func TestIssue113TranslationParityAndValidity(t *testing.T) {
 			if val, ok := dicts[langFile][k]; !ok || strings.TrimSpace(val) == "" {
 				t.Errorf("%s missing or empty translation for users.html key %q", langFile, k)
 			}
+		}
+	}
+}
+
+func TestIssue115_RemoveApiDocsAndImportUsers(t *testing.T) {
+	// 1. Assert absent translation keys across all 5 languages and verify 100% key parity
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	languages := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	removedKeys := []string{
+		"api_docs_title",
+		"api_docs_hint",
+		"import_users_title",
+		"import_source_label",
+		"remnawave_url_label",
+		"api_key_label",
+		"enable_sync",
+		"sync_hint",
+		"sync_now_btn",
+		"delete_sync_btn",
+		"auto_create_conns",
+		"sync_server_label",
+		"sync_running",
+		"sync_success",
+		"delete_sync_confirm",
+		"sync_deleted",
+	}
+
+	dicts := make(map[string]map[string]string)
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s: %v", langFile, err)
+		}
+		dicts[langFile] = dict
+
+		for _, k := range removedKeys {
+			if _, exists := dict[k]; exists {
+				t.Errorf("%s still contains obsolete key %q", langFile, k)
+			}
+		}
+	}
+
+	// Verify 100% key parity across all 5 language dictionaries
+	enDict := dicts["en.json"]
+	for _, langFile := range languages {
+		if langFile == "en.json" {
+			continue
+		}
+		currDict := dicts[langFile]
+		if len(currDict) != len(enDict) {
+			t.Errorf("key count mismatch between en.json (%d) and %s (%d)", len(enDict), langFile, len(currDict))
+		}
+		for k := range enDict {
+			if _, ok := currDict[k]; !ok {
+				t.Errorf("%s missing key %q present in en.json", langFile, k)
+			}
+		}
+		for k := range currDict {
+			if _, ok := enDict[k]; !ok {
+				t.Errorf("%s contains key %q not present in en.json", langFile, k)
+			}
+		}
+	}
+
+	// 2. Assert settings.html does not contain removed elements or functions
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	settingsData, err := fs.ReadFile(templatesFS, "settings.html")
+	if err != nil {
+		t.Fatalf("failed to read settings.html: %v", err)
+	}
+	settingsStr := string(settingsData)
+
+	forbiddenTokens := []string{
+		"api_docs_title",
+		"api_docs_hint",
+		"import_users_title",
+		"syncRemnawaveNow",
+		"deleteSyncRemnawave",
+		"updateProtocolsForSync",
+		"/docs",
+		"/redoc",
+		"remnawave_url",
+		"remnawave_api_key",
+		"remnawaveFields",
+		"syncCreateConns",
+		"href=\"#icon-book\"",
+		"href=\"#icon-refresh\"",
+	}
+
+	for _, token := range forbiddenTokens {
+		if strings.Contains(settingsStr, token) {
+			t.Errorf("settings.html contains forbidden token %q", token)
 		}
 	}
 }

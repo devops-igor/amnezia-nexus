@@ -24,7 +24,7 @@ func (d *DB) GetAllUsers(ctx context.Context) ([]models.User, error) {
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users ORDER BY created_at DESC`
 
@@ -54,7 +54,7 @@ func (d *DB) GetUser(ctx context.Context, id string) (*models.User, error) {
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users WHERE id = ?`
 
@@ -82,7 +82,7 @@ func (d *DB) GetUserByUsername(ctx context.Context, username string) (*models.Us
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users WHERE LOWER(username) = LOWER(?)`
 
@@ -105,7 +105,7 @@ func (d *DB) GetUserByShareToken(ctx context.Context, token string) (*models.Use
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users WHERE share_token = ?`
 
@@ -116,29 +116,6 @@ func (d *DB) GetUserByShareToken(ctx context.Context, token string) (*models.Use
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get user by share token: %w", err)
-	}
-	return &u, nil
-}
-
-// GetUserByRemnaWaveUUID retrieves a user by their external RemnaWave UUID.
-func (d *DB) GetUserByRemnaWaveUUID(ctx context.Context, uuid string) (*models.User, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
-		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
-		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
-		FROM users WHERE remnawave_uuid = ?`
-
-	row := d.sqlDB.QueryRowContext(ctx, query, uuid)
-	u, err := d.scanUserRow(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to get user by remnawave uuid: %w", err)
 	}
 	return &u, nil
 }
@@ -216,9 +193,9 @@ func (d *DB) CreateUser(ctx context.Context, u *models.User) (string, error) {
 		id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := d.sqlDB.ExecContext(ctx, query,
 		u.ID,
@@ -241,7 +218,6 @@ func (d *DB) CreateUser(ctx context.Context, u *models.User) (string, error) {
 		shareEnabledInt,
 		u.ShareToken,
 		u.SharePasswordHash,
-		u.RemnaWaveUUID,
 		createdAtStr,
 		lastResetStr,
 		expDateStr,
@@ -444,7 +420,7 @@ func (d *DB) GetUsersOverQuota(ctx context.Context) ([]models.User, error) {
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users WHERE enabled = 1 AND traffic_limit > 0 AND traffic_used >= traffic_limit`
 
@@ -475,7 +451,7 @@ func (d *DB) GetExpiredUsers(ctx context.Context) ([]models.User, error) {
 	query := `SELECT id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
-		share_enabled, share_token, share_password_hash, remnawave_uuid,
+		share_enabled, share_token, share_password_hash,
 		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
 		FROM users WHERE enabled = 1 AND (
 			(expires_at IS NOT NULL AND expires_at != '' AND expires_at < ?) OR
@@ -607,7 +583,7 @@ func (d *DB) GetLeaderboard(ctx context.Context, period string) ([]models.Leader
 
 func (d *DB) scanUser(s scannable) (models.User, error) {
 	var u models.User
-	var email, telID, desc, shareToken, sharePass, remnaUUID sql.NullString
+	var email, telID, desc, shareToken, sharePass sql.NullString
 	var monthlyResetAt, lastResetAt, expDate, expiresAt sql.NullString
 	var role, strategy, mimicry, limitsJSON, createdAt sql.NullString
 	var enabled, shareEnabled, pwdChange int
@@ -633,7 +609,6 @@ func (d *DB) scanUser(s scannable) (models.User, error) {
 		&shareEnabled,
 		&shareToken,
 		&sharePass,
-		&remnaUUID,
 		&createdAt,
 		&lastResetAt,
 		&expDate,
@@ -651,7 +626,6 @@ func (d *DB) scanUser(s scannable) (models.User, error) {
 	u.Description = nullStringToPtr(desc)
 	u.ShareToken = nullStringToPtr(shareToken)
 	u.SharePasswordHash = nullStringToPtr(sharePass)
-	u.RemnaWaveUUID = nullStringToPtr(remnaUUID)
 	u.MonthlyResetAt = nullStringToPtr(monthlyResetAt)
 	u.LastResetAt = nullStringToPtr(lastResetAt)
 

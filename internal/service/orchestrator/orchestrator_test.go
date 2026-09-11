@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,18 +162,6 @@ func (m *mockUserOps) PerformMassOperations(ctx context.Context, req userops.Mas
 	return m.errToRet
 }
 
-type mockRemnaSyncer struct {
-	count int
-	msg   string
-	err   error
-	calls int32
-}
-
-func (m *mockRemnaSyncer) Sync(ctx context.Context) (int, string, error) {
-	atomic.AddInt32(&m.calls, 1)
-	return m.count, m.msg, m.err
-}
-
 func setupTestDB(t *testing.T) (*database.DB, func()) {
 	f, err := os.CreateTemp("", "test_orch_*.db")
 	if err != nil {
@@ -203,14 +190,12 @@ func TestOrchestrator_LifecycleAndOptions(t *testing.T) {
 
 	reg := newMockOrchRegistry()
 	userOps := &mockUserOps{}
-	syncer := &mockRemnaSyncer{count: 5, msg: "ok"}
 
 	orch := New(db, reg,
 		WithBootDelay(10*time.Millisecond),
 		WithInterval(50*time.Millisecond),
 		WithMaxConcurrency(5),
 		WithUserOps(userOps),
-		WithRemnaWaveSyncer(syncer),
 	)
 
 	if orch.Name() != "background-orchestrator" {
@@ -1214,12 +1199,10 @@ func TestOrchestrator_ExtractBytes_And_ResetStrategies(t *testing.T) {
 
 func TestOrchestrator_RunAll_ErrorAggregation(t *testing.T) {
 	db, cleanup := setupTestDB(t)
-	defer cleanup()
+	cleanup() // close db immediately so subtasks fail
 
 	ctx := context.Background()
-
-	failingSyncer := &mockRemnaSyncer{err: errors.New("remnawave down")}
-	orch := New(db, nil, WithRemnaWaveSyncer(failingSyncer))
+	orch := New(db, nil)
 
 	err := orch.RunAll(ctx)
 	if err == nil {

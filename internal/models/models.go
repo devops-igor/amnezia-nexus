@@ -191,7 +191,6 @@ type User struct {
 	ShareEnabled           bool                 `json:"share_enabled" db:"share_enabled"`
 	ShareToken             *string              `json:"share_token,omitempty" db:"share_token"`
 	SharePasswordHash      *string              `json:"-" db:"share_password_hash"`
-	RemnaWaveUUID          *string              `json:"remnawave_uuid,omitempty" db:"remnawave_uuid"`
 	CreatedAt              time.Time            `json:"created_at" db:"created_at"`
 	LastResetAt            *string              `json:"last_reset_at,omitempty" db:"last_reset_at"`
 	ExpirationDate         *time.Time           `json:"expiration_date,omitempty" db:"expiration_date"`
@@ -328,17 +327,6 @@ type AppearanceSettings struct {
 	Logo     string `json:"logo"`
 	Subtitle string `json:"subtitle"`
 	Language string `json:"language"`
-}
-
-// SyncSettings holds RemnaWave external sync configuration.
-type SyncSettings struct {
-	RemnawaveURL         string `json:"remnawave_url"`
-	RemnawaveAPIKey      string `json:"remnawave_api_key"`
-	RemnawaveSync        bool   `json:"remnawave_sync"`
-	RemnawaveSyncUsers   bool   `json:"remnawave_sync_users"`
-	RemnawaveCreateConns bool   `json:"remnawave_create_conns"`
-	RemnawaveServerID    int64  `json:"remnawave_server_id"`
-	RemnawaveProtocol    string `json:"remnawave_protocol"`
 }
 
 // CaptchaSettings holds CAPTCHA toggle configuration.
@@ -941,7 +929,6 @@ type AutoTrialRequest struct {
 // SaveSettingsRequest defines settings save payload.
 type SaveSettingsRequest struct {
 	Appearance AppearanceSettings     `json:"appearance"`
-	Sync       SyncSettings           `json:"sync"`
 	Captcha    CaptchaSettings        `json:"captcha"`
 	Telegram   map[string]interface{} `json:"telegram,omitempty"`
 	SSL        SSLSettings            `json:"ssl"`

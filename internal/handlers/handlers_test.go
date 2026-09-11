@@ -337,8 +337,6 @@ func setupFullSettingsRouter(h *Handlers) *chi.Mux {
 	r := chi.NewRouter()
 	r.Get("/api/settings", h.GetSettingsHandler)
 	r.Post("/api/settings/save", h.SaveSettingsHandler)
-	r.Post("/api/settings/sync_now", h.SyncNowHandler)
-	r.Post("/api/settings/sync_delete", h.SyncDeleteHandler)
 	r.Get("/api/settings/backup/download", h.DownloadBackupHandler)
 	r.Post("/api/settings/backup/restore", h.RestoreBackupHandler)
 	return r

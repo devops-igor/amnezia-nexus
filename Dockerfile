@@ -27,7 +27,7 @@ FROM alpine:3.22
 WORKDIR /app
 
 # Install minimal runtime dependencies:
-# - ca-certificates: TLS verification for RemnaWave API & remote HTTPS
+# - ca-certificates: TLS verification for remote HTTPS
 # - tzdata: accurate timezone support
 # - iproute2: IP & interface management for TUN devices (ip link, ip addr)
 # - iptables: NAT / packet forwarding rules for VPN endpoint
