@@ -32,15 +32,49 @@ type PacketDevice interface {
 }
 
 // TokenBucket implements a token bucket rate limiter for per-peer bandwidth throttling.
+//
+// Rate-vs-burst semantics (issue #94): `rate` is the SUSTAINED throughput in
+// bytes per second — the long-run average the bucket refills at. `capacity`
+// is the BURST budget: the maximum number of bytes that can be consumed
+// instantaneously, bounded by the tokens accumulated in the bucket. The two
+// are independent: a bucket configured at 1 MB/s with a 4 MB capacity can
+// deliver a 4 MB burst immediately and then sustain 1 MB/s; a bucket at
+// 1 MB/s with capacity 128 KB can only ever burst 128 KB before waiting for
+// refills. `limitBps` alone is therefore NOT a hard per-second ceiling —
+// short windows may exceed it by up to the burst capacity.
+//
+// With no explicit capacity, NewTokenBucket defaults capacity to the rate,
+// i.e. the bucket starts full and permits an initial burst of up to one
+// full second of configured bandwidth (a configured 1 MB/s limit permits a
+// ~1 MB initial burst). Any supplied capacity is clamped to at least the
+// rate (see NewTokenBucket). Tokens refill continuously at the rate while
+// idle and cap at capacity.
+//
+// The bucket is mutex-guarded: Allow is safe for concurrent use from
+// multiple goroutines (per-peer limit buckets are shared by concurrent
+// packet pumps — see sessionRoute.tbDown/tbUp and RouteClientToBackend /
+// RouteBackendToClient).
 type TokenBucket struct {
-	rate       float64 // bytes per second
-	capacity   float64 // burst capacity in bytes
+	rate       float64 // bytes per second (sustained refill rate)
+	capacity   float64 // burst capacity in bytes (max instantaneous burst)
 	tokens     float64
 	lastUpdate time.Time
 	mu         sync.Mutex
 }
 
 // NewTokenBucket creates a new token bucket with rate in bytes per second.
+//
+// rateBps is the sustained refill rate in bytes/second; an optional second
+// argument overrides the burst capacity in bytes. Defaults and clamping:
+//   - capacity defaults to rateBps, so the bucket starts full and permits an
+//     initial burst of up to one second's worth of configured bandwidth
+//     (1 MB/s ⇒ ~1 MB initial burst — issue #94).
+//   - a capacity below rateBps is clamped UP to rateBps; the sustained rate
+//     always remains achievable.
+//   - tokens start at capacity (full bucket).
+//
+// A non-positive rate returns nil; callers treat a nil *TokenBucket as
+// "unlimited" (Allow on a nil receiver always returns true).
 func NewTokenBucket(rateBps int64, capacity ...int64) *TokenBucket {
 	if rateBps <= 0 {
 		return nil
@@ -201,6 +235,15 @@ func (f *Forwarder) RegisterSession(sessionID, connectionID, peerKey, assignedIP
 }
 
 // RegisterSessionWithLimit registers a peer session route and configures initial rate limits (in bytes/sec).
+//
+// Rate-limit wiring (issue #94): limitDownBps/limitUpBps are SUSTAINED
+// rates in bytes/second; each creates a TokenBucket whose burst capacity
+// defaults to the rate (see NewTokenBucket — a configured 1 MB/s limit
+// permits an initial ~1 MB burst before sustained limiting settles in).
+// The per-direction buckets (tbDown for backend→client, tbUp for
+// client→backend) are consumed per packet in RouteBackendToClient /
+// RouteClientToBackend and are shared by concurrent pumps; they are
+// mutex-guarded and safe for concurrent use.
 func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -268,6 +311,11 @@ func (f *Forwarder) stopRoutePumpLocked(route *sessionRoute) {
 }
 
 // SetPeerRateLimit sets per-peer bandwidth throttling limits in bytes per second.
+//
+// Rate-limit wiring (issue #94): the limits are SUSTAINED rates in
+// bytes/second (see TokenBucket); each replaces the peer's per-direction
+// bucket with a fresh one at burst capacity = rate. Passing 0 for a
+// direction removes that direction's bucket (unlimited).
 func (f *Forwarder) SetPeerRateLimit(peerKey string, limitDownBps, limitUpBps int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

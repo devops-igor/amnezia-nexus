@@ -8,10 +8,20 @@ import (
 )
 
 // WeightedRoundRobinBalancer distributes traffic proportionally based on backend weights using smooth weighted round-robin.
+//
+// Identity domain (issue #92): ALL scheduler state — configured weights and
+// the runtime smooth-WRR current weights — is keyed by the backend's
+// ServerID, the same identity the configured weight map uses. A single
+// identity domain means a backend's scheduler state is removed with the
+// backend (UpdateBackends prunes entries for servers no longer present) and
+// a recreated/new tunnel for the same server starts from that server's
+// carried-over smooth state (a fresh tunnel for an unknown server starts
+// fresh at its effective weight). Nothing keys on the per-tunnel ID, so no
+// stale per-ID entries can accumulate or skew scheduling.
 type WeightedRoundRobinBalancer struct {
 	mu             sync.Mutex
-	weights        map[int64]int
-	currentWeights map[int64]int
+	weights        map[int64]int // ServerID -> configured weight
+	currentWeights map[int64]int // ServerID -> smooth-WRR current weight
 	caps           CapacityConfig
 	tunnels        []*models.BackendTunnel
 }
@@ -31,11 +41,31 @@ func NewWeightedRoundRobinBalancer(weights map[int64]int, caps CapacityConfig) *
 	}
 }
 
-// UpdateBackends updates the internal list of available backend tunnels.
+// UpdateBackends updates the internal list of available backend tunnels and
+// prunes scheduler state for backends that are no longer present (issue
+// #92): a removed backend's ServerID entries in both the current-weight map
+// and the configured-weight map are dropped, so a recreated tunnel cannot
+// inherit stale scheduler state, and the maps cannot grow without bound as
+// backends churn. State for servers still present is preserved so the
+// smooth-WRR distribution stays stable across membership updates.
 func (wb *WeightedRoundRobinBalancer) UpdateBackends(tunnels []*models.BackendTunnel) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 	wb.tunnels = tunnels
+	present := make(map[int64]struct{}, len(tunnels))
+	for _, t := range tunnels {
+		present[t.ServerID] = struct{}{}
+	}
+	for sid := range wb.currentWeights {
+		if _, ok := present[sid]; !ok {
+			delete(wb.currentWeights, sid)
+		}
+	}
+	for sid := range wb.weights {
+		if _, ok := present[sid]; !ok {
+			delete(wb.weights, sid)
+		}
+	}
 }
 
 // GetAlgorithm returns the algorithm identifier.
@@ -93,15 +123,18 @@ func (wb *WeightedRoundRobinBalancer) SelectBackend(ctx context.Context, req *Ro
 		}
 		totalWeight += effectiveWeight
 
-		wb.currentWeights[t.ID] += effectiveWeight
-		if wb.currentWeights[t.ID] > maxCurrentWeight {
-			maxCurrentWeight = wb.currentWeights[t.ID]
+		// Scheduler state is keyed by ServerID (issue #92): a tunnel that
+		// is new to this balancer starts from its server's carried-over
+		// smooth state, or at 0 for an unknown server (fresh start).
+		wb.currentWeights[t.ServerID] += effectiveWeight
+		if wb.currentWeights[t.ServerID] > maxCurrentWeight {
+			maxCurrentWeight = wb.currentWeights[t.ServerID]
 			best = t
 		}
 	}
 
 	if best != nil {
-		wb.currentWeights[best.ID] -= totalWeight
+		wb.currentWeights[best.ServerID] -= totalWeight
 	}
 
 	return best, nil

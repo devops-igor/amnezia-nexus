@@ -389,17 +389,58 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 //     caller is that its replacements must still be serialized per peer
 //     (the SessionManager guarantees that under sm.mu) and must not be able
 //     to push more increments than live sessions onto one backend.
+//
+// Persistence (issue #96): the in-memory gauge mutation is the ONLY thing
+// that happens under p.mu — the DB write is issued AFTER the lock is
+// released (copy-state-release-persist), so a slow or blocked persist can
+// never stall the read-locked hot paths (GetTunnel/ListTunnels/
+// GetActiveTunnels). Because the DB write happens outside p.mu, two
+// persisters for the SAME tunnel could in principle write out of order;
+// every production mutator holds the VPN Service's s.mu (see above), so
+// same-tunnel updates are serialized upstream and the write order matches
+// the gauge order. A caller outside that regime could leave the DB
+// transiently behind the in-memory gauge (last write wins); the hourly
+// gauge reconciler (issue #78) self-corrects any residual divergence.
+// Persist errors are logged (not silently ignored) — the in-memory gauge is
+// already updated and remains authoritative for balancing; divergence is
+// bounded and reconcilable exactly as pinned by the #88 scenario-1
+// fault-injection tests.
 func (p *Pool) IncrementConnections(tunnelID int64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	var (
+		found     bool
+		persistID int64
+		count     int
+	)
 	if tunnel, ok := p.tunnelsByID[tunnelID]; ok {
 		tunnel.ActiveConnections++
-		if p.db != nil {
-			_ = p.db.UpdateBackendTunnel(context.Background(), tunnel.ID, map[string]any{
-				"active_connections": tunnel.ActiveConnections,
-			})
-		}
+		found = true
+		persistID = tunnel.ID
+		count = tunnel.ActiveConnections
+	}
+	p.mu.Unlock()
+	if found {
+		p.persistConnectionCount(persistID, int64(count))
+	}
+}
+
+// persistConnectionCount issues the DB write for the connection gauge AFTER
+// p.mu has been released (issue #96). It reads only immutable pool fields
+// (p.db is fixed at NewPool and never mutated), so it requires no lock. A
+// persist failure is logged with the gauge value that failed to land — the
+// in-memory counter stays correct and the divergence is reconciled by
+// reconcileConnectionCounts (startup + hourly).
+func (p *Pool) persistConnectionCount(tunnelID, count int64) {
+	if p.db == nil {
+		return
+	}
+	if err := p.db.UpdateBackendTunnel(context.Background(), tunnelID, map[string]any{
+		"active_connections": count,
+	}); err != nil {
+		slog.Error("failed to persist active_connections",
+			"tunnel_id", tunnelID,
+			"active_connections", count,
+			"error", err)
 	}
 }
 
@@ -415,19 +456,29 @@ func (p *Pool) IncrementConnections(tunnelID int64) {
 // mis-serialized caller from driving the gauge negative; the capacity
 // invariant itself depends on the caller-side serialization, not on this
 // method.
+//
+// Persistence (issue #96): copy-state-release-persist, exactly as
+// IncrementConnections — the DB write happens after p.mu is released, with
+// the same upstream-serialization and reconcile-backstop reasoning. Persist
+// failures are logged, never silently dropped.
 func (p *Pool) DecrementConnections(tunnelID int64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	var (
+		found     bool
+		persistID int64
+		count     int
+	)
 	if tunnel, ok := p.tunnelsByID[tunnelID]; ok {
 		if tunnel.ActiveConnections > 0 {
 			tunnel.ActiveConnections--
 		}
-		if p.db != nil {
-			_ = p.db.UpdateBackendTunnel(context.Background(), tunnel.ID, map[string]any{
-				"active_connections": tunnel.ActiveConnections,
-			})
-		}
+		found = true
+		persistID = tunnel.ID
+		count = tunnel.ActiveConnections
+	}
+	p.mu.Unlock()
+	if found {
+		p.persistConnectionCount(persistID, int64(count))
 	}
 }
 
