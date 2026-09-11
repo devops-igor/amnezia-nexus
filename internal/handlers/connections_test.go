@@ -991,3 +991,178 @@ func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
 		t.Errorf("expected connection to be deleted from DB, but still found")
 	}
 }
+
+func TestUserGetConnectionConfigHandler_NoPhantomConnection(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-phantom-1",
+		Username:     "phantomuser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	// 1. Create a user with a custom-named load balancer connection
+	conn := &models.UserConnection{
+		ID:         "conn-lb-custom-1",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "custom-client-pubkey-1",
+		Name:       "My Custom VPN",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	// 2. Call UserGetConnectionConfigHandler multiple times on that connection
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/config", conn.ID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req.WithContext(middleware.WithSession(req.Context(), sess)))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("iteration %d: expected 200 OK, got %d: %s", i, w.Code, w.Body.String())
+		}
+
+		var resp struct {
+			Status   string `json:"status"`
+			Config   string `json:"config"`
+			Filename string `json:"filename"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.Status != "ok" {
+			t.Errorf("iteration %d: expected status ok, got %q", i, resp.Status)
+		}
+		if !strings.Contains(resp.Config, "[Interface]") {
+			t.Errorf("iteration %d: expected config to contain [Interface]", i)
+		}
+		if resp.Filename != "My Custom VPN.conf" {
+			t.Errorf("iteration %d: expected filename 'My Custom VPN.conf', got %q", i, resp.Filename)
+		}
+	}
+
+	// 3. Call UserGetConnectionKitHandler
+	reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", conn.ID), nil)
+	wKit := httptest.NewRecorder()
+	r.ServeHTTP(wKit, reqKit.WithContext(middleware.WithSession(reqKit.Context(), sess)))
+	if wKit.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for kit, got %d", wKit.Code)
+	}
+
+	// 4. Assert that exactly 1 connection exists in DB
+	conns, err := db.GetConnectionsByUserID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("failed to get connections: %v", err)
+	}
+	if len(conns) != 1 {
+		t.Fatalf("expected exactly 1 connection in DB, got %d", len(conns))
+	}
+
+	// 5. Specifically assert that NO connection with Name: fmt.Sprintf("%s-awg", u.Username) was created
+	phantomName := fmt.Sprintf("%s-awg", u.Username)
+	for _, c := range conns {
+		if c.Name == phantomName {
+			t.Errorf("phantom connection %q was created in DB", phantomName)
+		}
+	}
+	if conns[0].Name != "My Custom VPN" {
+		t.Errorf("expected connection name 'My Custom VPN', got %q", conns[0].Name)
+	}
+	if conns[0].ID != conn.ID {
+		t.Errorf("expected connection ID %q, got %q", conn.ID, conns[0].ID)
+	}
+}
+
+func TestUserGetConnectionConfigHandler_MultipleConnectionsNoPhantom(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-lb-multi-1",
+		Username:     "multiuser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	// Create 2 custom-named connections
+	conn1 := &models.UserConnection{
+		ID:         "conn-lb-multi-phone",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "multi-phone-pubkey",
+		Name:       "Phone",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn1)
+
+	conn2 := &models.UserConnection{
+		ID:         "conn-lb-multi-laptop",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "multi-laptop-pubkey",
+		Name:       "Laptop",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now().Add(time.Second),
+	}
+	_, _ = db.CreateConnection(ctx, conn2)
+
+	sess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullConnectionsRouter(h)
+
+	// Fetch config for Phone
+	reqPhone := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/config", conn1.ID), nil)
+	wPhone := httptest.NewRecorder()
+	r.ServeHTTP(wPhone, reqPhone.WithContext(middleware.WithSession(reqPhone.Context(), sess)))
+	if wPhone.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Phone, got %d: %s", wPhone.Code, wPhone.Body.String())
+	}
+
+	// Fetch config for Laptop
+	reqLaptop := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/config", conn2.ID), nil)
+	wLaptop := httptest.NewRecorder()
+	r.ServeHTTP(wLaptop, reqLaptop.WithContext(middleware.WithSession(reqLaptop.Context(), sess)))
+	if wLaptop.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Laptop, got %d: %s", wLaptop.Code, wLaptop.Body.String())
+	}
+
+	// Verify exactly 2 connections remain, neither is phantom
+	conns, err := db.GetConnectionsByUserID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("failed to get connections: %v", err)
+	}
+	if len(conns) != 2 {
+		t.Fatalf("expected exactly 2 connections, got %d", len(conns))
+	}
+	phantomName := fmt.Sprintf("%s-awg", u.Username)
+	for _, c := range conns {
+		if c.Name == phantomName {
+			t.Errorf("phantom connection %q was created in DB", phantomName)
+		}
+	}
+}
