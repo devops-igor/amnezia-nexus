@@ -594,3 +594,133 @@ func TestVPNEnableBackendHandler_DynamicFallback(t *testing.T) {
 		t.Errorf("expected port 51820, got %v", awgData["port"])
 	}
 }
+
+// newAWGMockSSH returns an SSH client mock that satisfies the AWG
+// auto-detection fallback path (issue #29 delete tests): the server carries
+// no awg protocol entry, so EnableBackend resolves credentials via live SSH
+// probing — docker ps for the amnezia-awg container, wg0.conf for the port
+// and private key, wireguard_server_public_key.key for the public key.
+func newAWGMockSSH() *testMockSSHClient {
+	return &testMockSSHClient{
+		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "docker ps -a") && strings.Contains(cmd, "amnezia-awg") {
+				return "amnezia-awg\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-awg") {
+				return "Up 1 hour\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wg0.conf") || strings.Contains(cmd, "awg0.conf") {
+				return "[Interface]\nListenPort = 51820\nPrivateKey = server-priv\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wireguard_server_public_key.key") {
+				return "fallback-server-public-key\n", "", 0, nil
+			}
+			return "", "", 0, nil
+		},
+	}
+}
+
+// TestVPNDeleteBackendHandler covers the issue #29 DELETE route end-to-end
+// through setupFullVPNRouter: enable (mocked AWG over SSH) -> delete (200,
+// backend gone from the pool listing and the backend_tunnels table) ->
+// delete again (404) -> invalid id (400) -> unknown id (404).
+func TestVPNDeleteBackendHandler(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	srv := &models.Server{
+		Name:      "VPN-Node-Delete",
+		Host:      "127.0.0.1",
+		SSHPort:   22,
+		SSHUser:   "root",
+		SSHPass:   "pass",
+		Protocols: map[string]any{},
+		CreatedAt: time.Now(),
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullVPNRouter(h)
+
+	// Enable first so the backend tunnel exists in pool + DB.
+	reqEnable := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID), nil)
+	wEnable := httptest.NewRecorder()
+	r.ServeHTTP(wEnable, reqEnable)
+	if wEnable.Code != http.StatusOK {
+		t.Fatalf("setup: expected 200 when enabling backend, got %d (body: %s)", wEnable.Code, wEnable.Body.String())
+	}
+
+	// Success path: DELETE returns 200 and the backend disappears from the
+	// pool listing and the DB.
+	reqDelete := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/vpn/backends/%d", sID), nil)
+	wDelete := httptest.NewRecorder()
+	r.ServeHTTP(wDelete, reqDelete)
+	if wDelete.Code != http.StatusOK {
+		t.Fatalf("expected 200 when deleting backend, got %d (body: %s)", wDelete.Code, wDelete.Body.String())
+	}
+
+	reqList := httptest.NewRequest(http.MethodGet, "/api/vpn/backends", nil)
+	wList := httptest.NewRecorder()
+	r.ServeHTTP(wList, reqList)
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200 when listing backends, got %d", wList.Code)
+	}
+	var listResp struct {
+		Backends []struct {
+			ServerID int64 `json:"server_id"`
+		} `json:"backends"`
+	}
+	if err := json.NewDecoder(wList.Body).Decode(&listResp); err != nil {
+		t.Fatalf("failed to decode backends listing: %v", err)
+	}
+	for _, b := range listResp.Backends {
+		if b.ServerID == sID {
+			t.Errorf("backend %d still listed after DELETE", sID)
+		}
+	}
+
+	row, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if row != nil {
+		t.Errorf("backend_tunnels row id=%d still present after DELETE", row.ID)
+	}
+
+	// The server itself must be untouched (only the tunnel registration is
+	// removed, never the server or its protocol config).
+	if _, err := db.GetServer(ctx, sID); err != nil {
+		t.Errorf("server %d must survive backend delete: %v", sID, err)
+	}
+
+	// DELETE after already deleted -> 404 backend_not_found.
+	reqAgain := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/vpn/backends/%d", sID), nil)
+	wAgain := httptest.NewRecorder()
+	r.ServeHTTP(wAgain, reqAgain)
+	if wAgain.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when deleting an already-deleted backend, got %d (body: %s)", wAgain.Code, wAgain.Body.String())
+	}
+	var errResp map[string]any
+	_ = json.NewDecoder(wAgain.Body).Decode(&errResp)
+	if errCode, _ := errResp["error"].(string); errCode != "backend_not_found" {
+		t.Errorf("expected error code 'backend_not_found', got: %v", errCode)
+	}
+
+	// Invalid server_id -> 400.
+	reqInvalid := httptest.NewRequest(http.MethodDelete, "/api/vpn/backends/invalid", nil)
+	wInvalid := httptest.NewRecorder()
+	r.ServeHTTP(wInvalid, reqInvalid)
+	if wInvalid.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid server_id, got %d", wInvalid.Code)
+	}
+
+	// Unknown server id -> 404.
+	reqUnknown := httptest.NewRequest(http.MethodDelete, "/api/vpn/backends/99999", nil)
+	wUnknown := httptest.NewRecorder()
+	r.ServeHTTP(wUnknown, reqUnknown)
+	if wUnknown.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown server id, got %d", wUnknown.Code)
+	}
+}

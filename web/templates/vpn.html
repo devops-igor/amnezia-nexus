@@ -302,6 +302,15 @@
             vpnToggleBackend(b.server_id || b.id, disabledBackend ? 'enable' : 'disable');
         });
         tdActions.appendChild(btn);
+
+        const btnDelete = document.createElement('button');
+        btnDelete.type = 'button';
+        btnDelete.className = 'btn btn-sm btn-danger';
+        btnDelete.textContent = _('vpn_delete');
+        btnDelete.addEventListener('click', function () {
+            vpnDeleteBackend(b.server_id || b.id);
+        });
+        tdActions.appendChild(btnDelete);
         tr.appendChild(tdActions);
 
         return tr;
@@ -326,6 +335,37 @@
                 throw new Error(errMsg);
             }
             showToast(action === 'enable' ? _('vpn_enable') + ' OK' : _('vpn_disable') + ' OK', 'success');
+            vpnLoadData();
+        } catch (err) {
+            const errMsg = err.message || _('error');
+            const errBox = document.getElementById('vpnModalError');
+            if (errBox) {
+                errBox.textContent = errMsg;
+                errBox.style.display = 'block';
+            }
+            showToast(errMsg, 'error');
+        }
+    }
+
+    async function vpnDeleteBackend(serverId) {
+        if (!confirm(_('vpn_confirm_delete'))) return;
+        try {
+            const res = await fetch('/api/vpn/backends/' + encodeURIComponent(serverId), {
+                method: 'DELETE',
+                headers: { 'X-CSRF-Token': getCsrfToken() },
+            });
+            let data = null;
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = null;
+            }
+            if (!res.ok || (data && data.status && data.status !== 'ok')) {
+                const errMsg = (data && (data.detail || data.message || data.error)) ||
+                    `HTTP ${res.status} ${res.statusText || _('error')}`.trim();
+                throw new Error(errMsg);
+            }
+            showToast(_('vpn_delete') + ' OK', 'success');
             vpnLoadData();
         } catch (err) {
             const errMsg = err.message || _('error');

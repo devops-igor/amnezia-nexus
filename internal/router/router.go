@@ -298,6 +298,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/backends", h.VPNBackendsHandler)
 			r.Post("/backends/{server_id}/enable", h.VPNEnableBackendHandler)
 			r.Post("/backends/{server_id}/disable", h.VPNDisableBackendHandler)
+			r.Delete("/backends/{server_id}", h.VPNDeleteBackendHandler)
 			r.Get("/tunnels", h.VPNTunnelsHandler)
 			r.Get("/config", h.VPNGetConfigHandler)
 			r.Post("/config", h.VPNUpdateConfigHandler)

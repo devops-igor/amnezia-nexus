@@ -103,6 +103,35 @@ func (h *Handlers) VPNDisableBackendHandler(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// VPNDeleteBackendHandler permanently removes a backend tunnel from the
+// load-balancing pool (issue #29). The server itself and its AWG protocol
+// configuration are untouched; only the tunnel registration, its DB row and
+// any live session routing are drained and deleted.
+func (h *Handlers) VPNDeleteBackendHandler(w http.ResponseWriter, r *http.Request) {
+	serverID, err := parseServerID(r)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
+		return
+	}
+
+	ctx := r.Context()
+	if h.vpnSvc != nil {
+		if err := h.vpnSvc.DeleteBackend(ctx, serverID); err != nil {
+			if errors.Is(err, vpn.ErrBackendTunnelNotFound) {
+				h.JSONError(w, http.StatusNotFound, "backend_not_found", fmt.Sprintf("Backend %d not found", serverID))
+				return
+			}
+			// #nosec G706 -- Internal server audit log for failed backend delete
+			log.Printf("[vpn/handlers] failed to delete backend %d: %v", serverID, err)
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to delete backend")
+			return
+		}
+	}
+
+	h.audit(r, "vpn.backend_delete", map[string]any{"server_id": serverID})
+	h.JSONOK(w)
+}
+
 // VPNTunnelsHandler returns all active VPN tunnels (alias for backends).
 func (h *Handlers) VPNTunnelsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
