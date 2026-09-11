@@ -388,6 +388,35 @@ func (p *Pool) DecrementConnections(tunnelID int64) {
 	}
 }
 
+// SetConnectionCount sets a tunnel's active connections gauge to count and
+// persists it. It exists for the startup reconciliation (issue #54), which
+// recomputes the gauge from the authoritative vpn_sessions table; the normal
+// runtime path must keep using IncrementConnections/DecrementConnections.
+// On a DB persist failure the in-memory gauge is left updated while the DB
+// keeps the old value — the same divergence-on-error behavior as
+// IncrementConnections/DecrementConnections.
+func (p *Pool) SetConnectionCount(ctx context.Context, tunnelID int64, count int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByID[tunnelID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	if count < 0 {
+		count = 0
+	}
+	tunnel.ActiveConnections = count
+	if p.db != nil {
+		if err := p.db.UpdateBackendTunnel(ctx, tunnel.ID, map[string]any{
+			"active_connections": tunnel.ActiveConnections,
+		}); err != nil {
+			return fmt.Errorf("failed to persist active_connections for tunnel %d: %w", tunnel.ID, err)
+		}
+	}
+	return nil
+}
+
 // Close tears down all tunnels and cleans up resources.
 func (p *Pool) Close() error {
 	p.mu.Lock()
