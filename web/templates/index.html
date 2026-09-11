@@ -2,20 +2,35 @@
 <section>
     <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg);">
         <h1 class="section-title" style="margin-bottom:0;">
-            <span class="icon">🖥</span>
+            <svg class="icon"><use href="#icon-server"></use></svg>
             {{ _ "nav_servers" }}
         </h1>
         <button class="btn btn-primary" onclick="openModal('addServerModal')">
-            <span>＋</span> {{ _ "add_server" }}
+            <svg class="icon"><use href="#icon-plus"></use></svg> {{ _ "add_server" }}
         </button>
     </div>
 
     {{ if .servers }}
+    <!-- Search and filtering toolbar -->
+    <div class="table-toolbar" style="margin-bottom: var(--space-lg);">
+        <div class="table-search-box">
+            <svg class="table-search-icon icon"><use href="#icon-search"></use></svg>
+            <input type="text" class="table-search-input" id="serverSearchInput"
+                   placeholder="{{ _ "search" }}..." oninput="filterServers(this.value)">
+            <button type="button" class="table-search-clear" id="serverSearchClear"
+                    style="display:none;" onclick="clearServerSearch()" aria-label="{{ _ "cancel" }}">×</button>
+        </div>
+        <div class="text-sm text-muted" id="serverFilterCount"></div>
+    </div>
+
     <div class="server-grid" id="serverGrid">
         {{ range $server := .servers }}
-        <div class="card card-hover server-card" id="server-{{ $server.ID }}">
+        <div class="card card-hover server-card" id="server-{{ $server.ID }}"
+             data-server-name="{{ $server.Name }}" data-server-host="{{ $server.Host }}">
             <div class="server-meta">
-                <div class="server-icon">🖥</div>
+                <div class="server-icon">
+                    <svg class="icon" style="width:24px;height:24px;color:#fff;"><use href="#icon-server"></use></svg>
+                </div>
                 <div>
                     <div class="server-name" id="server-name-{{ $server.ID }}">{{ $server.Name }}</div>
                     <div class="server-host">{{ $server.Host }}:{{ $server.SSHPort }}</div>
@@ -46,25 +61,30 @@
                 </a>
                 <button class="btn btn-secondary btn-sm btn-icon" onclick="openRenameServerModal({{ $server.ID }}, '{{ $server.Name }}')"
                     title="{{ _ "rename_server" }}">
-                    ✏️
+                    <svg class="icon"><use href="#icon-pencil"></use></svg>
                 </button>
                 <button class="btn btn-danger btn-sm btn-icon" onclick="deleteServer({{ $server.ID }})"
                     title="{{ _ "delete" }}">
-                    🗑
+                    <svg class="icon"><use href="#icon-trash"></use></svg>
                 </button>
             </div>
         </div>
         {{ end }}
+        <div id="serverSearchEmpty" class="empty-state hidden" style="grid-column: 1 / -1; padding: var(--space-xl) 0;">
+            <div class="empty-icon"><svg class="icon" style="width:40px;height:40px;"><use href="#icon-search"></use></svg></div>
+            <div class="empty-title">{{ _ "no_matching_records" }}</div>
+            <div class="empty-desc">{{ _ "try_adjusting_search" }}</div>
+        </div>
     </div>
     {{ else }}
     <div class="empty-state">
-        <div class="empty-icon">🛡</div>
+        <div class="empty-icon"><svg class="icon" style="width:48px;height:48px;"><use href="#icon-shield"></use></svg></div>
         <div class="empty-title">{{ _ "no_servers" }}</div>
         <div class="empty-desc">
             {{ _ "add_server_desc" }}
         </div>
         <button class="btn btn-primary" onclick="openModal('addServerModal')">
-            <span>＋</span> {{ _ "add_server" }}
+            <svg class="icon"><use href="#icon-plus"></use></svg> {{ _ "add_server" }}
         </button>
     </div>
     {{ end }}
@@ -74,8 +94,13 @@
 <div class="modal-backdrop" id="addServerModal">
     <div class="modal">
         <div class="modal-header">
-            <h2 class="modal-title">{{ _ "add_server" }}</h2>
-            <button class="modal-close" onclick="closeModal('addServerModal')">×</button>
+            <h2 class="modal-title">
+                <svg class="icon"><use href="#icon-server"></use></svg>
+                {{ _ "add_server" }}
+            </h2>
+            <button class="modal-close" onclick="closeModal('addServerModal')" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
 
         <form id="addServerForm" onsubmit="return addServer(event)">
@@ -137,8 +162,13 @@
 <div class="modal-backdrop" id="renameServerModal">
     <div class="modal" style="max-width: 400px;">
         <div class="modal-header">
-            <h2 class="modal-title">{{ _ "rename_server" }}</h2>
-            <button class="modal-close" onclick="closeRenameServerModal()">×</button>
+            <h2 class="modal-title">
+                <svg class="icon"><use href="#icon-pencil"></use></svg>
+                {{ _ "rename_server" }}
+            </h2>
+            <button class="modal-close" onclick="closeRenameServerModal()" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
@@ -156,6 +186,42 @@
 
 {{ define "scripts" }}
 <script>
+    function filterServers(query) {
+        const q = (query || '').trim().toLowerCase();
+        const clearBtn = document.getElementById('serverSearchClear');
+        if (clearBtn) clearBtn.style.display = q ? 'flex' : 'none';
+
+        const cards = Array.from(document.querySelectorAll('.server-grid .server-card'));
+        let visibleCount = 0;
+
+        cards.forEach(card => {
+            const name = (card.getAttribute('data-server-name') || '').toLowerCase();
+            const host = (card.getAttribute('data-server-host') || '').toLowerCase();
+            const matches = !q || name.includes(q) || host.includes(q);
+            card.style.display = matches ? '' : 'none';
+            if (matches) visibleCount++;
+        });
+
+        const emptyEl = document.getElementById('serverSearchEmpty');
+        if (emptyEl) {
+            emptyEl.classList.toggle('hidden', visibleCount > 0);
+        }
+
+        const countEl = document.getElementById('serverFilterCount');
+        if (countEl) {
+            countEl.textContent = q ? `${visibleCount} / ${cards.length}` : '';
+        }
+    }
+
+    function clearServerSearch() {
+        const input = document.getElementById('serverSearchInput');
+        if (input) {
+            input.value = '';
+            input.focus();
+        }
+        filterServers('');
+    }
+
     function switchAuthTab(tab, btn) {
         document.querySelectorAll('.tabs .tab').forEach(t => t.classList.remove('active'));
         btn.classList.add('active');
@@ -185,7 +251,7 @@
                 private_key: document.getElementById('serverKey').value,
             };
 
-            const result = await apiCall('/api/servers/add', 'POST', data);
+            const result = await API.post('/api/servers/add', data);
 
             if (result.status === 'pending_fingerprint_confirmation') {
                 btn.disabled = false;
@@ -194,7 +260,13 @@
 
                 const msg = 'SSH host key fingerprint:\n\n' + result.fingerprint +
                     '\n\nVerify this matches the server\'s key, then confirm to add.';
-                if (!confirm(msg)) return;
+                const confirmed = await UI.confirm({
+                    title: 'SSH Host Key Verification',
+                    message: msg,
+                    confirmText: 'Trust & Connect',
+                    confirmVariant: 'primary'
+                });
+                if (!confirmed) return;
 
                 btn.disabled = true;
                 btnText.textContent = _('connecting');
@@ -210,16 +282,16 @@
                     server_info: result.server_info || '',
                     fingerprint: result.fingerprint,
                 };
-                await apiCall('/api/servers/confirm-fingerprint', 'POST', confirmData);
-                showToast(_('server_added'), 'success');
+                await API.post('/api/servers/confirm-fingerprint', confirmData);
+                UI.toast(_('server_added'), 'success');
                 setTimeout(() => window.location.reload(), 800);
                 return;
             }
-            showToast(_('server_added'), 'success');
+            UI.toast(_('server_added'), 'success');
             setTimeout(() => window.location.reload(), 800);
 
         } catch (err) {
-            showToast(err.message, 'error');
+            UI.toast(err.message, 'error');
         } finally {
             btn.disabled = false;
             btnText.textContent = _('connect');
@@ -228,14 +300,19 @@
     }
 
     async function deleteServer(serverId) {
-        if (!confirm(_('delete_confirm'))) return;
+        const confirmed = await UI.confirm({
+            title: _('delete') || 'Delete Server',
+            message: _('delete_confirm') || 'Are you sure you want to delete this server?',
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
 
         try {
-            await apiCall(`/api/servers/${serverId}/delete`, 'POST');
-            showToast(_('server_deleted'), 'success');
+            await API.post(`/api/servers/${serverId}/delete`);
+            UI.toast(_('server_deleted'), 'success');
             setTimeout(() => window.location.reload(), 500);
         } catch (err) {
-            showToast(err.message, 'error');
+            UI.toast(err.message, 'error');
         }
     }
 
@@ -249,10 +326,7 @@
         if (input) {
             input.value = name;
         }
-        openModal('renameServerModal');
-        if (input) {
-            setTimeout(() => input.focus(), 50);
-        }
+        openModal('renameServerModal', '#renameServerInput');
     }
 
     function closeRenameServerModal() {
@@ -265,21 +339,23 @@
         const input = document.getElementById('renameServerInput');
         const newName = input ? input.value.trim() : '';
         if (!newName) {
-            showToast(_('validation_failed') || 'Name cannot be empty', 'error');
+            UI.toast(_('validation_failed') || 'Name cannot be empty', 'error');
             return;
         }
         try {
-            const res = await apiCall(`/api/servers/${renameServerId}/rename`, 'POST', { name: newName });
-            showToast(_('server_renamed') || 'Server renamed', 'success');
+            await API.post(`/api/servers/${renameServerId}/rename`, { name: newName });
+            UI.toast(_('server_renamed') || 'Server renamed', 'success');
             closeRenameServerModal();
             const nameEl = document.getElementById(`server-name-${renameServerId}`);
             if (nameEl) {
                 nameEl.textContent = newName;
+                const card = document.getElementById(`server-${renameServerId}`);
+                if (card) card.setAttribute('data-server-name', newName);
             } else {
                 setTimeout(() => window.location.reload(), 300);
             }
         } catch (err) {
-            showToast(err.message, 'error');
+            UI.toast(err.message, 'error');
         }
     }
 </script>

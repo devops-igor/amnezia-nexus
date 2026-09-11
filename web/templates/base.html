@@ -6,11 +6,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="{{ _ "site_description" }}">
     <meta name="csrf-token" content="{{ .csrf_token }}">
-    <title>{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Panel{{ end }} {{ block "title_extra" . }}{{ end }}</title>
+    <title>{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Nexus{{ end }} {{ block "title_extra" . }}{{ end }}</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/css/style.css">
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t) }()</script>
     <script src="/static/js/qrcode.min.js"></script>
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/ui.js"></script>
+    <script src="/static/js/tables.js"></script>
+    <script src="/static/js/telemetry.js"></script>
     {{ block "head_extra" . }}{{ end }}
     <style>
         .lang-check {
@@ -29,63 +33,371 @@
 </head>
 
 <body>
+    <!-- ===== SVG Icon Sprite System ===== -->
+    <svg xmlns="http://www.w3.org/2000/svg" style="display: none;" id="nexus-svg-icons">
+        <defs>
+            <symbol id="icon-server" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+                <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+                <line x1="6" y1="6" x2="6.01" y2="6"></line>
+                <line x1="6" y1="18" x2="6.01" y2="18"></line>
+            </symbol>
+            <symbol id="icon-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </symbol>
+            <symbol id="icon-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                <circle cx="9" cy="7" r="4"></circle>
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </symbol>
+            <symbol id="icon-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+            </symbol>
+            <symbol id="icon-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="16" y="16" width="6" height="6" rx="1"></rect>
+                <rect x="2" y="16" width="6" height="6" rx="1"></rect>
+                <rect x="9" y="2" width="6" height="6" rx="1"></rect>
+                <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"></path>
+                <path d="M12 12V8"></path>
+            </symbol>
+            <symbol id="icon-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+            </symbol>
+            <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </symbol>
+            <symbol id="icon-key" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 2l-2 2m-1.5 1.5L13 10"></path>
+                <circle cx="7.5" cy="15.5" r="5.5"></circle>
+                <path d="m16 8 2 2"></path>
+                <path d="m13 11 3 3"></path>
+            </symbol>
+            <symbol id="icon-trophy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"></path>
+                <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"></path>
+                <path d="M4 22h16"></path>
+                <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"></path>
+                <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"></path>
+                <path d="M18 2H6v7a6 6 0 0 0 12 0V2z"></path>
+            </symbol>
+            <symbol id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="5"></circle>
+                <line x1="12" y1="1" x2="12" y2="3"></line>
+                <line x1="12" y1="21" x2="12" y2="23"></line>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                <line x1="1" y1="12" x2="3" y2="12"></line>
+                <line x1="21" y1="12" x2="23" y2="12"></line>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+            </symbol>
+            <symbol id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+            </symbol>
+            <symbol id="icon-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="2" y1="12" x2="22" y2="12"></line>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </symbol>
+            <symbol id="icon-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                <polyline points="16 17 21 12 16 7"></polyline>
+                <line x1="21" y1="12" x2="9" y2="12"></line>
+            </symbol>
+            <symbol id="icon-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+            </symbol>
+            <symbol id="icon-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+            </symbol>
+            <symbol id="icon-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+            </symbol>
+            <symbol id="icon-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                <line x1="10" y1="11" x2="10" y2="17"></line>
+                <line x1="14" y1="11" x2="14" y2="17"></line>
+            </symbol>
+            <symbol id="icon-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+            </symbol>
+            <symbol id="icon-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"></polyline>
+            </symbol>
+            <symbol id="icon-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"></polyline>
+            </symbol>
+            <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+            </symbol>
+            <symbol id="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </symbol>
+            <symbol id="icon-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+            </symbol>
+            <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </symbol>
+            <symbol id="icon-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+            </symbol>
+            <symbol id="icon-arrow-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"></line>
+                <polyline points="5 12 12 5 19 12"></polyline>
+            </symbol>
+            <symbol id="icon-arrow-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <polyline points="19 12 12 19 5 12"></polyline>
+            </symbol>
+            <symbol id="icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <polyline points="1 20 1 14 7 14"></polyline>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </symbol>
+            <symbol id="icon-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+            </symbol>
+            <symbol id="icon-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </symbol>
+            <symbol id="icon-qr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="7" height="7"></rect>
+                <rect x="14" y="3" width="7" height="7"></rect>
+                <rect x="14" y="14" width="7" height="7"></rect>
+                <rect x="3" y="14" width="7" height="7"></rect>
+                <line x1="7" y1="7" x2="7.01" y2="7"></line>
+                <line x1="17" y1="7" x2="17.01" y2="7"></line>
+                <line x1="7" y1="17" x2="7.01" y2="17"></line>
+                <line x1="17" y1="17" x2="17.01" y2="17"></line>
+            </symbol>
+            <symbol id="icon-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                <line x1="16" y1="2" x2="16" y2="6"></line>
+                <line x1="8" y1="2" x2="8" y2="6"></line>
+                <line x1="3" y1="10" x2="21" y2="10"></line>
+            </symbol>
+            <symbol id="icon-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </symbol>
+            <symbol id="icon-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+            </symbol>
+            <symbol id="icon-file-text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+                <polyline points="10 9 9 9 8 9"></polyline>
+            </symbol>
+            <symbol id="icon-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+            </symbol>
+            <symbol id="icon-database" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+            </symbol>
+            <symbol id="icon-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </symbol>
+        </defs>
+    </svg>
+
+    <!-- ===== Toast Notifications Container ===== -->
     <div class="toast-container" id="toastContainer"></div>
 
-    <div class="app-container">
-        <header class="app-header">
-            <a href="{{ if has_role .current_user "admin" "support" }}/{{ else }}/my{{ end }}" class="app-logo" style="text-decoration:none">
-                <div class="logo-icon">{{ if .site_settings.Logo }}{{ .site_settings.Logo }}{{ else }}🛡{{ end }}</div>
-                <div>
-                    <div class="logo-text">{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Panel{{ end }}</div>
-                    <div class="logo-subtitle">{{ if .site_settings.Subtitle }}{{ .site_settings.Subtitle }}{{ else }}Web Panel{{ end }}</div>
-                </div>
-            </a>
+    <!-- ===== Mobile Sticky Header (< 1024px) ===== -->
+    <header class="mobile-topbar">
+        <button class="btn btn-icon btn-ghost" id="drawerToggle" onclick="toggleMobileDrawer()" aria-label="Open menu">
+            <svg class="icon"><use href="#icon-menu"></use></svg>
+        </button>
+        <a href="{{ if has_role .current_user "admin" "support" }}/{{ else }}/my{{ end }}" class="app-logo" style="text-decoration:none">
+            <div class="logo-icon" style="width:36px;height:36px;font-size:18px;">
+                {{ if .site_settings.Logo }}{{ .site_settings.Logo }}{{ else }}<svg class="icon" style="width:20px;height:20px;color:#fff;"><use href="#icon-shield"></use></svg>{{ end }}
+            </div>
+            <div>
+                <div class="logo-text" style="font-size:1.1rem;">{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Nexus{{ end }}</div>
+            </div>
+        </a>
+        <div class="mobile-topbar-actions">
+            <button class="theme-toggle" onclick="openModal('langModal')" title="{{ _ "select_lang" }}">
+                <svg class="icon"><use href="#icon-globe"></use></svg>
+            </button>
+            <button class="theme-toggle" onclick="toggleTheme()" title="{{ _ "toggle_theme" }}" id="mobileThemeToggle">
+                <svg class="icon"><use href="#icon-moon"></use></svg>
+            </button>
+        </div>
+    </header>
 
-            {{ if .current_user }}
-            <nav class="header-nav">
-                {{ if has_role .current_user "admin" "support" }}
-                <a href="/" class="nav-link">{{ _ "nav_servers" }}</a>
-                <a href="/users" class="nav-link">{{ _ "nav_users" }}</a>
-                <a href="/vpn" class="nav-link">{{ _ "nav_vpn" }}</a>
+    <!-- ===== App Layout (Sidebar + Main Area) ===== -->
+    <div class="app-layout">
+        <!-- Desktop Sidebar & Mobile Drawer -->
+        <aside class="app-sidebar" id="appSidebar">
+            <div class="sidebar-header">
+                <a href="{{ if has_role .current_user "admin" "support" }}/{{ else }}/my{{ end }}" class="app-logo" style="text-decoration:none">
+                    <div class="logo-icon">
+                        {{ if .site_settings.Logo }}{{ .site_settings.Logo }}{{ else }}<svg class="icon" style="width:24px;height:24px;color:#fff;"><use href="#icon-shield"></use></svg>{{ end }}
+                    </div>
+                    <div class="logo-text-group">
+                        <div class="logo-title">{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Nexus{{ end }}</div>
+                        <div class="logo-badge">{{ if .site_settings.Subtitle }}{{ .site_settings.Subtitle }}{{ else }}Console{{ end }}</div>
+                    </div>
+                </a>
+                <button class="mobile-close-btn" onclick="toggleMobileDrawer()" aria-label="Close menu">
+                    <svg class="icon"><use href="#icon-x"></use></svg>
+                </button>
+            </div>
+
+            <!-- Navigation Links with SVG Icons and Active State -->
+            <nav class="sidebar-nav">
+                {{ if .current_user }}
+                    {{ if has_role .current_user "admin" "support" }}
+                    <div class="nav-section-label">INFRASTRUCTURE</div>
+                    <a href="/" class="sidebar-nav-link nav-link {{ if eq .active_page "servers" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-server"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_servers" }}</span>
+                    </a>
+                    <a href="/users" class="sidebar-nav-link nav-link {{ if eq .active_page "users" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-users"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_users" }}</span>
+                    </a>
+                    <a href="/vpn" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-network"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_vpn" }}</span>
+                    </a>
+                    {{ end }}
+
+                    {{ if has_role .current_user "admin" }}
+                    <a href="/settings" class="sidebar-nav-link nav-link {{ if eq .active_page "settings" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-settings"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_settings" }}</span>
+                    </a>
+                    {{ end }}
+
+                    <div class="nav-section-label">CLIENT</div>
+                    <a href="/my" class="sidebar-nav-link nav-link {{ if eq .active_page "my_connections" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-key"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_connections" }}</span>
+                    </a>
+                    <a href="/leaderboard" class="sidebar-nav-link nav-link {{ if eq .active_page "leaderboard" }}active{{ end }}">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-trophy"></use></svg></span>
+                        <span class="nav-label">{{ _ "leaderboard_nav" }}</span>
+                    </a>
+                {{ else }}
+                    <div class="nav-section-label">ACCESS</div>
+                    <a href="/my" class="sidebar-nav-link nav-link">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-key"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_connections" }}</span>
+                    </a>
+                    <a href="/login" class="sidebar-nav-link nav-link">
+                        <span class="nav-icon"><svg class="icon"><use href="#icon-shield"></use></svg></span>
+                        <span class="nav-label">{{ _ "login_title" }}</span>
+                    </a>
                 {{ end }}
-                {{ if has_role .current_user "admin" }}
-                <a href="/settings" class="nav-link">{{ _ "nav_settings" }}</a>
-                {{ end }}
-                <a href="/my" class="nav-link">{{ _ "nav_connections" }}</a>
-                <a href="/leaderboard" class="nav-link">🏆 {{ _ "leaderboard_nav" }}</a>
             </nav>
 
-            <div class="nav-user">
-                <button class="theme-toggle" onclick="openModal('langModal')" title="{{ _ "select_lang" }}"
-                    style="margin-right: var(--space-sm);">
-                    {{ if eq .lang "ru" }}🇷🇺{{ else if eq .lang "fr" }}🇫🇷{{ else if eq .lang "zh" }}🇨🇳{{ else if eq .lang "fa" }}🇮🇷{{ else }}🇺🇸{{ end }}
-                </button>
-                <button class="theme-toggle" onclick="toggleTheme()" title="{{ _ "toggle_theme" }}"
-                    id="themeToggle">🌙</button>
-                <span class="nav-username">{{ .current_user.Username }}</span>
-                <span
-                    class="badge badge-{{ if eq .current_user.Role "admin" }}success{{ else if eq .current_user.Role "support" }}info{{ else }}warn{{ end }}"
-                    style="font-size:0.65rem;">
-                    {{ .current_user.Role | upper }}
-                </span>
-                <a href="/logout" class="btn btn-secondary btn-sm">{{ _ "nav_logout" }}</a>
+            <!-- User Profile & Quick Actions Footer -->
+            <div class="sidebar-footer">
+                {{ if .current_user }}
+                <div class="sidebar-user-card">
+                    <div class="user-avatar">{{ if .current_user.Username }}{{ slice .current_user.Username 0 1 | upper }}{{ else }}<svg class="icon" style="width:16px;height:16px;"><use href="#icon-user"></use></svg>{{ end }}</div>
+                    <div class="user-details">
+                        <span class="user-name" title="{{ .current_user.Username }}">{{ if .current_user.Username }}{{ .current_user.Username }}{{ else }}User{{ end }}</span>
+                        {{ if .current_user.Role }}
+                        <span class="badge badge-{{ if eq .current_user.Role "admin" }}success{{ else if eq .current_user.Role "support" }}info{{ else }}warn{{ end }}" style="font-size:0.65rem; align-self: flex-start;">
+                            {{ .current_user.Role | upper }}
+                        </span>
+                        {{ end }}
+                    </div>
+                </div>
+                <div class="sidebar-actions">
+                    <button class="theme-toggle" onclick="openModal('langModal')" title="{{ _ "select_lang" }}">
+                        <svg class="icon"><use href="#icon-globe"></use></svg>
+                    </button>
+                    <button class="theme-toggle" onclick="toggleTheme()" title="{{ _ "toggle_theme" }}" id="themeToggle">
+                        <svg class="icon"><use href="#icon-moon"></use></svg>
+                    </button>
+                    <a href="/logout" class="btn btn-icon btn-ghost" title="{{ _ "nav_logout" }}" style="color: var(--danger);">
+                        <svg class="icon"><use href="#icon-logout"></use></svg>
+                    </a>
+                </div>
+                {{ else }}
+                <div class="sidebar-actions" style="justify-content: flex-end;">
+                    <button class="theme-toggle" onclick="openModal('langModal')" title="{{ _ "select_lang" }}">
+                        <svg class="icon"><use href="#icon-globe"></use></svg>
+                    </button>
+                    <button class="theme-toggle" onclick="toggleTheme()" title="{{ _ "toggle_theme" }}" id="themeToggle">
+                        <svg class="icon"><use href="#icon-moon"></use></svg>
+                    </button>
+                </div>
+                {{ end }}
             </div>
-            {{ else }}
-            <div class="nav-user">
-                <button class="theme-toggle" onclick="openModal('langModal')" title="{{ _ "select_lang" }}"
-                    style="margin-right: var(--space-sm);">
-                    {{ if eq .lang "ru" }}🇷🇺{{ else if eq .lang "fr" }}🇫🇷{{ else if eq .lang "zh" }}🇨🇳{{ else if eq .lang "fa" }}🇮🇷{{ else }}🇺🇸{{ end }}
-                </button>
-                <button class="theme-toggle" onclick="toggleTheme()" title="{{ _ "toggle_theme" }}"
-                    id="themeToggle">🌙</button>
-            </div>
-            {{ end }}
-        </header>
+        </aside>
 
-        <main>
+        <!-- Drawer Backdrop for mobile -->
+        <div class="drawer-backdrop" id="drawerBackdrop" onclick="toggleMobileDrawer()"></div>
+
+        <!-- Main Content Area -->
+        <main class="app-main">
             {{ block "content" . }}{{ end }}
         </main>
     </div>
+
+    <!-- Mobile Bottom Navigation Bar (< 768px) -->
+    <nav class="mobile-bottom-bar" id="mobileBottomBar">
+        {{ if .current_user }}
+            {{ if has_role .current_user "admin" "support" }}
+            <a href="/" class="bottom-bar-link {{ if eq .active_page "servers" }}active{{ end }}">
+                <svg class="icon"><use href="#icon-server"></use></svg>
+                <span>{{ _ "nav_servers" }}</span>
+            </a>
+            <a href="/users" class="bottom-bar-link {{ if eq .active_page "users" }}active{{ end }}">
+                <svg class="icon"><use href="#icon-users"></use></svg>
+                <span>{{ _ "nav_users" }}</span>
+            </a>
+            <a href="/vpn" class="bottom-bar-link {{ if eq .active_page "vpn" }}active{{ end }}">
+                <svg class="icon"><use href="#icon-network"></use></svg>
+                <span>{{ _ "nav_vpn" }}</span>
+            </a>
+            {{ end }}
+            <a href="/my" class="bottom-bar-link {{ if eq .active_page "my_connections" }}active{{ end }}">
+                <svg class="icon"><use href="#icon-key"></use></svg>
+                <span>{{ _ "nav_connections" }}</span>
+            </a>
+            <a href="/leaderboard" class="bottom-bar-link {{ if eq .active_page "leaderboard" }}active{{ end }}">
+                <svg class="icon"><use href="#icon-trophy"></use></svg>
+                <span>{{ _ "leaderboard_nav" }}</span>
+            </a>
+        {{ else }}
+            <a href="/my" class="bottom-bar-link">
+                <svg class="icon"><use href="#icon-key"></use></svg>
+                <span>{{ _ "nav_connections" }}</span>
+            </a>
+            <a href="/login" class="bottom-bar-link">
+                <svg class="icon"><use href="#icon-shield"></use></svg>
+                <span>{{ _ "login_title" }}</span>
+            </a>
+        {{ end }}
+    </nav>
 
     <!-- ===== Language Modal ===== -->
     <div class="modal-backdrop" id="langModal">
@@ -139,35 +451,53 @@
         </div>
     </div>
 
+    <!-- ===== Reusable Confirmation Modal ===== -->
+    <div class="modal-backdrop" id="nexusConfirmModal">
+        <div class="modal" style="max-width: 440px;">
+            <div class="modal-header">
+                <h2 class="modal-title" id="nexusConfirmTitle">{{ _ "confirm_action" }}</h2>
+                <button class="modal-close" type="button" aria-label="Close" id="nexusConfirmCloseBtn" onclick="UI.modal.close('nexusConfirmModal')">×</button>
+            </div>
+            <div id="nexusConfirmBody" style="font-size: 0.95rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: var(--space-lg); word-break: break-word;">
+            </div>
+            <div class="modal-footer" style="display: flex; gap: var(--space-sm); justify-content: flex-end;">
+                <button type="button" class="btn btn-secondary" id="nexusConfirmCancelBtn" onclick="UI.modal.close('nexusConfirmModal')">{{ _ "cancel" }}</button>
+                <button type="button" class="btn btn-danger" id="nexusConfirmOkBtn">{{ _ "confirm" }}</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        /* ===== XSS Prevention: Global escape functions ===== */
-        function escapeHtml(str) {
-            if (str === null || str === undefined) return '';
-            return String(str)
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#39;');
-        }
-
-        function escapeJs(str) {
-            if (str === null || str === undefined) return '';
-            return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-        }
-
+        /* ===== Translation Setup ===== */
         window.I18N = {{ .translations_json | safe_js }};
         window._ = function (key) { return window.I18N[key] || key; };
 
-        /* ===== CSRF Token for AJAX requests ===== */
-        window.getCsrfToken = function() {
-            // Try meta tag first (more reliable)
-            const meta = document.querySelector('meta[name="csrf-token"]');
-            if (meta) return meta.getAttribute('content');
-            // Fallback to cookie
-            const match = document.cookie.match(/csrftoken=([^;]+)/);
-            return match ? match[1] : '';
+        /* ===== Mobile Drawer Toggle ===== */
+        window.toggleMobileDrawer = function(forceState) {
+            const sidebar = document.getElementById('appSidebar');
+            const backdrop = document.getElementById('drawerBackdrop');
+            if (!sidebar) return;
+
+            const shouldOpen = typeof forceState === 'boolean'
+                ? forceState
+                : !sidebar.classList.contains('drawer-open');
+
+            if (shouldOpen) {
+                sidebar.classList.add('drawer-open');
+                if (backdrop) backdrop.classList.add('active');
+                document.body.style.overflow = 'hidden';
+            } else {
+                sidebar.classList.remove('drawer-open');
+                if (backdrop) backdrop.classList.remove('active');
+                document.body.style.overflow = '';
+            }
         };
+
+        window.addEventListener('resize', function() {
+            if (window.innerWidth >= 1024) {
+                window.toggleMobileDrawer(false);
+            }
+        });
 
         /* ===== Theme Toggle ===== */
         (function () {
@@ -179,7 +509,9 @@
                 document.querySelectorAll('.theme-toggle').forEach(btn => {
                     const isLang = btn.getAttribute('onclick') && btn.getAttribute('onclick').includes('langModal');
                     if (!isLang) {
-                        btn.textContent = isLight ? '☀️' : '🌙';
+                        btn.innerHTML = isLight
+                            ? '<svg class="icon"><use href="#icon-sun"></use></svg>'
+                            : '<svg class="icon"><use href="#icon-moon"></use></svg>';
                     }
                 });
             };
@@ -202,202 +534,12 @@
         /* ===== Active Nav Link ===== */
         (function () {
             const path = window.location.pathname;
-            document.querySelectorAll('.nav-link').forEach(link => {
+            document.querySelectorAll('.sidebar-nav-link, .bottom-bar-link, .nav-link').forEach(link => {
                 const href = link.getAttribute('href');
                 if (href === '/' && path === '/') link.classList.add('active');
                 else if (href !== '/' && path.startsWith(href)) link.classList.add('active');
             });
         })();
-
-        /* ===== Toast Notifications ===== */
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toastContainer');
-            if (!container) return;
-            const toast = document.createElement('div');
-            toast.className = `toast toast-${type}`;
-
-            const icons = { success: '✓', error: '✕', info: 'ℹ' };
-            const iconSpan = document.createElement('span');
-            iconSpan.textContent = icons[type] || 'ℹ';
-            const msgSpan = document.createElement('span');
-            msgSpan.textContent = String(message || '');
-
-            toast.appendChild(iconSpan);
-            toast.appendChild(document.createTextNode(' '));
-            toast.appendChild(msgSpan);
-
-            container.appendChild(toast);
-            setTimeout(() => {
-                toast.style.opacity = '0';
-                toast.style.transform = 'translateX(100%)';
-                toast.style.transition = 'all 0.3s ease';
-                setTimeout(() => toast.remove(), 300);
-            }, 4000);
-        }
-
-        /* ===== Modal Management ===== */
-        let previousActiveElement = null;
-
-        function openModal(id, focusSelector = null) {
-            const modal = document.getElementById(id);
-            if (modal) {
-                previousActiveElement = document.activeElement;
-                modal.classList.add('active');
-                document.body.style.overflow = 'hidden';
-                // Auto-focus first input/select or specified selector
-                const focusTarget = focusSelector
-                    ? modal.querySelector(focusSelector)
-                    : modal.querySelector('input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])');
-                if (focusTarget) {
-                    setTimeout(() => focusTarget.focus(), 100);
-                }
-            }
-        }
-
-        function closeModal(id) {
-            const modal = document.getElementById(id);
-            if (modal) {
-                modal.classList.remove('active');
-                document.body.style.overflow = '';
-                // Restore focus to previously focused element
-                if (previousActiveElement && previousActiveElement.focus) {
-                    previousActiveElement.focus();
-                }
-            }
-        }
-
-        /* Close modal on backdrop click */
-        document.addEventListener('click', (e) => {
-            if (e.target.classList.contains('modal-backdrop') && e.target.classList.contains('active')) {
-                e.target.classList.remove('active');
-                document.body.style.overflow = '';
-            }
-        });
-
-        /* Close modal on Escape */
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                document.querySelectorAll('.modal-backdrop.active').forEach(m => {
-                    m.classList.remove('active');
-                });
-                document.body.style.overflow = '';
-            }
-        });
-
-        /* Focus trap: keep Tab within active modal */
-        document.addEventListener('keydown', (e) => {
-            if (e.key !== 'Tab') return;
-            const activeModal = document.querySelector('.modal-backdrop.active');
-            if (!activeModal) return;
-            const focusable = activeModal.querySelectorAll(
-                'input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-            );
-            if (focusable.length === 0) return;
-            const first = focusable[0];
-            const last = focusable[focusable.length - 1];
-            if (e.shiftKey && document.activeElement === first) {
-                e.preventDefault();
-                last.focus();
-            } else if (!e.shiftKey && document.activeElement === last) {
-                e.preventDefault();
-                first.focus();
-            }
-        });
-
-        /* ===== API Helper ===== */
-        async function apiCall(url, method = 'GET', body = null) {
-            const opts = {
-                method,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-CSRF-Token': window.getCsrfToken(),
-                },
-            };
-            if (body) opts.body = JSON.stringify(body);
-
-            const res = await fetch(url, opts);
-
-            if (res.status === 401 || res.status === 403) {
-                // Check if this is a password_change_required response before redirecting to login
-                try {
-                    const clone = res.clone();
-                    const body = await clone.json();
-                    if (body.password_change_required) {
-                        window.location.href = '/change-password?forced=1';
-                        throw new Error('Password change required');
-                    }
-                } catch (parseErr) {
-                    // Response body wasn't JSON or wasn't password_change_required — proceed to redirect
-                }
-                window.location.href = '/login';
-                throw new Error('Session expired');
-            }
-
-            let data;
-            let contentType = res.headers.get('content-type') || '';
-
-            try {
-                // Check if response is JSON before parsing
-                if (contentType.includes('application/json')) {
-                    data = await res.json();
-                } else {
-                    // For non-JSON responses (e.g., HTML error pages from reverse proxy)
-                    const text = await res.text();
-                    // Try to parse as JSON anyway (might still be valid JSON)
-                    try {
-                        data = JSON.parse(text);
-                    } catch {
-                        // If it's HTML or plain text, extract meaningful error
-                        const match = text.match(/<title>([^<]+)<\/title>/i);
-                        const errorMsg = match ? match[1].trim() : text.substring(0, 200);
-                        data = { error: errorMsg };
-                    }
-                }
-            } catch (e) {
-                throw new Error('Failed to parse server response');
-            }
-
-            if (!res.ok) {
-                throw new Error(data.error || data.message || `HTTP ${res.status}: ${res.statusText}`);
-            }
-            return data;
-        }
-
-        /* ===== Copy to clipboard ===== */
-        async function copyToClipboard(text) {
-            try {
-                await navigator.clipboard.writeText(text);
-                showToast(_('copied_to_clipboard'), 'success');
-            } catch {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                ta.remove();
-                showToast(_('copied_to_clipboard'), 'success');
-            }
-        }
-
-        /* ===== Download file ===== */
-        function downloadFile(content, filename) {
-            const blob = new Blob([content], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.click();
-            URL.revokeObjectURL(url);
-        }
-
-        function formatBytes(bytes) {
-            if (!bytes || Number.isNaN(bytes) || bytes < 0) return '0 B';
-            bytes = Math.max(0, bytes);
-            const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-            const k = 1024;
-            const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
-        }
     </script>
 
     {{ block "scripts" . }}{{ end }}

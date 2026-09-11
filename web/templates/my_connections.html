@@ -7,18 +7,23 @@
     <div class="card" style="margin-bottom: var(--space-lg); padding: var(--space-md);">
         <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); flex-wrap: wrap; gap: var(--space-xs);">
             <div class="flex items-center gap-sm">
-                <span style="font-size: 1.25rem;">📡</span>
+                <div class="card-icon" style="color: var(--accent); display: flex; align-items: center;">
+                    <svg class="icon" style="width: 1.3rem; height: 1.3rem;"><use href="#icon-activity"></use></svg>
+                </div>
                 <div>
                     <h2 style="margin: 0; font-size: 1rem; font-weight: 600;">{{ _ "network_health" }}</h2>
-                    <p style="margin: 0; font-size: 0.8125rem; color: var(--color-text-muted, #94a3b8);">{{ _ "network_health_desc" }}</p>
+                    <p style="margin: 0; font-size: 0.8125rem; color: var(--text-muted);">{{ _ "network_health_desc" }}</p>
                 </div>
             </div>
         </div>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-top: 0.75rem;">
+        <div class="network-health-grid">
             {{ range $srv := .servers }}
-            <div style="background: var(--color-surface-hover, rgba(255,255,255,0.03)); padding: 0.6rem 0.8rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--color-border, rgba(255,255,255,0.08));">
-                <div class="flex items-center justify-between" style="margin-bottom: 0.25rem;">
-                    <span style="font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">🖥 {{ $srv.Name }}</span>
+            <div class="network-health-node">
+                <div class="flex items-center justify-between" style="margin-bottom: 0.35rem;">
+                    <span class="flex items-center gap-xs" style="font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                        <svg class="icon" style="width: 14px; height: 14px; color: var(--text-muted); flex-shrink: 0;"><use href="#icon-server"></use></svg>
+                        {{ $srv.Name }}
+                    </span>
                     {{ if eq (str $srv.Status) "online" }}
                     <span class="badge badge-success" style="font-size: 0.7rem; padding: 2px 6px;" title="{{ _ "server_operational_desc" }}">
                         <span class="badge-dot"></span> {{ _ "status_online" }}
@@ -37,7 +42,7 @@
                     </span>
                     {{ end }}
                 </div>
-                <div style="font-size: 0.75rem; color: var(--color-text-muted, #94a3b8);">
+                <div style="font-size: 0.75rem; color: var(--text-muted);">
                     {{ if eq (str $srv.Status) "online" }}
                     <span>{{ _ "server_operational_desc" }}</span>
                     {{ else if eq (str $srv.Status) "degraded" }}
@@ -54,17 +59,23 @@
     </div>
     {{ end }}
 
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); flex-wrap: wrap; gap: var(--space-md);">
+    <div class="connections-toolbar">
         <h1 class="section-title" style="margin-bottom:0;">
-            <span class="icon">🔗</span>
+            <span class="icon"><svg class="icon"><use href="#icon-key"></use></svg></span>
             {{ _ "my_connections_title" }}
         </h1>
-        <div class="flex items-center gap-sm">
+        <div class="connections-toolbar-actions">
+            <div class="table-search-box" style="min-width: 180px; max-width: 240px;">
+                <svg class="table-search-icon icon"><use href="#icon-search"></use></svg>
+                <input type="text" id="connSearchInput" class="form-input table-search-input" placeholder="{{ _ "search_connections" }}" oninput="filterConnections(this.value)">
+            </div>
             <button class="btn btn-secondary btn-sm sort-toggle" id="sortToggle" onclick="toggleSortOrder()">
-                📊 {{ _ "sort_by_traffic" }}
+                <svg class="icon"><use href="#icon-activity"></use></svg>
+                <span id="sortToggleText">{{ _ "sort_by_traffic" }}</span>
             </button>
             <button class="btn btn-primary" onclick="openCreateConnectionModal()">
-                <span>+</span> {{ _ "create_connection" }}
+                <svg class="icon"><use href="#icon-plus"></use></svg>
+                {{ _ "create_connection" }}
             </button>
         </div>
     </div>
@@ -74,26 +85,32 @@
         {{ range $c := .connections }}
         <div class="client-item" data-conn-id="{{ $c.ID }}" data-id="{{ $c.ID }}">
             <div class="client-info">
-                <div class="client-avatar">🔗</div>
+                <div class="client-avatar">
+                    <svg class="icon"><use href="#icon-key"></use></svg>
+                </div>
                 <div>
                     <div class="client-name">{{ if $c.Name }}{{ $c.Name }}{{ else }}VPN Connection{{ end }}</div>
                     <div class="client-meta">
-                        <span>🖥 {{ if eq $c.ServerID 0 }}Cluster (Auto){{ else if $c.ServerName }}{{ $c.ServerName }}{{ else }}Server #{{ $c.ServerID }}{{ end }}</span>
+                        <span><svg class="icon" style="width:13px;height:13px;vertical-align:-2px;"><use href="#icon-server"></use></svg> {{ if eq $c.ServerID 0 }}Cluster (Auto){{ else if $c.ServerName }}{{ $c.ServerName }}{{ else }}Server #{{ $c.ServerID }}{{ end }}</span>
                         {{ if eq $c.ServerID 0 }}
-                        <span class="badge badge-success" style="font-size:0.65rem;">⚡ Load Balancer</span>
+                        <span class="badge badge-success" style="font-size:0.65rem;">
+                            <svg class="icon" style="width:11px;height:11px;"><use href="#icon-zap"></use></svg> Load Balancer
+                        </span>
                         {{ end }}
                         <span class="badge badge-info" style="font-size:0.65rem;">
                             {{ proto_title $c.Protocol }}
                         </span>
                         {{ if and (eq $c.Protocol "awg") $c.AWGMimicry }}
-                        <span class="badge badge-info" style="font-size:0.65rem;">🛡 {{ $c.AWGMimicry | upper }}</span>
+                        <span class="badge badge-info" style="font-size:0.65rem;">
+                            <svg class="icon" style="width:11px;height:11px;"><use href="#icon-shield"></use></svg> {{ $c.AWGMimicry | upper }}
+                        </span>
                         {{ end }}
                         {{ if not $c.CreatedAt.IsZero }}
-                        <span>📅 {{ slice_str (format_time $c.CreatedAt) 0 10 }}</span>
+                        <span><svg class="icon" style="width:13px;height:13px;vertical-align:-2px;"><use href="#icon-calendar"></use></svg> {{ slice_str (format_time $c.CreatedAt) 0 10 }}</span>
                         {{ end }}
                         {{ if or $c.TrafficTotalRx $c.TrafficTotalTx }}
                         <span class="traffic-badge" data-rx="{{ $c.TrafficTotalRx }}" data-tx="{{ $c.TrafficTotalTx }}">
-                            📊 ↓ <span class="rx"></span> ↑ <span class="tx"></span>
+                            <svg class="icon" style="width:11px;height:11px;"><use href="#icon-activity"></use></svg> ↓ <span class="rx"></span> ↑ <span class="tx"></span>
                         </span>
                         {{ end }}
                     </div>
@@ -101,17 +118,17 @@
             </div>
             <div class="client-actions">
                 <button class="btn btn-secondary btn-sm" data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}" onclick="showRenameModal(this.dataset.cid, this.dataset.cname)">
-                    ✏️ {{ _ "rename" }}
+                    <svg class="icon"><use href="#icon-pencil"></use></svg> {{ _ "rename" }}
                 </button>
                 <button class="btn btn-primary btn-sm"
                     data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}" data-proto="{{ $c.Protocol }}"
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
-                    {{ _ "show_config" }}
+                    <svg class="icon"><use href="#icon-key"></use></svg> {{ _ "show_config" }}
                 </button>
                 <button class="btn btn-danger btn-sm"
                     data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}"
                     onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
-                    🗑️ {{ _ "delete" }}
+                    <svg class="icon"><use href="#icon-trash"></use></svg> {{ _ "delete" }}
                 </button>
             </div>
         </div>
@@ -120,40 +137,48 @@
 
     <!-- Always render the empty-state container so JS can hide it on first insert -->
     <div class="empty-state{{ if .connections }} hidden{{ end }}" id="emptyState">
-        <div class="empty-icon">🔗</div>
+        <div class="empty-icon"><svg class="icon" style="width:48px;height:48px;stroke-width:1.5;"><use href="#icon-link"></use></svg></div>
         <div class="empty-title">{{ _ "no_connections" }}</div>
         <div class="empty-desc">{{ _ "no_connections_user_desc" }}</div>
         <button class="btn btn-primary" onclick="openCreateConnectionModal()" style="margin-top: var(--space-md);">
-            <span>+</span> {{ _ "create_connection" }}
+            <svg class="icon"><use href="#icon-plus"></use></svg> {{ _ "create_connection" }}
         </button>
     </div>
 </section>
 
 <!-- ===== Config Modal ===== -->
 <div class="modal-backdrop" id="configModal">
-    <div class="modal" style="max-width: 600px;">
+    <div class="modal" style="max-width: 620px;">
         <div class="modal-header">
             <h2 class="modal-title" id="configModalTitle">{{ _ "config" }}</h2>
-            <button class="modal-close" onclick="closeModal('configModal')">×</button>
+            <button class="modal-close" onclick="UI.modal.close('configModal')">×</button>
         </div>
 
         <div class="config-tabs">
-            <button class="config-tab active" onclick="switchConfigTab('conf')">{{ _ "config_tab" }}</button>
-            <button class="config-tab" onclick="switchConfigTab('vpn')">{{ _ "vpn_key_tab" }}</button>
-            <button class="config-tab" onclick="switchConfigTab('qr')">{{ _ "qr_code_tab" }}</button>
-            <button class="config-tab" id="my-tab-kit-btn" onclick="switchConfigTab('kit')">{{ _ "connection_kit" }}</button>
+            <button class="config-tab active" onclick="switchConfigTab('conf')">
+                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-file-text"></use></svg> {{ _ "config_tab" }}
+            </button>
+            <button class="config-tab" onclick="switchConfigTab('vpn')">
+                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-key"></use></svg> {{ _ "vpn_key_tab" }}
+            </button>
+            <button class="config-tab" onclick="switchConfigTab('qr')">
+                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-qr"></use></svg> {{ _ "qr_code_tab" }}
+            </button>
+            <button class="config-tab" id="my-tab-kit-btn" onclick="switchConfigTab('kit')">
+                <svg class="icon" style="width:14px;height:14px;"><use href="#icon-shield"></use></svg> {{ _ "connection_kit" }}
+            </button>
         </div>
 
         <div class="config-panel active" id="panel-conf">
             <div class="config-display">
                 <div class="config-text" id="configText"></div>
                 <div class="config-actions">
-                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentConfig)" style="flex:1">
-                        {{ _ "copy_config" }}
+                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
+                        <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_config" }}
                     </button>
                     <button class="btn btn-primary btn-sm"
-                        onclick="downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
-                        {{ _ "download_conf" }}
+                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
                     </button>
                 </div>
             </div>
@@ -167,8 +192,8 @@
         <div class="config-panel" id="panel-vpn">
             <div class="vpn-link-box" id="vpnLinkText"></div>
             <div class="config-actions" style="margin-top: var(--space-sm);">
-                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentVpnLink)" style="flex:1">
-                    {{ _ "copy_key" }}
+                <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentVpnLink, this)" style="flex:1">
+                    <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_key" }}
                 </button>
             </div>
             <div class="form-hint" style="margin-top: var(--space-sm);">
@@ -177,9 +202,12 @@
         </div>
 
         <div class="config-panel" id="panel-qr">
-            <div class="qr-container">
-                <div id="qrCode"></div>
-                <div class="qr-hint" id="qrHint">{{ _ "qr_hint" }}</div>
+            <div class="qr-container" style="display:flex; flex-direction:column; align-items:center; gap:var(--space-md);">
+                <div id="qrCode" style="background:#fff; padding:12px; border-radius:var(--radius-md); box-shadow:var(--shadow-md);"></div>
+                <div class="qr-hint" id="qrHint" style="font-size:0.85rem; color:var(--text-muted); text-align:center;">{{ _ "qr_hint" }}</div>
+                <button class="btn btn-secondary btn-sm" onclick="downloadQRCode()" id="downloadQrBtn" style="margin-top:var(--space-xs);">
+                    <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }} QR
+                </button>
             </div>
         </div>
     </div>
@@ -190,7 +218,7 @@
     <div class="modal" style="max-width: 500px;">
         <div class="modal-header">
             <h2 class="modal-title">{{ _ "create_connection" }}</h2>
-            <button class="modal-close" onclick="closeModal('createConnModal')">×</button>
+            <button class="modal-close" onclick="UI.modal.close('createConnModal')">×</button>
         </div>
         <form id="createConnForm" onsubmit="event.preventDefault(); submitCreateConnection();">
             <div class="form-group">
@@ -198,12 +226,18 @@
                 <select class="form-select" id="createServerSelect" required onchange="onServerSelected()">
                     <option value="">- {{ _ "select" }} -</option>
                     {{ if .vpn_enabled }}
-                    <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true">⚡ Load Balancer (Auto-Select)</option>
+                    <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true" selected>⚡ {{ _ "load_balancer_auto" }} ({{ _ "recommended" }})</option>
                     {{ end }}
                     {{ range $srv := .servers }}
                     <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}">{{ $srv.Name }}</option>
                     {{ end }}
                 </select>
+                <div id="lbHighlightCallout" class="lb-selection-callout" style="display: {{ if .vpn_enabled }}flex{{ else }}none{{ end }};">
+                    <svg class="icon"><use href="#icon-zap"></use></svg>
+                    <div>
+                        <strong>{{ _ "recommended" }}:</strong> {{ _ "load_balancer_recommended_hint" }}
+                    </div>
+                </div>
             </div>
             <div class="form-group">
                 <label class="form-label" for="createProtoSelect">{{ _ "create_conn_protocol_label" }}</label>
@@ -226,8 +260,11 @@
                 <input class="form-input" type="text" id="createConnName" value="My Connection" required>
             </div>
             <div class="flex gap-sm" style="margin-top: var(--space-md);">
-                <button type="submit" class="btn btn-primary" id="createConnSubmit">{{ _ "create_conn_submit" }}</button>
-                <button type="button" class="btn btn-secondary" onclick="closeModal('createConnModal')">{{ _ "cancel" }}</button>
+                <button type="submit" class="btn btn-primary" id="createConnSubmit">
+                    <span id="createConnSubmitText">{{ _ "create_conn_submit" }}</span>
+                    <div class="spinner hidden" id="createConnSpinner" style="width:14px;height:14px;"></div>
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="UI.modal.close('createConnModal')">{{ _ "cancel" }}</button>
             </div>
         </form>
     </div>
@@ -264,10 +301,10 @@
 
     async function showMyConfig(connectionId, name, proto) {
         try {
-            showToast(_('loading_connections'), 'info');
-            const result = await apiCall(`/api/connections/${connectionId}/config`, 'POST');
+            UI.toast(_('loading_connections'), 'info');
+            const result = await API.post(`/api/connections/${connectionId}/config`);
 
-            if (result.config) {
+            if (result && result.config) {
                 currentConfig = result.config;
                 currentVpnLink = result.vpn_link || '';
                 currentConfigName = name.replace(/\s+/g, '_');
@@ -292,11 +329,11 @@
                 document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
 
                 switchConfigTab('conf');
-                openModal('configModal');
+                UI.modal.open('configModal');
                 generateQR(result.config);
             }
         } catch (err) {
-            showToast(`${_('error')}: ` + err.message, 'error');
+            UI.toast(`${_('error')}: ` + (err.message || err), 'error');
         }
     }
 
@@ -305,29 +342,36 @@
         if (!kitList) return;
         kitList.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem;">Loading profiles...</div>';
         try {
-            const res = await apiCall(`/api/connections/${connectionId}/kit`, 'POST');
-            if (res.kit) {
+            const res = await API.post(`/api/connections/${connectionId}/kit`);
+            if (res && res.kit) {
                 kitList.innerHTML = '';
                 for (const [protoKey, confText] of Object.entries(res.kit)) {
                     const item = document.createElement('div');
-                    item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
+                    item.style.cssText = 'background: var(--bg-surface, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
                     item.innerHTML = `
                         <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
-                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${escapeHtml(protoKey)} Profile</span>
+                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem; display:flex; align-items:center; gap:4px;">
+                                <svg class="icon" style="width:13px;height:13px;"><use href="#icon-shield"></use></svg>
+                                ${UI.escapeHtml(protoKey)} Profile
+                            </span>
                             <div class="flex gap-sm">
-                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">${_('copy_config')}</button>
-                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">${_('download_conf')}</button>
+                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">
+                                    <svg class="icon"><use href="#icon-copy"></use></svg> ${_('copy_config')}
+                                </button>
+                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">
+                                    <svg class="icon"><use href="#icon-download"></use></svg> ${_('download_conf')}
+                                </button>
                             </div>
                         </div>
-                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${escapeHtml(confText)}</code></pre>
+                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.2); padding: 0.5rem; border-radius: 4px; font-family: var(--font-mono);"><code>${UI.escapeHtml(confText)}</code></pre>
                     `;
-                    item.querySelector('.btn-kit-copy').onclick = () => copyToClipboard(confText);
-                    item.querySelector('.btn-kit-dl').onclick = () => downloadFile(confText, `${name}_${protoKey}.conf`);
+                    item.querySelector('.btn-kit-copy').onclick = function() { UI.copy(confText, this); };
+                    item.querySelector('.btn-kit-dl').onclick = function() { UI.downloadFile(confText, `${name}_${protoKey}.conf`); };
                     kitList.appendChild(item);
                 }
             }
         } catch (err) {
-            kitList.innerHTML = `<div style="color: var(--color-danger, #ef4444); font-size: 0.85rem;">${err.message}</div>`;
+            kitList.innerHTML = `<div style="color: var(--danger, #ef4444); font-size: 0.85rem;">${err.message || err}</div>`;
         }
     }
 
@@ -346,12 +390,37 @@
         container.innerHTML = '';
         try {
             new QRCode(container, {
-                text: text, width: 280, height: 280,
+                text: text, width: 260, height: 260,
                 colorDark: '#000000', colorLight: '#ffffff',
                 correctLevel: QRCode.CorrectLevel.L
             });
         } catch (e) {
             container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        }
+    }
+
+    function downloadQRCode() {
+        const qrContainer = document.getElementById('qrCode');
+        if (!qrContainer) return;
+        const img = qrContainer.querySelector('img');
+        const canvas = qrContainer.querySelector('canvas');
+        if (canvas) {
+            const url = canvas.toDataURL('image/png');
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (currentConfigName || 'vpn_config') + '_qr.png';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } else if (img && img.src) {
+            const a = document.createElement('a');
+            a.href = img.src;
+            a.download = (currentConfigName || 'vpn_config') + '_qr.png';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } else {
+            UI.toast('Unable to export QR image', 'error');
         }
     }
 
@@ -362,54 +431,56 @@
             dns: 'AmneziaDNS'
         };
         const isLB = conn.server_id === 0;
-        const name = escapeHtml(conn.name || 'VPN Connection');
-        const serverName = isLB ? 'Cluster (Auto)' : escapeHtml(conn.server_name || ('Server #' + (conn.server_id || '')));
-        const lbBadge = isLB ? '<span class="badge badge-success" style="font-size:0.65rem;">⚡ Load Balancer</span>' : '';
-        const protoLabel = escapeHtml(protoDisplay[conn.protocol] || (conn.protocol ? conn.protocol.toUpperCase() : ''));
-        const date = conn.created_at ? escapeHtml(conn.created_at.substring(0, 10)) : '';
-        const connId = escapeHtml(conn.id);
+        const name = UI.escapeHtml(conn.name || 'VPN Connection');
+        const serverName = isLB ? 'Cluster (Auto)' : UI.escapeHtml(conn.server_name || ('Server #' + (conn.server_id || '')));
+        const lbBadge = isLB ? '<span class="badge badge-success" style="font-size:0.65rem;"><svg class="icon" style="width:11px;height:11px;"><use href="#icon-zap"></use></svg> Load Balancer</span>' : '';
+        const protoLabel = UI.escapeHtml(protoDisplay[conn.protocol] || (conn.protocol ? conn.protocol.toUpperCase() : ''));
+        const date = conn.created_at ? UI.escapeHtml(conn.created_at.substring(0, 10)) : '';
+        const connId = UI.escapeHtml(conn.id);
         const totalRx = conn.traffic_total_rx || 0;
         const totalTx = conn.traffic_total_tx || 0;
         const trafficStr = totalRx > 0 || totalTx > 0
-            ? `<span class="traffic-badge">📊 ↓ ${formatBytes(totalRx)} ↑ ${formatBytes(totalTx)}</span>`
+            ? `<span class="traffic-badge"><svg class="icon" style="width:11px;height:11px;"><use href="#icon-activity"></use></svg> ↓ ${UI.formatBytes(totalRx)} ↑ ${UI.formatBytes(totalTx)}</span>`
             : '';
         const mimicryBadge = (conn.protocol === 'awg' && conn.awg_mimicry)
-            ? `<span class="badge badge-info" style="font-size:0.65rem;">🛡 ${escapeHtml(conn.awg_mimicry.toUpperCase())}</span>`
+            ? `<span class="badge badge-info" style="font-size:0.65rem;"><svg class="icon" style="width:11px;height:11px;"><use href="#icon-shield"></use></svg> ${UI.escapeHtml(conn.awg_mimicry.toUpperCase())}</span>`
             : '';
         const topClass = isTopConsumer ? ' top-consumer' : '';
         return `
         <div class="client-item${topClass}" data-conn-id="${connId}" data-id="${connId}">
             <div class="client-info">
-                <div class="client-avatar">🔗</div>
+                <div class="client-avatar">
+                    <svg class="icon"><use href="#icon-key"></use></svg>
+                </div>
                 <div>
                     <div class="client-name">${name}</div>
                     <div class="client-meta">
-                        <span>🖥 ${serverName}</span>
+                        <span><svg class="icon" style="width:13px;height:13px;vertical-align:-2px;"><use href="#icon-server"></use></svg> ${serverName}</span>
                         ${lbBadge}
                         <span class="badge badge-info" style="font-size:0.65rem;">
                             ${protoLabel}
                         </span>
                         ${mimicryBadge}
-                        ${date ? `<span>📅 ${date}</span>` : ''}
+                        ${date ? `<span><svg class="icon" style="width:13px;height:13px;vertical-align:-2px;"><use href="#icon-calendar"></use></svg> ${date}</span>` : ''}
                         ${trafficStr}
                     </div>
                 </div>
             </div>
             <div class="client-actions">
                 <button class="btn btn-secondary btn-sm"
-                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}"
+                    data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}"
                     onclick="showRenameModal(this.dataset.cid, this.dataset.cname)">
-                    ✏️ ${_('rename')}
+                    <svg class="icon"><use href="#icon-pencil"></use></svg> ${_('rename')}
                 </button>
                 <button class="btn btn-primary btn-sm"
-                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}" data-proto="${escapeHtml(conn.protocol || '')}"
+                    data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}" data-proto="${UI.escapeHtml(conn.protocol || '')}"
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
-                    ${_('show_config')}
+                    <svg class="icon"><use href="#icon-key"></use></svg> ${_('show_config')}
                 </button>
                 <button class="btn btn-danger btn-sm"
-                    data-cid="${escapeHtml(conn.id)}" data-cname="${escapeHtml(conn.name || 'Connection')}"
+                    data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}"
                     onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
-                    🗑️ ${_('delete')}
+                    <svg class="icon"><use href="#icon-trash"></use></svg> ${_('delete')}
                 </button>
             </div>
         </div>`;
@@ -417,20 +488,34 @@
 
     function openCreateConnectionModal() {
         document.getElementById('createConnForm').reset();
-        const protoSelect = document.getElementById('createProtoSelect');
-        protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
-        closeModal('configModal');
-        openModal('createConnModal', '#createServerSelect');
+        const serverSelect = document.getElementById('createServerSelect');
+        const lbOption = serverSelect.querySelector('option[value="0"]');
+        if (lbOption) {
+            serverSelect.value = '0';
+        } else if (serverSelect.options.length > 1) {
+            serverSelect.selectedIndex = 1;
+        }
+        onServerSelected();
+        UI.modal.close('configModal');
+        UI.modal.open('createConnModal', '#createServerSelect');
     }
 
     function onServerSelected() {
         const serverSelect = document.getElementById('createServerSelect');
         const serverId = parseInt(serverSelect.value);
         const protoSelect = document.getElementById('createProtoSelect');
+        const lbCallout = document.getElementById('lbHighlightCallout');
+
+        if (lbCallout) {
+            lbCallout.style.display = serverSelect.value === '0' ? 'flex' : 'none';
+        }
 
         protoSelect.innerHTML = '<option value="">- ' + _('select') + ' -</option>';
 
-        if (isNaN(serverId)) return;
+        if (isNaN(serverId)) {
+            document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            return;
+        }
 
         const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
         let protocols = null;
@@ -443,7 +528,10 @@
             const server = availableServers.find(s => s.id === serverId);
             if (server && server.protocols) protocols = server.protocols;
         }
-        if (!protocols) return;
+        if (!protocols) {
+            document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            return;
+        }
 
         const protoNames = {
             awg: 'AmneziaWG',
@@ -460,7 +548,10 @@
             }
         }
 
-        if (protoSelect.options.length === 2) {
+        const hasAwg = Array.from(protoSelect.options).some(o => o.value === 'awg');
+        if (hasAwg) {
+            protoSelect.value = 'awg';
+        } else if (protoSelect.options.length === 2) {
             protoSelect.selectedIndex = 1;
         }
 
@@ -472,13 +563,23 @@
     });
 
     let sortBy = 'traffic';
+    let searchQuery = '';
 
     function toggleSortOrder() {
         sortBy = sortBy === 'traffic' ? 'date' : 'traffic';
         const label = sortBy === 'traffic' ? _('sort_by_traffic') : _('sort_by_date');
-        document.getElementById('sortToggle').textContent = '📊 ' + label;
-        const connections = currentConnections || [];
-        renderConnectionsList(connections);
+        const sortTextEl = document.getElementById('sortToggleText');
+        if (sortTextEl) {
+            sortTextEl.textContent = label;
+        } else {
+            document.getElementById('sortToggle').innerHTML = `<svg class="icon"><use href="#icon-activity"></use></svg> <span id="sortToggleText">${label}</span>`;
+        }
+        renderConnectionsList(currentConnections);
+    }
+
+    function filterConnections(query) {
+        searchQuery = (query || '').toLowerCase().trim();
+        renderConnectionsList(currentConnections);
     }
 
     let currentConnections = initialConnections || [];
@@ -488,7 +589,17 @@
         const listEl = document.getElementById('myConnectionsList');
         const emptyEl = document.getElementById('emptyState');
 
-        if (!currentConnections || currentConnections.length === 0) {
+        let filtered = currentConnections;
+        if (searchQuery) {
+            filtered = filtered.filter(c => {
+                const name = (c.name || '').toLowerCase();
+                const sName = (c.server_name || '').toLowerCase();
+                const proto = (c.protocol || '').toLowerCase();
+                return name.includes(searchQuery) || sName.includes(searchQuery) || proto.includes(searchQuery);
+            });
+        }
+
+        if (!filtered || filtered.length === 0) {
             listEl.classList.add('hidden');
             emptyEl.classList.remove('hidden');
             return;
@@ -497,10 +608,10 @@
         emptyEl.classList.add('hidden');
         listEl.classList.remove('hidden');
 
-        const sorted = [...currentConnections].sort((a, b) => {
+        const sorted = [...filtered].sort((a, b) => {
             if (sortBy === 'traffic') {
-                const ta = a.traffic_total || 0;
-                const tb = b.traffic_total || 0;
+                const ta = a.traffic_total || (a.traffic_total_rx || 0) + (a.traffic_total_tx || 0);
+                const tb = b.traffic_total || (b.traffic_total_rx || 0) + (b.traffic_total_tx || 0);
                 return tb - ta;
             }
             const da = a.created_at ? new Date(a.created_at).getTime() : 0;
@@ -509,7 +620,11 @@
         });
 
         const maxTrafficConn = sorted.length > 0
-            ? sorted.reduce((max, c) => (c.traffic_total || 0) > (max.traffic_total || 0) ? c : max)
+            ? sorted.reduce((max, c) => {
+                const cT = (c.traffic_total || 0) || ((c.traffic_total_rx || 0) + (c.traffic_total_tx || 0));
+                const maxT = (max.traffic_total || 0) || ((max.traffic_total_rx || 0) + (max.traffic_total_tx || 0));
+                return cT > maxT ? c : max;
+            })
             : null;
 
         listEl.innerHTML = sorted.map(c => renderConnectionItem(c, maxTrafficConn && c.id === maxTrafficConn.id)).join('');
@@ -517,14 +632,9 @@
 
     async function refreshConnectionsList() {
         try {
-            const result = await apiCall('/api/connections', 'GET');
+            const result = await API.get('/api/connections');
             renderConnectionsList(result.connections || []);
-            document.querySelectorAll('.traffic-badge[data-rx]').forEach(el => {
-                const rx = parseInt(el.dataset.rx || '0', 10);
-                const tx = parseInt(el.dataset.tx || '0', 10);
-                el.querySelector('.rx').textContent = formatBytes(rx);
-                el.querySelector('.tx').textContent = formatBytes(tx);
-            });
+            formatInitialTrafficBadges();
         } catch (err) {
             console.error('Failed to refresh connections:', err);
         }
@@ -535,13 +645,15 @@
         const protoSelect = document.getElementById('createProtoSelect');
         const nameInput = document.getElementById('createConnName');
         const submitBtn = document.getElementById('createConnSubmit');
+        const submitText = document.getElementById('createConnSubmitText');
+        const spinner = document.getElementById('createConnSpinner');
 
         const serverId = parseInt(serverSelect.value);
         const protocol = protoSelect.value;
         const name = nameInput.value.trim() || 'My Connection';
 
         if (isNaN(serverId) || !protocol) {
-            showToast('Please select server and protocol', 'error');
+            UI.toast('Please select server and protocol', 'error');
             return;
         }
 
@@ -561,15 +673,16 @@
 
         try {
             submitBtn.disabled = true;
-            submitBtn.textContent = _('create_conn_creating');
+            if (submitText) submitText.textContent = _('create_conn_creating');
+            if (spinner) spinner.classList.remove('hidden');
 
-            const result = await apiCall('/api/connections/add', 'POST', payload);
-            closeModal('createConnModal');
-            showToast(_('create_conn_success'), 'success');
+            const result = await API.post('/api/connections/add', payload);
+            UI.modal.close('createConnModal');
+            UI.toast(_('create_conn_success'), 'success');
 
             await refreshConnectionsList();
 
-            if (result.config) {
+            if (result && result.config) {
                 const conn = result.connection;
                 currentConfig = result.config;
                 currentVpnLink = result.vpn_link || '';
@@ -586,14 +699,15 @@
                 }
 
                 switchConfigTab('conf');
-                openModal('configModal');
+                UI.modal.open('configModal');
                 generateQR(result.config);
             }
         } catch (err) {
-            showToast(`${_('create_conn_error')}: ` + err.message, 'error');
+            UI.toast(`${_('create_conn_error')}: ` + (err.message || err), 'error');
         } finally {
             submitBtn.disabled = false;
-            submitBtn.textContent = _('create_conn_submit');
+            if (submitText) submitText.textContent = _('create_conn_submit');
+            if (spinner) spinner.classList.add('hidden');
         }
     }
 
@@ -603,27 +717,32 @@
         renameConnectionId = connId;
         const input = document.getElementById('renameInput');
         input.value = currentName;
-        closeModal('configModal');
-        openModal('renameModal');
-        input.focus();
-        input.select();
+        UI.modal.close('configModal');
+        UI.modal.open('renameModal', '#renameInput');
     }
 
     function closeRenameModal() {
-        closeModal('renameModal');
+        UI.modal.close('renameModal');
         renameConnectionId = null;
     }
 
     async function deleteConnection(connectionId, name) {
-        if (!confirm(_('delete_connection_confirm'))) return;
+        const confirmed = await UI.confirm({
+            title: _('delete'),
+            message: _('delete_connection_confirm'),
+            confirmText: _('delete'),
+            confirmVariant: 'danger'
+        });
+        if (!confirmed) return;
+
         try {
-            await apiCall(`/api/connections/${connectionId}/delete`, 'POST');
+            await API.post(`/api/connections/${connectionId}/delete`);
             const card = document.querySelector(`[data-conn-id="${CSS.escape(connectionId)}"]`);
             if (card) card.remove();
             await refreshConnectionsList();
-            showToast(_('connection_deleted'), 'success');
+            UI.toast(_('connection_deleted'), 'success');
         } catch (e) {
-            showToast(`${_('error')}: ` + e.message, 'error');
+            UI.toast(`${_('error')}: ` + (e.message || e), 'error');
         }
     }
 
@@ -631,16 +750,16 @@
         const input = document.getElementById('renameInput');
         const newName = input.value.trim();
         if (!newName) {
-            showToast(_('rename_empty_name'), 'error');
+            UI.toast(_('rename_empty_name'), 'error');
             return;
         }
         try {
-            await apiCall(`/api/connections/${renameConnectionId}/rename`, 'POST', { name: newName });
+            await API.post(`/api/connections/${renameConnectionId}/rename`, { name: newName });
             closeRenameModal();
-            showToast(_('connection_renamed'), 'success');
-            refreshConnectionsList();
+            UI.toast(_('connection_renamed'), 'success');
+            await refreshConnectionsList();
         } catch (e) {
-            showToast(`${_('rename_failed')}: ` + e.message, 'error');
+            UI.toast(`${_('rename_failed')}: ` + (e.message || e), 'error');
         }
     }
 
@@ -648,8 +767,10 @@
         document.querySelectorAll('.traffic-badge[data-rx]').forEach(el => {
             const rx = parseInt(el.dataset.rx || '0', 10);
             const tx = parseInt(el.dataset.tx || '0', 10);
-            el.querySelector('.rx').textContent = formatBytes(rx);
-            el.querySelector('.tx').textContent = formatBytes(tx);
+            const rxEl = el.querySelector('.rx');
+            const txEl = el.querySelector('.tx');
+            if (rxEl) rxEl.textContent = UI.formatBytes(rx);
+            if (txEl) txEl.textContent = UI.formatBytes(tx);
         });
     }
 
