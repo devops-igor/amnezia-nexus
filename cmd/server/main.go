@@ -176,14 +176,12 @@ func run(ctx context.Context) error {
 		slog.Warn("Startup reconciliation encountered error", "err", err)
 	}
 
-	// 6. User Operations & RemnaWave Syncer
+	// 6. User Operations
 	userOps := service.NewUserOpsService(db, reg)
-	remnaSyncer := service.NewRemnaWaveSyncer(db, nil, userOps)
 
 	// 7. Background Orchestrator & Supervisor
 	orch := orchestrator.New(db, reg,
 		orchestrator.WithUserOps(userOps),
-		orchestrator.WithRemnaWaveSyncer(remnaSyncer),
 	)
 
 	sup := service.NewSupervisor()

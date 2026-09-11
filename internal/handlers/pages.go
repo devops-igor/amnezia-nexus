@@ -61,7 +61,7 @@ func (h *Handlers) ServerPageHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SettingsPageHandler renders system-wide settings and RemnaWave sync panels.
+// SettingsPageHandler renders system-wide settings.
 func (h *Handlers) SettingsPageHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	servers, _ := h.db.GetAllServers(ctx)

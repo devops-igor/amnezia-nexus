@@ -151,29 +151,9 @@ func TestSettingsBulkAndRawStrings(t *testing.T) {
 	}
 }
 
-func TestSettingsRemnaWaveAndFlags(t *testing.T) {
+func TestMigrationFlags(t *testing.T) {
 	db, _ := setupTestDB(t)
 	ctx := context.Background()
-
-	remnaSettings, err := db.GetRemnaWaveSettings(ctx)
-	if err != nil || remnaSettings == nil || remnaSettings.RemnawaveProtocol != "awg" {
-		t.Fatalf("GetRemnaWaveSettings failed: %+v, err=%v", remnaSettings, err)
-	}
-
-	syncConfig := &models.SyncSettings{
-		RemnawaveURL:         "https://remna.example.com",
-		RemnawaveAPIKey:      "api-key-test-12345",
-		RemnawaveSync:        true,
-		RemnawaveSyncUsers:   true,
-		RemnawaveCreateConns: true,
-		RemnawaveServerID:    1,
-		RemnawaveProtocol:    "telemt",
-	}
-	_ = db.SetSetting(ctx, "sync", syncConfig)
-	updatedRemna, _ := db.GetRemnaWaveSettings(ctx)
-	if updatedRemna == nil || updatedRemna.RemnawaveURL != "https://remna.example.com" {
-		t.Errorf("updated RemnaWave settings mismatch: %+v", updatedRemna)
-	}
 
 	flagVal, err := db.GetMigrationFlag(ctx, "non_existent_flag")
 	if err != nil || flagVal != "" {
