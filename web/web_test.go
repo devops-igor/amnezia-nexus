@@ -1088,3 +1088,218 @@ func TestModernClientDashboardPage(t *testing.T) {
 		t.Errorf("my_connections.html should retain href=\"#icon-key\" for cryptographic keys")
 	}
 }
+
+func TestIssue101VPNModernization(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Assert vpn.html contains all 36 required DOM element IDs
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	requiredDOMIDs := []string{
+		"vpn-listener-badge",
+		"vpn-listen-port",
+		"vpn-subnet",
+		"vpn-public-endpoint",
+		"vpn-edit-endpoint-btn",
+		"vpn-sessions",
+		"vpn-active-tunnels",
+		"vpn-rx",
+		"vpn-tx",
+		"vpnTableContainer",
+		"vpnBackendsTable",
+		"vpn-backends-tbody",
+		"vpn-backends-loading",
+		"vpn-add-backend-btn",
+		"addBackendModal",
+		"addBackendForm",
+		"vpnServerSelect",
+		"vpnServerDetails",
+		"vpnServerDetailHost",
+		"vpnServerDetailPort",
+		"vpnServerDetailStatus",
+		"vpnServerDetailAwgBadge",
+		"vpnServerDetailCheckRow",
+		"vpnServerDetailCheckHint",
+		"vpnQuickCheckBtn",
+		"vpnQuickCheckBtnText",
+		"vpnQuickCheckIcon",
+		"vpnQuickCheckSpinner",
+		"vpnNoServersNotice",
+		"vpnModalError",
+		"vpnAddBackendSubmitBtn",
+		"editEndpointModal",
+		"editEndpointForm",
+		"vpnPublicEndpointInput",
+		"vpnEndpointModalError",
+		"vpnEditEndpointSubmitBtn",
+	}
+	for _, id := range requiredDOMIDs {
+		if !strings.Contains(vpnStr, `id="`+id+`"`) {
+			t.Errorf("vpn.html missing required DOM element id=%q", id)
+		}
+	}
+
+	// 2. Assert broken 8px yellow speck is eliminated and replaced with pause/play icon buttons
+	if strings.Contains(vpnStr, "width:8px") || strings.Contains(vpnStr, "height:8px") {
+		t.Errorf("vpn.html should not contain broken 8px dot toggle button")
+	}
+	if !strings.Contains(vpnStr, `href="#icon-pause"`) {
+		t.Errorf("vpn.html missing href=\"#icon-pause\" for active backend toggle")
+	}
+	if !strings.Contains(vpnStr, `href="#icon-play"`) {
+		t.Errorf("vpn.html missing href=\"#icon-play\" for disabled backend toggle")
+	}
+
+	// 3. Assert latency tiers and indicators in JS
+	requiredLatencyTokens := []string{
+		"latency-pill",
+		"latency-good",
+		"latency-fair",
+		"latency-poor",
+		"latency-dot",
+	}
+	for _, token := range requiredLatencyTokens {
+		if !strings.Contains(vpnStr, token) {
+			t.Errorf("vpn.html missing required latency token %q", token)
+		}
+	}
+
+	// 4. Assert NexusTable options include statusFilters and statusAttribute
+	requiredTableOptions := []string{
+		"statusFilters: ['all', 'active', 'degraded', 'disabled']",
+		"statusAttribute: 'data-status'",
+		"searchPlaceholder",
+		"emptyMessage",
+	}
+	for _, opt := range requiredTableOptions {
+		if !strings.Contains(vpnStr, opt) {
+			t.Errorf("vpn.html missing NexusTable option %q", opt)
+		}
+	}
+
+	// 5. Assert hardcoded English strings eliminated from stat cards
+	unwantedEnglishTokens := []string{
+		"Entry point for LB traffic",
+		"Telemetry live",
+	}
+	for _, token := range unwantedEnglishTokens {
+		if strings.Contains(vpnStr, token) {
+			t.Errorf("vpn.html still contains raw English string %q", token)
+		}
+	}
+
+	// 6. Assert icons.html and base.html contain icon-play and icon-pause
+	iconsData, err := fs.ReadFile(templatesFS, "icons.html")
+	if err != nil {
+		t.Fatalf("failed to read icons.html: %v", err)
+	}
+	iconsStr := string(iconsData)
+	if !strings.Contains(iconsStr, `id="icon-play"`) {
+		t.Errorf("icons.html missing id=\"icon-play\" symbol")
+	}
+	if !strings.Contains(iconsStr, `id="icon-pause"`) {
+		t.Errorf("icons.html missing id=\"icon-pause\" symbol")
+	}
+
+	baseData, err := fs.ReadFile(templatesFS, "base.html")
+	if err != nil {
+		t.Fatalf("failed to read base.html: %v", err)
+	}
+	baseStr := string(baseData)
+	if !strings.Contains(baseStr, `id="icon-play"`) {
+		t.Errorf("base.html missing id=\"icon-play\" symbol")
+	}
+	if !strings.Contains(baseStr, `id="icon-pause"`) {
+		t.Errorf("base.html missing id=\"icon-pause\" symbol")
+	}
+
+	// 7. Assert tables.js supports statusFilters and container placement
+	tablesData, err := fs.ReadFile(staticFS, "js/tables.js")
+	if err != nil {
+		t.Fatalf("failed to read js/tables.js: %v", err)
+	}
+	tablesStr := string(tablesData)
+	if !strings.Contains(tablesStr, "statusFilters: null") {
+		t.Errorf("tables.js DEFAULT_OPTIONS missing statusFilters")
+	}
+	if !strings.Contains(tablesStr, "table-container") {
+		t.Errorf("tables.js missing table-container placement handling")
+	}
+
+	// 8. Assert style.css contains modern VPN, stat-card, latency pill, and info-card classes
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	requiredCSSClasses := []string{
+		".stat-card",
+		".stat-card-header",
+		".stat-card-title",
+		".stat-card-value",
+		".stat-card-sub",
+		".latency-pill",
+		".latency-good",
+		".latency-fair",
+		".latency-poor",
+		".latency-dot",
+		".info-card",
+		".info-card-grid",
+		".info-card-item",
+		".info-card-label",
+		".info-card-value",
+		".interactive-table th",
+		".interactive-table td",
+	}
+	for _, cls := range requiredCSSClasses {
+		if !strings.Contains(cssStr, cls) {
+			t.Errorf("style.css missing required class definition %q", cls)
+		}
+	}
+
+	// 9. Assert presence of new VPN keys across all 5 translations
+	newVPNTranslationKeys := []string{
+		"vpn_bandwidth",
+		"vpn_entry_point_hint",
+		"vpn_telemetry_live",
+		"vpn_port",
+		"vpn_unset_auto",
+		"vpn_unset_auto_detected",
+		"vpn_search_backends",
+		"vpn_no_backends_desc",
+	}
+	languages := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range newVPNTranslationKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required VPN key %q", langFile, k)
+			}
+		}
+	}
+}
