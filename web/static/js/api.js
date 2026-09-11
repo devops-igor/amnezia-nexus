@@ -18,14 +18,10 @@
     'use strict';
 
     /**
-     * Retrieve CSRF token from helper, meta tag, or cookie
+     * Retrieve CSRF token from meta tag or cookie
      * @returns {string}
      */
     function getCsrfToken() {
-        if (typeof window !== 'undefined' && typeof window.getCsrfToken === 'function') {
-            const token = window.getCsrfToken();
-            if (token) return token;
-        }
         if (typeof document !== 'undefined') {
             const meta = document.querySelector('meta[name="csrf-token"]');
             if (meta && meta.getAttribute('content')) {
