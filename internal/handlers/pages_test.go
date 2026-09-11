@@ -303,11 +303,11 @@ func TestPageHandlers(t *testing.T) {
 		if !strings.Contains(bodyLB, "Cluster (Auto)") {
 			t.Errorf("expected 'Cluster (Auto)' in /my rendered HTML, body:\n%s", bodyLB)
 		}
-		if !strings.Contains(bodyLB, "⚡ Load Balancer") {
-			t.Errorf("expected '⚡ Load Balancer' badge in /my rendered HTML")
+		if !strings.Contains(bodyLB, "Load Balancer") {
+			t.Errorf("expected 'Load Balancer' badge in /my rendered HTML")
 		}
-		if !strings.Contains(bodyLB, "⚡ Load Balancer (Auto-Select)") {
-			t.Errorf("expected '⚡ Load Balancer (Auto-Select)' option when vpn_enabled is true")
+		if !strings.Contains(bodyLB, "Load Balancer (Auto-Select)") {
+			t.Errorf("expected 'Load Balancer (Auto-Select)' option when vpn_enabled is true")
 		}
 		if !strings.Contains(bodyLB, `"server_name":"Load Balancer (Auto)"`) {
 			t.Errorf("expected 'Load Balancer (Auto)' server_name in JSON data")

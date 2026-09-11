@@ -661,3 +661,235 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		t.Errorf("users.html should not use showToast(), must use UI.toast")
 	}
 }
+
+func TestPhase6ClientExperienceAndPolish(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	// 1. Assert Client Self-Service Dashboard (my_connections.html)
+	myConnData, err := fs.ReadFile(templatesFS, "my_connections.html")
+	if err != nil {
+		t.Fatalf("failed to read my_connections.html: %v", err)
+	}
+	myConnStr := string(myConnData)
+
+	requiredMyConnTokens := []string{
+		"href=\"#icon-activity\"",
+		"href=\"#icon-server\"",
+		"href=\"#icon-key\"",
+		"href=\"#icon-shield\"",
+		"href=\"#icon-download\"",
+		"href=\"#icon-copy\"",
+		"href=\"#icon-qr\"",
+		"href=\"#icon-trash\"",
+		"href=\"#icon-pencil\"",
+		"href=\"#icon-plus\"",
+		"href=\"#icon-calendar\"",
+		"href=\"#icon-zap\"",
+		"href=\"#icon-file-text\"",
+		"UI.confirm",
+		"UI.copy",
+		"UI.downloadFile",
+		"UI.toast",
+		"UI.modal.open",
+		"UI.modal.close",
+		"UI.formatBytes",
+		"API.get",
+		"API.post",
+		"connSearchInput",
+		"filterConnections",
+		"toggleSortOrder",
+		"network-health-grid",
+		"network-health-node",
+	}
+	for _, token := range requiredMyConnTokens {
+		if !strings.Contains(myConnStr, token) {
+			t.Errorf("my_connections.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure no raw confirm(), apiCall(), showToast() in my_connections.html
+	if strings.Contains(myConnStr, "if (!confirm(") || strings.Contains(myConnStr, "if(!confirm(") {
+		t.Errorf("my_connections.html should not use raw confirm(), must use UI.confirm")
+	}
+	if strings.Contains(myConnStr, "apiCall(") {
+		t.Errorf("my_connections.html should not use apiCall(), must use API client")
+	}
+	if strings.Contains(myConnStr, "showToast(") {
+		t.Errorf("my_connections.html should not use showToast(), must use UI.toast")
+	}
+
+	// Ensure legacy emojis are eliminated from my_connections.html
+	legacyMyConnEmojis := []string{"📡", "🖥", "🔗", "📊", "⚡ Load Balancer", "✏️", "🗑️"}
+	for _, emoji := range legacyMyConnEmojis {
+		if strings.Contains(myConnStr, emoji) {
+			t.Errorf("my_connections.html should not contain legacy emoji %q", emoji)
+		}
+	}
+
+	// 2. Assert Authentication (login.html)
+	loginData, err := fs.ReadFile(templatesFS, "login.html")
+	if err != nil {
+		t.Fatalf("failed to read login.html: %v", err)
+	}
+	loginStr := string(loginData)
+
+	requiredLoginTokens := []string{
+		"nexus-svg-icons",
+		"href=\"#icon-shield\"",
+		"href=\"#icon-moon\"",
+		"href=\"#icon-sun\"",
+		"href=\"#icon-globe\"",
+		"href=\"#icon-user\"",
+		"href=\"#icon-lock\"",
+		"href=\"#icon-x\"",
+		"href=\"#icon-check\"",
+		"login-header-actions",
+		"login-card-elevated",
+		"login-icon-adornment-group",
+		"login-input-adornment",
+		"login-error-box",
+		"API.post",
+		"UI.modal.open",
+		"UI.modal.close",
+		"eq .lang \"fa\"",
+		"dir=\"rtl\"",
+	}
+	for _, token := range requiredLoginTokens {
+		if !strings.Contains(loginStr, token) {
+			t.Errorf("login.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure legacy emojis are eliminated from login.html
+	legacyLoginEmojis := []string{"🌙", "🇷🇺", "🇺🇸", "🇫🇷", "🇨🇳", "🇮🇷"}
+	for _, emoji := range legacyLoginEmojis {
+		if strings.Contains(loginStr, emoji) {
+			t.Errorf("login.html should not contain legacy emoji %q", emoji)
+		}
+	}
+
+	// 3. Assert System Settings (settings.html)
+	settingsData, err := fs.ReadFile(templatesFS, "settings.html")
+	if err != nil {
+		t.Fatalf("failed to read settings.html: %v", err)
+	}
+	settingsStr := string(settingsData)
+
+	requiredSettingsTokens := []string{
+		"href=\"#icon-settings\"",
+		"href=\"#icon-shield\"",
+		"href=\"#icon-book\"",
+		"href=\"#icon-lock\"",
+		"href=\"#icon-send\"",
+		"href=\"#icon-refresh\"",
+		"href=\"#icon-link\"",
+		"href=\"#icon-database\"",
+		"href=\"#icon-download\"",
+		"href=\"#icon-upload\"",
+		"href=\"#icon-check\"",
+		"settings-section-card",
+		"settings-card-header",
+		"switch-container",
+		"switch-slider",
+		"telegram_bot_title",
+		"telegram_enabled",
+		"telegram_bot_token",
+		"telegram_chat_id",
+		"API.post",
+		"UI.confirm",
+		"UI.toast",
+	}
+	for _, token := range requiredSettingsTokens {
+		if !strings.Contains(settingsStr, token) {
+			t.Errorf("settings.html missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure no raw confirm(), apiCall(), showToast() in settings.html
+	if strings.Contains(settingsStr, "if (!confirm(") || strings.Contains(settingsStr, "if(!confirm(") {
+		t.Errorf("settings.html should not use raw confirm(), must use UI.confirm")
+	}
+	if strings.Contains(settingsStr, "apiCall(") {
+		t.Errorf("settings.html should not use apiCall(), must use API client")
+	}
+	if strings.Contains(settingsStr, "showToast(") {
+		t.Errorf("settings.html should not use showToast(), must use UI.toast")
+	}
+
+	// Ensure legacy emojis are eliminated from settings.html
+	legacySettingsEmojis := []string{"⚙️", "🔒", "📖", "📑", "💾", "🔄", "📤", "⬇️", "⬆️", "🗑"}
+	for _, emoji := range legacySettingsEmojis {
+		if strings.Contains(settingsStr, emoji) {
+			t.Errorf("settings.html should not contain legacy emoji %q", emoji)
+		}
+	}
+
+	// 4. Multi-Language RTL/LTR and Translation Coverage
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	requiredLangFiles := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	requiredPhase6Keys := []string{
+		"telegram_bot_title",
+		"telegram_bot_enable",
+		"telegram_bot_token_label",
+		"telegram_chat_id_label",
+		"telegram_bot_hint",
+		"search_connections",
+	}
+
+	for _, langFile := range requiredLangFiles {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+
+		for _, k := range requiredPhase6Keys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("translation %s missing or empty required key %q", langFile, k)
+			}
+		}
+	}
+
+	// 5. CSS Tokens and RTL Rules in style.css
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+
+	requiredCSSRules := []string{
+		".switch-container",
+		".switch-slider",
+		"[dir=\"rtl\"] .switch-slider:before",
+		".login-header-actions",
+		"[dir=\"rtl\"] .login-header-actions",
+		".login-card-elevated",
+		".login-icon-adornment-group",
+		"[dir=\"rtl\"] .login-input-adornment",
+		".login-error-box",
+		".settings-section-card",
+		".settings-card-header",
+		".network-health-grid",
+		".network-health-node",
+	}
+	for _, rule := range requiredCSSRules {
+		if !strings.Contains(cssStr, rule) {
+			t.Errorf("style.css missing required Phase 6 CSS rule %q", rule)
+		}
+	}
+}
