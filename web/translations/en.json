@@ -456,5 +456,8 @@
   "telegram_bot_token_label": "Bot Token",
   "telegram_chat_id_label": "Admin Chat ID",
   "telegram_bot_hint": "Receive real-time security alerts and operational notifications directly in Telegram",
-  "search_connections": "Search connections..."
+  "search_connections": "Search connections...",
+  "load_balancer_auto": "Load Balancer (Auto-Select)",
+  "recommended": "Recommended",
+  "load_balancer_recommended_hint": "Automatically routes traffic to the fastest and most reliable backend server."
 }

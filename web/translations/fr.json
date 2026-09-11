@@ -420,5 +420,8 @@
   "telegram_bot_token_label": "Jeton de bot",
   "telegram_chat_id_label": "ID de chat administrateur",
   "telegram_bot_hint": "Recevez des alertes de sécurité et des notifications opérationnelles directement dans Telegram",
-  "search_connections": "Rechercher des connexions..."
+  "search_connections": "Rechercher des connexions...",
+  "load_balancer_auto": "Équilibreur de charge (Auto-sélection)",
+  "recommended": "Recommandé",
+  "load_balancer_recommended_hint": "Achemine automatiquement le trafic vers le serveur le plus rapide et le plus stable."
 }

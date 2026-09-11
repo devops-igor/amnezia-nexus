@@ -2938,4 +2938,36 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     margin-right: 0;
 }
 
+/* Load Balancer Selection Callout */
+.lb-selection-callout {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    margin-top: var(--space-sm);
+    padding: 0.625rem 0.875rem;
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    line-height: 1.4;
+}
+
+.lb-selection-callout .icon {
+    width: 16px;
+    height: 16px;
+    color: var(--success);
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.lb-selection-callout strong {
+    color: var(--success);
+}
+
+[dir="rtl"] .lb-selection-callout {
+    text-align: right;
+}
+
+
 

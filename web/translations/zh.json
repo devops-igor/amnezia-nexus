@@ -419,5 +419,8 @@
   "telegram_bot_token_label": "机器人 Token",
   "telegram_chat_id_label": "管理员 Chat ID",
   "telegram_bot_hint": "直接在 Telegram 中接收实时安全警报和运行通知",
-  "search_connections": "搜索连接..."
+  "search_connections": "搜索连接...",
+  "load_balancer_auto": "负载均衡器 (自动选择)",
+  "recommended": "推荐",
+  "load_balancer_recommended_hint": "自动将流量路由到最快且最稳定的服务器。"
 }

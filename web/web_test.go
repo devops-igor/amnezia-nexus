@@ -845,6 +845,9 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 		"telegram_chat_id_label",
 		"telegram_bot_hint",
 		"search_connections",
+		"load_balancer_auto",
+		"recommended",
+		"load_balancer_recommended_hint",
 	}
 
 	for _, langFile := range requiredLangFiles {
@@ -886,10 +889,145 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 		".settings-card-header",
 		".network-health-grid",
 		".network-health-node",
+		".lb-selection-callout",
+		"[dir=\"rtl\"] .lb-selection-callout",
 	}
 	for _, rule := range requiredCSSRules {
 		if !strings.Contains(cssStr, rule) {
 			t.Errorf("style.css missing required Phase 6 CSS rule %q", rule)
+		}
+	}
+}
+
+func TestAPIClientCsrfTokenRecursionPrevention(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	apiData, err := fs.ReadFile(staticFS, "js/api.js")
+	if err != nil {
+		t.Fatalf("failed to read js/api.js: %v", err)
+	}
+	apiStr := string(apiData)
+
+	// Extract getCsrfToken function body
+	startIdx := strings.Index(apiStr, "function getCsrfToken()")
+	if startIdx == -1 {
+		t.Fatalf("getCsrfToken function definition not found in js/api.js")
+	}
+
+	// Find the boundary before window.getCsrfToken export
+	endIdx := strings.Index(apiStr[startIdx:], "// Ensure window.getCsrfToken")
+	if endIdx == -1 {
+		t.Fatalf("window.getCsrfToken export boundary not found in js/api.js")
+	}
+	csrfFuncBody := apiStr[startIdx : startIdx+endIdx]
+
+	// 1. Assert getCsrfToken does NOT call window.getCsrfToken (preventing infinite recursion)
+	if strings.Contains(csrfFuncBody, "window.getCsrfToken") {
+		t.Errorf("getCsrfToken function body must not call window.getCsrfToken to prevent circular recursion")
+	}
+
+	// 2. Assert getCsrfToken inspects meta tag and cookie
+	requiredInspections := []string{
+		`meta[name="csrf-token"]`,
+		`getAttribute('content')`,
+		`csrftoken=([^;]+)`,
+	}
+	for _, req := range requiredInspections {
+		if !strings.Contains(csrfFuncBody, req) {
+			t.Errorf("getCsrfToken missing required inspection %q", req)
+		}
+	}
+
+	// 3. Assert window.getCsrfToken is safely exported
+	if !strings.Contains(apiStr, "window.getCsrfToken = getCsrfToken;") {
+		t.Errorf("js/api.js must safely export window.getCsrfToken")
+	}
+}
+
+func TestLoadBalancerHighlightAndAwgPreselection(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	myConnData, err := fs.ReadFile(templatesFS, "my_connections.html")
+	if err != nil {
+		t.Fatalf("failed to read my_connections.html: %v", err)
+	}
+	myConnStr := string(myConnData)
+
+	// 1. Assert presence of .lb-selection-callout, lbHighlightCallout, and load_balancer_auto in my_connections.html
+	requiredHTMLElements := []string{
+		`class="lb-selection-callout"`,
+		`id="lbHighlightCallout"`,
+		`load_balancer_auto`,
+		`load_balancer_recommended_hint`,
+		`data-is-lb="true" selected`,
+	}
+	for _, elem := range requiredHTMLElements {
+		if !strings.Contains(myConnStr, elem) {
+			t.Errorf("my_connections.html missing required element %q", elem)
+		}
+	}
+
+	// 2. Assert pre-selection of Load Balancer and 'awg' (AmneziaWG) in my_connections.html JavaScript
+	requiredJSLogic := []string{
+		`serverSelect.value = '0'`,
+		`protoSelect.value = 'awg'`,
+		`lbCallout.style.display = serverSelect.value === '0' ? 'flex' : 'none'`,
+		`document.getElementById('myAwgMimicryGroup').style.display = protoSelect.value === 'awg' ? '' : 'none'`,
+	}
+	for _, js := range requiredJSLogic {
+		if !strings.Contains(myConnStr, js) {
+			t.Errorf("my_connections.html missing required JS logic %q", js)
+		}
+	}
+
+	// 3. Assert CSS contains .lb-selection-callout and RTL rules
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	if !strings.Contains(cssStr, ".lb-selection-callout") {
+		t.Errorf("style.css missing .lb-selection-callout")
+	}
+	if !strings.Contains(cssStr, `[dir="rtl"] .lb-selection-callout`) {
+		t.Errorf("style.css missing RTL rule for .lb-selection-callout")
+	}
+
+	// 4. Assert presence of the new keys in all 5 JSON translation files
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+	requiredKeys := []string{
+		"load_balancer_auto",
+		"recommended",
+		"load_balancer_recommended_hint",
+	}
+	languages := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range requiredKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required key %q", langFile, k)
+			}
 		}
 	}
 }
