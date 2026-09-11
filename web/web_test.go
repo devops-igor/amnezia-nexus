@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"io/fs"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -1535,6 +1536,194 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		tmplStr := string(tmplData)
 		if !strings.Contains(tmplStr, `href="/static/css/style.css?v=1.1.0"`) {
 			t.Errorf("%s missing stylesheet cache busting query param ?v=1.1.0", tmpl)
+		}
+	}
+}
+
+func TestIssue113UsersUIModernization(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	// 1. Assert users.html references #icon-pause and #icon-play for user toggle controls
+	if !strings.Contains(usersStr, `href="#icon-pause"`) {
+		t.Errorf("users.html missing href=\"#icon-pause\" for active user toggle control")
+	}
+	if !strings.Contains(usersStr, `href="#icon-play"`) {
+		t.Errorf("users.html missing href=\"#icon-play\" for disabled user toggle control")
+	}
+
+	// 2. Assert users.html does not contain the old dot toggle markup for user toggling
+	if strings.Contains(usersStr, "badge-dot") {
+		t.Errorf("users.html must not contain legacy dot toggle markup (badge-dot)")
+	}
+
+	// 3. Assert #userConnsTable has width: 100% and min-width: 100%
+	if !strings.Contains(usersStr, `<table class="table interactive-table" id="userConnsTable" style="width: 100%; min-width: 100%;">`) {
+		t.Errorf("users.html missing table#userConnsTable with style=\"width: 100%%; min-width: 100%%;\"")
+	}
+
+	// 4. Assert #usersContainer and #usersGrid expand to full width
+	if !strings.Contains(usersStr, `id="usersContainer" class="hidden" style="width: 100%; min-width: 100%;"`) {
+		t.Errorf("users.html missing #usersContainer with width: 100%% and min-width: 100%%")
+	}
+	if !strings.Contains(usersStr, `id="usersGrid"`) || !strings.Contains(usersStr, `width: 100%; min-width: 100%;`) {
+		t.Errorf("users.html missing #usersGrid with width: 100%% and min-width: 100%%")
+	}
+
+	// 5. Assert action buttons use standardized button classes and danger hover
+	if !strings.Contains(usersStr, `btn-danger-hover`) {
+		t.Errorf("users.html missing btn-danger-hover class on delete action buttons")
+	}
+	if !strings.Contains(usersStr, `btn-success-hover`) {
+		t.Errorf("users.html missing btn-success-hover class on play toggle button")
+	}
+
+	// 6. Assert required DOM element IDs are preserved
+	requiredDOMIDs := []string{
+		"userSearch", "userSearchClear", "roleFilterChips", "usersContainer", "usersGrid",
+		"pagination", "prevPage", "pageInfo", "nextPage", "usersLoading", "usersEmpty",
+		"addUserModal", "addUserForm", "newUsername", "newPassword", "newRole", "newTelegramId",
+		"newEmail", "newTrafficLimit", "newTrafficResetStrategy", "newExpirationDate",
+		"newDescription", "newUserServer", "newUserProtocol",
+		"editUserModal", "editUserForm", "editUserId", "editUsername", "editTelegramId",
+		"editEmail", "editTrafficLimit", "editTrafficResetStrategy", "editExpirationDate", "editDescription",
+		"addUserConnModal", "addUserConnForm", "ucUserId", "ucServer", "ucProtocol", "ucName",
+		"userConnsModal", "userConnsTitle", "userConnsTableContainer", "userConnsTable",
+		"userConnsTableBody", "userConnsEmpty",
+		"configModal", "configModalTitle", "configText", "configQrCode",
+		"shareUserModal", "shareForm", "shareUserId", "shareUsername", "shareLinkInput",
+		"shareEnabled", "sharePassword",
+	}
+	for _, id := range requiredDOMIDs {
+		if !strings.Contains(usersStr, `id="`+id+`"`) {
+			t.Errorf("users.html missing required DOM element id=%q", id)
+		}
+	}
+
+	// 7. Assert style.css contains .clients-list, #usersContainer, #usersGrid, and #userConnsTable width rules
+	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssData)
+	if !strings.Contains(cssStr, "#usersContainer {\n    width: 100%;\n    min-width: 100%;\n}") {
+		t.Errorf("style.css missing #usersContainer width rules")
+	}
+	if !strings.Contains(cssStr, "#usersGrid {\n    width: 100%;\n    min-width: 100%;\n}") {
+		t.Errorf("style.css missing #usersGrid width rules")
+	}
+	if !strings.Contains(cssStr, "#userConnsTable {\n    width: 100%;\n    min-width: 100%;\n}") {
+		t.Errorf("style.css missing #userConnsTable width rules")
+	}
+}
+
+func TestIssue113TranslationParityAndValidity(t *testing.T) {
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	languages := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	dicts := make(map[string]map[string]string)
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		dicts[langFile] = dict
+	}
+
+	// 1. Strict key parity across all 5 files
+	baseKeys := dicts["en.json"]
+	for _, langFile := range languages[1:] {
+		curDict := dicts[langFile]
+		if len(curDict) != len(baseKeys) {
+			t.Errorf("key count mismatch between en.json (%d) and %s (%d)", len(baseKeys), langFile, len(curDict))
+		}
+		for k := range baseKeys {
+			val, ok := curDict[k]
+			if !ok {
+				t.Errorf("%s is missing key %q present in en.json", langFile, k)
+			} else if strings.TrimSpace(val) == "" {
+				t.Errorf("%s has empty translation for key %q", langFile, k)
+			}
+		}
+		for k := range curDict {
+			if _, ok := baseKeys[k]; !ok {
+				t.Errorf("%s has extra key %q not present in en.json", langFile, k)
+			}
+		}
+	}
+
+	// 2. Assert specific Issue #113 keys are defined
+	requiredKeys := []string{
+		"user_enable",
+		"user_disable",
+		"expired",
+		"expires",
+		"all",
+		"role_admin",
+		"role_support",
+		"role_user",
+		"role_filter",
+		"connections_count",
+		"delete_user_title",
+		"delete_connection",
+		"delete_conn_confirm",
+		"select_connection",
+		"search",
+	}
+	for _, k := range requiredKeys {
+		for _, langFile := range languages {
+			if val, ok := dicts[langFile][k]; !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required key %q", langFile, k)
+			}
+		}
+	}
+
+	// 3. Assert all template and JS translation keys in users.html exist across all 5 languages
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	tmplRe := regexp.MustCompile(`\{\{\s*_\s*"([^"]+)"\s*\}\}`)
+	jsRe := regexp.MustCompile(`_\(\s*['"]([^'"]+)['"]\s*\)`)
+
+	usersKeys := make(map[string]struct{})
+	for _, m := range tmplRe.FindAllStringSubmatch(usersStr, -1) {
+		usersKeys[m[1]] = struct{}{}
+	}
+	for _, m := range jsRe.FindAllStringSubmatch(usersStr, -1) {
+		usersKeys[m[1]] = struct{}{}
+	}
+
+	for k := range usersKeys {
+		for _, langFile := range languages {
+			if val, ok := dicts[langFile][k]; !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty translation for users.html key %q", langFile, k)
+			}
 		}
 	}
 }
