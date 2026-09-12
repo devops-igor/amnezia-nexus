@@ -67,6 +67,7 @@ type AWGParams struct {
 	I5                         string `json:"i5,omitempty"`
 	HeaderProtectionKey        string `json:"header_protection_key,omitempty"`
 	RandomTrailers             string `json:"random_trailers,omitempty"`
+	DisableCookies             string `json:"disable_cookies,omitempty"`
 }
 
 // ToMap converts AWGParams to a map of string key-values.
@@ -101,6 +102,9 @@ func (p *AWGParams) ToMap() map[string]string {
 	}
 	if p.RandomTrailers != "" {
 		m["random_trailers"] = p.RandomTrailers
+	}
+	if p.DisableCookies != "" {
+		m["disable_cookies"] = p.DisableCookies
 	}
 	return m
 }
@@ -195,6 +199,8 @@ func (p *AWGParams) applyHeaderAndMimicryParam(k, strVal string) {
 		p.HeaderProtectionKey = strVal
 	case "random_trailers", "randomtrailers":
 		p.RandomTrailers = strVal
+	case "disable_cookies", "disablecookies":
+		p.DisableCookies = strVal
 	}
 }
 
