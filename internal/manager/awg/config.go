@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"regexp"
 	"strings"
+
+	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
 )
 
 // AWGPeer represents a WireGuard peer entry in the server configuration.
@@ -108,6 +111,13 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 		}
 	}
 
+	if params.HeaderProtectionKey != "" {
+		lines = append(lines, fmt.Sprintf("HeaderProtectionKey = %s", params.HeaderProtectionKey))
+	}
+	if params.RandomTrailers != "" {
+		lines = append(lines, fmt.Sprintf("RandomTrailers = %s", params.RandomTrailers))
+	}
+
 	for _, peer := range peers {
 		lines = append(lines, "", "[Peer]", fmt.Sprintf("PublicKey = %s", peer.PublicKey))
 		if peer.PresharedKey != "" {
@@ -121,6 +131,9 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 
 // RenderClientConfig builds the WireGuard / AmneziaWG client configuration file text.
 func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey string, psk string, endpoint string, dns1, dns2 string, mtu string, params *AWGParams, ud *AWGClientUserData) string {
+	if serverPubKey == "" {
+		log.Printf("WARNING: RenderClientConfig called with empty serverPubKey")
+	}
 	if mtu == "" {
 		mtu = "1280"
 	}
@@ -173,6 +186,9 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 	if params.HeaderProtectionKey != "" {
 		lines = append(lines, fmt.Sprintf("HeaderProtectionKey = %s", params.HeaderProtectionKey))
 	}
+	if params.RandomTrailers != "" {
+		lines = append(lines, fmt.Sprintf("RandomTrailers = %s", params.RandomTrailers))
+	}
 
 	if ud != nil {
 		if ud.RekeyAfterTime != nil {
@@ -216,25 +232,34 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// ParseCPSBlob parses AWG binary tag string format '<b 0xHEX>' or '<r N><b 0xHEX>' into raw bytes.
+func ParseCPSBlob(tagStr string) ([]byte, error) {
+	return cps.ParseCPSBlob(tagStr)
+}
+
 // ParseServerConfig extracts parameters and peers from a server WireGuard config file.
 func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) {
 	params := make(map[string]string)
 	var peers []AWGPeer
 
 	paramMap := map[string]string{
-		"listenport": "port",
-		"mtu":        "mtu",
-		"jc":         "junk_packet_count",
-		"jmin":       "junk_packet_min_size",
-		"jmax":       "junk_packet_max_size",
-		"s1":         "init_packet_junk_size",
-		"s2":         "response_packet_junk_size",
-		"s3":         "cookie_reply_packet_junk_size",
-		"s4":         "transport_packet_junk_size",
-		"h1":         "init_packet_magic_header",
-		"h2":         "response_packet_magic_header",
-		"h3":         "underload_packet_magic_header",
-		"h4":         "transport_packet_magic_header",
+		"listenport":            "port",
+		"mtu":                   "mtu",
+		"jc":                    "junk_packet_count",
+		"jmin":                  "junk_packet_min_size",
+		"jmax":                  "junk_packet_max_size",
+		"s1":                    "init_packet_junk_size",
+		"s2":                    "response_packet_junk_size",
+		"s3":                    "cookie_reply_packet_junk_size",
+		"s4":                    "transport_packet_junk_size",
+		"h1":                    "init_packet_magic_header",
+		"h2":                    "response_packet_magic_header",
+		"h3":                    "underload_packet_magic_header",
+		"h4":                    "transport_packet_magic_header",
+		"headerprotectionkey":   "header_protection_key",
+		"header_protection_key": "header_protection_key",
+		"randomtrailers":        "random_trailers",
+		"random_trailers":       "random_trailers",
 	}
 
 	var currentPeer *AWGPeer
