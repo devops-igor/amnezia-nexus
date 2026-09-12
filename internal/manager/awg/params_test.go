@@ -763,3 +763,68 @@ func TestUpgradeDegenerateHeaders(t *testing.T) {
 		t.Errorf("fallback headers are not pairwise disjoint: %v", err)
 	}
 }
+
+func TestAWGParamsFromMap_HeaderProtectionKeyAndRandomTrailers(t *testing.T) {
+	hpKeys := []string{
+		"header_protection_key",
+		"HeaderProtectionKey",
+		"headerprotectionkey",
+		"hpkey",
+		"HPKEY",
+	}
+
+	for _, k := range hpKeys {
+		p := AWGParamsFromMap(map[string]any{
+			k: "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=",
+		})
+		if p.HeaderProtectionKey != "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=" {
+			t.Errorf("key %q: expected HeaderProtectionKey to be set, got %q", k, p.HeaderProtectionKey)
+		}
+	}
+
+	rtKeys := []string{
+		"random_trailers",
+		"RandomTrailers",
+		"randomtrailers",
+		"RANDOM_TRAILERS",
+	}
+
+	for _, k := range rtKeys {
+		p := AWGParamsFromMap(map[string]any{
+			k: "on",
+		})
+		if p.RandomTrailers != "on" {
+			t.Errorf("key %q: expected RandomTrailers 'on', got %q", k, p.RandomTrailers)
+		}
+
+		pBool := AWGParamsFromMap(map[string]any{
+			k: true,
+		})
+		if pBool.RandomTrailers != "true" {
+			t.Errorf("key %q: expected RandomTrailers 'true' for bool, got %q", k, pBool.RandomTrailers)
+		}
+	}
+}
+
+func TestAWGParams_ToMap_RandomTrailers(t *testing.T) {
+	p := &AWGParams{
+		HeaderProtectionKey: "test-hpkey",
+		RandomTrailers:      "on",
+	}
+	m := p.ToMap()
+	if m["header_protection_key"] != "test-hpkey" {
+		t.Errorf("expected header_protection_key 'test-hpkey', got %q", m["header_protection_key"])
+	}
+	if m["random_trailers"] != "on" {
+		t.Errorf("expected random_trailers 'on', got %q", m["random_trailers"])
+	}
+
+	pEmpty := &AWGParams{}
+	mEmpty := pEmpty.ToMap()
+	if _, ok := mEmpty["random_trailers"]; ok {
+		t.Errorf("expected random_trailers omitted when empty")
+	}
+	if _, ok := mEmpty["header_protection_key"]; ok {
+		t.Errorf("expected header_protection_key omitted when empty")
+	}
+}

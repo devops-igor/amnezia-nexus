@@ -97,6 +97,14 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker ps --filter name=^") {
+		if strings.Contains(cmd, "{{.Names}}") {
+			for _, name := range AWGContainerNames {
+				if strings.Contains(cmd, name) {
+					return name, "", 0, nil
+				}
+			}
+			return "amnezia-awg", "", 0, nil
+		}
 		return "Up 2 hours", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker ps -a --filter name=^") {
@@ -877,5 +885,226 @@ func TestAWGManager_ResolveContainerName_MaliciousRejected(t *testing.T) {
 	_, _ = mgr.getServerConfig(ctx, client, "amnezia-awg; id")
 	if strings.Contains(injectedCmd, "; id") {
 		t.Fatalf("malicious container name was interpolated into command: %s", injectedCmd)
+	}
+}
+
+func TestAWGManager_Server2_AWG31_AddClient_And_GetClientConfig(t *testing.T) {
+	ctx := context.Background()
+
+	server2Conf := `[Interface]
+PrivateKey = c2VydmVyMlByaXZLZXkxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ=
+Address = 10.8.1.1/24
+ListenPort = 33950
+MTU = 1280
+Jc = 4
+Jmin = 30
+Jmax = 80
+S1 = 40
+S2 = 60
+H1 = 12345
+H2 = 67890
+HeaderProtectionKey = dGVzdC1zZXJ2ZXIyLWhwLWtleS0xMjM0NQ==
+RandomTrailers = on
+`
+	server2PubKey := "server2PubKey1234567890123456789012345="
+	server2PSK := "server2PSK12345678901234567890123456789012="
+
+	mockClient := &mockAWGSSHClient{
+		files: map[string][]byte{
+			"/opt/amnezia/awg/awg0.conf":                       []byte(server2Conf),
+			"/opt/amnezia/awg/wireguard_server_public_key.key": []byte(server2PubKey),
+			"/opt/amnezia/awg/wireguard_psk.key":               []byte(server2PSK),
+			"/opt/amnezia/awg/clientsTable":                    []byte("[]"),
+		},
+		host: "91.226.221.253",
+		port: 22,
+	}
+
+	var commandsExecuted []string
+	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		commandsExecuted = append(commandsExecuted, cmd)
+
+		// Any command specifically targeting "amnezia-awg" (without 2) must FAIL on Server #2
+		if strings.Contains(cmd, " amnezia-awg ") ||
+			strings.Contains(cmd, " amnezia-awg:") ||
+			strings.Contains(cmd, "name=^amnezia-awg$") ||
+			strings.Contains(cmd, "docker exec -i amnezia-awg ") {
+			return "", "Error response from daemon: No such container: amnezia-awg", 1, errors.New("exit status 1")
+		}
+
+		// Container discovery for amnezia-awg2
+		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") {
+			if strings.Contains(cmd, "{{.Names}}") {
+				return "amnezia-awg2\n", "", 0, nil
+			}
+			return "Up 5 hours\n", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker ps --filter name=amnezia-awg") {
+			return "amnezia-awg2\n", "", 0, nil
+		}
+
+		// Reading files inside amnezia-awg2
+		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/wireguard_server_public_key.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/wireguard_psk.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/awg0.conf") {
+			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/clientsTable") {
+			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+		}
+
+		// docker cp to amnezia-awg2
+		if strings.Contains(cmd, "docker cp /tmp/_amnz_edit_config.conf amnezia-awg2:/opt/amnezia/awg/awg0.conf") {
+			mockClient.files["/opt/amnezia/awg/awg0.conf"] = mockClient.files["/tmp/_amnz_edit_config.conf"]
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker cp /tmp/_amnz_clients.json amnezia-awg2:/opt/amnezia/awg/clientsTable") {
+			mockClient.files["/opt/amnezia/awg/clientsTable"] = mockClient.files["/tmp/_amnz_clients.json"]
+			return "", "", 0, nil
+		}
+
+		// WireGuard / TC / live remediation commands
+		if strings.Contains(cmd, "tc ") || strings.Contains(cmd, "iptables") || strings.Contains(cmd, "ip route") || strings.Contains(cmd, "sysctl") {
+			return "OK", "", 0, nil
+		}
+		if strings.Contains(cmd, "awg syncconf") || strings.Contains(cmd, "show all") {
+			return "OK", "", 0, nil
+		}
+
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: mockClient})
+	server := &models.Server{
+		ID:      2,
+		Host:    "91.226.221.253",
+		SSHPort: 22,
+	}
+
+	// 1. AddClient
+	addParams := map[string]any{
+		"name":                 "TestServer2User",
+		"awg_speed_limit_down": 50,
+		"awg_speed_limit_up":   25,
+	}
+	res, err := mgr.AddClient(ctx, server, addParams)
+	if err != nil {
+		t.Fatalf("AddClient failed on Server #2 (amnezia-awg2): %v", err)
+	}
+
+	clientID, ok := res["client_id"].(string)
+	if !ok || clientID == "" {
+		t.Fatalf("AddClient did not return valid client_id: %+v", res)
+	}
+
+	configStr, ok := res["config"].(string)
+	if !ok || configStr == "" {
+		t.Fatalf("AddClient did not return config: %+v", res)
+	}
+
+	// Assertions on generated client config
+	if !strings.Contains(configStr, "PublicKey = "+server2PubKey) {
+		t.Errorf("AddClient generated empty or wrong PublicKey: expected %s, got config:\n%s", server2PubKey, configStr)
+	}
+	if strings.Contains(configStr, "PublicKey = \n") {
+		t.Errorf("AddClient produced config with empty PublicKey: %s", configStr)
+	}
+	if !strings.Contains(configStr, "HeaderProtectionKey = dGVzdC1zZXJ2ZXIyLWhwLWtleS0xMjM0NQ==") {
+		t.Errorf("AddClient missing HeaderProtectionKey: %s", configStr)
+	}
+	if !strings.Contains(configStr, "RandomTrailers = on") {
+		t.Errorf("AddClient missing RandomTrailers = on: %s", configStr)
+	}
+	if !strings.Contains(configStr, "Endpoint = 91.226.221.253:33950") {
+		t.Errorf("AddClient missing correct Endpoint: %s", configStr)
+	}
+
+	// 2. GetClientConfig
+	getClientCfg, err := mgr.GetClientConfig(ctx, server, clientID)
+	if err != nil {
+		t.Fatalf("GetClientConfig failed on Server #2: %v", err)
+	}
+	if !strings.Contains(getClientCfg, "PublicKey = "+server2PubKey) {
+		t.Errorf("GetClientConfig generated empty or wrong PublicKey: expected %s, got:\n%s", server2PubKey, getClientCfg)
+	}
+	if strings.Contains(getClientCfg, "PublicKey = \n") {
+		t.Errorf("GetClientConfig produced config with empty PublicKey: %s", getClientCfg)
+	}
+	if !strings.Contains(getClientCfg, "HeaderProtectionKey = dGVzdC1zZXJ2ZXIyLWhwLWtleS0xMjM0NQ==") {
+		t.Errorf("GetClientConfig missing HeaderProtectionKey: %s", getClientCfg)
+	}
+	if !strings.Contains(getClientCfg, "RandomTrailers = on") {
+		t.Errorf("GetClientConfig missing RandomTrailers = on: %s", getClientCfg)
+	}
+	if !strings.Contains(getClientCfg, "Endpoint = 91.226.221.253:33950") {
+		t.Errorf("GetClientConfig missing correct Endpoint: %s", getClientCfg)
+	}
+
+	// 3. RemoveClient
+	if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+		t.Fatalf("RemoveClient failed on Server #2: %v", err)
+	}
+}
+
+func TestAWGManager_ServerPubKeyEmpty_FailsLoudly(t *testing.T) {
+	ctx := context.Background()
+
+	confWithoutPrivKey := `[Interface]
+Address = 10.8.1.1/24
+ListenPort = 55424
+`
+	mockClient := &mockAWGSSHClient{
+		files: map[string][]byte{
+			"/opt/amnezia/awg/awg0.conf": []byte(confWithoutPrivKey),
+			"/opt/amnezia/awg/clientsTable": []byte(`[
+  {
+    "clientId": "testExistingClient",
+    "userData": {
+      "clientName": "Existing",
+      "clientPrivateKey": "privkey123",
+      "clientIp": "10.8.1.2"
+    }
+  }
+]`),
+		},
+	}
+
+	// Handler returns empty/error for public key retrieval
+	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "wireguard_server_public_key.key") || strings.Contains(cmd, "public-key") {
+			return "", "file not found", 1, errors.New("exit status 1")
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: mockClient})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// AddClient must fail loudly when server public key cannot be retrieved
+	_, err := mgr.AddClient(ctx, server, map[string]any{"name": "ShouldFail"})
+	if err == nil {
+		t.Fatal("expected AddClient to fail loudly when server public key is empty, got nil err")
+	}
+	if !strings.Contains(err.Error(), "public key") {
+		t.Errorf("expected error to mention public key, got: %v", err)
+	}
+
+	// GetClientConfig must also fail loudly
+	_, err = mgr.GetClientConfig(ctx, server, "testExistingClient")
+	if err == nil {
+		t.Fatal("expected GetClientConfig to fail loudly when server public key is empty, got nil err")
+	}
+	if !strings.Contains(err.Error(), "public key") {
+		t.Errorf("expected error to mention public key, got: %v", err)
 	}
 }

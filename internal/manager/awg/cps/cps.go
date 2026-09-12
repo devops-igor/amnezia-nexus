@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -54,6 +55,9 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 
 	if strings.HasPrefix(s, "<b 0x") && strings.HasSuffix(s, ">") {
 		hexData := strings.TrimSpace(s[5 : len(s)-1])
+		if hexData == "" {
+			return nil, errors.New("invalid hex in CPS blob: empty hex data")
+		}
 		raw, err := hex.DecodeString(hexData)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hex in CPS blob: %w", err)
