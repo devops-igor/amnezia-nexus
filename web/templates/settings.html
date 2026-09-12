@@ -12,9 +12,12 @@
     <div style="display: flex; flex-direction: column; gap: var(--space-lg);">
         <!-- BLOCK 1: Appearance -->
         <div class="card settings-section-card">
-            <div class="settings-card-header">
-                <svg class="icon"><use href="#icon-settings"></use></svg>
-                <h3 class="card-title">{{ _ "appearance" }}</h3>
+            <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: var(--space-sm);">
+                    <svg class="icon"><use href="#icon-settings"></use></svg>
+                    <h3 class="card-title">{{ _ "appearance" }}</h3>
+                </div>
+                <span class="badge badge-info" style="font-size: 0.72rem;">v{{ .app_version }}{{ if .app_codename }} — {{ .app_codename }}{{ end }}</span>
             </div>
             <form id="appearanceForm">
                 <div class="form-group">

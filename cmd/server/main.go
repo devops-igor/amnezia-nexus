@@ -28,6 +28,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-version", "-v", "version":
+			fmt.Printf("amnezia-nexus %s (%s)\n", config.AppVersion, config.AppCodename)
+			return
+		}
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -133,7 +141,7 @@ func run(ctx context.Context) error {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
-	slog.Info("Starting Amnezia Web Panel Server", "version", cfg.AppVersion, "port", cfg.Port)
+	slog.Info("Starting Amnezia Web Panel Server", "version", cfg.AppVersion, "codename", cfg.AppCodename, "port", cfg.Port)
 
 	// 3. Writability preflight check & SQLite database initialization
 	if err := database.CheckPreflight(cfg.DataDir, cfg.DBPath); err != nil {

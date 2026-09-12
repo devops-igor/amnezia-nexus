@@ -44,5 +44,8 @@ func TestSystemHandlers(t *testing.T) {
 		if resp["version"] != cfg.AppVersion {
 			t.Errorf("expected version %q, got %q", cfg.AppVersion, resp["version"])
 		}
+		if resp["codename"] != cfg.AppCodename {
+			t.Errorf("expected codename %q, got %q", cfg.AppCodename, resp["codename"])
+		}
 	})
 }

@@ -184,7 +184,7 @@ volumes:
 
 ### 2. Start the container
 
-> **Image tags:** the compose file above pins the **stable release** (`v1.1.0`).
+> **Image tags:** the compose file above pins the **stable release** (`v1.1.0` — Aurora).
 > Alternatively, use `:latest` to always track the newest build from `main` —
 > recommended only for testing, since it may include unreleased changes.
 > Available tags: https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus

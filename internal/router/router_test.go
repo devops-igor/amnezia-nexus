@@ -33,10 +33,11 @@ func setupTestRouterDB(t *testing.T) (*database.DB, *config.Config) {
 	})
 
 	cfg := &config.Config{
-		AppVersion: config.AppVersion,
-		Host:       "127.0.0.1",
-		Port:       5000,
-		SecretKey:  testSecretKey,
+		AppVersion:  config.AppVersion,
+		AppCodename: config.AppCodename,
+		Host:        "127.0.0.1",
+		Port:        5000,
+		SecretKey:   testSecretKey,
 	}
 
 	// Create an admin user so setup redirect does not block normal routes
@@ -99,6 +100,9 @@ func TestRouterVersionEndpoint(t *testing.T) {
 
 	if resp["version"] != cfg.AppVersion {
 		t.Errorf("expected version %q, got %q", cfg.AppVersion, resp["version"])
+	}
+	if resp["codename"] != config.AppCodename {
+		t.Errorf("expected codename %q, got %q", config.AppCodename, resp["codename"])
 	}
 }
 

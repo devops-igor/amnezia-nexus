@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-09-12
+## [1.1.0] — Aurora - 2026-09-12
+
+Amnezia Nexus 1.1.0 ("Aurora") upgrades backend server deployments to AmneziaWG 3.1
+with modern container naming (`amnezia-awg2`), preventing "Legacy 2.0 outdated" warnings
+in official Amnezia clients, adds interface self-healing, multi-language localization,
+and built-in release version and codename reporting.
 
 ### Added
 
@@ -20,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downed `awg0` interfaces during configuration synchronization (#132, #134)
 - Multi-language localization: complete translations across 5 languages (EN, RU,
   FR, ZH, FA) for server protocol installation and modal titles (#130, #133)
+- Application release reporting: `--version` / `-v` CLI flags, startup logging,
+  and web UI console badges displaying the active version and codename
 
 ### Changed
 
