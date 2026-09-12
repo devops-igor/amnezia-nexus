@@ -66,6 +66,7 @@ type AWGParams struct {
 	I4                         string `json:"i4,omitempty"`
 	I5                         string `json:"i5,omitempty"`
 	HeaderProtectionKey        string `json:"header_protection_key,omitempty"`
+	RandomTrailers             string `json:"random_trailers,omitempty"`
 }
 
 // ToMap converts AWGParams to a map of string key-values.
@@ -98,6 +99,9 @@ func (p *AWGParams) ToMap() map[string]string {
 	if p.HeaderProtectionKey != "" {
 		m["header_protection_key"] = p.HeaderProtectionKey
 	}
+	if p.RandomTrailers != "" {
+		m["random_trailers"] = p.RandomTrailers
+	}
 	return m
 }
 
@@ -127,57 +131,71 @@ func AWGParamsFromMap(m map[string]any) *AWGParams {
 	}
 
 	for k, v := range m {
-		strVal := fmt.Sprint(v)
-		switch strings.ToLower(k) {
-		case "port", "listenport":
-			p.Port = strVal
-		case "mtu":
-			p.MTU = strVal
-		case "subnet_address":
-			p.SubnetAddress = strVal
-		case "subnet_cidr":
-			p.SubnetCIDR = strVal
-		case "subnet_ip":
-			p.SubnetIP = strVal
-		case "dns1":
-			p.DNS1 = strVal
-		case "dns2":
-			p.DNS2 = strVal
-		case "junk_packet_count", "jc":
-			p.JunkPacketCount = strVal
-		case "junk_packet_min_size", "jmin":
-			p.JunkPacketMinSize = strVal
-		case "junk_packet_max_size", "jmax":
-			p.JunkPacketMaxSize = strVal
-		case "init_packet_junk_size", "s1":
-			p.InitPacketJunkSize = strVal
-		case "response_packet_junk_size", "s2":
-			p.ResponsePacketJunkSize = strVal
-		case "cookie_reply_packet_junk_size", "s3":
-			p.CookieReplyPacketJunkSize = strVal
-		case "transport_packet_junk_size", "s4":
-			p.TransportPacketJunkSize = strVal
-		case "init_packet_magic_header", "h1":
-			p.InitPacketMagicHeader = strVal
-		case "response_packet_magic_header", "h2":
-			p.ResponsePacketMagicHeader = strVal
-		case "underload_packet_magic_header", "h3":
-			p.UnderloadPacketMagicHeader = strVal
-		case "transport_packet_magic_header", "h4":
-			p.TransportPacketMagicHeader = strVal
-		case "i1":
-			p.I1 = strVal
-		case "i2":
-			p.I2 = strVal
-		case "i3":
-			p.I3 = strVal
-		case "i4":
-			p.I4 = strVal
-		case "i5":
-			p.I5 = strVal
-		}
+		p.applyParam(strings.ToLower(k), fmt.Sprint(v))
 	}
 	return p
+}
+
+func (p *AWGParams) applyParam(k, strVal string) {
+	switch k {
+	case "port", "listenport":
+		p.Port = strVal
+	case "mtu":
+		p.MTU = strVal
+	case "subnet_address":
+		p.SubnetAddress = strVal
+	case "subnet_cidr":
+		p.SubnetCIDR = strVal
+	case "subnet_ip":
+		p.SubnetIP = strVal
+	case "dns1":
+		p.DNS1 = strVal
+	case "dns2":
+		p.DNS2 = strVal
+	case "junk_packet_count", "jc":
+		p.JunkPacketCount = strVal
+	case "junk_packet_min_size", "jmin":
+		p.JunkPacketMinSize = strVal
+	case "junk_packet_max_size", "jmax":
+		p.JunkPacketMaxSize = strVal
+	case "init_packet_junk_size", "s1":
+		p.InitPacketJunkSize = strVal
+	case "response_packet_junk_size", "s2":
+		p.ResponsePacketJunkSize = strVal
+	case "cookie_reply_packet_junk_size", "s3":
+		p.CookieReplyPacketJunkSize = strVal
+	case "transport_packet_junk_size", "s4":
+		p.TransportPacketJunkSize = strVal
+	default:
+		p.applyHeaderAndMimicryParam(k, strVal)
+	}
+}
+
+func (p *AWGParams) applyHeaderAndMimicryParam(k, strVal string) {
+	switch k {
+	case "init_packet_magic_header", "h1":
+		p.InitPacketMagicHeader = strVal
+	case "response_packet_magic_header", "h2":
+		p.ResponsePacketMagicHeader = strVal
+	case "underload_packet_magic_header", "h3":
+		p.UnderloadPacketMagicHeader = strVal
+	case "transport_packet_magic_header", "h4":
+		p.TransportPacketMagicHeader = strVal
+	case "i1":
+		p.I1 = strVal
+	case "i2":
+		p.I2 = strVal
+	case "i3":
+		p.I3 = strVal
+	case "i4":
+		p.I4 = strVal
+	case "i5":
+		p.I5 = strVal
+	case "header_protection_key", "headerprotectionkey", "hpkey":
+		p.HeaderProtectionKey = strVal
+	case "random_trailers", "randomtrailers":
+		p.RandomTrailers = strVal
+	}
 }
 
 // GenerateWGKeypair generates a Curve25519 keypair formatted as base64 strings.
