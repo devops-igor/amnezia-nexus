@@ -478,6 +478,78 @@ func TestRenderClientConfig_HeaderProtectionKeyAndRandomTrailers(t *testing.T) {
 	}
 }
 
+func TestParseServerConfig_DisableCookies(t *testing.T) {
+	confText := `
+[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 33950
+MTU = 1280
+DisableCookies = on
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+	params, _, err := ParseServerConfig(confText)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if params["disable_cookies"] != "on" {
+		t.Errorf("expected disable_cookies 'on', got %q", params["disable_cookies"])
+	}
+
+	// Test lowercase variant disablecookies
+	confLower := `
+[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+disablecookies = on
+`
+	paramsLower, _, err := ParseServerConfig(confLower)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if paramsLower["disable_cookies"] != "on" {
+		t.Errorf("expected disablecookies mapped to disable_cookies, got %q", paramsLower["disable_cookies"])
+	}
+
+	// Test snake_case variant disable_cookies
+	confSnake := `
+[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+disable_cookies = on
+`
+	paramsSnake, _, err := ParseServerConfig(confSnake)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if paramsSnake["disable_cookies"] != "on" {
+		t.Errorf("expected disable_cookies mapped to disable_cookies, got %q", paramsSnake["disable_cookies"])
+	}
+}
+
+func TestRenderClientConfig_DisableCookies(t *testing.T) {
+	params := &AWGParams{
+		DisableCookies: "on",
+	}
+	cfg := RenderClientConfig("clientPriv", "10.8.1.2", "serverPub123", "psk123", "91.226.221.253:33950", "", "", "1280", params, nil)
+	if !strings.Contains(cfg, "DisableCookies = on") {
+		t.Errorf("expected DisableCookies = on in client config, got:\n%s", cfg)
+	}
+}
+
+func TestRenderServerConfig_DisableCookies(t *testing.T) {
+	params := &AWGParams{
+		DisableCookies: "on",
+	}
+	conf := RenderServerConfig("serverPrivKey", "10.8.1.1", "24", "55424", "1280", params, nil)
+	if !strings.Contains(conf, "DisableCookies = on") {
+		t.Errorf("expected DisableCookies = on in server config, got:\n%s", conf)
+	}
+}
+
 func TestParseCPSBlob_RejectsInvalidHex(t *testing.T) {
 	// Valid hex blob
 	validBytes, err := ParseCPSBlob("<b 0x01020304>")
