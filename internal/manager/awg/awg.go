@@ -642,6 +642,32 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 		cName, m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
+		// Self-healing: check whether interface awg0 is UP inside the container
+		ipCmd := fmt.Sprintf("docker exec -i %s ip link show %s", cName, m.interfaceName())
+		ipOut, _, ipCode, ipErr := client.RunSudoCommand(ctx, ipCmd)
+		isUp := ipErr == nil && ipCode == 0 && (strings.Contains(ipOut, "<UP") || strings.Contains(ipOut, ",UP") || strings.Contains(ipOut, "state UP"))
+		if !isUp {
+			upCmd := fmt.Sprintf("docker exec -i %s awg-quick up %s", cName, cfgPath)
+			upOut, upErrOut, upCode, upErr := client.RunSudoCommand(ctx, upCmd)
+			if upErr != nil || upCode != 0 {
+				upErrMsg := strings.TrimSpace(upErrOut)
+				if upErrMsg == "" {
+					upErrMsg = strings.TrimSpace(upOut)
+				} else if strings.TrimSpace(upOut) != "" {
+					upErrMsg = upErrMsg + ": " + strings.TrimSpace(upOut)
+				}
+				if upErr != nil {
+					return fmt.Errorf("failed to bring up AmneziaWG interface %s with awg-quick up in container %s (exit code %d): %s: %w",
+						m.interfaceName(), cName, upCode, upErrMsg, upErr)
+				}
+				return fmt.Errorf("failed to bring up AmneziaWG interface %s with awg-quick up in container %s (exit code %d): %s",
+					m.interfaceName(), cName, upCode, upErrMsg)
+			}
+			// Retry syncconf now that the interface is restored
+			out, errOut, code, err = client.RunSudoCommand(ctx, syncCmd)
+		}
+	}
+	if err != nil || code != 0 {
 		errMsg := strings.TrimSpace(errOut)
 		if errMsg == "" {
 			errMsg = strings.TrimSpace(out)

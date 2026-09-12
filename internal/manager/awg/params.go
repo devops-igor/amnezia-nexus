@@ -662,7 +662,7 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 		s1, _ = randIntBetween(30, 80)
 		s2, _ = randIntBetween(30, 80)
 		s3, _ = randIntBetween(15, 32)
-		s4, _ = randIntBetween(10, 20)
+		s4, _ = randIntBetween(12, 20)
 	}
 
 	// Enforce |s1 - s2| >= 10 constraint
@@ -692,6 +692,37 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 			s2 = s1 + 10
 		} else {
 			s2 = s1 - 10
+		}
+	}
+
+	// Enforce S1, S2, S3, S4 >= 12 floor constraint when headerProtection is enabled
+	// (matching HeaderCipherNonceSize = 12 in upstream amneziawg-go/v3/device/uapi.go:855-857
+	// and GenerateStandardObfuscationValues lines 555-567).
+	if headerProtection {
+		if s1 < 12 {
+			s1 = 12
+		}
+		if s2 < 12 {
+			s2 = 12
+		}
+		if s3 < 12 {
+			s3 = 12
+		}
+		if s4 < 12 {
+			s4 = 12
+		}
+
+		// Ensure |s1 - s2| >= 10 remains satisfied after floor clamping.
+		diff = s1 - s2
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff < 10 {
+			if s1+10 <= 150 {
+				s2 = s1 + 10
+			} else {
+				s2 = s1 - 10
+			}
 		}
 	}
 
