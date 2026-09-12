@@ -404,3 +404,117 @@ func TestClientsTable_TimingParametersBackwardCompat(t *testing.T) {
 		t.Errorf("expected RekeyAfterTime '100-140', got %q", reparsed[0].UserData.RekeyAfterTime.String())
 	}
 }
+
+func TestParseServerConfig_HeaderProtectionKeyAndRandomTrailers(t *testing.T) {
+	confText := `
+[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 33950
+MTU = 1280
+HeaderProtectionKey = dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=
+RandomTrailers = on
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+
+	params, _, err := ParseServerConfig(confText)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+
+	if params["header_protection_key"] != "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=" {
+		t.Errorf("expected header_protection_key to be extracted, got %q", params["header_protection_key"])
+	}
+	if params["random_trailers"] != "on" {
+		t.Errorf("expected random_trailers 'on', got %q", params["random_trailers"])
+	}
+
+	// Test lowercase variant without underscores
+	confLower := `
+[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 33950
+headerprotectionkey = abcdef123456
+randomtrailers = true
+`
+	paramsLower, _, err := ParseServerConfig(confLower)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if paramsLower["header_protection_key"] != "abcdef123456" {
+		t.Errorf("expected headerprotectionkey mapped to header_protection_key, got %q", paramsLower["header_protection_key"])
+	}
+	if paramsLower["random_trailers"] != "true" {
+		t.Errorf("expected randomtrailers mapped to random_trailers, got %q", paramsLower["random_trailers"])
+	}
+}
+
+func TestRenderClientConfig_HeaderProtectionKeyAndRandomTrailers(t *testing.T) {
+	params := &AWGParams{
+		HeaderProtectionKey: "dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=",
+		RandomTrailers:      "on",
+	}
+
+	cfg := RenderClientConfig("clientPriv", "10.8.1.2", "serverPub123", "psk123", "91.226.221.253:33950", "", "", "1280", params, nil)
+
+	if !strings.Contains(cfg, "HeaderProtectionKey = dGVzdC1oZWFkZXItcHJvdGVjdGlvbi1rZXktMTIzNDU=") {
+		t.Errorf("expected HeaderProtectionKey rendered in client config, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "RandomTrailers = on") {
+		t.Errorf("expected RandomTrailers = on rendered in client config, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "PublicKey = serverPub123") {
+		t.Errorf("expected PublicKey rendered in client config, got:\n%s", cfg)
+	}
+
+	// Guard against empty serverPubKey
+	cfgEmptyPub := RenderClientConfig("clientPriv", "10.8.1.2", "", "psk123", "91.226.221.253:33950", "", "", "1280", params, nil)
+	if !strings.Contains(cfgEmptyPub, "PublicKey = ") {
+		t.Errorf("expected PublicKey = in client config, got:\n%s", cfgEmptyPub)
+	}
+}
+
+func TestParseCPSBlob_RejectsInvalidHex(t *testing.T) {
+	// Valid hex blob
+	validBytes, err := ParseCPSBlob("<b 0x01020304>")
+	if err != nil {
+		t.Fatalf("expected valid hex to parse, got err: %v", err)
+	}
+	if len(validBytes) != 4 || validBytes[0] != 1 || validBytes[3] != 4 {
+		t.Errorf("unexpected bytes from valid blob: %x", validBytes)
+	}
+
+	// Non-hex characters in <b 0x...> blob (e.g. reported mflaredotcom corruption)
+	_, err = ParseCPSBlob("<b 0x0102036dflaredotcom0405>")
+	if err == nil {
+		t.Fatalf("expected error for non-hex characters in CPS blob, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid hex in CPS blob") {
+		t.Errorf("expected descriptive error mentioning invalid hex, got %v", err)
+	}
+
+	// Non-hex in random prefix blob
+	_, err = ParseCPSBlob("<r 2><b 0x0102036dflaredotcom0405>")
+	if err == nil {
+		t.Fatalf("expected error for non-hex characters in random prefix CPS blob, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid hex in CPS blob") {
+		t.Errorf("expected descriptive error mentioning invalid hex, got %v", err)
+	}
+
+	// Empty hex in <b 0x>
+	_, err = ParseCPSBlob("<b 0x>")
+	if err == nil {
+		t.Fatalf("expected error for empty hex data in <b 0x>, got nil")
+	}
+
+	// Invalid characters zzzz
+	_, err = ParseCPSBlob("<b 0xzzzz>")
+	if err == nil {
+		t.Fatalf("expected error for invalid hex zzzz, got nil")
+	}
+}

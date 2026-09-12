@@ -643,7 +643,11 @@ func (m *AWGManager) GetClients(ctx context.Context, server *models.Server) ([]m
 	}
 
 	// Live transfer stats via awg show all
-	showOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s %s show all 2>/dev/null", m.containerName(), m.wgBinary()))
+	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	showOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s %s show all 2>/dev/null", cName, m.wgBinary()))
 	showStats := parseWGShow(showOut)
 
 	var result []map[string]any
@@ -1048,16 +1052,9 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	clientPubKey := probePeerPubKey(clientParams)
 	isProbePeer := clientPubKey != "" || clientNameIsProbe
-	clientPrivKey := ""
-	if clientPubKey == "" {
-		// No caller-supplied key: generate a keypair. For probe-named clients
-		// this keeps the PSK-less probe policy while still yielding a valid
-		// peer identity (the name-only legacy fallback has no caller key, and
-		// a keyless [Peer] would be rejected by upsertPeerInConfig).
-		clientPrivKey, clientPubKey, err = GenerateWGKeypair()
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate client keypair: %w", err)
-		}
+	clientPrivKey, clientPubKey, err := resolveClientKeys(clientParams)
+	if err != nil {
+		return nil, err
 	}
 
 	// Read server config
@@ -1067,35 +1064,31 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 
 	usedIPs := GetUsedIPsFromConfig(confText)
-	subnetAddr := AWGDefaults["subnet_address"]
-	subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
-	gatewayIP := AWGDefaults["subnet_ip"]
-
 	serverParams, _, _ := ParseServerConfig(confText)
-	serverPubKeyOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key", m.containerName()))
-	serverPubKey := strings.TrimSpace(serverPubKeyOut)
+	serverPubKey, err := m.GetServerPublicKey(ctx, server)
+	if err != nil || serverPubKey == "" {
+		if err != nil {
+			return nil, fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
+		}
+		return nil, errors.New("AmneziaWG server public key is empty")
+	}
 
 	// Idempotency: reuse the existing entry (and its IP) when this identity is
 	// already registered instead of appending a duplicate peer.
 	clients, _ := m.getClientsTable(ctx, client)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
 
-	var psk, clientIP string
-	if existingIdx >= 0 {
-		clientIP = clients[existingIdx].UserData.ClientIP
+	clientIP, err := resolveClientIP(clients, existingIdx, usedIPs)
+	if err != nil {
+		return nil, err
 	}
-	if clientIP == "" {
-		clientIP, err = GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-		if err != nil {
-			return nil, err
-		}
-	}
+
 	// Normal clients get the server's PresharedKey (read fresh each call, as
 	// before). Probe peers force psk="": the prober derives IKpsk2 keys with an
 	// empty PSK, so the peer must be registered without one (R2).
+	var psk string
 	if !isProbePeer {
-		pskOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key", m.containerName()))
-		psk = strings.TrimSpace(pskOut)
+		psk, _ = m.GetServerPSK(ctx, server)
 	}
 
 	allowedIPs := ""
@@ -1150,9 +1143,44 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 
 	// Apply speed limit via TC
-	applyClientSpeedLimit(ctx, client, m.containerName(), m.interfaceName(), clientIP, speedDown, speedUp)
+	applyClientSpeedLimit(ctx, client, m.resolveContainerName(ctx, client), m.interfaceName(), clientIP, speedDown, speedUp)
 
-	// Render client config
+	// Render client config and connection kit
+	clientConfig, connectionKit := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
+
+	return map[string]any{
+		"client_id":      clientPubKey,
+		"client_name":    clientName,
+		"client_ip":      clientIP,
+		"config":         clientConfig,
+		"connection_kit": connectionKit,
+		"awg_mimicry":    mimicry,
+	}, nil
+}
+
+func resolveClientKeys(clientParams map[string]any) (string, string, error) {
+	clientPubKey := probePeerPubKey(clientParams)
+	if clientPubKey != "" {
+		return "", clientPubKey, nil
+	}
+	clientPrivKey, clientPubKey, err := GenerateWGKeypair()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate client keypair: %w", err)
+	}
+	return clientPrivKey, clientPubKey, nil
+}
+
+func resolveClientIP(clients []AWGClient, existingIdx int, usedIPs []string) (string, error) {
+	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
+		return clients[existingIdx].UserData.ClientIP, nil
+	}
+	subnetAddr := AWGDefaults["subnet_address"]
+	subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
+	gatewayIP := AWGDefaults["subnet_ip"]
+	return GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+}
+
+func (m *AWGManager) buildClientConfig(ctx context.Context, client ssh.SSHClient, server *models.Server, serverParams map[string]string, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey string, clients []AWGClient) (string, map[string]string) {
 	parsedParams := AWGParamsFromMap(convertStringMapToAny(serverParams))
 	if mimicry != "" {
 		if mp, err := cps.GenerateMimicryPackets(ctx, mimicry, "", client); err == nil {
@@ -1178,15 +1206,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 	clientConfig := RenderClientConfig(clientPrivKey, clientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams, ud)
 	connectionKit, _ := cps.GenerateConnectionKit(ctx, clientConfig, "", client)
-
-	return map[string]any{
-		"client_id":      clientPubKey,
-		"client_name":    clientName,
-		"client_ip":      clientIP,
-		"config":         clientConfig,
-		"connection_kit": connectionKit,
-		"awg_mimicry":    mimicry,
-	}, nil
+	return clientConfig, connectionKit
 }
 
 func convertStringMapToAny(m map[string]string) map[string]any {
@@ -1208,10 +1228,11 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	defer m.mu.Unlock()
 
 	// 1. Remove TC speed limit for peer IP
+	cName := m.resolveContainerName(ctx, client)
 	clients, _ := m.getClientsTable(ctx, client)
 	for _, c := range clients {
 		if c.ClientID == clientID && c.UserData.ClientIP != "" {
-			_ = tc.RemoveSpeedLimit(ctx, client, m.containerName(), m.interfaceName(), c.UserData.ClientIP)
+			_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), c.UserData.ClientIP)
 			break
 		}
 	}
@@ -1283,13 +1304,17 @@ func (m *AWGManager) GetClientConfig(ctx context.Context, server *models.Server,
 	}
 
 	serverParams, _, _ := ParseServerConfig(confText)
-	serverPubKeyOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key", m.containerName()))
-	serverPubKey := strings.TrimSpace(serverPubKeyOut)
+	serverPubKey, err := m.GetServerPublicKey(ctx, server)
+	if err != nil || serverPubKey == "" {
+		if err != nil {
+			return "", fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
+		}
+		return "", errors.New("AmneziaWG server public key is empty")
+	}
 
 	psk := ud.PSK
 	if psk == "" {
-		pskOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key", m.containerName()))
-		psk = strings.TrimSpace(pskOut)
+		psk, _ = m.GetServerPSK(ctx, server)
 	}
 
 	parsedParams := AWGParamsFromMap(convertStringMapToAny(serverParams))
@@ -1691,6 +1716,10 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 }
 
 func (m *AWGManager) syncClientTC(ctx context.Context, client ssh.SSHClient, clientIP string, curDown, curUp *int) {
+	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
 	if (curDown != nil && *curDown > 0) || (curUp != nil && *curUp > 0) {
 		dVal, uVal := 0, 0
 		if curDown != nil {
@@ -1699,9 +1728,9 @@ func (m *AWGManager) syncClientTC(ctx context.Context, client ssh.SSHClient, cli
 		if curUp != nil {
 			uVal = *curUp
 		}
-		_ = tc.ApplySpeedLimit(ctx, client, m.containerName(), m.interfaceName(), clientIP, dVal, uVal)
+		_ = tc.ApplySpeedLimit(ctx, client, cName, m.interfaceName(), clientIP, dVal, uVal)
 	} else {
-		_ = tc.RemoveSpeedLimit(ctx, client, m.containerName(), m.interfaceName(), clientIP)
+		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), clientIP)
 	}
 }
 
