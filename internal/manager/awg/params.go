@@ -68,6 +68,7 @@ type AWGParams struct {
 	HeaderProtectionKey        string `json:"header_protection_key,omitempty"`
 	RandomTrailers             string `json:"random_trailers,omitempty"`
 	DisableCookies             string `json:"disable_cookies,omitempty"`
+	ContentPaddingAddition     string `json:"content_padding_addition,omitempty"`
 }
 
 // ToMap converts AWGParams to a map of string key-values.
@@ -106,6 +107,9 @@ func (p *AWGParams) ToMap() map[string]string {
 	if p.DisableCookies != "" {
 		m["disable_cookies"] = p.DisableCookies
 	}
+	if p.ContentPaddingAddition != "" {
+		m["content_padding_addition"] = p.ContentPaddingAddition
+	}
 	return m
 }
 
@@ -134,74 +138,62 @@ func AWGParamsFromMap(m map[string]any) *AWGParams {
 		TransportPacketMagicHeader: AWGDefaults["transport_packet_magic_header"],
 	}
 
+	// Plain string-field assignments: keys are matched case-insensitively and
+	// both snake_case and CamelCase spellings map to the same field. Values
+	// are assigned unconditionally via fmt.Sprint, mirroring the previous
+	// switch-case chain exactly (including empty-string values).
+	stringFields := map[string]*string{
+		"port":                          &p.Port,
+		"listenport":                    &p.Port,
+		"mtu":                           &p.MTU,
+		"subnet_address":                &p.SubnetAddress,
+		"subnet_cidr":                   &p.SubnetCIDR,
+		"subnet_ip":                     &p.SubnetIP,
+		"dns1":                          &p.DNS1,
+		"dns2":                          &p.DNS2,
+		"junk_packet_count":             &p.JunkPacketCount,
+		"jc":                            &p.JunkPacketCount,
+		"junk_packet_min_size":          &p.JunkPacketMinSize,
+		"jmin":                          &p.JunkPacketMinSize,
+		"junk_packet_max_size":          &p.JunkPacketMaxSize,
+		"jmax":                          &p.JunkPacketMaxSize,
+		"init_packet_junk_size":         &p.InitPacketJunkSize,
+		"s1":                            &p.InitPacketJunkSize,
+		"response_packet_junk_size":     &p.ResponsePacketJunkSize,
+		"s2":                            &p.ResponsePacketJunkSize,
+		"cookie_reply_packet_junk_size": &p.CookieReplyPacketJunkSize,
+		"s3":                            &p.CookieReplyPacketJunkSize,
+		"transport_packet_junk_size":    &p.TransportPacketJunkSize,
+		"s4":                            &p.TransportPacketJunkSize,
+		"init_packet_magic_header":      &p.InitPacketMagicHeader,
+		"h1":                            &p.InitPacketMagicHeader,
+		"response_packet_magic_header":  &p.ResponsePacketMagicHeader,
+		"h2":                            &p.ResponsePacketMagicHeader,
+		"underload_packet_magic_header": &p.UnderloadPacketMagicHeader,
+		"h3":                            &p.UnderloadPacketMagicHeader,
+		"transport_packet_magic_header": &p.TransportPacketMagicHeader,
+		"h4":                            &p.TransportPacketMagicHeader,
+		"i1":                            &p.I1,
+		"i2":                            &p.I2,
+		"i3":                            &p.I3,
+		"i4":                            &p.I4,
+		"i5":                            &p.I5,
+		"header_protection_key":         &p.HeaderProtectionKey,
+		"headerprotectionkey":           &p.HeaderProtectionKey,
+		"hpkey":                         &p.HeaderProtectionKey,
+		"random_trailers":               &p.RandomTrailers,
+		"randomtrailers":                &p.RandomTrailers,
+		"disable_cookies":               &p.DisableCookies,
+		"disablecookies":                &p.DisableCookies,
+		"content_padding_addition":      &p.ContentPaddingAddition,
+		"contentpaddingaddition":        &p.ContentPaddingAddition,
+	}
 	for k, v := range m {
-		p.applyParam(strings.ToLower(k), fmt.Sprint(v))
+		if target, ok := stringFields[strings.ToLower(k)]; ok {
+			*target = fmt.Sprint(v)
+		}
 	}
 	return p
-}
-
-func (p *AWGParams) applyParam(k, strVal string) {
-	switch k {
-	case "port", "listenport":
-		p.Port = strVal
-	case "mtu":
-		p.MTU = strVal
-	case "subnet_address":
-		p.SubnetAddress = strVal
-	case "subnet_cidr":
-		p.SubnetCIDR = strVal
-	case "subnet_ip":
-		p.SubnetIP = strVal
-	case "dns1":
-		p.DNS1 = strVal
-	case "dns2":
-		p.DNS2 = strVal
-	case "junk_packet_count", "jc":
-		p.JunkPacketCount = strVal
-	case "junk_packet_min_size", "jmin":
-		p.JunkPacketMinSize = strVal
-	case "junk_packet_max_size", "jmax":
-		p.JunkPacketMaxSize = strVal
-	case "init_packet_junk_size", "s1":
-		p.InitPacketJunkSize = strVal
-	case "response_packet_junk_size", "s2":
-		p.ResponsePacketJunkSize = strVal
-	case "cookie_reply_packet_junk_size", "s3":
-		p.CookieReplyPacketJunkSize = strVal
-	case "transport_packet_junk_size", "s4":
-		p.TransportPacketJunkSize = strVal
-	default:
-		p.applyHeaderAndMimicryParam(k, strVal)
-	}
-}
-
-func (p *AWGParams) applyHeaderAndMimicryParam(k, strVal string) {
-	switch k {
-	case "init_packet_magic_header", "h1":
-		p.InitPacketMagicHeader = strVal
-	case "response_packet_magic_header", "h2":
-		p.ResponsePacketMagicHeader = strVal
-	case "underload_packet_magic_header", "h3":
-		p.UnderloadPacketMagicHeader = strVal
-	case "transport_packet_magic_header", "h4":
-		p.TransportPacketMagicHeader = strVal
-	case "i1":
-		p.I1 = strVal
-	case "i2":
-		p.I2 = strVal
-	case "i3":
-		p.I3 = strVal
-	case "i4":
-		p.I4 = strVal
-	case "i5":
-		p.I5 = strVal
-	case "header_protection_key", "headerprotectionkey", "hpkey":
-		p.HeaderProtectionKey = strVal
-	case "random_trailers", "randomtrailers":
-		p.RandomTrailers = strVal
-	case "disable_cookies", "disablecookies":
-		p.DisableCookies = strVal
-	}
 }
 
 // GenerateWGKeypair generates a Curve25519 keypair formatted as base64 strings.
@@ -744,7 +736,30 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 		I5:                         cpsPackets["i5"],
 	}
 
+	if headerProtection {
+		hpKey, err := generateHeaderProtectionKey()
+		if err != nil {
+			return nil, err
+		}
+		params.HeaderProtectionKey = hpKey
+		params.RandomTrailers = "on"
+		params.DisableCookies = "on"
+		params.ContentPaddingAddition = "16-64"
+	}
+
 	return params, nil
+}
+
+// generateHeaderProtectionKey generates a cryptographically random 32-byte
+// header protection key encoded in base64. It mirrors the portal endpoint's
+// generatePortalHeaderProtectionKey (internal/vpn/vpn.go) but lives here to
+// avoid an import cycle (internal/vpn imports this package).
+func generateHeaderProtectionKey() (string, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return "", fmt.Errorf("failed to generate random header protection key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(key), nil
 }
 
 // TimingRange represents an AmneziaWG timing parameter range [Lo, Hi].

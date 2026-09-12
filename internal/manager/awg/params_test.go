@@ -872,3 +872,119 @@ func TestAWGParams_ToMap_DisableCookies(t *testing.T) {
 		t.Errorf("expected disable_cookies omitted when empty")
 	}
 }
+
+func TestGenerateAWGParams_HeaderProtection(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		hp      bool
+	}{
+		{name: "standard_hp_on", profile: "standard", hp: true},
+		{name: "lite_hp_on", profile: "lite", hp: true},
+		{name: "pro_hp_on", profile: "pro", hp: true},
+		{name: "standard_hp_off", profile: "standard", hp: false},
+		{name: "lite_hp_off", profile: "lite", hp: false},
+		{name: "pro_hp_off", profile: "pro", hp: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			params, err := GenerateAWGParams(tc.profile, tc.hp)
+			if err != nil {
+				t.Fatalf("GenerateAWGParams(%s, %v) failed: %v", tc.profile, tc.hp, err)
+			}
+
+			if !tc.hp {
+				if params.HeaderProtectionKey != "" || params.RandomTrailers != "" ||
+					params.DisableCookies != "" || params.ContentPaddingAddition != "" {
+					t.Errorf("headerProtection=false must leave 3.x fields empty, got HP=%q RT=%q DC=%q CPA=%q",
+						params.HeaderProtectionKey, params.RandomTrailers, params.DisableCookies, params.ContentPaddingAddition)
+				}
+				return
+			}
+
+			raw, err := base64.StdEncoding.DecodeString(params.HeaderProtectionKey)
+			if err != nil {
+				t.Fatalf("HeaderProtectionKey is not valid base64: %v", err)
+			}
+			if len(raw) != 32 {
+				t.Errorf("decoded HeaderProtectionKey length = %d, want 32", len(raw))
+			}
+			if params.RandomTrailers != "on" {
+				t.Errorf("RandomTrailers = %q, want \"on\"", params.RandomTrailers)
+			}
+			if params.DisableCookies != "on" {
+				t.Errorf("DisableCookies = %q, want \"on\"", params.DisableCookies)
+			}
+			if params.ContentPaddingAddition == "" {
+				t.Errorf("ContentPaddingAddition must be set when header protection is on")
+			}
+
+			// 3.x must remain a superset: 2.0 mimicry fields still validate.
+			if err := ValidateAWGParams(params.ToMap()); err != nil {
+				t.Errorf("ValidateAWGParams failed on 3.x params: %v", err)
+			}
+		})
+	}
+}
+
+func TestGenerateAWGParams_HeaderProtection_Uniqueness(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 8; i++ {
+		params, err := GenerateAWGParams("standard", true)
+		if err != nil {
+			t.Fatalf("run %d: GenerateAWGParams failed: %v", i, err)
+		}
+		if seen[params.HeaderProtectionKey] {
+			t.Fatalf("duplicate HeaderProtectionKey across runs: randomness is broken")
+		}
+		seen[params.HeaderProtectionKey] = true
+	}
+}
+
+func TestAWGParamsFromMap_HeaderProtectionFields(t *testing.T) {
+	m := map[string]any{
+		"header_protection_key":    "HPBase64Key==",
+		"random_trailers":          "on",
+		"disable_cookies":          "on",
+		"content_padding_addition": "16-64",
+	}
+	p := AWGParamsFromMap(m)
+
+	if p.HeaderProtectionKey != "HPBase64Key==" {
+		t.Errorf("HeaderProtectionKey = %q, want %q", p.HeaderProtectionKey, "HPBase64Key==")
+	}
+	if p.RandomTrailers != "on" {
+		t.Errorf("RandomTrailers = %q, want \"on\"", p.RandomTrailers)
+	}
+	if p.DisableCookies != "on" {
+		t.Errorf("DisableCookies = %q, want \"on\"", p.DisableCookies)
+	}
+	if p.ContentPaddingAddition != "16-64" {
+		t.Errorf("ContentPaddingAddition = %q, want \"16-64\"", p.ContentPaddingAddition)
+	}
+
+	// ToMap roundtrip must carry the same values back (client-config path
+	// reads parsed server params through this map).
+	got := p.ToMap()
+	for k, want := range map[string]string{
+		"header_protection_key":    "HPBase64Key==",
+		"random_trailers":          "on",
+		"disable_cookies":          "on",
+		"content_padding_addition": "16-64",
+	} {
+		if got[k] != want {
+			t.Errorf("ToMap()[%s] = %q, want %q", k, got[k], want)
+		}
+	}
+
+	// CamelCase keys (raw config-file spellings) map to the same fields.
+	cc := AWGParamsFromMap(map[string]any{
+		"HeaderProtectionKey": "CCKey==",
+		"RandomTrailers":      "on",
+		"DisableCookies":      "on",
+	})
+	if cc.HeaderProtectionKey != "CCKey==" || cc.RandomTrailers != "on" || cc.DisableCookies != "on" {
+		t.Errorf("CamelCase key mapping failed: %+v", cc)
+	}
+}

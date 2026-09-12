@@ -111,6 +111,8 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 		}
 	}
 
+	// AmneziaWG 3.x fields: superset of 2.0 — emitted only when set so that
+	// 2.0-only backends keep rendering byte-identical configs.
 	if params.HeaderProtectionKey != "" {
 		lines = append(lines, fmt.Sprintf("HeaderProtectionKey = %s", params.HeaderProtectionKey))
 	}
