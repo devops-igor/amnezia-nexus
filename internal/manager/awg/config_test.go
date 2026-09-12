@@ -335,6 +335,37 @@ AllowedIPs = 10.8.1.2/32 # client
 	}
 }
 
+func TestParseServerConfig_FullLineSemicolonComments(t *testing.T) {
+	confText := `
+[Interface]
+PrivateKey = sPriv
+ListenPort = 55424
+; ListenPort = 51820
+; Jc = 5
+# Jc = 9
+Jc = 4
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+	params, _, err := ParseServerConfig(confText)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if params["port"] != "55424" {
+		t.Errorf("port: got %q, want 55424", params["port"])
+	}
+	if params["junk_packet_count"] != "4" {
+		t.Errorf("junk_packet_count: got %q, want 4", params["junk_packet_count"])
+	}
+	for k := range params {
+		if strings.HasPrefix(strings.TrimSpace(k), ";") {
+			t.Errorf("semicolon full-line comment parsed as key: %q", k)
+		}
+	}
+}
+
 func TestStripComment(t *testing.T) {
 	cases := []struct {
 		in, want string

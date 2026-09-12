@@ -288,7 +288,7 @@ func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) 
 	lines := strings.Split(configText, "\n")
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || trimmed == "" {
 			continue
 		}
 
