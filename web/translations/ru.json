@@ -246,6 +246,7 @@
   "period_monthly": "За месяц",
   "port": "Порт",
   "port_default_hint": "Порт по умолчанию: 55424. Убедитесь, что он не занят",
+  "port_telemt_hint": "Порт для Telegram-прокси (обычно 443)",
   "prepare_host": "Подготовка хоста...",
   "prev_page": "← Назад",
   "profile_locked": "Зафиксирован профиль: {}",
