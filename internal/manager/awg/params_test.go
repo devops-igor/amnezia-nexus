@@ -988,3 +988,49 @@ func TestAWGParamsFromMap_HeaderProtectionFields(t *testing.T) {
 		t.Errorf("CamelCase key mapping failed: %+v", cc)
 	}
 }
+
+func TestGenerateAWGParams_HeaderProtectionFloor(t *testing.T) {
+	profiles := []string{"standard", "lite", "pro"}
+	const iterations = 10000
+
+	for _, profile := range profiles {
+		t.Run(profile, func(t *testing.T) {
+			for i := 0; i < iterations; i++ {
+				params, err := GenerateAWGParams(profile, true)
+				if err != nil {
+					t.Fatalf("iteration %d: GenerateAWGParams(%s, true) failed: %v", i, profile, err)
+				}
+
+				s1, err := strconv.Atoi(params.InitPacketJunkSize)
+				if err != nil {
+					t.Fatalf("iteration %d: invalid S1 %q: %v", i, params.InitPacketJunkSize, err)
+				}
+				s2, err := strconv.Atoi(params.ResponsePacketJunkSize)
+				if err != nil {
+					t.Fatalf("iteration %d: invalid S2 %q: %v", i, params.ResponsePacketJunkSize, err)
+				}
+				s3, err := strconv.Atoi(params.CookieReplyPacketJunkSize)
+				if err != nil {
+					t.Fatalf("iteration %d: invalid S3 %q: %v", i, params.CookieReplyPacketJunkSize, err)
+				}
+				s4, err := strconv.Atoi(params.TransportPacketJunkSize)
+				if err != nil {
+					t.Fatalf("iteration %d: invalid S4 %q: %v", i, params.TransportPacketJunkSize, err)
+				}
+
+				if s1 < 12 || s2 < 12 || s3 < 12 || s4 < 12 {
+					t.Fatalf("iteration %d (%s): header protection floor violated: S1=%d, S2=%d, S3=%d, S4=%d (all must be >= 12)",
+						i, profile, s1, s2, s3, s4)
+				}
+
+				diff := s1 - s2
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff < 10 {
+					t.Fatalf("iteration %d (%s): |S1 - S2| < 10 (S1=%d, S2=%d)", i, profile, s1, s2)
+				}
+			}
+		})
+	}
+}
