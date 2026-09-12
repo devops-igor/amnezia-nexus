@@ -241,16 +241,26 @@ fi
 	return nil
 }
 
+// awgBaseImage pins the AmneziaWG-Go userspace base image to the 3.1 release.
+// Pinning (instead of :latest) guarantees freshly built backends speak the
+// 3.x protocol; the explicit pull before build ensures the tag exists on the
+// host instead of failing mid-build with a stale local cache.
+const awgBaseImage = "amneziavpn/amneziawg-go:3.1.20260828"
+
 func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
-	dockerfile := `FROM amneziavpn/amneziawg-go:latest
+	dockerfile := fmt.Sprintf(`FROM %s
 LABEL maintainer="AmneziaVPN"
 RUN apk add --no-cache bash curl dumb-init iptables && apk --update upgrade --no-cache
 RUN mkdir -p /opt/amnezia
 RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && echo "tail -f /dev/null" >> /opt/amnezia/start.sh && chmod a+x /opt/amnezia/start.sh
 ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
-`
+`, awgBaseImage)
 	if err := client.UploadSudoFile(ctx, "/opt/amnezia/amnezia-awg/Dockerfile", []byte(dockerfile), 0644); err != nil {
 		return fmt.Errorf("failed to upload Dockerfile: %w", err)
+	}
+
+	if _, errOut, pCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s", awgBaseImage)); err != nil || pCode != 0 {
+		return fmt.Errorf("failed to pull AWG base image %s (code %d): %s, %w", awgBaseImage, pCode, errOut, err)
 	}
 
 	if _, errOut, bCode, err := client.RunSudoCommand(ctx, "docker build --no-cache -t amnezia-awg /opt/amnezia/amnezia-awg"); err != nil || bCode != 0 {
@@ -357,7 +367,12 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 		profile = fmt.Sprint(p)
 	}
 
-	hpOn, _ := parseBoolParam(params["awg_header_protection"])
+	// AWG 3.1 header protection defaults to ON: new installs get 3.x semantics
+	// unless explicitly disabled (compat mode for 2.0 backends).
+	hpOn := true
+	if v, ok := parseBoolParam(params["awg_header_protection"]); ok {
+		hpOn = v
+	}
 	awgParams, err := GenerateAWGParams(profile, hpOn)
 	if err != nil {
 		return fmt.Errorf("failed to generate AWG params: %w", err)
@@ -1445,6 +1460,22 @@ func (m *AWGManager) enrichRunningServerStatus(ctx context.Context, server *mode
 		status["port"] = params["port"]
 		status["awg_params"] = params
 		status["clients_count"] = len(peers)
+		// Protocol generation is derived from the parsed backend config:
+		// a non-empty HeaderProtectionKey means the backend speaks AWG 3.1.
+		if params["header_protection_key"] != "" {
+			status["protocol_generation"] = "3.1"
+		} else {
+			status["protocol_generation"] = "2.0"
+		}
+	}
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	// Best-effort AWG version lookup; empty string on any failure.
+	if out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s awg --version", cName)); err == nil && code == 0 {
+		if line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0]); line != "" {
+			status["awg_version"] = line
+		}
 	}
 	// If port is missing or 0, fallback extraction from docker port or docker inspect
 	if p, ok := status["port"]; !ok || p == nil || fmt.Sprint(p) == "" || fmt.Sprint(p) == "0" {

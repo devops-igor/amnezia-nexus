@@ -1206,3 +1206,234 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 		t.Errorf("expected syncconf to target /etc/amnezia/amneziawg/awg0.conf, got: %s", syncCmdExecuted)
 	}
 }
+
+func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
+	var dockerfile string
+	var commands []string
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		commands = append(commands, cmd)
+		if strings.Contains(cmd, "docker build") {
+			uploaded, ok := client.files["/opt/amnezia/amnezia-awg/Dockerfile"]
+			if !ok {
+				return "", "Dockerfile missing", 1, nil
+			}
+			dockerfile = string(uploaded)
+		}
+		return "OK", "", 0, nil
+	}
+
+	if err := buildAndRunAWGContainer(context.Background(), client, "55424"); err != nil {
+		t.Fatalf("buildAndRunAWGContainer failed: %v", err)
+	}
+
+	if dockerfile == "" {
+		t.Fatalf("Dockerfile was never uploaded before docker build")
+	}
+	if !strings.Contains(dockerfile, "FROM "+awgBaseImage+"\n") {
+		t.Errorf("Dockerfile must pin FROM %s, got:\n%s", awgBaseImage, dockerfile)
+	}
+	if strings.Contains(dockerfile, ":latest") {
+		t.Errorf("Dockerfile must not reference :latest, got:\n%s", dockerfile)
+	}
+
+	pullIdx, buildIdx := -1, -1
+	for i, cmd := range commands {
+		if strings.HasPrefix(cmd, "docker pull "+awgBaseImage) && pullIdx == -1 {
+			pullIdx = i
+		}
+		if strings.Contains(cmd, "docker build") && buildIdx == -1 {
+			buildIdx = i
+		}
+	}
+	if pullIdx == -1 {
+		t.Errorf("expected an explicit %q command, got: %v", "docker pull "+awgBaseImage, commands)
+	}
+	if buildIdx == -1 {
+		t.Errorf("expected a docker build command, got: %v", commands)
+	}
+	if pullIdx != -1 && buildIdx != -1 && pullIdx > buildIdx {
+		t.Errorf("docker pull (idx %d) must run before docker build (idx %d)", pullIdx, buildIdx)
+	}
+}
+
+func TestBuildAndRunAWGContainer_PullFailureAborts(t *testing.T) {
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.HasPrefix(cmd, "docker pull ") {
+			return "", "manifest unknown", 1, nil
+		}
+		if strings.Contains(cmd, "docker build") {
+			t.Error("docker build must not run when the base image pull fails")
+		}
+		return "OK", "", 0, nil
+	}
+
+	err := buildAndRunAWGContainer(context.Background(), client, "55424")
+	if err == nil {
+		t.Fatalf("expected an error when docker pull fails")
+	}
+	if !strings.Contains(err.Error(), awgBaseImage) {
+		t.Errorf("error should mention the pinned base image, got: %v", err)
+	}
+}
+
+// TestInstall_HeaderProtectionDefaultOn verifies the plumbing contract:
+// absent awg_header_protection defaults to true (AWG 3.1), explicit false
+// keeps 2.0 semantics, explicit true generates 3.1 params.
+func TestInstall_HeaderProtectionDefaultOn(t *testing.T) {
+	tests := []struct {
+		name        string
+		hpValue     any
+		wantHPKey   bool
+		wantRandom  bool
+		wantCookies bool
+	}{
+		{name: "absent_defaults_true", hpValue: nil, wantHPKey: true, wantRandom: true, wantCookies: true},
+		{name: "explicit_true", hpValue: true, wantHPKey: true, wantRandom: true, wantCookies: true},
+		{name: "string_true", hpValue: "true", wantHPKey: true, wantRandom: true, wantCookies: true},
+		{name: "explicit_false_2_0", hpValue: false, wantHPKey: false, wantRandom: false, wantCookies: false},
+		{name: "string_false_2_0", hpValue: "false", wantHPKey: false, wantRandom: false, wantCookies: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			params := map[string]any{"port": "55424", "awg_profile": "standard"}
+			if tc.hpValue != nil {
+				params["awg_header_protection"] = tc.hpValue
+			}
+
+			awgParams, err := generateAWGParamsForInstall(params)
+			if err != nil {
+				t.Fatalf("generateAWGParamsForInstall failed: %v", err)
+			}
+			hasHP := awgParams.HeaderProtectionKey != ""
+			if hasHP != tc.wantHPKey {
+				t.Errorf("HeaderProtectionKey present = %v, want %v", hasHP, tc.wantHPKey)
+			}
+			if (awgParams.RandomTrailers != "") != tc.wantRandom {
+				t.Errorf("RandomTrailers present = %v, want %v", awgParams.RandomTrailers != "", tc.wantRandom)
+			}
+			if (awgParams.DisableCookies != "") != tc.wantCookies {
+				t.Errorf("DisableCookies present = %v, want %v", awgParams.DisableCookies != "", tc.wantCookies)
+			}
+		})
+	}
+}
+
+// generateAWGParamsForInstall mirrors Install()'s header-protection defaulting
+// logic so the default-on contract is testable without touching live hosts.
+func generateAWGParamsForInstall(params map[string]any) (*AWGParams, error) {
+	profile := "standard"
+	if p, ok := params["awg_profile"]; ok && fmt.Sprint(p) != "" {
+		profile = fmt.Sprint(p)
+	}
+	hpOn := true
+	if v, ok := parseBoolParam(params["awg_header_protection"]); ok {
+		hpOn = v
+	}
+	return GenerateAWGParams(profile, hpOn)
+}
+
+func TestGetServerStatus_ProtocolGenerationEnrichment(t *testing.T) {
+	tests := []struct {
+		name              string
+		conf              string
+		wantGeneration    string
+		wantHasGeneration bool
+	}{
+		{
+			name: "31_backend_reports_3_1",
+			conf: `[Interface]
+PrivateKey = k
+Address = 10.8.1.1/24
+MTU = 1280
+ListenPort = 55424
+Jc = 4
+H1 = 12345
+HeaderProtectionKey = AbCdEf1234567890AbCdEf1234567890AbCdEf12=
+RandomTrailers = on
+DisableCookies = on
+`,
+			wantGeneration:    "3.1",
+			wantHasGeneration: true,
+		},
+		{
+			name: "20_backend_reports_2_0",
+			conf: `[Interface]
+PrivateKey = k
+Address = 10.8.1.1/24
+MTU = 1280
+ListenPort = 55424
+Jc = 4
+H1 = 12345
+`,
+			wantGeneration:    "2.0",
+			wantHasGeneration: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newMockAWGSSHClient()
+			client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+				if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+					return tc.conf, "", 0, nil
+				}
+				if strings.Contains(cmd, "awg --version") {
+					return "wireguard-go version 0.0.20230223-amneziawg\n", "", 0, nil
+				}
+				if strings.Contains(cmd, "docker ps --filter") {
+					return "Up 2 hours", "", 0, nil
+				}
+				if strings.Contains(cmd, "docker ps -a --filter") {
+					return "amnezia-awg", "", 0, nil
+				}
+				return "OK", "", 0, nil
+			}
+			mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+			server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+			status, err := mgr.GetServerStatus(context.Background(), server)
+			if err != nil {
+				t.Fatalf("GetServerStatus failed: %v", err)
+			}
+			if got, ok := status["protocol_generation"]; !ok || got != tc.wantGeneration {
+				t.Errorf("protocol_generation = %v (present=%v), want %q", got, ok, tc.wantGeneration)
+			}
+			if v, ok := status["awg_version"]; !ok || v != "wireguard-go version 0.0.20230223-amneziawg" {
+				t.Errorf("awg_version = %v (present=%v), want mocked version line", v, ok)
+			}
+		})
+	}
+}
+
+func TestGetServerStatus_AWGVersionNonFatal(t *testing.T) {
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "awg --version") {
+			return "", "command not found", 127, nil
+		}
+		if strings.Contains(cmd, "docker ps --filter") {
+			return "Up 2 hours", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker ps -a --filter") {
+			return "amnezia-awg", "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	status, err := mgr.GetServerStatus(context.Background(), server)
+	if err != nil {
+		t.Fatalf("GetServerStatus must not fail when awg --version fails: %v", err)
+	}
+	if v, ok := status["awg_version"]; ok && fmt.Sprint(v) != "" {
+		t.Errorf("awg_version should be absent/empty on failure, got %v", v)
+	}
+	// protocol_generation comes from the config, which still parses fine here.
+	if got := status["protocol_generation"]; got != "2.0" {
+		t.Errorf("protocol_generation = %v, want 2.0", got)
+	}
+}
