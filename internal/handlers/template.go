@@ -717,6 +717,7 @@ func RenderTemplate(w http.ResponseWriter, r *http.Request, dbInstance *database
 	ctxData["translations_json"] = translationsJSON
 	ctxData["csrf_token"] = csrfToken
 	ctxData["app_version"] = config.AppVersion
+	ctxData["app_codename"] = config.AppCodename
 
 	// Merge caller-provided data
 	for k, v := range data {

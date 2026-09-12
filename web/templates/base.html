@@ -363,6 +363,9 @@
                     </button>
                 </div>
                 {{ end }}
+                <div class="sidebar-version-badge" style="display: flex; align-items: center; justify-content: center; width: 100%; font-size: 0.72rem; color: var(--text-muted); opacity: 0.8; padding-top: var(--space-xs); user-select: none;">
+                    v{{ .app_version }}{{ if .app_codename }} — {{ .app_codename }}{{ end }}
+                </div>
             </div>
         </aside>
 

@@ -40,10 +40,11 @@ func setupTestHandlers(t *testing.T) (*Handlers, *database.DB, *config.Config) {
 	})
 
 	cfg := &config.Config{
-		AppVersion: config.AppVersion,
-		Host:       "127.0.0.1",
-		Port:       5000,
-		SecretKey:  testSecretKey,
+		AppVersion:  config.AppVersion,
+		AppCodename: config.AppCodename,
+		Host:        "127.0.0.1",
+		Port:        5000,
+		SecretKey:   testSecretKey,
 	}
 
 	sshPool := ssh.NewSSHClientPool(ssh.PoolConfig{

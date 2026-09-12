@@ -25,14 +25,19 @@ func (h *Handlers) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// VersionHandler returns current application semantic version.
+// VersionHandler returns current application semantic version and codename.
 func (h *Handlers) VersionHandler(w http.ResponseWriter, r *http.Request) {
 	version := config.AppVersion
 	if h.cfg != nil && h.cfg.AppVersion != "" {
 		version = h.cfg.AppVersion
 	}
+	codename := config.AppCodename
+	if h.cfg != nil && h.cfg.AppCodename != "" {
+		codename = h.cfg.AppCodename
+	}
 
 	h.JSON(w, http.StatusOK, map[string]string{
-		"version": version,
+		"version":  version,
+		"codename": codename,
 	})
 }
