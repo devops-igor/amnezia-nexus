@@ -1739,3 +1739,143 @@ func TestPrepareHostAndContainers_DirectoryCreation(t *testing.T) {
 		t.Errorf("prep script missing /opt/amnezia/amnezia-awg2 path:\n%s", prepScriptExecuted)
 	}
 }
+
+func TestSaveServerConfig_SelfHealing_Success(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	syncAttempts := 0
+	awgQuickUpCalled := false
+	ipLinkShowCalled := false
+
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps") {
+			return "amnezia-awg2", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker cp") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "rm -f") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+			return "", "", 1, nil
+		}
+		if strings.Contains(cmd, "syncconf") {
+			syncAttempts++
+			if syncAttempts == 1 {
+				return "", "Unable to retrieve current interface configuration: Protocol not supported", 1, nil
+			}
+			// Second attempt succeeds after awg-quick up
+			return "OK", "", 0, nil
+		}
+		if strings.Contains(cmd, "ip link show awg0") {
+			ipLinkShowCalled = true
+			return "", "Device \"awg0\" does not exist.", 1, nil
+		}
+		if strings.Contains(cmd, "awg-quick up") {
+			awgQuickUpCalled = true
+			return "[#] ip link add dev awg0 type amneziawg\n[#] awg setconf awg0 ...", "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	err := mgr.saveServerConfig(ctx, client, "[Interface]\nPrivateKey = test\n")
+	if err != nil {
+		t.Fatalf("saveServerConfig should have succeeded via self-healing, got: %v", err)
+	}
+	if !ipLinkShowCalled {
+		t.Errorf("expected ip link show to be called to check interface status")
+	}
+	if !awgQuickUpCalled {
+		t.Errorf("expected awg-quick up to be called for self-healing")
+	}
+	if syncAttempts != 2 {
+		t.Errorf("expected 2 syncconf attempts, got %d", syncAttempts)
+	}
+}
+
+func TestSaveServerConfig_SelfHealing_AwgQuickUpFails(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps") {
+			return "amnezia-awg2", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker cp") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "rm -f") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+			return "", "", 1, nil
+		}
+		if strings.Contains(cmd, "syncconf") {
+			return "", "Unable to retrieve current interface configuration: Protocol not supported", 1, nil
+		}
+		if strings.Contains(cmd, "ip link show awg0") {
+			return "", "Device \"awg0\" does not exist.", 1, nil
+		}
+		if strings.Contains(cmd, "awg-quick up") {
+			return "", "S4 must be more then 12 to use headerProtection", 1, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	err := mgr.saveServerConfig(ctx, client, "[Interface]\nPrivateKey = test\n")
+	if err == nil {
+		t.Fatalf("expected saveServerConfig to fail when awg-quick up fails")
+	}
+	if !strings.Contains(err.Error(), "S4 must be more then 12 to use headerProtection") {
+		t.Errorf("expected error to include awg-quick up output, got: %v", err)
+	}
+}
+
+func TestSaveServerConfig_InterfaceAlreadyUp_NoSelfHealing(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	awgQuickUpCalled := false
+
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps") {
+			return "amnezia-awg2", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker cp") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "rm -f") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+			return "", "", 1, nil
+		}
+		if strings.Contains(cmd, "syncconf") {
+			return "", "Line 15: Syntax error in peer configuration", 1, nil
+		}
+		if strings.Contains(cmd, "ip link show awg0") {
+			return "5: awg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1280 qdisc noqueue state UNKNOWN", "", 0, nil
+		}
+		if strings.Contains(cmd, "awg-quick up") {
+			awgQuickUpCalled = true
+			return "", "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	err := mgr.saveServerConfig(ctx, client, "[Interface]\nPrivateKey = test\n")
+	if err == nil {
+		t.Fatalf("expected saveServerConfig to fail")
+	}
+	if awgQuickUpCalled {
+		t.Errorf("awg-quick up should NOT have been called when interface is already UP")
+	}
+	if !strings.Contains(err.Error(), "Syntax error") {
+		t.Errorf("expected error to contain syncconf output, got: %v", err)
+	}
+}
