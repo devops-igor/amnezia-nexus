@@ -512,6 +512,9 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 	if req.AWGCPSProtocol != nil {
 		params["awg_cps_protocol"] = *req.AWGCPSProtocol
 	}
+	if req.AWGHeaderProtection != nil {
+		params["awg_header_protection"] = *req.AWGHeaderProtection
+	}
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "install_failed", "Failed to install protocol")

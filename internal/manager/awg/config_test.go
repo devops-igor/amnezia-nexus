@@ -1,6 +1,7 @@
 package awg
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -588,5 +589,224 @@ func TestParseCPSBlob_RejectsInvalidHex(t *testing.T) {
 	_, err = ParseCPSBlob("<b 0xzzzz>")
 	if err == nil {
 		t.Fatalf("expected error for invalid hex zzzz, got nil")
+	}
+}
+
+func TestRenderServerConfig_AWG31_Fields(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  *AWGParams
+		want    []string
+		wantAbs []string
+	}{
+		{
+			name: "3.x_params_emit_hp_fields",
+			params: &AWGParams{
+				JunkPacketCount:       "4",
+				InitPacketMagicHeader: "12345",
+				HeaderProtectionKey:   "AbCdEf1234567890AbCdEf1234567890AbCdEf1234567=",
+				RandomTrailers:        "on",
+				DisableCookies:        "on",
+			},
+			want:    []string{"HeaderProtectionKey = AbCdEf1234567890AbCdEf1234567890AbCdEf1234567=", "RandomTrailers = on", "DisableCookies = on"},
+			wantAbs: nil,
+		},
+		{
+			name:    "2.0_params_omit_hp_fields",
+			params:  &AWGParams{JunkPacketCount: "4", InitPacketMagicHeader: "12345"},
+			want:    []string{"Jc = 4", "H1 = 12345"},
+			wantAbs: []string{"HeaderProtectionKey", "RandomTrailers", "DisableCookies"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := RenderServerConfig("srvPriv", "10.8.1.1", "24", "55424", "1280", tc.params, nil)
+			for _, want := range tc.want {
+				if !strings.Contains(conf, want+"\n") {
+					t.Errorf("server config missing line %q\nconfig:\n%s", want, conf)
+				}
+			}
+			for _, absent := range tc.wantAbs {
+				if strings.Contains(conf, absent) {
+					t.Errorf("server config must not contain %q\nconfig:\n%s", absent, conf)
+				}
+			}
+		})
+	}
+
+	// ContentPaddingAddition is client-side only: never in server config.
+	conf := RenderServerConfig("srvPriv", "10.8.1.1", "24", "55424", "1280",
+		&AWGParams{HeaderProtectionKey: "K==", ContentPaddingAddition: "16-64"}, nil)
+	if strings.Contains(conf, "ContentPaddingAddition") {
+		t.Errorf("server config must not contain ContentPaddingAddition")
+	}
+}
+
+func TestRenderClientConfig_AWG31_Fields(t *testing.T) {
+	hpKey := "ClientHPKeyAbCdEf1234567890AbCdEf1234567890="
+	tests := []struct {
+		name    string
+		params  *AWGParams
+		want    []string
+		wantAbs []string
+	}{
+		{
+			name: "3.x_params_emit_hp_key_and_flags",
+			params: &AWGParams{
+				JunkPacketCount:     "4",
+				I1:                  "<b 0xdeadbeef>",
+				HeaderProtectionKey: hpKey,
+				RandomTrailers:      "on",
+				DisableCookies:      "on",
+			},
+			want: []string{
+				"HeaderProtectionKey = " + hpKey,
+				"RandomTrailers = on",
+				"DisableCookies = on",
+			},
+		},
+		{
+			name:    "2.0_params_omit_hp_fields",
+			params:  &AWGParams{JunkPacketCount: "4"},
+			wantAbs: []string{"HeaderProtectionKey", "RandomTrailers", "DisableCookies"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := RenderClientConfig("cliPriv", "10.8.1.2", "srvPub", "psk", "1.2.3.4:55424", "", "", "1280", tc.params, nil)
+			for _, want := range tc.want {
+				if !strings.Contains(conf, want+"\n") {
+					t.Errorf("client config missing line %q\nconfig:\n%s", want, conf)
+				}
+			}
+			for _, absent := range tc.wantAbs {
+				if strings.Contains(conf, absent) {
+					t.Errorf("client config must not contain %q\nconfig:\n%s", absent, conf)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderClientConfig_AWG31_ServerParamsRoundTrip verifies the client HP key
+// is derived from the server's parsed config (not regenerated): a 3.1 server
+// config is parsed, mapped into AWGParams, and rendered into the client config
+// with the identical HeaderProtectionKey value.
+func TestRenderClientConfig_AWG31_ServerParamsRoundTrip(t *testing.T) {
+	serverHPKey := "RoundTripHPKeyAbCdEf1234567890AbCdEf12345678="
+	serverConf := RenderServerConfig("srvPriv", "10.8.1.1", "24", "55424", "1280", &AWGParams{
+		JunkPacketCount:     "5",
+		HeaderProtectionKey: serverHPKey,
+		RandomTrailers:      "on",
+		DisableCookies:      "on",
+	}, nil)
+
+	parsed, _, err := ParseServerConfig(serverConf)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if parsed["header_protection_key"] != serverHPKey {
+		t.Fatalf("parsed header_protection_key = %q, want %q", parsed["header_protection_key"], serverHPKey)
+	}
+	if parsed["random_trailers"] != "on" || parsed["disable_cookies"] != "on" {
+		t.Errorf("parsed flags = %q/%q, want on/on", parsed["random_trailers"], parsed["disable_cookies"])
+	}
+
+	parsedParams := AWGParamsFromMap(convertStringMapToAny(parsed))
+	clientConf := RenderClientConfig("cliPriv", "10.8.1.2", "srvPub", "psk", "1.2.3.4:55424", "", "", "1280", parsedParams, nil)
+
+	if !strings.Contains(clientConf, "HeaderProtectionKey = "+serverHPKey+"\n") {
+		t.Errorf("client config HP key differs from server config\nclient:\n%s", clientConf)
+	}
+}
+
+// TestRenderServerConfig_20Regression pins the exact 2.0 output: with no 3.x
+// fields set the rendered config must be byte-identical to the pre-3.1 output.
+func TestRenderServerConfig_20Regression(t *testing.T) {
+	params := &AWGParams{
+		JunkPacketCount:            "4",
+		JunkPacketMinSize:          "30",
+		JunkPacketMaxSize:          "80",
+		InitPacketJunkSize:         "40",
+		ResponsePacketJunkSize:     "60",
+		CookieReplyPacketJunkSize:  "20",
+		TransportPacketJunkSize:    "23",
+		InitPacketMagicHeader:      "12345",
+		ResponsePacketMagicHeader:  "67890",
+		UnderloadPacketMagicHeader: "11111",
+		TransportPacketMagicHeader: "22222",
+	}
+	peers := []AWGPeer{{PublicKey: "pubkey1", PresharedKey: "psk1", AllowedIPs: "10.8.1.2/32"}}
+
+	got := RenderServerConfig("serverPrivKey", "10.8.1.1", "24", "55424", "1280", params, peers)
+	want := `[Interface]
+PrivateKey = serverPrivKey
+Address = 10.8.1.1/24
+MTU = 1280
+ListenPort = 55424
+Jc = 4
+Jmin = 30
+Jmax = 80
+S1 = 40
+S2 = 60
+S3 = 20
+S4 = 23
+H1 = 12345
+H2 = 67890
+H3 = 11111
+H4 = 22222
+
+[Peer]
+PublicKey = pubkey1
+PresharedKey = psk1
+AllowedIPs = 10.8.1.2/32
+`
+	if got != want {
+		t.Errorf("2.0 server config changed.\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestParseServerConfig_20ConfigUnchanged proves that adding the 3.x keys to
+// ParseServerConfig's paramMap does not alter parsing of 2.0-only configs
+// (every key/value must be identical, and no phantom keys appear).
+func TestParseServerConfig_20ConfigUnchanged(t *testing.T) {
+	conf20 := `[Interface]
+PrivateKey = k
+Address = 10.8.1.1/24
+MTU = 1280
+ListenPort = 55424
+Jc = 4
+Jmin = 30
+Jmax = 80
+S1 = 40
+S2 = 60
+H1 = 12345
+H2 = 67890
+`
+
+	params, peers, err := ParseServerConfig(conf20)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+	if len(peers) != 0 {
+		t.Errorf("expected no peers, got %d", len(peers))
+	}
+	wantParams := map[string]string{
+		"Address":                      "10.8.1.1/24",
+		"PrivateKey":                   "k",
+		"port":                         "55424",
+		"mtu":                          "1280",
+		"junk_packet_count":            "4",
+		"junk_packet_min_size":         "30",
+		"junk_packet_max_size":         "80",
+		"init_packet_junk_size":        "40",
+		"response_packet_junk_size":    "60",
+		"init_packet_magic_header":     "12345",
+		"response_packet_magic_header": "67890",
+	}
+	if !reflect.DeepEqual(params, wantParams) {
+		t.Errorf("parsed 2.0 params changed.\ngot:  %#v\nwant: %#v", params, wantParams)
 	}
 }

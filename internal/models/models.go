@@ -521,13 +521,14 @@ func (r *RenameServerRequest) Validate() error {
 
 // InstallProtocolRequest defines protocol deployment options on a server.
 type InstallProtocolRequest struct {
-	Protocol       string                 `json:"protocol"`
-	Port           string                 `json:"port"`
-	TLSEmulation   *bool                  `json:"tls_emulation,omitempty"`
-	TLSDomain      *string                `json:"tls_domain,omitempty"`
-	MaxConnections *int                   `json:"max_connections,omitempty"`
-	AWGProfile     *AWGObfuscationProfile `json:"awg_profile,omitempty"`
-	AWGCPSProtocol *string                `json:"awg_cps_protocol,omitempty"`
+	Protocol            string                 `json:"protocol"`
+	Port                string                 `json:"port"`
+	TLSEmulation        *bool                  `json:"tls_emulation,omitempty"`
+	TLSDomain           *string                `json:"tls_domain,omitempty"`
+	MaxConnections      *int                   `json:"max_connections,omitempty"`
+	AWGProfile          *AWGObfuscationProfile `json:"awg_profile,omitempty"`
+	AWGCPSProtocol      *string                `json:"awg_cps_protocol,omitempty"`
+	AWGHeaderProtection *bool                  `json:"awg_header_protection,omitempty"`
 }
 
 func (r *InstallProtocolRequest) Validate() error {
