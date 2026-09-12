@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-12
+
+### Added
+
+- AmneziaWG 3.1 container installer: backend installer upgraded to AmneziaWG 3.1
+  using container name `amnezia-awg2` matching the official amnezia-client
+  specification, eliminating "Legacy 2.0 outdated" warnings while preserving
+  full backward compatibility for existing `amnezia-awg` deployments (#119, #122)
+- Extended AmneziaWG protocol parameters: support for `DisableCookies`,
+  `RandomTrailers`, and `HeaderProtectionKey` propagated to server configs and
+  client profile generation (#117, #120)
+- Interface self-healing: automated detection and recovery (`awg-quick up`) of
+  downed `awg0` interfaces during configuration synchronization (#132, #134)
+- Multi-language localization: complete translations across 5 languages (EN, RU,
+  FR, ZH, FA) for server protocol installation and modal titles (#130, #133)
+
+### Changed
+
+- Modernized `/users` management page with responsive layouts, action controls,
+  and user modals (#113, #114)
+- Removed incomplete and deprecated settings endpoints and navigation items
+  (API Documentation and Import Users) (#115, #116)
+- Pinned production Docker Compose example to `v1.1.0` release image (#112)
+
+### Fixed
+
+- Enforced S1..S4 >= 12 floor constraint in parameter generation under Header
+  Protection, preventing `awg syncconf` failures with `Invalid argument` /
+  `Protocol not supported` (#132, #134)
+- Fixed AWG 3.1 server public key retrieval and config generation for
+  non-default containers (#117, #118)
+- Hardened server config synchronization to fail loudly with actionable error
+  messages instead of silently ignoring `awg syncconf` failures (#117, #120)
+- Fixed hardcoded Cyrillic strings in server protocol installation modals (#130, #133)
+
 ## [1.0.0] - 2026-09-11
 
 First public release of amnezia-nexus, a self-hosted VPN management panel

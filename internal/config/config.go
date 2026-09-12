@@ -18,7 +18,7 @@ import (
 )
 
 // AppVersion represents the current version of the web panel.
-const AppVersion = "1.0.0"
+const AppVersion = "1.1.0"
 
 // Paths represents the standard filesystem paths used by the application.
 type Paths struct {

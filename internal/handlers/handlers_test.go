@@ -40,7 +40,7 @@ func setupTestHandlers(t *testing.T) (*Handlers, *database.DB, *config.Config) {
 	})
 
 	cfg := &config.Config{
-		AppVersion: "1.0.0",
+		AppVersion: config.AppVersion,
 		Host:       "127.0.0.1",
 		Port:       5000,
 		SecretKey:  testSecretKey,
