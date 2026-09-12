@@ -269,6 +269,90 @@ AllowedIPs = 10.8.1.3/32
 	}
 }
 
+func TestParseServerConfig_InlineComments(t *testing.T) {
+	confText := `
+[Interface]
+PrivateKey = sPrivKeyBase64Value==
+Address = 10.8.1.1/24
+ListenPort = 51820 ; udp port
+MTU = 1280 # tunnel mtu
+Jc = 5 # number of junk packets
+Jmin = 30 ; min junk size
+Jmax = 80 # max junk size
+S1 = 40 # init junk
+S2 = 60 ; response junk
+S3 = 10 # cookie junk
+S4 = 20 ; transport junk
+H1 = 12345 # magic
+H2 = 67890 ; magic
+H3 = 11111 # underload
+H4 = 22222 ; transport magic
+
+[Peer]
+PublicKey = pKey1WithBase64Chars+/=
+PresharedKey = psk1AlsoBase64==
+AllowedIPs = 10.8.1.2/32 # client
+`
+	params, peers, err := ParseServerConfig(confText)
+	if err != nil {
+		t.Fatalf("ParseServerConfig failed: %v", err)
+	}
+
+	want := map[string]string{
+		"port":                          "51820",
+		"mtu":                           "1280",
+		"junk_packet_count":             "5",
+		"junk_packet_min_size":          "30",
+		"junk_packet_max_size":          "80",
+		"init_packet_junk_size":         "40",
+		"response_packet_junk_size":     "60",
+		"cookie_reply_packet_junk_size": "10",
+		"transport_packet_junk_size":    "20",
+		"init_packet_magic_header":      "12345",
+		"response_packet_magic_header":  "67890",
+		"underload_packet_magic_header": "11111",
+		"transport_packet_magic_header": "22222",
+	}
+	for k, v := range want {
+		if params[k] != v {
+			t.Errorf("param %s: got %q, want %q", k, params[k], v)
+		}
+	}
+	if params["PrivateKey"] != "sPrivKeyBase64Value==" {
+		t.Errorf("PrivateKey should keep base64 intact, got %q", params["PrivateKey"])
+	}
+	if len(peers) != 1 {
+		t.Fatalf("expected 1 peer, got %d", len(peers))
+	}
+	if peers[0].PublicKey != "pKey1WithBase64Chars+/=" {
+		t.Errorf("peer PublicKey mangled: %q", peers[0].PublicKey)
+	}
+	if peers[0].PresharedKey != "psk1AlsoBase64==" {
+		t.Errorf("peer PresharedKey mangled: %q", peers[0].PresharedKey)
+	}
+	if peers[0].AllowedIPs != "10.8.1.2/32" {
+		t.Errorf("AllowedIPs: got %q", peers[0].AllowedIPs)
+	}
+}
+
+func TestStripComment(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"5 # number of junk packets", "5"},
+		{"51820 ; port", "51820"},
+		{"1280", "1280"},
+		{"abc+/=", "abc+/="},
+		{"on#no-space-still-comment", "on"},
+		{"  42  # x  ", "42"},
+	}
+	for _, tc := range cases {
+		if got := stripComment(strings.TrimSpace(tc.in)); got != tc.want {
+			t.Errorf("stripComment(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestGetNextIP(t *testing.T) {
 	usedIPs := []string{"10.8.1.2", "10.8.1.3"}
 	nextIP, err := GetNextIP(usedIPs, "10.8.1.0", 24, "10.8.1.1")
