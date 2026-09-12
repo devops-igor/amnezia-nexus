@@ -246,6 +246,7 @@
   "period_monthly": "Mensuel",
   "port": "Port",
   "port_default_hint": "Port par défaut : 55424. Assurez-vous qu'il est libre.",
+  "port_telemt_hint": "Port pour le proxy Telegram (généralement 443)",
   "prepare_host": "Préparation de l'hôte...",
   "prev_page": "← Retour",
   "profile_locked": "Profil verrouillé: {}",

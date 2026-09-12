@@ -18,7 +18,10 @@ import (
 )
 
 // AppVersion represents the current version of the web panel.
-const AppVersion = "1.0.0"
+const AppVersion = "1.1.0"
+
+// AppCodename represents the release codename of the current version.
+const AppCodename = "Aurora"
 
 // Paths represents the standard filesystem paths used by the application.
 type Paths struct {
@@ -30,6 +33,7 @@ type Paths struct {
 // Config / AppConfig contains runtime configuration parameters for the application.
 type Config struct {
 	AppVersion     string
+	AppCodename    string
 	Paths          *Paths
 	Host           string
 	Port           int
@@ -206,6 +210,7 @@ func LoadConfig() (*AppConfig, error) {
 
 	return &Config{
 		AppVersion:     AppVersion,
+		AppCodename:    AppCodename,
 		Paths:          paths,
 		Host:           host,
 		Port:           port,

@@ -8,7 +8,7 @@ import (
 )
 
 func TestSystemHandlers(t *testing.T) {
-	h, _, _ := setupTestHandlers(t)
+	h, _, cfg := setupTestHandlers(t)
 
 	t.Run("HealthHandler", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
@@ -23,7 +23,7 @@ func TestSystemHandlers(t *testing.T) {
 		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
-		if resp.Status != "ok" || resp.Version != "1.0.0" {
+		if resp.Status != "ok" || resp.Version != cfg.AppVersion {
 			t.Errorf("unexpected health response: %+v", resp)
 		}
 	})
@@ -41,8 +41,11 @@ func TestSystemHandlers(t *testing.T) {
 		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
-		if resp["version"] != "1.0.0" {
-			t.Errorf("expected version '1.0.0', got %q", resp["version"])
+		if resp["version"] != cfg.AppVersion {
+			t.Errorf("expected version %q, got %q", cfg.AppVersion, resp["version"])
+		}
+		if resp["codename"] != cfg.AppCodename {
+			t.Errorf("expected codename %q, got %q", cfg.AppCodename, resp["codename"])
 		}
 	})
 }

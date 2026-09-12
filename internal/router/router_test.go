@@ -33,10 +33,11 @@ func setupTestRouterDB(t *testing.T) (*database.DB, *config.Config) {
 	})
 
 	cfg := &config.Config{
-		AppVersion: "1.0.0",
-		Host:       "127.0.0.1",
-		Port:       5000,
-		SecretKey:  testSecretKey,
+		AppVersion:  config.AppVersion,
+		AppCodename: config.AppCodename,
+		Host:        "127.0.0.1",
+		Port:        5000,
+		SecretKey:   testSecretKey,
 	}
 
 	// Create an admin user so setup redirect does not block normal routes
@@ -74,8 +75,8 @@ func TestRouterHealthEndpoint(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp.Status != "ok" || resp.Version != "1.0.0" {
-		t.Errorf("expected status 'ok' and version '1.0.0', got %+v", resp)
+	if resp.Status != "ok" || resp.Version != cfg.AppVersion {
+		t.Errorf("expected status 'ok' and version %q, got %+v", cfg.AppVersion, resp)
 	}
 }
 
@@ -97,8 +98,11 @@ func TestRouterVersionEndpoint(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp["version"] != "1.0.0" {
-		t.Errorf("expected version '1.0.0', got %q", resp["version"])
+	if resp["version"] != cfg.AppVersion {
+		t.Errorf("expected version %q, got %q", cfg.AppVersion, resp["version"])
+	}
+	if resp["codename"] != config.AppCodename {
+		t.Errorf("expected codename %q, got %q", config.AppCodename, resp["codename"])
 	}
 }
 
@@ -406,7 +410,7 @@ func TestAuthSetupEndpointWithZeroUsers(t *testing.T) {
 	middleware.InvalidateSetupCache()
 
 	cfg := &config.Config{
-		AppVersion: "1.0.0",
+		AppVersion: config.AppVersion,
 		Host:       "127.0.0.1",
 		Port:       5000,
 		SecretKey:  testSecretKey,

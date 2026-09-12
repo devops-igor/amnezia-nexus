@@ -1151,7 +1151,7 @@
             portLabel.textContent = _('port') + ' (TCP)';
             portInput.value = '443';
             portInput.disabled = false;
-            portHint.textContent = 'Порт для Telegram-прокси (обычно 443)';
+            portHint.textContent = _('port_telemt_hint');
             telemtOpts.style.display = 'block';
         } else {
             portLabel.textContent = _('port') + ' (UDP)';
@@ -1180,7 +1180,7 @@
         progressDiv.classList.remove('hidden');
         const logEl = document.getElementById('installLog');
         const fillEl = document.getElementById('installProgressFill');
-        logEl.innerHTML = '<div class="log-line info">Начинаем установку...</div>';
+        logEl.innerHTML = `<div class="log-line info">${_('start_install')}</div>`;
         fillEl.style.width = '10%';
         fillEl.style.background = '';
         try {
@@ -1562,7 +1562,7 @@
                     currentConfig = result.config;
                     currentVpnLink = result.vpn_link || '';
                     currentConfigName = (connName || 'Connection').replace(/\s+/g, '_');
-                    document.getElementById('configModalTitle').textContent = `Конфигурация — ${connName || 'Connection'}`;
+                    document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName || 'Connection'}`;
                     document.getElementById('configText').textContent = result.config;
                     document.getElementById('vpnLinkText').textContent = currentVpnLink;
                     document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
