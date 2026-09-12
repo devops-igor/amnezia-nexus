@@ -905,6 +905,7 @@ H1 = 12345
 H2 = 67890
 HeaderProtectionKey = dGVzdC1zZXJ2ZXIyLWhwLWtleS0xMjM0NQ==
 RandomTrailers = on
+DisableCookies = on
 `
 	server2PubKey := "server2PubKey1234567890123456789012345="
 	server2PSK := "server2PSK12345678901234567890123456789012="
@@ -1019,6 +1020,9 @@ RandomTrailers = on
 	if !strings.Contains(configStr, "RandomTrailers = on") {
 		t.Errorf("AddClient missing RandomTrailers = on: %s", configStr)
 	}
+	if !strings.Contains(configStr, "DisableCookies = on") {
+		t.Errorf("AddClient missing DisableCookies = on: %s", configStr)
+	}
 	if !strings.Contains(configStr, "Endpoint = 91.226.221.253:33950") {
 		t.Errorf("AddClient missing correct Endpoint: %s", configStr)
 	}
@@ -1039,6 +1043,9 @@ RandomTrailers = on
 	}
 	if !strings.Contains(getClientCfg, "RandomTrailers = on") {
 		t.Errorf("GetClientConfig missing RandomTrailers = on: %s", getClientCfg)
+	}
+	if !strings.Contains(getClientCfg, "DisableCookies = on") {
+		t.Errorf("GetClientConfig missing DisableCookies = on: %s", getClientCfg)
 	}
 	if !strings.Contains(getClientCfg, "Endpoint = 91.226.221.253:33950") {
 		t.Errorf("GetClientConfig missing correct Endpoint: %s", getClientCfg)
@@ -1106,5 +1113,96 @@ ListenPort = 55424
 	}
 	if !strings.Contains(err.Error(), "public key") {
 		t.Errorf("expected error to mention public key, got: %v", err)
+	}
+}
+
+func TestAWGManager_SaveServerConfig_SyncconfFailure_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	mockClient := newMockAWGSSHClient()
+
+	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "syncconf") {
+			return "", "Line unrecognized: `DisableCookies = on`", 1, errors.New("exit status 1")
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "wireguard_server_public_key.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "wireguard_psk.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: mockClient})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	_, err := mgr.AddClient(ctx, server, map[string]any{"name": "SyncFailClient"})
+	if err == nil {
+		t.Fatal("expected AddClient to fail when syncconf fails, but got nil")
+	}
+	if !strings.Contains(err.Error(), "sync") {
+		t.Errorf("expected error to mention sync, got: %v", err)
+	}
+}
+
+func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
+	ctx := context.Background()
+	mockClient := newMockAWGSSHClient()
+
+	var copiedTarget string
+	var syncCmdExecuted string
+
+	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "test -f /opt/amnezia/awg/awg0.conf") {
+			return "", "No such file", 1, errors.New("exit status 1")
+		}
+		if strings.Contains(cmd, "test -f /etc/amnezia/amneziawg/awg0.conf") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") {
+			copiedTarget = cmd
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "syncconf") {
+			syncCmdExecuted = cmd
+			return "OK", "", 0, nil
+		}
+		if strings.Contains(cmd, "cat /etc/amnezia/amneziawg/awg0.conf") {
+			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+			return "", "No such file", 1, errors.New("exit status 1")
+		}
+		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "wireguard_server_public_key.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
+		}
+		if strings.Contains(cmd, "wireguard_psk.key") {
+			return string(mockClient.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
+		}
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: mockClient})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	_, err := mgr.AddClient(ctx, server, map[string]any{"name": "DynamicPathClient"})
+	if err != nil {
+		t.Fatalf("AddClient failed: %v", err)
+	}
+
+	if !strings.Contains(copiedTarget, "/etc/amnezia/amneziawg/awg0.conf") {
+		t.Errorf("expected config to be copied to /etc/amnezia/amneziawg/awg0.conf, got: %s", copiedTarget)
+	}
+	if !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/awg0.conf") {
+		t.Errorf("expected syncconf to target /etc/amnezia/amneziawg/awg0.conf, got: %s", syncCmdExecuted)
 	}
 }

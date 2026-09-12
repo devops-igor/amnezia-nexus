@@ -117,6 +117,9 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 	if params.RandomTrailers != "" {
 		lines = append(lines, fmt.Sprintf("RandomTrailers = %s", params.RandomTrailers))
 	}
+	if params.DisableCookies != "" {
+		lines = append(lines, fmt.Sprintf("DisableCookies = %s", params.DisableCookies))
+	}
 
 	for _, peer := range peers {
 		lines = append(lines, "", "[Peer]", fmt.Sprintf("PublicKey = %s", peer.PublicKey))
@@ -189,6 +192,9 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 	if params.RandomTrailers != "" {
 		lines = append(lines, fmt.Sprintf("RandomTrailers = %s", params.RandomTrailers))
 	}
+	if params.DisableCookies != "" {
+		lines = append(lines, fmt.Sprintf("DisableCookies = %s", params.DisableCookies))
+	}
 
 	if ud != nil {
 		if ud.RekeyAfterTime != nil {
@@ -260,6 +266,8 @@ func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) 
 		"header_protection_key": "header_protection_key",
 		"randomtrailers":        "random_trailers",
 		"random_trailers":       "random_trailers",
+		"disablecookies":        "disable_cookies",
+		"disable_cookies":       "disable_cookies",
 	}
 
 	var currentPeer *AWGPeer

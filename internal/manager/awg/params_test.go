@@ -828,3 +828,47 @@ func TestAWGParams_ToMap_RandomTrailers(t *testing.T) {
 		t.Errorf("expected header_protection_key omitted when empty")
 	}
 }
+
+func TestAWGParamsFromMap_DisableCookies(t *testing.T) {
+	dcKeys := []string{
+		"disable_cookies",
+		"DisableCookies",
+		"disablecookies",
+		"DISABLE_COOKIES",
+		"DISABLECOOKIES",
+	}
+
+	for _, k := range dcKeys {
+		p := AWGParamsFromMap(map[string]any{
+			k: "on",
+		})
+		if p.DisableCookies != "on" {
+			t.Errorf("key %q: expected DisableCookies 'on', got %q", k, p.DisableCookies)
+		}
+
+		pBool := AWGParamsFromMap(map[string]any{
+			k: true,
+		})
+		if pBool.DisableCookies != "true" {
+			t.Errorf("key %q: expected DisableCookies 'true' for bool, got %q", k, pBool.DisableCookies)
+		}
+	}
+}
+
+func TestAWGParams_ToMap_DisableCookies(t *testing.T) {
+	p := &AWGParams{
+		HeaderProtectionKey: "test-hpkey",
+		RandomTrailers:      "on",
+		DisableCookies:      "on",
+	}
+	m := p.ToMap()
+	if m["disable_cookies"] != "on" {
+		t.Errorf("expected disable_cookies 'on', got %q", m["disable_cookies"])
+	}
+
+	pEmpty := &AWGParams{}
+	mEmpty := pEmpty.ToMap()
+	if _, ok := mEmpty["disable_cookies"]; ok {
+		t.Errorf("expected disable_cookies omitted when empty")
+	}
+}

@@ -560,6 +560,22 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 	return "", fmt.Errorf("failed to get server config from containers: %v", names)
 }
 
+func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.SSHClient, containerName string) string {
+	candidates := []string{m.configPath(), "/etc/amnezia/amneziawg/awg0.conf"}
+	for _, p := range candidates {
+		cmd := fmt.Sprintf("docker exec -i %s test -f %s", containerName, p)
+		_, _, code, err := client.RunSudoCommand(ctx, cmd)
+		if err == nil && code == 0 {
+			return p
+		}
+	}
+	cmd := fmt.Sprintf("docker exec -i %s test -d /etc/amnezia/amneziawg", containerName)
+	if _, _, code, err := client.RunSudoCommand(ctx, cmd); err == nil && code == 0 {
+		return "/etc/amnezia/amneziawg/awg0.conf"
+	}
+	return m.configPath()
+}
+
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
@@ -576,14 +592,25 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", tmpPath))
 	}()
 
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, m.configPath())
+	cfgPath := m.resolveContainerConfigPath(ctx, client, cName)
+	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, cfgPath)
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
 	}
 
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c '%s syncconf %s <(%s-quick strip %s)'",
-		cName, m.wgBinary(), m.interfaceName(), m.wgBinary(), m.configPath())
-	_, _, _, _ = client.RunSudoCommand(ctx, syncCmd)
+		cName, m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)
+	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
+	if err != nil || code != 0 {
+		errMsg := strings.TrimSpace(errOut)
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(out)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to sync AmneziaWG config in container %s (exit code %d): %s: %w", cName, code, errMsg, err)
+		}
+		return fmt.Errorf("failed to sync AmneziaWG config in container %s (exit code %d): %s", cName, code, errMsg)
+	}
 	return nil
 }
 
