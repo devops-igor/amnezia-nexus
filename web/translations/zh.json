@@ -246,6 +246,7 @@
   "period_monthly": "每月",
   "port": "端口",
   "port_default_hint": "默认端口: 55424。请确保端口未被占用。",
+  "port_telemt_hint": "Telegram 代理端口（通常为 443）",
   "prepare_host": "准备环境...",
   "prev_page": "← 上一页",
   "profile_locked": "已锁定配置: {}",
