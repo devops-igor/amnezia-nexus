@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	AWGContainerNames  = []string{"amnezia-awg", "amnezia-awg2", "amnezia-awg-legacy"}
+	AWGContainerNames  = []string{"amnezia-awg2", "amnezia-awg", "amnezia-awg-legacy"}
 	containerNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 )
 
@@ -184,7 +184,7 @@ func (m *AWGManager) getSSHClient(ctx context.Context, server *models.Server) (s
 }
 
 func (m *AWGManager) containerName() string {
-	return "amnezia-awg"
+	return "amnezia-awg2"
 }
 
 func (m *AWGManager) configPath() string {
@@ -225,7 +225,7 @@ systemctl start docker; docker --version
 
 func prepareHostAndContainers(ctx context.Context, client ssh.SSHClient) error {
 	prepScript := `
-mkdir -p /opt/amnezia/amnezia-awg /opt/amnezia/awg
+mkdir -p /opt/amnezia/amnezia-awg2 /opt/amnezia/awg
 if ! docker network ls | grep -q amnezia-dns-net; then
   docker network create --driver bridge --subnet=172.29.172.0/24 --opt com.docker.network.bridge.name=amn0 amnezia-dns-net || true
 fi
@@ -247,7 +247,11 @@ fi
 // host instead of failing mid-build with a stale local cache.
 const awgBaseImage = "amneziavpn/amneziawg-go:3.1.20260828"
 
-func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
+func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
+	cName := m.containerName()
+	if !IsValidContainerName(cName) {
+		cName = "amnezia-awg2"
+	}
 	dockerfile := fmt.Sprintf(`FROM %s
 LABEL maintainer="AmneziaVPN"
 RUN apk add --no-cache bash curl dumb-init iptables && apk --update upgrade --no-cache
@@ -255,7 +259,7 @@ RUN mkdir -p /opt/amnezia
 RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && echo "tail -f /dev/null" >> /opt/amnezia/start.sh && chmod a+x /opt/amnezia/start.sh
 ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 `, awgBaseImage)
-	if err := client.UploadSudoFile(ctx, "/opt/amnezia/amnezia-awg/Dockerfile", []byte(dockerfile), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("/opt/amnezia/%s/Dockerfile", cName), []byte(dockerfile), 0644); err != nil {
 		return fmt.Errorf("failed to upload Dockerfile: %w", err)
 	}
 
@@ -263,8 +267,8 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 		return fmt.Errorf("failed to pull AWG base image %s (code %d): %s, %w", awgBaseImage, pCode, errOut, err)
 	}
 
-	if _, errOut, bCode, err := client.RunSudoCommand(ctx, "docker build --no-cache -t amnezia-awg /opt/amnezia/amnezia-awg"); err != nil || bCode != 0 {
-		return fmt.Errorf("failed to build amnezia-awg image (code %d): %s, %w", bCode, errOut, err)
+	if _, errOut, bCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker build --no-cache -t %s /opt/amnezia/%s", cName, cName)); err != nil || bCode != 0 {
+		return fmt.Errorf("failed to build %s image (code %d): %s, %w", cName, bCode, errOut, err)
 	}
 
 	runCmd := fmt.Sprintf(`docker run -d \
@@ -275,18 +279,30 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 -p %s:%s/udp \
 -v /lib/modules:/lib/modules \
 --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
---name amnezia-awg \
-amnezia-awg`, port, port)
+--name %s \
+%s`, port, port, cName, cName)
 
 	if _, errOut, rCode, err := client.RunSudoCommand(ctx, runCmd); err != nil || rCode != 0 {
 		return fmt.Errorf("failed to run container (code %d): %s, %w", rCode, errOut, err)
 	}
 
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker network connect amnezia-dns-net amnezia-awg 2>/dev/null || true")
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", cName))
 	return nil
 }
 
-func initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
+func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
+	return (&AWGManager{}).buildAndRunAWGContainer(ctx, client, port)
+}
+
+func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
+	cName := m.resolveContainerName(ctx, client)
+	if !IsValidContainerName(cName) {
+		cName = m.containerName()
+	}
+	if !IsValidContainerName(cName) {
+		cName = "amnezia-awg2"
+	}
+
 	serverPrivKey, serverPubKey, err := GenerateWGKeypair()
 	if err != nil {
 		return fmt.Errorf("failed to generate server keypair: %w", err)
@@ -302,13 +318,13 @@ echo "%s" > /opt/amnezia/awg/wireguard_server_private_key.key
 echo "%s" > /opt/amnezia/awg/wireguard_server_public_key.key
 echo "%s" > /opt/amnezia/awg/wireguard_psk.key
 `, serverPrivKey, serverPubKey, serverPSK)
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i amnezia-awg bash -c '%s'", keygenScript))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c '%s'", cName, keygenScript))
 
 	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, nil)
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_awg0.conf", []byte(serverConfig), 0600); err != nil {
 		return err
 	}
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker cp /tmp/_amnz_awg0.conf amnezia-awg:/opt/amnezia/awg/awg0.conf")
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp /tmp/_amnz_awg0.conf %s:/opt/amnezia/awg/awg0.conf", cName))
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_awg0.conf")
 
 	startScript := `#!/bin/bash
@@ -334,10 +350,10 @@ tail -f /dev/null
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_start.sh", []byte(startScript), 0755); err != nil {
 		return err
 	}
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker cp /tmp/_amnz_start.sh amnezia-awg:/opt/amnezia/start.sh")
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker exec amnezia-awg chmod +x /opt/amnezia/start.sh")
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp /tmp/_amnz_start.sh %s:/opt/amnezia/start.sh", cName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec %s chmod +x /opt/amnezia/start.sh", cName))
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_start.sh")
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker restart amnezia-awg")
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", cName))
 
 	firewallScript := `
 sysctl -w net.ipv4.ip_forward=1
@@ -345,6 +361,10 @@ iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptabl
 `
 	_, _, _, _ = client.RunSudoScript(ctx, firewallScript)
 	return nil
+}
+
+func initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
+	return (&AWGManager{}).initializeServerKeysAndConfig(ctx, client, port, awgParams)
 }
 
 // Install deploys Docker (if missing), builds the AWG container, configures parameters, and starts the service.
@@ -401,10 +421,10 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 	if err := prepareHostAndContainers(ctx, client); err != nil {
 		return err
 	}
-	if err := buildAndRunAWGContainer(ctx, client, port); err != nil {
+	if err := m.buildAndRunAWGContainer(ctx, client, port); err != nil {
 		return err
 	}
-	return initializeServerKeysAndConfig(ctx, client, port, awgParams)
+	return m.initializeServerKeysAndConfig(ctx, client, port, awgParams)
 }
 
 // Uninstall stops and removes all AWG containers and clean up directories.
@@ -427,7 +447,7 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", name))
 		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rmi %s 2>/dev/null || true", name))
 	}
-	_, _, _, _ = client.RunSudoCommand(ctx, "rm -rf /opt/amnezia/amnezia-awg /opt/amnezia/awg")
+	_, _, _, _ = client.RunSudoCommand(ctx, "rm -rf /opt/amnezia/amnezia-awg /opt/amnezia/amnezia-awg2 /opt/amnezia/awg")
 	return nil
 }
 
@@ -464,9 +484,14 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 	}
 	safeDefault := m.containerName()
 	if !IsValidContainerName(safeDefault) {
-		safeDefault = "amnezia-awg"
+		safeDefault = "amnezia-awg2"
 	}
 	return safeDefault
+}
+
+// ResolveContainerName returns the discovered or default container name for the given client.
+func (m *AWGManager) ResolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+	return m.resolveContainerName(ctx, client)
 }
 
 // ensureBackendRoutingAndNAT installs the return route for the portal client subnet,
