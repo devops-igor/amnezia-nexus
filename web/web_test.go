@@ -1828,3 +1828,57 @@ func TestIssue115_RemoveApiDocsAndImportUsers(t *testing.T) {
 		}
 	}
 }
+
+func TestServerTemplateI18nAndTranslations(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	// 1. Verify that server.html contains NO Cyrillic characters (regex [\x{0400}-\x{04FF}])
+	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
+	if matches := cyrillicRe.FindAllString(serverStr, -1); len(matches) > 0 {
+		t.Errorf("server.html contains hardcoded Cyrillic characters (%d occurrences): %v", len(matches), matches)
+	}
+
+	// 2. Verify server.html references required translation tokens
+	requiredTokens := []string{
+		"${_('start_install')}",
+		"_('port_telemt_hint')",
+		"${_('config')}",
+	}
+	for _, token := range requiredTokens {
+		if !strings.Contains(serverStr, token) {
+			t.Errorf("server.html missing required token %q", token)
+		}
+	}
+
+	// 3. Verify that port_telemt_hint, start_install, and config exist and have non-empty values in all 5 translations
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+	requiredKeys := []string{"port_telemt_hint", "start_install", "config"}
+	languages := []string{"en.json", "ru.json", "fr.json", "zh.json", "fa.json"}
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read translation %s: %v", langFile, err)
+		}
+		var parsed map[string]string
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("translation %s is not valid JSON: %v", langFile, err)
+		}
+		for _, key := range requiredKeys {
+			val, ok := parsed[key]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("translation %s missing or empty key %q", langFile, key)
+			}
+		}
+	}
+}
