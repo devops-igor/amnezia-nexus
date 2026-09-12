@@ -246,6 +246,16 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 }
 
 // ParseServerConfig extracts parameters and peers from a server WireGuard config file.
+
+// stripComment removes an inline # or ; comment from a WireGuard/AmneziaWG
+// config value. Cryptographic keys are base64 and never contain these markers.
+func stripComment(val string) string {
+	if i := strings.IndexAny(val, "#;"); i >= 0 {
+		return strings.TrimSpace(val[:i])
+	}
+	return val
+}
+
 func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) {
 	params := make(map[string]string)
 	var peers []AWGPeer
@@ -278,7 +288,7 @@ func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) 
 	lines := strings.Split(configText, "\n")
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || trimmed == "" {
 			continue
 		}
 
@@ -305,7 +315,7 @@ func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) 
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
+		val := stripComment(strings.TrimSpace(parts[1]))
 
 		if inInterface {
 			if mappedKey, ok := paramMap[strings.ToLower(key)]; ok {
