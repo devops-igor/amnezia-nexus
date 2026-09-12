@@ -307,8 +307,47 @@ func TestAddClient_EnsuresBackendNATRule(t *testing.T) {
 	if len(natCmds) == 0 {
 		t.Fatal("AddClient did not issue the backend NAT ensure command")
 	}
-	if !strings.Contains(natCmds[0], "docker exec amnezia-awg bash -c 'iptables -t nat") {
+	if !strings.Contains(natCmds[0], "docker exec amnezia-awg2 bash -c 'iptables -t nat") {
 		t.Errorf("NAT command should run inside the resolved container: %s", natCmds[0])
+	}
+}
+
+// TestAddClient_EnsuresBackendNATRule_LegacyContainer verifies that legacy servers
+// with amnezia-awg containers continue to execute NAT rules inside amnezia-awg.
+func TestAddClient_EnsuresBackendNATRule_LegacyContainer(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	var natCmds []string
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg$") {
+			return "amnezia-awg\n", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") {
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "iptables -t nat -C POSTROUTING") {
+			natCmds = append(natCmds, cmd)
+			return "", "", 0, nil
+		}
+		return defaultMockSudo(client, cmd)
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	server := &models.Server{ID: 8, Host: "10.0.0.8", SSHPort: 22, SSHUser: "root"}
+	params := map[string]any{
+		"clientName":  "Portal Data Plane",
+		"public_key":  "portalDataPlanePublicKeyThatIsLongEnoughToBeValidAAA=",
+		"allowed_ips": "0.0.0.0/0",
+	}
+	if _, err := mgr.AddClient(ctx, server, params); err != nil {
+		t.Fatalf("AddClient failed: %v", err)
+	}
+
+	if len(natCmds) == 0 {
+		t.Fatal("AddClient did not issue the backend NAT ensure command")
+	}
+	if !strings.Contains(natCmds[0], "docker exec amnezia-awg bash -c 'iptables -t nat") {
+		t.Errorf("NAT command should run inside legacy resolved container amnezia-awg: %s", natCmds[0])
 	}
 }
 
