@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — Aurora - 2026-09-13
+
+Amnezia Nexus 1.1.1 ("Aurora") is a patch release resolving HTTP/2 connectivity
+failures across VPN forwarding paths, backend enabling timeout vulnerabilities,
+and server configuration parsing.
+
+### Fixed
+
+- HTTP/2 Path MTU black hole: enabled TCP MSS clamping (`--clamp-mss-to-pmtu`)
+  on backend forward path and aligned default MTU to 1280, resolving connection
+  timeouts and protocol errors on HTTP/2 traffic while preserving existing client
+  configs (#136)
+- Backend enabling timeout resilience: decoupled `/api/vpn/backends/{id}/enable`
+  from client request cancellation with a bounded 45s deadline, bypassed redundant
+  NAT rules on probe peers, and batched container routing/NAT rules into a single
+  compound SSH execution (#48, #135)
+- Server config parsing: stripped inline comments (`#` and `;`) and skipped
+  full-line semicolon comments in `ParseServerConfig` (#129, #131)
+
 ## [1.1.0] — Aurora - 2026-09-12
 
 Amnezia Nexus 1.1.0 ("Aurora") upgrades backend server deployments to AmneziaWG 3.1
