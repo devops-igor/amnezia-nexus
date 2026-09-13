@@ -724,3 +724,104 @@ func TestVPNDeleteBackendHandler(t *testing.T) {
 		t.Fatalf("expected 404 for unknown server id, got %d", wUnknown.Code)
 	}
 }
+
+// TestVPNEnableBackendHandler_ContextCancellationResilience verifies that canceling
+// the incoming HTTP request context (e.g. client disconnect, reverse proxy timeout)
+// does not abort backend enablement due to context.WithoutCancel decoupling with 45s deadline.
+func TestVPNEnableBackendHandler_ContextCancellationResilience(t *testing.T) {
+	ctx := context.Background()
+	var capturedErr error
+	var capturedRemaining time.Duration
+	var capturedHasDeadline bool
+	var capturedCount int
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(cmdCtx context.Context, cmd string) (string, string, int, error) {
+			capturedCount++
+			capturedErr = cmdCtx.Err()
+			if deadline, ok := cmdCtx.Deadline(); ok {
+				capturedHasDeadline = true
+				capturedRemaining = time.Until(deadline)
+			}
+			if strings.Contains(cmd, "docker ps -a") && strings.Contains(cmd, "amnezia-awg") {
+				return "amnezia-awg\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-awg") {
+				return "Up 1 hour\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wg0.conf") || strings.Contains(cmd, "awg0.conf") {
+				return "[Interface]\nListenPort = 51820\nPrivateKey = server-priv\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "wireguard_server_public_key.key") {
+				return "fallback-server-public-key\n", "", 0, nil
+			}
+			return "", "", 0, nil
+		},
+	}
+
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+
+	srv := &models.Server{
+		Name:    "VPN-Node-Cancel-Resilience",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+		SSHPass: "pass",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"port":       float64(51820),
+				"public_key": "x9aB1234567890abcdef1234567890abcdef123456=",
+				"installed":  true,
+			},
+		},
+		CreatedAt: time.Now(),
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullVPNRouter(h)
+
+	// Create an HTTP request with a pre-canceled context simulating client disconnect
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	cancelReq()
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID), nil).WithContext(reqCtx)
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 when enabling backend despite canceled request context, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify that the operation was executed with an active context bounded by ~45s
+	if capturedCount == 0 {
+		t.Fatal("expected EnableBackend to execute SSH commands, but none were executed")
+	}
+	if capturedErr != nil {
+		t.Fatalf("expected command execution context to not be canceled, got err: %v", capturedErr)
+	}
+	if !capturedHasDeadline {
+		t.Fatal("expected command execution context to have a deadline")
+	}
+	if capturedRemaining <= 0 || capturedRemaining > 45*time.Second {
+		t.Fatalf("expected deadline within (0, 45s], got remaining: %v", capturedRemaining)
+	}
+
+	// Verify the backend tunnel was actually registered in the DB
+	backends, err := db.GetBackendTunnels(ctx)
+	if err != nil {
+		t.Fatalf("failed to get backend tunnels: %v", err)
+	}
+	var found bool
+	for _, b := range backends {
+		if b.ServerID == sID && b.Status != "disabled" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected backend for server %d to be enabled in backend_tunnels table", sID)
+	}
+}

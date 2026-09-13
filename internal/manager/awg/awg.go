@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"regexp"
 	"strconv"
@@ -525,18 +526,28 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 		fmt.Sprintf("iptables -C FORWARD -d %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -d %s -j ACCEPT", subnet, subnet),
 		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT",
 		"iptables -C FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || true",
-		"sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null; sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true",
+		"(sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null || true) && (sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true)",
 	}
 
+	var groupedRules []string
 	for _, rule := range rules {
-		cmd := fmt.Sprintf("docker exec %s bash -c '%s'", cName, rule)
-		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
-		if err != nil {
-			return fmt.Errorf("failed to apply backend routing/NAT rule in container %s: %w", cName, err)
+		groupedRules = append(groupedRules, fmt.Sprintf("( %s )", rule))
+	}
+	compoundCmd := fmt.Sprintf("docker exec %s bash -c '%s'", cName, strings.Join(groupedRules, " && "))
+	out, errOut, code, err := client.RunSudoCommand(ctx, compoundCmd)
+	if err != nil {
+		// #nosec G706 -- Internal log for container routing/NAT rule application failure
+		log.Printf("[awg/nat] failed to apply backend routing/NAT rule in container %s: %v", cName, err)
+		return fmt.Errorf("failed to apply backend routing/NAT rule in container %s: %w", cName, err)
+	}
+	if code != 0 {
+		errMsg := strings.TrimSpace(errOut)
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(out)
 		}
-		if code != 0 {
-			return fmt.Errorf("failed to apply backend routing/NAT rule in container %s (code %d): %s", cName, code, errOut)
-		}
+		// #nosec G706 -- Internal log for container routing/NAT rule application failure
+		log.Printf("[awg/nat] failed to apply backend routing/NAT rule in container %s (code %d): %s", cName, code, errMsg)
+		return fmt.Errorf("failed to apply backend routing/NAT rule in container %s (code %d): %s", cName, code, errMsg)
 	}
 
 	// Host-level defense-in-depth:
@@ -547,7 +558,7 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 		}
 	}
 	hostRule := fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || true", subnet, bridgeDev, subnet, bridgeDev)
-	_, errOut, code, err := client.RunSudoCommand(ctx, hostRule)
+	_, errOut, code, err = client.RunSudoCommand(ctx, hostRule)
 	if err != nil {
 		return fmt.Errorf("failed to apply host-level NAT defense rule: %w", err)
 	}
@@ -1215,6 +1226,18 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
 	_ = m.saveClientsTable(ctx, client, clients)
 
+	if isProbePeer {
+		// Probe peers need no client config, connection kit, or TC limits:
+		// nothing consumes a private key that does not exist. Probe peers only
+		// terminate keepalive probes on awg0 and never route or masquerade
+		// client traffic, so ensureBackendNATRule is skipped.
+		return map[string]any{
+			"client_id":   clientPubKey,
+			"client_name": clientName,
+			"client_ip":   clientIP,
+		}, nil
+	}
+
 	// Live remediation (issues #27, #36): ensure the return route, NAT masquerade,
 	// and FORWARD rules exist so portal data-plane traffic (non-local source
 	// subnets like 10.100.0.0/16) is forwarded and masqueraded. This covers
@@ -1223,16 +1246,6 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	// all load-balanced client traffic is dropped upstream.
 	if err := m.ensureBackendNATRule(ctx, client); err != nil {
 		return nil, fmt.Errorf("failed to ensure backend NAT rules: %w", err)
-	}
-
-	if isProbePeer {
-		// Probe peers need no client config, connection kit, or TC limits:
-		// nothing consumes a private key that does not exist.
-		return map[string]any{
-			"client_id":   clientPubKey,
-			"client_name": clientName,
-			"client_ip":   clientIP,
-		}, nil
 	}
 
 	// Apply speed limit via TC
