@@ -341,6 +341,7 @@ iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT
 iptables -C FORWARD -s 10.100.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.100.0.0/16 -j ACCEPT
 iptables -C FORWARD -d 10.100.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.100.0.0/16 -j ACCEPT
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s 10.100.0.0/16 -o eth0 -j MASQUERADE
 iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s 10.100.0.0/16 -o eth1 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
@@ -526,6 +527,7 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 		fmt.Sprintf("iptables -C FORWARD -d %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -d %s -j ACCEPT", subnet, subnet),
 		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth0 -j ACCEPT",
 		"iptables -C FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o eth1 -j ACCEPT 2>/dev/null || true",
+		"iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
 		"(sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null || true) && (sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true)",
 	}
 
@@ -565,6 +567,9 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 	if code != 0 {
 		return fmt.Errorf("failed to apply host-level NAT defense rule (code %d): %s", code, errOut)
 	}
+
+	hostMangleRule := "iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
+	_, _, _, _ = client.RunSudoCommand(ctx, hostMangleRule)
 
 	return nil
 }

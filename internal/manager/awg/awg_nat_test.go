@@ -72,6 +72,11 @@ func TestStartScript_InterfaceScopedMasquerade(t *testing.T) {
 	if !strings.Contains(script, "-s 10.100.0.0/16 -j ACCEPT") || !strings.Contains(script, "-d 10.100.0.0/16 -j ACCEPT") {
 		t.Errorf("start.sh missing FORWARD rules for portal subnet")
 	}
+
+	// TCPMSS clamping rule must be present for HTTP/2 and PMTU compatibility
+	if !strings.Contains(script, "TCPMSS --clamp-mss-to-pmtu") {
+		t.Errorf("start.sh missing TCPMSS clamp-mss-to-pmtu rule:\n%s", script)
+	}
 }
 
 // TestEnsureBackendRoutingAndNAT_CommandsAndValidation verifies the live-remediation
@@ -126,6 +131,11 @@ func TestEnsureBackendRoutingAndNAT_CommandsAndValidation(t *testing.T) {
 		}
 		if !strings.Contains(joined, "iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT") {
 			t.Errorf("missing FORWARD -i awg0 -o eth0 rule in: %s", joined)
+		}
+
+		// Verify TCPMSS clamping rule
+		if !strings.Contains(joined, "iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu") {
+			t.Errorf("missing TCPMSS clamp-mss-to-pmtu rule in: %s", joined)
 		}
 
 		// Verify rp_filter sysctl commands
@@ -462,6 +472,7 @@ func TestEnsureBackendRoutingAndNAT_BatchedCompoundExecution(t *testing.T) {
 		"iptables -C FORWARD -d 10.100.0.0/16 -j ACCEPT",
 		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT",
 		"iptables -C FORWARD -i awg0 -o eth1 -j ACCEPT",
+		"iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
 		"net.ipv4.conf.all.rp_filter=2",
 		"net.ipv4.conf.awg0.rp_filter=2",
 	}
