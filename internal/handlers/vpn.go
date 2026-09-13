@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
 	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
@@ -58,9 +60,11 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	ctx := r.Context()
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 45*time.Second)
+	defer cancel()
+
 	if h.vpnSvc != nil {
-		if err := h.vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		if err := h.vpnSvc.EnableBackend(bgCtx, serverID); err != nil {
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return

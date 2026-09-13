@@ -307,7 +307,7 @@ func TestAddClient_EnsuresBackendNATRule(t *testing.T) {
 	if len(natCmds) == 0 {
 		t.Fatal("AddClient did not issue the backend NAT ensure command")
 	}
-	if !strings.Contains(natCmds[0], "docker exec amnezia-awg2 bash -c 'iptables -t nat") {
+	if !strings.Contains(natCmds[0], "docker exec amnezia-awg2") || !strings.Contains(natCmds[0], "iptables -t nat") {
 		t.Errorf("NAT command should run inside the resolved container: %s", natCmds[0])
 	}
 }
@@ -346,7 +346,7 @@ func TestAddClient_EnsuresBackendNATRule_LegacyContainer(t *testing.T) {
 	if len(natCmds) == 0 {
 		t.Fatal("AddClient did not issue the backend NAT ensure command")
 	}
-	if !strings.Contains(natCmds[0], "docker exec amnezia-awg bash -c 'iptables -t nat") {
+	if !strings.Contains(natCmds[0], "docker exec amnezia-awg") || !strings.Contains(natCmds[0], "iptables -t nat") {
 		t.Errorf("NAT command should run inside legacy resolved container amnezia-awg: %s", natCmds[0])
 	}
 }
@@ -383,5 +383,91 @@ func TestAddClient_NATRuleFailureFailsLoudly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to ensure backend NAT rules") {
 		t.Errorf("error should wrap the NAT ensure failure, got: %v", err)
+	}
+}
+
+// TestAddClient_ProbePeerBypassesNATRule verifies that health probe peers bypass
+// backend NAT and routing rule application in AddClient, avoiding redundant SSH roundtrips.
+func TestAddClient_ProbePeerBypassesNATRule(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	var executedCmds []string
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		executedCmds = append(executedCmds, cmd)
+		return defaultMockSudo(client, cmd)
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 12, Host: "10.0.0.12", SSHPort: 22, SSHUser: "root"}
+
+	_, proberPub := testProberKeypair(t)
+	params := map[string]any{
+		"clientName": "Health Probe",
+		"public_key": proberPub,
+	}
+
+	res, err := mgr.AddClient(ctx, server, params)
+	if err != nil {
+		t.Fatalf("AddClient failed for probe peer: %v", err)
+	}
+	if res["client_id"] != proberPub {
+		t.Fatalf("expected client_id %s, got %v", proberPub, res["client_id"])
+	}
+
+	// Verify that no NAT or routing commands were executed
+	for _, cmd := range executedCmds {
+		if strings.Contains(cmd, "iptables") || strings.Contains(cmd, "ip route replace") || strings.Contains(cmd, "rp_filter") {
+			t.Errorf("probe peer registration should not execute NAT/routing commands, got: %s", cmd)
+		}
+	}
+}
+
+// TestEnsureBackendRoutingAndNAT_BatchedCompoundExecution verifies that ensureBackendRoutingAndNAT
+// combines the 11 container routing/NAT rules into a single compound bash invocation.
+func TestEnsureBackendRoutingAndNAT_BatchedCompoundExecution(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	var dockerExecCmds []string
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker exec") {
+			dockerExecCmds = append(dockerExecCmds, cmd)
+		}
+		return "", "", 0, nil
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	if err := mgr.ensureBackendRoutingAndNAT(ctx, client, "10.100.0.0/16"); err != nil {
+		t.Fatalf("ensureBackendRoutingAndNAT failed: %v", err)
+	}
+
+	// Exactly 1 compound docker exec command should be executed for container rules
+	if len(dockerExecCmds) != 1 {
+		t.Fatalf("expected exactly 1 docker exec command for container rules, got %d:\n%s", len(dockerExecCmds), strings.Join(dockerExecCmds, "\n"))
+	}
+
+	cmd := dockerExecCmds[0]
+	// Verify it targets resolved container amnezia-awg2
+	if !strings.Contains(cmd, "docker exec amnezia-awg2 bash -c '") {
+		t.Errorf("expected command to target amnezia-awg2 via bash -c, got: %s", cmd)
+	}
+
+	// Verify the 11 rules are joined with " && "
+	rulesExpected := []string{
+		"ip route replace 10.100.0.0/16 dev awg0",
+		"iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth0 -j MASQUERADE",
+		"iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth1 -j MASQUERADE",
+		"iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -j MASQUERADE",
+		"iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE",
+		"iptables -t nat -C POSTROUTING -o eth1 -j MASQUERADE",
+		"iptables -C FORWARD -s 10.100.0.0/16 -j ACCEPT",
+		"iptables -C FORWARD -d 10.100.0.0/16 -j ACCEPT",
+		"iptables -C FORWARD -i awg0 -o eth0 -j ACCEPT",
+		"iptables -C FORWARD -i awg0 -o eth1 -j ACCEPT",
+		"net.ipv4.conf.all.rp_filter=2",
+		"net.ipv4.conf.awg0.rp_filter=2",
+	}
+	for _, expected := range rulesExpected {
+		if !strings.Contains(cmd, expected) {
+			t.Errorf("compound command missing expected rule element %q in: %s", expected, cmd)
+		}
 	}
 }
