@@ -1458,7 +1458,18 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		}
 	}
 
-	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, 1340, awgParams)
+	beMTU := 1280
+	if awgParams != nil {
+		if mVal, ok := awgParams["mtu"].(string); ok && mVal != "" {
+			if parsed, err := strconv.Atoi(mVal); err == nil && parsed > 0 {
+				beMTU = parsed
+			}
+		} else if mInt, ok := awgParams["mtu"].(int); ok && mInt > 0 {
+			beMTU = mInt
+		}
+	}
+
+	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, awgParams)
 	if devErr != nil {
 		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}
@@ -2393,6 +2404,16 @@ func (s *Service) renderClientConfigForConnection(
 		ContentPaddingAddition: p.cpAdd,
 	}
 
+	clientMTU := "1280"
+	if awgConn != nil && len(awgConn.ClientParams) > 0 {
+		if m := getStringParam(awgConn.ClientParams, "mtu"); m != "" {
+			clientMTU = m
+		}
+	}
+	if clientMTU == "1280" && awgParams != nil && awgParams.MTU != "" {
+		clientMTU = awgParams.MTU
+	}
+
 	configStr := awg.RenderClientConfig(
 		p.clientPriv,
 		assignedIP,
@@ -2401,7 +2422,7 @@ func (s *Service) renderClientConfigForConnection(
 		endpointStr,
 		awg.AWGDefaults["dns1"],
 		awg.AWGDefaults["dns2"],
-		"1420",
+		clientMTU,
 		awgParams,
 		ud,
 	)
@@ -2912,4 +2933,4 @@ func (p *peerVirtualDevice) Write(pkt []byte) (int, error) {
 func (p *peerVirtualDevice) Read(pkt []byte) (int, error) { return 0, errors.New("not implemented") }
 func (p *peerVirtualDevice) Close() error                 { return nil }
 func (p *peerVirtualDevice) Name() string                 { return "virtual-" + p.peerKey }
-func (p *peerVirtualDevice) MTU() int                     { return 1420 }
+func (p *peerVirtualDevice) MTU() int                     { return 1280 }
