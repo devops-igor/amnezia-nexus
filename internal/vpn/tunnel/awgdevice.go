@@ -138,7 +138,14 @@ func toInt(v any) int {
 // NewAWGClientDevice creates a new AWGClientDevice.
 func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, awgParams map[string]any) (*AWGClientDevice, error) {
 	if mtu <= 0 {
-		mtu = 1340
+		if val, ok := lookupAWGParamStr(awgParams, "mtu"); ok && val != "" {
+			if m, err := strconv.Atoi(val); err == nil && m > 0 {
+				mtu = m
+			}
+		}
+		if mtu <= 0 {
+			mtu = 1280
+		}
 	}
 
 	privHex, err := base64ToHex(privateKey)
