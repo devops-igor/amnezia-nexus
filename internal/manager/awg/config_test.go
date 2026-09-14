@@ -34,6 +34,9 @@ func TestRenderServerConfig(t *testing.T) {
 	if !strings.Contains(conf, "PrivateKey = serverPrivKey") {
 		t.Errorf("missing private key")
 	}
+	if !strings.Contains(conf, "Table = off") {
+		t.Errorf("server config must contain 'Table = off' in [Interface]")
+	}
 	if !strings.Contains(conf, "PublicKey = pubkey1") {
 		t.Errorf("missing peer public key")
 	}
@@ -230,6 +233,7 @@ func TestParseServerConfig(t *testing.T) {
 PrivateKey = sPriv
 Address = 10.8.1.1/24
 ListenPort = 55424
+Table = off
 MTU = 1280
 Jc = 4
 Jmin = 30
@@ -254,7 +258,7 @@ AllowedIPs = 10.8.1.3/32
 		t.Fatalf("ParseServerConfig failed: %v", err)
 	}
 
-	if params["port"] != "55424" || params["junk_packet_count"] != "4" || params["init_packet_magic_header"] != "12345" {
+	if params["port"] != "55424" || params["junk_packet_count"] != "4" || params["init_packet_magic_header"] != "12345" || params["table"] != "off" {
 		t.Errorf("unexpected parsed params: %+v", params)
 	}
 
@@ -861,6 +865,7 @@ PrivateKey = serverPrivKey
 Address = 10.8.1.1/24
 MTU = 1280
 ListenPort = 55424
+Table = off
 Jc = 4
 Jmin = 30
 Jmax = 80
@@ -924,4 +929,150 @@ H2 = 67890
 	if !reflect.DeepEqual(params, wantParams) {
 		t.Errorf("parsed 2.0 params changed.\ngot:  %#v\nwant: %#v", params, wantParams)
 	}
+}
+
+func TestEnsureInterfaceTableOff(t *testing.T) {
+	t.Run("injects Table = off when missing after ListenPort", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+MTU = 1280
+Jc = 4
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+		want := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+Table = off
+MTU = 1280
+Jc = 4
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != want {
+			t.Errorf("EnsureInterfaceTableOff failed.\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("preserves existing Table = off without modification", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+MTU = 1280
+ListenPort = 55424
+Table = off
+Jc = 4
+
+[Peer]
+PublicKey = pKey1
+AllowedIPs = 10.8.1.2/32
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != input {
+			t.Errorf("EnsureInterfaceTableOff modified already compliant config.\ngot:\n%s\nwant:\n%s", got, input)
+		}
+	})
+
+	t.Run("replaces non-off Table directive with Table = off", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+Table = auto
+MTU = 1280
+
+[Peer]
+PublicKey = pKey1
+`
+		want := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+Table = off
+MTU = 1280
+
+[Peer]
+PublicKey = pKey1
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != want {
+			t.Errorf("EnsureInterfaceTableOff failed to replace Table = auto.\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("replaces numeric table directive with Table = off", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+Table = 51820
+`
+		want := `[Interface]
+PrivateKey = sPriv
+Table = off
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != want {
+			t.Errorf("EnsureInterfaceTableOff failed to replace Table = 51820.\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("handles bare Interface section without ListenPort", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+
+[Peer]
+PublicKey = pKey1
+`
+		want := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+Table = off
+
+[Peer]
+PublicKey = pKey1
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != want {
+			t.Errorf("EnsureInterfaceTableOff failed on config without ListenPort.\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("returns config without Interface section unmodified", func(t *testing.T) {
+		input := `[Peer]
+PublicKey = pKey1
+AllowedIPs = 0.0.0.0/0
+`
+		got := EnsureInterfaceTableOff(input)
+		if got != input {
+			t.Errorf("EnsureInterfaceTableOff modified config without [Interface].\ngot:\n%s\nwant:\n%s", got, input)
+		}
+	})
+
+	t.Run("handles CRLF line endings cleanly", func(t *testing.T) {
+		input := "[Interface]\r\nPrivateKey = sPriv\r\nListenPort = 55424\r\n\r\n[Peer]\r\nPublicKey = p1\r\n"
+		got := EnsureInterfaceTableOff(input)
+		if !strings.Contains(got, "Table = off\r\n") {
+			t.Errorf("EnsureInterfaceTableOff failed to preserve CRLF.\ngot:\n%q", got)
+		}
+	})
+
+	t.Run("is idempotent across multiple invocations", func(t *testing.T) {
+		input := `[Interface]
+PrivateKey = sPriv
+ListenPort = 55424
+`
+		once := EnsureInterfaceTableOff(input)
+		twice := EnsureInterfaceTableOff(once)
+		if once != twice {
+			t.Errorf("EnsureInterfaceTableOff is not idempotent.\nonce:\n%s\ntwice:\n%s", once, twice)
+		}
+	})
 }

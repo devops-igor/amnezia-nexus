@@ -86,6 +86,7 @@ func RenderServerConfig(serverPrivKey string, subnetIP, subnetCIDR string, port 
 		fmt.Sprintf("Address = %s/%s", subnetIP, subnetCIDR),
 		fmt.Sprintf("MTU = %s", mtu),
 		fmt.Sprintf("ListenPort = %s", port),
+		"Table = off",
 	}
 
 	mapping := []struct {
@@ -263,6 +264,7 @@ func ParseServerConfig(configText string) (map[string]string, []AWGPeer, error) 
 	paramMap := map[string]string{
 		"listenport":            "port",
 		"mtu":                   "mtu",
+		"table":                 "table",
 		"jc":                    "junk_packet_count",
 		"jmin":                  "junk_packet_min_size",
 		"jmax":                  "junk_packet_max_size",
@@ -455,4 +457,100 @@ func SerializeClientsTable(clients []AWGClient) (string, error) {
 		return "", fmt.Errorf("failed to serialize clients table: %w", err)
 	}
 	return string(b), nil
+}
+
+// EnsureInterfaceTableOff verifies that the [Interface] section of a server WireGuard
+// or AmneziaWG configuration contains 'Table = off'. If 'Table' is missing, it is injected
+// into [Interface] (immediately after ListenPort, or after the last directive in [Interface]).
+// If a non-'off' Table directive is present, it is replaced with 'Table = off'.
+// Non-interface sections, existing peers, comments, and line ending styles are preserved.
+func EnsureInterfaceTableOff(confText string) string {
+	trimmedConf := strings.TrimSpace(confText)
+	if trimmedConf == "" {
+		return confText
+	}
+
+	hasCRLF := strings.Contains(confText, "\r\n")
+	normalized := confText
+	if hasCRLF {
+		normalized = strings.ReplaceAll(confText, "\r\n", "\n")
+	}
+
+	lines := strings.Split(normalized, "\n")
+	interfaceIdx := -1
+	tableLineIdx := -1
+	tableIsOff := false
+	listenPortIdx := -1
+	lastDirectiveIdx := -1
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		if strings.EqualFold(trimmed, "[Interface]") {
+			interfaceIdx = i
+			// Continue scanning inside [Interface]
+			for j := i + 1; j < len(lines); j++ {
+				jTrimmed := strings.TrimSpace(lines[j])
+				if strings.HasPrefix(jTrimmed, "[") {
+					break
+				}
+				if jTrimmed == "" || strings.HasPrefix(jTrimmed, "#") || strings.HasPrefix(jTrimmed, ";") {
+					continue
+				}
+				lastDirectiveIdx = j
+				parts := strings.SplitN(jTrimmed, "=", 2)
+				if len(parts) == 2 {
+					key := strings.TrimSpace(parts[0])
+					val := stripComment(strings.TrimSpace(parts[1]))
+					if strings.EqualFold(key, "table") {
+						tableLineIdx = j
+						if strings.EqualFold(val, "off") {
+							tableIsOff = true
+						}
+					}
+					if strings.EqualFold(key, "listenport") {
+						listenPortIdx = j
+					}
+				}
+			}
+			break
+		}
+	}
+
+	if interfaceIdx == -1 {
+		return confText
+	}
+
+	if tableLineIdx >= 0 {
+		if tableIsOff {
+			return confText
+		}
+		// Replace non-off Table directive with Table = off
+		lines[tableLineIdx] = "Table = off"
+		res := strings.Join(lines, "\n")
+		if hasCRLF {
+			res = strings.ReplaceAll(res, "\n", "\r\n")
+		}
+		return res
+	}
+
+	// Table directive is missing in [Interface]. Inject Table = off.
+	insertAt := interfaceIdx + 1
+	if listenPortIdx >= 0 {
+		insertAt = listenPortIdx + 1
+	} else if lastDirectiveIdx >= 0 {
+		insertAt = lastDirectiveIdx + 1
+	}
+
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:insertAt]...)
+	out = append(out, "Table = off")
+	out = append(out, lines[insertAt:]...)
+
+	res := strings.Join(out, "\n")
+	if hasCRLF {
+		res = strings.ReplaceAll(res, "\n", "\r\n")
+	}
+	return res
 }
