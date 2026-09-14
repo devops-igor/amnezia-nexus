@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -1878,4 +1879,230 @@ func TestSaveServerConfig_InterfaceAlreadyUp_NoSelfHealing(t *testing.T) {
 	if !strings.Contains(err.Error(), "Syntax error") {
 		t.Errorf("expected error to contain syncconf output, got: %v", err)
 	}
+}
+
+func TestSaveServerConfig_SanitizesTableOff(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		return "", "", 0, nil
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	rawConfig := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+MTU = 1280
+`
+	if err := mgr.saveServerConfig(ctx, client, rawConfig); err != nil {
+		t.Fatalf("saveServerConfig failed: %v", err)
+	}
+
+	content, ok := client.files["/tmp/_amnz_edit_config.conf"]
+	if !ok {
+		t.Fatalf("expected /tmp/_amnz_edit_config.conf to be uploaded")
+	}
+	uploadedConfig := string(content)
+
+	if !strings.Contains(uploadedConfig, "Table = off") {
+		t.Errorf("saveServerConfig did not inject Table = off into uploaded config:\n%s", uploadedConfig)
+	}
+}
+
+func TestUpsertPeerInConfig_SanitizesTableOff(t *testing.T) {
+	rawConfig := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+MTU = 1280
+`
+	peerSec := `[Peer]
+PublicKey = newPeerPub123=
+AllowedIPs = 10.100.0.0/16
+`
+	out, err := upsertPeerInConfig(rawConfig, peerSec)
+	if err != nil {
+		t.Fatalf("upsertPeerInConfig failed: %v", err)
+	}
+
+	if !strings.Contains(out, "Table = off") {
+		t.Errorf("upsertPeerInConfig did not inject Table = off:\n%s", out)
+	}
+	if !strings.Contains(out, "PublicKey = newPeerPub123=") {
+		t.Errorf("upsertPeerInConfig missing peer public key:\n%s", out)
+	}
+}
+
+func TestPostRebootRoutingHijack_RegressionSimulation(t *testing.T) {
+	// Models the Linux policy routing table and FIB route lookup
+	type RouteRule struct {
+		Priority             int
+		Table                int
+		HasSuppress          bool
+		SuppressPrefixLength int
+		FwMark               int
+		InvertFw             bool
+	}
+
+	type RouteEntry struct {
+		DstCIDR   string
+		Dev       string
+		Gateway   string
+		Table     int
+		IsDefault bool
+	}
+
+	type KernelFIBState struct {
+		Rules  []RouteRule
+		Routes []RouteEntry
+	}
+
+	lookupRoute := func(fib KernelFIBState, dstIP string) (RouteEntry, error) {
+		ip := net.ParseIP(dstIP)
+		if ip == nil {
+			return RouteEntry{}, fmt.Errorf("invalid IP %s", dstIP)
+		}
+
+		for _, rule := range fib.Rules {
+			var defaultRoute *RouteEntry
+			matchedSpecific := false
+			var matchedRoute RouteEntry
+
+			// In Linux FIB lookup, specific routes take precedence over the default route
+			for _, r := range fib.Routes {
+				if r.Table != rule.Table {
+					continue
+				}
+				if r.IsDefault {
+					if !(rule.HasSuppress && 0 <= rule.SuppressPrefixLength) {
+						rCopy := r
+						defaultRoute = &rCopy
+					}
+					continue
+				}
+				_, cidrNet, err := net.ParseCIDR(r.DstCIDR)
+				if err == nil && cidrNet.Contains(ip) {
+					matchedSpecific = true
+					matchedRoute = r
+					break
+				}
+			}
+			if matchedSpecific {
+				return matchedRoute, nil
+			}
+			if defaultRoute != nil {
+				return *defaultRoute, nil
+			}
+		}
+		return RouteEntry{}, errors.New("network unreachable")
+	}
+
+	t.Run("patched: Table = off prevents table 51820 creation and routing loop", func(t *testing.T) {
+		// 1. Generate server configuration with Table = off
+		params := &AWGParams{MTU: "1280"}
+		peers := []AWGPeer{
+			{
+				PublicKey:  "portalDataPubkey123=",
+				AllowedIPs: "10.100.0.0/16", // Portal subnet, NOT 0.0.0.0/0
+			},
+		}
+		serverConf := RenderServerConfig("srvPriv", "10.8.1.1", "24", "55424", "1280", params, peers)
+
+		// Verify Table = off is present
+		if !strings.Contains(serverConf, "Table = off") {
+			t.Fatalf("server config missing Table = off:\n%s", serverConf)
+		}
+
+		// 2. Simulate awg-quick up behavior with Table = off:
+		// When Table = off, awg-quick does NOT install table 51820 or any ip rules.
+		// Standard container routing state:
+		fib := KernelFIBState{
+			Rules: []RouteRule{
+				{Priority: 0, Table: 255},     // local
+				{Priority: 32766, Table: 254}, // main
+				{Priority: 32767, Table: 253}, // default
+			},
+			Routes: []RouteEntry{
+				{IsDefault: true, Dev: "eth0", Gateway: "172.29.172.1", Table: 254}, // main default
+				{DstCIDR: "10.100.0.0/16", Dev: "awg0", Table: 254},                 // portal return route
+			},
+		}
+
+		// 3. Verify route resolution for public internet IP 8.8.8.8
+		route8, err := lookupRoute(fib, "8.8.8.8")
+		if err != nil {
+			t.Fatalf("route lookup for 8.8.8.8 failed: %v", err)
+		}
+		if route8.Dev != "eth0" || route8.Table != 254 {
+			t.Errorf("8.8.8.8 resolved via unexpected device/table: %+v (want eth0 table 254)", route8)
+		}
+
+		// 4. Verify route resolution for portal client 10.100.0.42
+		routePortal, err := lookupRoute(fib, "10.100.0.42")
+		if err != nil {
+			t.Fatalf("route lookup for portal client failed: %v", err)
+		}
+		if routePortal.Dev != "awg0" || routePortal.Table != 254 {
+			t.Errorf("portal traffic resolved via unexpected device/table: %+v (want awg0 table 254)", routePortal)
+		}
+	})
+
+	t.Run("negative control: missing Table = off with 0.0.0.0/0 creates table 51820 hijack", func(t *testing.T) {
+		// Simulates the exact pre-fix failure on VPN #1 and VPN #3:
+		// awg-quick up installs table 51820 default route and suppress_prefixlength 0 rule
+		hijackedFIB := KernelFIBState{
+			Rules: []RouteRule{
+				{Priority: 0, Table: 255},                                                 // local
+				{Priority: 32764, Table: 51820, FwMark: 51820, InvertFw: true},            // not fwmark 51820 table 51820
+				{Priority: 32765, Table: 254, HasSuppress: true, SuppressPrefixLength: 0}, // table main suppress_prefixlength 0
+				{Priority: 32766, Table: 254},                                             // lookup main
+			},
+			Routes: []RouteEntry{
+				{IsDefault: true, Dev: "eth0", Gateway: "172.29.172.1", Table: 254}, // main default
+				{IsDefault: true, Dev: "awg0", Table: 51820},                        // hijacked default in table 51820
+			},
+		}
+
+		// Verify 8.8.8.8 is hijacked into awg0 / table 51820
+		route8, err := lookupRoute(hijackedFIB, "8.8.8.8")
+		if err != nil {
+			t.Fatalf("route lookup failed: %v", err)
+		}
+		if route8.Dev != "awg0" || route8.Table != 51820 {
+			t.Errorf("expected negative control to demonstrate hijack dev awg0 table 51820, got: %+v", route8)
+		}
+
+		// Verify defensive cleanup remediates the FIB:
+		// Simulate:
+		//   ip -4 rule del not fwmark 51820 table 51820
+		//   ip -4 rule del table main suppress_prefixlength 0
+		//   ip -4 route flush table 51820
+		remediatedRules := make([]RouteRule, 0)
+		for _, r := range hijackedFIB.Rules {
+			if r.Table == 51820 || (r.Table == 254 && r.HasSuppress) {
+				continue // deleted by defensive cleanup
+			}
+			remediatedRules = append(remediatedRules, r)
+		}
+		remediatedRoutes := make([]RouteEntry, 0)
+		for _, r := range hijackedFIB.Routes {
+			if r.Table == 51820 {
+				continue // flushed
+			}
+			remediatedRoutes = append(remediatedRoutes, r)
+		}
+		remediatedFIB := KernelFIBState{
+			Rules:  remediatedRules,
+			Routes: remediatedRoutes,
+		}
+
+		route8Remediated, err := lookupRoute(remediatedFIB, "8.8.8.8")
+		if err != nil {
+			t.Fatalf("route lookup after remediation failed: %v", err)
+		}
+		if route8Remediated.Dev != "eth0" || route8Remediated.Table != 254 {
+			t.Errorf("after remediation 8.8.8.8 should resolve via eth0 table 254, got: %+v", route8Remediated)
+		}
+	})
 }

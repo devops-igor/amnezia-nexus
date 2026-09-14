@@ -77,6 +77,17 @@ func TestStartScript_InterfaceScopedMasquerade(t *testing.T) {
 	if !strings.Contains(script, "TCPMSS --clamp-mss-to-pmtu") {
 		t.Errorf("start.sh missing TCPMSS clamp-mss-to-pmtu rule:\n%s", script)
 	}
+
+	// Defensive cleanup of stale table 51820 policy routing rules and route table
+	if !strings.Contains(script, "ip -4 rule del not fwmark 51820 table 51820") {
+		t.Errorf("start.sh missing 'ip -4 rule del not fwmark 51820 table 51820' defensive cleanup:\n%s", script)
+	}
+	if !strings.Contains(script, "ip -4 rule del table main suppress_prefixlength 0") {
+		t.Errorf("start.sh missing 'ip -4 rule del table main suppress_prefixlength 0' defensive cleanup:\n%s", script)
+	}
+	if !strings.Contains(script, "ip -4 route flush table 51820") {
+		t.Errorf("start.sh missing 'ip -4 route flush table 51820' defensive cleanup:\n%s", script)
+	}
 }
 
 // TestEnsureBackendRoutingAndNAT_CommandsAndValidation verifies the live-remediation
@@ -141,6 +152,17 @@ func TestEnsureBackendRoutingAndNAT_CommandsAndValidation(t *testing.T) {
 		// Verify rp_filter sysctl commands
 		if !strings.Contains(joined, "net.ipv4.conf.all.rp_filter=2") || !strings.Contains(joined, "net.ipv4.conf.awg0.rp_filter=2") {
 			t.Errorf("missing rp_filter sysctl in: %s", joined)
+		}
+
+		// Verify defensive cleanup of stale table 51820 rules
+		if !strings.Contains(joined, "ip -4 rule del not fwmark 51820 table 51820") {
+			t.Errorf("missing defensive cleanup of 'not fwmark 51820 table 51820' in: %s", joined)
+		}
+		if !strings.Contains(joined, "ip -4 rule del table main suppress_prefixlength 0") {
+			t.Errorf("missing defensive cleanup of 'table main suppress_prefixlength 0' in: %s", joined)
+		}
+		if !strings.Contains(joined, "ip -4 route flush table 51820") {
+			t.Errorf("missing defensive cleanup of 'ip -4 route flush table 51820' in: %s", joined)
 		}
 	})
 
@@ -460,8 +482,11 @@ func TestEnsureBackendRoutingAndNAT_BatchedCompoundExecution(t *testing.T) {
 		t.Errorf("expected command to target amnezia-awg2 via bash -c, got: %s", cmd)
 	}
 
-	// Verify the 11 rules are joined with " && "
+	// Verify the compound command includes defensive cleanup and all 11 routing/NAT/forward rules joined with " && "
 	rulesExpected := []string{
+		"ip -4 rule del not fwmark 51820 table 51820",
+		"ip -4 rule del table main suppress_prefixlength 0",
+		"ip -4 route flush table 51820",
 		"ip route replace 10.100.0.0/16 dev awg0",
 		"iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth0 -j MASQUERADE",
 		"iptables -t nat -C POSTROUTING -s 10.100.0.0/16 -o eth1 -j MASQUERADE",
