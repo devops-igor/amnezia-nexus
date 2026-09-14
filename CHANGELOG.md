@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] — Aurora - 2026-09-15
+
+Amnezia Nexus 1.1.2 ("Aurora") is a patch release fixing WireGuard/AmneziaWG routing
+table hijack and routing loops on server reboot, Server #0 user connection configuration
+deletion and retrieval, streamlining the CI/CD pipeline, and cleaning up repository history.
+
+### Fixed
+
+- WireGuard/AmneziaWG post-reboot routing table hijack: added `Table = off` to server
+  interface configurations, automated config sanitization on disk, scoped portal peer
+  AllowedIPs to portal subnet CIDR, and added defensive startup cleanup for stale
+  table 51820 policy rules and route tables, preventing routing loops and packet
+  loss after container or node reboots (#139, #140)
+- Server #0 connection management: supported Server ID 0 (virtual cluster / auto load-balanced
+  servers) in connection deletion and configuration retrieval handlers, added orphaned
+  connection cleanup, and updated Web UI labeling to "Cluster (Auto)" (#138, #137)
+
+### Changed
+
+- Streamlined CI/CD pipeline: removed automated downstream CD/SSH deployment workflow
+  in favor of focused CI validation and automated multi-arch container image publishing
+  to GHCR (#141, #142)
+- Repository hygiene: completely purged legacy `docs/` and `deploy/` directories from
+  git history across all commits and added both to `.gitignore` (#143, #144)
+
 ## [1.1.1] — Aurora - 2026-09-13
 
 Amnezia Nexus 1.1.1 ("Aurora") is a patch release resolving HTTP/2 connectivity
