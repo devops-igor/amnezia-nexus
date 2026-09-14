@@ -1170,8 +1170,8 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	// Register the portal peers on the backend server (issue #43):
 	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) — the DATA
-	//     device key with AllowedIPs 0.0.0.0/0 so the backend accepts data
-	//     traffic from the portal subnet and routes replies to the data device.
+	//     device key with AllowedIPs scoped to portal client subnet so the backend accepts data
+	//     traffic from the portal subnet and routes replies to the data device (never 0.0.0.0/0).
 	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) — a
 	//     dedicated probe key so prober handshakes never roam the data peer's
 	//     return endpoint (per-peer endpoint roaming: last sender wins).
@@ -1220,8 +1220,11 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 // backend server (issue #43 key separation):
 //
 //  1. "Portal Data Plane" — the DATA device identity derive(tun.PrivateKey)
-//     with AllowedIPs 0.0.0.0/0, so the backend accepts data traffic from any
-//     portal client subnet and routes replies to the data device. The legacy
+//     with AllowedIPs scoped to the portal client subnet (s.getPortalSubnet(),
+//     e.g. 10.100.0.0/16), so the backend accepts data traffic from the
+//     portal client subnet and routes replies to the data device. The portal
+//     data plane peer must NEVER be granted 0.0.0.0/0 to prevent awg-quick from
+//     creating a default route hijack on reboot. The legacy
 //     name is kept deliberately: backends provisioned before the split already
 //     hold a peer of this name keyed by the same data identity, so the
 //     manager's upsert refreshes it in place instead of appending a duplicate
@@ -1265,12 +1268,13 @@ func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models
 		return fmt.Errorf("probe key for backend tunnel %d on server %d is missing or collides with the data key", tun.ID, server.ID)
 	}
 
+	portalSubnet := s.getPortalSubnet()
 	dataParams := map[string]any{
 		"clientName":        "Portal Data Plane",
 		"name":              "Portal Data Plane",
 		"public_key":        dataPub,
 		"client_public_key": dataPub,
-		"allowed_ips":       "0.0.0.0/0",
+		"allowed_ips":       portalSubnet,
 	}
 	if _, err := adder.AddClient(ctx, server, dataParams); err != nil {
 		return fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err)

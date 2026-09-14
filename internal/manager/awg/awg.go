@@ -329,8 +329,14 @@ echo "%s" > /opt/amnezia/awg/wireguard_psk.key
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_awg0.conf")
 
 	startScript := `#!/bin/bash
+ip -4 rule del not fwmark 51820 table 51820 2>/dev/null || true
+ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
+ip -4 route flush table 51820 2>/dev/null || true
 awg-quick down /opt/amnezia/awg/awg0.conf 2>/dev/null || true
 if [ -f /opt/amnezia/awg/awg0.conf ]; then awg-quick up /opt/amnezia/awg/awg0.conf; fi
+ip -4 rule del not fwmark 51820 table 51820 2>/dev/null || true
+ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
+ip -4 route flush table 51820 2>/dev/null || true
 ip route replace 10.100.0.0/16 dev awg0 2>/dev/null || ip route add 10.100.0.0/16 dev awg0 2>/dev/null || true
 sysctl -w net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 sysctl -w net.ipv4.conf.awg0.rp_filter=2 2>/dev/null || true
@@ -517,6 +523,9 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 	}
 
 	rules := []string{
+		"ip -4 rule del not fwmark 51820 table 51820 2>/dev/null || true",
+		"ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true",
+		"ip -4 route flush table 51820 2>/dev/null || true",
 		fmt.Sprintf("ip route replace %s dev awg0 2>/dev/null || ip route add %s dev awg0 2>/dev/null || true", subnet, subnet),
 		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s %s -o eth0 -j MASQUERADE", subnet, subnet),
 		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s %s -o eth1 -j MASQUERADE 2>/dev/null || true", subnet, subnet),
@@ -633,6 +642,7 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 }
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
+	content = EnsureInterfaceTableOff(content)
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
 		cName = m.containerName()
@@ -958,6 +968,7 @@ func probePeerPubKey(clientParams map[string]any) string {
 // identity that was re-keyed under the same client name). Duplicate blocks for
 // the same PublicKey are collapsed. Non-peer content is preserved as-is.
 func upsertPeerInConfig(confText, peerSection string, removePubKeys ...string) (string, error) {
+	confText = EnsureInterfaceTableOff(confText)
 	peerLines := strings.Split(strings.TrimSpace(peerSection), "\n")
 	newPub := ""
 	for _, line := range peerLines {

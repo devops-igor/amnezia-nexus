@@ -679,7 +679,7 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
 
-	// DATA peer: identity = derive(PrivateKey), allowed_ips 0.0.0.0/0.
+	// DATA peer: identity = derive(PrivateKey), allowed_ips = portal subnet (never 0.0.0.0/0).
 	dataPub, ok := dataParams["client_public_key"].(string)
 	if !ok || len(dataPub) == 0 {
 		t.Fatalf("missing or empty client_public_key in data params: %+v", dataParams)
@@ -691,8 +691,11 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 	if dataPub != derivedDataPub {
 		t.Errorf("registered data public key %s does not match tunnel-derived data pubkey %s", dataPub, derivedDataPub)
 	}
-	if aip, ok := dataParams["allowed_ips"]; !ok || aip != "0.0.0.0/0" {
-		t.Errorf("expected data peer allowed_ips '0.0.0.0/0', got: %v", dataParams["allowed_ips"])
+	if aip, ok := dataParams["allowed_ips"]; !ok || aip != "10.100.0.0/16" {
+		t.Errorf("expected data peer allowed_ips '10.100.0.0/16', got: %v", dataParams["allowed_ips"])
+	}
+	if aip, ok := dataParams["allowed_ips"]; ok && aip == "0.0.0.0/0" {
+		t.Errorf("data peer allowed_ips must NEVER be 0.0.0.0/0 (causes routing hijack on reboot)")
 	}
 
 	// PROBE peer: identity = derive(ProbePrivateKey), distinct from data key,
@@ -716,6 +719,49 @@ func TestEnableBackend_RegistersProberPeerOnBackend(t *testing.T) {
 	}
 	if aip, present := probeParams["allowed_ips"]; present {
 		t.Errorf("probe peer must carry NO allowed_ips key (defaults to clientIP/32), got: %v", aip)
+	}
+}
+
+func TestRegisterBackendPortalPeers_CustomSubnet(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.cfg = &models.VPNConfig{SubnetCIDR: "10.200.0.0/16"}
+	ctx := context.Background()
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "awg-custom-subnet-server",
+		Host: "198.51.100.44",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "server-endpoint-pubkey-custom",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	if len(adder.addedClients) < 1 {
+		t.Fatalf("expected at least 1 added client, got %d", len(adder.addedClients))
+	}
+	dataParams := adder.addedClients[0]
+	if aip, ok := dataParams["allowed_ips"]; !ok || aip != "10.200.0.0/16" {
+		t.Errorf("expected custom portal subnet '10.200.0.0/16', got: %v", dataParams["allowed_ips"])
+	}
+	if aip, ok := dataParams["allowed_ips"]; ok && aip == "0.0.0.0/0" {
+		t.Errorf("portal data plane peer must never receive 0.0.0.0/0")
 	}
 }
 
