@@ -320,19 +320,13 @@ func (h *Handlers) GetServerConnectionKitHandler(w http.ResponseWriter, r *http.
 	req.Protocol = models.NormalizeProtocol(req.Protocol)
 
 	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
 	sess := h.GetSession(r)
 	if sess != nil && sess.Role == models.RoleUser {
 		// Verify ownership
 		userConns, _ := h.db.GetConnectionsByUserID(ctx, sess.UserID)
 		owned := false
 		for _, c := range userConns {
-			if c.ServerID == serverID && c.ClientID == req.ClientID {
+			if c.ServerID == serverID && (c.ClientID == req.ClientID || c.ID == req.ClientID) {
 				owned = true
 				break
 			}
@@ -341,6 +335,17 @@ func (h *Handlers) GetServerConnectionKitHandler(w http.ResponseWriter, r *http.
 			h.JSONError(w, http.StatusForbidden, "forbidden", "Forbidden")
 			return
 		}
+	}
+
+	if serverID == 0 {
+		h.getServerConnectionKitZero(ctx, w, req.ClientID)
+		return
+	}
+
+	server, err := h.db.GetServer(ctx, serverID)
+	if err != nil || server == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
+		return
 	}
 
 	protoMgr, err := h.GetProtocolManager(req.Protocol)
@@ -388,6 +393,30 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 	}
 
 	ctx := r.Context()
+	if serverID == 0 {
+		clientPub := req.ClientID
+		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil && conn.ServerID == 0 {
+			if conn.ClientID != "" {
+				clientPub = conn.ClientID
+			}
+			_, _ = h.db.DeleteConnection(ctx, conn.ID)
+		}
+		if h.vpnSvc != nil && clientPub != "" {
+			_ = h.vpnSvc.ReleaseClient(ctx, clientPub)
+		}
+		if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, 0); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
+			return
+		}
+		if clientPub != req.ClientID {
+			_, _ = h.db.DeleteConnectionByClientID(ctx, clientPub, 0)
+		}
+
+		h.audit(r, "server_connection.remove", map[string]any{"server_id": 0, "protocol": req.Protocol, "client_id": req.ClientID})
+		h.JSONOK(w)
+		return
+	}
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
@@ -550,18 +579,12 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	}
 
 	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
 	sess := h.GetSession(r)
 	if sess != nil && sess.Role == models.RoleUser {
 		userConns, _ := h.db.GetConnectionsByUserID(ctx, sess.UserID)
 		owned := false
 		for _, c := range userConns {
-			if c.ServerID == serverID && c.ClientID == req.ClientID {
+			if c.ServerID == serverID && (c.ClientID == req.ClientID || c.ID == req.ClientID) {
 				owned = true
 				break
 			}
@@ -570,6 +593,17 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 			h.JSONError(w, http.StatusForbidden, "forbidden", "Forbidden")
 			return
 		}
+	}
+
+	if serverID == 0 {
+		h.getServerConnectionConfigZero(ctx, w, req.ClientID)
+		return
+	}
+
+	server, err := h.db.GetServer(ctx, serverID)
+	if err != nil || server == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
+		return
 	}
 
 	protoMgr, err := h.GetProtocolManager(req.Protocol)
@@ -700,5 +734,82 @@ func (h *Handlers) GetProtocolClientsHandler(w http.ResponseWriter, r *http.Requ
 	h.JSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"clients": filtered,
+	})
+}
+
+func (h *Handlers) getServerConnectionKitZero(ctx context.Context, w http.ResponseWriter, clientID string) {
+	if h.vpnSvc == nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
+		return
+	}
+
+	conn, err := h.db.GetConnectionByClientID(ctx, clientID, 0)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to query connection: "+err.Error())
+		return
+	}
+	if conn == nil {
+		if cByID, errID := h.db.GetConnection(ctx, clientID); errID == nil && cByID != nil && cByID.ServerID == 0 {
+			conn = cByID
+		}
+	}
+	if conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+
+	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+		return
+	}
+
+	vpnLink := GenerateVPNLink(configStr)
+	zipBytes, err := BuildConnectionKitZip(clientID, configStr, vpnLink)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to build connection kit archive")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"connection-%s.zip\"", clientID))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(zipBytes)
+}
+
+func (h *Handlers) getServerConnectionConfigZero(ctx context.Context, w http.ResponseWriter, clientID string) {
+	if h.vpnSvc == nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
+		return
+	}
+
+	conn, err := h.db.GetConnectionByClientID(ctx, clientID, 0)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to query connection: "+err.Error())
+		return
+	}
+	if conn == nil {
+		if cByID, errID := h.db.GetConnection(ctx, clientID); errID == nil && cByID != nil && cByID.ServerID == 0 {
+			conn = cByID
+		}
+	}
+	if conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+
+	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+		return
+	}
+
+	vpnLink := GenerateVPNLink(configStr)
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"config":      configStr,
+		"filename":    fmt.Sprintf("%s.conf", clientID),
+		"vpn_link":    vpnLink,
+		"awg_mimicry": conn.AWGMimicry,
 	})
 }

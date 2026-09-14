@@ -600,6 +600,17 @@ func TestUsersHandlers(t *testing.T) {
 		}
 		_, _ = db.CreateConnection(ctx, cUnknown)
 
+		cServer0 := &models.UserConnection{
+			ID:        "c-server0-1",
+			UserID:    fu.ID,
+			ServerID:  0,
+			Protocol:  "awg",
+			ClientID:  "client-server0",
+			Name:      "Cluster Auto Conn",
+			CreatedAt: time.Now(),
+		}
+		_, _ = db.CreateConnection(ctx, cServer0)
+
 		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/users/%s/connections", fu.ID), nil)
 		reqCtx := middleware.WithSession(req.Context(), adminSess)
 		w := httptest.NewRecorder()
@@ -614,6 +625,9 @@ func TestUsersHandlers(t *testing.T) {
 		}
 		if !strings.Contains(body, "Server #424242") {
 			t.Errorf("expected fallback server name in output")
+		}
+		if !strings.Contains(body, "Cluster (Auto)") {
+			t.Errorf("expected 'Cluster (Auto)' server name for ServerID 0 in output")
 		}
 	})
 

@@ -992,6 +992,127 @@ func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
 	}
 }
 
+func TestUserDeleteConnectionHandler_AdminSupportRoles(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	targetUser := &models.User{
+		ID:           "u-target-user-1",
+		Username:     "targetuser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, targetUser)
+
+	otherUser := &models.User{
+		ID:           "u-other-regular-1",
+		Username:     "otheruser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, otherUser)
+
+	adminUser := &models.User{
+		ID:           "u-admin-test-1",
+		Username:     "adminuser",
+		PasswordHash: "hash",
+		Role:         models.RoleAdmin,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, adminUser)
+
+	supportUser := &models.User{
+		ID:           "u-support-test-1",
+		Username:     "supportuser",
+		PasswordHash: "hash",
+		Role:         models.RoleSupport,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, supportUser)
+
+	conn1 := &models.UserConnection{
+		ID:        "conn-target-1",
+		UserID:    targetUser.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-pubkey-t1",
+		Name:      "Target Conn 1",
+		CreatedAt: time.Now(),
+	}
+	conn2 := &models.UserConnection{
+		ID:        "conn-target-2",
+		UserID:    targetUser.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-pubkey-t2",
+		Name:      "Target Conn 2",
+		CreatedAt: time.Now(),
+	}
+	conn3 := &models.UserConnection{
+		ID:        "conn-target-3",
+		UserID:    targetUser.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-pubkey-t3",
+		Name:      "Target Conn 3",
+		CreatedAt: time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn1)
+	_, _ = db.CreateConnection(ctx, conn2)
+	_, _ = db.CreateConnection(ctx, conn3)
+
+	r := setupFullConnectionsRouter(h)
+
+	// 1. Regular other user tries to delete conn1 -> 404 Not Found
+	reqOther := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", conn1.ID), nil)
+	reqOtherCtx := middleware.WithSession(reqOther.Context(), &models.SessionData{UserID: otherUser.ID, Role: models.RoleUser})
+	wOther := httptest.NewRecorder()
+	r.ServeHTTP(wOther, reqOther.WithContext(reqOtherCtx))
+	if wOther.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for other regular user, got %d", wOther.Code)
+	}
+
+	// 2. Admin deletes conn1 -> 200 OK
+	reqAdmin := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", conn1.ID), nil)
+	reqAdminCtx := middleware.WithSession(reqAdmin.Context(), &models.SessionData{UserID: adminUser.ID, Role: models.RoleAdmin})
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin.WithContext(reqAdminCtx))
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin deleting user conn, got %d: %s", wAdmin.Code, wAdmin.Body.String())
+	}
+	if c, _ := db.GetConnection(ctx, conn1.ID); c != nil {
+		t.Errorf("expected conn1 to be deleted from DB by admin")
+	}
+
+	// 3. Support deletes conn2 -> 200 OK
+	reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", conn2.ID), nil)
+	reqSupportCtx := middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: supportUser.ID, Role: models.RoleSupport})
+	wSupport := httptest.NewRecorder()
+	r.ServeHTTP(wSupport, reqSupport.WithContext(reqSupportCtx))
+	if wSupport.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for support deleting user conn, got %d: %s", wSupport.Code, wSupport.Body.String())
+	}
+	if c, _ := db.GetConnection(ctx, conn2.ID); c != nil {
+		t.Errorf("expected conn2 to be deleted from DB by support")
+	}
+
+	// 4. Admin views config of conn3 -> 200 OK
+	reqCfg := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/config", conn3.ID), nil)
+	reqCfgCtx := middleware.WithSession(reqCfg.Context(), &models.SessionData{UserID: adminUser.ID, Role: models.RoleAdmin})
+	wCfg := httptest.NewRecorder()
+	r.ServeHTTP(wCfg, reqCfg.WithContext(reqCfgCtx))
+	if wCfg.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin viewing user conn config, got %d: %s", wCfg.Code, wCfg.Body.String())
+	}
+}
+
 func TestUserGetConnectionConfigHandler_NoPhantomConnection(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
 	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)

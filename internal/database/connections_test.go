@@ -346,3 +346,54 @@ func TestConnections_ClientParamsPersistence(t *testing.T) {
 		t.Errorf("expected updated client_private_key 'privKeyDEF', got %v", afterUpdate.ClientParams["client_private_key"])
 	}
 }
+
+func TestGetConnectionByClientID(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "client_id_user"})
+
+	// Create a Server 0 connection
+	c0 := &models.UserConnection{
+		ID:        "conn-srv0-1",
+		UserID:    uID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "pubkey-srv0-xyz",
+		Name:      "Server 0 Conn",
+		CreatedAt: time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, c0); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	// Retrieve by clientID and serverID
+	found, err := db.GetConnectionByClientID(ctx, "pubkey-srv0-xyz", 0)
+	if err != nil {
+		t.Fatalf("GetConnectionByClientID failed: %v", err)
+	}
+	if found == nil {
+		t.Fatalf("expected to find connection, got nil")
+	}
+	if found.ID != c0.ID || found.ClientID != c0.ClientID || found.ServerID != 0 {
+		t.Errorf("unexpected connection fields: %+v", found)
+	}
+
+	// Mismatched serverID should return nil
+	mismatchServer, err := db.GetConnectionByClientID(ctx, "pubkey-srv0-xyz", 999)
+	if err != nil {
+		t.Fatalf("GetConnectionByClientID mismatched server failed: %v", err)
+	}
+	if mismatchServer != nil {
+		t.Errorf("expected nil for mismatched server, got %+v", mismatchServer)
+	}
+
+	// Non-existent clientID should return nil
+	notFound, err := db.GetConnectionByClientID(ctx, "non-existent-pubkey", 0)
+	if err != nil {
+		t.Fatalf("GetConnectionByClientID non-existent failed: %v", err)
+	}
+	if notFound != nil {
+		t.Errorf("expected nil for non-existent client, got %+v", notFound)
+	}
+}
