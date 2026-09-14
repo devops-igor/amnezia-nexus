@@ -559,3 +559,310 @@ func TestServerConnectionsHandlers(t *testing.T) {
 		}
 	})
 }
+
+func TestRemoveServerConnectionHandler_ServerZero(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-srv0-del-1",
+		Username:     "srv0deluser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	adminSess := &models.SessionData{
+		UserID: "admin-srv0",
+		Role:   models.RoleAdmin,
+	}
+
+	r := setupFullServerConnectionsRouter(h)
+
+	// 1. Delete Server 0 connection with active vpnSvc by client_id
+	c1 := &models.UserConnection{
+		ID:        "conn-srv0-rem-1",
+		UserID:    u.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-srv0-pubkey-1",
+		Name:      "Server 0 Conn 1",
+		CreatedAt: time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, c1)
+
+	body1, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: c1.ClientID,
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/remove", bytes.NewReader(body1))
+	req1Ctx := middleware.WithSession(req1.Context(), adminSess)
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1.WithContext(req1Ctx))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for server 0 removal with active vpnSvc, got %d: %s", w1.Code, w1.Body.String())
+	}
+	if found, _ := db.GetConnection(ctx, c1.ID); found != nil {
+		t.Errorf("expected connection %s to be deleted from DB", c1.ID)
+	}
+
+	// 2. Delete Server 0 orphaned connection with nil vpnSvc
+	cOrphan := &models.UserConnection{
+		ID:        "conn-srv0-rem-orphan",
+		UserID:    u.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-srv0-orphan-pubkey",
+		Name:      "Server 0 Orphaned Conn",
+		CreatedAt: time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, cOrphan)
+
+	origVPNSvc := h.vpnSvc
+	h.vpnSvc = nil
+
+	bodyOrphan, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: cOrphan.ClientID,
+	})
+	reqOrphan := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/remove", bytes.NewReader(bodyOrphan))
+	reqOrphanCtx := middleware.WithSession(reqOrphan.Context(), adminSess)
+	wOrphan := httptest.NewRecorder()
+	r.ServeHTTP(wOrphan, reqOrphan.WithContext(reqOrphanCtx))
+	if wOrphan.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for orphaned server 0 removal with nil vpnSvc, got %d: %s", wOrphan.Code, wOrphan.Body.String())
+	}
+	if found, _ := db.GetConnection(ctx, cOrphan.ID); found != nil {
+		t.Errorf("expected orphaned connection %s to be deleted from DB", cOrphan.ID)
+	}
+
+	// Restore vpnSvc
+	h.vpnSvc = origVPNSvc
+
+	// 3. Delete Server 0 connection when client_id is passed as the connection UUID
+	cUUID := &models.UserConnection{
+		ID:        "conn-srv0-uuid-test",
+		UserID:    u.ID,
+		ServerID:  0,
+		Protocol:  "awg",
+		ClientID:  "client-pubkey-uuid-test",
+		Name:      "Server 0 UUID Conn",
+		CreatedAt: time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, cUUID)
+
+	bodyUUID, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: cUUID.ID, // Passing connection UUID as ClientID
+	})
+	reqUUID := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/remove", bytes.NewReader(bodyUUID))
+	reqUUIDCtx := middleware.WithSession(reqUUID.Context(), adminSess)
+	wUUID := httptest.NewRecorder()
+	r.ServeHTTP(wUUID, reqUUID.WithContext(reqUUIDCtx))
+	if wUUID.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for server 0 removal by UUID, got %d: %s", wUUID.Code, wUUID.Body.String())
+	}
+	if found, _ := db.GetConnection(ctx, cUUID.ID); found != nil {
+		t.Errorf("expected connection %s to be deleted by UUID", cUUID.ID)
+	}
+}
+
+func TestGetServerConnectionConfigHandler_ServerZero(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-srv0-cfg-1",
+		Username:     "srv0cfguser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	otherUser := &models.User{
+		ID:           "u-srv0-cfg-other",
+		Username:     "srv0cfgother",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, otherUser)
+
+	conn := &models.UserConnection{
+		ID:         "conn-srv0-cfg-1",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "client-pubkey-cfg-1",
+		Name:       "Server 0 Config Conn",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn)
+
+	adminSess := &models.SessionData{
+		UserID: "admin-srv0",
+		Role:   models.RoleAdmin,
+	}
+	ownerSess := &models.SessionData{
+		UserID: u.ID,
+		Role:   models.RoleUser,
+	}
+	otherSess := &models.SessionData{
+		UserID: otherUser.ID,
+		Role:   models.RoleUser,
+	}
+
+	r := setupFullServerConnectionsRouter(h)
+
+	// 1. Admin gets config -> 200 OK
+	bodyAdmin, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: conn.ClientID,
+	})
+	reqAdmin := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/config", bytes.NewReader(bodyAdmin))
+	reqAdminCtx := middleware.WithSession(reqAdmin.Context(), adminSess)
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin.WithContext(reqAdminCtx))
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin getting server 0 config, got %d: %s", wAdmin.Code, wAdmin.Body.String())
+	}
+
+	// Re-fetch connection from DB since AWG config generation establishes and stores valid client public key
+	updatedConn, err := db.GetConnection(ctx, conn.ID)
+	if err != nil || updatedConn == nil {
+		t.Fatalf("failed to reload connection after config generation: %v", err)
+	}
+
+	// 2. Owner gets config -> 200 OK
+	bodyOwner, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: updatedConn.ClientID,
+	})
+	reqOwner := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/config", bytes.NewReader(bodyOwner))
+	reqOwnerCtx := middleware.WithSession(reqOwner.Context(), ownerSess)
+	wOwner := httptest.NewRecorder()
+	r.ServeHTTP(wOwner, reqOwner.WithContext(reqOwnerCtx))
+	if wOwner.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for owner getting server 0 config, got %d: %s", wOwner.Code, wOwner.Body.String())
+	}
+
+	// 3. Other regular user gets config -> 403 Forbidden
+	bodyOther, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: updatedConn.ClientID,
+	})
+	reqOther := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/config", bytes.NewReader(bodyOther))
+	reqOtherCtx := middleware.WithSession(reqOther.Context(), otherSess)
+	wOther := httptest.NewRecorder()
+	r.ServeHTTP(wOther, reqOther.WithContext(reqOtherCtx))
+	if wOther.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-owner getting server 0 config, got %d", wOther.Code)
+	}
+
+	// 4. Non-existent connection -> 404 Not Found
+	bodyMissing, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: "non-existent-client-pubkey",
+	})
+	reqMissing := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/config", bytes.NewReader(bodyMissing))
+	reqMissingCtx := middleware.WithSession(reqMissing.Context(), adminSess)
+	wMissing := httptest.NewRecorder()
+	r.ServeHTTP(wMissing, reqMissing.WithContext(reqMissingCtx))
+	if wMissing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for non-existent server 0 client, got %d", wMissing.Code)
+	}
+
+	// 5. vpnSvc nil -> 503 Service Unavailable
+	origVPNSvc := h.vpnSvc
+	h.vpnSvc = nil
+	reqNilVPN := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/config", bytes.NewReader(bodyAdmin))
+	reqNilVPNCtx := middleware.WithSession(reqNilVPN.Context(), adminSess)
+	wNilVPN := httptest.NewRecorder()
+	r.ServeHTTP(wNilVPN, reqNilVPN.WithContext(reqNilVPNCtx))
+	if wNilVPN.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for nil vpnSvc, got %d", wNilVPN.Code)
+	}
+	h.vpnSvc = origVPNSvc
+}
+
+func TestGetServerConnectionKitHandler_ServerZero(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	u := &models.User{
+		ID:           "u-srv0-kit-1",
+		Username:     "srv0kituser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, _ = db.CreateUser(ctx, u)
+
+	conn := &models.UserConnection{
+		ID:         "conn-srv0-kit-1",
+		UserID:     u.ID,
+		ServerID:   0,
+		Protocol:   "awg",
+		ClientID:   "client-pubkey-kit-1",
+		Name:       "Server 0 Kit Conn",
+		AWGMimicry: models.AWGMimicryAuto,
+		CreatedAt:  time.Now(),
+	}
+	_, _ = db.CreateConnection(ctx, conn)
+
+	adminSess := &models.SessionData{
+		UserID: "admin-srv0",
+		Role:   models.RoleAdmin,
+	}
+
+	r := setupFullServerConnectionsRouter(h)
+
+	// 1. Admin gets kit for server 0 -> 200 OK (zip)
+	body, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: conn.ClientID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(body))
+	reqCtx := middleware.WithSession(req.Context(), adminSess)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req.WithContext(reqCtx))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for server 0 kit, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Content-Type") != "application/zip" {
+		t.Errorf("expected Content-Type application/zip, got %s", w.Header().Get("Content-Type"))
+	}
+
+	// 2. Non-existent -> 404
+	bodyMissing, _ := json.Marshal(models.ConnectionActionRequest{
+		Protocol: "awg",
+		ClientID: "missing-client-kit",
+	})
+	reqMissing := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(bodyMissing))
+	reqMissingCtx := middleware.WithSession(reqMissing.Context(), adminSess)
+	wMissing := httptest.NewRecorder()
+	r.ServeHTTP(wMissing, reqMissing.WithContext(reqMissingCtx))
+	if wMissing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing connection kit, got %d", wMissing.Code)
+	}
+
+	// 3. nil vpnSvc -> 503
+	h.vpnSvc = nil
+	reqNil := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(body))
+	reqNilCtx := middleware.WithSession(reqNil.Context(), adminSess)
+	wNil := httptest.NewRecorder()
+	r.ServeHTTP(wNil, reqNil.WithContext(reqNilCtx))
+	if wNil.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for nil vpnSvc, got %d", wNil.Code)
+	}
+}

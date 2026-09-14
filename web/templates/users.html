@@ -945,7 +945,7 @@
                             <span style="font-weight:600;">${UI.escapeHtml(c.name || 'Connection')}</span>
                         </div>
                     </td>
-                    <td>${UI.escapeHtml(c.server_name || ('#' + c.server_id))}</td>
+                    <td>${(Number(c.server_id) === 0) ? 'Cluster (Auto)' : UI.escapeHtml(c.server_name || ('#' + c.server_id))}</td>
                     <td><span class="badge badge-info">${UI.escapeHtml(protoLabel)}</span></td>
                     <td data-sort-val="${totalTraffic}">
                         <div class="traffic-cell" style="font-size:0.8rem;">
@@ -956,15 +956,15 @@
                     <td style="text-align: right;">
                         <div class="flex items-center justify-end gap-xs">
                             <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('copy_config')}" aria-label="${_('copy_config')}"
-                                    onclick="copyUserConnectionDirect(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', this)">
+                                    onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', this)">
                                 <svg class="icon"><use href="#icon-copy"></use></svg>
                             </button>
                             <button type="button" class="btn btn-ghost btn-sm btn-icon" title="${_('config')}" aria-label="${_('config')}"
-                                    onclick="showUserConnectionConfig(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
+                                    onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
                                 <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
                             <button type="button" class="btn btn-ghost btn-sm btn-icon btn-danger-hover" style="color:var(--danger);" title="${_('delete')}" aria-label="${_('delete')}"
-                                    onclick="unlinkUserConnection(${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
+                                    onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
                                 <svg class="icon"><use href="#icon-trash"></use></svg>
                             </button>
                         </div>
@@ -990,12 +990,32 @@
         }
     }
 
-    async function copyUserConnectionDirect(serverId, clientId, protocol, btnEl) {
+    async function copyUserConnectionDirect(connIdOrServerId, serverIdOrClientId, clientIdOrProto, protocolOrBtn, maybeBtn) {
+        let connId, serverId, clientId, protocol, btnEl;
+        if (typeof connIdOrServerId === 'number') {
+            serverId = connIdOrServerId;
+            clientId = serverIdOrClientId;
+            protocol = clientIdOrProto;
+            btnEl = protocolOrBtn;
+            connId = '';
+        } else {
+            connId = connIdOrServerId;
+            serverId = serverIdOrClientId;
+            clientId = clientIdOrProto;
+            protocol = protocolOrBtn;
+            btnEl = maybeBtn;
+        }
+
         try {
-            const result = await API.post(`/api/servers/${serverId}/connections/config`, {
-                protocol: protocol,
-                client_id: clientId,
-            });
+            let result;
+            if (Number(serverId) === 0 && (!clientId || clientId === '')) {
+                result = await API.post(`/api/connections/${connId}/config`);
+            } else {
+                result = await API.post(`/api/servers/${serverId}/connections/config`, {
+                    protocol: protocol,
+                    client_id: clientId || connId,
+                });
+            }
             if (result && result.config) {
                 await UI.copy(result.config, btnEl);
             } else {
@@ -1006,7 +1026,22 @@
         }
     }
 
-    async function unlinkUserConnection(serverId, clientId, protocol, connName) {
+    async function unlinkUserConnection(connIdOrServerId, serverIdOrClientId, clientIdOrProto, protocolOrName, maybeName) {
+        let connId, serverId, clientId, protocol, connName;
+        if (typeof connIdOrServerId === 'number') {
+            serverId = connIdOrServerId;
+            clientId = serverIdOrClientId;
+            protocol = clientIdOrProto;
+            connName = protocolOrName || 'VPN';
+            connId = '';
+        } else {
+            connId = connIdOrServerId;
+            serverId = serverIdOrClientId;
+            clientId = clientIdOrProto;
+            protocol = protocolOrName;
+            connName = maybeName || 'VPN';
+        }
+
         const confirmed = await UI.confirm({
             title: _('delete_connection') || 'Delete Connection',
             message: _('delete_conn_confirm') || `Are you sure you want to delete connection "${connName}"?`,
@@ -1016,10 +1051,14 @@
         if (!confirmed) return;
 
         try {
-            await API.post(`/api/servers/${serverId}/connections/remove`, {
-                protocol: protocol,
-                client_id: clientId,
-            });
+            if (Number(serverId) === 0 && (!clientId || clientId === '')) {
+                await API.post(`/api/connections/${connId}/delete`);
+            } else {
+                await API.post(`/api/servers/${serverId}/connections/remove`, {
+                    protocol: protocol,
+                    client_id: clientId || connId,
+                });
+            }
             UI.toast(_('success'), 'success');
             await viewUserConnections(currentUserId, currentUsername);
             refreshUsersList();
@@ -1050,14 +1089,34 @@
         }
     }
 
-    async function showUserConnectionConfig(serverId, clientId, protocol, connName) {
+    async function showUserConnectionConfig(connIdOrServerId, serverIdOrClientId, clientIdOrProto, protocolOrName, maybeName) {
+        let connId, serverId, clientId, protocol, connName;
+        if (typeof connIdOrServerId === 'number') {
+            serverId = connIdOrServerId;
+            clientId = serverIdOrClientId;
+            protocol = clientIdOrProto;
+            connName = protocolOrName || 'VPN';
+            connId = '';
+        } else {
+            connId = connIdOrServerId;
+            serverId = serverIdOrClientId;
+            clientId = clientIdOrProto;
+            protocol = protocolOrName;
+            connName = maybeName || 'VPN';
+        }
+
         try {
             UI.toast(_('loading'), 'info');
-            const result = await API.post(`/api/servers/${serverId}/connections/config`, {
-                protocol: protocol,
-                client_id: clientId,
-            });
-            if (result.config) {
+            let result;
+            if (Number(serverId) === 0 && (!clientId || clientId === '')) {
+                result = await API.post(`/api/connections/${connId}/config`);
+            } else {
+                result = await API.post(`/api/servers/${serverId}/connections/config`, {
+                    protocol: protocol,
+                    client_id: clientId || connId,
+                });
+            }
+            if (result && result.config) {
                 currentConfig = result.config;
                 currentVpnLink = result.vpn_link || '';
                 currentConfigName = connName.replace(/\s+/g, '_');

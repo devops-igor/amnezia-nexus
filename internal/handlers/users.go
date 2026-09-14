@@ -585,7 +585,11 @@ func (h *Handlers) GetUserConnectionsHandler(w http.ResponseWriter, r *http.Requ
 	for i, c := range conns {
 		srvName := serversMap[c.ServerID]
 		if srvName == "" {
-			srvName = fmt.Sprintf("Server #%d", c.ServerID)
+			if c.ServerID == 0 {
+				srvName = "Cluster (Auto)"
+			} else {
+				srvName = fmt.Sprintf("Server #%d", c.ServerID)
+			}
 		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
