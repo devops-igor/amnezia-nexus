@@ -18,6 +18,7 @@ AGENTS.md
 workflow.md
 coverage.out
 docs/
+deploy/
 
 # Build output
 bin/
