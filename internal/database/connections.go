@@ -67,6 +67,27 @@ func (d *DB) GetConnectionByID(ctx context.Context, id string) (*models.UserConn
 	return d.GetConnection(ctx, id)
 }
 
+// GetConnectionByClientID retrieves a connection matching clientID and serverID.
+func (d *DB) GetConnectionByClientID(ctx context.Context, clientID string, serverID int64) (*models.UserConnection, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `SELECT id, user_id, server_id, protocol, client_id, name, awg_mimicry, client_params,
+		last_rx, last_tx, traffic_delta_rx, traffic_delta_tx,
+		traffic_total_rx, traffic_total_tx, traffic_total, created_at
+		FROM user_connections WHERE client_id = ? AND server_id = ? LIMIT 1`
+
+	row := d.sqlDB.QueryRowContext(ctx, query, clientID, serverID)
+	c, err := d.scanConnectionRow(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get connection by client id: %w", err)
+	}
+	return &c, nil
+}
+
 // GetConnectionsByUserID retrieves all connections owned by a user.
 func (d *DB) GetConnectionsByUserID(ctx context.Context, userID string) ([]models.UserConnection, error) {
 	d.mu.RLock()

@@ -365,7 +365,11 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 
 	ctx := r.Context()
 	conn, err := h.db.GetConnection(ctx, connectionID)
-	if err != nil || conn == nil || conn.UserID != sess.UserID {
+	if err != nil || conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
@@ -375,7 +379,7 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 			h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
 			return
 		}
-		configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, sess.UserID, conn.ID)
+		configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
 			return
@@ -438,7 +442,11 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 	conn, err := h.db.GetConnection(ctx, connectionID)
-	if err != nil || conn == nil || conn.UserID != sess.UserID {
+	if err != nil || conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
@@ -450,7 +458,7 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 		var err error
-		configStr, _, err = h.vpnSvc.GenerateClientConfigForConnection(ctx, sess.UserID, conn.ID)
+		configStr, _, err = h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
 			return
@@ -515,13 +523,17 @@ func (h *Handlers) UserRenameConnectionHandler(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 	conn, err := h.db.GetConnection(ctx, connectionID)
-	if err != nil || conn == nil || conn.UserID != sess.UserID {
+	if err != nil || conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
 
 	// Check duplicates
-	userConns, err := h.db.GetConnectionsByUserID(ctx, sess.UserID)
+	userConns, err := h.db.GetConnectionsByUserID(ctx, conn.UserID)
 	if err == nil {
 		for _, c := range userConns {
 			if c.ID != connectionID && strings.EqualFold(c.Name, req.Name) {
@@ -565,7 +577,11 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 	conn, err := h.db.GetConnection(ctx, connectionID)
-	if err != nil || conn == nil || conn.UserID != sess.UserID {
+	if err != nil || conn == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}

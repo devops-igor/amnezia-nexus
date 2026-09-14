@@ -1882,3 +1882,39 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 		}
 	}
 }
+
+func TestUsersTemplateServerZeroHandling(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	// Check Server 0 display name mapping
+	if !strings.Contains(usersStr, `(Number(c.server_id) === 0) ? 'Cluster (Auto)'`) {
+		t.Errorf("users.html must render 'Cluster (Auto)' when server_id is 0")
+	}
+
+	// Check that action buttons pass connection ID
+	if !strings.Contains(usersStr, `onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.html copyUserConnectionDirect must pass connection ID")
+	}
+	if !strings.Contains(usersStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.html showUserConnectionConfig must pass connection ID")
+	}
+	if !strings.Contains(usersStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.html unlinkUserConnection must pass connection ID")
+	}
+
+	// Check fallback/direct connection endpoint calls
+	if !strings.Contains(usersStr, `/api/connections/${connId}/delete`) {
+		t.Errorf("users.html unlinkUserConnection must support /api/connections/${connId}/delete")
+	}
+	if !strings.Contains(usersStr, `/api/connections/${connId}/config`) {
+		t.Errorf("users.html showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
+	}
+}
