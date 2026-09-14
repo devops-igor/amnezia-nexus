@@ -17,6 +17,7 @@ AGENTS.md
 .gitignore
 workflow.md
 coverage.out
+docs/
 
 # Build output
 bin/
