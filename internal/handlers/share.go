@@ -190,7 +190,7 @@ func (h *Handlers) GetShareConnectionConfigHandler(w http.ResponseWriter, r *htt
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, conn.ClientID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+		h.handleClientConfigError(w, err)
 		return
 	}
 
