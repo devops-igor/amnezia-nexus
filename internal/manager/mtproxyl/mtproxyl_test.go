@@ -606,3 +606,194 @@ func TestMTProxyL_GetServerStatus_ErrorsAndAbsence(t *testing.T) {
 		t.Errorf("expected container_running: false")
 	}
 }
+
+func TestExtractTGLink(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "clean link",
+			input:    "tg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef",
+		},
+		{
+			name:     "link wrapped in ANSI cyan and reset",
+			input:    "\x1b[36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234\x1b[0m",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link wrapped in octal ANSI escape sequences",
+			input:    "\033[36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234\033[0m",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link with bold and color formatting",
+			input:    "\x1b[1m\x1b[32mSuccess!\x1b[0m \x1b[1;36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234\x1b[0m\n",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link with bright colors and short reset",
+			input:    "\x1b[92m[OK]\x1b[0m \x1b[96mtg://proxy?server=server8.example.com&port=8443&secret=eeabcdef\x1b[m",
+			expected: "tg://proxy?server=server8.example.com&port=8443&secret=eeabcdef",
+		},
+		{
+			name:     "link followed by trailing double quotes",
+			input:    `Added secret. Link: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234"`,
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link followed by trailing single quotes",
+			input:    "Link: 'tg://proxy?server=1.2.3.4&port=443&secret=dd1234'",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link followed by trailing period",
+			input:    "Here is the proxy: tg://proxy?server=1.2.3.4&port=443&secret=dd1234.",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link followed by trailing semicolon and parenthesis",
+			input:    "(tg://proxy?server=1.2.3.4&port=443&secret=dd1234);",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link wrapped in angle brackets",
+			input:    "<tg://proxy?server=1.2.3.4&port=443&secret=dd1234>",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link wrapped in curly braces",
+			input:    "{tg://proxy?server=1.2.3.4&port=443&secret=dd1234}",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "link followed by question mark and exclamation",
+			input:    "Use this link: tg://proxy?server=1.2.3.4&port=443&secret=dd1234?!",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "corrupted terminal reset without escape char",
+			input:    "tg://proxy?server=1.2.3.4&port=443&secret=dd1234[0m",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234",
+		},
+		{
+			name:     "empty output",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "no link in output",
+			input:    "Proxy configuration updated successfully",
+			expected: "",
+		},
+		{
+			name:     "multiline realistic CLI output with ANSI colors",
+			input:    "=== MTProxyL Secret Manager ===\n\x1b[32m[OK]\x1b[0m User bob created\n\x1b[36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef\x1b[0m\nEnjoy your proxy!\n",
+			expected: "tg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractTGLink(tc.input)
+			if got != tc.expected {
+				t.Errorf("extractTGLink(%q) = %q, expected %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+type ansiMockSSHClient struct {
+	mockMTProxyLSSHClient
+}
+
+func (a *ansiMockSSHClient) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "secret add") {
+		return "\x1b[32m[OK]\x1b[0m Secret added successfully.\nLink: \x1b[36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef\x1b[0m\n", "", 0, nil
+	}
+	if strings.Contains(cmd, "secret link") {
+		return "\x1b[1;36mtg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef\x1b[0m\r\n", "", 0, nil
+	}
+	return a.mockMTProxyLSSHClient.RunCommand(ctx, cmd)
+}
+
+type ansiMockSSHProvider struct {
+	client *ansiMockSSHClient
+}
+
+func (p *ansiMockSSHProvider) Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error) {
+	return p.client, nil
+}
+
+func TestMTProxyLManager_AddClient_WithANSIEscapeCodes(t *testing.T) {
+	ctx := context.Background()
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+	provider := &ansiMockSSHProvider{client: &ansiMockSSHClient{}}
+	mgr := NewMTProxyLManager(provider)
+
+	res, err := mgr.AddClient(ctx, server, map[string]any{"name": "alice"})
+	if err != nil {
+		t.Fatalf("AddClient failed: %v", err)
+	}
+
+	expectedLink := "tg://proxy?server=1.2.3.4&port=443&secret=dd1234567890abcdef1234567890abcdef"
+	if res["config"] != expectedLink {
+		t.Errorf("expected config %q, got %q", expectedLink, res["config"])
+	}
+	if res["vpn_link"] != expectedLink {
+		t.Errorf("expected vpn_link %q, got %q", expectedLink, res["vpn_link"])
+	}
+
+	conf, err := mgr.GetClientConfig(ctx, server, "alice")
+	if err != nil {
+		t.Fatalf("GetClientConfig failed: %v", err)
+	}
+	if conf != expectedLink {
+		t.Errorf("expected GetClientConfig %q, got %q", expectedLink, conf)
+	}
+}
+
+type fallbackAnsiSSHClient struct {
+	mockMTProxyLSSHClient
+}
+
+func (f *fallbackAnsiSSHClient) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "secret add") {
+		return "\x1b[32m[OK]\x1b[0m Secret created without inline link.\n", "", 0, nil
+	}
+	if strings.Contains(cmd, "secret link") {
+		return "\x1b[36mtg://proxy?server=1.2.3.4&port=443&secret=ddfallback1234567890abcdef\x1b[0m\n", "", 0, nil
+	}
+	return f.mockMTProxyLSSHClient.RunCommand(ctx, cmd)
+}
+
+type fallbackAnsiSSHProvider struct {
+	client *fallbackAnsiSSHClient
+}
+
+func (p *fallbackAnsiSSHProvider) Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error) {
+	return p.client, nil
+}
+
+func TestMTProxyLManager_AddClient_FallbackToSecretLinkWithANSI(t *testing.T) {
+	ctx := context.Background()
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+	provider := &fallbackAnsiSSHProvider{client: &fallbackAnsiSSHClient{}}
+	mgr := NewMTProxyLManager(provider)
+
+	res, err := mgr.AddClient(ctx, server, map[string]any{"name": "charlie"})
+	if err != nil {
+		t.Fatalf("AddClient fallback failed: %v", err)
+	}
+
+	expectedLink := "tg://proxy?server=1.2.3.4&port=443&secret=ddfallback1234567890abcdef"
+	if res["config"] != expectedLink {
+		t.Errorf("expected config %q, got %q", expectedLink, res["config"])
+	}
+	if res["vpn_link"] != expectedLink {
+		t.Errorf("expected vpn_link %q, got %q", expectedLink, res["vpn_link"])
+	}
+}
