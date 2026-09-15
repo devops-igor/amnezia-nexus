@@ -22,12 +22,24 @@ const (
 	// #nosec G101
 	DefaultSecretsPath  = "/opt/mtproxyl/secrets.conf"
 	DefaultSettingsPath = "/opt/mtproxyl/settings.conf"
+	trailingLinkCutset  = ".,;:!?'\"`()[]{}<>\r\n\t "
 )
 
 var (
 	usernameSanitizeRegex = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
-	tgLinkRegex           = regexp.MustCompile(`tg://\S+`)
+	ansiRegex             = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|\x1b[@-Z\\-_]`)
+	tgLinkRegex           = regexp.MustCompile(`tg://proxy\?[a-zA-Z0-9_.~%&=-]+`)
 )
+
+// extractTGLink strips ANSI escape sequences, extracts the tg:// URL, and trims trailing artifacts.
+func extractTGLink(output string) string {
+	cleaned := ansiRegex.ReplaceAllString(output, "")
+	match := tgLinkRegex.FindString(cleaned)
+	if match == "" {
+		return ""
+	}
+	return strings.TrimRight(match, trailingLinkCutset)
+}
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {
@@ -256,12 +268,10 @@ func (m *MTProxyLManager) AddClient(ctx context.Context, server *models.Server, 
 	}
 
 	// Extract tg:// link
-	link := ""
-	if match := tgLinkRegex.FindString(out); match != "" {
-		link = match
-	} else {
+	link := extractTGLink(out)
+	if link == "" {
 		linkOut, _, _, _ := client.RunCommand(ctx, fmt.Sprintf("%s secret link %s", DefaultCLIPath, username))
-		link = tgLinkRegex.FindString(linkOut)
+		link = extractTGLink(linkOut)
 	}
 
 	return map[string]any{
@@ -300,7 +310,7 @@ func (m *MTProxyLManager) GetClientConfig(ctx context.Context, server *models.Se
 		return "", fmt.Errorf("failed to get client config (code %d): %s, %w", code, errOut, err)
 	}
 
-	link := tgLinkRegex.FindString(out)
+	link := extractTGLink(out)
 	return link, nil
 }
 
