@@ -910,7 +910,7 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 	}
 
 	// 3. Probe with error
-	orchErr := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	orchErr := New(db, nil, WithProbeFailureThreshold(1), WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 0, errors.New("timeout")
 	}))
 	if err := orchErr.CheckBackendTunnelHealth(ctx); err != nil {
@@ -1411,7 +1411,7 @@ func TestOrchestrator_VPNTasks_DetailedFailoverAndRebalance(t *testing.T) {
 	}
 
 	// 4. Test CheckBackendTunnelHealth failover with degraded tunnel and active sessions
-	orchFailover := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	orchFailover := New(db, nil, WithProbeFailureThreshold(1), WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		if strings.Contains(endpoint, "55420") {
 			return 0, errors.New("degraded endpoint")
 		}
