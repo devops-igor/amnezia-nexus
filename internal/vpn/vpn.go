@@ -35,12 +35,13 @@ type Status struct {
 	RxBytes           int64  `json:"rx_bytes"`
 	TxBytes           int64  `json:"tx_bytes"`
 	DroppedPackets    uint64 `json:"dropped_packets"`
-	// Issue #39 telemetry: return-path drops inside the forwarder (queue
-	// full / total) and rejected handshake initiations at the listener.
+	// Issue #39 & #151 telemetry: return-path drops inside the forwarder (queue
+	// full / no route / total) and rejected handshake initiations at the listener.
 	// A rising forwarder_drops_total with stable traffic means a stalled
-	// downstream path; a rising handshake_rejections means client (rekey)
-	// initiations are being classified as not-a-handshake.
+	// downstream path or unroutable backend returns; a rising handshake_rejections means
+	// client (rekey) initiations are being classified as not-a-handshake.
 	ForwarderDropsQueueFull uint64 `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute   uint64 `json:"forwarder_drops_no_route"`
 	ForwarderDropsTotal     uint64 `json:"forwarder_drops_total"`
 	HandshakeRejections     uint64 `json:"handshake_rejections"`
 	PublicEndpoint          string `json:"public_endpoint,omitempty"`
@@ -491,7 +492,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	stickyMgr := loadbalancer.NewStickySessionManager(db, lb, caps)
 
 	accountant := forwarder.NewTrafficAccountant(db, 2*time.Second)
-	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, 512)
+	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, 2048)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -1052,7 +1053,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		rx, tx, _ := s.forwarder.GetStats()
 		status.RxBytes = rx
 		status.TxBytes = tx
-		status.ForwarderDropsQueueFull, status.ForwarderDropsTotal = s.forwarder.DropStats()
+		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
 	}
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()

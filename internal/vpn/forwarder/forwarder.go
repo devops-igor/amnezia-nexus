@@ -165,7 +165,8 @@ type Forwarder struct {
 	totalRxBytes   atomic.Int64
 	totalTxBytes   atomic.Int64
 	dropsQueueFull atomic.Uint64 // return packets dropped: per-route queue full
-	dropsTotal     atomic.Uint64 // return-path drops counted so far (queue full)
+	dropsNoRoute   atomic.Uint64 // return packets dropped: unroutable / no session registered (issue #151)
+	dropsTotal     atomic.Uint64 // return-path drops counted so far (queue full + unroutable)
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -191,6 +192,11 @@ type Forwarder struct {
 	peerUnregs map[string]uint64 // peerKey -> stale teardown requests consumed
 }
 
+// DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
+// Sized to absorb downstream microbursts without drops while keeping memory bounded
+// (2048 packets ~ 2.8 MB @ MTU 1420, issue #151).
+const DefaultClientQueueSize = 2048
+
 // NewForwarder creates a new Forwarder.
 //
 // portalSubnetCIDR is the VPN client pool CIDR (the same source IPAM is
@@ -200,7 +206,7 @@ type Forwarder struct {
 // ALL rebinds (fail-closed) — self-heal silently stops working but the
 // hijack primitive stays closed.
 func NewForwarder(accountant *TrafficAccountant, portalSubnetCIDR string, bufSize ...int) *Forwarder {
-	qSize := 256
+	qSize := DefaultClientQueueSize
 	if len(bufSize) > 0 && bufSize[0] > 0 {
 		qSize = bufSize[0]
 	}
@@ -546,6 +552,8 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	route, ok := f.routesByIP[destIP]
 	if !ok {
 		f.mu.RUnlock()
+		f.dropsNoRoute.Add(1)
+		f.dropsTotal.Add(1)
 		return ErrSessionNotRegistered
 	}
 	clientQueue := route.clientQueue
@@ -727,11 +735,25 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 }
 
 // DropStats returns the number of return packets dropped because a route's
-// client queue was full, and the total number of return-path drops. Both are
-// exposed via the stats API so a stalled downstream path is visible without
-// tailing logs (issue #39).
-func (f *Forwarder) DropStats() (queueFull, total uint64) {
-	return f.dropsQueueFull.Load(), f.dropsTotal.Load()
+// client queue was full, the number of return packets dropped because no
+// registered session route matched the destination IP, and the total number
+// of return-path drops. Both are exposed via the stats API so a stalled
+// downstream path and unroutable sessions are visible without tailing logs
+// (issues #39, #151).
+func (f *Forwarder) DropStats() (queueFull, noRoute, total uint64) {
+	return f.dropsQueueFull.Load(), f.dropsNoRoute.Load(), f.dropsTotal.Load()
+}
+
+// DropsNoRoute returns the number of return packets dropped because no
+// registered session route matched the packet's destination IP (issue #151).
+func (f *Forwarder) DropsNoRoute() uint64 {
+	return f.dropsNoRoute.Load()
+}
+
+// DropsQueueFull returns the number of return packets dropped because a
+// route's client queue was full (issue #151).
+func (f *Forwarder) DropsQueueFull() uint64 {
+	return f.dropsQueueFull.Load()
 }
 
 // inPortalSubnet reports whether ip belongs to the portal client pool.

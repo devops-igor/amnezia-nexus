@@ -181,6 +181,7 @@ type ClientPacketRouter func(peerKey string, packet []byte) error
 // the right socket address.
 type activePeerState struct {
 	peerKey         string
+	udpAddr         *net.UDPAddr // cached pre-parsed UDP endpoint (avoids per-packet string resolution, issue #151)
 	receiverIdx     atomic.Uint32
 	sendCount       atomic.Uint64
 	lastSeen        atomic.Int64 // unix nanos
@@ -483,6 +484,11 @@ func (el *Listener) ListenerConfigSnapshot() ListenerConfig {
 	return el.config
 }
 
+// DefaultUDPSocketBufferSize is the default SO_RCVBUF and SO_SNDBUF buffer size (4 MB)
+// configured on the endpoint listener's UDP socket to prevent kernel-level packet drops
+// and socket backpressure during downstream traffic bursts (issue #151).
+const DefaultUDPSocketBufferSize = 4 * 1024 * 1024
+
 // Start binds the UDP port and starts the background loops.
 func (el *Listener) Start(ctx context.Context) error {
 	el.mu.Lock()
@@ -496,6 +502,13 @@ func (el *Listener) Start(ctx context.Context) error {
 	if err != nil {
 		el.mu.Unlock()
 		return fmt.Errorf("failed to bind UDP port %d: %w", el.config.ListenPort, err)
+	}
+
+	if err := conn.SetReadBuffer(DefaultUDPSocketBufferSize); err != nil {
+		log.Printf("[vpn/endpoint] warning: failed to set SO_RCVBUF to %d: %v", DefaultUDPSocketBufferSize, err)
+	}
+	if err := conn.SetWriteBuffer(DefaultUDPSocketBufferSize); err != nil {
+		log.Printf("[vpn/endpoint] warning: failed to set SO_SNDBUF to %d: %v", DefaultUDPSocketBufferSize, err)
 	}
 
 	el.udpConn = conn
@@ -681,6 +694,9 @@ func (el *Listener) TransportKeysFor(peerKey string) (*TransportKeys, bool) {
 // storeTransportKeys records the transport keys derived for a peer's active
 // handshake, replacing any previous keys from an earlier handshake.
 func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys) {
+	if keys != nil {
+		_ = keys.InitCiphers()
+	}
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	if el.noiseKeys == nil {
@@ -820,13 +836,22 @@ func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverId
 	if el.peersByAddr == nil {
 		el.peersByAddr = make(map[string]*activePeerState)
 	}
+	senderCopy := &net.UDPAddr{
+		IP:   append(net.IP(nil), sender.IP...),
+		Port: sender.Port,
+		Zone: sender.Zone,
+	}
 	st, ok := el.peersByAddr[sender.String()]
 	if !ok {
-		st = &activePeerState{peerKey: peerKey}
+		st = &activePeerState{
+			peerKey: peerKey,
+			udpAddr: senderCopy,
+		}
 		st.receiverIdx.Store(receiverIdx)
 		el.peersByAddr[sender.String()] = st
 	} else {
 		st.peerKey = peerKey
+		st.udpAddr = senderCopy
 		st.receiverIdx.Store(receiverIdx)
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
@@ -878,12 +903,23 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	if !ok {
 		return false
 	}
+	if st.udpAddr == nil {
+		el.mu.Lock()
+		if st.udpAddr == nil {
+			st.udpAddr = &net.UDPAddr{
+				IP:   append(net.IP(nil), sender.IP...),
+				Port: sender.Port,
+				Zone: sender.Zone,
+			}
+		}
+		el.mu.Unlock()
+	}
 	keys, ok := el.TransportKeysFor(st.peerKey)
 	if !ok || keys == nil || keys.RecvKey == nil {
 		return false
 	}
 
-	aead, err := chacha20poly1305.New(keys.RecvKey)
+	aead, err := keys.RecvCipher()
 	if err != nil {
 		return false
 	}
@@ -1016,19 +1052,26 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	}
 	udpConn := el.udpConn
 	hpKey := el.hpKey
+	var addr *net.UDPAddr
+	if st != nil {
+		addr = st.udpAddr
+	}
 	el.mu.RUnlock()
 	if st == nil || udpConn == nil {
 		return fmt.Errorf("no recorded address for peer %s", peerKey)
 	}
-	addr, err := net.ResolveUDPAddr("udp", addrStr)
-	if err != nil {
-		return fmt.Errorf("failed to resolve peer address %s: %w", addrStr, err)
+	if addr == nil {
+		var err error
+		addr, err = net.ResolveUDPAddr("udp", addrStr)
+		if err != nil {
+			return fmt.Errorf("failed to resolve peer address %s: %w", addrStr, err)
+		}
 	}
 
 	counter := st.sendCount.Add(1) - 1
-	aead, err := chacha20poly1305.New(keys.SendKey)
+	aead, err := keys.SendCipher()
 	if err != nil {
-		return fmt.Errorf("failed to create transport AEAD: %w", err)
+		return fmt.Errorf("failed to get transport send cipher: %w", err)
 	}
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:12], counter)
