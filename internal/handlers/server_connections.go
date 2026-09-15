@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
@@ -356,7 +360,7 @@ func (h *Handlers) GetServerConnectionKitHandler(w http.ResponseWriter, r *http.
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, req.ClientID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+		h.handleClientConfigError(w, err)
 		return
 	}
 
@@ -614,7 +618,7 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, req.ClientID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+		h.handleClientConfigError(w, err)
 		return
 	}
 
@@ -760,7 +764,7 @@ func (h *Handlers) getServerConnectionKitZero(ctx context.Context, w http.Respon
 
 	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+		h.handleClientConfigError(w, err)
 		return
 	}
 
@@ -800,7 +804,7 @@ func (h *Handlers) getServerConnectionConfigZero(ctx context.Context, w http.Res
 
 	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+		h.handleClientConfigError(w, err)
 		return
 	}
 
@@ -812,4 +816,67 @@ func (h *Handlers) getServerConnectionConfigZero(ctx context.Context, w http.Res
 		"vpn_link":    vpnLink,
 		"awg_mimicry": conn.AWGMimicry,
 	})
+}
+
+func isClientConfigNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "not stored") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "missing client") ||
+		strings.Contains(msg, "no such client") ||
+		strings.Contains(msg, "not yet provisioned") ||
+		strings.Contains(msg, "not provisioned") ||
+		strings.Contains(msg, "not yet generated") ||
+		strings.Contains(msg, "missing key") ||
+		strings.Contains(msg, "keys missing") ||
+		strings.Contains(msg, "missing private key") ||
+		strings.Contains(msg, "no client config")
+}
+
+func isClientConfigBadRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalid") ||
+		strings.Contains(msg, "bad parameter") ||
+		strings.Contains(msg, "bad request") ||
+		strings.Contains(msg, "malformed") ||
+		strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "is not a load balancer connection")
+}
+
+func (h *Handlers) handleClientConfigError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	if isClientConfigNotFoundError(err) {
+		msg := err.Error()
+		if !strings.HasPrefix(strings.ToLower(msg), "client config not found") {
+			msg = "Client config not found: " + msg
+		}
+		h.JSONError(w, http.StatusNotFound, "not_found", msg)
+		return
+	}
+	msgLower := strings.ToLower(err.Error())
+	if strings.Contains(msgLower, "unauthorized") || strings.Contains(msgLower, "forbidden") {
+		h.JSONError(w, http.StatusForbidden, "forbidden", err.Error())
+		return
+	}
+	if isClientConfigBadRequestError(err) {
+		code := "bad_request"
+		if strings.Contains(msgLower, "parameter") {
+			code = "invalid_parameter"
+		}
+		h.JSONError(w, http.StatusBadRequest, code, err.Error())
+		return
+	}
+	h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
 }

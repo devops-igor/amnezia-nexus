@@ -381,7 +381,7 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 		}
 		configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			h.handleClientConfigError(w, err)
 			return
 		}
 		vpnLink := GenerateVPNLink(configStr)
@@ -410,7 +410,7 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, conn.ClientID)
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+		h.handleClientConfigError(w, err)
 		return
 	}
 
@@ -460,7 +460,7 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 		var err error
 		configStr, _, err = h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			h.handleClientConfigError(w, err)
 			return
 		}
 	} else {
@@ -478,7 +478,7 @@ func (h *Handlers) UserGetConnectionKitHandler(w http.ResponseWriter, r *http.Re
 
 		configStr, err = protoMgr.GetClientConfig(ctx, server, conn.ClientID)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config")
+			h.handleClientConfigError(w, err)
 			return
 		}
 	}
