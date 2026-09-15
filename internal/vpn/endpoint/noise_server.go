@@ -1,6 +1,7 @@
 package endpoint
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
@@ -105,10 +106,74 @@ type InitiationInfo struct {
 // successful handshake. The server is the Noise responder: SendKey encrypts
 // server-to-client traffic and RecvKey decrypts client-to-server traffic
 // (WireGuard tempK2/tempK1 responder assignment from KDF2(ck, empty)).
-// Data-plane use of these keys is Batch 2 scope.
+// Pre-instantiated AEAD ciphers eliminate per-packet allocations on hot paths (issue #151).
 type TransportKeys struct {
-	SendKey []byte
-	RecvKey []byte
+	SendKey  []byte
+	RecvKey  []byte
+	SendAEAD cipher.AEAD
+	RecvAEAD cipher.AEAD
+}
+
+// NewTransportKeys creates a TransportKeys instance with pre-instantiated AEAD ciphers.
+func NewTransportKeys(sendKey, recvKey []byte) (*TransportKeys, error) {
+	tk := &TransportKeys{
+		SendKey: sendKey,
+		RecvKey: recvKey,
+	}
+	if err := tk.InitCiphers(); err != nil {
+		return nil, err
+	}
+	return tk, nil
+}
+
+// InitCiphers pre-instantiates the SendAEAD and RecvAEAD ciphers from SendKey and RecvKey.
+func (tk *TransportKeys) InitCiphers() error {
+	if tk == nil {
+		return nil
+	}
+	if len(tk.SendKey) > 0 && tk.SendAEAD == nil {
+		aead, err := chacha20poly1305.New(tk.SendKey)
+		if err != nil {
+			return fmt.Errorf("failed to create SendAEAD: %w", err)
+		}
+		tk.SendAEAD = aead
+	}
+	if len(tk.RecvKey) > 0 && tk.RecvAEAD == nil {
+		aead, err := chacha20poly1305.New(tk.RecvKey)
+		if err != nil {
+			return fmt.Errorf("failed to create RecvAEAD: %w", err)
+		}
+		tk.RecvAEAD = aead
+	}
+	return nil
+}
+
+// SendCipher returns the pre-instantiated SendAEAD cipher, or creates one if not yet initialized.
+func (tk *TransportKeys) SendCipher() (cipher.AEAD, error) {
+	if tk == nil {
+		return nil, errors.New("nil transport keys")
+	}
+	if tk.SendAEAD != nil {
+		return tk.SendAEAD, nil
+	}
+	if len(tk.SendKey) == 0 {
+		return nil, errors.New("empty send key")
+	}
+	return chacha20poly1305.New(tk.SendKey)
+}
+
+// RecvCipher returns the pre-instantiated RecvAEAD cipher, or creates one if not yet initialized.
+func (tk *TransportKeys) RecvCipher() (cipher.AEAD, error) {
+	if tk == nil {
+		return nil, errors.New("nil transport keys")
+	}
+	if tk.RecvAEAD != nil {
+		return tk.RecvAEAD, nil
+	}
+	if len(tk.RecvKey) == 0 {
+		return nil, errors.New("empty recv key")
+	}
+	return chacha20poly1305.New(tk.RecvKey)
 }
 
 // concat joins two byte slices into a freshly allocated result. It never
@@ -354,6 +419,7 @@ func computeResponseKeys(info *InitiationInfo) (serverEPub, encryptedEmpty []byt
 
 	recvKey, sendKey := health.KDF2(ck, nil)
 	transportKeys = &TransportKeys{SendKey: sendKey, RecvKey: recvKey}
+	_ = transportKeys.InitCiphers()
 	return serverEPub, encryptedEmpty, transportKeys, nil
 }
 

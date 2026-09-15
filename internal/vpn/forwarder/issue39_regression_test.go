@@ -91,9 +91,9 @@ func TestQueueFullRecoversAfterConsumerStall(t *testing.T) {
 		t.Fatalf("queue did not drain after consumer recovery: written=%d, want=%d (dropped=%d)", dev.count(), want, dropped)
 	}
 	// Every drop must be counted (feeding the stats API), never silent.
-	qf, total := f.DropStats()
-	if qf != uint64(dropped) || total != uint64(dropped) {
-		t.Fatalf("DropStats = (queueFull=%d, total=%d), want (%d, %d)", qf, total, dropped, dropped)
+	qf, noRoute, total := f.DropStats()
+	if qf != uint64(dropped) || noRoute != 0 || total != uint64(dropped) {
+		t.Fatalf("DropStats = (queueFull=%d, noRoute=%d, total=%d), want (%d, 0, %d)", qf, noRoute, total, dropped, dropped)
 	}
 }
 
