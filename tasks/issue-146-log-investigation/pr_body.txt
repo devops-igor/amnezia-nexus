@@ -1,0 +1,20 @@
+## What
+Deep investigation and performance analysis of `/home/igor/nexus.log` (7,135 log entries across 15.26 hours) and system behavior per `tasks/review_logs.md`. Documents diagnostic scripts, structured metrics extraction, and comprehensive handover report.
+
+## Why
+Investigate potential problems, errors, performance bottlenecks, resource leaks, abnormal behavior, WAF overhead, HTTP/2 activity, and reliability in the Amnezia Nexus data plane and control plane. Closes #146.
+
+## Technical Findings
+1. **Unthrottled Decryption Failure Log Storm (62.75% of total log volume)**: 4,477 logs in `internal/vpn/endpoint/listener.go:887` due to missing rate limiting on expired/desynchronized peer session keys.
+2. **Coupling Flaw in Handshake Rejection Path**: 198 false handshake rejections logged in `listener.go:743` when transport decryption failure returns `false`.
+3. **Downstream Packet Queue Drops**: 174 backend return packets dropped with `packet queue is full` and 10 with `session route not registered`.
+4. **Backend Tunnel 7 Intermittent Outages**: 3 health probe failures on `206.168.212.188:55424` triggering tunnel degradation and failover.
+5. **Memory & Reliability**: Zero memory leaks, zero OOMs, zero restarts; 15h 16m continuous uptime; sub-millisecond healthcheck latency (p50: 210 µs, p99: 284 µs).
+6. **WAF & HTTP/2**: Zero WAF/CRS overhead (WAF is absent in Nexus); 100% HTTP/1.1 traffic (HTTP/2 inactive).
+
+## Testing
+- Smoke test verification: `go build ./...` PASSED (exit code 0)
+- All 7 Go quality gates passed cleanly (`fmt`, `vet`, `build`, `test -race`, `golangci-lint`, `gosec`, `govulncheck`).
+- Handover report: `tasks/issue-146-log-investigation/DEV_HANDOVER.md`
+
+Closes #146
