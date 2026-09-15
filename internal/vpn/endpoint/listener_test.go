@@ -538,13 +538,33 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// 3. Corrupt / Invalid Packet: neither unmasked nor plaintext matches H4
+	// 3. Corrupt / Invalid Packet: neither unmasked nor plaintext matches H4.
+	// Since clientAddr belongs to an established peer session, handleTransportData
+	// returns true (decoupled from handshake rejection counter, issue #149),
+	// but the corrupt packet is dropped and never routed.
 	corruptDatagram := make([]byte, len(datagramMasked))
 	copy(corruptDatagram, datagramMasked)
 	corruptDatagram[cfg.S4] ^= 0xFF
 	corruptDatagram[cfg.S4+1] ^= 0xFF
-	if ok := el.handleTransportData(corruptDatagram, clientAddr); ok {
-		t.Fatal("handleTransportData accepted corrupt packet")
+
+	if ok := el.handleTransportData(corruptDatagram, clientAddr); !ok {
+		t.Fatal("handleTransportData returned false for established peer session")
+	}
+	mu.Lock()
+	if len(routedPackets) != 2 {
+		t.Fatalf("expected 2 routed packets (corrupt packet must be dropped), got %d", len(routedPackets))
+	}
+	mu.Unlock()
+
+	// 4. Unknown Sender: not an established session, must return false.
+	unknownAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:49999")
+	if ok := el.handleTransportData(corruptDatagram, unknownAddr); ok {
+		t.Fatal("handleTransportData returned true for unknown sender")
+	}
+
+	// 5. Truncated Datagram: too short for transport, must return false.
+	if ok := el.handleTransportData([]byte{1, 2, 3}, clientAddr); ok {
+		t.Fatal("handleTransportData returned true for truncated datagram")
 	}
 }
 
