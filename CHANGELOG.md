@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - Aurora - 2026-09-16
+
+Amnezia Nexus 1.1.3 ("Aurora") is a patch release improving downstream packet forwarding
+performance and UDP socket buffer sizing, adding backend tunnel health check retry thresholds,
+rate-limiting transport decryption failure logging, returning proper HTTP 404/400 status codes
+for missing client connection configs, and sanitizing MTProxy links.
+
+### Performance
+
+- Downstream return queue capacity enlarged to 2048 packets and 4 MB SO_RCVBUF/SO_SNDBUF socket buffers on endpoint listener (#151); SendToPeer return hot path optimized with cached UDP addresses and pre-instantiated AEAD ciphers (#151).
+
+### Resilience
+
+- Backend tunnel health check retry threshold (default 3 consecutive failures) in orchestrator to prevent false failovers on transient WAN packet loss (#152).
+
+### Fixed
+
+- Rate-limited transport decryption failure logging and decoupled decryption failures from handshake rejection counters in endpoint listener (#148, #149); returned HTTP 404 Not Found and 400 Bad Request instead of 500 when client connection configs are not found (#150); stripped ANSI escape sequences and sanitized trailing formatting artifacts from generated MTProxy links in mtproxyl manager (#157).
+
 ## [1.1.2] — Aurora - 2026-09-15
 
 Amnezia Nexus 1.1.2 ("Aurora") is a patch release fixing WireGuard/AmneziaWG routing

@@ -18,7 +18,7 @@ import (
 )
 
 // AppVersion represents the current version of the web panel.
-const AppVersion = "1.1.2"
+const AppVersion = "1.1.3"
 
 // AppCodename represents the release codename of the current version.
 const AppCodename = "Aurora"

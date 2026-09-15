@@ -151,7 +151,7 @@ Create `docker-compose.yaml`:
 ```yaml
 services:
   amnezia-panel:
-    image: ghcr.io/devops-igor/amnezia-nexus:v1.1.2
+    image: ghcr.io/devops-igor/amnezia-nexus:v1.1.3
     container_name: amnezia-panel
     restart: unless-stopped
     user: root
@@ -184,9 +184,8 @@ volumes:
 
 ### 2. Start the container
 
-> **Image tags:** the compose file above pins the **stable release** (`v1.1.2` — Aurora).
-> Alternatively, use `:latest` to always track the newest build from `main` —
-> recommended only for testing, since it may include unreleased changes.
+> **Image tags:** the compose file above pins the **stable release** (`v1.1.3` - Aurora).
+> Alternatively, use `:latest` to always track the newest build from `main` (recommended only for testing, since it may include unreleased changes).
 > Available tags: https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus
 
 ```bash
