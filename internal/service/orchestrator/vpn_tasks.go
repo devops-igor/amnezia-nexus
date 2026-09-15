@@ -43,6 +43,8 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	var degradedTunnels []int64
 	var healthyTunnels []*models.BackendTunnel
 
+	threshold := o.ProbeFailureThreshold()
+
 	for _, t := range tunnels {
 		if strings.EqualFold(t.Status, "disabled") {
 			continue
@@ -78,11 +80,34 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		)
 
 		if err != nil {
-			slog.Warn("Backend tunnel health probe failed", "tunnel_id", t.ID, "endpoint", t.Endpoint, "err", err)
+			failures := o.recordProbeFailure(t.ID)
+			if failures < threshold {
+				slog.Warn("Backend tunnel health probe failed (below failure threshold)",
+					"tunnel_id", t.ID,
+					"endpoint", t.Endpoint,
+					"failures", failures,
+					"threshold", threshold,
+					"err", err,
+				)
+				if !strings.EqualFold(t.Status, "degraded") {
+					healthyTunnels = append(healthyTunnels, &tCopy)
+				}
+				continue
+			}
+
+			slog.Warn("Backend tunnel health probe failed",
+				"tunnel_id", t.ID,
+				"endpoint", t.Endpoint,
+				"failures", failures,
+				"threshold", threshold,
+				"err", err,
+			)
 			_ = o.db.UpdateBackendTunnelStatus(ctx, t.ID, "degraded", 0)
 			degradedTunnels = append(degradedTunnels, t.ID)
 			continue
 		}
+
+		o.ResetProbeFailCount(t.ID)
 
 		latencyMS := int64(rtt.Milliseconds())
 		if latencyMS <= 0 {

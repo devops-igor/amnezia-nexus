@@ -30,6 +30,10 @@ type healthProbeKey struct {
 	psk        string
 }
 
+// DefaultProbeFailureThreshold is the default consecutive health probe failure count
+// before marking a backend tunnel degraded (matching tunnel.HealthProber.FailureThreshold).
+const DefaultProbeFailureThreshold = 3
+
 // ProbeFunc defines the signature for Noise IK handshake UDP probes.
 // h1 and h2 accept models.HeaderRange (AWG 3.1 header ranges, issue #49) or
 // uint32 (legacy single-value headers); ProbeAWGEndpointRange handles both.
@@ -37,17 +41,19 @@ type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, c
 
 // Orchestrator coordinates scheduled background maintenance and telemetry tasks.
 type Orchestrator struct {
-	db             *database.DB
-	registry       ProtocolResolver
-	userOps        UserOpsService
-	probeFn        ProbeFunc
-	bootDelay      time.Duration
-	interval       time.Duration
-	maxConcurrency int
+	db                    *database.DB
+	registry              ProtocolResolver
+	userOps               UserOpsService
+	probeFn               ProbeFunc
+	bootDelay             time.Duration
+	interval              time.Duration
+	maxConcurrency        int
+	probeFailureThreshold int
 
 	mu                sync.RWMutex
 	reachabilityCache map[int64]map[string]any
 	healthProbeKeys   map[int64]healthProbeKey
+	probeFailCounts   map[int64]int
 
 	running     bool
 	cancel      context.CancelFunc
@@ -103,6 +109,18 @@ func WithUserOps(ops UserOpsService) Option {
 	}
 }
 
+// WithProbeFailureThreshold configures the consecutive probe failure threshold
+// before marking a backend tunnel as degraded.
+func WithProbeFailureThreshold(threshold int) Option {
+	return func(o *Orchestrator) {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if threshold > 0 {
+			o.probeFailureThreshold = threshold
+		}
+	}
+}
+
 // New creates a new BackgroundTaskOrchestrator.
 func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrator {
 	var defaultUserOps UserOpsService
@@ -111,16 +129,18 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 	}
 
 	o := &Orchestrator{
-		db:                db,
-		registry:          registry,
-		userOps:           defaultUserOps,
-		probeFn:           health.ProbeAWGEndpointRange,
-		bootDelay:         60 * time.Second,
-		interval:          600 * time.Second,
-		maxConcurrency:    10,
-		reachabilityCache: make(map[int64]map[string]any),
-		healthProbeKeys:   make(map[int64]healthProbeKey),
-		stopCh:            make(chan struct{}),
+		db:                    db,
+		registry:              registry,
+		userOps:               defaultUserOps,
+		probeFn:               health.ProbeAWGEndpointRange,
+		bootDelay:             60 * time.Second,
+		interval:              600 * time.Second,
+		maxConcurrency:        10,
+		probeFailureThreshold: DefaultProbeFailureThreshold,
+		reachabilityCache:     make(map[int64]map[string]any),
+		healthProbeKeys:       make(map[int64]healthProbeKey),
+		probeFailCounts:       make(map[int64]int),
+		stopCh:                make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -301,4 +321,44 @@ func (o *Orchestrator) GetCachedServerReachability() map[int64]map[string]any {
 		copyMap[k] = copyInner
 	}
 	return copyMap
+}
+
+// ProbeFailureThreshold returns the configured consecutive probe failure threshold.
+func (o *Orchestrator) ProbeFailureThreshold() int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.probeFailureThreshold <= 0 {
+		return DefaultProbeFailureThreshold
+	}
+	return o.probeFailureThreshold
+}
+
+// ResetProbeFailCount clears the consecutive failure count for a backend tunnel.
+func (o *Orchestrator) ResetProbeFailCount(tunnelID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.probeFailCounts != nil {
+		delete(o.probeFailCounts, tunnelID)
+	}
+}
+
+// GetProbeFailCount returns the current consecutive failure count for a backend tunnel.
+func (o *Orchestrator) GetProbeFailCount(tunnelID int64) int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.probeFailCounts == nil {
+		return 0
+	}
+	return o.probeFailCounts[tunnelID]
+}
+
+// recordProbeFailure increments and returns the consecutive failure count for a backend tunnel.
+func (o *Orchestrator) recordProbeFailure(tunnelID int64) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.probeFailCounts == nil {
+		o.probeFailCounts = make(map[int64]int)
+	}
+	o.probeFailCounts[tunnelID]++
+	return o.probeFailCounts[tunnelID]
 }
