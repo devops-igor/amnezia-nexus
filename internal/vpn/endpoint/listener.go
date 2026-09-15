@@ -180,10 +180,11 @@ type ClientPacketRouter func(peerKey string, packet []byte) error
 // send counter so late transport datagrams and server→client sends can find
 // the right socket address.
 type activePeerState struct {
-	peerKey     string
-	receiverIdx atomic.Uint32
-	sendCount   atomic.Uint64
-	lastSeen    atomic.Int64 // unix nanos
+	peerKey         string
+	receiverIdx     atomic.Uint32
+	sendCount       atomic.Uint64
+	lastSeen        atomic.Int64 // unix nanos
+	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
 }
 
 // Listener manages the AWG endpoint UDP listener and peer lifecycle.
@@ -840,17 +841,26 @@ func (el *Listener) peerByAddr(addr string) (*activePeerState, bool) {
 	return st, ok
 }
 
+// decryptLogThrottleSeconds is the interval in seconds between transport decryption
+// failure logs for a given peer (issue #148).
+const decryptLogThrottleSeconds = 5
+
 // transportDataHeaderLen is the AWG/WireGuard transport-data header:
 // 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
 // the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
 const transportDataHeaderLen = 16
 
 // handleTransportData processes a datagram that failed handshake-initiation
-// parsing: if the sender address belongs to a peer with an established
-// session and stored transport keys, decrypt the AWG transport-data message
-// and hand the inner IP packet to the installed client packet router.
-// Anything else (unknown sender, garbage, keepalive from a stale address) is
-// silently dropped.
+// parsing. If the sender address belongs to a peer with an established session
+// and stored transport keys, it decrypts the AWG transport-data message and hands
+// the inner IP packet to the installed client packet router. If decryption fails,
+// the packet is dropped and failure logging is rate-limited per-peer (issue #148).
+//
+// It returns true if the datagram belongs to an established peer session (even if
+// decryption failed and the packet was dropped), preventing the caller from treating
+// transport data as an invalid handshake initiation (issue #149). It returns false
+// only when the datagram is not transport data for an established session (unknown
+// sender, missing transport keys, or datagram too short).
 func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bool {
 	s4 := el.config.S4
 	if s4 < 0 {
@@ -884,9 +894,16 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	packet, decErr := decryptTransportPayload(aead, datagram, payload, hpKey, s4, h4)
 	if packet == nil {
 		if decErr != nil {
-			log.Printf("[vpn/endpoint] transport data decryption failed for peer %s: %v", st.peerKey, decErr)
+			now := time.Now().Unix()
+			until := st.decryptLogUntil.Load()
+			if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
+				log.Printf("[vpn/endpoint] transport data decryption failed for peer %s: %v", st.peerKey, decErr)
+			}
 		}
-		return false
+		// Decouple transport data drops from handshake rejection counter (issue #149):
+		// datagram belongs to an established peer session, so return true to prevent
+		// incrementing handshakeRejects or emitting false handshake rejection logs.
+		return true
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
 
@@ -909,6 +926,9 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 // decryptTransportPayload attempts Header Protection unmasking and AEAD decryption,
 // falling back to plaintext H4 matching if HP unmasking does not match or fails.
 func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) ([]byte, error) {
+	if len(payload) < transportDataHeaderLen {
+		return nil, nil
+	}
 	var packet []byte
 	var decErr error
 
