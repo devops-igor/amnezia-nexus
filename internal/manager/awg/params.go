@@ -505,8 +505,41 @@ func UpgradeDegenerateHeaders(h1, h2, h3, h4 HeaderRange) (HeaderRange, HeaderRa
 	return genH1, genH2, genH3, genH4, true, nil
 }
 
+// adjustS2ToAvoidCollision enforces |s1 - s2| >= 10 and prevents packet length collisions
+// between WireGuard Initiation (148 bytes) and Response (92 bytes) messages (s2 != s1+56 && s1 != s2+56).
+// If s1 and s2 already satisfy both conditions, s2 is returned unmodified.
+// Otherwise, candidate s2 is selected ensuring |s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56.
+func adjustS2ToAvoidCollision(s1, s2 int) int {
+	diff := s1 - s2
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff >= 10 && s2 != s1+56 && s1 != s2+56 {
+		return s2
+	}
+	if s1+10 <= 150 && s1+10 != s1+56 && s1+10 != s1-56 {
+		s2 = s1 + 10
+	} else {
+		s2 = s1 - 10
+	}
+	// Re-verify both invariants defensively
+	diff = s1 - s2
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < 10 || s2 == s1+56 || s1 == s2+56 {
+		if s1+11 <= 150 {
+			s2 = s1 + 11
+		} else {
+			s2 = s1 - 11
+		}
+	}
+	return s2
+}
+
 // GenerateStandardObfuscationValues generates standard-profile obfuscation parameters:
-// H1-H4 across non-overlapping quadrants, and standard-profile S1-S4 satisfying |s1 - s2| >= 10.
+// H1-H4 across non-overlapping quadrants, and standard-profile S1-S4 satisfying |s1 - s2| >= 10
+// and avoiding packet length collision (s2 != s1+56 && s1 != s2+56).
 func GenerateStandardObfuscationValues() (h1, h2, h3, h4 HeaderRange, s1, s2, s3, s4 int, err error) {
 	h1, h2, h3, h4, err = GenerateQuadrantHeaders()
 	if err != nil {
@@ -535,22 +568,12 @@ func GenerateStandardObfuscationValues() (h1, h2, h3, h4 HeaderRange, s1, s2, s3
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff >= 10 {
+		if diff >= 10 && s2 != s1+56 && s1 != s2+56 {
 			break
 		}
 		s2, _ = randIntBetween(30, 80)
 	}
-	diff := s1 - s2
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff < 10 {
-		if s1+10 <= 150 {
-			s2 = s1 + 10
-		} else {
-			s2 = s1 - 10
-		}
-	}
+	s2 = adjustS2ToAvoidCollision(s1, s2)
 
 	// Ensure S1, S2, S3, S4 >= 12 unconditionally to satisfy the upstream AmneziaWG header protection floor constraint.
 	if s1 < 12 {
@@ -565,6 +588,10 @@ func GenerateStandardObfuscationValues() (h1, h2, h3, h4 HeaderRange, s1, s2, s3
 	if s4 < 12 {
 		s4 = 12
 	}
+
+	// Re-verify and adjust s2 after floor clamping so both |s1 - s2| >= 10 and
+	// s2 != s1+56 && s1 != s2+56 remain strictly satisfied.
+	s2 = adjustS2ToAvoidCollision(s1, s2)
 
 	return h1, h2, h3, h4, s1, s2, s3, s4, nil
 }
@@ -665,13 +692,13 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 		s4, _ = randIntBetween(12, 20)
 	}
 
-	// Enforce |s1 - s2| >= 10 constraint
+	// Enforce |s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56 across all profiles
 	for attempts := 0; attempts < 100; attempts++ {
 		diff := s1 - s2
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff >= 10 {
+		if diff >= 10 && s2 != s1+56 && s1 != s2+56 {
 			break
 		}
 		switch profile {
@@ -683,17 +710,7 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 			s2, _ = randIntBetween(30, 80)
 		}
 	}
-	diff := s1 - s2
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff < 10 {
-		if s1+10 <= 150 {
-			s2 = s1 + 10
-		} else {
-			s2 = s1 - 10
-		}
-	}
+	s2 = adjustS2ToAvoidCollision(s1, s2)
 
 	// Enforce S1, S2, S3, S4 >= 12 floor constraint when headerProtection is enabled
 	// (matching HeaderCipherNonceSize = 12 in upstream amneziawg-go/v3/device/uapi.go:855-857
@@ -712,18 +729,8 @@ func GenerateAWGParams(profile string, headerProtection bool) (*AWGParams, error
 			s4 = 12
 		}
 
-		// Ensure |s1 - s2| >= 10 remains satisfied after floor clamping.
-		diff = s1 - s2
-		if diff < 0 {
-			diff = -diff
-		}
-		if diff < 10 {
-			if s1+10 <= 150 {
-				s2 = s1 + 10
-			} else {
-				s2 = s1 - 10
-			}
-		}
+		// Re-verify both invariants (|s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56) after floor clamping.
+		s2 = adjustS2ToAvoidCollision(s1, s2)
 	}
 
 	h1, h2, h3, h4, err := GenerateQuadrantHeaders()
@@ -1105,8 +1112,18 @@ func GenerateClientTimingParams() (rekeyAfterTime, rekeyTimeout, rejectAfterTime
 	return rat, rt, rej, kt, mha, pk
 }
 
-// ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection.
-func ValidateAWGParams(params map[string]string) error {
+func getCaseInsensitiveParam(params map[string]string, keys ...string) string {
+	for _, key := range keys {
+		for k, v := range params {
+			if strings.EqualFold(k, key) && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return ""
+}
+
+func validateNumericBounds(params map[string]string) error {
 	numericBounds := map[string][2]int64{
 		"junk_packet_count":             {1, 100},
 		"junk_packet_min_size":          {1, 1000},
@@ -1115,11 +1132,18 @@ func ValidateAWGParams(params map[string]string) error {
 		"response_packet_junk_size":     {1, 1000},
 		"cookie_reply_packet_junk_size": {1, 1000},
 		"transport_packet_junk_size":    {1, 1000},
+		"s1":                            {1, 1000},
+		"s2":                            {1, 1000},
+		"s3":                            {1, 1000},
+		"s4":                            {1, 1000},
+		"jc":                            {1, 100},
+		"jmin":                          {1, 1000},
+		"jmax":                          {1, 1300},
 	}
 
 	for k, bounds := range numericBounds {
-		val, ok := params[k]
-		if !ok || val == "" {
+		val := getCaseInsensitiveParam(params, k)
+		if val == "" {
 			continue
 		}
 		num, err := strconv.ParseInt(val, 10, 64)
@@ -1130,7 +1154,36 @@ func ValidateAWGParams(params map[string]string) error {
 			return fmt.Errorf("param %s must be between %d and %d, got: %d", k, bounds[0], bounds[1], num)
 		}
 	}
+	return nil
+}
 
+func validateS1S2Collision(params map[string]string) error {
+	s1Str := getCaseInsensitiveParam(params, "init_packet_junk_size", "s1")
+	s2Str := getCaseInsensitiveParam(params, "response_packet_junk_size", "s2")
+	if s1Str == "" || s2Str == "" {
+		return nil
+	}
+
+	s1, err1 := strconv.Atoi(s1Str)
+	s2, err2 := strconv.Atoi(s2Str)
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+
+	diff := s1 - s2
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < 10 {
+		return fmt.Errorf("param init_packet_junk_size (s1=%d) and response_packet_junk_size (s2=%d): |s1 - s2| must be >= 10, difference is %d", s1, s2, diff)
+	}
+	if s2 == s1+56 || s1 == s2+56 {
+		return fmt.Errorf("AmneziaWG packet length collision: s1=%d and s2=%d cause handshake initiation and response packets to collide in length (s2 == s1 + 56 or s1 == s2 + 56)", s1, s2)
+	}
+	return nil
+}
+
+func validateMagicHeaders(params map[string]string) error {
 	magicHeaders := []string{
 		"init_packet_magic_header",
 		"response_packet_magic_header",
@@ -1138,8 +1191,8 @@ func ValidateAWGParams(params map[string]string) error {
 		"transport_packet_magic_header",
 	}
 	for _, k := range magicHeaders {
-		val, ok := params[k]
-		if !ok || val == "" {
+		val := getCaseInsensitiveParam(params, k)
+		if val == "" {
 			continue
 		}
 		hr, err := models.ParseHeaderRange(val)
@@ -1150,23 +1203,48 @@ func ValidateAWGParams(params map[string]string) error {
 			return fmt.Errorf("param %s must be between 5 and 4294967295, got: %s", k, val)
 		}
 	}
+	return nil
+}
 
+func validateCPSPackets(params map[string]string) error {
 	for _, k := range []string{"i1", "i2", "i3", "i4", "i5"} {
-		val, ok := params[k]
-		if !ok || val == "" {
+		val := getCaseInsensitiveParam(params, k)
+		if val == "" {
 			continue
 		}
 		if !strings.HasPrefix(val, "<") || !strings.HasSuffix(val, ">") {
 			return fmt.Errorf("param %s must be in <b 0xHEX> or <r N><b 0xHEX> format, got: %s", k, val)
 		}
 	}
-
-	if mtuStr, ok := params["mtu"]; ok && mtuStr != "" {
-		mtu, err := strconv.Atoi(mtuStr)
-		if err != nil || mtu < 1200 || mtu > 1500 {
-			return fmt.Errorf("param mtu must be between 1200 and 1500, got: %s", mtuStr)
-		}
-	}
-
 	return nil
+}
+
+func validateMTU(params map[string]string) error {
+	mtuStr := getCaseInsensitiveParam(params, "mtu")
+	if mtuStr == "" {
+		return nil
+	}
+	mtu, err := strconv.Atoi(mtuStr)
+	if err != nil || mtu < 1200 || mtu > 1500 {
+		return fmt.Errorf("param mtu must be between 1200 and 1500, got: %s", mtuStr)
+	}
+	return nil
+}
+
+// ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection
+// and validates AmneziaWG packet length constraints (|s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56).
+func ValidateAWGParams(params map[string]string) error {
+	if err := validateNumericBounds(params); err != nil {
+		return err
+	}
+	if err := validateS1S2Collision(params); err != nil {
+		return err
+	}
+	if err := validateMagicHeaders(params); err != nil {
+		return err
+	}
+	if err := validateCPSPackets(params); err != nil {
+		return err
+	}
+	return validateMTU(params)
 }

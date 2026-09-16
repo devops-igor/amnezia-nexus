@@ -1034,3 +1034,274 @@ func TestGenerateAWGParams_HeaderProtectionFloor(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateAWGParams_S1S2CollisionInvariant(t *testing.T) {
+	profiles := []string{"standard", "lite", "pro"}
+	hpSettings := []bool{false, true}
+	const iterations = 10000
+
+	for _, profile := range profiles {
+		for _, hp := range hpSettings {
+			testName := fmt.Sprintf("%s_hp_%v", profile, hp)
+			t.Run(testName, func(t *testing.T) {
+				for i := 0; i < iterations; i++ {
+					params, err := GenerateAWGParams(profile, hp)
+					if err != nil {
+						t.Fatalf("iteration %d: GenerateAWGParams(%s, %v) failed: %v", i, profile, hp, err)
+					}
+
+					s1, err := strconv.Atoi(params.InitPacketJunkSize)
+					if err != nil {
+						t.Fatalf("iteration %d: invalid S1 %q: %v", i, params.InitPacketJunkSize, err)
+					}
+					s2, err := strconv.Atoi(params.ResponsePacketJunkSize)
+					if err != nil {
+						t.Fatalf("iteration %d: invalid S2 %q: %v", i, params.ResponsePacketJunkSize, err)
+					}
+					s3, err := strconv.Atoi(params.CookieReplyPacketJunkSize)
+					if err != nil {
+						t.Fatalf("iteration %d: invalid S3 %q: %v", i, params.CookieReplyPacketJunkSize, err)
+					}
+					s4, err := strconv.Atoi(params.TransportPacketJunkSize)
+					if err != nil {
+						t.Fatalf("iteration %d: invalid S4 %q: %v", i, params.TransportPacketJunkSize, err)
+					}
+
+					diff := s1 - s2
+					if diff < 0 {
+						diff = -diff
+					}
+					if diff < 10 {
+						t.Fatalf("iteration %d (%s, hp=%v): |S1 - S2| < 10 (S1=%d, S2=%d)", i, profile, hp, s1, s2)
+					}
+					if s2 == s1+56 {
+						t.Fatalf("iteration %d (%s, hp=%v): packet length collision S2 == S1 + 56 (S1=%d, S2=%d)", i, profile, hp, s1, s2)
+					}
+					if s1 == s2+56 {
+						t.Fatalf("iteration %d (%s, hp=%v): packet length collision S1 == S2 + 56 (S1=%d, S2=%d)", i, profile, hp, s1, s2)
+					}
+
+					if hp {
+						if s1 < 12 || s2 < 12 || s3 < 12 || s4 < 12 {
+							t.Fatalf("iteration %d (%s, hp=true): header protection floor violated: S1=%d, S2=%d, S3=%d, S4=%d",
+								i, profile, s1, s2, s3, s4)
+						}
+					}
+				}
+			})
+		}
+	}
+
+	t.Run("GenerateStandardObfuscationValues", func(t *testing.T) {
+		for i := 0; i < iterations; i++ {
+			h1, h2, h3, h4, s1, s2, s3, s4, err := GenerateStandardObfuscationValues()
+			if err != nil {
+				t.Fatalf("iteration %d: GenerateStandardObfuscationValues failed: %v", i, err)
+			}
+
+			if h1.IsZero() || h2.IsZero() || h3.IsZero() || h4.IsZero() {
+				t.Fatalf("iteration %d: unexpected zero header", i)
+			}
+
+			diff := s1 - s2
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < 10 {
+				t.Fatalf("iteration %d: |S1 - S2| < 10 (S1=%d, S2=%d)", i, s1, s2)
+			}
+			if s2 == s1+56 {
+				t.Fatalf("iteration %d: packet length collision S2 == S1 + 56 (S1=%d, S2=%d)", i, s1, s2)
+			}
+			if s1 == s2+56 {
+				t.Fatalf("iteration %d: packet length collision S1 == S2 + 56 (S1=%d, S2=%d)", i, s1, s2)
+			}
+			if s1 < 12 || s2 < 12 || s3 < 12 || s4 < 12 {
+				t.Fatalf("iteration %d: floor violated: S1=%d, S2=%d, S3=%d, S4=%d", i, s1, s2, s3, s4)
+			}
+		}
+	})
+}
+
+func TestValidateAWGParams_S1S2CollisionValidation(t *testing.T) {
+	// 1. Colliding configurations where s2 == s1 + 56 or s1 == s2 + 56
+	collidingCases := []struct {
+		name   string
+		params map[string]string
+	}{
+		{
+			name: "s1=20_s2=76_short_keys",
+			params: map[string]string{
+				"s1": "20",
+				"s2": "76",
+			},
+		},
+		{
+			name: "s1=44_s2=100_short_keys",
+			params: map[string]string{
+				"s1": "44",
+				"s2": "100",
+			},
+		},
+		{
+			name: "s1=76_s2=20_reverse_collision",
+			params: map[string]string{
+				"s1": "76",
+				"s2": "20",
+			},
+		},
+		{
+			name: "s1=100_s2=44_reverse_collision",
+			params: map[string]string{
+				"s1": "100",
+				"s2": "44",
+			},
+		},
+		{
+			name: "s1=20_s2=76_full_keys",
+			params: map[string]string{
+				"init_packet_junk_size":     "20",
+				"response_packet_junk_size": "76",
+			},
+		},
+		{
+			name: "s1=44_s2=100_full_keys",
+			params: map[string]string{
+				"init_packet_junk_size":     "44",
+				"response_packet_junk_size": "100",
+			},
+		},
+		{
+			name: "s1=20_s2=76_case_insensitive",
+			params: map[string]string{
+				"S1": "20",
+				"S2": "76",
+			},
+		},
+	}
+
+	for _, tc := range collidingCases {
+		t.Run("colliding_"+tc.name, func(t *testing.T) {
+			err := ValidateAWGParams(tc.params)
+			if err == nil {
+				t.Fatalf("expected collision error for params %+v, got nil", tc.params)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "collision") {
+				t.Errorf("expected error message to mention collision, got: %v", err)
+			}
+		})
+	}
+
+	// 2. Diff < 10 configurations
+	diffTooSmallCases := []struct {
+		name   string
+		params map[string]string
+	}{
+		{
+			name: "diff=0",
+			params: map[string]string{
+				"s1": "30",
+				"s2": "30",
+			},
+		},
+		{
+			name: "diff=5",
+			params: map[string]string{
+				"s1": "20",
+				"s2": "25",
+			},
+		},
+		{
+			name: "diff=9",
+			params: map[string]string{
+				"init_packet_junk_size":     "50",
+				"response_packet_junk_size": "59",
+			},
+		},
+	}
+
+	for _, tc := range diffTooSmallCases {
+		t.Run("diff_small_"+tc.name, func(t *testing.T) {
+			err := ValidateAWGParams(tc.params)
+			if err == nil {
+				t.Fatalf("expected |s1 - s2| < 10 error for params %+v, got nil", tc.params)
+			}
+			if !strings.Contains(err.Error(), "|s1 - s2| must be >= 10") {
+				t.Errorf("expected error to mention |s1 - s2| >= 10, got: %v", err)
+			}
+		})
+	}
+
+	// 3. Valid configurations (diff >= 10 and diff != 56)
+	validCases := []struct {
+		name   string
+		params map[string]string
+	}{
+		{
+			name: "valid_short_keys",
+			params: map[string]string{
+				"s1": "20",
+				"s2": "40",
+			},
+		},
+		{
+			name: "valid_full_keys",
+			params: map[string]string{
+				"init_packet_junk_size":     "30",
+				"response_packet_junk_size": "80",
+			},
+		},
+		{
+			name: "valid_diff_10_boundary",
+			params: map[string]string{
+				"s1": "15",
+				"s2": "25",
+			},
+		},
+		{
+			name: "valid_diff_55_near_collision",
+			params: map[string]string{
+				"s1": "20",
+				"s2": "75",
+			},
+		},
+		{
+			name: "valid_diff_57_near_collision",
+			params: map[string]string{
+				"s1": "20",
+				"s2": "77",
+			},
+		},
+		{
+			name: "valid_lite_profile_values",
+			params: map[string]string{
+				"s1": "100",
+				"s2": "20",
+			},
+		},
+		{
+			name: "valid_only_s1_provided",
+			params: map[string]string{
+				"s1": "30",
+			},
+		},
+		{
+			name: "valid_only_s2_provided",
+			params: map[string]string{
+				"s2": "40",
+			},
+		},
+		{
+			name:   "valid_empty_map",
+			params: map[string]string{},
+		},
+	}
+
+	for _, tc := range validCases {
+		t.Run("valid_"+tc.name, func(t *testing.T) {
+			if err := ValidateAWGParams(tc.params); err != nil {
+				t.Fatalf("expected nil error for valid params %+v, got: %v", tc.params, err)
+			}
+		})
+	}
+}
