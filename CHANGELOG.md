@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - Aurora - 2026-09-16
+
+Amnezia Nexus 1.1.4 ("Aurora") is a patch release optimizing upstream packet forwarding
+performance and buffer sizing, enforcing AmneziaWG handshake packet length invariants,
+stabilizing race detector tests under CI, and migrating module imports.
+
+### Performance
+
+- Decoupled endpoint listener UDP read loop from transport decryption via a bounded worker pool (eliminating per-packet SetReadDeadline syscalls), enlarged VirtualTUN buffer capacity to 2048 packets, tuned backend AWG UDP socket buffers to 4 MB (SO_RCVBUF and SO_SNDBUF) via TunedBind, and added ingress drop accounting (#160).
+
+### Fixed
+
+- Enforced AmneziaWG S1/S2 packet length invariant (|s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56) in GenerateStandardObfuscationValues and GenerateAWGParams across all profiles, and in ValidateAWGParams, preventing cryptographic handshake failure caused by Initiation (148B) and Response (92B) packet size collisions (#125).
+- Stabilized TestListener_ConcurrentHighThroughputStream delivery threshold (90%) and sender pacing (75us) under the race detector on shared 2-core CI runners (#165).
+
+### Refactor
+
+- Migrated Go module path and package imports across the entire repository to github.com/devops-igor/amnezia-nexus (#161).
+
 ## [1.1.3] - Aurora - 2026-09-16
 
 Amnezia Nexus 1.1.3 ("Aurora") is a patch release improving downstream packet forwarding
