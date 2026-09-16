@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 )
 
 func TestAWGClientDevice_ReadWrite(t *testing.T) {
@@ -211,10 +212,20 @@ func TestAWGClientDevice_LastHandshakeTimeHook(t *testing.T) {
 }
 
 func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
-	pub, priv, _ := GenerateCurve25519KeyPair()
-	dev, err := NewAWGClientDevice("test-in-drop", "127.0.0.1:51820", priv, pub, 1340, nil)
-	if err != nil {
-		t.Fatalf("Failed to create AWGClientDevice: %v", err)
+	vtun := &VirtualTUN{
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
+		outPackets: make(chan []byte, 1024),
+		events:     make(chan tun.Event, 2),
+		closed:     make(chan struct{}),
+		mtu:        1340,
+		name:       "test-in-drop",
+	}
+	dev := &AWGClientDevice{
+		name:      "test-in-drop",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
 	}
 	defer dev.Close()
 
@@ -261,6 +272,13 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 		t.Errorf("expected vtun.DroppedPackets() == %d, got %d", excessWrites, dev.vtun.DroppedPackets())
 	}
 
+	// Also verify direct RecordDrop on VirtualTUN
+	vtun.RecordDrop()
+	if dev.DroppedPackets() != excessWrites+1 || vtun.DroppedPackets() != excessWrites+1 {
+		t.Errorf("expected drop count %d after RecordDrop, got dev=%d vtun=%d",
+			excessWrites+1, dev.DroppedPackets(), vtun.DroppedPackets())
+	}
+
 	// Drain 5 packets and verify writing again does not increment drops
 	for i := 0; i < 5; i++ {
 		<-dev.vtun.inPackets
@@ -276,17 +294,27 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 		}
 	}
 
-	// Drop count should still be excessWrites (no new drops)
-	if dev.DroppedPackets() != excessWrites {
-		t.Errorf("expected drop count to remain %d, got %d", excessWrites, dev.DroppedPackets())
+	// Drop count should remain excessWrites+1 (no new drops)
+	if dev.DroppedPackets() != excessWrites+1 {
+		t.Errorf("expected drop count to remain %d, got %d", excessWrites+1, dev.DroppedPackets())
 	}
 }
 
 func TestAWGClientDevice_WriteBufferIsolation(t *testing.T) {
-	pub, priv, _ := GenerateCurve25519KeyPair()
-	dev, err := NewAWGClientDevice("test-buf-isolation", "127.0.0.1:51820", priv, pub, 1340, nil)
-	if err != nil {
-		t.Fatalf("Failed to create AWGClientDevice: %v", err)
+	vtun := &VirtualTUN{
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
+		outPackets: make(chan []byte, 1024),
+		events:     make(chan tun.Event, 2),
+		closed:     make(chan struct{}),
+		mtu:        1340,
+		name:       "test-buf-isolation",
+	}
+	dev := &AWGClientDevice{
+		name:      "test-buf-isolation",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
 	}
 	defer dev.Close()
 

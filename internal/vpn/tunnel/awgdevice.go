@@ -366,8 +366,12 @@ func (d *AWGClientDevice) Close() error {
 	d.once.Do(func() {
 		d.closed.Store(true)
 		close(d.doneCh)
-		d.dev.Close()
-		_ = d.vtun.Close()
+		if d.dev != nil {
+			d.dev.Close()
+		}
+		if d.vtun != nil {
+			_ = d.vtun.Close()
+		}
 	})
 	return nil
 }
