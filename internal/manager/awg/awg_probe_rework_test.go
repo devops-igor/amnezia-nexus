@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/curve25519"
 )
 

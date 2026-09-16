@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // LeastConnectionsBalancer routes connections to the active backend with the lowest active connections count.

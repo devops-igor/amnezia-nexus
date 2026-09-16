@@ -10,9 +10,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/orchestrator"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
 )
 
 var _ orchestrator.TelemtQuotaManager = (*MTProxyLManager)(nil)

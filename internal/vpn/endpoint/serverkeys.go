@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/security"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 	"golang.org/x/crypto/curve25519"
 )
 

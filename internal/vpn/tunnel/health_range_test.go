@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // Issue #49: a backend provisioned with AWG 3.1 carries H1/H2 header RANGES

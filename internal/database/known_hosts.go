@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // GetKnownHost retrieves a known host record for a server ID. Returns nil, nil if not found.

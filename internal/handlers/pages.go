@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // IndexPageHandler renders the primary admin dashboard or redirects normal users.

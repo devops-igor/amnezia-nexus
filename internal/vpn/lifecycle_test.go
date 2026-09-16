@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
 // TestTunUnavailableManagementMode proves the production wiring contract:

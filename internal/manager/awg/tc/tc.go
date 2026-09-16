@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 )
 
 const (

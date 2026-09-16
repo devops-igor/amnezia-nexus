@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // Issue #49: resolveTunnelProbeParams must preserve AWG 3.1 H1/H2 RANGES for

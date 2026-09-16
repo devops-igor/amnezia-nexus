@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // WeightedRoundRobinBalancer distributes traffic proportionally based on backend weights using smooth weighted round-robin.

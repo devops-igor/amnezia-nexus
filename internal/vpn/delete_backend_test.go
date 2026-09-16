@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // TestDeleteBackendRemovesTunnelAndRow pins the Issue #29 contract for

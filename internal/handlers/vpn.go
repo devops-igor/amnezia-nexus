@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 // VPNStatusHandler returns operational metrics for the VPN subsystem.

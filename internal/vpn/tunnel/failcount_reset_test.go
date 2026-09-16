@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // TestHealthProber_ResetFailCount verifies the issue #50 primitive: clearing a

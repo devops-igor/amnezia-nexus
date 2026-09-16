@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 )
 
 // TrafficAccountant aggregates in-memory Rx/Tx byte counts and batches periodic DB updates.

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/security"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
 // LoadData dumps all database records into a unified BackupData structure matching legacy data.json.

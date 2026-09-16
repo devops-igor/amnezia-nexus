@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	gossh "golang.org/x/crypto/ssh"
 )
 

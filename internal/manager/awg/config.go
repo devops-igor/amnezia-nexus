@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 )
 
 // AWGPeer represents a WireGuard peer entry in the server configuration.

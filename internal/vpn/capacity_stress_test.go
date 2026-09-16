@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // Concurrency stress test for issue #86: the backend capacity invariant.

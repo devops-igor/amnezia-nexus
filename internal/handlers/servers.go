@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/tc"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/tc"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/go-chi/chi/v5"
 )
 

@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 )
 
 // newTestRateLimiter builds a small per-minute limiter with the given burst

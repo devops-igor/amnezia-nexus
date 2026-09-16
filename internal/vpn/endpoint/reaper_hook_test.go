@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // Regression test for the idle-timeout reaper discarding CheckTimeouts'
