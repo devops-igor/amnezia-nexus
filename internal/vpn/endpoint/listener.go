@@ -10,6 +10,8 @@ import (
 	"log"
 	randv2 "math/rand/v2"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -162,6 +164,12 @@ type ListenerConfig struct {
 	// S4 is the junk padding length before the transport encrypted payload; 0 selects
 	// health.DefaultS4.
 	S4 int
+	// NumWorkers is the number of worker goroutines for datagram processing (issue #160).
+	// If <= 0, defaults to runtime.NumCPU() (minimum 4).
+	NumWorkers int
+	// WorkerQueueSize is the capacity of the inbound packet dispatch queue (issue #160).
+	// If <= 0, defaults to 2048.
+	WorkerQueueSize int
 }
 
 // BackendSelector resolves the backend tunnel a newly authenticated peer's
@@ -188,6 +196,12 @@ type activePeerState struct {
 	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
 }
 
+// packetJob holds an inbound UDP datagram dispatched from the read loop to the worker pool (issue #160).
+type packetJob struct {
+	data   []byte
+	sender *net.UDPAddr
+}
+
 // Listener manages the AWG endpoint UDP listener and peer lifecycle.
 type Listener struct {
 	mu                  sync.RWMutex
@@ -203,6 +217,8 @@ type Listener struct {
 	peersByAddr         map[string]*activePeerState // sender UDP addr string -> peer state
 	udpConn             *net.UDPConn
 	tunDev              PacketDevice
+	packetQueue         chan packetJob
+	packetQueueDrops    atomic.Uint64
 	running             bool
 	draining            bool
 	stopCh              chan struct{}
@@ -231,10 +247,8 @@ type Listener struct {
 	handshakeRejects atomic.Uint64
 }
 
-// NewListener initializes a new AWG endpoint listener. serverKeys provides the
-// endpoint's persistent Noise server keypair (see ServerKeysManager); when nil
-// one is created from db (ephemeral when db is also nil).
-func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *IPAM, sessionMgr *SessionManager, serverKeys *ServerKeysManager) (*Listener, error) {
+// applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
+func applyListenerConfigDefaults(cfg *ListenerConfig) {
 	if cfg.ListenPort <= 0 {
 		cfg.ListenPort = 51820
 	}
@@ -271,6 +285,22 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 	if cfg.S4 == 0 {
 		cfg.S4 = health.DefaultS4
 	}
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = runtime.NumCPU()
+		if cfg.NumWorkers < 4 {
+			cfg.NumWorkers = 4
+		}
+	}
+	if cfg.WorkerQueueSize <= 0 {
+		cfg.WorkerQueueSize = 2048
+	}
+}
+
+// NewListener initializes a new AWG endpoint listener. serverKeys provides the
+// endpoint's persistent Noise server keypair (see ServerKeysManager); when nil
+// one is created from db (ephemeral when db is also nil).
+func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *IPAM, sessionMgr *SessionManager, serverKeys *ServerKeysManager) (*Listener, error) {
+	applyListenerConfigDefaults(&cfg)
 
 	if auth == nil && db != nil {
 		auth = NewDBAuthenticator(db)
@@ -296,7 +326,7 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 		for i, s := range []*int{&cfg.S1, &cfg.S2, &cfg.S3, &cfg.S4} {
 			if *s < health.HeaderCipherNonceSize {
 				// Mirrors upstream uapi.go:852-857: header protection is
-				// unusable with S<N below the cipher nonce size — HP clients
+				// unusable with S<N below the cipher nonce size: HP clients
 				// would be silently rejected with no distinguishing log.
 				return nil, fmt.Errorf("S%d must be >= %d to use headerProtection", i+1, health.HeaderCipherNonceSize)
 			}
@@ -461,9 +491,9 @@ func (el *Listener) headerProtectionKey() []byte {
 }
 
 // UpdateListenPort sets the UDP port the listener will bind at its next
-// Start. Callers must only invoke it while the listener is stopped — a
+// Start. Callers must only invoke it while the listener is stopped - a
 // running listener is already bound to its current port, and Start
-// (like UpdateObfuscation) refuses to run twice — so the VPN service
+// (like UpdateObfuscation) refuses to run twice - so the VPN service
 // propagates port changes only to idle listeners and rejects them while
 // the listener runs.
 func (el *Listener) UpdateListenPort(port int) {
@@ -520,11 +550,27 @@ func (el *Listener) Start(ctx context.Context) error {
 	el.running = true
 	el.draining = false
 	el.stopCh = make(chan struct{})
+
+	numWorkers := el.config.NumWorkers
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+		if numWorkers < 4 {
+			numWorkers = 4
+		}
+	}
+	queueSize := el.config.WorkerQueueSize
+	if queueSize <= 0 {
+		queueSize = 2048
+	}
+	el.packetQueue = make(chan packetJob, queueSize)
 	el.mu.Unlock()
 
-	el.wg.Add(2)
+	el.wg.Add(2 + numWorkers)
 	go el.udpReadLoop(ctx)
 	go el.heartbeatLoop(ctx)
+	for i := 0; i < numWorkers; i++ {
+		go el.workerLoop(ctx)
+	}
 
 	return nil
 }
@@ -651,6 +697,29 @@ func (el *Listener) HandshakeRejections() uint64 {
 	return el.handshakeRejects.Load()
 }
 
+// PacketQueueDrops returns the number of inbound datagrams dropped due to a full
+// worker dispatch queue. Nil receiver is safe and returns 0 (issue #160).
+func (el *Listener) PacketQueueDrops() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.packetQueueDrops.Load()
+}
+
+// WorkerPoolStats returns the configured worker count, current queue length,
+// and queue capacity (issue #160).
+func (el *Listener) WorkerPoolStats() (workers int, queueLen int, queueCap int) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	workers = el.config.NumWorkers
+	queueCap = el.config.WorkerQueueSize
+	if el.packetQueue != nil {
+		queueLen = len(el.packetQueue)
+		queueCap = cap(el.packetQueue)
+	}
+	return
+}
+
 // GetStats returns current traffic bytes and active session counts.
 func (el *Listener) GetStats() (rx int64, tx int64, active int) {
 	rx = el.rxBytes.Load()
@@ -758,17 +827,16 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		// Not a valid handshake initiation for this endpoint: transport data
 		// for an established session (or garbage). Try the transport path.
 		if !el.handleTransportData(datagram, sender) {
-			// Count every rejection that is not transport data — including
-			// too-short datagrams — so the counter reflects the true
+			// Count every rejection that is not transport data (including
+			// too-short datagrams) so the counter reflects the true
 			// rejection volume seen on the wire (issue #39 defect 2).
 			el.handshakeRejects.Add(1)
 			if !errors.Is(err, ErrDatagramTooShort) {
 				// Throttle rejection logs: a garbage flood that fails MAC1
 				// would otherwise produce one log line per packet.
-				// (Read-loop goroutine only: plain read/put is safe.)
 				now := time.Now().Unix()
-				if el.rejectLogUntil.Load() <= now {
-					el.rejectLogUntil.Store(now + 1)
+				until := el.rejectLogUntil.Load()
+				if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
 					log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
 				}
 			}
@@ -1129,26 +1197,19 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 	buf := make([]byte, 2048)
 
 	for {
-		select {
-		case <-el.stopCh:
-			return
-		default:
-		}
-
 		if el.udpConn == nil {
 			return
 		}
 
-		_ = el.udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, addr, err := el.udpConn.ReadFrom(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
 			select {
 			case <-el.stopCh:
 				return
 			default:
+				if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+					return
+				}
 				continue
 			}
 		}
@@ -1156,16 +1217,43 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 		if n > 0 {
 			el.rxBytes.Add(int64(n))
 			if udpAddr, ok := addr.(*net.UDPAddr); ok {
-				el.handleDatagram(ctx, buf[:n], udpAddr)
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				job := packetJob{
+					data:   data,
+					sender: udpAddr,
+				}
+				select {
+				case <-el.stopCh:
+					return
+				case el.packetQueue <- job:
+				default:
+					el.packetQueueDrops.Add(1)
+				}
 			}
+		}
+	}
+}
+
+func (el *Listener) workerLoop(ctx context.Context) {
+	defer el.wg.Done()
+	for {
+		select {
+		case <-el.stopCh:
+			return
+		case job, ok := <-el.packetQueue:
+			if !ok {
+				return
+			}
+			el.handleDatagram(ctx, job.data, job.sender)
 		}
 	}
 }
 
 // SessionReaperHook is invoked by heartbeatLoop with each session it reaps
 // for idleness, so the VPN service can release forwarder routes, tunnel pool
-// connection counts, and sticky affinity — the same cleanup an explicit
-// DisconnectSession performs. Without it, every idle timeout leaks those.
+// connection counts, and sticky affinity (the same cleanup an explicit
+// DisconnectSession performs). Without it, every idle timeout leaks those.
 type SessionReaperHook func(ctx context.Context, sess *models.VPNSession)
 
 // SetSessionReaperHook registers the idle-timeout cleanup callback. Must be

@@ -10,15 +10,15 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-func setupTestDB(t *testing.T) *database.DB {
-	t.Helper()
-	dir := t.TempDir()
+func setupTestDB(tb testing.TB) *database.DB {
+	tb.Helper()
+	dir := tb.TempDir()
 	dbPath := filepath.Join(dir, "test_vpn_auth.db")
 	db, err := database.Open(dbPath, "test-secret-key-1234567890123456")
 	if err != nil {
-		t.Fatalf("failed to open test db: %v", err)
+		tb.Fatalf("failed to open test db: %v", err)
 	}
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		_ = db.Close()
 	})
 	return db

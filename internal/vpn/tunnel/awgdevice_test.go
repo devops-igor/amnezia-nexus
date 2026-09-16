@@ -2,8 +2,12 @@ package tunnel
 
 import (
 	"bytes"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 )
 
 func TestAWGClientDevice_ReadWrite(t *testing.T) {
@@ -205,4 +209,191 @@ func TestAWGClientDevice_LastHandshakeTimeHook(t *testing.T) {
 	if !dev.LastHandshakeTime().IsZero() {
 		t.Errorf("expected zero handshake time, got %v", dev.LastHandshakeTime())
 	}
+}
+
+func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
+	vtun := &VirtualTUN{
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
+		outPackets: make(chan []byte, 1024),
+		events:     make(chan tun.Event, 2),
+		closed:     make(chan struct{}),
+		mtu:        1340,
+		name:       "test-in-drop",
+	}
+	dev := &AWGClientDevice{
+		name:      "test-in-drop",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
+	}
+	defer dev.Close()
+
+	if cap(dev.vtun.inPackets) != DefaultVirtualTUNInboundCapacity {
+		t.Fatalf("expected inPackets cap %d, got %d", DefaultVirtualTUNInboundCapacity, cap(dev.vtun.inPackets))
+	}
+	if dev.DroppedPackets() != 0 {
+		t.Fatalf("expected initial drop count 0, got %d", dev.DroppedPackets())
+	}
+
+	pkt := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
+
+	// Fill the inPackets channel to exact capacity (2048)
+	for i := 0; i < DefaultVirtualTUNInboundCapacity; i++ {
+		n, err := dev.Write(pkt)
+		if err != nil {
+			t.Fatalf("unexpected error on write %d: %v", i, err)
+		}
+		if n != len(pkt) {
+			t.Fatalf("expected %d bytes written, got %d", len(pkt), n)
+		}
+	}
+
+	if dev.DroppedPackets() != 0 {
+		t.Fatalf("expected 0 drops when inPackets is exactly full, got %d", dev.DroppedPackets())
+	}
+
+	// Subsequent writes should be dropped and increment dropCount
+	const excessWrites = 25
+	for i := 0; i < excessWrites; i++ {
+		n, err := dev.Write(pkt)
+		if err != nil {
+			t.Fatalf("unexpected error on dropped write %d: %v", i, err)
+		}
+		if n != len(pkt) {
+			t.Fatalf("expected n=%d reported, got %d", len(pkt), n)
+		}
+	}
+
+	if dev.DroppedPackets() != excessWrites {
+		t.Errorf("expected %d dropped packets, got %d", excessWrites, dev.DroppedPackets())
+	}
+	if dev.vtun.DroppedPackets() != excessWrites {
+		t.Errorf("expected vtun.DroppedPackets() == %d, got %d", excessWrites, dev.vtun.DroppedPackets())
+	}
+
+	// Also verify direct RecordDrop on VirtualTUN
+	vtun.RecordDrop()
+	if dev.DroppedPackets() != excessWrites+1 || vtun.DroppedPackets() != excessWrites+1 {
+		t.Errorf("expected drop count %d after RecordDrop, got dev=%d vtun=%d",
+			excessWrites+1, dev.DroppedPackets(), vtun.DroppedPackets())
+	}
+
+	// Drain 5 packets and verify writing again does not increment drops
+	for i := 0; i < 5; i++ {
+		<-dev.vtun.inPackets
+	}
+
+	for i := 0; i < 5; i++ {
+		n, err := dev.Write(pkt)
+		if err != nil {
+			t.Fatalf("unexpected error writing to drained queue: %v", err)
+		}
+		if n != len(pkt) {
+			t.Fatalf("expected n=%d, got %d", len(pkt), n)
+		}
+	}
+
+	// Drop count should remain excessWrites+1 (no new drops)
+	if dev.DroppedPackets() != excessWrites+1 {
+		t.Errorf("expected drop count to remain %d, got %d", excessWrites+1, dev.DroppedPackets())
+	}
+}
+
+func TestAWGClientDevice_WriteBufferIsolation(t *testing.T) {
+	vtun := &VirtualTUN{
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
+		outPackets: make(chan []byte, 1024),
+		events:     make(chan tun.Event, 2),
+		closed:     make(chan struct{}),
+		mtu:        1340,
+		name:       "test-buf-isolation",
+	}
+	dev := &AWGClientDevice{
+		name:      "test-buf-isolation",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
+	}
+	defer dev.Close()
+
+	expectedPkt := []byte{0x45, 0, 0, 20, 1, 2, 3, 4, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
+	orig := make([]byte, len(expectedPkt))
+	copy(orig, expectedPkt)
+
+	n, err := dev.Write(orig)
+	if err != nil || n != len(orig) {
+		t.Fatalf("Write failed: n=%d err=%v", n, err)
+	}
+
+	// Immediately mutate/zero orig after Write returns to simulate amneziawg-go buffer pool reuse
+	for i := range orig {
+		orig[i] = 0x00
+	}
+
+	select {
+	case receivedPkt := <-dev.vtun.inPackets:
+		if !bytes.Equal(receivedPkt, expectedPkt) {
+			t.Fatalf("packet corrupted: got %x, want %x", receivedPkt, expectedPkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for packet from inPackets")
+	}
+}
+
+func TestTunedBind_BufferTuning(t *testing.T) {
+	baseBind := conn.NewDefaultBind()
+	tuned := NewTunedBind(baseBind, DefaultUDPSocketBufferSize)
+
+	if tuned.BufferSize() != DefaultUDPSocketBufferSize {
+		t.Errorf("expected BufferSize %d, got %d", DefaultUDPSocketBufferSize, tuned.BufferSize())
+	}
+
+	fns, port, err := tuned.Open(0)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer tuned.Close()
+
+	if len(fns) == 0 {
+		t.Fatal("expected at least 1 receive function")
+	}
+	if port == 0 {
+		t.Fatal("expected non-zero bound port")
+	}
+
+	fd, err := tuned.PeekLookAtSocketFd4()
+	if err != nil {
+		t.Fatalf("PeekLookAtSocketFd4 failed: %v", err)
+	}
+	if fd < 0 {
+		t.Fatalf("expected non-negative fd, got %d", fd)
+	}
+
+	rcv, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	if err != nil {
+		t.Fatalf("GetsockoptInt SO_RCVBUF failed: %v", err)
+	}
+	snd, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	if err != nil {
+		t.Fatalf("GetsockoptInt SO_SNDBUF failed: %v", err)
+	}
+
+	// Linux kernel doubles the requested buffer size, or caps at rmem_max.
+	// We verify that the buffer size is positive and reasonably large.
+	if rcv <= 0 || snd <= 0 {
+		t.Errorf("expected positive socket buffers, got rcv=%d snd=%d", rcv, snd)
+	}
+}
+
+func TestTunedBind_DelegationAndFallbacks(t *testing.T) {
+	tuned := NewTunedBind(conn.NewDefaultBind(), -1)
+	if tuned.BufferSize() != DefaultUDPSocketBufferSize {
+		t.Errorf("expected default BufferSize %d on non-positive input, got %d", DefaultUDPSocketBufferSize, tuned.BufferSize())
+	}
+
+	// Test interface binding delegation before Open
+	_ = tuned.BindSocketToInterface4(0, false)
+	_ = tuned.BindSocketToInterface6(0, false)
 }

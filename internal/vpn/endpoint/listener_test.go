@@ -64,15 +64,15 @@ func TestChannelPacketDevice(t *testing.T) {
 	}
 }
 
-func getFreeUDPPort(t *testing.T) int {
-	t.Helper()
+func getFreeUDPPort(tb testing.TB) int {
+	tb.Helper()
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("ResolveUDPAddr failed: %v", err)
+		tb.Fatalf("ResolveUDPAddr failed: %v", err)
 	}
 	tempConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		t.Fatalf("ListenUDP failed: %v", err)
+		tb.Fatalf("ListenUDP failed: %v", err)
 	}
 	port := tempConn.LocalAddr().(*net.UDPAddr).Port
 	_ = tempConn.Close()
