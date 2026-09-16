@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // Tests for issue #85: sticky failover must not do DB I/O while holding

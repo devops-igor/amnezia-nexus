@@ -15,17 +15,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/captcha"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/dns"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/mtproxyl"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/captcha"
+	"github.com/devops-igor/amnezia-nexus/internal/config"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 // SSHPoolProvider defines an interface for getting and managing active SSH clients.

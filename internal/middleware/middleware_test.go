@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 func TestContextHelpers(t *testing.T) {

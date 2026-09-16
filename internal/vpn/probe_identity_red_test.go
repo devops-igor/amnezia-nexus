@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"

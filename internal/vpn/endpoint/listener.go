@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 

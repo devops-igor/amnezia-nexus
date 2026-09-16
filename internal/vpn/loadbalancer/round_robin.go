@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // RoundRobinBalancer uniformly distributes connections across active backends in sequential order.

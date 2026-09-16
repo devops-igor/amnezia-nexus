@@ -4,11 +4,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/orchestrator"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/reconciliation"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/supervisor"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/userops"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
+	"github.com/devops-igor/amnezia-nexus/internal/service/reconciliation"
+	"github.com/devops-igor/amnezia-nexus/internal/service/supervisor"
+	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 )
 
 // BackgroundService defines the contract for periodic or persistent background workers.

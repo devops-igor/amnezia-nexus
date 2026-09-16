@@ -17,14 +17,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/endpoint"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/forwarder"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.

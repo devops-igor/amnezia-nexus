@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // PROBE 1: single-backfill of rat while rt+rej are stored.

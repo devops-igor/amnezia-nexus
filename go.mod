@@ -1,4 +1,4 @@
-module github.com/devops-igor/amnezia-web-ui-go
+module github.com/devops-igor/amnezia-nexus
 
 go 1.26.0
 

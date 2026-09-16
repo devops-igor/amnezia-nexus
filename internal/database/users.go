@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // ErrUserAlreadyExists is returned when attempting to create a user with a duplicate username.

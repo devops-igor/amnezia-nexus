@@ -6,8 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/security"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
 const xfpTestSecret = "xfp-test-secret-key-0123456789abcdef"

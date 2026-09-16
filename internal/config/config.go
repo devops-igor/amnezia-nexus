@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/web"
+	"github.com/devops-igor/amnezia-nexus/web"
 )
 
 // AppVersion represents the current version of the web panel.

@@ -3,9 +3,9 @@ package vpn
 import (
 	"testing"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // Regression tests for the load-balancer integration bugs reported by the

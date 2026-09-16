@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 func TestGenerateWGKeypair(t *testing.T) {

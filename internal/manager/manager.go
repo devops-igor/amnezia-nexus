@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // SSHClient aliases the SSHClient interface from the ssh package.

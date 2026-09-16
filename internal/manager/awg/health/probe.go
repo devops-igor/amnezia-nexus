@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/cps"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // ProbeAWGEndpoint performs a pure-Go UDP Noise IK handshake probe and measures RTT latency.

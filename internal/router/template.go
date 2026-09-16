@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/database"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/handlers"
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/handlers"
 )
 
 // TemplateEngine aliases handlers.TemplateEngine for backwards compatibility.

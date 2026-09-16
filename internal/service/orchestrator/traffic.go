@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/service/userops"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -14,8 +14,8 @@ import (
 
 	"golang.org/x/crypto/chacha20poly1305"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager/awg/health"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 func captureLogOutput(w io.Writer) io.Writer {

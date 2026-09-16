@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/security"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 	_ "modernc.org/sqlite" // Pure-Go SQLite database driver
 )
 

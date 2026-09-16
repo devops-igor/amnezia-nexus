@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/manager"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/middleware"
-	"github.com/devops-igor/amnezia-web-ui-go/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/go-chi/chi/v5"
 )
 

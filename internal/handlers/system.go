@@ -3,7 +3,7 @@ package handlers
 import (
 	"net/http"
 
-	"github.com/devops-igor/amnezia-web-ui-go/internal/config"
+	"github.com/devops-igor/amnezia-nexus/internal/config"
 )
 
 // HealthResponse defines the standard payload returned by /api/health.
