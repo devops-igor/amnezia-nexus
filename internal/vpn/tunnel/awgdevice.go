@@ -347,8 +347,10 @@ func (d *AWGClientDevice) Write(p []byte) (int, error) {
 	if d.closed.Load() {
 		return 0, errors.New("device closed")
 	}
+	pkt := make([]byte, len(p))
+	copy(pkt, p)
 	select {
-	case d.vtun.inPackets <- p:
+	case d.vtun.inPackets <- pkt:
 		return len(p), nil
 	case <-d.doneCh:
 		return 0, errors.New("device closed")

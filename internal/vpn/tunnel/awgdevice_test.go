@@ -5,7 +5,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 )
@@ -283,29 +282,32 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 	}
 }
 
-func TestAWGClientDevice_WriteZeroCopy(t *testing.T) {
+func TestAWGClientDevice_WriteBufferIsolation(t *testing.T) {
 	pub, priv, _ := GenerateCurve25519KeyPair()
-	dev, err := NewAWGClientDevice("test-zero-copy", "127.0.0.1:51820", priv, pub, 1340, nil)
+	dev, err := NewAWGClientDevice("test-buf-isolation", "127.0.0.1:51820", priv, pub, 1340, nil)
 	if err != nil {
 		t.Fatalf("Failed to create AWGClientDevice: %v", err)
 	}
 	defer dev.Close()
 
-	originalPkt := []byte{0x45, 0, 0, 20, 1, 2, 3, 4, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
+	expectedPkt := []byte{0x45, 0, 0, 20, 1, 2, 3, 4, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
+	orig := make([]byte, len(expectedPkt))
+	copy(orig, expectedPkt)
 
-	n, err := dev.Write(originalPkt)
-	if err != nil || n != len(originalPkt) {
+	n, err := dev.Write(orig)
+	if err != nil || n != len(orig) {
 		t.Fatalf("Write failed: n=%d err=%v", n, err)
+	}
+
+	// Immediately mutate/zero orig after Write returns to simulate amneziawg-go buffer pool reuse
+	for i := range orig {
+		orig[i] = 0x00
 	}
 
 	select {
 	case receivedPkt := <-dev.vtun.inPackets:
-		if !bytes.Equal(receivedPkt, originalPkt) {
-			t.Fatalf("packet content mismatch: got %x, want %x", receivedPkt, originalPkt)
-		}
-		// Verify zero-redundant copy: received packet slice points to the exact same backing array
-		if unsafe.SliceData(receivedPkt) != unsafe.SliceData(originalPkt) {
-			t.Errorf("expected received packet to share backing array with original packet (zero redundant allocation)")
+		if !bytes.Equal(receivedPkt, expectedPkt) {
+			t.Fatalf("packet corrupted: got %x, want %x", receivedPkt, expectedPkt)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for packet from inPackets")

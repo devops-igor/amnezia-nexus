@@ -1821,9 +1821,12 @@ func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
 	}
 
 	// Issue #15: Load balancer client configs must be pure AWG 3+ and must NEVER contain I1..I5
-	for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
-		if strings.Contains(cfgStr, key+" =") || strings.Contains(cfgStr, key+"=") {
-			t.Errorf("GenerateClientConfig must not output CPS param %s, config:\n%s", key, cfgStr)
+	for _, line := range strings.Split(cfgStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+			if strings.HasPrefix(trimmed, key+" =") || strings.HasPrefix(trimmed, key+"=") {
+				t.Errorf("GenerateClientConfig must not output CPS param %s, config:\n%s", key, cfgStr)
+			}
 		}
 	}
 
@@ -2909,9 +2912,12 @@ func TestGenerateUserClientConfig_AWG3_Compliance(t *testing.T) {
 	}
 
 	// Verify NO CPS packets (Issue #15)
-	for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
-		if strings.Contains(cfgStr, key+" =") || strings.Contains(cfgStr, key+"=") {
-			t.Errorf("Load Balancer client config must not contain %s, got:\n%s", key, cfgStr)
+	for _, line := range strings.Split(cfgStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+			if strings.HasPrefix(trimmed, key+" =") || strings.HasPrefix(trimmed, key+"=") {
+				t.Errorf("Load Balancer client config must not contain %s, got:\n%s", key, cfgStr)
+			}
 		}
 	}
 }
