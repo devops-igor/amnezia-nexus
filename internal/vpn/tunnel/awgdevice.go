@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
@@ -91,6 +92,11 @@ func (t *VirtualTUN) DroppedPackets() uint64 {
 	return t.dropCount.Load()
 }
 
+// RecordDrop increments the dropped packet counter (issue #160).
+func (t *VirtualTUN) RecordDrop() {
+	t.dropCount.Add(1)
+}
+
 func (t *VirtualTUN) MTU() (int, error)        { return t.mtu, nil }
 func (t *VirtualTUN) Name() (string, error)    { return t.name, nil }
 func (t *VirtualTUN) Events() <-chan tun.Event { return t.events }
@@ -135,6 +141,14 @@ func toInt(v any) int {
 	return 0
 }
 
+// DefaultVirtualTUNInboundCapacity is the default buffer capacity for VirtualTUN inbound packets (2048)
+// to absorb bursty upload traffic without drops (issue #160).
+const DefaultVirtualTUNInboundCapacity = 2048
+
+// DefaultUDPSocketBufferSize is the default SO_RCVBUF and SO_SNDBUF buffer size (4 MB)
+// configured on backend AWG client UDP sockets to prevent kernel-level packet drops (issue #160).
+const DefaultUDPSocketBufferSize = 4 * 1024 * 1024
+
 // NewAWGClientDevice creates a new AWGClientDevice.
 func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, awgParams map[string]any) (*AWGClientDevice, error) {
 	if mtu <= 0 {
@@ -158,7 +172,7 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 	}
 
 	vtun := &VirtualTUN{
-		inPackets:  make(chan []byte, 1024),
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
 		outPackets: make(chan []byte, 1024),
 		events:     make(chan tun.Event, 2),
 		closed:     make(chan struct{}),
@@ -167,7 +181,7 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 	}
 
 	logger := device.NewLogger(device.LogLevelSilent, name)
-	dev := device.NewDevice(vtun, conn.NewDefaultBind(), logger)
+	dev := device.NewDevice(vtun, NewTunedBind(conn.NewDefaultBind(), DefaultUDPSocketBufferSize), logger)
 
 	var cfg string
 	cfg += buildAWGIPCConfig(privHex, pubHex, endpoint, awgParams)
@@ -333,14 +347,15 @@ func (d *AWGClientDevice) Write(p []byte) (int, error) {
 	if d.closed.Load() {
 		return 0, errors.New("device closed")
 	}
-	pkt := make([]byte, len(p))
-	copy(pkt, p)
 	select {
-	case d.vtun.inPackets <- pkt:
+	case d.vtun.inPackets <- p:
 		return len(p), nil
 	case <-d.doneCh:
 		return 0, errors.New("device closed")
 	default:
+		if d.vtun != nil {
+			d.vtun.RecordDrop()
+		}
 		return len(p), nil
 	}
 }
@@ -402,4 +417,82 @@ func (d *AWGClientDevice) LastHandshakeTime() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(sec, nsec)
+}
+
+// TunedBind wraps a conn.Bind to tune SO_RCVBUF and SO_SNDBUF on opened UDP sockets (issue #160).
+type TunedBind struct {
+	conn.Bind
+	bufferSize int
+}
+
+// NewTunedBind wraps a conn.Bind with socket buffer tuning.
+func NewTunedBind(bind conn.Bind, bufferSize int) *TunedBind {
+	if bufferSize <= 0 {
+		bufferSize = DefaultUDPSocketBufferSize
+	}
+	return &TunedBind{
+		Bind:       bind,
+		bufferSize: bufferSize,
+	}
+}
+
+// Open opens the underlying bind and applies SO_RCVBUF and SO_SNDBUF socket buffer tuning.
+func (b *TunedBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	fns, actualPort, err := b.Bind.Open(port)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.tuneBuffers()
+	return fns, actualPort, nil
+}
+
+// tuneBuffers sets SO_RCVBUF and SO_SNDBUF on the underlying socket descriptors.
+func (b *TunedBind) tuneBuffers() {
+	if peek, ok := b.Bind.(conn.PeekLookAtSocketFd); ok {
+		if fd, err := peek.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
+			_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, b.bufferSize)
+			_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, b.bufferSize)
+		}
+		if fd, err := peek.PeekLookAtSocketFd6(); err == nil && fd >= 0 {
+			_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, b.bufferSize)
+			_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, b.bufferSize)
+		}
+	}
+}
+
+// PeekLookAtSocketFd4 implements conn.PeekLookAtSocketFd.
+func (b *TunedBind) PeekLookAtSocketFd4() (int, error) {
+	if peek, ok := b.Bind.(conn.PeekLookAtSocketFd); ok {
+		return peek.PeekLookAtSocketFd4()
+	}
+	return -1, errors.New("not supported")
+}
+
+// PeekLookAtSocketFd6 implements conn.PeekLookAtSocketFd.
+func (b *TunedBind) PeekLookAtSocketFd6() (int, error) {
+	if peek, ok := b.Bind.(conn.PeekLookAtSocketFd); ok {
+		return peek.PeekLookAtSocketFd6()
+	}
+	return -1, errors.New("not supported")
+}
+
+// BindSocketToInterface4 implements conn.BindSocketToInterface.
+func (b *TunedBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
+	if bsi, ok := b.Bind.(conn.BindSocketToInterface); ok {
+		return bsi.BindSocketToInterface4(interfaceIndex, blackhole)
+	}
+	return errors.New("not supported")
+}
+
+// BindSocketToInterface6 implements conn.BindSocketToInterface.
+func (b *TunedBind) BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error {
+	if bsi, ok := b.Bind.(conn.BindSocketToInterface); ok {
+		return bsi.BindSocketToInterface6(interfaceIndex, blackhole)
+	}
+	return errors.New("not supported")
+}
+
+// BufferSize returns the configured socket buffer size.
+func (b *TunedBind) BufferSize() int {
+	return b.bufferSize
 }
