@@ -361,6 +361,7 @@ type BackupData struct {
 	ConnectionCreationLog []map[string]any `json:"connection_creation_log"`
 	KnownHosts            []map[string]any `json:"known_hosts,omitempty"`
 	LeaderboardSnapshots  []map[string]any `json:"leaderboard_snapshots,omitempty"`
+	AWGIPAllocations      []map[string]any `json:"awg_ip_allocations,omitempty"`
 	Settings              map[string]any   `json:"settings"`
 }
 

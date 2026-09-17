@@ -220,7 +220,33 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateUserSessionVersion(ctx); err != nil {
 		return err
 	}
-	return d.migrateBackendTunnelsProbePrivateKey(ctx)
+	if err := d.migrateBackendTunnelsProbePrivateKey(ctx); err != nil {
+		return err
+	}
+	return d.migrateAWGIPAllocations(ctx)
+}
+
+func (d *DB) migrateAWGIPAllocations(ctx context.Context) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS awg_ip_allocations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_id INTEGER NOT NULL,
+			client_id TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'allocated',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(server_id, ip)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server ON awg_ip_allocations(server_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server_client ON awg_ip_allocations(server_id, client_id)`,
+	}
+	for _, q := range queries {
+		if _, err := d.sqlDB.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("failed to migrate awg_ip_allocations: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) migrateUserSessionVersion(ctx context.Context) error {

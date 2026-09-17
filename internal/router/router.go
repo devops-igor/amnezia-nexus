@@ -49,6 +49,9 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 	}, db)
 
 	awgMgr := awg.NewAWGManager(sshPool)
+	if db != nil {
+		awgMgr.SetIPAllocator(db)
+	}
 	mtproxylMgr := mtproxyl.NewMTProxyLManager(sshPool)
 	dnsMgr := dns.NewDNSManager(sshPool)
 

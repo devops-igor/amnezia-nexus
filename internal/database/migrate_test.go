@@ -222,9 +222,17 @@ func TestLoadDataAndSaveDataBasic(t *testing.T) {
 		KeyText:  "FULL_KEY",
 	})
 
+	allocatedIP, allocErr := db.AllocateAWGClientIP(ctx, s1ID, "full-client-key", "full-client-key", nil, "10.66.66.0", 24, "10.66.66.1")
+	if allocErr != nil {
+		t.Fatalf("AllocateAWGClientIP failed: %v", allocErr)
+	}
+
 	backup, err := db.LoadData(ctx)
 	if err != nil {
 		t.Fatalf("LoadData failed: %v", err)
+	}
+	if len(backup.AWGIPAllocations) != 1 {
+		t.Errorf("expected 1 AWGIPAllocation in backup, got %d", len(backup.AWGIPAllocations))
 	}
 
 	tmpDir := t.TempDir()
@@ -241,6 +249,11 @@ func TestLoadDataAndSaveDataBasic(t *testing.T) {
 	freshServers, _ := freshDB.GetAllServers(ctx)
 	if len(freshServers) != 1 || freshServers[0].Name != "Full Server 1" || freshServers[0].SSHPass != "Pass1!" {
 		t.Errorf("fresh server mismatch: %+v", freshServers)
+	}
+
+	freshAllocations, err := freshDB.GetAllocatedAWGIPs(ctx, s1ID)
+	if err != nil || len(freshAllocations) != 1 || freshAllocations[0] != allocatedIP {
+		t.Errorf("fresh DB allocated AWG IPs mismatch: %v (err: %v)", freshAllocations, err)
 	}
 }
 
