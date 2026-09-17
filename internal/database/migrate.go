@@ -39,6 +39,7 @@ func (d *DB) LoadData(ctx context.Context) (*models.BackupData, error) {
 	creationLog, _ := d.loadCreationLog(ctx)
 	knownHosts, _ := d.loadKnownHosts(ctx)
 	snapshots, _ := d.loadLeaderboardSnapshots(ctx)
+	awgAllocations, _ := d.loadAWGIPAllocations(ctx)
 	settings, _ := d.GetAllSettings(ctx)
 
 	return &models.BackupData{
@@ -48,6 +49,7 @@ func (d *DB) LoadData(ctx context.Context) (*models.BackupData, error) {
 		ConnectionCreationLog: creationLog,
 		KnownHosts:            knownHosts,
 		LeaderboardSnapshots:  snapshots,
+		AWGIPAllocations:      awgAllocations,
 		Settings:              settings,
 	}, nil
 }
@@ -258,6 +260,32 @@ func (d *DB) loadLeaderboardSnapshots(ctx context.Context) ([]map[string]any, er
 	return res, nil
 }
 
+func (d *DB) loadAWGIPAllocations(ctx context.Context) ([]map[string]any, error) {
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, server_id, client_id, ip, status, created_at, updated_at FROM awg_ip_allocations ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var res []map[string]any
+	for rows.Next() {
+		var id, serverID int64
+		var clientID, ip, status, createdAt, updatedAt string
+		if err := rows.Scan(&id, &serverID, &clientID, &ip, &status, &createdAt, &updatedAt); err == nil {
+			res = append(res, map[string]any{
+				"id":         id,
+				"server_id":  serverID,
+				"client_id":  clientID,
+				"ip":         ip,
+				"status":     status,
+				"created_at": createdAt,
+				"updated_at": updatedAt,
+			})
+		}
+	}
+	return res, nil
+}
+
 // SaveData restores and replaces the full database content from BackupData within a single transaction in correct FK order.
 func (d *DB) SaveData(ctx context.Context, data *models.BackupData) error {
 	d.writeMu.Lock()
@@ -279,6 +307,7 @@ func (d *DB) SaveData(ctx context.Context, data *models.BackupData) error {
 		"DELETE FROM known_hosts",
 		"DELETE FROM backend_tunnels",
 		"DELETE FROM leaderboard_snapshots",
+		"DELETE FROM awg_ip_allocations",
 		"DELETE FROM users",
 		"DELETE FROM servers",
 		"DELETE FROM settings",
@@ -290,6 +319,9 @@ func (d *DB) SaveData(ctx context.Context, data *models.BackupData) error {
 	}
 
 	if err := d.saveServers(ctx, tx, data.Servers); err != nil {
+		return err
+	}
+	if err := d.saveAWGIPAllocations(ctx, tx, data.AWGIPAllocations); err != nil {
 		return err
 	}
 	if err := d.saveUsers(ctx, tx, data.Users); err != nil {
@@ -583,6 +615,38 @@ func (d *DB) saveAuxiliaryTables(ctx context.Context, tx *sql.Tx, data *models.B
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 				year, month, username, rank, download, upload, total, snapAt,
 			)
+		}
+	}
+	return nil
+}
+
+func (d *DB) saveAWGIPAllocations(ctx context.Context, tx *sql.Tx, allocations []map[string]any) error {
+	for _, entry := range allocations {
+		sid := getInt64(entry["server_id"])
+		cid, _ := entry["client_id"].(string)
+		ip, _ := entry["ip"].(string)
+		status, _ := entry["status"].(string)
+		if status == "" {
+			status = "allocated"
+		}
+		createdAt, _ := entry["created_at"].(string)
+		if createdAt == "" {
+			createdAt = time.Now().Format(time.RFC3339)
+		}
+		updatedAt, _ := entry["updated_at"].(string)
+		if updatedAt == "" {
+			updatedAt = createdAt
+		}
+
+		if sid > 0 && ip != "" {
+			_, err := tx.ExecContext(ctx, `INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(server_id, ip) DO UPDATE SET client_id = excluded.client_id, status = excluded.status, updated_at = excluded.updated_at`,
+				sid, cid, ip, status, createdAt, updatedAt,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to restore awg_ip_allocation: %w", err)
+			}
 		}
 	}
 	return nil

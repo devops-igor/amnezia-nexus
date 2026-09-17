@@ -2,10 +2,12 @@ package awg
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
@@ -44,9 +46,45 @@ type SSHProvider interface {
 }
 
 // IPAllocator defines an interface for managing atomic IP address allocations.
+//
+// Contract:
+//   - AllocateAWGClientIP:
+//   - clientID: logical identifier for the client (e.g. user ID or explicit client identifier).
+//   - clientPubKey: WireGuard / AmneziaWG public key for the peer.
+//   - The allocation is idempotent: if an allocation already exists for either clientID or
+//     clientPubKey on serverID, the previously allocated IP is retained and returned.
+//   - Concurrent allocations on the same server are synchronized and serialized to guarantee
+//     zero IP collisions within the subnet.
+//   - ReleaseAWGClientIP:
+//   - Releases the allocation matching serverID and clientID (and/or ip).
 type IPAllocator interface {
 	AllocateAWGClientIP(ctx context.Context, serverID int64, clientID, clientPubKey string, usedConfigIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error)
 	ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error
+}
+
+// serverLockRegistry provides per-server mutex synchronization across manager instances.
+type serverLockRegistry struct {
+	mu    sync.Mutex
+	locks map[int64]*sync.Mutex
+}
+
+var globalServerLocks = newServerLockRegistry()
+
+func newServerLockRegistry() *serverLockRegistry {
+	return &serverLockRegistry{
+		locks: make(map[int64]*sync.Mutex),
+	}
+}
+
+func (r *serverLockRegistry) getLock(serverID int64) *sync.Mutex {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	l, ok := r.locks[serverID]
+	if !ok {
+		l = &sync.Mutex{}
+		r.locks[serverID] = l
+	}
+	return l
 }
 
 // AWGManager implements manager.ProtocolManager for AmneziaWG.
@@ -58,6 +96,7 @@ type AWGManager struct {
 	cacheMu        sync.RWMutex
 	containerCache map[string]containerCacheEntry
 	ipAllocator    IPAllocator
+	serverLocks    *serverLockRegistry
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -65,7 +104,22 @@ func NewAWGManager(pool SSHProvider) *AWGManager {
 	return &AWGManager{
 		sshPool:        pool,
 		containerCache: make(map[string]containerCacheEntry),
+		serverLocks:    globalServerLocks,
 	}
+}
+
+// SetServerLockRegistry overrides the server lock registry used by the manager instance.
+func (m *AWGManager) SetServerLockRegistry(r *serverLockRegistry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.serverLocks = r
+}
+
+func (m *AWGManager) getServerLock(serverID int64) *sync.Mutex {
+	if m.serverLocks != nil {
+		return m.serverLocks.getLock(serverID)
+	}
+	return globalServerLocks.getLock(serverID)
 }
 
 // SetIPAllocator sets the IP allocator for the AWGManager.
@@ -674,7 +728,9 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 	if !IsValidContainerName(cName) {
 		return errors.New("invalid container name")
 	}
-	tmpPath := "/tmp/_amnz_edit_config.conf"
+	randBytes := make([]byte, 8)
+	_, _ = rand.Read(randBytes)
+	tmpPath := fmt.Sprintf("/tmp/_amnz_edit_config_%d_%x.conf", time.Now().UnixNano(), randBytes)
 	if err := client.UploadSudoFile(ctx, tmpPath, []byte(content), 0600); err != nil {
 		return err
 	}
@@ -758,7 +814,9 @@ func (m *AWGManager) saveClientsTable(ctx context.Context, client ssh.SSHClient,
 		return err
 	}
 
-	tmpPath := "/tmp/_amnz_clients.json"
+	randBytes := make([]byte, 8)
+	_, _ = rand.Read(randBytes)
+	tmpPath := fmt.Sprintf("/tmp/_amnz_clients_%d_%x.json", time.Now().UnixNano(), randBytes)
 	if err := client.UploadSudoFile(ctx, tmpPath, []byte(jsonData), 0600); err != nil {
 		return err
 	}
@@ -1186,6 +1244,14 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		return nil, err
 	}
 
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1222,20 +1288,17 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clients, _ := m.getClientsTable(ctx, client)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
 
-	var serverID int64
-	if server != nil {
-		serverID = server.ID
-	}
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
-	clientIP, newlyAllocated, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs)
+	clientIP, newlyAllocated, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams)
 	if err != nil {
 		return nil, err
 	}
 
+	remoteCommitted := false
 	defer func() {
-		if err != nil && newlyAllocated && m.ipAllocator != nil {
-			_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP)
+		if err != nil && newlyAllocated {
+			m.rollbackAllocatedPeer(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, remoteCommitted)
 		}
 	}()
 
@@ -1249,23 +1312,24 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	allowedIPs := resolveAllowedIPs(clientParams)
 	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP, allowedIPs)
-	removePubKeys := peerRemovalKeys(existingPubKey, clientPubKey)
-	newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
-	if err != nil {
+
+	if err = m.commitPeerConfigWithCAS(ctx, client, confText, peerSection, clientPubKey, clientName, existingPubKey); err != nil {
 		return nil, err
 	}
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
-		return nil, err
-	}
+	remoteCommitted = true
 
 	// Parse speed limits if provided
 	speedDown, speedUp := parseSpeedLimits(clientParams)
 	mimicry := resolveMimicry(clientParams)
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
-	// Save to clientsTable (update in place when the identity already exists)
+	// Fresh read-and-upsert for clientsTable to avoid lost updates
+	clients, _ = m.getClientsTable(ctx, client)
+	existingIdx, _ = findExistingClient(clients, clientPubKey, clientName)
 	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
-	_ = m.saveClientsTable(ctx, client, clients)
+	if saveClientsErr := m.saveClientsTable(ctx, client, clients); saveClientsErr != nil {
+		slog.Warn("failed to save clients table", "server_id", serverID, "client_ip", clientIP, "error", saveClientsErr)
+	}
 
 	if isProbePeer {
 		// Probe peers need no client config, connection kit, or TC limits:
@@ -1285,8 +1349,9 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	// backends provisioned with the old subnet-scoped start.sh without
 	// restarting or re-creating the container. Fail loudly: without the rules,
 	// all load-balanced client traffic is dropped upstream.
-	if err := m.ensureBackendNATRule(ctx, client); err != nil {
-		return nil, fmt.Errorf("failed to ensure backend NAT rules: %w", err)
+	if err = m.ensureBackendNATRule(ctx, client); err != nil {
+		err = fmt.Errorf("failed to ensure backend NAT rules: %w", err)
+		return nil, err
 	}
 
 	// Apply speed limit via TC
@@ -1305,6 +1370,171 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}, nil
 }
 
+func (m *AWGManager) commitPeerConfigWithCAS(
+	ctx context.Context,
+	client ssh.SSHClient,
+	initialConf, peerSection, clientPubKey, clientName, existingPubKey string,
+) error {
+	confText := initialConf
+	currExistingPubKey := existingPubKey
+
+	for attempt := 0; attempt < 5; attempt++ {
+		freshConf, err := m.getServerConfig(ctx, client)
+		if err != nil {
+			return fmt.Errorf("failed to fetch remote config for CAS check: %w", err)
+		}
+		if freshConf != confText {
+			confText = freshConf
+			clients, _ := m.getClientsTable(ctx, client)
+			_, currExistingPubKey = findExistingClient(clients, clientPubKey, clientName)
+			continue
+		}
+
+		removePubKeys := peerRemovalKeys(currExistingPubKey, clientPubKey)
+		newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
+		if err != nil {
+			return fmt.Errorf("failed to upsert peer in config: %w", err)
+		}
+		return m.saveServerConfig(ctx, client, newConfig)
+	}
+
+	return errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
+}
+
+func removePeerFromConfig(confText, pubKey, ip string) string {
+	confText = EnsureInterfaceTableOff(confText)
+	lines := strings.Split(strings.TrimRight(confText, "\n"), "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "[Peer]" {
+			out = append(out, lines[i])
+			continue
+		}
+		j := i + 1
+		for j < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
+			j++
+		}
+		block := lines[i:j]
+		match := false
+		for _, bl := range block {
+			trimmed := strings.TrimSpace(bl)
+			if pubKey != "" && strings.HasPrefix(trimmed, "PublicKey = ") {
+				if strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey = ")) == pubKey {
+					match = true
+					break
+				}
+			}
+			if ip != "" && strings.HasPrefix(trimmed, "AllowedIPs = ") {
+				if strings.Contains(trimmed, ip) {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			out = append(out, block...)
+		}
+		i = j - 1
+	}
+	return strings.Join(out, "\n") + "\n"
+}
+
+func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHClient, pubKey, ip string) error {
+	confText, err := m.getServerConfig(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to get server config for peer removal: %w", err)
+	}
+
+	newConfig := removePeerFromConfig(confText, pubKey, ip)
+	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+		return fmt.Errorf("failed to save config during peer removal: %w", err)
+	}
+
+	clients, err := m.getClientsTable(ctx, client)
+	if err == nil && len(clients) > 0 {
+		var updated []AWGClient
+		for _, c := range clients {
+			if (pubKey != "" && c.ClientID == pubKey) || (ip != "" && c.UserData.ClientIP == ip) {
+				continue
+			}
+			updated = append(updated, c)
+		}
+		_ = m.saveClientsTable(ctx, client, updated)
+	}
+
+	if ip != "" {
+		cName := m.resolveContainerName(ctx, client)
+		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), ip)
+	}
+
+	return nil
+}
+
+func (m *AWGManager) rollbackAllocatedPeer(
+	ctx context.Context,
+	client ssh.SSHClient,
+	serverID int64,
+	effectiveClientID, clientPubKey, clientIP string,
+	remoteCommitted bool,
+) {
+	if m.ipAllocator == nil {
+		return
+	}
+	if !remoteCommitted {
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP); relErr != nil {
+			slog.Warn("failed to release AWG client IP", "server_id", serverID, "client_id", effectiveClientID, "ip", clientIP, "error", relErr)
+		}
+		return
+	}
+
+	// remoteCommitted: peer was already written to remote server.
+	// Attempt to remove the peer from the remote server.
+	if err := m.removePeerFromRemote(ctx, client, clientPubKey, clientIP); err != nil {
+		slog.Error("failed to remove peer from remote server during rollback; retaining IP allocation to prevent zombie IP collision",
+			"server_id", serverID,
+			"client_id", effectiveClientID,
+			"ip", clientIP,
+			"error", err,
+		)
+		return
+	}
+
+	if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP); relErr != nil {
+		slog.Warn("failed to release AWG client IP after remote removal", "server_id", serverID, "client_id", effectiveClientID, "ip", clientIP, "error", relErr)
+	}
+}
+
+func parseServerSubnetParams(serverParams map[string]string) (string, int, string) {
+	subnetAddr := AWGDefaults["subnet_address"]
+	subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
+	gatewayIP := AWGDefaults["subnet_ip"]
+
+	if serverParams == nil {
+		return subnetAddr, subnetCIDR, gatewayIP
+	}
+
+	addrVal := ""
+	if v, ok := serverParams["Address"]; ok && strings.TrimSpace(v) != "" {
+		addrVal = strings.TrimSpace(v)
+	} else if v, ok := serverParams["address"]; ok && strings.TrimSpace(v) != "" {
+		addrVal = strings.TrimSpace(v)
+	}
+
+	if addrVal != "" {
+		ip, ipNet, err := net.ParseCIDR(addrVal)
+		if err == nil && ip != nil && ipNet != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				gatewayIP = ip4.String()
+				subnetAddr = ipNet.IP.To4().String()
+				ones, _ := ipNet.Mask.Size()
+				subnetCIDR = ones
+			}
+		}
+	}
+
+	return subnetAddr, subnetCIDR, gatewayIP
+}
+
 func (m *AWGManager) obtainClientIP(
 	ctx context.Context,
 	serverID int64,
@@ -1313,22 +1543,21 @@ func (m *AWGManager) obtainClientIP(
 	existingIdx int,
 	clientPubKey string,
 	usedIPs []string,
+	serverParams map[string]string,
 ) (string, bool, error) {
 	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
 		return clients[existingIdx].UserData.ClientIP, false, nil
 	}
+	subnetAddr, subnetCIDR, gatewayIP := parseServerSubnetParams(serverParams)
 	if m.ipAllocator != nil {
 		effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
-		subnetAddr := AWGDefaults["subnet_address"]
-		subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
-		gatewayIP := AWGDefaults["subnet_ip"]
 		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 		if allocErr != nil {
 			return "", false, allocErr
 		}
 		return allocatedIP, true, nil
 	}
-	resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs)
+	resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 	if resErr != nil {
 		return "", false, resErr
 	}
@@ -1386,13 +1615,10 @@ func resolveClientKeys(clientParams map[string]any) (string, string, error) {
 	return clientPrivKey, clientPubKey, nil
 }
 
-func resolveClientIP(clients []AWGClient, existingIdx int, usedIPs []string) (string, error) {
+func resolveClientIP(clients []AWGClient, existingIdx int, usedIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error) {
 	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
 		return clients[existingIdx].UserData.ClientIP, nil
 	}
-	subnetAddr := AWGDefaults["subnet_address"]
-	subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
-	gatewayIP := AWGDefaults["subnet_ip"]
 	return GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 }
 
@@ -1439,6 +1665,14 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	if err != nil {
 		return err
 	}
+
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1497,11 +1731,9 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 
 	// 4. Release allocated IP
 	if m.ipAllocator != nil {
-		var serverID int64
-		if server != nil {
-			serverID = server.ID
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, clientID, peerIP); relErr != nil {
+			slog.Warn("failed to release AWG client IP on client removal", "server_id", serverID, "client_id", clientID, "ip", peerIP, "error", relErr)
 		}
-		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, clientID, peerIP)
 	}
 
 	return nil
@@ -1580,6 +1812,14 @@ func (m *AWGManager) ToggleClient(ctx context.Context, server *models.Server, cl
 	if err != nil {
 		return err
 	}
+
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1899,6 +2139,14 @@ func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clie
 		return err
 	}
 
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1994,6 +2242,14 @@ func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, c
 	if err != nil {
 		return "", err
 	}
+
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

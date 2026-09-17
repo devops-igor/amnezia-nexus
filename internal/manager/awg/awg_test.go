@@ -86,12 +86,45 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_psk.key") {
 		return string(m.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
 	}
-	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients.json") {
-		m.files["/opt/amnezia/awg/clientsTable"] = m.files["/tmp/_amnz_clients.json"]
+	if strings.HasPrefix(cmd, "rm -f ") {
+		path := strings.Trim(strings.TrimSpace(strings.TrimPrefix(cmd, "rm -f ")), "'\"")
+		if strings.HasPrefix(path, "/tmp/_amnz_edit_config_") || strings.HasPrefix(path, "/tmp/_amnz_clients_") {
+			delete(m.files, path)
+		}
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") {
-		m.files["/opt/amnezia/awg/awg0.conf"] = m.files["/tmp/_amnz_edit_config.conf"]
+	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients") {
+		fields := strings.Fields(cmd)
+		if len(fields) >= 3 {
+			src := strings.Trim(fields[2], "'\"")
+			if m.files[src] != nil {
+				m.files["/opt/amnezia/awg/clientsTable"] = m.files[src]
+				return "", "", 0, nil
+			}
+		}
+		for p, c := range m.files {
+			if strings.Contains(p, "_amnz_clients") {
+				m.files["/opt/amnezia/awg/clientsTable"] = c
+				break
+			}
+		}
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config") {
+		fields := strings.Fields(cmd)
+		if len(fields) >= 3 {
+			src := strings.Trim(fields[2], "'\"")
+			if m.files[src] != nil {
+				m.files["/opt/amnezia/awg/awg0.conf"] = m.files[src]
+				return "", "", 0, nil
+			}
+		}
+		for p, c := range m.files {
+			if strings.Contains(p, "_amnz_edit_config") {
+				m.files["/opt/amnezia/awg/awg0.conf"] = c
+				break
+			}
+		}
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_awg0.conf") {
@@ -964,12 +997,22 @@ DisableCookies = on
 		}
 
 		// docker cp to amnezia-awg2
-		if strings.Contains(cmd, "docker cp '/tmp/_amnz_edit_config.conf' 'amnezia-awg2':'/opt/amnezia/awg/awg0.conf'") {
-			mockClient.files["/opt/amnezia/awg/awg0.conf"] = mockClient.files["/tmp/_amnz_edit_config.conf"]
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config") && strings.Contains(cmd, "awg0.conf") {
+			for p, c := range mockClient.files {
+				if strings.Contains(p, "_amnz_edit_config") {
+					mockClient.files["/opt/amnezia/awg/awg0.conf"] = c
+					break
+				}
+			}
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp '/tmp/_amnz_clients.json' 'amnezia-awg2':'/opt/amnezia/awg/clientsTable'") {
-			mockClient.files["/opt/amnezia/awg/clientsTable"] = mockClient.files["/tmp/_amnz_clients.json"]
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients") && strings.Contains(cmd, "clientsTable") {
+			for p, c := range mockClient.files {
+				if strings.Contains(p, "_amnz_clients") {
+					mockClient.files["/opt/amnezia/awg/clientsTable"] = c
+					break
+				}
+			}
 			return "", "", 0, nil
 		}
 
@@ -1170,7 +1213,7 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 		if strings.Contains(cmd, "test -f") && strings.Contains(cmd, "etc/amnezia/amneziawg") {
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") {
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config") {
 			copiedTarget = cmd
 			return "", "", 0, nil
 		}
@@ -1642,12 +1685,22 @@ func TestBackwardCompatibility_LegacyAmneziaAWGContainer(t *testing.T) {
 		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_psk.key") {
 			return string(client.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients.json") && strings.Contains(cmd, "amnezia-awg") {
-			client.files["/opt/amnezia/awg/clientsTable"] = client.files["/tmp/_amnz_clients.json"]
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients") && strings.Contains(cmd, "clientsTable") {
+			for p, c := range client.files {
+				if strings.Contains(p, "_amnz_clients") {
+					client.files["/opt/amnezia/awg/clientsTable"] = c
+					break
+				}
+			}
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") && strings.Contains(cmd, "amnezia-awg") {
-			client.files["/opt/amnezia/awg/awg0.conf"] = client.files["/tmp/_amnz_edit_config.conf"]
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config") && strings.Contains(cmd, "awg0.conf") {
+			for p, c := range client.files {
+				if strings.Contains(p, "_amnz_edit_config") {
+					client.files["/opt/amnezia/awg/awg0.conf"] = c
+					break
+				}
+			}
 			return "", "", 0, nil
 		}
 
@@ -1899,11 +1952,16 @@ MTU = 1280
 		t.Fatalf("saveServerConfig failed: %v", err)
 	}
 
-	content, ok := client.files["/tmp/_amnz_edit_config.conf"]
-	if !ok {
-		t.Fatalf("expected /tmp/_amnz_edit_config.conf to be uploaded")
+	var uploadedConfig string
+	for path, content := range client.files {
+		if strings.Contains(path, "_amnz_edit_config") {
+			uploadedConfig = string(content)
+			break
+		}
 	}
-	uploadedConfig := string(content)
+	if uploadedConfig == "" {
+		t.Fatalf("expected /tmp/_amnz_edit_config_*.conf to be uploaded")
+	}
 
 	if !strings.Contains(uploadedConfig, "Table = off") {
 		t.Errorf("saveServerConfig did not inject Table = off into uploaded config:\n%s", uploadedConfig)
@@ -1937,8 +1995,10 @@ H2 = 15000000-25000000
 	if sshAttempted {
 		t.Errorf("saveServerConfig should have failed before executing SSH commands")
 	}
-	if _, uploaded := client.files["/tmp/_amnz_edit_config.conf"]; uploaded {
-		t.Errorf("saveServerConfig should have failed before uploading config file")
+	for path := range client.files {
+		if strings.Contains(path, "_amnz_edit_config") {
+			t.Errorf("saveServerConfig should have failed before uploading config file, found: %s", path)
+		}
 	}
 }
 
