@@ -1212,12 +1212,9 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	usedIPs := GetUsedIPsFromConfig(confText)
 	serverParams, _, _ := ParseServerConfig(confText)
-	serverPubKey, err := m.GetServerPublicKey(ctx, server)
-	if err != nil || serverPubKey == "" {
-		if err != nil {
-			return nil, fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
-		}
-		return nil, errors.New("AmneziaWG server public key is empty")
+	serverPubKey, err := m.getServerPublicKeyRequired(ctx, server)
+	if err != nil {
+		return nil, err
 	}
 
 	// Idempotency: reuse the existing entry (and its IP) when this identity is
@@ -1225,36 +1222,15 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clients, _ := m.getClientsTable(ctx, client)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
 
-	var clientIP string
-	var newlyAllocated bool
 	var serverID int64
 	if server != nil {
 		serverID = server.ID
 	}
+	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
-	effectiveClientID := clientPubKey
-	if cid, ok := clientParams["client_id"].(string); ok && strings.TrimSpace(cid) != "" {
-		effectiveClientID = strings.TrimSpace(cid)
-	}
-
-	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
-		clientIP = clients[existingIdx].UserData.ClientIP
-	} else if m.ipAllocator != nil {
-		subnetAddr := AWGDefaults["subnet_address"]
-		subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
-		gatewayIP := AWGDefaults["subnet_ip"]
-		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-		if allocErr != nil {
-			return nil, allocErr
-		}
-		clientIP = allocatedIP
-		newlyAllocated = true
-	} else {
-		resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs)
-		if resErr != nil {
-			return nil, resErr
-		}
-		clientIP = resolvedIP
+	clientIP, newlyAllocated, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs)
+	if err != nil {
+		return nil, err
 	}
 
 	defer func() {
@@ -1271,15 +1247,9 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		psk, _ = m.GetServerPSK(ctx, server)
 	}
 
-	allowedIPs := ""
-	if aip, ok := clientParams["allowed_ips"]; ok && aip != nil {
-		allowedIPs = fmt.Sprint(aip)
-	}
+	allowedIPs := resolveAllowedIPs(clientParams)
 	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP, allowedIPs)
-	var removePubKeys []string
-	if existingPubKey != "" && existingPubKey != clientPubKey {
-		removePubKeys = []string{existingPubKey}
-	}
+	removePubKeys := peerRemovalKeys(existingPubKey, clientPubKey)
 	newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
 	if err != nil {
 		return nil, err
@@ -1290,12 +1260,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	// Parse speed limits if provided
 	speedDown, speedUp := parseSpeedLimits(clientParams)
-
-	mimicry := "auto"
-	if v, ok := clientParams["awg_mimicry"]; ok && fmt.Sprint(v) != "" {
-		mimicry = fmt.Sprint(v)
-	}
-
+	mimicry := resolveMimicry(clientParams)
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
 	// Save to clientsTable (update in place when the identity already exists)
@@ -1338,6 +1303,75 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		"connection_kit": connectionKit,
 		"awg_mimicry":    mimicry,
 	}, nil
+}
+
+func (m *AWGManager) obtainClientIP(
+	ctx context.Context,
+	serverID int64,
+	clientParams map[string]any,
+	clients []AWGClient,
+	existingIdx int,
+	clientPubKey string,
+	usedIPs []string,
+) (string, bool, error) {
+	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
+		return clients[existingIdx].UserData.ClientIP, false, nil
+	}
+	if m.ipAllocator != nil {
+		effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
+		subnetAddr := AWGDefaults["subnet_address"]
+		subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
+		gatewayIP := AWGDefaults["subnet_ip"]
+		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+		if allocErr != nil {
+			return "", false, allocErr
+		}
+		return allocatedIP, true, nil
+	}
+	resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs)
+	if resErr != nil {
+		return "", false, resErr
+	}
+	return resolvedIP, false, nil
+}
+
+func resolveEffectiveClientID(clientParams map[string]any, clientPubKey string) string {
+	if cid, ok := clientParams["client_id"].(string); ok && strings.TrimSpace(cid) != "" {
+		return strings.TrimSpace(cid)
+	}
+	return clientPubKey
+}
+
+func (m *AWGManager) getServerPublicKeyRequired(ctx context.Context, server *models.Server) (string, error) {
+	serverPubKey, err := m.GetServerPublicKey(ctx, server)
+	if err != nil {
+		return "", fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
+	}
+	if serverPubKey == "" {
+		return "", errors.New("AmneziaWG server public key is empty")
+	}
+	return serverPubKey, nil
+}
+
+func resolveAllowedIPs(clientParams map[string]any) string {
+	if aip, ok := clientParams["allowed_ips"]; ok && aip != nil {
+		return fmt.Sprint(aip)
+	}
+	return ""
+}
+
+func resolveMimicry(clientParams map[string]any) string {
+	if v, ok := clientParams["awg_mimicry"]; ok && fmt.Sprint(v) != "" {
+		return fmt.Sprint(v)
+	}
+	return "auto"
+}
+
+func peerRemovalKeys(existingPubKey, clientPubKey string) []string {
+	if existingPubKey != "" && existingPubKey != clientPubKey {
+		return []string{existingPubKey}
+	}
+	return nil
 }
 
 func resolveClientKeys(clientParams map[string]any) (string, string, error) {

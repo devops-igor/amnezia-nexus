@@ -55,73 +55,22 @@ func (d *DB) AllocateAWGClientIP(
 	const maxRetries = 50
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// 1. Idempotency: Check if clientID or clientPubKey already has an active allocation on this server
-		if storedClientID != "" || clientPubKey != "" {
-			var existingIP string
-			var checkErr error
-			if storedClientID != "" && clientPubKey != "" && storedClientID != clientPubKey {
-				checkErr = d.sqlDB.QueryRowContext(ctx,
-					"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?) LIMIT 1",
-					serverID, storedClientID, clientPubKey,
-				).Scan(&existingIP)
-			} else {
-				lookupID := storedClientID
-				if lookupID == "" {
-					lookupID = clientPubKey
-				}
-				checkErr = d.sqlDB.QueryRowContext(ctx,
-					"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND client_id = ? LIMIT 1",
-					serverID, lookupID,
-				).Scan(&existingIP)
-			}
-
-			if checkErr == nil && existingIP != "" {
-				return existingIP, nil
-			} else if checkErr != nil && !errors.Is(checkErr, sql.ErrNoRows) {
-				return "", fmt.Errorf("failed to check existing AWG IP allocation: %w", checkErr)
-			}
+		existingIP, err := d.findExistingAllocation(ctx, serverID, storedClientID, clientPubKey)
+		if err != nil {
+			return "", err
+		}
+		if existingIP != "" {
+			return existingIP, nil
 		}
 
 		// 2. Query all existing allocated IPs for this server
-		rows, err := d.sqlDB.QueryContext(ctx,
-			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated'",
-			serverID,
-		)
+		allocatedIPs, err := d.fetchAllocatedIPs(ctx, serverID)
 		if err != nil {
-			return "", fmt.Errorf("failed to query allocated AWG IPs: %w", err)
+			return "", err
 		}
-
-		var allocatedIPs []string
-		for rows.Next() {
-			var ip string
-			if err := rows.Scan(&ip); err != nil {
-				rows.Close()
-				return "", fmt.Errorf("failed to scan allocated AWG IP: %w", err)
-			}
-			allocatedIPs = append(allocatedIPs, ip)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return "", fmt.Errorf("failed reading allocated AWG IPs: %w", err)
-		}
-		rows.Close()
 
 		// 3. Merge usedConfigIPs and DB allocations into unified set
-		usedMap := make(map[string]bool, len(usedConfigIPs)+len(allocatedIPs))
-		var combinedUsed []string
-		for _, ip := range usedConfigIPs {
-			ip = strings.TrimSpace(ip)
-			if ip != "" && !usedMap[ip] {
-				usedMap[ip] = true
-				combinedUsed = append(combinedUsed, ip)
-			}
-		}
-		for _, ip := range allocatedIPs {
-			ip = strings.TrimSpace(ip)
-			if ip != "" && !usedMap[ip] {
-				usedMap[ip] = true
-				combinedUsed = append(combinedUsed, ip)
-			}
-		}
+		combinedUsed := mergeUsedIPs(usedConfigIPs, allocatedIPs)
 
 		// 4. Calculate next available IP
 		nextIP, err := awg.GetNextIP(combinedUsed, subnetAddr, subnetCIDR, gatewayIP)
@@ -147,6 +96,82 @@ func (d *DB) AllocateAWGClientIP(
 	}
 
 	return "", fmt.Errorf("failed to allocate AWG IP after %d attempts due to collisions", maxRetries)
+}
+
+func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, storedClientID, clientPubKey string) (string, error) {
+	if storedClientID == "" && clientPubKey == "" {
+		return "", nil
+	}
+
+	var existingIP string
+	var err error
+	if storedClientID != "" && clientPubKey != "" && storedClientID != clientPubKey {
+		err = d.sqlDB.QueryRowContext(ctx,
+			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?) LIMIT 1",
+			serverID, storedClientID, clientPubKey,
+		).Scan(&existingIP)
+	} else {
+		lookupID := storedClientID
+		if lookupID == "" {
+			lookupID = clientPubKey
+		}
+		err = d.sqlDB.QueryRowContext(ctx,
+			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND client_id = ? LIMIT 1",
+			serverID, lookupID,
+		).Scan(&existingIP)
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to check existing AWG IP allocation: %w", err)
+	}
+	return existingIP, nil
+}
+
+func (d *DB) fetchAllocatedIPs(ctx context.Context, serverID int64) ([]string, error) {
+	rows, err := d.sqlDB.QueryContext(ctx,
+		"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated'",
+		serverID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query allocated AWG IPs: %w", err)
+	}
+	defer rows.Close()
+
+	var allocatedIPs []string
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, fmt.Errorf("failed to scan allocated AWG IP: %w", err)
+		}
+		allocatedIPs = append(allocatedIPs, ip)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed reading allocated AWG IPs: %w", err)
+	}
+	return allocatedIPs, nil
+}
+
+func mergeUsedIPs(usedConfigIPs, allocatedIPs []string) []string {
+	usedMap := make(map[string]bool, len(usedConfigIPs)+len(allocatedIPs))
+	var combinedUsed []string
+	for _, ip := range usedConfigIPs {
+		ip = strings.TrimSpace(ip)
+		if ip != "" && !usedMap[ip] {
+			usedMap[ip] = true
+			combinedUsed = append(combinedUsed, ip)
+		}
+	}
+	for _, ip := range allocatedIPs {
+		ip = strings.TrimSpace(ip)
+		if ip != "" && !usedMap[ip] {
+			usedMap[ip] = true
+			combinedUsed = append(combinedUsed, ip)
+		}
+	}
+	return combinedUsed
 }
 
 // ReleaseAWGClientIP removes or frees the allocated IP record for a client on the specified server.
