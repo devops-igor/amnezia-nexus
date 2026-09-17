@@ -70,6 +70,16 @@ func TestUsersHandlers(t *testing.T) {
 		if wDef.Code != http.StatusOK {
 			t.Errorf("expected 200 for default list, got %d", wDef.Code)
 		}
+		var respDef models.PaginatedUsersResponse
+		if err := json.NewDecoder(wDef.Body).Decode(&respDef); err != nil {
+			t.Fatalf("decode default failed: %v", err)
+		}
+		if respDef.Size != 12 {
+			t.Errorf("expected default size 12, got %d", respDef.Size)
+		}
+		if respDef.Page != 1 {
+			t.Errorf("expected default page 1, got %d", respDef.Page)
+		}
 	})
 
 	t.Run("AddUserHandler Duplicate Username", func(t *testing.T) {
@@ -310,6 +320,21 @@ func TestUsersHandlers(t *testing.T) {
 		r.ServeHTTP(wFar, reqFar)
 		if wFar.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", wFar.Code)
+		}
+
+		// Invalid / zero size fallback to default 12
+		reqInvalidSize := httptest.NewRequest(http.MethodGet, "/api/users?size=0", nil)
+		wInvalidSize := httptest.NewRecorder()
+		r.ServeHTTP(wInvalidSize, reqInvalidSize)
+		if wInvalidSize.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", wInvalidSize.Code)
+		}
+		var respInvalid models.PaginatedUsersResponse
+		if err := json.NewDecoder(wInvalidSize.Body).Decode(&respInvalid); err != nil {
+			t.Fatalf("decode invalid size resp failed: %v", err)
+		}
+		if respInvalid.Size != 12 {
+			t.Errorf("expected fallback size 12 for size=0, got %d", respInvalid.Size)
 		}
 	})
 
