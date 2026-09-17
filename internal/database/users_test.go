@@ -281,3 +281,86 @@ func TestUsersDateAndNullScanningEdgeCases(t *testing.T) {
 		t.Errorf("expected error updating user with unmarshalable limits")
 	}
 }
+
+func TestUserSessionVersion(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Newly created user should default to SessionVersion = 1
+	user := &models.User{
+		Username: "version_test_user",
+		Role:     models.RoleUser,
+		Enabled:  true,
+	}
+	userID, err := db.CreateUser(ctx, user)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	fetched, err := db.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser failed: %v", err)
+	}
+	if fetched.SessionVersion != 1 {
+		t.Errorf("expected new user SessionVersion=1, got %d", fetched.SessionVersion)
+	}
+
+	// 2. Bump session version
+	v2, err := db.BumpUserSessionVersion(ctx, userID)
+	if err != nil {
+		t.Fatalf("BumpUserSessionVersion failed: %v", err)
+	}
+	if v2 != 2 {
+		t.Errorf("expected bumped version=2, got %d", v2)
+	}
+
+	fetchedAfterBump, err := db.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser after bump failed: %v", err)
+	}
+	if fetchedAfterBump.SessionVersion != 2 {
+		t.Errorf("expected fetched SessionVersion=2, got %d", fetchedAfterBump.SessionVersion)
+	}
+
+	// 3. Bump again
+	v3, err := db.BumpUserSessionVersion(ctx, userID)
+	if err != nil {
+		t.Fatalf("BumpUserSessionVersion 2nd failed: %v", err)
+	}
+	if v3 != 3 {
+		t.Errorf("expected bumped version=3, got %d", v3)
+	}
+
+	// 4. Non-existent user returns error
+	if _, err := db.BumpUserSessionVersion(ctx, "non-existent-user-id"); err == nil {
+		t.Errorf("expected error bumping session version for non-existent user")
+	}
+}
+
+func TestMigrateUserSessionVersion(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// Verify migrateUserSessionVersion is idempotent on an already migrated table
+	if err := db.migrateUserSessionVersion(ctx); err != nil {
+		t.Fatalf("expected idempotent migrateUserSessionVersion to succeed: %v", err)
+	}
+
+	// Create a user and verify session_version is scanned correctly
+	u := &models.User{
+		Username: "mig_user",
+		Role:     models.RoleUser,
+		Enabled:  true,
+	}
+	uid, err := db.CreateUser(ctx, u)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	got, err := db.GetUser(ctx, uid)
+	if err != nil {
+		t.Fatalf("GetUser failed: %v", err)
+	}
+	if got.SessionVersion != 1 {
+		t.Errorf("expected SessionVersion 1, got %d", got.SessionVersion)
+	}
+}

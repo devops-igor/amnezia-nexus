@@ -664,9 +664,10 @@ func TestDisabledUser_SessionRejected(t *testing.T) {
 	}
 
 	sessionData := &models.SessionData{
-		UserID:   testUser.ID,
-		Username: testUser.Username,
-		Role:     testUser.Role,
+		UserID:         testUser.ID,
+		Username:       testUser.Username,
+		Role:           testUser.Role,
+		SessionVersion: 1,
 	}
 	encodedCookie, err := security.EncodeSession(sessionData.ToMap(), cfg.SecretKey)
 	if err != nil {
@@ -796,5 +797,299 @@ func TestEmptySecretKey_ReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(wLogin.Body.String(), "Session signing key not configured") {
 		t.Errorf("expected detail 'Session signing key not configured', got %s", wLogin.Body.String())
+	}
+}
+
+func TestSessionVersionRevocation_PasswordChange(t *testing.T) {
+	h, db, cfg := setupTestHandlers(t)
+	ctx := context.Background()
+
+	middleware.SetUserLookup(func(ctx context.Context, userID string) (*models.User, error) {
+		return db.GetUser(ctx, userID)
+	})
+	t.Cleanup(func() {
+		middleware.SetUserLookup(nil)
+	})
+
+	passHash, _ := security.HashPassword("CurrentPass123!")
+	user := &models.User{
+		ID:           "test-pw-user-1",
+		Username:     "pwuser",
+		PasswordHash: passHash,
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, err := db.CreateUser(ctx, user)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// 1. Initial login to get session cookie
+	loginBody, _ := json.Marshal(models.LoginRequest{
+		Username: "pwuser",
+		Password: "CurrentPass123!",
+	})
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(loginBody))
+	loginRec := httptest.NewRecorder()
+	h.APILoginHandler(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d (%s)", loginRec.Code, loginRec.Body.String())
+	}
+
+	var oldCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName {
+			oldCookie = c
+			break
+		}
+	}
+	if oldCookie == nil {
+		t.Fatal("expected session cookie from login")
+	}
+
+	// Verify session version in cookie payload is 1
+	oldDataMap, err := security.DecodeSession(oldCookie.Value, cfg.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to decode old cookie: %v", err)
+	}
+	oldSess := models.SessionDataFromMap(oldDataMap)
+	if oldSess.SessionVersion != 1 {
+		t.Errorf("expected initial session version 1, got %d", oldSess.SessionVersion)
+	}
+
+	// Verify old cookie works before password change
+	testEndpoint := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	authChain := middleware.Session(cfg.SecretKey)(middleware.RequireAuth(testEndpoint))
+
+	reqBefore := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	reqBefore.AddCookie(oldCookie)
+	wBefore := httptest.NewRecorder()
+	authChain.ServeHTTP(wBefore, reqBefore)
+	if wBefore.Code != http.StatusOK {
+		t.Fatalf("expected 200 before password change, got %d", wBefore.Code)
+	}
+
+	// 2. Change password using the active session
+	changeBody, _ := json.Marshal(models.ChangePasswordRequest{
+		CurrentPassword: "CurrentPass123!",
+		NewPassword:     "NewPass123456!",
+		ConfirmPassword: "NewPass123456!",
+	})
+	changeReq := httptest.NewRequest(http.MethodPost, "/api/auth/change-password", bytes.NewReader(changeBody))
+	changeReq.AddCookie(oldCookie)
+	changeRec := httptest.NewRecorder()
+	middleware.Session(cfg.SecretKey)(http.HandlerFunc(h.APIChangePasswordHandler)).ServeHTTP(changeRec, changeReq)
+	if changeRec.Code != http.StatusOK {
+		t.Fatalf("change password failed: %d (%s)", changeRec.Code, changeRec.Body.String())
+	}
+
+	var newCookie *http.Cookie
+	for _, c := range changeRec.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge > 0 {
+			newCookie = c
+			break
+		}
+	}
+	if newCookie == nil {
+		t.Fatal("expected new session cookie after password change")
+	}
+
+	// Verify new session version is 2
+	newDataMap, err := security.DecodeSession(newCookie.Value, cfg.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to decode new cookie: %v", err)
+	}
+	newSess := models.SessionDataFromMap(newDataMap)
+	if newSess.SessionVersion != 2 {
+		t.Errorf("expected new session version 2, got %d", newSess.SessionVersion)
+	}
+
+	// Verify user's session version in DB is 2
+	dbUser, err := db.GetUser(ctx, user.ID)
+	if err != nil || dbUser == nil {
+		t.Fatalf("failed to fetch user from DB: %v", err)
+	}
+	if dbUser.SessionVersion != 2 {
+		t.Errorf("expected DB session version 2, got %d", dbUser.SessionVersion)
+	}
+
+	// 3. Stale old cookie MUST be rejected with 401 and cleared
+	reqAfterOld := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	reqAfterOld.AddCookie(oldCookie)
+	wAfterOld := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterOld, reqAfterOld)
+	if wAfterOld.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for old session cookie after password change, got %d", wAfterOld.Code)
+	}
+	oldCleared := false
+	for _, c := range wAfterOld.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge == -1 {
+			oldCleared = true
+			break
+		}
+	}
+	if !oldCleared {
+		t.Errorf("expected old session cookie to be cleared on 401")
+	}
+
+	// 4. New cookie MUST succeed with 200 OK
+	reqAfterNew := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	reqAfterNew.AddCookie(newCookie)
+	wAfterNew := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterNew, reqAfterNew)
+	if wAfterNew.Code != http.StatusOK {
+		t.Errorf("expected 200 for new session cookie, got %d", wAfterNew.Code)
+	}
+}
+
+func TestSessionVersionRevocation_LogoutAll(t *testing.T) {
+	h, db, cfg := setupTestHandlers(t)
+	ctx := context.Background()
+
+	middleware.SetUserLookup(func(ctx context.Context, userID string) (*models.User, error) {
+		return db.GetUser(ctx, userID)
+	})
+	t.Cleanup(func() {
+		middleware.SetUserLookup(nil)
+	})
+
+	passHash, _ := security.HashPassword("Pass123!Safe")
+	user := &models.User{
+		ID:           "test-logoutall-user",
+		Username:     "logoutalluser",
+		PasswordHash: passHash,
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	_, err := db.CreateUser(ctx, user)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	// Login to get session cookie (version 1)
+	loginBody, _ := json.Marshal(models.LoginRequest{
+		Username: "logoutalluser",
+		Password: "Pass123!Safe",
+	})
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(loginBody))
+	loginRec := httptest.NewRecorder()
+	h.APILoginHandler(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+
+	var sessCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName {
+			sessCookie = c
+			break
+		}
+	}
+	if sessCookie == nil {
+		t.Fatal("expected session cookie from login")
+	}
+
+	testEndpoint := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	authChain := middleware.Session(cfg.SecretKey)(middleware.RequireAuth(testEndpoint))
+
+	// Request before logout-all succeeds
+	req1 := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	req1.AddCookie(sessCookie)
+	w1 := httptest.NewRecorder()
+	authChain.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 before logout-all, got %d", w1.Code)
+	}
+
+	// Perform logout-all via API (JSON)
+	logoutReq := httptest.NewRequest(http.MethodPost, "/api/auth/logout-all", nil)
+	logoutReq.AddCookie(sessCookie)
+	wLogout := httptest.NewRecorder()
+	middleware.Session(cfg.SecretKey)(http.HandlerFunc(h.LogoutAllHandler)).ServeHTTP(wLogout, logoutReq)
+	if wLogout.Code != http.StatusOK {
+		t.Fatalf("expected 200 from LogoutAllHandler, got %d (body: %s)", wLogout.Code, wLogout.Body.String())
+	}
+
+	// Verify cookie cleared in response
+	cleared := false
+	for _, c := range wLogout.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge == -1 {
+			cleared = true
+			break
+		}
+	}
+	if !cleared {
+		t.Errorf("expected session cookie to be cleared on logout-all")
+	}
+
+	// Verify DB session_version incremented
+	dbUser, err := db.GetUser(ctx, user.ID)
+	if err != nil || dbUser == nil {
+		t.Fatalf("failed to fetch user: %v", err)
+	}
+	if dbUser.SessionVersion != 2 {
+		t.Errorf("expected DB session version 2, got %d", dbUser.SessionVersion)
+	}
+
+	// Old cookie MUST now be rejected with 401
+	reqAfter := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	reqAfter.AddCookie(sessCookie)
+	wAfter := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfter, reqAfter)
+	if wAfter.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for revoked session after logout-all, got %d", wAfter.Code)
+	}
+}
+
+func TestAPISetupHandler_SessionVersion(t *testing.T) {
+	hEmpty, dbEmpty, cfgEmpty := setupTestHandlers(t)
+	ctx := context.Background()
+
+	body, _ := json.Marshal(models.SetupRequest{
+		Username:        "adminversion",
+		Password:        "AdminSecret123!",
+		ConfirmPassword: "AdminSecret123!",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	hEmpty.APISetupHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	var sessionCookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge > 0 {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected session cookie from setup")
+	}
+
+	decoded, err := security.DecodeSession(sessionCookie.Value, cfgEmpty.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to decode setup cookie: %v", err)
+	}
+	sess := models.SessionDataFromMap(decoded)
+	if sess.SessionVersion != 1 {
+		t.Errorf("expected session version 1 in setup cookie, got %d", sess.SessionVersion)
+	}
+
+	admin, err := dbEmpty.GetUserByUsername(ctx, "adminversion")
+	if err != nil || admin == nil {
+		t.Fatalf("failed to query admin user: %v", err)
+	}
+	if admin.SessionVersion != 1 {
+		t.Errorf("expected admin session_version 1 in DB, got %d", admin.SessionVersion)
 	}
 }

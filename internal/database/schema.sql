@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS users (
     expires_at TEXT,
     awg_mimicry TEXT DEFAULT 'auto',
     password_change_required INTEGER NOT NULL DEFAULT 0,
+    session_version INTEGER NOT NULL DEFAULT 1,
     limits TEXT
 );
 

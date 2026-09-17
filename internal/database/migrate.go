@@ -103,7 +103,7 @@ func (d *DB) loadUsers(ctx context.Context) ([]map[string]any, error) {
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load users: %w", err)
@@ -143,6 +143,7 @@ func (d *DB) loadUsers(ctx context.Context) ([]map[string]any, error) {
 			"expires_at":               formatTimePtr(u.ExpiresAt),
 			"awg_mimicry":              string(u.AWGMimicry),
 			"password_change_required": u.PasswordChangeRequired,
+			"session_version":          u.SessionVersion,
 			"limits":                   u.Limits,
 		}
 		users = append(users, uMap)
@@ -459,13 +460,18 @@ func (d *DB) saveUsers(ctx context.Context, tx *sql.Tx, users []map[string]any) 
 			limitsJSON = string(b)
 		}
 
+		sessionVersion := int(getInt64(u["session_version"]))
+		if sessionVersion <= 0 {
+			sessionVersion = 1
+		}
+
 		query := `INSERT INTO users (
 			id, username, email, telegramId, description, password_hash, role, enabled,
 			traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 			monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 			share_enabled, share_token, share_password_hash,
-			created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 		_, err := tx.ExecContext(ctx, query,
 			id, username, nullString(email), nullString(telID), nullString(desc),
@@ -474,6 +480,7 @@ func (d *DB) saveUsers(ctx context.Context, tx *sql.Tx, users []map[string]any) 
 			strategy, shareEnabledInt, nullString(shareToken), nullString(sharePass),
 			createdAtStr, lastResetStr, nullString(expDateStr),
 			nullString(expiresAtStr), mimicry, pwdChangeInt, limitsJSON,
+			sessionVersion,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to restore user: %w", err)

@@ -25,7 +25,7 @@ func (d *DB) GetAllUsers(ctx context.Context) ([]models.User, error) {
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users ORDER BY created_at DESC`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -55,7 +55,7 @@ func (d *DB) GetUser(ctx context.Context, id string) (*models.User, error) {
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -83,7 +83,7 @@ func (d *DB) GetUserByUsername(ctx context.Context, username string) (*models.Us
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users WHERE LOWER(username) = LOWER(?)`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, strings.TrimSpace(username))
@@ -106,7 +106,7 @@ func (d *DB) GetUserByShareToken(ctx context.Context, token string) (*models.Use
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users WHERE share_token = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, token)
@@ -189,13 +189,19 @@ func (d *DB) CreateUser(ctx context.Context, u *models.User) (string, error) {
 		pwdChangeInt = 1
 	}
 
+	sessionVersion := u.SessionVersion
+	if sessionVersion <= 0 {
+		sessionVersion = 1
+	}
+	u.SessionVersion = sessionVersion
+
 	query := `INSERT INTO users (
 		id, username, email, telegramId, description, password_hash, role, enabled,
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := d.sqlDB.ExecContext(ctx, query,
 		u.ID,
@@ -225,6 +231,7 @@ func (d *DB) CreateUser(ctx context.Context, u *models.User) (string, error) {
 		string(u.AWGMimicry),
 		pwdChangeInt,
 		limitsJSON,
+		sessionVersion,
 	)
 
 	if err != nil {
@@ -398,6 +405,32 @@ func (d *DB) UpdateUserLimits(ctx context.Context, id string, limits map[string]
 	return err
 }
 
+// BumpUserSessionVersion atomically increments session_version = session_version + 1
+// for the given user and returns the new version.
+func (d *DB) BumpUserSessionVersion(ctx context.Context, userID string) (int, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	res, err := d.sqlDB.ExecContext(ctx, "UPDATE users SET session_version = session_version + 1 WHERE id = ?", userID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to bump user session version: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if rows == 0 {
+		return 0, fmt.Errorf("user not found: %s", userID)
+	}
+
+	var newVersion int
+	err = d.sqlDB.QueryRowContext(ctx, "SELECT session_version FROM users WHERE id = ?", userID).Scan(&newVersion)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get new session version: %w", err)
+	}
+	return newVersion, nil
+}
+
 // UpdateUserExpiry updates user expiration timestamp.
 func (d *DB) UpdateUserExpiry(ctx context.Context, id string, expiresAt *time.Time) error {
 	var expStr *string
@@ -421,7 +454,7 @@ func (d *DB) GetUsersOverQuota(ctx context.Context) ([]models.User, error) {
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users WHERE enabled = 1 AND traffic_limit > 0 AND traffic_used >= traffic_limit`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -452,7 +485,7 @@ func (d *DB) GetExpiredUsers(ctx context.Context) ([]models.User, error) {
 		traffic_limit, traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
 		monthly_rx, monthly_tx, monthly_reset_at, traffic_reset_strategy,
 		share_enabled, share_token, share_password_hash,
-		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits
+		created_at, last_reset_at, expiration_date, expires_at, awg_mimicry, password_change_required, limits, session_version
 		FROM users WHERE enabled = 1 AND (
 			(expires_at IS NOT NULL AND expires_at != '' AND expires_at < ?) OR
 			(expiration_date IS NOT NULL AND expiration_date != '' AND expiration_date < ?)
@@ -586,7 +619,7 @@ func (d *DB) scanUser(s scannable) (models.User, error) {
 	var email, telID, desc, shareToken, sharePass sql.NullString
 	var monthlyResetAt, lastResetAt, expDate, expiresAt sql.NullString
 	var role, strategy, mimicry, limitsJSON, createdAt sql.NullString
-	var enabled, shareEnabled, pwdChange int
+	var enabled, shareEnabled, pwdChange, sessionVersion int
 
 	err := s.Scan(
 		&u.ID,
@@ -616,10 +649,16 @@ func (d *DB) scanUser(s scannable) (models.User, error) {
 		&mimicry,
 		&pwdChange,
 		&limitsJSON,
+		&sessionVersion,
 	)
 	if err != nil {
 		return u, err
 	}
+
+	if sessionVersion <= 0 {
+		sessionVersion = 1
+	}
+	u.SessionVersion = sessionVersion
 
 	u.Email = nullStringToPtr(email)
 	u.TelegramID = nullStringToPtr(telID)

@@ -322,6 +322,7 @@ func TestSessionDataMethods(t *testing.T) {
 		Username:               "john",
 		Role:                   RoleUser,
 		PasswordChangeRequired: true,
+		SessionVersion:         3,
 		CaptchaID:              "captcha-abc123",
 		ShareAuthenticated:     map[string]bool{"token1": true},
 		Extra:                  map[string]any{"custom": "val"},
@@ -338,16 +339,26 @@ func TestSessionDataMethods(t *testing.T) {
 	}
 
 	m := userSession.ToMap()
-	if m["user_id"] != "user-1" || m["role"] != "user" || m["captcha_id"] != "captcha-abc123" {
+	if m["user_id"] != "user-1" || m["role"] != "user" || m["captcha_id"] != "captcha-abc123" || m["session_version"] != 3 {
 		t.Errorf("ToMap serialized incorrectly: %+v", m)
 	}
 
 	parsed := SessionDataFromMap(m)
-	if parsed.UserID != "user-1" || parsed.Role != RoleUser || !parsed.PasswordChangeRequired || parsed.CaptchaID != "captcha-abc123" {
+	if parsed.UserID != "user-1" || parsed.Role != RoleUser || !parsed.PasswordChangeRequired || parsed.CaptchaID != "captcha-abc123" || parsed.SessionVersion != 3 {
 		t.Errorf("SessionDataFromMap parsed incorrectly: %+v", parsed)
 	}
 	if !parsed.ShareAuthenticated["token1"] {
 		t.Errorf("ShareAuthenticated not restored: %+v", parsed.ShareAuthenticated)
+	}
+
+	// Test SessionVersion handling of float64 and int64 (JSON map decodings)
+	fromFloat := SessionDataFromMap(map[string]any{"user_id": "u-flt", "session_version": float64(5)})
+	if fromFloat.SessionVersion != 5 {
+		t.Errorf("expected SessionVersion 5 from float64, got %d", fromFloat.SessionVersion)
+	}
+	fromInt64 := SessionDataFromMap(map[string]any{"user_id": "u-i64", "session_version": int64(7)})
+	if fromInt64.SessionVersion != 7 {
+		t.Errorf("expected SessionVersion 7 from int64, got %d", fromInt64.SessionVersion)
 	}
 
 	adminSession := &SessionData{
