@@ -279,8 +279,8 @@ func (h *Handlers) ClearServerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, c := range containers {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s || true", c))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm %s || true", c))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s || true", ssh.EscapeShellArg(c)))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm %s || true", ssh.EscapeShellArg(c)))
 	}
 	_, _, _, _ = client.RunSudoCommand(ctx, "docker network rm amnezia-dns-net || true")
 	if _, _, _, err := client.RunSudoCommand(ctx, "rm -rf /opt/amnezia"); err != nil {
@@ -632,11 +632,11 @@ func (h *Handlers) ToggleContainerHandler(w http.ResponseWriter, r *http.Request
 	var runErr error
 	switch req.Action {
 	case "start":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker start %s", containerName))
+		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker start %s", ssh.EscapeShellArg(containerName)))
 	case "stop":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s", containerName))
+		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(containerName)))
 	default:
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", containerName))
+		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(containerName)))
 	}
 	if runErr != nil {
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to %s container %s: %v", req.Action, containerName, runErr))
@@ -689,7 +689,7 @@ func (h *Handlers) GetServerConfigHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", configPath))
+	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(configPath)))
 	if err != nil || code != 0 {
 		out = "# Configuration not found or empty"
 	}
