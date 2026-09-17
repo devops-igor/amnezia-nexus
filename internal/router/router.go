@@ -172,7 +172,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Get("/leaderboard", h.LeaderboardPageHandler)
 	r.Get("/share/{token}", h.SharePageHandler)
 	r.Get("/logout", h.LogoutHandler)
-	r.With(middleware.RequireAuth).Get("/logout-all", h.LogoutAllHandler)
 	r.Get("/set_lang/{lang}", h.SetLangHandler)
 
 	// 5. Auth API Group

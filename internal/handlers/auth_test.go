@@ -1049,51 +1049,6 @@ func TestSessionVersionRevocation_LogoutAll(t *testing.T) {
 	}
 }
 
-func TestLogoutAllHandler_HTML(t *testing.T) {
-	h, db, cfg := setupTestHandlers(t)
-	ctx := context.Background()
-
-	user := &models.User{
-		ID:             "html-logout-user",
-		Username:       "htmllogout",
-		Role:           models.RoleUser,
-		Enabled:        true,
-		SessionVersion: 1,
-		CreatedAt:      time.Now(),
-	}
-	_, _ = db.CreateUser(ctx, user)
-
-	sess := &models.SessionData{
-		UserID:         user.ID,
-		Username:       user.Username,
-		Role:           user.Role,
-		SessionVersion: 1,
-	}
-	encodedCookie, _ := security.EncodeSession(sess.ToMap(), cfg.SecretKey)
-
-	req := httptest.NewRequest(http.MethodGet, "/logout-all", nil)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	req.AddCookie(&http.Cookie{Name: middleware.SessionCookieName, Value: encodedCookie})
-	w := httptest.NewRecorder()
-	middleware.Session(cfg.SecretKey)(http.HandlerFunc(h.LogoutAllHandler)).ServeHTTP(w, req)
-
-	if w.Code != http.StatusFound {
-		t.Fatalf("expected 302 redirect for HTML logout-all, got %d", w.Code)
-	}
-	if loc := w.Header().Get("Location"); loc != "/login" {
-		t.Errorf("expected redirect to /login, got %q", loc)
-	}
-
-	// Verify session version bumped to 2
-	dbUser, err := db.GetUser(ctx, user.ID)
-	if err != nil || dbUser == nil {
-		t.Fatalf("failed to fetch user: %v", err)
-	}
-	if dbUser.SessionVersion != 2 {
-		t.Errorf("expected DB session version 2, got %d", dbUser.SessionVersion)
-	}
-}
-
 func TestAPISetupHandler_SessionVersion(t *testing.T) {
 	hEmpty, dbEmpty, cfgEmpty := setupTestHandlers(t)
 	ctx := context.Background()

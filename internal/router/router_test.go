@@ -945,3 +945,24 @@ func TestRouterServerRename(t *testing.T) {
 		t.Errorf("expected 200 OK for admin patch rename, got %d (body: %s)", wAdminPatch.Code, wAdminPatch.Body.String())
 	}
 }
+
+func TestRouter_LogoutAllRoutes(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	r := NewRouter(cfg, db, nil)
+
+	// 1. GET /logout-all must return 404 Not Found (removed to prevent CSRF logout DoS)
+	reqGet := httptest.NewRequest(http.MethodGet, "/logout-all", nil)
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, reqGet)
+	if wGet.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for GET /logout-all, got %d", wGet.Code)
+	}
+
+	// 2. POST /api/auth/logout-all requires CSRF and authentication
+	reqPostNoCSRF := httptest.NewRequest(http.MethodPost, "/api/auth/logout-all", nil)
+	wPostNoCSRF := httptest.NewRecorder()
+	r.ServeHTTP(wPostNoCSRF, reqPostNoCSRF)
+	if wPostNoCSRF.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for POST /api/auth/logout-all without CSRF token, got %d", wPostNoCSRF.Code)
+	}
+}

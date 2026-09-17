@@ -414,12 +414,6 @@ func (h *Handlers) LogoutAllHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.audit(r, "auth.logout_all", map[string]any{"user_id": sess.UserID, "username": sess.Username})
 	middleware.ClearSessionCookie(w)
-
-	if strings.Contains(r.Header.Get("Accept"), "text/html") {
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
-	}
-
 	h.JSONOK(w, map[string]any{"message": "Logged out from all devices"})
 }
 
