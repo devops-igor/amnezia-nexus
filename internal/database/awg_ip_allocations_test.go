@@ -241,3 +241,100 @@ func TestAllocateAWGClientIP_ConcurrentAllocations(t *testing.T) {
 		t.Fatalf("expected %d unique IPs, got %d", numClients, len(seen))
 	}
 }
+
+func TestTransferAWGClientIPLease_ReKeying(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	subnetAddr := "10.66.66.0"
+	subnetCIDR := 24
+	gatewayIP := "10.66.66.1"
+
+	const (
+		keyK1 = "pubkey-K1"
+		keyK2 = "pubkey-K2"
+	)
+
+	// 1. Initial allocation with K1
+	ip1, err := db.AllocateAWGClientIP(ctx, serverID, keyK1, keyK1, nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("first allocation failed: %v", err)
+	}
+
+	// 2. Transfer lease from K1 to K2
+	if err := db.TransferAWGClientIPLease(ctx, serverID, keyK2, keyK1, ip1); err != nil {
+		t.Fatalf("transfer to K2 failed: %v", err)
+	}
+
+	// 3. Allocate with K2 — should verify ownership and return same IP
+	ip2, err := db.AllocateAWGClientIP(ctx, serverID, keyK2, keyK2, nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("allocation with K2 failed: %v", err)
+	}
+	if ip2 != ip1 {
+		t.Fatalf("expected K2 to retain IP %s, got: %s", ip1, ip2)
+	}
+
+	// 4. Transfer lease back from K2 to K1
+	if err := db.TransferAWGClientIPLease(ctx, serverID, keyK1, keyK2, ip2); err != nil {
+		t.Fatalf("transfer back to K1 failed: %v", err)
+	}
+
+	// 5. Allocate with K1 — should verify ownership and return same IP
+	ip3, err := db.AllocateAWGClientIP(ctx, serverID, keyK1, keyK1, nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("allocation with K1 failed: %v", err)
+	}
+	if ip3 != ip1 {
+		t.Fatalf("expected K1 to retain IP %s, got: %s", ip1, ip3)
+	}
+
+	// Total allocations count in DB should be exactly 1
+	allocated, err := db.GetAllocatedAWGIPs(ctx, serverID)
+	if err != nil || len(allocated) != 1 {
+		t.Fatalf("expected 1 allocation in DB, got: %+v", allocated)
+	}
+}
+
+func TestAllocateAWGClientIP_OwnershipVerification_ClaimedByOther(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	subnetAddr := "10.66.66.0"
+	subnetCIDR := 24
+	gatewayIP := "10.66.66.1"
+
+	// Client Alice allocates first IP (10.66.66.2)
+	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("alice allocation failed: %v", err)
+	}
+	if ipAlice != "10.66.66.2" {
+		t.Fatalf("expected 10.66.66.2, got: %s", ipAlice)
+	}
+
+	// Verify that Bob cannot claim Alice's IP
+	claimed, err := db.isAllocationClaimedByOther(ctx, serverID, ipAlice, "bob", "bob-key")
+	if err != nil {
+		t.Fatalf("isAllocationClaimedByOther check failed: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected IP %s to be claimed by other (alice) from bob's perspective", ipAlice)
+	}
+
+	// When Bob allocates, he gets 10.66.66.3, not Alice's IP
+	ipBob, err := db.AllocateAWGClientIP(ctx, serverID, "bob", "bob-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("bob allocation failed: %v", err)
+	}
+	if ipBob == ipAlice {
+		t.Fatalf("bob collided with alice's IP: %s", ipBob)
+	}
+	if ipBob != "10.66.66.3" {
+		t.Fatalf("expected 10.66.66.3 for bob, got: %s", ipBob)
+	}
+}

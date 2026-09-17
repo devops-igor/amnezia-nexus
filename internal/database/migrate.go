@@ -39,7 +39,10 @@ func (d *DB) LoadData(ctx context.Context) (*models.BackupData, error) {
 	creationLog, _ := d.loadCreationLog(ctx)
 	knownHosts, _ := d.loadKnownHosts(ctx)
 	snapshots, _ := d.loadLeaderboardSnapshots(ctx)
-	awgAllocations, _ := d.loadAWGIPAllocations(ctx)
+	awgAllocations, err := d.loadAWGIPAllocations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWG IP allocations: %w", err)
+	}
 	settings, _ := d.GetAllSettings(ctx)
 
 	return &models.BackupData{
@@ -263,7 +266,7 @@ func (d *DB) loadLeaderboardSnapshots(ctx context.Context) ([]map[string]any, er
 func (d *DB) loadAWGIPAllocations(ctx context.Context) ([]map[string]any, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, server_id, client_id, ip, status, created_at, updated_at FROM awg_ip_allocations ORDER BY id")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query AWG IP allocations: %w", err)
 	}
 	defer rows.Close()
 
@@ -271,17 +274,21 @@ func (d *DB) loadAWGIPAllocations(ctx context.Context) ([]map[string]any, error)
 	for rows.Next() {
 		var id, serverID int64
 		var clientID, ip, status, createdAt, updatedAt string
-		if err := rows.Scan(&id, &serverID, &clientID, &ip, &status, &createdAt, &updatedAt); err == nil {
-			res = append(res, map[string]any{
-				"id":         id,
-				"server_id":  serverID,
-				"client_id":  clientID,
-				"ip":         ip,
-				"status":     status,
-				"created_at": createdAt,
-				"updated_at": updatedAt,
-			})
+		if err := rows.Scan(&id, &serverID, &clientID, &ip, &status, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan AWG IP allocation: %w", err)
 		}
+		res = append(res, map[string]any{
+			"id":         id,
+			"server_id":  serverID,
+			"client_id":  clientID,
+			"ip":         ip,
+			"status":     status,
+			"created_at": createdAt,
+			"updated_at": updatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed reading AWG IP allocations: %w", err)
 	}
 	return res, nil
 }

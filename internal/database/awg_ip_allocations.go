@@ -60,7 +60,13 @@ func (d *DB) AllocateAWGClientIP(
 			return "", err
 		}
 		if existingIP != "" {
-			return existingIP, nil
+			claimed, claimErr := d.isAllocationClaimedByOther(ctx, serverID, existingIP, storedClientID, clientPubKey)
+			if claimErr != nil {
+				return "", claimErr
+			}
+			if !claimed {
+				return existingIP, nil
+			}
 		}
 
 		// 2. Query all existing allocated IPs for this server
@@ -128,6 +134,25 @@ func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, storedC
 		return "", fmt.Errorf("failed to check existing AWG IP allocation: %w", err)
 	}
 	return existingIP, nil
+}
+
+func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip, storedClientID, clientPubKey string) (bool, error) {
+	var ownerID string
+	err := d.sqlDB.QueryRowContext(ctx,
+		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
+		serverID, ip,
+	).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to verify AWG IP ownership: %w", err)
+	}
+	ownerID = strings.TrimSpace(ownerID)
+	if (storedClientID != "" && ownerID == storedClientID) || (clientPubKey != "" && ownerID == clientPubKey) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (d *DB) fetchAllocatedIPs(ctx context.Context, serverID int64) ([]string, error) {
@@ -205,6 +230,30 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 
 	if err != nil {
 		return fmt.Errorf("failed to release AWG client IP: %w", err)
+	}
+	return nil
+}
+
+// TransferAWGClientIPLease transfers the allocation record to a new client ID or public key
+// when an existing client is re-keyed or re-registered.
+func (d *DB) TransferAWGClientIPLease(ctx context.Context, serverID int64, newClientID, oldClientID, ip string) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	newClientID = strings.TrimSpace(newClientID)
+	oldClientID = strings.TrimSpace(oldClientID)
+	ip = strings.TrimSpace(ip)
+	if newClientID == "" || (oldClientID == "" && ip == "") {
+		return nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := d.sqlDB.ExecContext(ctx,
+		"UPDATE awg_ip_allocations SET client_id = ?, updated_at = ? WHERE server_id = ? AND (client_id = ? OR ip = ?)",
+		newClientID, now, serverID, oldClientID, ip,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to transfer AWG IP lease: %w", err)
 	}
 	return nil
 }
