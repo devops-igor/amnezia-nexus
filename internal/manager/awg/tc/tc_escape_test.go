@@ -78,17 +78,51 @@ func TestBuildBatchTCScript_MaliciousPeerIP(t *testing.T) {
 		t.Fatalf("escaped argument not properly quoted: %s", escapedArg)
 	}
 
-	// Verify the inner script content is present within the escaped argument.
-	// The tc commands should be inside the single-quoted region.
+	// The tc commands should be inside the single-quoted region, and peerIP
+	// must be escaped with ssh.EscapeShellArg within the inner script.
 	if !strings.Contains(escapedArg, "tc class add dev") {
 		t.Fatalf("inner tc command not found in escaped argument: %s", escapedArg)
 	}
-	if !strings.Contains(escapedArg, "match ip dst 10.0.0.50/32") {
-		t.Fatalf("peer IP filter not found in escaped argument: %s", escapedArg)
+	if !strings.Contains(escapedArg, `match ip dst '\''10.0.0.50'\''/32`) {
+		t.Fatalf("peer IP download filter not found in escaped argument: %s", escapedArg)
+	}
+	if !strings.Contains(escapedArg, `match ip src '\''10.0.0.50'\''/32`) {
+		t.Fatalf("peer IP upload filter not found in escaped argument: %s", escapedArg)
 	}
 }
 
-// TestBuildBatchTCScript_MaliciousPeerIP_BreakoutAttempt verifies that a
+// TestBuildBatchTCScript_MaliciousClientIP verifies that malicious clientIp
+// values with shell metacharacters (e.g. 10.0.0.$(id), 10.0.$(id).5) are
+// rejected by PeerToClassID and completely omitted from the batch script.
+func TestBuildBatchTCScript_MaliciousClientIP(t *testing.T) {
+	maliciousIPs := []string{
+		"10.0.0.$(id)",
+		"10.0.$(id).5",
+		"10.0.0.1; rm -rf /",
+		"`reboot`",
+		"::1",
+		"invalid",
+	}
+
+	for _, malIP := range maliciousIPs {
+		clients := []map[string]any{
+			{
+				"clientIp": malIP,
+				"userData": map[string]any{
+					"speed_limit_down": 10,
+					"speed_limit_up":   5,
+				},
+			},
+		}
+
+		_, clientScript := BuildBatchTCScript("amnezia-awg", clients, nil, nil)
+		if clientScript != "" {
+			t.Fatalf("expected empty client script for malicious/invalid IP %q, got: %s", malIP, clientScript)
+		}
+	}
+}
+
+// TestBuildBatchTCScript_MaliciousContainerName verifies that a
 // malicious peer IP with shell metacharacters is contained. Since PeerToClassID
 // rejects non-numeric IPs, we test with a crafted container name to verify
 // the escaping pattern holds. The key assertion is that the sh -c argument

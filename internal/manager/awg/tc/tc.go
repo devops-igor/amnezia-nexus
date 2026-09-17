@@ -3,6 +3,7 @@ package tc
 import (
 	"context"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,6 +23,10 @@ const (
 
 // PeerToClassID converts a peer IP address (e.g. "10.8.1.45") to an HTB class ID.
 func PeerToClassID(peerIP string) (int, error) {
+	ip := net.ParseIP(peerIP)
+	if ip == nil || ip.To4() == nil {
+		return 0, fmt.Errorf("invalid IPv4 address: %s", peerIP)
+	}
 	parts := strings.Split(peerIP, ".")
 	if len(parts) != 4 {
 		return 0, fmt.Errorf("invalid IP address: %s", peerIP)
@@ -336,9 +341,9 @@ func BuildBatchTCScript(containerName string, clients []map[string]any, globalLi
 			ssh.EscapeShellArg(containerName),
 			ssh.EscapeShellArg(fmt.Sprintf("tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip dst %s/32 flowid 1:%d; tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip src %s/32 flowid 1:%d; true",
 				DefaultInterface, GlobalPoolClassID, classID, speedDown, speedDown,
-				DefaultInterface, peerIP, classID,
+				DefaultInterface, ssh.EscapeShellArg(peerIP), classID,
 				IFBDevice, GlobalPoolClassID, classID, speedUp, speedUp,
-				IFBDevice, peerIP, classID)),
+				IFBDevice, ssh.EscapeShellArg(peerIP), classID)),
 		))
 	}
 

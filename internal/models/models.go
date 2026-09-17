@@ -425,24 +425,6 @@ func ValidateTLSDomain(domain string) error {
 	return nil
 }
 
-// IsValidIdentifier returns true when name is non-empty, within length limits,
-// and free of shell metacharacters and control characters. It uses a reject-list
-// approach so that Unicode names (Cyrillic, Arabic, CJK, accented Latin, etc.)
-// are accepted — ClientName never reaches a shell directly; it is written into
-// JSON and uploaded via SFTP. The reject-list blocks only dangerous characters.
-func IsValidIdentifier(name string) bool {
-	if name == "" {
-		return false
-	}
-	if len(name) > 255 {
-		return false
-	}
-	if shellMetacharRegex.MatchString(name) {
-		return false
-	}
-	return true
-}
-
 // ValidateIdentifierName checks that name is non-empty, within length limits,
 // free of null bytes, and free of shell metacharacters. Used by request
 // Validate() methods for connection/client/server names.

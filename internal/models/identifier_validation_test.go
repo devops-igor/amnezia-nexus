@@ -4,52 +4,53 @@ import (
 	"testing"
 )
 
-func TestIsValidIdentifier(t *testing.T) {
+func TestValidateIdentifierName(t *testing.T) {
 	tests := []struct {
-		name string
-		want bool
+		name    string
+		wantErr bool
 	}{
-		{"", false},
-		{"valid-name", true},
-		{"valid_name", true},
-		{"Valid Name 123", true},
-		{"name.with.dots", true},
-		{"alpha123numeric", true},
+		{"", true},
+		{"valid-name", false},
+		{"valid_name", false},
+		{"Valid Name 123", false},
+		{"name.with.dots", false},
+		{"alpha123numeric", false},
 		// Non-ASCII Unicode names must PASS (reject-list, not allowlist)
-		{"Мой телефон", true},
-		{"گوشی من", true},
-		{"我的手机", true},
-		{"Téléphone", true},
-		{"Home Laptop", true},
-		{"café", true},
+		{"Мой телефон", false},
+		{"گوشی من", false},
+		{"我的手机", false},
+		{"Téléphone", false},
+		{"Home Laptop", false},
+		{"café", false},
 		// Shell metacharacters must be rejected
-		{"name;rm -rf /", false},
-		{"name|cat /etc/passwd", false},
-		{"name&bg", false},
-		{"name$HOME", false},
-		{"name`whoami`", false},
-		{"name\nnewline", false},
-		{"name(evil)", false},
-		{"name<file", false},
-		{"name>file", false},
-		{"name{evil}", false},
-		{"name!bang", false},
-		{"name#hash", false},
-		{"name\\backslash", false},
-		{"name'quote", false},
-		{`name"doublequote`, false},
-		{"name\x00null", false},
+		{"name;rm -rf /", true},
+		{"name|cat /etc/passwd", true},
+		{"name&bg", true},
+		{"name$HOME", true},
+		{"name`whoami`", true},
+		{"name\nnewline", true},
+		{"name(evil)", true},
+		{"name<file", true},
+		{"name>file", true},
+		{"name{evil}", true},
+		{"name!bang", true},
+		{"name#hash", true},
+		{"name\\backslash", true},
+		{"name'quote", true},
+		{`name"doublequote`, true},
+		{"name\x00null", true},
 		// Additional shell injection patterns
-		{"test;rm -rf /", false},
-		{"name$(id)", false},
-		{"a|b", false},
-		{"x`id`", false},
-		{"foo&bar", false},
+		{"test;rm -rf /", true},
+		{"name$(id)", true},
+		{"a|b", true},
+		{"x`id`", true},
+		{"foo&bar", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsValidIdentifier(tc.name); got != tc.want {
-				t.Errorf("IsValidIdentifier(%q) = %v, want %v", tc.name, got, tc.want)
+			err := ValidateIdentifierName(tc.name)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ValidateIdentifierName(%q) error = %v, wantErr %v", tc.name, err, tc.wantErr)
 			}
 		})
 	}

@@ -1,8 +1,11 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +34,61 @@ func TestEscapeShellArg(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("EscapeShellArg(%q) = %q; expected %q", tt.input, got, tt.expected)
 		}
+	}
+}
+
+func TestEscapeShellArg_ArgvRoundTrip(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"empty string", ""},
+		{"simple word", "hello"},
+		{"spaces between words", "hello world foo bar"},
+		{"multiple consecutive spaces", "hello    world"},
+		{"tabs and newlines", "line1\nline2\twith\ttabs\n"},
+		{"single quotes", "it's a 'quoted' string"},
+		{"double quotes", `"hello" "world"`},
+		{"nested mixed quotes", `'""'''"'''"`},
+		{"dollar variable expansion", "$HOME $PATH ${USER} $1 $?"},
+		{"command substitution dollar", "$(whoami) $(rm -rf /) $(cat /etc/passwd)"},
+		{"command substitution backticks", "`whoami` `id` `cat /etc/shadow`"},
+		{"shell metacharacters", "; | & && || ;;"},
+		{"redirects", "> < >> 2>&1 | tee /tmp/evil"},
+		{"globs and wildcards", "* ? [a-z] {a,b}"},
+		{"parentheses and subshells", "(id) && (reboot)"},
+		{"brackets and braces", "{1..10} [test]"},
+		{"backslash escapes", `\n \t \\ \" \' \$`},
+		{"unicode characters", "Мой телефон 📱 café 測試"},
+		{"null byte sanitization", "prefix\x00suffix\x00test"},
+		{"complex exploit payload", `'; rm -rf /; $(whoami); ` + "`reboot`" + `; echo "pwned" > /tmp/pwn; #`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			escaped := EscapeShellArg(tc.input)
+			script := fmt.Sprintf(`set -- %s; printf "%%d\n" "$#"; for a in "$@"; do printf "%%s\0" "$a"; done`, escaped)
+			cmd := exec.Command("sh", "-c", script)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("sh execution failed: %v, script: %s", err, script)
+			}
+
+			parts := bytes.SplitN(out, []byte("\n"), 2)
+			if len(parts) < 2 {
+				t.Fatalf("unexpected output format: %q", out)
+			}
+			argCount := string(parts[0])
+			if argCount != "1" {
+				t.Fatalf("expected exactly 1 argument after shell unpacking, got %s for input %q", argCount, tc.input)
+			}
+
+			unpackedArg := bytes.TrimSuffix(parts[1], []byte("\x00"))
+			expected := []byte(strings.ReplaceAll(tc.input, "\x00", ""))
+			if !bytes.Equal(unpackedArg, expected) {
+				t.Fatalf("argument corrupted after shell unpacking: got %q, want %q", unpackedArg, expected)
+			}
+		})
 	}
 }
 
