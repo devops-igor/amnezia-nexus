@@ -723,13 +723,11 @@ func TestLegacyMyConnectionsRoutesParity(t *testing.T) {
 		})
 	}
 
-	// 4. POST /api/my/connections/{id}/config and POST /api/my/connections/{id}/kit
+	// 4. POST /api/my/connections/{id}/config and POST /api/connections/{id}/config
 	// For server_id=1 without server in DB, should return 404 Connection/Server not found from handler logic, NOT 404 from unrouted path
 	for _, path := range []string{
 		"/api/my/connections/conn-legacy-1/config",
 		"/api/connections/conn-legacy-1/config",
-		"/api/my/connections/conn-legacy-1/kit",
-		"/api/connections/conn-legacy-1/kit",
 	} {
 		t.Run("POST "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, path, nil).WithContext(userCtx)

@@ -234,41 +234,6 @@ func TestGenerateMimicryPackets(t *testing.T) {
 	}
 }
 
-func TestGenerateConnectionKit(t *testing.T) {
-	ctx := context.Background()
-	baseConfig := `[Interface]
-Address = 10.8.1.2/32
-PrivateKey = aaaaaaaa
-DNS = 94.140.14.14, 94.140.15.15
-I1 = <b 0xold>
-
-[Peer]
-PublicKey = bbbbbbbb
-Endpoint = 1.2.3.4:55424
-`
-
-	kit, err := GenerateConnectionKit(ctx, baseConfig, "example.com", nil)
-	if err != nil {
-		t.Fatalf("GenerateConnectionKit failed: %v", err)
-	}
-
-	for _, proto := range []string{"tls", "quic", "dns", "sip"} {
-		conf, ok := kit[proto]
-		if !ok {
-			t.Fatalf("missing %s in connection kit", proto)
-		}
-		if !strings.Contains(conf, "[Interface]") || !strings.Contains(conf, "[Peer]") {
-			t.Errorf("missing Interface/Peer sections in %s config", proto)
-		}
-		if !strings.Contains(conf, "I1 = <") {
-			t.Errorf("missing I1 parameter in %s config:\n%s", proto, conf)
-		}
-		if strings.Contains(conf, "I1 = <b 0xold>") {
-			t.Errorf("old I1 was not stripped in %s config", proto)
-		}
-	}
-}
-
 type mockCPSSSHClient struct {
 	fail bool
 }
