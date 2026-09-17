@@ -389,36 +389,8 @@ func TestConnectionsHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("UserGetConnectionKitHandler Zip Content", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", c1.ID), nil)
-		reqCtx := middleware.WithSession(req.Context(), sess)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req.WithContext(reqCtx))
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-		if w.Header().Get("Content-Type") != "application/zip" {
-			t.Errorf("expected application/zip, got %s", w.Header().Get("Content-Type"))
-		}
-		if !strings.Contains(w.Header().Get("Content-Disposition"), "-kit.zip") {
-			t.Errorf("expected kit zip Content-Disposition, got %s", w.Header().Get("Content-Disposition"))
-		}
-	})
-
 	t.Run("UserGetConnectionConfigHandler Not Found", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/connections/nonexistent/config", nil)
-		reqCtx := middleware.WithSession(req.Context(), sess)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req.WithContext(reqCtx))
-
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", w.Code)
-		}
-	})
-
-	t.Run("UserGetConnectionKitHandler Not Found", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/connections/nonexistent/kit", nil)
 		reqCtx := middleware.WithSession(req.Context(), sess)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req.WithContext(reqCtx))
@@ -499,35 +471,6 @@ func TestConnectionsHandlers(t *testing.T) {
 		r.ServeHTTP(wBadProto, reqBadProto.WithContext(reqBadProtoCtx))
 		if wBadProto.Code != http.StatusBadRequest {
 			t.Errorf("expected 400 for config with unsupported proto, got %d", wBadProto.Code)
-		}
-
-		// Kit handler with missing server -> 404
-		reqKitNoSrv := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", cNoSrv.ID), nil)
-		reqKitNoSrvCtx := middleware.WithSession(reqKitNoSrv.Context(), sess)
-		wKitNoSrv := httptest.NewRecorder()
-		r.ServeHTTP(wKitNoSrv, reqKitNoSrv.WithContext(reqKitNoSrvCtx))
-		if wKitNoSrv.Code != http.StatusNotFound {
-			t.Errorf("expected 404 for kit with missing server, got %d", wKitNoSrv.Code)
-		}
-
-		// Kit handler with unsupported proto -> 400
-		reqKitBadProto := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", cBadProto.ID), nil)
-		reqKitBadProtoCtx := middleware.WithSession(reqKitBadProto.Context(), sess)
-		wKitBadProto := httptest.NewRecorder()
-		r.ServeHTTP(wKitBadProto, reqKitBadProto.WithContext(reqKitBadProtoCtx))
-		if wKitBadProto.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for kit with unsupported proto, got %d", wKitBadProto.Code)
-		}
-	})
-
-	t.Run("UserGetConnectionKitHandler Success", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", c1.ID), nil)
-		reqCtx := middleware.WithSession(req.Context(), sess)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req.WithContext(reqCtx))
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
 		}
 	})
 
@@ -922,22 +865,6 @@ func TestUserGetConnectionConfigHandler_LoadBalanced(t *testing.T) {
 	if resp.VPNLink == "" {
 		t.Errorf("expected non-empty vpn_link")
 	}
-
-	// Also test connection kit for ServerID == 0
-	reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", conn.ID), nil)
-	reqKitCtx := middleware.WithSession(reqKit.Context(), sess)
-	wKit := httptest.NewRecorder()
-	r.ServeHTTP(wKit, reqKit.WithContext(reqKitCtx))
-
-	if wKit.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for kit, got %d", wKit.Code)
-	}
-	if wKit.Header().Get("Content-Type") != "application/zip" {
-		t.Errorf("expected application/zip Content-Type, got %q", wKit.Header().Get("Content-Type"))
-	}
-	if len(wKit.Body.Bytes()) == 0 {
-		t.Errorf("expected non-empty zip bytes")
-	}
 }
 
 func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
@@ -1177,15 +1104,7 @@ func TestUserGetConnectionConfigHandler_NoPhantomConnection(t *testing.T) {
 		}
 	}
 
-	// 3. Call UserGetConnectionKitHandler
-	reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", conn.ID), nil)
-	wKit := httptest.NewRecorder()
-	r.ServeHTTP(wKit, reqKit.WithContext(middleware.WithSession(reqKit.Context(), sess)))
-	if wKit.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for kit, got %d", wKit.Code)
-	}
-
-	// 4. Assert that exactly 1 connection exists in DB
+	// 3. Assert that exactly 1 connection exists in DB
 	conns, err := db.GetConnectionsByUserID(ctx, u.ID)
 	if err != nil {
 		t.Fatalf("failed to get connections: %v", err)

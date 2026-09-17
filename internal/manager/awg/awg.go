@@ -1357,16 +1357,15 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	// Apply speed limit via TC
 	applyClientSpeedLimit(ctx, client, m.resolveContainerName(ctx, client), m.interfaceName(), clientIP, speedDown, speedUp)
 
-	// Render client config and connection kit
-	clientConfig, connectionKit := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
+	// Render client config
+	clientConfig := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
 
 	return map[string]any{
-		"client_id":      clientPubKey,
-		"client_name":    clientName,
-		"client_ip":      clientIP,
-		"config":         clientConfig,
-		"connection_kit": connectionKit,
-		"awg_mimicry":    mimicry,
+		"client_id":   clientPubKey,
+		"client_name": clientName,
+		"client_ip":   clientIP,
+		"config":      clientConfig,
+		"awg_mimicry": mimicry,
 	}, nil
 }
 
@@ -1622,7 +1621,7 @@ func resolveClientIP(clients []AWGClient, existingIdx int, usedIPs []string, sub
 	return GetNextIP(usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 }
 
-func (m *AWGManager) buildClientConfig(ctx context.Context, client ssh.SSHClient, server *models.Server, serverParams map[string]string, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey string, clients []AWGClient) (string, map[string]string) {
+func (m *AWGManager) buildClientConfig(ctx context.Context, client ssh.SSHClient, server *models.Server, serverParams map[string]string, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey string, clients []AWGClient) string {
 	parsedParams := AWGParamsFromMap(convertStringMapToAny(serverParams))
 	if mimicry != "" {
 		if mp, err := cps.GenerateMimicryPackets(ctx, mimicry, "", client); err == nil {
@@ -1647,8 +1646,7 @@ func (m *AWGManager) buildClientConfig(ctx context.Context, client ssh.SSHClient
 		}
 	}
 	clientConfig := RenderClientConfig(clientPrivKey, clientIP, serverPubKey, psk, endpoint, AWGDefaults["dns1"], AWGDefaults["dns2"], parsedParams.MTU, parsedParams, ud)
-	connectionKit, _ := cps.GenerateConnectionKit(ctx, clientConfig, "", client)
-	return clientConfig, connectionKit
+	return clientConfig
 }
 
 func convertStringMapToAny(m map[string]string) map[string]any {

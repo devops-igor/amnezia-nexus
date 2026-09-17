@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -182,54 +180,6 @@ func (h *Handlers) Translate(r *http.Request, key string) string {
 func GenerateVPNLink(configText string) string {
 	b64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(configText)))
 	return fmt.Sprintf("vpn://%s", b64)
-}
-
-// BuildConnectionKitZip generates a ZIP archive byte slice containing client config files and metadata.
-func BuildConnectionKitZip(name string, configContent string, vpnLink string) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	zw := zip.NewWriter(buf)
-
-	baseName := strings.TrimSpace(name)
-	if baseName == "" {
-		baseName = "client"
-	}
-	baseName = strings.ReplaceAll(baseName, "/", "_")
-	baseName = strings.ReplaceAll(baseName, "\\", "_")
-
-	// 1. .conf file
-	confHeader := &zip.FileHeader{
-		Name:   fmt.Sprintf("%s.conf", baseName),
-		Method: zip.Deflate,
-	}
-	confWriter, err := zw.CreateHeader(confHeader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to add conf to zip: %w", err)
-	}
-	if _, err := confWriter.Write([]byte(configContent)); err != nil {
-		return nil, fmt.Errorf("failed to write conf into zip: %w", err)
-	}
-
-	// 2. .vpn link file
-	if vpnLink != "" {
-		vpnHeader := &zip.FileHeader{
-			Name:   fmt.Sprintf("%s.vpn", baseName),
-			Method: zip.Deflate,
-		}
-		vpnWriter, err := zw.CreateHeader(vpnHeader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to add vpn link to zip: %w", err)
-		}
-		if _, err := vpnWriter.Write([]byte(vpnLink)); err != nil {
-			return nil, fmt.Errorf("failed to write vpn link into zip: %w", err)
-		}
-	}
-
-	// 3. Close zip writer
-	if err := zw.Close(); err != nil {
-		return nil, fmt.Errorf("failed to finalize zip: %w", err)
-	}
-
-	return buf.Bytes(), nil
 }
 
 // GetSSHClient gets an active SSH client for the given server using the pool.

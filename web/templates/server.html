@@ -542,7 +542,6 @@
             <button class="config-tab active" onclick="switchConfigTab('conf')">{{ _ "config_tab" }}</button>
             <button class="config-tab" onclick="switchConfigTab('vpn')">{{ _ "vpn_key_tab" }}</button>
             <button class="config-tab" onclick="switchConfigTab('qr')">{{ _ "qr_code_tab" }}</button>
-            <button class="config-tab" id="tab-kit-btn" onclick="switchConfigTab('kit')">{{ _ "connection_kit" }}</button>
         </div>
 
         <!-- Config Panel -->
@@ -559,12 +558,6 @@
                     </button>
                 </div>
             </div>
-        </div>
-
-        <!-- Connection Kit Panel -->
-        <div class="config-panel" id="panel-kit">
-            <div class="form-hint" style="margin-bottom: var(--space-sm);">{{ _ "connection_kit_desc" }}</div>
-            <div id="connectionKitList" style="display: flex; flex-direction: column; gap: 0.75rem;"></div>
         </div>
 
         <!-- VPN Key Panel -->
@@ -626,30 +619,6 @@
                     {{ _ "save" }}
                 </button>
             </div>
-        </div>
-    </div>
-</div>
-
-<!-- ===== Auto Trial Modal ===== -->
-<div class="modal-backdrop" id="autoTrialModal">
-    <div class="modal" style="max-width: 600px;">
-        <div class="modal-header">
-            <h2 class="modal-title" id="autoTrialModalTitle">
-                <svg class="icon" style="margin-right:6px;"><use href="#icon-shield"></use></svg>
-                {{ _ "start_auto_trial" }}
-            </h2>
-            <button class="modal-close" onclick="closeModal('autoTrialModal')" aria-label="{{ _ "cancel" }}">
-                <svg class="icon"><use href="#icon-x"></use></svg>
-            </button>
-        </div>
-        <div style="margin-bottom: var(--space-md);">
-            <div class="form-hint" style="margin-bottom: var(--space-md);">
-                Real AmneziaWG health check & Auto Trial mimicry profiles. Download or copy profile configurations to test connectivity against this server.
-            </div>
-            <div id="autoTrialList" style="display: flex; flex-direction: column; gap: 0.75rem;"></div>
-        </div>
-        <div class="modal-footer">
-            <button type="button" class="btn btn-primary" onclick="closeModal('autoTrialModal')">{{ _ "done" }}</button>
         </div>
     </div>
 </div>
@@ -1372,7 +1341,6 @@
 
                 const toggleTitle = enabled ? _('stop') : _('starting');
                 const awgSpeedBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="openEditSpeedLimitModal(this.dataset.cid)" title="${_('edit_speed_limit')}"><svg class="icon"><use href="#icon-settings"></use></svg></button>` : '';
-                const awgTrialBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" onclick="startAutoTrial(this.dataset.cid, this.dataset.cname)" title="${_('start_auto_trial')}"><svg class="icon"><use href="#icon-shield"></use></svg></button>` : '';
                 const awgRotateBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="rotateClientMimicry(this.dataset.cid)" title="${_('rotate_profile')}"><svg class="icon"><use href="#icon-refresh"></use></svg></button>` : '';
 
                 const tr = document.createElement('tr');
@@ -1406,7 +1374,6 @@
                                 <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
                             ${awgSpeedBtn}
-                            ${awgTrialBtn}
                             ${awgRotateBtn}
                             ${proto === 'telemt' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>` : ''}
                             <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
@@ -1453,49 +1420,6 @@
                 await UI.copy(result.config, btnEl);
             } else {
                 UI.toast(_('config_unavailable') || 'Config unavailable', 'warning');
-            }
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function startAutoTrial(clientId, connName) {
-        try {
-            UI.toast(_('loading'), 'info');
-            const res = await API.post(`/api/servers/${SERVER_ID}/connections/kit`, {
-                protocol: 'awg',
-                client_id: clientId,
-            });
-            if (res.kit) {
-                const kit = res.kit;
-                const trialList = document.getElementById('autoTrialList');
-                if (trialList) {
-                    trialList.innerHTML = '';
-                    for (const [protoKey, confText] of Object.entries(kit)) {
-                        const item = document.createElement('div');
-                        item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
-                        item.innerHTML = `
-                            <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
-                                <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${UI.escapeHtml(protoKey)} Profile</span>
-                                <div class="flex gap-sm">
-                                    <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">
-                                        <svg class="icon"><use href="#icon-copy"></use></svg> ${_('copy')}
-                                    </button>
-                                    <button type="button" class="btn btn-primary btn-sm btn-kit-dl">
-                                        <svg class="icon"><use href="#icon-download"></use></svg> ${_('download')}
-                                    </button>
-                                </div>
-                            </div>
-                            <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${UI.escapeHtml(confText)}</code></pre>
-                        `;
-                        const copyBtn = item.querySelector('.btn-kit-copy');
-                        copyBtn.onclick = () => UI.copy(confText, copyBtn);
-                        item.querySelector('.btn-kit-dl').onclick = () => UI.downloadFile(confText, `${connName || 'trial'}_${protoKey}.conf`);
-                        trialList.appendChild(item);
-                    }
-                }
-                document.getElementById('autoTrialModalTitle').innerHTML = `<svg class="icon" style="margin-right:6px;"><use href="#icon-shield"></use></svg> ${_('start_auto_trial')} — ${UI.escapeHtml(connName || 'Connection')}`;
-                openModal('autoTrialModal');
             }
         } catch (err) {
             UI.toast(_('error') + ': ' + err.message, 'error');
@@ -1568,12 +1492,6 @@
                     document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
                     document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
                     document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
-                    if (proto === 'awg' && result.client_id) {
-                        document.getElementById('tab-kit-btn').style.display = '';
-                        loadConnectionKit(result.client_id, connName || 'Connection');
-                    } else {
-                        document.getElementById('tab-kit-btn').style.display = 'none';
-                    }
                     switchConfigTab('conf');
                     openModal('configModal');
                     generateQR(result.config);
@@ -1669,44 +1587,6 @@
         }
     }
 
-    async function loadConnectionKit(clientId, connName) {
-        const kitList = document.getElementById('connectionKitList');
-        if (!kitList) return;
-        kitList.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem;">Loading profiles...</div>';
-        try {
-            const res = await API.post(`/api/servers/${SERVER_ID}/connections/kit`, {
-                protocol: 'awg', client_id: clientId
-            });
-            if (res.kit) {
-                kitList.innerHTML = '';
-                for (const [protoKey, confText] of Object.entries(res.kit)) {
-                    const item = document.createElement('div');
-                    item.style.cssText = 'background: var(--bg-primary, rgba(0,0,0,0.2)); padding: 0.75rem; border-radius: var(--radius-sm, 6px); border: 1px solid var(--border-color, rgba(255,255,255,0.08));';
-                    item.innerHTML = `
-                        <div class="flex items-center justify-between" style="margin-bottom: 0.5rem;">
-                            <span style="font-weight: 600; text-transform: uppercase; font-size: 0.85rem;">🛡 ${UI.escapeHtml(protoKey)} Profile</span>
-                            <div class="flex gap-sm">
-                                <button type="button" class="btn btn-secondary btn-sm btn-kit-copy">
-                                    <svg class="icon"><use href="#icon-copy"></use></svg> ${_('copy')}
-                                </button>
-                                <button type="button" class="btn btn-primary btn-sm btn-kit-dl">
-                                    <svg class="icon"><use href="#icon-download"></use></svg> ${_('download')}
-                                </button>
-                            </div>
-                        </div>
-                        <pre style="font-size: 0.72rem; max-height: 80px; overflow-y: auto; margin: 0; background: rgba(0,0,0,0.15); padding: 0.5rem; border-radius: 4px;"><code>${UI.escapeHtml(confText)}</code></pre>
-                    `;
-                    const copyBtn = item.querySelector('.btn-kit-copy');
-                    copyBtn.onclick = () => UI.copy(confText, copyBtn);
-                    item.querySelector('.btn-kit-dl').onclick = () => UI.downloadFile(confText, `${connName}_${protoKey}.conf`);
-                    kitList.appendChild(item);
-                }
-            }
-        } catch (err) {
-            kitList.innerHTML = `<div style="color: var(--color-danger, #ef4444); font-size: 0.85rem;">${err.message}</div>`;
-        }
-    }
-
     async function showConnectionConfig(clientId, connName, hasKey) {
         const proto = document.getElementById('connProtoSelect').value;
 
@@ -1714,13 +1594,6 @@
         document.getElementById('panel-qr').style.display = '';
         document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
         document.querySelectorAll('.config-tab')[2].style.display = '';
-
-        if (proto === 'awg') {
-            document.getElementById('tab-kit-btn').style.display = '';
-            loadConnectionKit(clientId, connName);
-        } else {
-            document.getElementById('tab-kit-btn').style.display = 'none';
-        }
 
         document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
 
@@ -1733,7 +1606,6 @@
             document.getElementById('vpnLinkText').textContent = '';
             document.getElementById('panel-vpn').style.display = 'none';
             document.getElementById('panel-qr').style.display = 'none';
-            document.getElementById('tab-kit-btn').style.display = 'none';
             document.querySelectorAll('.config-tab')[1].style.display = 'none';
             document.querySelectorAll('.config-tab')[2].style.display = 'none';
             switchConfigTab('conf');
@@ -1780,8 +1652,8 @@
         document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
         const tabs = document.querySelectorAll('.config-tab');
-        const panels = { conf: 'panel-conf', vpn: 'panel-vpn', qr: 'panel-qr', kit: 'panel-kit' };
-        const tabIdx = { conf: 0, vpn: 1, qr: 2, kit: 3 };
+        const panels = { conf: 'panel-conf', vpn: 'panel-vpn', qr: 'panel-qr' };
+        const tabIdx = { conf: 0, vpn: 1, qr: 2 };
         if (tabs[tabIdx[tab]]) tabs[tabIdx[tab]].classList.add('active');
         if (document.getElementById(panels[tab])) document.getElementById(panels[tab]).classList.add('active');
     }

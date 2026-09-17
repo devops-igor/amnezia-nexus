@@ -3,12 +3,9 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -282,99 +279,6 @@ func (h *Handlers) AutoTrialHandler(w http.ResponseWriter, r *http.Request) {
 		"trials":   trials,
 		"profiles": trials,
 	})
-}
-
-// GetServerConnectionKitHandler creates and downloads a client connection kit ZIP archive.
-func (h *Handlers) GetServerConnectionKitHandler(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerID(r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
-		return
-	}
-
-	var req struct {
-		ClientID string `json:"client_id"`
-		Protocol string `json:"protocol"`
-	}
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1048576))
-		if len(bodyBytes) > 0 {
-			_ = json.Unmarshal(bodyBytes, &req)
-			if req.ClientID == "" {
-				vals, _ := url.ParseQuery(string(bodyBytes))
-				req.ClientID = vals.Get("client_id")
-				req.Protocol = vals.Get("protocol")
-			}
-		}
-	}
-	if req.ClientID == "" {
-		req.ClientID = r.URL.Query().Get("client_id")
-	}
-	if req.Protocol == "" {
-		req.Protocol = r.URL.Query().Get("protocol")
-	}
-
-	if req.ClientID == "" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "client_id is required")
-		return
-	}
-	if req.Protocol == "" {
-		req.Protocol = "awg"
-	}
-	req.Protocol = models.NormalizeProtocol(req.Protocol)
-
-	ctx := r.Context()
-	sess := h.GetSession(r)
-	if sess != nil && sess.Role == models.RoleUser {
-		// Verify ownership
-		userConns, _ := h.db.GetConnectionsByUserID(ctx, sess.UserID)
-		owned := false
-		for _, c := range userConns {
-			if c.ServerID == serverID && (c.ClientID == req.ClientID || c.ID == req.ClientID) {
-				owned = true
-				break
-			}
-		}
-		if !owned {
-			h.JSONError(w, http.StatusForbidden, "forbidden", "Forbidden")
-			return
-		}
-	}
-
-	if serverID == 0 {
-		h.getServerConnectionKitZero(ctx, w, req.ClientID)
-		return
-	}
-
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
-	protoMgr, err := h.GetProtocolManager(req.Protocol)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
-		return
-	}
-
-	configStr, err := protoMgr.GetClientConfig(ctx, server, req.ClientID)
-	if err != nil {
-		h.handleClientConfigError(w, err)
-		return
-	}
-
-	vpnLink := GenerateVPNLink(configStr)
-	zipBytes, err := BuildConnectionKitZip(req.ClientID, configStr, vpnLink)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to build connection kit archive")
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"connection-%s.zip\"", req.ClientID))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(zipBytes)
 }
 
 // RemoveServerConnectionHandler deletes a client connection from the server and DB.
@@ -738,46 +642,6 @@ func (h *Handlers) GetProtocolClientsHandler(w http.ResponseWriter, r *http.Requ
 		"status":  "ok",
 		"clients": filtered,
 	})
-}
-
-func (h *Handlers) getServerConnectionKitZero(ctx context.Context, w http.ResponseWriter, clientID string) {
-	if h.vpnSvc == nil {
-		h.JSONError(w, http.StatusServiceUnavailable, "vpn_unavailable", "VPN load balancer is not available")
-		return
-	}
-
-	conn, err := h.db.GetConnectionByClientID(ctx, clientID, 0)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to query connection: "+err.Error())
-		return
-	}
-	if conn == nil {
-		if cByID, errID := h.db.GetConnection(ctx, clientID); errID == nil && cByID != nil && cByID.ServerID == 0 {
-			conn = cByID
-		}
-	}
-	if conn == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
-		return
-	}
-
-	configStr, _, err := h.vpnSvc.GenerateClientConfigForConnection(ctx, conn.UserID, conn.ID)
-	if err != nil {
-		h.handleClientConfigError(w, err)
-		return
-	}
-
-	vpnLink := GenerateVPNLink(configStr)
-	zipBytes, err := BuildConnectionKitZip(clientID, configStr, vpnLink)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to build connection kit archive")
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"connection-%s.zip\"", clientID))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(zipBytes)
 }
 
 func (h *Handlers) getServerConnectionConfigZero(ctx context.Context, w http.ResponseWriter, clientID string) {

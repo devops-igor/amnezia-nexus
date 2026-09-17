@@ -209,7 +209,7 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("User Connection Config and Kit Handlers", func(t *testing.T) {
+	t.Run("User Connection Config and Rename Handlers", func(t *testing.T) {
 		// Re-create connection for user
 		newC := &models.UserConnection{
 			ID:         "conn-cfg-test",
@@ -246,16 +246,6 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 			t.Errorf("expected 404 for missing connection config, got %d", wMissing.Code)
 		}
 
-		// UserGetConnectionKitHandler
-		reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/kit", newC.ID), nil)
-		reqKit = reqKit.WithContext(context.WithValue(reqKit.Context(), chi.RouteCtxKey, rctxCfg))
-		reqKit = reqKit.WithContext(middleware.WithSession(reqKit.Context(), sess))
-		wKit := httptest.NewRecorder()
-		h.UserGetConnectionKitHandler(wKit, reqKit)
-		if wKit.Code != http.StatusOK {
-			t.Errorf("expected 200 for user connection kit, got %d", wKit.Code)
-		}
-
 		// UserRenameConnectionHandler
 		bodyRename, _ := json.Marshal(models.RenameConnectionRequest{Name: "Super New Name"})
 		reqRename := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/connections/%s/rename", newC.ID), bytes.NewReader(bodyRename))
@@ -267,17 +257,9 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 			t.Errorf("expected 200 for user rename connection, got %d", wRename.Code)
 		}
 
-		// Server connection kit and config
-		reqSrvKit := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/connections/kit?client_id=%s&protocol=awg", sID, newC.ClientID), nil)
+		// Server connection config
 		rctxSrv := chi.NewRouteContext()
 		rctxSrv.URLParams.Add("server_id", fmt.Sprintf("%d", sID))
-		reqSrvKit = reqSrvKit.WithContext(context.WithValue(reqSrvKit.Context(), chi.RouteCtxKey, rctxSrv))
-		wSrvKit := httptest.NewRecorder()
-		h.GetServerConnectionKitHandler(wSrvKit, reqSrvKit)
-		if wSrvKit.Code != http.StatusOK {
-			t.Errorf("expected 200 for server connection kit, got %d", wSrvKit.Code)
-		}
-
 		bodyCfg, _ := json.Marshal(models.ConnectionActionRequest{
 			ClientID: newC.ClientID,
 			Protocol: "awg",
@@ -394,25 +376,13 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("Template Rendering and Kit Builders", func(t *testing.T) {
+	t.Run("Template Rendering", func(t *testing.T) {
 		// RenderTemplate error case (non-existent template)
 		wTmpl := httptest.NewRecorder()
 		reqTmpl := httptest.NewRequest(http.MethodGet, "/", nil)
 		err := RenderTemplate(wTmpl, reqTmpl, db, "non_existent_page.html", nil)
 		if err == nil {
 			t.Errorf("expected error for missing template")
-		}
-
-		// BuildConnectionKitZip with content
-		zipBytes, err := BuildConnectionKitZip("my-telemt", "tg://proxy?server=1.2.3.4", "vpn://testlink")
-		if err != nil || len(zipBytes) == 0 {
-			t.Errorf("expected successful telemt kit zip build, got err=%v", err)
-		}
-
-		// BuildConnectionKitZip with empty name fallback
-		zipEmpty, err := BuildConnectionKitZip("", "nameserver 1.2.3.4", "")
-		if err != nil || len(zipEmpty) == 0 {
-			t.Errorf("expected successful empty name kit zip build, got err=%v", err)
 		}
 	})
 
