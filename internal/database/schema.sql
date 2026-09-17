@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS vpn_sessions (
     FOREIGN KEY (backend_tunnel_id) REFERENCES backend_tunnels(id) ON DELETE CASCADE
 );
 
+-- 11. AWG IP Allocations
+CREATE TABLE IF NOT EXISTS awg_ip_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER NOT NULL,
+    client_id TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'allocated',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(server_id, ip)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_user_connections_user_id ON user_connections(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_connections_server_id ON user_connections(server_id);
@@ -156,3 +168,5 @@ CREATE INDEX IF NOT EXISTS idx_users_remnawave_uuid ON users(remnawave_uuid);
 CREATE INDEX IF NOT EXISTS idx_backend_tunnels_server_id ON backend_tunnels(server_id);
 CREATE INDEX IF NOT EXISTS idx_vpn_sessions_user_id ON vpn_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_vpn_sessions_peer ON vpn_sessions(peer_public_key);
+CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server ON awg_ip_allocations(server_id);
+CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server_client ON awg_ip_allocations(server_id, client_id);

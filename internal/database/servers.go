@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -303,9 +304,18 @@ func (d *DB) DeleteServer(ctx context.Context, id int64) (bool, error) {
 		_ = tx.Rollback()
 	}()
 
-	_, _ = tx.ExecContext(ctx, "DELETE FROM user_connections WHERE server_id = ?", id)
-	_, _ = tx.ExecContext(ctx, "DELETE FROM known_hosts WHERE server_id = ?", id)
-	_, _ = tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE server_id = ?", id)
+	if _, err := tx.ExecContext(ctx, "DELETE FROM user_connections WHERE server_id = ?", id); err != nil {
+		slog.Warn("failed to delete user_connections for server", "server_id", id, "error", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM known_hosts WHERE server_id = ?", id); err != nil {
+		slog.Warn("failed to delete known_hosts for server", "server_id", id, "error", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE server_id = ?", id); err != nil {
+		slog.Warn("failed to delete backend_tunnels for server", "server_id", id, "error", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM awg_ip_allocations WHERE server_id = ?", id); err != nil {
+		slog.Warn("failed to delete awg_ip_allocations for server", "server_id", id, "error", err)
+	}
 
 	res, err := tx.ExecContext(ctx, "DELETE FROM servers WHERE id = ?", id)
 	if err != nil {
