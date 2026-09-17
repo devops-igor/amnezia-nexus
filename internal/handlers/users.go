@@ -45,7 +45,7 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 0 {
 		page = p
 	}
-	size := 10
+	size := 12
 	if s, err := strconv.Atoi(r.URL.Query().Get("size")); err == nil && s > 0 && s <= 100 {
 		size = s
 	}

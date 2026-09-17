@@ -1918,3 +1918,23 @@ func TestUsersTemplateServerZeroHandling(t *testing.T) {
 		t.Errorf("users.html showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
 	}
 }
+
+func TestUsersTemplatePageSize(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("failed to get templates sub FS: %v", err)
+	}
+
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+
+	if !strings.Contains(usersStr, "let pageSize = 12;") {
+		t.Errorf("users.html must configure 'let pageSize = 12;' for 3-column responsive grid layout")
+	}
+	if strings.Contains(usersStr, "let pageSize = 10;") {
+		t.Errorf("users.html must not contain obsolete 'let pageSize = 10;'")
+	}
+}
