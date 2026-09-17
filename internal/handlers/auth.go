@@ -215,10 +215,15 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create session data
+	sessionVersion := user.SessionVersion
+	if sessionVersion <= 0 {
+		sessionVersion = 1
+	}
 	sessionData := &models.SessionData{
 		UserID:                 user.ID,
 		Username:               user.Username,
 		Role:                   user.Role,
+		SessionVersion:         sessionVersion,
 		PasswordChangeRequired: user.PasswordChangeRequired,
 		ShareAuthenticated:     make(map[string]bool),
 	}
@@ -289,6 +294,7 @@ func (h *Handlers) APISetupHandler(w http.ResponseWriter, r *http.Request) {
 		Role:                   models.RoleAdmin,
 		Enabled:                true,
 		PasswordChangeRequired: false,
+		SessionVersion:         1,
 		CreatedAt:              time.Now(),
 	}
 
@@ -310,6 +316,7 @@ func (h *Handlers) APISetupHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:                 adminUser.ID,
 		Username:               adminUser.Username,
 		Role:                   adminUser.Role,
+		SessionVersion:         1,
 		PasswordChangeRequired: false,
 		ShareAuthenticated:     make(map[string]bool),
 	}
@@ -371,8 +378,15 @@ func (h *Handlers) APIChangePasswordHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Update session cookie with password_change_required = false
+	newVersion, err := h.db.BumpUserSessionVersion(ctx, user.ID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update session version")
+		return
+	}
+
+	// Update session cookie with password_change_required = false and new session_version
 	sess.PasswordChangeRequired = false
+	sess.SessionVersion = newVersion
 	if h.cfg != nil && h.cfg.SecretKey != "" {
 		_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
 	}
@@ -380,6 +394,33 @@ func (h *Handlers) APIChangePasswordHandler(w http.ResponseWriter, r *http.Reque
 	h.audit(r, "auth.change_password", map[string]any{"user_id": user.ID, "username": user.Username})
 
 	h.JSONOK(w, map[string]any{"message": "Password updated"})
+}
+
+// LogoutAllHandler invalidates all active sessions for the authenticated user and clears the session cookie.
+func (h *Handlers) LogoutAllHandler(w http.ResponseWriter, r *http.Request) {
+	sess := h.GetSession(r)
+	if sess == nil || !sess.IsAuthenticated() {
+		h.JSONError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	}
+
+	ctx := r.Context()
+	if h.db != nil {
+		if _, err := h.db.BumpUserSessionVersion(ctx, sess.UserID); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to invalidate sessions")
+			return
+		}
+	}
+
+	h.audit(r, "auth.logout_all", map[string]any{"user_id": sess.UserID, "username": sess.Username})
+	middleware.ClearSessionCookie(w)
+
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+
+	h.JSONOK(w, map[string]any{"message": "Logged out from all devices"})
 }
 
 var digitBitmaps = [10][7]uint8{

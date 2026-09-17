@@ -197,6 +197,7 @@ type User struct {
 	ExpiresAt              *time.Time           `json:"expires_at,omitempty" db:"expires_at"`
 	AWGMimicry             AWGMimicryProfile    `json:"awg_mimicry" db:"awg_mimicry"`
 	PasswordChangeRequired bool                 `json:"password_change_required" db:"password_change_required"`
+	SessionVersion         int                  `json:"session_version" db:"session_version"`
 	Limits                 map[string]any       `json:"limits,omitempty" db:"limits"`
 }
 
@@ -595,6 +596,7 @@ type SessionData struct {
 	Username               string   `json:"username,omitempty"`
 	Role                   UserRole `json:"role,omitempty"`
 	PasswordChangeRequired bool     `json:"password_change_required,omitempty"`
+	SessionVersion         int      `json:"session_version,omitempty"`
 	// CaptchaID is the opaque id of the server-side captcha challenge
 	// (issue #84). The answer itself never leaves the server.
 	CaptchaID          string          `json:"captcha_id,omitempty"`
@@ -635,6 +637,9 @@ func (s *SessionData) ToMap() map[string]any {
 	if s.PasswordChangeRequired {
 		m["password_change_required"] = true
 	}
+	if s.SessionVersion > 0 {
+		m["session_version"] = s.SessionVersion
+	}
 	if s.CaptchaID != "" {
 		m["captcha_id"] = s.CaptchaID
 	}
@@ -673,6 +678,15 @@ func SessionDataFromMap(m map[string]any) *SessionData {
 		case "password_change_required":
 			if b, ok := v.(bool); ok {
 				s.PasswordChangeRequired = b
+			}
+		case "session_version":
+			switch val := v.(type) {
+			case int:
+				s.SessionVersion = val
+			case float64:
+				s.SessionVersion = int(val)
+			case int64:
+				s.SessionVersion = int(val)
 			}
 		case "captcha_id":
 			if str, ok := v.(string); ok {

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -238,5 +239,111 @@ func TestRequireAdminOrSupport(t *testing.T) {
 	supportProtected.ServeHTTP(wAdmin, reqAdmin.WithContext(ctxAdmin))
 	if wAdmin.Code != http.StatusOK {
 		t.Errorf("expected 200 for admin role, got %d", wAdmin.Code)
+	}
+}
+
+func TestRequireAuth_SessionVersionRevocation(t *testing.T) {
+	defer SetUserLookup(nil)
+
+	dbUser := &models.User{
+		ID:             "u-revoked",
+		Username:       "bob",
+		Role:           models.RoleUser,
+		Enabled:        true,
+		SessionVersion: 2,
+	}
+
+	SetUserLookup(func(ctx context.Context, userID string) (*models.User, error) {
+		if userID == dbUser.ID {
+			return dbUser, nil
+		}
+		return nil, nil
+	})
+
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	protected := RequireAuth(okHandler)
+
+	// 1. Session with matching session_version (2 == 2) -> 200 OK
+	reqValid := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	ctxValid := WithSession(reqValid.Context(), &models.SessionData{
+		UserID:         "u-revoked",
+		Role:           models.RoleUser,
+		SessionVersion: 2,
+	})
+	wValid := httptest.NewRecorder()
+	protected.ServeHTTP(wValid, reqValid.WithContext(ctxValid))
+	if wValid.Code != http.StatusOK {
+		t.Errorf("expected 200 for matching session version, got %d", wValid.Code)
+	}
+
+	// 2. Stale session with older session_version (1 < 2) -> 401 Unauthorized + cookie cleared
+	reqStale := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	ctxStale := WithSession(reqStale.Context(), &models.SessionData{
+		UserID:         "u-revoked",
+		Role:           models.RoleUser,
+		SessionVersion: 1,
+	})
+	wStale := httptest.NewRecorder()
+	protected.ServeHTTP(wStale, reqStale.WithContext(ctxStale))
+	if wStale.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for stale session version, got %d", wStale.Code)
+	}
+	cookies := wStale.Result().Cookies()
+	cleared := false
+	for _, c := range cookies {
+		if c.Name == SessionCookieName && c.MaxAge == -1 {
+			cleared = true
+			break
+		}
+	}
+	if !cleared {
+		t.Errorf("expected session cookie to be cleared for revoked session")
+	}
+
+	// 3. Stale session on HTML page -> 302 to /login + cookie cleared
+	reqHTML := httptest.NewRequest(http.MethodGet, "/my", nil)
+	reqHTML.Header.Set("Accept", "text/html")
+	ctxHTML := WithSession(reqHTML.Context(), &models.SessionData{
+		UserID:         "u-revoked",
+		Role:           models.RoleUser,
+		SessionVersion: 1,
+	})
+	wHTML := httptest.NewRecorder()
+	protected.ServeHTTP(wHTML, reqHTML.WithContext(ctxHTML))
+	if wHTML.Code != http.StatusFound {
+		t.Errorf("expected 302 for stale session HTML request, got %d", wHTML.Code)
+	}
+	if loc := wHTML.Header().Get("Location"); loc != "/login" {
+		t.Errorf("expected redirect to /login, got %q", loc)
+	}
+
+	// 4. Legacy session without session_version (0 -> effective 1) on user with SessionVersion 2 -> 401
+	reqLegacyStale := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	ctxLegacyStale := WithSession(reqLegacyStale.Context(), &models.SessionData{
+		UserID:         "u-revoked",
+		Role:           models.RoleUser,
+		SessionVersion: 0,
+	})
+	wLegacyStale := httptest.NewRecorder()
+	protected.ServeHTTP(wLegacyStale, reqLegacyStale.WithContext(ctxLegacyStale))
+	if wLegacyStale.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for legacy session against bumped user, got %d", wLegacyStale.Code)
+	}
+
+	// 5. Legacy session without session_version (0 -> effective 1) on user with SessionVersion 1 -> 200 OK
+	dbUser.SessionVersion = 1
+	reqLegacyValid := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
+	ctxLegacyValid := WithSession(reqLegacyValid.Context(), &models.SessionData{
+		UserID:         "u-revoked",
+		Role:           models.RoleUser,
+		SessionVersion: 0,
+	})
+	wLegacyValid := httptest.NewRecorder()
+	protected.ServeHTTP(wLegacyValid, reqLegacyValid.WithContext(ctxLegacyValid))
+	if wLegacyValid.Code != http.StatusOK {
+		t.Errorf("expected 200 for legacy session against baseline user, got %d", wLegacyValid.Code)
 	}
 }

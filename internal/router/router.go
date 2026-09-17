@@ -172,6 +172,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Get("/leaderboard", h.LeaderboardPageHandler)
 	r.Get("/share/{token}", h.SharePageHandler)
 	r.Get("/logout", h.LogoutHandler)
+	r.With(middleware.RequireAuth).Get("/logout-all", h.LogoutAllHandler)
 	r.Get("/set_lang/{lang}", h.SetLangHandler)
 
 	// 5. Auth API Group
@@ -180,6 +181,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.With(middleware.RateLimit(loginLimiter)).Post("/login", h.APILoginHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/setup", h.APISetupHandler)
 		r.With(middleware.RequireAuth).Post("/change-password", h.APIChangePasswordHandler)
+		r.With(middleware.RequireAuth).Post("/logout-all", h.LogoutAllHandler)
 	})
 
 	// 6. User-facing Session Protected Pages & APIs

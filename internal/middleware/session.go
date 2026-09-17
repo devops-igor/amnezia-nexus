@@ -32,7 +32,7 @@ func SetUserLookup(fn UserLookupFunc) {
 	userLookupMu.Unlock()
 }
 
-func checkUserActive(ctx context.Context, userID string) (*models.User, bool) {
+func checkUserActive(ctx context.Context, userID string, sessionVersion int) (*models.User, bool) {
 	userLookupMu.RLock()
 	fn := userLookupFn
 	userLookupMu.RUnlock()
@@ -41,6 +41,13 @@ func checkUserActive(ctx context.Context, userID string) (*models.User, bool) {
 	}
 	u, err := fn(ctx, userID)
 	if err != nil || u == nil || !u.Enabled {
+		return nil, false
+	}
+	effectiveVersion := sessionVersion
+	if effectiveVersion <= 0 {
+		effectiveVersion = 1
+	}
+	if u.SessionVersion > 0 && effectiveVersion < u.SessionVersion {
 		return nil, false
 	}
 	return u, true
@@ -145,7 +152,7 @@ func RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		dbUser, active := checkUserActive(r.Context(), session.UserID)
+		dbUser, active := checkUserActive(r.Context(), session.UserID, session.SessionVersion)
 		if !active {
 			ClearSessionCookie(w)
 			if isAPIRequest(r) {
@@ -176,7 +183,7 @@ func RequireAdmin(next http.Handler) http.Handler {
 			return
 		}
 
-		dbUser, active := checkUserActive(r.Context(), session.UserID)
+		dbUser, active := checkUserActive(r.Context(), session.UserID, session.SessionVersion)
 		if !active {
 			ClearSessionCookie(w)
 			if isAPIRequest(r) {
@@ -211,7 +218,7 @@ func RequireAdminOrSupport(next http.Handler) http.Handler {
 			return
 		}
 
-		dbUser, active := checkUserActive(r.Context(), session.UserID)
+		dbUser, active := checkUserActive(r.Context(), session.UserID, session.SessionVersion)
 		if !active {
 			ClearSessionCookie(w)
 			if isAPIRequest(r) {
