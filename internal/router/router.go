@@ -180,6 +180,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.With(middleware.RateLimit(loginLimiter)).Post("/login", h.APILoginHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/setup", h.APISetupHandler)
 		r.With(middleware.RequireAuth).Post("/change-password", h.APIChangePasswordHandler)
+		r.With(middleware.RequireAuth).Post("/logout-all", h.LogoutAllHandler)
 	})
 
 	// 6. User-facing Session Protected Pages & APIs

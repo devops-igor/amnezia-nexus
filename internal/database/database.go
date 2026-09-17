@@ -72,6 +72,7 @@ var (
 		"expires_at":               true,
 		"awg_mimicry":              true,
 		"password_change_required": true,
+		"session_version":          true,
 		"limits":                   true,
 	}
 
@@ -216,7 +217,42 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateUserConnectionsClientParams(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateUserSessionVersion(ctx); err != nil {
+		return err
+	}
 	return d.migrateBackendTunnelsProbePrivateKey(ctx)
+}
+
+func (d *DB) migrateUserSessionVersion(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(users)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect users schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasSessionVersion := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "session_version") {
+			hasSessionVersion = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasSessionVersion {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("failed to add session_version column to users: %w", err)
+		}
+	}
+	return nil
 }
 
 // migrateBackendTunnelsProbePrivateKey adds the probe_private_key column to
