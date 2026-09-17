@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/tc"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -716,6 +717,20 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
+	}
+
+	if req.Protocol == "awg" {
+		params, _, err := awg.ParseServerConfig(req.Config)
+		if err != nil {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+			return
+		}
+		if len(params) > 0 {
+			if err := awg.ValidateAWGParams(params); err != nil {
+				h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+				return
+			}
+		}
 	}
 
 	configPath, ok := models.ConfigPathForProtocol(req.Protocol)
