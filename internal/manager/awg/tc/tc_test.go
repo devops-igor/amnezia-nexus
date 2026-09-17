@@ -102,10 +102,24 @@ func TestPeerToClassID(t *testing.T) {
 		{"10.8.1.45", 145, false},
 		{"10.8.1.1", 101, false},
 		{"10.8.1.253", 353, false},
+		{"10.0.0.5", 105, false},
 		{"10.8.1.0", 0, true},
+		{"10.0.0.0", 0, true},
 		{"10.8.1.254", 0, true},
+		{"10.0.0.254", 0, true},
+		{"10.0.0.255", 0, true},
 		{"invalid.ip", 0, true},
 		{"10.8.1", 0, true},
+		// Strict IPv4 validation test cases
+		{"10.0.$(id).5", 0, true},
+		{"10.0.0.1; reboot", 0, true},
+		{"10.0.0.1\nreboot", 0, true},
+		{"::1", 0, true},
+		{"2001:db8::1", 0, true},
+		{"invalid", 0, true},
+		{"10.0.0.5; rm -rf /", 0, true},
+		{"256.1.1.1", 0, true},
+		{"", 0, true},
 	}
 
 	for _, tt := range tests {

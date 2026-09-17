@@ -521,11 +521,10 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if req.ClientID == "" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "client_id is required")
+	if err := req.Validate(); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
-	req.Protocol = models.NormalizeProtocol(req.Protocol)
 
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)

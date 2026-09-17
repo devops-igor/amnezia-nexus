@@ -129,7 +129,7 @@ func TestEnsureBackendRoutingAndNAT_CommandsAndValidation(t *testing.T) {
 		if !strings.Contains(joined, "iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE") {
 			t.Errorf("missing eth0 POSTROUTING MASQUERADE rule in: %s", joined)
 		}
-		if !strings.Contains(joined, "! -o amn0 -j MASQUERADE") {
+		if !strings.Contains(joined, "! -o 'amn0' -j MASQUERADE") {
 			t.Errorf("missing host-level defense-in-depth MASQUERADE rule in: %s", joined)
 		}
 
@@ -205,7 +205,7 @@ func TestEnsureBackendRoutingAndNAT_CommandsAndValidation(t *testing.T) {
 		client := newMockAWGSSHClient()
 		var cmds []string
 		client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-			if strings.Contains(cmd, "name=^amnezia-awg2$") {
+			if strings.Contains(cmd, "name=^'amnezia-awg2'$") {
 				return "amnezia-awg2\n", "", 0, nil
 			}
 			if strings.Contains(cmd, "docker ps") {
@@ -224,7 +224,7 @@ func TestEnsureBackendRoutingAndNAT_CommandsAndValidation(t *testing.T) {
 			t.Fatal("no commands executed")
 		}
 		for _, cmd := range cmds {
-			if strings.Contains(cmd, "docker exec") && !strings.Contains(cmd, "docker exec amnezia-awg2") {
+			if strings.Contains(cmd, "docker exec") && !strings.Contains(cmd, "'amnezia-awg2'") {
 				t.Errorf("expected container command to target amnezia-awg2, got: %s", cmd)
 			}
 		}
@@ -339,7 +339,7 @@ func TestAddClient_EnsuresBackendNATRule(t *testing.T) {
 	if len(natCmds) == 0 {
 		t.Fatal("AddClient did not issue the backend NAT ensure command")
 	}
-	if !strings.Contains(natCmds[0], "docker exec amnezia-awg2") || !strings.Contains(natCmds[0], "iptables -t nat") {
+	if !strings.Contains(natCmds[0], "'amnezia-awg2'") || !strings.Contains(natCmds[0], "iptables -t nat") {
 		t.Errorf("NAT command should run inside the resolved container: %s", natCmds[0])
 	}
 }
@@ -351,10 +351,10 @@ func TestAddClient_EnsuresBackendNATRule_LegacyContainer(t *testing.T) {
 	client := newMockAWGSSHClient()
 	var natCmds []string
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg$") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg'$") {
 			return "amnezia-awg\n", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg2'$") {
 			return "", "", 0, nil
 		}
 		if strings.Contains(cmd, "iptables -t nat -C POSTROUTING") {
@@ -378,7 +378,7 @@ func TestAddClient_EnsuresBackendNATRule_LegacyContainer(t *testing.T) {
 	if len(natCmds) == 0 {
 		t.Fatal("AddClient did not issue the backend NAT ensure command")
 	}
-	if !strings.Contains(natCmds[0], "docker exec amnezia-awg") || !strings.Contains(natCmds[0], "iptables -t nat") {
+	if !strings.Contains(natCmds[0], "'amnezia-awg'") || !strings.Contains(natCmds[0], "iptables -t nat") {
 		t.Errorf("NAT command should run inside legacy resolved container amnezia-awg: %s", natCmds[0])
 	}
 }
@@ -478,7 +478,7 @@ func TestEnsureBackendRoutingAndNAT_BatchedCompoundExecution(t *testing.T) {
 
 	cmd := dockerExecCmds[0]
 	// Verify it targets resolved container amnezia-awg2
-	if !strings.Contains(cmd, "docker exec amnezia-awg2 bash -c '") {
+	if !strings.Contains(cmd, "docker exec 'amnezia-awg2' bash -c") {
 		t.Errorf("expected command to target amnezia-awg2 via bash -c, got: %s", cmd)
 	}
 

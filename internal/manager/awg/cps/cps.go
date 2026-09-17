@@ -282,7 +282,7 @@ func SelectMimicryDomain(ctx context.Context, sshClient ssh.SSHClient, protocol 
 	}
 
 	for _, domain := range candidates[:limit] {
-		cmd := fmt.Sprintf("timeout 2 bash -c 'echo > /dev/tcp/%s/%d' 2>/dev/null && echo OK || echo FAIL", domain, port)
+		cmd := fmt.Sprintf("timeout 2 bash -c %s 2>/dev/null && echo OK || echo FAIL", ssh.EscapeShellArg(fmt.Sprintf("echo > /dev/tcp/%s/%d", domain, port)))
 		stdout, _, _, err := sshClient.RunCommand(ctx, cmd)
 		if err == nil && strings.Contains(stdout, "OK") {
 			return domain, nil

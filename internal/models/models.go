@@ -371,6 +371,14 @@ var (
 	SetupUsernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 	TLSDomainRegex     = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,126}[a-zA-Z0-9])?$|^[a-zA-Z0-9]$`)
 	HostnameRegex      = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,253}[a-zA-Z0-9])?$|^[a-zA-Z0-9]$`)
+	// shellMetacharRegex matches characters that are dangerous if interpolated
+	// into a shell command: control characters (0x00-0x1f, 0x7f), and shell
+	// metacharacters: ; | & $ ` ( ) < > { } ! # \ " ' and backslash.
+	// Everything else — including Unicode letters — is allowed, because
+	// ClientName never reaches a shell directly; it is written into JSON and
+	// uploaded via SFTP. The reject-list blocks injection chars while keeping
+	// non-Latin names (Cyrillic, Arabic, CJK, etc.) working.
+	shellMetacharRegex = regexp.MustCompile("[\\x00-\\x1f\\x7f;|&$`()<>{}!#\\\\\"']")
 )
 
 // ValidatePasswordComplexity enforces password strength rules.
@@ -413,6 +421,25 @@ func ValidateHost(host string) error {
 func ValidateTLSDomain(domain string) error {
 	if !TLSDomainRegex.MatchString(domain) {
 		return errors.New("tls_domain must be 1-128 chars, alphanumeric/dots/hyphens/underscores only")
+	}
+	return nil
+}
+
+// ValidateIdentifierName checks that name is non-empty, within length limits,
+// free of null bytes, and free of shell metacharacters. Used by request
+// Validate() methods for connection/client/server names.
+func ValidateIdentifierName(name string) error {
+	if strings.Contains(name, "\x00") {
+		return errors.New("name cannot contain null bytes")
+	}
+	if name == "" {
+		return errors.New("name must be between 1 and 255 characters")
+	}
+	if len(name) > 255 {
+		return errors.New("name must be between 1 and 255 characters")
+	}
+	if shellMetacharRegex.MatchString(name) {
+		return errors.New("name contains invalid characters; shell metacharacters and control characters are not allowed")
 	}
 	return nil
 }
@@ -511,11 +538,8 @@ type RenameServerRequest struct {
 
 func (r *RenameServerRequest) Validate() error {
 	r.Name = strings.TrimSpace(r.Name)
-	if strings.Contains(r.Name, "\x00") {
-		return errors.New("name cannot contain null bytes")
-	}
-	if r.Name == "" || len(r.Name) > 255 {
-		return errors.New("name must be between 1 and 255 characters")
+	if err := ValidateIdentifierName(r.Name); err != nil {
+		return err
 	}
 	return nil
 }
@@ -760,8 +784,8 @@ func (r *AddConnectionRequest) Validate() error {
 		return fmt.Errorf("invalid protocol: %s", r.Protocol)
 	}
 	r.Name = strings.TrimSpace(r.Name)
-	if r.Name == "" || len(r.Name) > 255 {
-		return errors.New("name must be between 1 and 255 characters")
+	if err := ValidateIdentifierName(r.Name); err != nil {
+		return err
 	}
 	return nil
 }
@@ -796,8 +820,8 @@ func (r *MyAddConnectionRequest) Validate() error {
 		return errors.New("server_id must be greater than 0")
 	}
 	r.Name = strings.TrimSpace(r.Name)
-	if r.Name == "" || len(r.Name) > 255 {
-		return errors.New("name must be between 1 and 255 characters")
+	if err := ValidateIdentifierName(r.Name); err != nil {
+		return err
 	}
 	return nil
 }
@@ -823,8 +847,8 @@ func (r *AddUserConnectionRequest) Validate() error {
 		return fmt.Errorf("invalid protocol: %s", r.Protocol)
 	}
 	r.Name = strings.TrimSpace(r.Name)
-	if r.Name == "" || len(r.Name) > 255 {
-		return errors.New("name must be between 1 and 255 characters")
+	if err := ValidateIdentifierName(r.Name); err != nil {
+		return err
 	}
 	return nil
 }
@@ -843,6 +867,31 @@ type EditConnectionRequest struct {
 	AWGMimicry        *string `json:"awg_mimicry,omitempty"`
 }
 
+// Validate checks the EditConnectionRequest fields for protocol validity and,
+// when Name is provided, ensures it contains only safe identifier characters.
+// Protocol validation is conditional: if Protocol is empty, the check is
+// skipped to preserve backward compatibility (edit requests that only update
+// name or limits don't need to re-specify the protocol).
+func (r *EditConnectionRequest) Validate() error {
+	if r.Protocol != "" {
+		r.Protocol = NormalizeProtocol(r.Protocol)
+		if !IsValidProtocol(r.Protocol) {
+			return fmt.Errorf("invalid protocol: %s", r.Protocol)
+		}
+	}
+	if r.ClientID == "" {
+		return errors.New("client_id is required")
+	}
+	if r.Name != nil {
+		name := strings.TrimSpace(*r.Name)
+		if err := ValidateIdentifierName(name); err != nil {
+			return err
+		}
+		r.Name = &name
+	}
+	return nil
+}
+
 // RenameConnectionRequest defines connection rename payload.
 type RenameConnectionRequest struct {
 	Name string `json:"name"`
@@ -850,11 +899,8 @@ type RenameConnectionRequest struct {
 
 func (r *RenameConnectionRequest) Validate() error {
 	r.Name = strings.TrimSpace(r.Name)
-	if strings.Contains(r.Name, "\x00") {
-		return errors.New("name cannot contain null bytes")
-	}
-	if r.Name == "" || len(r.Name) > 255 {
-		return errors.New("name must be between 1 and 255 characters")
+	if err := ValidateIdentifierName(r.Name); err != nil {
+		return err
 	}
 	return nil
 }

@@ -74,27 +74,27 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if m.sudoCmdHandler != nil {
 		return m.sudoCmdHandler(cmd)
 	}
-	if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {
 		return string(m.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 	}
-	if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable") {
 		return string(m.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 	}
-	if strings.Contains(cmd, "cat /opt/amnezia/awg/wireguard_server_public_key.key") {
+	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_server_public_key.key") {
 		return string(m.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
 	}
-	if strings.Contains(cmd, "cat /opt/amnezia/awg/wireguard_psk.key") {
+	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_psk.key") {
 		return string(m.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
 	}
-	if strings.Contains(cmd, "docker cp /tmp/_amnz_clients.json") {
+	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients.json") {
 		m.files["/opt/amnezia/awg/clientsTable"] = m.files["/tmp/_amnz_clients.json"]
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker cp /tmp/_amnz_edit_config.conf") {
+	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") {
 		m.files["/opt/amnezia/awg/awg0.conf"] = m.files["/tmp/_amnz_edit_config.conf"]
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker cp /tmp/_amnz_awg0.conf") {
+	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_awg0.conf") {
 		m.files["/opt/amnezia/awg/awg0.conf"] = m.files["/tmp/_amnz_awg0.conf"]
 		return "", "", 0, nil
 	}
@@ -123,7 +123,7 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if strings.Contains(cmd, "wireguard_psk.key") {
 		return "serverPSK1234567890123456789012345678901234=", "", 0, nil
 	}
-	if strings.Contains(cmd, "awg show all") {
+	if strings.Contains(cmd, "show all") && strings.Contains(cmd, "awg") {
 		return "peer: pubkey1\n  latest handshake: 1 minute ago\n  transfer: 1.50 MiB received, 3.20 MiB sent\n  allowed ips: 10.8.1.2/32\n", "", 0, nil
 	}
 	return "OK", "", 0, nil
@@ -515,13 +515,13 @@ func TestAWGManager_GetServerStatus_LegacyContainersAndErrors(t *testing.T) {
 	// Test with amnezia-awg2 container
 	client2 := newMockAWGSSHClient()
 	client2.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.Contains(cmd, "docker ps -a --filter name=^amnezia-awg2$") {
+		if strings.Contains(cmd, "docker ps -a --filter name=^'amnezia-awg2'$") {
 			return "amnezia-awg2\n", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker ps -a --filter") {
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg2'$") {
 			return "Up 5 hours", "", 0, nil
 		}
 		return "OK", "", 0, nil
@@ -624,7 +624,7 @@ func TestAWGManager_PublicKeyFallbackFromPrivateKeyAndPortDiscovery(t *testing.T
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 		// Mock dynamic container discovery
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") && strings.Contains(cmd, "{{.Names}}") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg2'$") && strings.Contains(cmd, "{{.Names}}") {
 			return "amnezia-awg2\n", "", 0, nil
 		}
 		// Public key file / wg show fails
@@ -931,15 +931,15 @@ DisableCookies = on
 		commandsExecuted = append(commandsExecuted, cmd)
 
 		// Any command specifically targeting "amnezia-awg" (without 2) must FAIL on Server #2
-		if strings.Contains(cmd, " amnezia-awg ") ||
-			strings.Contains(cmd, " amnezia-awg:") ||
-			strings.Contains(cmd, "name=^amnezia-awg$") ||
-			strings.Contains(cmd, "docker exec -i amnezia-awg ") {
+		if strings.Contains(cmd, "'amnezia-awg' ") ||
+			strings.Contains(cmd, "'amnezia-awg':") ||
+			strings.Contains(cmd, "name=^'amnezia-awg'$") ||
+			strings.Contains(cmd, "docker exec -i 'amnezia-awg' ") {
 			return "", "Error response from daemon: No such container: amnezia-awg", 1, errors.New("exit status 1")
 		}
 
 		// Container discovery for amnezia-awg2
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg2$") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg2'$") {
 			if strings.Contains(cmd, "{{.Names}}") {
 				return "amnezia-awg2\n", "", 0, nil
 			}
@@ -950,25 +950,25 @@ DisableCookies = on
 		}
 
 		// Reading files inside amnezia-awg2
-		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/wireguard_server_public_key.key") {
+		if strings.Contains(cmd, "'amnezia-awg2' cat '/opt/amnezia/awg/wireguard_server_public_key.key'") {
 			return string(mockClient.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/wireguard_psk.key") {
+		if strings.Contains(cmd, "'amnezia-awg2' cat '/opt/amnezia/awg/wireguard_psk.key'") {
 			return string(mockClient.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "'amnezia-awg2' cat '/opt/amnezia/awg/awg0.conf'") {
 			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "amnezia-awg2 cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "'amnezia-awg2' cat '/opt/amnezia/awg/clientsTable'") {
 			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
 
 		// docker cp to amnezia-awg2
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_edit_config.conf amnezia-awg2:/opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "docker cp '/tmp/_amnz_edit_config.conf' 'amnezia-awg2':'/opt/amnezia/awg/awg0.conf'") {
 			mockClient.files["/opt/amnezia/awg/awg0.conf"] = mockClient.files["/tmp/_amnz_edit_config.conf"]
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_clients.json amnezia-awg2:/opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "docker cp '/tmp/_amnz_clients.json' 'amnezia-awg2':'/opt/amnezia/awg/clientsTable'") {
 			mockClient.files["/opt/amnezia/awg/clientsTable"] = mockClient.files["/tmp/_amnz_clients.json"]
 			return "", "", 0, nil
 		}
@@ -1090,10 +1090,10 @@ ListenPort = 55424
 		if strings.Contains(cmd, "wireguard_server_public_key.key") || strings.Contains(cmd, "public-key") {
 			return "", "file not found", 1, errors.New("exit status 1")
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {
 			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable") {
 			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
 		return "OK", "", 0, nil
@@ -1164,10 +1164,10 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 	var syncCmdExecuted string
 
 	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.Contains(cmd, "test -f /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "test -f") && strings.Contains(cmd, "awg0.conf") && strings.Contains(cmd, "opt/amnezia/awg") {
 			return "", "No such file", 1, errors.New("exit status 1")
 		}
-		if strings.Contains(cmd, "test -f /etc/amnezia/amneziawg/awg0.conf") {
+		if strings.Contains(cmd, "test -f") && strings.Contains(cmd, "etc/amnezia/amneziawg") {
 			return "", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") {
@@ -1178,13 +1178,13 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 			syncCmdExecuted = cmd
 			return "OK", "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /etc/amnezia/amneziawg/awg0.conf") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "etc/amnezia/amneziawg/awg0.conf") {
 			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "opt/amnezia/awg/awg0.conf") {
 			return "", "No such file", 1, errors.New("exit status 1")
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable") {
 			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
 		if strings.Contains(cmd, "wireguard_server_public_key.key") {
@@ -1244,7 +1244,7 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 
 	pullIdx, buildIdx := -1, -1
 	for i, cmd := range commands {
-		if strings.HasPrefix(cmd, "docker pull "+awgBaseImage) && pullIdx == -1 {
+		if strings.HasPrefix(cmd, "docker pull '"+awgBaseImage+"'") && pullIdx == -1 {
 			pullIdx = i
 		}
 		if strings.Contains(cmd, "docker build") && buildIdx == -1 {
@@ -1265,7 +1265,7 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 func TestBuildAndRunAWGContainer_PullFailureAborts(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.HasPrefix(cmd, "docker pull ") {
+		if strings.HasPrefix(cmd, "docker pull '") {
 			return "", "manifest unknown", 1, nil
 		}
 		if strings.Contains(cmd, "docker build") {
@@ -1382,10 +1382,10 @@ H1 = 12345
 		t.Run(tc.name, func(t *testing.T) {
 			client := newMockAWGSSHClient()
 			client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-				if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+				if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {
 					return tc.conf, "", 0, nil
 				}
-				if strings.Contains(cmd, "awg --version") {
+				if strings.Contains(cmd, "awg") && strings.Contains(cmd, "--version") {
 					return "wireguard-go version 0.0.20230223-amneziawg\n", "", 0, nil
 				}
 				if strings.Contains(cmd, "docker ps --filter") {
@@ -1416,7 +1416,7 @@ H1 = 12345
 func TestGetServerStatus_AWGVersionNonFatal(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.Contains(cmd, "awg --version") {
+		if strings.Contains(cmd, "awg") && strings.Contains(cmd, "--version") {
 			return "", "command not found", 127, nil
 		}
 		if strings.Contains(cmd, "docker ps --filter") {
@@ -1482,37 +1482,37 @@ func TestInstall_CreatesAWG2Container_CommandsAndConfig(t *testing.T) {
 		t.Fatalf("Dockerfile was not uploaded to /opt/amnezia/amnezia-awg2/Dockerfile")
 	}
 	if !strings.Contains(string(dockerfileBytes), "FROM "+awgBaseImage) {
-		t.Errorf("Dockerfile missing pinned base image")
+		t.Errorf("Dockerfile missing pinned base image (got Dockerfile without FROM %s)", awgBaseImage)
 	}
 
 	// 2. Verify command sequence targets amnezia-awg2
 	var foundPull, foundBuild, foundRun, foundNetwork, foundKeygen, foundCpConf, foundCpStart, foundChmod, foundRestart bool
 	for _, cmd := range commandsRun {
-		if strings.HasPrefix(cmd, "docker pull "+awgBaseImage) {
+		if strings.HasPrefix(cmd, "docker pull '"+awgBaseImage+"'") {
 			foundPull = true
 		}
-		if strings.Contains(cmd, "docker build --no-cache -t amnezia-awg2 /opt/amnezia/amnezia-awg2") {
+		if strings.Contains(cmd, "docker build --no-cache -t 'amnezia-awg2'") {
 			foundBuild = true
 		}
-		if strings.Contains(cmd, "docker run -d") && strings.Contains(cmd, "--name amnezia-awg2") && strings.Contains(cmd, "amnezia-awg2") {
+		if strings.Contains(cmd, "docker run -d") && strings.Contains(cmd, "--name 'amnezia-awg2'") && strings.Contains(cmd, "'amnezia-awg2'") {
 			foundRun = true
 		}
-		if strings.Contains(cmd, "docker network connect amnezia-dns-net amnezia-awg2") {
+		if strings.Contains(cmd, "docker network connect amnezia-dns-net 'amnezia-awg2'") {
 			foundNetwork = true
 		}
-		if strings.Contains(cmd, "docker exec -i amnezia-awg2 bash -c") && strings.Contains(cmd, "wireguard_server_private_key.key") {
+		if strings.Contains(cmd, "docker exec -i 'amnezia-awg2' bash -c") && strings.Contains(cmd, "wireguard_server_private_key.key") {
 			foundKeygen = true
 		}
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_awg0.conf amnezia-awg2:/opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "docker cp '/tmp/_amnz_awg0.conf' 'amnezia-awg2':'/opt/amnezia/awg/awg0.conf'") {
 			foundCpConf = true
 		}
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_start.sh amnezia-awg2:/opt/amnezia/start.sh") {
+		if strings.Contains(cmd, "docker cp '/tmp/_amnz_start.sh' 'amnezia-awg2':'/opt/amnezia/start.sh'") {
 			foundCpStart = true
 		}
-		if strings.Contains(cmd, "docker exec amnezia-awg2 chmod +x /opt/amnezia/start.sh") {
+		if strings.Contains(cmd, "docker exec 'amnezia-awg2' chmod +x /opt/amnezia/start.sh") {
 			foundChmod = true
 		}
-		if strings.Contains(cmd, "docker restart amnezia-awg2") {
+		if strings.Contains(cmd, "docker restart 'amnezia-awg2'") {
 			foundRestart = true
 		}
 	}
@@ -1565,22 +1565,22 @@ func TestUninstall_CleansUpBothAWGAndAWG2(t *testing.T) {
 
 	var stoppedAwg, stoppedAwg2, rmAwg, rmAwg2, rmiAwg, rmiAwg2, rmDirs bool
 	for _, cmd := range commandsRun {
-		if strings.Contains(cmd, "docker stop amnezia-awg ") || strings.HasSuffix(cmd, "docker stop amnezia-awg") {
+		if strings.Contains(cmd, "docker stop 'amnezia-awg'") {
 			stoppedAwg = true
 		}
-		if strings.Contains(cmd, "docker stop amnezia-awg2 ") || strings.HasSuffix(cmd, "docker stop amnezia-awg2") {
+		if strings.Contains(cmd, "docker stop 'amnezia-awg2'") {
 			stoppedAwg2 = true
 		}
-		if strings.Contains(cmd, "docker rm -fv amnezia-awg ") || strings.HasSuffix(cmd, "docker rm -fv amnezia-awg") {
+		if strings.Contains(cmd, "docker rm -fv 'amnezia-awg'") {
 			rmAwg = true
 		}
-		if strings.Contains(cmd, "docker rm -fv amnezia-awg2 ") || strings.HasSuffix(cmd, "docker rm -fv amnezia-awg2") {
+		if strings.Contains(cmd, "docker rm -fv 'amnezia-awg2'") {
 			rmAwg2 = true
 		}
-		if strings.Contains(cmd, "docker rmi amnezia-awg ") || strings.HasSuffix(cmd, "docker rmi amnezia-awg") {
+		if strings.Contains(cmd, "docker rmi 'amnezia-awg'") {
 			rmiAwg = true
 		}
-		if strings.Contains(cmd, "docker rmi amnezia-awg2 ") || strings.HasSuffix(cmd, "docker rmi amnezia-awg2") {
+		if strings.Contains(cmd, "docker rmi 'amnezia-awg2'") {
 			rmiAwg2 = true
 		}
 		if strings.Contains(cmd, "rm -rf /opt/amnezia/amnezia-awg /opt/amnezia/amnezia-awg2 /opt/amnezia/awg") {
@@ -1616,13 +1616,13 @@ func TestBackwardCompatibility_LegacyAmneziaAWGContainer(t *testing.T) {
 		}
 
 		// amnezia-awg exists and is running
-		if strings.Contains(cmd, "docker ps --filter name=^amnezia-awg$") {
+		if strings.Contains(cmd, "docker ps --filter name=^'amnezia-awg'$") {
 			if strings.Contains(cmd, "{{.Names}}") {
 				return "amnezia-awg\n", "", 0, nil
 			}
 			return "Up 24 hours\n", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker ps -a --filter name=^amnezia-awg$") {
+		if strings.Contains(cmd, "docker ps -a --filter name=^'amnezia-awg'$") {
 			return "amnezia-awg\n", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker ps --filter name=amnezia-awg") {
@@ -1630,23 +1630,23 @@ func TestBackwardCompatibility_LegacyAmneziaAWGContainer(t *testing.T) {
 		}
 
 		// Container reads and cp for amnezia-awg
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {
 			return string(client.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable") {
 			return string(client.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/wireguard_server_public_key.key") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_server_public_key.key") {
 			return string(client.files["/opt/amnezia/awg/wireguard_server_public_key.key"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/wireguard_psk.key") {
+		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "wireguard_psk.key") {
 			return string(client.files["/opt/amnezia/awg/wireguard_psk.key"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_clients.json amnezia-awg:/opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients.json") && strings.Contains(cmd, "amnezia-awg") {
 			client.files["/opt/amnezia/awg/clientsTable"] = client.files["/tmp/_amnz_clients.json"]
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "docker cp /tmp/_amnz_edit_config.conf amnezia-awg:/opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config.conf") && strings.Contains(cmd, "amnezia-awg") {
 			client.files["/opt/amnezia/awg/awg0.conf"] = client.files["/tmp/_amnz_edit_config.conf"]
 			return "", "", 0, nil
 		}
@@ -1760,7 +1760,7 @@ func TestSaveServerConfig_SelfHealing_Success(t *testing.T) {
 		if strings.Contains(cmd, "rm -f") {
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+		if strings.Contains(cmd, "test -d") && strings.Contains(cmd, "etc/amnezia/amneziawg") {
 			return "", "", 1, nil
 		}
 		if strings.Contains(cmd, "syncconf") {
@@ -1771,7 +1771,7 @@ func TestSaveServerConfig_SelfHealing_Success(t *testing.T) {
 			// Second attempt succeeds after awg-quick up
 			return "OK", "", 0, nil
 		}
-		if strings.Contains(cmd, "ip link show awg0") {
+		if strings.Contains(cmd, "ip link show") && strings.Contains(cmd, "awg0") {
 			ipLinkShowCalled = true
 			return "", "Device \"awg0\" does not exist.", 1, nil
 		}
@@ -1812,13 +1812,13 @@ func TestSaveServerConfig_SelfHealing_AwgQuickUpFails(t *testing.T) {
 		if strings.Contains(cmd, "rm -f") {
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+		if strings.Contains(cmd, "test -d") && strings.Contains(cmd, "etc/amnezia/amneziawg") {
 			return "", "", 1, nil
 		}
 		if strings.Contains(cmd, "syncconf") {
 			return "", "Unable to retrieve current interface configuration: Protocol not supported", 1, nil
 		}
-		if strings.Contains(cmd, "ip link show awg0") {
+		if strings.Contains(cmd, "ip link show") && strings.Contains(cmd, "awg0") {
 			return "", "Device \"awg0\" does not exist.", 1, nil
 		}
 		if strings.Contains(cmd, "awg-quick up") {
@@ -1853,13 +1853,13 @@ func TestSaveServerConfig_InterfaceAlreadyUp_NoSelfHealing(t *testing.T) {
 		if strings.Contains(cmd, "rm -f") {
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "test -d /etc/amnezia/amneziawg") {
+		if strings.Contains(cmd, "test -d") && strings.Contains(cmd, "etc/amnezia/amneziawg") {
 			return "", "", 1, nil
 		}
 		if strings.Contains(cmd, "syncconf") {
 			return "", "Line 15: Syntax error in peer configuration", 1, nil
 		}
-		if strings.Contains(cmd, "ip link show awg0") {
+		if strings.Contains(cmd, "ip link show") && strings.Contains(cmd, "awg0") {
 			return "5: awg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1280 qdisc noqueue state UNKNOWN", "", 0, nil
 		}
 		if strings.Contains(cmd, "awg-quick up") {
