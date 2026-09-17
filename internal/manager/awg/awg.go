@@ -642,6 +642,16 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 }
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
+	params, _, err := ParseServerConfig(content)
+	if err != nil {
+		return fmt.Errorf("invalid server config: %w", err)
+	}
+	if len(params) > 0 {
+		if err := ValidateAWGParams(params); err != nil {
+			return fmt.Errorf("invalid AWG parameters: %w", err)
+		}
+	}
+
 	content = EnsureInterfaceTableOff(content)
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {

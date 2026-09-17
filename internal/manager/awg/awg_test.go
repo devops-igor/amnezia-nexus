@@ -1910,6 +1910,38 @@ MTU = 1280
 	}
 }
 
+func TestSaveServerConfig_RejectsOverlappingHeaderRanges(t *testing.T) {
+	ctx := context.Background()
+	sshAttempted := false
+	client := newMockAWGSSHClient()
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		sshAttempted = true
+		return "", "", 0, nil
+	}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	overlappingConfig := `[Interface]
+PrivateKey = sPriv
+Address = 10.8.1.1/24
+ListenPort = 55424
+H1 = 10000000-20000000
+H2 = 15000000-25000000
+`
+	err := mgr.saveServerConfig(ctx, client, overlappingConfig)
+	if err == nil {
+		t.Fatalf("expected error when saving server config with overlapping H1-H4 ranges, got nil")
+	}
+	if !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("expected error to mention 'overlap', got: %v", err)
+	}
+	if sshAttempted {
+		t.Errorf("saveServerConfig should have failed before executing SSH commands")
+	}
+	if _, uploaded := client.files["/tmp/_amnz_edit_config.conf"]; uploaded {
+		t.Errorf("saveServerConfig should have failed before uploading config file")
+	}
+}
+
 func TestUpsertPeerInConfig_SanitizesTableOff(t *testing.T) {
 	rawConfig := `[Interface]
 PrivateKey = sPriv

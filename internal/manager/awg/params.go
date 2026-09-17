@@ -1112,15 +1112,20 @@ func GenerateClientTimingParams() (rekeyAfterTime, rekeyTimeout, rejectAfterTime
 	return rat, rt, rej, kt, mha, pk
 }
 
-func getCaseInsensitiveParam(params map[string]string, keys ...string) string {
+func getParamKeyAndVal(params map[string]string, keys ...string) (string, string) {
 	for _, key := range keys {
 		for k, v := range params {
 			if strings.EqualFold(k, key) && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
+				return k, strings.TrimSpace(v)
 			}
 		}
 	}
-	return ""
+	return "", ""
+}
+
+func getCaseInsensitiveParam(params map[string]string, keys ...string) string {
+	_, val := getParamKeyAndVal(params, keys...)
+	return val
 }
 
 func validateNumericBounds(params map[string]string) error {
@@ -1184,25 +1189,37 @@ func validateS1S2Collision(params map[string]string) error {
 }
 
 func validateMagicHeaders(params map[string]string) error {
-	magicHeaders := []string{
-		"init_packet_magic_header",
-		"response_packet_magic_header",
-		"underload_packet_magic_header",
-		"transport_packet_magic_header",
+	headerDefs := []struct {
+		canon string
+		alias string
+	}{
+		{"init_packet_magic_header", "h1"},
+		{"response_packet_magic_header", "h2"},
+		{"underload_packet_magic_header", "h3"},
+		{"transport_packet_magic_header", "h4"},
 	}
-	for _, k := range magicHeaders {
-		val := getCaseInsensitiveParam(params, k)
+
+	var ranges [4]HeaderRange
+
+	for i, def := range headerDefs {
+		key, val := getParamKeyAndVal(params, def.canon, def.alias)
 		if val == "" {
 			continue
 		}
 		hr, err := models.ParseHeaderRange(val)
 		if err != nil {
-			return fmt.Errorf("param %s must be a valid header range, got: %s: %w", k, val, err)
+			return fmt.Errorf("param %s must be a valid header range, got: %s: %w", key, val, err)
 		}
 		if hr.Lo < 5 || uint64(hr.Hi) > 4294967295 {
-			return fmt.Errorf("param %s must be between 5 and 4294967295, got: %s", k, val)
+			return fmt.Errorf("param %s must be between 5 and 4294967295, got: %s", key, val)
 		}
+		ranges[i] = hr
 	}
+
+	if err := ValidateQuadrantDisjointness(ranges[0], ranges[1], ranges[2], ranges[3]); err != nil {
+		return err
+	}
+
 	return nil
 }
 
