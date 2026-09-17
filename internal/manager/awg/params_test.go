@@ -1305,3 +1305,142 @@ func TestValidateAWGParams_S1S2CollisionValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAWGParams_HeaderRangeOverlap(t *testing.T) {
+	overlapCases := []struct {
+		name        string
+		params      map[string]string
+		expectedErr string
+	}{
+		{
+			name: "overlap_H1_H2_canonical",
+			params: map[string]string{
+				"init_packet_magic_header":     "10000000-20000000",
+				"response_packet_magic_header": "15000000-25000000",
+			},
+			expectedErr: "header ranges H1 (10000000-20000000) and H2 (15000000-25000000) overlap",
+		},
+		{
+			name: "overlap_H2_H4_canonical",
+			params: map[string]string{
+				"response_packet_magic_header":  "30000000-40000000",
+				"transport_packet_magic_header": "35000000-45000000",
+			},
+			expectedErr: "header ranges H2 (30000000-40000000) and H4 (35000000-45000000) overlap",
+		},
+		{
+			name: "overlap_H1_H2_short_aliases",
+			params: map[string]string{
+				"h1": "10000000-20000000",
+				"h2": "15000000-25000000",
+			},
+			expectedErr: "header ranges H1 (10000000-20000000) and H2 (15000000-25000000) overlap",
+		},
+		{
+			name: "overlap_H2_H4_short_aliases",
+			params: map[string]string{
+				"h2": "30000000-40000000",
+				"h4": "35000000-45000000",
+			},
+			expectedErr: "header ranges H2 (30000000-40000000) and H4 (35000000-45000000) overlap",
+		},
+		{
+			name: "overlap_mixed_canonical_and_alias",
+			params: map[string]string{
+				"init_packet_magic_header": "10000000-20000000",
+				"h3":                       "19000000-25000000",
+			},
+			expectedErr: "header ranges H1 (10000000-20000000) and H3 (19000000-25000000) overlap",
+		},
+		{
+			name: "overlap_degenerate_single_values",
+			params: map[string]string{
+				"h1": "50000",
+				"h2": "50000",
+			},
+			expectedErr: "header ranges H1 (50000) and H2 (50000) overlap",
+		},
+		{
+			name: "overlap_degenerate_value_inside_range",
+			params: map[string]string{
+				"h1": "1000-2000",
+				"h3": "1500",
+			},
+			expectedErr: "header ranges H1 (1000-2000) and H3 (1500) overlap",
+		},
+		{
+			name: "invalid_alias_header_range_format",
+			params: map[string]string{
+				"h1": "not-a-number",
+			},
+			expectedErr: "must be a valid header range",
+		},
+		{
+			name: "invalid_alias_header_range_bounds",
+			params: map[string]string{
+				"h1": "2",
+			},
+			expectedErr: "must be between 5 and 4294967295",
+		},
+	}
+
+	for _, tc := range overlapCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateAWGParams(tc.params)
+			if err == nil {
+				t.Fatalf("expected error for params %+v, got nil", tc.params)
+			}
+			if !strings.Contains(err.Error(), tc.expectedErr) {
+				t.Errorf("expected error to contain %q, got: %v", tc.expectedErr, err)
+			}
+		})
+	}
+
+	validCases := []struct {
+		name   string
+		params map[string]string
+	}{
+		{
+			name: "valid_disjoint_canonical",
+			params: map[string]string{
+				"init_packet_magic_header":      "10000000-20000000",
+				"response_packet_magic_header":  "30000000-40000000",
+				"underload_packet_magic_header": "50000000-60000000",
+				"transport_packet_magic_header": "70000000-80000000",
+			},
+		},
+		{
+			name: "valid_disjoint_aliases",
+			params: map[string]string{
+				"h1": "10000000-20000000",
+				"h2": "30000000-40000000",
+				"h3": "50000000-60000000",
+				"h4": "70000000-80000000",
+			},
+		},
+		{
+			name: "valid_partial_disjoint",
+			params: map[string]string{
+				"h1": "10000000-20000000",
+				"h3": "50000000-60000000",
+			},
+		},
+		{
+			name: "valid_disjoint_degenerate_single_values",
+			params: map[string]string{
+				"h1": "10000",
+				"h2": "20000",
+				"h3": "30000",
+				"h4": "40000",
+			},
+		},
+	}
+
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateAWGParams(tc.params); err != nil {
+				t.Fatalf("expected nil error for valid params %+v, got: %v", tc.params, err)
+			}
+		})
+	}
+}

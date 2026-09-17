@@ -11,10 +11,20 @@ import (
 )
 
 func TestAWGClientDevice_ReadWrite(t *testing.T) {
-	pub, priv, _ := GenerateCurve25519KeyPair()
-	dev, err := NewAWGClientDevice("test-awg", "127.0.0.1:51820", priv, pub, 1340, nil)
-	if err != nil {
-		t.Fatalf("Failed to create AWGClientDevice: %v", err)
+	vtun := &VirtualTUN{
+		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
+		outPackets: make(chan []byte, 1024),
+		events:     make(chan tun.Event, 2),
+		closed:     make(chan struct{}),
+		mtu:        1340,
+		name:       "test-awg",
+	}
+	dev := &AWGClientDevice{
+		name:      "test-awg",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
 	}
 	defer dev.Close()
 

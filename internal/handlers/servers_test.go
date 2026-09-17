@@ -441,6 +441,39 @@ func TestServerHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("SaveServerConfigHandler Rejects Overlapping AWG Headers", func(t *testing.T) {
+		overlappingConf := "[Interface]\nPrivateKey = aaaa\nListenPort = 55424\nH1 = 10000000-20000000\nH2 = 15000000-25000000\n"
+		body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": overlappingConf})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for overlapping header ranges in SaveServerConfigHandler, got %d", w.Code)
+		}
+		var resp map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp["error"] != "validation_failed" {
+			t.Errorf("expected error code 'validation_failed', got %v", resp["error"])
+		}
+		detail, _ := resp["detail"].(string)
+		if !strings.Contains(detail, "overlap") {
+			t.Errorf("expected detail to mention 'overlap', got %q", detail)
+		}
+	})
+
+	t.Run("SaveServerConfigHandler Accepts Disjoint AWG Headers", func(t *testing.T) {
+		validConf := "[Interface]\nPrivateKey = aaaa\nListenPort = 55424\nH1 = 10000000-20000000\nH2 = 30000000-40000000\nH3 = 50000000-60000000\nH4 = 70000000-80000000\n"
+		body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": validConf})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusBadRequest {
+			t.Errorf("expected non-400 for valid disjoint headers, got 400: %s", w.Body.String())
+		}
+	})
+
 	t.Run("SetClientSpeedLimitHandler Bad JSON", func(t *testing.T) {
 		// Bad JSON body
 		reqBad := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", serverID), bytes.NewReader([]byte("bad")))
