@@ -45,7 +45,7 @@ func TestDatabaseInitSchemaAndPing(t *testing.T) {
 	tables := []string{
 		"servers", "users", "user_connections", "connection_creation_log",
 		"settings", "migration_flags", "known_hosts", "leaderboard_snapshots",
-		"backend_tunnels", "vpn_sessions",
+		"backend_tunnels", "vpn_sessions", "awg_ip_allocations",
 	}
 
 	for _, tbl := range tables {

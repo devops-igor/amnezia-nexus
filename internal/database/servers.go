@@ -306,6 +306,7 @@ func (d *DB) DeleteServer(ctx context.Context, id int64) (bool, error) {
 	_, _ = tx.ExecContext(ctx, "DELETE FROM user_connections WHERE server_id = ?", id)
 	_, _ = tx.ExecContext(ctx, "DELETE FROM known_hosts WHERE server_id = ?", id)
 	_, _ = tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE server_id = ?", id)
+	_, _ = tx.ExecContext(ctx, "DELETE FROM awg_ip_allocations WHERE server_id = ?", id)
 
 	res, err := tx.ExecContext(ctx, "DELETE FROM servers WHERE id = ?", id)
 	if err != nil {

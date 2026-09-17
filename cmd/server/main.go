@@ -170,6 +170,9 @@ func run(ctx context.Context) error {
 	}, db)
 
 	awgMgr := awg.NewAWGManager(sshPool)
+	if db != nil {
+		awgMgr.SetIPAllocator(db)
+	}
 	mtproxylMgr := mtproxyl.NewMTProxyLManager(sshPool)
 	dnsMgr := dns.NewDNSManager(sshPool)
 

@@ -43,6 +43,12 @@ type SSHProvider interface {
 	Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error)
 }
 
+// IPAllocator defines an interface for managing atomic IP address allocations.
+type IPAllocator interface {
+	AllocateAWGClientIP(ctx context.Context, serverID int64, clientID, clientPubKey string, usedConfigIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error)
+	ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error
+}
+
 // AWGManager implements manager.ProtocolManager for AmneziaWG.
 //
 //nolint:revive
@@ -51,6 +57,7 @@ type AWGManager struct {
 	mu             sync.Mutex
 	cacheMu        sync.RWMutex
 	containerCache map[string]containerCacheEntry
+	ipAllocator    IPAllocator
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -59,6 +66,13 @@ func NewAWGManager(pool SSHProvider) *AWGManager {
 		sshPool:        pool,
 		containerCache: make(map[string]containerCacheEntry),
 	}
+}
+
+// SetIPAllocator sets the IP allocator for the AWGManager.
+func (m *AWGManager) SetIPAllocator(allocator IPAllocator) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ipAllocator = allocator
 }
 
 func (m *AWGManager) getCachedContainer(key string) (string, bool) {
@@ -931,6 +945,9 @@ func resolveClientName(clientParams map[string]any) string {
 	if n, ok := clientParams["clientName"]; ok && fmt.Sprint(n) != "" {
 		return fmt.Sprint(n)
 	}
+	if n, ok := clientParams["client_name"]; ok && fmt.Sprint(n) != "" {
+		return fmt.Sprint(n)
+	}
 	return "client"
 }
 
@@ -1163,7 +1180,7 @@ func applyClientSpeedLimit(ctx context.Context, client ssh.SSHClient, containerN
 // Registration is idempotent: an existing clientsTable entry for the same
 // identity (by client ID or client name) is updated in place, keeping its IP,
 // instead of appending a duplicate [Peer], which amneziawg rejects.
-func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (res map[string]any, err error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
 		return nil, err
@@ -1208,10 +1225,43 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clients, _ := m.getClientsTable(ctx, client)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
 
-	clientIP, err := resolveClientIP(clients, existingIdx, usedIPs)
-	if err != nil {
-		return nil, err
+	var clientIP string
+	var newlyAllocated bool
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
 	}
+
+	effectiveClientID := clientPubKey
+	if cid, ok := clientParams["client_id"].(string); ok && strings.TrimSpace(cid) != "" {
+		effectiveClientID = strings.TrimSpace(cid)
+	}
+
+	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
+		clientIP = clients[existingIdx].UserData.ClientIP
+	} else if m.ipAllocator != nil {
+		subnetAddr := AWGDefaults["subnet_address"]
+		subnetCIDR, _ := strconv.Atoi(AWGDefaults["subnet_cidr"])
+		gatewayIP := AWGDefaults["subnet_ip"]
+		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+		if allocErr != nil {
+			return nil, allocErr
+		}
+		clientIP = allocatedIP
+		newlyAllocated = true
+	} else {
+		resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs)
+		if resErr != nil {
+			return nil, resErr
+		}
+		clientIP = resolvedIP
+	}
+
+	defer func() {
+		if err != nil && newlyAllocated && m.ipAllocator != nil {
+			_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP)
+		}
+	}()
 
 	// Normal clients get the server's PresharedKey (read fresh each call, as
 	// before). Probe peers force psk="": the prober derives IKpsk2 keys with an
@@ -1362,8 +1412,10 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	// 1. Remove TC speed limit for peer IP
 	cName := m.resolveContainerName(ctx, client)
 	clients, _ := m.getClientsTable(ctx, client)
+	var peerIP string
 	for _, c := range clients {
 		if c.ClientID == clientID && c.UserData.ClientIP != "" {
+			peerIP = c.UserData.ClientIP
 			_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), c.UserData.ClientIP)
 			break
 		}
@@ -1382,6 +1434,12 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 			continue
 		}
 		if strings.Contains(sec, clientID) {
+			if peerIP == "" {
+				ipRegex := regexp.MustCompile(`AllowedIPs\s*=\s*(\d+\.\d+\.\d+\.\d+)`)
+				if matches := ipRegex.FindStringSubmatch(sec); len(matches) > 1 {
+					peerIP = matches[1]
+				}
+			}
 			continue
 		}
 		newSections = append(newSections, sec)
@@ -1399,7 +1457,20 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 			updatedClients = append(updatedClients, c)
 		}
 	}
-	return m.saveClientsTable(ctx, client, updatedClients)
+	if err := m.saveClientsTable(ctx, client, updatedClients); err != nil {
+		return err
+	}
+
+	// 4. Release allocated IP
+	if m.ipAllocator != nil {
+		var serverID int64
+		if server != nil {
+			serverID = server.ID
+		}
+		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, clientID, peerIP)
+	}
+
+	return nil
 }
 
 // GetClientConfig reconstructs the client config file for an existing client ID.
