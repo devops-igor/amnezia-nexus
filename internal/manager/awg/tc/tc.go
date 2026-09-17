@@ -37,7 +37,7 @@ func tcExec(ctx context.Context, sshClient ssh.SSHClient, containerName, args st
 	if containerName == "" {
 		containerName = DefaultContainer
 	}
-	cmd := fmt.Sprintf("docker exec -i %s tc %s", containerName, args)
+	cmd := fmt.Sprintf("docker exec -i %s tc %s", ssh.EscapeShellArg(containerName), args)
 	return sshClient.RunSudoCommand(ctx, cmd)
 }
 
@@ -45,7 +45,7 @@ func ipExec(ctx context.Context, sshClient ssh.SSHClient, containerName, args st
 	if containerName == "" {
 		containerName = DefaultContainer
 	}
-	cmd := fmt.Sprintf("docker exec -i %s ip %s", containerName, args)
+	cmd := fmt.Sprintf("docker exec -i %s ip %s", ssh.EscapeShellArg(containerName), args)
 	return sshClient.RunSudoCommand(ctx, cmd)
 }
 
@@ -70,16 +70,16 @@ func SetupIFB(ctx context.Context, sshClient ssh.SSHClient, containerName string
 	}
 
 	// 3. Setup ingress qdisc on awg0
-	qdiscOut, _, qCode, _ := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc show dev %s", DefaultInterface))
+	qdiscOut, _, qCode, _ := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc show dev %s", ssh.EscapeShellArg(DefaultInterface)))
 	if qCode != 0 || !strings.Contains(qdiscOut, "ingress") {
-		_, errOut, code, err := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc add dev %s handle ffff: ingress", DefaultInterface))
+		_, errOut, code, err := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc add dev %s handle ffff: ingress", ssh.EscapeShellArg(DefaultInterface)))
 		if err != nil || (code != 0 && !strings.Contains(errOut, "File exists")) {
 			return fmt.Errorf("failed to add ingress qdisc on awg0 (code %d): %s, %w", code, errOut, err)
 		}
 	}
 
 	// 4. Add filter redirecting awg0 ingress to ifb0
-	filterCmd := fmt.Sprintf("filter add dev %s parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev %s", DefaultInterface, IFBDevice)
+	filterCmd := fmt.Sprintf("filter add dev %s parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev %s", ssh.EscapeShellArg(DefaultInterface), ssh.EscapeShellArg(IFBDevice))
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, filterCmd); err != nil || (code != 0 && !strings.Contains(errOut, "File exists")) {
 		return fmt.Errorf("failed to add ingress redirect filter (code %d): %s, %w", code, errOut, err)
 	}
@@ -93,7 +93,7 @@ func TeardownIFB(ctx context.Context, sshClient ssh.SSHClient, containerName str
 		containerName = DefaultContainer
 	}
 
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc del dev %s handle ffff: ingress", DefaultInterface))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc del dev %s handle ffff: ingress", ssh.EscapeShellArg(DefaultInterface)))
 	_, _, _, _ = ipExec(ctx, sshClient, containerName, "link del ifb0")
 	return nil
 }
@@ -108,13 +108,13 @@ func SetupQdisc(ctx context.Context, sshClient ssh.SSHClient, containerName, ifa
 	}
 
 	// Check if HTB already exists
-	out, _, code, _ := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc show dev %s", iface))
+	out, _, code, _ := tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc show dev %s", ssh.EscapeShellArg(iface)))
 	if code == 0 && strings.Contains(out, "htb") {
 		return nil
 	}
 
 	// Remove old qdisc
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc del dev %s root 2>/dev/null", iface))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("qdisc del dev %s root 2>/dev/null", ssh.EscapeShellArg(iface)))
 
 	poolRate := DefaultClassRate
 	if globalLimitMbps != nil && *globalLimitMbps > 0 {
@@ -122,19 +122,19 @@ func SetupQdisc(ctx context.Context, sshClient ssh.SSHClient, containerName, ifa
 	}
 
 	// Add root HTB qdisc
-	qdiscCmd := fmt.Sprintf("qdisc add dev %s root handle 1: htb default %d", iface, DefaultClassID)
+	qdiscCmd := fmt.Sprintf("qdisc add dev %s root handle 1: htb default %d", ssh.EscapeShellArg(iface), DefaultClassID)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, qdiscCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add HTB qdisc on %s (code %d): %s, %w", iface, code, errOut, err)
 	}
 
 	// Add global pool class 1:1
-	poolCmd := fmt.Sprintf("class add dev %s parent 1: classid 1:%d htb rate %s", iface, GlobalPoolClassID, poolRate)
+	poolCmd := fmt.Sprintf("class add dev %s parent 1: classid 1:%d htb rate %s", ssh.EscapeShellArg(iface), GlobalPoolClassID, poolRate)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, poolCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add global pool class on %s (code %d): %s, %w", iface, code, errOut, err)
 	}
 
 	// Add default unlimited class 1:9999
-	defaultCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", iface, GlobalPoolClassID, DefaultClassID, DefaultClassRate, poolRate)
+	defaultCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", ssh.EscapeShellArg(iface), GlobalPoolClassID, DefaultClassID, DefaultClassRate, poolRate)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, defaultCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add default class on %s (code %d): %s, %w", iface, code, errOut, err)
 	}
@@ -143,7 +143,7 @@ func SetupQdisc(ctx context.Context, sshClient ssh.SSHClient, containerName, ifa
 }
 
 func findFilterHandles(ctx context.Context, sshClient ssh.SSHClient, containerName, iface string, classID int) []string {
-	out, _, _, err := tcExec(ctx, sshClient, containerName, fmt.Sprintf("filter show dev %s parent 1:", iface))
+	out, _, _, err := tcExec(ctx, sshClient, containerName, fmt.Sprintf("filter show dev %s parent 1:", ssh.EscapeShellArg(iface)))
 	if err != nil || out == "" {
 		return nil
 	}
@@ -177,7 +177,7 @@ func RemoveSpeedLimit(ctx context.Context, sshClient ssh.SSHClient, containerNam
 	// Remove on awg0 (download)
 	handlesDown := findFilterHandles(ctx, sshClient, containerName, DefaultInterface, classID)
 	for _, h := range handlesDown {
-		delFilterCmd := fmt.Sprintf("filter del dev %s parent 1: protocol ip prio 1 handle %s u32", DefaultInterface, h)
+		delFilterCmd := fmt.Sprintf("filter del dev %s parent 1: protocol ip prio 1 handle %s u32", DefaultInterface, ssh.EscapeShellArg(h))
 		_, _, _, _ = tcExec(ctx, sshClient, containerName, delFilterCmd)
 	}
 	delClassDown := fmt.Sprintf("class del dev %s parent 1:%d classid 1:%d", DefaultInterface, GlobalPoolClassID, classID)
@@ -186,7 +186,7 @@ func RemoveSpeedLimit(ctx context.Context, sshClient ssh.SSHClient, containerNam
 	// Remove on ifb0 (upload)
 	handlesUp := findFilterHandles(ctx, sshClient, containerName, IFBDevice, classID)
 	for _, h := range handlesUp {
-		delFilterCmd := fmt.Sprintf("filter del dev %s parent 1: protocol ip prio 1 handle %s u32", IFBDevice, h)
+		delFilterCmd := fmt.Sprintf("filter del dev %s parent 1: protocol ip prio 1 handle %s u32", IFBDevice, ssh.EscapeShellArg(h))
 		_, _, _, _ = tcExec(ctx, sshClient, containerName, delFilterCmd)
 	}
 	delClassUp := fmt.Sprintf("class del dev %s parent 1:%d classid 1:%d", IFBDevice, GlobalPoolClassID, classID)
@@ -219,21 +219,21 @@ func ApplySpeedLimit(ctx context.Context, sshClient ssh.SSHClient, containerName
 	_ = RemoveSpeedLimit(ctx, sshClient, containerName, iface, peerIP)
 
 	// Download on awg0
-	classDownCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit", DefaultInterface, GlobalPoolClassID, classID, downMbps, downMbps)
+	classDownCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit", ssh.EscapeShellArg(DefaultInterface), GlobalPoolClassID, classID, downMbps, downMbps)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, classDownCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add download class for %s (code %d): %s, %w", peerIP, code, errOut, err)
 	}
-	filterDownCmd := fmt.Sprintf("filter add dev %s parent 1: protocol ip prio 1 u32 match ip dst %s/32 flowid 1:%d", DefaultInterface, peerIP, classID)
+	filterDownCmd := fmt.Sprintf("filter add dev %s parent 1: protocol ip prio 1 u32 match ip dst %s/32 flowid 1:%d", DefaultInterface, ssh.EscapeShellArg(peerIP), classID)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, filterDownCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add download filter for %s (code %d): %s, %w", peerIP, code, errOut, err)
 	}
 
 	// Upload on ifb0
-	classUpCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit", IFBDevice, GlobalPoolClassID, classID, upMbps, upMbps)
+	classUpCmd := fmt.Sprintf("class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit", ssh.EscapeShellArg(IFBDevice), GlobalPoolClassID, classID, upMbps, upMbps)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, classUpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add upload class for %s (code %d): %s, %w", peerIP, code, errOut, err)
 	}
-	filterUpCmd := fmt.Sprintf("filter add dev %s parent 1: protocol ip prio 1 u32 match ip src %s/32 flowid 1:%d", IFBDevice, peerIP, classID)
+	filterUpCmd := fmt.Sprintf("filter add dev %s parent 1: protocol ip prio 1 u32 match ip src %s/32 flowid 1:%d", IFBDevice, ssh.EscapeShellArg(peerIP), classID)
 	if _, errOut, code, err := tcExec(ctx, sshClient, containerName, filterUpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to add upload filter for %s (code %d): %s, %w", peerIP, code, errOut, err)
 	}
@@ -258,12 +258,12 @@ func SetGlobalLimit(ctx context.Context, sshClient ssh.SSHClient, containerName 
 	}
 
 	// Update awg0 pool and default ceil
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1: classid 1:%d htb rate %s", DefaultInterface, GlobalPoolClassID, downRate))
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", DefaultInterface, GlobalPoolClassID, DefaultClassID, DefaultClassRate, downRate))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1: classid 1:%d htb rate %s", ssh.EscapeShellArg(DefaultInterface), GlobalPoolClassID, downRate))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", ssh.EscapeShellArg(DefaultInterface), GlobalPoolClassID, DefaultClassID, DefaultClassRate, downRate))
 
 	// Update ifb0 pool and default ceil
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1: classid 1:%d htb rate %s", IFBDevice, GlobalPoolClassID, upRate))
-	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", IFBDevice, GlobalPoolClassID, DefaultClassID, DefaultClassRate, upRate))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1: classid 1:%d htb rate %s", ssh.EscapeShellArg(IFBDevice), GlobalPoolClassID, upRate))
+	_, _, _, _ = tcExec(ctx, sshClient, containerName, fmt.Sprintf("class change dev %s parent 1:%d classid 1:%d htb rate %s ceil %s", ssh.EscapeShellArg(IFBDevice), GlobalPoolClassID, DefaultClassID, DefaultClassRate, upRate))
 
 	return nil
 }
@@ -285,11 +285,11 @@ func BuildBatchTCScript(containerName string, clients []map[string]any, globalLi
 	}
 
 	infraCommands := []string{
-		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev %s root 2>/dev/null; tc qdisc del dev %s root 2>/dev/null; true'", containerName, DefaultInterface, IFBDevice),
-		fmt.Sprintf("docker exec -i %s sh -c 'ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null; true'", containerName),
-		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc add dev %s handle ffff: ingress 2>/dev/null; tc filter add dev %s parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev %s 2>/dev/null; true'", containerName, DefaultInterface, DefaultInterface, IFBDevice),
-		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev %s root 2>/dev/null; tc qdisc add dev %s root handle 1: htb default %d; tc class add dev %s parent 1: classid 1:%d htb rate %s; tc class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s; true'", containerName, DefaultInterface, DefaultInterface, DefaultClassID, DefaultInterface, GlobalPoolClassID, downRate, DefaultInterface, GlobalPoolClassID, DefaultClassID, DefaultClassRate, downRate),
-		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev %s root 2>/dev/null; tc qdisc add dev %s root handle 1: htb default %d; tc class add dev %s parent 1: classid 1:%d htb rate %s; tc class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s; true'", containerName, IFBDevice, IFBDevice, DefaultClassID, IFBDevice, GlobalPoolClassID, upRate, IFBDevice, GlobalPoolClassID, DefaultClassID, DefaultClassRate, upRate),
+		fmt.Sprintf("docker exec -i %s sh -c %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(fmt.Sprintf("tc qdisc del dev %s root 2>/dev/null; tc qdisc del dev %s root 2>/dev/null; true", DefaultInterface, IFBDevice))),
+		fmt.Sprintf("docker exec -i %s sh -c %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg("ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up 2>/dev/null; true")),
+		fmt.Sprintf("docker exec -i %s sh -c %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(fmt.Sprintf("tc qdisc add dev %s handle ffff: ingress 2>/dev/null; tc filter add dev %s parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev %s 2>/dev/null; true", DefaultInterface, DefaultInterface, IFBDevice))),
+		fmt.Sprintf("docker exec -i %s sh -c %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(fmt.Sprintf("tc qdisc del dev %s root 2>/dev/null; tc qdisc add dev %s root handle 1: htb default %d; tc class add dev %s parent 1: classid 1:%d htb rate %s; tc class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s; true", DefaultInterface, DefaultInterface, DefaultClassID, DefaultInterface, GlobalPoolClassID, downRate, DefaultInterface, GlobalPoolClassID, DefaultClassID, DefaultClassRate, downRate))),
+		fmt.Sprintf("docker exec -i %s sh -c %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(fmt.Sprintf("tc qdisc del dev %s root 2>/dev/null; tc qdisc add dev %s root handle 1: htb default %d; tc class add dev %s parent 1: classid 1:%d htb rate %s; tc class add dev %s parent 1:%d classid 1:%d htb rate %s ceil %s; true", IFBDevice, IFBDevice, DefaultClassID, IFBDevice, GlobalPoolClassID, upRate, IFBDevice, GlobalPoolClassID, DefaultClassID, DefaultClassRate, upRate))),
 	}
 
 	var clientCommands []string
@@ -332,12 +332,13 @@ func BuildBatchTCScript(containerName string, clients []map[string]any, globalLi
 			continue
 		}
 
-		clientCommands = append(clientCommands, fmt.Sprintf("docker exec -i %s sh -c 'tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip dst %s/32 flowid 1:%d; tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip src %s/32 flowid 1:%d; true'",
-			containerName,
-			DefaultInterface, GlobalPoolClassID, classID, speedDown, speedDown,
-			DefaultInterface, peerIP, classID,
-			IFBDevice, GlobalPoolClassID, classID, speedUp, speedUp,
-			IFBDevice, peerIP, classID,
+		clientCommands = append(clientCommands, fmt.Sprintf("docker exec -i %s sh -c %s",
+			ssh.EscapeShellArg(containerName),
+			ssh.EscapeShellArg(fmt.Sprintf("tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip dst %s/32 flowid 1:%d; tc class add dev %s parent 1:%d classid 1:%d htb rate %dmbit ceil %dmbit; tc filter add dev %s parent 1: protocol ip prio 1 u32 match ip src %s/32 flowid 1:%d; true",
+				DefaultInterface, GlobalPoolClassID, classID, speedDown, speedDown,
+				DefaultInterface, peerIP, classID,
+				IFBDevice, GlobalPoolClassID, classID, speedUp, speedUp,
+				IFBDevice, peerIP, classID)),
 		))
 	}
 

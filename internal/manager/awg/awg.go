@@ -236,8 +236,8 @@ fi
 	}
 
 	for _, name := range AWGContainerNames {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", name))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", name))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
 	}
 	return nil
 }
@@ -264,11 +264,11 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 		return fmt.Errorf("failed to upload Dockerfile: %w", err)
 	}
 
-	if _, errOut, pCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s", awgBaseImage)); err != nil || pCode != 0 {
+	if _, errOut, pCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s", ssh.EscapeShellArg(awgBaseImage))); err != nil || pCode != 0 {
 		return fmt.Errorf("failed to pull AWG base image %s (code %d): %s, %w", awgBaseImage, pCode, errOut, err)
 	}
 
-	if _, errOut, bCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker build --no-cache -t %s /opt/amnezia/%s", cName, cName)); err != nil || bCode != 0 {
+	if _, errOut, bCode, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker build --no-cache -t %s /opt/amnezia/%s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cName))); err != nil || bCode != 0 {
 		return fmt.Errorf("failed to build %s image (code %d): %s, %w", cName, bCode, errOut, err)
 	}
 
@@ -281,13 +281,13 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 -v /lib/modules:/lib/modules \
 --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
 --name %s \
-%s`, port, port, cName, cName)
+%s`, ssh.EscapeShellArg(port), ssh.EscapeShellArg(port), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cName))
 
 	if _, errOut, rCode, err := client.RunSudoCommand(ctx, runCmd); err != nil || rCode != 0 {
 		return fmt.Errorf("failed to run container (code %d): %s, %w", rCode, errOut, err)
 	}
 
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", cName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", ssh.EscapeShellArg(cName)))
 	return nil
 }
 
@@ -319,13 +319,13 @@ echo "%s" > /opt/amnezia/awg/wireguard_server_private_key.key
 echo "%s" > /opt/amnezia/awg/wireguard_server_public_key.key
 echo "%s" > /opt/amnezia/awg/wireguard_psk.key
 `, serverPrivKey, serverPubKey, serverPSK)
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c '%s'", cName, keygenScript))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(keygenScript)))
 
 	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, nil)
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_awg0.conf", []byte(serverConfig), 0600); err != nil {
 		return err
 	}
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp /tmp/_amnz_awg0.conf %s:/opt/amnezia/awg/awg0.conf", cName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp '/tmp/_amnz_awg0.conf' %s:'/opt/amnezia/awg/awg0.conf'", ssh.EscapeShellArg(cName)))
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_awg0.conf")
 
 	startScript := `#!/bin/bash
@@ -358,10 +358,10 @@ tail -f /dev/null
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_start.sh", []byte(startScript), 0755); err != nil {
 		return err
 	}
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp /tmp/_amnz_start.sh %s:/opt/amnezia/start.sh", cName))
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec %s chmod +x /opt/amnezia/start.sh", cName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker cp '/tmp/_amnz_start.sh' %s:'/opt/amnezia/start.sh'", ssh.EscapeShellArg(cName)))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec %s chmod +x /opt/amnezia/start.sh", ssh.EscapeShellArg(cName)))
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -f /tmp/_amnz_start.sh")
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", cName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(cName)))
 
 	firewallScript := `
 sysctl -w net.ipv4.ip_forward=1
@@ -451,9 +451,9 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 		if !IsValidContainerName(name) {
 			continue
 		}
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", name))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", name))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rmi %s 2>/dev/null || true", name))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rmi %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
 	}
 	_, _, _, _ = client.RunSudoCommand(ctx, "rm -rf /opt/amnezia/amnezia-awg /opt/amnezia/amnezia-awg2 /opt/amnezia/awg")
 	return nil
@@ -468,7 +468,7 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 		if !IsValidContainerName(name) {
 			continue
 		}
-		out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", name))
+		out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(name)))
 		if err == nil && code == 0 {
 			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 				trimmed := strings.TrimSpace(line)
@@ -544,7 +544,7 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 	for _, rule := range rules {
 		groupedRules = append(groupedRules, fmt.Sprintf("( %s )", rule))
 	}
-	compoundCmd := fmt.Sprintf("docker exec %s bash -c '%s'", cName, strings.Join(groupedRules, " && "))
+	compoundCmd := fmt.Sprintf("docker exec %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(strings.Join(groupedRules, " && ")))
 	out, errOut, code, err := client.RunSudoCommand(ctx, compoundCmd)
 	if err != nil {
 		// #nosec G706 -- Internal log for container routing/NAT rule application failure
@@ -568,7 +568,7 @@ func (m *AWGManager) ensureBackendRoutingAndNAT(ctx context.Context, client ssh.
 			bridgeDev = "docker0"
 		}
 	}
-	hostRule := fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || true", subnet, bridgeDev, subnet, bridgeDev)
+	hostRule := fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %s ! -o %s -j MASQUERADE 2>/dev/null || true", ssh.EscapeShellArg(subnet), ssh.EscapeShellArg(bridgeDev), ssh.EscapeShellArg(subnet), ssh.EscapeShellArg(bridgeDev))
 	_, errOut, code, err = client.RunSudoCommand(ctx, hostRule)
 	if err != nil {
 		return fmt.Errorf("failed to apply host-level NAT defense rule: %w", err)
@@ -616,7 +616,7 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/awg0.conf 2>/dev/null", name, m.configPath(), name)
+		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/awg0.conf' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.configPath()), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return out, nil
@@ -628,13 +628,13 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.SSHClient, containerName string) string {
 	candidates := []string{m.configPath(), "/etc/amnezia/amneziawg/awg0.conf"}
 	for _, p := range candidates {
-		cmd := fmt.Sprintf("docker exec -i %s test -f %s", containerName, p)
+		cmd := fmt.Sprintf("docker exec -i %s test -f %s", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(p))
 		_, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 {
 			return p
 		}
 	}
-	cmd := fmt.Sprintf("docker exec -i %s test -d /etc/amnezia/amneziawg", containerName)
+	cmd := fmt.Sprintf("docker exec -i %s test -d '/etc/amnezia/amneziawg'", ssh.EscapeShellArg(containerName))
 	if _, _, code, err := client.RunSudoCommand(ctx, cmd); err == nil && code == 0 {
 		return "/etc/amnezia/amneziawg/awg0.conf"
 	}
@@ -655,25 +655,25 @@ func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient,
 		return err
 	}
 	defer func() {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", tmpPath))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", ssh.EscapeShellArg(tmpPath)))
 	}()
 
 	cfgPath := m.resolveContainerConfigPath(ctx, client, cName)
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, cfgPath)
+	cpCmd := fmt.Sprintf("docker cp %s %s:%s", ssh.EscapeShellArg(tmpPath), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cfgPath))
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
 	}
 
-	syncCmd := fmt.Sprintf("docker exec -i %s bash -c '%s syncconf %s <(%s-quick strip %s)'",
-		cName, m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)
+	syncCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s <(%s-quick strip %s)", m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)))
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
 		// Self-healing: check whether interface awg0 is UP inside the container
-		ipCmd := fmt.Sprintf("docker exec -i %s ip link show %s", cName, m.interfaceName())
+		ipCmd := fmt.Sprintf("docker exec -i %s ip link show %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.interfaceName()))
 		ipOut, _, ipCode, ipErr := client.RunSudoCommand(ctx, ipCmd)
 		isUp := ipErr == nil && ipCode == 0 && (strings.Contains(ipOut, "<UP") || strings.Contains(ipOut, ",UP") || strings.Contains(ipOut, "state UP"))
 		if !isUp {
-			upCmd := fmt.Sprintf("docker exec -i %s awg-quick up %s", cName, cfgPath)
+			upCmd := fmt.Sprintf("docker exec -i %s awg-quick up %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cfgPath))
 			upOut, upErrOut, upCode, upErr := client.RunSudoCommand(ctx, upCmd)
 			if upErr != nil || upCode != 0 {
 				upErrMsg := strings.TrimSpace(upErrOut)
@@ -714,7 +714,7 @@ func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) 
 	if !IsValidContainerName(cName) {
 		return []AWGClient{}, errors.New("invalid container name")
 	}
-	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", cName, m.clientsTablePath()))
+	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.clientsTablePath())))
 	if code != 0 || strings.TrimSpace(out) == "" {
 		return []AWGClient{}, nil
 	}
@@ -739,10 +739,10 @@ func (m *AWGManager) saveClientsTable(ctx context.Context, client ssh.SSHClient,
 		return err
 	}
 	defer func() {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", tmpPath))
+		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", ssh.EscapeShellArg(tmpPath)))
 	}()
 
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", tmpPath, cName, m.clientsTablePath())
+	cpCmd := fmt.Sprintf("docker cp %s %s:%s", ssh.EscapeShellArg(tmpPath), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.clientsTablePath()))
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to copy clientsTable into container (code %d): %s, %w", code, errOut, err)
 	}
@@ -766,7 +766,7 @@ func (m *AWGManager) GetClients(ctx context.Context, server *models.Server) ([]m
 	if !IsValidContainerName(cName) {
 		cName = m.containerName()
 	}
-	showOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s %s show all 2>/dev/null", cName, m.wgBinary()))
+	showOut, _, _, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s %s show all 2>/dev/null", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.wgBinary())))
 	showStats := parseWGShow(showOut)
 
 	var result []map[string]any
@@ -1520,7 +1520,7 @@ func (m *AWGManager) findExistingContainer(ctx context.Context, client ssh.SSHCl
 		if !IsValidContainerName(name) {
 			continue
 		}
-		outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", name))
+		outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(name)))
 		if errAll != nil || codeAll != 0 {
 			return "", false, fmt.Errorf("docker ps -a failed checking %s (code %d): %s, %w", name, codeAll, errOutAll, errAll)
 		}
@@ -1552,7 +1552,7 @@ func (m *AWGManager) enrichRunningServerStatus(ctx context.Context, server *mode
 		cName = m.containerName()
 	}
 	// Best-effort AWG version lookup; empty string on any failure.
-	if out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s awg --version", cName)); err == nil && code == 0 {
+	if out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s 'awg' --version", ssh.EscapeShellArg(cName))); err == nil && code == 0 {
 		if line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0]); line != "" {
 			status["awg_version"] = line
 		}
@@ -1588,7 +1588,7 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		m.setCachedContainerForServer(server, foundName)
 		m.setCachedContainerForClient(client, foundName)
 
-		outRun, errOutRun, codeRun, errRun := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Status}}'", foundName))
+		outRun, errOutRun, codeRun, errRun := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Status}}'", ssh.EscapeShellArg(foundName)))
 		if errRun != nil || codeRun != 0 {
 			return nil, fmt.Errorf("docker ps failed checking %s (code %d): %s, %w", foundName, codeRun, errOutRun, errRun)
 		}
@@ -1627,7 +1627,7 @@ func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHCli
 	if !IsValidContainerName(containerName) {
 		return 0
 	}
-	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker port %s 2>/dev/null", containerName))
+	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker port %s 2>/dev/null", ssh.EscapeShellArg(containerName)))
 	if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimSpace(line)
@@ -1640,7 +1640,7 @@ func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHCli
 		}
 	}
 
-	inspectCmd := fmt.Sprintf("docker inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}} {{end}}' %s 2>/dev/null", containerName)
+	inspectCmd := fmt.Sprintf("docker inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}} {{end}}' %s 2>/dev/null", ssh.EscapeShellArg(containerName))
 	outInspect, _, codeInspect, errInspect := client.RunSudoCommand(ctx, inspectCmd)
 	if errInspect == nil && codeInspect == 0 && strings.TrimSpace(outInspect) != "" {
 		for _, part := range strings.Fields(outInspect) {
@@ -1674,7 +1674,7 @@ func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Serv
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_server_public_key.key 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", name, name, m.wgBinary(), name)
+		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_server_public_key.key' 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
@@ -1724,7 +1724,7 @@ func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (s
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat /opt/amnezia/awg/wireguard_psk.key 2>/dev/null || docker exec -i %s cat /etc/amnezia/amneziawg/wireguard_psk.key 2>/dev/null", name, name)
+		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_psk.key' 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/wireguard_psk.key' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil

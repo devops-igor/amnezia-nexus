@@ -238,7 +238,7 @@ func (m *MTProxyLManager) AddClient(ctx context.Context, server *models.Server, 
 	}
 
 	// Run secret add
-	out, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret add %s", DefaultCLIPath, username))
+	out, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret add %s", DefaultCLIPath, ssh.EscapeShellArg(username)))
 	if err != nil || code != 0 {
 		return nil, fmt.Errorf("failed to add secret (code %d): %s, %w", code, errOut, err)
 	}
@@ -263,14 +263,14 @@ func (m *MTProxyLManager) AddClient(ctx context.Context, server *models.Server, 
 	}
 
 	if maxIPs > 0 || quotaBytes > 0 || expires != "0" {
-		limitCmd := fmt.Sprintf("%s secret setlimits %s %d %d %d %s", DefaultCLIPath, username, maxConns, maxIPs, quotaBytes, expires)
+		limitCmd := fmt.Sprintf("%s secret setlimits %s %d %d %d %s", DefaultCLIPath, ssh.EscapeShellArg(username), maxConns, maxIPs, quotaBytes, ssh.EscapeShellArg(expires))
 		_, _, _, _ = client.RunCommand(ctx, limitCmd)
 	}
 
 	// Extract tg:// link
 	link := extractTGLink(out)
 	if link == "" {
-		linkOut, _, _, _ := client.RunCommand(ctx, fmt.Sprintf("%s secret link %s", DefaultCLIPath, username))
+		linkOut, _, _, _ := client.RunCommand(ctx, fmt.Sprintf("%s secret link %s", DefaultCLIPath, ssh.EscapeShellArg(username)))
 		link = extractTGLink(linkOut)
 	}
 
@@ -291,7 +291,7 @@ func (m *MTProxyLManager) RemoveClient(ctx context.Context, server *models.Serve
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	_, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret remove %s", DefaultCLIPath, clientID))
+	_, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret remove %s", DefaultCLIPath, ssh.EscapeShellArg(clientID)))
 	if err != nil || code != 0 {
 		return fmt.Errorf("failed to remove secret %s (code %d): %s, %w", clientID, code, errOut, err)
 	}
@@ -305,7 +305,7 @@ func (m *MTProxyLManager) GetClientConfig(ctx context.Context, server *models.Se
 		return "", err
 	}
 
-	out, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret link %s", DefaultCLIPath, clientID))
+	out, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret link %s", DefaultCLIPath, ssh.EscapeShellArg(clientID)))
 	if err != nil || code != 0 {
 		return "", fmt.Errorf("failed to get client config (code %d): %s, %w", code, errOut, err)
 	}
@@ -326,7 +326,7 @@ func (m *MTProxyLManager) ToggleClient(ctx context.Context, server *models.Serve
 		action = "enable"
 	}
 
-	_, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret %s %s", DefaultCLIPath, action, clientID))
+	_, errOut, code, err := client.RunCommand(ctx, fmt.Sprintf("%s secret %s %s", DefaultCLIPath, ssh.EscapeShellArg(action), ssh.EscapeShellArg(clientID)))
 	if err != nil || code != 0 {
 		return fmt.Errorf("failed to %s secret %s (code %d): %s, %w", action, clientID, code, errOut, err)
 	}
@@ -358,7 +358,7 @@ func (m *MTProxyLManager) EditClient(ctx context.Context, server *models.Server,
 		expires = fmt.Sprint(v)
 	}
 
-	limitCmd := fmt.Sprintf("%s secret setlimits %s %d %d %d %s", DefaultCLIPath, clientID, maxConns, maxIPs, quotaBytes, expires)
+	limitCmd := fmt.Sprintf("%s secret setlimits %s %d %d %d %s", DefaultCLIPath, ssh.EscapeShellArg(clientID), maxConns, maxIPs, quotaBytes, ssh.EscapeShellArg(expires))
 	_, errOut, code, err := client.RunCommand(ctx, limitCmd)
 	if err != nil || code != 0 {
 		return fmt.Errorf("failed to update limits for %s (code %d): %s, %w", clientID, code, errOut, err)
