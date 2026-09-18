@@ -209,7 +209,7 @@ func remoteLockAcquireCmd(resource any, token string) string {
 	// Atomic directory/file lock with timeout (30 seconds) and stale lock recovery (60 seconds).
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ]; then if [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then rm -rf "$flock_path.stale.$now.$$" "$flock_path.stale.$$"; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then rm -rf "$flock_path.ownerless.$now.$$" "$flock_path.ownerless.$$"; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
+		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ]; then if [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then if [ "$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null)" = "$stale_token" ]; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then if [ ! -s "$flock_path.ownerless.$now.$$/owner" ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(token),
 	)
@@ -237,16 +237,50 @@ func remoteLockHeartbeatCmd(resource any, token string) string {
 }
 
 func (m *AWGManager) resolveLockResource(ctx context.Context, client ssh.SSHClient, serverID int64) string {
-	if m != nil && client != nil {
+	if m == nil {
+		return fmt.Sprintf("server_%d", serverID)
+	}
+
+	iface := m.interfaceName()
+	if iface == "" {
+		iface = "awg0"
+	}
+
+	if client != nil {
+		if cached, ok := m.getCachedContainerForClient(client); ok && IsValidContainerName(cached) {
+			if serverID > 0 {
+				m.setCachedContainer(fmt.Sprintf("id:%d", serverID), cached)
+			}
+			return fmt.Sprintf("%s_%s", cached, iface)
+		}
+		if serverID > 0 {
+			if cached, ok := m.getCachedContainer(fmt.Sprintf("id:%d", serverID)); ok && IsValidContainerName(cached) {
+				m.setCachedContainerForClient(client, cached)
+				return fmt.Sprintf("%s_%s", cached, iface)
+			}
+		}
+
 		cName := m.resolveContainerName(ctx, client)
 		if IsValidContainerName(cName) {
-			iface := m.interfaceName()
-			if iface == "" {
-				iface = "awg0"
+			if serverID > 0 {
+				m.setCachedContainer(fmt.Sprintf("id:%d", serverID), cName)
 			}
 			return fmt.Sprintf("%s_%s", cName, iface)
 		}
 	}
+
+	// Check cached container name for client/server before falling back
+	if client != nil {
+		if cached, ok := m.getCachedContainerForClient(client); ok && IsValidContainerName(cached) {
+			return fmt.Sprintf("%s_%s", cached, iface)
+		}
+	}
+	if serverID > 0 {
+		if cached, ok := m.getCachedContainer(fmt.Sprintf("id:%d", serverID)); ok && IsValidContainerName(cached) {
+			return fmt.Sprintf("%s_%s", cached, iface)
+		}
+	}
+
 	return fmt.Sprintf("server_%d", serverID)
 }
 
@@ -711,7 +745,37 @@ func (m *AWGManager) Uninstall(ctx context.Context, server *models.Server) error
 	return nil
 }
 
+func runDockerCmdWithRetry(ctx context.Context, client ssh.SSHClient, cmd string) (string, int, error) {
+	const maxRetries = 2
+	var (
+		out  string
+		code int
+		err  error
+	)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", code, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		out, _, code, err = client.RunSudoCommand(ctx, cmd)
+		if err == nil && code == 0 {
+			return out, code, nil
+		}
+	}
+	return out, code, err
+}
+
 func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+	if client == nil {
+		safeDefault := m.containerName()
+		if !IsValidContainerName(safeDefault) {
+			safeDefault = "amnezia-awg2"
+		}
+		return safeDefault
+	}
 	if cached, ok := m.getCachedContainerForClient(client); ok {
 		return cached
 	}
@@ -720,7 +784,7 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 		if !IsValidContainerName(name) {
 			continue
 		}
-		out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(name)))
+		out, code, err := runDockerCmdWithRetry(ctx, client, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(name)))
 		if err == nil && code == 0 {
 			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 				trimmed := strings.TrimSpace(line)
@@ -732,7 +796,7 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 		}
 	}
 	// Fallback to any running container with name starting with amnezia-awg
-	out, _, code, err := client.RunSudoCommand(ctx, "docker ps --filter name=amnezia-awg --format '{{.Names}}'")
+	out, code, err := runDockerCmdWithRetry(ctx, client, "docker ps --filter name=amnezia-awg --format '{{.Names}}'")
 	if err == nil && code == 0 {
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 			trimmed := strings.TrimSpace(line)

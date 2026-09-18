@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 func setupTestDBForAllocations(t *testing.T) (*DB, func()) {
@@ -896,5 +899,56 @@ func TestAdoptAWGClientIPLease_ReconcilesDifferentLiveIP(t *testing.T) {
 	}
 	if newStatus != "allocated" || newClientID != "client-reconcile" {
 		t.Fatalf("expected new lease status=allocated client_id=client-reconcile, got status=%s client_id=%s", newStatus, newClientID)
+	}
+}
+
+func TestLoadData_AWGIPAllocationsQueryFailure_AbortsBackupExport(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Open database and seed users and servers
+	_, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Fault Injection Server",
+		Host:      "192.0.2.10",
+		SSHUser:   "root",
+		SSHPort:   22,
+		Protocols: map[string]any{"awg": map[string]any{"port": 51820}},
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test server: %v", err)
+	}
+
+	uEmail := "test_fault@example.com"
+	_, err = db.CreateUser(ctx, &models.User{
+		Username:     "fault_test_user",
+		Email:        &uEmail,
+		PasswordHash: "secret_hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test user: %v", err)
+	}
+
+	// 2. Inject fault into awg_ip_allocations (drop table)
+	_, err = db.SQLDB().ExecContext(ctx, "DROP TABLE awg_ip_allocations")
+	if err != nil {
+		t.Fatalf("failed to drop table awg_ip_allocations: %v", err)
+	}
+
+	// 3. Call db.LoadData(ctx)
+	backup, err := db.LoadData(ctx)
+
+	// 4. Assert LoadData returns non-nil error indicating failure to query AWG IP allocations
+	if err == nil {
+		t.Fatalf("expected error from LoadData after dropping awg_ip_allocations, got nil")
+	}
+	if backup != nil {
+		t.Fatalf("expected nil backup on query failure, got: %+v", backup)
+	}
+	if !strings.Contains(err.Error(), "AWG IP allocations") {
+		t.Fatalf("expected error message to mention AWG IP allocations, got: %v", err)
 	}
 }
