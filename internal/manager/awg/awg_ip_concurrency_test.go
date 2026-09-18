@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,20 +51,22 @@ func extractLockKey(cmd string) string {
 }
 
 type threadSafeMockSSHClient struct {
-	mu                     sync.RWMutex
-	files                  map[string][]byte
-	failSaveServerConfig   atomic.Bool
-	failSyncconf           atomic.Bool
-	failSyncconfOnce       atomic.Bool
-	syncconfCount          atomic.Int32
-	failSaveClientsTable   atomic.Bool
-	failEnsureNAT          atomic.Bool
-	failOnSecondSaveConfig atomic.Bool
-	saveConfigCount        atomic.Int32
-	driftCount             atomic.Int32
-	host                   string
-	port                   int
-	serverID               *int64
+	mu                           sync.RWMutex
+	files                        map[string][]byte
+	failSaveServerConfig         atomic.Bool
+	failSyncconf                 atomic.Bool
+	failSyncconfOnce             atomic.Bool
+	syncconfCount                atomic.Int32
+	failSaveClientsTable         atomic.Bool
+	failSaveClientsTableOnSecond atomic.Bool
+	saveClientsTableCount        atomic.Int32
+	failEnsureNAT                atomic.Bool
+	failOnSecondSaveConfig       atomic.Bool
+	saveConfigCount              atomic.Int32
+	driftCount                   atomic.Int32
+	host                         string
+	port                         int
+	serverID                     *int64
 }
 
 func newThreadSafeMockSSHClient() *threadSafeMockSSHClient {
@@ -175,6 +179,11 @@ func (m *threadSafeMockSSHClient) RunSudoCommand(ctx context.Context, cmd string
 	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "clients") {
 		if m.failSaveClientsTable.Load() {
 			return "", "simulated write failure on clientsTable", 1, errors.New("simulated failure saving clientsTable")
+		}
+		if m.failSaveClientsTableOnSecond.Load() {
+			if m.saveClientsTableCount.Add(1) >= 2 {
+				return "", "simulated write failure on second clientsTable save", 1, errors.New("simulated failure saving clientsTable")
+			}
 		}
 		fields := strings.Fields(cmd)
 		if len(fields) >= 3 {
@@ -932,14 +941,14 @@ func TestAWGManager_Rollback_DockerCpSucceeds_SyncconfFails_RemoteRemovalFailure
 }
 
 func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
-	mgr, db, _, server, cleanup := setupAWGManagerWithDB(t)
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	const (
-		keyK1 = "pubKeyK1================================"
-		keyK2 = "pubKeyK2================================"
+		keyK1 = "ERERERERERERERERERERERERERERERERERERERERERE="
+		keyK2 = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
 	)
 
 	// 1. Initial provision with key K1
@@ -950,6 +959,10 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial AddClient with K1 failed: %v", err)
 	}
+	clientID1, _ := res1["client_id"].(string)
+	if clientID1 != keyK1 {
+		t.Fatalf("expected client_id %s, got: %s", keyK1, clientID1)
+	}
 	ip1, _ := res1["client_ip"].(string)
 	if ip1 == "" {
 		t.Fatalf("expected valid IP for K1")
@@ -958,6 +971,23 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	allocated1, err := db.GetAllocatedAWGIPs(ctx, server.ID)
 	if err != nil || len(allocated1) != 1 || allocated1[0] != ip1 {
 		t.Fatalf("expected 1 DB allocation for K1 (%s), got: %+v", ip1, allocated1)
+	}
+	owner1, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || owner1 != keyK1 {
+		t.Fatalf("expected DB lease owner %s, got: %s (err: %v)", keyK1, owner1, err)
+	}
+	// Assert remote peers in awg0.conf and clientsTable metadata
+	sshClient.mu.RLock()
+	conf1 := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	table1 := string(sshClient.files["/opt/amnezia/awg/clientsTable"])
+	sshClient.mu.RUnlock()
+	_, peers1, err := awg.ParseServerConfig(conf1)
+	if err != nil || len(peers1) != 1 || peers1[0].PublicKey != keyK1 {
+		t.Fatalf("expected 1 peer with key %s in awg0.conf, got: %+v", keyK1, peers1)
+	}
+	clients1, err := awg.ParseClientsTable(table1)
+	if err != nil || len(clients1) != 1 || clients1[0].ClientID != keyK1 || clients1[0].UserData.ClientIP != ip1 {
+		t.Fatalf("expected 1 client in clientsTable with key %s and IP %s, got: %+v", keyK1, ip1, clients1)
 	}
 
 	// 2. Re-key Alice to key K2
@@ -968,6 +998,10 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-key AddClient with K2 failed: %v", err)
 	}
+	clientID2, _ := res2["client_id"].(string)
+	if clientID2 != keyK2 {
+		t.Fatalf("expected client_id %s, got: %s", keyK2, clientID2)
+	}
 	ip2, _ := res2["client_ip"].(string)
 	if ip2 != ip1 {
 		t.Fatalf("expected re-keyed client to retain original IP %s, got: %s", ip1, ip2)
@@ -976,6 +1010,23 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	allocated2, err := db.GetAllocatedAWGIPs(ctx, server.ID)
 	if err != nil || len(allocated2) != 1 || allocated2[0] != ip1 {
 		t.Fatalf("expected DB allocations count to remain 1 with IP %s, got: %+v", ip1, allocated2)
+	}
+	owner2, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || owner2 != keyK2 {
+		t.Fatalf("expected DB lease owner updated to %s, got: %s (err: %v)", keyK2, owner2, err)
+	}
+	// Assert remote peers in awg0.conf and clientsTable metadata
+	sshClient.mu.RLock()
+	conf2 := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	table2 := string(sshClient.files["/opt/amnezia/awg/clientsTable"])
+	sshClient.mu.RUnlock()
+	_, peers2, err := awg.ParseServerConfig(conf2)
+	if err != nil || len(peers2) != 1 || peers2[0].PublicKey != keyK2 {
+		t.Fatalf("expected 1 peer with key %s in awg0.conf (keyK1 removed), got: %+v", keyK2, peers2)
+	}
+	clients2, err := awg.ParseClientsTable(table2)
+	if err != nil || len(clients2) != 1 || clients2[0].ClientID != keyK2 || clients2[0].UserData.ClientIP != ip1 {
+		t.Fatalf("expected 1 client in clientsTable with key %s and IP %s, got: %+v", keyK2, ip1, clients2)
 	}
 
 	// 3. Re-key Alice back to key K1
@@ -986,6 +1037,10 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-key AddClient back to K1 failed: %v", err)
 	}
+	clientID3, _ := res3["client_id"].(string)
+	if clientID3 != keyK1 {
+		t.Fatalf("expected client_id %s, got: %s", keyK1, clientID3)
+	}
 	ip3, _ := res3["client_ip"].(string)
 	if ip3 != ip1 {
 		t.Fatalf("expected re-keyed client back to K1 to retain original IP %s, got: %s", ip1, ip3)
@@ -994,6 +1049,23 @@ func TestAWGManager_ReKeying_K1_K2_K1(t *testing.T) {
 	allocated3, err := db.GetAllocatedAWGIPs(ctx, server.ID)
 	if err != nil || len(allocated3) != 1 || allocated3[0] != ip1 {
 		t.Fatalf("expected DB allocations count to remain 1 with IP %s, got: %+v", ip1, allocated3)
+	}
+	owner3, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || owner3 != keyK1 {
+		t.Fatalf("expected DB lease owner updated back to %s, got: %s (err: %v)", keyK1, owner3, err)
+	}
+	// Assert remote peers in awg0.conf and clientsTable metadata
+	sshClient.mu.RLock()
+	conf3 := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	table3 := string(sshClient.files["/opt/amnezia/awg/clientsTable"])
+	sshClient.mu.RUnlock()
+	_, peers3, err := awg.ParseServerConfig(conf3)
+	if err != nil || len(peers3) != 1 || peers3[0].PublicKey != keyK1 {
+		t.Fatalf("expected 1 peer with key %s in awg0.conf, got: %+v", keyK1, peers3)
+	}
+	clients3, err := awg.ParseClientsTable(table3)
+	if err != nil || len(clients3) != 1 || clients3[0].ClientID != keyK1 || clients3[0].UserData.ClientIP != ip1 {
+		t.Fatalf("expected 1 client in clientsTable with key %s and IP %s, got: %+v", keyK1, ip1, clients3)
 	}
 }
 
@@ -1143,5 +1215,378 @@ func TestAWGManager_RemoteLockSerialization_CrossProcess(t *testing.T) {
 	allocated, err := db.GetAllocatedAWGIPs(ctx, server.ID)
 	if err != nil || len(allocated) != numClients {
 		t.Fatalf("expected %d allocations in DB, got: %d (err: %v)", numClients, len(allocated), err)
+	}
+}
+
+func TestRemoteLock_ShellScriptContentionAndStaleLockReclamation(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	serverID := int64(8888)
+	lockPath := awg.RemoteLockPath(serverID)
+	_ = os.RemoveAll(lockPath)
+	defer os.RemoveAll(lockPath)
+
+	ctx := context.Background()
+
+	// 1. Verify contention: run 5 workers concurrently competing for the lock
+	const numWorkers = 5
+	var (
+		activeWorkers atomic.Int32
+		maxConcurrent atomic.Int32
+		wg            sync.WaitGroup
+	)
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(wID int) {
+			defer wg.Done()
+			token := fmt.Sprintf("worker-%d-%d", wID, time.Now().UnixNano())
+			acqCmd := awg.RemoteLockAcquireCmd(serverID, token)
+
+			cmd := exec.CommandContext(ctx, "bash", "-c", acqCmd)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Errorf("worker %d failed to acquire lock: %v (out: %s)", wID, err, string(out))
+				return
+			}
+
+			// In critical section
+			curr := activeWorkers.Add(1)
+			for {
+				max := maxConcurrent.Load()
+				if curr > max {
+					if maxConcurrent.CompareAndSwap(max, curr) {
+						break
+					}
+				} else {
+					break
+				}
+			}
+
+			time.Sleep(50 * time.Millisecond)
+			activeWorkers.Add(-1)
+
+			relCmd := awg.RemoteLockReleaseCmd(serverID, token)
+			relExec := exec.CommandContext(ctx, "bash", "-c", relCmd)
+			if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
+				t.Errorf("worker %d failed to release lock: %v (out: %s)", wID, relErr, string(relOut))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	if max := maxConcurrent.Load(); max > 1 {
+		t.Fatalf("expected mutual exclusion under contention, but max concurrent was %d", max)
+	}
+
+	// 2. Verify stale lock reclamation & explicit ownership protection
+	_ = os.RemoveAll(lockPath)
+	if err := os.Mkdir(lockPath, 0755); err != nil {
+		t.Fatalf("failed to create stale lock dir: %v", err)
+	}
+	oldOwnerToken := "stale-owner-token"
+	ownerFile := filepath.Join(lockPath, "owner")
+	if err := os.WriteFile(ownerFile, []byte(oldOwnerToken+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write owner file: %v", err)
+	}
+
+	// Set directory mtime to 120 seconds in the past (> 60 seconds stale threshold)
+	pastTime := time.Now().Add(-120 * time.Second)
+	if err := os.Chtimes(lockPath, pastTime, pastTime); err != nil {
+		t.Fatalf("failed to set past mtime: %v", err)
+	}
+
+	newToken := "successor-token"
+	acqCmd := awg.RemoteLockAcquireCmd(serverID, newToken)
+	cmd := exec.CommandContext(ctx, "bash", "-c", acqCmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to reclaim stale lock: %v (out: %s)", err, string(out))
+	}
+
+	// Lock dir must exist with the new token
+	ownerData, err := os.ReadFile(ownerFile)
+	if err != nil {
+		t.Fatalf("failed to read owner file after reclamation: %v", err)
+	}
+	if strings.TrimSpace(string(ownerData)) != newToken {
+		t.Fatalf("expected owner token %s, got: %s", newToken, strings.TrimSpace(string(ownerData)))
+	}
+
+	// Old stale owner attempts release using old token — MUST NOT delete successor's lock!
+	staleRelCmd := awg.RemoteLockReleaseCmd(serverID, oldOwnerToken)
+	relExec := exec.CommandContext(ctx, "bash", "-c", staleRelCmd)
+	if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
+		t.Fatalf("stale release command failed: %v (out: %s)", relErr, string(relOut))
+	}
+
+	if _, err := os.Stat(lockPath); os.IsNotExist(err) {
+		t.Fatalf("stale owner release erroneously removed successor's lock!")
+	}
+
+	// Successor releases with its valid token — MUST remove lock dir
+	successorRelCmd := awg.RemoteLockReleaseCmd(serverID, newToken)
+	succExec := exec.CommandContext(ctx, "bash", "-c", successorRelCmd)
+	if succOut, succErr := succExec.CombinedOutput(); succErr != nil {
+		t.Fatalf("successor release failed: %v (out: %s)", succErr, string(succOut))
+	}
+
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected lock dir to be deleted after valid successor release")
+	}
+}
+
+func TestAWGManager_IncompleteMetadataRollbackFailure_RetainsLease(t *testing.T) {
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Provision client A
+	resA, err := mgr.AddClient(ctx, server, map[string]any{"client_name": "clientA"})
+	if err != nil {
+		t.Fatalf("provisioning clientA failed: %v", err)
+	}
+	ipA, _ := resA["client_ip"].(string)
+
+	// Arm failure on NAT rule and failure on second saveClientsTable (which happens during rollback)
+	sshClient.failEnsureNAT.Store(true)
+	sshClient.failSaveClientsTableOnSecond.Store(true)
+
+	// Provision client B — will fail at NAT and trigger rollback
+	_, err = mgr.AddClient(ctx, server, map[string]any{"client_name": "clientB"})
+	if err == nil {
+		t.Fatalf("expected AddClient for clientB to fail")
+	}
+
+	// Because saving clientsTable during rollback failed, clientB's IP lease MUST be retained
+	allocated, err := db.GetAllocatedAWGIPs(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("failed to query DB: %v", err)
+	}
+	if len(allocated) != 2 {
+		t.Fatalf("expected 2 DB allocations retained (clientA + clientB), got %d: %+v", len(allocated), allocated)
+	}
+	if allocated[0] != ipA && allocated[1] != ipA {
+		t.Fatalf("expected clientA IP %s in allocations: %+v", ipA, allocated)
+	}
+}
+
+func TestAWGManager_FailedRekeying_RollbackCompensation(t *testing.T) {
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const (
+		keyK1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		keyK2 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+	)
+
+	// 1. Initial provision with key K1
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Alice",
+		"public_key":  keyK1,
+	})
+	if err != nil {
+		t.Fatalf("initial AddClient failed: %v", err)
+	}
+	ip1, _ := res1["client_ip"].(string)
+
+	owner1, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || owner1 != keyK1 {
+		t.Fatalf("expected initial owner %s, got: %s (err: %v)", keyK1, owner1, err)
+	}
+
+	// 2. Arm failure on saving server config so commitPeerConfigWithCAS fails before remote commit
+	sshClient.failSaveServerConfig.Store(true)
+
+	// Attempt re-keying to key K2
+	_, err = mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Alice",
+		"public_key":  keyK2,
+	})
+	if err == nil {
+		t.Fatalf("expected re-keying to fail when saveServerConfig fails")
+	}
+
+	// 3. Verify rollback compensation: lease ownership in DB MUST be restored to key K1!
+	ownerAfter, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || ownerAfter != keyK1 {
+		t.Fatalf("expected DB lease owner reverted back to %s after pre-commit failure, got: %s (err: %v)", keyK1, ownerAfter, err)
+	}
+
+	// Total allocations count must remain 1
+	allocated, err := db.GetAllocatedAWGIPs(ctx, server.ID)
+	if err != nil || len(allocated) != 1 || allocated[0] != ip1 {
+		t.Fatalf("expected 1 allocation with IP %s, got: %+v", ip1, allocated)
+	}
+}
+
+func TestAWGManager_ExistingClientWithoutLeaseRow_MetadataSyncAndAdoption(t *testing.T) {
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const (
+		keyAlice = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
+		legacyIP = "10.66.66.77"
+	)
+
+	// Populate remote state with a legacy client in clientsTable and awg0.conf,
+	// but NO allocation in DB (simulating upgrade of an existing deployment).
+	legacyClient := awg.AWGClient{
+		ClientID: keyAlice,
+		UserData: awg.AWGClientUserData{
+			ClientName: "LegacyAlice",
+			ClientIP:   legacyIP,
+			Enabled:    true,
+		},
+	}
+	tableData, err := awg.SerializeClientsTable([]awg.AWGClient{legacyClient})
+	if err != nil {
+		t.Fatalf("failed to serialize clientsTable: %v", err)
+	}
+
+	sshClient.mu.Lock()
+	sshClient.files["/opt/amnezia/awg/clientsTable"] = []byte(tableData)
+	sshClient.files["/opt/amnezia/awg/awg0.conf"] = []byte(fmt.Sprintf(
+		"[Interface]\nPrivateKey = privkey\nAddress = 10.66.66.1/24\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n",
+		keyAlice, legacyIP,
+	))
+	sshClient.mu.Unlock()
+
+	// Verify DB has 0 allocations initially
+	initialAllocated, err := db.GetAllocatedAWGIPs(ctx, server.ID)
+	if err != nil || len(initialAllocated) != 0 {
+		t.Fatalf("expected 0 initial allocations in DB, got: %+v", initialAllocated)
+	}
+
+	// 1. Provisioning / updating LegacyAlice should adopt legacyIP into DB and preserve it
+	res, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "LegacyAlice",
+		"public_key":  keyAlice,
+	})
+	if err != nil {
+		t.Fatalf("AddClient for legacy client failed: %v", err)
+	}
+	returnedIP, _ := res["client_ip"].(string)
+	if returnedIP != legacyIP {
+		t.Fatalf("expected legacy IP %s to be preserved, got: %s", legacyIP, returnedIP)
+	}
+
+	// Verify DB now has legacyIP allocated to keyAlice
+	owner, err := db.GetAWGIPAllocationOwner(ctx, server.ID, legacyIP)
+	if err != nil || owner != keyAlice {
+		t.Fatalf("expected DB lease owner %s for legacy IP %s, got: %s (err: %v)", keyAlice, legacyIP, owner, err)
+	}
+
+	// 2. Verify metadata IP synchronization when existingIdx >= 0 and IP changes
+	// Setup client Bob in clientsTable with an IP that is already claimed by someone else in DB
+	const (
+		keyBob      = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="
+		claimedIP   = "10.66.66.88"
+		otherClient = "someone-else-key"
+	)
+	// Other client claims 10.66.66.88 in DB
+	adopted, err := db.AdoptAWGClientIPLease(ctx, server.ID, otherClient, otherClient, claimedIP)
+	if err != nil || !adopted {
+		t.Fatalf("failed to adopt claimedIP for otherClient: %v (adopted: %v)", err, adopted)
+	}
+
+	bobClient := awg.AWGClient{
+		ClientID: keyBob,
+		UserData: awg.AWGClientUserData{
+			ClientName: "Bob",
+			ClientIP:   claimedIP,
+			Enabled:    true,
+		},
+	}
+	sshClient.mu.Lock()
+	currentTable, _ := awg.ParseClientsTable(string(sshClient.files["/opt/amnezia/awg/clientsTable"]))
+	currentTable = append(currentTable, bobClient)
+	newTableBytes, _ := awg.SerializeClientsTable(currentTable)
+	sshClient.files["/opt/amnezia/awg/clientsTable"] = []byte(newTableBytes)
+	sshClient.mu.Unlock()
+
+	// Provision Bob: since claimedIP is owned by otherClient, allocator should assign a new IP,
+	// and upsertClientEntry MUST update Bob's ClientIP in clientsTable!
+	resBob, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Bob",
+		"public_key":  keyBob,
+	})
+	if err != nil {
+		t.Fatalf("AddClient for Bob failed: %v", err)
+	}
+	bobNewIP, _ := resBob["client_ip"].(string)
+	if bobNewIP == claimedIP || bobNewIP == "" {
+		t.Fatalf("expected Bob to receive a new distinct IP, got: %s", bobNewIP)
+	}
+
+	// Verify clientsTable metadata was updated with the new IP for Bob
+	sshClient.mu.RLock()
+	finalTable, err := awg.ParseClientsTable(string(sshClient.files["/opt/amnezia/awg/clientsTable"]))
+	sshClient.mu.RUnlock()
+	if err != nil {
+		t.Fatalf("failed to parse final clientsTable: %v", err)
+	}
+	foundBob := false
+	for _, c := range finalTable {
+		if c.ClientID == keyBob {
+			foundBob = true
+			if c.UserData.ClientIP != bobNewIP {
+				t.Fatalf("expected Bob's ClientIP in clientsTable metadata to be updated to %s, got: %s", bobNewIP, c.UserData.ClientIP)
+			}
+		}
+	}
+	if !foundBob {
+		t.Fatalf("Bob not found in clientsTable")
+	}
+}
+
+func TestAWGManager_EditClient_ErrorPropagation(t *testing.T) {
+	mgr, _, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Initial provision client (enabled = true)
+	res, err := mgr.AddClient(ctx, server, map[string]any{"client_name": "edit-client"})
+	if err != nil {
+		t.Fatalf("initial AddClient failed: %v", err)
+	}
+	clientID, _ := res["client_id"].(string)
+
+	// Arm failure on server config update
+	sshClient.failSaveServerConfig.Store(true)
+
+	// Attempt to disable client
+	err = mgr.EditClient(ctx, server, clientID, map[string]any{"enabled": false})
+	if err == nil {
+		t.Fatalf("expected EditClient to fail when updateServerConfigPeer fails")
+	}
+	if !strings.Contains(err.Error(), "failed to update server peer config") {
+		t.Errorf("expected error mentioning failed to update server peer config, got: %v", err)
+	}
+
+	// Verify target.UserData.Enabled was NOT updated to false in clientsTable
+	sshClient.mu.RLock()
+	tableStr := string(sshClient.files["/opt/amnezia/awg/clientsTable"])
+	sshClient.mu.RUnlock()
+
+	clients, err := awg.ParseClientsTable(tableStr)
+	if err != nil {
+		t.Fatalf("failed to parse clientsTable: %v", err)
+	}
+	for _, c := range clients {
+		if c.ClientID == clientID {
+			if !c.UserData.Enabled {
+				t.Fatalf("expected client enabled to remain true after uncommitted update failure")
+			}
+		}
 	}
 }

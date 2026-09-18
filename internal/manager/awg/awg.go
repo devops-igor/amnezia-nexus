@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -59,10 +60,13 @@ type SSHProvider interface {
 //   - Releases the allocation matching serverID and clientID (and/or ip).
 //   - TransferAWGClientIPLease:
 //   - Transfers allocation lease ownership when an existing client re-keys.
+//   - AdoptAWGClientIPLease:
+//   - Adopts an existing metadata IP for an upgraded client into SQLite if available.
 type IPAllocator interface {
 	AllocateAWGClientIP(ctx context.Context, serverID int64, clientID, clientPubKey string, usedConfigIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error)
 	ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error
 	TransferAWGClientIPLease(ctx context.Context, serverID int64, newClientID, oldClientID, ip string) error
+	AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID, clientPubKey, ip string) (bool, error)
 }
 
 // ServerLockRegistry provides per-server mutex synchronization across manager instances.
@@ -133,30 +137,45 @@ func (m *AWGManager) SetIPAllocator(allocator IPAllocator) {
 	m.ipAllocator = allocator
 }
 
+func generateLockToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 func remoteLockPath(serverID int64) string {
 	return fmt.Sprintf("/tmp/amnezia_awg_server_%d.lock", serverID)
 }
 
-func remoteLockAcquireCmd(serverID int64) string {
+func remoteLockAcquireCmd(serverID int64, token string) string {
 	lockDir := remoteLockPath(serverID)
 	// Atomic directory/file lock with timeout (30 seconds) and stale lock recovery (60 seconds).
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; timeout=30; start=$(date +%%%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%%%s); age=$((now - $(stat -c %%%%Y "$flock_path" 2>/dev/null || stat -f %%%%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then rm -rf "$flock_path" 2>/dev/null; fi; fi; now=$(date +%%%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done`,
+		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then rm -rf "$flock_path" 2>/dev/null; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
 		ssh.EscapeShellArg(lockDir),
+		ssh.EscapeShellArg(token),
 	)
 }
 
-func remoteLockReleaseCmd(serverID int64) string {
+func remoteLockReleaseCmd(serverID int64, token string) string {
 	lockDir := remoteLockPath(serverID)
-	return fmt.Sprintf("rm -rf %s", ssh.EscapeShellArg(lockDir))
+	return fmt.Sprintf(
+		`if [ "$(cat %s/owner 2>/dev/null)" = %s ]; then rm -rf %s; fi`,
+		ssh.EscapeShellArg(lockDir),
+		ssh.EscapeShellArg(token),
+		ssh.EscapeShellArg(lockDir),
+	)
 }
 
 func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, serverID int64) (func(), error) {
 	if client == nil || serverID <= 0 {
 		return func() {}, nil
 	}
-	cmd := remoteLockAcquireCmd(serverID)
+	token := generateLockToken()
+	cmd := remoteLockAcquireCmd(serverID, token)
 	_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
 	if err != nil || code != 0 {
 		return nil, fmt.Errorf("failed to acquire remote server lock on server %d (exit code %d): %s: %w", serverID, code, strings.TrimSpace(errOut), err)
@@ -165,7 +184,7 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 	var once sync.Once
 	unlock := func() {
 		once.Do(func() {
-			relCmd := remoteLockReleaseCmd(serverID)
+			relCmd := remoteLockReleaseCmd(serverID, token)
 			_, _, _, _ = client.RunSudoCommand(context.Background(), relCmd)
 		})
 	}
@@ -1218,6 +1237,7 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 		clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
 		clients[existingIdx].UserData.PSK = psk
 		clients[existingIdx].UserData.Enabled = true
+		clients[existingIdx].UserData.ClientIP = clientIP
 
 		ud := &clients[existingIdx].UserData
 		if ud.RekeyAfterTime == nil {
@@ -1361,7 +1381,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
-	clientIP, newlyAllocated, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams)
+	clientIP, newlyAllocated, rekeyed, previousOwner, rekeyedIP, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams)
 	if err != nil {
 		return nil, err
 	}
@@ -1369,8 +1389,13 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	diskWritten := false
 	remoteCommitted := false
 	defer func() {
-		if err != nil && newlyAllocated {
-			m.rollbackAllocatedPeer(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, diskWritten, remoteCommitted)
+		if err != nil {
+			if rekeyed && !remoteCommitted && m.ipAllocator != nil {
+				_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
+			}
+			if newlyAllocated {
+				m.rollbackAllocatedPeer(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, diskWritten, remoteCommitted)
+			}
 		}
 	}()
 
@@ -1550,7 +1575,10 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 	}
 
 	clients, err := m.getClientsTable(ctx, client)
-	if err == nil && len(clients) > 0 {
+	if err != nil {
+		return fmt.Errorf("failed to get clients table during peer removal: %w", err)
+	}
+	if len(clients) > 0 {
 		var updated []AWGClient
 		for _, c := range clients {
 			if (pubKey != "" && c.ClientID == pubKey) || (ip != "" && c.UserData.ClientIP == ip) {
@@ -1558,7 +1586,9 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 			}
 			updated = append(updated, c)
 		}
-		_ = m.saveClientsTable(ctx, client, updated)
+		if err := m.saveClientsTable(ctx, client, updated); err != nil {
+			return fmt.Errorf("failed to save clients table during peer removal: %w", err)
+		}
 	}
 
 	if ip != "" {
@@ -1644,7 +1674,7 @@ func (m *AWGManager) obtainClientIP(
 	clientPubKey string,
 	usedIPs []string,
 	serverParams map[string]string,
-) (string, bool, error) {
+) (string, bool, bool, string, string, error) {
 	subnetAddr, subnetCIDR, gatewayIP := parseServerSubnetParams(serverParams)
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
@@ -1654,33 +1684,46 @@ func (m *AWGManager) obtainClientIP(
 			existingIP := existingClient.UserData.ClientIP
 			existingPubKey := existingClient.ClientID
 
+			rekeyed := false
+			previousOwner := ""
+			rekeyedIP := ""
+
 			// Re-keying ownership transfer: if existing peer is replacing K1 with K2
-			if existingPubKey != "" && existingPubKey != clientPubKey {
-				_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP)
+			if existingPubKey != "" && clientPubKey != "" && existingPubKey != clientPubKey {
+				rekeyed = true
+				previousOwner = existingPubKey
+				rekeyedIP = existingIP
+				if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP); transErr != nil {
+					// Existing client had no lease row in DB, attempt to adopt existingIP for new key
+					_, _ = m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP)
+				}
+			} else {
+				// Existing client without lease row in DB: adopt existingIP if not claimed
+				_, _ = m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP)
 			}
 
 			allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 			if allocErr != nil {
-				return "", false, allocErr
+				return "", false, false, "", "", allocErr
 			}
-			return allocatedIP, allocatedIP != existingIP, nil
+			return allocatedIP, allocatedIP != existingIP, rekeyed, previousOwner, rekeyedIP, nil
 		}
 
 		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 		if allocErr != nil {
-			return "", false, allocErr
+			return "", false, false, "", "", allocErr
 		}
-		return allocatedIP, true, nil
+		return allocatedIP, true, false, "", "", nil
 	}
 
 	if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
-		return clients[existingIdx].UserData.ClientIP, false, nil
+		return clients[existingIdx].UserData.ClientIP, false, false, "", "", nil
 	}
 	resolvedIP, resErr := resolveClientIP(clients, existingIdx, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 	if resErr != nil {
-		return "", false, resErr
+		return "", false, false, "", "", resErr
 	}
-	return resolvedIP, false, nil
+	return resolvedIP, false, false, "", "", nil
 }
 
 func resolveEffectiveClientID(clientParams map[string]any, clientPubKey string) string {
@@ -2310,8 +2353,10 @@ func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clie
 	}
 
 	if newEnabled, ok := parseBoolParam(params["enabled"]); ok && newEnabled != target.UserData.Enabled {
+		if err := m.updateServerConfigPeer(ctx, client, clientID, target.UserData.ClientIP, target.UserData.PSK, newEnabled); err != nil {
+			return fmt.Errorf("failed to update server peer config: %w", err)
+		}
 		target.UserData.Enabled = newEnabled
-		_ = m.updateServerConfigPeer(ctx, client, clientID, target.UserData.ClientIP, target.UserData.PSK, newEnabled)
 	}
 
 	down, downOk := parseSpeedLimit(params, "speed_limit_down", "awg_speed_limit_down", "speedDown")

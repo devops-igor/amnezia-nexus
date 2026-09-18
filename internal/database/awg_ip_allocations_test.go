@@ -338,3 +338,83 @@ func TestAllocateAWGClientIP_OwnershipVerification_ClaimedByOther(t *testing.T) 
 		t.Fatalf("expected 10.66.66.3 for bob, got: %s", ipBob)
 	}
 }
+
+func TestTransferAWGClientIPLease_RejectionWhenNotOwned(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	subnetAddr := "10.66.66.0"
+	subnetCIDR := 24
+	gatewayIP := "10.66.66.1"
+
+	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("alice allocation failed: %v", err)
+	}
+
+	// Attempt to transfer Alice's IP claiming it was owned by Bob (who does not own it)
+	err = db.TransferAWGClientIPLease(ctx, serverID, "eve-key", "bob-key", ipAlice)
+	if err == nil {
+		t.Fatalf("expected transfer to fail when oldClientID is not the owner")
+	}
+	expectedErrMsg := fmt.Sprintf("lease transfer rejected: IP %s on server %d is not owned by bob-key", ipAlice, serverID)
+	if err.Error() != expectedErrMsg {
+		t.Fatalf("expected error %q, got: %q", expectedErrMsg, err.Error())
+	}
+
+	// Attempt to transfer an unallocated IP
+	err = db.TransferAWGClientIPLease(ctx, serverID, "eve-key", "alice-key", "10.66.66.99")
+	if err == nil {
+		t.Fatalf("expected transfer of unallocated IP to fail")
+	}
+}
+
+func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	subnetAddr := "10.66.66.0"
+	subnetCIDR := 24
+	gatewayIP := "10.66.66.1"
+
+	// 1. Adopt an existing legacy client's IP that has no DB lease row
+	legacyIP := "10.66.66.50"
+	adopted, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-client", "legacy-key", legacyIP)
+	if err != nil {
+		t.Fatalf("adopt legacy IP failed: %v", err)
+	}
+	if !adopted {
+		t.Fatalf("expected legacy IP to be adopted successfully")
+	}
+
+	// Submitting AllocateAWGClientIP for this client should preserve the adopted IP
+	allocIP, err := db.AllocateAWGClientIP(ctx, serverID, "legacy-client", "legacy-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	if err != nil {
+		t.Fatalf("allocate after adopt failed: %v", err)
+	}
+	if allocIP != legacyIP {
+		t.Fatalf("expected adopted IP %s to be preserved, got %s", legacyIP, allocIP)
+	}
+
+	// 2. Attempt to adopt the same IP by another client should be rejected
+	adopted2, err := db.AdoptAWGClientIPLease(ctx, serverID, "attacker", "attacker-key", legacyIP)
+	if err != nil {
+		t.Fatalf("adopt check failed: %v", err)
+	}
+	if adopted2 {
+		t.Fatalf("expected adoption of already claimed IP to return false")
+	}
+
+	// 3. Idempotent adoption by the same client should return true
+	adoptedAgain, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-client", "legacy-key", legacyIP)
+	if err != nil {
+		t.Fatalf("idempotent adopt failed: %v", err)
+	}
+	if !adoptedAgain {
+		t.Fatalf("expected idempotent adoption to return true")
+	}
+}
