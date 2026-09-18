@@ -173,6 +173,9 @@ func (d *DB) InitSchema(ctx context.Context) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	// Clean up legacy duplicate active AWG IP allocations before applying schema unique index
+	_, _ = d.sqlDB.ExecContext(ctx, `DELETE FROM awg_ip_allocations WHERE status = 'allocated' AND id NOT IN (SELECT MAX(id) FROM awg_ip_allocations WHERE status = 'allocated' GROUP BY server_id, client_id)`)
+
 	if _, err := d.sqlDB.ExecContext(ctx, SchemaSQL); err != nil {
 		return fmt.Errorf("failed to execute schema DDL: %w", err)
 	}
@@ -240,6 +243,8 @@ func (d *DB) migrateAWGIPAllocations(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server ON awg_ip_allocations(server_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server_client ON awg_ip_allocations(server_id, client_id)`,
+		`DELETE FROM awg_ip_allocations WHERE status = 'allocated' AND id NOT IN (SELECT MAX(id) FROM awg_ip_allocations WHERE status = 'allocated' GROUP BY server_id, client_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON awg_ip_allocations(server_id, client_id) WHERE status = 'allocated'`,
 	}
 	for _, q := range queries {
 		if _, err := d.sqlDB.ExecContext(ctx, q); err != nil {

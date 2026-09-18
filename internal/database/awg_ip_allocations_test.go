@@ -2,9 +2,13 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func setupTestDBForAllocations(t *testing.T) (*DB, func()) {
@@ -123,7 +127,7 @@ func TestAllocateAWGClientIP_ReleaseAndReallocation(t *testing.T) {
 	}
 
 	// Release client 1 (.2 is freed)
-	if err := db.ReleaseAWGClientIP(ctx, serverID, "client1", ip1); err != nil {
+	if err := db.ReleaseAWGClientIP(ctx, serverID, "pubkey1", ip1); err != nil {
 		t.Fatalf("release failed: %v", err)
 	}
 
@@ -416,5 +420,249 @@ func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
 	}
 	if !adoptedAgain {
 		t.Fatalf("expected idempotent adoption to return true")
+	}
+}
+
+func TestAWGIPAllocations_ConcurrentClientIdentity_EnforcesUniqueness(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_concurrent_identity.db")
+
+	db1, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("failed to open db1: %v", err)
+	}
+	defer db1.Close()
+
+	db2, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("failed to open db2: %v", err)
+	}
+	defer db2.Close()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	clientID := "concurrent-client-identity"
+	clientPubKey := "concurrent-pubkey-identity"
+	subnetAddr := "10.66.66.0"
+	subnetCIDR := 24
+	gatewayIP := "10.66.66.1"
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	results := make([]string, concurrency)
+	errors := make([]error, concurrency)
+
+	startBarrier := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-startBarrier
+
+			targetDB := db1
+			if idx%2 != 0 {
+				targetDB = db2
+			}
+
+			ip, allocErr := targetDB.AllocateAWGClientIP(ctx, serverID, clientID, clientPubKey, nil, subnetAddr, subnetCIDR, gatewayIP)
+			results[idx] = ip
+			errors[idx] = allocErr
+		}(i)
+	}
+
+	close(startBarrier)
+	wg.Wait()
+
+	// 1. All calls succeed without returning errors
+	for i := 0; i < concurrency; i++ {
+		if errors[i] != nil {
+			t.Fatalf("goroutine %d returned unexpected error: %v", i, errors[i])
+		}
+		if results[i] == "" {
+			t.Fatalf("goroutine %d returned empty IP", i)
+		}
+	}
+
+	// 2. All returned IPs are identical
+	firstIP := results[0]
+	for i := 1; i < concurrency; i++ {
+		if results[i] != firstIP {
+			t.Fatalf("goroutine %d got different IP %s, expected %s", i, results[i], firstIP)
+		}
+	}
+
+	// 3. Exactly ONE row with status = 'allocated' exists in awg_ip_allocations for that (server_id, client_id)
+	var count int
+	err = db1.SQLDB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM awg_ip_allocations WHERE server_id = ? AND (client_id = ? OR client_id = ?) AND status = 'allocated'",
+		serverID, clientID, clientPubKey,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to query active lease count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 active row for client in awg_ip_allocations, got %d", count)
+	}
+}
+
+func TestAWGIPAllocations_MismatchedRelease_PreservesOtherClientLease(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	serverID := int64(1)
+	clientA := "ClientA"
+	ipA := "10.66.66.5"
+	clientB := "ClientB"
+	ipB := "10.66.66.6"
+
+	// Insert allocation for Client A with IP A (10.66.66.5)
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.SQLDB().ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, 'allocated', ?, ?)",
+		serverID, clientA, ipA, now, now,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert Client A allocation: %v", err)
+	}
+
+	// Insert allocation for Client B with IP B (10.66.66.6)
+	_, err = db.SQLDB().ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, 'allocated', ?, ?)",
+		serverID, clientB, ipB, now, now,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert Client B allocation: %v", err)
+	}
+
+	// Call ReleaseAWGClientIP(ctx, serverID, "ClientA", "10.66.66.6") (Client A with Client B's IP)
+	err = db.ReleaseAWGClientIP(ctx, serverID, clientA, ipB)
+	if err != nil {
+		t.Fatalf("unexpected error from mismatched ReleaseAWGClientIP: %v", err)
+	}
+
+	// Assert Client B's allocation for 10.66.66.6 is still present and active in the database!
+	var ownerB string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated'",
+		serverID, ipB,
+	).Scan(&ownerB)
+	if err != nil {
+		t.Fatalf("expected Client B allocation for %s to remain active, got: %v", ipB, err)
+	}
+	if ownerB != clientB {
+		t.Fatalf("expected owner of %s to be %s, got: %s", ipB, clientB, ownerB)
+	}
+
+	// Call ReleaseAWGClientIP(ctx, serverID, "ClientA", "10.66.66.5") (matching)
+	err = db.ReleaseAWGClientIP(ctx, serverID, clientA, ipA)
+	if err != nil {
+		t.Fatalf("unexpected error from matching ReleaseAWGClientIP: %v", err)
+	}
+
+	// Assert Client A's allocation is removed, and Client B's allocation remains intact
+	var ownerA string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated'",
+		serverID, ipA,
+	).Scan(&ownerA)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected Client A allocation to be removed, got: %v (owner=%s)", err, ownerA)
+	}
+
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated'",
+		serverID, ipB,
+	).Scan(&ownerB)
+	if err != nil {
+		t.Fatalf("expected Client B allocation for %s to remain active after Client A release, got: %v", ipB, err)
+	}
+	if ownerB != clientB {
+		t.Fatalf("expected owner of %s to remain %s, got: %s", ipB, clientB, ownerB)
+	}
+}
+
+func TestAWGIPAllocations_Migration_CleansLegacyDuplicateActiveRecords(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_legacy_migration.db")
+
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite db: %v", err)
+	}
+
+	// Setup legacy table without uq_awg_ip_allocations_server_client_active index
+	_, err = rawDB.Exec(`
+		CREATE TABLE awg_ip_allocations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_id INTEGER NOT NULL,
+			client_id TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'allocated',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(server_id, ip)
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to create legacy table: %v", err)
+	}
+
+	// Insert duplicate active allocations for same (server_id=1, client_id="dup-client")
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = rawDB.Exec(`
+		INSERT INTO awg_ip_allocations (id, server_id, client_id, ip, status, created_at, updated_at) VALUES
+		(1, 1, 'dup-client', '10.66.66.2', 'allocated', ?, ?),
+		(2, 1, 'dup-client', '10.66.66.3', 'allocated', ?, ?),
+		(3, 1, 'other-client', '10.66.66.4', 'allocated', ?, ?);
+	`, now, now, now, now, now, now)
+	if err != nil {
+		t.Fatalf("failed to insert duplicate records: %v", err)
+	}
+	_ = rawDB.Close()
+
+	// Open with database.Open which runs runMigrationsLocked -> migrateAWGIPAllocations
+	db, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("Open failed on legacy DB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Verify older duplicate (id=1) was cleaned up, and newest duplicate (id=2) was retained
+	var remainingIP string
+	var remainingID int64
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT id, ip FROM awg_ip_allocations WHERE server_id = 1 AND client_id = 'dup-client' AND status = 'allocated'",
+	).Scan(&remainingID, &remainingIP)
+	if err != nil {
+		t.Fatalf("failed to query remaining lease: %v", err)
+	}
+	if remainingID != 2 || remainingIP != "10.66.66.3" {
+		t.Fatalf("expected newest record id=2 ip=10.66.66.3, got id=%d ip=%s", remainingID, remainingIP)
+	}
+
+	// Verify 'other-client' remains intact
+	var otherIP string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT ip FROM awg_ip_allocations WHERE server_id = 1 AND client_id = 'other-client' AND status = 'allocated'",
+	).Scan(&otherIP)
+	if err != nil || otherIP != "10.66.66.4" {
+		t.Fatalf("expected other-client 10.66.66.4 intact, got: %s, err: %v", otherIP, err)
+	}
+
+	// Verify unique index prevents inserting another duplicate active record
+	_, err = db.SQLDB().ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (1, 'dup-client', '10.66.66.99', 'allocated', ?, ?)",
+		now, now,
+	)
+	if err == nil {
+		t.Fatalf("expected unique index constraint violation when inserting duplicate active client lease, got nil")
+	}
+	if !isUniqueConstraintError(err) {
+		t.Fatalf("expected unique constraint error, got: %v", err)
 	}
 }

@@ -56,12 +56,12 @@ func (d *DB) AllocateAWGClientIP(
 	const maxRetries = 50
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// 1. Idempotency: Check if clientID or clientPubKey already has an active allocation on this server
-		existingIP, err := d.findExistingAllocation(ctx, serverID, storedClientID, clientPubKey)
+		existingIP, err := d.findExistingAllocation(ctx, serverID, clientID, clientPubKey)
 		if err != nil {
 			return "", err
 		}
 		if existingIP != "" {
-			claimed, claimErr := d.isAllocationClaimedByOther(ctx, serverID, existingIP, storedClientID, clientPubKey)
+			claimed, claimErr := d.isAllocationClaimedByOther(ctx, serverID, existingIP, clientID, clientPubKey)
 			if claimErr != nil {
 				return "", claimErr
 			}
@@ -105,22 +105,24 @@ func (d *DB) AllocateAWGClientIP(
 	return "", fmt.Errorf("failed to allocate AWG IP after %d attempts due to collisions", maxRetries)
 }
 
-func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, storedClientID, clientPubKey string) (string, error) {
-	if storedClientID == "" && clientPubKey == "" {
+func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, clientID, clientPubKey string) (string, error) {
+	clientID = strings.TrimSpace(clientID)
+	clientPubKey = strings.TrimSpace(clientPubKey)
+	if clientID == "" && clientPubKey == "" {
 		return "", nil
 	}
 
 	var existingIP string
 	var err error
-	if storedClientID != "" && clientPubKey != "" && storedClientID != clientPubKey {
+	if clientID != "" && clientPubKey != "" && clientID != clientPubKey {
 		err = d.sqlDB.QueryRowContext(ctx,
 			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?) LIMIT 1",
-			serverID, storedClientID, clientPubKey,
+			serverID, clientID, clientPubKey,
 		).Scan(&existingIP)
 	} else {
-		lookupID := storedClientID
+		lookupID := clientPubKey
 		if lookupID == "" {
-			lookupID = clientPubKey
+			lookupID = clientID
 		}
 		err = d.sqlDB.QueryRowContext(ctx,
 			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND client_id = ? LIMIT 1",
@@ -137,7 +139,9 @@ func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, storedC
 	return existingIP, nil
 }
 
-func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip, storedClientID, clientPubKey string) (bool, error) {
+func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip, clientID, clientPubKey string) (bool, error) {
+	clientID = strings.TrimSpace(clientID)
+	clientPubKey = strings.TrimSpace(clientPubKey)
 	var ownerID string
 	err := d.sqlDB.QueryRowContext(ctx,
 		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
@@ -150,7 +154,7 @@ func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip,
 		return false, fmt.Errorf("failed to verify AWG IP ownership: %w", err)
 	}
 	ownerID = strings.TrimSpace(ownerID)
-	if (storedClientID != "" && ownerID == storedClientID) || (clientPubKey != "" && ownerID == clientPubKey) {
+	if (clientID != "" && ownerID == clientID) || (clientPubKey != "" && ownerID == clientPubKey) {
 		return false, nil
 	}
 	return true, nil
@@ -214,7 +218,7 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 	var err error
 	if clientID != "" && ip != "" {
 		_, err = d.sqlDB.ExecContext(ctx,
-			"DELETE FROM awg_ip_allocations WHERE server_id = ? AND (client_id = ? OR ip = ?)",
+			"DELETE FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND ip = ?",
 			serverID, clientID, ip,
 		)
 	} else if ip != "" {
