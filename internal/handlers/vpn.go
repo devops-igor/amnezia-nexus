@@ -38,10 +38,13 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 // VPNSessionsHandler returns active VPN sessions enriched with user and
 // backend server identity (admin/support only; enforcement by the
 // RequireAdminOrSupport route middleware). (issue #189)
+// The row set is memory-authoritative (Service.SessionsLive): it is derived
+// from the same in-memory connected set the active-sessions card counts, so
+// the card and the table agree by construction (issue #189 improvement round).
 func (h *Handlers) VPNSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	var sessions []models.EnrichedVPNSession
 	if h.vpnSvc != nil {
-		got, err := h.vpnSvc.SessionsEnriched(r.Context())
+		got, err := h.vpnSvc.SessionsLive(r.Context())
 		if err != nil {
 			// #nosec G706 -- Internal server audit log for failed session listing
 			log.Printf("[vpn/handlers] failed to list enriched sessions: %v", err)

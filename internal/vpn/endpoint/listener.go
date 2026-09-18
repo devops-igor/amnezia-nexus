@@ -624,7 +624,7 @@ func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicK
 		return nil, errors.New("endpoint listener subsystem not initialized")
 	}
 
-	user, _, err := auth.AuthenticatePeer(ctx, peerPublicKey)
+	user, conn, err := auth.AuthenticatePeer(ctx, peerPublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("peer authentication failed: %w", err)
 	}
@@ -634,7 +634,7 @@ func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicK
 		return nil, fmt.Errorf("ip allocation failed: %w", err)
 	}
 
-	sess, err := sm.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backendTunnelID)
+	sess, err := sm.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backendTunnelID, conn.Name)
 	if err != nil {
 		_ = ipam.Release(peerPublicKey)
 		return nil, fmt.Errorf("session creation failed: %w", err)

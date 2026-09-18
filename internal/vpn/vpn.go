@@ -1106,6 +1106,9 @@ func (s *Service) TotalDroppedPackets() uint64 {
 // last_seen comes from the DB row only: it is the last accounted traffic
 // activity visible via the accountant flush — not transport-level peer
 // liveness (review-2 P2). Read-path only (issue #189).
+//
+// Row-set source is the DB. For the admin table that must agree with the
+// active-sessions card by construction, use SessionsLive instead.
 func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSession, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
@@ -1116,14 +1119,20 @@ func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSes
 		return nil, err
 	}
 
-	// Add buffered, un-flushed accountant deltas. Exact, no double
-	// counting: Flush swaps each buffer to 0 when it persists the
-	// drained amount into the DB row.
+	return s.applyBufferedAccountantDeltas(sessions), nil
+}
+
+// applyBufferedAccountantDeltas adds the forwarder accountant's un-flushed
+// buffered rx/tx deltas onto each session's persisted counters. Exact, no
+// double counting: Flush swaps each buffer to 0 when it persists the drained
+// amount into the DB row. Shared by SessionsEnriched (DB truth) and
+// SessionsLive (memory truth).
+func (s *Service) applyBufferedAccountantDeltas(sessions []models.EnrichedVPNSession) []models.EnrichedVPNSession {
 	s.mu.RLock()
 	accountant := s.accountant
 	s.mu.RUnlock()
 	if accountant == nil {
-		return sessions, nil
+		return sessions
 	}
 	for i := range sessions {
 		if rx, tx := accountant.GetSessionTraffic(sessions[i].ID); rx != 0 || tx != 0 {
@@ -1131,7 +1140,118 @@ func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSes
 			sessions[i].TxBytes += tx
 		}
 	}
-	return sessions, nil
+	return sessions
+}
+
+// SessionsLive is the memory-authoritative variant of SessionsEnriched
+// (issue #189 improvement round): the row set comes from the SessionManager's
+// in-memory connected set — the same source the active-sessions card counts —
+// so the card and the admin table can never disagree. Ghost DB rows (peers
+// that vanished without a teardown) cannot appear, and a live session can
+// never be missing from the table. Identity enrichment runs in ONE DB pass
+// keyed by the snapshot's session IDs; a session whose user/tunnel/server
+// rows are gone (or whose backend_tunnel_id is 0) keeps the same fallbacks as
+// the DB-enriched path: 'unknown' and 'Server #<tunnelID>'. ConnectionName is
+// the value captured at handshake from the authenticating user_connection —
+// the manager always knows it, so no fallback is needed. last_seen is the
+// in-memory LastSeen (refreshed by TouchSession/UpdateActivity); like the DB
+// path it is activity telemetry, not transport-level liveness proof.
+func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	if s.db == nil {
+		return nil, errors.New("database not available")
+	}
+	if s.sessionMgr == nil {
+		return nil, errors.New("session manager not initialized")
+	}
+
+	snapshot := s.sessionMgr.ListActiveSessionsSnapshot()
+
+	out := make([]models.EnrichedVPNSession, 0, len(snapshot))
+	for i := range snapshot {
+		sess := snapshot[i]
+		out = append(out, models.EnrichedVPNSession{
+			ID:              sess.ID,
+			UserID:          sess.UserID,
+			Username:        "unknown",
+			BackendTunnelID: sess.BackendTunnelID,
+			ServerID:        0,
+			ServerName:      fmt.Sprintf("Server #%d", sess.BackendTunnelID),
+			PeerPublicKey:   sess.PeerPublicKey,
+			AssignedIP:      sess.AssignedIP,
+			ConnectedAt:     sess.ConnectedAt,
+			LastSeen:        sess.LastSeen,
+			RxBytes:         sess.RxBytes,
+			TxBytes:         sess.TxBytes,
+			Status:          sess.Status,
+			ConnectionName:  sess.ConnectionName,
+		})
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+
+	// Identity enrichment, single pass: username via the session's user,
+	// server identity via the session's backend tunnel. QMARK placeholders
+	// (modernc.org/sqlite).
+	ids := make([]string, 0, len(out))
+	seen := make(map[string]struct{}, len(out))
+	for i := range out {
+		if _, dup := seen[out[i].ID]; dup {
+			continue
+		}
+		seen[out[i].ID] = struct{}{}
+		ids = append(ids, out[i].ID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	query := `SELECT s.id, COALESCE(u.username, 'unknown') AS username,
+		COALESCE(t.server_id, 0) AS server_id,
+		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name
+		FROM vpn_sessions s
+		LEFT JOIN users u ON u.id = s.user_id
+		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
+		LEFT JOIN servers srv ON srv.id = t.server_id
+		WHERE s.id IN (` + placeholders + `)`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to enrich live vpn sessions: %w", err)
+	}
+	defer rows.Close()
+
+	type liveIdentity struct {
+		username   string
+		serverID   int64
+		serverName string
+	}
+	byID := make(map[string]liveIdentity, len(ids))
+	for rows.Next() {
+		var id string
+		var ident liveIdentity
+		if err := rows.Scan(&id, &ident.username, &ident.serverID, &ident.serverName); err != nil {
+			return nil, fmt.Errorf("failed to scan live vpn session identity: %w", err)
+		}
+		byID[id] = ident
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate live vpn session identities: %w", err)
+	}
+
+	// Misses (session row already torn down, or a DB hiccup mid-lifetime)
+	// keep the fallbacks set above — same COALESCE semantics as the
+	// DB-enriched read path.
+	for i := range out {
+		if ident, ok := byID[out[i].ID]; ok {
+			out[i].Username = ident.username
+			out[i].ServerID = ident.serverID
+			out[i].ServerName = ident.serverName
+		}
+	}
+
+	return s.applyBufferedAccountantDeltas(out), nil
 }
 
 // GetBackends returns all registered backend tunnels.
@@ -2080,7 +2200,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID)
+	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name)
 	if err != nil {
 		_ = s.ipam.Release(peerPublicKey)
 		return nil, nil, fmt.Errorf("session creation failed: %w", err)

@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS vpn_sessions (
     rx_bytes INTEGER DEFAULT 0,
     tx_bytes INTEGER DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'connected',
+    connection_name TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (backend_tunnel_id) REFERENCES backend_tunnels(id) ON DELETE CASCADE
 );

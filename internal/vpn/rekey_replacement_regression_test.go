@@ -99,7 +99,7 @@ func TestRekeyReplacementAcrossBackends(t *testing.T) {
 
 	// Connect on oldTun.
 	svc.pool.IncrementConnections(oldTun.ID)
-	sess1, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-move-78", "10.202.0.61", oldTun.ID)
+	sess1, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-move-78", "10.202.0.61", oldTun.ID, "")
 	if err != nil {
 		t.Fatalf("CreateSession (initial): %v", err)
 	}
@@ -111,7 +111,7 @@ func TestRekeyReplacementAcrossBackends(t *testing.T) {
 	// Rekey onto newTun: the replacement hook performs BOTH sides of the
 	// migration (decrement old, increment new) — exactly what
 	// HandleIncomingPeer would drive when the balancer selects newTun.
-	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-move-78", "10.202.0.61", newTun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-move-78", "10.202.0.61", newTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession (rekey): %v", err)
 	}
 
@@ -155,7 +155,7 @@ func TestPeriodicGaugeReconcileCorrectsDrift(t *testing.T) {
 
 	// One real connected session...
 	svc.pool.IncrementConnections(tun.ID)
-	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-reconcile-78", "10.202.0.71", tun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-reconcile-78", "10.202.0.71", tun.ID, ""); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	// ...plus artificial drift (e.g. an unresolved residual leak).
