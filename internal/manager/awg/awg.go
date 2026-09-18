@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
@@ -99,12 +100,14 @@ func (r *ServerLockRegistry) getLock(serverID int64) *sync.Mutex {
 //
 //nolint:revive
 type AWGManager struct {
-	sshPool        SSHProvider
-	mu             sync.Mutex
-	cacheMu        sync.RWMutex
-	containerCache map[string]containerCacheEntry
-	ipAllocator    IPAllocator
-	serverLocks    *ServerLockRegistry
+	sshPool                 SSHProvider
+	mu                      sync.Mutex
+	cacheMu                 sync.RWMutex
+	containerCache          map[string]containerCacheEntry
+	ipAllocator             IPAllocator
+	serverLocks             *ServerLockRegistry
+	lockHeartbeatIntervalNs atomic.Int64
+	lockHeartbeatTimeoutNs  atomic.Int64
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -135,6 +138,35 @@ func (m *AWGManager) SetIPAllocator(allocator IPAllocator) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ipAllocator = allocator
+}
+
+const (
+	defaultRemoteLockHeartbeatInterval = 10 * time.Second
+	defaultRemoteLockHeartbeatTimeout  = 5 * time.Second
+)
+
+// SetLockHeartbeatConfig configures the interval and timeout for remote lock renewal heartbeats.
+func (m *AWGManager) SetLockHeartbeatConfig(interval, timeout time.Duration) {
+	if m == nil {
+		return
+	}
+	m.lockHeartbeatIntervalNs.Store(int64(interval))
+	m.lockHeartbeatTimeoutNs.Store(int64(timeout))
+}
+
+func (m *AWGManager) getLockHeartbeatConfig() (time.Duration, time.Duration) {
+	if m == nil {
+		return defaultRemoteLockHeartbeatInterval, defaultRemoteLockHeartbeatTimeout
+	}
+	interval := time.Duration(m.lockHeartbeatIntervalNs.Load())
+	if interval <= 0 {
+		interval = defaultRemoteLockHeartbeatInterval
+	}
+	timeout := time.Duration(m.lockHeartbeatTimeoutNs.Load())
+	if timeout <= 0 {
+		timeout = defaultRemoteLockHeartbeatTimeout
+	}
+	return interval, timeout
 }
 
 func generateLockToken() string {
@@ -170,6 +202,17 @@ func remoteLockReleaseCmd(serverID int64, token string) string {
 	)
 }
 
+func remoteLockHeartbeatCmd(serverID int64, token string) string {
+	lockDir := remoteLockPath(serverID)
+	return fmt.Sprintf(
+		`if [ -d %s ] && [ "$(cat %s/owner 2>/dev/null)" = %s ]; then touch -m %s; fi`,
+		ssh.EscapeShellArg(lockDir),
+		ssh.EscapeShellArg(lockDir),
+		ssh.EscapeShellArg(token),
+		ssh.EscapeShellArg(lockDir),
+	)
+}
+
 func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, serverID int64) (func(), error) {
 	if client == nil || serverID <= 0 {
 		return func() {}, nil
@@ -181,9 +224,40 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 		return nil, fmt.Errorf("failed to acquire remote server lock on server %d (exit code %d): %s: %w", serverID, code, strings.TrimSpace(errOut), err)
 	}
 
+	interval, timeout := m.getLockHeartbeatConfig()
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
+	touchCmd := remoteLockHeartbeatCmd(serverID, token)
+
+	var heartbeatWg sync.WaitGroup
+	heartbeatWg.Add(1)
+	go func() {
+		defer heartbeatWg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				touchCtx, touchCancel := context.WithTimeout(heartbeatCtx, timeout)
+				_, errOut, code, err := client.RunSudoCommand(touchCtx, touchCmd)
+				touchCancel()
+				if err != nil || code != 0 {
+					if !errors.Is(touchCtx.Err(), context.Canceled) {
+						slog.Debug("failed to refresh remote server lock heartbeat", "server_id", serverID, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+					}
+				}
+			}
+		}
+	}()
+
 	var once sync.Once
 	unlock := func() {
 		once.Do(func() {
+			cancelHeartbeat()
+			heartbeatWg.Wait()
+
 			relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			relCmd := remoteLockReleaseCmd(serverID, token)

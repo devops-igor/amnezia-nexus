@@ -123,6 +123,10 @@ func (m *threadSafeMockSSHClient) RunSudoCommand(ctx context.Context, cmd string
 		return "OK", "", 0, nil
 	}
 
+	if strings.Contains(cmd, "amnezia_awg_server_") && strings.Contains(cmd, "touch -m") {
+		return "OK", "", 0, nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1686,6 +1690,175 @@ func TestRemoteLock_TwoSimultaneousStaleLockReclaimers(t *testing.T) {
 	}
 	if max := maxConcurrent.Load(); max != 1 {
 		t.Fatalf("expected mutual exclusion strictly preserved (max 1), got: %d", max)
+	}
+}
+
+type localBashSSHClient struct {
+	*threadSafeMockSSHClient
+	heartbeats atomic.Int32
+}
+
+func newLocalBashSSHClient(serverID int64) *localBashSSHClient {
+	mock := newThreadSafeMockSSHClient()
+	mock.serverID = &serverID
+	return &localBashSSHClient{
+		threadSafeMockSSHClient: mock,
+	}
+}
+
+func (c *localBashSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "touch -m") {
+		c.heartbeats.Add(1)
+	}
+	execCmd := exec.CommandContext(ctx, "bash", "-c", cmd)
+	out, err := execCmd.CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return string(out), string(out), exitErr.ExitCode(), err
+		}
+		return string(out), string(out), 1, err
+	}
+	return string(out), "", 0, nil
+}
+
+func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	serverID := int64(9995)
+	lockPath := awg.RemoteLockPath(serverID)
+	_ = os.RemoveAll(lockPath)
+	defer os.RemoveAll(lockPath)
+
+	ctx := context.Background()
+
+	// 1. Holder A acquires the remote lock with token A and keeps heartbeat active
+	mgrA := awg.NewAWGManager(nil)
+	// Fast heartbeat in test: refresh mtime every 40ms with 2s timeout
+	mgrA.SetLockHeartbeatConfig(40*time.Millisecond, 2*time.Second)
+
+	clientA := newLocalBashSSHClient(serverID)
+
+	unlockA, err := mgrA.AcquireRemoteServerLock(ctx, clientA, serverID)
+	if err != nil {
+		t.Fatalf("Holder A failed to acquire remote lock: %v", err)
+	}
+
+	ownerFile := filepath.Join(lockPath, "owner")
+	ownerBytes, err := os.ReadFile(ownerFile)
+	if err != nil {
+		unlockA()
+		t.Fatalf("failed to read owner file after Holder A acquired: %v", err)
+	}
+	tokenA := strings.TrimSpace(string(ownerBytes))
+	if tokenA == "" {
+		unlockA()
+		t.Fatalf("expected non-empty token A in owner file")
+	}
+
+	// Verify that Holder A's heartbeat actively refreshes mtime even if directory timestamp ages:
+	// Intentionally backdate mtime to simulate elapsed time exceeding the 60s stale threshold
+	pastTime := time.Now().Add(-120 * time.Second)
+	if err := os.Chtimes(lockPath, pastTime, pastTime); err != nil {
+		unlockA()
+		t.Fatalf("failed to set past mtime: %v", err)
+	}
+
+	// Wait for heartbeat ticker to execute touch -m
+	time.Sleep(120 * time.Millisecond)
+
+	fi, err := os.Stat(lockPath)
+	if err != nil {
+		unlockA()
+		t.Fatalf("lock directory missing: %v", err)
+	}
+	if time.Since(fi.ModTime()) > 5*time.Second {
+		unlockA()
+		t.Fatalf("expected heartbeat to keep mtime fresh, but lock age is %v", time.Since(fi.ModTime()))
+	}
+	if clientA.heartbeats.Load() == 0 {
+		unlockA()
+		t.Fatalf("expected heartbeat touch commands to be executed")
+	}
+
+	// 2. Contender B attempts to acquire the lock while Holder A is active.
+	// Contender B checks whether directory is stale. Because Holder A's heartbeat keeps mtime fresh,
+	// Contender B must be blocked and cannot steal the lock.
+	tokenB := "contender-b-token"
+	acqCmdB := awg.RemoteLockAcquireCmd(serverID, tokenB)
+
+	contenderDone := make(chan error, 1)
+	go func() {
+		cmdB := exec.CommandContext(ctx, "bash", "-c", acqCmdB)
+		out, runErr := cmdB.CombinedOutput()
+		if runErr != nil {
+			contenderDone <- fmt.Errorf("contender failed: %w (out: %s)", runErr, string(out))
+			return
+		}
+		contenderDone <- nil
+	}()
+
+	// Assert that Contender B is blocked while Holder A remains active
+	select {
+	case err := <-contenderDone:
+		unlockA()
+		t.Fatalf("contender should be blocked while Holder A is active, but finished early: %v", err)
+	case <-time.After(350 * time.Millisecond):
+		// Expected: contender remains blocked
+	}
+
+	// Assert that Holder A still owns the lock (lock not stolen)
+	currentOwner, err := os.ReadFile(ownerFile)
+	if err != nil {
+		unlockA()
+		t.Fatalf("failed to read owner file: %v", err)
+	}
+	if strings.TrimSpace(string(currentOwner)) != tokenA {
+		unlockA()
+		t.Fatalf("lock was stolen! expected owner %s, got %s", tokenA, strings.TrimSpace(string(currentOwner)))
+	}
+
+	// 3. Holder A releases the lock
+	heartbeatsBeforeUnlock := clientA.heartbeats.Load()
+	unlockA()
+
+	// Verify heartbeat goroutine was stopped by unlockA: no more heartbeats should fire
+	time.Sleep(100 * time.Millisecond)
+	if extraHeartbeats := clientA.heartbeats.Load() - heartbeatsBeforeUnlock; extraHeartbeats > 0 {
+		t.Fatalf("heartbeat continued firing after unlock: %d extra heartbeats", extraHeartbeats)
+	}
+
+	// 4. Assert that Contender B can successfully acquire the lock now that Holder A released it
+	select {
+	case err := <-contenderDone:
+		if err != nil {
+			t.Fatalf("contender failed to acquire lock after Holder A released: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("contender timed out waiting to acquire lock after release")
+	}
+
+	// Assert Contender B is now the registered owner
+	finalOwner, err := os.ReadFile(ownerFile)
+	if err != nil {
+		t.Fatalf("failed to read owner file after Contender B acquired: %v", err)
+	}
+	if strings.TrimSpace(string(finalOwner)) != tokenB {
+		t.Fatalf("expected Contender B token %s, got: %s", tokenB, strings.TrimSpace(string(finalOwner)))
+	}
+
+	// Clean up: Contender B releases the lock
+	relCmdB := awg.RemoteLockReleaseCmd(serverID, tokenB)
+	relExec := exec.CommandContext(ctx, "bash", "-c", relCmdB)
+	if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
+		t.Fatalf("contender failed to release lock: %v (out: %s)", relErr, string(relOut))
+	}
+
+	// Verify lock directory is removed
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after release")
 	}
 }
 
