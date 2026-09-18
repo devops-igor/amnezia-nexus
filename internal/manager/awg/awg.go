@@ -154,7 +154,7 @@ func remoteLockAcquireCmd(serverID int64, token string) string {
 	// Atomic directory/file lock with timeout (30 seconds) and stale lock recovery (60 seconds).
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then rm -rf "$flock_path" 2>/dev/null; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
+		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ] && [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then rm -rf "$flock_path.stale.$now.$$" "$flock_path.stale.$$"; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(token),
 	)
@@ -184,8 +184,13 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 	var once sync.Once
 	unlock := func() {
 		once.Do(func() {
+			relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 			relCmd := remoteLockReleaseCmd(serverID, token)
-			_, _, _, _ = client.RunSudoCommand(context.Background(), relCmd)
+			_, errOut, code, err := client.RunSudoCommand(relCtx, relCmd)
+			if err != nil || code != 0 {
+				slog.Warn("failed to release remote server lock", "server_id", serverID, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+			}
 		})
 	}
 	return unlock, nil
@@ -878,8 +883,17 @@ func (m *AWGManager) getClientsTable(ctx context.Context, client ssh.SSHClient) 
 	if !IsValidContainerName(cName) {
 		return []AWGClient{}, errors.New("invalid container name")
 	}
-	out, _, code, _ := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.clientsTablePath())))
-	if code != 0 || strings.TrimSpace(out) == "" {
+	out, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s cat %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(m.clientsTablePath())))
+	if err != nil {
+		return []AWGClient{}, fmt.Errorf("failed to read clientsTable: %w", err)
+	}
+	if code != 0 {
+		if strings.Contains(errOut, "No such file") || strings.Contains(out, "No such file") {
+			return []AWGClient{}, nil
+		}
+		return []AWGClient{}, fmt.Errorf("failed to read clientsTable (exit code %d): %s", code, strings.TrimSpace(errOut))
+	}
+	if strings.TrimSpace(out) == "" {
 		return []AWGClient{}, nil
 	}
 	return ParseClientsTable(out)
@@ -1368,20 +1382,28 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 
 	usedIPs := GetUsedIPsFromConfig(confText)
-	serverParams, _, _ := ParseServerConfig(confText)
+	serverParams, remotePeers, _ := ParseServerConfig(confText)
 	serverPubKey, err := m.getServerPublicKeyRequired(ctx, server)
 	if err != nil {
 		return nil, err
 	}
 
+	initialConfText := confText
+
 	// Idempotency: reuse the existing entry (and its IP) when this identity is
 	// already registered instead of appending a duplicate peer.
-	clients, _ := m.getClientsTable(ctx, client)
+	clients, err := m.getClientsTable(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	initialClients := append([]AWGClient(nil), clients...)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
 
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
-	clientIP, newlyAllocated, rekeyed, previousOwner, rekeyedIP, err := m.obtainClientIP(ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams)
+	clientIP, newlyAllocated, rekeyed, previousOwner, rekeyedIP, err := m.obtainClientIP(
+		ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams, remotePeers,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1390,12 +1412,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	remoteCommitted := false
 	defer func() {
 		if err != nil {
-			if rekeyed && !remoteCommitted && m.ipAllocator != nil {
-				_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
-			}
-			if newlyAllocated {
-				m.rollbackAllocatedPeer(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, diskWritten, remoteCommitted)
-			}
+			m.rollbackAddClient(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, previousOwner, rekeyedIP, initialConfText, initialClients, rekeyed, newlyAllocated, diskWritten, remoteCommitted)
 		}
 	}()
 
@@ -1421,7 +1438,10 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
 	// Fresh read-and-upsert for clientsTable to avoid lost updates
-	clients, _ = m.getClientsTable(ctx, client)
+	clients, err = m.getClientsTable(ctx, client)
+	if err != nil {
+		return nil, err
+	}
 	existingIdx, _ = findExistingClient(clients, clientPubKey, clientName)
 	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
 	if err = m.saveClientsTable(ctx, client, clients); err != nil {
@@ -1481,7 +1501,10 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 		}
 		if freshConf != confText {
 			confText = freshConf
-			clients, _ := m.getClientsTable(ctx, client)
+			clients, err := m.getClientsTable(ctx, client)
+			if err != nil {
+				return false, fmt.Errorf("failed to fetch clientsTable for CAS retry: %w", err)
+			}
 			_, currExistingPubKey = findExistingClient(clients, clientPubKey, clientName)
 			continue
 		}
@@ -1599,6 +1622,54 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 	return nil
 }
 
+func (m *AWGManager) restorePreviousPeer(ctx context.Context, client ssh.SSHClient, initialConfText string, initialClients []AWGClient) error {
+	if err := m.saveServerConfig(ctx, client, initialConfText); err != nil {
+		return fmt.Errorf("failed to restore initial server config: %w", err)
+	}
+	if err := m.saveClientsTable(ctx, client, initialClients); err != nil {
+		return fmt.Errorf("failed to restore initial clients table: %w", err)
+	}
+	return nil
+}
+
+func (m *AWGManager) rollbackAddClient(
+	ctx context.Context,
+	client ssh.SSHClient,
+	serverID int64,
+	effectiveClientID, clientPubKey, clientIP, previousOwner, rekeyedIP, initialConfText string,
+	initialClients []AWGClient,
+	rekeyed, newlyAllocated, diskWritten, remoteCommitted bool,
+) {
+	if rekeyed && m.ipAllocator != nil {
+		if !diskWritten {
+			_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
+		} else {
+			if restoreErr := m.restorePreviousPeer(ctx, client, initialConfText, initialClients); restoreErr != nil {
+				slog.Error("failed to restore previous peer on remote server during re-key rollback; retaining new key lease in DB to prevent zombie IP collision",
+					"server_id", serverID,
+					"previous_owner", previousOwner,
+					"new_client_id", effectiveClientID,
+					"ip", rekeyedIP,
+					"error", restoreErr,
+				)
+			} else {
+				if relErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); relErr != nil {
+					slog.Warn("failed to revert AWG client IP lease to previous owner after remote restore",
+						"server_id", serverID,
+						"previous_owner", previousOwner,
+						"new_client_id", effectiveClientID,
+						"ip", rekeyedIP,
+						"error", relErr,
+					)
+				}
+			}
+		}
+	}
+	if newlyAllocated && !rekeyed {
+		m.rollbackAllocatedPeer(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, diskWritten, remoteCommitted)
+	}
+}
+
 func (m *AWGManager) rollbackAllocatedPeer(
 	ctx context.Context,
 	client ssh.SSHClient,
@@ -1665,6 +1736,40 @@ func parseServerSubnetParams(serverParams map[string]string) (string, int, strin
 	return subnetAddr, subnetCIDR, gatewayIP
 }
 
+func conflictingRemotePeer(remotePeers []AWGPeer, targetIPStr, allowedKey string) *AWGPeer {
+	targetIP := net.ParseIP(strings.TrimSpace(targetIPStr))
+	if targetIP == nil {
+		return nil
+	}
+	for _, peer := range remotePeers {
+		if peer.PublicKey != allowedKey && peerHasIP(peer, targetIP) {
+			p := peer
+			return &p
+		}
+	}
+	return nil
+}
+
+func peerHasIP(peer AWGPeer, targetIP net.IP) bool {
+	if targetIP == nil {
+		return false
+	}
+	for _, part := range strings.Split(peer.AllowedIPs, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		parsedIP, _, err := net.ParseCIDR(part)
+		if err != nil {
+			parsedIP = net.ParseIP(part)
+		}
+		if parsedIP != nil && parsedIP.Equal(targetIP) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *AWGManager) obtainClientIP(
 	ctx context.Context,
 	serverID int64,
@@ -1674,6 +1779,7 @@ func (m *AWGManager) obtainClientIP(
 	clientPubKey string,
 	usedIPs []string,
 	serverParams map[string]string,
+	remotePeers []AWGPeer,
 ) (string, bool, bool, string, string, error) {
 	subnetAddr, subnetCIDR, gatewayIP := parseServerSubnetParams(serverParams)
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
@@ -1687,23 +1793,47 @@ func (m *AWGManager) obtainClientIP(
 			rekeyed := false
 			previousOwner := ""
 			rekeyedIP := ""
+			transferSucceeded := false
 
 			// Re-keying ownership transfer: if existing peer is replacing K1 with K2
 			if existingPubKey != "" && clientPubKey != "" && existingPubKey != clientPubKey {
 				rekeyed = true
 				previousOwner = existingPubKey
 				rekeyedIP = existingIP
-				if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP); transErr != nil {
+				if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP); transErr == nil {
+					transferSucceeded = true
+				} else {
 					// Existing client had no lease row in DB, attempt to adopt existingIP for new key
-					_, _ = m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP)
+					if conflictingRemotePeer(remotePeers, existingIP, existingPubKey) != nil {
+						allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+						if allocErr != nil {
+							return "", false, false, "", "", allocErr
+						}
+						return allocatedIP, true, false, "", "", nil
+					}
+					if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
+						return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease during re-keying: %w", adoptErr)
+					}
 				}
 			} else {
 				// Existing client without lease row in DB: adopt existingIP if not claimed
-				_, _ = m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP)
+				if conflictingRemotePeer(remotePeers, existingIP, clientPubKey) != nil {
+					allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+					if allocErr != nil {
+						return "", false, false, "", "", allocErr
+					}
+					return allocatedIP, true, false, "", "", nil
+				}
+				if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
+					return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease: %w", adoptErr)
+				}
 			}
 
 			allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 			if allocErr != nil {
+				if transferSucceeded {
+					_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
+				}
 				return "", false, false, "", "", allocErr
 			}
 			return allocatedIP, allocatedIP != existingIP, rekeyed, previousOwner, rekeyedIP, nil
@@ -1846,7 +1976,10 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 
 	// 1. Remove TC speed limit for peer IP
 	cName := m.resolveContainerName(ctx, client)
-	clients, _ := m.getClientsTable(ctx, client)
+	clients, err := m.getClientsTable(ctx, client)
+	if err != nil {
+		return err
+	}
 	var peerIP string
 	for _, c := range clients {
 		if c.ClientID == clientID && c.UserData.ClientIP != "" {

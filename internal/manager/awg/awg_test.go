@@ -1175,10 +1175,10 @@ func TestAWGManager_SaveServerConfig_SyncconfFailure_ReturnsError(t *testing.T) 
 		if strings.Contains(cmd, "syncconf") {
 			return "", "Line unrecognized: `DisableCookies = on`", 1, errors.New("exit status 1")
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "cat") && strings.Contains(cmd, "awg0.conf") {
 			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "cat") && strings.Contains(cmd, "clientsTable") {
 			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
 		if strings.Contains(cmd, "wireguard_server_public_key.key") {
