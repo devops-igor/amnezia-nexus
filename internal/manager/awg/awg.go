@@ -1739,14 +1739,14 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 	return nil
 }
 
-func (m *AWGManager) restorePreviousPeer(ctx context.Context, client ssh.SSHClient, initialConfText string, initialClients []AWGClient) error {
+func (m *AWGManager) restorePreviousPeer(ctx context.Context, client ssh.SSHClient, initialConfText string, initialClients []AWGClient) (bool, error) {
 	if err := m.saveServerConfig(ctx, client, initialConfText); err != nil {
-		return fmt.Errorf("failed to restore initial server config: %w", err)
+		return false, fmt.Errorf("failed to restore initial server config: %w", err)
 	}
 	if err := m.saveClientsTable(ctx, client, initialClients); err != nil {
-		return fmt.Errorf("failed to restore initial clients table: %w", err)
+		return true, fmt.Errorf("failed to restore initial clients table: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (m *AWGManager) rollbackAddClient(
@@ -1759,10 +1759,19 @@ func (m *AWGManager) rollbackAddClient(
 ) {
 	if rekeyed && m.ipAllocator != nil {
 		if !diskWritten {
-			_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
+			if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); transErr != nil {
+				slog.Error("failed to revert AWG client IP lease to previous owner during re-key rollback without disk write",
+					"server_id", serverID,
+					"previous_owner", previousOwner,
+					"new_client_id", effectiveClientID,
+					"ip", rekeyedIP,
+					"error", transErr,
+				)
+			}
 		} else {
-			if restoreErr := m.restorePreviousPeer(ctx, client, initialConfText, initialClients); restoreErr != nil {
-				slog.Error("failed to restore previous peer on remote server during re-key rollback; retaining new key lease in DB to prevent zombie IP collision",
+			configRestored, restoreErr := m.restorePreviousPeer(ctx, client, initialConfText, initialClients)
+			if !configRestored {
+				slog.Error("failed to restore previous peer config on remote server during re-key rollback; retaining new key lease in DB to prevent zombie IP collision",
 					"server_id", serverID,
 					"previous_owner", previousOwner,
 					"new_client_id", effectiveClientID,
@@ -1770,8 +1779,17 @@ func (m *AWGManager) rollbackAddClient(
 					"error", restoreErr,
 				)
 			} else {
+				if restoreErr != nil {
+					slog.Warn("remote peer config restored to previous owner but clients table restore failed during re-key rollback",
+						"server_id", serverID,
+						"previous_owner", previousOwner,
+						"new_client_id", effectiveClientID,
+						"ip", rekeyedIP,
+						"error", restoreErr,
+					)
+				}
 				if relErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); relErr != nil {
-					slog.Warn("failed to revert AWG client IP lease to previous owner after remote restore",
+					slog.Error("failed to revert AWG client IP lease to previous owner after remote restore",
 						"server_id", serverID,
 						"previous_owner", previousOwner,
 						"new_client_id", effectiveClientID,
@@ -1887,6 +1905,134 @@ func peerHasIP(peer AWGPeer, targetIP net.IP) bool {
 	return false
 }
 
+func (m *AWGManager) allocateNonConflictingIP(
+	ctx context.Context,
+	serverID int64,
+	effectiveClientID, clientPubKey string,
+	usedIPs []string,
+	subnetAddr string,
+	subnetCIDR int,
+	gatewayIP string,
+	remotePeers []AWGPeer,
+) (string, error) {
+	for {
+		allocatedIP, err := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+		if err != nil {
+			return "", err
+		}
+		if conflictingRemotePeer(remotePeers, allocatedIP, clientPubKey) == nil {
+			return allocatedIP, nil
+		}
+		slog.Warn("allocated IP conflicts with active remote peer; releasing stale lease and re-allocating",
+			"server_id", serverID,
+			"client_id", effectiveClientID,
+			"ip", allocatedIP,
+		)
+		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP)
+		usedIPs = append(usedIPs, allocatedIP)
+	}
+}
+
+func (m *AWGManager) obtainExistingClientIPWithAllocator(
+	ctx context.Context,
+	serverID int64,
+	effectiveClientID, clientPubKey string,
+	existingClient AWGClient,
+	usedIPs []string,
+	subnetAddr string,
+	subnetCIDR int,
+	gatewayIP string,
+	remotePeers []AWGPeer,
+) (string, bool, bool, string, string, error) {
+	existingIP := existingClient.UserData.ClientIP
+	existingPubKey := existingClient.ClientID
+
+	rekeyed := false
+	previousOwner := ""
+	rekeyedIP := ""
+	transferSucceeded := false
+
+	// Re-keying ownership transfer: if existing peer is replacing K1 with K2
+	if existingPubKey != "" && clientPubKey != "" && existingPubKey != clientPubKey {
+		rekeyed = true
+		previousOwner = existingPubKey
+		rekeyedIP = existingIP
+		if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP); transErr == nil {
+			transferSucceeded = true
+		} else {
+			// Existing client had no lease row in DB, attempt to adopt existingIP for new key
+			if conflictingRemotePeer(remotePeers, existingIP, existingPubKey) != nil {
+				allocatedIP, allocErr := m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)
+				if allocErr != nil {
+					return "", false, false, "", "", allocErr
+				}
+				return allocatedIP, true, false, "", "", nil
+			}
+			if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
+				return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease during re-keying: %w", adoptErr)
+			}
+		}
+	} else {
+		// Existing client without lease row in DB: adopt existingIP if not claimed
+		if conflictingRemotePeer(remotePeers, existingIP, clientPubKey) != nil {
+			allocatedIP, allocErr := m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)
+			if allocErr != nil {
+				return "", false, false, "", "", allocErr
+			}
+			return allocatedIP, true, false, "", "", nil
+		}
+		if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
+			return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease: %w", adoptErr)
+		}
+	}
+
+	allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+	if allocErr != nil {
+		if transferSucceeded {
+			if compErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); compErr != nil {
+				slog.Error("failed to revert AWG client IP lease to previous owner during allocation failure compensation",
+					"server_id", serverID,
+					"previous_owner", previousOwner,
+					"new_client_id", effectiveClientID,
+					"ip", rekeyedIP,
+					"error", compErr,
+				)
+			}
+		}
+		return "", false, false, "", "", allocErr
+	}
+
+	allowedKey := clientPubKey
+	if rekeyed && previousOwner != "" {
+		allowedKey = previousOwner
+	}
+	if conflictingRemotePeer(remotePeers, allocatedIP, allowedKey) != nil {
+		slog.Warn("allocated IP conflicts with active remote peer; releasing stale lease and re-allocating",
+			"server_id", serverID,
+			"client_id", effectiveClientID,
+			"ip", allocatedIP,
+		)
+		if transferSucceeded {
+			if compErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); compErr != nil {
+				slog.Error("failed to revert AWG client IP lease to previous owner during conflicting allocation compensation",
+					"server_id", serverID,
+					"previous_owner", previousOwner,
+					"new_client_id", effectiveClientID,
+					"ip", rekeyedIP,
+					"error", compErr,
+				)
+			}
+		}
+		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP)
+		usedIPs = append(usedIPs, allocatedIP)
+		allocatedIP, allocErr = m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)
+		if allocErr != nil {
+			return "", false, false, "", "", allocErr
+		}
+	}
+	return allocatedIP, allocatedIP != existingIP, rekeyed, previousOwner, rekeyedIP, nil
+}
+
 func (m *AWGManager) obtainClientIP(
 	ctx context.Context,
 	serverID int64,
@@ -1903,60 +2049,13 @@ func (m *AWGManager) obtainClientIP(
 
 	if m.ipAllocator != nil {
 		if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
-			existingClient := clients[existingIdx]
-			existingIP := existingClient.UserData.ClientIP
-			existingPubKey := existingClient.ClientID
-
-			rekeyed := false
-			previousOwner := ""
-			rekeyedIP := ""
-			transferSucceeded := false
-
-			// Re-keying ownership transfer: if existing peer is replacing K1 with K2
-			if existingPubKey != "" && clientPubKey != "" && existingPubKey != clientPubKey {
-				rekeyed = true
-				previousOwner = existingPubKey
-				rekeyedIP = existingIP
-				if transErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, effectiveClientID, existingPubKey, existingIP); transErr == nil {
-					transferSucceeded = true
-				} else {
-					// Existing client had no lease row in DB, attempt to adopt existingIP for new key
-					if conflictingRemotePeer(remotePeers, existingIP, existingPubKey) != nil {
-						allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-						if allocErr != nil {
-							return "", false, false, "", "", allocErr
-						}
-						return allocatedIP, true, false, "", "", nil
-					}
-					if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
-						return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease during re-keying: %w", adoptErr)
-					}
-				}
-			} else {
-				// Existing client without lease row in DB: adopt existingIP if not claimed
-				if conflictingRemotePeer(remotePeers, existingIP, clientPubKey) != nil {
-					allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-					if allocErr != nil {
-						return "", false, false, "", "", allocErr
-					}
-					return allocatedIP, true, false, "", "", nil
-				}
-				if _, adoptErr := m.ipAllocator.AdoptAWGClientIPLease(ctx, serverID, effectiveClientID, clientPubKey, existingIP); adoptErr != nil {
-					return "", false, false, "", "", fmt.Errorf("failed to adopt AWG client IP lease: %w", adoptErr)
-				}
-			}
-
-			allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
-			if allocErr != nil {
-				if transferSucceeded {
-					_ = m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP)
-				}
-				return "", false, false, "", "", allocErr
-			}
-			return allocatedIP, allocatedIP != existingIP, rekeyed, previousOwner, rekeyedIP, nil
+			return m.obtainExistingClientIPWithAllocator(
+				ctx, serverID, effectiveClientID, clientPubKey, clients[existingIdx],
+				usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers,
+			)
 		}
 
-		allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
+		allocatedIP, allocErr := m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)
 		if allocErr != nil {
 			return "", false, false, "", "", allocErr
 		}

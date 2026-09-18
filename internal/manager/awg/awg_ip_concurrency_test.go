@@ -2237,6 +2237,170 @@ func TestAWGManager_ReKeying_DiskWriteSucceeds_SyncconfFails_RestoresPreviousPee
 	})
 }
 
+func TestAWGManager_ReKeying_ConfigRestoreSucceeds_ClientsTableFails_RevertsLeaseToK1(t *testing.T) {
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const (
+		keyK1 = "ERERERERERERERERERERERERERERERERERERERERERE="
+		keyK2 = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
+	)
+
+	// 1. Initial provision with K1 succeeds
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Alice",
+		"public_key":  keyK1,
+	})
+	if err != nil {
+		t.Fatalf("initial AddClient with K1 failed: %v", err)
+	}
+	ip1, _ := res1["client_ip"].(string)
+	if ip1 == "" {
+		t.Fatalf("expected valid IP for K1")
+	}
+
+	owner1, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || owner1 != keyK1 {
+		t.Fatalf("expected initial lease owner %s, got: %s (err: %v)", keyK1, owner1, err)
+	}
+
+	// 2. Arm saveClientsTable failure.
+	// commitPeerConfigWithCAS (awg0.conf write + syncconf) will succeed for K2,
+	// but saveClientsTable will fail.
+	// In rollbackAddClient:
+	// - restorePreviousPeer calls saveServerConfig(K1) -> succeeds! (configRestored = true)
+	// - restorePreviousPeer calls saveClientsTable -> fails!
+	// - rollbackAddClient sees configRestored = true and reverts DB lease to K1.
+	sshClient.failSaveClientsTable.Store(true)
+
+	_, err = mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Alice",
+		"public_key":  keyK2,
+	})
+	if err == nil {
+		t.Fatalf("expected AddClient with K2 to fail due to clientsTable save failure")
+	}
+
+	// 3. Assertion 1: DB lease is reverted back to K1 (previousOwner).
+	ownerAfterRollback, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil {
+		t.Fatalf("failed to query owner after rollback: %v", err)
+	}
+	if ownerAfterRollback != keyK1 {
+		t.Fatalf("expected DB lease owner to revert back to K1 (%s), got: %s", keyK1, ownerAfterRollback)
+	}
+
+	// Also verify remote peer in awg0.conf was restored to K1
+	sshClient.mu.RLock()
+	conf := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	sshClient.mu.RUnlock()
+
+	_, peers, err := awg.ParseServerConfig(conf)
+	if err != nil || len(peers) != 1 || peers[0].PublicKey != keyK1 {
+		t.Fatalf("expected live peer in awg0.conf to be restored to %s, got: %+v", keyK1, peers)
+	}
+
+	// 4. Assertion 2: A subsequent allocation for K2 receives a different IP and cannot reuse K1's IP.
+	// Reset failure flag so subsequent client provisioning can succeed
+	sshClient.failSaveClientsTable.Store(false)
+
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Bob",
+		"public_key":  keyK2,
+	})
+	if err != nil {
+		t.Fatalf("subsequent AddClient with K2 failed: %v", err)
+	}
+	ip2, _ := res2["client_ip"].(string)
+	if ip2 == "" {
+		t.Fatalf("expected valid IP for K2")
+	}
+	if ip2 == ip1 {
+		t.Fatalf("expected K2 to receive a different IP from K1 (%s), but got duplicate IP %s", ip1, ip2)
+	}
+
+	// Verify both leases in DB
+	ownerK1, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip1)
+	if err != nil || ownerK1 != keyK1 {
+		t.Fatalf("expected ip1 to be owned by K1 (%s), got: %s", keyK1, ownerK1)
+	}
+	ownerK2, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip2)
+	if err != nil || ownerK2 != keyK2 {
+		t.Fatalf("expected ip2 to be owned by K2 (%s), got: %s", keyK2, ownerK2)
+	}
+}
+
+func TestAWGManager_ObtainClientIP_ZombieDBLease_CollidesWithRemotePeer_ReallocatesNewIP(t *testing.T) {
+	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const (
+		keyK1 = "ERERERERERERERERERERERERERERERERERERERERERE="
+		keyK2 = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
+	)
+
+	// 1. Initial provision with K1 succeeds on 10.66.66.2
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Alice",
+		"public_key":  keyK1,
+	})
+	if err != nil {
+		t.Fatalf("initial AddClient with K1 failed: %v", err)
+	}
+	ip1, _ := res1["client_ip"].(string)
+
+	// 2. Simulate zombie lease in DB:
+	// Manually force an active lease for K2 pointing to K1's IP (10.66.66.2)
+	// (e.g. from an uncompensated legacy crash or stale state)
+	_, _ = db.ExecContext(ctx, "DELETE FROM awg_ip_allocations WHERE client_id = ?", keyK1)
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, 'allocated', datetime('now'), datetime('now'))",
+		server.ID, keyK2, ip1,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert zombie lease: %v", err)
+	}
+
+	// In awg0.conf, K1 is still the active live peer occupying ip1
+	sshClient.mu.RLock()
+	conf := string(sshClient.files["/opt/amnezia/awg/awg0.conf"])
+	sshClient.mu.RUnlock()
+	_, peers, err := awg.ParseServerConfig(conf)
+	if err != nil || len(peers) != 1 || peers[0].PublicKey != keyK1 {
+		t.Fatalf("expected live peer in awg0.conf to be K1 (%s), got: %+v", keyK1, peers)
+	}
+
+	// 3. Now provision K2 as a new client ("Bob").
+	// obtainClientIP allocator defense-in-depth:
+	// AllocateAWGClientIP finds existing DB lease (ip1).
+	// But conflictingRemotePeer detects that ip1 is occupied by K1 on awg0.conf!
+	// It releases K2's stale lease, adds ip1 to usedIPs, and re-allocates a new IP.
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"client_name": "Bob",
+		"public_key":  keyK2,
+	})
+	if err != nil {
+		t.Fatalf("AddClient with K2 failed: %v", err)
+	}
+	ip2, _ := res2["client_ip"].(string)
+	if ip2 == "" {
+		t.Fatalf("expected valid IP for K2")
+	}
+	if ip2 == ip1 {
+		t.Fatalf("defense-in-depth failed: expected K2 to receive different IP than live peer K1 (%s), got duplicate %s", ip1, ip2)
+	}
+
+	// Verify K2 owns ip2 in DB
+	ownerK2, err := db.GetAWGIPAllocationOwner(ctx, server.ID, ip2)
+	if err != nil || ownerK2 != keyK2 {
+		t.Fatalf("expected ip2 to be owned by K2 (%s), got: %s", keyK2, ownerK2)
+	}
+}
+
 func TestAWGManager_LegacyAdoption_ConflictingRemotePeer_AllocatesFreshIP(t *testing.T) {
 	mgr, db, sshClient, server, cleanup := setupAWGManagerWithDB(t)
 	defer cleanup()
