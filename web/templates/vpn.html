@@ -105,6 +105,39 @@
     </div>
 </div>
 
+<!-- ACTIVE SESSIONS TABLE -->
+<div class="card">
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
+        <div class="flex items-center gap-sm">
+            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-users"></use></svg>
+            <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_active_sessions" }}</h3>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <table class="table interactive-table" id="vpnSessionsTable" style="width: 100%; min-width: 100%;">
+            <thead>
+                <tr>
+                    <th class="sortable" data-sort-type="string">{{ _ "username" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
+                    <th class="sortable" data-sort-type="date">{{ _ "vpn_col_connected" }}</th>
+                    <th class="sortable" data-sort-type="date">{{ _ "vpn_col_last_seen" }}</th>
+                    <th class="sortable" data-sort-type="bytes">{{ _ "traffic" }}</th>
+                </tr>
+            </thead>
+            <tbody id="vpn-sessions-tbody">
+                <tr id="vpn-sessions-loading" class="table-loading-row">
+                    <td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                        <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
+                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
 <!-- ADD BACKEND MODAL -->
 <div class="modal-backdrop" id="addBackendModal">
     <div class="modal" style="max-width: 520px;">
@@ -216,6 +249,7 @@
     let vpnCurrentBackends = [];
     let vpnConfiguredPublicEndpoint = '';
     let vpnTableInstance = null;
+    let vpnSessionsTableInstance = null;
 
     function vpnFormatApiError(err, res, data) {
         const errMsg = (data && (data.detail || data.message || data.error)) ||
@@ -716,12 +750,105 @@
         }
     }
 
+    function vpnFormatSessionDateTime(dateStr) {
+        try {
+            const d = new Date(dateStr);
+            if (isNaN(d)) return dateStr;
+            return d.toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: 'numeric' })
+                + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        } catch { return dateStr; }
+    }
+
+    function vpnRenderSessionRow(s) {
+        const tr = document.createElement('tr');
+        tr.setAttribute('data-status', s.status || '');
+
+        const tdUser = document.createElement('td');
+        tdUser.className = 'font-weight-600';
+        tdUser.textContent = s.username || '—';
+        tr.appendChild(tdUser);
+
+        const tdServer = document.createElement('td');
+        tdServer.className = 'font-weight-600';
+        tdServer.textContent = s.server_name || '—';
+        tr.appendChild(tdServer);
+
+        const tdIp = document.createElement('td');
+        tdIp.className = 'font-mono text-sm';
+        tdIp.textContent = s.assigned_ip || '—';
+        tr.appendChild(tdIp);
+
+        const tdConnected = document.createElement('td');
+        tdConnected.className = 'text-sm text-muted';
+        tdConnected.setAttribute('data-sort-val', String(Date.parse(s.connected_at) || 0));
+        tdConnected.textContent = vpnFormatSessionDateTime(s.connected_at);
+        tr.appendChild(tdConnected);
+
+        const tdLastSeen = document.createElement('td');
+        tdLastSeen.className = 'text-sm text-muted';
+        tdLastSeen.setAttribute('data-sort-val', String(Date.parse(s.last_seen) || 0));
+        tdLastSeen.textContent = vpnFormatSessionDateTime(s.last_seen);
+        tr.appendChild(tdLastSeen);
+
+        const tdTraffic = document.createElement('td');
+        tdTraffic.className = 'font-mono text-sm';
+        tdTraffic.style.fontVariantNumeric = 'tabular-nums';
+        tdTraffic.setAttribute('data-sort-val', String((Number(s.rx_bytes) || 0) + (Number(s.tx_bytes) || 0)));
+        tdTraffic.textContent = Telemetry.formatBytes(s.rx_bytes || 0) + ' / ' + Telemetry.formatBytes(s.tx_bytes || 0);
+        tr.appendChild(tdTraffic);
+
+        return tr;
+    }
+
+    function renderSessions(sessions) {
+        const tbody = document.getElementById('vpn-sessions-tbody');
+        tbody.textContent = '';
+        if (!sessions || !sessions.length) {
+            const tr = document.createElement('tr');
+            tr.className = 'table-empty-state';
+            const td = document.createElement('td');
+            td.colSpan = 6;
+            td.style.padding = 'var(--space-2xl) var(--space-md)';
+            td.style.textAlign = 'center';
+            td.innerHTML = `
+                <div class="empty-state" style="padding: 0;">
+                    <div class="empty-icon" style="margin-bottom: var(--space-sm);">
+                        <svg class="icon text-muted" style="width: 48px; height: 48px;"><use href="#icon-users"></use></svg>
+                    </div>
+                    <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${UI.escapeHtml(_('vpn_no_sessions'))}</div>
+                </div>
+            `;
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            if (vpnSessionsTableInstance) vpnSessionsTableInstance.refresh();
+            return;
+        }
+
+        for (const s of sessions) {
+            tbody.appendChild(vpnRenderSessionRow(s));
+        }
+
+        if (vpnSessionsTableInstance) {
+            vpnSessionsTableInstance.refresh();
+        } else {
+            vpnSessionsTableInstance = new NexusTable('#vpnSessionsTable', {
+                searchable: true,
+                sortable: true,
+                paginate: true,
+                pageSize: 10,
+                searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
+                emptyMessage: _('vpn_no_sessions') || 'No active sessions'
+            });
+        }
+    }
+
     async function vpnLoadData() {
         try {
-            const [status, cfg, backendData] = await Promise.all([
+            const [status, cfg, backendData, sessionsData] = await Promise.all([
                 API.get('/api/vpn/status'),
                 API.get('/api/vpn/config').catch(() => ({})),
-                API.get('/api/vpn/backends')
+                API.get('/api/vpn/backends'),
+                API.get('/api/vpn/sessions').catch(() => ({ sessions: [] }))
             ]);
 
             const backends = (backendData && (backendData.backends || backendData.tunnels)) || [];
@@ -772,6 +899,7 @@
                 tr.appendChild(td);
                 tbody.appendChild(tr);
                 if (vpnTableInstance) vpnTableInstance.refresh();
+                renderSessions((sessionsData && sessionsData.sessions) || []);
                 return;
             }
 
@@ -793,6 +921,8 @@
                     emptyMessage: _('vpn_no_backends') || 'No backends configured'
                 });
             }
+
+            renderSessions((sessionsData && sessionsData.sessions) || []);
         } catch (err) {
             const tbody = document.getElementById('vpn-backends-tbody');
             if (tbody) {
