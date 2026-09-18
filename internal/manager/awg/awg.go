@@ -267,8 +267,7 @@ func (m *AWGManager) resolveLockResource(ctx context.Context, client ssh.SSHClie
 			}
 		}
 
-		cName := m.resolveContainerName(ctx, client)
-		if IsValidContainerName(cName) {
+		if cName, ok := m.discoverContainerName(ctx, client); ok && IsValidContainerName(cName) {
 			if serverID > 0 {
 				m.setCachedContainer(fmt.Sprintf("id:%d", serverID), cName)
 			}
@@ -775,16 +774,12 @@ func runDockerCmdWithRetry(ctx context.Context, client ssh.SSHClient, cmd string
 	return out, code, err
 }
 
-func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+func (m *AWGManager) discoverContainerName(ctx context.Context, client ssh.SSHClient) (string, bool) {
 	if client == nil {
-		safeDefault := m.containerName()
-		if !IsValidContainerName(safeDefault) {
-			safeDefault = "amnezia-awg2"
-		}
-		return safeDefault
+		return "", false
 	}
-	if cached, ok := m.getCachedContainerForClient(client); ok {
-		return cached
+	if cached, ok := m.getCachedContainerForClient(client); ok && IsValidContainerName(cached) {
+		return cached, true
 	}
 
 	for _, name := range AWGContainerNames {
@@ -797,7 +792,7 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 				trimmed := strings.TrimSpace(line)
 				if trimmed == name {
 					m.setCachedContainerForClient(client, name)
-					return name
+					return name, true
 				}
 			}
 		}
@@ -809,8 +804,17 @@ func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHCli
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "amnezia-awg") && IsValidContainerName(trimmed) {
 				m.setCachedContainerForClient(client, trimmed)
-				return trimmed
+				return trimmed, true
 			}
+		}
+	}
+	return "", false
+}
+
+func (m *AWGManager) resolveContainerName(ctx context.Context, client ssh.SSHClient) string {
+	if client != nil {
+		if found, ok := m.discoverContainerName(ctx, client); ok {
+			return found
 		}
 	}
 	safeDefault := m.containerName()
@@ -1976,6 +1980,8 @@ func peerHasIP(peer AWGPeer, targetIP net.IP) bool {
 	return false
 }
 
+const maxConflictRetries = 10
+
 func (m *AWGManager) allocateNonConflictingIP(
 	ctx context.Context,
 	serverID int64,
@@ -1986,7 +1992,7 @@ func (m *AWGManager) allocateNonConflictingIP(
 	gatewayIP string,
 	remotePeers []AWGPeer,
 ) (string, error) {
-	for {
+	for attempt := 0; attempt < maxConflictRetries; attempt++ {
 		allocatedIP, err := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 		if err != nil {
 			return "", err
@@ -1998,9 +2004,30 @@ func (m *AWGManager) allocateNonConflictingIP(
 			"server_id", serverID,
 			"client_id", effectiveClientID,
 			"ip", allocatedIP,
+			"attempt", attempt+1,
 		)
-		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP)
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP); relErr != nil {
+			slog.Warn("failed to release conflicting allocated IP lease",
+				"server_id", serverID,
+				"client_id", effectiveClientID,
+				"ip", allocatedIP,
+				"error", relErr,
+			)
+		}
 		usedIPs = append(usedIPs, allocatedIP)
+	}
+	return "", fmt.Errorf("failed to allocate non-conflicting IP on server %d after %d attempts: all candidates conflict with remote peers", serverID, maxConflictRetries)
+}
+
+func (m *AWGManager) revertRekeyedLease(ctx context.Context, serverID int64, previousOwner, newClientID, ip, reason string) {
+	if compErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, newClientID, ip); compErr != nil {
+		slog.Error("failed to revert AWG client IP lease to previous owner during "+reason,
+			"server_id", serverID,
+			"previous_owner", previousOwner,
+			"new_client_id", newClientID,
+			"ip", ip,
+			"error", compErr,
+		)
 	}
 }
 
@@ -2060,15 +2087,7 @@ func (m *AWGManager) obtainExistingClientIPWithAllocator(
 	allocatedIP, allocErr := m.ipAllocator.AllocateAWGClientIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP)
 	if allocErr != nil {
 		if transferSucceeded {
-			if compErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); compErr != nil {
-				slog.Error("failed to revert AWG client IP lease to previous owner during allocation failure compensation",
-					"server_id", serverID,
-					"previous_owner", previousOwner,
-					"new_client_id", effectiveClientID,
-					"ip", rekeyedIP,
-					"error", compErr,
-				)
-			}
+			m.revertRekeyedLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP, "allocation failure compensation")
 		}
 		return "", false, false, "", "", allocErr
 	}
@@ -2084,17 +2103,16 @@ func (m *AWGManager) obtainExistingClientIPWithAllocator(
 			"ip", allocatedIP,
 		)
 		if transferSucceeded {
-			if compErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); compErr != nil {
-				slog.Error("failed to revert AWG client IP lease to previous owner during conflicting allocation compensation",
-					"server_id", serverID,
-					"previous_owner", previousOwner,
-					"new_client_id", effectiveClientID,
-					"ip", rekeyedIP,
-					"error", compErr,
-				)
-			}
+			m.revertRekeyedLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP, "conflicting allocation compensation")
 		}
-		_ = m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP)
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, allocatedIP); relErr != nil {
+			slog.Warn("failed to release conflicting allocated IP lease",
+				"server_id", serverID,
+				"client_id", effectiveClientID,
+				"ip", allocatedIP,
+				"error", relErr,
+			)
+		}
 		usedIPs = append(usedIPs, allocatedIP)
 		allocatedIP, allocErr = m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)
 		if allocErr != nil {

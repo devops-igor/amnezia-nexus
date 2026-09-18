@@ -1037,3 +1037,160 @@ func TestAllocateAWGClientIP_PostMigrationProvisioningRegression(t *testing.T) {
 		t.Fatalf("expected new-client-2 to receive 10.8.0.5, got %s", newIP2)
 	}
 }
+
+func TestLoadData_AWGIPAllocationsScanFailure_AbortsBackupExport(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Seed server and user so preceding loads succeed
+	_, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Fault Server",
+		Host:      "192.0.2.10",
+		SSHUser:   "root",
+		SSHPort:   22,
+		Protocols: map[string]any{"awg": map[string]any{"port": 51820}},
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test server: %v", err)
+	}
+
+	uEmail := "test_scan_fault@example.com"
+	_, err = db.CreateUser(ctx, &models.User{
+		Username:     "scan_fault_test_user",
+		Email:        &uEmail,
+		PasswordHash: "secret_hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test user: %v", err)
+	}
+
+	// Drop and recreate awg_ip_allocations with nullable columns
+	_, err = db.SQLDB().ExecContext(ctx, "DROP TABLE awg_ip_allocations")
+	if err != nil {
+		t.Fatalf("failed to drop table awg_ip_allocations: %v", err)
+	}
+	_, err = db.SQLDB().ExecContext(ctx, `
+		CREATE TABLE awg_ip_allocations (
+			id INTEGER PRIMARY KEY,
+			server_id INTEGER,
+			client_id TEXT,
+			ip TEXT,
+			status TEXT,
+			created_at TEXT,
+			updated_at TEXT
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to recreate nullable awg_ip_allocations: %v", err)
+	}
+	// Insert row with NULL client_id which fails rows.Scan into string
+	_, err = db.SQLDB().ExecContext(ctx, "INSERT INTO awg_ip_allocations (id, server_id, client_id, ip, status, created_at, updated_at) VALUES (1, 1, NULL, '10.0.0.2', 'allocated', '2026-01-01', '2026-01-01')")
+	if err != nil {
+		t.Fatalf("failed to insert null client_id: %v", err)
+	}
+
+	backup, err := db.LoadData(ctx)
+	if err == nil {
+		t.Fatalf("expected error from LoadData on scan failure, got nil")
+	}
+	if backup != nil {
+		t.Fatalf("expected nil backup on scan failure, got: %+v", backup)
+	}
+	if !strings.Contains(err.Error(), "AWG IP allocations") || !strings.Contains(err.Error(), "scan") {
+		t.Fatalf("expected error message to mention AWG IP allocations and scan, got: %v", err)
+	}
+}
+
+func TestLoadData_AWGIPAllocationsIterationFailure_AbortsBackupExport(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Seed server and user so preceding loads succeed
+	_, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Fault Server Iteration",
+		Host:      "192.0.2.11",
+		SSHUser:   "root",
+		SSHPort:   22,
+		Protocols: map[string]any{"awg": map[string]any{"port": 51820}},
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test server: %v", err)
+	}
+
+	uEmail := "test_iter_fault@example.com"
+	_, err = db.CreateUser(ctx, &models.User{
+		Username:     "iter_fault_test_user",
+		Email:        &uEmail,
+		PasswordHash: "secret_hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test user: %v", err)
+	}
+
+	// Drop awg_ip_allocations and replace with a VIEW where iteration triggers an evaluation error
+	_, err = db.SQLDB().ExecContext(ctx, "DROP TABLE awg_ip_allocations")
+	if err != nil {
+		t.Fatalf("failed to drop table awg_ip_allocations: %v", err)
+	}
+
+	// Create fault_table with PRIMARY KEY id so SQLite streams without temp sort B-tree,
+	// and view awg_ip_allocations evaluating json(raw_val) during row streaming.
+	_, err = db.SQLDB().ExecContext(ctx, `
+		CREATE TABLE fault_table (
+			id INTEGER PRIMARY KEY,
+			server_id INTEGER NOT NULL,
+			client_id TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			raw_val TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to create fault_table: %v", err)
+	}
+
+	_, err = db.SQLDB().ExecContext(ctx, `
+		CREATE VIEW awg_ip_allocations AS
+		SELECT id, server_id, client_id, ip, status, created_at, json(raw_val) AS updated_at
+		FROM fault_table
+	`)
+	if err != nil {
+		t.Fatalf("failed to create awg_ip_allocations view: %v", err)
+	}
+
+	_, err = db.SQLDB().ExecContext(ctx, `
+		INSERT INTO fault_table (id, server_id, client_id, ip, status, created_at, raw_val)
+		VALUES (1, 1, 'client-1', '10.0.0.2', 'allocated', '2026-01-01', '{}')
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert row 1: %v", err)
+	}
+
+	_, err = db.SQLDB().ExecContext(ctx, `
+		INSERT INTO fault_table (id, server_id, client_id, ip, status, created_at, raw_val)
+		VALUES (2, 1, 'client-2', '10.0.0.3', 'allocated', '2026-01-01', '{bad-json')
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert row 2: %v", err)
+	}
+
+	backup, err := db.LoadData(ctx)
+	if err == nil {
+		t.Fatalf("expected error from LoadData during iteration error, got nil")
+	}
+	if backup != nil {
+		t.Fatalf("expected nil backup on iteration error, got: %+v", backup)
+	}
+	if !strings.Contains(err.Error(), "AWG IP allocations") || !strings.Contains(err.Error(), "reading AWG IP allocations") {
+		t.Fatalf("expected error message to mention reading AWG IP allocations, got: %v", err)
+	}
+}
