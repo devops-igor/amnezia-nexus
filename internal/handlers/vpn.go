@@ -38,9 +38,11 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 // VPNSessionsHandler returns active VPN sessions enriched with user and
 // backend server identity (admin/support only; enforcement by the
 // RequireAdminOrSupport route middleware). (issue #189)
-// The row set is memory-authoritative (Service.SessionsLive): it is derived
-// from the same in-memory connected set the active-sessions card counts, so
-// the card and the table agree by construction (issue #189 improvement round).
+// Row membership derives from the live session set (Service.SessionsLive):
+// the same in-memory connected set the active-sessions card counts, so the
+// card and the table agree by construction (issue #189 improvement round);
+// traffic and last_seen come from the accounting pipeline — DB cumulative
+// totals plus un-flushed buffered deltas, continuous across flushes.
 func (h *Handlers) VPNSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	var sessions []models.EnrichedVPNSession
 	if h.vpnSvc != nil {

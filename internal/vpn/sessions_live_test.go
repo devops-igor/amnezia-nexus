@@ -11,6 +11,8 @@ package vpn
 import (
 	"fmt"
 	"testing"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // TestSessionsLiveMatchesActiveCount pins the core issue-#189 guarantee: the
@@ -187,6 +189,61 @@ func TestSessionsLiveAccountantDeltas(t *testing.T) {
 	}
 	if want := dbRow.TxBytes + 300; got.TxBytes != want {
 		t.Errorf("tx = %d, want persisted %d + buffered 300 = %d", got.TxBytes, dbRow.TxBytes, want)
+	}
+}
+
+// TestSessionsLiveTrafficAcrossFlush is the reviewer's exact re-review P1
+// scenario: production traffic only reaches the DB via the accountant's
+// periodic Flush, and a flush DRAINS the buffered counters to zero — so
+// before this fix the live table (seeded from the memory snapshot alone)
+// dropped back to ~0 right after every flush. The display contract is that
+// the value must be continuous across a flush: DB cumulative totals
+// (seeded from vpn_sessions) + whatever is still buffered, never a reset.
+func TestSessionsLiveTrafficAcrossFlush(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, peerKeyAlice := setupTestVPNService(t, db)
+	ctx := t.Context()
+
+	lbTunnel(t, svc, db, 959, "awg959", "pub959", "priv959", "10.9.9.159:51820")
+	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed: %v", err)
+	}
+
+	// The service is never started, so the accountant's flush loop is not
+	// running: Flush is called synchronously below, exactly like the
+	// production periodic flusher would.
+	liveRow := func() models.EnrichedVPNSession {
+		t.Helper()
+		live, err := svc.SessionsLive(ctx)
+		if err != nil {
+			t.Fatalf("SessionsLive failed: %v", err)
+		}
+		if len(live) != 1 || live[0].ID != sess.ID {
+			t.Fatalf("live table = %+v, want exactly session %s", live, sess.ID)
+		}
+		return live[0]
+	}
+
+	svc.accountant.RecordRx(sess.ID, "", 500)
+
+	if got := liveRow().RxBytes; got != 500 {
+		t.Fatalf("before flush: rx = %d, want 500 (DB base 0 + buffered 500)", got)
+	}
+
+	if err := svc.accountant.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	// Flush persisted the 500 into vpn_sessions and drained the buffer to
+	// 0 — the displayed value must NOT fall back with it.
+	if got := liveRow().RxBytes; got != 500 {
+		t.Errorf("after flush: rx = %d, want 500 (now the DB cumulative total; before the fix this dropped to 0)", got)
+	}
+
+	svc.accountant.RecordRx(sess.ID, "", 300)
+
+	if got := liveRow().RxBytes; got != 800 {
+		t.Errorf("after flush + new traffic: rx = %d, want 800 (DB cumulative 500 + buffered 300)", got)
 	}
 }
 
