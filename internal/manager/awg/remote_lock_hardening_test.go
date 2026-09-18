@@ -21,8 +21,10 @@ func TestRemoteLock_SuccessorLockTOCTOU_PreservesSuccessor(t *testing.T) {
 	// 1. Verify that remoteLockAcquireCmd contains the generation-safe TOCTOU verification and rollback logic
 	cmdStr := remoteLockAcquireCmd("test_resource", "test_token")
 	expectedTokens := []string{
-		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi`,
-		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi`,
+		`gate_path="$flock_path.gate"`,
+		`if [ -d "$gate_path" ]; then`,
+		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi`,
+		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi`,
 	}
 	for _, expected := range expectedTokens {
 		if !strings.Contains(cmdStr, expected) {
@@ -529,4 +531,206 @@ func TestRemoteLock_GenerationRace_PauseBeforeRename_PreservesSuccessor(t *testi
 
 	// 10. Clean up
 	releaseLockAssertSuccess(t, ctx, resName, slowToken)
+}
+
+func prepareSlowReclaimerInjectedCmd(t *testing.T, resName, slowToken, b1Reached, b1Resume, b2Reached, b2Resume string) string {
+	t.Helper()
+	slowCmd := remoteLockAcquireCmd(resName, slowToken)
+
+	targetPattern1 := `if mv "$flock_path" "$flock_path.stale.$now.$$"`
+	barrier1Injection := fmt.Sprintf(
+		`touch %s; while [ ! -f %s ]; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
+		ssh.EscapeShellArg(b1Reached),
+		ssh.EscapeShellArg(b1Resume),
+	)
+	if !strings.Contains(slowCmd, targetPattern1) {
+		t.Fatalf("slowCmd missing targetPattern1 for barrier1 injection: %s", slowCmd)
+	}
+	injected := strings.Replace(slowCmd, targetPattern1, barrier1Injection, 1)
+
+	targetPattern2 := `else if [ ! -d "$flock_path" ]; then`
+	barrier2Injection := fmt.Sprintf(
+		`else touch %s; while [ ! -f %s ]; do sleep 0.01; done; if [ ! -d "$flock_path" ]; then`,
+		ssh.EscapeShellArg(b2Reached),
+		ssh.EscapeShellArg(b2Resume),
+	)
+	if !strings.Contains(injected, targetPattern2) {
+		t.Fatalf("slowInjectedCmd missing targetPattern2 for barrier2 injection: %s", injected)
+	}
+	return strings.Replace(injected, targetPattern2, barrier2Injection, 1)
+}
+
+func verifyContenderCBlocked(t *testing.T, cDone chan error, lockPath, contenderToken string) {
+	t.Helper()
+	select {
+	case err := <-cDone:
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: contender C acquired lock during reclamation window: %v", err)
+	case <-time.After(350 * time.Millisecond):
+		// Expected: contender C is blocked waiting on acquisition gate
+	}
+
+	if ownerBytes, err := os.ReadFile(filepath.Join(lockPath, "owner")); err == nil {
+		if strings.Contains(string(ownerBytes), contenderToken) {
+			t.Fatalf("MUTUAL EXCLUSION BROKEN: Contender C stole lock during reclamation window")
+		}
+	}
+}
+
+func verifySubsequentWinnersSerialized(t *testing.T, ctx context.Context, resName, lockPath, slowToken, contenderToken string, slowDone, cDone chan error) {
+	t.Helper()
+
+	var firstWinner string
+	var otherDone chan error
+	var otherToken string
+
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("Slow Reclaimer A failed to acquire after B release: %v", err)
+		}
+		firstWinner = slowToken
+		otherDone = cDone
+		otherToken = contenderToken
+	case err := <-cDone:
+		if err != nil {
+			t.Fatalf("Contender C failed to acquire after B release: %v", err)
+		}
+		firstWinner = contenderToken
+		otherDone = slowDone
+		otherToken = slowToken
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for next contender (A or C) to acquire lock after B release")
+	}
+
+	assertLockOwnerEquals(t, lockPath, firstWinner, "first winner holds lock")
+	releaseLockAssertSuccess(t, ctx, resName, firstWinner)
+
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Fatalf("second contender failed to acquire after first winner release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for second contender to acquire lock")
+	}
+
+	assertLockOwnerEquals(t, lockPath, otherToken, "second contender holds lock")
+	releaseLockAssertSuccess(t, ctx, resName, otherToken)
+}
+
+func TestRemoteLock_ThreeContender_StaleRecoveryDoesNotDisplaceLiveSuccessorToThirdParty(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("three_contender_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	gatePath := lockPath + ".gate"
+	_ = os.RemoveAll(lockPath)
+	_ = os.RemoveAll(gatePath)
+	defer func() {
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+	}()
+
+	tempDir := t.TempDir()
+	barrier1Reached := filepath.Join(tempDir, "barrier1_reached")
+	barrier1Resume := filepath.Join(tempDir, "barrier1_resume")
+	barrier2Reached := filepath.Join(tempDir, "barrier2_reached")
+	barrier2Resume := filepath.Join(tempDir, "barrier2_resume")
+
+	// 1. Setup an abandoned stale lock directory with past timestamp (>60s)
+	setupAbandonedStaleLock(t, lockPath, "abandoned-owner-303", 120*time.Second)
+
+	// 2. Prepare Slow Reclaimer A command with two synchronization barriers
+	slowToken := "slow-reclaimer-token-A"
+	slowInjectedCmd := prepareSlowReclaimerInjectedCmd(
+		t, resName, slowToken,
+		barrier1Reached, barrier1Resume,
+		barrier2Reached, barrier2Resume,
+	)
+
+	// 3. Launch Slow Reclaimer A in a background goroutine
+	slowDone := make(chan error, 1)
+	go func() {
+		cmd := exec.CommandContext(ctx, "bash", "-c", slowInjectedCmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			slowDone <- fmt.Errorf("slow reclaimer A exited with error: %w (out: %s)", err, string(out))
+			return
+		}
+		slowDone <- nil
+	}()
+
+	// 4. Wait deterministically until Slow Reclaimer A pauses at Barrier 1 (before rename)
+	waitForBarrierFile(t, barrier1Reached, 5*time.Second)
+
+	// 5. Fast Successor B executes standard acquisition, reclaims stale lock, and becomes active owner
+	fastToken := "fast-successor-token-B"
+	fastCmd := remoteLockAcquireCmd(resName, fastToken)
+	if fastOut, fastErr := exec.CommandContext(ctx, "bash", "-c", fastCmd).CombinedOutput(); fastErr != nil {
+		t.Fatalf("fast successor B failed to acquire lock: %v (out: %s)", fastErr, string(fastOut))
+	}
+	assertLockOwnerEquals(t, lockPath, fastToken, "after fast successor B acquire")
+
+	// 6. Signal Slow Reclaimer A to resume from Barrier 1 and execute rename
+	if err := os.WriteFile(barrier1Resume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier1 resume: %v", err)
+	}
+
+	// 7. Wait until Slow Reclaimer A executes rename and pauses at Barrier 2 (between rename and restore)
+	waitForBarrierFile(t, barrier2Reached, 5*time.Second)
+
+	// Verify that canonical lock path does NOT exist at this moment (it was renamed to .stale...)
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected canonical lock path to be absent during rename window, but it exists")
+	}
+
+	// 8. Contender C attempts to acquire the lock during this window
+	contenderToken := "contender-token-C"
+	contenderCmd := remoteLockAcquireCmd(resName, contenderToken)
+	cDone := make(chan error, 1)
+	go func() {
+		cmd := exec.CommandContext(ctx, "bash", "-c", contenderCmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			cDone <- fmt.Errorf("contender C exited with error: %w (out: %s)", err, string(out))
+			return
+		}
+		cDone <- nil
+	}()
+
+	// 9. Assert that Contender C CANNOT acquire canonical lock or steal B's active ownership
+	verifyContenderCBlocked(t, cDone, lockPath, contenderToken)
+
+	// 10. Signal Slow Reclaimer A to resume from Barrier 2 (execute rollback/restoration)
+	if err := os.WriteFile(barrier2Resume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier2 resume: %v", err)
+	}
+
+	// Give A time to restore B's lock and verify B's ownership remains intact
+	time.Sleep(100 * time.Millisecond)
+	assertLockOwnerEquals(t, lockPath, fastToken, "after Slow Reclaimer A restored Fast Successor B lock")
+
+	// Verify neither Slow Reclaimer A nor Contender C acquired while Fast Successor B is active
+	select {
+	case err := <-slowDone:
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: Slow Reclaimer A acquired while B was active: %v", err)
+	case err := <-cDone:
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: Contender C acquired while B was active: %v", err)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: both A and C remain blocked while B holds the lock
+	}
+
+	// 11. Fast Successor B finishes critical section and releases lock
+	releaseLockAssertSuccess(t, ctx, resName, fastToken)
+
+	// 12-15. Verify subsequent contenders (A and C) serialize cleanly and release
+	verifySubsequentWinnersSerialized(t, ctx, resName, lockPath, slowToken, contenderToken, slowDone, cDone)
+
+	// Final verification: lock directory is completely cleaned up
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("canonical lock directory still exists after final release")
+	}
 }
