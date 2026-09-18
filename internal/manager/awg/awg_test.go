@@ -74,7 +74,7 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if m.sudoCmdHandler != nil {
 		return m.sudoCmdHandler(cmd)
 	}
-	if strings.Contains(cmd, "amnezia_awg_server_") {
+	if strings.Contains(cmd, "amnezia_awg_") {
 		return "OK", "", 0, nil
 	}
 	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {

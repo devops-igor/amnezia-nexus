@@ -177,23 +177,46 @@ func generateLockToken() string {
 	return hex.EncodeToString(b)
 }
 
-func remoteLockPath(serverID int64) string {
-	return fmt.Sprintf("/tmp/amnezia_awg_server_%d.lock", serverID)
+func remoteLockPath(resource any) string {
+	var target string
+	switch v := resource.(type) {
+	case int64:
+		target = fmt.Sprintf("server_%d", v)
+	case int:
+		target = fmt.Sprintf("server_%d", v)
+	case string:
+		target = strings.TrimSpace(v)
+		if strings.HasPrefix(target, "/tmp/amnezia_awg_") && strings.HasSuffix(target, ".lock") {
+			return target
+		}
+	case fmt.Stringer:
+		target = v.String()
+	default:
+		target = fmt.Sprintf("%v", v)
+	}
+	if target == "" {
+		target = "server_0"
+	}
+	return fmt.Sprintf("/tmp/amnezia_awg_%s.lock", target)
 }
 
-func remoteLockAcquireCmd(serverID int64, token string) string {
-	lockDir := remoteLockPath(serverID)
+func remoteLockResourcePath(resource string) string {
+	return remoteLockPath(resource)
+}
+
+func remoteLockAcquireCmd(resource any, token string) string {
+	lockDir := remoteLockPath(resource)
 	// Atomic directory/file lock with timeout (30 seconds) and stale lock recovery (60 seconds).
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ] && [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then rm -rf "$flock_path.stale.$now.$$" "$flock_path.stale.$$"; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
+		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ]; then if [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then rm -rf "$flock_path.stale.$now.$$" "$flock_path.stale.$$"; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then rm -rf "$flock_path.ownerless.$now.$$" "$flock_path.ownerless.$$"; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(token),
 	)
 }
 
-func remoteLockReleaseCmd(serverID int64, token string) string {
-	lockDir := remoteLockPath(serverID)
+func remoteLockReleaseCmd(resource any, token string) string {
+	lockDir := remoteLockPath(resource)
 	return fmt.Sprintf(
 		`if [ "$(cat %s/owner 2>/dev/null)" = %s ]; then rm -rf %s; fi`,
 		ssh.EscapeShellArg(lockDir),
@@ -202,8 +225,8 @@ func remoteLockReleaseCmd(serverID int64, token string) string {
 	)
 }
 
-func remoteLockHeartbeatCmd(serverID int64, token string) string {
-	lockDir := remoteLockPath(serverID)
+func remoteLockHeartbeatCmd(resource any, token string) string {
+	lockDir := remoteLockPath(resource)
 	return fmt.Sprintf(
 		`if [ -d %s ] && [ "$(cat %s/owner 2>/dev/null)" = %s ]; then touch -m %s; fi`,
 		ssh.EscapeShellArg(lockDir),
@@ -213,12 +236,32 @@ func remoteLockHeartbeatCmd(serverID int64, token string) string {
 	)
 }
 
+func (m *AWGManager) resolveLockResource(ctx context.Context, client ssh.SSHClient, serverID int64) string {
+	if m != nil && client != nil {
+		cName := m.resolveContainerName(ctx, client)
+		if IsValidContainerName(cName) {
+			iface := m.interfaceName()
+			if iface == "" {
+				iface = "awg0"
+			}
+			return fmt.Sprintf("%s_%s", cName, iface)
+		}
+	}
+	return fmt.Sprintf("server_%d", serverID)
+}
+
+// ResolveLockResource returns the physical lock target resource identifier for the remote server.
+func (m *AWGManager) ResolveLockResource(ctx context.Context, client ssh.SSHClient, serverID int64) string {
+	return m.resolveLockResource(ctx, client, serverID)
+}
+
 func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, serverID int64) (func(), error) {
 	if client == nil || serverID <= 0 {
 		return func() {}, nil
 	}
+	resource := m.resolveLockResource(ctx, client, serverID)
 	token := generateLockToken()
-	cmd := remoteLockAcquireCmd(serverID, token)
+	cmd := remoteLockAcquireCmd(resource, token)
 	_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
 	if err != nil || code != 0 {
 		return nil, fmt.Errorf("failed to acquire remote server lock on server %d (exit code %d): %s: %w", serverID, code, strings.TrimSpace(errOut), err)
@@ -226,7 +269,7 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 
 	interval, timeout := m.getLockHeartbeatConfig()
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
-	touchCmd := remoteLockHeartbeatCmd(serverID, token)
+	touchCmd := remoteLockHeartbeatCmd(resource, token)
 
 	var heartbeatWg sync.WaitGroup
 	heartbeatWg.Add(1)
@@ -245,7 +288,7 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 				touchCancel()
 				if err != nil || code != 0 {
 					if !errors.Is(touchCtx.Err(), context.Canceled) {
-						slog.Debug("failed to refresh remote server lock heartbeat", "server_id", serverID, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+						slog.Debug("failed to refresh remote server lock heartbeat", "server_id", serverID, "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
 					}
 				}
 			}
@@ -260,10 +303,10 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 
 			relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			relCmd := remoteLockReleaseCmd(serverID, token)
+			relCmd := remoteLockReleaseCmd(resource, token)
 			_, errOut, code, err := client.RunSudoCommand(relCtx, relCmd)
 			if err != nil || code != 0 {
-				slog.Warn("failed to release remote server lock", "server_id", serverID, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+				slog.Warn("failed to release remote server lock", "server_id", serverID, "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
 			}
 		})
 	}

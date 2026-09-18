@@ -39,7 +39,7 @@ func getMockRemoteLock(path string) chan struct{} {
 }
 
 func extractLockKey(cmd string) string {
-	idx := strings.Index(cmd, "/tmp/amnezia_awg_server_")
+	idx := strings.Index(cmd, "/tmp/amnezia_awg_")
 	if idx == -1 {
 		return "default_lock"
 	}
@@ -102,7 +102,7 @@ func (m *threadSafeMockSSHClient) RunCommand(ctx context.Context, cmd string) (s
 }
 
 func (m *threadSafeMockSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
-	if strings.Contains(cmd, "amnezia_awg_server_") && (strings.Contains(cmd, "mkdir") || strings.Contains(cmd, "flock")) {
+	if strings.Contains(cmd, "amnezia_awg_") && (strings.Contains(cmd, "mkdir") || strings.Contains(cmd, "flock")) {
 		key := extractLockKey(cmd)
 		ch := getMockRemoteLock(key)
 		select {
@@ -113,7 +113,7 @@ func (m *threadSafeMockSSHClient) RunSudoCommand(ctx context.Context, cmd string
 		}
 	}
 
-	if strings.Contains(cmd, "amnezia_awg_server_") && (strings.Contains(cmd, "rm -rf") || strings.Contains(cmd, "rmdir") || strings.Contains(cmd, "unlock")) {
+	if strings.Contains(cmd, "amnezia_awg_") && (strings.Contains(cmd, "rm -rf") || strings.Contains(cmd, "rmdir") || strings.Contains(cmd, "unlock")) {
 		key := extractLockKey(cmd)
 		ch := getMockRemoteLock(key)
 		select {
@@ -123,7 +123,7 @@ func (m *threadSafeMockSSHClient) RunSudoCommand(ctx context.Context, cmd string
 		return "OK", "", 0, nil
 	}
 
-	if strings.Contains(cmd, "amnezia_awg_server_") && strings.Contains(cmd, "touch -m") {
+	if strings.Contains(cmd, "amnezia_awg_") && strings.Contains(cmd, "touch -m") {
 		return "OK", "", 0, nil
 	}
 
@@ -1707,6 +1707,9 @@ func newLocalBashSSHClient(serverID int64) *localBashSSHClient {
 }
 
 func (c *localBashSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker ps") {
+		return "amnezia-awg", "", 0, nil
+	}
 	if strings.Contains(cmd, "touch -m") {
 		c.heartbeats.Add(1)
 	}
@@ -1728,19 +1731,18 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	}
 
 	serverID := int64(9995)
-	lockPath := awg.RemoteLockPath(serverID)
-	_ = os.RemoveAll(lockPath)
-	defer os.RemoveAll(lockPath)
-
-	ctx := context.Background()
-
-	// 1. Holder A acquires the remote lock with token A and keeps heartbeat active
 	mgrA := awg.NewAWGManager(nil)
 	// Fast heartbeat in test: refresh mtime every 40ms with 2s timeout
 	mgrA.SetLockHeartbeatConfig(40*time.Millisecond, 2*time.Second)
 
 	clientA := newLocalBashSSHClient(serverID)
+	ctx := context.Background()
+	resource := mgrA.ResolveLockResource(ctx, clientA, serverID)
+	lockPath := awg.RemoteLockPath(resource)
+	_ = os.RemoveAll(lockPath)
+	defer os.RemoveAll(lockPath)
 
+	// 1. Holder A acquires the remote lock with token A and keeps heartbeat active
 	unlockA, err := mgrA.AcquireRemoteServerLock(ctx, clientA, serverID)
 	if err != nil {
 		t.Fatalf("Holder A failed to acquire remote lock: %v", err)
@@ -1787,7 +1789,7 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	// Contender B checks whether directory is stale. Because Holder A's heartbeat keeps mtime fresh,
 	// Contender B must be blocked and cannot steal the lock.
 	tokenB := "contender-b-token"
-	acqCmdB := awg.RemoteLockAcquireCmd(serverID, tokenB)
+	acqCmdB := awg.RemoteLockAcquireCmd(resource, tokenB)
 
 	contenderDone := make(chan error, 1)
 	go func() {
@@ -1821,12 +1823,12 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	}
 
 	// 3. Holder A releases the lock
-	heartbeatsBeforeUnlock := clientA.heartbeats.Load()
 	unlockA()
+	heartbeatsAfterUnlock := clientA.heartbeats.Load()
 
 	// Verify heartbeat goroutine was stopped by unlockA: no more heartbeats should fire
 	time.Sleep(100 * time.Millisecond)
-	if extraHeartbeats := clientA.heartbeats.Load() - heartbeatsBeforeUnlock; extraHeartbeats > 0 {
+	if extraHeartbeats := clientA.heartbeats.Load() - heartbeatsAfterUnlock; extraHeartbeats > 0 {
 		t.Fatalf("heartbeat continued firing after unlock: %d extra heartbeats", extraHeartbeats)
 	}
 
@@ -1850,7 +1852,7 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	}
 
 	// Clean up: Contender B releases the lock
-	relCmdB := awg.RemoteLockReleaseCmd(serverID, tokenB)
+	relCmdB := awg.RemoteLockReleaseCmd(resource, tokenB)
 	relExec := exec.CommandContext(ctx, "bash", "-c", relCmdB)
 	if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
 		t.Fatalf("contender failed to release lock: %v (out: %s)", relErr, string(relOut))
@@ -1859,6 +1861,222 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	// Verify lock directory is removed
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("lock directory still exists after release")
+	}
+}
+
+func TestRemoteLock_OwnerlessStaleLockRecovery(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	tests := []struct {
+		name       string
+		writeOwner bool
+		ownerData  []byte
+	}{
+		{
+			name:       "MissingOwnerFile",
+			writeOwner: false,
+		},
+		{
+			name:       "EmptyOwnerFile",
+			writeOwner: true,
+			ownerData:  []byte(""),
+		},
+		{
+			name:       "WhitespaceOwnerFile",
+			writeOwner: true,
+			ownerData:  []byte("   \n"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serverID := int64(7700 + time.Now().UnixNano()%1000)
+			lockPath := awg.RemoteLockPath(serverID)
+			_ = os.RemoveAll(lockPath)
+			defer os.RemoveAll(lockPath)
+
+			if err := os.MkdirAll(lockPath, 0755); err != nil {
+				t.Fatalf("failed to create lock directory: %v", err)
+			}
+
+			if tc.writeOwner {
+				ownerPath := filepath.Join(lockPath, "owner")
+				if err := os.WriteFile(ownerPath, tc.ownerData, 0644); err != nil {
+					t.Fatalf("failed to write owner file: %v", err)
+				}
+			}
+
+			// Backdate mtime past 60s stale threshold
+			pastTime := time.Now().Add(-120 * time.Second)
+			if err := os.Chtimes(lockPath, pastTime, pastTime); err != nil {
+				t.Fatalf("failed to set past mtime: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			token := fmt.Sprintf("contender-%s-%d", tc.name, time.Now().UnixNano())
+			acqCmd := awg.RemoteLockAcquireCmd(serverID, token)
+
+			cmd := exec.CommandContext(ctx, "bash", "-c", acqCmd)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("failed to acquire lock over ownerless stale directory: %v (output: %s)", err, string(out))
+			}
+
+			// Verify contender became the owner
+			ownerBytes, err := os.ReadFile(filepath.Join(lockPath, "owner"))
+			if err != nil {
+				t.Fatalf("failed to read owner file after acquisition: %v", err)
+			}
+			if strings.TrimSpace(string(ownerBytes)) != token {
+				t.Fatalf("expected owner token %s, got: %s", token, strings.TrimSpace(string(ownerBytes)))
+			}
+
+			// Clean up via release
+			relCmd := awg.RemoteLockReleaseCmd(serverID, token)
+			relExec := exec.CommandContext(ctx, "bash", "-c", relCmd)
+			if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
+				t.Fatalf("failed to release lock: %v (output: %s)", relErr, string(relOut))
+			}
+
+			if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+				t.Fatalf("lock directory still exists after release")
+			}
+		})
+	}
+}
+
+func TestRemoteLock_DifferentServerIDsSameTarget_Serialize(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	mgr := awg.NewAWGManager(nil)
+
+	serverID1 := int64(101)
+	serverID2 := int64(102)
+
+	client1 := newLocalBashSSHClient(serverID1)
+	client2 := newLocalBashSSHClient(serverID2)
+
+	res1 := mgr.ResolveLockResource(ctx, client1, serverID1)
+	res2 := mgr.ResolveLockResource(ctx, client2, serverID2)
+
+	if res1 != res2 {
+		t.Fatalf("expected both server IDs to resolve to identical resource, got res1=%s res2=%s", res1, res2)
+	}
+
+	path1 := awg.RemoteLockPath(res1)
+	path2 := awg.RemoteLockPath(res2)
+
+	if path1 != path2 {
+		t.Fatalf("expected both server IDs to use identical lock path, got path1=%s path2=%s", path1, path2)
+	}
+
+	_ = os.RemoveAll(path1)
+	defer os.RemoveAll(path1)
+
+	var (
+		activeCount   atomic.Int32
+		maxConcurrent atomic.Int32
+		orderMu       sync.Mutex
+		acquireOrder  []int64
+		wg            sync.WaitGroup
+	)
+
+	startGate := make(chan struct{})
+
+	runWorker := func(serverID int64, client ssh.SSHClient) {
+		defer wg.Done()
+		<-startGate
+
+		unlock, err := mgr.AcquireRemoteServerLock(ctx, client, serverID)
+		if err != nil {
+			t.Errorf("server %d failed to acquire lock: %v", serverID, err)
+			return
+		}
+
+		current := activeCount.Add(1)
+		for {
+			max := maxConcurrent.Load()
+			if current > max {
+				if maxConcurrent.CompareAndSwap(max, current) {
+					break
+				}
+			} else {
+				break
+			}
+		}
+
+		orderMu.Lock()
+		acquireOrder = append(acquireOrder, serverID)
+		orderMu.Unlock()
+
+		// Hold critical section briefly to force serialized queueing
+		time.Sleep(100 * time.Millisecond)
+
+		activeCount.Add(-1)
+		unlock()
+	}
+
+	wg.Add(2)
+	go runWorker(serverID1, client1)
+	go runWorker(serverID2, client2)
+
+	close(startGate)
+	wg.Wait()
+
+	if max := maxConcurrent.Load(); max != 1 {
+		t.Fatalf("expected strict serialization (maxConcurrent=1), got: %d", max)
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(acquireOrder) != 2 {
+		t.Fatalf("expected 2 acquisitions, got: %d", len(acquireOrder))
+	}
+
+	if _, err := os.Stat(path1); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after both servers released")
+	}
+}
+
+func TestAWGManager_ResolveLockResource_And_LockPaths(t *testing.T) {
+	ctx := context.Background()
+	mgr := awg.NewAWGManager(nil)
+
+	// 1. Nil client falls back to server_<id>
+	resNil := mgr.ResolveLockResource(ctx, nil, 42)
+	if resNil != "server_42" {
+		t.Fatalf("expected server_42 for nil client, got: %s", resNil)
+	}
+
+	// 2. Client with resolved container name scopes resource as <container>_<interface>
+	mockClient := newThreadSafeMockSSHClient()
+	resMock := mgr.ResolveLockResource(ctx, mockClient, 42)
+	if resMock != "amnezia-awg_awg0" {
+		t.Fatalf("expected amnezia-awg_awg0 for mockClient, got: %s", resMock)
+	}
+
+	// 3. remoteLockPath compatibility: int64, string, full path
+	if p := awg.RemoteLockPath(int64(42)); p != "/tmp/amnezia_awg_server_42.lock" {
+		t.Fatalf("unexpected path for int64: %s", p)
+	}
+	if p := awg.RemoteLockPath("server_42"); p != "/tmp/amnezia_awg_server_42.lock" {
+		t.Fatalf("unexpected path for server_42: %s", p)
+	}
+	if p := awg.RemoteLockPath("amnezia-awg_awg0"); p != "/tmp/amnezia_awg_amnezia-awg_awg0.lock" {
+		t.Fatalf("unexpected path for resource string: %s", p)
+	}
+	if p := awg.RemoteLockResourcePath("custom_resource"); p != "/tmp/amnezia_awg_custom_resource.lock" {
+		t.Fatalf("unexpected path for RemoteLockResourcePath: %s", p)
+	}
+	if p := awg.RemoteLockPath("/tmp/amnezia_awg_already_full.lock"); p != "/tmp/amnezia_awg_already_full.lock" {
+		t.Fatalf("unexpected path for already full path: %s", p)
 	}
 }
 

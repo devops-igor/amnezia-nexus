@@ -11,6 +11,7 @@ var (
 	RemoteLockReleaseCmd   = remoteLockReleaseCmd
 	RemoteLockHeartbeatCmd = remoteLockHeartbeatCmd
 	RemoteLockPath         = remoteLockPath
+	RemoteLockResourcePath = remoteLockResourcePath
 	GenerateLockToken      = generateLockToken
 )
 
