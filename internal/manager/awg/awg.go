@@ -207,9 +207,10 @@ func remoteLockResourcePath(resource string) string {
 func remoteLockAcquireCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
 	// Atomic directory/file lock with timeout (30 seconds) and stale lock recovery (60 seconds).
+	// Generation-safe ownership metadata (<token> <timestamp>) and re-verification on rename prevent successor TOCTOU.
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); age=$((now - $(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"))); if [ "$age" -ge 60 ]; then stale_token=$(cat "$flock_path/owner" 2>/dev/null); if [ -n "$stale_token" ]; then if [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then if [ "$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null)" = "$stale_token" ]; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then if [ ! -s "$flock_path.ownerless.$now.$$/owner" ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; echo %s > "$flock_path/owner"`,
+		`flock_path=%s; timeout=30; start=$(date +%%s); while ! mkdir "$flock_path" 2>/dev/null; do if [ -d "$flock_path" ]; then now=$(date +%%s); mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$now"); if [ $((now - mtime)) -ge 60 ]; then stale_info=$(cat "$flock_path/owner" 2>/dev/null); set -- $stale_info; stale_token="$1"; stale_ts="$2"; if [ -n "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$cur_now"); if [ $((cur_now - cur_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ $((cur_now - stale_ts)) -ge 60 ]; }; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.stale.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.stale.$now.$$" 2>/dev/null || echo "$ren_now"); ren_info=$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; ren_ts="$2"; if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null || echo "$cur_now"); if [ $((cur_now - cur_mtime)) -ge 60 ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.ownerless.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.ownerless.$now.$$" 2>/dev/null || echo "$ren_now"); ren_info=$(cat "$flock_path.ownerless.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.1 2>/dev/null || sleep 1; done; acq_now=$(date +%%s); echo %s "$acq_now" > "$flock_path/owner"`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(token),
 	)
@@ -217,21 +218,27 @@ func remoteLockAcquireCmd(resource any, token string) string {
 
 func remoteLockReleaseCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
+	escapedTok := ssh.EscapeShellArg(token)
 	return fmt.Sprintf(
-		`if [ "$(cat %s/owner 2>/dev/null)" = %s ]; then rm -rf %s; fi`,
+		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then rm -rf %s; fi`,
 		ssh.EscapeShellArg(lockDir),
-		ssh.EscapeShellArg(token),
+		escapedTok,
+		escapedTok,
+		escapedTok,
 		ssh.EscapeShellArg(lockDir),
 	)
 }
 
 func remoteLockHeartbeatCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
+	escapedTok := ssh.EscapeShellArg(token)
 	return fmt.Sprintf(
-		`if [ -d %s ] && [ "$(cat %s/owner 2>/dev/null)" = %s ]; then touch -m %s; fi`,
+		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -d %s ] && [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then touch -m %s; fi`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(lockDir),
-		ssh.EscapeShellArg(token),
+		escapedTok,
+		escapedTok,
+		escapedTok,
 		ssh.EscapeShellArg(lockDir),
 	)
 }

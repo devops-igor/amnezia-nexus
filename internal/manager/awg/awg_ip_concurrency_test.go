@@ -1317,11 +1317,11 @@ func TestRemoteLock_ShellScriptContentionAndStaleLockReclamation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read owner file after reclamation: %v", err)
 	}
-	if strings.TrimSpace(string(ownerData)) != newToken {
+	if fields := strings.Fields(string(ownerData)); len(fields) == 0 || fields[0] != newToken {
 		t.Fatalf("expected owner token %s, got: %s", newToken, strings.TrimSpace(string(ownerData)))
 	}
 
-	// Old stale owner attempts release using old token — MUST NOT delete successor's lock!
+	// Old stale owner attempts release using old token - MUST NOT delete successor's lock!
 	staleRelCmd := awg.RemoteLockReleaseCmd(serverID, oldOwnerToken)
 	relExec := exec.CommandContext(ctx, "bash", "-c", staleRelCmd)
 	if relOut, relErr := relExec.CombinedOutput(); relErr != nil {
@@ -1665,7 +1665,7 @@ func TestRemoteLock_TwoSimultaneousStaleLockReclaimers(t *testing.T) {
 			ownerData, err := os.ReadFile(ownerFile)
 			if err != nil {
 				t.Errorf("worker %d failed to read owner file: %v", workerID, err)
-			} else if strings.TrimSpace(string(ownerData)) != token {
+			} else if fields := strings.Fields(string(ownerData)); len(fields) == 0 || fields[0] != token {
 				t.Errorf("worker %d found unexpected owner %s, expected %s", workerID, strings.TrimSpace(string(ownerData)), token)
 			}
 
@@ -1754,11 +1754,12 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 		unlockA()
 		t.Fatalf("failed to read owner file after Holder A acquired: %v", err)
 	}
-	tokenA := strings.TrimSpace(string(ownerBytes))
-	if tokenA == "" {
+	ownerFields := strings.Fields(string(ownerBytes))
+	if len(ownerFields) == 0 {
 		unlockA()
 		t.Fatalf("expected non-empty token A in owner file")
 	}
+	tokenA := ownerFields[0]
 
 	// Verify that Holder A's heartbeat actively refreshes mtime even if directory timestamp ages:
 	// Intentionally backdate mtime to simulate elapsed time exceeding the 60s stale threshold
@@ -1817,7 +1818,7 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 		unlockA()
 		t.Fatalf("failed to read owner file: %v", err)
 	}
-	if strings.TrimSpace(string(currentOwner)) != tokenA {
+	if fields := strings.Fields(string(currentOwner)); len(fields) == 0 || fields[0] != tokenA {
 		unlockA()
 		t.Fatalf("lock was stolen! expected owner %s, got %s", tokenA, strings.TrimSpace(string(currentOwner)))
 	}
@@ -1847,7 +1848,7 @@ func TestRemoteLock_ActiveHolderExceedsStaleTimeout_ContenderBlocked(t *testing.
 	if err != nil {
 		t.Fatalf("failed to read owner file after Contender B acquired: %v", err)
 	}
-	if strings.TrimSpace(string(finalOwner)) != tokenB {
+	if fields := strings.Fields(string(finalOwner)); len(fields) == 0 || fields[0] != tokenB {
 		t.Fatalf("expected Contender B token %s, got: %s", tokenB, strings.TrimSpace(string(finalOwner)))
 	}
 
@@ -1931,7 +1932,7 @@ func TestRemoteLock_OwnerlessStaleLockRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to read owner file after acquisition: %v", err)
 			}
-			if strings.TrimSpace(string(ownerBytes)) != token {
+			if fields := strings.Fields(string(ownerBytes)); len(fields) == 0 || fields[0] != token {
 				t.Fatalf("expected owner token %s, got: %s", token, strings.TrimSpace(string(ownerBytes)))
 			}
 

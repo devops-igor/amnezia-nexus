@@ -11,16 +11,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 )
 
 func TestRemoteLock_SuccessorLockTOCTOU_PreservesSuccessor(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Verify that remoteLockAcquireCmd contains the successor TOCTOU verification and rollback logic
+	// 1. Verify that remoteLockAcquireCmd contains the generation-safe TOCTOU verification and rollback logic
 	cmdStr := remoteLockAcquireCmd("test_resource", "test_token")
 	expectedTokens := []string{
-		`if [ "$(cat "$flock_path/owner" 2>/dev/null)" = "$stale_token" ]; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then if [ "$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null)" = "$stale_token" ]; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi`,
-		`elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then if [ ! -s "$flock_path.ownerless.$now.$$/owner" ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi; fi; fi`,
+		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; else mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; fi`,
+		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; else mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; fi`,
 	}
 	for _, expected := range expectedTokens {
 		if !strings.Contains(cmdStr, expected) {
@@ -30,171 +32,321 @@ func TestRemoteLock_SuccessorLockTOCTOU_PreservesSuccessor(t *testing.T) {
 
 	// 2. Functional test: Existing owner token mismatch rolls back and preserves successor
 	t.Run("ExistingOwner_SuccessorTokenMismatch_RollsBackAndPreservesSuccessor", func(t *testing.T) {
-		tempDir := t.TempDir()
-		flockPath := filepath.Join(tempDir, "test.lock")
-		staleToken := "stale-owner-token"
-		successorToken := "successor-owner-token"
-
-		// Simulate state where flock_path was renamed to flock_path.stale.$now.$$,
-		// but inside the renamed directory, the owner belongs to a successor.
-		now := time.Now().Unix()
-		pid := os.Getpid()
-		staleRenamedDir := fmt.Sprintf("%s.stale.%d.%d", flockPath, now, pid)
-
-		if err := os.MkdirAll(staleRenamedDir, 0755); err != nil {
-			t.Fatalf("failed to create simulated stale directory: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(staleRenamedDir, "owner"), []byte(successorToken+"\n"), 0644); err != nil {
-			t.Fatalf("failed to write successor owner file: %v", err)
-		}
-
-		// Execute TOCTOU verification block
-		shCmd := fmt.Sprintf(
-			`flock_path="%s"; stale_token="%s"; now="%d"; if [ "$(cat "$flock_path.stale.%d.%d/owner" 2>/dev/null)" = "$stale_token" ]; then rm -rf "$flock_path.stale.%d.%d"; else mv "$flock_path.stale.%d.%d" "$flock_path" 2>/dev/null; fi`,
-			flockPath, staleToken, now, now, pid, now, pid, now, pid,
-		)
-		out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
-		if err != nil {
-			t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
-		}
-
-		// Successor lock directory must be preserved at flockPath
-		if _, err := os.Stat(flockPath); os.IsNotExist(err) {
-			t.Fatalf("successor lock directory was not restored after token mismatch!")
-		}
-
-		// Owner must still be successorToken
-		ownerBytes, err := os.ReadFile(filepath.Join(flockPath, "owner"))
-		if err != nil {
-			t.Fatalf("failed to read restored owner file: %v", err)
-		}
-		if strings.TrimSpace(string(ownerBytes)) != successorToken {
-			t.Fatalf("expected restored owner %s, got: %s", successorToken, strings.TrimSpace(string(ownerBytes)))
-		}
-
-		// Renamed directory must no longer exist
-		if _, err := os.Stat(staleRenamedDir); !os.IsNotExist(err) {
-			t.Fatalf("stale renamed directory still exists after restore!")
-		}
+		runExistingOwnerMismatchRollbackTest(t, ctx)
 	})
 
 	// 3. Functional test: Ownerless directory where owner appears rolls back and preserves successor
 	t.Run("OwnerlessStale_SuccessorWritesOwner_RollsBackAndPreservesSuccessor", func(t *testing.T) {
-		tempDir := t.TempDir()
-		flockPath := filepath.Join(tempDir, "test.lock")
-		successorToken := "successor-ownerless-token"
-
-		now := time.Now().Unix()
-		pid := os.Getpid()
-		ownerlessRenamedDir := fmt.Sprintf("%s.ownerless.%d.%d", flockPath, now, pid)
-
-		if err := os.MkdirAll(ownerlessRenamedDir, 0755); err != nil {
-			t.Fatalf("failed to create simulated ownerless directory: %v", err)
-		}
-		// Successor wrote an owner file into directory
-		if err := os.WriteFile(filepath.Join(ownerlessRenamedDir, "owner"), []byte(successorToken+"\n"), 0644); err != nil {
-			t.Fatalf("failed to write successor owner file: %v", err)
-		}
-
-		shCmd := fmt.Sprintf(
-			`flock_path="%s"; now="%d"; if [ ! -s "$flock_path.ownerless.%d.%d/owner" ]; then rm -rf "$flock_path.ownerless.%d.%d"; else mv "$flock_path.ownerless.%d.%d" "$flock_path" 2>/dev/null; fi`,
-			flockPath, now, now, pid, now, pid, now, pid,
-		)
-		out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
-		if err != nil {
-			t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
-		}
-
-		// Successor lock directory must be preserved at flockPath
-		if _, err := os.Stat(flockPath); os.IsNotExist(err) {
-			t.Fatalf("successor lock directory was not restored after owner file detected!")
-		}
-
-		ownerBytes, err := os.ReadFile(filepath.Join(flockPath, "owner"))
-		if err != nil {
-			t.Fatalf("failed to read restored owner file: %v", err)
-		}
-		if strings.TrimSpace(string(ownerBytes)) != successorToken {
-			t.Fatalf("expected restored owner %s, got: %s", successorToken, strings.TrimSpace(string(ownerBytes)))
-		}
+		runOwnerlessSuccessorWritesOwnerRollbackTest(t, ctx)
 	})
 
 	// 4. Functional test: Matching stale token correctly reclaims and deletes stale directory
 	t.Run("MatchingStaleToken_RemovesStaleDirAndAllowsAcquisition", func(t *testing.T) {
-		tempDir := t.TempDir()
-		flockPath := filepath.Join(tempDir, "test.lock")
-		staleToken := "matching-stale-token"
-
-		now := time.Now().Unix()
-		pid := os.Getpid()
-		staleRenamedDir := fmt.Sprintf("%s.stale.%d.%d", flockPath, now, pid)
-
-		if err := os.MkdirAll(staleRenamedDir, 0755); err != nil {
-			t.Fatalf("failed to create simulated stale directory: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(staleRenamedDir, "owner"), []byte(staleToken+"\n"), 0644); err != nil {
-			t.Fatalf("failed to write stale owner file: %v", err)
-		}
-
-		shCmd := fmt.Sprintf(
-			`flock_path="%s"; stale_token="%s"; now="%d"; if [ "$(cat "$flock_path.stale.%d.%d/owner" 2>/dev/null)" = "$stale_token" ]; then rm -rf "$flock_path.stale.%d.%d"; else mv "$flock_path.stale.%d.%d" "$flock_path" 2>/dev/null; fi`,
-			flockPath, staleToken, now, now, pid, now, pid, now, pid,
-		)
-		out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
-		if err != nil {
-			t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
-		}
-
-		// Directory must be removed
-		if _, err := os.Stat(staleRenamedDir); !os.IsNotExist(err) {
-			t.Fatalf("stale directory should have been removed when tokens matched!")
-		}
+		runMatchingStaleTokenReclaimTest(t, ctx)
 	})
 
 	// 5. End-to-end acquire and release execution with stale reclamation
 	t.Run("EndToEnd_RemoteLockAcquireCmd_ReclaimsStaleLockCleanly", func(t *testing.T) {
-		resName := fmt.Sprintf("toctou_e2e_%d", time.Now().UnixNano())
-		lockPath := remoteLockPath(resName)
-		_ = os.RemoveAll(lockPath)
-		defer func() { _ = os.RemoveAll(lockPath) }()
+		runEndToEndStaleReclaimTest(t, ctx)
+	})
+}
 
-		if err := os.MkdirAll(lockPath, 0755); err != nil {
-			t.Fatalf("failed to create lock directory: %v", err)
-		}
-		staleToken := "old-stale-token-123"
-		if err := os.WriteFile(filepath.Join(lockPath, "owner"), []byte(staleToken+"\n"), 0644); err != nil {
-			t.Fatalf("failed to write owner file: %v", err)
-		}
-		// Set mtime to 120 seconds in past
-		past := time.Now().Add(-120 * time.Second)
-		_ = os.Chtimes(lockPath, past, past)
+func runExistingOwnerMismatchRollbackTest(t *testing.T, ctx context.Context) {
+	tempDir := t.TempDir()
+	flockPath := filepath.Join(tempDir, "test.lock")
+	staleToken := "stale-owner-token"
+	successorToken := "successor-owner-token"
 
-		newToken := "new-successor-token-456"
-		acqCmd := remoteLockAcquireCmd(resName, newToken)
-		cmd := exec.CommandContext(ctx, "bash", "-c", acqCmd)
+	now := time.Now().Unix()
+	pid := os.Getpid()
+	staleRenamedDir := fmt.Sprintf("%s.stale.%d.%d", flockPath, now, pid)
+
+	if err := os.MkdirAll(staleRenamedDir, 0755); err != nil {
+		t.Fatalf("failed to create simulated stale directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staleRenamedDir, "owner"), []byte(successorToken+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write successor owner file: %v", err)
+	}
+
+	shCmd := fmt.Sprintf(
+		`flock_path="%s"; stale_token="%s"; now="%d"; ren_now="%d"; ren_mtime=0; ren_info=$(cat "%s.stale.%d.%d/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; ren_ts="$2"; if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "%s.stale.%d.%d"; else mv "%s.stale.%d.%d" "$flock_path" 2>/dev/null; fi`,
+		flockPath, staleToken, now, now+100, flockPath, now, pid, flockPath, now, pid, flockPath, now, pid,
+	)
+	out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
+	}
+
+	if _, err := os.Stat(flockPath); os.IsNotExist(err) {
+		t.Fatalf("successor lock directory was not restored after token mismatch!")
+	}
+
+	ownerBytes, err := os.ReadFile(filepath.Join(flockPath, "owner"))
+	if err != nil {
+		t.Fatalf("failed to read restored owner file: %v", err)
+	}
+	if strings.TrimSpace(string(ownerBytes)) != successorToken {
+		t.Fatalf("expected restored owner %s, got: %s", successorToken, strings.TrimSpace(string(ownerBytes)))
+	}
+
+	if _, err := os.Stat(staleRenamedDir); !os.IsNotExist(err) {
+		t.Fatalf("stale renamed directory still exists after restore!")
+	}
+}
+
+func runOwnerlessSuccessorWritesOwnerRollbackTest(t *testing.T, ctx context.Context) {
+	tempDir := t.TempDir()
+	flockPath := filepath.Join(tempDir, "test.lock")
+	successorToken := "successor-ownerless-token"
+
+	now := time.Now().Unix()
+	pid := os.Getpid()
+	ownerlessRenamedDir := fmt.Sprintf("%s.ownerless.%d.%d", flockPath, now, pid)
+
+	if err := os.MkdirAll(ownerlessRenamedDir, 0755); err != nil {
+		t.Fatalf("failed to create simulated ownerless directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ownerlessRenamedDir, "owner"), []byte(successorToken+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write successor owner file: %v", err)
+	}
+
+	shCmd := fmt.Sprintf(
+		`flock_path="%s"; now="%d"; ren_now="%d"; ren_mtime=0; ren_info=$(cat "%s.ownerless.%d.%d/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; if { [ ! -s "%s.ownerless.%d.%d/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "%s.ownerless.%d.%d"; else mv "%s.ownerless.%d.%d" "$flock_path" 2>/dev/null; fi`,
+		flockPath, now, now+100, flockPath, now, pid, flockPath, now, pid, flockPath, now, pid, flockPath, now, pid,
+	)
+	out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
+	}
+
+	if _, err := os.Stat(flockPath); os.IsNotExist(err) {
+		t.Fatalf("successor lock directory was not restored after owner file detected!")
+	}
+
+	ownerBytes, err := os.ReadFile(filepath.Join(flockPath, "owner"))
+	if err != nil {
+		t.Fatalf("failed to read restored owner file: %v", err)
+	}
+	if strings.TrimSpace(string(ownerBytes)) != successorToken {
+		t.Fatalf("expected restored owner %s, got: %s", successorToken, strings.TrimSpace(string(ownerBytes)))
+	}
+}
+
+func runMatchingStaleTokenReclaimTest(t *testing.T, ctx context.Context) {
+	tempDir := t.TempDir()
+	flockPath := filepath.Join(tempDir, "test.lock")
+	staleToken := "matching-stale-token"
+
+	now := time.Now().Unix()
+	pid := os.Getpid()
+	staleRenamedDir := fmt.Sprintf("%s.stale.%d.%d", flockPath, now, pid)
+
+	if err := os.MkdirAll(staleRenamedDir, 0755); err != nil {
+		t.Fatalf("failed to create simulated stale directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staleRenamedDir, "owner"), []byte(staleToken+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write stale owner file: %v", err)
+	}
+
+	shCmd := fmt.Sprintf(
+		`flock_path="%s"; stale_token="%s"; now="%d"; ren_now="%d"; ren_mtime=0; ren_info=$(cat "%s.stale.%d.%d/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; ren_ts="$2"; if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "%s.stale.%d.%d"; else mv "%s.stale.%d.%d" "$flock_path" 2>/dev/null; fi`,
+		flockPath, staleToken, now, now+100, flockPath, now, pid, flockPath, now, pid, flockPath, now, pid,
+	)
+	out, err := exec.CommandContext(ctx, "bash", "-c", shCmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed executing shell TOCTOU block: %v (out: %s)", err, string(out))
+	}
+
+	if _, err := os.Stat(staleRenamedDir); !os.IsNotExist(err) {
+		t.Fatalf("stale directory should have been removed when tokens matched!")
+	}
+}
+
+func runEndToEndStaleReclaimTest(t *testing.T, ctx context.Context) {
+	resName := fmt.Sprintf("toctou_e2e_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	_ = os.RemoveAll(lockPath)
+	defer func() { _ = os.RemoveAll(lockPath) }()
+
+	if err := os.MkdirAll(lockPath, 0755); err != nil {
+		t.Fatalf("failed to create lock directory: %v", err)
+	}
+	staleToken := "old-stale-token-123"
+	if err := os.WriteFile(filepath.Join(lockPath, "owner"), []byte(staleToken+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write owner file: %v", err)
+	}
+	past := time.Now().Add(-120 * time.Second)
+	_ = os.Chtimes(lockPath, past, past)
+
+	newToken := "new-successor-token-456"
+	acqCmd := remoteLockAcquireCmd(resName, newToken)
+	cmd := exec.CommandContext(ctx, "bash", "-c", acqCmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to acquire lock after stale reclamation: %v (out: %s)", err, string(out))
+	}
+
+	ownerData, err := os.ReadFile(filepath.Join(lockPath, "owner"))
+	if err != nil {
+		t.Fatalf("failed to read acquired owner: %v", err)
+	}
+	fields := strings.Fields(string(ownerData))
+	if len(fields) == 0 || fields[0] != newToken {
+		t.Fatalf("expected owner token %s, got: %s", newToken, strings.TrimSpace(string(ownerData)))
+	}
+	if len(fields) < 2 {
+		t.Fatalf("expected generation metadata timestamp in owner file, got: %s", strings.TrimSpace(string(ownerData)))
+	}
+
+	relCmd := remoteLockReleaseCmd(resName, newToken)
+	if relOut, relErr := exec.CommandContext(ctx, "bash", "-c", relCmd).CombinedOutput(); relErr != nil {
+		t.Fatalf("failed to release lock: %v (out: %s)", relErr, string(relOut))
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after release!")
+	}
+}
+
+func setupAbandonedStaleLock(t *testing.T, lockPath, token string, age time.Duration) {
+	t.Helper()
+	if err := os.MkdirAll(lockPath, 0755); err != nil {
+		t.Fatalf("failed to create initial lock dir: %v", err)
+	}
+	pastTime := time.Now().Add(-age)
+	if err := os.WriteFile(filepath.Join(lockPath, "owner"), []byte(fmt.Sprintf("%s %d\n", token, pastTime.Unix())), 0644); err != nil {
+		t.Fatalf("failed to write initial owner: %v", err)
+	}
+	if err := os.Chtimes(lockPath, pastTime, pastTime); err != nil {
+		t.Fatalf("failed to set past mtime: %v", err)
+	}
+}
+
+func waitForBarrierFile(t *testing.T, barrierFile string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(barrierFile); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for barrier file: %s", barrierFile)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertLockOwnerEquals(t *testing.T, lockPath, expectedToken, errorContext string) {
+	t.Helper()
+	ownerBytes, err := os.ReadFile(filepath.Join(lockPath, "owner"))
+	if err != nil {
+		t.Fatalf("%s: failed to read owner file: %v", errorContext, err)
+	}
+	fields := strings.Fields(string(ownerBytes))
+	if len(fields) == 0 || fields[0] != expectedToken {
+		t.Fatalf("%s: expected owner %s, got %s", errorContext, expectedToken, strings.TrimSpace(string(ownerBytes)))
+	}
+}
+
+func releaseLockAssertSuccess(t *testing.T, ctx context.Context, resName, token string) {
+	t.Helper()
+	relCmd := remoteLockReleaseCmd(resName, token)
+	out, err := exec.CommandContext(ctx, "bash", "-c", relCmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to release lock for %s: %v (out: %s)", token, err, string(out))
+	}
+}
+
+func TestRemoteLock_GenerationRace_StaleReclaimerPreservesActiveSuccessor(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("gen_race_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	_ = os.RemoveAll(lockPath)
+	defer os.RemoveAll(lockPath)
+
+	tempDir := t.TempDir()
+	barrierReached := filepath.Join(tempDir, "barrier_reached")
+	barrierResume := filepath.Join(tempDir, "barrier_resume")
+
+	// 1. Setup an abandoned stale lock directory with past timestamp (>60s)
+	setupAbandonedStaleLock(t, lockPath, "abandoned-owner-101", 120*time.Second)
+
+	// 2. Slow Reclaimer command with an artificial barrier between the timestamp measurement and the token inspection
+	slowToken := "slow-reclaimer-token"
+	slowCmd := remoteLockAcquireCmd(resName, slowToken)
+
+	barrierInjection := fmt.Sprintf(
+		`if [ $((now - mtime)) -ge 60 ]; then touch %s; while [ ! -f %s ]; do sleep 0.01; done;`,
+		ssh.EscapeShellArg(barrierReached),
+		ssh.EscapeShellArg(barrierResume),
+	)
+	targetPattern := `if [ $((now - mtime)) -ge 60 ]; then`
+	if !strings.Contains(slowCmd, targetPattern) {
+		t.Fatalf("slowCmd missing target pattern for barrier injection: %s", slowCmd)
+	}
+	slowInjectedCmd := strings.Replace(slowCmd, targetPattern, barrierInjection, 1)
+
+	// 3. Launch Slow Reclaimer in a background goroutine
+	slowDone := make(chan error, 1)
+	go func() {
+		cmd := exec.CommandContext(ctx, "bash", "-c", slowInjectedCmd)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("failed to acquire lock after stale reclamation: %v (out: %s)", err, string(out))
+			slowDone <- fmt.Errorf("slow reclaimer exited with error: %w (out: %s)", err, string(out))
+			return
 		}
+		slowDone <- nil
+	}()
 
-		// Verify owner is newToken
-		ownerData, err := os.ReadFile(filepath.Join(lockPath, "owner"))
+	// 4. Wait deterministically until Slow Reclaimer has measured the old mtime and paused at the barrier
+	waitForBarrierFile(t, barrierReached, 5*time.Second)
+
+	// 5. Fast Reclaimer executes standard acquisition: reclaims stale lock, acquires fresh lock
+	fastToken := "fast-reclaimer-token"
+	fastCmd := remoteLockAcquireCmd(resName, fastToken)
+	if fastOut, fastErr := exec.CommandContext(ctx, "bash", "-c", fastCmd).CombinedOutput(); fastErr != nil {
+		t.Fatalf("fast reclaimer failed to acquire: %v (out: %s)", fastErr, string(fastOut))
+	}
+	assertLockOwnerEquals(t, lockPath, fastToken, "after fast acquire")
+
+	// 6. Signal Slow Reclaimer to resume
+	if err := os.WriteFile(barrierResume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier resume: %v", err)
+	}
+
+	// 7. Verify Slow Reclaimer DOES NOT steal or delete Fast Reclaimer's active lock
+	select {
+	case err := <-slowDone:
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: slow reclaimer acquired or exited while fast reclaimer was active: %v", err)
+	case <-time.After(350 * time.Millisecond):
+		// Expected: slow reclaimer is blocked
+	}
+	assertLockOwnerEquals(t, lockPath, fastToken, "while fast active")
+
+	// 8. Fast Reclaimer releases the lock
+	releaseLockAssertSuccess(t, ctx, resName, fastToken)
+
+	// 9. Now Slow Reclaimer can proceed to acquire the lock
+	select {
+	case err := <-slowDone:
 		if err != nil {
-			t.Fatalf("failed to read acquired owner: %v", err)
+			t.Fatalf("slow reclaimer failed to acquire after fast release: %v", err)
 		}
-		if strings.TrimSpace(string(ownerData)) != newToken {
-			t.Fatalf("expected owner token %s, got: %s", newToken, strings.TrimSpace(string(ownerData)))
-		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("slow reclaimer timed out waiting to acquire lock after release")
+	}
+	assertLockOwnerEquals(t, lockPath, slowToken, "after slow reclaimer acquired")
 
-		// Release lock
-		relCmd := remoteLockReleaseCmd(resName, newToken)
-		if relOut, relErr := exec.CommandContext(ctx, "bash", "-c", relCmd).CombinedOutput(); relErr != nil {
-			t.Fatalf("failed to release lock: %v (out: %s)", relErr, string(relOut))
-		}
-		if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-			t.Fatalf("lock directory still exists after release!")
-		}
-	})
+	// 10. Clean up: Slow Reclaimer releases lock
+	releaseLockAssertSuccess(t, ctx, resName, slowToken)
+
+	// Lock dir must be gone
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after final release")
+	}
 }
 
 func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *testing.T) {
@@ -288,4 +440,93 @@ func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *t
 			t.Fatalf("expected server_99 fallback for uncached nil client, got: %s", res)
 		}
 	})
+}
+
+func TestRemoteLock_GenerationRace_PauseBeforeRename_PreservesSuccessor(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("gen_race_rename_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	_ = os.RemoveAll(lockPath)
+	defer os.RemoveAll(lockPath)
+
+	tempDir := t.TempDir()
+	barrierReached := filepath.Join(tempDir, "barrier_reached")
+	barrierResume := filepath.Join(tempDir, "barrier_resume")
+
+	// 1. Setup an abandoned stale lock directory with past timestamp (>60s)
+	setupAbandonedStaleLock(t, lockPath, "abandoned-owner-202", 120*time.Second)
+
+	// 2. Slow Reclaimer command with barrier injected right before mv rename
+	slowToken := "slow-reclaimer-token-2"
+	slowCmd := remoteLockAcquireCmd(resName, slowToken)
+
+	targetPattern := `if mv "$flock_path" "$flock_path.stale.$now.$$"`
+	barrierInjection := fmt.Sprintf(
+		`touch %s; while [ ! -f %s ]; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
+		ssh.EscapeShellArg(barrierReached),
+		ssh.EscapeShellArg(barrierResume),
+	)
+	if !strings.Contains(slowCmd, targetPattern) {
+		t.Fatalf("slowCmd missing target pattern for barrier injection: %s", slowCmd)
+	}
+	slowInjectedCmd := strings.Replace(slowCmd, targetPattern, barrierInjection, 1)
+
+	// 3. Launch Slow Reclaimer in a background goroutine
+	slowDone := make(chan error, 1)
+	go func() {
+		cmd := exec.CommandContext(ctx, "bash", "-c", slowInjectedCmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			slowDone <- fmt.Errorf("slow reclaimer exited with error: %w (out: %s)", err, string(out))
+			return
+		}
+		slowDone <- nil
+	}()
+
+	// 4. Wait until Slow Reclaimer has verified the old mtime and paused right before mv
+	waitForBarrierFile(t, barrierReached, 5*time.Second)
+
+	// 5. Fast Reclaimer acquires fresh lock
+	fastToken := "fast-reclaimer-token-2"
+	fastCmd := remoteLockAcquireCmd(resName, fastToken)
+	if fastOut, fastErr := exec.CommandContext(ctx, "bash", "-c", fastCmd).CombinedOutput(); fastErr != nil {
+		t.Fatalf("fast reclaimer failed to acquire: %v (out: %s)", fastErr, string(fastOut))
+	}
+	assertLockOwnerEquals(t, lockPath, fastToken, "after fast acquire")
+
+	// 6. Signal Slow Reclaimer to resume and attempt mv
+	if err := os.WriteFile(barrierResume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier resume: %v", err)
+	}
+
+	// 7. Slow Reclaimer renames, detects token/timestamp mismatch inside renamed directory,
+	// and rolls back (restoring Fast Reclaimer's lock). Slow Reclaimer remains blocked.
+	select {
+	case err := <-slowDone:
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: slow reclaimer acquired or exited while fast reclaimer was active: %v", err)
+	case <-time.After(350 * time.Millisecond):
+		// Expected: slow reclaimer is blocked
+	}
+	assertLockOwnerEquals(t, lockPath, fastToken, "while fast active")
+
+	// 8. Fast Reclaimer releases the lock
+	releaseLockAssertSuccess(t, ctx, resName, fastToken)
+
+	// 9. Now Slow Reclaimer acquires the lock
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("slow reclaimer failed to acquire after fast release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("slow reclaimer timed out waiting to acquire lock after release")
+	}
+	assertLockOwnerEquals(t, lockPath, slowToken, "after slow reclaimer acquired")
+
+	// 10. Clean up
+	releaseLockAssertSuccess(t, ctx, resName, slowToken)
 }
