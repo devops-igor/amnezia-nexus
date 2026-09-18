@@ -952,3 +952,88 @@ func TestLoadData_AWGIPAllocationsQueryFailure_AbortsBackupExport(t *testing.T) 
 		t.Fatalf("expected error message to mention AWG IP allocations, got: %v", err)
 	}
 }
+
+func TestAllocateAWGClientIP_PostMigrationProvisioningRegression(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_post_migration_provisioning.db")
+
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite db: %v", err)
+	}
+
+	// Setup legacy table without uq_awg_ip_allocations_server_client_active index
+	_, err = rawDB.Exec(`
+		CREATE TABLE awg_ip_allocations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_id INTEGER NOT NULL,
+			client_id TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'allocated',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(server_id, ip)
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to create legacy table: %v", err)
+	}
+
+	// Seed legacy duplicate active leases for a server (.2 and .3 under same client_id)
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = rawDB.Exec(`
+		INSERT INTO awg_ip_allocations (id, server_id, client_id, ip, status, created_at, updated_at) VALUES
+		(1, 1, 'legacy-client', '10.8.0.2', 'allocated', ?, ?),
+		(2, 1, 'legacy-client', '10.8.0.3', 'allocated', ?, ?);
+	`, now, now, now, now)
+	if err != nil {
+		t.Fatalf("failed to insert legacy duplicate records: %v", err)
+	}
+	_ = rawDB.Close()
+
+	// Open with database.Open which runs migration reconciling duplicates
+	db, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("Open failed on legacy DB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Verify legacy migration state: .2 is allocated, .3 is superseded
+	var status2, status3 string
+	err = db.SQLDB().QueryRowContext(ctx, "SELECT status FROM awg_ip_allocations WHERE server_id = 1 AND ip = '10.8.0.2'").Scan(&status2)
+	if err != nil {
+		t.Fatalf("failed to query status for 10.8.0.2: %v", err)
+	}
+	if status2 != "allocated" {
+		t.Fatalf("expected 10.8.0.2 to remain allocated, got %s", status2)
+	}
+
+	err = db.SQLDB().QueryRowContext(ctx, "SELECT status FROM awg_ip_allocations WHERE server_id = 1 AND ip = '10.8.0.3'").Scan(&status3)
+	if err != nil {
+		t.Fatalf("failed to query status for 10.8.0.3: %v", err)
+	}
+	if status3 != "superseded" {
+		t.Fatalf("expected 10.8.0.3 to be superseded, got %s", status3)
+	}
+
+	// Call db.AllocateAWGClientIP for a brand new client identity on the same server
+	newIP1, err := db.AllocateAWGClientIP(ctx, 1, "new-client-1", "pubkey-1", nil, "10.8.0.0", 24, "10.8.0.1")
+	if err != nil {
+		t.Fatalf("AllocateAWGClientIP failed for new-client-1: %v", err)
+	}
+	if newIP1 != "10.8.0.4" {
+		t.Fatalf("expected new-client-1 to receive 10.8.0.4 (skipping allocated .2 and superseded .3), got %s", newIP1)
+	}
+
+	// Verify subsequent allocation continues cleanly
+	newIP2, err := db.AllocateAWGClientIP(ctx, 1, "new-client-2", "pubkey-2", nil, "10.8.0.0", 24, "10.8.0.1")
+	if err != nil {
+		t.Fatalf("AllocateAWGClientIP failed for new-client-2: %v", err)
+	}
+	if newIP2 != "10.8.0.5" {
+		t.Fatalf("expected new-client-2 to receive 10.8.0.5, got %s", newIP2)
+	}
+}

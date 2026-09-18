@@ -162,7 +162,7 @@ func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip,
 
 func (d *DB) fetchAllocatedIPs(ctx context.Context, serverID int64) ([]string, error) {
 	rows, err := d.sqlDB.QueryContext(ctx,
-		"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated'",
+		"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status != 'released'",
 		serverID,
 	)
 	if err != nil {
