@@ -245,51 +245,27 @@ func remoteLockHeartbeatCmd(resource any, token string) string {
 	)
 }
 
+// resolveLockResource anchors remote mutation locking to the physical AWG interface/target
+// on the remote host (e.g. iface_awg0). Because lock files reside on the target host filesystem,
+// the host is already its natural namespace. Scoping the lock to the physical interface guarantees
+// that all Server.ID records and manager instances targeting the same host interface serialize on
+// the exact same lock path regardless of container discovery state (success, failure, retry, recovery).
 func (m *AWGManager) resolveLockResource(ctx context.Context, client ssh.SSHClient, serverID int64) string {
-	if m == nil {
-		return fmt.Sprintf("server_%d", serverID)
-	}
+	_ = ctx
+	_ = client
+	_ = serverID
 
-	iface := m.interfaceName()
-	if iface == "" {
-		iface = "awg0"
-	}
-
-	if client != nil {
-		if cached, ok := m.getCachedContainerForClient(client); ok && IsValidContainerName(cached) {
-			if serverID > 0 {
-				m.setCachedContainer(fmt.Sprintf("id:%d", serverID), cached)
-			}
-			return fmt.Sprintf("%s_%s", cached, iface)
-		}
-		if serverID > 0 {
-			if cached, ok := m.getCachedContainer(fmt.Sprintf("id:%d", serverID)); ok && IsValidContainerName(cached) {
-				m.setCachedContainerForClient(client, cached)
-				return fmt.Sprintf("%s_%s", cached, iface)
-			}
-		}
-
-		if cName, ok := m.discoverContainerName(ctx, client); ok && IsValidContainerName(cName) {
-			if serverID > 0 {
-				m.setCachedContainer(fmt.Sprintf("id:%d", serverID), cName)
-			}
-			return fmt.Sprintf("%s_%s", cName, iface)
+	iface := "awg0"
+	if m != nil {
+		if name := strings.TrimSpace(m.interfaceName()); name != "" {
+			iface = name
 		}
 	}
-
-	// Check cached container name for client/server before falling back
-	if client != nil {
-		if cached, ok := m.getCachedContainerForClient(client); ok && IsValidContainerName(cached) {
-			return fmt.Sprintf("%s_%s", cached, iface)
-		}
+	iface = strings.ToLower(iface)
+	if strings.HasPrefix(iface, "iface_") {
+		return iface
 	}
-	if serverID > 0 {
-		if cached, ok := m.getCachedContainer(fmt.Sprintf("id:%d", serverID)); ok && IsValidContainerName(cached) {
-			return fmt.Sprintf("%s_%s", cached, iface)
-		}
-	}
-
-	return fmt.Sprintf("server_%d", serverID)
+	return fmt.Sprintf("iface_%s", iface)
 }
 
 // ResolveLockResource returns the physical lock target resource identifier for the remote server.

@@ -92,10 +92,10 @@ func TestAWGManager_FailedContainerDiscovery_DoesNotPopulateCache(t *testing.T) 
 		t.Fatalf("expected getCachedContainerForClient to return false after failed discovery")
 	}
 
-	// 2. ResolveLockResource on discovery failure falls back to stable server_<id> without caching
+	// 2. ResolveLockResource unifies remote locking on the physical interface without cache dependency
 	lockRes := mgr.ResolveLockResource(ctx, client, serverID)
-	if lockRes != "server_101" {
-		t.Fatalf("expected stable fallback server_101 on failed discovery, got: %s", lockRes)
+	if lockRes != "iface_awg0" {
+		t.Fatalf("expected stable interface lock iface_awg0 on failed discovery, got: %s", lockRes)
 	}
 
 	mgr.cacheMu.RLock()
@@ -123,8 +123,11 @@ func TestAWGManager_FailedContainerDiscovery_DoesNotPopulateCache(t *testing.T) 
 	}
 
 	lockResRecovered := mgr.ResolveLockResource(ctx, client, serverID)
-	if lockResRecovered != "amnezia-awg_awg0" {
-		t.Fatalf("expected lock resource amnezia-awg_awg0 after recovery, got: %s", lockResRecovered)
+	if lockResRecovered != "iface_awg0" {
+		t.Fatalf("expected lock resource iface_awg0 after recovery, got: %s", lockResRecovered)
+	}
+	if lockRes != lockResRecovered {
+		t.Fatalf("lock resource must not diverge across discovery states: got %s vs %s", lockRes, lockResRecovered)
 	}
 }
 

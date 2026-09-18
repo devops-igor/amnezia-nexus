@@ -2050,17 +2050,17 @@ func TestAWGManager_ResolveLockResource_And_LockPaths(t *testing.T) {
 	ctx := context.Background()
 	mgr := awg.NewAWGManager(nil)
 
-	// 1. Nil client falls back to server_<id>
+	// 1. Nil client resolves to physical interface target
 	resNil := mgr.ResolveLockResource(ctx, nil, 42)
-	if resNil != "server_42" {
-		t.Fatalf("expected server_42 for nil client, got: %s", resNil)
+	if resNil != "iface_awg0" {
+		t.Fatalf("expected iface_awg0 for nil client, got: %s", resNil)
 	}
 
-	// 2. Client with resolved container name scopes resource as <container>_<interface>
+	// 2. Client with mock SSH client resolves to physical interface target
 	mockClient := newThreadSafeMockSSHClient()
 	resMock := mgr.ResolveLockResource(ctx, mockClient, 42)
-	if resMock != "amnezia-awg_awg0" {
-		t.Fatalf("expected amnezia-awg_awg0 for mockClient, got: %s", resMock)
+	if resMock != "iface_awg0" {
+		t.Fatalf("expected iface_awg0 for mockClient, got: %s", resMock)
 	}
 
 	// 3. remoteLockPath compatibility: int64, string, full path
@@ -2069,6 +2069,9 @@ func TestAWGManager_ResolveLockResource_And_LockPaths(t *testing.T) {
 	}
 	if p := awg.RemoteLockPath("server_42"); p != "/tmp/amnezia_awg_server_42.lock" {
 		t.Fatalf("unexpected path for server_42: %s", p)
+	}
+	if p := awg.RemoteLockPath("iface_awg0"); p != "/tmp/amnezia_awg_iface_awg0.lock" {
+		t.Fatalf("unexpected path for iface_awg0: %s", p)
 	}
 	if p := awg.RemoteLockPath("amnezia-awg_awg0"); p != "/tmp/amnezia_awg_amnezia-awg_awg0.lock" {
 		t.Fatalf("unexpected path for resource string: %s", p)

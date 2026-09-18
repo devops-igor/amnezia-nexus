@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -354,22 +355,15 @@ func TestRemoteLock_GenerationRace_StaleReclaimerPreservesActiveSuccessor(t *tes
 func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Transient error during Docker discovery retries up to 2 times and succeeds
-	t.Run("TransientDiscoveryError_RetriesAndResolvesContainer", func(t *testing.T) {
+	// 1. Transient discovery error resolves to physical interface target
+	t.Run("TransientDiscoveryError_ResolvesPhysicalInterface", func(t *testing.T) {
 		client := newMockAWGSSHClient()
 		client.host = "192.0.2.1"
 		client.port = 22
 
-		var callCount atomic.Int32
 		client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 			if strings.Contains(cmd, "docker ps") {
-				count := callCount.Add(1)
-				if count == 1 {
-					// First attempt fails with transient error
-					return "", "transient docker daemon glitch", 1, errors.New("transient docker daemon glitch")
-				}
-				// Second attempt (first retry) succeeds
-				return "amnezia-awg\n", "", 0, nil
+				return "", "transient docker daemon glitch", 1, errors.New("transient docker daemon glitch")
 			}
 			return "OK", "", 0, nil
 		}
@@ -377,15 +371,15 @@ func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *t
 		mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
 		res := mgr.ResolveLockResource(ctx, client, 42)
 
-		if res != "amnezia-awg_awg0" {
-			t.Fatalf("expected amnezia-awg_awg0 after retry, got: %s", res)
+		if res != "iface_awg0" {
+			t.Fatalf("expected iface_awg0 under transient error, got: %s", res)
 		}
-		if callCount.Load() < 2 {
-			t.Fatalf("expected at least 2 docker ps calls due to retry, got: %d", callCount.Load())
+		if p := remoteLockPath(res); p != "/tmp/amnezia_awg_iface_awg0.lock" {
+			t.Fatalf("expected lock path /tmp/amnezia_awg_iface_awg0.lock, got: %s", p)
 		}
 	})
 
-	// 2. Cached container for server keeps resolution stable when discovery permanently fails
+	// 2. Cached container for server keeps resolution stable on physical interface
 	t.Run("CachedContainerForServer_StableWhenClientDiscoveryFails", func(t *testing.T) {
 		client := newMockAWGSSHClient()
 		client.host = "192.0.2.2"
@@ -399,16 +393,15 @@ func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *t
 		}
 
 		mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
-		// Pre-populate container cache for server ID 42
 		mgr.setCachedContainer("id:42", "amnezia-awg")
 
 		res := mgr.ResolveLockResource(ctx, client, 42)
-		if res != "amnezia-awg_awg0" {
-			t.Fatalf("expected cached container amnezia-awg_awg0, got: %s", res)
+		if res != "iface_awg0" {
+			t.Fatalf("expected iface_awg0, got: %s", res)
 		}
 	})
 
-	// 3. Cached container for client keeps resolution stable
+	// 3. Cached container for client keeps resolution stable on physical interface
 	t.Run("CachedContainerForClient_StableAcrossCalls", func(t *testing.T) {
 		client := newMockAWGSSHClient()
 		client.host = "192.0.2.3"
@@ -418,28 +411,32 @@ func TestAWGManager_ResolveLockResource_StableUnderTransientDiscoveryGlitch(t *t
 		mgr.setCachedContainerForClient(client, "amnezia-awg")
 
 		res := mgr.ResolveLockResource(ctx, client, 42)
-		if res != "amnezia-awg_awg0" {
-			t.Fatalf("expected cached container amnezia-awg_awg0, got: %s", res)
+		if res != "iface_awg0" {
+			t.Fatalf("expected iface_awg0, got: %s", res)
 		}
 	})
 
-	// 4. Nil client uses cached container for server
+	// 4. Nil client resolves to physical interface target
 	t.Run("NilClient_UsesCachedServerContainer", func(t *testing.T) {
 		mgr := NewAWGManager(nil)
 		mgr.setCachedContainer("id:55", "amnezia-awg")
 
 		res := mgr.ResolveLockResource(ctx, nil, 55)
-		if res != "amnezia-awg_awg0" {
-			t.Fatalf("expected amnezia-awg_awg0 from cached server container, got: %s", res)
+		if res != "iface_awg0" {
+			t.Fatalf("expected iface_awg0 from cached server container, got: %s", res)
 		}
 	})
 
-	// 5. Nil client without cache falls back to server ID
+	// 5. Distinct server IDs resolve to identical physical interface lock
 	t.Run("NilClient_NoCache_FallsBackToServerID", func(t *testing.T) {
 		mgr := NewAWGManager(nil)
-		res := mgr.ResolveLockResource(ctx, nil, 99)
-		if res != "server_99" {
-			t.Fatalf("expected server_99 fallback for uncached nil client, got: %s", res)
+		res1 := mgr.ResolveLockResource(ctx, nil, 99)
+		res2 := mgr.ResolveLockResource(ctx, nil, 101)
+		if res1 != "iface_awg0" || res2 != "iface_awg0" {
+			t.Fatalf("expected iface_awg0 for both server IDs, got %s and %s", res1, res2)
+		}
+		if res1 != res2 {
+			t.Fatalf("distinct server IDs must resolve to identical lock resource: %s != %s", res1, res2)
 		}
 	})
 }
@@ -732,5 +729,190 @@ func TestRemoteLock_ThreeContender_StaleRecoveryDoesNotDisplaceLiveSuccessorToTh
 	// Final verification: lock directory is completely cleaned up
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("canonical lock directory still exists after final release")
+	}
+}
+
+func newSharedHostSSHClient(serverID int64, dockerHealthy *atomic.Bool, configPath string) *mockAWGSSHClient {
+	_ = configPath
+	mock := newMockAWGSSHClient()
+	mock.host = "192.0.2.100"
+	mock.port = 22
+	mock.serverID = &serverID
+
+	mock.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps") {
+			if !dockerHealthy.Load() {
+				return "", "docker daemon unreachable", 1, errors.New("docker daemon unreachable")
+			}
+			return "amnezia-awg\n", "", 0, nil
+		}
+		execCmd := exec.Command("bash", "-c", cmd)
+		out, err := execCmd.CombinedOutput()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return string(out), string(out), exitErr.ExitCode(), err
+			}
+			return string(out), string(out), 1, err
+		}
+		return string(out), "", 0, nil
+	}
+
+	return mock
+}
+
+func runSharedHostWorker(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	mgr *AWGManager,
+	client ssh.SSHClient,
+	serverID int64,
+	peerBlock string,
+	configPath string,
+	startGate <-chan struct{},
+	dockerHealthy *atomic.Bool,
+	activeCount *atomic.Int32,
+	maxConcurrent *atomic.Int32,
+	errs chan<- error,
+) {
+	defer wg.Done()
+	<-startGate
+
+	unlock, err := mgr.acquireRemoteServerLock(ctx, client, serverID)
+	if err != nil {
+		errs <- fmt.Errorf("server %d failed to acquire lock: %w", serverID, err)
+		return
+	}
+	defer unlock()
+
+	cur := activeCount.Add(1)
+	defer activeCount.Add(-1)
+
+	for {
+		max := maxConcurrent.Load()
+		if cur > max {
+			if maxConcurrent.CompareAndSwap(max, cur) {
+				break
+			}
+		} else {
+			break
+		}
+	}
+
+	// Simulate Docker recovery during configuration read/write
+	dockerHealthy.Store(true)
+
+	currentBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		errs <- fmt.Errorf("server %d failed to read config: %w", serverID, err)
+		return
+	}
+
+	// Sleep briefly to force contention and verify mutual exclusion prevents lost updates
+	time.Sleep(60 * time.Millisecond)
+
+	newContent := string(currentBytes) + peerBlock
+	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil {
+		errs <- fmt.Errorf("server %d failed to write updated config: %w", serverID, err)
+		return
+	}
+}
+
+func TestRemoteLock_DiscoveryFailureAndRecovery_ZeroLostUpdates(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	serverID1 := int64(301)
+	serverID2 := int64(302)
+
+	canonicalLockPath := "/tmp/amnezia_awg_iface_awg0.lock"
+	_ = os.RemoveAll(canonicalLockPath)
+	_ = os.RemoveAll(canonicalLockPath + ".gate")
+	defer func() {
+		_ = os.RemoveAll(canonicalLockPath)
+		_ = os.RemoveAll(canonicalLockPath + ".gate")
+	}()
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "awg0.conf")
+	initialConfig := "[Interface]\nAddress = 10.66.66.1/24\nListenPort = 51820\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0600); err != nil {
+		t.Fatalf("failed to write initial config: %v", err)
+	}
+
+	var dockerHealthy atomic.Bool
+	dockerHealthy.Store(false)
+
+	client1 := newSharedHostSSHClient(serverID1, &dockerHealthy, configPath)
+	client2 := newSharedHostSSHClient(serverID2, &dockerHealthy, configPath)
+
+	mgr1 := NewAWGManager(&mockAWGSSHProvider{client: client1})
+	mgr2 := NewAWGManager(&mockAWGSSHProvider{client: client2})
+
+	// 1. Assert both distinct server IDs resolve to the exact same physical lock path under discovery failure
+	res1 := mgr1.ResolveLockResource(ctx, client1, serverID1)
+	res2 := mgr2.ResolveLockResource(ctx, client2, serverID2)
+
+	if res1 != "iface_awg0" || res2 != "iface_awg0" {
+		t.Fatalf("expected both to resolve to iface_awg0, got res1=%s res2=%s", res1, res2)
+	}
+	if res1 != res2 {
+		t.Fatalf("expected identical resource across server IDs, got res1=%s res2=%s", res1, res2)
+	}
+
+	path1 := remoteLockPath(res1)
+	path2 := remoteLockPath(res2)
+	if path1 != canonicalLockPath || path2 != canonicalLockPath {
+		t.Fatalf("expected canonical lock path %s, got path1=%s path2=%s", canonicalLockPath, path1, path2)
+	}
+
+	// 2. Assert concurrent lock acquisition serializes strictly and survives Docker recovery with zero lost updates
+	var (
+		activeCount   atomic.Int32
+		maxConcurrent atomic.Int32
+		wg            sync.WaitGroup
+		errs          = make(chan error, 2)
+	)
+
+	startGate := make(chan struct{})
+
+	peer1Block := "\n[Peer]\nPublicKey = PeerKey1111111111111111111111111111111111111\nAllowedIPs = 10.66.66.2/32\n"
+	peer2Block := "\n[Peer]\nPublicKey = PeerKey2222222222222222222222222222222222222\nAllowedIPs = 10.66.66.3/32\n"
+
+	wg.Add(2)
+	go runSharedHostWorker(ctx, &wg, mgr1, client1, serverID1, peer1Block, configPath, startGate, &dockerHealthy, &activeCount, &maxConcurrent, errs)
+	go runSharedHostWorker(ctx, &wg, mgr2, client2, serverID2, peer2Block, configPath, startGate, &dockerHealthy, &activeCount, &maxConcurrent, errs)
+
+	close(startGate)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("worker failed: %v", err)
+		}
+	}
+
+	if max := maxConcurrent.Load(); max != 1 {
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: expected maxConcurrent=1, got: %d", max)
+	}
+
+	finalBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read final config: %v", err)
+	}
+	finalContent := string(finalBytes)
+
+	if !strings.Contains(finalContent, "PeerKey1111111111111111111111111111111111111") {
+		t.Fatalf("LOST UPDATE: Peer 1 was overwritten or missing from final config:\n%s", finalContent)
+	}
+	if !strings.Contains(finalContent, "PeerKey2222222222222222222222222222222222222") {
+		t.Fatalf("LOST UPDATE: Peer 2 was overwritten or missing from final config:\n%s", finalContent)
+	}
+
+	if _, err := os.Stat(canonicalLockPath); !os.IsNotExist(err) {
+		t.Fatalf("canonical lock directory still exists after both released")
 	}
 }
