@@ -485,6 +485,55 @@ func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, err
 	return sessions, rows.Err()
 }
 
+// GetEnrichedActiveVPNSessions returns all currently connected sessions with
+// identity joins resolved: username from users, server identity via
+// backend_tunnels -> servers. Rows whose joins miss fall back to 'unknown'
+// and 'Server #<id>'. Read-path only (issue #189).
+func (d *DB) GetEnrichedActiveVPNSessions(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `SELECT s.id, s.user_id, COALESCE(u.username, 'unknown') AS username,
+		s.backend_tunnel_id, COALESCE(t.server_id, 0) AS server_id,
+		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name,
+		s.peer_public_key, s.assigned_ip, s.connected_at, s.last_seen,
+		s.rx_bytes, s.tx_bytes, s.status
+		FROM vpn_sessions s
+		LEFT JOIN users u ON u.id = s.user_id
+		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
+		LEFT JOIN servers srv ON srv.id = t.server_id
+		WHERE s.status = 'connected'
+		ORDER BY s.connected_at DESC`
+
+	rows, err := d.sqlDB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query enriched active vpn sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []models.EnrichedVPNSession
+	for rows.Next() {
+		var s models.EnrichedVPNSession
+		var connectedAt, lastSeen sql.NullString
+		if err := rows.Scan(
+			&s.ID, &s.UserID, &s.Username, &s.BackendTunnelID, &s.ServerID,
+			&s.ServerName, &s.PeerPublicKey, &s.AssignedIP, &connectedAt, &lastSeen,
+			&s.RxBytes, &s.TxBytes, &s.Status,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan enriched vpn session: %w", err)
+		}
+		if connectedAt.Valid && connectedAt.String != "" {
+			s.ConnectedAt = parseTime(connectedAt.String)
+		}
+		if lastSeen.Valid && lastSeen.String != "" {
+			s.LastSeen = parseTime(lastSeen.String)
+		}
+		sessions = append(sessions, s)
+	}
+
+	return sessions, rows.Err()
+}
+
 // DeleteVPNSession removes a VPN session record.
 func (d *DB) DeleteVPNSession(ctx context.Context, sessionID string) error {
 	d.writeMu.Lock()

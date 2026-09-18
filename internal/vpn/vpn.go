@@ -1098,6 +1098,39 @@ func (s *Service) TotalDroppedPackets() uint64 {
 	return total
 }
 
+// SessionsEnriched returns active sessions with identity joins resolved from
+// the database, stitched with live counters: rx/tx bytes and last_seen come
+// from the in-memory SessionManager when the session is present there (memory
+// is authoritative while running), and fall back to the DB row otherwise.
+// Read-path only (issue #189).
+func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	if s.db == nil {
+		return nil, errors.New("database not available")
+	}
+
+	sessions, err := s.db.GetEnrichedActiveVPNSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Stitch live counters: the DB row is the fallback, memory is
+	// authoritative while the session is connected.
+	s.mu.RLock()
+	sessionMgr := s.sessionMgr
+	s.mu.RUnlock()
+	if sessionMgr == nil {
+		return sessions, nil
+	}
+	for i := range sessions {
+		if sess, ok := sessionMgr.GetSessionByID(sessions[i].ID); ok {
+			sessions[i].RxBytes = sess.RxBytes
+			sessions[i].TxBytes = sess.TxBytes
+			sessions[i].LastSeen = sess.LastSeen
+		}
+	}
+	return sessions, nil
+}
+
 // GetBackends returns all registered backend tunnels.
 func (s *Service) GetBackends(ctx context.Context) ([]*models.BackendTunnel, error) {
 	s.mu.RLock()
