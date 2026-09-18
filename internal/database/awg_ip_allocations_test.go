@@ -632,7 +632,7 @@ func TestAWGIPAllocations_Migration_CleansLegacyDuplicateActiveRecords(t *testin
 
 	ctx := context.Background()
 
-	// Verify older duplicate (id=1) was cleaned up, and newest duplicate (id=2) was retained
+	// Verify earliest row (id=1) was retained as allocated without user_connections match
 	var remainingIP string
 	var remainingID int64
 	err = db.SQLDB().QueryRowContext(ctx,
@@ -641,8 +641,20 @@ func TestAWGIPAllocations_Migration_CleansLegacyDuplicateActiveRecords(t *testin
 	if err != nil {
 		t.Fatalf("failed to query remaining lease: %v", err)
 	}
-	if remainingID != 2 || remainingIP != "10.66.66.3" {
-		t.Fatalf("expected newest record id=2 ip=10.66.66.3, got id=%d ip=%s", remainingID, remainingIP)
+	if remainingID != 1 || remainingIP != "10.66.66.2" {
+		t.Fatalf("expected earliest record id=1 ip=10.66.66.2, got id=%d ip=%s", remainingID, remainingIP)
+	}
+
+	// Verify divergent row (id=2) was not deleted but marked superseded
+	var supersededIP, supersededStatus string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT ip, status FROM awg_ip_allocations WHERE id = 2",
+	).Scan(&supersededIP, &supersededStatus)
+	if err != nil {
+		t.Fatalf("failed to query superseded record id=2: %v", err)
+	}
+	if supersededIP != "10.66.66.3" || supersededStatus != "superseded" {
+		t.Fatalf("expected id=2 ip=10.66.66.3 status=superseded, got ip=%s status=%s", supersededIP, supersededStatus)
 	}
 
 	// Verify 'other-client' remains intact
@@ -664,5 +676,225 @@ func TestAWGIPAllocations_Migration_CleansLegacyDuplicateActiveRecords(t *testin
 	}
 	if !isUniqueConstraintError(err) {
 		t.Fatalf("expected unique constraint error, got: %v", err)
+	}
+}
+
+func TestAWGIPAllocations_Migration_OlderRowValid_PreservesOlderLease(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_migration_older_valid.db")
+
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite db: %v", err)
+	}
+
+	_, err = rawDB.Exec(SchemaSQL)
+	if err != nil {
+		t.Fatalf("failed to init schema in raw sqlite db: %v", err)
+	}
+	_, err = rawDB.Exec("DROP INDEX IF EXISTS uq_awg_ip_allocations_server_client_active")
+	if err != nil {
+		t.Fatalf("failed to drop unique index: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = rawDB.Exec(`
+		INSERT INTO users (id, username, created_at) VALUES ('u1', 'testuser1', ?);
+		INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name, client_params, created_at)
+		VALUES ('conn-1', 'u1', 1, 'amnezia-wg', 'test-client', 'Test Client', '{"assigned_ip": "10.66.66.2"}', ?);
+		INSERT INTO awg_ip_allocations (id, server_id, client_id, ip, status, created_at, updated_at) VALUES
+		(1, 1, 'test-client', '10.66.66.2', 'allocated', ?, ?),
+		(2, 1, 'test-client', '10.66.66.3', 'allocated', ?, ?);
+	`, now, now, now, now, now, now)
+	if err != nil {
+		t.Fatalf("failed to seed legacy records: %v", err)
+	}
+	_ = rawDB.Close()
+
+	db, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("Open failed on legacy DB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Assert id=1 is retained with status = 'allocated' and ip = 10.66.66.2
+	var id1Status, id1IP string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, ip FROM awg_ip_allocations WHERE id = 1",
+	).Scan(&id1Status, &id1IP)
+	if err != nil {
+		t.Fatalf("failed to query id=1: %v", err)
+	}
+	if id1Status != "allocated" || id1IP != "10.66.66.2" {
+		t.Fatalf("expected id=1 status=allocated ip=10.66.66.2, got status=%s ip=%s", id1Status, id1IP)
+	}
+
+	// Assert id=2 is preserved with status = 'superseded'
+	var id2Status, id2IP string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, ip FROM awg_ip_allocations WHERE id = 2",
+	).Scan(&id2Status, &id2IP)
+	if err != nil {
+		t.Fatalf("failed to query id=2: %v", err)
+	}
+	if id2Status != "superseded" || id2IP != "10.66.66.3" {
+		t.Fatalf("expected id=2 status=superseded ip=10.66.66.3, got status=%s ip=%s", id2Status, id2IP)
+	}
+}
+
+func TestAWGIPAllocations_Migration_NewerRowValid_PreservesNewerLease(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_migration_newer_valid.db")
+
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite db: %v", err)
+	}
+
+	_, err = rawDB.Exec(SchemaSQL)
+	if err != nil {
+		t.Fatalf("failed to init schema in raw sqlite db: %v", err)
+	}
+	_, err = rawDB.Exec("DROP INDEX IF EXISTS uq_awg_ip_allocations_server_client_active")
+	if err != nil {
+		t.Fatalf("failed to drop unique index: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = rawDB.Exec(`
+		INSERT INTO users (id, username, created_at) VALUES ('u1', 'testuser2', ?);
+		INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name, client_params, created_at)
+		VALUES ('conn-2', 'u1', 1, 'amnezia-wg', 'test-client', 'Test Client', '{"assigned_ip": "10.66.66.3"}', ?);
+		INSERT INTO awg_ip_allocations (id, server_id, client_id, ip, status, created_at, updated_at) VALUES
+		(1, 1, 'test-client', '10.66.66.2', 'allocated', ?, ?),
+		(2, 1, 'test-client', '10.66.66.3', 'allocated', ?, ?);
+	`, now, now, now, now, now, now)
+	if err != nil {
+		t.Fatalf("failed to seed legacy records: %v", err)
+	}
+	_ = rawDB.Close()
+
+	db, err := Open(dbPath, "")
+	if err != nil {
+		t.Fatalf("Open failed on legacy DB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Assert id=2 is retained with status = 'allocated' and ip = 10.66.66.3
+	var id2Status, id2IP string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, ip FROM awg_ip_allocations WHERE id = 2",
+	).Scan(&id2Status, &id2IP)
+	if err != nil {
+		t.Fatalf("failed to query id=2: %v", err)
+	}
+	if id2Status != "allocated" || id2IP != "10.66.66.3" {
+		t.Fatalf("expected id=2 status=allocated ip=10.66.66.3, got status=%s ip=%s", id2Status, id2IP)
+	}
+
+	// Assert id=1 is preserved with status = 'superseded'
+	var id1Status, id1IP string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, ip FROM awg_ip_allocations WHERE id = 1",
+	).Scan(&id1Status, &id1IP)
+	if err != nil {
+		t.Fatalf("failed to query id=1: %v", err)
+	}
+	if id1Status != "superseded" || id1IP != "10.66.66.2" {
+		t.Fatalf("expected id=1 status=superseded ip=10.66.66.2, got status=%s ip=%s", id1Status, id1IP)
+	}
+}
+
+func TestAdoptAWGClientIPLease_ReactivatesSupersededLease(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Seed superseded allocation for an IP
+	_, err := db.SQLDB().ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (1, 'old-client', '10.66.66.5', 'superseded', ?, ?)",
+		now, now,
+	)
+	if err != nil {
+		t.Fatalf("failed to seed superseded allocation: %v", err)
+	}
+
+	// Call AdoptAWGClientIPLease
+	adopted, err := db.AdoptAWGClientIPLease(ctx, 1, "new-client", "", "10.66.66.5")
+	if err != nil {
+		t.Fatalf("AdoptAWGClientIPLease failed: %v", err)
+	}
+	if !adopted {
+		t.Fatalf("expected adoption to succeed, got false")
+	}
+
+	// Assert status is updated to 'allocated'
+	var status, clientID string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, client_id FROM awg_ip_allocations WHERE server_id = 1 AND ip = '10.66.66.5'",
+	).Scan(&status, &clientID)
+	if err != nil {
+		t.Fatalf("failed to query allocation: %v", err)
+	}
+	if status != "allocated" || clientID != "new-client" {
+		t.Fatalf("expected status=allocated client_id=new-client, got status=%s client_id=%s", status, clientID)
+	}
+}
+
+func TestAdoptAWGClientIPLease_ReconcilesDifferentLiveIP(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Client has active allocation on 10.66.66.2
+	_, err := db.SQLDB().ExecContext(ctx,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (1, 'client-reconcile', '10.66.66.2', 'allocated', ?, ?)",
+		now, now,
+	)
+	if err != nil {
+		t.Fatalf("failed to seed active lease: %v", err)
+	}
+
+	// Adopt a different live IP 10.66.66.3
+	adopted, err := db.AdoptAWGClientIPLease(ctx, 1, "client-reconcile", "", "10.66.66.3")
+	if err != nil {
+		t.Fatalf("adopt new live IP failed: %v", err)
+	}
+	if !adopted {
+		t.Fatalf("expected adoption of new live IP to succeed")
+	}
+
+	// Verify old lease is superseded
+	var oldStatus string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status FROM awg_ip_allocations WHERE server_id = 1 AND ip = '10.66.66.2'",
+	).Scan(&oldStatus)
+	if err != nil {
+		t.Fatalf("failed to query old lease: %v", err)
+	}
+	if oldStatus != "superseded" {
+		t.Fatalf("expected old lease status=superseded, got %s", oldStatus)
+	}
+
+	// Verify new lease is allocated
+	var newStatus, newClientID string
+	err = db.SQLDB().QueryRowContext(ctx,
+		"SELECT status, client_id FROM awg_ip_allocations WHERE server_id = 1 AND ip = '10.66.66.3'",
+	).Scan(&newStatus, &newClientID)
+	if err != nil {
+		t.Fatalf("failed to query new lease: %v", err)
+	}
+	if newStatus != "allocated" || newClientID != "client-reconcile" {
+		t.Fatalf("expected new lease status=allocated client_id=client-reconcile, got status=%s client_id=%s", newStatus, newClientID)
 	}
 }

@@ -307,6 +307,8 @@ func (d *DB) AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID
 		return false, fmt.Errorf("failed to check existing IP allocation for adoption: %w", err)
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339)
+
 	// Check if this client already has an active allocation on this server
 	var existingClientIP string
 	err = d.sqlDB.QueryRowContext(ctx,
@@ -317,15 +319,26 @@ func (d *DB) AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID
 		if existingClientIP == ip {
 			return true, nil
 		}
-		return false, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+		// If the client currently has a different active allocation on this server that was marked 'allocated',
+		// but ip is unallocated to any other client: update the old allocation to status = 'superseded' and activate ip.
+		_, err = d.sqlDB.ExecContext(ctx,
+			"UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?)",
+			now, serverID, storedClientID, clientID,
+		)
+		if err != nil {
+			return false, fmt.Errorf("failed to supersede existing allocation for client: %w", err)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("failed to check client allocation for adoption: %w", err)
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
 	_, err = d.sqlDB.ExecContext(ctx,
-		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, 'allocated', ?, ?)",
+		`INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at)
+		VALUES (?, ?, ?, 'allocated', ?, ?)
+		ON CONFLICT(server_id, ip) DO UPDATE SET
+			client_id = excluded.client_id,
+			status = 'allocated',
+			updated_at = excluded.updated_at`,
 		serverID, storedClientID, ip, now, now,
 	)
 	if err != nil {
