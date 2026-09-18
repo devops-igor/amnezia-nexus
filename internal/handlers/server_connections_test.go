@@ -176,67 +176,6 @@ func TestServerConnectionsHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("GetServerConnectionKitHandler Branches", func(t *testing.T) {
-		// 1. Query Params
-		reqQuery := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit?client_id=client-1&protocol=awg", serverID), nil)
-		reqQueryCtx := middleware.WithSession(reqQuery.Context(), adminSess)
-		wQuery := httptest.NewRecorder()
-		r.ServeHTTP(wQuery, reqQuery.WithContext(reqQueryCtx))
-		if wQuery.Code != http.StatusOK {
-			t.Errorf("expected 200 via query params, got %d", wQuery.Code)
-		}
-
-		// 2. Form Body
-		reqForm := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", serverID), strings.NewReader("client_id=client-1&protocol=awg"))
-		reqFormCtx := middleware.WithSession(reqForm.Context(), adminSess)
-		wForm := httptest.NewRecorder()
-		r.ServeHTTP(wForm, reqForm.WithContext(reqFormCtx))
-		if wForm.Code != http.StatusOK {
-			t.Errorf("expected 200 via form body, got %d", wForm.Code)
-		}
-
-		// 3. Owned User
-		ownerSess := &models.SessionData{UserID: u.ID, Role: models.RoleUser}
-		bodyOwner, _ := json.Marshal(models.ConnectionActionRequest{Protocol: "awg", ClientID: "client-1"})
-		reqOwner := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", serverID), bytes.NewReader(bodyOwner))
-		reqOwnerCtx := middleware.WithSession(reqOwner.Context(), ownerSess)
-		wOwner := httptest.NewRecorder()
-		r.ServeHTTP(wOwner, reqOwner.WithContext(reqOwnerCtx))
-		if wOwner.Code != http.StatusOK {
-			t.Errorf("expected 200 for owned user kit, got %d", wOwner.Code)
-		}
-
-		// 4. Missing Client ID
-		reqEmpty := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", serverID), bytes.NewReader([]byte("{}")))
-		wEmpty := httptest.NewRecorder()
-		r.ServeHTTP(wEmpty, reqEmpty)
-		if wEmpty.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for missing client_id, got %d", wEmpty.Code)
-		}
-
-		// 5. Nonexistent Client ID -> 404 Not Found
-		bodyMissing, _ := json.Marshal(models.ConnectionActionRequest{Protocol: "awg", ClientID: "nonexistent-client-id"})
-		reqMissing := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", serverID), bytes.NewReader(bodyMissing))
-		reqMissingCtx := middleware.WithSession(reqMissing.Context(), adminSess)
-		wMissing := httptest.NewRecorder()
-		r.ServeHTTP(wMissing, reqMissing.WithContext(reqMissingCtx))
-		if wMissing.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 for nonexistent client kit, got %d (body: %s)", wMissing.Code, wMissing.Body.String())
-		}
-		var errKitResp map[string]any
-		_ = json.Unmarshal(wMissing.Body.Bytes(), &errKitResp)
-		if errKitResp["error"] != "not_found" {
-			t.Errorf("expected error code 'not_found', got %v", errKitResp["error"])
-		}
-		detailKit := fmt.Sprint(errKitResp["detail"])
-		if detailKit == "<nil>" {
-			detailKit = fmt.Sprint(errKitResp["message"])
-		}
-		if !strings.Contains(detailKit, "Client config not found") {
-			t.Errorf("expected detail to contain 'Client config not found', got %v", detailKit)
-		}
-	})
-
 	t.Run("GetServerConnectionConfigHandler Owned User", func(t *testing.T) {
 		ownerSess := &models.SessionData{UserID: u.ID, Role: models.RoleUser}
 		bodyOwner, _ := json.Marshal(models.ConnectionActionRequest{Protocol: "awg", ClientID: "client-1"})
@@ -841,81 +780,7 @@ func TestGetServerConnectionConfigHandler_ServerZero(t *testing.T) {
 	h.vpnSvc = origVPNSvc
 }
 
-func TestGetServerConnectionKitHandler_ServerZero(t *testing.T) {
-	mockSSH := &testMockSSHClient{}
-	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
-	ctx := context.Background()
-
-	u := &models.User{
-		ID:           "u-srv0-kit-1",
-		Username:     "srv0kituser",
-		PasswordHash: "hash",
-		Role:         models.RoleUser,
-		Enabled:      true,
-		CreatedAt:    time.Now(),
-	}
-	_, _ = db.CreateUser(ctx, u)
-
-	conn := &models.UserConnection{
-		ID:         "conn-srv0-kit-1",
-		UserID:     u.ID,
-		ServerID:   0,
-		Protocol:   "awg",
-		ClientID:   "client-pubkey-kit-1",
-		Name:       "Server 0 Kit Conn",
-		AWGMimicry: models.AWGMimicryAuto,
-		CreatedAt:  time.Now(),
-	}
-	_, _ = db.CreateConnection(ctx, conn)
-
-	adminSess := &models.SessionData{
-		UserID: "admin-srv0",
-		Role:   models.RoleAdmin,
-	}
-
-	r := setupFullServerConnectionsRouter(h)
-
-	// 1. Admin gets kit for server 0 -> 200 OK (zip)
-	body, _ := json.Marshal(models.ConnectionActionRequest{
-		Protocol: "awg",
-		ClientID: conn.ClientID,
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(body))
-	reqCtx := middleware.WithSession(req.Context(), adminSess)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req.WithContext(reqCtx))
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for server 0 kit, got %d: %s", w.Code, w.Body.String())
-	}
-	if w.Header().Get("Content-Type") != "application/zip" {
-		t.Errorf("expected Content-Type application/zip, got %s", w.Header().Get("Content-Type"))
-	}
-
-	// 2. Non-existent -> 404
-	bodyMissing, _ := json.Marshal(models.ConnectionActionRequest{
-		Protocol: "awg",
-		ClientID: "missing-client-kit",
-	})
-	reqMissing := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(bodyMissing))
-	reqMissingCtx := middleware.WithSession(reqMissing.Context(), adminSess)
-	wMissing := httptest.NewRecorder()
-	r.ServeHTTP(wMissing, reqMissing.WithContext(reqMissingCtx))
-	if wMissing.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for missing connection kit, got %d", wMissing.Code)
-	}
-
-	// 3. nil vpnSvc -> 503
-	h.vpnSvc = nil
-	reqNil := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(body))
-	reqNilCtx := middleware.WithSession(reqNil.Context(), adminSess)
-	wNil := httptest.NewRecorder()
-	r.ServeHTTP(wNil, reqNil.WithContext(reqNilCtx))
-	if wNil.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 for nil vpnSvc, got %d", wNil.Code)
-	}
-}
-
-func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
+func TestServerConnectionsConfig_ErrorDifferentiation(t *testing.T) {
 	t.Run("Unit: isClientConfigNotFoundError", func(t *testing.T) {
 		tests := []struct {
 			err  error
@@ -1006,25 +871,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 		}
 
 		body, _ := json.Marshal(models.ConnectionActionRequest{Protocol: "awg", ClientID: "c1"})
-		reqKit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", srvID), bytes.NewReader(body))
-		wKit := httptest.NewRecorder()
-		r.ServeHTTP(wKit, reqKit.WithContext(middleware.WithSession(reqKit.Context(), adminSess)))
-		if wKit.Code != http.StatusNotFound {
-			t.Errorf("expected 404 for not stored kit, got %d", wKit.Code)
-		}
-		var respKit map[string]any
-		_ = json.Unmarshal(wKit.Body.Bytes(), &respKit)
-		if respKit["error"] != "not_found" {
-			t.Errorf("expected error 'not_found', got %v", respKit["error"])
-		}
-		detailKit := fmt.Sprint(respKit["detail"])
-		if detailKit == "<nil>" {
-			detailKit = fmt.Sprint(respKit["message"])
-		}
-		if !strings.Contains(detailKit, "Client config not found") {
-			t.Errorf("expected 'Client config not found' in detail, got %v", detailKit)
-		}
-
 		reqCfg := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/config", srvID), bytes.NewReader(body))
 		wCfg := httptest.NewRecorder()
 		r.ServeHTTP(wCfg, reqCfg.WithContext(middleware.WithSession(reqCfg.Context(), adminSess)))
@@ -1049,12 +895,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 			return "", fmt.Errorf("client %s not found in clients table", clientID)
 		}
 
-		wKit2 := httptest.NewRecorder()
-		r.ServeHTTP(wKit2, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
-		if wKit2.Code != http.StatusNotFound {
-			t.Errorf("expected 404 for client not found kit, got %d", wKit2.Code)
-		}
-
 		wCfg2 := httptest.NewRecorder()
 		r.ServeHTTP(wCfg2, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/config", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
 		if wCfg2.Code != http.StatusNotFound {
@@ -1064,17 +904,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 		// 3. Bad parameter / Invalid input -> 400
 		mockMgr.getClientConfigFn = func(ctx context.Context, server *models.Server, clientID string) (string, error) {
 			return "", errors.New("invalid client identifier provided")
-		}
-
-		wKit3 := httptest.NewRecorder()
-		r.ServeHTTP(wKit3, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
-		if wKit3.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for invalid client input kit, got %d", wKit3.Code)
-		}
-		var respKit3 map[string]any
-		_ = json.Unmarshal(wKit3.Body.Bytes(), &respKit3)
-		if respKit3["error"] != "bad_request" && respKit3["error"] != "invalid_parameter" {
-			t.Errorf("expected error 'bad_request', got %v", respKit3["error"])
 		}
 
 		wCfg3 := httptest.NewRecorder()
@@ -1088,17 +917,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 			return "", errors.New("dial tcp: ssh transport failure")
 		}
 
-		wKit4 := httptest.NewRecorder()
-		r.ServeHTTP(wKit4, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
-		if wKit4.Code != http.StatusInternalServerError {
-			t.Errorf("expected 500 for internal error kit, got %d", wKit4.Code)
-		}
-		var respKit4 map[string]any
-		_ = json.Unmarshal(wKit4.Body.Bytes(), &respKit4)
-		if respKit4["error"] != "internal_error" {
-			t.Errorf("expected error 'internal_error', got %v", respKit4["error"])
-		}
-
 		wCfg4 := httptest.NewRecorder()
 		r.ServeHTTP(wCfg4, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/config", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
 		if wCfg4.Code != http.StatusInternalServerError {
@@ -1108,15 +926,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 		// 5. Valid client config -> 200 OK
 		mockMgr.getClientConfigFn = func(ctx context.Context, server *models.Server, clientID string) (string, error) {
 			return "[Interface]\nPrivateKey=testkey123\nAddress=10.0.0.2/32\n", nil
-		}
-
-		wKit5 := httptest.NewRecorder()
-		r.ServeHTTP(wKit5, httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/kit", srvID), bytes.NewReader(body)).WithContext(middleware.WithSession(context.Background(), adminSess)))
-		if wKit5.Code != http.StatusOK {
-			t.Errorf("expected 200 for valid kit, got %d", wKit5.Code)
-		}
-		if wKit5.Header().Get("Content-Type") != "application/zip" {
-			t.Errorf("expected application/zip content-type, got %s", wKit5.Header().Get("Content-Type"))
 		}
 
 		wCfg5 := httptest.NewRecorder()
@@ -1190,19 +999,6 @@ func TestServerConnectionKitAndConfig_ErrorDifferentiation(t *testing.T) {
 		_ = json.Unmarshal(wCfg.Body.Bytes(), &respCfg)
 		if respCfg["error"] != "not_found" {
 			t.Errorf("expected 'not_found', got %v", respCfg["error"])
-		}
-
-		// Kit on Server 0 should return 404 Not Found, not 500
-		reqKit := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/kit", bytes.NewReader(body))
-		wKit := httptest.NewRecorder()
-		r.ServeHTTP(wKit, reqKit.WithContext(middleware.WithSession(reqKit.Context(), adminSess)))
-		if wKit.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 for server 0 missing user kit, got %d: %s", wKit.Code, wKit.Body.String())
-		}
-		var respKit map[string]any
-		_ = json.Unmarshal(wKit.Body.Bytes(), &respKit)
-		if respKit["error"] != "not_found" {
-			t.Errorf("expected 'not_found', got %v", respKit["error"])
 		}
 	})
 }

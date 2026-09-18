@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"net/http"
@@ -301,7 +300,6 @@ func setupFullServerConnectionsRouter(h *Handlers) *chi.Mux {
 	r.Post("/api/servers/{server_id}/connections/add", h.AddServerConnectionHandler)
 	r.Post("/api/servers/{server_id}/connections/{client_id}/rotate-mimicry", h.RotateMimicryHandler)
 	r.Post("/api/servers/{server_id}/connections/auto-trial", h.AutoTrialHandler)
-	r.Post("/api/servers/{server_id}/connections/kit", h.GetServerConnectionKitHandler)
 	r.Post("/api/servers/{server_id}/connections/remove", h.RemoveServerConnectionHandler)
 	r.Post("/api/servers/{server_id}/connections/edit", h.EditServerConnectionHandler)
 	r.Post("/api/servers/{server_id}/connections/config", h.GetServerConnectionConfigHandler)
@@ -328,7 +326,6 @@ func setupFullConnectionsRouter(h *Handlers) *chi.Mux {
 	r.Get("/api/my/connections", h.UserGetMyConnectionsHandler)
 	r.Post("/api/connections/add", h.UserAddConnectionHandler)
 	r.Post("/api/connections/{connection_id}/config", h.UserGetConnectionConfigHandler)
-	r.Post("/api/connections/{connection_id}/kit", h.UserGetConnectionKitHandler)
 	r.Post("/api/connections/{connection_id}/rename", h.UserRenameConnectionHandler)
 	r.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
 	return r
@@ -434,21 +431,6 @@ func TestHandlersHelpers(t *testing.T) {
 		t.Errorf("expected vpn:// prefix, got %s", vpnLink)
 	}
 
-	// BuildConnectionKitZip
-	zipBytes, err := BuildConnectionKitZip("test-client", "[Interface]\nAddress=10.0.0.2/32\n", vpnLink)
-	if err != nil || len(zipBytes) == 0 {
-		t.Fatalf("BuildConnectionKitZip failed: %v", err)
-	}
-
-	// Verify zip contents
-	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-	if err != nil {
-		t.Fatalf("failed to read zip: %v", err)
-	}
-	if len(zr.File) < 2 {
-		t.Errorf("expected at least 2 files in zip, got %d", len(zr.File))
-	}
-
 	t.Run("NewHandlers Auto Registration", func(t *testing.T) {
 		// Exercised via setupTestHandlersWithMockSSH: nil registry with managers set
 		mockPool := &testMockSSHPool{client: &testMockSSHClient{}}
@@ -476,23 +458,6 @@ func TestHandlersHelpers(t *testing.T) {
 		}
 	})
 
-	t.Run("BuildConnectionKitZip Special Chars", func(t *testing.T) {
-		zipBytes, err := BuildConnectionKitZip("client/with\\special", "[Interface]\n", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-		if err != nil {
-			t.Fatalf("failed to read zip: %v", err)
-		}
-		if len(zr.File) != 1 {
-			t.Errorf("expected 1 file (conf only, no vpn link), got %d", len(zr.File))
-		}
-		if zr.File[0].Name != "client_with_special.conf" {
-			t.Errorf("expected sanitized name, got %s", zr.File[0].Name)
-		}
-	})
-
 	t.Run("GetProtocolManager", func(t *testing.T) {
 		if mgr, err := h.GetProtocolManager("awg"); err != nil || mgr == nil {
 			t.Errorf("expected awg manager, got err: %v", err)
@@ -513,12 +478,6 @@ func TestHandlersHelpers(t *testing.T) {
 	reqPanelLang.AddCookie(&http.Cookie{Name: "panel_lang", Value: "ru"})
 	if lang := h.GetLang(reqPanelLang); lang != "ru" {
 		t.Errorf("expected ru from panel_lang, got %s", lang)
-	}
-
-	// BuildConnectionKitZip empty name & no vpn link
-	zipSimple, err := BuildConnectionKitZip("", "[Interface]\nAddress=10.0.0.3/32\n", "")
-	if err != nil || len(zipSimple) == 0 {
-		t.Errorf("BuildConnectionKitZip failed: %v", err)
 	}
 
 	// GetProtocolManager without registry
