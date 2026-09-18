@@ -242,6 +242,53 @@ func TestRequireAdminOrSupport(t *testing.T) {
 	}
 }
 
+// TestRequireAuthPlusAdminOrSupportChain proves the full middleware stack
+// protecting /api/vpn/sessions (issue #191): in production the /api/vpn group
+// sits inside a RequireAuth-wrapped tree with RequireAdminOrSupport applied
+// on top. The chain — not the handler — must answer 401 for anonymous
+// callers and 403 for authenticated non-privileged users.
+func TestRequireAuthPlusAdminOrSupportChain(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	chain := RequireAuth(RequireAdminOrSupport(okHandler))
+
+	// Unauthenticated -> 401
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil)
+	wUnauth := httptest.NewRecorder()
+	chain.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated caller, got %d", wUnauth.Code)
+	}
+
+	// Authenticated regular user -> 403
+	reqUser := httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil)
+	ctxUser := WithSession(reqUser.Context(), &models.SessionData{UserID: "u-1", Role: models.RoleUser})
+	wUser := httptest.NewRecorder()
+	chain.ServeHTTP(wUser, reqUser.WithContext(ctxUser))
+	if wUser.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for authenticated regular user, got %d", wUser.Code)
+	}
+
+	// Authenticated admin -> 200
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil)
+	ctxAdmin := WithSession(reqAdmin.Context(), &models.SessionData{UserID: "adm-1", Role: models.RoleAdmin})
+	wAdmin := httptest.NewRecorder()
+	chain.ServeHTTP(wAdmin, reqAdmin.WithContext(ctxAdmin))
+	if wAdmin.Code != http.StatusOK {
+		t.Errorf("expected 200 for admin, got %d", wAdmin.Code)
+	}
+
+	// Authenticated support -> 200
+	reqSupport := httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil)
+	ctxSupport := WithSession(reqSupport.Context(), &models.SessionData{UserID: "supp-1", Role: models.RoleSupport})
+	wSupport := httptest.NewRecorder()
+	chain.ServeHTTP(wSupport, reqSupport.WithContext(ctxSupport))
+	if wSupport.Code != http.StatusOK {
+		t.Errorf("expected 200 for support, got %d", wSupport.Code)
+	}
+}
+
 func TestRequireAuth_SessionVersionRevocation(t *testing.T) {
 	defer SetUserLookup(nil)
 

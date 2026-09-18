@@ -1098,6 +1098,42 @@ func (s *Service) TotalDroppedPackets() uint64 {
 	return total
 }
 
+// SessionsEnriched returns active sessions with identity joins and persisted
+// traffic resolved from the database, plus the forwarder accountant's
+// un-flushed buffered deltas on top: rx/tx are the last-flushed DB totals
+// (production-live via the periodic Flush into UpdateVPNSessionTraffic)
+// plus whatever RecordRx/RecordTx has buffered but not yet flushed.
+// last_seen comes from the DB row only: it is the last accounted traffic
+// activity visible via the accountant flush — not transport-level peer
+// liveness (review-2 P2). Read-path only (issue #189).
+func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	if s.db == nil {
+		return nil, errors.New("database not available")
+	}
+
+	sessions, err := s.db.GetEnrichedActiveVPNSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add buffered, un-flushed accountant deltas. Exact, no double
+	// counting: Flush swaps each buffer to 0 when it persists the
+	// drained amount into the DB row.
+	s.mu.RLock()
+	accountant := s.accountant
+	s.mu.RUnlock()
+	if accountant == nil {
+		return sessions, nil
+	}
+	for i := range sessions {
+		if rx, tx := accountant.GetSessionTraffic(sessions[i].ID); rx != 0 || tx != 0 {
+			sessions[i].RxBytes += rx
+			sessions[i].TxBytes += tx
+		}
+	}
+	return sessions, nil
+}
+
 // GetBackends returns all registered backend tunnels.
 func (s *Service) GetBackends(ctx context.Context) ([]*models.BackendTunnel, error) {
 	s.mu.RLock()

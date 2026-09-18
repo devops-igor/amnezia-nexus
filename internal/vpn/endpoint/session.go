@@ -195,6 +195,21 @@ func (sm *SessionManager) GetSessionByID(sessionID string) (*models.VPNSession, 
 	return sess, ok
 }
 
+// GetSessionSnapshotByID retrieves a copy of the session for a session ID.
+// Unlike GetSessionByID (which exposes the live *VPNSession pointer and is
+// racy for readers that inspect the struct after unlock), the returned
+// value is copied under sm.mu.RLock, mirroring ListActiveSessions' convention.
+// Use this for any code that reads session fields outside the manager's lock.
+func (sm *SessionManager) GetSessionSnapshotByID(sessionID string) (models.VPNSession, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	sess, ok := sm.sessionsByID[sessionID]
+	if !ok {
+		return models.VPNSession{}, false
+	}
+	return *sess, true
+}
+
 // GetSessionsByUserID retrieves all active sessions belonging to a user ID.
 func (sm *SessionManager) GetSessionsByUserID(userID string) []*models.VPNSession {
 	sm.mu.RLock()

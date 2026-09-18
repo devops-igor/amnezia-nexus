@@ -13,7 +13,112 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
+
+// TestVPNSessionsHandler covers the admin sessions endpoint (issues #189/#191):
+// rows come from Service.SessionsEnriched, management-only mode (nil vpn
+// service) must yield an empty JSON list, and a service error maps to 500.
+func TestVPNSessionsHandler(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns enriched sessions", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+
+		sID, err := db.CreateServer(ctx, &models.Server{Name: "Edge Node 9", Host: "198.51.100.19"})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+		uID, err := db.CreateUser(ctx, &models.User{Username: "dave"})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+		tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      sID,
+			InterfaceName: "awg-be-9",
+			PublicKey:     "pubkey-be-9",
+			PrivateKey:    "privkey-be-9",
+			Endpoint:      "198.51.100.19:51820",
+		})
+		if err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
+		if err := db.CreateVPNSession(ctx, &models.VPNSession{
+			ID:              "sess-handler",
+			UserID:          uID,
+			BackendTunnelID: tID,
+			PeerPublicKey:   "peer-handler",
+			AssignedIP:      "10.100.0.39",
+			RxBytes:         10,
+			TxBytes:         20,
+			Status:          "connected",
+		}); err != nil {
+			t.Fatalf("CreateVPNSession failed: %v", err)
+		}
+
+		r := setupFullVPNRouter(h)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		var got struct {
+			Sessions []models.EnrichedVPNSession `json:"sessions"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("failed to decode response: %v (body: %s)", err, w.Body.String())
+		}
+		if len(got.Sessions) != 1 {
+			t.Fatalf("expected 1 session row, got %d: %+v", len(got.Sessions), got.Sessions)
+		}
+		row := got.Sessions[0]
+		if row.Username != "dave" {
+			t.Errorf("expected username 'dave' from join, got %q", row.Username)
+		}
+		if row.ServerName != "Edge Node 9" {
+			t.Errorf("expected server_name 'Edge Node 9' from join, got %q", row.ServerName)
+		}
+		if row.AssignedIP != "10.100.0.39" {
+			t.Errorf("expected assigned_ip '10.100.0.39', got %q", row.AssignedIP)
+		}
+	})
+
+	t.Run("nil vpn service returns empty list", func(t *testing.T) {
+		_, db, cfg := setupTestHandlers(t)
+		hNil := NewHandlers(Dependencies{Config: cfg, DB: db})
+		r := setupFullVPNRouter(hNil)
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 in management-only mode, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, `"sessions":[]`) {
+			t.Errorf("expected empty JSON list (not null), got: %s", body)
+		}
+	})
+
+	t.Run("service error maps to 500", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		// Zero-value service has no DB backing, so SessionsEnriched fails;
+		// construction starts nothing, so this stays a pure test double.
+		h.vpnSvc = &vpn.Service{}
+
+		r := setupFullVPNRouter(h)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "internal_error") {
+			t.Errorf("expected internal_error code, got: %s", w.Body.String())
+		}
+	})
+}
 
 func TestVPNHandlers(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)

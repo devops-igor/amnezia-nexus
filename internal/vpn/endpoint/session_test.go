@@ -276,3 +276,55 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 		t.Errorf("traffic mismatch: rx=%d, tx=%d", updatedDBSess.RxBytes, updatedDBSess.TxBytes)
 	}
 }
+
+// TestSessionManagerSnapshotByID verifies the copy-under-lock accessor:
+// the returned struct is a detached snapshot whose mutation never leaks
+// into manager state, and unknown IDs report not-found. Review rework for
+// issue #189 (safe accessor for future readers; issue #205 will likely
+// need it too).
+func TestSessionManagerSnapshotByID(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sm := NewSessionManager(db, nil)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "snapshot_user"})
+
+	sess, err := sm.CreateSession(ctx, uID, "snapshot-peer", "10.100.0.20", tID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	got, ok := sm.GetSessionSnapshotByID(sess.ID)
+	if !ok {
+		t.Fatalf("GetSessionSnapshotByID: session %s not found", sess.ID)
+	}
+	if got.ID != sess.ID || got.PeerPublicKey != "snapshot-peer" || got.Status != "connected" {
+		t.Errorf("snapshot fields mismatch: %+v", got)
+	}
+
+	// Mutating the snapshot must not touch the manager's stored session.
+	got.RxBytes = 123456
+	got.TxBytes = 654321
+	got.Status = "disconnected"
+
+	again, ok := sm.GetSessionSnapshotByID(sess.ID)
+	if !ok {
+		t.Fatalf("second GetSessionSnapshotByID: session %s not found", sess.ID)
+	}
+	if again.RxBytes != 0 || again.TxBytes != 0 || again.Status != "connected" {
+		t.Errorf("snapshot mutation leaked into manager state: %+v", again)
+	}
+
+	if _, ok := sm.GetSessionSnapshotByID("ghost-id"); ok {
+		t.Errorf("expected ghost id to not be found")
+	}
+}

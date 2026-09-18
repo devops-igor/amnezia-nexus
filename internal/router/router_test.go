@@ -363,6 +363,7 @@ func TestRouterEndpointDispatch(t *testing.T) {
 		{http.MethodGet, "/api/settings", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/users", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/status", adminSession, nil, http.StatusOK},
+		{http.MethodGet, "/api/vpn/sessions", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/backends", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/tunnels", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/config", adminSession, nil, http.StatusOK},
