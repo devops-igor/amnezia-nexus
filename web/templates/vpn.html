@@ -803,7 +803,20 @@
     function renderSessions(sessions) {
         const tbody = document.getElementById('vpn-sessions-tbody');
         tbody.textContent = '';
+        if (vpnSessionsTableInstance) {
+            // Post-init: NexusTable renders its own emptyMessage on refresh,
+            // so never inject a custom empty row here — just update the rows
+            // (possibly zero) and refresh.
+            for (const s of (sessions || [])) {
+                tbody.appendChild(vpnRenderSessionRow(s));
+            }
+            vpnSessionsTableInstance.refresh();
+            return;
+        }
         if (!sessions || !sessions.length) {
+            // Pre-init empty state: no NexusTable exists yet to render its
+            // emptyMessage, so build the custom empty row here (and leave
+            // the table uninitialized until real rows arrive).
             const tr = document.createElement('tr');
             tr.className = 'table-empty-state';
             const td = document.createElement('td');
@@ -820,7 +833,6 @@
             `;
             tr.appendChild(td);
             tbody.appendChild(tr);
-            if (vpnSessionsTableInstance) vpnSessionsTableInstance.refresh();
             return;
         }
 
@@ -828,18 +840,14 @@
             tbody.appendChild(vpnRenderSessionRow(s));
         }
 
-        if (vpnSessionsTableInstance) {
-            vpnSessionsTableInstance.refresh();
-        } else {
-            vpnSessionsTableInstance = new NexusTable('#vpnSessionsTable', {
-                searchable: true,
-                sortable: true,
-                paginate: true,
-                pageSize: 10,
-                searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
-                emptyMessage: _('vpn_no_sessions') || 'No active sessions'
-            });
-        }
+        vpnSessionsTableInstance = new NexusTable('#vpnSessionsTable', {
+            searchable: true,
+            sortable: true,
+            paginate: true,
+            pageSize: 10,
+            searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
+            emptyMessage: _('vpn_no_sessions') || 'No active sessions'
+        });
     }
 
     async function vpnLoadData() {

@@ -43,7 +43,9 @@ func (h *Handlers) VPNSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if h.vpnSvc != nil {
 		got, err := h.vpnSvc.SessionsEnriched(r.Context())
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			// #nosec G706 -- Internal server audit log for failed session listing
+			log.Printf("[vpn/handlers] failed to list enriched sessions: %v", err)
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 			return
 		}
 		sessions = got
