@@ -71,17 +71,19 @@ func TestSessionsEnriched(t *testing.T) {
 			t.Fatalf("Flush failed: %v", err)
 		}
 
-		// UpdateVPNSessionTraffic SETs rx_bytes/tx_bytes to the drained
-		// delta (absolute-set, not += — the write-path semantics tracked
-		// in issue #205, intentionally out of scope here). So after this
-		// flush the row holds exactly the drained deltas (500/300), the
-		// buffer is empty, and SessionsEnriched must equal the DB row.
+		// UpdateVPNSessionTraffic ADDS the drained deltas to the stored
+		// counters (cumulative-since-connect semantics, review-2 P1):
+		// seeded row 1000/2000 + flushed 500/300 -> row 1500/2300, buffer
+		// empty, and SessionsEnriched must equal the DB row. Session
+		// counters being cumulative is now the fixed contract; issue #205
+		// remains open for the connection-level/user-level rollup audit
+		// and the Drain/failover zero-counter hazard (pre-existing).
 		row, err := db.GetEnrichedActiveVPNSessions(ctx)
 		if err != nil || len(row) != 1 {
 			t.Fatalf("post-flush row read failed: %v (%d rows)", err, len(row))
 		}
-		if row[0].RxBytes != 500 || row[0].TxBytes != 300 {
-			t.Fatalf("post-flush DB row rx=%d tx=%d, want 500/300 per UpdateVPNSessionTraffic absolute-set semantics (issue #205)", row[0].RxBytes, row[0].TxBytes)
+		if row[0].RxBytes != 1500 || row[0].TxBytes != 2300 {
+			t.Fatalf("post-flush DB row rx=%d tx=%d, want 1500/2300 cumulative (seed 1000/2000 + flush 500/300)", row[0].RxBytes, row[0].TxBytes)
 		}
 
 		if rx, tx := accountant.GetSessionTraffic("sess-flush"); rx != 0 || tx != 0 {
@@ -96,8 +98,8 @@ func TestSessionsEnriched(t *testing.T) {
 			t.Fatalf("expected 1 session, got %d: %+v", len(sessions), sessions)
 		}
 		got := sessions[0]
-		if got.RxBytes != 500 || got.TxBytes != 300 {
-			t.Errorf("after flush displayed counters must equal DB row: rx=%d tx=%d, want 500/300", got.RxBytes, got.TxBytes)
+		if got.RxBytes != 1500 || got.TxBytes != 2300 {
+			t.Errorf("after flush displayed counters must equal cumulative DB row: rx=%d tx=%d, want 1500/2300", got.RxBytes, got.TxBytes)
 		}
 	})
 

@@ -462,6 +462,7 @@
   "vpn_select_server": "Sélectionner un serveur",
   "vpn_server_no_awg_warning": "Ce serveur n'a pas AmneziaWG (AWG) configuré.",
   "vpn_sessions": "Sessions connectées",
+  "vpn_sessions_stale": "Données de session indisponibles — affichage des dernières valeurs connues",
   "vpn_status": "État du VPN",
   "vpn_stopped": "Arrêté",
   "vpn_subnet": "Sous-réseau",

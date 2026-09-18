@@ -184,8 +184,36 @@ func TestVPNSessionsCRUDAndTraffic(t *testing.T) {
 	_ = db.CreateVPNSession(ctx, sess1Update)
 
 	bobSess, _ := db.GetVPNSessionByPeerKey(ctx, "peer-key-bob")
-	if err := db.UpdateVPNSessionTraffic(ctx, bobSess.ID, 5000, 10000); err != nil {
-		t.Fatalf("UpdateVPNSessionTraffic failed: %v", err)
+	if bobSess == nil {
+		t.Fatalf("GetVPNSessionByPeerKey returned nil for peer-key-bob")
+	}
+
+	// Regression (review-2 P1 / issue #205): UpdateVPNSessionTraffic must
+	// ADD its arguments to the stored counters (deltas in, cumulative
+	// totals stored), not overwrite the row with the last window. Exactly
+	// the reviewer's case: 100 -> +500 -> 600 -> +300 -> 900. Under the
+	// old absolute-SET semantics the row would hold 500 then 300 and this
+	// test fails at both checks.
+	if err := db.UpdateVPNSessionTraffic(ctx, bobSess.ID, 100, 100); err != nil {
+		t.Fatalf("seed UpdateVPNSessionTraffic failed: %v", err)
+	}
+	row, _ := db.GetVPNSessionByPeerKey(ctx, "peer-key-bob")
+	if row == nil || row.RxBytes != 100 || row.TxBytes != 100 {
+		t.Fatalf("after first flush: row=%+v, want rx=100 tx=100", row)
+	}
+	if err := db.UpdateVPNSessionTraffic(ctx, bobSess.ID, 500, 500); err != nil {
+		t.Fatalf("second UpdateVPNSessionTraffic failed: %v", err)
+	}
+	row, _ = db.GetVPNSessionByPeerKey(ctx, "peer-key-bob")
+	if row == nil || row.RxBytes != 600 || row.TxBytes != 600 {
+		t.Fatalf("after +500: row=%+v, want rx=600 tx=600 cumulative — absolute-SET code fails here with 500", row)
+	}
+	if err := db.UpdateVPNSessionTraffic(ctx, bobSess.ID, 300, 300); err != nil {
+		t.Fatalf("third UpdateVPNSessionTraffic failed: %v", err)
+	}
+	row, _ = db.GetVPNSessionByPeerKey(ctx, "peer-key-bob")
+	if row == nil || row.RxBytes != 900 || row.TxBytes != 900 {
+		t.Fatalf("after +300: row=%+v, want rx=900 tx=900 cumulative — absolute-SET code fails here with 300", row)
 	}
 
 	activeSess, err := db.GetActiveVPNSessions(ctx)

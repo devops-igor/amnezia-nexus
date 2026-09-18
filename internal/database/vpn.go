@@ -421,13 +421,18 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	return nil
 }
 
-// UpdateVPNSessionTraffic updates session bytes in/out and last seen timestamp.
+// UpdateVPNSessionTraffic adds the given rx/tx DELTAS to the session's
+// stored counters and refreshes last_seen to now. Row values are therefore
+// cumulative-since-connect: each call increments rx_bytes and tx_bytes by
+// its arguments rather than overwriting them (review-2 P1, issue #205).
+// The single production caller is TrafficAccountant.Flush, which passes
+// per-window deltas drained from its buffers.
 func (d *DB) UpdateVPNSessionTraffic(ctx context.Context, sessionID string, rx, tx int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE vpn_sessions SET rx_bytes = ?, tx_bytes = ?, last_seen = ? WHERE id = ?`
+	query := `UPDATE vpn_sessions SET rx_bytes = rx_bytes + ?, tx_bytes = tx_bytes + ?, last_seen = ? WHERE id = ?`
 
 	_, err := d.sqlDB.ExecContext(ctx, query, rx, tx, nowStr, sessionID)
 	if err != nil {

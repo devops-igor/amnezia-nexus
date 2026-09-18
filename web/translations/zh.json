@@ -462,6 +462,7 @@
   "vpn_select_server": "选择服务器",
   "vpn_server_no_awg_warning": "此服务器未配置 AmneziaWG (AWG)。",
   "vpn_sessions": "已连接会话",
+  "vpn_sessions_stale": "会话数据不可用——正在显示最后已知的值",
   "vpn_status": "VPN 状态",
   "vpn_stopped": "已停止",
   "vpn_subnet": "子网",

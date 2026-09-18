@@ -462,6 +462,7 @@
   "vpn_select_server": "انتخاب سرور",
   "vpn_server_no_awg_warning": "این سرور دارای پیکربندی AmneziaWG (AWG) نیست.",
   "vpn_sessions": "نشست‌های متصل",
+  "vpn_sessions_stale": "داده‌های نشست در دسترس نیست — آخرین مقادیر شناخته‌شده نمایش داده می‌شود",
   "vpn_status": "وضعیت VPN",
   "vpn_stopped": "متوقف شده",
   "vpn_subnet": "زیرشبکه",

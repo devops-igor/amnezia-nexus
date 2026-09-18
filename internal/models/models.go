@@ -311,10 +311,12 @@ type EnrichedVPNSession struct {
 	PeerPublicKey   string    `json:"peer_public_key"`
 	AssignedIP      string    `json:"assigned_ip"`
 	ConnectedAt     time.Time `json:"connected_at"`
-	LastSeen        time.Time `json:"last_seen"`
-	RxBytes         int64     `json:"rx_bytes"`
-	TxBytes         int64     `json:"tx_bytes"`
-	Status          string    `json:"status"`
+	// LastSeen is the last accounted traffic activity visible via the
+	// accountant flush; not transport-level peer liveness (review-2 P2).
+	LastSeen time.Time `json:"last_seen"`
+	RxBytes  int64     `json:"rx_bytes"`
+	TxBytes  int64     `json:"tx_bytes"`
+	Status   string    `json:"status"`
 }
 
 // VPNConfig stores dynamic configuration for the in-process VPN subsystem.

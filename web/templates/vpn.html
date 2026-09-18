@@ -250,6 +250,13 @@
     let vpnConfiguredPublicEndpoint = '';
     let vpnTableInstance = null;
     let vpnSessionsTableInstance = null;
+    // Stale-state tracking for the sessions table (review-2 P3):
+    // vpnLastSessions keeps the last successful /api/vpn/sessions payload,
+    // vpnSessionsStale is true while that endpoint is failing. While stale,
+    // the table shows the last known rows plus a distinct warning banner —
+    // never a plain "no sessions" empty state.
+    let vpnLastSessions = null;
+    let vpnSessionsStale = false;
 
     function vpnFormatApiError(err, res, data) {
         const errMsg = (data && (data.detail || data.message || data.error)) ||
@@ -800,9 +807,39 @@
         return tr;
     }
 
+    function vpnRenderSessionsStaleBanner() {
+        const tbody = document.getElementById('vpn-sessions-tbody');
+        if (!tbody) return;
+        let banner = document.getElementById('vpnSessionsStaleBanner');
+        if (!vpnSessionsStale) {
+            if (banner) banner.remove();
+            return;
+        }
+        if (banner) return;
+        banner = document.createElement('tr');
+        banner.id = 'vpnSessionsStaleBanner';
+        banner.className = 'table-empty-state';
+        banner.innerHTML = `
+            <td colspan="6" style="padding: var(--space-md);">
+                <div class="empty-state" style="padding: 0;">
+                    <div class="empty-title" style="display: flex; align-items: center; justify-content: center; gap: var(--space-sm); font-size: 0.9rem; font-weight: 600; margin: 0; color: var(--warning, #b45309);">
+                        <svg class="icon" style="width: 18px; height: 18px; flex-shrink: 0;"><use href="#icon-x"></use></svg>
+                        <span>${UI.escapeHtml(_('vpn_sessions_stale') || 'Session data unavailable — showing last known values')}</span>
+                    </div>
+                </div>
+            </td>
+        `;
+        tbody.insertBefore(banner, tbody.firstChild);
+    }
+
     function renderSessions(sessions) {
         const tbody = document.getElementById('vpn-sessions-tbody');
         tbody.textContent = '';
+        // Apply/clear the stale banner AFTER the wipe: the banner is a
+        // tbody child, so inserting it before the clear would destroy it.
+        // Rows appended below land after it, and NexusTable refreshes
+        // never reorder it (table-empty-state rows are not indexed).
+        vpnRenderSessionsStaleBanner();
         if (vpnSessionsTableInstance) {
             // Post-init: NexusTable renders its own emptyMessage on refresh,
             // so never inject a custom empty row here — just update the rows
@@ -856,7 +893,18 @@
                 API.get('/api/vpn/status'),
                 API.get('/api/vpn/config').catch(() => ({})),
                 API.get('/api/vpn/backends'),
-                API.get('/api/vpn/sessions').catch(() => ({ sessions: [] }))
+                API.get('/api/vpn/sessions').then(function (data) {
+                    // Success: remember the payload and clear the stale flag
+                    // (review-2 P3 — flag resets on next success).
+                    vpnLastSessions = data;
+                    vpnSessionsStale = false;
+                    return data;
+                }).catch(function () {
+                    // Failure: keep showing the LAST successful payload and
+                    // flag the table as stale instead of faking an empty list.
+                    vpnSessionsStale = true;
+                    return { sessions: vpnLastSessions && vpnLastSessions.sessions ? vpnLastSessions.sessions : [] };
+                })
             ]);
 
             const backends = (backendData && (backendData.backends || backendData.tunnels)) || [];

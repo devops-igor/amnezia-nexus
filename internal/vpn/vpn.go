@@ -1103,7 +1103,9 @@ func (s *Service) TotalDroppedPackets() uint64 {
 // un-flushed buffered deltas on top: rx/tx are the last-flushed DB totals
 // (production-live via the periodic Flush into UpdateVPNSessionTraffic)
 // plus whatever RecordRx/RecordTx has buffered but not yet flushed.
-// last_seen comes from the DB row only. Read-path only (issue #189).
+// last_seen comes from the DB row only: it is the last accounted traffic
+// activity visible via the accountant flush — not transport-level peer
+// liveness (review-2 P2). Read-path only (issue #189).
 func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSession, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
