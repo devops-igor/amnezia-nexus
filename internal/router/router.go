@@ -320,6 +320,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		// VPN Subsystem API (Admin endpoints)
 		r.Route("/api/vpn", func(r chi.Router) {
 			r.Get("/status", h.VPNStatusHandler)
+			r.Get("/sessions", h.VPNSessionsHandler)
 			r.Get("/backends", h.VPNBackendsHandler)
 			r.Post("/backends/{server_id}/enable", h.VPNEnableBackendHandler)
 			r.Post("/backends/{server_id}/disable", h.VPNDisableBackendHandler)
