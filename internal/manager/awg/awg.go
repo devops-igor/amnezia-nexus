@@ -107,6 +107,9 @@ type AWGManager struct {
 	serverLocks             *ServerLockRegistry
 	lockHeartbeatIntervalNs atomic.Int64
 	lockHeartbeatTimeoutNs  atomic.Int64
+	// tcCleaned guards the one-shot legacy tc-state sweep: server IDs that
+	// have already been swept by this manager instance. Guarded by mu.
+	tcCleaned map[int64]bool
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -114,6 +117,7 @@ func NewAWGManager(pool SSHProvider) *AWGManager {
 	return &AWGManager{
 		sshPool:        pool,
 		containerCache: make(map[string]containerCacheEntry),
+		tcCleaned:      make(map[int64]bool),
 		serverLocks:    globalServerLocks,
 	}
 }
@@ -515,14 +519,18 @@ fi
 }
 
 // awgBaseImage pins the AmneziaWG userspace base image used to build AWG
-// backends. devopsigor/amneziawg:latest is a multiarch (amd64+arm64) image
-// built from the AmneziaWG v3.1.20260828 source in the amneziawg-docker repo
-// (devopsigor publishing); multiarch is required because backends install on
-// both amd64 and arm64 hosts — the upstream amneziavpn/amneziawg-go image
-// publishes amd64 only, which broke ARM64 installs (Issue #225). The explicit
-// pull before build ensures the tag exists on the host instead of failing
+// backends. devopsigor/amneziawg:v3.1.20260828-1 is a versioned multiarch
+// (amd64+arm64) tag from the amneziawg-docker repo, built from the
+// AmneziaWG v3.1.20260828 source (devopsigor publishing). Multiarch is
+// required because backends install on both amd64 and arm64 hosts — the
+// upstream amneziavpn/amneziawg-go image publishes amd64 only, which broke
+// ARM64 installs (Issue #225). The versioned tag is chosen over :latest
+// because this image becomes a privileged VPN container on remote hosts:
+// a mutable floating tag is a supply-chain and reproducibility hazard, so
+// installs must pin an immutable, verifiable version. The explicit pull
+// before build ensures the tag exists on the host instead of failing
 // mid-build with a stale local cache.
-const awgBaseImage = "devopsigor/amneziawg:latest"
+const awgBaseImage = "devopsigor/amneziawg:v3.1.20260828-1"
 
 func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()
@@ -579,6 +587,41 @@ func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port str
 	return (&AWGManager{}).buildAndRunAWGContainer(ctx, client, port)
 }
 
+// legacyTcCleanupCommands returns the exact remote commands that clear tc
+// data-plane state installed by the pre-74b34d9 speed-limit code inside the
+// AWG container: the root qdisc on awg0 (plus its per-client HTB classes and
+// filters), the root qdisc on ifb0, and finally the ifb0 redirect device.
+// Every command carries `|| true` — the sweep is strictly best-effort.
+func legacyTcCleanupCommands(containerName string) []string {
+	cn := ssh.EscapeShellArg(containerName)
+	return []string{
+		fmt.Sprintf("docker exec -i %s tc qdisc del dev awg0 root 2>/dev/null || true", cn),
+		fmt.Sprintf("docker exec -i %s tc qdisc del dev ifb0 root 2>/dev/null || true", cn),
+		fmt.Sprintf("docker exec -i %s ip link del ifb0 2>/dev/null || true", cn),
+	}
+}
+
+// CleanupLegacyTcRules removes leftover tc speed-limit state (HTB qdiscs,
+// filters, the ifb0 redirect device) from an existing AWG container. The
+// speed-limit removal (74b34d9) deleted the control plane without clearing
+// remote data-plane state, so deployments installed by the old code kept
+// enforcing invisible limits with no UI/API left to clear them (PR #231
+// re-review, Fix 2). Idempotent by construction: every command is a delete
+// guarded by `|| true`, so re-running on a clean container is a no-op.
+// Errors are logged and never propagated — this must not disturb the caller.
+func (m *AWGManager) CleanupLegacyTcRules(ctx context.Context, client ssh.SSHClient, containerName string) {
+	if !IsValidContainerName(containerName) {
+		slog.Warn("legacy tc cleanup: skipping invalid container name", "container", containerName)
+		return
+	}
+	for _, cmd := range legacyTcCleanupCommands(containerName) {
+		if _, errOut, code, err := client.RunSudoCommand(ctx, cmd); err != nil || code != 0 {
+			slog.Warn("legacy tc cleanup: command failed (best-effort, continuing)",
+				"command", cmd, "exit_code", code, "stderr", errOut, "error", err)
+		}
+	}
+}
+
 // checkUDPPortAvailable verifies that the requested UDP port is not already
 // bound on the remote host before the AWG install pulls or builds anything.
 // It checks two sources: host listening UDP sockets (`ss -lun`) and existing
@@ -597,10 +640,13 @@ func checkUDPPortAvailable(ctx context.Context, client ssh.SSHClient, port strin
 		return fmt.Errorf(conflictErr, port)
 	}
 
-	portsOut, _, _, err := client.RunSudoCommand(ctx, "docker ps --format '{{.Ports}}' 2>/dev/null || true")
+	portsOut, _, _, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter publish=%s/udp --format '{{.Ports}}' 2>/dev/null || true", ssh.EscapeShellArg(port)))
 	if err != nil {
 		slog.Warn("preflight: failed to list docker port bindings", "error", err)
-	} else if dockerUDPPortBound(portsOut, port) {
+	} else if strings.TrimSpace(portsOut) != "" {
+		// Non-empty output: some container already publishes this host
+		// port (the publish filter matches the HOST side, regardless of
+		// the container-side port, and covers ranges).
 		return fmt.Errorf(conflictErr, port)
 	}
 
@@ -618,28 +664,6 @@ func udpPortBound(ssOut, port string) bool {
 			if strings.HasSuffix(field, ":"+port) {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-// dockerUDPPortBound reports whether `docker ps --format '{{.Ports}}'` output
-// contains a UDP port binding publishing the given host port, e.g.
-// `0.0.0.0:51820->51820/udp`. TCP-only bindings do not count: the AWG backend
-// only needs the UDP port free.
-func dockerUDPPortBound(portsOut, port string) bool {
-	normalized := strings.ReplaceAll(portsOut, ", ", "\n")
-	for _, line := range strings.Split(normalized, "\n") {
-		if !strings.Contains(line, "->"+port+"/udp") {
-			continue
-		}
-		idx := strings.Index(line, "->")
-		if idx == 0 {
-			continue
-		}
-		host := line[:idx]
-		if host == port || strings.HasSuffix(host, ":"+port) {
-			return true
 		}
 	}
 	return false
@@ -2556,6 +2580,26 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
 		return nil, err
+	}
+
+	// One-shot legacy tc cleanup (PR #231 re-review Fix 2): containers
+	// installed before the speed-limit removal (74b34d9) may still carry
+	// HTB qdiscs/filters/ifb0 rules that outlive the deleted control plane.
+	// The status path is the earliest reliable point where a resolved SSH
+	// client and the real container name are both available, and it fires on
+	// the natural first poll after a panel restart. The once-per-server map
+	// keeps the cost at exactly three commands, once per server per process.
+	if server != nil {
+		m.mu.Lock()
+		alreadyCleaned := m.tcCleaned[server.ID]
+		if !alreadyCleaned {
+			m.tcCleaned[server.ID] = true
+		}
+		m.mu.Unlock()
+		if !alreadyCleaned {
+			cName := m.resolveContainerName(ctx, client)
+			m.CleanupLegacyTcRules(ctx, client, cName)
+		}
 	}
 
 	foundName, exists, err := m.findExistingContainer(ctx, client)

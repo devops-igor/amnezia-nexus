@@ -197,6 +197,27 @@ func TestCheckUDPPortAvailable(t *testing.T) {
 			dpsOut:  "0.0.0.0:443->443/udp",
 			wantErr: false,
 		},
+		{
+			name:    "publish_filter_host_differs_from_container_port",
+			port:    "51820",
+			ssOut:   "",
+			dpsOut:  "0.0.0.0:51820->55424/udp",
+			wantErr: true,
+		},
+		{
+			name:    "publish_filter_range_includes_port",
+			port:    "51821",
+			ssOut:   "",
+			dpsOut:  "0.0.0.0:51820-51830->51820-51830/udp",
+			wantErr: true,
+		},
+		{
+			name:    "tcp_binding_not_udp",
+			port:    "51820",
+			ssOut:   "",
+			dpsOut:  "0.0.0.0:51820->51820/tcp",
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
