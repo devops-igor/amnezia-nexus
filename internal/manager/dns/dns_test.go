@@ -96,10 +96,10 @@ func (m *mockDNSSSHClient) RunCommand(ctx context.Context, cmd string) (string, 
 
 func (m *mockDNSSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
 	m.commandsRun = append(m.commandsRun, "sudo: "+cmd)
-	if strings.Contains(cmd, "docker ps --filter name=^amnezia-dns$") {
+	if strings.Contains(cmd, "docker ps --filter name=^'amnezia-dns'$") || strings.Contains(cmd, "docker ps --filter name=^amnezia-dns$") {
 		return "Up 5 hours", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker ps -a --filter name=^amnezia-dns$") {
+	if strings.Contains(cmd, "docker ps -a --filter name=^'amnezia-dns'$") || strings.Contains(cmd, "docker ps -a --filter name=^amnezia-dns$") {
 		return "amnezia-dns", "", 0, nil
 	}
 	return "OK", "", 0, nil
@@ -432,5 +432,97 @@ func TestDNSManager_GetServerStatus_ErrorsAndAbsence(t *testing.T) {
 	mRunErr := NewDNSManager(pRunErr)
 	if _, err := mRunErr.GetServerStatus(ctx, server); err == nil {
 		t.Errorf("expected error when docker ps status check fails")
+	}
+}
+
+func TestDNSManager_CommandsAreEscaped(t *testing.T) {
+	ctx := context.Background()
+	provider := &mockDNSSSHProvider{}
+	mgr := NewDNSManager(provider)
+
+	server := &models.Server{
+		ID:      1,
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+
+	// 1. Install
+	installParams := map[string]any{
+		"dns1": "1.1.1.1",
+		"dns2": "1.0.0.1",
+	}
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	// 2. GetServerStatus
+	if _, err := mgr.GetServerStatus(ctx, server); err != nil {
+		t.Fatalf("GetServerStatus failed: %v", err)
+	}
+
+	// 3. Uninstall
+	if err := mgr.Uninstall(ctx, server); err != nil {
+		t.Fatalf("Uninstall failed: %v", err)
+	}
+
+	commands := provider.client.commandsRun
+	if len(commands) == 0 {
+		t.Fatal("expected commands to be recorded, got none")
+	}
+
+	// Verify that each expected command was executed with single-quoted arguments.
+	expectedSubstrings := []string{
+		"mkdir -p '" + DNSConfigDir + "'",
+		"docker build -t '" + DNSContainerName + "' '" + DNSConfigDir + "'",
+		"docker stop '" + DNSContainerName + "'",
+		"docker rm -fv '" + DNSContainerName + "'",
+		"docker network ls | grep -q '" + DNSNetworkName + "' || docker network create --subnet 172.29.172.0/24 '" + DNSNetworkName + "'",
+		"docker run -d --name '" + DNSContainerName + "' --restart always --network '" + DNSNetworkName + "' --ip='" + DNSStaticIP + "' '" + DNSContainerName + "'",
+		"docker ps | grep -q 'amnezia-awg' && docker network connect '" + DNSNetworkName + "' 'amnezia-awg' || true",
+		"docker ps | grep -q 'telemt' && docker network connect '" + DNSNetworkName + "' 'telemt' || true",
+		"docker ps -a --filter name=^'" + DNSContainerName + "'$ --format '{{.Names}}'",
+		"docker ps --filter name=^'" + DNSContainerName + "'$ --format '{{.Status}}'",
+		"rm -rf '" + DNSConfigDir + "'",
+	}
+
+	for _, expected := range expectedSubstrings {
+		found := false
+		for _, cmd := range commands {
+			if strings.Contains(cmd, expected) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected command containing %q was not executed in: %v", expected, commands)
+		}
+	}
+
+	// Negative assertions: verify no unquoted interpolations exist across all executed commands
+	unquotedForbidden := []string{
+		"mkdir -p " + DNSConfigDir,
+		"docker build -t " + DNSContainerName + " ",
+		"docker stop " + DNSContainerName + " ",
+		"docker rm -fv " + DNSContainerName + " ",
+		"grep -q " + DNSNetworkName + " ",
+		"--subnet 172.29.172.0/24 " + DNSNetworkName,
+		"--name " + DNSContainerName + " ",
+		"--network " + DNSNetworkName + " ",
+		"--ip=" + DNSStaticIP + " ",
+		"grep -q amnezia-awg ",
+		"grep -q telemt ",
+		"docker network connect " + DNSNetworkName + " amnezia-awg",
+		"docker network connect " + DNSNetworkName + " telemt",
+		"name=^" + DNSContainerName + "$",
+		"rm -rf " + DNSConfigDir,
+	}
+
+	for _, unquoted := range unquotedForbidden {
+		for _, cmd := range commands {
+			if strings.Contains(cmd, unquoted) {
+				t.Errorf("found unescaped argument in command %q matching forbidden pattern %q", cmd, unquoted)
+			}
+		}
 	}
 }
