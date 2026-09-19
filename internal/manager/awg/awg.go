@@ -527,7 +527,7 @@ fi
 // ARM64 installs (Issue #225). The versioned tag is chosen over :latest
 // because this image becomes a privileged VPN container on remote hosts:
 // a mutable floating tag is a supply-chain and reproducibility hazard, so
-// installs must pin an immutable, verifiable version. The explicit pull
+// installs must pin a pinned, versioned release. The explicit pull
 // before build ensures the tag exists on the host instead of failing
 // mid-build with a stale local cache.
 const awgBaseImage = "devopsigor/amneziawg:v3.1.20260828-1"
@@ -591,13 +591,14 @@ func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port str
 // data-plane state installed by the pre-74b34d9 speed-limit code inside the
 // AWG container: the root qdisc on awg0 (plus its per-client HTB classes and
 // filters), the root qdisc on ifb0, and finally the ifb0 redirect device.
-// Every command carries `|| true` — the sweep is strictly best-effort.
+// Every command carries `|| true` inside the container shell — the sweep is
+// strictly best-effort inside the container, while docker exec failures propagate.
 func legacyTcCleanupCommands(containerName string) []string {
 	cn := ssh.EscapeShellArg(containerName)
 	return []string{
-		fmt.Sprintf("docker exec -i %s tc qdisc del dev awg0 root 2>/dev/null || true", cn),
-		fmt.Sprintf("docker exec -i %s tc qdisc del dev ifb0 root 2>/dev/null || true", cn),
-		fmt.Sprintf("docker exec -i %s ip link del ifb0 2>/dev/null || true", cn),
+		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev awg0 root 2>/dev/null || true'", cn),
+		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev ifb0 root 2>/dev/null || true'", cn),
+		fmt.Sprintf("docker exec -i %s sh -c 'ip link del ifb0 2>/dev/null || true'", cn),
 	}
 }
 
@@ -621,7 +622,11 @@ func (m *AWGManager) CleanupLegacyTcRules(ctx context.Context, client ssh.SSHCli
 			slog.Warn("legacy tc cleanup: command failed (will retry on next status poll)",
 				"command", cmd, "exit_code", code, "stderr", errOut, "error", err)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("%s failed (exit %d): %s, %w", cmd, code, errOut, err)
+				if err != nil {
+					firstErr = fmt.Errorf("%s failed (exit %d): %s, %w", cmd, code, errOut, err)
+				} else {
+					firstErr = fmt.Errorf("%s failed (exit %d): %s", cmd, code, errOut)
+				}
 			}
 		}
 	}
@@ -2588,32 +2593,6 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		return nil, err
 	}
 
-	// Legacy tc cleanup (PR #231 re-review Fix 2): containers installed
-	// before the speed-limit removal (74b34d9) may still carry HTB
-	// qdiscs/filters/ifb0 rules that outlive the deleted control plane.
-	// The status path is the earliest reliable point where a resolved SSH
-	// client and the real container name are both available, and it fires on
-	// the natural first poll after a panel restart. tcCleaned is set ONLY
-	// after a successful sweep: a failed attempt stays unmarked so the next
-	// status poll retries (re-review blocker — a pre-success flag permanently
-	// disabled cleanup for the server).
-	if server != nil {
-		m.mu.Lock()
-		alreadyCleaned := m.tcCleaned[server.ID]
-		m.mu.Unlock()
-		if !alreadyCleaned {
-			cName := m.resolveContainerName(ctx, client)
-			if err := m.CleanupLegacyTcRules(ctx, client, cName); err != nil {
-				slog.Warn("legacy tc cleanup failed; will retry on next status poll",
-					"server_id", server.ID, "error", err)
-			} else {
-				m.mu.Lock()
-				m.tcCleaned[server.ID] = true
-				m.mu.Unlock()
-			}
-		}
-	}
-
 	foundName, exists, err := m.findExistingContainer(ctx, client)
 	if err != nil {
 		return nil, err
@@ -2629,6 +2608,28 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 			return nil, fmt.Errorf("docker ps failed checking %s (code %d): %s, %w", foundName, codeRun, errOutRun, errRun)
 		}
 		running = strings.Contains(outRun, "Up")
+	}
+
+	// Legacy tc cleanup (PR #231 re-review Fix 2): containers installed
+	// before the speed-limit removal (74b34d9) may still carry HTB
+	// qdiscs/filters/ifb0 rules that outlive the deleted control plane.
+	// Only attempt cleanup if the container exists and is running.
+	// tcCleaned is set ONLY after a successful sweep: a failed attempt stays
+	// unmarked so the next status poll retries.
+	if server != nil && exists && running && IsValidContainerName(foundName) {
+		m.mu.Lock()
+		alreadyCleaned := m.tcCleaned[server.ID]
+		m.mu.Unlock()
+		if !alreadyCleaned {
+			if err := m.CleanupLegacyTcRules(ctx, client, foundName); err != nil {
+				slog.Warn("legacy tc cleanup failed; will retry on next status poll",
+					"server_id", server.ID, "error", err)
+			} else {
+				m.mu.Lock()
+				m.tcCleaned[server.ID] = true
+				m.mu.Unlock()
+			}
+		}
 	}
 
 	status := map[string]any{

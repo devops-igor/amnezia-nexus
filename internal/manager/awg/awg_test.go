@@ -74,6 +74,10 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if m.sudoCmdHandler != nil {
 		return m.sudoCmdHandler(cmd)
 	}
+	return m.defaultRunSudo(cmd)
+}
+
+func (m *mockAWGSSHClient) defaultRunSudo(cmd string) (string, string, int, error) {
 	if strings.Contains(cmd, "amnezia_awg_") {
 		return "OK", "", 0, nil
 	}
