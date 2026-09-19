@@ -275,7 +275,7 @@ func TestTransferAWGClientIPLease_ReKeying(t *testing.T) {
 		t.Fatalf("transfer to K2 failed: %v", err)
 	}
 
-	// 3. Allocate with K2 — should verify ownership and return same IP
+	// 3. Allocate with K2: should verify ownership and return same IP
 	ip2, err := db.AllocateAWGClientIP(ctx, serverID, keyK2, keyK2, nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("allocation with K2 failed: %v", err)
@@ -289,7 +289,7 @@ func TestTransferAWGClientIPLease_ReKeying(t *testing.T) {
 		t.Fatalf("transfer back to K1 failed: %v", err)
 	}
 
-	// 5. Allocate with K1 — should verify ownership and return same IP
+	// 5. Allocate with K1: should verify ownership and return same IP
 	ip3, err := db.AllocateAWGClientIP(ctx, serverID, keyK1, keyK1, nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("allocation with K1 failed: %v", err)

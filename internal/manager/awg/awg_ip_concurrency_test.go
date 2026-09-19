@@ -929,7 +929,7 @@ func TestAWGManager_Rollback_DockerCpSucceeds_SyncconfFails_RemoteRemovalFailure
 	sshClient.failSyncconf.Store(false)
 	sshClient.failOnSecondSaveConfig.Store(false)
 
-	// Provision subsequent client — MUST NOT receive the zombie IP
+	// Provision subsequent client: MUST NOT receive the zombie IP
 	res2, err := mgr.AddClient(ctx, server, map[string]any{"client_name": "subsequent-syncconf-client"})
 	if err != nil {
 		t.Fatalf("subsequent AddClient failed: %v", err)
@@ -1332,7 +1332,7 @@ func TestRemoteLock_ShellScriptContentionAndStaleLockReclamation(t *testing.T) {
 		t.Fatalf("stale owner release erroneously removed successor's lock!")
 	}
 
-	// Successor releases with its valid token — MUST remove lock dir
+	// Successor releases with its valid token: MUST remove lock dir
 	successorRelCmd := awg.RemoteLockReleaseCmd(serverID, newToken)
 	succExec := exec.CommandContext(ctx, "bash", "-c", successorRelCmd)
 	if succOut, succErr := succExec.CombinedOutput(); succErr != nil {
@@ -1361,7 +1361,7 @@ func TestAWGManager_IncompleteMetadataRollbackFailure_RetainsLease(t *testing.T)
 	sshClient.failEnsureNAT.Store(true)
 	sshClient.failSaveClientsTableOnSecond.Store(true)
 
-	// Provision client B — will fail at NAT and trigger rollback
+	// Provision client B: will fail at NAT and trigger rollback
 	_, err = mgr.AddClient(ctx, server, map[string]any{"client_name": "clientB"})
 	if err == nil {
 		t.Fatalf("expected AddClient for clientB to fail")
