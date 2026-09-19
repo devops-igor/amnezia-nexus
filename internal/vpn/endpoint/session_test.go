@@ -2,7 +2,9 @@ package endpoint
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -326,5 +328,184 @@ func TestSessionManagerSnapshotByID(t *testing.T) {
 
 	if _, ok := sm.GetSessionSnapshotByID("ghost-id"); ok {
 		t.Errorf("expected ghost id to not be found")
+	}
+}
+
+func sessionIDs(sessions []models.VPNSession) []string {
+	ids := make([]string, len(sessions))
+	for i, s := range sessions {
+		ids[i] = s.ID
+	}
+	return ids
+}
+
+func TestListActiveSessionsSnapshot_DeterministicOrder(t *testing.T) {
+	t.Run("EmptyAndSingleSession", testSnapshotEmptyAndSingleSession)
+	t.Run("DeterministicOrderingAndTieBreaking", testSnapshotDeterministicOrderingAndTieBreaking)
+	t.Run("ConcurrentReadSafety", testSnapshotConcurrentReadSafety)
+}
+
+func testSnapshotEmptyAndSingleSession(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	emptySnap := sm.ListActiveSessionsSnapshot()
+	if len(emptySnap) != 0 {
+		t.Fatalf("expected 0 sessions, got %d", len(emptySnap))
+	}
+
+	ctx := context.Background()
+	sess, err := sm.CreateSession(ctx, "u1", "peer1", "10.100.0.10", 1, "conn1")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	singleSnap := sm.ListActiveSessionsSnapshot()
+	if len(singleSnap) != 1 || singleSnap[0].ID != sess.ID {
+		t.Fatalf("expected 1 session matching ID %s, got %+v", sess.ID, singleSnap)
+	}
+}
+
+func testSnapshotDeterministicOrderingAndTieBreaking(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	ctx := context.Background()
+
+	baseTime := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+
+	testSessions := []struct {
+		id          string
+		peerKey     string
+		ip          string
+		connectedAt time.Time
+	}{
+		{id: "sess-mid-c", peerKey: "peer-mc", ip: "10.100.0.21", connectedAt: baseTime.Add(1 * time.Hour)},
+		{id: "sess-old-y", peerKey: "peer-oy", ip: "10.100.0.22", connectedAt: baseTime},
+		{id: "sess-new-z", peerKey: "peer-nz", ip: "10.100.0.23", connectedAt: baseTime.Add(2 * time.Hour)},
+		{id: "sess-mid-a", peerKey: "peer-ma", ip: "10.100.0.24", connectedAt: baseTime.Add(1 * time.Hour)},
+		{id: "sess-old-x", peerKey: "peer-ox", ip: "10.100.0.25", connectedAt: baseTime},
+		{id: "sess-mid-b", peerKey: "peer-mb", ip: "10.100.0.26", connectedAt: baseTime.Add(1 * time.Hour)},
+	}
+
+	for _, ts := range testSessions {
+		sess, err := sm.CreateSession(ctx, "user-test", ts.peerKey, ts.ip, 1, "test")
+		if err != nil {
+			t.Fatalf("CreateSession failed for %s: %v", ts.peerKey, err)
+		}
+		sm.mu.Lock()
+		delete(sm.sessionsByID, sess.ID)
+		sess.ID = ts.id
+		sess.ConnectedAt = ts.connectedAt
+		sm.sessionsByID[ts.id] = sess
+		sm.mu.Unlock()
+	}
+
+	expectedIDs := []string{
+		"sess-new-z",
+		"sess-mid-a",
+		"sess-mid-b",
+		"sess-mid-c",
+		"sess-old-x",
+		"sess-old-y",
+	}
+
+	for iter := 0; iter < 50; iter++ {
+		snapshot := sm.ListActiveSessionsSnapshot()
+		verifySnapshotOrderInvariants(t, iter, snapshot, expectedIDs)
+	}
+}
+
+func verifySnapshotOrderInvariants(t *testing.T, iter int, snapshot []models.VPNSession, expectedIDs []string) {
+	t.Helper()
+	if len(snapshot) != len(expectedIDs) {
+		t.Fatalf("iteration %d: expected %d sessions, got %d", iter, len(expectedIDs), len(snapshot))
+	}
+
+	for i, wantID := range expectedIDs {
+		if snapshot[i].ID != wantID {
+			t.Fatalf("iteration %d: mismatch at index %d: got %s, want %s (all IDs: %v)",
+				iter, i, snapshot[i].ID, wantID, sessionIDs(snapshot))
+		}
+	}
+
+	for i := 0; i < len(snapshot)-1; i++ {
+		curr := snapshot[i]
+		next := snapshot[i+1]
+
+		if curr.ConnectedAt.Before(next.ConnectedAt) {
+			t.Fatalf("iteration %d: chronological ordering violated: index %d (%s at %v) is before index %d (%s at %v)",
+				iter, i, curr.ID, curr.ConnectedAt, i+1, next.ID, next.ConnectedAt)
+		}
+
+		if curr.ConnectedAt.Equal(next.ConnectedAt) && curr.ID >= next.ID {
+			t.Fatalf("iteration %d: tie-breaker ordering violated: index %d (%s) >= index %d (%s) with equal timestamp %v",
+				iter, i, curr.ID, i+1, next.ID, curr.ConnectedAt)
+		}
+	}
+}
+
+func testSnapshotConcurrentReadSafety(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	ctx := context.Background()
+
+	baseTime := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 10; i++ {
+		pKey := fmt.Sprintf("concurrent-peer-%02d", i)
+		ip := fmt.Sprintf("10.100.0.%d", 100+i)
+		sess, err := sm.CreateSession(ctx, "user-concurrent", pKey, ip, 1, "test")
+		if err != nil {
+			t.Fatalf("CreateSession %d failed: %v", i, err)
+		}
+		sm.mu.Lock()
+		delete(sm.sessionsByID, sess.ID)
+		sess.ID = fmt.Sprintf("sess-%02d", i)
+		sess.ConnectedAt = baseTime.Add(time.Duration(i%3) * time.Minute)
+		sm.sessionsByID[sess.ID] = sess
+		sm.mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	readers := 8
+	iterations := 100
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runConcurrentReader(t, sm, iterations)
+		}()
+	}
+
+	writers := 4
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			pKey := fmt.Sprintf("concurrent-peer-%02d", idx)
+			for it := 0; it < iterations; it++ {
+				sm.UpdateActivity(pKey, 10, 20)
+				sm.TouchSession(pKey)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+}
+
+func runConcurrentReader(t *testing.T, sm *SessionManager, iterations int) {
+	t.Helper()
+	for it := 0; it < iterations; it++ {
+		snap := sm.ListActiveSessionsSnapshot()
+		if len(snap) != 10 {
+			t.Errorf("expected 10 sessions, got %d", len(snap))
+			return
+		}
+		for i := 0; i < len(snap)-1; i++ {
+			if snap[i].ConnectedAt.Before(snap[i+1].ConnectedAt) {
+				t.Errorf("chronological invariant violated concurrently")
+				return
+			}
+			if snap[i].ConnectedAt.Equal(snap[i+1].ConnectedAt) && snap[i].ID >= snap[i+1].ID {
+				t.Errorf("tie-breaker invariant violated concurrently")
+				return
+			}
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -344,21 +345,31 @@ func (sm *SessionManager) ListActiveSessions() []*models.VPNSession {
 }
 
 // ListActiveSessionsSnapshot returns value copies of all active sessions,
-// taken under sm.mu.RLock. Unlike ListActiveSessions (pointers to copies —
-// safe from manager mutation, but callers still share one struct per entry),
-// each element here is an independent copy, so the slice can be enriched and
-// rendered without any aliasing against the live set. This is the source of
-// truth for the memory-authoritative admin session table (issue #189
-// improvement round): the card count and the table rows are derived from the
-// same in-memory set by construction.
+// taken under sm.mu.RLock and sorted deterministically:
+// Primary: ConnectedAt DESC (newer sessions first).
+// Secondary tie-breaker: ID ASC (lexicographical on session ID).
+// Lock contention is minimized by releasing sm.mu.RLock before sorting.
+// Unlike ListActiveSessions (pointers to copies - safe from manager
+// mutation, but callers still share one struct per entry), each element
+// here is an independent copy, so the slice can be enriched and rendered
+// without any aliasing against the live set. This is the source of truth
+// for the memory-authoritative admin session table (issue #189 improvement
+// round): the card count and the table rows are derived from the same
+// in-memory set by construction.
 func (sm *SessionManager) ListActiveSessionsSnapshot() []models.VPNSession {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
 	result := make([]models.VPNSession, 0, len(sm.sessionsByID))
 	for _, s := range sm.sessionsByID {
 		result = append(result, *s)
 	}
+	sm.mu.RUnlock()
+
+	sort.Slice(result, func(i, j int) bool {
+		if !result[i].ConnectedAt.Equal(result[j].ConnectedAt) {
+			return result[i].ConnectedAt.After(result[j].ConnectedAt)
+		}
+		return result[i].ID < result[j].ID
+	})
 	return result
 }
 
