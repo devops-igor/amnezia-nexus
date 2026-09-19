@@ -608,18 +608,24 @@ func legacyTcCleanupCommands(containerName string) []string {
 // enforcing invisible limits with no UI/API left to clear them (PR #231
 // re-review, Fix 2). Idempotent by construction: every command is a delete
 // guarded by `|| true`, so re-running on a clean container is a no-op.
-// Errors are logged and never propagated — this must not disturb the caller.
-func (m *AWGManager) CleanupLegacyTcRules(ctx context.Context, client ssh.SSHClient, containerName string) {
+// Returns an error if any cleanup command failed so the caller can retry
+// later (the status-path guard only marks a server cleaned on success).
+func (m *AWGManager) CleanupLegacyTcRules(ctx context.Context, client ssh.SSHClient, containerName string) error {
 	if !IsValidContainerName(containerName) {
 		slog.Warn("legacy tc cleanup: skipping invalid container name", "container", containerName)
-		return
+		return fmt.Errorf("invalid container name %q", containerName)
 	}
+	var firstErr error
 	for _, cmd := range legacyTcCleanupCommands(containerName) {
 		if _, errOut, code, err := client.RunSudoCommand(ctx, cmd); err != nil || code != 0 {
-			slog.Warn("legacy tc cleanup: command failed (best-effort, continuing)",
+			slog.Warn("legacy tc cleanup: command failed (will retry on next status poll)",
 				"command", cmd, "exit_code", code, "stderr", errOut, "error", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s failed (exit %d): %s, %w", cmd, code, errOut, err)
+			}
 		}
 	}
+	return firstErr
 }
 
 // checkUDPPortAvailable verifies that the requested UDP port is not already
@@ -2582,23 +2588,29 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		return nil, err
 	}
 
-	// One-shot legacy tc cleanup (PR #231 re-review Fix 2): containers
-	// installed before the speed-limit removal (74b34d9) may still carry
-	// HTB qdiscs/filters/ifb0 rules that outlive the deleted control plane.
+	// Legacy tc cleanup (PR #231 re-review Fix 2): containers installed
+	// before the speed-limit removal (74b34d9) may still carry HTB
+	// qdiscs/filters/ifb0 rules that outlive the deleted control plane.
 	// The status path is the earliest reliable point where a resolved SSH
 	// client and the real container name are both available, and it fires on
-	// the natural first poll after a panel restart. The once-per-server map
-	// keeps the cost at exactly three commands, once per server per process.
+	// the natural first poll after a panel restart. tcCleaned is set ONLY
+	// after a successful sweep: a failed attempt stays unmarked so the next
+	// status poll retries (re-review blocker — a pre-success flag permanently
+	// disabled cleanup for the server).
 	if server != nil {
 		m.mu.Lock()
 		alreadyCleaned := m.tcCleaned[server.ID]
-		if !alreadyCleaned {
-			m.tcCleaned[server.ID] = true
-		}
 		m.mu.Unlock()
 		if !alreadyCleaned {
 			cName := m.resolveContainerName(ctx, client)
-			m.CleanupLegacyTcRules(ctx, client, cName)
+			if err := m.CleanupLegacyTcRules(ctx, client, cName); err != nil {
+				slog.Warn("legacy tc cleanup failed; will retry on next status poll",
+					"server_id", server.ID, "error", err)
+			} else {
+				m.mu.Lock()
+				m.tcCleaned[server.ID] = true
+				m.mu.Unlock()
+			}
 		}
 	}
 

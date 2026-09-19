@@ -59,22 +59,72 @@ func TestCleanupLegacyTcRules_InvalidContainerNameSkipsExec(t *testing.T) {
 	}
 }
 
-// TestCleanupLegacyTcRules_ProbeErrorsAreNotFatal locks the best-effort
-// contract: command errors (connection resets, exit codes) are logged and
-// swallowed, never propagated.
-func TestCleanupLegacyTcRules_ProbeErrorsAreNotFatal(t *testing.T) {
+// TestCleanupLegacyTcRules_CommandFailureReturnsError locks the retry
+// contract: a failing command must surface as a returned error so the
+// status-path guard leaves the server unmarked and retries on the next poll.
+func TestCleanupLegacyTcRules_CommandFailureReturnsError(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 		return "", "connection reset", 255, context.DeadlineExceeded
 	}
 
-	NewAWGManager(nil).CleanupLegacyTcRules(context.Background(), client, "amnezia-awg2")
-	// No panic and no returned error: pass is the assertion.
+	err := NewAWGManager(nil).CleanupLegacyTcRules(context.Background(), client, "amnezia-awg2")
+	if err == nil {
+		t.Fatal("expected an error when cleanup commands fail (retry contract)")
+	}
 }
 
 // TestCleanupLegacyTcRules_OncePerServer pins the once-per-server guard: the
 // sweep runs exactly once per server per panel process, then the guard short
 // -circuits and no further SSH commands are issued.
+
+// TestCleanupLegacyTcRules_RetriesAfterFailure is the re-review blocker's
+// regression: the tcCleaned marker must be set ONLY after a successful sweep.
+// A first failed cleanup (SSH error) leaves the server unmarked so the next
+// status poll retries; a subsequent successful sweep marks it done.
+func TestCleanupLegacyTcRules_RetriesAfterFailure(t *testing.T) {
+	client := newMockAWGSSHClient()
+	var cmds []string
+	failCleanup := true
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		cmds = append(cmds, cmd)
+		// Only the tc-cleanup commands fail on the first pass; discovery
+		// and status commands must succeed so the status call completes.
+		if failCleanup && (strings.Contains(cmd, "tc qdisc del") || strings.Contains(cmd, "ip link del ifb0")) {
+			return "", "connection reset", 255, context.DeadlineExceeded
+		}
+		return "", "", 0, nil
+	}
+	server := &models.Server{ID: 77, Host: "10.0.0.77", SSHPort: 22, SSHUser: "root"}
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+
+	// First status: cleanup fails -> server stays unmarked.
+	if _, err := mgr.GetServerStatus(context.Background(), server); err != nil {
+		t.Fatalf("first GetServerStatus failed: %v", err)
+	}
+	mgr.mu.Lock()
+	marked := mgr.tcCleaned[server.ID]
+	mgr.mu.Unlock()
+	if marked {
+		t.Fatal("server marked cleaned despite failed cleanup — permanent-skip bug")
+	}
+
+	// Second status with the SSH path healthy: cleanup must RUN AGAIN.
+	failCleanup = false
+	if _, err := mgr.GetServerStatus(context.Background(), server); err != nil {
+		t.Fatalf("second GetServerStatus failed: %v", err)
+	}
+	mgr.mu.Lock()
+	marked = mgr.tcCleaned[server.ID]
+	mgr.mu.Unlock()
+	if !marked {
+		t.Fatal("server should be marked cleaned after a successful sweep")
+	}
+	if len(cmds) <= 3 {
+		t.Fatalf("expected cleanup commands re-issued on retry, got %d total commands", len(cmds))
+	}
+}
+
 func TestCleanupLegacyTcRules_OncePerServer(t *testing.T) {
 	client := newMockAWGSSHClient()
 	var cmds []string
