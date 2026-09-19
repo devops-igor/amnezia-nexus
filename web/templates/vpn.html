@@ -122,12 +122,11 @@
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
-                    <th class="sortable" data-sort-type="bytes">{{ _ "traffic" }}</th>
                 </tr>
             </thead>
             <tbody id="vpn-sessions-tbody">
                 <tr id="vpn-sessions-loading" class="table-loading-row">
-                    <td colspan="5" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                    <td colspan="4" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
                         <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
                         <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
                     </td>
@@ -780,13 +779,6 @@
         tdIp.textContent = s.assigned_ip || '—';
         tr.appendChild(tdIp);
 
-        const tdTraffic = document.createElement('td');
-        tdTraffic.className = 'font-mono text-sm';
-        tdTraffic.style.fontVariantNumeric = 'tabular-nums';
-        tdTraffic.setAttribute('data-sort-val', String((Number(s.rx_bytes) || 0) + (Number(s.tx_bytes) || 0)));
-        tdTraffic.textContent = Telemetry.formatBytes(s.rx_bytes || 0) + ' / ' + Telemetry.formatBytes(s.tx_bytes || 0);
-        tr.appendChild(tdTraffic);
-
         return tr;
     }
 
@@ -803,7 +795,7 @@
         banner.id = 'vpnSessionsStaleBanner';
         banner.className = 'table-empty-state';
         banner.innerHTML = `
-            <td colspan="5" style="padding: var(--space-md);">
+            <td colspan="4" style="padding: var(--space-md);">
                 <div class="empty-state" style="padding: 0;">
                     <div class="empty-title" style="display: flex; align-items: center; justify-content: center; gap: var(--space-sm); font-size: 0.9rem; font-weight: 600; margin: 0; color: var(--warning, #b45309);">
                         <svg class="icon" style="width: 18px; height: 18px; flex-shrink: 0;"><use href="#icon-x"></use></svg>
@@ -840,7 +832,7 @@
             const tr = document.createElement('tr');
             tr.className = 'table-empty-state';
             const td = document.createElement('td');
-            td.colSpan = 5;
+            td.colSpan = 4;
             td.style.padding = 'var(--space-2xl) var(--space-md)';
             td.style.textAlign = 'center';
             td.innerHTML = `
