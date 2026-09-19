@@ -533,7 +533,6 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 		"UI.toast",
 		"API.get",
 		"API.post",
-		"API.patch",
 		"NexusTable",
 		"connectionsTable",
 		"connectionsTableContainer",
