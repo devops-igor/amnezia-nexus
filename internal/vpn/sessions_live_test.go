@@ -144,6 +144,84 @@ func TestSessionsLiveDBMissFallback(t *testing.T) {
 	}
 }
 
+// TestSessionsLiveIdentitySurvivesDisplacedDBRow is the issue-#213
+// regression: identity is resolved by PEER PUBLIC KEY (the stable connection
+// config), not by vpn_sessions row survival. The displaced-row case — the
+// row lost to the UNIQUE assigned_ip collision when another user's config
+// legitimately reclaims the IP — removes the vpn_sessions row while user,
+// user_connection, backend tunnel and server rows all still exist. SessionsLive
+// must STILL resolve the username (via user_connections.client_id =
+// peer_public_key -> users) and the server name (via the snapshot's
+// backend tunnel -> servers), while traffic stays correct: the DB row is
+// gone, so persisted counters are 0 and only the buffered accountant deltas
+// show.
+func TestSessionsLiveIdentitySurvivesDisplacedDBRow(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, peerKeyAlice := setupTestVPNService(t, db)
+	ctx := t.Context()
+
+	tun := lbTunnel(t, svc, db, 960, "awg960", "pub960", "priv960", "10.9.9.160:51820")
+	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed: %v", err)
+	}
+
+	// Displace the vpn_sessions row exactly like the UNIQUE assigned_ip
+	// collision does: the row disappears, everything around it (user,
+	// user_connection keyed by peer key, backend tunnel, server) survives.
+	// Raw SQL on purpose — production has no primitive for this, and the
+	// point is that identity must not depend on this row at all.
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM vpn_sessions WHERE id = ?", sess.ID); err != nil {
+		t.Fatalf("displacing vpn_sessions row failed: %v", err)
+	}
+	row, err := db.GetVPNSessionByID(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetVPNSessionByID failed: %v", err)
+	}
+	if row != nil {
+		t.Fatalf("precondition: vpn_sessions row survived displacement: %+v", row)
+	}
+
+	// Buffered, un-flushed traffic after the displacement: with the DB row
+	// gone the persisted base is 0, so the displayed values are exactly the
+	// buffered deltas.
+	svc.accountant.RecordRx(sess.ID, "", 700)
+	svc.accountant.RecordTx(sess.ID, "", 200)
+
+	live, err := svc.SessionsLive(ctx)
+	if err != nil {
+		t.Fatalf("SessionsLive failed: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("expected the displaced-row session to stay in the live table, got %d rows: %+v", len(live), live)
+	}
+	got := live[0]
+	if got.ID != sess.ID {
+		t.Fatalf("row ID = %s, want %s", got.ID, sess.ID)
+	}
+	if got.Username != "alice" {
+		t.Errorf("username = %q, want %q (resolved from peer key via user_connections, not the deleted vpn_sessions row)", got.Username, "alice")
+	}
+	if got.ServerName != tun.InterfaceName {
+		t.Errorf("server name = %q, want %q (resolved from the snapshot's backend tunnel via servers)", got.ServerName, tun.InterfaceName)
+	}
+	if got.ServerID != tun.ServerID {
+		t.Errorf("server ID = %d, want %d", got.ServerID, tun.ServerID)
+	}
+	if got.RxBytes != 700 {
+		t.Errorf("rx = %d, want 700 (DB row gone -> persisted 0 + buffered 700)", got.RxBytes)
+	}
+	if got.TxBytes != 200 {
+		t.Errorf("tx = %d, want 200 (DB row gone -> persisted 0 + buffered 200)", got.TxBytes)
+	}
+	if !got.LastSeen.Equal(sess.LastSeen) {
+		t.Errorf("last_seen = %v, want the snapshot value %v (no DB row to seed from)", got.LastSeen, sess.LastSeen)
+	}
+	if got.PeerPublicKey != peerKeyAlice {
+		t.Errorf("peer key = %q, want %q", got.PeerPublicKey, peerKeyAlice)
+	}
+}
+
 // TestSessionsLiveAccountantDeltas checks the telemetry path: SessionsLive
 // adds the accountant's un-flushed buffered deltas on top of the session's
 // persisted (DB) counters — the same values production traffic produces

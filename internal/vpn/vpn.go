@@ -1150,18 +1150,29 @@ func (s *Service) applyBufferedAccountantDeltas(sessions []models.EnrichedVPNSes
 // disagree. Ghost DB rows (peers that vanished without a teardown) cannot
 // appear, and a live session can never be missing from the table.
 //
+// Identity is resolved by PEER PUBLIC KEY (issue #213), not by vpn_sessions
+// row survival: the peer key is the stable connection-config identity
+// (user_connections.client_id, the same key DBAuthenticator authenticates),
+// so a live session keeps its username and server identity even when its
+// vpn_sessions row is displaced — e.g. the UNIQUE assigned_ip collision when
+// another user's config legitimately reclaims the IP. The username comes
+// from user_connections -> users, the server identity from the snapshot's
+// backend tunnel -> servers. Identity fallbacks match the DB-enriched path:
+// a peer key with no user_connections row (or a user row gone) renders
+// 'unknown'; a tunnel missing from backend_tunnels renders
+// 'Server #<tunnelID>' with server ID 0.
+//
 // Traffic and last_seen are NOT memory-authoritative: production traffic
 // never updates the manager's per-session counters (UpdateActivity /
 // TouchSession have no production call sites), so rx/tx/last_seen are seeded
-// from the persisted vpn_sessions row — cumulative-since-connect totals,
-// written incrementally by TrafficAccountant.Flush — in the SAME single DB
-// pass that resolves identity, and the accountant's un-flushed buffered
-// deltas are added on top. The displayed value is therefore DB cumulative +
-// buffered, continuous across flushes. A session with no DB row
-// (brand-new session, enrichment miss) keeps the snapshot's zeros; the
-// buffered deltas still apply to it. Identity fallbacks match the
-// DB-enriched path: a session whose user/tunnel/server rows are gone (or
-// whose backend_tunnel_id is 0) gets 'unknown' and 'Server #<tunnelID>'.
+// from the persisted vpn_sessions row by session ID — cumulative-since-
+// connect totals, written incrementally by TrafficAccountant.Flush — and
+// the accountant's un-flushed buffered deltas are added on top. The
+// displayed value is therefore DB cumulative + buffered, continuous across
+// flushes. A session with no DB row (brand-new session, displaced row,
+// enrichment miss) keeps the snapshot's zeros and in-memory last_seen; the
+// buffered deltas still apply to it either way.
+//
 // ConnectionName is the value captured at handshake from the authenticating
 // user_connection — the manager always knows it, so no fallback is needed.
 // Like the DB path, last_seen is accounting activity telemetry (the last
@@ -1200,8 +1211,8 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 		return out, nil
 	}
 
-	// Identity enrichment, single pass: username via the session's user,
-	// server identity via the session's backend tunnel. QMARK placeholders
+	// Traffic/last_seen seeding (issue #213: unchanged contract) — single
+	// pass over vpn_sessions by session ID. QMARK placeholders
 	// (modernc.org/sqlite).
 	ids := make([]string, 0, len(out))
 	seen := make(map[string]struct{}, len(out))
@@ -1217,74 +1228,182 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	for i, id := range ids {
 		args[i] = id
 	}
-	query := `SELECT s.id, COALESCE(u.username, 'unknown') AS username,
-		COALESCE(t.server_id, 0) AS server_id,
-		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name,
+	trafficQuery := `SELECT s.id,
 		COALESCE(s.rx_bytes, 0) AS rx_bytes, COALESCE(s.tx_bytes, 0) AS tx_bytes,
 		COALESCE(s.last_seen, '') AS last_seen
 		FROM vpn_sessions s
-		LEFT JOIN users u ON u.id = s.user_id
-		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
-		LEFT JOIN servers srv ON srv.id = t.server_id
 		WHERE s.id IN (` + placeholders + `)`
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, trafficQuery, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to enrich live vpn sessions: %w", err)
+		return nil, fmt.Errorf("failed to enrich live vpn session traffic: %w", err)
 	}
-	defer rows.Close()
 
-	type liveIdentity struct {
-		username   string
-		serverID   int64
-		serverName string
-		rxBytes    int64
-		txBytes    int64
-		lastSeen   time.Time
+	type liveTraffic struct {
+		rxBytes  int64
+		txBytes  int64
+		lastSeen time.Time
 	}
-	byID := make(map[string]liveIdentity, len(ids))
+	byID := make(map[string]liveTraffic, len(ids))
 	for rows.Next() {
 		var id string
-		var ident liveIdentity
+		var traffic liveTraffic
 		var lastSeenStr string
-		if err := rows.Scan(&id, &ident.username, &ident.serverID, &ident.serverName,
-			&ident.rxBytes, &ident.txBytes, &lastSeenStr); err != nil {
-			return nil, fmt.Errorf("failed to scan live vpn session identity: %w", err)
+		if err := rows.Scan(&id, &traffic.rxBytes, &traffic.txBytes, &lastSeenStr); err != nil {
+			_ = rows.Close() // early close; error already superseding
+			return nil, fmt.Errorf("failed to scan live vpn session traffic: %w", err)
 		}
 		if lastSeenStr != "" {
 			if ts, err := time.Parse(time.RFC3339, lastSeenStr); err == nil {
-				ident.lastSeen = ts
+				traffic.lastSeen = ts
 			}
 		}
-		byID[id] = ident
+		byID[id] = traffic
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate live vpn session identities: %w", err)
+		_ = rows.Close() // early close; error already superseding
+		return nil, fmt.Errorf("failed to iterate live vpn session traffic: %w", err)
+	}
+	_ = rows.Close() // fully iterated; release before the identity queries
+
+	// Identity resolution keyed by PEER PUBLIC KEY (issue #213): the peer
+	// key is the stable connection-config identity, so the username
+	// survives vpn_sessions row displacement. user_connections.client_id is
+	// treated as globally unique (same precedent as
+	// DBAuthenticator.AuthenticatePeer) — duplicates, if data ever
+	// degenerated, would map to an arbitrary-but-stable iteration winner
+	// and must not fabricate traffic.
+	usernames, err := s.resolveUsernamesByPeerKey(ctx, out)
+	if err != nil {
+		return nil, err
 	}
 
-	// Misses (session row already torn down, or a DB hiccup mid-lifetime)
-	// keep the fallbacks set above — same COALESCE semantics as the
-	// DB-enriched read path. When the DB row exists it is authoritative for
-	// traffic and last_seen: the persisted counters are cumulative
-	// (Flush adds deltas via UpdateVPNSessionTraffic), and the snapshot's
-	// per-session counters never move in production, so seeding from the DB
-	// is what keeps the displayed total continuous across flushes. Rows
-	// without a DB row keep the snapshot's zero counters and in-memory
-	// last_seen; the buffered deltas are added below either way.
+	// Server identity from the snapshot's backend tunnel (independent of
+	// vpn_sessions): one small pass over backend_tunnels + servers. A
+	// tunnel gone from the table falls back to 'Server #<tunnelID>'.
+	byTunnel, err := s.resolveServerNamesByTunnel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge. Identity (peer-key pass, authoritative) and server identity
+	// (snapshot tunnel) are applied unconditionally; traffic/last_seen are
+	// applied only when the vpn_sessions row exists. Misses keep the
+	// fallbacks set above — same COALESCE semantics as the DB-enriched
+	// read path. When the DB row exists it is authoritative for traffic
+	// and last_seen: the persisted counters are cumulative (Flush adds
+	// deltas via UpdateVPNSessionTraffic), and the snapshot's per-session
+	// counters never move in production, so seeding from the DB is what
+	// keeps the displayed total continuous across flushes. Rows without a
+	// DB row keep the snapshot's zero counters and in-memory last_seen;
+	// the buffered deltas are added below either way.
 	for i := range out {
-		if ident, ok := byID[out[i].ID]; ok {
-			out[i].Username = ident.username
-			out[i].ServerID = ident.serverID
-			out[i].ServerName = ident.serverName
-			out[i].RxBytes = ident.rxBytes
-			out[i].TxBytes = ident.txBytes
-			if !ident.lastSeen.IsZero() {
-				out[i].LastSeen = ident.lastSeen
+		if username, ok := usernames[out[i].PeerPublicKey]; ok {
+			out[i].Username = username
+		}
+		if srv, ok := byTunnel[out[i].BackendTunnelID]; ok {
+			out[i].ServerID = srv.serverID
+			out[i].ServerName = srv.serverName
+		}
+		if traffic, ok := byID[out[i].ID]; ok {
+			out[i].RxBytes = traffic.rxBytes
+			out[i].TxBytes = traffic.txBytes
+			if !traffic.lastSeen.IsZero() {
+				out[i].LastSeen = traffic.lastSeen
 			}
 		}
 	}
 
 	return s.applyBufferedAccountantDeltas(out), nil
+}
+
+// resolveUsernamesByPeerKey resolves session identity by PEER PUBLIC KEY
+// (issue #213): user_connections.client_id is the stable connection-config
+// identity, so the username survives vpn_sessions row displacement.
+// user_connections.client_id is treated as globally unique (same precedent
+// as DBAuthenticator.AuthenticatePeer) — duplicates, if data ever
+// degenerated, would map to an arbitrary-but-stable iteration winner.
+func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []models.EnrichedVPNSession) (map[string]string, error) {
+	peerKeys := make([]string, 0, len(sessions))
+	peerSeen := make(map[string]struct{}, len(sessions))
+	for i := range sessions {
+		pk := sessions[i].PeerPublicKey
+		if pk == "" {
+			continue
+		}
+		if _, dup := peerSeen[pk]; dup {
+			continue
+		}
+		peerSeen[pk] = struct{}{}
+		peerKeys = append(peerKeys, pk)
+	}
+	usernames := make(map[string]string, len(peerKeys))
+	if len(peerKeys) == 0 {
+		return usernames, nil
+	}
+
+	pkPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(peerKeys)), ",")
+	pkArgs := make([]any, len(peerKeys))
+	for i, pk := range peerKeys {
+		pkArgs[i] = pk
+	}
+	identityQuery := `SELECT uc.client_id AS pk, COALESCE(u.username, 'unknown') AS username
+		FROM user_connections uc
+		LEFT JOIN users u ON u.id = uc.user_id
+		WHERE uc.client_id IN (` + pkPlaceholders + `)`
+
+	idRows, err := s.db.QueryContext(ctx, identityQuery, pkArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve live session identity by peer key: %w", err)
+	}
+	defer idRows.Close()
+	for idRows.Next() {
+		var pk, username string
+		if err := idRows.Scan(&pk, &username); err != nil {
+			return nil, fmt.Errorf("failed to scan live session identity: %w", err)
+		}
+		usernames[pk] = username
+	}
+	if err := idRows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate live session identities: %w", err)
+	}
+	return usernames, nil
+}
+
+// liveServerIdentity is one backend tunnel's resolved server identity.
+type liveServerIdentity struct {
+	serverID   int64
+	serverName string
+}
+
+// resolveServerNamesByTunnel maps backend tunnel IDs to server identity
+// (independent of vpn_sessions): backend_tunnels -> servers by tunnel ID.
+// One small pass over a small table, cached per call. A tunnel missing from
+// backend_tunnels simply has no entry; callers keep their fallback.
+func (s *Service) resolveServerNamesByTunnel(ctx context.Context) (map[int64]liveServerIdentity, error) {
+	serverQuery := `SELECT t.id AS tunnel_id, COALESCE(t.server_id, 0) AS server_id,
+		COALESCE(srv.name, 'Server #' || t.id) AS server_name
+		FROM backend_tunnels t
+		LEFT JOIN servers srv ON srv.id = t.server_id`
+
+	srvRows, err := s.db.QueryContext(ctx, serverQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve live session server identity: %w", err)
+	}
+	defer srvRows.Close()
+	byTunnel := make(map[int64]liveServerIdentity)
+	for srvRows.Next() {
+		var tunnelID int64
+		var srv liveServerIdentity
+		if err := srvRows.Scan(&tunnelID, &srv.serverID, &srv.serverName); err != nil {
+			return nil, fmt.Errorf("failed to scan live session server identity: %w", err)
+		}
+		byTunnel[tunnelID] = srv
+	}
+	if err := srvRows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate live session server identities: %w", err)
+	}
+	return byTunnel, nil
 }
 
 // GetBackends returns all registered backend tunnels.
