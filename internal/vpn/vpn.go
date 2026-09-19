@@ -1269,8 +1269,10 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	// Identity resolution keyed by PEER PUBLIC KEY (issue #213): the peer
 	// key is the stable connection-config identity, so the username
 	// survives vpn_sessions row displacement. user_connections.client_id is
-	// treated as globally unique (same precedent as
-	// DBAuthenticator.AuthenticatePeer) — duplicates, if data ever
+	// cryptographically unique by construction (Curve25519 public key;
+	// enforced in practice by the auth path treating it as the identity
+	// key, not by a schema constraint — same precedent as
+	// DBAuthenticator.AuthenticatePeer). Duplicates, if data ever
 	// degenerated, would map to an arbitrary-but-stable iteration winner
 	// and must not fabricate traffic.
 	usernames, err := s.resolveUsernamesByPeerKey(ctx, out)
@@ -1279,9 +1281,20 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	}
 
 	// Server identity from the snapshot's backend tunnel (independent of
-	// vpn_sessions): one small pass over backend_tunnels + servers. A
-	// tunnel gone from the table falls back to 'Server #<tunnelID>'.
-	byTunnel, err := s.resolveServerNamesByTunnel(ctx)
+	// vpn_sessions): one small pass over backend_tunnels + servers, scoped
+	// to the DISTINCT tunnels the live snapshot references (backend_tunnels
+	// grows unboundedly; only snapshot tunnels are needed). A tunnel gone
+	// from the table falls back to 'Server #<tunnelID>'.
+	tunnelIDs := make([]int64, 0, len(out))
+	tunnelSeen := make(map[int64]struct{}, len(out))
+	for i := range out {
+		if _, dup := tunnelSeen[out[i].BackendTunnelID]; dup {
+			continue
+		}
+		tunnelSeen[out[i].BackendTunnelID] = struct{}{}
+		tunnelIDs = append(tunnelIDs, out[i].BackendTunnelID)
+	}
+	byTunnel, err := s.resolveServerNamesByTunnel(ctx, tunnelIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -1320,9 +1333,11 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 // resolveUsernamesByPeerKey resolves session identity by PEER PUBLIC KEY
 // (issue #213): user_connections.client_id is the stable connection-config
 // identity, so the username survives vpn_sessions row displacement.
-// user_connections.client_id is treated as globally unique (same precedent
-// as DBAuthenticator.AuthenticatePeer) — duplicates, if data ever
-// degenerated, would map to an arbitrary-but-stable iteration winner.
+// client_id is cryptographically unique by construction (Curve25519 public
+// key; enforced in practice by the auth path treating it as the identity
+// key, not by a schema constraint — same precedent as
+// DBAuthenticator.AuthenticatePeer). Duplicates, if data ever degenerated,
+// would map to an arbitrary-but-stable iteration winner.
 func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []models.EnrichedVPNSession) (map[string]string, error) {
 	peerKeys := make([]string, 0, len(sessions))
 	peerSeen := make(map[string]struct{}, len(sessions))
@@ -1377,21 +1392,33 @@ type liveServerIdentity struct {
 }
 
 // resolveServerNamesByTunnel maps backend tunnel IDs to server identity
-// (independent of vpn_sessions): backend_tunnels -> servers by tunnel ID.
-// One small pass over a small table, cached per call. A tunnel missing from
-// backend_tunnels simply has no entry; callers keep their fallback.
-func (s *Service) resolveServerNamesByTunnel(ctx context.Context) (map[int64]liveServerIdentity, error) {
+// (independent of vpn_sessions): backend_tunnels -> servers by tunnel ID,
+// scoped to the caller-supplied DISTINCT tunnel IDs (the ones the live
+// snapshot references). tunnelIDs empty -> empty map, no query. A tunnel
+// missing from backend_tunnels simply has no entry; callers keep their
+// fallback.
+func (s *Service) resolveServerNamesByTunnel(ctx context.Context, tunnelIDs []int64) (map[int64]liveServerIdentity, error) {
+	byTunnel := make(map[int64]liveServerIdentity)
+	if len(tunnelIDs) == 0 {
+		return byTunnel, nil
+	}
+
+	tPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(tunnelIDs)), ",")
+	tArgs := make([]any, len(tunnelIDs))
+	for i, id := range tunnelIDs {
+		tArgs[i] = id
+	}
 	serverQuery := `SELECT t.id AS tunnel_id, COALESCE(t.server_id, 0) AS server_id,
 		COALESCE(srv.name, 'Server #' || t.id) AS server_name
 		FROM backend_tunnels t
-		LEFT JOIN servers srv ON srv.id = t.server_id`
+		LEFT JOIN servers srv ON srv.id = t.server_id
+		WHERE t.id IN (` + tPlaceholders + `)`
 
-	srvRows, err := s.db.QueryContext(ctx, serverQuery)
+	srvRows, err := s.db.QueryContext(ctx, serverQuery, tArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve live session server identity: %w", err)
 	}
 	defer srvRows.Close()
-	byTunnel := make(map[int64]liveServerIdentity)
 	for srvRows.Next() {
 		var tunnelID int64
 		var srv liveServerIdentity
