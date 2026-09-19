@@ -117,8 +117,6 @@ func (m *MTProxyLManager) Install(ctx context.Context, server *models.Server, pa
 	// 4. Configure FakeTLS domain if present
 	if domain, ok := params["tls_domain"].(string); ok && domain != "" {
 		_, _, _, _ = client.RunCommand(ctx, fmt.Sprintf("%s domain %s", DefaultCLIPath, domain))
-	} else if tlsDomain, ok := params["tlsDomain"].(string); ok && tlsDomain != "" {
-		_, _, _, _ = client.RunCommand(ctx, fmt.Sprintf("%s domain %s", DefaultCLIPath, tlsDomain))
 	}
 
 	// 5. Start proxy
