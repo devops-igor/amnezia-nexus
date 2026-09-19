@@ -136,12 +136,6 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	if req.TelemtExpiry != nil {
 		clientParams["telemt_expiry"] = *req.TelemtExpiry
 	}
-	if req.AWGSpeedLimitDown != nil {
-		clientParams["speed_limit_down"] = *req.AWGSpeedLimitDown
-	}
-	if req.AWGSpeedLimitUp != nil {
-		clientParams["speed_limit_up"] = *req.AWGSpeedLimitUp
-	}
 	if req.AWGMimicry != nil {
 		clientParams["awg_mimicry"] = *req.AWGMimicry
 	}
@@ -355,12 +349,6 @@ func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req
 		return nil
 	}
 	params := make(map[string]any)
-	if req.AWGSpeedLimitDown != nil {
-		params["speed_limit_down"] = *req.AWGSpeedLimitDown
-	}
-	if req.AWGSpeedLimitUp != nil {
-		params["speed_limit_up"] = *req.AWGSpeedLimitUp
-	}
 	if req.AWGMimicry != nil {
 		params["awg_mimicry"] = *req.AWGMimicry
 	}

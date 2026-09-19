@@ -797,15 +797,13 @@ func (r *ServerConfigSaveRequest) Validate() error {
 
 // AddConnectionRequest defines parameters for adding a new connection to a server.
 type AddConnectionRequest struct {
-	Protocol          string  `json:"protocol"`
-	Name              string  `json:"name"`
-	UserID            *string `json:"user_id,omitempty"`
-	TelemtQuota       *string `json:"telemt_quota,omitempty"`
-	TelemtMaxIPs      *int    `json:"telemt_max_ips,omitempty"`
-	TelemtExpiry      *string `json:"telemt_expiry,omitempty"`
-	AWGSpeedLimitDown *int    `json:"awg_speed_limit_down,omitempty"`
-	AWGSpeedLimitUp   *int    `json:"awg_speed_limit_up,omitempty"`
-	AWGMimicry        *string `json:"awg_mimicry,omitempty"`
+	Protocol     string  `json:"protocol"`
+	Name         string  `json:"name"`
+	UserID       *string `json:"user_id,omitempty"`
+	TelemtQuota  *string `json:"telemt_quota,omitempty"`
+	TelemtMaxIPs *int    `json:"telemt_max_ips,omitempty"`
+	TelemtExpiry *string `json:"telemt_expiry,omitempty"`
+	AWGMimicry   *string `json:"awg_mimicry,omitempty"`
 }
 
 func (r *AddConnectionRequest) Validate() error {
@@ -822,16 +820,14 @@ func (r *AddConnectionRequest) Validate() error {
 
 // MyAddConnectionRequest defines parameters for adding a user's own connection.
 type MyAddConnectionRequest struct {
-	ServerID          int64   `json:"server_id"`
-	Protocol          string  `json:"protocol"`
-	Name              string  `json:"name"`
-	LoadBalanced      bool    `json:"load_balanced,omitempty"`
-	TelemtQuota       *string `json:"telemt_quota,omitempty"`
-	TelemtMaxIPs      *int    `json:"telemt_max_ips,omitempty"`
-	TelemtExpiry      *string `json:"telemt_expiry,omitempty"`
-	AWGSpeedLimitDown *int    `json:"awg_speed_limit_down,omitempty"`
-	AWGSpeedLimitUp   *int    `json:"awg_speed_limit_up,omitempty"`
-	AWGMimicry        *string `json:"awg_mimicry,omitempty"`
+	ServerID     int64   `json:"server_id"`
+	Protocol     string  `json:"protocol"`
+	Name         string  `json:"name"`
+	LoadBalanced bool    `json:"load_balanced,omitempty"`
+	TelemtQuota  *string `json:"telemt_quota,omitempty"`
+	TelemtMaxIPs *int    `json:"telemt_max_ips,omitempty"`
+	TelemtExpiry *string `json:"telemt_expiry,omitempty"`
+	AWGMimicry   *string `json:"awg_mimicry,omitempty"`
 }
 
 func (r *MyAddConnectionRequest) Validate() error {
@@ -885,16 +881,14 @@ func (r *AddUserConnectionRequest) Validate() error {
 
 // EditConnectionRequest defines parameters for editing an existing connection.
 type EditConnectionRequest struct {
-	Protocol          string  `json:"protocol"`
-	ClientID          string  `json:"client_id"`
-	Name              *string `json:"name,omitempty"`
-	UserID            *string `json:"user_id,omitempty"`
-	TelemtQuota       *string `json:"telemt_quota,omitempty"`
-	TelemtMaxIPs      *int    `json:"telemt_max_ips,omitempty"`
-	TelemtExpiry      *string `json:"telemt_expiry,omitempty"`
-	AWGSpeedLimitDown *int    `json:"awg_speed_limit_down,omitempty"`
-	AWGSpeedLimitUp   *int    `json:"awg_speed_limit_up,omitempty"`
-	AWGMimicry        *string `json:"awg_mimicry,omitempty"`
+	Protocol     string  `json:"protocol"`
+	ClientID     string  `json:"client_id"`
+	Name         *string `json:"name,omitempty"`
+	UserID       *string `json:"user_id,omitempty"`
+	TelemtQuota  *string `json:"telemt_quota,omitempty"`
+	TelemtMaxIPs *int    `json:"telemt_max_ips,omitempty"`
+	TelemtExpiry *string `json:"telemt_expiry,omitempty"`
+	AWGMimicry   *string `json:"awg_mimicry,omitempty"`
 }
 
 // Validate checks the EditConnectionRequest fields for protocol validity and,
@@ -933,21 +927,6 @@ func (r *RenameConnectionRequest) Validate() error {
 		return err
 	}
 	return nil
-}
-
-// SpeedLimitRequest defines client speed limit configuration.
-type SpeedLimitRequest struct {
-	ClientID       string `json:"client_id"`
-	SpeedLimitDown *int   `json:"speed_limit_down,omitempty"`
-	SpeedLimitUp   *int   `json:"speed_limit_up,omitempty"`
-}
-
-// AwgSpeedLimitConfigRequest defines AWG server-wide speed limits.
-type AwgSpeedLimitConfigRequest struct {
-	GlobalSpeedLimitDown  *int `json:"global_speed_limit_down,omitempty"`
-	GlobalSpeedLimitUp    *int `json:"global_speed_limit_up,omitempty"`
-	DefaultSpeedLimitDown *int `json:"default_speed_limit_down,omitempty"`
-	DefaultSpeedLimitUp   *int `json:"default_speed_limit_up,omitempty"`
 }
 
 // UpdateUserRequest defines parameters for updating an existing user.

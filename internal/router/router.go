@@ -250,10 +250,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Post("/{server_id}/connections/config", h.GetServerConnectionConfigHandler)
 				r.Post("/{server_id}/connections/toggle", h.ToggleServerConnectionHandler)
 				r.Get("/{server_id}/{protocol}/clients", h.GetProtocolClientsHandler)
-				r.Patch("/{server_id}/connections/speed-limit", h.SetClientSpeedLimitHandler)
-				r.Get("/{server_id}/awg/speed-limit-config", h.GetAWGSpeedLimitConfigHandler)
-				r.Patch("/{server_id}/awg/speed-limit-config", h.SetAWGSpeedLimitConfigHandler)
-				r.Post("/{server_id}/awg/apply-default-speed-limits", h.ApplyDefaultSpeedLimitsHandler)
 			})
 		})
 	})
@@ -290,10 +286,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Post("/{server_id}/connections/config", h.GetServerConnectionConfigHandler)
 		r.Post("/{server_id}/connections/toggle", h.ToggleServerConnectionHandler)
 		r.Get("/{server_id}/{protocol}/clients", h.GetProtocolClientsHandler)
-		r.Patch("/{server_id}/connections/speed-limit", h.SetClientSpeedLimitHandler)
-		r.Get("/{server_id}/awg/speed-limit-config", h.GetAWGSpeedLimitConfigHandler)
-		r.Patch("/{server_id}/awg/speed-limit-config", h.SetAWGSpeedLimitConfigHandler)
-		r.Post("/{server_id}/awg/apply-default-speed-limits", h.ApplyDefaultSpeedLimitsHandler)
 
 		// User management API
 		r.Route("/api/users", func(r chi.Router) {

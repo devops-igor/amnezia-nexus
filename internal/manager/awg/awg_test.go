@@ -293,10 +293,8 @@ func TestAWGManagerLifecycle(t *testing.T) {
 
 	// 4. Test AddClient
 	addParams := map[string]any{
-		"name":                 "NewUser",
-		"awg_speed_limit_down": 20,
-		"awg_speed_limit_up":   10,
-		"awg_mimicry":          "tls",
+		"name":        "NewUser",
+		"awg_mimicry": "tls",
 	}
 	newClient, err := mgr.AddClient(ctx, server, addParams)
 	if err != nil {
@@ -416,11 +414,9 @@ func TestAWGManager_EditClient(t *testing.T) {
 	mgr := NewAWGManager(provider)
 	server := &models.Server{ID: 1, Host: "1.2.3.4"}
 
-	// 1. Edit client name and speed limits
+	// 1. Edit client name
 	editParams := map[string]any{
-		"name":             "RenamedUser",
-		"speed_limit_down": 50,
-		"speed_limit_up":   25,
+		"name": "RenamedUser",
 	}
 	if err := mgr.EditClient(ctx, server, "pubkey1", editParams); err != nil {
 		t.Fatalf("EditClient failed: %v", err)
@@ -436,27 +432,8 @@ func TestAWGManager_EditClient(t *testing.T) {
 	if clients[0].UserData.ClientName != "RenamedUser" {
 		t.Errorf("expected client name RenamedUser, got %s", clients[0].UserData.ClientName)
 	}
-	if clients[0].UserData.SpeedLimitDown == nil || *clients[0].UserData.SpeedLimitDown != 50 {
-		t.Errorf("expected speed_limit_down 50, got %v", clients[0].UserData.SpeedLimitDown)
-	}
-	if clients[0].UserData.SpeedLimitUp == nil || *clients[0].UserData.SpeedLimitUp != 25 {
-		t.Errorf("expected speed_limit_up 25, got %v", clients[0].UserData.SpeedLimitUp)
-	}
 
-	// 2. Remove speed limits (set to 0)
-	clearLimits := map[string]any{
-		"speed_limit_down": 0,
-		"speed_limit_up":   0,
-	}
-	if err := mgr.EditClient(ctx, server, "pubkey1", clearLimits); err != nil {
-		t.Fatalf("EditClient(clear limits) failed: %v", err)
-	}
-	clients, _ = mgr.getClientsTable(ctx, client)
-	if clients[0].UserData.SpeedLimitDown != nil {
-		t.Errorf("expected nil speed_limit_down, got %v", clients[0].UserData.SpeedLimitDown)
-	}
-
-	// 3. Edit enabled status (toggle disable, then enable)
+	// 2. Edit enabled status (toggle disable, then enable)
 	if err := mgr.EditClient(ctx, server, "pubkey1", map[string]any{"enabled": false}); err != nil {
 		t.Fatalf("EditClient(enabled=false) failed: %v", err)
 	}
@@ -1039,9 +1016,7 @@ DisableCookies = on
 
 	// 1. AddClient
 	addParams := map[string]any{
-		"name":                 "TestServer2User",
-		"awg_speed_limit_down": 50,
-		"awg_speed_limit_up":   25,
+		"name": "TestServer2User",
 	}
 	res, err := mgr.AddClient(ctx, server, addParams)
 	if err != nil {

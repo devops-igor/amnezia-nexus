@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
-	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/tc"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/curve25519"
@@ -1226,8 +1225,6 @@ func (m *AWGManager) GetClients(ctx context.Context, server *models.Server) ([]m
 			"psk":               ud.PSK,
 			"enabled":           ud.Enabled,
 			"awg_mimicry":       ud.AWGMimicry,
-			"speed_limit_down":  ud.SpeedLimitDown,
-			"speed_limit_up":    ud.SpeedLimitUp,
 			"latestHandshake":   ud.LatestHandshake,
 			"dataReceived":      ud.DataReceived,
 			"dataSent":          ud.DataSent,
@@ -1358,21 +1355,6 @@ func resolveClientName(clientParams map[string]any) string {
 	return "client"
 }
 
-func parseSpeedLimits(clientParams map[string]any) (*int, *int) {
-	var speedDown, speedUp *int
-	if v, ok := clientParams["awg_speed_limit_down"]; ok && v != nil {
-		if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-			speedDown = &val
-		}
-	}
-	if v, ok := clientParams["awg_speed_limit_up"]; ok && v != nil {
-		if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-			speedUp = &val
-		}
-	}
-	return speedDown, speedUp
-}
-
 // probePeerPubKey extracts a valid caller-supplied WireGuard public key from
 // clientParams (checked keys: "public_key", then "client_public_key").
 // A valid key is base64 that decodes to exactly 32 bytes. Returns "" when
@@ -1495,7 +1477,7 @@ func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP, allowedIPs st
 
 // upsertClientEntry updates the clientsTable entry at existingIdx in place
 // (keeping IP and identity fields), or appends a new entry when idx < 0.
-func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, speedDown, speedUp *int, contentPadding bool) []AWGClient {
+func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, contentPadding bool) []AWGClient {
 	if existingIdx >= 0 {
 		clients[existingIdx].ClientID = clientPubKey
 		clients[existingIdx].UserData.ClientName = clientName
@@ -1549,8 +1531,6 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			PSK:                    psk,
 			Enabled:                true,
 			AWGMimicry:             mimicry,
-			SpeedLimitDown:         speedDown,
-			SpeedLimitUp:           speedUp,
 			RekeyAfterTime:         rat,
 			RekeyTimeout:           rt,
 			RejectAfterTime:        rej,
@@ -1560,21 +1540,6 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			ContentPaddingAddition: cpAdd,
 		},
 	})
-}
-
-// applyClientSpeedLimit applies TC speed limits when any limit is set.
-func applyClientSpeedLimit(ctx context.Context, client ssh.SSHClient, containerName, interfaceName, clientIP string, speedDown, speedUp *int) {
-	if speedDown == nil && speedUp == nil {
-		return
-	}
-	dVal, uVal := 0, 0
-	if speedDown != nil {
-		dVal = *speedDown
-	}
-	if speedUp != nil {
-		uVal = *speedUp
-	}
-	_ = tc.ApplySpeedLimit(ctx, client, containerName, interfaceName, clientIP, dVal, uVal)
 }
 
 // AddClient provisions a new client/peer in the AWG configuration.
@@ -1683,8 +1648,6 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 	remoteCommitted = true
 
-	// Parse speed limits if provided
-	speedDown, speedUp := parseSpeedLimits(clientParams)
 	mimicry := resolveMimicry(clientParams)
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
@@ -1694,7 +1657,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		return nil, err
 	}
 	existingIdx, _ = findExistingClient(clients, clientPubKey, clientName)
-	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
+	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, cpOn)
 	if err = m.saveClientsTable(ctx, client, clients); err != nil {
 		return nil, fmt.Errorf("failed to save clients table: %w", err)
 	}
@@ -1721,9 +1684,6 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		err = fmt.Errorf("failed to ensure backend NAT rules: %w", err)
 		return nil, err
 	}
-
-	// Apply speed limit via TC
-	applyClientSpeedLimit(ctx, client, m.resolveContainerName(ctx, client), m.interfaceName(), clientIP, speedDown, speedUp)
 
 	// Render client config
 	clientConfig := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
@@ -1863,11 +1823,6 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 		if err := m.saveClientsTable(ctx, client, updated); err != nil {
 			return fmt.Errorf("failed to save clients table during peer removal: %w", err)
 		}
-	}
-
-	if ip != "" {
-		cName := m.resolveContainerName(ctx, client)
-		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), ip)
 	}
 
 	return nil
@@ -2340,8 +2295,7 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	}
 	defer unlockRemote()
 
-	// 1. Remove TC speed limit for peer IP
-	cName := m.resolveContainerName(ctx, client)
+	// 1. Find peer IP for the client being removed
 	clients, err := m.getClientsTable(ctx, client)
 	if err != nil {
 		return err
@@ -2350,7 +2304,6 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	for _, c := range clients {
 		if c.ClientID == clientID && c.UserData.ClientIP != "" {
 			peerIP = c.UserData.ClientIP
-			_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), c.UserData.ClientIP)
 			break
 		}
 	}
@@ -2789,22 +2742,7 @@ func parseBoolParam(val any) (bool, bool) {
 	}
 }
 
-func parseSpeedLimit(params map[string]any, keys ...string) (*int, bool) {
-	for _, k := range keys {
-		if v, ok := params[k]; ok {
-			if v == nil {
-				return nil, true
-			}
-			if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-				return &val, true
-			}
-			return nil, true
-		}
-	}
-	return nil, false
-}
-
-// EditClient modifies client metadata, enabling/disabling, and bandwidth limits with TC sync.
+// EditClient modifies client metadata and enabling/disabling state.
 func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clientID string, params map[string]any) error {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -2858,18 +2796,6 @@ func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clie
 		target.UserData.Enabled = newEnabled
 	}
 
-	down, downOk := parseSpeedLimit(params, "speed_limit_down", "awg_speed_limit_down", "speedDown")
-	up, upOk := parseSpeedLimit(params, "speed_limit_up", "awg_speed_limit_up", "speedUp")
-	if downOk || upOk {
-		if downOk {
-			target.UserData.SpeedLimitDown = down
-		}
-		if upOk {
-			target.UserData.SpeedLimitUp = up
-		}
-		m.syncClientTC(ctx, client, target.UserData.ClientIP, target.UserData.SpeedLimitDown, target.UserData.SpeedLimitUp)
-	}
-
 	return m.saveClientsTable(ctx, client, clients)
 }
 
@@ -2894,25 +2820,6 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
 	return m.saveServerConfig(ctx, client, newConfig)
-}
-
-func (m *AWGManager) syncClientTC(ctx context.Context, client ssh.SSHClient, clientIP string, curDown, curUp *int) {
-	cName := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(cName) {
-		cName = m.containerName()
-	}
-	if (curDown != nil && *curDown > 0) || (curUp != nil && *curUp > 0) {
-		dVal, uVal := 0, 0
-		if curDown != nil {
-			dVal = *curDown
-		}
-		if curUp != nil {
-			uVal = *curUp
-		}
-		_ = tc.ApplySpeedLimit(ctx, client, cName, m.interfaceName(), clientIP, dVal, uVal)
-	} else {
-		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), clientIP)
-	}
 }
 
 // RotateMimicry rotates a client's mimicry profile through the sequence:
