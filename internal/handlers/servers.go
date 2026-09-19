@@ -518,6 +518,7 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
+		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)
 		h.JSONError(w, http.StatusInternalServerError, "install_failed", "Failed to install protocol")
 		return
 	}

@@ -515,16 +515,28 @@ fi
 	return nil
 }
 
-// awgBaseImage pins the AmneziaWG-Go userspace base image to the 3.1 release.
-// Pinning (instead of :latest) guarantees freshly built backends speak the
-// 3.x protocol; the explicit pull before build ensures the tag exists on the
-// host instead of failing mid-build with a stale local cache.
-const awgBaseImage = "amneziavpn/amneziawg-go:3.1.20260828"
+// awgBaseImage pins the AmneziaWG userspace base image used to build AWG
+// backends. devopsigor/amneziawg:latest is a multiarch (amd64+arm64) image
+// built from the AmneziaWG v3.1.20260828 source in the amneziawg-docker repo
+// (devopsigor publishing); multiarch is required because backends install on
+// both amd64 and arm64 hosts — the upstream amneziavpn/amneziawg-go image
+// publishes amd64 only, which broke ARM64 installs (Issue #225). The explicit
+// pull before build ensures the tag exists on the host instead of failing
+// mid-build with a stale local cache.
+const awgBaseImage = "devopsigor/amneziawg:latest"
 
 func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()
 	if !IsValidContainerName(cName) {
 		cName = "amnezia-awg2"
+	}
+	// Preflight: fail fast when the UDP port is already bound (host socket or
+	// existing docker port binding) instead of discovering it at `docker run`
+	// time after a slow pull+build cycle (Issue #225). Best-effort: a port
+	// could still bind between check and run — `docker run` remains the final
+	// authority.
+	if err := checkUDPPortAvailable(ctx, client, port); err != nil {
+		return err
 	}
 	dockerfile := fmt.Sprintf(`FROM %s
 LABEL maintainer="AmneziaVPN"
@@ -566,6 +578,72 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
 func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	return (&AWGManager{}).buildAndRunAWGContainer(ctx, client, port)
+}
+
+// checkUDPPortAvailable verifies that the requested UDP port is not already
+// bound on the remote host before the AWG install pulls or builds anything.
+// It checks two sources: host listening UDP sockets (`ss -lun`) and existing
+// docker port bindings (`docker ps --format '{{.Ports}}'`), because a port
+// published by another container does not appear in host `ss` output when the
+// panel itself runs inside a container (Issue #225, Server 1). A failed
+// probe command is not fatal — the install proceeds and any real conflict
+// still surfaces from `docker run` as before.
+func checkUDPPortAvailable(ctx context.Context, client ssh.SSHClient, port string) error {
+	const conflictErr = "UDP port %s is already in use on the server — choose a different port for the AWG backend"
+
+	ssOut, _, _, err := client.RunSudoCommand(ctx, "ss -lun 2>/dev/null || true")
+	if err != nil {
+		slog.Warn("preflight: failed to list listening UDP sockets", "error", err)
+	} else if udpPortBound(ssOut, port) {
+		return fmt.Errorf(conflictErr, port)
+	}
+
+	portsOut, _, _, err := client.RunSudoCommand(ctx, "docker ps --format '{{.Ports}}' 2>/dev/null || true")
+	if err != nil {
+		slog.Warn("preflight: failed to list docker port bindings", "error", err)
+	} else if dockerUDPPortBound(portsOut, port) {
+		return fmt.Errorf(conflictErr, port)
+	}
+
+	return nil
+}
+
+// udpPortBound reports whether ss(8) output shows a UDP socket whose local
+// port equals port. Matching is token-based: strings.Fields yields the local
+// endpoint as a single `addr:port` token (e.g. `0.0.0.0:51820` or `[::]:53`),
+// and the suffix `:<port>` is matched against the whole token to avoid prefix
+// false positives such as `:5182` matching a bound `:51820`.
+func udpPortBound(ssOut, port string) bool {
+	for _, line := range strings.Split(ssOut, "\n") {
+		for _, field := range strings.Fields(line) {
+			if strings.HasSuffix(field, ":"+port) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dockerUDPPortBound reports whether `docker ps --format '{{.Ports}}'` output
+// contains a UDP port binding publishing the given host port, e.g.
+// `0.0.0.0:51820->51820/udp`. TCP-only bindings do not count: the AWG backend
+// only needs the UDP port free.
+func dockerUDPPortBound(portsOut, port string) bool {
+	normalized := strings.ReplaceAll(portsOut, ", ", "\n")
+	for _, line := range strings.Split(normalized, "\n") {
+		if !strings.Contains(line, "->"+port+"/udp") {
+			continue
+		}
+		idx := strings.Index(line, "->")
+		if idx == 0 {
+			continue
+		}
+		host := line[:idx]
+		if host == port || strings.HasSuffix(host, ":"+port) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {

@@ -1284,8 +1284,8 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 	if !strings.Contains(dockerfile, "FROM "+awgBaseImage+"\n") {
 		t.Errorf("Dockerfile must pin FROM %s, got:\n%s", awgBaseImage, dockerfile)
 	}
-	if strings.Contains(dockerfile, ":latest") {
-		t.Errorf("Dockerfile must not reference :latest, got:\n%s", dockerfile)
+	if !strings.Contains(dockerfile, "FROM devopsigor/amneziawg:") {
+		t.Errorf("Dockerfile must use the multiarch devopsigor/amneziawg base image (ARM64 support), got:\n%s", dockerfile)
 	}
 
 	pullIdx, buildIdx := -1, -1
