@@ -177,6 +177,14 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 	if strings.Contains(cmd, "tc qdisc") {
 		return "qdisc tbf 1: dev eth0 root", "", 0, nil
 	}
+	if strings.Contains(cmd, "ss -lun") {
+		// Preflight: no UDP listener on the requested port.
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker ps") {
+		// Preflight: publish filter finds no existing binding.
+		return "", "", 0, nil
+	}
 	return "ok", "", 0, nil
 }
 

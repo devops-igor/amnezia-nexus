@@ -1239,6 +1239,14 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 		commands = append(commands, cmd)
+		if strings.Contains(cmd, "ss -lun") {
+			// Preflight: no UDP listener on the requested port.
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker ps") {
+			// Preflight: publish filter finds no existing binding.
+			return "", "", 0, nil
+		}
 		if strings.Contains(cmd, "docker build") {
 			uploaded, ok := client.files["/opt/amnezia/amnezia-awg2/Dockerfile"]
 			if !ok {
@@ -1286,6 +1294,10 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 func TestBuildAndRunAWGContainer_PullFailureAborts(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "ss -lun") || strings.Contains(cmd, "docker ps") {
+			// Preflight: port free.
+			return "", "", 0, nil
+		}
 		if strings.HasPrefix(cmd, "docker pull '") {
 			return "", "manifest unknown", 1, nil
 		}

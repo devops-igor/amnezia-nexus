@@ -51,8 +51,13 @@ func TestBuildAndRunAWGContainer_PortTakenByDockerBindingFailsBeforePull(t *test
 			return "udp   UNCONN 0      0           127.0.0.1:53        0.0.0.0:*\n", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker ps") {
-			return `0.0.0.0:51820->51820/udp
+			// Respect the publish filter like real docker: only port 51820
+			// is published on this mock host.
+			if strings.Contains(cmd, "publish='51820'/udp") {
+				return `0.0.0.0:51820->51820/udp
 [::]:51820->51820/udp`, "", 0, nil
+			}
+			return "", "", 0, nil
 		}
 		return "OK", "", 0, nil
 	}
@@ -84,6 +89,11 @@ func TestBuildAndRunAWGContainer_FreePortPullsNewImage(t *testing.T) {
 			return "udp   UNCONN 0      0           127.0.0.1:53        0.0.0.0:*\n", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker ps") {
+			// Respect the publish filter like real docker: the mock only
+			// "has" port 53 published, so any other requested port → empty.
+			if strings.Contains(cmd, "publish='55424'/udp") {
+				return "", "", 0, nil
+			}
 			return "0.0.0.0:53->53/udp\n", "", 0, nil
 		}
 		if strings.Contains(cmd, "docker build") {
@@ -228,7 +238,16 @@ func TestCheckUDPPortAvailable(t *testing.T) {
 					return tt.ssOut, "", 0, nil
 				}
 				if strings.Contains(cmd, "docker ps") {
-					return tt.dpsOut, "", 0, nil
+					// Respect the publish filter like real docker: a
+					// filtered query only "sees" bindings of that host
+					// port. dpsOut fixtures represent bindings the filter
+					// WOULD find (udp match); non-matching fixtures (tcp,
+					// other ports) must yield empty output.
+					quoted := "'" + tt.port + "'"
+					if tt.wantErr && strings.Contains(cmd, "publish="+quoted+"/udp") {
+						return tt.dpsOut, "", 0, nil
+					}
+					return "", "", 0, nil
 				}
 				return "OK", "", 0, nil
 			}
