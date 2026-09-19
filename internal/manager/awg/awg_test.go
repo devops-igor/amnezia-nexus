@@ -74,6 +74,9 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if m.sudoCmdHandler != nil {
 		return m.sudoCmdHandler(cmd)
 	}
+	if strings.Contains(cmd, "amnezia_awg_") {
+		return "OK", "", 0, nil
+	}
 	if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf") {
 		return string(m.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 	}
@@ -1172,10 +1175,10 @@ func TestAWGManager_SaveServerConfig_SyncconfFailure_ReturnsError(t *testing.T) 
 		if strings.Contains(cmd, "syncconf") {
 			return "", "Line unrecognized: `DisableCookies = on`", 1, errors.New("exit status 1")
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/awg0.conf") {
+		if strings.Contains(cmd, "cat") && strings.Contains(cmd, "awg0.conf") {
 			return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
 		}
-		if strings.Contains(cmd, "cat /opt/amnezia/awg/clientsTable") {
+		if strings.Contains(cmd, "cat") && strings.Contains(cmd, "clientsTable") {
 			return string(mockClient.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
 		}
 		if strings.Contains(cmd, "wireguard_server_public_key.key") {
@@ -2195,6 +2198,65 @@ func TestPostRebootRoutingHijack_RegressionSimulation(t *testing.T) {
 		}
 		if route8Remediated.Dev != "eth0" || route8Remediated.Table != 254 {
 			t.Errorf("after remediation 8.8.8.8 should resolve via eth0 table 254, got: %+v", route8Remediated)
+		}
+	})
+}
+
+func TestRemovePeerFromConfig_PrefixIsolation(t *testing.T) {
+	initialConf := `[Interface]
+PrivateKey = serverPrivKey1234567890123456789012345=
+Address = 10.66.66.1/24
+ListenPort = 51820
+
+[Peer]
+PublicKey = pubKey2=====================================
+AllowedIPs = 10.66.66.2/32
+
+[Peer]
+PublicKey = pubKey20====================================
+AllowedIPs = 10.66.66.20/32
+
+[Peer]
+PublicKey = pubKey200===================================
+AllowedIPs = 10.66.66.200/32
+`
+
+	t.Run("remove by public key for peer .2", func(t *testing.T) {
+		res := removePeerFromConfig(initialConf, "pubKey2=====================================", "")
+		if strings.Contains(res, "10.66.66.2/32") || strings.Contains(res, "pubKey2=====================================") {
+			t.Errorf("expected peer .2 to be removed, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.20/32") || !strings.Contains(res, "pubKey20====================================") {
+			t.Errorf("expected peer .20 to remain untouched, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.200/32") || !strings.Contains(res, "pubKey200===================================") {
+			t.Errorf("expected peer .200 to remain untouched, got:\n%s", res)
+		}
+	})
+
+	t.Run("remove by IP only for peer .2 (prefix isolation)", func(t *testing.T) {
+		res := removePeerFromConfig(initialConf, "", "10.66.66.2")
+		if strings.Contains(res, "10.66.66.2/32") || strings.Contains(res, "pubKey2=====================================") {
+			t.Errorf("expected peer .2 to be removed by IP, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.20/32") || !strings.Contains(res, "pubKey20====================================") {
+			t.Errorf("expected peer .20 to remain untouched when removing .2 by IP, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.200/32") || !strings.Contains(res, "pubKey200===================================") {
+			t.Errorf("expected peer .200 to remain untouched when removing .2 by IP, got:\n%s", res)
+		}
+	})
+
+	t.Run("remove by IP for peer .20 leaving .2 and .200", func(t *testing.T) {
+		res := removePeerFromConfig(initialConf, "", "10.66.66.20")
+		if strings.Contains(res, "10.66.66.20/32") || strings.Contains(res, "pubKey20====================================") {
+			t.Errorf("expected peer .20 to be removed by IP, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.2/32") || !strings.Contains(res, "pubKey2=====================================") {
+			t.Errorf("expected peer .2 to remain untouched when removing .20 by IP, got:\n%s", res)
+		}
+		if !strings.Contains(res, "10.66.66.200/32") || !strings.Contains(res, "pubKey200===================================") {
+			t.Errorf("expected peer .200 to remain untouched when removing .20 by IP, got:\n%s", res)
 		}
 	})
 }
