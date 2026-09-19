@@ -797,3 +797,54 @@ func TestMTProxyLManager_AddClient_FallbackToSecretLinkWithANSI(t *testing.T) {
 		t.Errorf("expected vpn_link %q, got %q", expectedLink, res["vpn_link"])
 	}
 }
+
+func TestMTProxyL_Install_FakeTLSDomain(t *testing.T) {
+	ctx := context.Background()
+	server := &models.Server{ID: 1, Host: "127.0.0.1"}
+
+	t.Run("valid tls_domain executes domain configuration command", func(t *testing.T) {
+		mockClient := &mockMTProxyLSSHClient{}
+		provider := &mockMTProxyLSSHProvider{client: mockClient}
+		mgr := NewMTProxyLManager(provider)
+
+		params := map[string]any{
+			"port":       "443",
+			"tls_domain": "valid.example.com",
+		}
+		if err := mgr.Install(ctx, server, params); err != nil {
+			t.Fatalf("Install failed: %v", err)
+		}
+
+		expectedCmd := "/usr/local/bin/mtproxyl domain valid.example.com"
+		found := false
+		for _, cmd := range mockClient.commandsRun {
+			if cmd == expectedCmd {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected command %q was not executed; commands run: %v", expectedCmd, mockClient.commandsRun)
+		}
+	})
+
+	t.Run("dead camelCase tlsDomain param is ignored and not configured", func(t *testing.T) {
+		mockClient := &mockMTProxyLSSHClient{}
+		provider := &mockMTProxyLSSHProvider{client: mockClient}
+		mgr := NewMTProxyLManager(provider)
+
+		params := map[string]any{
+			"port":      "443",
+			"tlsDomain": "ignored.example.com",
+		}
+		if err := mgr.Install(ctx, server, params); err != nil {
+			t.Fatalf("Install failed: %v", err)
+		}
+
+		for _, cmd := range mockClient.commandsRun {
+			if strings.Contains(cmd, "domain") {
+				t.Errorf("unexpected domain command executed for dead tlsDomain param: %s", cmd)
+			}
+		}
+	})
+}
