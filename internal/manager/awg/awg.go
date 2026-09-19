@@ -1991,6 +1991,7 @@ func (m *AWGManager) allocateNonConflictingIP(
 				"ip", allocatedIP,
 				"error", relErr,
 			)
+			return "", fmt.Errorf("failed to release conflicting allocated IP lease for client %s (IP %s): %w", effectiveClientID, allocatedIP, relErr)
 		}
 		usedIPs = append(usedIPs, allocatedIP)
 	}
@@ -2090,6 +2091,7 @@ func (m *AWGManager) obtainExistingClientIPWithAllocator(
 				"ip", allocatedIP,
 				"error", relErr,
 			)
+			return "", false, false, "", "", fmt.Errorf("failed to release conflicting allocated IP lease for client %s (IP %s): %w", effectiveClientID, allocatedIP, relErr)
 		}
 		usedIPs = append(usedIPs, allocatedIP)
 		allocatedIP, allocErr = m.allocateNonConflictingIP(ctx, serverID, effectiveClientID, clientPubKey, usedIPs, subnetAddr, subnetCIDR, gatewayIP, remotePeers)

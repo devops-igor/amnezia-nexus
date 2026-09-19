@@ -131,7 +131,7 @@ func TestAWGManager_FailedContainerDiscovery_DoesNotPopulateCache(t *testing.T) 
 	}
 }
 
-func TestAWGManager_AllocateNonConflictingIP_ReleaseFailure_LoggedAndContinues(t *testing.T) {
+func TestAWGManager_AllocateNonConflictingIP_ReleaseFailure_AbortsWithError(t *testing.T) {
 	ctx := context.Background()
 
 	allocator := &mockFaultyIPAllocator{
@@ -169,17 +169,20 @@ func TestAWGManager_AllocateNonConflictingIP_ReleaseFailure_LoggedAndContinues(t
 		"10.66.66.1",
 		remotePeers,
 	)
-	if err != nil {
-		t.Fatalf("expected allocateNonConflictingIP to succeed despite release failure, got err: %v", err)
+	if err == nil {
+		t.Fatalf("expected allocateNonConflictingIP to abort on release failure, got nil error and IP: %s", allocatedIP)
 	}
-	if allocatedIP != "10.66.66.3" {
-		t.Fatalf("expected allocated IP 10.66.66.3, got: %s", allocatedIP)
+	if allocatedIP != "" {
+		t.Fatalf("expected empty IP on release failure, got: %s", allocatedIP)
+	}
+	if !strings.Contains(err.Error(), "failed to release conflicting allocated IP lease") {
+		t.Fatalf("expected descriptive release failure error, got: %v", err)
 	}
 	if allocator.releaseCount.Load() != 1 {
 		t.Fatalf("expected 1 release attempt, got: %d", allocator.releaseCount.Load())
 	}
-	if allocator.allocCount.Load() != 2 {
-		t.Fatalf("expected 2 allocation attempts, got: %d", allocator.allocCount.Load())
+	if allocator.allocCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 allocation attempt (aborted before retry), got: %d", allocator.allocCount.Load())
 	}
 }
 
@@ -187,9 +190,9 @@ func TestAWGManager_AllocateNonConflictingIP_ExhaustsRetries_ReturnsDescriptiveE
 	ctx := context.Background()
 
 	allocator := &mockFaultyIPAllocator{
-		failRelease: true,
+		failRelease: false,
 	}
-	// Always returns 10.66.66.2 simulating persistent conflict or release failure repeating lease
+	// Always returns 10.66.66.2 simulating persistent conflict where candidates conflict with remote peers
 	allocator.allocFunc = func(ctx context.Context, serverID int64, clientID, clientPubKey string, usedIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error) {
 		return "10.66.66.2", nil
 	}
@@ -229,5 +232,61 @@ func TestAWGManager_AllocateNonConflictingIP_ExhaustsRetries_ReturnsDescriptiveE
 	}
 	if allocator.releaseCount.Load() != 10 {
 		t.Fatalf("expected exactly 10 release attempts, got: %d", allocator.releaseCount.Load())
+	}
+}
+
+func TestAWGManager_ObtainExistingClientIP_ReleaseFailure_AbortsWithError(t *testing.T) {
+	ctx := context.Background()
+
+	allocator := &mockFaultyIPAllocator{
+		failRelease: true,
+	}
+	allocator.allocFunc = func(ctx context.Context, serverID int64, clientID, clientPubKey string, usedIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error) {
+		return "10.66.66.2", nil
+	}
+
+	mgr := NewAWGManager(nil)
+	mgr.SetIPAllocator(allocator)
+
+	remotePeers := []AWGPeer{
+		{
+			PublicKey:  "ConflictingKey==============================",
+			AllowedIPs: "10.66.66.2/32",
+		},
+	}
+
+	existingClient := AWGClient{
+		ClientID: "existing-client-key",
+		UserData: AWGClientUserData{
+			ClientIP: "10.66.66.99",
+		},
+	}
+
+	allocatedIP, _, _, _, _, err := mgr.obtainExistingClientIPWithAllocator(
+		ctx,
+		1,
+		"client-1",
+		"existing-client-key",
+		existingClient,
+		nil,
+		"10.66.66.0",
+		24,
+		"10.66.66.1",
+		remotePeers,
+	)
+	if err == nil {
+		t.Fatalf("expected error from obtainExistingClientIPWithAllocator on release failure, got nil")
+	}
+	if allocatedIP != "" {
+		t.Fatalf("expected empty IP on release failure, got: %s", allocatedIP)
+	}
+	if !strings.Contains(err.Error(), "failed to release conflicting allocated IP lease") {
+		t.Fatalf("expected release failure error message, got: %v", err)
+	}
+	if allocator.releaseCount.Load() != 1 {
+		t.Fatalf("expected 1 release attempt, got: %d", allocator.releaseCount.Load())
+	}
+	if allocator.allocCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 allocation attempt before abort, got: %d", allocator.allocCount.Load())
 	}
 }
