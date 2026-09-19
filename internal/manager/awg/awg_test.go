@@ -96,6 +96,14 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 		}
 		return "", "", 0, nil
 	}
+	if strings.Contains(cmd, "ss -lun") {
+		// Preflight: no UDP listener bound on the mock host.
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker ps --filter publish=") {
+		// Preflight: no existing container publishes the port.
+		return "", "", 0, nil
+	}
 	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients") {
 		fields := strings.Fields(cmd)
 		if len(fields) >= 3 {
