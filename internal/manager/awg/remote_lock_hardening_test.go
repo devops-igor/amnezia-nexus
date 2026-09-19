@@ -24,6 +24,11 @@ func TestRemoteLock_SuccessorLockTOCTOU_PreservesSuccessor(t *testing.T) {
 	expectedTokens := []string{
 		`gate_path="$flock_path.gate"`,
 		`if ! mkdir "$gate_path" 2>/dev/null; then`,
+		`g_info=$(cat "$gate_path/owner" 2>/dev/null)`,
+		`if [ $((g_now - g_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ $((g_now - g_ts)) -ge 15 ]; }; then`,
+		`g_ren_dir="$gate_path.stale.$g_now.$$"`,
+		`if [ "$g_ren_tok" = "$g_tok" ] && [ $((g_ren_now - g_ren_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ "$g_ren_ts" = "$g_ts" ]; } && { [ -z "$g_ren_ts" ] || [ $((g_ren_now - g_ren_ts)) -ge 15 ]; }; then rm -rf "$g_ren_dir"; else if [ ! -d "$gate_path" ]; then mv "$g_ren_dir" "$gate_path" 2>/dev/null; else rm -rf "$g_ren_dir"; fi; fi`,
+		`g_acq_ts=$(date +%s); echo 'test_token' "$g_acq_ts" > "$gate_path/owner" 2>/dev/null;`,
 		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi`,
 		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi`,
 	}
@@ -221,6 +226,22 @@ func setupAbandonedStaleLock(t *testing.T, lockPath, token string, age time.Dura
 	}
 	if err := os.Chtimes(lockPath, pastTime, pastTime); err != nil {
 		t.Fatalf("failed to set past mtime: %v", err)
+	}
+}
+
+func setupAbandonedStaleGate(t *testing.T, gatePath, token string, age time.Duration) {
+	t.Helper()
+	if err := os.MkdirAll(gatePath, 0755); err != nil {
+		t.Fatalf("failed to create initial gate dir: %v", err)
+	}
+	pastTime := time.Now().Add(-age)
+	if token != "" {
+		if err := os.WriteFile(filepath.Join(gatePath, "owner"), []byte(fmt.Sprintf("%s %d\n", token, pastTime.Unix())), 0644); err != nil {
+			t.Fatalf("failed to write initial gate owner: %v", err)
+		}
+	}
+	if err := os.Chtimes(gatePath, pastTime, pastTime); err != nil {
+		t.Fatalf("failed to set past mtime on gate: %v", err)
 	}
 }
 
@@ -995,11 +1016,11 @@ func TestRemoteLock_AtomicGateMutex_FencesCanonicalLockAndStaleReclamation(t *te
 			_ = os.RemoveAll(gatePath)
 		}()
 
-		// Create stale gate mutex (>10s old)
+		// Create stale gate mutex (>= 15s old)
 		if err := os.MkdirAll(gatePath, 0755); err != nil {
 			t.Fatalf("failed to create gate dir: %v", err)
 		}
-		pastTime := time.Now().Add(-15 * time.Second)
+		pastTime := time.Now().Add(-20 * time.Second)
 		if err := os.Chtimes(gatePath, pastTime, pastTime); err != nil {
 			t.Fatalf("failed to set past mtime on gate: %v", err)
 		}
@@ -1016,6 +1037,588 @@ func TestRemoteLock_AtomicGateMutex_FencesCanonicalLockAndStaleReclamation(t *te
 
 		if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
 			t.Fatalf("gate path still exists after acquisition and release")
+		}
+	})
+}
+
+func launchContenderAcquire(ctx context.Context, resName, token string) chan error {
+	done := make(chan error, 1)
+	cmd := remoteLockAcquireCmd(resName, token)
+	go func() {
+		out, err := exec.CommandContext(ctx, "bash", "-c", cmd).CombinedOutput()
+		if err != nil {
+			done <- fmt.Errorf("contender exited with error: %w (out: %s)", err, string(out))
+			return
+		}
+		done <- nil
+	}()
+	return done
+}
+
+func assertContenderBlocked(t *testing.T, done chan error, waitDuration time.Duration, errMsg string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: %v", errMsg, err)
+	case <-time.After(waitDuration):
+	}
+}
+
+func awaitCommandSuccess(t *testing.T, done chan error, timeout time.Duration, errMsg string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s: %v", errMsg, err)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("%s: timed out after %v", errMsg, timeout)
+	}
+}
+
+func awaitNextContenderAcquisition(t *testing.T, numContenders int, completed []bool, contenderAcquired []chan struct{}, contenderErrs []chan error) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for i := 0; i < numContenders; i++ {
+			if completed[i] {
+				continue
+			}
+			select {
+			case <-contenderAcquired[i]:
+				return i
+			case err := <-contenderErrs[i]:
+				t.Fatalf("contender %d error: %v", i+1, err)
+			default:
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for next contender to acquire lock")
+	return -1
+}
+
+func assertNoOtherContenderAcquired(t *testing.T, winnerIdx int, numContenders int, completed []bool, contenderAcquired []chan struct{}) {
+	t.Helper()
+	for i := 0; i < numContenders; i++ {
+		if i == winnerIdx || completed[i] {
+			continue
+		}
+		select {
+		case <-contenderAcquired[i]:
+			t.Fatalf("MUTUAL EXCLUSION BROKEN: contender %d acquired while contender %d was holding lock", i+1, winnerIdx+1)
+		default:
+		}
+	}
+}
+
+func releaseAndAwaitContenderDone(t *testing.T, idx int, contenderReleaseSignal, contenderDone []chan struct{}) {
+	t.Helper()
+	contenderReleaseSignal[idx] <- struct{}{}
+	select {
+	case <-contenderDone[idx]:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for contender %d to release lock", idx+1)
+	}
+}
+
+func TestRemoteLock_ContenderSerializedBehindGateMutex_DuringStaleReclamation(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("gate_ser_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	gatePath := lockPath + ".gate"
+	_ = os.RemoveAll(lockPath)
+	_ = os.RemoveAll(gatePath)
+	defer func() {
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+	}()
+
+	tempDir := t.TempDir()
+	barrierReached := filepath.Join(tempDir, "barrier_reached")
+	barrierResume := filepath.Join(tempDir, "barrier_resume")
+
+	// 1. Setup an abandoned stale lock directory with past timestamp (>60s)
+	staleToken := "stale-owner-ser-101"
+	setupAbandonedStaleLock(t, lockPath, staleToken, 120*time.Second)
+
+	// 2. Reclaimer A starts acquiring. Inject barrier right after gate is acquired and owner written,
+	// before it inspects or renames $flock_path.
+	reclaimerToken := "reclaimer-gate-token-A"
+	reclaimerCmd := remoteLockAcquireCmd(resName, reclaimerToken)
+
+	targetPattern := fmt.Sprintf(`echo %s "$g_acq_ts" > "$gate_path/owner" 2>/dev/null;`, ssh.EscapeShellArg(reclaimerToken))
+	if !strings.Contains(reclaimerCmd, targetPattern) {
+		t.Fatalf("reclaimerCmd missing target pattern for gate barrier injection: %s", reclaimerCmd)
+	}
+
+	barrierInjection := fmt.Sprintf(
+		`%s touch %s; while [ ! -f %s ]; do sleep 0.01; done;`,
+		targetPattern,
+		ssh.EscapeShellArg(barrierReached),
+		ssh.EscapeShellArg(barrierResume),
+	)
+	reclaimerInjectedCmd := strings.Replace(reclaimerCmd, targetPattern, barrierInjection, 1)
+
+	reclaimerDone := make(chan error, 1)
+	go func() {
+		out, err := exec.CommandContext(ctx, "bash", "-c", reclaimerInjectedCmd).CombinedOutput()
+		if err != nil {
+			reclaimerDone <- fmt.Errorf("reclaimer exited with error: %w (out: %s)", err, string(out))
+			return
+		}
+		reclaimerDone <- nil
+	}()
+
+	// 3. Wait until Reclaimer A has acquired gate mutex and paused
+	waitForBarrierFile(t, barrierReached, 5*time.Second)
+
+	// Verify Reclaimer A holds the gate mutex
+	if _, err := os.Stat(gatePath); os.IsNotExist(err) {
+		t.Fatalf("expected gate directory to exist while Reclaimer A is inside critical section")
+	}
+	assertLockOwnerEquals(t, gatePath, reclaimerToken, "reclaimer holding gate")
+
+	// 4. Start Contender B attempting to acquire the lock
+	contenderToken := "contender-gate-token-B"
+	contenderDone := launchContenderAcquire(ctx, resName, contenderToken)
+
+	// 5. Verify Contender B is strictly blocked behind the gate mutex
+	assertContenderBlocked(t, contenderDone, 350*time.Millisecond, "MUTUAL EXCLUSION BROKEN: contender acquired or exited while reclaimer held gate")
+
+	// 6. Verify Contender B DID NOT touch or alter $flock_path
+	assertLockOwnerEquals(t, lockPath, staleToken, "stale lock must remain untouched while contender is blocked")
+
+	// Verify no stale rename dirs created by contender
+	matches, _ := filepath.Glob(lockPath + ".stale.*")
+	if len(matches) > 0 {
+		t.Fatalf("unexpected stale renamed directory created before reclaimer executed: %v", matches)
+	}
+
+	// 7. Unblock Reclaimer A to proceed with stale reclamation
+	if err := os.WriteFile(barrierResume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier resume: %v", err)
+	}
+
+	// 8. Wait for Reclaimer A to complete stale reclamation and acquire canonical lock
+	awaitCommandSuccess(t, reclaimerDone, 5*time.Second, "reclaimer failed")
+	assertLockOwnerEquals(t, lockPath, reclaimerToken, "after reclaimer acquired")
+
+	// 9. Contender B is now waiting on the active lock held by Reclaimer A
+	assertContenderBlocked(t, contenderDone, 350*time.Millisecond, "contender acquired while reclaimer is actively holding lock")
+
+	// 10. Reclaimer A releases the lock
+	releaseLockAssertSuccess(t, ctx, resName, reclaimerToken)
+
+	// 11. Contender B should now successfully acquire the lock
+	awaitCommandSuccess(t, contenderDone, 5*time.Second, "contender failed to acquire lock after reclaimer release")
+	assertLockOwnerEquals(t, lockPath, contenderToken, "after contender acquired")
+	releaseLockAssertSuccess(t, ctx, resName, contenderToken)
+
+	// Verify all lock directories are cleaned up
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after release")
+	}
+	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+		t.Fatalf("gate directory still exists after release")
+	}
+}
+
+func TestRemoteLock_StaleReclaimerPausedInGate_AllContendersWaitOnGate(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("gate_multi_wait_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	gatePath := lockPath + ".gate"
+	_ = os.RemoveAll(lockPath)
+	_ = os.RemoveAll(gatePath)
+	defer func() {
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+	}()
+
+	tempDir := t.TempDir()
+	barrierReached := filepath.Join(tempDir, "barrier_reached")
+	barrierResume := filepath.Join(tempDir, "barrier_resume")
+
+	// 1. Setup an abandoned stale lock directory (>60s)
+	staleToken := "stale-owner-multi-101"
+	setupAbandonedStaleLock(t, lockPath, staleToken, 120*time.Second)
+
+	// 2. Reclaimer starts and pauses inside gate critical section while holding the gate
+	reclaimerToken := "reclaimer-holding-gate"
+	reclaimerCmd := remoteLockAcquireCmd(resName, reclaimerToken)
+
+	targetPattern := fmt.Sprintf(`echo %s "$g_acq_ts" > "$gate_path/owner" 2>/dev/null;`, ssh.EscapeShellArg(reclaimerToken))
+	if !strings.Contains(reclaimerCmd, targetPattern) {
+		t.Fatalf("reclaimerCmd missing target pattern for gate barrier injection: %s", reclaimerCmd)
+	}
+
+	barrierInjection := fmt.Sprintf(
+		`%s touch %s; while [ ! -f %s ]; do sleep 0.01; done;`,
+		targetPattern,
+		ssh.EscapeShellArg(barrierReached),
+		ssh.EscapeShellArg(barrierResume),
+	)
+	reclaimerInjectedCmd := strings.Replace(reclaimerCmd, targetPattern, barrierInjection, 1)
+
+	reclaimerDone := make(chan error, 1)
+	go func() {
+		out, err := exec.CommandContext(ctx, "bash", "-c", reclaimerInjectedCmd).CombinedOutput()
+		if err != nil {
+			reclaimerDone <- fmt.Errorf("reclaimer error: %w (out: %s)", err, string(out))
+			return
+		}
+		reclaimerDone <- nil
+	}()
+
+	waitForBarrierFile(t, barrierReached, 5*time.Second)
+
+	// 3. Launch 3 competing contenders simultaneously
+	const numContenders = 3
+	contenderAcquired := make([]chan struct{}, numContenders)
+	contenderReleaseSignal := make([]chan struct{}, numContenders)
+	contenderDone := make([]chan struct{}, numContenders)
+	contenderErrs := make([]chan error, numContenders)
+	contenderTokens := make([]string, numContenders)
+
+	for i := 0; i < numContenders; i++ {
+		contenderAcquired[i] = make(chan struct{}, 1)
+		contenderReleaseSignal[i] = make(chan struct{}, 1)
+		contenderDone[i] = make(chan struct{}, 1)
+		contenderErrs[i] = make(chan error, 1)
+		contenderTokens[i] = fmt.Sprintf("multi-contender-%d", i+1)
+		cCmd := remoteLockAcquireCmd(resName, contenderTokens[i])
+		idx := i
+		go func() {
+			out, err := exec.CommandContext(ctx, "bash", "-c", cCmd).CombinedOutput()
+			if err != nil {
+				contenderErrs[idx] <- fmt.Errorf("contender %d error: %w (out: %s)", idx+1, err, string(out))
+				return
+			}
+			contenderAcquired[idx] <- struct{}{}
+			<-contenderReleaseSignal[idx]
+			relCmd := remoteLockReleaseCmd(resName, contenderTokens[idx])
+			_, _ = exec.CommandContext(ctx, "bash", "-c", relCmd).CombinedOutput()
+			contenderDone[idx] <- struct{}{}
+		}()
+	}
+
+	// 4. Verify ALL contenders are waiting on the gate
+	time.Sleep(350 * time.Millisecond)
+	for i := 0; i < numContenders; i++ {
+		select {
+		case <-contenderAcquired[i]:
+			t.Fatalf("contender %d bypassed gate mutex while reclaimer was holding gate", i+1)
+		case err := <-contenderErrs[i]:
+			t.Fatalf("contender %d failed while reclaimer held gate: %v", i+1, err)
+		default:
+			// Expected: still waiting
+		}
+	}
+
+	// Canonical lock is still owned by stale token
+	assertLockOwnerEquals(t, lockPath, staleToken, "stale lock preserved while contenders wait on gate")
+	assertLockOwnerEquals(t, gatePath, reclaimerToken, "gate held by reclaimer")
+
+	// 5. Unblock reclaimer
+	if err := os.WriteFile(barrierResume, []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write barrier resume: %v", err)
+	}
+
+	awaitCommandSuccess(t, reclaimerDone, 5*time.Second, "reclaimer timed out finishing reclamation")
+	assertLockOwnerEquals(t, lockPath, reclaimerToken, "reclaimer holds lock after completing")
+
+	// 6. Reclaimer releases the lock
+	releaseLockAssertSuccess(t, ctx, resName, reclaimerToken)
+
+	// 7. Exactly one contender acquires at a time, and all serialize cleanly
+	completed := make([]bool, numContenders)
+	for step := 0; step < numContenders; step++ {
+		winnerIdx := awaitNextContenderAcquisition(t, numContenders, completed, contenderAcquired, contenderErrs)
+		assertLockOwnerEquals(t, lockPath, contenderTokens[winnerIdx], fmt.Sprintf("winner at step %d", step+1))
+		assertNoOtherContenderAcquired(t, winnerIdx, numContenders, completed, contenderAcquired)
+		releaseAndAwaitContenderDone(t, winnerIdx, contenderReleaseSignal, contenderDone)
+		completed[winnerIdx] = true
+	}
+
+	// Clean final state
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock dir still exists")
+	}
+	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+		t.Fatalf("gate dir still exists")
+	}
+}
+
+func TestRemoteLock_SimultaneousGateReclaimers_OnlyOneEntersGate(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+	resName := fmt.Sprintf("gate_race_%d", time.Now().UnixNano())
+	lockPath := remoteLockPath(resName)
+	gatePath := lockPath + ".gate"
+	_ = os.RemoveAll(lockPath)
+	_ = os.RemoveAll(gatePath)
+	defer func() {
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+	}()
+
+	// Setup a stale gate directory (20s old) with crashed owner metadata
+	setupAbandonedStaleGate(t, gatePath, "crashed-gate-token-99", 20*time.Second)
+
+	var (
+		activeLockHolders atomic.Int32
+		maxConcurrent     atomic.Int32
+		wg                sync.WaitGroup
+		errs              = make(chan error, 3)
+		startGate         = make(chan struct{})
+	)
+
+	tokens := []string{"reclaimer-race-alpha", "reclaimer-race-beta", "reclaimer-race-gamma"}
+	const numReclaimers = 3
+	wg.Add(numReclaimers)
+
+	for i := 0; i < numReclaimers; i++ {
+		tok := tokens[i]
+		go func() {
+			defer wg.Done()
+			cmdStr := remoteLockAcquireCmd(resName, tok)
+
+			<-startGate
+			out, err := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+			if err != nil {
+				errs <- fmt.Errorf("reclaimer %s failed to acquire: %w (out: %s)", tok, err, string(out))
+				return
+			}
+
+			cur := activeLockHolders.Add(1)
+			for {
+				oldMax := maxConcurrent.Load()
+				if cur <= oldMax || maxConcurrent.CompareAndSwap(oldMax, cur) {
+					break
+				}
+			}
+
+			// Hold the lock briefly to expose any overlap
+			time.Sleep(50 * time.Millisecond)
+
+			assertLockOwnerEquals(t, lockPath, tok, "holder verified")
+
+			activeLockHolders.Add(-1)
+			relCmd := remoteLockReleaseCmd(resName, tok)
+			relOut, relErr := exec.CommandContext(ctx, "bash", "-c", relCmd).CombinedOutput()
+			if relErr != nil {
+				errs <- fmt.Errorf("reclaimer %s failed to release: %w (out: %s)", tok, relErr, string(relOut))
+				return
+			}
+		}()
+	}
+
+	close(startGate)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrency race failure: %v", err)
+		}
+	}
+
+	if max := maxConcurrent.Load(); max != 1 {
+		t.Fatalf("MUTUAL EXCLUSION BROKEN on stale gate race: expected maxConcurrent=1, got %d", max)
+	}
+
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock directory still exists after all completed")
+	}
+	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+		t.Fatalf("gate directory still exists after all completed")
+	}
+}
+
+func TestRemoteLock_AbandonedGateRecovery_OwnerGenerationValidation(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+
+	t.Run("FreshGateWithMetadata_ProtectedFromEviction", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_fresh_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Create fresh gate (2s old)
+		setupAbandonedStaleGate(t, gatePath, "active-gate-tok", 2*time.Second)
+
+		contenderCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+		defer cancel()
+
+		cmdStr := remoteLockAcquireCmd(resName, "contender-tok")
+		out, err := exec.CommandContext(contenderCtx, "bash", "-c", cmdStr).CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected contender to fail/timeout on fresh gate, but acquired! out: %s", string(out))
+		}
+
+		// Gate must remain intact
+		if _, statErr := os.Stat(gatePath); os.IsNotExist(statErr) {
+			t.Fatalf("fresh gate was erroneously evicted!")
+		}
+		assertLockOwnerEquals(t, gatePath, "active-gate-tok", "fresh gate owner preserved")
+	})
+
+	t.Run("ExpiredGateWithMetadata_SafelyReclaimed", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_exp_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Create expired gate (20s old)
+		setupAbandonedStaleGate(t, gatePath, "stale-gate-tok", 20*time.Second)
+
+		reclaimerToken := "reclaimer-gate-success"
+		cmdStr := remoteLockAcquireCmd(resName, reclaimerToken)
+		out, err := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+		if err != nil {
+			t.Fatalf("failed to acquire lock with expired gate: %v (out: %s)", err, string(out))
+		}
+
+		assertLockOwnerEquals(t, lockPath, reclaimerToken, "reclaimed lock owner")
+		releaseLockAssertSuccess(t, ctx, resName, reclaimerToken)
+
+		if _, statErr := os.Stat(gatePath); !os.IsNotExist(statErr) {
+			t.Fatalf("gate directory still exists after release")
+		}
+	})
+
+	t.Run("MtimeExpiredButTimestampFresh_ProtectedFromEviction", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_mtime_skew_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Gate directory mtime is expired (25s ago), but owner timestamp is fresh (now)
+		if err := os.MkdirAll(gatePath, 0755); err != nil {
+			t.Fatalf("failed to create gate dir: %v", err)
+		}
+		nowTs := time.Now().Unix()
+		if err := os.WriteFile(filepath.Join(gatePath, "owner"), []byte(fmt.Sprintf("skew-token %d\n", nowTs)), 0644); err != nil {
+			t.Fatalf("failed to write owner: %v", err)
+		}
+		pastTime := time.Now().Add(-25 * time.Second)
+		if err := os.Chtimes(gatePath, pastTime, pastTime); err != nil {
+			t.Fatalf("failed to set past mtime: %v", err)
+		}
+
+		contenderCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+		defer cancel()
+
+		cmdStr := remoteLockAcquireCmd(resName, "contender-tok")
+		out, err := exec.CommandContext(contenderCtx, "bash", "-c", cmdStr).CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected contender to fail/timeout when gate timestamp is fresh, but acquired! out: %s", string(out))
+		}
+
+		// Gate must NOT be evicted because owner timestamp is fresh
+		if _, statErr := os.Stat(gatePath); os.IsNotExist(statErr) {
+			t.Fatalf("gate with fresh timestamp was erroneously evicted!")
+		}
+		assertLockOwnerEquals(t, gatePath, "skew-token", "skew gate owner preserved")
+	})
+
+	t.Run("TimestampExpiredButMtimeFresh_ProtectedFromEviction", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_ts_skew_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Owner timestamp is expired (25s ago), but directory mtime is fresh (now)
+		if err := os.MkdirAll(gatePath, 0755); err != nil {
+			t.Fatalf("failed to create gate dir: %v", err)
+		}
+		pastTs := time.Now().Add(-25 * time.Second).Unix()
+		if err := os.WriteFile(filepath.Join(gatePath, "owner"), []byte(fmt.Sprintf("ts-skew-token %d\n", pastTs)), 0644); err != nil {
+			t.Fatalf("failed to write owner: %v", err)
+		}
+		now := time.Now()
+		if err := os.Chtimes(gatePath, now, now); err != nil {
+			t.Fatalf("failed to set fresh mtime: %v", err)
+		}
+
+		contenderCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+		defer cancel()
+
+		cmdStr := remoteLockAcquireCmd(resName, "contender-tok")
+		out, err := exec.CommandContext(contenderCtx, "bash", "-c", cmdStr).CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected contender to fail/timeout when gate mtime is fresh, but acquired! out: %s", string(out))
+		}
+
+		// Gate must NOT be evicted because directory mtime is fresh
+		if _, statErr := os.Stat(gatePath); os.IsNotExist(statErr) {
+			t.Fatalf("gate with fresh mtime was erroneously evicted!")
+		}
+		assertLockOwnerEquals(t, gatePath, "ts-skew-token", "ts-skew gate owner preserved")
+	})
+
+	t.Run("OwnerlessCrashedGate_Expired_SafelyReclaimed", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_ownerless_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Ownerless gate (token=""), expired 20s ago
+		setupAbandonedStaleGate(t, gatePath, "", 20*time.Second)
+
+		reclaimerToken := "reclaimer-ownerless-gate"
+		cmdStr := remoteLockAcquireCmd(resName, reclaimerToken)
+		out, err := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+		if err != nil {
+			t.Fatalf("failed to acquire lock with expired ownerless gate: %v (out: %s)", err, string(out))
+		}
+
+		assertLockOwnerEquals(t, lockPath, reclaimerToken, "ownerless reclaimed lock owner")
+		releaseLockAssertSuccess(t, ctx, resName, reclaimerToken)
+
+		if _, statErr := os.Stat(gatePath); !os.IsNotExist(statErr) {
+			t.Fatalf("gate directory still exists after release")
 		}
 	})
 }
