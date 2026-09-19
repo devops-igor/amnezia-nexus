@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 	"github.com/go-chi/chi/v5"
@@ -344,16 +345,37 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	if req.AWGMimicry != nil {
 		updates["awg_mimicry"] = *req.AWGMimicry
 	}
+	var passwordUpdated bool
 	if req.Password != nil && *req.Password != "" {
-		if hash, err := security.HashPassword(*req.Password); err == nil {
-			updates["password_hash"] = hash
+		hash, err := security.HashPassword(*req.Password)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to hash password")
+			return
 		}
+		updates["password_hash"] = hash
+		passwordUpdated = true
 	}
 
 	if len(updates) > 0 {
 		if _, err := h.db.UpdateUser(ctx, userID, updates); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
 			return
+		}
+	}
+
+	if passwordUpdated {
+		newVer, err := h.db.BumpUserSessionVersion(ctx, userID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update session version")
+			return
+		}
+
+		sess := h.GetSession(r)
+		if sess != nil && sess.UserID == userID {
+			sess.SessionVersion = newVer
+			if h.cfg != nil {
+				_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
+			}
 		}
 	}
 
