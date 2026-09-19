@@ -1106,6 +1106,9 @@ func (s *Service) TotalDroppedPackets() uint64 {
 // last_seen comes from the DB row only: it is the last accounted traffic
 // activity visible via the accountant flush — not transport-level peer
 // liveness (review-2 P2). Read-path only (issue #189).
+//
+// Row-set source is the DB. For the admin table that must agree with the
+// active-sessions card by construction, use SessionsLive instead.
 func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSession, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
@@ -1116,14 +1119,20 @@ func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSes
 		return nil, err
 	}
 
-	// Add buffered, un-flushed accountant deltas. Exact, no double
-	// counting: Flush swaps each buffer to 0 when it persists the
-	// drained amount into the DB row.
+	return s.applyBufferedAccountantDeltas(sessions), nil
+}
+
+// applyBufferedAccountantDeltas adds the forwarder accountant's un-flushed
+// buffered rx/tx deltas onto each session's persisted counters. Exact, no
+// double counting: Flush swaps each buffer to 0 when it persists the drained
+// amount into the DB row. Shared by SessionsEnriched (DB truth) and
+// SessionsLive (memory truth).
+func (s *Service) applyBufferedAccountantDeltas(sessions []models.EnrichedVPNSession) []models.EnrichedVPNSession {
 	s.mu.RLock()
 	accountant := s.accountant
 	s.mu.RUnlock()
 	if accountant == nil {
-		return sessions, nil
+		return sessions
 	}
 	for i := range sessions {
 		if rx, tx := accountant.GetSessionTraffic(sessions[i].ID); rx != 0 || tx != 0 {
@@ -1131,7 +1140,151 @@ func (s *Service) SessionsEnriched(ctx context.Context) ([]models.EnrichedVPNSes
 			sessions[i].TxBytes += tx
 		}
 	}
-	return sessions, nil
+	return sessions
+}
+
+// SessionsLive is the memory-authoritative variant of SessionsEnriched
+// (issue #189 improvement round): the SNAPSHOT — row membership — comes from
+// the SessionManager's in-memory connected set, the same source the
+// active-sessions card counts, so the card and the admin table can never
+// disagree. Ghost DB rows (peers that vanished without a teardown) cannot
+// appear, and a live session can never be missing from the table.
+//
+// Traffic and last_seen are NOT memory-authoritative: production traffic
+// never updates the manager's per-session counters (UpdateActivity /
+// TouchSession have no production call sites), so rx/tx/last_seen are seeded
+// from the persisted vpn_sessions row — cumulative-since-connect totals,
+// written incrementally by TrafficAccountant.Flush — in the SAME single DB
+// pass that resolves identity, and the accountant's un-flushed buffered
+// deltas are added on top. The displayed value is therefore DB cumulative +
+// buffered, continuous across flushes. A session with no DB row
+// (brand-new session, enrichment miss) keeps the snapshot's zeros; the
+// buffered deltas still apply to it. Identity fallbacks match the
+// DB-enriched path: a session whose user/tunnel/server rows are gone (or
+// whose backend_tunnel_id is 0) gets 'unknown' and 'Server #<tunnelID>'.
+// ConnectionName is the value captured at handshake from the authenticating
+// user_connection — the manager always knows it, so no fallback is needed.
+// Like the DB path, last_seen is accounting activity telemetry (the last
+// flush that moved counters), not transport-level liveness proof.
+func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	if s.db == nil {
+		return nil, errors.New("database not available")
+	}
+	if s.sessionMgr == nil {
+		return nil, errors.New("session manager not initialized")
+	}
+
+	snapshot := s.sessionMgr.ListActiveSessionsSnapshot()
+
+	out := make([]models.EnrichedVPNSession, 0, len(snapshot))
+	for i := range snapshot {
+		sess := snapshot[i]
+		out = append(out, models.EnrichedVPNSession{
+			ID:              sess.ID,
+			UserID:          sess.UserID,
+			Username:        "unknown",
+			BackendTunnelID: sess.BackendTunnelID,
+			ServerID:        0,
+			ServerName:      fmt.Sprintf("Server #%d", sess.BackendTunnelID),
+			PeerPublicKey:   sess.PeerPublicKey,
+			AssignedIP:      sess.AssignedIP,
+			ConnectedAt:     sess.ConnectedAt,
+			LastSeen:        sess.LastSeen,
+			RxBytes:         sess.RxBytes,
+			TxBytes:         sess.TxBytes,
+			Status:          sess.Status,
+			ConnectionName:  sess.ConnectionName,
+		})
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+
+	// Identity enrichment, single pass: username via the session's user,
+	// server identity via the session's backend tunnel. QMARK placeholders
+	// (modernc.org/sqlite).
+	ids := make([]string, 0, len(out))
+	seen := make(map[string]struct{}, len(out))
+	for i := range out {
+		if _, dup := seen[out[i].ID]; dup {
+			continue
+		}
+		seen[out[i].ID] = struct{}{}
+		ids = append(ids, out[i].ID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	query := `SELECT s.id, COALESCE(u.username, 'unknown') AS username,
+		COALESCE(t.server_id, 0) AS server_id,
+		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name,
+		COALESCE(s.rx_bytes, 0) AS rx_bytes, COALESCE(s.tx_bytes, 0) AS tx_bytes,
+		COALESCE(s.last_seen, '') AS last_seen
+		FROM vpn_sessions s
+		LEFT JOIN users u ON u.id = s.user_id
+		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
+		LEFT JOIN servers srv ON srv.id = t.server_id
+		WHERE s.id IN (` + placeholders + `)`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to enrich live vpn sessions: %w", err)
+	}
+	defer rows.Close()
+
+	type liveIdentity struct {
+		username   string
+		serverID   int64
+		serverName string
+		rxBytes    int64
+		txBytes    int64
+		lastSeen   time.Time
+	}
+	byID := make(map[string]liveIdentity, len(ids))
+	for rows.Next() {
+		var id string
+		var ident liveIdentity
+		var lastSeenStr string
+		if err := rows.Scan(&id, &ident.username, &ident.serverID, &ident.serverName,
+			&ident.rxBytes, &ident.txBytes, &lastSeenStr); err != nil {
+			return nil, fmt.Errorf("failed to scan live vpn session identity: %w", err)
+		}
+		if lastSeenStr != "" {
+			if ts, err := time.Parse(time.RFC3339, lastSeenStr); err == nil {
+				ident.lastSeen = ts
+			}
+		}
+		byID[id] = ident
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate live vpn session identities: %w", err)
+	}
+
+	// Misses (session row already torn down, or a DB hiccup mid-lifetime)
+	// keep the fallbacks set above — same COALESCE semantics as the
+	// DB-enriched read path. When the DB row exists it is authoritative for
+	// traffic and last_seen: the persisted counters are cumulative
+	// (Flush adds deltas via UpdateVPNSessionTraffic), and the snapshot's
+	// per-session counters never move in production, so seeding from the DB
+	// is what keeps the displayed total continuous across flushes. Rows
+	// without a DB row keep the snapshot's zero counters and in-memory
+	// last_seen; the buffered deltas are added below either way.
+	for i := range out {
+		if ident, ok := byID[out[i].ID]; ok {
+			out[i].Username = ident.username
+			out[i].ServerID = ident.serverID
+			out[i].ServerName = ident.serverName
+			out[i].RxBytes = ident.rxBytes
+			out[i].TxBytes = ident.txBytes
+			if !ident.lastSeen.IsZero() {
+				out[i].LastSeen = ident.lastSeen
+			}
+		}
+	}
+
+	return s.applyBufferedAccountantDeltas(out), nil
 }
 
 // GetBackends returns all registered backend tunnels.
@@ -2080,7 +2233,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID)
+	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name)
 	if err != nil {
 		_ = s.ipam.Release(peerPublicKey)
 		return nil, nil, fmt.Errorf("session creation failed: %w", err)

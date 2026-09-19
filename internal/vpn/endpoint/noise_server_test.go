@@ -336,7 +336,7 @@ func TestEndpointListenerHandshakeOverUDP(t *testing.T) {
 		}
 		// Allocate IP and create session just like HandleIncomingPeer
 		assignedIP, _ := el.IPAM().Allocate(peerPublicKey)
-		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1)
+		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1, "")
 		return sess, &models.BackendTunnel{ID: 1}, nil
 	})
 	if err := el.Start(ctx); err != nil {
@@ -583,7 +583,7 @@ func TestEndpointListenerHandshakeOverUDP_HeaderProtection(t *testing.T) {
 			return nil, nil, err
 		}
 		assignedIP, _ := el.IPAM().Allocate(peerPublicKey)
-		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1)
+		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1, "")
 		return sess, &models.BackendTunnel{ID: 1}, nil
 	})
 
@@ -692,7 +692,7 @@ func TestEndpointListenerHandshakeOverUDP_BackwardCompat_PlaintextPeer(t *testin
 			return nil, nil, err
 		}
 		assignedIP, _ := el.IPAM().Allocate(peerPublicKey)
-		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1)
+		sess, _ := el.SessionManager().CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), 1, "")
 		return sess, &models.BackendTunnel{ID: 1}, nil
 	})
 

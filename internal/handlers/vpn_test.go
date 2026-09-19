@@ -25,36 +25,76 @@ func TestVPNSessionsHandler(t *testing.T) {
 	t.Run("returns enriched sessions", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 
+		// SessionsLive is memory-authoritative: rows come from the session
+		// manager's in-memory connected set, NOT from vpn_sessions rows. A
+		// DB-seeded row alone never appears. Build a real (unstarted)
+		// service and create the session through its real entry point —
+		// the same path a live handshake takes (HandleIncomingPeer minus
+		// the UDP listener, which only Start() binds).
+		uID, err := db.CreateUser(ctx, &models.User{Username: "dave", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+		_, err = db.CreateConnection(ctx, &models.UserConnection{
+			UserID:   uID,
+			Protocol: "awg",
+			ClientID: "peer-handler",
+			Name:     "dave-phone",
+		})
+		if err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		vpnSvc, err := vpn.NewVPNService(db, &models.VPNConfig{
+			Algorithm:          models.LBLeastConnections,
+			ListenPort:         0,
+			SubnetCIDR:         "10.100.0.0/16",
+			MaxTotalPeers:      100,
+			MaxPeersPerBackend: 100,
+			Weights:            make(map[int64]int),
+		})
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		// Deterministic probe stub (same pattern as setupTestVPNService in
+		// internal/vpn): without it the real prober's first failed probe
+		// against the fake endpoint asynchronously flips the tunnel to
+		// degraded, racing HandleIncomingPeer ("no active backend tunnels").
+		vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			return 20 * time.Millisecond, nil
+		})
+		t.Cleanup(func() { _ = vpnSvc.Stop() })
+		h.vpnSvc = vpnSvc
+
+		// Backend registered the way production persists it: a server row
+		// plus an active backend tunnel that Start() syncs into the pool.
+		// The backend data plane is an in-memory VirtualTUN (no SSH, no
+		// real network); ListenPort 0 makes the endpoint bind a random UDP
+		// port, and Stop() releases it.
 		sID, err := db.CreateServer(ctx, &models.Server{Name: "Edge Node 9", Host: "198.51.100.19"})
 		if err != nil {
 			t.Fatalf("CreateServer failed: %v", err)
 		}
-		uID, err := db.CreateUser(ctx, &models.User{Username: "dave"})
-		if err != nil {
-			t.Fatalf("CreateUser failed: %v", err)
-		}
-		tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 			ServerID:      sID,
 			InterfaceName: "awg-be-9",
 			PublicKey:     "pubkey-be-9",
-			PrivateKey:    "privkey-be-9",
+			PrivateKey:    "cHJpdmtleS1iZS05cHJpdmtleS1iZS05",
 			Endpoint:      "198.51.100.19:51820",
-		})
-		if err != nil {
+			Status:        "active",
+		}); err != nil {
 			t.Fatalf("CreateBackendTunnel failed: %v", err)
 		}
-		if err := db.CreateVPNSession(ctx, &models.VPNSession{
-			ID:              "sess-handler",
-			UserID:          uID,
-			BackendTunnelID: tID,
-			PeerPublicKey:   "peer-handler",
-			AssignedIP:      "10.100.0.39",
-			RxBytes:         10,
-			TxBytes:         20,
-			Status:          "connected",
-		}); err != nil {
-			t.Fatalf("CreateVPNSession failed: %v", err)
+		if err := vpnSvc.Start(ctx); err != nil {
+			t.Fatalf("vpnSvc.Start failed: %v", err)
 		}
+
+		sess, _, err := vpnSvc.HandleIncomingPeer(ctx, "peer-handler")
+		if err != nil {
+			t.Fatalf("HandleIncomingPeer failed: %v", err)
+		}
+		sess.RxBytes = 10
+		sess.TxBytes = 20
 
 		r := setupFullVPNRouter(h)
 		w := httptest.NewRecorder()
@@ -79,8 +119,8 @@ func TestVPNSessionsHandler(t *testing.T) {
 		if row.ServerName != "Edge Node 9" {
 			t.Errorf("expected server_name 'Edge Node 9' from join, got %q", row.ServerName)
 		}
-		if row.AssignedIP != "10.100.0.39" {
-			t.Errorf("expected assigned_ip '10.100.0.39', got %q", row.AssignedIP)
+		if row.AssignedIP != "10.100.0.2" {
+			t.Errorf("expected assigned_ip '10.100.0.2' (first IPAM allocation through the real path), got %q", row.AssignedIP)
 		}
 	})
 

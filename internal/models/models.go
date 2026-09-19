@@ -295,6 +295,10 @@ type VPNSession struct {
 	RxBytes         int64     `json:"rx_bytes" db:"rx_bytes"`
 	TxBytes         int64     `json:"tx_bytes" db:"tx_bytes"`
 	Status          string    `json:"status" db:"status"` // connected, disconnected, draining
+	// ConnectionName is the user-facing config name (UserConnection.Name)
+	// resolved at handshake time. Legacy rows pre-dating the column carry ""
+	// and are never backfilled.
+	ConnectionName string `json:"connection_name" db:"connection_name"`
 }
 
 // EnrichedVPNSession is an active VPN session with identity joins resolved:
@@ -317,6 +321,9 @@ type EnrichedVPNSession struct {
 	RxBytes  int64     `json:"rx_bytes"`
 	TxBytes  int64     `json:"tx_bytes"`
 	Status   string    `json:"status"`
+	// ConnectionName is the user-facing config name captured at handshake;
+	// "unknown" when the underlying user_connection row is gone.
+	ConnectionName string `json:"connection_name"`
 }
 
 // VPNConfig stores dynamic configuration for the in-process VPN subsystem.

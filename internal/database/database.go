@@ -223,6 +223,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateBackendTunnelsProbePrivateKey(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateVPNSessionsConnectionName(ctx); err != nil {
+		return err
+	}
 	return d.migrateAWGIPAllocations(ctx)
 }
 
@@ -313,6 +316,44 @@ func (d *DB) migrateBackendTunnelsProbePrivateKey(ctx context.Context) error {
 	if !hasProbeKey {
 		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN probe_private_key TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("failed to add probe_private_key column: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateVPNSessionsConnectionName adds the connection_name column to
+// vpn_sessions on databases created before per-session connection config
+// names were tracked (issue #189 improvement round). The name is resolved
+// from the user_connection at handshake time and stored on the session row;
+// legacy rows start empty and are never backfilled (the config that a
+// historical session used is unknowable after the fact).
+func (d *DB) migrateVPNSessionsConnectionName(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(vpn_sessions)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect vpn_sessions schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasConnectionName := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "connection_name") {
+			hasConnectionName = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasConnectionName {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE vpn_sessions ADD COLUMN connection_name TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add connection_name column: %w", err)
 		}
 	}
 	return nil

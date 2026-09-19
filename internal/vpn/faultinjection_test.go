@@ -357,11 +357,11 @@ func TestRestartRacingReconcileGaugeOnly(t *testing.T) {
 
 	// Two real connected sessions.
 	svc.pool.IncrementConnections(tun.ID)
-	if _, err := svc.sessionMgr.CreateSession(ctx, uID, peerKey, "10.203.0.1", tun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(ctx, uID, peerKey, "10.203.0.1", tun.ID, ""); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	svc.pool.IncrementConnections(tun.ID)
-	sessB, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-restart-b", "10.203.0.2", tun.ID)
+	sessB, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-restart-b", "10.203.0.2", tun.ID, "")
 	if err != nil {
 		t.Fatalf("CreateSession b: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestDisconnectConcurrentWithFailover(t *testing.T) {
 			for i := 0; i < nPeers; i++ {
 				peer := fmt.Sprintf("peer-race-%d-%d", iter, i)
 				svc.pool.IncrementConnections(deadTun.ID)
-				if _, err := svc.sessionMgr.CreateSession(ctx, uID, peer, fmt.Sprintf("10.204.0.%d", i+1), deadTun.ID); err != nil {
+				if _, err := svc.sessionMgr.CreateSession(ctx, uID, peer, fmt.Sprintf("10.204.0.%d", i+1), deadTun.ID, ""); err != nil {
 					t.Fatalf("CreateSession %d: %v", i, err)
 				}
 				svc.stickyMgr.AssignPeerAffinity(peer, deadTun.ID)

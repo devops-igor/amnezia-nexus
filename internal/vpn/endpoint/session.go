@@ -94,7 +94,11 @@ func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
 // redirect live routes (issue #78 — every rekey previously leaked +1 on the
 // old backend's ActiveConnections gauge because neither the pool decrement
 // nor a teardown for the old ID ever ran).
-func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64) (*models.VPNSession, error) {
+// connectionName is the user-facing config name resolved by the caller's
+// authentication lookup; it is stored on the session (memory + DB row) and
+// deliberately carried onto every replacement of the same peer (a rekey
+// re-authenticates the same user_connection, so the fresh name is passed in).
+func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string) (*models.VPNSession, error) {
 	if userID == "" || peerPublicKey == "" || assignedIP == "" {
 		return nil, errors.New("missing required session fields")
 	}
@@ -147,6 +151,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 		RxBytes:         0,
 		TxBytes:         0,
 		Status:          "connected",
+		ConnectionName:  connectionName,
 	}
 
 	if sm.db != nil {
@@ -334,6 +339,25 @@ func (sm *SessionManager) ListActiveSessions() []*models.VPNSession {
 	for _, s := range sm.sessionsByID {
 		copySess := *s
 		result = append(result, &copySess)
+	}
+	return result
+}
+
+// ListActiveSessionsSnapshot returns value copies of all active sessions,
+// taken under sm.mu.RLock. Unlike ListActiveSessions (pointers to copies —
+// safe from manager mutation, but callers still share one struct per entry),
+// each element here is an independent copy, so the slice can be enriched and
+// rendered without any aliasing against the live set. This is the source of
+// truth for the memory-authoritative admin session table (issue #189
+// improvement round): the card count and the table rows are derived from the
+// same in-memory set by construction.
+func (sm *SessionManager) ListActiveSessionsSnapshot() []models.VPNSession {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	result := make([]models.VPNSession, 0, len(sm.sessionsByID))
+	for _, s := range sm.sessionsByID {
+		result = append(result, *s)
 	}
 	return result
 }

@@ -31,12 +31,12 @@ func TestSessionManagerCRUD(t *testing.T) {
 	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "user1"})
 
 	// Validation
-	if _, err := sm.CreateSession(ctx, "", "peer1", "10.100.0.2", tID); err == nil {
+	if _, err := sm.CreateSession(ctx, "", "peer1", "10.100.0.2", tID, ""); err == nil {
 		t.Errorf("expected error for missing userID")
 	}
 
 	// 1. Create Session
-	sess1, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID)
+	sess1, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession sess1 failed: %v", err)
 	}
@@ -113,11 +113,11 @@ func TestSessionManagerTimeoutsAndDrain(t *testing.T) {
 	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "user1"})
 	u2ID, _ := db.CreateUser(ctx, &models.User{Username: "user2"})
 
-	sess1, _ := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID)
-	_, _ = sm.CreateSession(ctx, u2ID, "peer2", "10.100.0.3", tID)
+	sess1, _ := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID, "")
+	_, _ = sm.CreateSession(ctx, u2ID, "peer2", "10.100.0.3", tID, "")
 
 	// Recreate with peer1 replaces old session
-	sess1New, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.4", tID)
+	sess1New, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.4", tID, "")
 	if err != nil {
 		t.Fatalf("Recreate peer1 session failed: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	peerKey := "reconnect-peer-pubkey-1"
 
 	// 1. Initial connection
-	sess1, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.15", tID)
+	sess1, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.15", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession 1 failed: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	}
 
 	// 2. Peer Reconnect (creates new session with new UUID for same peer key)
-	sess2, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.16", tID)
+	sess2, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.16", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession 2 failed: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestSessionManagerSnapshotByID(t *testing.T) {
 	})
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "snapshot_user"})
 
-	sess, err := sm.CreateSession(ctx, uID, "snapshot-peer", "10.100.0.20", tID)
+	sess, err := sm.CreateSession(ctx, uID, "snapshot-peer", "10.100.0.20", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
