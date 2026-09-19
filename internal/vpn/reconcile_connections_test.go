@@ -45,7 +45,7 @@ func TestReconcileConnectionCountsResetsStaleCounter(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if _, err := svc.sessionMgr.CreateSession(ctx, uID,
 			"peer-reconcile-"+string(rune('a'+i)),
-			"10.201.1."+strconv.Itoa(10+i), tun.ID); err != nil {
+			"10.201.1."+strconv.Itoa(10+i), tun.ID, ""); err != nil {
 			t.Fatalf("setup: CreateSession %d failed: %v", i, err)
 		}
 	}
@@ -87,7 +87,7 @@ func TestReconcileConnectionCountsZeroWhenNoSessions(t *testing.T) {
 	// One real session that gets disconnected BEFORE the reconcile: its row
 	// flips to disconnected, so the desired count is 0, not 1.
 	sess, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-reconcile-zero",
-		"10.201.1.20", tun.ID)
+		"10.201.1.20", tun.ID, "")
 	if err != nil {
 		t.Fatalf("setup: CreateSession failed: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestReconcileConnectionCountsNoDriftNoChange(t *testing.T) {
 	// Make the gauge TRUE: exactly one connected session.
 	svc.pool.IncrementConnections(tun.ID)
 	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-reconcile-ok",
-		"10.201.1.30", tun.ID); err != nil {
+		"10.201.1.30", tun.ID, ""); err != nil {
 		t.Fatalf("setup: CreateSession failed: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestReconcileConnectionCountsUnknownTunnelRefs(t *testing.T) {
 	}
 	svc.pool.IncrementConnections(tun.ID)
 	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-reconcile-known",
-		"10.201.1.42", tun.ID); err != nil {
+		"10.201.1.42", tun.ID, ""); err != nil {
 		t.Fatalf("setup: CreateSession failed: %v", err)
 	}
 

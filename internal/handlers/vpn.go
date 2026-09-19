@@ -35,6 +35,32 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSON(w, http.StatusOK, status)
 }
 
+// VPNSessionsHandler returns active VPN sessions enriched with user and
+// backend server identity (admin/support only; enforcement by the
+// RequireAdminOrSupport route middleware). (issue #189)
+// Row membership derives from the live session set (Service.SessionsLive):
+// the same in-memory connected set the active-sessions card counts, so the
+// card and the table agree by construction (issue #189 improvement round);
+// traffic and last_seen come from the accounting pipeline — DB cumulative
+// totals plus un-flushed buffered deltas, continuous across flushes.
+func (h *Handlers) VPNSessionsHandler(w http.ResponseWriter, r *http.Request) {
+	var sessions []models.EnrichedVPNSession
+	if h.vpnSvc != nil {
+		got, err := h.vpnSvc.SessionsLive(r.Context())
+		if err != nil {
+			// #nosec G706 -- Internal server audit log for failed session listing
+			log.Printf("[vpn/handlers] failed to list enriched sessions: %v", err)
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
+			return
+		}
+		sessions = got
+	}
+	if sessions == nil {
+		sessions = []models.EnrichedVPNSession{}
+	}
+	h.JSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
 // VPNBackendsHandler returns all configured VPN backend tunnels.
 func (h *Handlers) VPNBackendsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

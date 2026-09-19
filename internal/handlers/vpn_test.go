@@ -13,7 +13,152 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
+
+// TestVPNSessionsHandler covers the admin sessions endpoint (issues #189/#191):
+// rows come from Service.SessionsEnriched, management-only mode (nil vpn
+// service) must yield an empty JSON list, and a service error maps to 500.
+func TestVPNSessionsHandler(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns enriched sessions", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+
+		// SessionsLive is memory-authoritative: rows come from the session
+		// manager's in-memory connected set, NOT from vpn_sessions rows. A
+		// DB-seeded row alone never appears. Build a real (unstarted)
+		// service and create the session through its real entry point —
+		// the same path a live handshake takes (HandleIncomingPeer minus
+		// the UDP listener, which only Start() binds).
+		uID, err := db.CreateUser(ctx, &models.User{Username: "dave", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+		_, err = db.CreateConnection(ctx, &models.UserConnection{
+			UserID:   uID,
+			Protocol: "awg",
+			ClientID: "peer-handler",
+			Name:     "dave-phone",
+		})
+		if err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		vpnSvc, err := vpn.NewVPNService(db, &models.VPNConfig{
+			Algorithm:          models.LBLeastConnections,
+			ListenPort:         0,
+			SubnetCIDR:         "10.100.0.0/16",
+			MaxTotalPeers:      100,
+			MaxPeersPerBackend: 100,
+			Weights:            make(map[int64]int),
+		})
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		// Deterministic probe stub (same pattern as setupTestVPNService in
+		// internal/vpn): without it the real prober's first failed probe
+		// against the fake endpoint asynchronously flips the tunnel to
+		// degraded, racing HandleIncomingPeer ("no active backend tunnels").
+		vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			return 20 * time.Millisecond, nil
+		})
+		t.Cleanup(func() { _ = vpnSvc.Stop() })
+		h.vpnSvc = vpnSvc
+
+		// Backend registered the way production persists it: a server row
+		// plus an active backend tunnel that Start() syncs into the pool.
+		// The backend data plane is an in-memory VirtualTUN (no SSH, no
+		// real network); ListenPort 0 makes the endpoint bind a random UDP
+		// port, and Stop() releases it.
+		sID, err := db.CreateServer(ctx, &models.Server{Name: "Edge Node 9", Host: "198.51.100.19"})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+		if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      sID,
+			InterfaceName: "awg-be-9",
+			PublicKey:     "pubkey-be-9",
+			PrivateKey:    "cHJpdmtleS1iZS05cHJpdmtleS1iZS05",
+			Endpoint:      "198.51.100.19:51820",
+			Status:        "active",
+		}); err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
+		if err := vpnSvc.Start(ctx); err != nil {
+			t.Fatalf("vpnSvc.Start failed: %v", err)
+		}
+
+		sess, _, err := vpnSvc.HandleIncomingPeer(ctx, "peer-handler")
+		if err != nil {
+			t.Fatalf("HandleIncomingPeer failed: %v", err)
+		}
+		sess.RxBytes = 10
+		sess.TxBytes = 20
+
+		r := setupFullVPNRouter(h)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		var got struct {
+			Sessions []models.EnrichedVPNSession `json:"sessions"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("failed to decode response: %v (body: %s)", err, w.Body.String())
+		}
+		if len(got.Sessions) != 1 {
+			t.Fatalf("expected 1 session row, got %d: %+v", len(got.Sessions), got.Sessions)
+		}
+		row := got.Sessions[0]
+		if row.Username != "dave" {
+			t.Errorf("expected username 'dave' from join, got %q", row.Username)
+		}
+		if row.ServerName != "Edge Node 9" {
+			t.Errorf("expected server_name 'Edge Node 9' from join, got %q", row.ServerName)
+		}
+		if row.AssignedIP != "10.100.0.2" {
+			t.Errorf("expected assigned_ip '10.100.0.2' (first IPAM allocation through the real path), got %q", row.AssignedIP)
+		}
+	})
+
+	t.Run("nil vpn service returns empty list", func(t *testing.T) {
+		_, db, cfg := setupTestHandlers(t)
+		hNil := NewHandlers(Dependencies{Config: cfg, DB: db})
+		r := setupFullVPNRouter(hNil)
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 in management-only mode, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, `"sessions":[]`) {
+			t.Errorf("expected empty JSON list (not null), got: %s", body)
+		}
+	})
+
+	t.Run("service error maps to 500", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		// Zero-value service has no DB backing, so SessionsEnriched fails;
+		// construction starts nothing, so this stays a pure test double.
+		h.vpnSvc = &vpn.Service{}
+
+		r := setupFullVPNRouter(h)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/vpn/sessions", nil))
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "internal_error") {
+			t.Errorf("expected internal_error code, got: %s", w.Body.String())
+		}
+	})
+}
 
 func TestVPNHandlers(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)

@@ -41,7 +41,7 @@ func TestHeartbeatLoopInvokesReaperHook(t *testing.T) {
 	defer func() { _ = el.Stop() }()
 
 	// A session that goes idle must be reaped and handed to the hook.
-	if _, err := sm.CreateSession(ctx, "u-idle", "peer-idle", "10.77.0.1", 1); err != nil {
+	if _, err := sm.CreateSession(ctx, "u-idle", "peer-idle", "10.77.0.1", 1, ""); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 

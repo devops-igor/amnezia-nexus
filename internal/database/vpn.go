@@ -247,7 +247,7 @@ func (d *DB) GetVPNSessionByPeerKey(ctx context.Context, key string) (*models.VP
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
-		connected_at, last_seen, rx_bytes, tx_bytes, status
+		connected_at, last_seen, rx_bytes, tx_bytes, status, connection_name
 		FROM vpn_sessions WHERE peer_public_key = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, key)
@@ -267,7 +267,7 @@ func (d *DB) GetVPNSessionByID(ctx context.Context, id string) (*models.VPNSessi
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
-		connected_at, last_seen, rx_bytes, tx_bytes, status
+		connected_at, last_seen, rx_bytes, tx_bytes, status, connection_name
 		FROM vpn_sessions WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -287,7 +287,7 @@ func (d *DB) GetVPNSessionsByUserID(ctx context.Context, userID string) ([]model
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
-		connected_at, last_seen, rx_bytes, tx_bytes, status
+		connected_at, last_seen, rx_bytes, tx_bytes, status, connection_name
 		FROM vpn_sessions WHERE user_id = ? ORDER BY connected_at DESC`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query, userID)
@@ -388,8 +388,8 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 
 	query := `INSERT INTO vpn_sessions (
 		id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
-		connected_at, last_seen, rx_bytes, tx_bytes, status
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		connected_at, last_seen, rx_bytes, tx_bytes, status, connection_name
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(peer_public_key) DO UPDATE SET
 		id = excluded.id,
 		user_id = excluded.user_id,
@@ -399,7 +399,8 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 		last_seen = excluded.last_seen,
 		rx_bytes = excluded.rx_bytes,
 		tx_bytes = excluded.tx_bytes,
-		status = excluded.status`
+		status = excluded.status,
+		connection_name = excluded.connection_name`
 
 	_, err := d.sqlDB.ExecContext(ctx, query,
 		s.ID,
@@ -412,6 +413,7 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 		s.RxBytes,
 		s.TxBytes,
 		s.Status,
+		s.ConnectionName,
 	)
 
 	if err != nil {
@@ -421,13 +423,18 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	return nil
 }
 
-// UpdateVPNSessionTraffic updates session bytes in/out and last seen timestamp.
+// UpdateVPNSessionTraffic adds the given rx/tx DELTAS to the session's
+// stored counters and refreshes last_seen to now. Row values are therefore
+// cumulative-since-connect: each call increments rx_bytes and tx_bytes by
+// its arguments rather than overwriting them (review-2 P1, issue #205).
+// The single production caller is TrafficAccountant.Flush, which passes
+// per-window deltas drained from its buffers.
 func (d *DB) UpdateVPNSessionTraffic(ctx context.Context, sessionID string, rx, tx int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE vpn_sessions SET rx_bytes = ?, tx_bytes = ?, last_seen = ? WHERE id = ?`
+	query := `UPDATE vpn_sessions SET rx_bytes = rx_bytes + ?, tx_bytes = tx_bytes + ?, last_seen = ? WHERE id = ?`
 
 	_, err := d.sqlDB.ExecContext(ctx, query, rx, tx, nowStr, sessionID)
 	if err != nil {
@@ -464,7 +471,7 @@ func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, err
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, user_id, backend_tunnel_id, peer_public_key, assigned_ip,
-		connected_at, last_seen, rx_bytes, tx_bytes, status
+		connected_at, last_seen, rx_bytes, tx_bytes, status, connection_name
 		FROM vpn_sessions WHERE status = 'connected' ORDER BY connected_at DESC`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -478,6 +485,55 @@ func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, err
 		s, err := d.scanVPNSession(rows)
 		if err != nil {
 			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+
+	return sessions, rows.Err()
+}
+
+// GetEnrichedActiveVPNSessions returns all currently connected sessions with
+// identity joins resolved: username from users, server identity via
+// backend_tunnels -> servers. Rows whose joins miss fall back to 'unknown'
+// and 'Server #<id>'. Read-path only (issue #189).
+func (d *DB) GetEnrichedActiveVPNSessions(ctx context.Context) ([]models.EnrichedVPNSession, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `SELECT s.id, s.user_id, COALESCE(u.username, 'unknown') AS username,
+		s.backend_tunnel_id, COALESCE(t.server_id, 0) AS server_id,
+		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name,
+		s.peer_public_key, s.assigned_ip, s.connected_at, s.last_seen,
+		s.rx_bytes, s.tx_bytes, s.status, s.connection_name
+		FROM vpn_sessions s
+		LEFT JOIN users u ON u.id = s.user_id
+		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
+		LEFT JOIN servers srv ON srv.id = t.server_id
+		WHERE s.status = 'connected'
+		ORDER BY s.connected_at DESC`
+
+	rows, err := d.sqlDB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query enriched active vpn sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []models.EnrichedVPNSession
+	for rows.Next() {
+		var s models.EnrichedVPNSession
+		var connectedAt, lastSeen sql.NullString
+		if err := rows.Scan(
+			&s.ID, &s.UserID, &s.Username, &s.BackendTunnelID, &s.ServerID,
+			&s.ServerName, &s.PeerPublicKey, &s.AssignedIP, &connectedAt, &lastSeen,
+			&s.RxBytes, &s.TxBytes, &s.Status, &s.ConnectionName,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan enriched vpn session: %w", err)
+		}
+		if connectedAt.Valid && connectedAt.String != "" {
+			s.ConnectedAt = parseTime(connectedAt.String)
+		}
+		if lastSeen.Valid && lastSeen.String != "" {
+			s.LastSeen = parseTime(lastSeen.String)
 		}
 		sessions = append(sessions, s)
 	}
@@ -565,6 +621,7 @@ func (d *DB) scanVPNSession(s scannable) (models.VPNSession, error) {
 		&v.RxBytes,
 		&v.TxBytes,
 		&v.Status,
+		&v.ConnectionName,
 	)
 	if err != nil {
 		return v, err

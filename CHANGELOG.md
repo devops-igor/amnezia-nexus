@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - Polaris - 2026-09-19
+
+Feature release introducing admin load balancer session visibility, revocable user sessions with session versioning, atomic IP allocation for AmneziaWG clients, remote command shell escaping, and header protection range exclusivity.
+
+### Added
+
+- Admin load balancer session visibility: real-time visibility into active user sessions across backend servers, memory-authoritative session tracking, connection configuration display, monotonic traffic accounting, and peer public key identity resolution (#189, #204, #210, #214).
+- Revocable user sessions: per-user session version tracking to instantly invalidate active sessions on password change, along with a dedicated logout-all endpoint (#97, #169).
+- Atomic IP allocation: dedicated allocation table with concurrency locking and transaction safety to eliminate duplicate IP provisioning under concurrent requests (#126, #172).
+
+### Security
+
+- Remote command sanitization: strict shell escaping and argument validation across remote SSH and Docker execution boundaries (#124, #170).
+- AmneziaWG header validation: enforced mutual exclusivity across H1-H4 header ranges to prevent fallback to un-obfuscated WireGuard headers (#127, #168).
+
+### Changed
+
+- Increased user management cards per page from 10 to 12 for three-column grid layouts (#176, #178).
+- Removed deprecated and non-functional Connection Kit feature (#179, #187).
+
 ## [1.1.4] - Aurora - 2026-09-16
 
 Amnezia Nexus 1.1.4 ("Aurora") is a patch release optimizing upstream packet forwarding

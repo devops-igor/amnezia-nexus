@@ -295,6 +295,35 @@ type VPNSession struct {
 	RxBytes         int64     `json:"rx_bytes" db:"rx_bytes"`
 	TxBytes         int64     `json:"tx_bytes" db:"tx_bytes"`
 	Status          string    `json:"status" db:"status"` // connected, disconnected, draining
+	// ConnectionName is the user-facing config name (UserConnection.Name)
+	// resolved at handshake time. Legacy rows pre-dating the column carry ""
+	// and are never backfilled.
+	ConnectionName string `json:"connection_name" db:"connection_name"`
+}
+
+// EnrichedVPNSession is an active VPN session with identity joins resolved:
+// username from users, backend tunnel and server identity from backend
+// tunnels and servers. Read-path only; used by the admin sessions view
+// (issue #189).
+type EnrichedVPNSession struct {
+	ID              string    `json:"id"`
+	UserID          string    `json:"user_id"`
+	Username        string    `json:"username"`
+	BackendTunnelID int64     `json:"backend_tunnel_id"`
+	ServerID        int64     `json:"server_id"`
+	ServerName      string    `json:"server_name"`
+	PeerPublicKey   string    `json:"peer_public_key"`
+	AssignedIP      string    `json:"assigned_ip"`
+	ConnectedAt     time.Time `json:"connected_at"`
+	// LastSeen is the last accounted traffic activity visible via the
+	// accountant flush; not transport-level peer liveness (review-2 P2).
+	LastSeen time.Time `json:"last_seen"`
+	RxBytes  int64     `json:"rx_bytes"`
+	TxBytes  int64     `json:"tx_bytes"`
+	Status   string    `json:"status"`
+	// ConnectionName is the user-facing config name captured at handshake;
+	// "unknown" when the underlying user_connection row is gone.
+	ConnectionName string `json:"connection_name"`
 }
 
 // VPNConfig stores dynamic configuration for the in-process VPN subsystem.

@@ -50,7 +50,7 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 	if oldTun.ActiveConnections != 1 {
 		t.Fatalf("setup: expected 1 active connection, got %d", oldTun.ActiveConnections)
 	}
-	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-1", "10.200.0.1", oldTun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-1", "10.200.0.1", oldTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 	sess, ok := svc.sessionMgr.GetSession("peer-pool-1")
@@ -66,7 +66,7 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 
 	// Path 2: DisconnectUser
 	svc.pool.IncrementConnections(oldTun.ID)
-	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-2", "10.200.0.2", oldTun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-2", "10.200.0.2", oldTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 	if err := svc.DisconnectUser(t.Context(), uID); err != nil {
@@ -78,7 +78,7 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 
 	// Path 3: ReleaseClient
 	svc.pool.IncrementConnections(oldTun.ID)
-	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-3", "10.200.0.3", oldTun.ID); err != nil {
+	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-3", "10.200.0.3", oldTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 	if err := svc.ReleaseClient(t.Context(), "peer-pool-3"); err != nil {

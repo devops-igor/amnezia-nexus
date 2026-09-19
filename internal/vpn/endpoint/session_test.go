@@ -31,12 +31,12 @@ func TestSessionManagerCRUD(t *testing.T) {
 	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "user1"})
 
 	// Validation
-	if _, err := sm.CreateSession(ctx, "", "peer1", "10.100.0.2", tID); err == nil {
+	if _, err := sm.CreateSession(ctx, "", "peer1", "10.100.0.2", tID, ""); err == nil {
 		t.Errorf("expected error for missing userID")
 	}
 
 	// 1. Create Session
-	sess1, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID)
+	sess1, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession sess1 failed: %v", err)
 	}
@@ -113,11 +113,11 @@ func TestSessionManagerTimeoutsAndDrain(t *testing.T) {
 	u1ID, _ := db.CreateUser(ctx, &models.User{Username: "user1"})
 	u2ID, _ := db.CreateUser(ctx, &models.User{Username: "user2"})
 
-	sess1, _ := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID)
-	_, _ = sm.CreateSession(ctx, u2ID, "peer2", "10.100.0.3", tID)
+	sess1, _ := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.2", tID, "")
+	_, _ = sm.CreateSession(ctx, u2ID, "peer2", "10.100.0.3", tID, "")
 
 	// Recreate with peer1 replaces old session
-	sess1New, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.4", tID)
+	sess1New, err := sm.CreateSession(ctx, u1ID, "peer1", "10.100.0.4", tID, "")
 	if err != nil {
 		t.Fatalf("Recreate peer1 session failed: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	peerKey := "reconnect-peer-pubkey-1"
 
 	// 1. Initial connection
-	sess1, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.15", tID)
+	sess1, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.15", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession 1 failed: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	}
 
 	// 2. Peer Reconnect (creates new session with new UUID for same peer key)
-	sess2, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.16", tID)
+	sess2, err := sm.CreateSession(ctx, uID, peerKey, "10.100.0.16", tID, "")
 	if err != nil {
 		t.Fatalf("CreateSession 2 failed: %v", err)
 	}
@@ -274,5 +274,57 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	}
 	if updatedDBSess.RxBytes != 4096 || updatedDBSess.TxBytes != 8192 {
 		t.Errorf("traffic mismatch: rx=%d, tx=%d", updatedDBSess.RxBytes, updatedDBSess.TxBytes)
+	}
+}
+
+// TestSessionManagerSnapshotByID verifies the copy-under-lock accessor:
+// the returned struct is a detached snapshot whose mutation never leaks
+// into manager state, and unknown IDs report not-found. Review rework for
+// issue #189 (safe accessor for future readers; issue #205 will likely
+// need it too).
+func TestSessionManagerSnapshotByID(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sm := NewSessionManager(db, nil)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "snapshot_user"})
+
+	sess, err := sm.CreateSession(ctx, uID, "snapshot-peer", "10.100.0.20", tID, "")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	got, ok := sm.GetSessionSnapshotByID(sess.ID)
+	if !ok {
+		t.Fatalf("GetSessionSnapshotByID: session %s not found", sess.ID)
+	}
+	if got.ID != sess.ID || got.PeerPublicKey != "snapshot-peer" || got.Status != "connected" {
+		t.Errorf("snapshot fields mismatch: %+v", got)
+	}
+
+	// Mutating the snapshot must not touch the manager's stored session.
+	got.RxBytes = 123456
+	got.TxBytes = 654321
+	got.Status = "disconnected"
+
+	again, ok := sm.GetSessionSnapshotByID(sess.ID)
+	if !ok {
+		t.Fatalf("second GetSessionSnapshotByID: session %s not found", sess.ID)
+	}
+	if again.RxBytes != 0 || again.TxBytes != 0 || again.Status != "connected" {
+		t.Errorf("snapshot mutation leaked into manager state: %+v", again)
+	}
+
+	if _, ok := sm.GetSessionSnapshotByID("ghost-id"); ok {
+		t.Errorf("expected ghost id to not be found")
 	}
 }
