@@ -32,8 +32,6 @@ type AWGClientUserData struct {
 	PSK                    string       `json:"psk,omitempty"`
 	Enabled                bool         `json:"enabled"`
 	AWGMimicry             string       `json:"awg_mimicry,omitempty"`
-	SpeedLimitDown         *int         `json:"speed_limit_down,omitempty"`
-	SpeedLimitUp           *int         `json:"speed_limit_up,omitempty"`
 	LatestHandshake        string       `json:"latestHandshake,omitempty"`
 	DataReceived           string       `json:"dataReceived,omitempty"`
 	DataSent               string       `json:"dataSent,omitempty"`

@@ -241,47 +241,6 @@
             </button>
         </div>
     </div>
-
-    <!-- AWG Speed Limit Settings -->
-    <div class="card" id="awgSpeedLimitSettingsCard" style="width:100%;">
-        <div class="card-title">{{ _ "awg_speed_limit_settings" }}</div>
-        <div class="card-subtitle" style="margin-bottom: var(--space-md);">
-            {{ _ "global_pool_hint" }}
-        </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md); margin-bottom: var(--space-lg);">
-            <div class="form-group" style="margin-bottom: 0;">
-                <label class="form-label" style="white-space: nowrap;">{{ _ "global_speed_limit_down" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="globalSpeedLimitDown" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-            <div class="form-group" style="margin-bottom: 0;">
-                <label class="form-label" style="white-space: nowrap;">{{ _ "global_speed_limit_up" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="globalSpeedLimitUp" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-        </div>
-        <div class="divider" style="margin-bottom: var(--space-md);"></div>
-        <div class="card-subtitle" style="margin-bottom: var(--space-md);">
-            {{ _ "default_limit_hint" }}
-        </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md); margin-bottom: var(--space-lg);">
-            <div class="form-group" style="margin-bottom: 0;">
-                <label class="form-label" style="white-space: nowrap;">{{ _ "default_speed_limit_down" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="defaultSpeedLimitDown" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-            <div class="form-group" style="margin-bottom: 0;">
-                <label class="form-label" style="white-space: nowrap;">{{ _ "default_speed_limit_up" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="defaultSpeedLimitUp" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-        </div>
-        <div class="flex gap-sm">
-            <button class="btn btn-primary" onclick="saveAwgSpeedLimitConfig()" style="flex:1; min-width:0;" id="saveAwgSpeedLimitBtn">
-                {{ _ "save" }}
-            </button>
-            <button class="btn btn-secondary" onclick="applyDefaultSpeedLimits()" style="flex:1; min-width:0;" id="applyDefaultSpeedLimitBtn">
-                {{ _ "apply_to_all" }}
-            </button>
-        </div>
-        <div id="awgSpeedLimitStatus" style="margin-top: var(--space-sm); text-align: center; font-size: 0.85rem;"></div>
-    </div>
 </div>
 
 <!-- Connections Section -->
@@ -321,7 +280,6 @@
                         <th class="sortable" data-sort-type="string">IP / Endpoint</th>
                         <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
                         <th class="sortable" data-sort-type="bytes">Rx / Tx</th>
-                        <th class="sortable" data-sort-type="numeric">{{ _ "speed_limit_down" }}</th>
                         <th data-sortable="false" style="text-align: right;">{{ _ "actions" }}</th>
                     </tr>
                 </thead>
@@ -474,55 +432,12 @@
             </div>
         </div>
 
-        <div id="awgSpeedLimitOptions"
-            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
-            <div class="form-group">
-                <label class="form-label">{{ _ "speed_limit_down" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="awgSpeedLimitDown" placeholder="{{ _ "empty_unlimited" }}" min="0">
-                <div class="form-hint">{{ _ "speed_limit_down_hint" }}</div>
-            </div>
-            <div class="form-group">
-                <label class="form-label">{{ _ "speed_limit_up" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="awgSpeedLimitUp" placeholder="{{ _ "empty_unlimited" }}" min="0">
-                <div class="form-hint">{{ _ "speed_limit_up_hint" }}</div>
-            </div>
-        </div>
-
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('addConnectionModal')">{{ _ "cancel" }}</button>
             <button class="btn btn-primary" onclick="addConnection()" id="addConnBtn">
                 <span id="addConnBtnText">{{ _ "create" }}</span>
                 <div class="spinner hidden" id="addConnSpinner"></div>
             </button>
-        </div>
-    </div>
-</div>
-
-<!-- ===== Edit Speed Limit Modal ===== -->
-<div class="modal-backdrop" id="editSpeedLimitModal">
-    <div class="modal" style="max-width: 400px;">
-        <div class="modal-header">
-            <h2 class="modal-title">{{ _ "edit_speed_limit" }}</h2>
-            <button class="modal-close" onclick="closeModal('editSpeedLimitModal')" aria-label="{{ _ "cancel" }}">
-                <svg class="icon"><use href="#icon-x"></use></svg>
-            </button>
-        </div>
-        <div style="padding: var(--space-md) 0;">
-            <div class="form-group">
-                <label class="form-label">{{ _ "speed_limit_down" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="editSpeedLimitDown" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-            <div class="form-group">
-                <label class="form-label">{{ _ "speed_limit_up" }} ({{ _ "mbps" }})</label>
-                <input class="form-input" type="number" id="editSpeedLimitUp" placeholder="{{ _ "empty_unlimited" }}" min="0">
-            </div>
-        </div>
-        <div class="flex gap-sm" style="padding-bottom: var(--space-md);">
-            <button class="btn btn-danger" onclick="clearSpeedLimits()" style="flex:1;">{{ _ "remove_limits" }}</button>
-            <button class="btn btn-primary" onclick="saveSpeedLimits()" style="flex:1;">{{ _ "save" }}</button>
-        </div>
-        <div style="padding-bottom: var(--space-sm);">
-            <button class="btn btn-secondary" onclick="closeModal('editSpeedLimitModal')" style="width:100%;">{{ _ "cancel" }}</button>
         </div>
     </div>
 </div>
@@ -1322,25 +1237,13 @@
                     `;
                 }
 
-                // Speed limit column
-                let speedHtml = '';
-                let speedNumeric = 0;
-                if (proto === 'awg' && (userData.speed_limit_down || userData.speed_limit_up)) {
-                    const down = userData.speed_limit_down;
-                    const up = userData.speed_limit_up;
-                    speedNumeric = Math.max(down || 0, up || 0);
-                    const parts = [];
-                    if (down) parts.push(`↓${down}`);
-                    if (up) parts.push(`↑${up}`);
-                    speedHtml = `<span class="badge badge-warn" style="font-size:0.7rem;">⚡ ${parts.join(' ')} Mbps</span>`;
-                } else if (proto === 'telemt' && userData.quota) {
-                    speedHtml = `<span class="badge" style="font-size:0.7rem;">Quota: ${UI.escapeHtml(UI.formatBytes(userData.quota))}</span>`;
-                } else {
-                    speedHtml = `<span class="text-muted" style="font-size:0.8rem;">—</span>`;
+                // Quota badge (telemt quota shares the traffic column)
+                let quotaHtml = `<span class="text-muted" style="font-size:0.8rem;">—</span>`;
+                if (proto === 'telemt' && userData.quota) {
+                    quotaHtml = `<span class="badge" style="font-size:0.7rem;">Quota: ${UI.escapeHtml(UI.formatBytes(userData.quota))}</span>`;
                 }
 
                 const toggleTitle = enabled ? _('stop') : _('starting');
-                const awgSpeedBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="openEditSpeedLimitModal(this.dataset.cid)" title="${_('edit_speed_limit')}"><svg class="icon"><use href="#icon-settings"></use></svg></button>` : '';
                 const awgRotateBtn = proto === 'awg' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="rotateClientMimicry(this.dataset.cid)" title="${_('rotate_profile')}"><svg class="icon"><use href="#icon-refresh"></use></svg></button>` : '';
 
                 const tr = document.createElement('tr');
@@ -1363,8 +1266,7 @@
                         <code style="font-size:0.8rem; font-family:var(--font-mono, monospace);">${UI.escapeHtml(clientIp)}</code>
                     </td>
                     <td>${statusHtml}</td>
-                    <td data-sort-val="${numericBytes}">${trafficHtml}</td>
-                    <td data-sort-val="${speedNumeric}">${speedHtml}</td>
+                    <td data-sort-val="${numericBytes}">${trafficHtml}${quotaHtml !== `<span class="text-muted" style="font-size:0.8rem;">—</span>` ? ' ' + quotaHtml : ''}</td>
                     <td data-searchable="false" style="text-align: right;">
                         <div class="client-actions">
                             <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" onclick="copyConnectionConfig(this.dataset.cid, this.dataset.cname, this)" title="${_('copy')}">
@@ -1373,7 +1275,6 @@
                             <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" data-haskey="${!!userData.clientPrivateKey || proto === 'telemt'}" onclick="showConnectionConfig(this.dataset.cid, this.dataset.cname, this.dataset.haskey === 'true')" title="${_('config')}">
                                 <svg class="icon"><use href="#icon-file-text"></use></svg>
                             </button>
-                            ${awgSpeedBtn}
                             ${awgRotateBtn}
                             ${proto === 'telemt' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>` : ''}
                             <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
@@ -1460,10 +1361,6 @@
                 params.name = connName || 'Connection';
             }
             if (proto === 'awg') {
-                const downVal = document.getElementById('awgSpeedLimitDown').value;
-                const upVal = document.getElementById('awgSpeedLimitUp').value;
-                if (downVal !== '' && downVal !== null) params.awg_speed_limit_down = parseInt(downVal) || null;
-                if (upVal !== '' && upVal !== null) params.awg_speed_limit_up = parseInt(upVal) || null;
                 const mimicrySelect = document.getElementById('awgMimicryProfile');
                 if (mimicrySelect && mimicrySelect.value) {
                     params.awg_mimicry = mimicrySelect.value;
@@ -1514,7 +1411,6 @@
         isEditingConn = isEdit;
         const proto = document.getElementById('connProtoSelect').value;
         const telemtOpts = document.getElementById('telemtConnOptions');
-        const awgSpeedOpts = document.getElementById('awgSpeedLimitOptions');
         const awgMimicryOpts = document.getElementById('awgMimicryOptions');
 
         document.getElementById('addConnectionModalTitle').textContent = isEdit ? _('edit_connection') : _('add_connection');
@@ -1524,15 +1420,11 @@
         document.getElementById('connectionUserId').value = (isEdit && clientData && clientData.assigned_user_id) ? clientData.assigned_user_id : '';
 
         if (proto === 'awg') {
-            awgSpeedOpts.style.display = 'block';
             if (awgMimicryOpts) awgMimicryOpts.style.display = isEdit ? 'none' : 'block';
             if (!isEdit) {
-                document.getElementById('awgSpeedLimitDown').value = '';
-                document.getElementById('awgSpeedLimitUp').value = '';
                 if (document.getElementById('awgMimicryProfile')) document.getElementById('awgMimicryProfile').value = 'auto';
             }
         } else {
-            awgSpeedOpts.style.display = 'none';
             if (awgMimicryOpts) awgMimicryOpts.style.display = 'none';
         }
 
@@ -1744,147 +1636,6 @@
         }
     });
 
-    let editingSpeedLimitClientId = null;
-
-    function openEditSpeedLimitModal(clientId) {
-        editingSpeedLimitClientId = clientId;
-        const userData = window.connectionsStore[clientId] || {};
-        document.getElementById('editSpeedLimitDown').value = userData.speed_limit_down || '';
-        document.getElementById('editSpeedLimitUp').value = userData.speed_limit_up || '';
-        openModal('editSpeedLimitModal', '#editSpeedLimitDown');
-    }
-
-    async function saveSpeedLimits() {
-        if (!editingSpeedLimitClientId) return;
-        const downVal = document.getElementById('editSpeedLimitDown').value;
-        const upVal = document.getElementById('editSpeedLimitUp').value;
-        const speed_down = (downVal !== '' && downVal !== null) ? parseInt(downVal) : null;
-        const speed_up = (upVal !== '' && upVal !== null) ? parseInt(upVal) : null;
-        try {
-            await API.patch(`/api/servers/${SERVER_ID}/connections/speed-limit`, {
-                client_id: editingSpeedLimitClientId,
-                speed_limit_down: speed_down,
-                speed_limit_up: speed_up,
-            });
-            UI.toast(_('connection_updated'), 'success');
-            closeModal('editSpeedLimitModal');
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function clearSpeedLimits() {
-        if (!editingSpeedLimitClientId) return;
-        try {
-            await API.patch(`/api/servers/${SERVER_ID}/connections/speed-limit`, {
-                client_id: editingSpeedLimitClientId,
-                speed_limit_down: null,
-                speed_limit_up: null,
-            });
-            UI.toast(_('connection_updated'), 'success');
-            closeModal('editSpeedLimitModal');
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function loadAwgSpeedLimitConfig() {
-        try {
-            const data = await API.get(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, { silent: true });
-            document.getElementById('globalSpeedLimitDown').value = (data.global_speed_limit_down != null) ? data.global_speed_limit_down : '';
-            document.getElementById('globalSpeedLimitUp').value = (data.global_speed_limit_up != null) ? data.global_speed_limit_up : '';
-            document.getElementById('defaultSpeedLimitDown').value = (data.default_speed_limit_down != null) ? data.default_speed_limit_down : '';
-            document.getElementById('defaultSpeedLimitUp').value = (data.default_speed_limit_up != null) ? data.default_speed_limit_up : '';
-        } catch (err) {
-            console.warn('Could not load AWG speed limit config:', err.message);
-        }
-    }
-
-    async function saveAwgSpeedLimitConfig() {
-        const btn = document.getElementById('saveAwgSpeedLimitBtn');
-        const statusEl = document.getElementById('awgSpeedLimitStatus');
-        const globalDown = document.getElementById('globalSpeedLimitDown').value;
-        const globalUp = document.getElementById('globalSpeedLimitUp').value;
-        const defaultDown = document.getElementById('defaultSpeedLimitDown').value;
-        const defaultUp = document.getElementById('defaultSpeedLimitUp').value;
-        
-        const payload = {
-            global_speed_limit_down: (globalDown !== '') ? parseInt(globalDown) : null,
-            global_speed_limit_up: (globalUp !== '') ? parseInt(globalUp) : null,
-            default_speed_limit_down: (defaultDown !== '') ? parseInt(defaultDown) : null,
-            default_speed_limit_up: (defaultUp !== '') ? parseInt(defaultUp) : null,
-        };
-        
-        btn.disabled = true;
-        btn.textContent = '...';
-        
-        try {
-            await API.patch(`/api/servers/${SERVER_ID}/awg/speed-limit-config`, payload);
-            statusEl.textContent = _('speed_limit_config_saved');
-            statusEl.style.color = 'var(--success)';
-            UI.toast(_('speed_limit_config_saved'), 'success');
-            setTimeout(() => { statusEl.textContent = ''; }, 3000);
-        } catch (err) {
-            statusEl.textContent = _('speed_limit_config_error');
-            statusEl.style.color = 'var(--danger)';
-            UI.toast(_('speed_limit_config_error') + ': ' + err.message, 'error');
-            setTimeout(() => { statusEl.textContent = ''; }, 5000);
-        } finally {
-            btn.disabled = false;
-            btn.textContent = _('save');
-        }
-    }
-
-    async function applyDefaultSpeedLimits() {
-        const defaultDown = document.getElementById('defaultSpeedLimitDown').value;
-        const defaultUp = document.getElementById('defaultSpeedLimitUp').value;
-        
-        if (defaultDown === '' && defaultUp === '') {
-            document.getElementById('awgSpeedLimitStatus').textContent = _('apply_to_all_error');
-            document.getElementById('awgSpeedLimitStatus').style.color = 'var(--danger)';
-            UI.toast(_('apply_to_all_error'), 'error');
-            return;
-        }
-        
-        const msg = _('apply_to_all_confirm').replace('{down}', defaultDown || '∞').replace('{up}', defaultUp || '∞');
-        const confirmed = await UI.confirm({
-            title: _('apply_to_all') || 'Apply to All',
-            message: msg,
-            confirmText: 'Apply',
-            confirmVariant: 'primary'
-        });
-        if (!confirmed) return;
-        
-        const btn = document.getElementById('applyDefaultSpeedLimitBtn');
-        const statusEl = document.getElementById('awgSpeedLimitStatus');
-        btn.disabled = true;
-        btn.textContent = '...';
-        
-        try {
-            const result = await API.post(`/api/servers/${SERVER_ID}/awg/apply-default-speed-limits`, {});
-            if (result.errors && result.errors.length > 0) {
-                statusEl.textContent = _('apply_to_all_partial').replace('{applied}', result.applied).replace('{errors}', result.errors.length);
-                statusEl.style.color = 'var(--warning)';
-            } else {
-                statusEl.textContent = _('apply_to_all_success').replace('{count}', result.applied);
-                statusEl.style.color = 'var(--success)';
-            }
-            UI.toast(_('apply_to_all_success').replace('{count}', result.applied || 0), 'success');
-            setTimeout(() => { statusEl.textContent = ''; }, 5000);
-            loadConnections();
-        } catch (err) {
-            statusEl.textContent = _('apply_to_all_error');
-            statusEl.style.color = 'var(--danger)';
-            UI.toast(_('apply_to_all_error') + ': ' + err.message, 'error');
-            setTimeout(() => { statusEl.textContent = ''; }, 5000);
-        } finally {
-            btn.disabled = false;
-            btn.textContent = _('apply_to_all');
-        }
-    }
-
     let renameServerId = null;
 
     function openRenameServerModal(serverId, currentName) {
@@ -1927,7 +1678,6 @@
 
     checkServer();
     loadServerStats();
-    loadAwgSpeedLimitConfig();
     updateReachability();
     setInterval(updateReachability, 30000);
 </script>

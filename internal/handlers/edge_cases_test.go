@@ -94,49 +94,6 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("Server Config and Protocol Edge Cases", func(t *testing.T) {
-		// AWG speed limit on non-existent server
-		reqNoServer := httptest.NewRequest(http.MethodGet, "/api/servers/9999/awg/speed-limit-config", nil)
-		rctx := chi.NewRouteContext()
-		rctx.URLParams.Add("server_id", "9999")
-		reqNoServer = reqNoServer.WithContext(context.WithValue(reqNoServer.Context(), chi.RouteCtxKey, rctx))
-		wNoServer := httptest.NewRecorder()
-		h.GetAWGSpeedLimitConfigHandler(wNoServer, reqNoServer)
-		if wNoServer.Code != http.StatusNotFound {
-			t.Errorf("expected 404, got %d", wNoServer.Code)
-		}
-
-		// Apply default speed limits on non-existent server
-		wApplyNoSrv := httptest.NewRecorder()
-		h.ApplyDefaultSpeedLimitsHandler(wApplyNoSrv, reqNoServer)
-		if wApplyNoSrv.Code != http.StatusNotFound {
-			t.Errorf("expected 404, got %d", wApplyNoSrv.Code)
-		}
-
-		// Server with no AWG installed
-		noAWGSrv := &models.Server{
-			Name:      "NoAWG",
-			Host:      "1.2.3.4",
-			Protocols: map[string]any{},
-		}
-		noAWGID, _ := db.CreateServer(ctx, noAWGSrv)
-		reqNoAWG := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", noAWGID), nil)
-		rctxNoAWG := chi.NewRouteContext()
-		rctxNoAWG.URLParams.Add("server_id", fmt.Sprintf("%d", noAWGID))
-		reqNoAWG = reqNoAWG.WithContext(context.WithValue(reqNoAWG.Context(), chi.RouteCtxKey, rctxNoAWG))
-		wNoAWG := httptest.NewRecorder()
-		h.GetAWGSpeedLimitConfigHandler(wNoAWG, reqNoAWG)
-		if wNoAWG.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for non-installed AWG, got %d", wNoAWG.Code)
-		}
-
-		wApplyNoAWG := httptest.NewRecorder()
-		h.ApplyDefaultSpeedLimitsHandler(wApplyNoAWG, reqNoAWG)
-		if wApplyNoAWG.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for non-installed AWG, got %d", wApplyNoAWG.Code)
-		}
-	})
-
 	t.Run("Server Connection Management Edge Cases", func(t *testing.T) {
 		// Edit connection re-assign and rename
 		newUID := user.ID

@@ -101,19 +101,15 @@ func TestServerConnectionsHandlers(t *testing.T) {
 		quota := "1000"
 		maxIPs := 2
 		exp := "30"
-		down := 10
-		up := 10
 		mim := string(models.AWGMimicryAuto)
 		body, _ := json.Marshal(models.AddConnectionRequest{
-			Protocol:          "awg",
-			Name:              "New Server Conn",
-			UserID:            &u.ID,
-			TelemtQuota:       &quota,
-			TelemtMaxIPs:      &maxIPs,
-			TelemtExpiry:      &exp,
-			AWGSpeedLimitDown: &down,
-			AWGSpeedLimitUp:   &up,
-			AWGMimicry:        &mim,
+			Protocol:     "awg",
+			Name:         "New Server Conn",
+			UserID:       &u.ID,
+			TelemtQuota:  &quota,
+			TelemtMaxIPs: &maxIPs,
+			TelemtExpiry: &exp,
+			AWGMimicry:   &mim,
 		})
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/add", serverID), bytes.NewReader(body))
 		w := httptest.NewRecorder()
@@ -303,18 +299,14 @@ func TestServerConnectionsHandlers(t *testing.T) {
 	})
 
 	t.Run("EditServerConnectionHandler", func(t *testing.T) {
-		down := 20
-		up := 20
 		mim := string(models.AWGMimicryTLS)
 		name := "Edited Device"
 		body, _ := json.Marshal(models.EditConnectionRequest{
-			Protocol:          "awg",
-			ClientID:          "client-1",
-			Name:              &name,
-			UserID:            &u.ID,
-			AWGSpeedLimitDown: &down,
-			AWGSpeedLimitUp:   &up,
-			AWGMimicry:        &mim,
+			Protocol:   "awg",
+			ClientID:   "client-1",
+			Name:       &name,
+			UserID:     &u.ID,
+			AWGMimicry: &mim,
 		})
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/edit", serverID), bytes.NewReader(body))
 		w := httptest.NewRecorder()

@@ -582,12 +582,6 @@ func (h *Handlers) appendConnectionParams(params map[string]any, req models.MyAd
 	if req.TelemtExpiry != nil {
 		params["telemt_expiry"] = *req.TelemtExpiry
 	}
-	if req.AWGSpeedLimitDown != nil {
-		params["speed_limit_down"] = *req.AWGSpeedLimitDown
-	}
-	if req.AWGSpeedLimitUp != nil {
-		params["speed_limit_up"] = *req.AWGSpeedLimitUp
-	}
 	if req.AWGMimicry != nil {
 		params["awg_mimicry"] = *req.AWGMimicry
 	}
