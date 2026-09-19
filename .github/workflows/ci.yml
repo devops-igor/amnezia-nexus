@@ -29,9 +29,12 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: Run go vet
+        run: go vet ./...
+
       # golangci-lint: the golangci-lint-action@v6 downloads prebuilt binaries
       # (built with go1.24) that cannot parse this project's toolchain
-      # (go.mod: go 1.26.6) — and its install-mode: source input is NOT
+      # (go.mod: go 1.26.6) -- and its install-mode: source input is NOT
       # honored for pinned versions (verified: it still downloaded the
       # prebuilt binary). So we build the linter from source ourselves with
       # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
