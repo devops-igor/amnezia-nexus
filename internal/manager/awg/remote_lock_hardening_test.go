@@ -23,9 +23,9 @@ func TestRemoteLock_SuccessorLockTOCTOU_PreservesSuccessor(t *testing.T) {
 	cmdStr := remoteLockAcquireCmd("test_resource", "test_token")
 	expectedTokens := []string{
 		`gate_path="$flock_path.gate"`,
-		`if [ -d "$gate_path" ]; then`,
-		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi`,
-		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi`,
+		`if ! mkdir "$gate_path" 2>/dev/null; then`,
+		`if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi`,
+		`if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi`,
 	}
 	for _, expected := range expectedTokens {
 		if !strings.Contains(cmdStr, expected) {
@@ -282,7 +282,7 @@ func TestRemoteLock_GenerationRace_StaleReclaimerPreservesActiveSuccessor(t *tes
 	slowCmd := remoteLockAcquireCmd(resName, slowToken)
 
 	barrierInjection := fmt.Sprintf(
-		`if [ $((now - mtime)) -ge 60 ]; then touch %s; while [ ! -f %s ]; do sleep 0.01; done;`,
+		`if [ $((now - mtime)) -ge 60 ]; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; touch %s; while [ ! -f %s ]; do sleep 0.01; done; while ! mkdir "$gate_path" 2>/dev/null; do sleep 0.01; done;`,
 		ssh.EscapeShellArg(barrierReached),
 		ssh.EscapeShellArg(barrierResume),
 	)
@@ -465,7 +465,7 @@ func TestRemoteLock_GenerationRace_PauseBeforeRename_PreservesSuccessor(t *testi
 
 	targetPattern := `if mv "$flock_path" "$flock_path.stale.$now.$$"`
 	barrierInjection := fmt.Sprintf(
-		`touch %s; while [ ! -f %s ]; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
+		`rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; touch %s; while [ ! -f %s ]; do sleep 0.01; done; while ! mkdir "$gate_path" 2>/dev/null; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
 		ssh.EscapeShellArg(barrierReached),
 		ssh.EscapeShellArg(barrierResume),
 	)
@@ -536,7 +536,7 @@ func prepareSlowReclaimerInjectedCmd(t *testing.T, resName, slowToken, b1Reached
 
 	targetPattern1 := `if mv "$flock_path" "$flock_path.stale.$now.$$"`
 	barrier1Injection := fmt.Sprintf(
-		`touch %s; while [ ! -f %s ]; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
+		`rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; touch %s; while [ ! -f %s ]; do sleep 0.01; done; while ! mkdir "$gate_path" 2>/dev/null; do sleep 0.01; done; if mv "$flock_path" "$flock_path.stale.$now.$$"`,
 		ssh.EscapeShellArg(b1Reached),
 		ssh.EscapeShellArg(b1Resume),
 	)
@@ -915,4 +915,107 @@ func TestRemoteLock_DiscoveryFailureAndRecovery_ZeroLostUpdates(t *testing.T) {
 	if _, err := os.Stat(canonicalLockPath); !os.IsNotExist(err) {
 		t.Fatalf("canonical lock directory still exists after both released")
 	}
+}
+
+func TestRemoteLock_AtomicGateMutex_FencesCanonicalLockAndStaleReclamation(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available on this environment")
+	}
+
+	ctx := context.Background()
+
+	t.Run("LiveGateBlocksContenderFromVacantCanonicalLock", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_block_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Create active gate mutex; canonical lock path is intentionally left absent/vacant
+		if err := os.MkdirAll(gatePath, 0755); err != nil {
+			t.Fatalf("failed to create gate dir: %v", err)
+		}
+
+		contenderToken := "contender-blocked-token"
+		contenderCmd := remoteLockAcquireCmd(resName, contenderToken)
+
+		done := make(chan error, 1)
+		go func() {
+			out, err := exec.CommandContext(ctx, "bash", "-c", contenderCmd).CombinedOutput()
+			if err != nil {
+				done <- fmt.Errorf("contender error: %w (out: %s)", err, string(out))
+				return
+			}
+			done <- nil
+		}()
+
+		// Contender must be blocked by the gate mutex even though canonical lock path is absent
+		select {
+		case err := <-done:
+			t.Fatalf("MUTUAL EXCLUSION BROKEN: contender acquired vacant lock while gate mutex was held: %v", err)
+		case <-time.After(350 * time.Millisecond):
+			// Expected: blocked
+		}
+
+		if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+			t.Fatalf("canonical lock was created while gate mutex was held!")
+		}
+
+		// Release the gate mutex
+		if err := os.RemoveAll(gatePath); err != nil {
+			t.Fatalf("failed to remove gate dir: %v", err)
+		}
+
+		// Contender should now acquire the lock
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("contender failed to acquire after gate release: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("contender timed out waiting to acquire after gate release")
+		}
+
+		assertLockOwnerEquals(t, lockPath, contenderToken, "after gate release")
+		releaseLockAssertSuccess(t, ctx, resName, contenderToken)
+	})
+
+	t.Run("StaleGateCleanedUpAndLockAcquired", func(t *testing.T) {
+		resName := fmt.Sprintf("gate_stale_%d", time.Now().UnixNano())
+		lockPath := remoteLockPath(resName)
+		gatePath := lockPath + ".gate"
+		_ = os.RemoveAll(lockPath)
+		_ = os.RemoveAll(gatePath)
+		defer func() {
+			_ = os.RemoveAll(lockPath)
+			_ = os.RemoveAll(gatePath)
+		}()
+
+		// Create stale gate mutex (>10s old)
+		if err := os.MkdirAll(gatePath, 0755); err != nil {
+			t.Fatalf("failed to create gate dir: %v", err)
+		}
+		pastTime := time.Now().Add(-15 * time.Second)
+		if err := os.Chtimes(gatePath, pastTime, pastTime); err != nil {
+			t.Fatalf("failed to set past mtime on gate: %v", err)
+		}
+
+		token := "reclaimer-stale-gate-token"
+		cmdStr := remoteLockAcquireCmd(resName, token)
+		out, err := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+		if err != nil {
+			t.Fatalf("failed to acquire lock with stale gate: %v (out: %s)", err, string(out))
+		}
+
+		assertLockOwnerEquals(t, lockPath, token, "acquired after stale gate cleanup")
+		releaseLockAssertSuccess(t, ctx, resName, token)
+
+		if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+			t.Fatalf("gate path still exists after acquisition and release")
+		}
+	})
 }
