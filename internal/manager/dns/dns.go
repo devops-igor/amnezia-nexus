@@ -69,7 +69,7 @@ func (m *DNSManager) Install(ctx context.Context, server *models.Server, params 
 	}
 
 	// 2. Prepare directory
-	if _, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("mkdir -p %s", DNSConfigDir)); err != nil || code != 0 {
+	if _, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("mkdir -p %s", ssh.EscapeShellArg(DNSConfigDir))); err != nil || code != 0 {
 		return fmt.Errorf("failed to create DNS directory: %w", err)
 	}
 
@@ -93,21 +93,20 @@ func (m *DNSManager) Install(ctx context.Context, server *models.Server, params 
 	}
 
 	// 4. Build Docker image
-	if _, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker build -t %s %s", DNSContainerName, DNSConfigDir)); err != nil || code != 0 {
+	if _, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker build -t %s %s", ssh.EscapeShellArg(DNSContainerName), ssh.EscapeShellArg(DNSConfigDir))); err != nil || code != 0 {
 		return fmt.Errorf("failed to build %s image (code %d): %s, %w", DNSContainerName, code, errOut, err)
 	}
 
 	// 5. Remove existing container
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", DNSContainerName))
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", DNSContainerName))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(DNSContainerName)))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(DNSContainerName)))
 
 	// 6. Ensure internal network exists
-	netScript := fmt.Sprintf("docker network ls | grep -q %s || docker network create --subnet 172.29.172.0/24 %s", DNSNetworkName, DNSNetworkName)
+	netScript := fmt.Sprintf("docker network ls | grep -q %s || docker network create --subnet 172.29.172.0/24 %s", ssh.EscapeShellArg(DNSNetworkName), ssh.EscapeShellArg(DNSNetworkName))
 	_, _, _, _ = client.RunSudoCommand(ctx, netScript)
 
 	// 7. Run container
-	runCmd := fmt.Sprintf("docker run -d --name %s --restart always --network %s --ip=%s %s",
-		DNSContainerName, DNSNetworkName, DNSStaticIP, DNSContainerName)
+	runCmd := fmt.Sprintf("docker run -d --name %s --restart always --network %s --ip=%s %s", ssh.EscapeShellArg(DNSContainerName), ssh.EscapeShellArg(DNSNetworkName), ssh.EscapeShellArg(DNSStaticIP), ssh.EscapeShellArg(DNSContainerName))
 	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to run %s container (code %d): %s, %w", DNSContainerName, code, errOut, err)
 	}
@@ -115,7 +114,7 @@ func (m *DNSManager) Install(ctx context.Context, server *models.Server, params 
 	// 8. Connect existing VPN containers to DNS network
 	vpnContainers := []string{"amnezia-awg", "telemt"}
 	for _, c := range vpnContainers {
-		connectCmd := fmt.Sprintf("docker ps | grep -q %s && docker network connect %s %s || true", c, DNSNetworkName, c)
+		connectCmd := fmt.Sprintf("docker ps | grep -q %s && docker network connect %s %s || true", ssh.EscapeShellArg(c), ssh.EscapeShellArg(DNSNetworkName), ssh.EscapeShellArg(c))
 		_, _, _, _ = client.RunSudoCommand(ctx, connectCmd)
 	}
 
@@ -132,9 +131,9 @@ func (m *DNSManager) Uninstall(ctx context.Context, server *models.Server) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", DNSContainerName))
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", DNSContainerName))
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -rf %s", DNSConfigDir))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(DNSContainerName)))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(DNSContainerName)))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -rf %s", ssh.EscapeShellArg(DNSConfigDir)))
 	return nil
 }
 
@@ -167,7 +166,7 @@ func (m *DNSManager) GetServerStatus(ctx context.Context, server *models.Server)
 		return nil, err
 	}
 
-	outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", DNSContainerName))
+	outAll, errOutAll, codeAll, errAll := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps -a --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(DNSContainerName)))
 	if errAll != nil || codeAll != 0 {
 		return nil, fmt.Errorf("docker ps -a failed checking %s (code %d): %s, %w", DNSContainerName, codeAll, errOutAll, errAll)
 	}
@@ -182,7 +181,7 @@ func (m *DNSManager) GetServerStatus(ctx context.Context, server *models.Server)
 
 	var running bool
 	if exists {
-		outRun, errOutRun, codeRun, errRun := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Status}}'", DNSContainerName))
+		outRun, errOutRun, codeRun, errRun := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Status}}'", ssh.EscapeShellArg(DNSContainerName)))
 		if errRun != nil || codeRun != 0 {
 			return nil, fmt.Errorf("docker ps failed checking %s (code %d): %s, %w", DNSContainerName, codeRun, errOutRun, errRun)
 		}
