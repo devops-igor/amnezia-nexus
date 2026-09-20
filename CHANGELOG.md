@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - Polaris - 2026-09-21
+
+Maintenance and stability release introducing ARM64 AWG container support, removing legacy speed limits, hardening cross-process concurrency and peer rollback, and fixing session invalidation on password changes.
+
+### Fixed
+
+- ARM64 AmneziaWG installation: pinned multi-arch base image v3.1.20260828-1 and added preflight port validation to prevent container failures on ARM64 hosts (#225, #231).
+- Session invalidation: bumped session version on admin password reset to terminate existing user sessions across devices (#171, #228).
+- AWG parameter collision: synchronized static default parameters to satisfy S1/S2 packet length difference invariants and prevent handshake failures (#232, #233, #234, #235).
+- Remote process concurrency: secured multi-process execution, improved peer rollback handling, and stabilized lease re-keying (#186).
+- Endpoint ordering: enforced deterministic sorting for active session snapshots (#219).
+
+### Changed
+
+- Speed limit removal: retired legacy client speed limiting and migrated traffic control cleanup into container execution boundaries (#225, #231).
+- Active sessions UI: simplified table layout by removing unmetered traffic columns (#189, #218).
+
 ## [1.2.0] - Polaris - 2026-09-19
 
 Feature release introducing admin load balancer session visibility, revocable user sessions with session versioning, atomic IP allocation for AmneziaWG clients, remote command shell escaping, and header protection range exclusivity.
