@@ -150,140 +150,25 @@ func TestServerHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("GetAWGSpeedLimitConfigHandler", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", serverID), nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
+	t.Run("RemovedSpeedLimitRoutesReturn404", func(t *testing.T) {
+		// Speed-limit functionality was removed (issue #225): the routes must be gone.
+		type removedRoute struct {
+			method, path string
 		}
-
-		// Bad ID
-		reqBad := httptest.NewRequest(http.MethodGet, "/api/servers/bad/awg/speed-limit-config", nil)
-		wBad := httptest.NewRecorder()
-		r.ServeHTTP(wBad, reqBad)
-		if wBad.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", wBad.Code)
+		removed := []removedRoute{
+			{http.MethodPatch, "/api/servers/{server_id}/connections/speed-limit"},
+			{http.MethodGet, "/api/servers/{server_id}/awg/speed-limit-config"},
+			{http.MethodPatch, "/api/servers/{server_id}/awg/speed-limit-config"},
+			{http.MethodPost, "/api/servers/{server_id}/awg/apply-default-speed-limits"},
 		}
-
-		// Not found
-		req404 := httptest.NewRequest(http.MethodGet, "/api/servers/88888/awg/speed-limit-config", nil)
-		w404 := httptest.NewRecorder()
-		r.ServeHTTP(w404, req404)
-		if w404.Code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", w404.Code)
-		}
-	})
-
-	t.Run("SetAWGSpeedLimitConfigHandler", func(t *testing.T) {
-		down := 100
-		up := 100
-		body, _ := json.Marshal(models.AwgSpeedLimitConfigRequest{
-			GlobalSpeedLimitDown: &down,
-			GlobalSpeedLimitUp:   &up,
-		})
-		req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", serverID), bytes.NewReader(body))
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		// Bad body
-		reqBad := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", serverID), bytes.NewReader([]byte("invalid-json")))
-		wBad := httptest.NewRecorder()
-		r.ServeHTTP(wBad, reqBad)
-		if wBad.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", wBad.Code)
-		}
-	})
-
-	t.Run("ApplyDefaultSpeedLimitsHandler", func(t *testing.T) {
-		// Server without configured default limits -> 400
-		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/awg/apply-default-speed-limits", serverID), nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 when no default limits configured, got %d", w.Code)
-		}
-
-		// Configure default limits on server and apply
-		defDown := 20
-		defUp := 30
-		cfgBody, _ := json.Marshal(models.AwgSpeedLimitConfigRequest{
-			DefaultSpeedLimitDown: &defDown,
-			DefaultSpeedLimitUp:   &defUp,
-		})
-		reqSet := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", serverID), bytes.NewReader(cfgBody))
-		wSet := httptest.NewRecorder()
-		r.ServeHTTP(wSet, reqSet)
-		if wSet.Code != http.StatusOK {
-			t.Fatalf("expected 200 setting speed limit config, got %d", wSet.Code)
-		}
-
-		reqApply := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/awg/apply-default-speed-limits", serverID), nil)
-		wApply := httptest.NewRecorder()
-		r.ServeHTTP(wApply, reqApply)
-		if wApply.Code != http.StatusOK {
-			t.Fatalf("expected 200 applying default limits, got %d (body: %s)", wApply.Code, wApply.Body.String())
-		}
-
-		// Server with AWG not installed -> 400
-		sNoAWG := &models.Server{Name: "No-AWG-Server", Host: "1.1.1.88", SSHUser: "root", Protocols: map[string]any{"telemt": map[string]any{"installed": true}}}
-		sNoAWGID, _ := db.CreateServer(ctx, sNoAWG)
-		reqNoAWG := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/awg/apply-default-speed-limits", sNoAWGID), nil)
-		wNoAWG := httptest.NewRecorder()
-		r.ServeHTTP(wNoAWG, reqNoAWG)
-		if wNoAWG.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for uninstalled AWG, got %d", wNoAWG.Code)
-		}
-
-		// Get and Set speed limit config on server without AWG installed -> 400
-		reqGetNoAWG := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", sNoAWGID), nil)
-		wGetNoAWG := httptest.NewRecorder()
-		r.ServeHTTP(wGetNoAWG, reqGetNoAWG)
-		if wGetNoAWG.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 getting speed limit config for uninstalled AWG, got %d", wGetNoAWG.Code)
-		}
-
-		reqSetNoAWG := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", sNoAWGID), bytes.NewReader(cfgBody))
-		wSetNoAWG := httptest.NewRecorder()
-		r.ServeHTTP(wSetNoAWG, reqSetNoAWG)
-		if wSetNoAWG.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 setting speed limit config for uninstalled AWG, got %d", wSetNoAWG.Code)
-		}
-
-		// 404 server
-		req404 := httptest.NewRequest(http.MethodPost, "/api/servers/77777/awg/apply-default-speed-limits", nil)
-		w404 := httptest.NewRecorder()
-		r.ServeHTTP(w404, req404)
-		if w404.Code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", w404.Code)
-		}
-	})
-
-	t.Run("SetClientSpeedLimitHandler", func(t *testing.T) {
-		limitDown := 50
-		limitUp := 50
-		body, _ := json.Marshal(models.SpeedLimitRequest{
-			ClientID:       "client-1",
-			SpeedLimitDown: &limitDown,
-			SpeedLimitUp:   &limitUp,
-		})
-		req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", serverID), bytes.NewReader(body))
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		// Missing client_id
-		badBody, _ := json.Marshal(models.SpeedLimitRequest{})
-		reqBad := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", serverID), bytes.NewReader(badBody))
-		wBad := httptest.NewRecorder()
-		r.ServeHTTP(wBad, reqBad)
-		if wBad.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", wBad.Code)
+		for _, rt := range removed {
+			path := strings.ReplaceAll(rt.path, "{server_id}", fmt.Sprintf("%d", serverID))
+			req := httptest.NewRequest(rt.method, path, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("%s %s: expected 404 after speed-limit removal, got %d", rt.method, rt.path, w.Code)
+			}
 		}
 	})
 
@@ -471,27 +356,6 @@ func TestServerHandlers(t *testing.T) {
 		r.ServeHTTP(w, req)
 		if w.Code == http.StatusBadRequest {
 			t.Errorf("expected non-400 for valid disjoint headers, got 400: %s", w.Body.String())
-		}
-	})
-
-	t.Run("SetClientSpeedLimitHandler Bad JSON", func(t *testing.T) {
-		// Bad JSON body
-		reqBad := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", serverID), bytes.NewReader([]byte("bad")))
-		wBad := httptest.NewRecorder()
-		r.ServeHTTP(wBad, reqBad)
-		if wBad.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 for bad body, got %d", wBad.Code)
-		}
-
-		// Server not found
-		limitDown := 10
-		limitUp := 10
-		bodyNF, _ := json.Marshal(models.SpeedLimitRequest{ClientID: "c1", SpeedLimitDown: &limitDown, SpeedLimitUp: &limitUp})
-		reqNF := httptest.NewRequest(http.MethodPatch, "/api/servers/99999/connections/speed-limit", bytes.NewReader(bodyNF))
-		wNF := httptest.NewRecorder()
-		r.ServeHTTP(wNF, reqNF)
-		if wNF.Code != http.StatusNotFound {
-			t.Errorf("expected 404 for missing server, got %d", wNF.Code)
 		}
 	})
 
@@ -757,16 +621,14 @@ func TestServerHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("Speed Limit and Custom Protocol Paths", func(t *testing.T) {
+	t.Run("Custom Protocol Paths", func(t *testing.T) {
 		sSpeed := &models.Server{
 			Name:    "Speed-Server",
 			Host:    "1.1.1.5",
 			SSHUser: "root",
 			Protocols: map[string]any{
 				"awg": map[string]any{
-					"installed":        true,
-					"speed_limit_down": float64(100),
-					"speed_limit_up":   float64(200),
+					"installed": true,
 				},
 				"customproto": map[string]any{
 					"installed": true,
@@ -774,39 +636,6 @@ func TestServerHandlers(t *testing.T) {
 			},
 		}
 		sSpeedID, _ := db.CreateServer(ctx, sSpeed)
-
-		// GetAWGSpeedLimitConfigHandler with speed limits set
-		reqSpeed := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", sSpeedID), nil)
-		wSpeed := httptest.NewRecorder()
-		r.ServeHTTP(wSpeed, reqSpeed)
-		if wSpeed.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", wSpeed.Code)
-		}
-
-		// Server with nested awg_speed_limit_config
-		sSpeedNested := &models.Server{
-			Name:    "Speed-Nested",
-			Host:    "1.1.1.9",
-			SSHUser: "root",
-			Protocols: map[string]any{
-				"awg": map[string]any{
-					"installed": true,
-					"awg_speed_limit_config": map[string]any{
-						"global_speed_limit_down":  float64(500),
-						"global_speed_limit_up":    float64(500),
-						"default_speed_limit_down": float64(50),
-						"default_speed_limit_up":   float64(50),
-					},
-				},
-			},
-		}
-		sSpeedNestedID, _ := db.CreateServer(ctx, sSpeedNested)
-		reqSpeedNested := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/awg/speed-limit-config", sSpeedNestedID), nil)
-		wSpeedNested := httptest.NewRecorder()
-		r.ServeHTTP(wSpeedNested, reqSpeedNested)
-		if wSpeedNested.Code != http.StatusOK {
-			t.Errorf("expected 200 for nested speed config, got %d", wSpeedNested.Code)
-		}
 
 		// ToggleContainerHandler for telemt
 		bodyTelemtToggle, _ := json.Marshal(map[string]any{"protocol": "telemt", "action": "start"})
@@ -871,26 +700,6 @@ func TestServerHandlers(t *testing.T) {
 		rUploadFail.ServeHTTP(wSave, reqSave)
 		if wSave.Code != http.StatusInternalServerError {
 			t.Errorf("expected 500 for upload fail, got %d", wSave.Code)
-		}
-
-		// SetClientSpeedLimit with remove (0 limits) on failing SSH returns 500
-		zero := 0
-		bodyZero, _ := json.Marshal(models.SpeedLimitRequest{ClientID: "client-1", SpeedLimitDown: &zero, SpeedLimitUp: &zero})
-		reqZero := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", sBrID), bytes.NewReader(bodyZero))
-		wZero := httptest.NewRecorder()
-		rUploadFail.ServeHTTP(wZero, reqZero)
-		if wZero.Code != http.StatusInternalServerError {
-			t.Errorf("expected 500 for speed limit removal on failing SSH, got %d", wZero.Code)
-		}
-
-		// On working router r, speed limit removal succeeds (200)
-		sWork := &models.Server{Name: "Working-Server", Host: "1.1.1.3", SSHUser: "root", Protocols: map[string]any{"awg": map[string]any{"installed": true}}}
-		sWorkID, _ := db.CreateServer(ctx, sWork)
-		reqZeroWorking := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/connections/speed-limit", sWorkID), bytes.NewReader(bodyZero))
-		wZeroWorking := httptest.NewRecorder()
-		r.ServeHTTP(wZeroWorking, reqZeroWorking)
-		if wZeroWorking.Code != http.StatusOK {
-			t.Errorf("expected 200 for speed limit removal on working SSH, got %d", wZeroWorking.Code)
 		}
 	})
 

@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
-	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/tc"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/curve25519"
@@ -108,6 +107,9 @@ type AWGManager struct {
 	serverLocks             *ServerLockRegistry
 	lockHeartbeatIntervalNs atomic.Int64
 	lockHeartbeatTimeoutNs  atomic.Int64
+	// tcCleaned guards the one-shot legacy tc-state sweep: server IDs that
+	// have already been swept by this manager instance. Guarded by mu.
+	tcCleaned map[int64]bool
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -115,6 +117,7 @@ func NewAWGManager(pool SSHProvider) *AWGManager {
 	return &AWGManager{
 		sshPool:        pool,
 		containerCache: make(map[string]containerCacheEntry),
+		tcCleaned:      make(map[int64]bool),
 		serverLocks:    globalServerLocks,
 	}
 }
@@ -515,16 +518,32 @@ fi
 	return nil
 }
 
-// awgBaseImage pins the AmneziaWG-Go userspace base image to the 3.1 release.
-// Pinning (instead of :latest) guarantees freshly built backends speak the
-// 3.x protocol; the explicit pull before build ensures the tag exists on the
-// host instead of failing mid-build with a stale local cache.
-const awgBaseImage = "amneziavpn/amneziawg-go:3.1.20260828"
+// awgBaseImage pins the AmneziaWG userspace base image used to build AWG
+// backends. devopsigor/amneziawg:v3.1.20260828-1 is a versioned multiarch
+// (amd64+arm64) tag from the amneziawg-docker repo, built from the
+// AmneziaWG v3.1.20260828 source (devopsigor publishing). Multiarch is
+// required because backends install on both amd64 and arm64 hosts — the
+// upstream amneziavpn/amneziawg-go image publishes amd64 only, which broke
+// ARM64 installs (Issue #225). The versioned tag is chosen over :latest
+// because this image becomes a privileged VPN container on remote hosts:
+// a mutable floating tag is a supply-chain and reproducibility hazard, so
+// installs must pin a pinned, versioned release. The explicit pull
+// before build ensures the tag exists on the host instead of failing
+// mid-build with a stale local cache.
+const awgBaseImage = "devopsigor/amneziawg:v3.1.20260828-1"
 
 func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()
 	if !IsValidContainerName(cName) {
 		cName = "amnezia-awg2"
+	}
+	// Preflight: fail fast when the UDP port is already bound (host socket or
+	// existing docker port binding) instead of discovering it at `docker run`
+	// time after a slow pull+build cycle (Issue #225). Best-effort: a port
+	// could still bind between check and run — `docker run` remains the final
+	// authority.
+	if err := checkUDPPortAvailable(ctx, client, port); err != nil {
+		return err
 	}
 	dockerfile := fmt.Sprintf(`FROM %s
 LABEL maintainer="AmneziaVPN"
@@ -566,6 +585,99 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
 func buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	return (&AWGManager{}).buildAndRunAWGContainer(ctx, client, port)
+}
+
+// legacyTcCleanupCommands returns the exact remote commands that clear tc
+// data-plane state installed by the pre-74b34d9 speed-limit code inside the
+// AWG container: the root qdisc on awg0 (plus its per-client HTB classes and
+// filters), the root qdisc on ifb0, and finally the ifb0 redirect device.
+// Every command carries `|| true` inside the container shell — the sweep is
+// strictly best-effort inside the container, while docker exec failures propagate.
+func legacyTcCleanupCommands(containerName string) []string {
+	cn := ssh.EscapeShellArg(containerName)
+	return []string{
+		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev awg0 root 2>/dev/null || true'", cn),
+		fmt.Sprintf("docker exec -i %s sh -c 'tc qdisc del dev ifb0 root 2>/dev/null || true'", cn),
+		fmt.Sprintf("docker exec -i %s sh -c 'ip link del ifb0 2>/dev/null || true'", cn),
+	}
+}
+
+// CleanupLegacyTcRules removes leftover tc speed-limit state (HTB qdiscs,
+// filters, the ifb0 redirect device) from an existing AWG container. The
+// speed-limit removal (74b34d9) deleted the control plane without clearing
+// remote data-plane state, so deployments installed by the old code kept
+// enforcing invisible limits with no UI/API left to clear them (PR #231
+// re-review, Fix 2). Idempotent by construction: every command is a delete
+// guarded by `|| true`, so re-running on a clean container is a no-op.
+// Returns an error if any cleanup command failed so the caller can retry
+// later (the status-path guard only marks a server cleaned on success).
+func (m *AWGManager) CleanupLegacyTcRules(ctx context.Context, client ssh.SSHClient, containerName string) error {
+	if !IsValidContainerName(containerName) {
+		slog.Warn("legacy tc cleanup: skipping invalid container name", "container", containerName)
+		return fmt.Errorf("invalid container name %q", containerName)
+	}
+	var firstErr error
+	for _, cmd := range legacyTcCleanupCommands(containerName) {
+		if _, errOut, code, err := client.RunSudoCommand(ctx, cmd); err != nil || code != 0 {
+			slog.Warn("legacy tc cleanup: command failed (will retry on next status poll)",
+				"command", cmd, "exit_code", code, "stderr", errOut, "error", err)
+			if firstErr == nil {
+				if err != nil {
+					firstErr = fmt.Errorf("%s failed (exit %d): %s, %w", cmd, code, errOut, err)
+				} else {
+					firstErr = fmt.Errorf("%s failed (exit %d): %s", cmd, code, errOut)
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
+// checkUDPPortAvailable verifies that the requested UDP port is not already
+// bound on the remote host before the AWG install pulls or builds anything.
+// It checks two sources: host listening UDP sockets (`ss -lun`) and existing
+// docker port bindings (`docker ps --format '{{.Ports}}'`), because a port
+// published by another container does not appear in host `ss` output when the
+// panel itself runs inside a container (Issue #225, Server 1). A failed
+// probe command is not fatal — the install proceeds and any real conflict
+// still surfaces from `docker run` as before.
+func checkUDPPortAvailable(ctx context.Context, client ssh.SSHClient, port string) error {
+	const conflictErr = "UDP port %s is already in use on the server — choose a different port for the AWG backend"
+
+	ssOut, _, _, err := client.RunSudoCommand(ctx, "ss -lun 2>/dev/null || true")
+	if err != nil {
+		slog.Warn("preflight: failed to list listening UDP sockets", "error", err)
+	} else if udpPortBound(ssOut, port) {
+		return fmt.Errorf(conflictErr, port)
+	}
+
+	portsOut, _, _, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker ps --filter publish=%s/udp --format '{{.Ports}}' 2>/dev/null || true", ssh.EscapeShellArg(port)))
+	if err != nil {
+		slog.Warn("preflight: failed to list docker port bindings", "error", err)
+	} else if strings.TrimSpace(portsOut) != "" {
+		// Non-empty output: some container already publishes this host
+		// port (the publish filter matches the HOST side, regardless of
+		// the container-side port, and covers ranges).
+		return fmt.Errorf(conflictErr, port)
+	}
+
+	return nil
+}
+
+// udpPortBound reports whether ss(8) output shows a UDP socket whose local
+// port equals port. Matching is token-based: strings.Fields yields the local
+// endpoint as a single `addr:port` token (e.g. `0.0.0.0:51820` or `[::]:53`),
+// and the suffix `:<port>` is matched against the whole token to avoid prefix
+// false positives such as `:5182` matching a bound `:51820`.
+func udpPortBound(ssOut, port string) bool {
+	for _, line := range strings.Split(ssOut, "\n") {
+		for _, field := range strings.Fields(line) {
+			if strings.HasSuffix(field, ":"+port) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
@@ -1148,8 +1260,6 @@ func (m *AWGManager) GetClients(ctx context.Context, server *models.Server) ([]m
 			"psk":               ud.PSK,
 			"enabled":           ud.Enabled,
 			"awg_mimicry":       ud.AWGMimicry,
-			"speed_limit_down":  ud.SpeedLimitDown,
-			"speed_limit_up":    ud.SpeedLimitUp,
 			"latestHandshake":   ud.LatestHandshake,
 			"dataReceived":      ud.DataReceived,
 			"dataSent":          ud.DataSent,
@@ -1280,21 +1390,6 @@ func resolveClientName(clientParams map[string]any) string {
 	return "client"
 }
 
-func parseSpeedLimits(clientParams map[string]any) (*int, *int) {
-	var speedDown, speedUp *int
-	if v, ok := clientParams["awg_speed_limit_down"]; ok && v != nil {
-		if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-			speedDown = &val
-		}
-	}
-	if v, ok := clientParams["awg_speed_limit_up"]; ok && v != nil {
-		if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-			speedUp = &val
-		}
-	}
-	return speedDown, speedUp
-}
-
 // probePeerPubKey extracts a valid caller-supplied WireGuard public key from
 // clientParams (checked keys: "public_key", then "client_public_key").
 // A valid key is base64 that decodes to exactly 32 bytes. Returns "" when
@@ -1417,7 +1512,7 @@ func peerSectionFor(isProbePeer bool, clientPubKey, psk, clientIP, allowedIPs st
 
 // upsertClientEntry updates the clientsTable entry at existingIdx in place
 // (keeping IP and identity fields), or appends a new entry when idx < 0.
-func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, speedDown, speedUp *int, contentPadding bool) []AWGClient {
+func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, contentPadding bool) []AWGClient {
 	if existingIdx >= 0 {
 		clients[existingIdx].ClientID = clientPubKey
 		clients[existingIdx].UserData.ClientName = clientName
@@ -1471,8 +1566,6 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			PSK:                    psk,
 			Enabled:                true,
 			AWGMimicry:             mimicry,
-			SpeedLimitDown:         speedDown,
-			SpeedLimitUp:           speedUp,
 			RekeyAfterTime:         rat,
 			RekeyTimeout:           rt,
 			RejectAfterTime:        rej,
@@ -1482,21 +1575,6 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 			ContentPaddingAddition: cpAdd,
 		},
 	})
-}
-
-// applyClientSpeedLimit applies TC speed limits when any limit is set.
-func applyClientSpeedLimit(ctx context.Context, client ssh.SSHClient, containerName, interfaceName, clientIP string, speedDown, speedUp *int) {
-	if speedDown == nil && speedUp == nil {
-		return
-	}
-	dVal, uVal := 0, 0
-	if speedDown != nil {
-		dVal = *speedDown
-	}
-	if speedUp != nil {
-		uVal = *speedUp
-	}
-	_ = tc.ApplySpeedLimit(ctx, client, containerName, interfaceName, clientIP, dVal, uVal)
 }
 
 // AddClient provisions a new client/peer in the AWG configuration.
@@ -1605,8 +1683,6 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 	remoteCommitted = true
 
-	// Parse speed limits if provided
-	speedDown, speedUp := parseSpeedLimits(clientParams)
 	mimicry := resolveMimicry(clientParams)
 	cpOn, _ := parseBoolParam(clientParams["awg_content_padding"])
 
@@ -1616,7 +1692,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		return nil, err
 	}
 	existingIdx, _ = findExistingClient(clients, clientPubKey, clientName)
-	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, speedDown, speedUp, cpOn)
+	clients = upsertClientEntry(clients, existingIdx, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry, cpOn)
 	if err = m.saveClientsTable(ctx, client, clients); err != nil {
 		return nil, fmt.Errorf("failed to save clients table: %w", err)
 	}
@@ -1643,9 +1719,6 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		err = fmt.Errorf("failed to ensure backend NAT rules: %w", err)
 		return nil, err
 	}
-
-	// Apply speed limit via TC
-	applyClientSpeedLimit(ctx, client, m.resolveContainerName(ctx, client), m.interfaceName(), clientIP, speedDown, speedUp)
 
 	// Render client config
 	clientConfig := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
@@ -1785,11 +1858,6 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 		if err := m.saveClientsTable(ctx, client, updated); err != nil {
 			return fmt.Errorf("failed to save clients table during peer removal: %w", err)
 		}
-	}
-
-	if ip != "" {
-		cName := m.resolveContainerName(ctx, client)
-		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), ip)
 	}
 
 	return nil
@@ -2262,8 +2330,7 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	}
 	defer unlockRemote()
 
-	// 1. Remove TC speed limit for peer IP
-	cName := m.resolveContainerName(ctx, client)
+	// 1. Find peer IP for the client being removed
 	clients, err := m.getClientsTable(ctx, client)
 	if err != nil {
 		return err
@@ -2272,7 +2339,6 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	for _, c := range clients {
 		if c.ClientID == clientID && c.UserData.ClientIP != "" {
 			peerIP = c.UserData.ClientIP
-			_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), c.UserData.ClientIP)
 			break
 		}
 	}
@@ -2544,6 +2610,28 @@ func (m *AWGManager) GetServerStatus(ctx context.Context, server *models.Server)
 		running = strings.Contains(outRun, "Up")
 	}
 
+	// Legacy tc cleanup (PR #231 re-review Fix 2): containers installed
+	// before the speed-limit removal (74b34d9) may still carry HTB
+	// qdiscs/filters/ifb0 rules that outlive the deleted control plane.
+	// Only attempt cleanup if the container exists and is running.
+	// tcCleaned is set ONLY after a successful sweep: a failed attempt stays
+	// unmarked so the next status poll retries.
+	if server != nil && exists && running && IsValidContainerName(foundName) {
+		m.mu.Lock()
+		alreadyCleaned := m.tcCleaned[server.ID]
+		m.mu.Unlock()
+		if !alreadyCleaned {
+			if err := m.CleanupLegacyTcRules(ctx, client, foundName); err != nil {
+				slog.Warn("legacy tc cleanup failed; will retry on next status poll",
+					"server_id", server.ID, "error", err)
+			} else {
+				m.mu.Lock()
+				m.tcCleaned[server.ID] = true
+				m.mu.Unlock()
+			}
+		}
+	}
+
 	status := map[string]any{
 		"protocol":          "awg",
 		"container_exists":  exists,
@@ -2711,22 +2799,7 @@ func parseBoolParam(val any) (bool, bool) {
 	}
 }
 
-func parseSpeedLimit(params map[string]any, keys ...string) (*int, bool) {
-	for _, k := range keys {
-		if v, ok := params[k]; ok {
-			if v == nil {
-				return nil, true
-			}
-			if val, err := strconv.Atoi(fmt.Sprint(v)); err == nil && val > 0 {
-				return &val, true
-			}
-			return nil, true
-		}
-	}
-	return nil, false
-}
-
-// EditClient modifies client metadata, enabling/disabling, and bandwidth limits with TC sync.
+// EditClient modifies client metadata and enabling/disabling state.
 func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clientID string, params map[string]any) error {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -2780,18 +2853,6 @@ func (m *AWGManager) EditClient(ctx context.Context, server *models.Server, clie
 		target.UserData.Enabled = newEnabled
 	}
 
-	down, downOk := parseSpeedLimit(params, "speed_limit_down", "awg_speed_limit_down", "speedDown")
-	up, upOk := parseSpeedLimit(params, "speed_limit_up", "awg_speed_limit_up", "speedUp")
-	if downOk || upOk {
-		if downOk {
-			target.UserData.SpeedLimitDown = down
-		}
-		if upOk {
-			target.UserData.SpeedLimitUp = up
-		}
-		m.syncClientTC(ctx, client, target.UserData.ClientIP, target.UserData.SpeedLimitDown, target.UserData.SpeedLimitUp)
-	}
-
 	return m.saveClientsTable(ctx, client, clients)
 }
 
@@ -2816,25 +2877,6 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
 	return m.saveServerConfig(ctx, client, newConfig)
-}
-
-func (m *AWGManager) syncClientTC(ctx context.Context, client ssh.SSHClient, clientIP string, curDown, curUp *int) {
-	cName := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(cName) {
-		cName = m.containerName()
-	}
-	if (curDown != nil && *curDown > 0) || (curUp != nil && *curUp > 0) {
-		dVal, uVal := 0, 0
-		if curDown != nil {
-			dVal = *curDown
-		}
-		if curUp != nil {
-			uVal = *curUp
-		}
-		_ = tc.ApplySpeedLimit(ctx, client, cName, m.interfaceName(), clientIP, dVal, uVal)
-	} else {
-		_ = tc.RemoveSpeedLimit(ctx, client, cName, m.interfaceName(), clientIP)
-	}
 }
 
 // RotateMimicry rotates a client's mimicry profile through the sequence:

@@ -74,6 +74,10 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 	if m.sudoCmdHandler != nil {
 		return m.sudoCmdHandler(cmd)
 	}
+	return m.defaultRunSudo(cmd)
+}
+
+func (m *mockAWGSSHClient) defaultRunSudo(cmd string) (string, string, int, error) {
 	if strings.Contains(cmd, "amnezia_awg_") {
 		return "OK", "", 0, nil
 	}
@@ -94,6 +98,14 @@ func (m *mockAWGSSHClient) RunSudoCommand(ctx context.Context, cmd string) (stri
 		if strings.HasPrefix(path, "/tmp/_amnz_edit_config_") || strings.HasPrefix(path, "/tmp/_amnz_clients_") {
 			delete(m.files, path)
 		}
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "ss -lun") {
+		// Preflight: no UDP listener bound on the mock host.
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker ps --filter publish=") {
+		// Preflight: no existing container publishes the port.
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_clients") {
@@ -293,10 +305,8 @@ func TestAWGManagerLifecycle(t *testing.T) {
 
 	// 4. Test AddClient
 	addParams := map[string]any{
-		"name":                 "NewUser",
-		"awg_speed_limit_down": 20,
-		"awg_speed_limit_up":   10,
-		"awg_mimicry":          "tls",
+		"name":        "NewUser",
+		"awg_mimicry": "tls",
 	}
 	newClient, err := mgr.AddClient(ctx, server, addParams)
 	if err != nil {
@@ -416,11 +426,9 @@ func TestAWGManager_EditClient(t *testing.T) {
 	mgr := NewAWGManager(provider)
 	server := &models.Server{ID: 1, Host: "1.2.3.4"}
 
-	// 1. Edit client name and speed limits
+	// 1. Edit client name
 	editParams := map[string]any{
-		"name":             "RenamedUser",
-		"speed_limit_down": 50,
-		"speed_limit_up":   25,
+		"name": "RenamedUser",
 	}
 	if err := mgr.EditClient(ctx, server, "pubkey1", editParams); err != nil {
 		t.Fatalf("EditClient failed: %v", err)
@@ -436,27 +444,8 @@ func TestAWGManager_EditClient(t *testing.T) {
 	if clients[0].UserData.ClientName != "RenamedUser" {
 		t.Errorf("expected client name RenamedUser, got %s", clients[0].UserData.ClientName)
 	}
-	if clients[0].UserData.SpeedLimitDown == nil || *clients[0].UserData.SpeedLimitDown != 50 {
-		t.Errorf("expected speed_limit_down 50, got %v", clients[0].UserData.SpeedLimitDown)
-	}
-	if clients[0].UserData.SpeedLimitUp == nil || *clients[0].UserData.SpeedLimitUp != 25 {
-		t.Errorf("expected speed_limit_up 25, got %v", clients[0].UserData.SpeedLimitUp)
-	}
 
-	// 2. Remove speed limits (set to 0)
-	clearLimits := map[string]any{
-		"speed_limit_down": 0,
-		"speed_limit_up":   0,
-	}
-	if err := mgr.EditClient(ctx, server, "pubkey1", clearLimits); err != nil {
-		t.Fatalf("EditClient(clear limits) failed: %v", err)
-	}
-	clients, _ = mgr.getClientsTable(ctx, client)
-	if clients[0].UserData.SpeedLimitDown != nil {
-		t.Errorf("expected nil speed_limit_down, got %v", clients[0].UserData.SpeedLimitDown)
-	}
-
-	// 3. Edit enabled status (toggle disable, then enable)
+	// 2. Edit enabled status (toggle disable, then enable)
 	if err := mgr.EditClient(ctx, server, "pubkey1", map[string]any{"enabled": false}); err != nil {
 		t.Fatalf("EditClient(enabled=false) failed: %v", err)
 	}
@@ -1039,9 +1028,7 @@ DisableCookies = on
 
 	// 1. AddClient
 	addParams := map[string]any{
-		"name":                 "TestServer2User",
-		"awg_speed_limit_down": 50,
-		"awg_speed_limit_up":   25,
+		"name": "TestServer2User",
 	}
 	res, err := mgr.AddClient(ctx, server, addParams)
 	if err != nil {
@@ -1264,6 +1251,14 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 		commands = append(commands, cmd)
+		if strings.Contains(cmd, "ss -lun") {
+			// Preflight: no UDP listener on the requested port.
+			return "", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker ps") {
+			// Preflight: publish filter finds no existing binding.
+			return "", "", 0, nil
+		}
 		if strings.Contains(cmd, "docker build") {
 			uploaded, ok := client.files["/opt/amnezia/amnezia-awg2/Dockerfile"]
 			if !ok {
@@ -1284,8 +1279,8 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 	if !strings.Contains(dockerfile, "FROM "+awgBaseImage+"\n") {
 		t.Errorf("Dockerfile must pin FROM %s, got:\n%s", awgBaseImage, dockerfile)
 	}
-	if strings.Contains(dockerfile, ":latest") {
-		t.Errorf("Dockerfile must not reference :latest, got:\n%s", dockerfile)
+	if !strings.Contains(dockerfile, "FROM devopsigor/amneziawg:") {
+		t.Errorf("Dockerfile must use the multiarch devopsigor/amneziawg base image (ARM64 support), got:\n%s", dockerfile)
 	}
 
 	pullIdx, buildIdx := -1, -1
@@ -1311,6 +1306,10 @@ func TestBuildAndRunAWGContainer_PinnedImageAndPull(t *testing.T) {
 func TestBuildAndRunAWGContainer_PullFailureAborts(t *testing.T) {
 	client := newMockAWGSSHClient()
 	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "ss -lun") || strings.Contains(cmd, "docker ps") {
+			// Preflight: port free.
+			return "", "", 0, nil
+		}
 		if strings.HasPrefix(cmd, "docker pull '") {
 			return "", "manifest unknown", 1, nil
 		}

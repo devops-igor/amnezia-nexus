@@ -177,6 +177,14 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 	if strings.Contains(cmd, "tc qdisc") {
 		return "qdisc tbf 1: dev eth0 root", "", 0, nil
 	}
+	if strings.Contains(cmd, "ss -lun") {
+		// Preflight: no UDP listener on the requested port.
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker ps") {
+		// Preflight: publish filter finds no existing binding.
+		return "", "", 0, nil
+	}
 	return "ok", "", 0, nil
 }
 
@@ -287,10 +295,6 @@ func setupFullServerRouter(h *Handlers) *chi.Mux {
 	r.Post("/api/servers/{server_id}/server_config", h.GetServerConfigHandler)
 	r.Post("/api/servers/{server_id}/server_config/save", h.SaveServerConfigHandler)
 	r.Get("/api/servers/{server_id}/reachability", h.GetServerReachabilityHandler)
-	r.Patch("/api/servers/{server_id}/connections/speed-limit", h.SetClientSpeedLimitHandler)
-	r.Get("/api/servers/{server_id}/awg/speed-limit-config", h.GetAWGSpeedLimitConfigHandler)
-	r.Patch("/api/servers/{server_id}/awg/speed-limit-config", h.SetAWGSpeedLimitConfigHandler)
-	r.Post("/api/servers/{server_id}/awg/apply-default-speed-limits", h.ApplyDefaultSpeedLimitsHandler)
 	return r
 }
 

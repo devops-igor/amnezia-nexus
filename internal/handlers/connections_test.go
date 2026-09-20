@@ -199,16 +199,12 @@ func TestConnectionsHandlers(t *testing.T) {
 	})
 
 	t.Run("UserAddConnectionHandler With All Params Success", func(t *testing.T) {
-		down := 100
-		up := 200
 		mim := string(models.AWGMimicryTLS)
 		body, _ := json.Marshal(models.MyAddConnectionRequest{
-			ServerID:          sID,
-			Protocol:          "awg",
-			Name:              "Fully Paramed Conn",
-			AWGSpeedLimitDown: &down,
-			AWGSpeedLimitUp:   &up,
-			AWGMimicry:        &mim,
+			ServerID:   sID,
+			Protocol:   "awg",
+			Name:       "Fully Paramed Conn",
+			AWGMimicry: &mim,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/connections/add", bytes.NewReader(body))
 		reqCtx := middleware.WithSession(req.Context(), sess)
