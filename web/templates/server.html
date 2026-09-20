@@ -608,7 +608,7 @@
     async function loadServerStats() {
         try {
             const stats = await API.post(`/api/servers/${SERVER_ID}/stats`, null, { silent: true });
-            if (!stats || typeof stats !== 'object' || stats.error || Object.keys(stats).length === 0) {
+            if (!stats || typeof stats !== 'object' || stats.error || Object.keys(stats).length === 0 || (stats.ram_total === 0 && stats.disk_total === 0)) {
                 throw new Error(stats && stats.error ? stats.error : 'Empty or invalid server stats');
             }
             const el = document.getElementById('serverStats');

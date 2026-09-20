@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -338,8 +339,17 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"echo '===UPTIME==='; " +
 		"uptime -p 2>/dev/null || uptime"
 
-	out, _, _, _ := client.RunCommand(ctx, combinedCmd)
-	stats := parseCombinedStats(out)
+	out, _, code, err := client.RunCommand(ctx, combinedCmd)
+	if err != nil || code != 0 {
+		h.JSONError(w, http.StatusBadGateway, "stats_failed", "Failed to collect server statistics")
+		return
+	}
+
+	stats, err := parseCombinedStats(out)
+	if err != nil {
+		h.JSONError(w, http.StatusBadGateway, "stats_failed", "Malformed server statistics output")
+		return
+	}
 
 	h.JSON(w, http.StatusOK, stats)
 }
@@ -838,7 +848,11 @@ func parseServerID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(idStr, 10, 64)
 }
 
-func parseCombinedStats(raw string) models.ServerStatsResponse {
+func parseCombinedStats(raw string) (models.ServerStatsResponse, error) {
+	if strings.TrimSpace(raw) == "" {
+		return models.ServerStatsResponse{}, errors.New("empty stats output")
+	}
+
 	var resp models.ServerStatsResponse
 	sections := make(map[string]string)
 
@@ -901,7 +915,11 @@ func parseCombinedStats(raw string) models.ServerStatsResponse {
 		resp.Uptime = uptimeStr
 	}
 
-	return resp
+	if resp.RAMTotal <= 0 || resp.DiskTotal <= 0 {
+		return models.ServerStatsResponse{}, fmt.Errorf("incomplete stats output: missing ram or disk metrics")
+	}
+
+	return resp, nil
 }
 
 // ListServersHandler returns all configured servers (with sensitive credentials stripped).

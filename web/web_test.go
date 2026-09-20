@@ -1976,6 +1976,10 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 	if !strings.Contains(serverStr, "if (!stats || typeof stats !== 'object'") {
 		t.Errorf("server.html loadServerStats must validate stats payload before DOM updates")
 	}
+	expectedZeroCheck := "stats.ram_total === 0 && stats.disk_total === 0"
+	if !strings.Contains(serverStr, expectedZeroCheck) {
+		t.Errorf("server.html loadServerStats must check for zero totals: expected %q", expectedZeroCheck)
+	}
 
 	if !strings.Contains(serverStr, "return stats;") {
 		t.Errorf("server.html loadServerStats must return stats payload")

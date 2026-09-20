@@ -171,8 +171,8 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 	if strings.Contains(cmd, "docker --version") {
 		return "Docker version 24.0.5, build cedb786", "", 0, nil
 	}
-	if strings.Contains(cmd, "top -bn1") {
-		return "top - 12:00:00 up 10 days\nTasks: 100 total\n%Cpu(s):  5.0 us,  2.0 sy,  0.0 ni, 93.0 id\nMiB Mem :   2000.0 total,    500.0 free,   1000.0 used\n/dev/sda1       50G   20G   30G  40% /", "", 0, nil
+	if strings.Contains(cmd, "top -bn1") || strings.Contains(cmd, "===CPU===") {
+		return "===CPU===\n5.0\n===RAM===\n1048576 2097152\n===DISK===\n1073741824 2147483648\n===NET===\n1000 2000\n===UPTIME===\nup 10 days\n", "", 0, nil
 	}
 	if strings.Contains(cmd, "tc qdisc") {
 		return "qdisc tbf 1: dev eth0 root", "", 0, nil
