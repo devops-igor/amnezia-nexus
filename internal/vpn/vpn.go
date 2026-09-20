@@ -84,14 +84,6 @@ type Session = models.VPNSession
 // LoadBalancer is an alias for loadbalancer.LoadBalancer.
 type LoadBalancer = loadbalancer.LoadBalancer
 
-// LeastConnectionsLoadBalancer is an alias for loadbalancer.LeastConnectionsBalancer.
-type LeastConnectionsLoadBalancer = loadbalancer.LeastConnectionsBalancer
-
-// NewLeastConnectionsLoadBalancer creates a least connections load balancer.
-func NewLeastConnectionsLoadBalancer() *loadbalancer.LeastConnectionsBalancer {
-	return loadbalancer.NewLeastConnectionsBalancer(loadbalancer.CapacityConfig{})
-}
-
 // AWGStatusProvider defines an interface for querying live AWG status on a server.
 type AWGStatusProvider interface {
 	GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error)
@@ -617,21 +609,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	})
 
 	return svc, nil
-}
-
-// NewService creates a new VPNService with a specific algorithm (backwards compatibility).
-func NewService(algo models.LoadBalancingAlgorithm) *Service {
-	cfg := &models.VPNConfig{
-		Algorithm:          algo,
-		ListenPort:         51820,
-		SubnetCIDR:         "10.100.0.0/16",
-		HealthThresholdMS:  500,
-		MaxTotalPeers:      1000,
-		MaxPeersPerBackend: 250,
-		Weights:            make(map[int64]int),
-	}
-	svc, _ := NewVPNService(nil, cfg)
-	return svc
 }
 
 // SetProbeFunc sets the health probe function for testing or customized reachability probing.
