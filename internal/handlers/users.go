@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -336,17 +337,15 @@ func buildUserUpdates(req *models.UpdateUserRequest) (map[string]any, bool, erro
 	return updates, passwordUpdated, nil
 }
 
-func (h *Handlers) handlePasswordResetSessionBump(w http.ResponseWriter, r *http.Request, userID string) error {
-	newVer, err := h.db.BumpUserSessionVersion(r.Context(), userID)
-	if err != nil {
-		return err
-	}
-
+func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Request, userID string, newVer int) error {
 	sess := h.GetSession(r)
 	if sess != nil && sess.UserID == userID {
 		sess.SessionVersion = newVer
 		if h.cfg != nil {
-			_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge)
+			if err := middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge); err != nil {
+				slog.Error("failed to set session cookie on password reset", "error", err, "user_id", userID)
+				return err
+			}
 		}
 	}
 	return nil
@@ -384,16 +383,28 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(updates) > 0 {
-		if _, err := h.db.UpdateUser(ctx, userID, updates); err != nil {
+	if passwordUpdated {
+		ok, newVer, err := h.db.UpdateUserAndBumpSession(ctx, userID, updates)
+		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
 			return
 		}
-	}
-
-	if passwordUpdated {
-		if err := h.handlePasswordResetSessionBump(w, r, userID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update session version")
+		if !ok {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+			return
+		}
+		if err := h.refreshSelfSessionCookie(w, r, userID, newVer); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update session cookie")
+			return
+		}
+	} else if len(updates) > 0 {
+		ok, err := h.db.UpdateUser(ctx, userID, updates)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			return
+		}
+		if !ok {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 			return
 		}
 	}

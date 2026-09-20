@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -252,42 +253,29 @@ func isUniqueConstraintError(err error) bool {
 	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "idx_users_username") || strings.Contains(msg, "constraint failed")
 }
 
-// UpdateUser dynamically updates fields on a user record. Returns true if user existed and was updated.
-func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
-	var exists int
-	err := d.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM users WHERE id = ?", id).Scan(&exists)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-
+func buildUserUpdateClauses(updates map[string]any, skipCols map[string]bool) ([]string, []any, error) {
+	cols := make([]string, 0, len(updates))
 	for k := range updates {
 		if !allowedUserColumns[k] {
-			return false, fmt.Errorf("unknown user column: %s", k)
+			return nil, nil, fmt.Errorf("unknown user column: %s", k)
 		}
+		cols = append(cols, k)
 	}
-
-	if len(updates) == 0 {
-		return true, nil
-	}
+	sort.Strings(cols)
 
 	var setClauses []string
 	var values []any
 
-	for col, val := range updates {
-		if col == "id" {
+	for _, col := range cols {
+		if col == "id" || (skipCols != nil && skipCols[col]) {
 			continue
 		}
+		val := updates[col]
 		if col == "limits" {
 			if m, ok := val.(map[string]any); ok {
 				b, err := json.Marshal(m)
 				if err != nil {
-					return false, fmt.Errorf("failed to marshal limits: %w", err)
+					return nil, nil, fmt.Errorf("failed to marshal limits: %w", err)
 				}
 				val = string(b)
 			}
@@ -318,6 +306,32 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 		values = append(values, val)
 	}
 
+	return setClauses, values, nil
+}
+
+// UpdateUser dynamically updates fields on a user record. Returns true if user existed and was updated.
+func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	var exists int
+	err := d.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM users WHERE id = ?", id).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if len(updates) == 0 {
+		return true, nil
+	}
+
+	setClauses, values, err := buildUserUpdateClauses(updates, nil)
+	if err != nil {
+		return false, err
+	}
+
 	if len(setClauses) == 0 {
 		return true, nil
 	}
@@ -332,6 +346,57 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 	}
 
 	return true, nil
+}
+
+// UpdateUserAndBumpSession updates user attributes and increments session_version
+// by 1 in a single database transaction. Returns whether the user existed and the new session_version.
+func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to begin update user and bump session tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var exists int
+	err = tx.QueryRowContext(ctx, "SELECT 1 FROM users WHERE id = ?", id).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, 0, nil
+		}
+		return false, 0, err
+	}
+
+	setClauses, values, err := buildUserUpdateClauses(updates, map[string]bool{"session_version": true})
+	if err != nil {
+		return false, 0, err
+	}
+
+	setClauses = append(setClauses, "session_version = session_version + 1")
+	values = append(values, id)
+
+	// #nosec G201 -- Column names are validated against allowedUserColumns allowlist
+	query := fmt.Sprintf("UPDATE users SET %s WHERE id = ?", strings.Join(setClauses, ", "))
+
+	if _, err := tx.ExecContext(ctx, query, values...); err != nil {
+		return false, 0, fmt.Errorf("failed to update user %s: %w", id, err)
+	}
+
+	var newVersion int
+	err = tx.QueryRowContext(ctx, "SELECT session_version FROM users WHERE id = ?", id).Scan(&newVersion)
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to get new session version: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, 0, fmt.Errorf("failed to commit update user and bump session: %w", err)
+	}
+
+	return true, newVersion, nil
 }
 
 // DeleteUser deletes a user and all associated connections in a transaction.

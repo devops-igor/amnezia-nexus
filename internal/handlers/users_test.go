@@ -1066,4 +1066,65 @@ func TestUpdateUserHandler_AdminPasswordReset_BumpsSessionVersion(t *testing.T) 
 	if wAfterOldAdmin.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 Unauthorized for stale admin cookie after self-reset, got %d", wAfterOldAdmin.Code)
 	}
+
+	// Invariant 5: Failure during atomic update returns 500 and leaves previous password and session_version unchanged
+	_, err = db.ExecContext(ctx, "CREATE TRIGGER test_fail_update BEFORE UPDATE OF description ON users WHEN NEW.description = 'FAIL_SIMULATION' BEGIN SELECT RAISE(ABORT, 'simulated database update failure'); END;")
+	if err != nil {
+		t.Fatalf("failed to create failure trigger: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS test_fail_update")
+	}()
+
+	failPass := "FailedPass999!"
+	failDesc := "FAIL_SIMULATION"
+	failBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password:    &failPass,
+		Description: &failDesc,
+	})
+	failReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", targetUser.ID), bytes.NewReader(failBody))
+	failReq.AddCookie(refreshedAdminCookie)
+	failRec := httptest.NewRecorder()
+	r.ServeHTTP(failRec, failReq)
+
+	if failRec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when atomic update fails, got %d (%s)", failRec.Code, failRec.Body.String())
+	}
+
+	// Clean up trigger before checking user state
+	_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS test_fail_update")
+
+	// Verify target user's password and session version in DB are untouched
+	dbTargetAfterFail, err := db.GetUser(ctx, targetUser.ID)
+	if err != nil || dbTargetAfterFail == nil {
+		t.Fatalf("failed to fetch target user after failed update: %v", err)
+	}
+	if dbTargetAfterFail.SessionVersion != 2 {
+		t.Errorf("expected target session_version to remain 2 after failed update, got %d", dbTargetAfterFail.SessionVersion)
+	}
+	if !security.CheckPasswordHash(newTargetPassword, dbTargetAfterFail.PasswordHash) {
+		t.Errorf("expected target password to remain %q after failed update", newTargetPassword)
+	}
+	if dbTargetAfterFail.Description != nil && *dbTargetAfterFail.Description == "FAIL_SIMULATION" {
+		t.Errorf("expected description not to be updated after rollback")
+	}
+
+	// Invariant 6: Error from SetSessionCookieForRequest is handled and returns 500 internal_error
+	origSecret := cfg.SecretKey
+	cfg.SecretKey = ""
+	defer func() { cfg.SecretKey = origSecret }()
+
+	cookieFailPass := "SelfPassShouldFailCookie123!"
+	cookieFailBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password: &cookieFailPass,
+	})
+	cookieFailReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", adminUser.ID), bytes.NewReader(cookieFailBody))
+	cookieFailReq.AddCookie(refreshedAdminCookie)
+	cookieFailRec := httptest.NewRecorder()
+	r.ServeHTTP(cookieFailRec, cookieFailReq)
+
+	if cookieFailRec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error when session cookie refresh fails, got %d", cookieFailRec.Code)
+	}
+	cfg.SecretKey = origSecret
 }
