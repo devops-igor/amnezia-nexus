@@ -13,7 +13,7 @@ Maintenance and stability release introducing ARM64 AWG container support, remov
 
 - ARM64 AmneziaWG installation: pinned multi-arch base image v3.1.20260828-1 and added preflight port validation to prevent container failures on ARM64 hosts (#225, #231).
 - Session invalidation: bumped session version on admin password reset to terminate existing user sessions across devices (#171, #228).
-- AWG parameter collision: synchronized static default parameters to satisfy S1/S2 packet length difference invariants and prevent handshake failures (#232, #233, #234, #235).
+- AWG parameter collision: synchronized static default parameters to satisfy S1/S2 packet length difference invariants and prevent handshake failures (#227, #233, #234, #235).
 - Remote process concurrency: secured multi-process execution, improved peer rollback handling, and stabilized lease re-keying (#186).
 - Endpoint ordering: enforced deterministic sorting for active session snapshots (#219).
 
