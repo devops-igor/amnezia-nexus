@@ -364,3 +364,112 @@ func TestMigrateUserSessionVersion(t *testing.T) {
 		t.Errorf("expected SessionVersion 1, got %d", got.SessionVersion)
 	}
 }
+
+func TestUpdateUserAndBumpSession_Atomicity(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Create a user with SessionVersion=1
+	u := &models.User{
+		ID:             "atomic-test-user",
+		Username:       "atomic_user",
+		PasswordHash:   "initial-hash",
+		SessionVersion: 1,
+	}
+	userID, err := db.CreateUser(ctx, u)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// 2. Successful atomic update: update password_hash and telegramId while bumping session_version
+	updates := map[string]any{
+		"password_hash": "new-secret-hash",
+		"telegramId":    "@atomic_tele",
+	}
+	ok, newVer, err := db.UpdateUserAndBumpSession(ctx, userID, updates)
+	if err != nil {
+		t.Fatalf("UpdateUserAndBumpSession failed: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected ok=true for existing user")
+	}
+	if newVer != 2 {
+		t.Fatalf("expected new session_version=2, got %d", newVer)
+	}
+
+	// Verify both fields and session_version are updated in DB
+	fetched, err := db.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser failed: %v", err)
+	}
+	if fetched.PasswordHash != "new-secret-hash" {
+		t.Errorf("expected PasswordHash='new-secret-hash', got %q", fetched.PasswordHash)
+	}
+	if fetched.TelegramID == nil || *fetched.TelegramID != "@atomic_tele" {
+		t.Errorf("expected TelegramID='@atomic_tele', got %v", fetched.TelegramID)
+	}
+	if fetched.SessionVersion != 2 {
+		t.Errorf("expected SessionVersion=2, got %d", fetched.SessionVersion)
+	}
+
+	// 3. Rollback on cancelled context: neither password nor session_version should change
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	failUpdates := map[string]any{
+		"password_hash": "rolled-back-hash",
+		"telegramId":    "@never_tele",
+	}
+	_, _, err = db.UpdateUserAndBumpSession(canceledCtx, userID, failUpdates)
+	if err == nil {
+		t.Fatalf("expected error with canceled context, got nil")
+	}
+
+	// Verify no changes were committed to the user
+	fetchedAfterCancel, err := db.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser failed: %v", err)
+	}
+	if fetchedAfterCancel.PasswordHash != "new-secret-hash" {
+		t.Errorf("expected PasswordHash to remain 'new-secret-hash', got %q", fetchedAfterCancel.PasswordHash)
+	}
+	if fetchedAfterCancel.TelegramID == nil || *fetchedAfterCancel.TelegramID != "@atomic_tele" {
+		t.Errorf("expected TelegramID to remain '@atomic_tele', got %v", fetchedAfterCancel.TelegramID)
+	}
+	if fetchedAfterCancel.SessionVersion != 2 {
+		t.Errorf("expected SessionVersion to remain 2, got %d", fetchedAfterCancel.SessionVersion)
+	}
+
+	// 4. Rollback on invalid column: verify transaction fails and rolls back
+	invalidUpdates := map[string]any{
+		"password_hash":  "invalid-col-hash",
+		"unknown_column": "invalid_val",
+	}
+	_, _, err = db.UpdateUserAndBumpSession(ctx, userID, invalidUpdates)
+	if err == nil {
+		t.Fatalf("expected error with invalid column, got nil")
+	}
+
+	fetchedAfterInvalid, err := db.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser failed: %v", err)
+	}
+	if fetchedAfterInvalid.PasswordHash != "new-secret-hash" {
+		t.Errorf("expected PasswordHash to remain 'new-secret-hash', got %q", fetchedAfterInvalid.PasswordHash)
+	}
+	if fetchedAfterInvalid.SessionVersion != 2 {
+		t.Errorf("expected SessionVersion to remain 2, got %d", fetchedAfterInvalid.SessionVersion)
+	}
+
+	// 5. Non-existent user returns ok=false, newVer=0, err=nil
+	okGhost, verGhost, err := db.UpdateUserAndBumpSession(ctx, "non-existent-user", updates)
+	if err != nil {
+		t.Fatalf("UpdateUserAndBumpSession for ghost returned error: %v", err)
+	}
+	if okGhost {
+		t.Errorf("expected ok=false for non-existent user, got true")
+	}
+	if verGhost != 0 {
+		t.Errorf("expected ver=0 for non-existent user, got %d", verGhost)
+	}
+}
