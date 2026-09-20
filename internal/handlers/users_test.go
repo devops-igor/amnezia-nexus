@@ -13,6 +13,8 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
+	"github.com/go-chi/chi/v5"
 )
 
 func TestUsersHandlers(t *testing.T) {
@@ -812,4 +814,317 @@ func TestUsersHandlers(t *testing.T) {
 			t.Errorf("expected 32 hex chars, got %d (%s)", len(tok), tok)
 		}
 	})
+}
+
+func TestUpdateUserHandler_AdminPasswordReset_BumpsSessionVersion(t *testing.T) {
+	h, db, cfg := setupTestHandlers(t)
+	ctx := context.Background()
+
+	middleware.SetUserLookup(func(ctx context.Context, userID string) (*models.User, error) {
+		return db.GetUser(ctx, userID)
+	})
+	t.Cleanup(func() {
+		middleware.SetUserLookup(nil)
+	})
+
+	// 1. Seed admin and target users
+	adminPassHash, err := security.HashPassword("AdminPass123!")
+	if err != nil {
+		t.Fatalf("failed to hash admin password: %v", err)
+	}
+	adminUser := &models.User{
+		ID:             "admin-test-id",
+		Username:       "admin_user",
+		PasswordHash:   adminPassHash,
+		Role:           models.RoleAdmin,
+		Enabled:        true,
+		SessionVersion: 1,
+		CreatedAt:      time.Now(),
+	}
+	if _, err := db.CreateUser(ctx, adminUser); err != nil {
+		t.Fatalf("failed to create admin: %v", err)
+	}
+
+	targetPassHash, err := security.HashPassword("TargetPass123!")
+	if err != nil {
+		t.Fatalf("failed to hash target password: %v", err)
+	}
+	targetUser := &models.User{
+		ID:             "target-test-id",
+		Username:       "target_user",
+		PasswordHash:   targetPassHash,
+		Role:           models.RoleUser,
+		Enabled:        true,
+		SessionVersion: 1,
+		CreatedAt:      time.Now(),
+	}
+	if _, err := db.CreateUser(ctx, targetUser); err != nil {
+		t.Fatalf("failed to create target: %v", err)
+	}
+
+	// 2. Generate signed session cookies for both users
+	adminSess := &models.SessionData{
+		UserID:         adminUser.ID,
+		Username:       adminUser.Username,
+		Role:           adminUser.Role,
+		SessionVersion: 1,
+	}
+	adminEncoded, err := security.EncodeSession(adminSess.ToMap(), cfg.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to encode admin session: %v", err)
+	}
+	adminCookie := &http.Cookie{
+		Name:  middleware.SessionCookieName,
+		Value: adminEncoded,
+	}
+
+	targetSess := &models.SessionData{
+		UserID:         targetUser.ID,
+		Username:       targetUser.Username,
+		Role:           targetUser.Role,
+		SessionVersion: 1,
+	}
+	targetEncoded, err := security.EncodeSession(targetSess.ToMap(), cfg.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to encode target session: %v", err)
+	}
+	targetCookie := &http.Cookie{
+		Name:  middleware.SessionCookieName,
+		Value: targetEncoded,
+	}
+
+	// Protected endpoint to verify session validity
+	testEndpoint := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	authChain := middleware.Session(cfg.SecretKey)(middleware.RequireAuth(testEndpoint))
+
+	// Router for user update endpoints wrapped with session middleware
+	r := chi.NewRouter()
+	r.Use(middleware.Session(cfg.SecretKey))
+	r.Post("/api/users/{user_id}/update", h.UpdateUserHandler)
+
+	// Pre-condition: Both cookies are currently valid
+	reqBeforeTarget := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqBeforeTarget.AddCookie(targetCookie)
+	wBeforeTarget := httptest.NewRecorder()
+	authChain.ServeHTTP(wBeforeTarget, reqBeforeTarget)
+	if wBeforeTarget.Code != http.StatusOK {
+		t.Fatalf("expected target user cookie to be valid before reset, got %d", wBeforeTarget.Code)
+	}
+
+	reqBeforeAdmin := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqBeforeAdmin.AddCookie(adminCookie)
+	wBeforeAdmin := httptest.NewRecorder()
+	authChain.ServeHTTP(wBeforeAdmin, reqBeforeAdmin)
+	if wBeforeAdmin.Code != http.StatusOK {
+		t.Fatalf("expected admin cookie to be valid before reset, got %d", wBeforeAdmin.Code)
+	}
+
+	// 3. Admin resets target user's password
+	newTargetPassword := "NewTargetPass456!"
+	updateTargetBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password: &newTargetPassword,
+	})
+	updateTargetReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", targetUser.ID), bytes.NewReader(updateTargetBody))
+	updateTargetReq.AddCookie(adminCookie)
+	updateTargetRec := httptest.NewRecorder()
+	r.ServeHTTP(updateTargetRec, updateTargetReq)
+
+	if updateTargetRec.Code != http.StatusOK {
+		t.Fatalf("admin reset target password failed: %d (%s)", updateTargetRec.Code, updateTargetRec.Body.String())
+	}
+
+	// Verify target user's session_version bumped in DB
+	dbTarget, err := db.GetUser(ctx, targetUser.ID)
+	if err != nil || dbTarget == nil {
+		t.Fatalf("failed to fetch target user from DB: %v", err)
+	}
+	if dbTarget.SessionVersion != 2 {
+		t.Fatalf("expected target user session_version 2 in DB, got %d", dbTarget.SessionVersion)
+	}
+
+	// Invariant 1: Target user's pre-reset session cookie returns 401 Unauthorized
+	reqAfterTarget := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqAfterTarget.AddCookie(targetCookie)
+	wAfterTarget := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterTarget, reqAfterTarget)
+	if wAfterTarget.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for target user's stale session cookie, got %d", wAfterTarget.Code)
+	}
+
+	// Verify stale cookie was cleared with MaxAge == -1
+	targetCleared := false
+	for _, c := range wAfterTarget.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge == -1 {
+			targetCleared = true
+			break
+		}
+	}
+	if !targetCleared {
+		t.Errorf("expected target session cookie to be cleared on 401")
+	}
+
+	// Invariant 2: Admin session remains valid (200 OK) when resetting another user
+	reqAfterAdmin := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqAfterAdmin.AddCookie(adminCookie)
+	wAfterAdmin := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterAdmin, reqAfterAdmin)
+	if wAfterAdmin.Code != http.StatusOK {
+		t.Errorf("expected admin cookie to remain valid (200 OK) after resetting other user, got %d", wAfterAdmin.Code)
+	}
+	dbAdmin, err := db.GetUser(ctx, adminUser.ID)
+	if err != nil || dbAdmin == nil {
+		t.Fatalf("failed to fetch admin user from DB: %v", err)
+	}
+	if dbAdmin.SessionVersion != 1 {
+		t.Errorf("expected admin session_version to remain 1 in DB, got %d", dbAdmin.SessionVersion)
+	}
+
+	// Invariant 3: Non-password update does not bump session version
+	updatedEmail := "target-updated@example.com"
+	emptyPass := ""
+	updateNonPassBody, _ := json.Marshal(models.UpdateUserRequest{
+		Email:    &updatedEmail,
+		Password: &emptyPass,
+	})
+	updateNonPassReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", targetUser.ID), bytes.NewReader(updateNonPassBody))
+	updateNonPassReq.AddCookie(adminCookie)
+	updateNonPassRec := httptest.NewRecorder()
+	r.ServeHTTP(updateNonPassRec, updateNonPassReq)
+	if updateNonPassRec.Code != http.StatusOK {
+		t.Fatalf("admin update target email failed: %d (%s)", updateNonPassRec.Code, updateNonPassRec.Body.String())
+	}
+	dbTargetAfterEmail, err := db.GetUser(ctx, targetUser.ID)
+	if err != nil || dbTargetAfterEmail == nil {
+		t.Fatalf("failed to fetch target user: %v", err)
+	}
+	if dbTargetAfterEmail.SessionVersion != 2 {
+		t.Errorf("expected session_version to remain 2 after non-password update, got %d", dbTargetAfterEmail.SessionVersion)
+	}
+
+	// Invariant 4: Admin resetting their own password refreshes cookie and remains authenticated
+	newAdminPassword := "NewAdminPass456!"
+	updateAdminBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password: &newAdminPassword,
+	})
+	updateAdminReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", adminUser.ID), bytes.NewReader(updateAdminBody))
+	updateAdminReq.AddCookie(adminCookie)
+	updateAdminRec := httptest.NewRecorder()
+	r.ServeHTTP(updateAdminRec, updateAdminReq)
+
+	if updateAdminRec.Code != http.StatusOK {
+		t.Fatalf("admin self password reset failed: %d (%s)", updateAdminRec.Code, updateAdminRec.Body.String())
+	}
+
+	// Verify new refreshed cookie was issued in response
+	var refreshedAdminCookie *http.Cookie
+	for _, c := range updateAdminRec.Result().Cookies() {
+		if c.Name == middleware.SessionCookieName && c.MaxAge > 0 {
+			refreshedAdminCookie = c
+			break
+		}
+	}
+	if refreshedAdminCookie == nil {
+		t.Fatal("expected refreshed session cookie after admin self-reset")
+	}
+
+	// Decode refreshed cookie and assert session_version is 2
+	refreshedDataMap, err := security.DecodeSession(refreshedAdminCookie.Value, cfg.SecretKey)
+	if err != nil {
+		t.Fatalf("failed to decode refreshed cookie: %v", err)
+	}
+	refreshedSess := models.SessionDataFromMap(refreshedDataMap)
+	if refreshedSess.SessionVersion != 2 {
+		t.Errorf("expected refreshed session version 2, got %d", refreshedSess.SessionVersion)
+	}
+
+	// Verify admin's session version in DB is 2
+	dbAdminAfterSelf, err := db.GetUser(ctx, adminUser.ID)
+	if err != nil || dbAdminAfterSelf == nil {
+		t.Fatalf("failed to fetch admin user after self-reset: %v", err)
+	}
+	if dbAdminAfterSelf.SessionVersion != 2 {
+		t.Errorf("expected admin session_version 2 in DB after self-reset, got %d", dbAdminAfterSelf.SessionVersion)
+	}
+
+	// Refreshed cookie MUST succeed with 200 OK
+	reqAfterRefreshed := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqAfterRefreshed.AddCookie(refreshedAdminCookie)
+	wAfterRefreshed := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterRefreshed, reqAfterRefreshed)
+	if wAfterRefreshed.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for refreshed admin session cookie, got %d", wAfterRefreshed.Code)
+	}
+
+	// Old admin cookie MUST now be rejected with 401 Unauthorized
+	reqAfterOldAdmin := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	reqAfterOldAdmin.AddCookie(adminCookie)
+	wAfterOldAdmin := httptest.NewRecorder()
+	authChain.ServeHTTP(wAfterOldAdmin, reqAfterOldAdmin)
+	if wAfterOldAdmin.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for stale admin cookie after self-reset, got %d", wAfterOldAdmin.Code)
+	}
+
+	// Invariant 5: Failure during atomic update returns 500 and leaves previous password and session_version unchanged
+	_, err = db.ExecContext(ctx, "CREATE TRIGGER test_fail_update BEFORE UPDATE OF description ON users WHEN NEW.description = 'FAIL_SIMULATION' BEGIN SELECT RAISE(ABORT, 'simulated database update failure'); END;")
+	if err != nil {
+		t.Fatalf("failed to create failure trigger: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS test_fail_update")
+	}()
+
+	failPass := "FailedPass999!"
+	failDesc := "FAIL_SIMULATION"
+	failBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password:    &failPass,
+		Description: &failDesc,
+	})
+	failReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", targetUser.ID), bytes.NewReader(failBody))
+	failReq.AddCookie(refreshedAdminCookie)
+	failRec := httptest.NewRecorder()
+	r.ServeHTTP(failRec, failReq)
+
+	if failRec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when atomic update fails, got %d (%s)", failRec.Code, failRec.Body.String())
+	}
+
+	// Clean up trigger before checking user state
+	_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS test_fail_update")
+
+	// Verify target user's password and session version in DB are untouched
+	dbTargetAfterFail, err := db.GetUser(ctx, targetUser.ID)
+	if err != nil || dbTargetAfterFail == nil {
+		t.Fatalf("failed to fetch target user after failed update: %v", err)
+	}
+	if dbTargetAfterFail.SessionVersion != 2 {
+		t.Errorf("expected target session_version to remain 2 after failed update, got %d", dbTargetAfterFail.SessionVersion)
+	}
+	if !security.CheckPasswordHash(newTargetPassword, dbTargetAfterFail.PasswordHash) {
+		t.Errorf("expected target password to remain %q after failed update", newTargetPassword)
+	}
+	if dbTargetAfterFail.Description != nil && *dbTargetAfterFail.Description == "FAIL_SIMULATION" {
+		t.Errorf("expected description not to be updated after rollback")
+	}
+
+	// Invariant 6: Error from SetSessionCookieForRequest is handled and returns 500 internal_error
+	origSecret := cfg.SecretKey
+	cfg.SecretKey = ""
+	defer func() { cfg.SecretKey = origSecret }()
+
+	cookieFailPass := "SelfPassShouldFailCookie123!"
+	cookieFailBody, _ := json.Marshal(models.UpdateUserRequest{
+		Password: &cookieFailPass,
+	})
+	cookieFailReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", adminUser.ID), bytes.NewReader(cookieFailBody))
+	cookieFailReq.AddCookie(refreshedAdminCookie)
+	cookieFailRec := httptest.NewRecorder()
+	r.ServeHTTP(cookieFailRec, cookieFailReq)
+
+	if cookieFailRec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error when session cookie refresh fails, got %d", cookieFailRec.Code)
+	}
+	cfg.SecretKey = origSecret
 }

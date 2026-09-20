@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 	"github.com/go-chi/chi/v5"
@@ -287,6 +289,68 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 	resp["vpn_link"] = GenerateVPNLink(configStr)
 }
 
+func applyExpirationUpdate(req *models.UpdateUserRequest, updates map[string]any) {
+	if req.ExpiresAt != nil {
+		if t, err := time.Parse(time.RFC3339, *req.ExpiresAt); err == nil {
+			updates["expires_at"] = t
+			updates["expiration_date"] = t
+		}
+	} else if req.ExpirationDate != nil {
+		if t, err := time.Parse(time.RFC3339, *req.ExpirationDate); err == nil {
+			updates["expires_at"] = t
+			updates["expiration_date"] = t
+		}
+	}
+}
+
+func buildUserUpdates(req *models.UpdateUserRequest) (map[string]any, bool, error) {
+	updates := make(map[string]any)
+	if req.TelegramID != nil {
+		updates["telegramId"] = *req.TelegramID
+	}
+	if req.Email != nil {
+		updates["email"] = *req.Email
+	}
+	if req.Description != nil {
+		updates["description"] = *req.Description
+	}
+	if req.TrafficLimit != nil {
+		updates["traffic_limit"] = int64(*req.TrafficLimit * 1024 * 1024 * 1024)
+	}
+	if req.TrafficResetStrategy != nil {
+		updates["traffic_reset_strategy"] = *req.TrafficResetStrategy
+		updates["last_reset_at"] = time.Now().Format(time.RFC3339)
+	}
+	applyExpirationUpdate(req, updates)
+	if req.AWGMimicry != nil {
+		updates["awg_mimicry"] = *req.AWGMimicry
+	}
+	var passwordUpdated bool
+	if req.Password != nil && *req.Password != "" {
+		hash, err := security.HashPassword(*req.Password)
+		if err != nil {
+			return nil, false, err
+		}
+		updates["password_hash"] = hash
+		passwordUpdated = true
+	}
+	return updates, passwordUpdated, nil
+}
+
+func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Request, userID string, newVer int) error {
+	sess := h.GetSession(r)
+	if sess != nil && sess.UserID == userID {
+		sess.SessionVersion = newVer
+		if h.cfg != nil {
+			if err := middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, middleware.DefaultSessionMaxAge); err != nil {
+				slog.Error("failed to set session cookie on password reset", "error", err, "user_id", userID)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // UpdateUserHandler updates user attributes and resets limits if modified.
 func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
@@ -313,46 +377,34 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updates := make(map[string]any)
-	if req.TelegramID != nil {
-		updates["telegramId"] = *req.TelegramID
-	}
-	if req.Email != nil {
-		updates["email"] = *req.Email
-	}
-	if req.Description != nil {
-		updates["description"] = *req.Description
-	}
-	if req.TrafficLimit != nil {
-		updates["traffic_limit"] = int64(*req.TrafficLimit * 1024 * 1024 * 1024)
-	}
-	if req.TrafficResetStrategy != nil {
-		updates["traffic_reset_strategy"] = *req.TrafficResetStrategy
-		updates["last_reset_at"] = time.Now().Format(time.RFC3339)
-	}
-	if req.ExpiresAt != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpiresAt); err == nil {
-			updates["expires_at"] = t
-			updates["expiration_date"] = t
-		}
-	} else if req.ExpirationDate != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpirationDate); err == nil {
-			updates["expires_at"] = t
-			updates["expiration_date"] = t
-		}
-	}
-	if req.AWGMimicry != nil {
-		updates["awg_mimicry"] = *req.AWGMimicry
-	}
-	if req.Password != nil && *req.Password != "" {
-		if hash, err := security.HashPassword(*req.Password); err == nil {
-			updates["password_hash"] = hash
-		}
+	updates, passwordUpdated, err := buildUserUpdates(&req)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to hash password")
+		return
 	}
 
-	if len(updates) > 0 {
-		if _, err := h.db.UpdateUser(ctx, userID, updates); err != nil {
+	if passwordUpdated {
+		ok, newVer, err := h.db.UpdateUserAndBumpSession(ctx, userID, updates)
+		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			return
+		}
+		if !ok {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+			return
+		}
+		if err := h.refreshSelfSessionCookie(w, r, userID, newVer); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update session cookie")
+			return
+		}
+	} else if len(updates) > 0 {
+		ok, err := h.db.UpdateUser(ctx, userID, updates)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			return
+		}
+		if !ok {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 			return
 		}
 	}
