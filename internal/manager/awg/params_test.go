@@ -1444,3 +1444,75 @@ func TestValidateAWGParams_HeaderRangeOverlap(t *testing.T) {
 		})
 	}
 }
+
+func TestAWGDefaults_PassesValidation(t *testing.T) {
+	t.Run("validation_compliance", func(t *testing.T) {
+		if err := ValidateAWGParams(AWGDefaults); err != nil {
+			t.Fatalf("ValidateAWGParams(AWGDefaults) returned error: %v", err)
+		}
+	})
+
+	t.Run("s1_s2_collision_avoidance", func(t *testing.T) {
+		s1, err1 := strconv.Atoi(AWGDefaults["init_packet_junk_size"])
+		s2, err2 := strconv.Atoi(AWGDefaults["response_packet_junk_size"])
+		if err1 != nil || err2 != nil {
+			t.Fatalf("failed to parse junk sizes: s1=%v, s2=%v", err1, err2)
+		}
+
+		diff := s1 - s2
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff < 10 {
+			t.Errorf("expected |s1 - s2| >= 10, got |%d - %d| = %d", s1, s2, diff)
+		}
+		if s2 == s1+56 || s1 == s2+56 {
+			t.Errorf("expected s2 != s1 + 56 && s1 != s2 + 56, but s1=%d, s2=%d collided", s1, s2)
+		}
+	})
+
+	t.Run("s1_s4_floor_invariant", func(t *testing.T) {
+		keys := []string{
+			"init_packet_junk_size",
+			"response_packet_junk_size",
+			"cookie_reply_packet_junk_size",
+			"transport_packet_junk_size",
+		}
+		for _, k := range keys {
+			val, err := strconv.Atoi(AWGDefaults[k])
+			if err != nil {
+				t.Fatalf("failed to parse %s: %v", k, err)
+			}
+			if val < 12 {
+				t.Errorf("expected %s >= 12, got %d", k, val)
+			}
+		}
+	})
+
+	t.Run("magic_headers_validity_and_disjointness", func(t *testing.T) {
+		headerKeys := []string{
+			"init_packet_magic_header",
+			"response_packet_magic_header",
+			"underload_packet_magic_header",
+			"transport_packet_magic_header",
+		}
+		var ranges [4]HeaderRange
+		for i, k := range headerKeys {
+			hr, err := models.ParseHeaderRange(AWGDefaults[k])
+			if err != nil {
+				t.Fatalf("failed to parse %s: %v", k, err)
+			}
+			if hr.IsZero() {
+				t.Errorf("magic header %s must not be zero", k)
+			}
+			if hr.Lo < 5 || uint64(hr.Hi) > 4294967295 {
+				t.Errorf("magic header %s (%s) out of valid bounds [5, 4294967295]", k, hr.String())
+			}
+			ranges[i] = hr
+		}
+
+		if err := ValidateQuadrantDisjointness(ranges[0], ranges[1], ranges[2], ranges[3]); err != nil {
+			t.Errorf("magic headers quadrant disjointness failed: %v", err)
+		}
+	})
+}

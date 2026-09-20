@@ -29,7 +29,7 @@ var AWGDefaults = map[string]string{
 	"junk_packet_min_size":          "10",
 	"junk_packet_max_size":          "30",
 	"init_packet_junk_size":         "15",
-	"response_packet_junk_size":     "18",
+	"response_packet_junk_size":     "40",
 	"cookie_reply_packet_junk_size": "20",
 	"transport_packet_junk_size":    "23",
 	"init_packet_magic_header":      "1020325451",
