@@ -35,7 +35,7 @@ const (
 	DefaultH3 = uint32(1766607858)
 	DefaultH4 = uint32(2528465083)
 	DefaultS1 = 15
-	DefaultS2 = 18
+	DefaultS2 = 40
 	DefaultS3 = 20
 	DefaultS4 = 23
 

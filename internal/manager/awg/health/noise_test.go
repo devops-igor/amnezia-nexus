@@ -752,3 +752,62 @@ func TestVerifyAWGResponsePacket_MAC1Validation(t *testing.T) {
 		t.Errorf("expected verification to fail for wrong receiver index")
 	}
 }
+
+func TestHealthDefaults_PassesValidationAndInvariants(t *testing.T) {
+	// 1. Distance Invariant: |DefaultS1 - DefaultS2| >= 10
+	diff := DefaultS1 - DefaultS2
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < 10 {
+		t.Errorf("expected |DefaultS1 - DefaultS2| >= 10, got %d (S1=%d, S2=%d)", diff, DefaultS1, DefaultS2)
+	}
+
+	// 2. Collision Invariant: DefaultS2 != DefaultS1 + 56 and DefaultS1 != DefaultS2 + 56
+	if DefaultS2 == DefaultS1+56 {
+		t.Errorf("collision invariant violated: DefaultS2 (%d) == DefaultS1 + 56 (%d)", DefaultS2, DefaultS1+56)
+	}
+	if DefaultS1 == DefaultS2+56 {
+		t.Errorf("collision invariant violated: DefaultS1 (%d) == DefaultS2 + 56 (%d)", DefaultS1, DefaultS2+56)
+	}
+
+	// 3. S1..S4 Floor Invariant: all >= 12
+	if DefaultS1 < 12 {
+		t.Errorf("expected DefaultS1 >= 12, got %d", DefaultS1)
+	}
+	if DefaultS2 < 12 {
+		t.Errorf("expected DefaultS2 >= 12, got %d", DefaultS2)
+	}
+	if DefaultS3 < 12 {
+		t.Errorf("expected DefaultS3 >= 12, got %d", DefaultS3)
+	}
+	if DefaultS4 < 12 {
+		t.Errorf("expected DefaultS4 >= 12, got %d", DefaultS4)
+	}
+
+	// 4. Magic Headers Validity: non-zero, within [5, 4294967295], and mutually distinct
+	headers := []struct {
+		name string
+		val  uint32
+	}{
+		{"DefaultH1", DefaultH1},
+		{"DefaultH2", DefaultH2},
+		{"DefaultH3", DefaultH3},
+		{"DefaultH4", DefaultH4},
+	}
+
+	seen := make(map[uint32]string)
+	for _, h := range headers {
+		if h.val == 0 {
+			t.Errorf("expected %s != 0", h.name)
+		}
+		val64 := uint64(h.val)
+		if val64 < 5 || val64 > 4294967295 {
+			t.Errorf("expected %s within uint32 bounds [5, 4294967295], got %d", h.name, h.val)
+		}
+		if prev, exists := seen[h.val]; exists {
+			t.Errorf("header collision: %s and %s share value %d", h.name, prev, h.val)
+		}
+		seen[h.val] = h.name
+	}
+}
