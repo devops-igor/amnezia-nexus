@@ -1449,6 +1449,76 @@ func TestServerStatsHandler_Failures(t *testing.T) {
 			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
 		}
 	})
+
+	t.Run("Missing or empty CPU section returns 502 with stats_failed", func(t *testing.T) {
+		for _, raw := range []string{
+			"===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+			"===CPU===\n\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+			"===CPU===\n   \t  \n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+		} {
+			mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+				return raw, "", 0, nil
+			}
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadGateway {
+				t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+			}
+			if !strings.Contains(w.Body.String(), "stats_failed") {
+				t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+			}
+		}
+	})
+
+	t.Run("Malformed CPU returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\nnot-a-number\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Missing NET section returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\n15.5\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Malformed NET returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\n15.5\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\ninvalid net\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
 }
 
 func TestParseCombinedStats(t *testing.T) {
@@ -1495,9 +1565,45 @@ func TestParseCombinedStats(t *testing.T) {
 		}
 	})
 
-	t.Run("IncompleteOutputMissingRAMReturnsError", func(t *testing.T) {
+	t.Run("MissingCPUSectionReturnsError", func(t *testing.T) {
+		raw := "===RAM===\n2097152 8388608\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===NET===\n102400 204800\n"
+
+		_, err := parseCombinedStats(raw)
+		if err == nil {
+			t.Errorf("expected error for missing CPU stats, got nil")
+		}
+	})
+
+	t.Run("EmptyCPUSectionReturnsError", func(t *testing.T) {
+		for _, emptyCPU := range []string{
+			"===CPU===\n\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n   \t  \n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(emptyCPU)
+			if err == nil {
+				t.Errorf("expected error for empty CPU stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MalformedCPUReturnsError", func(t *testing.T) {
+		for _, badCPU := range []string{
+			"===CPU===\nnot-a-number\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n-5.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badCPU)
+			if err == nil {
+				t.Errorf("expected error for malformed CPU stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingRAMSectionReturnsError", func(t *testing.T) {
 		raw := "===CPU===\n10.0\n" +
 			"===DISK===\n10485760 52428800\n" +
+			"===NET===\n102400 204800\n" +
 			"===UPTIME===\nup 1 day\n"
 
 		_, err := parseCombinedStats(raw)
@@ -1506,9 +1612,23 @@ func TestParseCombinedStats(t *testing.T) {
 		}
 	})
 
-	t.Run("IncompleteOutputMissingDiskReturnsError", func(t *testing.T) {
+	t.Run("MalformedRAMUsedReturnsError", func(t *testing.T) {
+		for _, badRAM := range []string{
+			"===CPU===\n10.0\n===RAM===\nabc 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n-10 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badRAM)
+			if err == nil {
+				t.Errorf("expected error for malformed RAM stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingDISKSectionReturnsError", func(t *testing.T) {
 		raw := "===CPU===\n10.0\n" +
 			"===RAM===\n2097152 8388608\n" +
+			"===NET===\n102400 204800\n" +
 			"===UPTIME===\nup 1 day\n"
 
 		_, err := parseCombinedStats(raw)
@@ -1517,14 +1637,89 @@ func TestParseCombinedStats(t *testing.T) {
 		}
 	})
 
-	t.Run("IncompleteOutputZeroTotalsReturnsError", func(t *testing.T) {
+	t.Run("MalformedDISKUsedReturnsError", func(t *testing.T) {
+		for _, badDisk := range []string{
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\nabc 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n-1 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badDisk)
+			if err == nil {
+				t.Errorf("expected error for malformed DISK stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingNETSectionReturnsError", func(t *testing.T) {
 		raw := "===CPU===\n10.0\n" +
-			"===RAM===\n0 0\n" +
-			"===DISK===\n0 0\n"
+			"===RAM===\n2097152 8388608\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===UPTIME===\nup 1 day\n"
 
 		_, err := parseCombinedStats(raw)
 		if err == nil {
-			t.Errorf("expected error for zero totals, got nil")
+			t.Errorf("expected error for missing NET stats, got nil")
+		}
+	})
+
+	t.Run("MalformedNETReturnsError", func(t *testing.T) {
+		for _, badNet := range []string{
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\ninvalid net\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n-1 50\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n50 -1\n",
+		} {
+			_, err := parseCombinedStats(badNet)
+			if err == nil {
+				t.Errorf("expected error for malformed NET stats, got nil")
+			}
+		}
+	})
+
+	t.Run("IncompleteOutputZeroTotalsReturnsError", func(t *testing.T) {
+		for _, zeroTotals := range []string{
+			"===CPU===\n10.0\n===RAM===\n0 0\n===DISK===\n0 5000000\n===NET===\n0 0\n",
+			"===CPU===\n10.0\n===RAM===\n0 1000000\n===DISK===\n0 0\n===NET===\n0 0\n",
+			"===CPU===\n10.0\n===RAM===\n0 0\n===DISK===\n0 0\n===NET===\n0 0\n",
+		} {
+			_, err := parseCombinedStats(zeroTotals)
+			if err == nil {
+				t.Errorf("expected error for zero totals, got nil")
+			}
+		}
+	})
+
+	t.Run("LegitimateZerosAccepted", func(t *testing.T) {
+		raw := "===CPU===\n0.0\n" +
+			"===RAM===\n0 1000000\n" +
+			"===DISK===\n0 5000000\n" +
+			"===NET===\n0 0\n" +
+			"===UPTIME===\nup 10 minutes\n"
+
+		stats, err := parseCombinedStats(raw)
+		if err != nil {
+			t.Fatalf("expected no error for legitimate zeros, got: %v", err)
+		}
+		if stats.CPU != 0.0 {
+			t.Errorf("expected CPU 0.0, got %v", stats.CPU)
+		}
+		if stats.RAMUsed != 0 || stats.RAMTotal != 1000000 {
+			t.Errorf("expected RAM 0/1000000, got used=%d total=%d", stats.RAMUsed, stats.RAMTotal)
+		}
+		if stats.RAMPercent != 0.0 {
+			t.Errorf("expected RAMPercent 0.0, got %v", stats.RAMPercent)
+		}
+		if stats.DiskUsed != 0 || stats.DiskTotal != 5000000 {
+			t.Errorf("expected Disk 0/5000000, got used=%d total=%d", stats.DiskUsed, stats.DiskTotal)
+		}
+		if stats.DiskPercent != 0.0 {
+			t.Errorf("expected DiskPercent 0.0, got %v", stats.DiskPercent)
+		}
+		if stats.NetRx != 0 || stats.NetTx != 0 {
+			t.Errorf("expected Net 0/0, got rx=%d tx=%d", stats.NetRx, stats.NetTx)
+		}
+		if stats.Uptime != "up 10 minutes" {
+			t.Errorf("expected Uptime 'up 10 minutes', got %q", stats.Uptime)
 		}
 	})
 }
