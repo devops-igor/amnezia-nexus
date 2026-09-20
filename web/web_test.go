@@ -1937,3 +1937,60 @@ func TestUsersTemplatePageSize(t *testing.T) {
 		t.Errorf("users.html must not contain obsolete 'let pageSize = 10;'")
 	}
 }
+
+func TestServerTemplate_TelemetryPolling(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	// 1. Verify STATS_REFRESH_INTERVAL_MS definition
+	const expectedInterval = "const STATS_REFRESH_INTERVAL_MS = 30000;"
+	if !strings.Contains(serverStr, expectedInterval) {
+		t.Errorf("server.html must define %q", expectedInterval)
+	}
+
+	// 2. Verify registration of Telemetry.poll for server-stats and server-reachability
+	expectedStatsPoll := "Telemetry.poll('server-stats-' + SERVER_ID, loadServerStats, STATS_REFRESH_INTERVAL_MS);"
+	if !strings.Contains(serverStr, expectedStatsPoll) {
+		t.Errorf("server.html missing Telemetry.poll for server-stats: expected %q", expectedStatsPoll)
+	}
+
+	expectedReachPoll := "Telemetry.poll('server-reachability-' + SERVER_ID, updateReachability, STATS_REFRESH_INTERVAL_MS);"
+	if !strings.Contains(serverStr, expectedReachPoll) {
+		t.Errorf("server.html missing Telemetry.poll for server-reachability: expected %q", expectedReachPoll)
+	}
+
+	// 3. Verify no bare setInterval(updateReachability) remains
+	if strings.Contains(serverStr, "setInterval(updateReachability") {
+		t.Errorf("server.html must not contain bare unmanaged 'setInterval(updateReachability'")
+	}
+
+	// 4. Verify error preservation behavior in loadServerStats
+	if !strings.Contains(serverStr, "if (!stats || typeof stats !== 'object'") {
+		t.Errorf("server.html loadServerStats must validate stats payload before DOM updates")
+	}
+
+	if !strings.Contains(serverStr, "return stats;") {
+		t.Errorf("server.html loadServerStats must return stats payload")
+	}
+
+	if !strings.Contains(serverStr, "throw err;") {
+		t.Errorf("server.html loadServerStats must re-throw errors for Telemetry.poll failure tracking")
+	}
+
+	loadStatsIdx := strings.Index(serverStr, "async function loadServerStats()")
+	if loadStatsIdx == -1 {
+		t.Fatalf("server.html missing loadServerStats function")
+	}
+	loadStatsBlock := serverStr[loadStatsIdx : loadStatsIdx+strings.Index(serverStr[loadStatsIdx:], "\n    }")]
+	if strings.Contains(loadStatsBlock, "innerHTML = ''") || strings.Contains(loadStatsBlock, "innerHTML = \"\"") {
+		t.Errorf("loadServerStats must not blank DOM innerHTML on error")
+	}
+}
