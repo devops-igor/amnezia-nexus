@@ -2,11 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GO_DIR="${GO_DIR:-$REPO_ROOT/amnezia-nexus}"
-if [ ! -d "$GO_DIR" ]; then
-    GO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-fi
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+GO_DIR="${GO_DIR:-$REPO_ROOT}"
 
 # Setup hermetic temporary directory
 TMP_DIR=$(mktemp -d /tmp/amnezia-e2e-XXXXXX)
