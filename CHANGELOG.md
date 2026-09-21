@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Compatibility policy: formalized and adopted the Amnezia Nexus Compatibility Policy in `useful_notes/COMPATIBILITY.md`, defining HTTP API, Go internal, frontend, and data migration lifecycles, and scheduling immediate removal of `/api/servers/*` and `/api/my/connections/*` in v1.2.0 (#263).
+
 ## [1.2.1] - Polaris - 2026-09-21
 
 Maintenance and stability release introducing ARM64 AWG container support, removing legacy speed limits, hardening cross-process concurrency and peer rollback, and fixing session invalidation on password changes.
