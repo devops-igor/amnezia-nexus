@@ -27,10 +27,16 @@ jobs:
           import re
           import subprocess
           import sys
+          import urllib.request
 
           def compare_versions(v1, v2):
+              def strip_build_metadata(v):
+                  if "+" in v:
+                      return v.split("+", 1)[0]
+                  return v
+
               def norm(v):
-                  v = v.strip()
+                  v = strip_build_metadata(v).strip()
                   if ":" in v:
                       v = v.split(":")[-1]
                   if v.startswith("v") or v.startswith("V"):
@@ -42,10 +48,12 @@ jobs:
                   return 0
 
               def split_segs(v):
-                  return [s for s in re.split(r'[.\-_+]', v) if s]
+                  return [s for s in re.split(r'[.\-_]', norm(v)) if s]
 
-              segs1, segs2 = split_segs(n1), split_segs(n2)
+              segs1, segs2 = split_segs(v1), split_segs(v2)
               min_len = min(len(segs1), len(segs2))
+
+              prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
 
               for i in range(min_len):
                   s1, s2 = segs1[i], segs2[i]
@@ -69,18 +77,18 @@ jobs:
                           return 1
                       continue
 
-                  prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
-                  if s1.isdigit() and any(s2.lower().startswith(p) for p in prereleases):
-                      return 1
-                  if s2.isdigit() and any(s1.lower().startswith(p) for p in prereleases):
+                  # SemVer 2.0.0 Rule 11.4.2/11.4.3: Numeric identifiers always have lower
+                  # precedence than non-numeric identifiers.
+                  if s1.isdigit() and not s2.isdigit():
                       return -1
+                  if not s1.isdigit() and s2.isdigit():
+                      return 1
 
                   if s1 < s2:
                       return -1
                   if s1 > s2:
                       return 1
 
-              prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
               if len(segs1) > len(segs2):
                   for s in segs1[min_len:]:
                       if any(s.lower().startswith(p) for p in prereleases):
@@ -99,7 +107,7 @@ jobs:
 
               return 0
 
-          # 1. Extract pinned versions from service.go and go.mod
+          # 1. Extract pinned versions from service.go and validate go.mod
           with open("internal/service/upstream/service.go", "r", encoding="utf-8") as f:
               svc_code = f.read()
 
@@ -110,17 +118,38 @@ jobs:
           pinned_go = m_go.group(1) if m_go else "v3.1.20260828"
           pinned_tools = m_tools.group(1) if m_tools else "v3.1.20260812"
           pinned_base_image = m_img.group(1) if m_img else "devopsigor/amneziawg:v3.1.20260828-1"
+          pinned_base_tag = pinned_base_image.split(":")[-1] if ":" in pinned_base_image else pinned_base_image
+
+          go_mod_version = None
+          go_mod_drift = False
+          if os.path.exists("go.mod"):
+              with open("go.mod", "r", encoding="utf-8") as f:
+                  go_mod_content = f.read()
+              m_gomod = re.search(r'github\.com/amnezia-vpn/amneziawg-go/v\d+\s+([^\s]+)', go_mod_content)
+              if m_gomod:
+                  go_mod_version = m_gomod.group(1).strip()
+                  if go_mod_version != pinned_go:
+                      go_mod_drift = True
+                      print(f"WARNING: go.mod amneziawg-go version ({go_mod_version}) drifts from PinnedAWGGoVersion ({pinned_go})!", file=sys.stderr)
 
           components = [
               {
                   "name": "amneziawg-go",
                   "repo": "amnezia-vpn/amneziawg-go",
+                  "type": "github",
                   "pinned": pinned_go,
               },
               {
                   "name": "amneziawg-tools",
                   "repo": "amnezia-vpn/amneziawg-tools",
+                  "type": "github",
                   "pinned": pinned_tools,
+              },
+              {
+                  "name": "docker-base-image",
+                  "repo": "devopsigor/amneziawg",
+                  "type": "docker",
+                  "pinned": pinned_base_tag,
               }
           ]
 
@@ -131,24 +160,44 @@ jobs:
           for comp in components:
               repo = comp["repo"]
               name = comp["name"]
+              comp_type = comp["type"]
               pinned = comp["pinned"]
 
               print(f"Checking {name} ({repo})...")
-              cmd = ["gh", "api", f"repos/{repo}/tags?per_page=10", "--jq", ".[].name"]
-              res = subprocess.run(cmd, capture_output=True, text=True)
+              tags = []
 
-              if res.returncode != 0:
-                  print(f"Warning: gh api error for {repo}: {res.stderr.strip()}", file=sys.stderr)
-                  summary_rows.append({
-                      "name": name,
-                      "pinned": pinned,
-                      "latest": pinned,
-                      "update": "Error",
-                      "url": f"https://github.com/{repo}/tags"
-                  })
-                  continue
+              if comp_type == "github":
+                  cmd = ["gh", "api", f"repos/{repo}/tags?per_page=10", "--jq", ".[].name"]
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  if res.returncode != 0:
+                      print(f"Warning: gh api error for {repo}: {res.stderr.strip()}", file=sys.stderr)
+                      summary_rows.append({
+                          "name": name,
+                          "pinned": pinned,
+                          "latest": pinned,
+                          "update": "Error",
+                          "url": f"https://github.com/{repo}/tags"
+                      })
+                      continue
+                  tags = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+              elif comp_type == "docker":
+                  docker_url = f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=10"
+                  req = urllib.request.Request(docker_url, headers={"User-Agent": "amnezia-nexus/1.2.1"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=10) as resp:
+                          data = json.loads(resp.read().decode("utf-8"))
+                          tags = [item["name"] for item in data.get("results", []) if item.get("name") and item.get("name") != "latest"]
+                  except Exception as e:
+                      print(f"Warning: Docker Hub query error for {repo}: {e}", file=sys.stderr)
+                      summary_rows.append({
+                          "name": name,
+                          "pinned": pinned,
+                          "latest": pinned,
+                          "update": "Error",
+                          "url": f"https://hub.docker.com/r/{repo}/tags"
+                      })
+                      continue
 
-              tags = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
               max_tag = ""
               for tag in tags:
                   norm_tag = tag.lstrip("vV")
@@ -160,7 +209,10 @@ jobs:
                   max_tag = tags[0] if tags else pinned
 
               update_available = compare_versions(max_tag, pinned) > 0
-              rel_url = f"https://github.com/{repo}/releases/tag/{max_tag}"
+              if comp_type == "docker":
+                  rel_url = f"https://hub.docker.com/r/{repo}/tags"
+              else:
+                  rel_url = f"https://github.com/{repo}/releases/tag/{max_tag}"
 
               print(f"  Pinned: {pinned}")
               print(f"  Latest: {max_tag}")
@@ -174,12 +226,11 @@ jobs:
                   "url": rel_url
               })
 
-              # 3. Create issue if update detected and no open alert exists
+              # 3. Create issue if update detected and no open alert exists for this (component, version)
               if update_available:
                   any_update_found = True
                   print(f"New upstream release detected for {name}: {max_tag}")
 
-                  # Check for existing open issues with [Upstream Alert]
                   search_cmd = [
                       "gh", "issue", "list",
                       "--state", "open",
@@ -188,25 +239,33 @@ jobs:
                   ]
                   search_res = subprocess.run(search_cmd, capture_output=True, text=True)
                   alert_exists = False
+                  prior_open_alerts = []
                   if search_res.returncode == 0 and search_res.stdout.strip():
                       try:
                           issues = json.loads(search_res.stdout)
                           for issue in issues:
                               title = issue.get("title", "")
                               if "[Upstream Alert]" in title and name in title:
-                                  print(f"Open alert issue #{issue.get('number')} already exists for {name}: {title}")
-                                  alert_exists = True
-                                  break
+                                  if max_tag in title:
+                                      print(f"Open alert issue #{issue.get('number')} already exists for {name} {max_tag}: {title}")
+                                      alert_exists = True
+                                      break
+                                  else:
+                                      prior_open_alerts.append(f"#{issue.get('number')} ({title})")
                       except Exception as e:
                           print(f"Error parsing issue search results: {e}", file=sys.stderr)
 
                   if not alert_exists:
+                      prior_note = ""
+                      if prior_open_alerts:
+                          prior_note = "\n\n### Prior Open Alerts\n" + "\n".join(f"- {a}" for a in prior_open_alerts)
+
                       issue_title = f"[Upstream Alert] New AmneziaWG upstream release detected: {name} {max_tag}"
                       issue_body = (
                           f"## Upstream Release Notification\n\n"
                           f"A new upstream release has been detected for **{name}**:\n\n"
                           f"- **Component**: `{name}`\n"
-                          f"- **Repository**: https://github.com/{repo}\n"
+                          f"- **Repository**: {repo}\n"
                           f"- **Pinned Version**: `{pinned}`\n"
                           f"- **New Upstream Version**: `{max_tag}`\n"
                           f"- **Release URL**: {rel_url}\n"
@@ -215,6 +274,7 @@ jobs:
                           f"1. Review changes in upstream {name} {max_tag}.\n"
                           f"2. Build and publish updated container base image `devopsigor/amneziawg` if needed.\n"
                           f"3. Update pinned version constant in `internal/service/upstream/service.go` and `go.mod`."
+                          f"{prior_note}"
                       )
 
                       create_cmd = [
@@ -225,7 +285,6 @@ jobs:
                       ]
                       create_res = subprocess.run(create_cmd, capture_output=True, text=True)
                       if create_res.returncode != 0:
-                          # Fallback without label if label enhancement is missing
                           fallback_cmd = [
                               "gh", "issue", "create",
                               "--title", issue_title,
@@ -236,6 +295,7 @@ jobs:
                               print(f"Created issue without label: {fallback_res.stdout.strip()}")
                           else:
                               print(f"Failed to create issue: {fallback_res.stderr.strip()}", file=sys.stderr)
+                              sys.exit(1)
                       else:
                           print(f"Created issue: {create_res.stdout.strip()}")
 
@@ -248,8 +308,10 @@ jobs:
                   f.write("| :--- | :--- | :--- | :--- | :--- |\n")
                   for row in summary_rows:
                       link = f"[{row['latest']}]({row['url']})"
-                      f.write(f"| `{row['name']}` | `{row['pinned']}` | {link} | {row['update']} | [GitHub Repo]({row['url']}) |\n")
+                      f.write(f"| `{row['name']}` | `{row['pinned']}` | {link} | {row['update']} | [Upstream Link]({row['url']}) |\n")
                   f.write(f"\n**Docker Base Image**: `{pinned_base_image}`\n")
+                  if go_mod_drift:
+                      f.write(f"\n> [!CAUTION]\n> **Version Drift Detected**: `go.mod` specifies `{go_mod_version}` for `amneziawg-go`, but `service.go` pins `{pinned_go}`. Please align them.\n")
                   if any_update_found:
                       f.write("\n> [!WARNING]\n> One or more upstream components have newer versions available. Check open issues for details.\n")
                   else:

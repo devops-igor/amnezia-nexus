@@ -283,12 +283,22 @@
                 <div style="padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary);">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <div style="font-weight: 600; color: var(--text-primary);">Docker Base Image</div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-weight: 600; color: var(--text-primary);">Docker Base Image</span>
+                                <a id="repoLink-docker-base-image" href="https://hub.docker.com/r/devopsigor/amneziawg/tags" target="_blank" rel="noopener noreferrer" style="color: var(--text-muted); display: inline-flex; align-items: center;">
+                                    <svg class="icon" style="width: 13px; height: 13px;"><use href="#icon-link"></use></svg>
+                                </a>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px;">
+                                <span>{{ _ "pinned" }}: <strong id="pinned-docker-base-image">v3.1.20260828-1</strong></span>
+                                <span style="margin: 0 6px;">|</span>
+                                <span>{{ _ "latest" }}: <strong id="latest-docker-base-image">...</strong></span>
+                            </div>
                             <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px; font-family: monospace;" id="upstreamBaseImage">
                                 devopsigor/amneziawg:v3.1.20260828-1
                             </div>
                         </div>
-                        <span class="badge badge-info" style="font-size: 0.72rem;">Docker Hub</span>
+                        <span id="badge-docker-base-image" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
                     </div>
                 </div>
 
@@ -455,6 +465,8 @@
             }
 
             const hasUpdate = !!data.update_available;
+            const hasComponentError = data.components && Array.isArray(data.components) && data.components.some(comp => !!comp.error);
+            const isDegradedOrError = hasComponentError || data.status === 'degraded' || data.status === 'error';
 
             if (data.components && Array.isArray(data.components)) {
                 data.components.forEach(comp => {
@@ -475,9 +487,11 @@
                         } else if (comp.update_available) {
                             badgeEl.className = 'badge badge-warning';
                             badgeEl.textContent = _('update_available') || 'Update available';
+                            badgeEl.title = '';
                         } else {
                             badgeEl.className = 'badge badge-success';
                             badgeEl.textContent = _('up_to_date') || 'Up to date';
+                            badgeEl.title = '';
                         }
                     }
                 });
@@ -487,6 +501,13 @@
                 if (hasUpdate) {
                     overallBadge.className = 'badge badge-warning';
                     overallBadge.textContent = _('update_available') || 'Update available';
+                } else if (isDegradedOrError) {
+                    overallBadge.className = 'badge badge-secondary';
+                    if (data.status === 'degraded') {
+                        overallBadge.textContent = _('status_degraded') || 'Degraded';
+                    } else {
+                        overallBadge.textContent = _('error') || 'Error';
+                    }
                 } else {
                     overallBadge.className = 'badge badge-success';
                     overallBadge.textContent = _('up_to_date') || 'Up to date';

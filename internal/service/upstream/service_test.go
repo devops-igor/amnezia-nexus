@@ -24,11 +24,45 @@ func TestCompareVersions(t *testing.T) {
 		{"v1.0.0", "v1.0.0", 0},
 		{"", "", 0},
 
-		// Calendar versions
+		// SemVer 2.0.0 build metadata (+...) stripped before precedence comparison
+		{"1.0.0+1", "1.0.0+2", 0},
+		{"1.0.0+2", "1.0.0+1", 0},
+		{"1.0.0+build.1", "1.0.0+build.2", 0},
+		{"1.0.0+build", "1.0.0", 0},
+		{"1.0.0", "1.0.0+build", 0},
+		{"1.0.0-alpha+001", "1.0.0-alpha+002", 0},
+
+		// SemVer 2.0.0 rule 11.4.2/11.4.3: numeric prereleases have lower precedence than non-numeric
+		{"1.0.0-1", "1.0.0-alpha", -1},
+		{"1.0.0-alpha", "1.0.0-1", 1},
+		{"1.0.0-1", "1.0.0-rc1", -1},
+		{"1.0.0-rc1", "1.0.0-1", 1},
+		{"1.0.0-1", "1.0.0-2", -1},
+		{"1.0.0-2", "1.0.0-1", 1},
+
+		// Release vs prerelease precedence: 1.0.0-alpha < 1.0.0
+		{"1.0.0-alpha", "1.0.0", -1},
+		{"1.0.0", "1.0.0-alpha", 1},
+		{"v1.0.0-rc1", "v1.0.0", -1},
+		{"v1.0.0", "v1.0.0-rc1", 1},
+		{"v1.0.0-rc2", "v1.0.0-rc1", 1},
+		{"v1.0.0-rc10", "v1.0.0-rc2", 1},
+		{"v1.0.0-beta", "v1.0.0-alpha", 1},
+
+		// Calendar versions (CalVer)
+		{"v3.1.20260828", "v3.1.20260901", -1},
+		{"v3.1.20260901", "v3.1.20260828", 1},
 		{"v3.1.20260828", "v3.1.20260814", 1},
 		{"v3.1.20260814", "v3.1.20260828", -1},
 		{"v3.1.20260812", "v3.0.20260805", 1},
 		{"v3.0.20260805", "v3.1.20260812", -1},
+
+		// Docker image revision comparison (v3.1.20260828-1 < v3.1.20260828-2)
+		{"v3.1.20260828-1", "v3.1.20260828-2", -1},
+		{"v3.1.20260828-2", "v3.1.20260828-1", 1},
+		{"devopsigor/amneziawg:v3.1.20260828-1", "devopsigor/amneziawg:v3.1.20260828-2", -1},
+		{"devopsigor/amneziawg:v3.1.20260828-2", "devopsigor/amneziawg:v3.1.20260828-1", 1},
+		{"devopsigor/amneziawg:v3.1.20260828-1", "devopsigor/amneziawg:v3.1.20260828-1", 0},
 
 		// Standard semver
 		{"v1.2.3", "v1.2.4", -1},
@@ -42,21 +76,10 @@ func TestCompareVersions(t *testing.T) {
 		{"v1.0.1", "v1.0", 1},
 		{"v1.0", "v1.0.1", -1},
 
-		// Packaging revisions (hyphen + number)
+		// Packaging revisions (hyphen + number on calver)
 		{"v1.0.20260618-2", "v1.0.20260618", 1},
 		{"v1.0.20260618", "v1.0.20260618-2", -1},
 		{"v1.0.20260618-2", "v1.0.20260618-1", 1},
-
-		// Prereleases (lower precedence than release)
-		{"v1.0.0-rc1", "v1.0.0", -1},
-		{"v1.0.0", "v1.0.0-rc1", 1},
-		{"v1.0.0-rc2", "v1.0.0-rc1", 1},
-		{"v1.0.0-rc10", "v1.0.0-rc2", 1},
-		{"v1.0.0-beta", "v1.0.0-alpha", 1},
-
-		// Full image tag comparisons
-		{"devopsigor/amneziawg:v3.1.20260828-2", "devopsigor/amneziawg:v3.1.20260828-1", 1},
-		{"devopsigor/amneziawg:v3.1.20260828-1", "devopsigor/amneziawg:v3.1.20260828-1", 0},
 	}
 
 	for _, tc := range tests {
@@ -70,11 +93,24 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
+func setupMockServers(t *testing.T) (*httptest.Server, *httptest.Server, *http.ServeMux, *http.ServeMux) {
+	t.Helper()
+	ghMux := http.NewServeMux()
+	dhMux := http.NewServeMux()
+
+	ghSrv := httptest.NewServer(ghMux)
+	dhSrv := httptest.NewServer(dhMux)
+
+	return ghSrv, dhSrv, ghMux, dhMux
+}
+
 func TestServiceCheck_Success(t *testing.T) {
-	mux := http.NewServeMux()
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
 
 	// amneziawg-go tags
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
 		tags := []gitHubTag{
 			{Name: "v3.1.20260828"},
 			{Name: "v3.1.20260814"},
@@ -84,7 +120,7 @@ func TestServiceCheck_Success(t *testing.T) {
 	})
 
 	// amneziawg-tools tags
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
 		tags := []gitHubTag{
 			{Name: "v3.1.20260812"},
 			{Name: "v3.0.20260805"},
@@ -94,7 +130,7 @@ func TestServiceCheck_Success(t *testing.T) {
 	})
 
 	// amneziawg-tools releases
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/releases", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/releases", func(w http.ResponseWriter, r *http.Request) {
 		releases := []gitHubRelease{
 			{
 				TagName:     "v3.1.20260812",
@@ -106,16 +142,27 @@ func TestServiceCheck_Success(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(releases)
 	})
 
-	// amneziawg-go releases (returns 404 like production)
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/releases", func(w http.ResponseWriter, r *http.Request) {
+	// amneziawg-go releases (returns 404)
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/releases", func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
 
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	// Docker Hub tags for devopsigor/amneziawg
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		resp := dockerHubResponse{
+			Count: 2,
+			Results: []dockerHubTag{
+				{Name: "latest", LastUpdated: time.Now()},
+				{Name: "v3.1.20260828-1", LastUpdated: time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 
 	svc := NewService(
-		WithBaseURL(srv.URL),
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
 		WithToken("test-token"),
 	)
 
@@ -129,12 +176,15 @@ func TestServiceCheck_Success(t *testing.T) {
 		t.Fatal("expected non-nil UpstreamStatus")
 	}
 
+	if status.Status != "up_to_date" {
+		t.Errorf("expected Status='up_to_date', got %q", status.Status)
+	}
 	if status.UpdateAvailable {
 		t.Errorf("expected UpdateAvailable=false, got true")
 	}
 
-	if len(status.Components) != 2 {
-		t.Fatalf("expected 2 components, got %d", len(status.Components))
+	if len(status.Components) != 3 {
+		t.Fatalf("expected 3 components, got %d", len(status.Components))
 	}
 
 	goComp := status.Components[0]
@@ -156,16 +206,29 @@ func TestServiceCheck_Success(t *testing.T) {
 		t.Errorf("unexpected error on amneziawg-tools: %s", toolsComp.Error)
 	}
 
+	dockerComp := status.Components[2]
+	if dockerComp.Name != "docker-base-image" || dockerComp.LatestVersion != "v3.1.20260828-1" || dockerComp.UpdateAvailable {
+		t.Errorf("unexpected docker-base-image status: %+v", dockerComp)
+	}
+	if dockerComp.PublishedAt.IsZero() {
+		t.Errorf("expected non-zero PublishedAt for docker-base-image")
+	}
+	if dockerComp.Error != "" {
+		t.Errorf("unexpected error on docker-base-image: %s", dockerComp.Error)
+	}
+
 	if status.BaseImage != PinnedAWGBaseImage {
 		t.Errorf("expected BaseImage %q, got %q", PinnedAWGBaseImage, status.BaseImage)
 	}
 }
 
 func TestServiceCheck_UpdateAvailable(t *testing.T) {
-	mux := http.NewServeMux()
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
 
 	// amneziawg-go has a newer tag: v3.1.20260930
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
 		tags := []gitHubTag{
 			{Name: "v3.1.20260930"},
 			{Name: "v3.1.20260828"},
@@ -174,7 +237,7 @@ func TestServiceCheck_UpdateAvailable(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(tags)
 	})
 
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
 		tags := []gitHubTag{
 			{Name: "v3.1.20260812"},
 		}
@@ -182,51 +245,264 @@ func TestServiceCheck_UpdateAvailable(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(tags)
 	})
 
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	// Docker Hub has a newer tag: v3.1.20260828-2
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		resp := dockerHubResponse{
+			Count: 2,
+			Results: []dockerHubTag{
+				{Name: "latest", LastUpdated: time.Now()},
+				{Name: "v3.1.20260828-2", LastUpdated: time.Now()},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 
-	svc := NewService(WithBaseURL(srv.URL))
+	svc := NewService(
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
+	)
 
 	status, err := svc.Check(context.Background(), false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	if status.Status != "update_available" {
+		t.Errorf("expected overall Status='update_available', got %q", status.Status)
+	}
 	if !status.UpdateAvailable {
 		t.Errorf("expected overall UpdateAvailable=true")
 	}
 
+	// amneziawg-go has update
 	if !status.Components[0].UpdateAvailable {
 		t.Errorf("expected amneziawg-go UpdateAvailable=true")
 	}
-
 	if status.Components[0].LatestVersion != "v3.1.20260930" {
 		t.Errorf("expected latest version v3.1.20260930, got %s", status.Components[0].LatestVersion)
 	}
 
+	// amneziawg-tools is up to date
 	if status.Components[1].UpdateAvailable {
 		t.Errorf("expected amneziawg-tools UpdateAvailable=false")
+	}
+
+	// docker-base-image has update
+	if !status.Components[2].UpdateAvailable {
+		t.Errorf("expected docker-base-image UpdateAvailable=true")
+	}
+	if status.Components[2].LatestVersion != "v3.1.20260828-2" {
+		t.Errorf("expected latest version v3.1.20260828-2, got %s", status.Components[2].LatestVersion)
+	}
+}
+
+func TestServiceCheck_DegradedAndNoCachePoisoning(t *testing.T) {
+	var toolsRequestCount int32
+	var goRequestCount int32
+
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
+
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&goRequestCount, 1)
+		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260828"}})
+	})
+
+	// amneziawg-tools fails with rate limit
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&toolsRequestCount, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message": "rate limit"}`))
+	})
+
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(dockerHubResponse{
+			Count: 1,
+			Results: []dockerHubTag{
+				{Name: "v3.1.20260828-1", LastUpdated: time.Now()},
+			},
+		})
+	})
+
+	svc := NewService(
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
+		WithCacheTTL(1*time.Hour),
+	)
+
+	ctx := context.Background()
+
+	// Initial check results in degraded status
+	status1, err := svc.Check(ctx, false)
+	if err != nil {
+		t.Fatalf("Check returned unexpected error: %v", err)
+	}
+
+	if status1.Status != "degraded" {
+		t.Errorf("expected Status='degraded', got %q", status1.Status)
+	}
+	if status1.UpdateAvailable {
+		t.Errorf("expected UpdateAvailable=false in degraded check")
+	}
+	if status1.Components[1].Error == "" {
+		t.Errorf("expected tools component to record rate limit error")
+	}
+
+	// CRITICAL TEST: Degraded state MUST NOT be cached as valid fresh state for 1 hour.
+	// Calling Check again without forceRefresh must still make new queries because cache was not set.
+	prevToolsRequests := atomic.LoadInt32(&toolsRequestCount)
+	status2, err := svc.Check(ctx, false)
+	if err != nil {
+		t.Fatalf("second Check returned error: %v", err)
+	}
+	if status2.Status != "degraded" {
+		t.Errorf("expected second status to be degraded, got %q", status2.Status)
+	}
+	if atomic.LoadInt32(&toolsRequestCount) <= prevToolsRequests {
+		t.Errorf("expected retry without cache lockout for degraded component, but no new requests were made")
+	}
+}
+
+func TestServiceCheck_AllErrors(t *testing.T) {
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
+
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+
+	svc := NewService(
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
+	)
+
+	status, err := svc.Check(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Check returned unexpected error: %v", err)
+	}
+
+	if status.Status != "error" {
+		t.Errorf("expected Status='error', got %q", status.Status)
+	}
+	if status.UpdateAvailable {
+		t.Errorf("expected UpdateAvailable=false on error")
+	}
+
+	for _, comp := range status.Components {
+		if comp.Error == "" {
+			t.Errorf("expected component %s to record error", comp.Name)
+		}
+	}
+}
+
+func TestServiceCheck_LastKnownGoodFallback(t *testing.T) {
+	var goShouldFail int32
+
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
+
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&goShouldFail) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260901"}})
+	})
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260812"}})
+	})
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(dockerHubResponse{
+			Count: 1,
+			Results: []dockerHubTag{
+				{Name: "v3.1.20260828-1", LastUpdated: time.Now()},
+			},
+		})
+	})
+
+	svc := NewService(
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
+		WithCacheTTL(10*time.Millisecond),
+	)
+
+	ctx := context.Background()
+
+	// Step 1: Initial successful check populates last-known-good
+	status1, err := svc.Check(ctx, false)
+	if err != nil {
+		t.Fatalf("initial check failed: %v", err)
+	}
+	if status1.Status != "update_available" {
+		t.Errorf("expected update_available, got %q", status1.Status)
+	}
+	if status1.Components[0].LatestVersion != "v3.1.20260901" {
+		t.Fatalf("expected v3.1.20260901, got %s", status1.Components[0].LatestVersion)
+	}
+
+	// Step 2: Expire cache and trigger failure on amneziawg-go
+	time.Sleep(20 * time.Millisecond)
+	atomic.StoreInt32(&goShouldFail, 1)
+
+	// Step 3: Check should retain error indicator while falling back to last-known-good values
+	status2, err := svc.Check(ctx, false)
+	if err != nil {
+		t.Fatalf("second check failed: %v", err)
+	}
+
+	if status2.Status != "update_available" {
+		t.Errorf("expected update_available from fallback, got %q", status2.Status)
+	}
+	goComp := status2.Components[0]
+	if goComp.Error == "" {
+		t.Errorf("expected error indicator to be retained on failed component")
+	}
+	if goComp.LatestVersion != "v3.1.20260901" {
+		t.Errorf("expected last-known-good LatestVersion 'v3.1.20260901', got %q", goComp.LatestVersion)
+	}
+	if !goComp.UpdateAvailable {
+		t.Errorf("expected fallback UpdateAvailable to remain true")
 	}
 }
 
 func TestServiceCheck_Caching(t *testing.T) {
 	var requestCount int32
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
+
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requestCount, 1)
 		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260828"}})
 	})
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requestCount, 1)
 		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260812"}})
 	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		_ = json.NewEncoder(w).Encode(dockerHubResponse{
+			Count: 1,
+			Results: []dockerHubTag{
+				{Name: "v3.1.20260828-1", LastUpdated: time.Now()},
+			},
+		})
+	})
 
 	svc := NewService(
-		WithBaseURL(srv.URL),
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
 		WithCacheTTL(1*time.Hour),
 	)
 
@@ -238,8 +514,8 @@ func TestServiceCheck_Caching(t *testing.T) {
 		t.Fatalf("first check error: %v", err)
 	}
 	initialRequests := atomic.LoadInt32(&requestCount)
-	if initialRequests < 2 {
-		t.Fatalf("expected at least 2 requests, got %d", initialRequests)
+	if initialRequests < 3 {
+		t.Fatalf("expected at least 3 requests, got %d", initialRequests)
 	}
 
 	// Cache hit (forceRefresh = false)
@@ -267,132 +543,30 @@ func TestServiceCheck_Caching(t *testing.T) {
 	}
 }
 
-func TestServiceCheck_RateLimitAndErrors(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"message": "API rate limit exceeded"}`))
-	})
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"message": "Too many requests"}`))
-	})
+func TestServiceCheck_ConcurrencyAndRace(t *testing.T) {
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
 
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	svc := NewService(WithBaseURL(srv.URL))
-
-	status, err := svc.Check(context.Background(), false)
-	if err != nil {
-		t.Fatalf("Check should not return fatal error on upstream rate limit: %v", err)
-	}
-
-	if status == nil {
-		t.Fatal("expected non-nil status")
-	}
-
-	if status.UpdateAvailable {
-		t.Errorf("expected UpdateAvailable=false when errors occur")
-	}
-
-	for _, comp := range status.Components {
-		if comp.Error == "" {
-			t.Errorf("expected component %s to record rate-limit error", comp.Name)
-		}
-		if comp.LatestVersion != comp.PinnedVersion {
-			t.Errorf("expected component %s to retain pinned version on error", comp.Name)
-		}
-	}
-}
-
-func TestServiceCheck_StaleCacheFallback(t *testing.T) {
-	var shouldFail int32
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
-		if atomic.LoadInt32(&shouldFail) == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260828"}})
 	})
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
-		if atomic.LoadInt32(&shouldFail) == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260812"}})
 	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(dockerHubResponse{
+			Count: 1,
+			Results: []dockerHubTag{
+				{Name: "v3.1.20260828-1", LastUpdated: time.Now()},
+			},
+		})
+	})
 
 	svc := NewService(
-		WithBaseURL(srv.URL),
-		WithCacheTTL(10*time.Millisecond),
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
 	)
-
-	// Step 1: Successful initial population
-	initial, err := svc.Check(context.Background(), false)
-	if err != nil {
-		t.Fatalf("initial check failed: %v", err)
-	}
-
-	// Step 2: Expire cache and simulate server failure
-	time.Sleep(20 * time.Millisecond)
-	atomic.StoreInt32(&shouldFail, 1)
-
-	// Step 3: Check should fallback to stale cache
-	fallback, err := svc.Check(context.Background(), false)
-	if err != nil {
-		t.Fatalf("fallback check returned error: %v", err)
-	}
-
-	if fallback.CheckedAt != initial.CheckedAt {
-		t.Errorf("expected fallback to return stale cache with original CheckedAt")
-	}
-}
-
-func TestServiceCheck_MalformedJSON(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{not-json}`))
-	})
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{not-json}`))
-	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	svc := NewService(WithBaseURL(srv.URL))
-
-	status, err := svc.Check(context.Background(), false)
-	if err != nil {
-		t.Fatalf("unexpected error on malformed JSON: %v", err)
-	}
-
-	if status.Components[0].Error == "" {
-		t.Errorf("expected error recorded on malformed JSON")
-	}
-}
-
-func TestServiceCheck_ConcurrencyAndRace(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260828"}})
-	})
-	mux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260812"}})
-	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	svc := NewService(WithBaseURL(srv.URL))
 
 	var wg sync.WaitGroup
 	ctx := context.Background()

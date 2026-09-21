@@ -31,6 +31,7 @@ func TestGetUpstreamStatusHandler_Success(t *testing.T) {
 
 	mockStatus := &upstream.UpstreamStatus{
 		CheckedAt:       time.Now().UTC(),
+		Status:          "up_to_date",
 		UpdateAvailable: false,
 		Components: []upstream.ComponentStatus{
 			{
@@ -62,6 +63,9 @@ func TestGetUpstreamStatusHandler_Success(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
+	if resp.Status != "up_to_date" {
+		t.Errorf("expected Status='up_to_date', got %q", resp.Status)
+	}
 	if resp.UpdateAvailable != false {
 		t.Errorf("expected UpdateAvailable=false")
 	}
@@ -79,6 +83,7 @@ func TestGetUpstreamStatusHandler_ForceRefresh(t *testing.T) {
 	mockSvc := &mockUpstreamService{
 		status: &upstream.UpstreamStatus{
 			CheckedAt:       time.Now().UTC(),
+			Status:          "update_available",
 			UpdateAvailable: true,
 			Components:      []upstream.ComponentStatus{},
 			BaseImage:       upstream.PinnedAWGBaseImage,
@@ -96,6 +101,14 @@ func TestGetUpstreamStatusHandler_ForceRefresh(t *testing.T) {
 	}
 	if !mockSvc.lastRefresh {
 		t.Errorf("expected lastRefresh=true when ?refresh=true is provided")
+	}
+
+	var resp upstream.UpstreamStatus
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "update_available" {
+		t.Errorf("expected Status='update_available', got %q", resp.Status)
 	}
 }
 
