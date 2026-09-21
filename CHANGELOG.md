@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remote lock release race: eliminated concurrent `.gate` deletion in `remoteLockReleaseCmd` that caused flaky `ENOTEMPTY` errors and lock release failures under acquisition contention.
 
+### Removed
+
+- Legacy internal/vpn constructors: removed unused compatibility shims NewService, NewLeastConnectionsLoadBalancer, and type alias LeastConnectionsLoadBalancer per useful_notes/COMPATIBILITY.md (#260).
+
 ## [1.2.1] - Polaris - 2026-09-21
 
 Maintenance and stability release introducing ARM64 AWG container support, removing legacy speed limits, hardening cross-process concurrency and peer rollback, and fixing session invalidation on password changes.
