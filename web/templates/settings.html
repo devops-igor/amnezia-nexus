@@ -215,6 +215,106 @@
                 {{ _ "restore_confirm" }}
             </p>
         </div>
+
+        <!-- BLOCK 7: Upstream AmneziaWG Components -->
+        <div class="card settings-section-card" id="upstreamCard">
+            <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: var(--space-sm);">
+                    <svg class="icon"><use href="#icon-activity"></use></svg>
+                    <h3 class="card-title">{{ _ "upstream_components_title" }}</h3>
+                </div>
+                <span id="upstreamOverallBadge" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
+            </div>
+
+            <div style="display: flex; flex-direction: column; gap: var(--space-md);">
+                <!-- Warning Alert Banner -->
+                <div id="upstreamUpdateBanner" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); background: rgba(245, 158, 11, 0.12); border: 1px solid var(--warning, #f59e0b); color: var(--text-primary); font-size: 0.85rem;">
+                    <div style="display: flex; align-items: center; gap: var(--space-sm);">
+                        <svg class="icon" style="color: var(--warning, #f59e0b); flex-shrink: 0; width: 18px; height: 18px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path>
+                            <line x1="12" y1="9" x2="12" y2="13"></line>
+                            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                        </svg>
+                        <span>{{ _ "upstream_update_available_notice" }}</span>
+                    </div>
+                </div>
+
+                <!-- Component 1: amneziawg-go -->
+                <div style="padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-weight: 600; color: var(--text-primary);">amneziawg-go</span>
+                                <a id="repoLink-amneziawg-go" href="https://github.com/amnezia-vpn/amneziawg-go/tags" target="_blank" rel="noopener noreferrer" style="color: var(--text-muted); display: inline-flex; align-items: center;">
+                                    <svg class="icon" style="width: 13px; height: 13px;"><use href="#icon-link"></use></svg>
+                                </a>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px;">
+                                <span>{{ _ "pinned" }}: <strong id="pinned-amneziawg-go">v3.1.20260828</strong></span>
+                                <span style="margin: 0 6px;">|</span>
+                                <span>{{ _ "latest" }}: <strong id="latest-amneziawg-go">...</strong></span>
+                            </div>
+                        </div>
+                        <span id="badge-amneziawg-go" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
+                    </div>
+                </div>
+
+                <!-- Component 2: amneziawg-tools -->
+                <div style="padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-weight: 600; color: var(--text-primary);">amneziawg-tools</span>
+                                <a id="repoLink-amneziawg-tools" href="https://github.com/amnezia-vpn/amneziawg-tools/tags" target="_blank" rel="noopener noreferrer" style="color: var(--text-muted); display: inline-flex; align-items: center;">
+                                    <svg class="icon" style="width: 13px; height: 13px;"><use href="#icon-link"></use></svg>
+                                </a>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px;">
+                                <span>{{ _ "pinned" }}: <strong id="pinned-amneziawg-tools">v3.1.20260812</strong></span>
+                                <span style="margin: 0 6px;">|</span>
+                                <span>{{ _ "latest" }}: <strong id="latest-amneziawg-tools">...</strong></span>
+                            </div>
+                        </div>
+                        <span id="badge-amneziawg-tools" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
+                    </div>
+                </div>
+
+                <!-- Pinned Docker Base Image -->
+                <div style="padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-weight: 600; color: var(--text-primary);">Docker Base Image</span>
+                                <a id="repoLink-docker-base-image" href="https://hub.docker.com/r/devopsigor/amneziawg/tags" target="_blank" rel="noopener noreferrer" style="color: var(--text-muted); display: inline-flex; align-items: center;">
+                                    <svg class="icon" style="width: 13px; height: 13px;"><use href="#icon-link"></use></svg>
+                                </a>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px;">
+                                <span>{{ _ "pinned" }}: <strong id="pinned-docker-base-image">v3.1.20260828-1</strong></span>
+                                <span style="margin: 0 6px;">|</span>
+                                <span>{{ _ "latest" }}: <strong id="latest-docker-base-image">...</strong></span>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px; font-family: monospace;" id="upstreamBaseImage">
+                                devopsigor/amneziawg:v3.1.20260828-1
+                            </div>
+                        </div>
+                        <span id="badge-docker-base-image" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
+                    </div>
+                </div>
+
+                <!-- Footer with timestamp and Check for Updates button -->
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: var(--space-xs); border-top: 1px solid var(--border-color); padding-top: var(--space-sm);">
+                    <span style="font-size: 0.75rem; color: var(--text-muted);" id="upstreamCheckedAt"></span>
+                    <button type="button" class="btn btn-secondary btn-sm" id="upstreamCheckBtn" onclick="checkUpstreamStatus(true)" style="display: flex; align-items: center; gap: var(--space-xs);">
+                        <svg class="icon" style="width: 14px; height: 14px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+                        </svg>
+                        <span id="upstreamCheckBtnText">{{ _ "check_updates" }}</span>
+                        <div class="spinner hidden" id="upstreamSpinner" style="width: 12px; height: 12px;"></div>
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -338,5 +438,94 @@
             e.target.value = '';
         }
     }
+
+    async function checkUpstreamStatus(force) {
+        const btn = document.getElementById('upstreamCheckBtn');
+        const spinner = document.getElementById('upstreamSpinner');
+        const overallBadge = document.getElementById('upstreamOverallBadge');
+        const banner = document.getElementById('upstreamUpdateBanner');
+        const checkedAtSpan = document.getElementById('upstreamCheckedAt');
+
+        if (btn) btn.disabled = true;
+        if (spinner) spinner.classList.remove('hidden');
+
+        try {
+            const url = force ? '/api/system/upstream-status?refresh=true' : '/api/system/upstream-status';
+            const data = await API.get(url);
+
+            if (!data) return;
+
+            if (data.checked_at && checkedAtSpan) {
+                const date = new Date(data.checked_at);
+                checkedAtSpan.textContent = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+
+            if (data.base_image && document.getElementById('upstreamBaseImage')) {
+                document.getElementById('upstreamBaseImage').textContent = data.base_image;
+            }
+
+            if (data.components && Array.isArray(data.components)) {
+                data.components.forEach(comp => {
+                    const pinnedEl = document.getElementById('pinned-' + comp.name);
+                    const latestEl = document.getElementById('latest-' + comp.name);
+                    const badgeEl = document.getElementById('badge-' + comp.name);
+                    const linkEl = document.getElementById('repoLink-' + comp.name);
+
+                    if (pinnedEl && comp.pinned_version) pinnedEl.textContent = comp.pinned_version;
+                    if (latestEl && comp.latest_version) latestEl.textContent = comp.latest_version;
+                    if (linkEl && comp.release_url) linkEl.href = comp.release_url;
+
+                    if (badgeEl) {
+                        if (comp.error) {
+                            badgeEl.className = 'badge badge-secondary';
+                            badgeEl.textContent = 'Error';
+                            badgeEl.title = comp.error;
+                        } else if (comp.update_available) {
+                            badgeEl.className = 'badge badge-warning';
+                            badgeEl.textContent = _('update_available') || 'Update available';
+                            badgeEl.title = '';
+                        } else {
+                            badgeEl.className = 'badge badge-success';
+                            badgeEl.textContent = _('up_to_date') || 'Up to date';
+                            badgeEl.title = '';
+                        }
+                    }
+                });
+            }
+
+            if (overallBadge) {
+                if (data.status === 'degraded') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('status_degraded') || 'Degraded';
+                } else if (data.status === 'error') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('error') || 'Error';
+                } else if (data.update_available) {
+                    overallBadge.className = 'badge badge-warning';
+                    overallBadge.textContent = _('update_available') || 'Update available';
+                } else {
+                    overallBadge.className = 'badge badge-success';
+                    overallBadge.textContent = _('up_to_date') || 'Up to date';
+                }
+            }
+
+            if (banner) {
+                banner.style.display = data.update_available ? 'block' : 'none';
+            }
+        } catch (err) {
+            console.error('Failed to fetch upstream status:', err);
+            if (overallBadge) {
+                overallBadge.className = 'badge badge-secondary';
+                overallBadge.textContent = _('error') || 'Error';
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+            if (spinner) spinner.classList.add('hidden');
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        checkUpstreamStatus(false);
+    });
 </script>
 {{ end }}

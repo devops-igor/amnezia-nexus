@@ -449,5 +449,12 @@
   "vpn_unset_auto_detected": "Auto: %s",
   "wrong_share_password": "Wrong password",
   "you_label": "YOU",
-  "your_rank": "Your Rank"
+  "your_rank": "Your Rank",
+  "check_updates": "Check for Updates",
+  "latest": "Latest",
+  "pinned": "Pinned",
+  "up_to_date": "Up to date",
+  "update_available": "Update available",
+  "upstream_components_title": "Upstream AmneziaWG Components",
+  "upstream_update_available_notice": "A newer upstream release is available. Review changes and consider updating container images."
 }
