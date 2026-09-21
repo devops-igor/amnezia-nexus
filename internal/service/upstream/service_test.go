@@ -43,6 +43,12 @@ func TestCompareVersions(t *testing.T) {
 		// Release vs prerelease precedence: 1.0.0-alpha < 1.0.0
 		{"1.0.0-alpha", "1.0.0", -1},
 		{"1.0.0", "1.0.0-alpha", 1},
+		{"1.0.0", "1.0.0-foo", 1},
+		{"1.0.0-foo", "1.0.0", -1},
+		{"1.0.0", "1.0.0-0", 1},
+		{"1.0.0-0", "1.0.0", -1},
+		{"1.0.0-alpha.0", "1.0.0-alpha", 1},
+		{"1.0.0-alpha", "1.0.0-alpha.0", -1},
 		{"v1.0.0-rc1", "v1.0.0", -1},
 		{"v1.0.0", "v1.0.0-rc1", 1},
 		{"v1.0.0-rc2", "v1.0.0-rc1", 1},
@@ -460,8 +466,11 @@ func TestServiceCheck_LastKnownGoodFallback(t *testing.T) {
 		t.Fatalf("second check failed: %v", err)
 	}
 
-	if status2.Status != "update_available" {
-		t.Errorf("expected update_available from fallback, got %q", status2.Status)
+	if status2.Status != "degraded" {
+		t.Errorf("expected degraded from fallback with partial error, got %q", status2.Status)
+	}
+	if !status2.UpdateAvailable {
+		t.Errorf("expected UpdateAvailable=true from fallback even when degraded")
 	}
 	goComp := status2.Components[0]
 	if goComp.Error == "" {
@@ -472,6 +481,53 @@ func TestServiceCheck_LastKnownGoodFallback(t *testing.T) {
 	}
 	if !goComp.UpdateAvailable {
 		t.Errorf("expected fallback UpdateAvailable to remain true")
+	}
+}
+
+func TestServiceCheck_DegradedWhenAnyFailsEvenWithUpdate(t *testing.T) {
+	ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+	defer ghSrv.Close()
+	defer dhSrv.Close()
+
+	// amneziawg-go has update available
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: "v3.1.20260901"}})
+	})
+	// amneziawg-tools fails with error
+	ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	// docker is up to date
+	dhMux.HandleFunc("/repositories/devopsigor/amneziawg/tags", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(dockerHubResponse{
+			Count: 1,
+			Results: []dockerHubTag{
+				{Name: "v3.1.20260828-1", LastUpdated: time.Now()},
+			},
+		})
+	})
+
+	svc := NewService(
+		WithBaseURL(ghSrv.URL),
+		WithDockerBaseURL(dhSrv.URL),
+	)
+
+	status, err := svc.Check(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Check failed: %v", err)
+	}
+
+	if status.Status != "degraded" {
+		t.Errorf("expected Status='degraded', got %q", status.Status)
+	}
+	if !status.UpdateAvailable {
+		t.Errorf("expected UpdateAvailable=true, got false")
+	}
+	if !status.Components[0].UpdateAvailable {
+		t.Errorf("expected amneziawg-go UpdateAvailable=true")
+	}
+	if status.Components[1].Error == "" {
+		t.Errorf("expected amneziawg-tools to have error")
 	}
 }
 

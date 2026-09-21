@@ -464,10 +464,6 @@
                 document.getElementById('upstreamBaseImage').textContent = data.base_image;
             }
 
-            const hasUpdate = !!data.update_available;
-            const hasComponentError = data.components && Array.isArray(data.components) && data.components.some(comp => !!comp.error);
-            const isDegradedOrError = hasComponentError || data.status === 'degraded' || data.status === 'error';
-
             if (data.components && Array.isArray(data.components)) {
                 data.components.forEach(comp => {
                     const pinnedEl = document.getElementById('pinned-' + comp.name);
@@ -498,16 +494,15 @@
             }
 
             if (overallBadge) {
-                if (hasUpdate) {
+                if (data.status === 'degraded') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('status_degraded') || 'Degraded';
+                } else if (data.status === 'error') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('error') || 'Error';
+                } else if (data.update_available) {
                     overallBadge.className = 'badge badge-warning';
                     overallBadge.textContent = _('update_available') || 'Update available';
-                } else if (isDegradedOrError) {
-                    overallBadge.className = 'badge badge-secondary';
-                    if (data.status === 'degraded') {
-                        overallBadge.textContent = _('status_degraded') || 'Degraded';
-                    } else {
-                        overallBadge.textContent = _('error') || 'Error';
-                    }
                 } else {
                     overallBadge.className = 'badge badge-success';
                     overallBadge.textContent = _('up_to_date') || 'Up to date';
@@ -515,13 +510,13 @@
             }
 
             if (banner) {
-                banner.style.display = hasUpdate ? 'block' : 'none';
+                banner.style.display = data.update_available ? 'block' : 'none';
             }
         } catch (err) {
             console.error('Failed to fetch upstream status:', err);
             if (overallBadge) {
                 overallBadge.className = 'badge badge-secondary';
-                overallBadge.textContent = 'Error';
+                overallBadge.textContent = _('error') || 'Error';
             }
         } finally {
             if (btn) btn.disabled = false;

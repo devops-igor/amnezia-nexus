@@ -35,76 +35,127 @@ jobs:
                       return v.split("+", 1)[0]
                   return v
 
-              def norm(v):
+              def clean(v):
                   v = strip_build_metadata(v).strip()
                   if ":" in v:
                       v = v.split(":")[-1]
                   if v.startswith("v") or v.startswith("V"):
                       v = v[1:]
-                  return v
+                  return v.strip()
 
-              n1, n2 = norm(v1), norm(v2)
-              if n1 == n2:
+              c1, c2 = clean(v1), clean(v2)
+              if c1 == c2:
                   return 0
+              if not c1:
+                  return -1
+              if not c2:
+                  return 1
 
-              def split_segs(v):
-                  return [s for s in re.split(r'[.\-_]', norm(v)) if s]
+              def parse_ver(v):
+                  if "-" in v:
+                      core_str, pre_str = v.split("-", 1)
+                      has_pre = True
+                  else:
+                      core_str, pre_str = v, ""
+                      has_pre = False
+                  core_parts = [s.strip() for s in core_str.split(".") if s.strip()]
+                  return core_parts, has_pre, pre_str
 
-              segs1, segs2 = split_segs(v1), split_segs(v2)
-              min_len = min(len(segs1), len(segs2))
+              core1, has_pre1, pre_str1 = parse_ver(c1)
+              core2, has_pre2, pre_str2 = parse_ver(c2)
 
-              prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
-
-              for i in range(min_len):
-                  s1, s2 = segs1[i], segs2[i]
+              # 1. Compare core versions numerically / lexically
+              min_core = min(len(core1), len(core2))
+              for i in range(min_core):
+                  s1, s2 = core1[i], core2[i]
                   if s1 == s2:
                       continue
                   if s1.isdigit() and s2.isdigit():
                       i1, i2 = int(s1), int(s2)
-                      if i1 < i2:
-                          return -1
-                      if i1 > i2:
-                          return 1
-                      continue
-
-                  m1 = re.match(r'^([a-zA-Z]+)(\d+)$', s1)
-                  m2 = re.match(r'^([a-zA-Z]+)(\d+)$', s2)
-                  if m1 and m2 and m1.group(1).lower() == m2.group(1).lower():
-                      i1, i2 = int(m1.group(2)), int(m2.group(2))
-                      if i1 < i2:
-                          return -1
-                      if i1 > i2:
-                          return 1
-                      continue
-
-                  # SemVer 2.0.0 Rule 11.4.2/11.4.3: Numeric identifiers always have lower
-                  # precedence than non-numeric identifiers.
-                  if s1.isdigit() and not s2.isdigit():
+                      if i1 != i2:
+                          return -1 if i1 < i2 else 1
+                  elif s1.isdigit() and not s2.isdigit():
                       return -1
-                  if not s1.isdigit() and s2.isdigit():
+                  elif not s1.isdigit() and s2.isdigit():
                       return 1
+                  else:
+                      if s1 != s2:
+                          return -1 if s1 < s2 else 1
 
-                  if s1 < s2:
-                      return -1
-                  if s1 > s2:
-                      return 1
-
-              if len(segs1) > len(segs2):
-                  for s in segs1[min_len:]:
-                      if any(s.lower().startswith(p) for p in prereleases):
-                          return -1
+              if len(core1) > len(core2):
+                  for s in core1[min_core:]:
                       if s.isdigit() and int(s) > 0:
                           return 1
-                  return 0
-
-              if len(segs2) > len(segs1):
-                  for s in segs2[min_len:]:
-                      if any(s.lower().startswith(p) for p in prereleases):
+                      if not s.isdigit() and s:
                           return 1
+              elif len(core2) > len(core1):
+                  for s in core2[min_core:]:
                       if s.isdigit() and int(s) > 0:
                           return -1
+                      if not s.isdigit() and s:
+                          return -1
+
+              # Core versions match. Check Dedicated CalVer Packaging Revision Path.
+              def get_calver_patch(core_parts):
+                  if len(core_parts) >= 3:
+                      p = core_parts[2]
+                      if len(p) >= 8 and p.isdigit():
+                          return p
+                  return None
+
+              calver1 = get_calver_patch(core1)
+              calver2 = get_calver_patch(core2)
+
+              if calver1 and calver2:
+                  is_pkg1 = (not has_pre1) or pre_str1.isdigit()
+                  is_pkg2 = (not has_pre2) or pre_str2.isdigit()
+                  if is_pkg1 and is_pkg2:
+                      rev1 = int(pre_str1) if (has_pre1 and pre_str1.isdigit()) else 0
+                      rev2 = int(pre_str2) if (has_pre2 and pre_str2.isdigit()) else 0
+                      if rev1 != rev2:
+                          return -1 if rev1 < rev2 else 1
+                      return 0
+
+              # SemVer 2.0.0 Precedence:
+              if not has_pre1 and has_pre2:
+                  return 1
+              if has_pre1 and not has_pre2:
+                  return -1
+              if not has_pre1 and not has_pre2:
                   return 0
 
+              # Both have prereleases: compare dot-separated identifiers
+              ids1 = [s for s in pre_str1.split(".") if s]
+              ids2 = [s for s in pre_str2.split(".") if s]
+              min_pre = min(len(ids1), len(ids2))
+
+              for i in range(min_pre):
+                  id1, id2 = ids1[i], ids2[i]
+                  if id1 == id2:
+                      continue
+                  if id1.isdigit() and id2.isdigit():
+                      i1, i2 = int(id1), int(id2)
+                      if i1 != i2:
+                          return -1 if i1 < i2 else 1
+                  elif id1.isdigit() and not id2.isdigit():
+                      return -1
+                  elif not id1.isdigit() and id2.isdigit():
+                      return 1
+                  else:
+                      m1 = re.match(r'^([a-zA-Z]+)(\d+)$', id1)
+                      m2 = re.match(r'^([a-zA-Z]+)(\d+)$', id2)
+                      if m1 and m2 and m1.group(1).lower() == m2.group(1).lower():
+                          n1, n2 = int(m1.group(2)), int(m2.group(2))
+                          if n1 != n2:
+                              return -1 if n1 < n2 else 1
+                      else:
+                          if id1 != id2:
+                              return -1 if id1 < id2 else 1
+
+              if len(ids1) > len(ids2):
+                  return 1
+              if len(ids2) > len(ids1):
+                  return -1
               return 0
 
           # 1. Extract pinned versions from service.go and validate go.mod
