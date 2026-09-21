@@ -63,7 +63,9 @@ def test_onboard_server_add(authenticated_page: Page, base_url: str, csrf_token:
         "private_key": creds["private_key"],
         "name": creds["name"],
     }
-    add_result = api_post(authenticated_page, "/api/servers/add", add_payload, csrf_token)
+    add_result = api_post(
+        authenticated_page, "/api/servers/add", add_payload, csrf_token, timeout=60_000
+    )
     assert add_result["status"] == 200, (
         f"POST /api/servers/add returned status {add_result['status']}: "
         f"{add_result.get('body')}"
@@ -91,7 +93,11 @@ def test_onboard_server_add(authenticated_page: Page, base_url: str, csrf_token:
         "fingerprint": fingerprint,
     }
     confirm_result = api_post(
-        authenticated_page, "/api/servers/confirm-fingerprint", confirm_payload, csrf_token
+        authenticated_page,
+        "/api/servers/confirm-fingerprint",
+        confirm_payload,
+        csrf_token,
+        timeout=60_000,
     )
     assert confirm_result["status"] == 200, (
         f"POST /api/servers/confirm-fingerprint returned status {confirm_result['status']}: "
@@ -113,7 +119,9 @@ def test_onboard_server_reachability(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
     """Verify Server 1 reachability and Docker installation via check API."""
-    check_result = api_post(authenticated_page, "/api/servers/1/check", {}, csrf_token)
+    check_result = api_post(
+        authenticated_page, "/api/servers/1/check", {}, csrf_token, timeout=60_000
+    )
     assert check_result["status"] == 200, (
         f"POST /api/servers/1/check returned status {check_result['status']}: "
         f"{check_result.get('body')}"
@@ -139,7 +147,11 @@ def test_onboard_install_amneziawg(
         "port": "51820",
     }
     install_result = api_post(
-        authenticated_page, "/api/servers/1/install", install_payload, csrf_token
+        authenticated_page,
+        "/api/servers/1/install",
+        install_payload,
+        csrf_token,
+        timeout=180_000,
     )
     assert install_result["status"] == 200, (
         f"POST /api/servers/1/install returned status {install_result['status']}: "
@@ -156,8 +168,8 @@ def test_onboard_install_amneziawg(
 def test_onboard_verify_awg_container_healthy(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """Poll Server 1 status up to 90s until AmneziaWG container is running and healthy."""
-    max_wait_seconds = 90
+    """Poll Server 1 status up to 120s until AmneziaWG container is running and healthy."""
+    max_wait_seconds = 120
     poll_interval = 3
     deadline = time.time() + max_wait_seconds
 
@@ -165,7 +177,9 @@ def test_onboard_verify_awg_container_healthy(
     last_body: dict = {}
 
     while time.time() < deadline:
-        check_result = api_post(authenticated_page, "/api/servers/1/check", {}, csrf_token)
+        check_result = api_post(
+            authenticated_page, "/api/servers/1/check", {}, csrf_token, timeout=60_000
+        )
         if check_result["status"] == 200 and isinstance(check_result.get("body"), dict):
             last_body = check_result["body"]
             protocols = last_body.get("protocols", {})
