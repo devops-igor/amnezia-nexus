@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestEscapeShellArg(t *testing.T) {
@@ -178,5 +180,45 @@ func TestRunSession_CancelledContext(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("expected error on canceled context, got nil")
+	}
+}
+
+func TestRunSession_TypedNilStdin(t *testing.T) {
+	server := NewMockSSHServer(t, "root", "rootPass")
+	defer server.Close()
+
+	ctx := context.Background()
+	cfg := Config{
+		Host:            server.Host(),
+		Port:            server.Port(),
+		User:            "root",
+		Password:        "rootPass",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	client, err := Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to dial mock server: %v", err)
+	}
+	defer client.Close()
+
+	// 1. Typed nil *strings.Reader wrapped in io.Reader
+	var typedNilReader *strings.Reader
+	stdout, stderr, code, err := RunSession(ctx, client.GetUnderlyingClient(), "echo typed-nil-reader", typedNilReader)
+	if err != nil || code != 0 {
+		t.Fatalf("RunSession failed with typed nil *strings.Reader: code=%d, err=%v, stderr=%s", code, err, stderr)
+	}
+	if stdout != "typed-nil-reader" {
+		t.Fatalf("expected stdout 'typed-nil-reader', got %q", stdout)
+	}
+
+	// 2. Typed nil *bytes.Buffer wrapped in io.Reader
+	var typedNilBuffer *bytes.Buffer
+	stdout, stderr, code, err = RunSession(ctx, client.GetUnderlyingClient(), "echo typed-nil-buffer", typedNilBuffer)
+	if err != nil || code != 0 {
+		t.Fatalf("RunSession failed with typed nil *bytes.Buffer: code=%d, err=%v, stderr=%s", code, err, stderr)
+	}
+	if stdout != "typed-nil-buffer" {
+		t.Fatalf("expected stdout 'typed-nil-buffer', got %q", stdout)
 	}
 }
