@@ -1,0 +1,96 @@
+name: DEV Server E2E Verification
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  workflow_dispatch:
+
+concurrency:
+  group: dev-server-deployment
+  cancel-in-progress: false
+
+jobs:
+  e2e-dev:
+    name: DEV Server E2E Verification
+    runs-on: [ self-hosted, linux, arm64, dev ]
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build PR Docker Image
+        run: |
+          docker build -t "ghcr.io/devops-igor/amnezia-nexus:pr-${{ github.event.pull_request.number || 'manual' }}" .
+
+      - name: Clean-Slate Deployment
+        run: |
+          docker rm -f amnezia-awg2 2>/dev/null || true
+          sudo ip link del awg0 2>/dev/null || true
+          cd ~ && docker compose down -v
+          PR_TAG="pr-${{ github.event.pull_request.number || 'manual' }}"
+          sed -i "s|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}|" ~/docker-compose.yaml
+          grep -q 'E2E_TESTING' ~/docker-compose.yaml || sed -i '/environment:/a \ \ \ \ \ - E2E_TESTING=true' ~/docker-compose.yaml
+          cd ~ && docker compose up -d
+          echo "Waiting for panel health endpoint..."
+          READY=0
+          for i in $(seq 1 45); do
+            if curl -s -f http://127.0.0.1:8443/api/health >/dev/null 2>&1; then
+              echo "Panel is healthy after ${i}s"
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Error: Panel failed to become healthy within 45 seconds" >&2
+            cd ~ && docker compose logs
+            exit 1
+          fi
+
+      - name: Run Playwright E2E Lifecycle Suite
+        run: |
+          python3 -m venv ~/e2e-venv
+          source ~/e2e-venv/bin/activate
+          pip install --quiet -r tests/e2e/requirements.txt
+          playwright install --with-deps chromium
+          E2E_BASE_URL="http://127.0.0.1:8443" \
+          E2E_ADMIN_USER="admin" \
+          E2E_ADMIN_PASS="AdminE2EPass123!" \
+          E2E_SERVER_HOST="172.17.0.1" \
+          E2E_SERVER_SSH_KEY="${HOME}/.ssh/id_ed25519" \
+          ./scripts/run_e2e_lifecycle.sh
+
+      - name: Post-Test Teardown, Docker Prune & Restoration Invariant
+        if: always()
+        run: |
+          echo "==> Cleaning AmneziaWG containers and interfaces..."
+          docker rm -f amnezia-awg2 2>/dev/null || true
+          sudo ip link del awg0 2>/dev/null || true
+          echo "==> Stopping PR container and wiping volume..."
+          cd ~ && docker compose down -v
+          echo "==> Pruning Docker system (containers, images, build cache, volumes)..."
+          docker system prune -af --volumes
+          echo "==> Restoring ~/docker-compose.yaml to production configuration..."
+          sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
+          sed -i '/E2E_TESTING=true/d' ~/docker-compose.yaml
+          echo "==> Pulling latest production image and starting production container..."
+          docker pull ghcr.io/devops-igor/amnezia-nexus:latest || true && cd ~ && docker compose up -d
+          echo "==> Verifying production container health at http://127.0.0.1:8443/api/health..."
+          READY=0
+          for i in $(seq 1 45); do
+            if curl -s -f http://127.0.0.1:8443/api/health >/dev/null 2>&1; then
+              echo "Production panel is healthy after ${i}s"
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          echo "==> Cleaning up Python E2E virtual environment..."
+          rm -rf ~/e2e-venv
+          if [ "$READY" -ne 1 ]; then
+            echo "Error: Production panel failed to become healthy within 45 seconds" >&2
+            cd ~ && docker compose logs
+            exit 1
+          fi
+          echo "==> Post-test teardown and production restoration complete."
