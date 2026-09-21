@@ -227,12 +227,11 @@ func remoteLockReleaseCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
 	escapedTok := ssh.EscapeShellArg(token)
 	return fmt.Sprintf(
-		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then rm -rf %s %s.gate 2>/dev/null; fi`,
+		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then rm -rf %s 2>/dev/null; fi`,
 		ssh.EscapeShellArg(lockDir),
 		escapedTok,
 		escapedTok,
 		escapedTok,
-		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(lockDir),
 	)
 }
