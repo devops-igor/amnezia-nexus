@@ -14,7 +14,7 @@ Configure headless/headed via --headed CLI flag or E2E_HEADLESS env var.
 import os
 import time
 import logging
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urljoin
 
 import pytest
@@ -196,7 +196,7 @@ def csrf_token(authenticated_page: Page, base_url: str) -> str:
     return token
 
 
-def api_get(page: Page, url: str) -> Any:
+def api_get(page: Page, url: str, timeout: Optional[float] = None) -> Any:
     """Make a GET request via Playwright's request API (bypasses CSP).
 
     Uses page.request (APIRequestContext) which shares the browser context's
@@ -205,13 +205,17 @@ def api_get(page: Page, url: str) -> Any:
     Args:
         page: Authenticated Playwright page (used for its request context).
         url: Relative URL path (e.g., '/api/servers').
+        timeout: Optional request timeout in milliseconds.
 
     Returns:
         Parsed JSON response body. Returns a dict with 'error' key for
         non-JSON responses.
     """
     full_url = urljoin(page.url, url)
-    response = page.request.get(full_url)
+    get_kwargs: Dict[str, Any] = {}
+    if timeout is not None:
+        get_kwargs["timeout"] = timeout
+    response = page.request.get(full_url, **get_kwargs)
     content_type = response.headers.get("content-type", "")
     text = response.text()
 
@@ -224,7 +228,13 @@ def api_get(page: Page, url: str) -> Any:
     return {"error": text[:200], "status": response.status}
 
 
-def api_post(page: Page, url: str, data: Dict[str, Any], token: str) -> Dict[str, Any]:
+def api_post(
+    page: Page,
+    url: str,
+    data: Dict[str, Any],
+    token: str,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
     """Make a POST request via Playwright's request API (bypasses CSP).
 
     Uses page.request (APIRequestContext) which shares the browser context's
@@ -235,6 +245,7 @@ def api_post(page: Page, url: str, data: Dict[str, Any], token: str) -> Dict[str
         url: Relative URL path (e.g., '/api/users/add').
         data: JSON-serializable body dict.
         token: CSRF token string.
+        timeout: Optional request timeout in milliseconds.
 
     Returns:
         Dict with 'status' (int) and 'body' (dict). Handles HTML error
@@ -242,14 +253,16 @@ def api_post(page: Page, url: str, data: Dict[str, Any], token: str) -> Dict[str
         CSRF rejection page), body contains {error: <first 200 chars>}.
     """
     full_url = urljoin(page.url, url)
-    response = page.request.post(
-        full_url,
-        data=data,
-        headers={
+    post_kwargs: Dict[str, Any] = {
+        "data": data,
+        "headers": {
             "X-CSRF-Token": token,
             "Content-Type": "application/json",
         },
-    )
+    }
+    if timeout is not None:
+        post_kwargs["timeout"] = timeout
+    response = page.request.post(full_url, **post_kwargs)
 
     content_type = response.headers.get("content-type", "")
     text = response.text()
