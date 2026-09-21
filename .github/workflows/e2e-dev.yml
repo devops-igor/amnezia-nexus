@@ -30,7 +30,12 @@ jobs:
           cd ~ && docker compose down -v
           PR_TAG="pr-${{ github.event.pull_request.number || 'manual' }}"
           sed -i "s|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}|" ~/docker-compose.yaml
-          grep -q 'E2E_TESTING' ~/docker-compose.yaml || sed -i '/environment:/a \ \ \ \ \ - E2E_TESTING=true' ~/docker-compose.yaml
+          cat << 'EOF' > ~/docker-compose.override.yaml
+          services:
+            amnezia-panel:
+              environment:
+                - E2E_TESTING=true
+          EOF
           cd ~ && docker compose up -d
           echo "Waiting for panel health endpoint..."
           READY=0
@@ -45,6 +50,11 @@ jobs:
           if [ "$READY" -ne 1 ]; then
             echo "Error: Panel failed to become healthy within 45 seconds" >&2
             cd ~ && docker compose logs
+            exit 1
+          fi
+          echo "Verifying E2E_TESTING flag inside container..."
+          if [ "$(docker exec amnezia-panel printenv E2E_TESTING)" != "true" ]; then
+            echo "Error: E2E_TESTING is not enabled inside container" >&2
             exit 1
           fi
 
@@ -72,8 +82,9 @@ jobs:
           echo "==> Pruning Docker system (containers, images, build cache, volumes)..."
           docker system prune -af --volumes
           echo "==> Restoring ~/docker-compose.yaml to production configuration..."
+          rm -f ~/docker-compose.override.yaml
           sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
-          sed -i '/E2E_TESTING=true/d' ~/docker-compose.yaml
+          sed -i '/E2E_TESTING/d' ~/docker-compose.yaml
           echo "==> Pulling latest production image and starting production container..."
           docker pull ghcr.io/devops-igor/amnezia-nexus:latest || true && cd ~ && docker compose up -d
           echo "==> Verifying production container health at http://127.0.0.1:8443/api/health..."
