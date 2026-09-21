@@ -100,16 +100,16 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `test_connections.py` | 5 | Connection list, add, config/QR, toggle, delete |
 | `test_users.py` | 7 | User list, add, edit, toggle, add connection, delete, XSS |
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
-| `test_settings.py` | 4 | Page load, change title, captcha toggle, backup download |
+| `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
 
-**Total: 44 test scenarios across 9 test suites**
+**Total: 46 test scenarios across 9 test suites**
 
 ---
 
 ## E2E Test Suite & Exact API Coverage Matrix
 
-The following table provides the exhaustive mapping of all 44 test scenarios across all 9 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
+The following table provides the exhaustive mapping of all 46 test scenarios across all 9 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
 
 | Test File | Test Name | Target UI / Page Visited | Exact APIs Called | HTTP Method |
 |-----------|-----------|--------------------------|-------------------|-------------|
@@ -154,6 +154,8 @@ The following table provides the exhaustive mapping of all 44 test scenarios acr
 | `test_settings.py` | `test_change_title` | `/settings` (Appearance Settings), `/` | `/api/settings`<br>`/api/settings/save` | GET<br>POST |
 | `test_settings.py` | `test_captcha_toggle` | `/settings` (Security / Captcha Settings) | `/api/settings`<br>`/api/settings/save` | GET<br>POST |
 | `test_settings.py` | `test_backup_download` | `/settings` (Backup & Restore) | `/api/settings/backup/download` | GET |
+| `test_settings.py` | `test_upstream_status_api` | None (Direct REST API) | `/api/system/upstream-status`<br>`/api/system/upstream-status?refresh=true` | GET<br>GET |
+| `test_settings.py` | `test_upstream_status_ui` | `/settings` (Upstream Components Card) | `/api/system/upstream-status`<br>`/api/system/upstream-status?refresh=true` | GET<br>GET |
 | `test_share.py` | `test_enable_sharing` | `/users` (Share Setup Modal) | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup` | GET<br>POST<br>POST |
 | `test_share.py` | `test_access_share_link` | `/share/{share_token}` | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST |
 | `test_share.py` | `test_download_config_from_share` | `/share/{share_token}` (Config Download) | `/api/servers/`<br>`/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/share/{token}/auth`<br>`/api/users/{user_id}/delete` | GET<br>GET<br>POST<br>POST<br>POST<br>POST |
@@ -162,7 +164,7 @@ The following table provides the exhaustive mapping of all 44 test scenarios acr
 
 ## Categorized Summary of Tested REST API Endpoints
 
-The E2E test suite exercises 25 distinct REST API routes across the platform, including 23 core functional endpoints and 2 automated server onboarding endpoints:
+The E2E test suite exercises 26 distinct REST API routes across the platform, including 24 core functional endpoints and 2 automated server onboarding endpoints:
 
 ### 1. Authentication & Initial Setup (2 endpoints)
 - `POST /api/auth/setup` - Initial administrator account setup (locked after initialization)
@@ -197,9 +199,10 @@ The E2E test suite exercises 25 distinct REST API routes across the platform, in
 ### 6. User Self-Service Portal (1 endpoint)
 - `GET /api/my/connections` - Fetches authenticated user's self-service connections and quota limits
 
-### 7. System Settings & Maintenance (2 endpoints)
+### 7. System Settings & Maintenance (3 endpoints)
 - `GET /api/settings` - Retrieves global panel configuration (appearance, security, limits)
 - `POST /api/settings/save` - Persists updated panel appearance, branding, and security parameters
+- `GET /api/system/upstream-status` - Retrieves upstream component release status and update availability (supports `?refresh=true`)
 
 ### Additional Utility & Public Endpoints (2 endpoints)
 - `GET /api/settings/backup/download` - Downloads complete JSON database backup archive

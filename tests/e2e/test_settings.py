@@ -240,3 +240,93 @@ def test_backup_download(authenticated_page: Page, base_url: str) -> None:
     content_type = result.headers.get("content-type", "")
     text = result.text()
     assert text.startswith("{") or text.startswith("[")
+
+
+@pytest.mark.e2e
+def test_upstream_status_api(authenticated_page: Page, base_url: str) -> None:
+    """GET /api/system/upstream-status returns valid upstream component status."""
+    page = authenticated_page
+
+    # Request upstream status via API
+    result = api_get(page, "/api/system/upstream-status")
+
+    # Validate response shape
+    assert_response_shape(
+        result,
+        {
+            "checked_at": str,
+            "update_available": bool,
+            "components": list,
+            "base_image": str,
+        },
+        "upstream_status",
+    )
+
+    # Validate base_image contains amneziawg or devopsigor
+    base_image = result.get("base_image", "")
+    assert "amneziawg" in base_image or "devopsigor" in base_image
+
+    # Validate components list contains items for amneziawg-go and amneziawg-tools
+    components = result.get("components", [])
+    component_names = {comp.get("name") for comp in components if isinstance(comp, dict)}
+    assert "amneziawg-go" in component_names
+    assert "amneziawg-tools" in component_names
+
+    # Verify keys for each component
+    for comp in components:
+        assert isinstance(comp, dict)
+        for key in ("name", "pinned_version", "latest_version", "release_url"):
+            assert key in comp
+
+    # Make force refresh request and verify valid response
+    refresh_result = api_get(page, "/api/system/upstream-status?refresh=true")
+    assert isinstance(refresh_result, dict)
+    assert_response_shape(
+        refresh_result,
+        {
+            "checked_at": str,
+            "update_available": bool,
+            "components": list,
+            "base_image": str,
+        },
+        "upstream_status_refresh",
+    )
+
+
+@pytest.mark.e2e
+def test_upstream_status_ui(authenticated_page: Page, base_url: str) -> None:
+    """Upstream AmneziaWG Components card rendered on /settings."""
+    page = authenticated_page
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+
+    # Verify visibility of upstream section elements
+    badge_go = page.locator("#badge-amneziawg-go")
+    badge_tools = page.locator("#badge-amneziawg-tools")
+    base_image_el = page.locator("#upstreamBaseImage")
+
+    badge_go.wait_for(state="visible")
+    badge_tools.wait_for(state="visible")
+    base_image_el.wait_for(state="visible")
+
+    assert badge_go.is_visible()
+    assert badge_tools.is_visible()
+    assert base_image_el.is_visible()
+
+    # Verify Docker base image text contains devopsigor/amneziawg
+    base_image_text = base_image_el.inner_text()
+    assert "devopsigor/amneziawg" in base_image_text
+
+    # Verify "Check for Updates" button exists and can be clicked
+    check_btn = page.locator("#upstreamCheckBtn")
+    check_btn.wait_for(state="visible")
+    assert check_btn.is_visible()
+    assert check_btn.is_enabled()
+
+    page_errors: list[str] = []
+    page.on("pageerror", lambda err: page_errors.append(str(err)))
+
+    check_btn.click()
+    page.wait_for_load_state("networkidle")
+    assert len(page_errors) == 0
+    assert check_btn.is_visible()

@@ -449,5 +449,12 @@
   "vpn_unset_auto_detected": "Auto : %s",
   "wrong_share_password": "Mauvais mot de passe",
   "you_label": "YOU",
-  "your_rank": "Votre rang"
+  "your_rank": "Votre rang",
+  "check_updates": "Vérifier les mises à jour",
+  "latest": "Dernière",
+  "pinned": "Épinglé",
+  "up_to_date": "À jour",
+  "update_available": "Mise à jour disponible",
+  "upstream_components_title": "Composants AmneziaWG (Upstream)",
+  "upstream_update_available_notice": "Une version plus récente est disponible. Consultez les modifications et mettez à jour les conteneurs."
 }
