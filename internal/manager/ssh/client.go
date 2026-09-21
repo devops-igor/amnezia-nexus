@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -241,12 +242,12 @@ func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string
 		return "", "", -1, ErrNotConnected
 	}
 
-	var stdinReader *strings.Reader
+	var stdin io.Reader
 	if stdinInput != "" {
-		stdinReader = strings.NewReader(stdinInput)
+		stdin = strings.NewReader(stdinInput)
 	}
 
-	return RunSession(ctx, client, formattedCmd, stdinReader)
+	return RunSession(ctx, client, formattedCmd, stdin)
 }
 
 // RunScript executes a multi-line shell script via bash stdin.

@@ -174,6 +174,45 @@ func TestClient_SudoCommands(t *testing.T) {
 	if err != nil || code != 0 || stdout != "root-sudo" {
 		t.Fatalf("root RunSudoCommand failed: code=%d, err=%v, out=%s, stderr=%s", code, err, stdout, stderr)
 	}
+
+	// 3. Non-root user with empty password (passwordless sudo / SSH key auth)
+	// Verifies that empty password does not pass a typed nil *strings.Reader to RunSession,
+	// avoiding nil dereference panics in golang.org/x/crypto/ssh session stdin handling.
+	noPassServer := NewMockSSHServer(t, "debian", "")
+	defer noPassServer.Close()
+
+	edKeyPEM, err := GenerateTestEd25519Key()
+	if err != nil {
+		t.Fatalf("failed to generate ed25519 key: %v", err)
+	}
+	signer, err := ParsePrivateKey(edKeyPEM, "")
+	if err != nil {
+		t.Fatalf("failed to parse private key: %v", err)
+	}
+	noPassServer.SetAuthorizedKey(signer.PublicKey())
+
+	noPassCfg := Config{
+		Host:            noPassServer.Host(),
+		Port:            noPassServer.Port(),
+		User:            "debian",
+		Password:        "",
+		PrivateKey:      edKeyPEM,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	noPassClient, err := Dial(ctx, noPassCfg)
+	if err != nil {
+		t.Fatalf("failed to dial non-root user with key auth: %v", err)
+	}
+	defer noPassClient.Close()
+
+	stdout, stderr, code, err = noPassClient.RunSudoCommand(ctx, "echo sudo-nopass")
+	if err != nil || code != 0 {
+		t.Fatalf("RunSudoCommand with empty password failed: code=%d, err=%v, stderr=%s", code, err, stderr)
+	}
+	if stdout != "success" && stdout != "sudo executed" {
+		t.Fatalf("unexpected sudo stdout: %s", stdout)
+	}
 }
 
 func TestClient_SFTPAndUploadDownload(t *testing.T) {
