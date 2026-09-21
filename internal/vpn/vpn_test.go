@@ -42,8 +42,8 @@ func setupTestDB(t *testing.T) *database.DB {
 	return db
 }
 
-func TestLegacyServiceAndBalancer(t *testing.T) {
-	lb := NewLeastConnectionsLoadBalancer()
+func TestServiceAndBalancerSelection(t *testing.T) {
+	lb := loadbalancer.NewLeastConnectionsBalancer(loadbalancer.CapacityConfig{})
 	ctx := context.Background()
 
 	// No tunnels
@@ -79,8 +79,11 @@ func TestLegacyServiceAndBalancer(t *testing.T) {
 		t.Errorf("expected tunnel ID 4 (2 active connections), got ID %d (%d connections)", best.ID, best.ActiveConnections)
 	}
 
-	// Legacy NewService
-	svc := NewService(models.LBLeastConnections)
+	// Production NewVPNService
+	svc, err := NewVPNService(nil, &models.VPNConfig{Algorithm: models.LBLeastConnections})
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
 	bestSvc, err := svc.SelectTunnel(ctx, tunnels)
 	if err != nil || bestSvc.ID != 4 {
 		t.Errorf("SelectTunnel mismatch: %+v, err: %v", bestSvc, err)
