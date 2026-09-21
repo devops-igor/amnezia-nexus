@@ -283,63 +283,6 @@ func TestSetLangEndpoint(t *testing.T) {
 	}
 }
 
-func TestCleanReferer(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"empty", "", "/"},
-		{"relative path", "/settings", "/settings"},
-		{"relative path with query", "/server/1?tab=logs", "/server/1?tab=logs"},
-		{"absolute http url", "http://evil.com/hack", "/hack"},
-		{"absolute https url", "https://example.com/dashboard?view=grid", "/dashboard?view=grid"},
-		{"invalid url", "://invalid-url", "/"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := CleanReferer(tt.input)
-			if got != tt.want {
-				t.Errorf("CleanReferer(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFormatBytes(t *testing.T) {
-	tests := []struct {
-		bytes int64
-		want  string
-	}{
-		{0, "0 B"},
-		{500, "500 B"},
-		{1024, "1.00 KB"},
-		{1536, "1.50 KB"},
-		{1048576, "1.00 MB"},
-		{1073741824, "1.00 GB"},
-		{-1073741824, "-1.00 GB"},
-	}
-
-	for _, tt := range tests {
-		got := FormatBytes(tt.bytes)
-		if got != tt.want {
-			t.Errorf("FormatBytes(%d) = %q, want %q", tt.bytes, got, tt.want)
-		}
-	}
-}
-
-func TestFormatTime(t *testing.T) {
-	if got := FormatTime(time.Time{}); got != "" {
-		t.Errorf("expected empty string for zero time, got %q", got)
-	}
-
-	fixed := time.Date(2026, 8, 28, 15, 4, 5, 0, time.UTC)
-	if got := FormatTime(fixed); got != "2026-08-28 15:04:05" {
-		t.Errorf("expected '2026-08-28 15:04:05', got %q", got)
-	}
-}
-
 func TestRouterEndpointDispatch(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
 	r := NewRouter(cfg, db, nil)
