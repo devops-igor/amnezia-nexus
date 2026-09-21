@@ -1,0 +1,257 @@
+name: Upstream Component Monitor
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    name: Check Upstream AmneziaWG Releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Monitor Upstream Tags and Alert
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          def compare_versions(v1, v2):
+              def norm(v):
+                  v = v.strip()
+                  if ":" in v:
+                      v = v.split(":")[-1]
+                  if v.startswith("v") or v.startswith("V"):
+                      v = v[1:]
+                  return v
+
+              n1, n2 = norm(v1), norm(v2)
+              if n1 == n2:
+                  return 0
+
+              def split_segs(v):
+                  return [s for s in re.split(r'[.\-_+]', v) if s]
+
+              segs1, segs2 = split_segs(n1), split_segs(n2)
+              min_len = min(len(segs1), len(segs2))
+
+              for i in range(min_len):
+                  s1, s2 = segs1[i], segs2[i]
+                  if s1 == s2:
+                      continue
+                  if s1.isdigit() and s2.isdigit():
+                      i1, i2 = int(s1), int(s2)
+                      if i1 < i2:
+                          return -1
+                      if i1 > i2:
+                          return 1
+                      continue
+
+                  m1 = re.match(r'^([a-zA-Z]+)(\d+)$', s1)
+                  m2 = re.match(r'^([a-zA-Z]+)(\d+)$', s2)
+                  if m1 and m2 and m1.group(1).lower() == m2.group(1).lower():
+                      i1, i2 = int(m1.group(2)), int(m2.group(2))
+                      if i1 < i2:
+                          return -1
+                      if i1 > i2:
+                          return 1
+                      continue
+
+                  prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
+                  if s1.isdigit() and any(s2.lower().startswith(p) for p in prereleases):
+                      return 1
+                  if s2.isdigit() and any(s1.lower().startswith(p) for p in prereleases):
+                      return -1
+
+                  if s1 < s2:
+                      return -1
+                  if s1 > s2:
+                      return 1
+
+              prereleases = ("alpha", "beta", "rc", "dev", "pre", "preview")
+              if len(segs1) > len(segs2):
+                  for s in segs1[min_len:]:
+                      if any(s.lower().startswith(p) for p in prereleases):
+                          return -1
+                      if s.isdigit() and int(s) > 0:
+                          return 1
+                  return 0
+
+              if len(segs2) > len(segs1):
+                  for s in segs2[min_len:]:
+                      if any(s.lower().startswith(p) for p in prereleases):
+                          return 1
+                      if s.isdigit() and int(s) > 0:
+                          return -1
+                  return 0
+
+              return 0
+
+          # 1. Extract pinned versions from service.go and go.mod
+          with open("internal/service/upstream/service.go", "r", encoding="utf-8") as f:
+              svc_code = f.read()
+
+          m_go = re.search(r'PinnedAWGGoVersion\s*=\s*"([^"]+)"', svc_code)
+          m_tools = re.search(r'PinnedAWGToolsVersion\s*=\s*"([^"]+)"', svc_code)
+          m_img = re.search(r'PinnedAWGBaseImage\s*=\s*"([^"]+)"', svc_code)
+
+          pinned_go = m_go.group(1) if m_go else "v3.1.20260828"
+          pinned_tools = m_tools.group(1) if m_tools else "v3.1.20260812"
+          pinned_base_image = m_img.group(1) if m_img else "devopsigor/amneziawg:v3.1.20260828-1"
+
+          components = [
+              {
+                  "name": "amneziawg-go",
+                  "repo": "amnezia-vpn/amneziawg-go",
+                  "pinned": pinned_go,
+              },
+              {
+                  "name": "amneziawg-tools",
+                  "repo": "amnezia-vpn/amneziawg-tools",
+                  "pinned": pinned_tools,
+              }
+          ]
+
+          # 2. Query upstream tags and compare
+          summary_rows = []
+          any_update_found = False
+
+          for comp in components:
+              repo = comp["repo"]
+              name = comp["name"]
+              pinned = comp["pinned"]
+
+              print(f"Checking {name} ({repo})...")
+              cmd = ["gh", "api", f"repos/{repo}/tags?per_page=10", "--jq", ".[].name"]
+              res = subprocess.run(cmd, capture_output=True, text=True)
+
+              if res.returncode != 0:
+                  print(f"Warning: gh api error for {repo}: {res.stderr.strip()}", file=sys.stderr)
+                  summary_rows.append({
+                      "name": name,
+                      "pinned": pinned,
+                      "latest": pinned,
+                      "update": "Error",
+                      "url": f"https://github.com/{repo}/tags"
+                  })
+                  continue
+
+              tags = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+              max_tag = ""
+              for tag in tags:
+                  norm_tag = tag.lstrip("vV")
+                  if norm_tag and norm_tag[0].isdigit():
+                      if not max_tag or compare_versions(tag, max_tag) > 0:
+                          max_tag = tag
+
+              if not max_tag:
+                  max_tag = tags[0] if tags else pinned
+
+              update_available = compare_versions(max_tag, pinned) > 0
+              rel_url = f"https://github.com/{repo}/releases/tag/{max_tag}"
+
+              print(f"  Pinned: {pinned}")
+              print(f"  Latest: {max_tag}")
+              print(f"  Update available: {update_available}")
+
+              summary_rows.append({
+                  "name": name,
+                  "pinned": pinned,
+                  "latest": max_tag,
+                  "update": "Yes (Alert)" if update_available else "No (Up to date)",
+                  "url": rel_url
+              })
+
+              # 3. Create issue if update detected and no open alert exists
+              if update_available:
+                  any_update_found = True
+                  print(f"New upstream release detected for {name}: {max_tag}")
+
+                  # Check for existing open issues with [Upstream Alert]
+                  search_cmd = [
+                      "gh", "issue", "list",
+                      "--state", "open",
+                      "--search", "in:title [Upstream Alert]",
+                      "--json", "number,title"
+                  ]
+                  search_res = subprocess.run(search_cmd, capture_output=True, text=True)
+                  alert_exists = False
+                  if search_res.returncode == 0 and search_res.stdout.strip():
+                      try:
+                          issues = json.loads(search_res.stdout)
+                          for issue in issues:
+                              title = issue.get("title", "")
+                              if "[Upstream Alert]" in title and name in title:
+                                  print(f"Open alert issue #{issue.get('number')} already exists for {name}: {title}")
+                                  alert_exists = True
+                                  break
+                      except Exception as e:
+                          print(f"Error parsing issue search results: {e}", file=sys.stderr)
+
+                  if not alert_exists:
+                      issue_title = f"[Upstream Alert] New AmneziaWG upstream release detected: {name} {max_tag}"
+                      issue_body = (
+                          f"## Upstream Release Notification\n\n"
+                          f"A new upstream release has been detected for **{name}**:\n\n"
+                          f"- **Component**: `{name}`\n"
+                          f"- **Repository**: https://github.com/{repo}\n"
+                          f"- **Pinned Version**: `{pinned}`\n"
+                          f"- **New Upstream Version**: `{max_tag}`\n"
+                          f"- **Release URL**: {rel_url}\n"
+                          f"- **Current Docker Base Image**: `{pinned_base_image}`\n\n"
+                          f"### Next Steps\n"
+                          f"1. Review changes in upstream {name} {max_tag}.\n"
+                          f"2. Build and publish updated container base image `devopsigor/amneziawg` if needed.\n"
+                          f"3. Update pinned version constant in `internal/service/upstream/service.go` and `go.mod`."
+                      )
+
+                      create_cmd = [
+                          "gh", "issue", "create",
+                          "--title", issue_title,
+                          "--body", issue_body,
+                          "--label", "enhancement"
+                      ]
+                      create_res = subprocess.run(create_cmd, capture_output=True, text=True)
+                      if create_res.returncode != 0:
+                          # Fallback without label if label enhancement is missing
+                          fallback_cmd = [
+                              "gh", "issue", "create",
+                              "--title", issue_title,
+                              "--body", issue_body
+                          ]
+                          fallback_res = subprocess.run(fallback_cmd, capture_output=True, text=True)
+                          if fallback_res.returncode == 0:
+                              print(f"Created issue without label: {fallback_res.stdout.strip()}")
+                          else:
+                              print(f"Failed to create issue: {fallback_res.stderr.strip()}", file=sys.stderr)
+                      else:
+                          print(f"Created issue: {create_res.stdout.strip()}")
+
+          # 4. Generate GitHub Step Summary
+          step_summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary_file:
+              with open(step_summary_file, "a", encoding="utf-8") as f:
+                  f.write("## Upstream AmneziaWG Component Status\n\n")
+                  f.write("| Component | Pinned Version | Latest Upstream | Update Available | Upstream Link |\n")
+                  f.write("| :--- | :--- | :--- | :--- | :--- |\n")
+                  for row in summary_rows:
+                      link = f"[{row['latest']}]({row['url']})"
+                      f.write(f"| `{row['name']}` | `{row['pinned']}` | {link} | {row['update']} | [GitHub Repo]({row['url']}) |\n")
+                  f.write(f"\n**Docker Base Image**: `{pinned_base_image}`\n")
+                  if any_update_found:
+                      f.write("\n> [!WARNING]\n> One or more upstream components have newer versions available. Check open issues for details.\n")
+                  else:
+                      f.write("\n> [!NOTE]\n> All upstream components match their pinned versions.\n")
+          EOF
