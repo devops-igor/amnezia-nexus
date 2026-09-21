@@ -58,6 +58,19 @@ python3 -m pytest tests/e2e/test_auth.py -m e2e -v
 python3 -m pytest tests/e2e/ -m e2e -v
 ```
 
+### Deterministic 3-Stage Clean-Slate Lifecycle Verification
+
+To run the complete lifecycle suite (Initial Setup -> Server 1 Onboard & AWG 3.1 -> Full Functional Tests) against a clean database:
+
+```bash
+E2E_BASE_URL=http://localhost:8000 \
+E2E_ADMIN_USER=admin \
+E2E_ADMIN_PASS="$ADMIN_PASSWORD" \
+E2E_SERVER_HOST=172.17.0.1 \
+E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
+./scripts/run_e2e_lifecycle.sh
+```
+
 ---
 
 ## Environment Variables
@@ -68,6 +81,11 @@ python3 -m pytest tests/e2e/ -m e2e -v
 | `E2E_HEADLESS` | `1` | Set to `0` for visible browser |
 | `E2E_ADMIN_USER` | `admin` | Admin username for login |
 | `E2E_ADMIN_PASS` | (empty) | Admin password — **set via env var, never hardcode** |
+| `E2E_SERVER_HOST` | `172.17.0.1` | Remote server hostname or bridge IP for onboarding |
+| `E2E_SERVER_SSH_PORT` | `22` | SSH port for server onboarding |
+| `E2E_SERVER_SSH_USER` | `ubuntu` | SSH username for server onboarding |
+| `E2E_SERVER_SSH_KEY` | (empty) | Path to private SSH key for onboarding |
+| `E2E_SERVER_SSH_PASS` | (empty) | SSH password for onboarding (optional fallback) |
 
 ---
 
@@ -76,6 +94,7 @@ python3 -m pytest tests/e2e/ -m e2e -v
 | File | Tests | What it covers |
 |------|-------|---------------|
 | `test_setup.py` | 4 | Initial setup wizard, validation, admin creation, lock |
+| `test_onboard.py` | 4 | Server 1 SSH onboarding, fingerprint confirm, AWG 3.1 deploy, health |
 | `test_auth.py` | 6 | Login page, success, failure, rate limiting, CSRF, logout |
 | `test_servers.py` | 7 | Server list, detail, check, install, stats, add form, reboot |
 | `test_connections.py` | 5 | Connection list, add, config/QR, toggle, delete |
@@ -84,7 +103,7 @@ python3 -m pytest tests/e2e/ -m e2e -v
 | `test_settings.py` | 4 | Page load, change title, captcha toggle, backup download |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
 
-**Total: 40 test scenarios**
+**Total: 44 test scenarios**
 
 ---
 
