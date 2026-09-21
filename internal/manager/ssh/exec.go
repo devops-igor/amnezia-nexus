@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -101,7 +102,10 @@ func RunSession(ctx context.Context, client *gossh.Client, cmd string, stdin io.
 	session.Stderr = &stderrBuf
 
 	if stdin != nil {
-		session.Stdin = stdin
+		val := reflect.ValueOf(stdin)
+		if val.Kind() != reflect.Ptr || !val.IsNil() {
+			session.Stdin = stdin
+		}
 	}
 
 	// Goroutine to handle context cancellation / timeout

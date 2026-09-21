@@ -449,5 +449,12 @@
   "vpn_unset_auto_detected": "Авто: %s",
   "wrong_share_password": "Неверный пароль",
   "you_label": "YOU",
-  "your_rank": "Ваш ранг"
+  "your_rank": "Ваш ранг",
+  "check_updates": "Проверить обновления",
+  "latest": "Последняя",
+  "pinned": "Закреплено",
+  "up_to_date": "Актуально",
+  "update_available": "Доступно обновление",
+  "upstream_components_title": "Компоненты AmneziaWG (Upstream)",
+  "upstream_update_available_notice": "Доступен новый релиз компонентов AmneziaWG. Ознакомьтесь с изменениями и обновите образы."
 }

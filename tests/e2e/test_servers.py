@@ -1,5 +1,7 @@
 """E2E tests for server management pages and API."""
 
+import os
+
 import pytest
 from playwright.sync_api import Page
 
@@ -137,6 +139,11 @@ def test_server_add_form(authenticated_page: Page, base_url: str) -> None:
 
 
 @pytest.mark.e2e
+@pytest.mark.skipif(
+    os.environ.get("E2E_TESTING", "").lower() == "true"
+    or os.environ.get("CI", "").lower() == "true",
+    reason="Rebooting target server is disabled in automated CI/E2E test runs to prevent terminating the runner host",
+)
 def test_server_reboot(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
     """Click 'Reboot' on a server -> sees reboot confirmation/status."""
     page = authenticated_page

@@ -309,6 +309,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Post("/backup/restore", h.RestoreBackupHandler)
 		})
 
+		// System API
+		r.Route("/api/system", func(r chi.Router) {
+			r.Get("/upstream-status", h.GetUpstreamStatusHandler)
+		})
+
 		// VPN Subsystem API (Admin endpoints)
 		r.Route("/api/vpn", func(r chi.Router) {
 			r.Get("/status", h.VPNStatusHandler)

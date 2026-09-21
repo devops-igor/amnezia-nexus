@@ -46,6 +46,8 @@ func setupTestHandlers(t *testing.T) (*Handlers, *database.DB, *config.Config) {
 		SecretKey:   testSecretKey,
 	}
 
+	_ = config.LoadTranslations()
+
 	sshPool := ssh.NewSSHClientPool(ssh.PoolConfig{
 		IdleTimeout:     5 * time.Minute,
 		KeepAlivePeriod: 30 * time.Second,

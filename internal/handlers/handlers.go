@@ -23,6 +23,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
@@ -30,6 +31,11 @@ import (
 type SSHPoolProvider interface {
 	Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error)
 	Remove(serverID int64)
+}
+
+// UpstreamChecker defines an interface for checking upstream component statuses.
+type UpstreamChecker interface {
+	Check(ctx context.Context, forceRefresh bool) (*upstream.UpstreamStatus, error)
 }
 
 // Dependencies holds all runtime dependencies required by the HTTP handlers.
@@ -42,6 +48,7 @@ type Dependencies struct {
 	MTProxyLManager *mtproxyl.MTProxyLManager
 	DNSManager      *dns.DNSManager
 	VPNService      *vpn.Service
+	UpstreamService UpstreamChecker
 }
 
 // Handlers encapsulates all HTTP route handlers and business logic.
@@ -54,6 +61,7 @@ type Handlers struct {
 	mtproxylMgr   *mtproxyl.MTProxyLManager
 	dnsMgr        *dns.DNSManager
 	vpnSvc        *vpn.Service
+	upstreamSvc   UpstreamChecker
 	dialTimeout   func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu       sync.Mutex
 	captchaOnce   sync.Once
@@ -91,6 +99,11 @@ func NewHandlers(deps Dependencies) *Handlers {
 		mtproxylMgr: deps.MTProxyLManager,
 		dnsMgr:      deps.DNSManager,
 		vpnSvc:      deps.VPNService,
+		upstreamSvc: deps.UpstreamService,
+	}
+
+	if h.upstreamSvc == nil {
+		h.upstreamSvc = upstream.NewService()
 	}
 
 	if h.registry == nil {
@@ -110,6 +123,16 @@ func NewHandlers(deps Dependencies) *Handlers {
 	}
 
 	return h
+}
+
+// UpstreamService returns the upstream service checker.
+func (h *Handlers) UpstreamService() UpstreamChecker {
+	return h.upstreamSvc
+}
+
+// SetUpstreamService sets the upstream service checker.
+func (h *Handlers) SetUpstreamService(svc UpstreamChecker) {
+	h.upstreamSvc = svc
 }
 
 // JSON writes a typed JSON response with status code.

@@ -304,6 +304,7 @@ func TestRouterEndpointDispatch(t *testing.T) {
 		{http.MethodGet, "/api/auth/captcha", nil, nil, http.StatusOK},
 		{http.MethodGet, "/api/leaderboard", nil, nil, http.StatusOK},
 		{http.MethodGet, "/api/settings", adminSession, nil, http.StatusOK},
+		{http.MethodGet, "/api/system/upstream-status", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/users", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/status", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/sessions", adminSession, nil, http.StatusOK},
@@ -906,5 +907,57 @@ func TestRouter_LogoutAllRoutes(t *testing.T) {
 	r.ServeHTTP(wPostNoCSRF, reqPostNoCSRF)
 	if wPostNoCSRF.Code != http.StatusForbidden {
 		t.Errorf("expected 403 Forbidden for POST /api/auth/logout-all without CSRF token, got %d", wPostNoCSRF.Code)
+	}
+}
+
+func TestRouter_UpstreamStatusAuth(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	r := NewRouter(cfg, db, nil)
+	ctx := context.Background()
+
+	// Seed regular user
+	_, err := db.CreateUser(ctx, &models.User{
+		ID:        "user-regular-id",
+		Username:  "regularuser",
+		Role:      models.RoleUser,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("failed to seed regular user: %v", err)
+	}
+
+	// 1. Unauthenticated request -> 401 Unauthorized
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/api/system/upstream-status", nil)
+	wUnauth := httptest.NewRecorder()
+	r.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for unauthenticated request, got %d", wUnauth.Code)
+	}
+
+	// 2. Regular user (non-admin) -> 403 Forbidden
+	userCtx := middleware.WithSession(ctx, &models.SessionData{
+		UserID:   "user-regular-id",
+		Username: "regularuser",
+		Role:     models.RoleUser,
+	})
+	reqUser := httptest.NewRequest(http.MethodGet, "/api/system/upstream-status", nil).WithContext(userCtx)
+	wUser := httptest.NewRecorder()
+	r.ServeHTTP(wUser, reqUser)
+	if wUser.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for regular user, got %d", wUser.Code)
+	}
+
+	// 3. Admin user -> 200 OK
+	adminCtx := middleware.WithSession(ctx, &models.SessionData{
+		UserID:   "admin-id",
+		Username: "admin",
+		Role:     models.RoleAdmin,
+	})
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/api/system/upstream-status", nil).WithContext(adminCtx)
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, reqAdmin)
+	if wAdmin.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for admin user, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
 	}
 }
