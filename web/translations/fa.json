@@ -449,5 +449,12 @@
   "vpn_unset_auto_detected": "خودکار: %s",
   "wrong_share_password": "رمز عبور اشتباه است",
   "you_label": "YOU",
-  "your_rank": "رتبه شما"
+  "your_rank": "رتبه شما",
+  "check_updates": "بررسی به‌روزرسانی‌ها",
+  "latest": "آخرین",
+  "pinned": "پین شده",
+  "up_to_date": "به‌روز",
+  "update_available": "به‌روزرسانی موجود است",
+  "upstream_components_title": "اجزای بالادستی AmneziaWG",
+  "upstream_update_available_notice": "نسخه بالادستی جدیدتری در دسترس است. تغییرات را بررسی کرده و به‌روزرسانی کنید."
 }
