@@ -19,6 +19,9 @@ const (
 	PinnedAWGToolsVersion = "v3.1.20260812"
 	PinnedAWGBaseImage    = "devopsigor/amneziawg:v3.1.20260828-1"
 
+	DefaultDockerRepo    = "devopsigor/amneziawg"
+	DefaultDockerBaseURL = "https://hub.docker.com/v2"
+
 	DefaultCacheTTL = 1 * time.Hour
 	DefaultTimeout  = 10 * time.Second
 	UserAgent       = "amnezia-nexus/1.2.1"
@@ -41,6 +44,7 @@ type ComponentStatus struct {
 //nolint:revive // Stutter is permitted to strictly adhere to task specification
 type UpstreamStatus struct {
 	CheckedAt       time.Time         `json:"checked_at"`
+	Status          string            `json:"status"`
 	UpdateAvailable bool              `json:"update_available"`
 	Components      []ComponentStatus `json:"components"`
 	BaseImage       string            `json:"base_image"`
@@ -48,13 +52,15 @@ type UpstreamStatus struct {
 
 // Service queries and caches upstream release metadata.
 type Service struct {
-	mu         sync.RWMutex
-	cached     *UpstreamStatus
-	cachedAt   time.Time
-	cacheTTL   time.Duration
-	httpClient *http.Client
-	baseURL    string
-	token      string
+	mu            sync.RWMutex
+	cached        *UpstreamStatus
+	cachedAt      time.Time
+	cacheTTL      time.Duration
+	lastKnownGood map[string]ComponentStatus
+	httpClient    *http.Client
+	baseURL       string
+	dockerBaseURL string
+	token         string
 }
 
 // Option configures a Service instance.
@@ -73,6 +79,13 @@ func WithHTTPClient(client *http.Client) Option {
 func WithBaseURL(url string) Option {
 	return func(s *Service) {
 		s.baseURL = strings.TrimRight(url, "/")
+	}
+}
+
+// WithDockerBaseURL overrides the Docker Hub API base URL (useful for testing).
+func WithDockerBaseURL(url string) Option {
+	return func(s *Service) {
+		s.dockerBaseURL = strings.TrimRight(url, "/")
 	}
 }
 
@@ -98,12 +111,14 @@ func NewService(opts ...Option) *Service {
 	}
 
 	s := &Service{
-		cacheTTL: DefaultCacheTTL,
+		cacheTTL:      DefaultCacheTTL,
+		lastKnownGood: make(map[string]ComponentStatus),
 		httpClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
-		baseURL: "https://api.github.com",
-		token:   token,
+		baseURL:       "https://api.github.com",
+		dockerBaseURL: DefaultDockerBaseURL,
+		token:         token,
 	}
 
 	for _, opt := range opts {
@@ -113,80 +128,243 @@ func NewService(opts ...Option) *Service {
 	return s
 }
 
-// CompareVersions compares two version strings v1 and v2.
+// CompareVersions compares two version strings v1 and v2 according to SemVer 2.0.0
+// and CalVer conventions.
 // Returns -1 if v1 < v2, 0 if v1 == v2, and 1 if v1 > v2.
-// It handles semantic versions (e.g. "v1.2.3") and calendar-version strings (e.g. "v3.1.20260828").
 func CompareVersions(v1, v2 string) int {
-	norm1 := normalizeVersion(v1)
-	norm2 := normalizeVersion(v2)
+	clean1 := cleanVersion(v1)
+	clean2 := cleanVersion(v2)
 
-	if norm1 == norm2 {
+	if clean1 == clean2 {
 		return 0
 	}
-
-	segs1 := splitSegments(v1)
-	segs2 := splitSegments(v2)
-
-	minLen := len(segs1)
-	if len(segs2) < minLen {
-		minLen = len(segs2)
+	if clean1 == "" {
+		return -1
+	}
+	if clean2 == "" {
+		return 1
 	}
 
-	for i := 0; i < minLen; i++ {
-		s1 := segs1[i]
-		s2 := segs2[i]
+	core1, hasPre1, preStr1 := parseVersion(clean1)
+	core2, hasPre2, preStr2 := parseVersion(clean2)
 
-		cmp := compareSegment(s1, s2)
-		if cmp != 0 {
+	if cmp := compareCoreVersions(core1, core2); cmp != 0 {
+		return cmp
+	}
+
+	if cmp, ok := compareCalVerRevisions(core1, core2, hasPre1, hasPre2, preStr1, preStr2); ok {
+		return cmp
+	}
+
+	return comparePrerelease(hasPre1, hasPre2, preStr1, preStr2)
+}
+
+func compareCoreVersions(core1, core2 []string) int {
+	minCore := len(core1)
+	if len(core2) < minCore {
+		minCore = len(core2)
+	}
+
+	for i := 0; i < minCore; i++ {
+		if cmp := compareSegment(core1[i], core2[i]); cmp != 0 {
 			return cmp
 		}
 	}
 
-	if len(segs1) > len(segs2) {
-		for i := minLen; i < len(segs1); i++ {
-			if isPrerelease(segs1[i]) {
-				return -1
-			}
-			if isNonZero(segs1[i]) {
+	if len(core1) > len(core2) {
+		for _, s := range core1[minCore:] {
+			if isNonZero(s) {
 				return 1
 			}
 		}
-		return 0
-	}
-
-	if len(segs2) > len(segs1) {
-		for i := minLen; i < len(segs2); i++ {
-			if isPrerelease(segs2[i]) {
-				return 1
-			}
-			if isNonZero(segs2[i]) {
+	} else if len(core2) > len(core1) {
+		for _, s := range core2[minCore:] {
+			if isNonZero(s) {
 				return -1
 			}
 		}
-		return 0
 	}
 
 	return 0
 }
 
-func normalizeVersion(v string) string {
+func compareCalVerRevisions(core1, core2 []string, hasPre1, hasPre2 bool, preStr1, preStr2 string) (int, bool) {
+	calVer1 := getCalVerPatch(core1)
+	calVer2 := getCalVerPatch(core2)
+
+	if calVer1 == "" || calVer2 == "" {
+		return 0, false
+	}
+
+	isPkg1 := !hasPre1 || isNumeric(preStr1)
+	isPkg2 := !hasPre2 || isNumeric(preStr2)
+	if !isPkg1 || !isPkg2 {
+		return 0, false
+	}
+
+	var rev1, rev2 uint64
+	if hasPre1 && isNumeric(preStr1) {
+		rev1, _ = strconv.ParseUint(preStr1, 10, 64)
+	}
+	if hasPre2 && isNumeric(preStr2) {
+		rev2, _ = strconv.ParseUint(preStr2, 10, 64)
+	}
+	if rev1 < rev2 {
+		return -1, true
+	}
+	if rev1 > rev2 {
+		return 1, true
+	}
+	return 0, true
+}
+
+func comparePrerelease(hasPre1, hasPre2 bool, preStr1, preStr2 string) int {
+	// SemVer 2.0.0 Precedence:
+	// A version without a prerelease has HIGHER precedence than a version with ANY prerelease.
+	if !hasPre1 && hasPre2 {
+		return 1
+	}
+	if hasPre1 && !hasPre2 {
+		return -1
+	}
+	if !hasPre1 && !hasPre2 {
+		return 0
+	}
+
+	// If both have prereleases, compare dot-separated identifiers from left to right:
+	ids1 := strings.Split(preStr1, ".")
+	ids2 := strings.Split(preStr2, ".")
+	minPre := len(ids1)
+	if len(ids2) < minPre {
+		minPre = len(ids2)
+	}
+
+	for i := 0; i < minPre; i++ {
+		if cmp := comparePrereleaseIdentifier(ids1[i], ids2[i]); cmp != 0 {
+			return cmp
+		}
+	}
+
+	// Larger set of prerelease identifiers has higher precedence if preceding are equal.
+	if len(ids1) > len(ids2) {
+		return 1
+	}
+	if len(ids2) > len(ids1) {
+		return -1
+	}
+
+	return 0
+}
+
+func cleanVersion(v string) string {
 	v = strings.TrimSpace(v)
 	if idx := strings.LastIndex(v, ":"); idx != -1 {
 		v = v[idx+1:]
 	}
+	if idx := strings.Index(v, "+"); idx != -1 {
+		v = v[:idx]
+	}
 	v = strings.TrimPrefix(v, "v")
 	v = strings.TrimPrefix(v, "V")
-	return v
+	return strings.TrimSpace(v)
 }
 
-func splitSegments(v string) []string {
-	norm := normalizeVersion(v)
-	if norm == "" {
-		return nil
+func normalizeVersion(v string) string {
+	return cleanVersion(v)
+}
+
+func parseVersion(v string) ([]string, bool, string) {
+	if idx := strings.Index(v, "-"); idx != -1 {
+		corePart := v[:idx]
+		prePart := v[idx+1:]
+		return splitCoreSegments(corePart), true, prePart
 	}
-	return strings.FieldsFunc(norm, func(r rune) bool {
-		return r == '.' || r == '-' || r == '_' || r == '+'
-	})
+	return splitCoreSegments(v), false, ""
+}
+
+func splitCoreSegments(v string) []string {
+	parts := strings.Split(v, ".")
+	var res []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
+func getCalVerPatch(core []string) string {
+	if len(core) >= 3 {
+		p := core[2]
+		if len(p) >= 8 && isNumeric(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func comparePrereleaseIdentifier(id1, id2 string) int {
+	if id1 == id2 {
+		return 0
+	}
+
+	num1 := isNumeric(id1)
+	num2 := isNumeric(id2)
+
+	if num1 && num2 {
+		n1, _ := strconv.ParseUint(id1, 10, 64)
+		n2, _ := strconv.ParseUint(id2, 10, 64)
+		if n1 < n2 {
+			return -1
+		}
+		if n1 > n2 {
+			return 1
+		}
+		return 0
+	}
+
+	// SemVer 2.0.0 Rule 11.4.3: Numeric identifiers always have lower
+	// precedence than non-numeric identifiers.
+	if num1 && !num2 {
+		return -1
+	}
+	if !num1 && num2 {
+		return 1
+	}
+
+	// Both non-numeric identifiers
+	prefix1, n1, ok1 := splitPrefixAndNumber(id1)
+	prefix2, n2, ok2 := splitPrefixAndNumber(id2)
+	if ok1 && ok2 && prefix1 == prefix2 {
+		if n1 < n2 {
+			return -1
+		}
+		if n1 > n2 {
+			return 1
+		}
+		return 0
+	}
+
+	if id1 < id2 {
+		return -1
+	}
+	if id1 > id2 {
+		return 1
+	}
+	return 0
 }
 
 func compareSegment(s1, s2 string) int {
@@ -207,23 +385,11 @@ func compareSegment(s1, s2 string) int {
 		return 0
 	}
 
-	prefix1, num1, ok1 := splitPrefixAndNumber(s1)
-	prefix2, num2, ok2 := splitPrefixAndNumber(s2)
-	if ok1 && ok2 && prefix1 == prefix2 {
-		if num1 < num2 {
-			return -1
-		}
-		if num1 > num2 {
-			return 1
-		}
-		return 0
-	}
-
-	if err1 == nil && isPrerelease(s2) {
-		return 1
-	}
-	if err2 == nil && isPrerelease(s1) {
+	if err1 == nil && err2 != nil {
 		return -1
+	}
+	if err1 != nil && err2 == nil {
+		return 1
 	}
 
 	if s1 < s2 {
@@ -248,22 +414,12 @@ func splitPrefixAndNumber(s string) (string, uint64, bool) {
 	return strings.ToLower(nonDigits), num, true
 }
 
-func isPrerelease(seg string) bool {
-	lower := strings.ToLower(seg)
-	for _, p := range []string{"alpha", "beta", "rc", "dev", "pre", "preview"} {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
 func isNonZero(seg string) bool {
 	n, err := strconv.ParseUint(seg, 10, 64)
 	if err == nil {
 		return n > 0
 	}
-	return true
+	return seg != ""
 }
 
 type gitHubTag struct {
@@ -274,6 +430,16 @@ type gitHubRelease struct {
 	TagName     string    `json:"tag_name"`
 	HTMLURL     string    `json:"html_url"`
 	PublishedAt time.Time `json:"published_at"`
+}
+
+type dockerHubTag struct {
+	Name        string    `json:"name"`
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+type dockerHubResponse struct {
+	Count   int            `json:"count"`
+	Results []dockerHubTag `json:"results"`
 }
 
 func (s *Service) newRequest(ctx context.Context, endpoint string) (*http.Request, error) {
@@ -363,6 +529,42 @@ func (s *Service) queryGitHubReleases(ctx context.Context, repo string) ([]gitHu
 	return releases, nil
 }
 
+func (s *Service) queryDockerHubTags(ctx context.Context, repo string) ([]dockerHubTag, error) {
+	url := fmt.Sprintf("%s/repositories/%s/tags?page_size=10", s.dockerBaseURL, strings.TrimPrefix(repo, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error querying docker tags for %s: %w", repo, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return nil, fmt.Errorf("Docker Hub rate limit exceeded (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Docker Hub tags returned HTTP %d for %s", resp.StatusCode, repo)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	var res dockerHubResponse
+	if err := json.Unmarshal(body, &res); err != nil {
+		return nil, fmt.Errorf("decoding docker tags JSON: %w", err)
+	}
+
+	return res.Results, nil
+}
+
 func (s *Service) queryComponent(ctx context.Context, repo string) (string, time.Time, string, error) {
 	tags, err := s.queryGitHubTags(ctx, repo)
 	if err != nil {
@@ -410,6 +612,54 @@ func (s *Service) queryComponent(ctx context.Context, repo string) (string, time
 	return maxTag, publishedAt, releaseURL, nil
 }
 
+func (s *Service) queryDockerComponent(ctx context.Context, repo string) (string, time.Time, string, error) {
+	tags, err := s.queryDockerHubTags(ctx, repo)
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+
+	var maxTag string
+	var publishedAt time.Time
+
+	for _, t := range tags {
+		name := strings.TrimSpace(t.Name)
+		if name == "" || name == "latest" {
+			continue
+		}
+		norm := normalizeVersion(name)
+		if norm == "" || (norm[0] < '0' || norm[0] > '9') {
+			continue
+		}
+		if maxTag == "" || CompareVersions(name, maxTag) > 0 {
+			maxTag = name
+			publishedAt = t.LastUpdated
+		}
+	}
+
+	if maxTag == "" {
+		for _, t := range tags {
+			if t.Name != "" && t.Name != "latest" {
+				maxTag = t.Name
+				publishedAt = t.LastUpdated
+				break
+			}
+		}
+		if maxTag == "" {
+			return "", time.Time{}, "", fmt.Errorf("no valid tags found for docker repo %s", repo)
+		}
+	}
+
+	releaseURL := fmt.Sprintf("https://hub.docker.com/r/%s/tags", repo)
+	return maxTag, publishedAt, releaseURL, nil
+}
+
+func (s *Service) getLastKnownGood(name string) (ComponentStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	prev, ok := s.lastKnownGood[name]
+	return prev, ok
+}
+
 func (s *Service) fetchComponent(ctx context.Context, name, repo, pinnedVersion string) ComponentStatus {
 	status := ComponentStatus{
 		Name:          name,
@@ -422,6 +672,12 @@ func (s *Service) fetchComponent(ctx context.Context, name, repo, pinnedVersion 
 	latestTag, publishedAt, releaseURL, err := s.queryComponent(ctx, repo)
 	if err != nil {
 		status.Error = err.Error()
+		if prev, ok := s.getLastKnownGood(name); ok {
+			status.LatestVersion = prev.LatestVersion
+			status.ReleaseURL = prev.ReleaseURL
+			status.PublishedAt = prev.PublishedAt
+			status.UpdateAvailable = CompareVersions(status.LatestVersion, status.PinnedVersion) > 0
+		}
 		return status
 	}
 
@@ -437,6 +693,47 @@ func (s *Service) fetchComponent(ctx context.Context, name, repo, pinnedVersion 
 	return status
 }
 
+func parseDockerTag(image string) string {
+	if idx := strings.LastIndex(image, ":"); idx != -1 {
+		return image[idx+1:]
+	}
+	return image
+}
+
+func (s *Service) fetchDockerComponent(ctx context.Context, name, repo, pinnedImage string) ComponentStatus {
+	pinnedTag := parseDockerTag(pinnedImage)
+	status := ComponentStatus{
+		Name:          name,
+		Repo:          repo,
+		PinnedVersion: pinnedTag,
+		LatestVersion: pinnedTag,
+		ReleaseURL:    fmt.Sprintf("https://hub.docker.com/r/%s/tags", repo),
+	}
+
+	latestTag, publishedAt, releaseURL, err := s.queryDockerComponent(ctx, repo)
+	if err != nil {
+		status.Error = err.Error()
+		if prev, ok := s.getLastKnownGood(name); ok {
+			status.LatestVersion = prev.LatestVersion
+			status.ReleaseURL = prev.ReleaseURL
+			status.PublishedAt = prev.PublishedAt
+			status.UpdateAvailable = CompareVersions(status.LatestVersion, status.PinnedVersion) > 0
+		}
+		return status
+	}
+
+	status.LatestVersion = latestTag
+	if releaseURL != "" {
+		status.ReleaseURL = releaseURL
+	}
+	if !publishedAt.IsZero() {
+		status.PublishedAt = publishedAt
+	}
+
+	status.UpdateAvailable = CompareVersions(latestTag, pinnedTag) > 0
+	return status
+}
+
 // Check queries upstream component statuses, respecting the 1-hour cache unless forceRefresh is true.
 func (s *Service) Check(ctx context.Context, forceRefresh bool) (*UpstreamStatus, error) {
 	s.mu.RLock()
@@ -445,31 +742,57 @@ func (s *Service) Check(ctx context.Context, forceRefresh bool) (*UpstreamStatus
 		s.mu.RUnlock()
 		return cachedCopy, nil
 	}
-	stale := s.cached
 	s.mu.RUnlock()
 
 	goStatus := s.fetchComponent(ctx, "amneziawg-go", "amnezia-vpn/amneziawg-go", PinnedAWGGoVersion)
 	toolsStatus := s.fetchComponent(ctx, "amneziawg-tools", "amnezia-vpn/amneziawg-tools", PinnedAWGToolsVersion)
+	dockerStatus := s.fetchDockerComponent(ctx, "docker-base-image", DefaultDockerRepo, PinnedAWGBaseImage)
 
-	// If both components returned an error and a stale cache is available, return stale cache
-	if goStatus.Error != "" && toolsStatus.Error != "" && stale != nil {
-		return s.cloneStatus(stale), nil
+	components := []ComponentStatus{goStatus, toolsStatus, dockerStatus}
+
+	errCount := 0
+	updateCount := 0
+	for _, c := range components {
+		if c.Error != "" {
+			errCount++
+		}
+		if c.UpdateAvailable {
+			updateCount++
+		}
+	}
+
+	var status string
+	switch {
+	case errCount == len(components):
+		status = "error"
+	case errCount > 0:
+		status = "degraded"
+	case updateCount > 0:
+		status = "update_available"
+	default:
+		status = "up_to_date"
 	}
 
 	newStatus := &UpstreamStatus{
 		CheckedAt:       time.Now().UTC(),
-		UpdateAvailable: goStatus.UpdateAvailable || toolsStatus.UpdateAvailable,
-		Components:      []ComponentStatus{goStatus, toolsStatus},
+		Status:          status,
+		UpdateAvailable: updateCount > 0,
+		Components:      components,
 		BaseImage:       PinnedAWGBaseImage,
 	}
 
-	// Cache if at least one component succeeded without error
-	if goStatus.Error == "" || toolsStatus.Error == "" {
-		s.mu.Lock()
+	s.mu.Lock()
+	for _, comp := range components {
+		if comp.Error == "" {
+			s.lastKnownGood[comp.Name] = comp
+		}
+	}
+	// Only cache the combined snapshot if ALL components succeeded without error
+	if errCount == 0 {
 		s.cached = newStatus
 		s.cachedAt = time.Now()
-		s.mu.Unlock()
 	}
+	s.mu.Unlock()
 
 	return s.cloneStatus(newStatus), nil
 }

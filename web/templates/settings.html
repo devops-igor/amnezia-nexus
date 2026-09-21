@@ -283,12 +283,22 @@
                 <div style="padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary);">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <div style="font-weight: 600; color: var(--text-primary);">Docker Base Image</div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-weight: 600; color: var(--text-primary);">Docker Base Image</span>
+                                <a id="repoLink-docker-base-image" href="https://hub.docker.com/r/devopsigor/amneziawg/tags" target="_blank" rel="noopener noreferrer" style="color: var(--text-muted); display: inline-flex; align-items: center;">
+                                    <svg class="icon" style="width: 13px; height: 13px;"><use href="#icon-link"></use></svg>
+                                </a>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px;">
+                                <span>{{ _ "pinned" }}: <strong id="pinned-docker-base-image">v3.1.20260828-1</strong></span>
+                                <span style="margin: 0 6px;">|</span>
+                                <span>{{ _ "latest" }}: <strong id="latest-docker-base-image">...</strong></span>
+                            </div>
                             <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 3px; font-family: monospace;" id="upstreamBaseImage">
                                 devopsigor/amneziawg:v3.1.20260828-1
                             </div>
                         </div>
-                        <span class="badge badge-info" style="font-size: 0.72rem;">Docker Hub</span>
+                        <span id="badge-docker-base-image" class="badge badge-secondary" style="font-size: 0.72rem;">...</span>
                     </div>
                 </div>
 
@@ -454,8 +464,6 @@
                 document.getElementById('upstreamBaseImage').textContent = data.base_image;
             }
 
-            const hasUpdate = !!data.update_available;
-
             if (data.components && Array.isArray(data.components)) {
                 data.components.forEach(comp => {
                     const pinnedEl = document.getElementById('pinned-' + comp.name);
@@ -475,16 +483,24 @@
                         } else if (comp.update_available) {
                             badgeEl.className = 'badge badge-warning';
                             badgeEl.textContent = _('update_available') || 'Update available';
+                            badgeEl.title = '';
                         } else {
                             badgeEl.className = 'badge badge-success';
                             badgeEl.textContent = _('up_to_date') || 'Up to date';
+                            badgeEl.title = '';
                         }
                     }
                 });
             }
 
             if (overallBadge) {
-                if (hasUpdate) {
+                if (data.status === 'degraded') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('status_degraded') || 'Degraded';
+                } else if (data.status === 'error') {
+                    overallBadge.className = 'badge badge-secondary';
+                    overallBadge.textContent = _('error') || 'Error';
+                } else if (data.update_available) {
                     overallBadge.className = 'badge badge-warning';
                     overallBadge.textContent = _('update_available') || 'Update available';
                 } else {
@@ -494,13 +510,13 @@
             }
 
             if (banner) {
-                banner.style.display = hasUpdate ? 'block' : 'none';
+                banner.style.display = data.update_available ? 'block' : 'none';
             }
         } catch (err) {
             console.error('Failed to fetch upstream status:', err);
             if (overallBadge) {
                 overallBadge.className = 'badge badge-secondary';
-                overallBadge.textContent = 'Error';
+                overallBadge.textContent = _('error') || 'Error';
             }
         } finally {
             if (btn) btn.disabled = false;
