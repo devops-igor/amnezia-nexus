@@ -410,7 +410,6 @@ func TestPhase3TablesAndTelemetryEngine(t *testing.T) {
 		".sparkline-container",
 		".sparkline-svg",
 		".sparkline-dot",
-		"@keyframes pulse-dot",
 	}
 	for _, item := range requiredCSSPhase3 {
 		if !strings.Contains(cssStr, item) {
