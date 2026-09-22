@@ -52,14 +52,15 @@ func (m *SessionMetrics) snapshot() map[string]int64 {
 
 // SessionManager tracks active VPN peer sessions in memory and SQLite.
 type SessionManager struct {
-	mu              sync.RWMutex
-	db              *database.DB
-	ipam            *IPAM
-	sessionsByPeer  map[string]*models.VPNSession // peerPublicKey -> session
-	sessionsByID    map[string]*models.VPNSession // sessionID -> session
-	activeCount     atomic.Int64
-	metrics         SessionMetrics
-	replacementHook ReplacementHook
+	mu               sync.RWMutex
+	db               *database.DB
+	ipam             *IPAM
+	sessionsByPeer   map[string]*models.VPNSession // peerPublicKey -> session
+	sessionsByID     map[string]*models.VPNSession // sessionID -> session
+	activeCount      atomic.Int64
+	lifecycleVersion atomic.Uint64
+	metrics          SessionMetrics
+	replacementHook  ReplacementHook
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -86,6 +87,16 @@ func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
 // leak paths (issue #78) stay distinguishable in production telemetry.
 func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
 	return sm.metrics.snapshot()
+}
+
+// LifecycleVersion returns the monotonically increasing session lifecycle version.
+func (sm *SessionManager) LifecycleVersion() uint64 {
+	return sm.lifecycleVersion.Load()
+}
+
+// BumpLifecycleVersion manually increments and returns the session lifecycle version.
+func (sm *SessionManager) BumpLifecycleVersion() uint64 {
+	return sm.lifecycleVersion.Add(1)
 }
 
 // CreateSession allocates a new VPN session and persists it. When a session
@@ -172,6 +183,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	sm.sessionsByPeer[peerPublicKey] = sess
 	sm.sessionsByID[sessionID] = sess
 	sm.activeCount.Add(1)
+	sm.lifecycleVersion.Add(1)
 
 	// Fire the replacement hook AFTER the new session is fully registered so
 	// the caller sees a consistent old→new transition. The hook migrates the
@@ -290,6 +302,7 @@ func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, st
 	delete(sm.sessionsByID, sessionID)
 	delete(sm.sessionsByPeer, sess.PeerPublicKey)
 	sm.activeCount.Add(-1)
+	sm.lifecycleVersion.Add(1)
 
 	return nil
 }
@@ -323,6 +336,9 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 		delete(sm.sessionsByPeer, sess.PeerPublicKey)
 		sm.activeCount.Add(-1)
 	}
+	if len(timedOut) > 0 {
+		sm.lifecycleVersion.Add(1)
+	}
 	sm.mu.Unlock()
 
 	return timedOut, nil
@@ -338,6 +354,9 @@ func (sm *SessionManager) Drain(ctx context.Context, timeout time.Duration) erro
 		if sm.db != nil {
 			_ = sm.db.CreateVPNSession(ctx, sess)
 		}
+	}
+	if len(sm.sessionsByID) > 0 {
+		sm.lifecycleVersion.Add(1)
 	}
 	return nil
 }

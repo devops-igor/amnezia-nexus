@@ -677,6 +677,64 @@ func TestVPNUpdateConfigHandler_PUT_PublicEndpointMerge(t *testing.T) {
 	}
 }
 
+// TestVPNUpdateConfigHandler_PUT_AffinityTTLMinutesMerge verifies that partial
+// config updates preserve AffinityTTLMinutes across requests (issue #281).
+func TestVPNUpdateConfigHandler_PUT_AffinityTTLMinutesMerge(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	r := setupFullVPNRouter(h)
+
+	getAffinityTTL := func() int {
+		t.Helper()
+		reqGet := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
+		wGet := httptest.NewRecorder()
+		r.ServeHTTP(wGet, reqGet)
+		if wGet.Code != http.StatusOK {
+			t.Fatalf("GET /api/vpn/config expected 200, got %d", wGet.Code)
+		}
+		var cfg models.VPNConfig
+		if err := json.Unmarshal(wGet.Body.Bytes(), &cfg); err != nil {
+			t.Fatalf("GET response is not valid VPNConfig JSON: %v", err)
+		}
+		return cfg.AffinityTTLMinutes
+	}
+
+	// 1. PUT with affinity_ttl_minutes: 45 -> 200, verify GET returns 45.
+	putBody1 := []byte(`{"affinity_ttl_minutes": 45}`)
+	reqPut1 := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBody1))
+	wPut1 := httptest.NewRecorder()
+	r.ServeHTTP(wPut1, reqPut1)
+	if wPut1.Code != http.StatusOK {
+		t.Fatalf("PUT with affinity_ttl_minutes 45 expected 200, got %d: %s", wPut1.Code, wPut1.Body.String())
+	}
+	if got := getAffinityTTL(); got != 45 {
+		t.Fatalf("expected affinity_ttl_minutes 45, got %d", got)
+	}
+
+	// 2. Partial PUT without affinity_ttl_minutes -> 200, verify GET returns 45 (not reset to default 30).
+	putBody2 := []byte(`{"algorithm": "round_robin"}`)
+	reqPut2 := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBody2))
+	wPut2 := httptest.NewRecorder()
+	r.ServeHTTP(wPut2, reqPut2)
+	if wPut2.Code != http.StatusOK {
+		t.Fatalf("PUT without affinity_ttl_minutes expected 200, got %d: %s", wPut2.Code, wPut2.Body.String())
+	}
+	if got := getAffinityTTL(); got != 45 {
+		t.Fatalf("expected affinity_ttl_minutes to remain 45 after partial update, got %d", got)
+	}
+
+	// 3. Explicit PUT with affinity_ttl_minutes: 60 -> 200, verify GET returns 60.
+	putBody3 := []byte(`{"affinity_ttl_minutes": 60}`)
+	reqPut3 := httptest.NewRequest(http.MethodPut, "/api/vpn/config", bytes.NewReader(putBody3))
+	wPut3 := httptest.NewRecorder()
+	r.ServeHTTP(wPut3, reqPut3)
+	if wPut3.Code != http.StatusOK {
+		t.Fatalf("PUT with affinity_ttl_minutes 60 expected 200, got %d: %s", wPut3.Code, wPut3.Body.String())
+	}
+	if got := getAffinityTTL(); got != 60 {
+		t.Fatalf("expected affinity_ttl_minutes 60, got %d", got)
+	}
+}
+
 func TestVPNEnableBackendHandler_DynamicFallback(t *testing.T) {
 	ctx := context.Background()
 	mockSSH := &testMockSSHClient{

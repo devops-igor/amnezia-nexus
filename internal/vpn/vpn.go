@@ -152,7 +152,8 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	lastReconcileTime time.Time
+	lastReconcileTime         time.Time
+	reconcilePostSnapshotHook func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -648,6 +649,14 @@ func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 	s.backendDevices[tunID] = dev
 }
 
+// SetReconcilePostSnapshotHook registers a test hook called immediately after
+// reading the active session snapshot in reconcileConnectionCounts, before s.mu is acquired.
+func (s *Service) SetReconcilePostSnapshotHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcilePostSnapshotHook = fn
+}
+
 // GetBackendDeviceForTest returns the backend device for a tunnel ID.
 func (s *Service) GetBackendDeviceForTest(tunID int64) BackendDevice {
 	s.mu.RLock()
@@ -901,6 +910,11 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 		return
 	}
 
+	var versionBefore uint64
+	if s.sessionMgr != nil {
+		versionBefore = s.sessionMgr.LifecycleVersion()
+	}
+
 	sessions, err := s.db.GetActiveVPNSessions(ctx)
 	dbReadTime := time.Now().UTC()
 	if err != nil {
@@ -908,8 +922,23 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 		return
 	}
 
+	var postHook func()
+	s.mu.RLock()
+	postHook = s.reconcilePostSnapshotHook
+	s.mu.RUnlock()
+	if postHook != nil {
+		postHook()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.sessionMgr != nil && s.sessionMgr.LifecycleVersion() != versionBefore {
+		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during DB snapshot (version %d -> %d)",
+			versionBefore, s.sessionMgr.LifecycleVersion())
+		return
+	}
+
 	s.lastReconcileTime = dbReadTime
 
 	desired := make(map[int64]int)
@@ -2003,6 +2032,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 			// least-connections and capacity filtering.
 			s.pool.DecrementConnections(tunnel.ID)
 			s.pool.IncrementConnections(m.NewBackendTunnelID)
+		}
+		if len(migrations) > 0 && s.sessionMgr != nil {
+			s.sessionMgr.BumpLifecycleVersion()
 		}
 	}
 

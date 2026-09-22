@@ -5108,3 +5108,72 @@ func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
 		t.Fatal("deadlock detected: concurrent timeout sweep, HandleIncomingPeer, and reconciliation did not complete in 10s")
 	}
 }
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-stale-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.91", tunID, "conn-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-a", peerKeyA, "10.100.0.91", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// 2. Configure reconcilePostSnapshotHook:
+	// While reconciliation is paused post-DB read, create a new Session B and increment live pool counter.
+	// This mutates sessionMgr lifecycle version and moves live gauge to 2.
+	// Because DB snapshot only contains Session A (count 1), if the snapshot were applied,
+	// it would clobber the gauge back to 1.
+	hookFired := false
+	vpnSvc.SetReconcilePostSnapshotHook(func() {
+		hookFired = true
+		peerKeyB := "peer-reconcile-stale-b"
+		sessB, errCreate := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyB, "10.100.0.92", tunID, "conn-b")
+		if errCreate != nil {
+			t.Fatalf("hook: CreateSession B failed: %v", errCreate)
+		}
+		vpnSvc.forwarder.RegisterSession(sessB.ID, "conn-b", peerKeyB, "10.100.0.92", tunID)
+		vpnSvc.pool.IncrementConnections(tunID)
+	})
+
+	// 3. Run reconcileConnectionCounts:
+	// Prior to DB read: lifecycleVersion is V1.
+	// DB read returns 1 session (Session A).
+	// Hook fires: Session B created, lifecycleVersion becomes V2, pool gauge is 2.
+	// Reconciliation acquires lock: sees lifecycleVersion V2 != V1 -> aborts!
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	if !hookFired {
+		t.Fatal("expected reconcilePostSnapshotHook to fire")
+	}
+
+	// 4. Verify pool gauge remains 2, not reset to 1
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 2 {
+		t.Errorf("expected pool ActiveConnections to remain 2, got %d (stale snapshot was not rejected)", tunAfter.ActiveConnections)
+	}
+}
