@@ -29,7 +29,7 @@ When users connect directly to a foreign VPS, an IP block takes down everyone's 
 
 ```text
 [Users Inside the Country] 
-     │  (Domestic connection — stays unblocked)
+     │  (Domestic connection - stays unblocked)
      ▼
 [Nexus Portal (Hosted Locally)] 
      │  1. Terminates client handshake & decrypts traffic
@@ -232,7 +232,7 @@ TRUSTED_PROXIES=10.0.0.0/8        # or the exact proxy IP, e.g. 172.18.0.1
 
 With this set, requests forwarded by the trusted proxy with
 `X-Forwarded-Proto: https` are treated as secure client connections and session
-cookies are issued with the `Secure` attribute — even though the panel's own
+cookies are issued with the `Secure` attribute - even though the panel's own
 socket is plain HTTP. Requests from any other peer carrying
 `X-Forwarded-Proto` are **not** trusted. When the panel terminates TLS itself,
 cookies are `Secure` automatically (no extra configuration), and
@@ -246,3 +246,9 @@ cookies are `Secure` automatically (no extra configuration), and
 2. **Add your server**: Go to **Servers** -> **Add Server**. Enter the IP address, SSH port, and SSH credentials of your remote node so Nexus can manage it.
 3. **Add it to the VPN pool**: Go to the **VPN** section, click **Add Backend**, choose your server from the dropdown, and click **Enable Backend**. Nexus will connect to the node, verify its AmneziaWG container, set up NAT forwarding rules, and add it to the active load balancing pool.
 4. **Create client configs**: Go to **Clients** -> **Create Client**. You can scan the generated QR code with the Amnezia VPN mobile app or download the `.conf` file for your desktop.
+
+---
+
+## Documentation & Specifications
+
+- [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.

@@ -31,6 +31,7 @@ func TestGetUpstreamStatusHandler_Success(t *testing.T) {
 
 	mockStatus := &upstream.UpstreamStatus{
 		CheckedAt:       time.Now().UTC(),
+		Status:          "up_to_date",
 		UpdateAvailable: false,
 		Components: []upstream.ComponentStatus{
 			{
@@ -62,6 +63,9 @@ func TestGetUpstreamStatusHandler_Success(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
+	if resp.Status != "up_to_date" {
+		t.Errorf("expected Status='up_to_date', got %q", resp.Status)
+	}
 	if resp.UpdateAvailable != false {
 		t.Errorf("expected UpdateAvailable=false")
 	}
@@ -79,6 +83,7 @@ func TestGetUpstreamStatusHandler_ForceRefresh(t *testing.T) {
 	mockSvc := &mockUpstreamService{
 		status: &upstream.UpstreamStatus{
 			CheckedAt:       time.Now().UTC(),
+			Status:          "update_available",
 			UpdateAvailable: true,
 			Components:      []upstream.ComponentStatus{},
 			BaseImage:       upstream.PinnedAWGBaseImage,
@@ -96,6 +101,14 @@ func TestGetUpstreamStatusHandler_ForceRefresh(t *testing.T) {
 	}
 	if !mockSvc.lastRefresh {
 		t.Errorf("expected lastRefresh=true when ?refresh=true is provided")
+	}
+
+	var resp upstream.UpstreamStatus
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "update_available" {
+		t.Errorf("expected Status='update_available', got %q", resp.Status)
 	}
 }
 
@@ -128,5 +141,67 @@ func TestGetUpstreamStatusHandler_NilService(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected status 503, got %d", w.Code)
+	}
+}
+
+func TestGetUpstreamStatusHandler_DegradedWithUpdateAvailable(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	mockStatus := &upstream.UpstreamStatus{
+		CheckedAt:       time.Now().UTC(),
+		Status:          "degraded",
+		UpdateAvailable: true,
+		Components: []upstream.ComponentStatus{
+			{
+				Name:            "amneziawg-go",
+				Repo:            "amnezia-vpn/amneziawg-go",
+				PinnedVersion:   upstream.PinnedAWGGoVersion,
+				LatestVersion:   "v3.1.20260901",
+				UpdateAvailable: true,
+				ReleaseURL:      "https://github.com/amnezia-vpn/amneziawg-go/releases/tag/v3.1.20260901",
+			},
+			{
+				Name:            "amneziawg-tools",
+				Repo:            "amnezia-vpn/amneziawg-tools",
+				PinnedVersion:   upstream.PinnedAWGToolsVersion,
+				LatestVersion:   upstream.PinnedAWGToolsVersion,
+				UpdateAvailable: false,
+				Error:           "GitHub API rate limit exceeded",
+			},
+		},
+		BaseImage: upstream.PinnedAWGBaseImage,
+	}
+
+	mockSvc := &mockUpstreamService{status: mockStatus}
+	h.SetUpstreamService(mockSvc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/upstream-status", nil)
+	w := httptest.NewRecorder()
+
+	h.GetUpstreamStatusHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var resp upstream.UpstreamStatus
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Status != "degraded" {
+		t.Errorf("expected Status='degraded', got %q", resp.Status)
+	}
+	if !resp.UpdateAvailable {
+		t.Errorf("expected UpdateAvailable=true, got false")
+	}
+	if len(resp.Components) != 2 {
+		t.Fatalf("expected 2 components, got %d", len(resp.Components))
+	}
+	if !resp.Components[0].UpdateAvailable {
+		t.Errorf("expected first component to have UpdateAvailable=true")
+	}
+	if resp.Components[1].Error == "" {
+		t.Errorf("expected second component to have error")
 	}
 }
