@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
@@ -24,42 +25,51 @@ type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, c
 
 // HealthConfig defines tuning parameters for the backend health prober.
 type HealthConfig struct {
-	Interval           time.Duration
-	Timeout            time.Duration
-	LatencyThresholdMS int64
-	FailureThreshold   int
-	H1                 uint32
-	H2                 uint32
-	S1                 int
-	S2                 int
+	Interval             time.Duration
+	Timeout              time.Duration
+	LatencyThresholdMS   int64
+	FailureThreshold     int
+	H1                   uint32
+	H2                   uint32
+	S1                   int
+	S2                   int
+	SelfHealingInterval  time.Duration
+	SelfHealingThreshold int
+	DisableSelfHealing   bool
 }
 
 // DefaultHealthConfig returns standard default prober settings.
 func DefaultHealthConfig() HealthConfig {
 	return HealthConfig{
-		Interval:           10 * time.Second,
-		Timeout:            3 * time.Second,
-		LatencyThresholdMS: 500,
-		FailureThreshold:   3,
-		H1:                 health.DefaultH1,
-		H2:                 health.DefaultH2,
-		S1:                 health.DefaultS1,
-		S2:                 health.DefaultS2,
+		Interval:             10 * time.Second,
+		Timeout:              3 * time.Second,
+		LatencyThresholdMS:   500,
+		FailureThreshold:     3,
+		H1:                   health.DefaultH1,
+		H2:                   health.DefaultH2,
+		S1:                   health.DefaultS1,
+		S2:                   health.DefaultS2,
+		SelfHealingInterval:  1 * time.Minute,
+		SelfHealingThreshold: 2,
+		DisableSelfHealing:   false,
 	}
 }
 
 // HealthProber periodically performs Noise IK handshake probes against backend tunnels.
 type HealthProber struct {
-	mu           sync.RWMutex
-	pool         *Pool
-	db           *database.DB
-	cfg          HealthConfig
-	probeFn      ProbeFunc
-	onActiveHook func(ctx context.Context, tunnel *models.BackendTunnel) error
-	failCounts   map[int64]int
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
-	running      bool
+	mu             sync.RWMutex
+	pool           *Pool
+	db             *database.DB
+	cfg            HealthConfig
+	probeFn        ProbeFunc
+	onActiveHook   func(ctx context.Context, tunnel *models.BackendTunnel) error
+	onSelfHealHook func(ctx context.Context, tunnel *models.BackendTunnel) error
+	failCounts     map[int64]int
+	autoDisabled   map[int64]bool
+	successCounts  map[int64]int
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
+	running        bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -88,6 +98,12 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 	if cfg.S2 < 0 {
 		cfg.S2 = health.DefaultS2
 	}
+	if cfg.SelfHealingInterval <= 0 {
+		cfg.SelfHealingInterval = 1 * time.Minute
+	}
+	if cfg.SelfHealingThreshold <= 0 {
+		cfg.SelfHealingThreshold = 2
+	}
 
 	pFn := health.ProbeAWGEndpointRange
 	if len(probeFn) > 0 && probeFn[0] != nil {
@@ -95,12 +111,14 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 	}
 
 	return &HealthProber{
-		pool:       pool,
-		db:         db,
-		cfg:        cfg,
-		probeFn:    pFn,
-		failCounts: make(map[int64]int),
-		stopCh:     make(chan struct{}),
+		pool:          pool,
+		db:            db,
+		cfg:           cfg,
+		probeFn:       pFn,
+		failCounts:    make(map[int64]int),
+		autoDisabled:  make(map[int64]bool),
+		successCounts: make(map[int64]int),
+		stopCh:        make(chan struct{}),
 	}
 }
 
@@ -121,9 +139,10 @@ func (hp *HealthProber) SetOnActiveHook(fn func(ctx context.Context, tunnel *mod
 	hp.onActiveHook = fn
 }
 
-// ResetFailCount clears the consecutive-failure counter for a backend server
-// (issue #50). EnableBackend calls it when an administrator manually re-enables
-// a health-auto-disabled tunnel: without the reset the counter stays at or
+// ResetFailCount clears the consecutive-failure counter, auto-disabled state,
+// and consecutive-success counter for a backend server (issues #50, #279).
+// EnableBackend calls it when an administrator manually re-enables a
+// health-auto-disabled tunnel: without the reset the counter stays at or
 // above FailureThreshold, so the first failed probe after re-enable would
 // instantly re-disable the backend instead of granting the full grace period.
 // Nil-receiver safe, matching SetProbeFunc's guard style.
@@ -134,6 +153,8 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	hp.failCounts[serverID] = 0
+	delete(hp.autoDisabled, serverID)
+	delete(hp.successCounts, serverID)
 }
 
 // Config returns a copy of the prober configuration.
@@ -230,18 +251,11 @@ func (hp *HealthProber) resolveTunnelParams(ctx context.Context, serverID int64)
 	return h1, h2, s1, s2, ""
 }
 
-// ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
-// Administratively disabled tunnels are never probed and never have their status written:
-// a healthy handshake would otherwise resurrect the tunnel (status write + onActiveHook
-// device re-attach) and steer live sessions onto a blackhole, which is the root cause of
-// issues #28/#43.
-func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
+// probeEndpoint executes a single Noise IK handshake probe against a backend tunnel
+// using its dedicated probe key without checking whether the tunnel is disabled.
+func (hp *HealthProber) probeEndpoint(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
-	}
-	if tunnel.Status == "disabled" {
-		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", tunnel.ID, "server_id", tunnel.ServerID)
-		return 0, ErrTunnelDisabled
 	}
 
 	h1, h2, s1, s2, hpKey := hp.resolveTunnelParams(ctx, tunnel.ServerID)
@@ -256,7 +270,12 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		probePrivKey = tunnel.PrivateKey
 	}
 
-	rtt, err := hp.probeFn(
+	hp.mu.RLock()
+	probeFn := hp.probeFn
+	timeout := hp.cfg.Timeout
+	hp.mu.RUnlock()
+
+	rtt, err := probeFn(
 		ctx,
 		tunnel.Endpoint,
 		tunnel.PublicKey,
@@ -267,7 +286,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		h2,
 		s1,
 		s2,
-		hp.cfg.Timeout,
+		timeout,
 	)
 
 	latencyMS := int64(rtt.Milliseconds())
@@ -275,6 +294,27 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		latencyMS = 1
 	}
 
+	if err != nil {
+		return 0, err
+	}
+	return latencyMS, nil
+}
+
+// ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
+// Administratively disabled tunnels are never probed and never have their status written:
+// a healthy handshake would otherwise resurrect the tunnel (status write + onActiveHook
+// device re-attach) and steer live sessions onto a blackhole, which is the root cause of
+// issues #28/#43.
+func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
+	if tunnel == nil {
+		return 0, errors.New("tunnel is nil")
+	}
+	if tunnel.Status == "disabled" {
+		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", tunnel.ID, "server_id", tunnel.ServerID)
+		return 0, ErrTunnelDisabled
+	}
+
+	latencyMS, err := hp.probeEndpoint(ctx, tunnel)
 	if err != nil {
 		hp.mu.Lock()
 		defer hp.mu.Unlock()
@@ -284,6 +324,8 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		status := "degraded"
 		if failures >= hp.cfg.FailureThreshold {
 			status = "disabled"
+			hp.autoDisabled[tunnel.ServerID] = true
+			hp.successCounts[tunnel.ServerID] = 0
 		}
 
 		if hp.pool != nil {
@@ -313,6 +355,8 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 				hookStatus := "degraded"
 				if failures >= hp.cfg.FailureThreshold {
 					hookStatus = "disabled"
+					hp.autoDisabled[tunnel.ServerID] = true
+					hp.successCounts[tunnel.ServerID] = 0
 				}
 
 				if hp.pool != nil {
@@ -327,11 +371,188 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	defer hp.mu.Unlock()
 
 	hp.failCounts[tunnel.ServerID] = 0
+	delete(hp.autoDisabled, tunnel.ServerID)
+	delete(hp.successCounts, tunnel.ServerID)
 	if hp.pool != nil {
 		_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, latencyMS)
 	}
 
 	return latencyMS, nil
+}
+
+// MarkAutoDisabled marks a backend server as auto-disabled due to health probe failures.
+func (hp *HealthProber) MarkAutoDisabled(serverID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.autoDisabled[serverID] = true
+	hp.successCounts[serverID] = 0
+}
+
+// MarkAdminDisabled clears auto-disabled tracking for a backend server when administratively disabled.
+func (hp *HealthProber) MarkAdminDisabled(serverID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	delete(hp.autoDisabled, serverID)
+	delete(hp.successCounts, serverID)
+}
+
+// IsAutoDisabled reports whether a backend server is currently auto-disabled.
+func (hp *HealthProber) IsAutoDisabled(serverID int64) bool {
+	if hp == nil {
+		return false
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.autoDisabled[serverID]
+}
+
+// GetSelfHealingState returns the auto-disabled flag and consecutive probe successes for a server.
+func (hp *HealthProber) GetSelfHealingState(serverID int64) (autoDisabled bool, consecutiveSuccesses int) {
+	if hp == nil {
+		return false, 0
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.autoDisabled[serverID], hp.successCounts[serverID]
+}
+
+// SetOnSelfHealHook registers a hook called to recover an auto-disabled backend tunnel.
+func (hp *HealthProber) SetOnSelfHealHook(fn func(ctx context.Context, tunnel *models.BackendTunnel) error) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.onSelfHealHook = fn
+}
+
+// SetSelfHealingEnabled enables or disables the self-healing sweep.
+func (hp *HealthProber) SetSelfHealingEnabled(enabled bool) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.cfg.DisableSelfHealing = !enabled
+}
+
+// SelfHealSweep sweeps auto-disabled tunnels and attempts to recover them with flap damping.
+func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
+	if hp == nil || hp.pool == nil {
+		return 0
+	}
+
+	hp.mu.RLock()
+	if hp.cfg.DisableSelfHealing {
+		hp.mu.RUnlock()
+		return 0
+	}
+	threshold := hp.cfg.SelfHealingThreshold
+	latencyThreshold := hp.cfg.LatencyThresholdMS
+	hp.mu.RUnlock()
+
+	tunnels := hp.pool.ListTunnels()
+	var targets []*models.BackendTunnel
+	for _, t := range tunnels {
+		if !hp.IsAutoDisabled(t.ServerID) {
+			continue
+		}
+		targets = append(targets, t)
+	}
+
+	if len(targets) == 0 {
+		return 0
+	}
+
+	var wg sync.WaitGroup
+	var reconnectedCount atomic.Int64
+
+	for _, t := range targets {
+		tun := t
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
+
+			latencyMS, err := hp.probeEndpoint(ctx, tun)
+			if err != nil {
+				hp.mu.Lock()
+				hp.successCounts[tun.ServerID] = 0
+				hp.mu.Unlock()
+				slog.Debug("self-healing probe failed", "server_id", tun.ServerID, "error", err)
+				return
+			}
+
+			hp.mu.Lock()
+			hp.successCounts[tun.ServerID]++
+			successes := hp.successCounts[tun.ServerID]
+			hp.mu.Unlock()
+
+			if successes < threshold {
+				slog.Info("self-healing flap damping active",
+					"server_id", tun.ServerID,
+					"consecutive_successes", successes,
+					"threshold", threshold,
+				)
+				return
+			}
+
+			// Flap damping threshold met. Check if still auto-disabled before hook.
+			if !hp.IsAutoDisabled(tun.ServerID) {
+				return
+			}
+
+			hp.mu.RLock()
+			hook := hp.onSelfHealHook
+			if hook == nil {
+				hook = hp.onActiveHook
+			}
+			hp.mu.RUnlock()
+
+			if hook != nil {
+				if hookErr := hook(ctx, tun); hookErr != nil {
+					slog.Warn("self-healing hook failed", "server_id", tun.ServerID, "error", hookErr)
+					hp.mu.Lock()
+					hp.successCounts[tun.ServerID] = 0
+					hp.mu.Unlock()
+					return
+				}
+			}
+
+			hp.mu.Lock()
+			hp.failCounts[tun.ServerID] = 0
+			delete(hp.autoDisabled, tun.ServerID)
+			delete(hp.successCounts, tun.ServerID)
+			hp.mu.Unlock()
+
+			newStatus := "active"
+			if latencyMS > latencyThreshold {
+				newStatus = "degraded"
+			}
+
+			if hp.pool != nil {
+				_ = hp.pool.SetTunnelStatus(ctx, tun.ServerID, newStatus, latencyMS)
+			}
+			reconnectedCount.Add(1)
+			slog.Info("self-healing successfully restored backend tunnel",
+				"server_id", tun.ServerID,
+				"tunnel_id", tun.ID,
+				"status", newStatus,
+				"latency_ms", latencyMS,
+			)
+		}()
+	}
+
+	wg.Wait()
+	return int(reconnectedCount.Load())
 }
 
 // ProbeAll probes all backend tunnels concurrently and updates their statuses.
@@ -366,7 +587,7 @@ func (hp *HealthProber) ProbeAll(ctx context.Context) map[int64]error {
 	return results
 }
 
-// Start launches the periodic background probing loop.
+// Start launches the periodic background probing loop and self-healing sweep loop.
 func (hp *HealthProber) Start(ctx context.Context) {
 	hp.mu.Lock()
 	if hp.running {
@@ -377,8 +598,9 @@ func (hp *HealthProber) Start(ctx context.Context) {
 	hp.stopCh = make(chan struct{})
 	hp.mu.Unlock()
 
-	hp.wg.Add(1)
+	hp.wg.Add(2)
 	go hp.probingLoop(ctx)
+	go hp.selfHealingLoop(ctx)
 }
 
 // Stop terminates the background prober.
@@ -416,6 +638,30 @@ func (hp *HealthProber) probingLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			_ = hp.ProbeAll(ctx)
+		}
+	}
+}
+
+func (hp *HealthProber) selfHealingLoop(ctx context.Context) {
+	defer hp.wg.Done()
+
+	hp.mu.RLock()
+	interval := hp.cfg.SelfHealingInterval
+	hp.mu.RUnlock()
+
+	if interval <= 0 {
+		interval = 1 * time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-hp.stopCh:
+			return
+		case <-ticker.C:
+			_ = hp.SelfHealSweep(ctx)
 		}
 	}
 }

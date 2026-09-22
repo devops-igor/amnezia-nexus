@@ -629,6 +629,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	svc.prober.SetOnActiveHook(func(ctx context.Context, t *models.BackendTunnel) error {
 		return svc.ensureBackendDeviceAttached(ctx, t)
 	})
+	svc.prober.SetOnSelfHealHook(func(ctx context.Context, t *models.BackendTunnel) error {
+		return svc.EnableBackend(ctx, t.ServerID)
+	})
 
 	return svc, nil
 }
@@ -670,6 +673,18 @@ func (s *Service) ProbeTunnel(ctx context.Context, t *models.BackendTunnel) (int
 	return s.prober.ProbeTunnel(ctx, t)
 }
 
+// SelfHealSweep sweeps auto-disabled backend tunnels and attempts to recover them.
+func (s *Service) SelfHealSweep(ctx context.Context) int {
+	s.mu.RLock()
+	prober := s.prober
+	s.mu.RUnlock()
+
+	if prober == nil {
+		return 0
+	}
+	return prober.SelfHealSweep(ctx)
+}
+
 // SetHealthProber sets a custom health prober instance.
 func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 	s.mu.Lock()
@@ -678,6 +693,9 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 	if s.prober != nil {
 		s.prober.SetOnActiveHook(func(ctx context.Context, t *models.BackendTunnel) error {
 			return s.ensureBackendDeviceAttached(ctx, t)
+		})
+		s.prober.SetOnSelfHealHook(func(ctx context.Context, t *models.BackendTunnel) error {
+			return s.EnableBackend(ctx, t.ServerID)
 		})
 	}
 }
@@ -1954,6 +1972,10 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	}
 
 	_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDisabled, 0)
+
+	if s.prober != nil {
+		s.prober.MarkAdminDisabled(serverID)
+	}
 
 	// Detach and stop the backend UDP device created by EnableBackend so the
 	// forwarder stops routing client packets to a disabled backend.
