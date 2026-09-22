@@ -1,6 +1,6 @@
 package loadbalancer
 
-// Failure-injection test matrix for issue #88 — failover scenarios (2, 3, 5).
+// Failure-injection test matrix for issue #88 - failover scenarios (2, 3, 5).
 //
 // Every test asserts a resulting STATE INVARIANT, not merely that an error
 // was returned:
@@ -29,15 +29,6 @@ type injectedError struct{ msg string }
 
 func (e *injectedError) Error() string { return "injected failure: " + e.msg }
 
-// GetPeerAffinitySnapshot returns the in-memory peer affinity for a peer.
-// (Test helper: reads the map under the manager's read lock.)
-func (sm *StickySessionManager) GetPeerAffinity(peerKey string) (int64, bool) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	tid, ok := sm.peerAffinity[peerKey]
-	return tid, ok
-}
-
 // readFailStore fails GetActiveVPNSessions with the configured error;
 // persists delegate to the inner store (issue #85 StickyStore seam).
 type readFailStore struct {
@@ -54,7 +45,7 @@ func (r *readFailStore) CreateVPNSession(ctx context.Context, s *models.VPNSessi
 }
 
 // hangingStore blocks GetActiveVPNSessions until its gate is closed, then
-// delegates — a controllable-latency DB read for scenario 3.
+// delegates - a controllable-latency DB read for scenario 3.
 type hangingStore struct {
 	inner StickyStore
 	gate  chan struct{}
@@ -137,7 +128,7 @@ func TestFailoverBackendDiesMidMigrationMatrix(t *testing.T) {
 	// (sticky.go re-check). The selection-failure subtest therefore also
 	// asserts the second-order invariant: a skipped peer's affinity either
 	// still names the degraded backend EXPLICITLY (reported, reconcilable)
-	// or has been cleared — never a value that silently pretends migration.
+	// or has been cleared - never a value that silently pretends migration.
 
 	t.Run("selection-failure-strands-nothing-silently", func(t *testing.T) {
 		db, t1, t2 := failoverFixture(t)
@@ -203,11 +194,11 @@ func TestFailoverBackendDiesMidMigrationMatrix(t *testing.T) {
 			t.Errorf("in-memory peer not migrated despite DB read failure: %+v", res.Migrations)
 		}
 		// Invariant scope: the DB READ failed, so no DB row was visible to
-		// the failover — the row (mkSession created it via the real db)
+		// the failover - the row (mkSession created it via the real db)
 		// still names the dead backend, and that stranding is invisible to
 		// the failover by construction. The documented contract (sticky.go
 		// HandleFailover) is "DB read failure is not fatal; migrate
-		// in-memory affinities only" — so the exact invariant here is:
+		// in-memory affinities only" - so the exact invariant here is:
 		// (a) in-memory migration happened (asserted above), (b) the skip
 		// reporting stays consistent (counter == reported), (c) sticky
 		// affinity does not resolve back onto the dead backend, and (d) the
@@ -229,7 +220,7 @@ func TestFailoverBackendDiesMidMigrationMatrix(t *testing.T) {
 		mkSession(t, db, "sess-nohealth", "u-nh", "peer-nohealth", t1)
 		sm.AssignPeerAffinity("peer-nohealth", t1)
 
-		// Healthy set excludes the degraded tunnel (t1) — exactly what
+		// Healthy set excludes the degraded tunnel (t1) - exactly what
 		// disableBackendLocked passes via pool.GetActiveTunnels().
 		res, err := sm.HandleFailover(ctx, t1, []*models.BackendTunnel{
 			{ID: t1 + 999, Status: "degraded", ActiveConnections: 0},
@@ -305,7 +296,7 @@ func TestFailoverDBReadBlocksWithReadersUnblocked(t *testing.T) {
 	case <-readersDone:
 		// Readers completed while HandleFailover's DB read is still hung.
 	case <-failoverDone:
-		t.Fatal("failover completed before readers — reader was blocked behind the hanging DB read")
+		t.Fatal("failover completed before readers - reader was blocked behind the hanging DB read")
 	case <-time.After(2 * time.Second):
 		t.Fatal("readers hung behind the failover DB read (mutex held across DB I/O)")
 	}

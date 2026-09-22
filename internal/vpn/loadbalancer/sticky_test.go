@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -138,7 +139,7 @@ func TestStickySessionManager(t *testing.T) {
 	migrated := failover.Migrations
 	// HandleFailover emits records in a deterministic order (sorted by peer
 	// key): callers iterate the full set to redirect forwarder routes, so
-	// order itself carries no signal — but a stable order makes failover
+	// order itself carries no signal - but a stable order makes failover
 	// observable and repeatable. Two peers were affinitized to t1ID here:
 	// peer-a (moved to t1 in step 5) and peer-failover-1. Both must migrate
 	// to t2 (the only healthy tunnel in the pool). Find each record by peer
@@ -169,5 +170,245 @@ func TestStickySessionManager(t *testing.T) {
 	// HandleFailover when no healthy backends exist
 	if _, err := sticky.HandleFailover(ctx, t2ID, nil); err != ErrNoActiveBackends {
 		t.Errorf("expected ErrNoActiveBackends when no healthy tunnels for failover, got %v", err)
+	}
+}
+
+func TestStickySessionManager_AffinityTTL_Expires(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	tunnels := []*models.BackendTunnel{
+		{ID: 1, Status: "active", ActiveConnections: 10},
+		{ID: 2, Status: "active", ActiveConnections: 2},
+	}
+
+	req := &RoutingRequest{
+		UserID:           "user-ttl-1",
+		PeerPublicKey:    "peer-ttl-1",
+		AvailableTunnels: tunnels,
+	}
+
+	// First request at t0: least-connections assigns to tunnel 2 (2 < 10)
+	backend, isNew, err := sm.GetOrAssignBackend(ctx, req)
+	if err != nil || !isNew || backend.ID != 2 {
+		t.Fatalf("expected new assignment to tunnel 2, got %+v (isNew: %v, err: %v)", backend, isNew, err)
+	}
+
+	// Change connection counts so tunnel 1 becomes optimal (0 < 10)
+	tunnels[0].ActiveConnections = 0
+	tunnels[1].ActiveConnections = 10
+
+	// Advance time within TTL (5 minutes < 10 minutes)
+	currTime = t0.Add(5 * time.Minute)
+
+	// Affinity must still hold: user sticks to tunnel 2
+	backend, isNew, err = sm.GetOrAssignBackend(ctx, req)
+	if err != nil || isNew || backend.ID != 2 {
+		t.Fatalf("expected affinity hit on tunnel 2 within TTL, got %+v (isNew: %v, err: %v)", backend, isNew, err)
+	}
+
+	// Advance time past TTL (15 minutes > 10 minutes)
+	currTime = currTime.Add(15 * time.Minute)
+
+	// In-memory queries should report affinity expired
+	if tid, ok := sm.GetAffinity("user-ttl-1"); ok {
+		t.Errorf("expected GetAffinity to report expired (false), got tid=%d", tid)
+	}
+	if tid, ok := sm.GetPeerAffinity("peer-ttl-1"); ok {
+		t.Errorf("expected GetPeerAffinity to report expired (false), got tid=%d", tid)
+	}
+
+	// Next request after expiration: balancer selects optimal backend (tunnel 1 with 0 connections)
+	backend, isNew, err = sm.GetOrAssignBackend(ctx, req)
+	if err != nil || !isNew || backend.ID != 1 {
+		t.Fatalf("expected re-assignment to tunnel 1 after TTL expiration, got %+v (isNew: %v, err: %v)", backend, isNew, err)
+	}
+
+	// New affinity on tunnel 1 must be active
+	if tid, ok := sm.GetAffinity("user-ttl-1"); !ok || tid != 1 {
+		t.Errorf("expected GetAffinity to be tunnel 1, got tid=%d, ok=%v", tid, ok)
+	}
+	if tid, ok := sm.GetPeerAffinity("peer-ttl-1"); !ok || tid != 1 {
+		t.Errorf("expected GetPeerAffinity to be tunnel 1, got tid=%d, ok=%v", tid, ok)
+	}
+}
+
+func TestStickySessionManager_AffinityTTL_RefreshedByActiveUse(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	tunnels := []*models.BackendTunnel{
+		{ID: 1, Status: "active", ActiveConnections: 20},
+		{ID: 2, Status: "active", ActiveConnections: 5},
+	}
+
+	req := &RoutingRequest{
+		UserID:           "user-refresh",
+		PeerPublicKey:    "peer-refresh",
+		AvailableTunnels: tunnels,
+	}
+
+	// Initial assignment at t0 -> Tunnel 2
+	b1, isNew, err := sm.GetOrAssignBackend(ctx, req)
+	if err != nil || !isNew || b1.ID != 2 {
+		t.Fatalf("initial assignment failed: backend=%+v isNew=%v err=%v", b1, isNew, err)
+	}
+
+	// Tunnel 1 drops to 0 connections
+	tunnels[0].ActiveConnections = 0
+	tunnels[1].ActiveConnections = 25
+
+	// Active request at t0 + 6m (< 10m): affinity preserved and lastSeen refreshed to t0 + 6m
+	currTime = t0.Add(6 * time.Minute)
+	b2, isNew, err := sm.GetOrAssignBackend(ctx, req)
+	if err != nil || isNew || b2.ID != 2 {
+		t.Fatalf("expected sticky hit at t0+6m: backend=%+v isNew=%v err=%v", b2, isNew, err)
+	}
+
+	// At t0 + 12m: 12 minutes from t0, but only 6 minutes from lastSeen (t0+6m)
+	// Because of refresh, affinity MUST STILL BE VALID
+	currTime = t0.Add(12 * time.Minute)
+	if tid, ok := sm.GetAffinity("user-refresh"); !ok || tid != 2 {
+		t.Fatalf("expected affinity alive at t0+12m due to refresh, got tid=%d, ok=%v", tid, ok)
+	}
+
+	b3, isNew, err := sm.GetOrAssignBackend(ctx, req)
+	if err != nil || isNew || b3.ID != 2 {
+		t.Fatalf("expected sticky hit at t0+12m: backend=%+v isNew=%v err=%v", b3, isNew, err)
+	}
+
+	// Advance time by 11 minutes (t0 + 23m, which is 11m > 10m after t0+12m)
+	currTime = t0.Add(23 * time.Minute)
+
+	// Now idle for 11m > 10m TTL -> should expire
+	if tid, ok := sm.GetAffinity("user-refresh"); ok {
+		t.Fatalf("expected affinity to expire after 11m inactivity, got tid=%d", tid)
+	}
+
+	b4, isNew, err := sm.GetOrAssignBackend(ctx, req)
+	if err != nil || !isNew || b4.ID != 1 {
+		t.Fatalf("expected re-assignment to tunnel 1 after TTL expiry, got backend=%+v isNew=%v err=%v", b4, isNew, err)
+	}
+}
+
+func TestStickySessionManager_CustomNowFunc(t *testing.T) {
+	db := setupTestDB(t)
+
+	// Verify default TTL when AffinityTTL <= 0
+	capsDefault := CapacityConfig{}
+	base := NewLeastConnectionsBalancer(capsDefault)
+	smDefault := NewStickySessionManager(db, base, capsDefault)
+
+	t0 := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	fakeTime := t0
+	smDefault.SetNowFunc(func() time.Time { return fakeTime })
+
+	smDefault.AssignAffinity("u-default", 101)
+	smDefault.AssignPeerAffinity("p-default", 101)
+
+	// Valid at t0
+	if tid, ok := smDefault.GetAffinity("u-default"); !ok || tid != 101 {
+		t.Errorf("expected valid affinity at t0, got tid=%d, ok=%v", tid, ok)
+	}
+	if tid, ok := smDefault.GetPeerAffinity("p-default"); !ok || tid != 101 {
+		t.Errorf("expected valid peer affinity at t0, got tid=%d, ok=%v", tid, ok)
+	}
+
+	// Advance by 29 minutes (less than DefaultAffinityTTL of 30 minutes)
+	fakeTime = t0.Add(29 * time.Minute)
+	if tid, ok := smDefault.GetAffinity("u-default"); !ok || tid != 101 {
+		t.Errorf("expected valid affinity at t0+29m, got tid=%d, ok=%v", tid, ok)
+	}
+
+	// Advance past 30 minutes (31 minutes)
+	fakeTime = t0.Add(31 * time.Minute)
+	if _, ok := smDefault.GetAffinity("u-default"); ok {
+		t.Errorf("expected affinity to be expired at t0+31m with DefaultAffinityTTL")
+	}
+	if _, ok := smDefault.GetPeerAffinity("p-default"); ok {
+		t.Errorf("expected peer affinity to be expired at t0+31m with DefaultAffinityTTL")
+	}
+}
+
+func TestStickySessionManager_Failover_ExpiredAffinityNotRevived(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	// Tunnel 1 and Tunnel 2
+	t2 := &models.BackendTunnel{ID: 2, Status: "active", ActiveConnections: 0}
+
+	// Assign user-1 and peer-1 to tunnel 1 at t0
+	sm.AssignAffinity("user-1", 1)
+	sm.AssignPeerAffinity("peer-1", 1)
+
+	// Also assign an active peer-2 at t0 + 8m
+	currTime = t0.Add(8 * time.Minute)
+	sm.AssignAffinity("user-2", 1)
+	sm.AssignPeerAffinity("peer-2", 1)
+
+	// Advance time to t0 + 15m (user-1/peer-1 expired: 15m > 10m TTL, but user-2/peer-2 active: 7m < 10m TTL)
+	currTime = t0.Add(15 * time.Minute)
+
+	// Degrade tunnel 1 and trigger failover to tunnel 2
+	res, err := sm.HandleFailover(ctx, 1, []*models.BackendTunnel{t2})
+	if err != nil {
+		t.Fatalf("HandleFailover failed: %v", err)
+	}
+
+	// Peer-2 should be migrated to tunnel 2
+	if len(res.Migrations) != 1 || res.Migrations[0].PeerPublicKey != "peer-2" || res.Migrations[0].NewBackendTunnelID != 2 {
+		t.Errorf("expected peer-2 to be migrated to tunnel 2, got %+v", res.Migrations)
+	}
+
+	// Peer-1 must NOT have been migrated, and its expired affinity must be purged
+	if tid, ok := sm.GetPeerAffinity("peer-1"); ok {
+		t.Errorf("expected expired peer-1 affinity to NOT be revived/present, got tid=%d", tid)
+	}
+	if tid, ok := sm.GetAffinity("user-1"); ok {
+		t.Errorf("expected expired user-1 affinity to NOT be revived/present, got tid=%d", tid)
+	}
+
+	// Peer-2's affinity must be active on tunnel 2
+	if tid, ok := sm.GetPeerAffinity("peer-2"); !ok || tid != 2 {
+		t.Errorf("expected active peer-2 to have affinity to tunnel 2, got tid=%d (ok=%v)", tid, ok)
 	}
 }

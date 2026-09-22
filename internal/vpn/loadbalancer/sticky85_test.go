@@ -111,7 +111,7 @@ func mkSession(t *testing.T, db *database.DB, id, username, peer string, backend
 
 // TestFailoverSelectionFailureDoesNotStrandOthers pins issue #85: when
 // backend selection fails for ONE peer, the other peers must still migrate,
-// and the failing peer must be counted + reported — never silently left.
+// and the failing peer must be counted + reported - never silently left.
 func TestFailoverSelectionFailureDoesNotStrandOthers(t *testing.T) {
 	db, t1, t2 := failoverFixture(t)
 	ctx := context.Background()
@@ -162,7 +162,7 @@ func TestFailoverSelectionFailureDoesNotStrandOthers(t *testing.T) {
 
 // TestFailoverNoSessionLeftOnDisabledBackendUnlessReported pins issue #85:
 // after HandleFailover, every DB session on the degraded backend is either
-// migrated or present in Skipped — nothing in between.
+// migrated or present in Skipped - nothing in between.
 func TestFailoverNoSessionLeftOnDisabledBackendUnlessReported(t *testing.T) {
 	db, t1, t2 := failoverFixture(t)
 	ctx := context.Background()
@@ -326,7 +326,7 @@ func TestGetAffinityNotBlockedBehindFailoverDBDelay(t *testing.T) {
 		// Readers finished while failover DB I/O was in flight: mutex not
 		// held across DB I/O. (failoverDone intentionally not awaited yet.)
 	case <-failoverDone:
-		t.Fatal("failover completed before readers — reader was blocked behind DB delay")
+		t.Fatal("failover completed before readers - reader was blocked behind DB delay")
 	}
 	<-failoverDone
 }

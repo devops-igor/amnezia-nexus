@@ -243,6 +243,12 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if cfg.ContentPaddingAddition == "" {
 		cfg.ContentPaddingAddition = current.ContentPaddingAddition
 	}
+	if cfg.AffinityTTLMinutes == 0 {
+		cfg.AffinityTTLMinutes = current.AffinityTTLMinutes
+	}
+	if cfg.MinRebalanceSessions == 0 {
+		cfg.MinRebalanceSessions = current.MinRebalanceSessions
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.

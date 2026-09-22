@@ -52,14 +52,15 @@ func (m *SessionMetrics) snapshot() map[string]int64 {
 
 // SessionManager tracks active VPN peer sessions in memory and SQLite.
 type SessionManager struct {
-	mu              sync.RWMutex
-	db              *database.DB
-	ipam            *IPAM
-	sessionsByPeer  map[string]*models.VPNSession // peerPublicKey -> session
-	sessionsByID    map[string]*models.VPNSession // sessionID -> session
-	activeCount     atomic.Int64
-	metrics         SessionMetrics
-	replacementHook ReplacementHook
+	mu               sync.RWMutex
+	db               *database.DB
+	ipam             *IPAM
+	sessionsByPeer   map[string]*models.VPNSession // peerPublicKey -> session
+	sessionsByID     map[string]*models.VPNSession // sessionID -> session
+	activeCount      atomic.Int64
+	lifecycleVersion atomic.Uint64
+	metrics          SessionMetrics
+	replacementHook  ReplacementHook
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -74,7 +75,7 @@ func NewSessionManager(db *database.DB, ipam *IPAM) *SessionManager {
 
 // SetReplacementHook registers the session-replacement callback (issue #78).
 // Must be called before Start accepts traffic; the hook runs while sm.mu is
-// held, so it must only touch the pool counter and DB — never re-enter the
+// held, so it must only touch the pool counter and DB - never re-enter the
 // session manager.
 func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
 	sm.mu.Lock()
@@ -88,11 +89,32 @@ func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
 	return sm.metrics.snapshot()
 }
 
+// LifecycleVersion returns the monotonically increasing session lifecycle version.
+func (sm *SessionManager) LifecycleVersion() uint64 {
+	return sm.lifecycleVersion.Load()
+}
+
+// BumpLifecycleVersion manually increments and returns the session lifecycle version.
+func (sm *SessionManager) BumpLifecycleVersion() uint64 {
+	return sm.lifecycleVersion.Add(1)
+}
+
+// LockLifecycle acquires an exclusive lock on the session manager to fence
+// lifecycle mutations against atomic operations like gauge reconciliation.
+func (sm *SessionManager) LockLifecycle() {
+	sm.mu.Lock()
+}
+
+// UnlockLifecycle releases the exclusive lock on the session manager.
+func (sm *SessionManager) UnlockLifecycle() {
+	sm.mu.Unlock()
+}
+
 // CreateSession allocates a new VPN session and persists it. When a session
 // already exists for the same peer (client rekey/reconnect), the old session
 // is fully replaced: removed from memory, its DB row closed, and the
 // replacement hook fires so the caller can migrate the pool counter and
-// redirect live routes (issue #78 — every rekey previously leaked +1 on the
+// redirect live routes (issue #78 - every rekey previously leaked +1 on the
 // old backend's ActiveConnections gauge because neither the pool decrement
 // nor a teardown for the old ID ever ran).
 // connectionName is the user-facing config name resolved by the caller's
@@ -109,7 +131,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 
 	// If session already exists for this peer, close it before creating a new
 	// one. The DB row is deleted here (same primitive the clean-disconnect
-	// path uses) so no orphan row for a dead session ID survives — a later
+	// path uses) so no orphan row for a dead session ID survives - a later
 	// DisconnectSession(oldID) would otherwise return ErrSessionNotFound and
 	// its mirror-decrement would never run.
 	var replaced *models.VPNSession
@@ -118,6 +140,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 		delete(sm.sessionsByID, oldSess.ID)
 		delete(sm.sessionsByPeer, peerPublicKey)
 		sm.activeCount.Add(-1)
+		sm.lifecycleVersion.Add(1)
 		sm.metrics.ReplacementsTotal.Add(1)
 		if sm.db != nil {
 			// Same teardown primitive as CloseSession: the row must go, or
@@ -128,7 +151,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 			}
 		}
 		// NOTE: the old session's IPAM allocation is intentionally NOT
-		// released here — the replacement reuses the same peer IP (the
+		// released here - the replacement reuses the same peer IP (the
 		// caller re-resolved the allocation just before CreateSession), so
 		// releasing would drop a still-valid reservation.
 	}
@@ -158,7 +181,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	if sm.db != nil {
 		if err := sm.db.CreateVPNSession(ctx, sess); err != nil {
 			if replaced != nil {
-				// The replacement is lost; keep the leak observable — the
+				// The replacement is lost; keep the leak observable - the
 				// caller's pool counter for the old backend is still holding
 				// the previous session's count and the hook below will not
 				// run with a usable new session.
@@ -172,6 +195,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	sm.sessionsByPeer[peerPublicKey] = sess
 	sm.sessionsByID[sessionID] = sess
 	sm.activeCount.Add(1)
+	sm.lifecycleVersion.Add(1)
 
 	// Fire the replacement hook AFTER the new session is fully registered so
 	// the caller sees a consistent old→new transition. The hook migrates the
@@ -252,6 +276,16 @@ func (sm *SessionManager) TouchSession(peerPublicKey string) {
 	}
 }
 
+// SetSessionLastSeen sets the last seen timestamp of a session.
+func (sm *SessionManager) SetSessionLastSeen(peerPublicKey string, t time.Time) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sess, ok := sm.sessionsByPeer[peerPublicKey]; ok {
+		sess.LastSeen = t
+	}
+}
+
 // CloseSession transitions a session to the specified status and releases IPAM allocation.
 func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, status string) error {
 	sm.mu.Lock()
@@ -280,6 +314,7 @@ func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, st
 	delete(sm.sessionsByID, sessionID)
 	delete(sm.sessionsByPeer, sess.PeerPublicKey)
 	sm.activeCount.Add(-1)
+	sm.lifecycleVersion.Add(1)
 
 	return nil
 }
@@ -301,6 +336,7 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 	}
 
 	for _, sess := range timedOut {
+		sess.TimedOutAt = now
 		sess.Status = "disconnected"
 		if sm.db != nil {
 			_ = sm.db.CloseVPNSession(ctx, sess.ID)
@@ -311,6 +347,9 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 		delete(sm.sessionsByID, sess.ID)
 		delete(sm.sessionsByPeer, sess.PeerPublicKey)
 		sm.activeCount.Add(-1)
+	}
+	if len(timedOut) > 0 {
+		sm.lifecycleVersion.Add(1)
 	}
 	sm.mu.Unlock()
 
@@ -327,6 +366,9 @@ func (sm *SessionManager) Drain(ctx context.Context, timeout time.Duration) erro
 		if sm.db != nil {
 			_ = sm.db.CreateVPNSession(ctx, sess)
 		}
+	}
+	if len(sm.sessionsByID) > 0 {
+		sm.lifecycleVersion.Add(1)
 	}
 	return nil
 }

@@ -335,6 +335,9 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if cfg.MaxPeersPerBackend == 0 {
 		cfg.MaxPeersPerBackend = 250
 	}
+	if cfg.AffinityTTLMinutes <= 0 {
+		cfg.AffinityTTLMinutes = 30
+	}
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}

@@ -151,6 +151,12 @@ type Service struct {
 	// across the per-backend read loops: all accesses are atomic, so the
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
+
+	lastReconcileTime         time.Time
+	lastReconcileByTunnel     map[int64]time.Time
+	reconcilePostSnapshotHook func()
+	reconcilePreApplyHook     func()
+	reconcilePreCommitHook    func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -496,6 +502,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	caps := loadbalancer.CapacityConfig{
 		MaxTotalPeers:      cfg.MaxTotalPeers,
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
+		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
 
 	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
@@ -522,36 +529,33 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		// real persisted identity instead of empty strings (which would
 		// wipe the keypair on the next save and invalidate every rendered
 		// client config).
-		if db != nil {
-			if fresh, ferr := db.GetVPNConfig(context.Background()); ferr == nil && fresh != nil {
-				cfg.ServerPrivateKey = fresh.ServerPrivateKey
-				cfg.ServerPublicKey = fresh.ServerPublicKey
-			}
-		}
+		cfg.ServerPublicKey = pub
+		cfg.ServerPrivateKey = priv
 	}
 
 	svc := &Service{
-		db:            db,
-		cfg:           cfg,
-		endpoint:      epListener,
-		sessionMgr:    sessionMgr,
-		ipam:          ipam,
-		auth:          auth,
-		pool:          pool,
-		prober:        prober,
-		reconnectMgr:  reconnectMgr,
-		balancer:      lb,
-		stickyMgr:     stickyMgr,
-		forwarder:     fwd,
-		accountant:    accountant,
-		portalPubKey:  pub,
-		portalPrivKey: priv,
+		db:                    db,
+		cfg:                   cfg,
+		endpoint:              epListener,
+		sessionMgr:            sessionMgr,
+		ipam:                  ipam,
+		auth:                  auth,
+		pool:                  pool,
+		prober:                prober,
+		reconnectMgr:          reconnectMgr,
+		balancer:              lb,
+		stickyMgr:             stickyMgr,
+		forwarder:             fwd,
+		accountant:            accountant,
+		portalPubKey:          pub,
+		portalPrivKey:         priv,
+		lastReconcileByTunnel: make(map[int64]time.Time),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
 	// Issue #78: session replacement (client rekey/reconnect) must migrate the
-	// pool connection counter off the old backend — without this every rekey
+	// pool connection counter off the old backend - without this every rekey
 	// leaked +1 on the old backend's ActiveConnections gauge (the original
 	// connect incremented it in HandleIncomingPeer; the replacement path never
 	// decremented, and a later DisconnectSession(oldID) found nothing because
@@ -562,13 +566,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// (and closes its DB row) BEFORE persisting the new one, and fires this
 	// hook only after the new session is fully registered. The hook runs while
 	// SessionManager.mu is held, so it must only touch the pool counter and
-	// forwarder/sticky state — it must never re-enter the session manager.
+	// forwarder/sticky state - it must never re-enter the session manager.
 	// Capacity serialization note (issue #86): the hook's pool counter
 	// migration therefore participates in the capacity invariant only
-	// transitively — CreateSession's only production call site today is
-	// HandleIncomingPeer, which holds s.mu for the whole select →
-	// CreateSession → increment sequence, so the hook in fact runs nested
-	// under BOTH locks (s.mu → sm.mu; the reverse order is never taken).
+	// transitively - CreateSession's only production call site today is
+	// HandleIncomingPeer, which holds s.mu for the whole select ->
+	// CreateSession -> increment sequence, so the hook in fact runs nested
+	// under BOTH locks (s.mu -> sm.mu; the reverse order is never taken).
 	// If a CreateSession call site outside s.mu is ever added, the hook
 	// escapes the capacity serialization regime and the contract on
 	// tunnel.Pool.IncrementConnections must be re-evaluated.
@@ -600,22 +604,19 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
 	})
-	// Idle-timeout reaper: run the same teardown as an explicit disconnect
-	// (forwarder route, pool counter, sticky affinity) for each reaped
-	// session. Without this, idle timeouts leak all three (the reaper used
-	// to discard CheckTimeouts' return value).
+	// Idle-timeout reaper: run teardown directly on the reaped session
+	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
+	// already closed and removed the session from sessionMgr, so we must not
+	// call DisconnectSession (which looks up the session by ID and fails).
 	epListener.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
-		if sess == nil {
-			return
-		}
-		_ = svc.DisconnectSession(ctx, sess.ID)
+		svc.reapSession(ctx, sess)
 	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		// Issue #43 (session 8): the previous closure short-circuited here
 		// whenever a data device was attached, synthesizing a fake 10ms
 		// success (or a fake handshake timeout) from LastHandshakeTime alone
-		// — without sending anything. The real Noise IK prober (the only
+		// - without sending anything. The real Noise IK prober (the only
 		// user of the dedicated probe key) was unreachable, so the backend's
 		// probe peer never handshook. The prober now runs the real
 		// health.ProbeAWGEndpoint on EVERY cycle regardless of data-device
@@ -650,6 +651,30 @@ func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 		s.backendDevices = make(map[int64]BackendDevice)
 	}
 	s.backendDevices[tunID] = dev
+}
+
+// SetReconcilePostSnapshotHook registers a test hook called immediately after
+// reading the active session snapshot in reconcileConnectionCounts, before s.mu is acquired.
+func (s *Service) SetReconcilePostSnapshotHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcilePostSnapshotHook = fn
+}
+
+// SetReconcilePreApplyHook registers a test hook called under s.mu before
+// the tunnel reconciliation apply phase in reconcileConnectionCounts.
+func (s *Service) SetReconcilePreApplyHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcilePreApplyHook = fn
+}
+
+// SetReconcilePreCommitHook registers a test hook called under s.mu and sm.LockLifecycle
+// immediately before applying changes in reconcileConnectionCounts.
+func (s *Service) SetReconcilePreCommitHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcilePreCommitHook = fn
 }
 
 // GetBackendDeviceForTest returns the backend device for a tunnel ID.
@@ -889,6 +914,12 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
+// isLifecycleMutated returns true if the session manager exists and its
+// lifecycle version has advanced beyond versionBefore.
+func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
+	return s.sessionMgr != nil && s.sessionMgr.LifecycleVersion() != versionBefore
+}
+
 // reconcileConnectionCounts recomputes the active_connections gauge of every
 // tunnel in the pool from the authoritative vpn_sessions table (issue #54).
 // The gauge is a LIVE count of status='connected' sessions per backend
@@ -905,9 +936,47 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 		return
 	}
 
+	var versionBefore uint64
+	if s.sessionMgr != nil {
+		versionBefore = s.sessionMgr.LifecycleVersion()
+	}
+
 	sessions, err := s.db.GetActiveVPNSessions(ctx)
+	dbReadTime := time.Now().UTC()
 	if err != nil {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped, cannot read active sessions: %v", err)
+		return
+	}
+
+	var postHook func()
+	s.mu.RLock()
+	postHook = s.reconcilePostSnapshotHook
+	s.mu.RUnlock()
+	if postHook != nil {
+		postHook()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sessionMgr != nil {
+		s.sessionMgr.LockLifecycle()
+		defer s.sessionMgr.UnlockLifecycle()
+	}
+
+	if s.isLifecycleMutated(versionBefore) {
+		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during DB snapshot (version %d -> %d)",
+			versionBefore, s.sessionMgr.LifecycleVersion())
+		return
+	}
+
+	if s.reconcilePreApplyHook != nil {
+		s.reconcilePreApplyHook()
+	}
+
+	if s.isLifecycleMutated(versionBefore) {
+		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during pre-apply hook (version %d -> %d)",
+			versionBefore, s.sessionMgr.LifecycleVersion())
 		return
 	}
 
@@ -917,18 +986,53 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	}
 
 	tunnels := s.pool.ListTunnels()
-	anyDrift := false
+	tunnelChanges := make(map[int64]int)
+	stagedReconcile := make(map[int64]time.Time)
 	for _, tun := range tunnels {
 		want := desired[tun.ID]
 		if tun.ActiveConnections == want {
+			stagedReconcile[tun.ID] = dbReadTime
 			continue
 		}
-		anyDrift = true
+		tunnelChanges[tun.ID] = want
+		stagedReconcile[tun.ID] = dbReadTime
+	}
+
+	if s.reconcilePreCommitHook != nil {
+		s.reconcilePreCommitHook()
+	}
+
+	if s.isLifecycleMutated(versionBefore) {
+		log.Printf("[vpn] warning: connection gauge reconciliation aborted: session lifecycle mutated before commit (version %d -> %d)",
+			versionBefore, s.sessionMgr.LifecycleVersion())
+		return
+	}
+
+	anyDrift := len(tunnelChanges) > 0
+	allSucceeded := true
+	for _, tun := range tunnels {
+		want, changed := tunnelChanges[tun.ID]
+		if !changed {
+			continue
+		}
 		if err := s.pool.SetConnectionCount(ctx, tun.ID, want); err != nil {
+			allSucceeded = false
+			delete(stagedReconcile, tun.ID)
 			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
 			continue
 		}
 		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
+	}
+
+	if s.lastReconcileByTunnel == nil {
+		s.lastReconcileByTunnel = make(map[int64]time.Time)
+	}
+	for tunID, ts := range stagedReconcile {
+		s.lastReconcileByTunnel[tunID] = ts
+	}
+
+	if allSucceeded {
+		s.lastReconcileTime = dbReadTime
 	}
 
 	// Sessions whose BackendTunnelID is not in the pool: count them as the
@@ -948,15 +1052,15 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 }
 
 // ConnectionGaugeReconcileInterval is the cadence of the periodic gauge
-// reconciliation (issue #78 decision: hourly — short enough that drift never
+// reconciliation (issue #78 decision: hourly - short enough that drift never
 // lives longer than one interval, cheap enough to be a single indexed DB
 // read over the vpn_sessions table per hour).
 const ConnectionGaugeReconcileInterval = time.Hour
 
 // StartGaugeReconciler launches the hourly periodic reconcile of the
 // active_connections gauge (issue #78 short-term safety net). It reuses the
-// existing, tested reconcileConnectionCounts primitive unchanged — no new
-// counting logic — so the gauge is the ONLY thing it corrects: it never
+// existing, tested reconcileConnectionCounts primitive unchanged - no new
+// counting logic - so the gauge is the ONLY thing it corrects: it never
 // creates, closes, or resurrects sessions, and therefore cannot fight the
 // session reaper. Reaper interaction: the reaper's teardown closes real
 // session rows synchronously via DisconnectSession before the gauge can be
@@ -2003,6 +2107,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 			s.pool.DecrementConnections(tunnel.ID)
 			s.pool.IncrementConnections(m.NewBackendTunnelID)
 		}
+		if len(migrations) > 0 && s.sessionMgr != nil {
+			s.sessionMgr.BumpLifecycleVersion()
+		}
 	}
 
 	return nil
@@ -2204,6 +2311,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	caps := loadbalancer.CapacityConfig{
 		MaxTotalPeers:      cfg.MaxTotalPeers,
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
+		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
 
 	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
@@ -2274,6 +2382,63 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	}
 
 	return nil
+}
+
+// reapSession tears down forwarder routes, sticky affinities, and pool counters
+// for an idle-timeout reaped session. To protect against reconnect and reconcile
+// races, peer/user affinity is only cleared if no newer active session exists for
+// the peer/user, and pool connection counter decrement is skipped if periodic
+// reconciliation already re-synchronized the gauge from the database.
+func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
+	if sess == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.forwarder != nil {
+		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+	}
+
+	if s.stickyMgr != nil {
+		shouldClearPeer := true
+		if s.sessionMgr != nil {
+			if activePeerSess, ok := s.sessionMgr.GetSession(sess.PeerPublicKey); ok && activePeerSess != nil && activePeerSess.ID != sess.ID {
+				shouldClearPeer = false
+			}
+		}
+		if shouldClearPeer {
+			s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+		}
+
+		shouldClearUser := true
+		if s.sessionMgr != nil {
+			activeUserSessions := s.sessionMgr.GetSessionsByUserID(sess.UserID)
+			for _, us := range activeUserSessions {
+				if us != nil && us.ID != sess.ID {
+					shouldClearUser = false
+					break
+				}
+			}
+		}
+		if shouldClearUser {
+			s.stickyMgr.ClearAffinity(sess.UserID)
+		}
+	}
+
+	if s.pool != nil {
+		shouldDecrement := true
+		var tunReconcileTime time.Time
+		if s.lastReconcileByTunnel != nil {
+			tunReconcileTime = s.lastReconcileByTunnel[sess.BackendTunnelID]
+		}
+		if !sess.TimedOutAt.IsZero() && !tunReconcileTime.IsZero() && tunReconcileTime.After(sess.TimedOutAt) {
+			shouldDecrement = false
+		}
+		if shouldDecrement {
+			s.pool.DecrementConnections(sess.BackendTunnelID)
+		}
+	}
 }
 
 // DisconnectSession disconnects a specific VPN session by ID.

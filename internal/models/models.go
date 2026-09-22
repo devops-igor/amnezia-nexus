@@ -299,6 +299,10 @@ type VPNSession struct {
 	// resolved at handshake time. Legacy rows pre-dating the column carry ""
 	// and are never backfilled.
 	ConnectionName string `json:"connection_name" db:"connection_name"`
+	// TimedOutAt records when CheckTimeouts detected that the session exceeded
+	// the idle timeout. Used by the session reaper to avoid duplicate counter
+	// decrements if periodic reconciliation ran after this timestamp.
+	TimedOutAt time.Time `json:"-" db:"-"`
 }
 
 // EnrichedVPNSession is an active VPN session with identity joins resolved:
@@ -326,7 +330,7 @@ type EnrichedVPNSession struct {
 	ConnectionName string `json:"connection_name"`
 }
 
-// VPNConfig stores dynamic configuration for the in-process VPN subsystem.
+// VPNConfig holds runtime configuration for the built-in VPN service.
 type VPNConfig struct {
 	Algorithm              LoadBalancingAlgorithm `json:"algorithm"`
 	Weights                map[int64]int          `json:"weights"` // server_id -> weight (1-100)
@@ -335,6 +339,7 @@ type VPNConfig struct {
 	SubnetCIDR             string                 `json:"subnet_cidr"`
 	MaxTotalPeers          int                    `json:"max_total_peers"`
 	MaxPeersPerBackend     int                    `json:"max_peers_per_backend"`
+	AffinityTTLMinutes     int                    `json:"affinity_ttl_minutes,omitempty"`
 	MinRebalanceSessions   int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
 	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
 	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
