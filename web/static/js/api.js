@@ -9,10 +9,6 @@
         module.exports = factory();
     } else {
         root.API = factory();
-        // Backward compatibility
-        root.apiCall = function (url, method, body, options) {
-            return root.API.request(url, Object.assign({}, options, { method: method || 'GET', body: body !== undefined ? body : null }));
-        };
     }
 }(typeof self !== 'undefined' ? self : this, function () {
     'use strict';
