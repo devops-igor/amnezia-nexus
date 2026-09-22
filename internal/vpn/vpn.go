@@ -600,22 +600,19 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
 	})
-	// Idle-timeout reaper: run the same teardown as an explicit disconnect
-	// (forwarder route, pool counter, sticky affinity) for each reaped
-	// session. Without this, idle timeouts leak all three (the reaper used
-	// to discard CheckTimeouts' return value).
+	// Idle-timeout reaper: run teardown directly on the reaped session
+	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
+	// already closed and removed the session from sessionMgr, so we must not
+	// call DisconnectSession (which looks up the session by ID and fails).
 	epListener.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
-		if sess == nil {
-			return
-		}
-		_ = svc.DisconnectSession(ctx, sess.ID)
+		svc.reapSession(ctx, sess)
 	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		// Issue #43 (session 8): the previous closure short-circuited here
 		// whenever a data device was attached, synthesizing a fake 10ms
 		// success (or a fake handshake timeout) from LastHandshakeTime alone
-		// — without sending anything. The real Noise IK prober (the only
+		// - without sending anything. The real Noise IK prober (the only
 		// user of the dedicated probe key) was unreachable, so the backend's
 		// probe peer never handshook. The prober now runs the real
 		// health.ProbeAWGEndpoint on EVERY cycle regardless of data-device
@@ -2274,6 +2271,28 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	}
 
 	return nil
+}
+
+// reapSession tears down forwarder routes, sticky affinities, and pool counters
+// for an idle-timeout reaped session directly, without attempting to look it up in
+// sessionMgr (where CheckTimeouts has already removed it).
+func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
+	if sess == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.forwarder != nil {
+		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+	}
+	if s.stickyMgr != nil {
+		s.stickyMgr.ClearAffinity(sess.UserID)
+		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+	}
+	if s.pool != nil {
+		s.pool.DecrementConnections(sess.BackendTunnelID)
+	}
 }
 
 // DisconnectSession disconnects a specific VPN session by ID.

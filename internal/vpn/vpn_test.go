@@ -4717,3 +4717,123 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 		}
 	}
 }
+
+func TestSessionReaperHook_Teardown(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	var targetTunnel *models.BackendTunnel
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			targetTunnel = tun
+			break
+		}
+	}
+	if targetTunnel == nil {
+		targetTunnel = tunnels[0]
+	}
+	tunID := targetTunnel.ID
+
+	// 1. Establish state simulating an active session:
+	// - session in sessionMgr
+	// - route registered in forwarder
+	// - sticky affinities in stickyMgr
+	// - incremented connection count in pool
+	sessID := "sess-reaper-test-1"
+	assignedIP := "10.100.0.88"
+	createdSess, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIP, tunID, sessID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	vpnSvc.forwarder.RegisterSession(sessID, "conn-1", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// Verify pre-conditions
+	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); !ok {
+		t.Fatalf("expected forwarder route to be registered")
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
+		t.Fatalf("expected user sticky affinity to be %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
+		t.Fatalf("expected peer sticky affinity to be %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+	tunBefore, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunBefore.ActiveConnections != 1 {
+		t.Fatalf("expected pool ActiveConnections=1, got %d (err=%v)", tunBefore.ActiveConnections, err)
+	}
+
+	// 2. Age session past IdleTimeout (default 3m, age by 10m)
+	createdSess.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+
+	// 3. Trigger timeout sweep through listener (which invokes the registered SessionReaperHook)
+	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) == 0 {
+		t.Fatalf("expected at least 1 timed out session, got 0")
+	}
+	if timedOut[0].ID != createdSess.ID {
+		t.Fatalf("expected timed out session %s, got %s", createdSess.ID, timedOut[0].ID)
+	}
+
+	// 4. Verify post-conditions after reaper hook teardown:
+	// a) Session is removed from sessionMgr
+	if _, ok := vpnSvc.sessionMgr.GetSessionByID(createdSess.ID); ok {
+		t.Errorf("session still found in sessionMgr after sweep")
+	}
+
+	// b) Forwarder route unregistered
+	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); ok {
+		t.Errorf("forwarder route for %s still registered after reaper teardown", peerKeyAlice)
+	}
+
+	// c) Sticky affinities cleared
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); ok {
+		t.Errorf("user sticky affinity still present for %s (tid=%d)", uID, tid)
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); ok {
+		t.Errorf("peer sticky affinity still present for %s (tid=%d)", peerKeyAlice, tid)
+	}
+
+	// d) Pool connection count decremented to 0
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections=0 after reaper teardown, got %d (err=%v)", tunAfter.ActiveConnections, err)
+	}
+}
+
+func TestService_ReapSession_EdgeCases(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	// Calling with nil session should not panic or error
+	vpnSvc.reapSession(ctx, nil)
+
+	// Calling with empty/non-existent session fields should not panic
+	dummySess := &models.VPNSession{
+		ID:              "non-existent",
+		UserID:          "",
+		PeerPublicKey:   "no-such-peer",
+		BackendTunnelID: 999999,
+	}
+	vpnSvc.reapSession(ctx, dummySess)
+}
