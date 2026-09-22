@@ -234,7 +234,6 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 		"post(url",
 		"patch(url",
 		"delete: del",
-		"root.apiCall",
 	}
 	for _, sig := range requiredAPISignatures {
 		if !strings.Contains(apiStr, sig) {
@@ -316,6 +315,40 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 		if !strings.Contains(baseStr, item) {
 			t.Errorf("base.html missing required component integration %q", item)
 		}
+	}
+}
+
+func TestDeadCompatibilityAliasesPruned(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	// 1. Verify api.js does not contain root.apiCall
+	apiData, err := fs.ReadFile(staticFS, "js/api.js")
+	if err != nil {
+		t.Fatalf("failed to read js/api.js: %v", err)
+	}
+	if strings.Contains(string(apiData), "root.apiCall") {
+		t.Errorf("js/api.js must not contain dead compatibility alias root.apiCall")
+	}
+
+	// 2. Verify ui.js does not contain root.confirmModal
+	uiData, err := fs.ReadFile(staticFS, "js/ui.js")
+	if err != nil {
+		t.Fatalf("failed to read js/ui.js: %v", err)
+	}
+	if strings.Contains(string(uiData), "root.confirmModal") {
+		t.Errorf("js/ui.js must not contain dead compatibility alias root.confirmModal")
+	}
+
+	// 3. Verify tables.js does not contain root.DataTable
+	tablesData, err := fs.ReadFile(staticFS, "js/tables.js")
+	if err != nil {
+		t.Fatalf("failed to read js/tables.js: %v", err)
+	}
+	if strings.Contains(string(tablesData), "root.DataTable") {
+		t.Errorf("js/tables.js must not contain dead compatibility alias root.DataTable")
 	}
 }
 

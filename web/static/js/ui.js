@@ -9,7 +9,7 @@
         module.exports = factory();
     } else {
         root.UI = factory();
-        // Backward-compatible global exports
+        // Supported global helpers for template invocation (active template call surface)
         root.showToast = function (message, type) {
             return root.UI.toast(message, type);
         };
@@ -21,9 +21,6 @@
         };
         root.copyToClipboard = function (text, triggerElement) {
             return root.UI.copy(text, triggerElement);
-        };
-        root.confirmModal = function (options) {
-            return root.UI.confirm(options);
         };
         root.formatBytes = function (bytes) {
             return root.UI.formatBytes(bytes);
