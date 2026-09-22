@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -933,18 +934,25 @@ func TestVPNDeleteBackendHandler(t *testing.T) {
 // does not abort backend enablement due to context.WithoutCancel decoupling with 45s deadline.
 func TestVPNEnableBackendHandler_ContextCancellationResilience(t *testing.T) {
 	ctx := context.Background()
-	var capturedErr error
-	var capturedRemaining time.Duration
-	var capturedHasDeadline bool
-	var capturedCount int
+	var (
+		mu                  sync.Mutex
+		capturedErr         error
+		capturedRemaining   time.Duration
+		capturedHasDeadline bool
+		capturedCount       int
+	)
 	mockSSH := &testMockSSHClient{
 		cmdFunc: func(cmdCtx context.Context, cmd string) (string, string, int, error) {
+			mu.Lock()
 			capturedCount++
-			capturedErr = cmdCtx.Err()
-			if deadline, ok := cmdCtx.Deadline(); ok {
-				capturedHasDeadline = true
-				capturedRemaining = time.Until(deadline)
+			if capturedCount == 1 {
+				capturedErr = cmdCtx.Err()
+				if deadline, ok := cmdCtx.Deadline(); ok {
+					capturedHasDeadline = true
+					capturedRemaining = time.Until(deadline)
+				}
 			}
+			mu.Unlock()
 			if strings.Contains(cmd, "docker ps -a") && strings.Contains(cmd, "amnezia-awg") {
 				return "amnezia-awg\n", "", 0, nil
 			}
@@ -999,17 +1007,24 @@ func TestVPNEnableBackendHandler_ContextCancellationResilience(t *testing.T) {
 	}
 
 	// Verify that the operation was executed with an active context bounded by ~45s
-	if capturedCount == 0 {
+	mu.Lock()
+	count := capturedCount
+	cmdErr := capturedErr
+	hasDeadline := capturedHasDeadline
+	remaining := capturedRemaining
+	mu.Unlock()
+
+	if count == 0 {
 		t.Fatal("expected EnableBackend to execute SSH commands, but none were executed")
 	}
-	if capturedErr != nil {
-		t.Fatalf("expected command execution context to not be canceled, got err: %v", capturedErr)
+	if cmdErr != nil {
+		t.Fatalf("expected command execution context to not be canceled, got err: %v", cmdErr)
 	}
-	if !capturedHasDeadline {
+	if !hasDeadline {
 		t.Fatal("expected command execution context to have a deadline")
 	}
-	if capturedRemaining <= 0 || capturedRemaining > 45*time.Second {
-		t.Fatalf("expected deadline within (0, 45s], got remaining: %v", capturedRemaining)
+	if remaining <= 0 || remaining > 45*time.Second {
+		t.Fatalf("expected deadline within (0, 45s], got remaining: %v", remaining)
 	}
 
 	// Verify the backend tunnel was actually registered in the DB
