@@ -151,6 +151,9 @@ type Service struct {
 	// across the per-backend read loops: all accesses are atomic, so the
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
+
+	reconcileEpoch uint64
+	timedOutEpoch  map[string]uint64
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -546,12 +549,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		accountant:    accountant,
 		portalPubKey:  pub,
 		portalPrivKey: priv,
+		timedOutEpoch: make(map[string]uint64),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
 	// Issue #78: session replacement (client rekey/reconnect) must migrate the
-	// pool connection counter off the old backend — without this every rekey
+	// pool connection counter off the old backend - without this every rekey
 	// leaked +1 on the old backend's ActiveConnections gauge (the original
 	// connect incremented it in HandleIncomingPeer; the replacement path never
 	// decremented, and a later DisconnectSession(oldID) found nothing because
@@ -562,13 +566,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// (and closes its DB row) BEFORE persisting the new one, and fires this
 	// hook only after the new session is fully registered. The hook runs while
 	// SessionManager.mu is held, so it must only touch the pool counter and
-	// forwarder/sticky state — it must never re-enter the session manager.
+	// forwarder/sticky state - it must never re-enter the session manager.
 	// Capacity serialization note (issue #86): the hook's pool counter
 	// migration therefore participates in the capacity invariant only
-	// transitively — CreateSession's only production call site today is
-	// HandleIncomingPeer, which holds s.mu for the whole select →
-	// CreateSession → increment sequence, so the hook in fact runs nested
-	// under BOTH locks (s.mu → sm.mu; the reverse order is never taken).
+	// transitively - CreateSession's only production call site today is
+	// HandleIncomingPeer, which holds s.mu for the whole select ->
+	// CreateSession -> increment sequence, so the hook in fact runs nested
+	// under BOTH locks (s.mu -> sm.mu; the reverse order is never taken).
 	// If a CreateSession call site outside s.mu is ever added, the hook
 	// escapes the capacity serialization regime and the contract on
 	// tunnel.Pool.IncrementConnections must be re-evaluated.
@@ -599,6 +603,17 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		if svc.stickyMgr != nil {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
+	})
+	sessionMgr.SetTimeoutHook(func(sess *models.VPNSession) {
+		if sess == nil {
+			return
+		}
+		svc.mu.Lock()
+		if svc.timedOutEpoch == nil {
+			svc.timedOutEpoch = make(map[string]uint64)
+		}
+		svc.timedOutEpoch[sess.ID] = svc.reconcileEpoch
+		svc.mu.Unlock()
 	})
 	// Idle-timeout reaper: run teardown directly on the reaped session
 	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
@@ -901,6 +916,9 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if s.pool == nil || s.db == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcileEpoch++
 
 	sessions, err := s.db.GetActiveVPNSessions(ctx)
 	if err != nil {
@@ -945,15 +963,15 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 }
 
 // ConnectionGaugeReconcileInterval is the cadence of the periodic gauge
-// reconciliation (issue #78 decision: hourly — short enough that drift never
+// reconciliation (issue #78 decision: hourly - short enough that drift never
 // lives longer than one interval, cheap enough to be a single indexed DB
 // read over the vpn_sessions table per hour).
 const ConnectionGaugeReconcileInterval = time.Hour
 
 // StartGaugeReconciler launches the hourly periodic reconcile of the
 // active_connections gauge (issue #78 short-term safety net). It reuses the
-// existing, tested reconcileConnectionCounts primitive unchanged — no new
-// counting logic — so the gauge is the ONLY thing it corrects: it never
+// existing, tested reconcileConnectionCounts primitive unchanged - no new
+// counting logic - so the gauge is the ONLY thing it corrects: it never
 // creates, closes, or resurrects sessions, and therefore cannot fight the
 // session reaper. Reaper interaction: the reaper's teardown closes real
 // session rows synchronously via DisconnectSession before the gauge can be
@@ -2274,8 +2292,10 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 }
 
 // reapSession tears down forwarder routes, sticky affinities, and pool counters
-// for an idle-timeout reaped session directly, without attempting to look it up in
-// sessionMgr (where CheckTimeouts has already removed it).
+// for an idle-timeout reaped session. To protect against reconnect and reconcile
+// races, peer/user affinity is only cleared if no newer active session exists for
+// the peer/user, and pool connection counter decrement is skipped if periodic
+// reconciliation already re-synchronized the gauge from the database.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
@@ -2286,12 +2306,46 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if s.forwarder != nil {
 		s.forwarder.UnregisterSession(sess.PeerPublicKey)
 	}
+
 	if s.stickyMgr != nil {
-		s.stickyMgr.ClearAffinity(sess.UserID)
-		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+		shouldClearPeer := true
+		if s.sessionMgr != nil {
+			if activePeerSess, ok := s.sessionMgr.GetSession(sess.PeerPublicKey); ok && activePeerSess != nil && activePeerSess.ID != sess.ID {
+				shouldClearPeer = false
+			}
+		}
+		if shouldClearPeer {
+			s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+		}
+
+		shouldClearUser := true
+		if s.sessionMgr != nil {
+			activeUserSessions := s.sessionMgr.GetSessionsByUserID(sess.UserID)
+			for _, us := range activeUserSessions {
+				if us != nil && us.ID != sess.ID {
+					shouldClearUser = false
+					break
+				}
+			}
+		}
+		if shouldClearUser {
+			s.stickyMgr.ClearAffinity(sess.UserID)
+		}
 	}
+
 	if s.pool != nil {
-		s.pool.DecrementConnections(sess.BackendTunnelID)
+		shouldDecrement := true
+		if s.timedOutEpoch != nil {
+			if epoch, ok := s.timedOutEpoch[sess.ID]; ok {
+				delete(s.timedOutEpoch, sess.ID)
+				if epoch != s.reconcileEpoch {
+					shouldDecrement = false
+				}
+			}
+		}
+		if shouldDecrement {
+			s.pool.DecrementConnections(sess.BackendTunnelID)
+		}
 	}
 }
 

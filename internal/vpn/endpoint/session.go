@@ -28,6 +28,10 @@ var (
 // old backend's ActiveConnections gauge.
 type ReplacementHook func(ctx context.Context, old, new *models.VPNSession)
 
+// TimeoutHook is invoked when a session times out in CheckTimeouts before the
+// session is removed from memory and database tables.
+type TimeoutHook func(sess *models.VPNSession)
+
 // SessionMetrics instruments the session-lifecycle paths so counter-leak
 // paths are distinguishable in production (issue #78 direction item 2):
 // replacements_total counts session replacements, and the paired
@@ -60,6 +64,7 @@ type SessionManager struct {
 	activeCount     atomic.Int64
 	metrics         SessionMetrics
 	replacementHook ReplacementHook
+	timeoutHook     TimeoutHook
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -74,11 +79,18 @@ func NewSessionManager(db *database.DB, ipam *IPAM) *SessionManager {
 
 // SetReplacementHook registers the session-replacement callback (issue #78).
 // Must be called before Start accepts traffic; the hook runs while sm.mu is
-// held, so it must only touch the pool counter and DB — never re-enter the
+// held, so it must only touch the pool counter and DB - never re-enter the
 // session manager.
 func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
 	sm.mu.Lock()
 	sm.replacementHook = fn
+	sm.mu.Unlock()
+}
+
+// SetTimeoutHook registers a callback invoked when a session times out in CheckTimeouts.
+func (sm *SessionManager) SetTimeoutHook(fn TimeoutHook) {
+	sm.mu.Lock()
+	sm.timeoutHook = fn
 	sm.mu.Unlock()
 }
 
@@ -92,7 +104,7 @@ func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
 // already exists for the same peer (client rekey/reconnect), the old session
 // is fully replaced: removed from memory, its DB row closed, and the
 // replacement hook fires so the caller can migrate the pool counter and
-// redirect live routes (issue #78 — every rekey previously leaked +1 on the
+// redirect live routes (issue #78 - every rekey previously leaked +1 on the
 // old backend's ActiveConnections gauge because neither the pool decrement
 // nor a teardown for the old ID ever ran).
 // connectionName is the user-facing config name resolved by the caller's
@@ -109,7 +121,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 
 	// If session already exists for this peer, close it before creating a new
 	// one. The DB row is deleted here (same primitive the clean-disconnect
-	// path uses) so no orphan row for a dead session ID survives — a later
+	// path uses) so no orphan row for a dead session ID survives - a later
 	// DisconnectSession(oldID) would otherwise return ErrSessionNotFound and
 	// its mirror-decrement would never run.
 	var replaced *models.VPNSession
@@ -128,7 +140,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 			}
 		}
 		// NOTE: the old session's IPAM allocation is intentionally NOT
-		// released here — the replacement reuses the same peer IP (the
+		// released here - the replacement reuses the same peer IP (the
 		// caller re-resolved the allocation just before CreateSession), so
 		// releasing would drop a still-valid reservation.
 	}
@@ -158,7 +170,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	if sm.db != nil {
 		if err := sm.db.CreateVPNSession(ctx, sess); err != nil {
 			if replaced != nil {
-				// The replacement is lost; keep the leak observable — the
+				// The replacement is lost; keep the leak observable - the
 				// caller's pool counter for the old backend is still holding
 				// the previous session's count and the hook below will not
 				// run with a usable new session.
@@ -301,6 +313,9 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 	}
 
 	for _, sess := range timedOut {
+		if sm.timeoutHook != nil {
+			sm.timeoutHook(sess)
+		}
 		sess.Status = "disconnected"
 		if sm.db != nil {
 			_ = sm.db.CloseVPNSession(ctx, sess.ID)
