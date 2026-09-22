@@ -24,7 +24,7 @@ const (
 
 	DefaultCacheTTL = 1 * time.Hour
 	DefaultTimeout  = 10 * time.Second
-	UserAgent       = "amnezia-nexus/1.2.1"
+	UserAgent       = "amnezia-nexus/1.3.0"
 )
 
 // ComponentStatus represents the upstream status of a single AmneziaWG component.

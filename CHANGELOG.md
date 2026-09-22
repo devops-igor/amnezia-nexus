@@ -7,18 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - Orion - 2026-09-23
+
+Major feature release introducing backend self-healing reconciliation, sticky session affinity TTL, upstream AmneziaWG release monitoring and admin visibility, periodic server resource telemetry polling, automated Playwright E2E verification, and compatibility policy governance.
+
 ### Added
 
-- Compatibility policy: formalized and adopted the Amnezia Nexus Compatibility Policy in `useful_notes/COMPATIBILITY.md`, defining HTTP API, Go internal, frontend, and data migration lifecycles, and scheduling immediate removal of `/api/servers/*` and `/api/my/connections/*` in v1.2.0 (#263).
+- Self-healing reconciliation: background periodic health sweeps, flap damping, and automated re-activation of healthy backend servers with persistent disable provenance and two-phase atomic state transitions (#279, #282).
+- Sticky session affinity TTL: configurable session affinity duration (default 30 minutes) with automatic eviction of expired affinities to balance returning client connections (#281, #283).
+- Upstream release monitoring: automated tracking of upstream amneziawg-go, amneziawg-tools, and Docker base images with admin visibility in Settings, daily scheduled monitor workflow, and GET /api/system/upstream-status endpoint (#242, #270).
+- Periodic server telemetry polling: dynamic resource monitoring (CPU, RAM, disk, network) in the server dashboard via Telemetry.poll streams with tab-visibility awareness and in-flight request guards (#206, #232).
+- End-to-end integration test suite: in-tree Playwright test suite covering onboarding, protocol installation, session handling, settings, and full lifecycle automation (#246, #247, #264, #265).
+- Automated CI DEV verification: hardware-locked E2E verification workflow on self-hosted ARM64 runners with clean-slate volume teardown and ephemeral environment overrides (#240, #248, #266).
+- Compatibility policy: formalized and adopted the Amnezia Nexus Compatibility Policy in `useful_notes/COMPATIBILITY.md`, defining HTTP API, Go internal, frontend, and data migration lifecycles (#263, #275).
+
+### Changed
+
+- Portal stylesheet cleanup: pruned dead CSS selectors and orphaned pulse-dot animation rules from the portal stylesheet (#250, #251, #252, #253, #254, #255, #256, #267).
+- Router template shims: removed unused template compatibility shims from router initialization (#249, #269).
 
 ### Fixed
 
-- Remote lock release race: eliminated concurrent `.gate` deletion in `remoteLockReleaseCmd` that caused flaky `ENOTEMPTY` errors and lock release failures under acquisition contention.
+- Idle session reaper teardown: eliminated race conditions and deadlocks in the session idle reaper by removing lock inversion, synchronizing lifecycle mutations, and verifying session generation before clearing affinities (#281, #283).
+- Upstream version comparison and status reporting: aligned version comparison with SemVer 2.0.0 prerelease precedence rules, fixed partial-failure cache poisoning, and added degraded health badges (#273, #274).
+- Remote lock release race: eliminated concurrent `.gate` directory deletion in `remoteLockReleaseCmd` that caused flaky `ENOTEMPTY` errors and lock release failures under acquisition contention (#263, #275).
+- SSH command empty password handling: avoided typed nil pointer boxing in RunSudoCommand and added defensive reflection checks in SSH session setup (#248, #266).
 
 ### Removed
 
-- Frontend compatibility aliases: removed unused `window.apiCall`, `window.confirmModal`, and `window.DataTable` aliases in favor of `API`, `UI`, and `NexusTable` per `useful_notes/COMPATIBILITY.md` §4.2 (#257, #258, #259).
-- Legacy internal/vpn constructors: removed unused compatibility shims NewService, NewLeastConnectionsLoadBalancer, and type alias LeastConnectionsLoadBalancer per useful_notes/COMPATIBILITY.md (#260).
+- Frontend compatibility aliases: removed unused `window.apiCall`, `window.confirmModal`, and `window.DataTable` aliases in favor of `API`, `UI`, and `NexusTable` per `useful_notes/COMPATIBILITY.md` §4.2 (#257, #258, #259, #280).
+- Legacy internal/vpn constructors: removed unused compatibility shims `NewService`, `NewLeastConnectionsLoadBalancer`, and type alias `LeastConnectionsLoadBalancer` per `useful_notes/COMPATIBILITY.md` (#260, #276).
 
 ## [1.2.1] - Polaris - 2026-09-21
 
