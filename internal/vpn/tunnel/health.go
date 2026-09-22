@@ -475,20 +475,7 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 	latencyThreshold := hp.cfg.LatencyThresholdMS
 	hp.mu.RUnlock()
 
-	tunnels := hp.pool.ListTunnels()
-	var targets []*models.BackendTunnel
-	for _, t := range tunnels {
-		if t.Status != "disabled" {
-			continue
-		}
-		if t.DisableReason == models.DisableReasonAdmin {
-			continue
-		}
-		if t.DisableReason == models.DisableReasonHealth || hp.IsAutoDisabled(t.ServerID) {
-			targets = append(targets, t)
-		}
-	}
-
+	targets := hp.collectSelfHealTargets()
 	if len(targets) == 0 {
 		return 0
 	}
@@ -501,136 +488,194 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if ctx.Err() != nil {
-				return
+			if hp.reconcileTunnel(ctx, tun, threshold, latencyThreshold) {
+				reconnectedCount.Add(1)
 			}
-
-			expectedVersion := tun.StateVersion
-
-			latencyMS, err := hp.probeEndpoint(ctx, tun)
-			if err != nil {
-				hp.mu.Lock()
-				hp.successCounts[tun.ServerID] = 0
-				hp.mu.Unlock()
-				slog.Debug("self-healing probe failed", "server_id", tun.ServerID, "error", err)
-				return
-			}
-
-			hp.mu.Lock()
-			hp.successCounts[tun.ServerID]++
-			successes := hp.successCounts[tun.ServerID]
-			hp.mu.Unlock()
-
-			if successes < threshold {
-				slog.Info("self-healing flap damping active",
-					"server_id", tun.ServerID,
-					"consecutive_successes", successes,
-					"threshold", threshold,
-				)
-				return
-			}
-
-			// Pre-hook fence: verify tunnel is still in health-disabled state with expected state_version
-			tunNow, err := hp.pool.GetTunnel(tun.ServerID)
-			if err != nil || tunNow == nil {
-				return
-			}
-			if tunNow.Status != "disabled" ||
-				tunNow.DisableReason == models.DisableReasonAdmin ||
-				(tunNow.DisableReason != models.DisableReasonHealth && !hp.IsAutoDisabled(tun.ServerID)) ||
-				tunNow.StateVersion != expectedVersion {
-				slog.Info("self-healing aborted: tunnel state changed before hook",
-					"server_id", tun.ServerID,
-					"current_status", tunNow.Status,
-					"current_reason", tunNow.DisableReason,
-					"current_version", tunNow.StateVersion,
-					"expected_version", expectedVersion,
-				)
-				return
-			}
-
-			hp.mu.RLock()
-			hook := hp.onSelfHealHook
-			if hook == nil {
-				hook = hp.onActiveHook
-			}
-			hp.mu.RUnlock()
-
-			if hook != nil {
-				if hookErr := hook(ContextWithSelfHealing(ctx), tunNow); hookErr != nil {
-					slog.Warn("self-healing hook failed", "server_id", tun.ServerID, "error", hookErr)
-					hp.mu.Lock()
-					hp.successCounts[tun.ServerID] = 0
-					hp.mu.Unlock()
-					return
-				}
-			}
-
-			// Post-hook check: verify tunnel was not administratively disabled during hook execution
-			tunAfterHook, err := hp.pool.GetTunnel(tun.ServerID)
-			if err != nil || tunAfterHook == nil {
-				return
-			}
-			if tunAfterHook.DisableReason == models.DisableReasonAdmin {
-				slog.Warn("self-healing aborted: tunnel administratively disabled during hook execution",
-					"server_id", tun.ServerID,
-				)
-				hp.mu.Lock()
-				delete(hp.autoDisabled, tun.ServerID)
-				delete(hp.successCounts, tun.ServerID)
-				hp.mu.Unlock()
-				return
-			}
-
-			newStatus := "active"
-			if latencyMS > latencyThreshold {
-				newStatus = "degraded"
-			}
-
-			if tunAfterHook.Status != "active" {
-				swapped, err := hp.pool.CompareAndSwapTunnelStatus(
-					ctx,
-					tun.ServerID,
-					"disabled",
-					tunNow.DisableReason,
-					tunNow.StateVersion,
-					newStatus,
-					models.DisableReasonNone,
-					latencyMS,
-				)
-				if err != nil {
-					slog.Error("self-healing CAS status update failed",
-						"server_id", tun.ServerID,
-						"error", err,
-					)
-					return
-				}
-				if !swapped {
-					slog.Info("self-healing CAS status update missed: state changed concurrently",
-						"server_id", tun.ServerID,
-					)
-					return
-				}
-			}
-
-			hp.mu.Lock()
-			hp.failCounts[tun.ServerID] = 0
-			delete(hp.autoDisabled, tun.ServerID)
-			delete(hp.successCounts, tun.ServerID)
-			hp.mu.Unlock()
-
-			reconnectedCount.Add(1)
-			slog.Info("self-healing successfully restored backend tunnel",
-				"server_id", tun.ServerID,
-				"tunnel_id", tun.ID,
-				"status", newStatus,
-				"latency_ms", latencyMS,
-			)
 		}()
 	}
 
 	wg.Wait()
 	return int(reconnectedCount.Load())
+}
+
+func (hp *HealthProber) collectSelfHealTargets() []*models.BackendTunnel {
+	tunnels := hp.pool.ListTunnels()
+	var targets []*models.BackendTunnel
+	for _, t := range tunnels {
+		if t.Status != "disabled" || t.DisableReason == models.DisableReasonAdmin {
+			continue
+		}
+		if t.DisableReason == models.DisableReasonHealth || hp.IsAutoDisabled(t.ServerID) {
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
+func (hp *HealthProber) reconcileTunnel(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	threshold int,
+	latencyThreshold int64,
+) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	latencyMS, ok := hp.probeAndFlapDamp(ctx, tun, threshold)
+	if !ok {
+		return false
+	}
+
+	tunNow, ok := hp.verifyPreHookState(tun)
+	if !ok {
+		return false
+	}
+
+	if !hp.invokeSelfHealHook(ctx, tunNow) {
+		return false
+	}
+
+	return hp.finalizeSelfHealRecovery(ctx, tun, tunNow, latencyMS, latencyThreshold)
+}
+
+func (hp *HealthProber) probeAndFlapDamp(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	threshold int,
+) (int64, bool) {
+	latencyMS, err := hp.probeEndpoint(ctx, tun)
+	if err != nil {
+		hp.mu.Lock()
+		hp.successCounts[tun.ServerID] = 0
+		hp.mu.Unlock()
+		slog.Debug("self-healing probe failed", "server_id", tun.ServerID, "error", err)
+		return 0, false
+	}
+
+	hp.mu.Lock()
+	hp.successCounts[tun.ServerID]++
+	successes := hp.successCounts[tun.ServerID]
+	hp.mu.Unlock()
+
+	if successes < threshold {
+		slog.Info("self-healing flap damping active",
+			"server_id", tun.ServerID,
+			"consecutive_successes", successes,
+			"threshold", threshold,
+		)
+		return 0, false
+	}
+	return latencyMS, true
+}
+
+func (hp *HealthProber) verifyPreHookState(tun *models.BackendTunnel) (*models.BackendTunnel, bool) {
+	tunNow, err := hp.pool.GetTunnel(tun.ServerID)
+	if err != nil || tunNow == nil {
+		return nil, false
+	}
+	if tunNow.Status != "disabled" ||
+		tunNow.DisableReason == models.DisableReasonAdmin ||
+		(tunNow.DisableReason != models.DisableReasonHealth && !hp.IsAutoDisabled(tun.ServerID)) ||
+		tunNow.StateVersion != tun.StateVersion {
+		slog.Info("self-healing aborted: tunnel state changed before hook",
+			"server_id", tun.ServerID,
+			"current_status", tunNow.Status,
+			"current_reason", tunNow.DisableReason,
+			"current_version", tunNow.StateVersion,
+			"expected_version", tun.StateVersion,
+		)
+		return nil, false
+	}
+	return tunNow, true
+}
+
+func (hp *HealthProber) invokeSelfHealHook(ctx context.Context, tunNow *models.BackendTunnel) bool {
+	hp.mu.RLock()
+	hook := hp.onSelfHealHook
+	if hook == nil {
+		hook = hp.onActiveHook
+	}
+	hp.mu.RUnlock()
+
+	if hook != nil {
+		if hookErr := hook(ContextWithSelfHealing(ctx), tunNow); hookErr != nil {
+			slog.Warn("self-healing hook failed", "server_id", tunNow.ServerID, "error", hookErr)
+			hp.mu.Lock()
+			hp.successCounts[tunNow.ServerID] = 0
+			hp.mu.Unlock()
+			return false
+		}
+	}
+	return true
+}
+
+func (hp *HealthProber) finalizeSelfHealRecovery(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	tunNow *models.BackendTunnel,
+	latencyMS int64,
+	latencyThreshold int64,
+) bool {
+	tunAfterHook, err := hp.pool.GetTunnel(tun.ServerID)
+	if err != nil || tunAfterHook == nil {
+		return false
+	}
+	if tunAfterHook.DisableReason == models.DisableReasonAdmin {
+		slog.Warn("self-healing aborted: tunnel administratively disabled during hook execution",
+			"server_id", tun.ServerID,
+		)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, tun.ServerID)
+		delete(hp.successCounts, tun.ServerID)
+		hp.mu.Unlock()
+		return false
+	}
+
+	newStatus := "active"
+	if latencyMS > latencyThreshold {
+		newStatus = "degraded"
+	}
+
+	if tunAfterHook.Status != "active" {
+		swapped, err := hp.pool.CompareAndSwapTunnelStatus(
+			ctx,
+			tun.ServerID,
+			"disabled",
+			tunNow.DisableReason,
+			tunNow.StateVersion,
+			newStatus,
+			models.DisableReasonNone,
+			latencyMS,
+		)
+		if err != nil {
+			slog.Error("self-healing CAS status update failed",
+				"server_id", tun.ServerID,
+				"error", err,
+			)
+			return false
+		}
+		if !swapped {
+			slog.Info("self-healing CAS status update missed: state changed concurrently",
+				"server_id", tun.ServerID,
+			)
+			return false
+		}
+	}
+
+	hp.mu.Lock()
+	hp.failCounts[tun.ServerID] = 0
+	delete(hp.autoDisabled, tun.ServerID)
+	delete(hp.successCounts, tun.ServerID)
+	hp.mu.Unlock()
+
+	slog.Info("self-healing successfully restored backend tunnel",
+		"server_id", tun.ServerID,
+		"tunnel_id", tun.ID,
+		"status", newStatus,
+		"latency_ms", latencyMS,
+	)
+	return true
 }
 
 // ProbeAll probes all backend tunnels concurrently and updates their statuses.
