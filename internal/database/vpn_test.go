@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -505,5 +506,162 @@ func TestCreateVPNSession_AssignedIPConflictResolution(t *testing.T) {
 	}
 	if bobAfterClose != nil {
 		t.Errorf("expected session to be deleted after CloseVPNSession, got: %+v", bobAfterClose)
+	}
+}
+
+func TestBackendTunnel_DisableReasonAndStateVersion(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "CAS Server", Host: "192.0.2.55"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// 1. CreateBackendTunnel defaults state_version to 1 if not provided
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-cas-1",
+		PublicKey:     "pub-cas-1",
+		PrivateKey:    "priv-cas-1",
+		Endpoint:      "192.0.2.55:51820",
+		Status:        models.TunnelStatusDisabled,
+		DisableReason: models.DisableReasonHealth,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	tun, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil || tun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if tun.Status != models.TunnelStatusDisabled {
+		t.Errorf("expected status %q, got %q", models.TunnelStatusDisabled, tun.Status)
+	}
+	if tun.DisableReason != models.DisableReasonHealth {
+		t.Errorf("expected disable_reason %q, got %q", models.DisableReasonHealth, tun.DisableReason)
+	}
+	if tun.StateVersion != 1 {
+		t.Errorf("expected state_version 1, got %d", tun.StateVersion)
+	}
+
+	// 2. UpdateBackendTunnelStatusWithReason bumps state_version and sets admin disable
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+		t.Fatalf("UpdateBackendTunnelStatusWithReason failed: %v", err)
+	}
+
+	tun, err = db.GetBackendTunnel(ctx, tID)
+	if err != nil || tun == nil {
+		t.Fatalf("GetBackendTunnel after update failed: %v", err)
+	}
+	if tun.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected disable_reason %q, got %q", models.DisableReasonAdmin, tun.DisableReason)
+	}
+	if tun.StateVersion != 2 {
+		t.Errorf("expected state_version 2, got %d", tun.StateVersion)
+	}
+
+	// 3. CompareAndSwapTunnelStatus fails on mismatched version
+	swapped, err := db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 1, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	if err != nil {
+		t.Fatalf("CompareAndSwapTunnelStatus returned unexpected error: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail on stale expected version 1, but it succeeded")
+	}
+
+	// 4. CompareAndSwapTunnelStatus fails on mismatched reason
+	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	if err != nil {
+		t.Fatalf("CompareAndSwapTunnelStatus returned unexpected error: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail on mismatched expected reason health, but it succeeded")
+	}
+
+	// 5. CompareAndSwapTunnelStatus succeeds on matching state and bumps version
+	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	if err != nil {
+		t.Fatalf("CompareAndSwapTunnelStatus returned error: %v", err)
+	}
+	if !swapped {
+		t.Fatal("expected CAS to succeed on matching state, but it failed")
+	}
+
+	tun, err = db.GetBackendTunnel(ctx, tID)
+	if err != nil || tun == nil {
+		t.Fatalf("GetBackendTunnel after CAS failed: %v", err)
+	}
+	if tun.Status != models.TunnelStatusActive {
+		t.Errorf("expected status active after CAS, got %q", tun.Status)
+	}
+	if tun.DisableReason != models.DisableReasonNone {
+		t.Errorf("expected empty disable_reason after CAS, got %q", tun.DisableReason)
+	}
+	if tun.StateVersion != 3 {
+		t.Errorf("expected state_version 3 after CAS, got %d", tun.StateVersion)
+	}
+	if tun.LatencyMS != 15 {
+		t.Errorf("expected latency_ms 15 after CAS, got %d", tun.LatencyMS)
+	}
+}
+
+func TestMigrateBackendTunnelsDisableReason(t *testing.T) {
+	ctx := context.Background()
+	// Open raw SQLite database without running standard migrations
+	rawDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory sqlite: %v", err)
+	}
+	defer rawDB.Close()
+
+	// Create legacy backend_tunnels table without disable_reason and state_version
+	_, err = rawDB.ExecContext(ctx, `
+		CREATE TABLE backend_tunnels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_id INTEGER NOT NULL,
+			interface_name TEXT NOT NULL,
+			public_key TEXT NOT NULL,
+			private_key TEXT NOT NULL,
+			endpoint TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'connecting',
+			created_at TEXT NOT NULL
+		);
+		INSERT INTO backend_tunnels (server_id, interface_name, public_key, private_key, endpoint, status, created_at)
+		VALUES (1, 'awg-leg-1', 'pub', 'priv', '192.0.2.1:51820', 'disabled', '2026-09-01T00:00:00Z');
+	`)
+	if err != nil {
+		t.Fatalf("failed to create legacy backend_tunnels: %v", err)
+	}
+
+	d := &DB{
+		sqlDB:     rawDB,
+		secretKey: testSecretKey,
+	}
+
+	// Run migration
+	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
+		t.Fatalf("migrateBackendTunnelsDisableReason failed: %v", err)
+	}
+
+	// Idempotency: running a second time should not error
+	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
+		t.Fatalf("idempotent migration call failed: %v", err)
+	}
+
+	// Query row and verify defaults
+	var disableReason string
+	var stateVersion int64
+	row := rawDB.QueryRowContext(ctx, "SELECT disable_reason, state_version FROM backend_tunnels WHERE id = 1")
+	if err := row.Scan(&disableReason, &stateVersion); err != nil {
+		t.Fatalf("failed to scan migrated columns: %v", err)
+	}
+
+	if disableReason != "" {
+		t.Errorf("expected default empty disable_reason, got %q", disableReason)
+	}
+	if stateVersion != 1 {
+		t.Errorf("expected default state_version 1, got %d", stateVersion)
 	}
 }

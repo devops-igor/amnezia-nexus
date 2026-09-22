@@ -923,6 +923,112 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 	}
 }
 
+type mockStatusUpdater struct {
+	mu      sync.Mutex
+	updates []tunnelStatusUpdate
+}
+
+type tunnelStatusUpdate struct {
+	serverID  int64
+	status    string
+	latencyMS int64
+}
+
+func (m *mockStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updates = append(m.updates, tunnelStatusUpdate{
+		serverID:  serverID,
+		status:    status,
+		latencyMS: latencyMS,
+	})
+	return nil
+}
+
+func TestOrchestrator_CheckBackendTunnelHealth_SkipsAdminDisabled(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Admin Disabled", Host: "10.0.0.88", SSHPort: 22})
+
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srvID,
+		InterfaceName: "awg-admin-skip",
+		PublicKey:     "pub-admin-skip",
+		Endpoint:      "127.0.0.1:55499",
+		Status:        "disabled",
+		DisableReason: models.DisableReasonAdmin,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	probed := false
+	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		probed = true
+		return 20 * time.Millisecond, nil
+	}))
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	if probed {
+		t.Fatal("expected probe to NOT be invoked for admin-disabled backend tunnel")
+	}
+
+	tun, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil || tun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if tun.Status != "disabled" || tun.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected tunnel to remain disabled/admin, got status=%q reason=%q", tun.Status, tun.DisableReason)
+	}
+}
+
+func TestOrchestrator_CheckBackendTunnelHealth_UsesTunnelStatusUpdater(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Updater", Host: "10.0.0.89", SSHPort: 22})
+
+	_, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srvID,
+		InterfaceName: "awg-updater",
+		PublicKey:     "pub-updater",
+		Endpoint:      "127.0.0.1:55498",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	updater := &mockStatusUpdater{}
+	orch := New(db, nil,
+		WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			return 42 * time.Millisecond, nil
+		}),
+		WithTunnelStatusUpdater(updater),
+	)
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	updater.mu.Lock()
+	defer updater.mu.Unlock()
+	if len(updater.updates) != 1 {
+		t.Fatalf("expected 1 update call to TunnelStatusUpdater, got %d", len(updater.updates))
+	}
+	if updater.updates[0].serverID != srvID || updater.updates[0].status != "active" || updater.updates[0].latencyMS != 42 {
+		t.Errorf("unexpected update payload: %+v", updater.updates[0])
+	}
+}
+
 func TestOrchestrator_SyncTraffic_TeleMTAndProtocols(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()

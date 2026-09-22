@@ -1028,3 +1028,77 @@ func TestVPNEnableBackendHandler_ContextCancellationResilience(t *testing.T) {
 		t.Fatalf("expected backend for server %d to be enabled in backend_tunnels table", sID)
 	}
 }
+
+func TestVPNDisableBackend_PersistenceFailureReturns500(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	srv := &models.Server{
+		Name:      "VPN-Node-Disable-Fail",
+		Host:      "127.0.0.1",
+		SSHPort:   22,
+		SSHUser:   "root",
+		SSHPass:   "pass",
+		Protocols: map[string]any{},
+		CreatedAt: time.Now(),
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullVPNRouter(h)
+
+	// Enable backend first so the backend tunnel exists in pool and DB.
+	reqEnable := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID), nil)
+	wEnable := httptest.NewRecorder()
+	r.ServeHTTP(wEnable, reqEnable)
+	if wEnable.Code != http.StatusOK {
+		t.Fatalf("setup: expected 200 when enabling backend, got %d (body: %s)", wEnable.Code, wEnable.Body.String())
+	}
+
+	// Verify backend tunnel is active in DB before disable attempt
+	tunBefore, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("expected backend tunnel in DB, got: %v, err: %v", tunBefore, err)
+	}
+	if tunBefore.Status != "active" {
+		t.Fatalf("expected status 'active' before disable, got: %s", tunBefore.Status)
+	}
+
+	// Attempt to disable with a canceled context to inject DB write/persistence failure
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	reqDisable := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/disable", sID), nil).WithContext(canceledCtx)
+	wDisable := httptest.NewRecorder()
+	r.ServeHTTP(wDisable, reqDisable)
+
+	if wDisable.Code == http.StatusOK {
+		t.Fatalf("expected failure, but got HTTP 200 OK")
+	}
+	if wDisable.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when backend disable persistence fails, got %d (body: %s)", wDisable.Code, wDisable.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.NewDecoder(wDisable.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to parse JSON error response: %v", err)
+	}
+	if errCode, _ := errResp["error"].(string); errCode != "internal_error" {
+		t.Errorf("expected error code 'internal_error', got: %v", errCode)
+	}
+	detail, _ := errResp["detail"].(string)
+	if !strings.Contains(detail, "failed to persist administrative backend disable") {
+		t.Errorf("expected error detail to mention persistence failure, got: %s", detail)
+	}
+
+	// Verify backend status remains active in DB
+	tunAfter, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("expected backend tunnel still in DB, got: %v, err: %v", tunAfter, err)
+	}
+	if tunAfter.Status != "active" {
+		t.Errorf("expected backend status to remain 'active' in DB, got: %s", tunAfter.Status)
+	}
+}

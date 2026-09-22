@@ -24,6 +24,11 @@ type UserOpsService interface {
 	PerformMassOperations(ctx context.Context, req userops.MassOperationRequest) error
 }
 
+// TunnelStatusUpdater defines the interface for synchronizing backend tunnel health status with the VPN subsystem.
+type TunnelStatusUpdater interface {
+	SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error
+}
+
 type healthProbeKey struct {
 	clientPriv string
 	serverPub  string
@@ -44,6 +49,7 @@ type Orchestrator struct {
 	db                    *database.DB
 	registry              ProtocolResolver
 	userOps               UserOpsService
+	statusUpdater         TunnelStatusUpdater
 	probeFn               ProbeFunc
 	bootDelay             time.Duration
 	interval              time.Duration
@@ -121,6 +127,13 @@ func WithProbeFailureThreshold(threshold int) Option {
 	}
 }
 
+// WithTunnelStatusUpdater configures a tunnel status updater on Orchestrator initialization.
+func WithTunnelStatusUpdater(u TunnelStatusUpdater) Option {
+	return func(o *Orchestrator) {
+		o.statusUpdater = u
+	}
+}
+
 // New creates a new BackgroundTaskOrchestrator.
 func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrator {
 	var defaultUserOps UserOpsService
@@ -148,6 +161,13 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 	}
 
 	return o
+}
+
+// SetTunnelStatusUpdater configures the tunnel status updater (e.g. VPN service).
+func (o *Orchestrator) SetTunnelStatusUpdater(u TunnelStatusUpdater) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.statusUpdater = u
 }
 
 // Name returns the service identifier for supervisor registration.

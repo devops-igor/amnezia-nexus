@@ -46,7 +46,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "disabled") {
+		if strings.EqualFold(t.Status, "disabled") || t.DisableReason == models.DisableReasonAdmin {
 			continue
 		}
 
@@ -102,7 +102,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 				"threshold", threshold,
 				"err", err,
 			)
-			_ = o.db.UpdateBackendTunnelStatus(ctx, t.ID, "degraded", 0)
+			o.updateTunnelStatus(ctx, &t, "degraded", 0)
 			degradedTunnels = append(degradedTunnels, t.ID)
 			continue
 		}
@@ -122,41 +122,66 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			healthyTunnels = append(healthyTunnels, &tCopy)
 		}
 
-		_ = o.db.UpdateBackendTunnelStatus(ctx, t.ID, status, latencyMS)
+		o.updateTunnelStatus(ctx, &t, status, latencyMS)
 	}
 
 	// Trigger failover / migration for sessions on degraded tunnels
-	if len(degradedTunnels) > 0 && len(healthyTunnels) > 0 {
-		sessions, err := o.db.GetActiveVPNSessions(ctx)
-		if err == nil && len(sessions) > 0 {
-			degradedMap := make(map[int64]bool)
-			for _, tid := range degradedTunnels {
-				degradedMap[tid] = true
-			}
-
-			migrated := 0
-			hIdx := 0
-			for _, s := range sessions {
-				if degradedMap[s.BackendTunnelID] {
-					target := healthyTunnels[hIdx%len(healthyTunnels)]
-					hIdx++
-					s.BackendTunnelID = target.ID
-					s.Status = "connected"
-					if err := o.db.CreateVPNSession(ctx, &s); err == nil {
-						migrated++
-					}
-				}
-			}
-			if migrated > 0 {
-				slog.Info("Migrated VPN sessions from degraded backend tunnels", "count", migrated)
-			}
-		}
-	}
+	o.migrateDegradedTunnelSessions(ctx, degradedTunnels, healthyTunnels)
 
 	return nil
 }
 
+// migrateDegradedTunnelSessions migrates active sessions off degraded tunnels onto healthy ones.
+func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degradedTunnels []int64, healthyTunnels []*models.BackendTunnel) {
+	if len(degradedTunnels) == 0 || len(healthyTunnels) == 0 || o.db == nil {
+		return
+	}
+	sessions, err := o.db.GetActiveVPNSessions(ctx)
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+
+	degradedMap := make(map[int64]bool, len(degradedTunnels))
+	for _, tid := range degradedTunnels {
+		degradedMap[tid] = true
+	}
+
+	migrated := 0
+	hIdx := 0
+	for _, s := range sessions {
+		if degradedMap[s.BackendTunnelID] {
+			target := healthyTunnels[hIdx%len(healthyTunnels)]
+			hIdx++
+			s.BackendTunnelID = target.ID
+			s.Status = "connected"
+			if err := o.db.CreateVPNSession(ctx, &s); err == nil {
+				migrated++
+			}
+		}
+	}
+	if migrated > 0 {
+		slog.Info("Migrated VPN sessions from degraded backend tunnels", "count", migrated)
+	}
+}
+
 // resolvedProbeParams carries the obfuscation parameters used for a raw UDP
+// updateTunnelStatus updates a backend tunnel's status and latency using the configured
+// TunnelStatusUpdater (e.g. VPN service pool) or falls back to an atomic CAS DB update.
+func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) {
+	o.mu.RLock()
+	updater := o.statusUpdater
+	o.mu.RUnlock()
+
+	if updater != nil {
+		_ = updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS)
+		return
+	}
+
+	if o.db != nil {
+		_, _ = o.db.CompareAndSwapTunnelStatus(ctx, t.ID, t.Status, t.DisableReason, t.StateVersion, status, t.DisableReason, latencyMS)
+	}
+}
+
 // Noise IK probe against a backend tunnel. h1/h2 carry models.HeaderRange
 // (full AWG 3.1 ranges, issue #49); they are typed `any` to match ProbeFunc,
 // which ProbeAWGEndpointRange accepts alongside uint32.

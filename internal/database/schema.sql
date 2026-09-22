@@ -122,6 +122,8 @@ CREATE TABLE IF NOT EXISTS backend_tunnels (
     probe_private_key TEXT NOT NULL DEFAULT '',
     endpoint TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'connecting',
+    disable_reason TEXT NOT NULL DEFAULT '',
+    state_version INTEGER NOT NULL DEFAULT 1,
     last_health_check TEXT,
     latency_ms INTEGER DEFAULT 0,
     active_connections INTEGER DEFAULT 0,
