@@ -173,11 +173,37 @@ func TestServerHandlers(t *testing.T) {
 	})
 
 	t.Run("ServerStatsHandler", func(t *testing.T) {
+		origCmd := mockSSH.cmdFunc
+		defer func() { mockSSH.cmdFunc = origCmd }()
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "===CPU===") {
+				return "===CPU===\n15.5\n===RAM===\n2097152000 8388608000\n===DISK===\n10737418240 53687091200\n===NET===\n123456 654321\n===UPTIME===\nup 5 days, 2 hours\n", "", 0, nil
+			}
+			if origCmd != nil {
+				return origCmd(ctx, cmd)
+			}
+			return "ok", "", 0, nil
+		}
+
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var stats models.ServerStatsResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+			t.Fatalf("failed to decode stats response: %v", err)
+		}
+		if stats.CPU != 15.5 {
+			t.Errorf("expected CPU 15.5, got %v", stats.CPU)
+		}
+		if stats.RAMTotal != 8388608000 || stats.RAMUsed != 2097152000 {
+			t.Errorf("expected RAM totals, got used=%d total=%d", stats.RAMUsed, stats.RAMTotal)
+		}
+		if stats.DiskTotal != 53687091200 || stats.DiskUsed != 10737418240 {
+			t.Errorf("expected Disk totals, got used=%d total=%d", stats.DiskUsed, stats.DiskTotal)
 		}
 	})
 
@@ -463,15 +489,18 @@ func TestServerHandlers(t *testing.T) {
 
 	t.Run("ParseCombinedStats", func(t *testing.T) {
 		raw := "===CPU===\n12.5\n===RAM===\n1000 2000\n===DISK===\n5000 10000\n===NET===\n1024 2048\n===UPTIME===\nup 2 hours\n"
-		stats := parseCombinedStats(raw)
+		stats, err := parseCombinedStats(raw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if stats.CPU != 12.5 || stats.RAMPercent != 50.0 || stats.DiskPercent != 50.0 || stats.NetRx != 1024 || stats.NetTx != 2048 || stats.Uptime != "up 2 hours" {
 			t.Errorf("parseCombinedStats failed: %+v", stats)
 		}
 
 		// Empty string
-		emptyStats := parseCombinedStats("")
-		if emptyStats.CPU != 0 {
-			t.Errorf("expected 0 stats")
+		_, err = parseCombinedStats("")
+		if err == nil {
+			t.Errorf("expected error for empty stats")
 		}
 	})
 
@@ -1335,6 +1364,362 @@ func TestRenameServerHandler(t *testing.T) {
 
 		if wSupport.Code != http.StatusOK {
 			t.Errorf("expected 200 OK for support user, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
+		}
+	})
+}
+
+func TestServerStatsHandler_Failures(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Stats-Fail-Server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	t.Run("SSH error returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "connection timed out", 255, errors.New("ssh: connection dropped")
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Non-zero exit code returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "command terminated abnormally", 1, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Empty output returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Malformed incomplete output returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\n10.5\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Missing or empty CPU section returns 502 with stats_failed", func(t *testing.T) {
+		for _, raw := range []string{
+			"===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+			"===CPU===\n\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+			"===CPU===\n   \t  \n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n",
+		} {
+			mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+				return raw, "", 0, nil
+			}
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadGateway {
+				t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+			}
+			if !strings.Contains(w.Body.String(), "stats_failed") {
+				t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+			}
+		}
+	})
+
+	t.Run("Malformed CPU returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\nnot-a-number\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100 200\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Missing NET section returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\n15.5\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+
+	t.Run("Malformed NET returns 502 with stats_failed", func(t *testing.T) {
+		mockSSH.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+			return "===CPU===\n15.5\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\ninvalid net\n", "", 0, nil
+		}
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/stats", serverID), nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "stats_failed") {
+			t.Errorf("expected stats_failed error code, got %s", w.Body.String())
+		}
+	})
+}
+
+func TestParseCombinedStats(t *testing.T) {
+	t.Run("ValidLinuxStats", func(t *testing.T) {
+		raw := "===CPU===\n15.5\n" +
+			"===RAM===\n2097152 8388608\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===NET===\n102400 204800\n" +
+			"===UPTIME===\nup 3 days, 4 hours\n"
+
+		stats, err := parseCombinedStats(raw)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if stats.CPU != 15.5 {
+			t.Errorf("expected CPU 15.5, got %v", stats.CPU)
+		}
+		if stats.RAMUsed != 2097152 || stats.RAMTotal != 8388608 {
+			t.Errorf("expected RAM 2097152/8388608, got used=%d total=%d", stats.RAMUsed, stats.RAMTotal)
+		}
+		if stats.RAMPercent != 25.0 {
+			t.Errorf("expected RAMPercent 25.0, got %v", stats.RAMPercent)
+		}
+		if stats.DiskUsed != 10485760 || stats.DiskTotal != 52428800 {
+			t.Errorf("expected Disk 10485760/52428800, got used=%d total=%d", stats.DiskUsed, stats.DiskTotal)
+		}
+		if stats.DiskPercent != 20.0 {
+			t.Errorf("expected DiskPercent 20.0, got %v", stats.DiskPercent)
+		}
+		if stats.NetRx != 102400 || stats.NetTx != 204800 {
+			t.Errorf("expected Net 102400/204800, got rx=%d tx=%d", stats.NetRx, stats.NetTx)
+		}
+		if stats.Uptime != "up 3 days, 4 hours" {
+			t.Errorf("expected Uptime 'up 3 days, 4 hours', got %q", stats.Uptime)
+		}
+	})
+
+	t.Run("EmptyStringReturnsError", func(t *testing.T) {
+		for _, empty := range []string{"", "   \n\t  \n"} {
+			_, err := parseCombinedStats(empty)
+			if err == nil {
+				t.Errorf("expected error for empty raw stats %q, got nil", empty)
+			}
+		}
+	})
+
+	t.Run("MissingCPUSectionReturnsError", func(t *testing.T) {
+		raw := "===RAM===\n2097152 8388608\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===NET===\n102400 204800\n"
+
+		_, err := parseCombinedStats(raw)
+		if err == nil {
+			t.Errorf("expected error for missing CPU stats, got nil")
+		}
+	})
+
+	t.Run("EmptyCPUSectionReturnsError", func(t *testing.T) {
+		for _, emptyCPU := range []string{
+			"===CPU===\n\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n   \t  \n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(emptyCPU)
+			if err == nil {
+				t.Errorf("expected error for empty CPU stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MalformedCPUReturnsError", func(t *testing.T) {
+		for _, badCPU := range []string{
+			"===CPU===\nnot-a-number\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n-5.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badCPU)
+			if err == nil {
+				t.Errorf("expected error for malformed CPU stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingRAMSectionReturnsError", func(t *testing.T) {
+		raw := "===CPU===\n10.0\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===NET===\n102400 204800\n" +
+			"===UPTIME===\nup 1 day\n"
+
+		_, err := parseCombinedStats(raw)
+		if err == nil {
+			t.Errorf("expected error for missing RAM stats, got nil")
+		}
+	})
+
+	t.Run("MalformedRAMUsedReturnsError", func(t *testing.T) {
+		for _, badRAM := range []string{
+			"===CPU===\n10.0\n===RAM===\nabc 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n-10 8388608\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152\n===DISK===\n10485760 52428800\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badRAM)
+			if err == nil {
+				t.Errorf("expected error for malformed RAM stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingDISKSectionReturnsError", func(t *testing.T) {
+		raw := "===CPU===\n10.0\n" +
+			"===RAM===\n2097152 8388608\n" +
+			"===NET===\n102400 204800\n" +
+			"===UPTIME===\nup 1 day\n"
+
+		_, err := parseCombinedStats(raw)
+		if err == nil {
+			t.Errorf("expected error for missing DISK stats, got nil")
+		}
+	})
+
+	t.Run("MalformedDISKUsedReturnsError", func(t *testing.T) {
+		for _, badDisk := range []string{
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\nabc 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n-1 52428800\n===NET===\n102400 204800\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760\n===NET===\n102400 204800\n",
+		} {
+			_, err := parseCombinedStats(badDisk)
+			if err == nil {
+				t.Errorf("expected error for malformed DISK stats, got nil")
+			}
+		}
+	})
+
+	t.Run("MissingNETSectionReturnsError", func(t *testing.T) {
+		raw := "===CPU===\n10.0\n" +
+			"===RAM===\n2097152 8388608\n" +
+			"===DISK===\n10485760 52428800\n" +
+			"===UPTIME===\nup 1 day\n"
+
+		_, err := parseCombinedStats(raw)
+		if err == nil {
+			t.Errorf("expected error for missing NET stats, got nil")
+		}
+	})
+
+	t.Run("MalformedNETReturnsError", func(t *testing.T) {
+		for _, badNet := range []string{
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\ninvalid net\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n100\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n-1 50\n",
+			"===CPU===\n10.0\n===RAM===\n2097152 8388608\n===DISK===\n10485760 52428800\n===NET===\n50 -1\n",
+		} {
+			_, err := parseCombinedStats(badNet)
+			if err == nil {
+				t.Errorf("expected error for malformed NET stats, got nil")
+			}
+		}
+	})
+
+	t.Run("IncompleteOutputZeroTotalsReturnsError", func(t *testing.T) {
+		for _, zeroTotals := range []string{
+			"===CPU===\n10.0\n===RAM===\n0 0\n===DISK===\n0 5000000\n===NET===\n0 0\n",
+			"===CPU===\n10.0\n===RAM===\n0 1000000\n===DISK===\n0 0\n===NET===\n0 0\n",
+			"===CPU===\n10.0\n===RAM===\n0 0\n===DISK===\n0 0\n===NET===\n0 0\n",
+		} {
+			_, err := parseCombinedStats(zeroTotals)
+			if err == nil {
+				t.Errorf("expected error for zero totals, got nil")
+			}
+		}
+	})
+
+	t.Run("LegitimateZerosAccepted", func(t *testing.T) {
+		raw := "===CPU===\n0.0\n" +
+			"===RAM===\n0 1000000\n" +
+			"===DISK===\n0 5000000\n" +
+			"===NET===\n0 0\n" +
+			"===UPTIME===\nup 10 minutes\n"
+
+		stats, err := parseCombinedStats(raw)
+		if err != nil {
+			t.Fatalf("expected no error for legitimate zeros, got: %v", err)
+		}
+		if stats.CPU != 0.0 {
+			t.Errorf("expected CPU 0.0, got %v", stats.CPU)
+		}
+		if stats.RAMUsed != 0 || stats.RAMTotal != 1000000 {
+			t.Errorf("expected RAM 0/1000000, got used=%d total=%d", stats.RAMUsed, stats.RAMTotal)
+		}
+		if stats.RAMPercent != 0.0 {
+			t.Errorf("expected RAMPercent 0.0, got %v", stats.RAMPercent)
+		}
+		if stats.DiskUsed != 0 || stats.DiskTotal != 5000000 {
+			t.Errorf("expected Disk 0/5000000, got used=%d total=%d", stats.DiskUsed, stats.DiskTotal)
+		}
+		if stats.DiskPercent != 0.0 {
+			t.Errorf("expected DiskPercent 0.0, got %v", stats.DiskPercent)
+		}
+		if stats.NetRx != 0 || stats.NetTx != 0 {
+			t.Errorf("expected Net 0/0, got rx=%d tx=%d", stats.NetRx, stats.NetTx)
+		}
+		if stats.Uptime != "up 10 minutes" {
+			t.Errorf("expected Uptime 'up 10 minutes', got %q", stats.Uptime)
 		}
 	})
 }
