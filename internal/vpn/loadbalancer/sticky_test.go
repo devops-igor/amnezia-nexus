@@ -355,3 +355,60 @@ func TestStickySessionManager_CustomNowFunc(t *testing.T) {
 		t.Errorf("expected peer affinity to be expired at t0+31m with DefaultAffinityTTL")
 	}
 }
+
+func TestStickySessionManager_Failover_ExpiredAffinityNotRevived(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	// Tunnel 1 and Tunnel 2
+	t2 := &models.BackendTunnel{ID: 2, Status: "active", ActiveConnections: 0}
+
+	// Assign user-1 and peer-1 to tunnel 1 at t0
+	sm.AssignAffinity("user-1", 1)
+	sm.AssignPeerAffinity("peer-1", 1)
+
+	// Also assign an active peer-2 at t0 + 8m
+	currTime = t0.Add(8 * time.Minute)
+	sm.AssignAffinity("user-2", 1)
+	sm.AssignPeerAffinity("peer-2", 1)
+
+	// Advance time to t0 + 15m (user-1/peer-1 expired: 15m > 10m TTL, but user-2/peer-2 active: 7m < 10m TTL)
+	currTime = t0.Add(15 * time.Minute)
+
+	// Degrade tunnel 1 and trigger failover to tunnel 2
+	res, err := sm.HandleFailover(ctx, 1, []*models.BackendTunnel{t2})
+	if err != nil {
+		t.Fatalf("HandleFailover failed: %v", err)
+	}
+
+	// Peer-2 should be migrated to tunnel 2
+	if len(res.Migrations) != 1 || res.Migrations[0].PeerPublicKey != "peer-2" || res.Migrations[0].NewBackendTunnelID != 2 {
+		t.Errorf("expected peer-2 to be migrated to tunnel 2, got %+v", res.Migrations)
+	}
+
+	// Peer-1 must NOT have been migrated, and its expired affinity must be purged
+	if tid, ok := sm.GetPeerAffinity("peer-1"); ok {
+		t.Errorf("expected expired peer-1 affinity to NOT be revived/present, got tid=%d", tid)
+	}
+	if tid, ok := sm.GetAffinity("user-1"); ok {
+		t.Errorf("expected expired user-1 affinity to NOT be revived/present, got tid=%d", tid)
+	}
+
+	// Peer-2's affinity must be active on tunnel 2
+	if tid, ok := sm.GetPeerAffinity("peer-2"); !ok || tid != 2 {
+		t.Errorf("expected active peer-2 to have affinity to tunnel 2, got tid=%d (ok=%v)", tid, ok)
+	}
+}

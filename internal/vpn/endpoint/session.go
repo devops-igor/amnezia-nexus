@@ -28,10 +28,6 @@ var (
 // old backend's ActiveConnections gauge.
 type ReplacementHook func(ctx context.Context, old, new *models.VPNSession)
 
-// TimeoutHook is invoked when a session times out in CheckTimeouts before the
-// session is removed from memory and database tables.
-type TimeoutHook func(sess *models.VPNSession)
-
 // SessionMetrics instruments the session-lifecycle paths so counter-leak
 // paths are distinguishable in production (issue #78 direction item 2):
 // replacements_total counts session replacements, and the paired
@@ -64,7 +60,6 @@ type SessionManager struct {
 	activeCount     atomic.Int64
 	metrics         SessionMetrics
 	replacementHook ReplacementHook
-	timeoutHook     TimeoutHook
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -84,13 +79,6 @@ func NewSessionManager(db *database.DB, ipam *IPAM) *SessionManager {
 func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
 	sm.mu.Lock()
 	sm.replacementHook = fn
-	sm.mu.Unlock()
-}
-
-// SetTimeoutHook registers a callback invoked when a session times out in CheckTimeouts.
-func (sm *SessionManager) SetTimeoutHook(fn TimeoutHook) {
-	sm.mu.Lock()
-	sm.timeoutHook = fn
 	sm.mu.Unlock()
 }
 
@@ -264,6 +252,16 @@ func (sm *SessionManager) TouchSession(peerPublicKey string) {
 	}
 }
 
+// SetSessionLastSeen sets the last seen timestamp of a session.
+func (sm *SessionManager) SetSessionLastSeen(peerPublicKey string, t time.Time) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sess, ok := sm.sessionsByPeer[peerPublicKey]; ok {
+		sess.LastSeen = t
+	}
+}
+
 // CloseSession transitions a session to the specified status and releases IPAM allocation.
 func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, status string) error {
 	sm.mu.Lock()
@@ -313,9 +311,7 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 	}
 
 	for _, sess := range timedOut {
-		if sm.timeoutHook != nil {
-			sm.timeoutHook(sess)
-		}
+		sess.TimedOutAt = now
 		sess.Status = "disconnected"
 		if sm.db != nil {
 			_ = sm.db.CloseVPNSession(ctx, sess.ID)

@@ -152,8 +152,7 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	reconcileEpoch uint64
-	timedOutEpoch  map[string]uint64
+	lastReconcileTime time.Time
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -499,6 +498,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	caps := loadbalancer.CapacityConfig{
 		MaxTotalPeers:      cfg.MaxTotalPeers,
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
+		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
 
 	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
@@ -525,12 +525,8 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		// real persisted identity instead of empty strings (which would
 		// wipe the keypair on the next save and invalidate every rendered
 		// client config).
-		if db != nil {
-			if fresh, ferr := db.GetVPNConfig(context.Background()); ferr == nil && fresh != nil {
-				cfg.ServerPrivateKey = fresh.ServerPrivateKey
-				cfg.ServerPublicKey = fresh.ServerPublicKey
-			}
-		}
+		cfg.ServerPublicKey = pub
+		cfg.ServerPrivateKey = priv
 	}
 
 	svc := &Service{
@@ -549,7 +545,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		accountant:    accountant,
 		portalPubKey:  pub,
 		portalPrivKey: priv,
-		timedOutEpoch: make(map[string]uint64),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
@@ -603,17 +598,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		if svc.stickyMgr != nil {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
-	})
-	sessionMgr.SetTimeoutHook(func(sess *models.VPNSession) {
-		if sess == nil {
-			return
-		}
-		svc.mu.Lock()
-		if svc.timedOutEpoch == nil {
-			svc.timedOutEpoch = make(map[string]uint64)
-		}
-		svc.timedOutEpoch[sess.ID] = svc.reconcileEpoch
-		svc.mu.Unlock()
 	})
 	// Idle-timeout reaper: run teardown directly on the reaped session
 	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
@@ -916,15 +900,17 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if s.pool == nil || s.db == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.reconcileEpoch++
 
 	sessions, err := s.db.GetActiveVPNSessions(ctx)
+	dbReadTime := time.Now().UTC()
 	if err != nil {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped, cannot read active sessions: %v", err)
 		return
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconcileTime = dbReadTime
 
 	desired := make(map[int64]int)
 	for i := range sessions {
@@ -2219,6 +2205,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	caps := loadbalancer.CapacityConfig{
 		MaxTotalPeers:      cfg.MaxTotalPeers,
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
+		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
 
 	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
@@ -2335,13 +2322,8 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 	if s.pool != nil {
 		shouldDecrement := true
-		if s.timedOutEpoch != nil {
-			if epoch, ok := s.timedOutEpoch[sess.ID]; ok {
-				delete(s.timedOutEpoch, sess.ID)
-				if epoch != s.reconcileEpoch {
-					shouldDecrement = false
-				}
-			}
+		if !sess.TimedOutAt.IsZero() && !s.lastReconcileTime.IsZero() && s.lastReconcileTime.After(sess.TimedOutAt) {
+			shouldDecrement = false
 		}
 		if shouldDecrement {
 			s.pool.DecrementConnections(sess.BackendTunnelID)

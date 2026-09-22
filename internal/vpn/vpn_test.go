@@ -4996,6 +4996,9 @@ func TestSessionReaperHook_ReconcileRace(t *testing.T) {
 	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
 		t.Fatalf("expected session A to time out, got %+v", timedOut)
 	}
+	if timedOut[0].TimedOutAt.IsZero() {
+		t.Fatalf("expected TimedOutAt to be set on timed-out session")
+	}
 
 	var reapedSessA *models.VPNSession
 	select {
@@ -5021,6 +5024,9 @@ func TestSessionReaperHook_ReconcileRace(t *testing.T) {
 	if err != nil || tunReconciled.ActiveConnections != 1 {
 		t.Fatalf("expected ActiveConnections=1 after reconciliation, got %d", tunReconciled.ActiveConnections)
 	}
+	if vpnSvc.lastReconcileTime.IsZero() || !vpnSvc.lastReconcileTime.After(reapedSessA.TimedOutAt) {
+		t.Fatalf("expected lastReconcileTime to be after TimedOutAt")
+	}
 
 	// 6. Now the delayed reapSession for session A runs
 	vpnSvc.reapSession(ctx, reapedSessA)
@@ -5029,5 +5035,76 @@ func TestSessionReaperHook_ReconcileRace(t *testing.T) {
 	tunFinal, err := vpnSvc.pool.GetTunnelByID(tunID)
 	if err != nil || tunFinal.ActiveConnections != 1 {
 		t.Errorf("expected pool ActiveConnections to remain 1 after stale reaper, got %d", tunFinal.ActiveConnections)
+	}
+}
+
+func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	peerKeyBob := "peer-deadlock-bob"
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: 1,
+		Protocol: "awg",
+		ClientID: peerKeyBob,
+		Name:     "bob-phone",
+	})
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Worker 1: repeatedly creates sessions and ages them
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		peers := []string{peerKeyAlice, peerKeyBob}
+		for i := 0; i < 50; i++ {
+			p := peers[i%len(peers)]
+			sess, _, err := vpnSvc.HandleIncomingPeer(ctx, p)
+			if err == nil && sess != nil {
+				vpnSvc.endpoint.SessionManager().SetSessionLastSeen(p, time.Now().UTC().Add(-10*time.Minute))
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Worker 2: repeatedly triggers timeout sweeps
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_, _ = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Worker 3: runs periodic reconciliation
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			vpnSvc.reconcileConnectionCounts(ctx)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded without deadlock
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock detected: concurrent timeout sweep, HandleIncomingPeer, and reconciliation did not complete in 10s")
 	}
 }
