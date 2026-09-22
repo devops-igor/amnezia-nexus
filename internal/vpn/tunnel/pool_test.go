@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -303,5 +304,283 @@ func TestProbeKeySurvivesAddTunnelAndSyncRoundTrip(t *testing.T) {
 	}
 	if restored.ProbePrivateKey == restored.PrivateKey {
 		t.Error("restored probe key must still differ from the data private key")
+	}
+}
+
+func TestTunnelPool_SyncFromDB_LoadsDisableReasonAndStateVersion(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "sync-test-server", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Insert tunnel directly in DB with explicit disable_reason and state_version
+	now := time.Now().UTC()
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:        sID,
+		InterfaceName:   "awg-be-10",
+		PublicKey:       "sync-pubkey",
+		PrivateKey:      "sync-privkey",
+		Endpoint:        "192.0.2.10:51820",
+		Status:          models.TunnelStatusDisabled,
+		DisableReason:   models.DisableReasonHealth,
+		StateVersion:    7,
+		CreatedAt:       now,
+		LastHealthCheck: &now,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	freshPool := NewPool(db)
+	if err := freshPool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tun, err := freshPool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tun.ID != tID {
+		t.Errorf("expected tunnel ID %d, got %d", tID, tun.ID)
+	}
+	if tun.Status != models.TunnelStatusDisabled {
+		t.Errorf("expected status %q, got %q", models.TunnelStatusDisabled, tun.Status)
+	}
+	if tun.DisableReason != models.DisableReasonHealth {
+		t.Errorf("expected disable_reason %q, got %q", models.DisableReasonHealth, tun.DisableReason)
+	}
+	if tun.StateVersion != 7 {
+		t.Errorf("expected state_version 7, got %d", tun.StateVersion)
+	}
+}
+
+func TestTunnelPool_SetTunnelStatus_ErrorPropagationAndStateIntegrity(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "err-prop-server", Host: "192.0.2.11"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "192.0.2.11:51820", "pubkey-11")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+	if tun.Status != models.TunnelStatusActive || tun.StateVersion != 1 {
+		t.Fatalf("initial state unexpected: status=%s, version=%d", tun.Status, tun.StateVersion)
+	}
+
+	// 1. Simulate DB failure via canceled context: error must be propagated and in-memory state unchanged
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	err = pool.SetTunnelStatus(canceledCtx, sID, models.TunnelStatusDegraded, 200)
+	if err == nil {
+		t.Fatal("expected SetTunnelStatus to return error on canceled context, got nil")
+	}
+
+	cur, err := pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if cur.Status != models.TunnelStatusActive {
+		t.Errorf("expected status to remain active after DB error, got %q", cur.Status)
+	}
+	if cur.LatencyMS != 10 {
+		t.Errorf("expected latency to remain 10 after DB error, got %d", cur.LatencyMS)
+	}
+	if cur.StateVersion != 1 {
+		t.Errorf("expected state_version to remain 1 after DB error, got %d", cur.StateVersion)
+	}
+
+	// 2. Successful update with valid context updates memory and DB, bumping state_version
+	if err := pool.SetTunnelStatus(ctx, sID, models.TunnelStatusDegraded, 200); err != nil {
+		t.Fatalf("SetTunnelStatus with valid context failed: %v", err)
+	}
+
+	cur, err = pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel after successful update failed: %v", err)
+	}
+	if cur.Status != models.TunnelStatusDegraded {
+		t.Errorf("expected status degraded, got %q", cur.Status)
+	}
+	if cur.LatencyMS != 200 {
+		t.Errorf("expected latency 200, got %d", cur.LatencyMS)
+	}
+	if cur.StateVersion != 2 {
+		t.Errorf("expected state_version 2, got %d", cur.StateVersion)
+	}
+
+	// Verify DB record matches
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusDegraded || dbTun.StateVersion != 2 {
+		t.Errorf("DB record mismatch: status=%q, version=%d", dbTun.Status, dbTun.StateVersion)
+	}
+}
+
+func TestTunnelPool_SetTunnelStatusWithReason(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "reason-test-server", Host: "192.0.2.12"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "192.0.2.12:51820", "pubkey-12")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	// 1. Set disabled with health reason
+	if err := pool.SetTunnelStatusWithReason(ctx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	cur, _ := pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusDisabled || cur.DisableReason != models.DisableReasonHealth || cur.StateVersion != 2 {
+		t.Errorf("unexpected pool state after SetTunnelStatusWithReason: %+v", cur)
+	}
+
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusDisabled || dbTun.DisableReason != models.DisableReasonHealth || dbTun.StateVersion != 2 {
+		t.Errorf("unexpected DB state after SetTunnelStatusWithReason: %+v", dbTun)
+	}
+
+	// 2. Set active via SetTunnelStatus: must clear DisableReason to empty string and bump version
+	if err := pool.SetTunnelStatus(ctx, sID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("SetTunnelStatus active failed: %v", err)
+	}
+
+	cur, _ = pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusActive || cur.DisableReason != models.DisableReasonNone || cur.StateVersion != 3 {
+		t.Errorf("unexpected pool state after SetTunnelStatus active: status=%q, reason=%q, version=%d", cur.Status, cur.DisableReason, cur.StateVersion)
+	}
+
+	dbTun, _ = db.GetBackendTunnel(ctx, tun.ID)
+	if dbTun.Status != models.TunnelStatusActive || dbTun.DisableReason != models.DisableReasonNone || dbTun.StateVersion != 3 {
+		t.Errorf("unexpected DB state after SetTunnelStatus active: status=%q, reason=%q, version=%d", dbTun.Status, dbTun.DisableReason, dbTun.StateVersion)
+	}
+
+	// 3. Error propagation on DB failure
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	err = pool.SetTunnelStatusWithReason(canceledCtx, sID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0)
+	if err == nil {
+		t.Fatal("expected error on canceled context, got nil")
+	}
+	cur, _ = pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusActive || cur.StateVersion != 3 {
+		t.Errorf("expected pool state unchanged on DB failure: status=%q, version=%d", cur.Status, cur.StateVersion)
+	}
+}
+
+func TestTunnelPool_CompareAndSwapTunnelStatus(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "cas-test-server", Host: "192.0.2.13"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "192.0.2.13:51820", "pubkey-13")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if err := pool.SetTunnelStatusWithReason(ctx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	// Current state: status=disabled, reason=health, version=2
+
+	// 1. Non-existent server ID returns ErrTunnelNotFound
+	if _, err := pool.CompareAndSwapTunnelStatus(ctx, 99999, models.TunnelStatusDisabled, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 10); err != ErrTunnelNotFound {
+		t.Errorf("expected ErrTunnelNotFound for unknown server, got %v", err)
+	}
+
+	// 2. Mismatched version fails
+	swapped, err := pool.CompareAndSwapTunnelStatus(ctx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 1, models.TunnelStatusActive, models.DisableReasonNone, 10)
+	if err != nil {
+		t.Fatalf("CAS returned error: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail on stale version 1")
+	}
+
+	// 3. Mismatched reason fails
+	swapped, err = pool.CompareAndSwapTunnelStatus(ctx, sID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 2, models.TunnelStatusActive, models.DisableReasonNone, 10)
+	if err != nil {
+		t.Fatalf("CAS returned error: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail on mismatched reason admin")
+	}
+
+	// 4. Mismatched status fails
+	swapped, err = pool.CompareAndSwapTunnelStatus(ctx, sID, models.TunnelStatusActive, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 10)
+	if err != nil {
+		t.Fatalf("CAS returned error: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail on mismatched status active")
+	}
+
+	// Assert in-memory state is still untouched
+	cur, _ := pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusDisabled || cur.DisableReason != models.DisableReasonHealth || cur.StateVersion != 2 {
+		t.Fatalf("pool state modified despite failed CAS attempts: %+v", cur)
+	}
+
+	// 5. Successful CAS update
+	swapped, err = pool.CompareAndSwapTunnelStatus(ctx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	if err != nil {
+		t.Fatalf("CAS returned error: %v", err)
+	}
+	if !swapped {
+		t.Fatal("expected CAS to succeed on matching state")
+	}
+
+	cur, _ = pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusActive || cur.DisableReason != models.DisableReasonNone || cur.StateVersion != 3 || cur.LatencyMS != 15 {
+		t.Errorf("unexpected pool state after successful CAS: %+v", cur)
+	}
+
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusActive || dbTun.DisableReason != models.DisableReasonNone || dbTun.StateVersion != 3 || dbTun.LatencyMS != 15 {
+		t.Errorf("unexpected DB state after successful CAS: %+v", dbTun)
+	}
+
+	// 6. DB error during CAS propagates error and leaves state untouched
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	swapped, err = pool.CompareAndSwapTunnelStatus(canceledCtx, sID, models.TunnelStatusActive, models.DisableReasonNone, 3, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
+	if err == nil {
+		t.Fatal("expected error on canceled context CAS, got nil")
+	}
+	if swapped {
+		t.Fatal("expected swapped to be false on error")
+	}
+	cur, _ = pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusActive || cur.StateVersion != 3 {
+		t.Errorf("pool state modified despite error during CAS: %+v", cur)
 	}
 }

@@ -264,6 +264,18 @@ type ConnectionLogEntry struct {
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
+// Backend tunnel statuses and disable reasons.
+const (
+	TunnelStatusConnecting = "connecting"
+	TunnelStatusActive     = "active"
+	TunnelStatusDegraded   = "degraded"
+	TunnelStatusDisabled   = "disabled"
+
+	DisableReasonNone   = ""
+	DisableReasonHealth = "health"
+	DisableReasonAdmin  = "admin"
+)
+
 // BackendTunnel represents an in-process AWG tunnel to a backend VPN server.
 type BackendTunnel struct {
 	ID            int64  `json:"id" db:"id"`
@@ -277,6 +289,8 @@ type BackendTunnel struct {
 	ProbePrivateKey   string     `json:"-" db:"probe_private_key"` // Encrypted at rest
 	Endpoint          string     `json:"endpoint" db:"endpoint"`
 	Status            string     `json:"status" db:"status"` // connecting, active, degraded, disabled
+	DisableReason     string     `json:"disable_reason,omitempty" db:"disable_reason"`
+	StateVersion      int64      `json:"state_version" db:"state_version"`
 	LastHealthCheck   *time.Time `json:"last_health_check,omitempty" db:"last_health_check"`
 	LatencyMS         int64      `json:"latency_ms" db:"latency_ms"`
 	ActiveConnections int        `json:"active_connections" db:"active_connections"`

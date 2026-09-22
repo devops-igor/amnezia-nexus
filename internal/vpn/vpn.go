@@ -631,7 +631,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		return svc.ensureBackendDeviceAttached(ctx, t)
 	})
 	svc.prober.SetOnSelfHealHook(func(ctx context.Context, t *models.BackendTunnel) error {
-		return svc.EnableBackend(ctx, t.ServerID)
+		return svc.EnableBackend(tunnel.ContextWithSelfHealing(ctx), t.ServerID)
 	})
 
 	return svc, nil
@@ -720,7 +720,7 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 			return s.ensureBackendDeviceAttached(ctx, t)
 		})
 		s.prober.SetOnSelfHealHook(func(ctx context.Context, t *models.BackendTunnel) error {
-			return s.EnableBackend(ctx, t.ServerID)
+			return s.EnableBackend(tunnel.ContextWithSelfHealing(ctx), t.ServerID)
 		})
 	}
 }
@@ -1603,6 +1603,17 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return errors.New("database not available")
 	}
 
+	var (
+		hasInitial     bool
+		initialReason  string
+		initialVersion int64
+	)
+	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
+		hasInitial = true
+		initialReason = initTun.DisableReason
+		initialVersion = initTun.StateVersion
+	}
+
 	server, err := db.GetServerByID(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("failed to load server %d: %w", serverID, err)
@@ -1652,6 +1663,26 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	currTun, err := pool.GetTunnel(serverID)
+	if err != nil {
+		return err
+	}
+	if tunnel.IsSelfHealingContext(ctx) && currTun.DisableReason == models.DisableReasonAdmin {
+		return errors.New("backend was administratively disabled; aborting enable")
+	}
+	if hasInitial {
+		// If an administrator disabled this backend while enable was in-flight,
+		// or if concurrent state mutation occurred, abort to respect the disable.
+		if currTun.DisableReason == models.DisableReasonAdmin && initialReason != models.DisableReasonAdmin {
+			return errors.New("backend was administratively disabled; aborting enable")
+		}
+		if currTun.StateVersion != initialVersion {
+			return errors.New("backend state modified concurrently; aborting enable")
+		}
+	} else if currTun.DisableReason == models.DisableReasonAdmin {
+		return errors.New("backend was administratively disabled; aborting enable")
+	}
+
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
 		return err
 	}
@@ -1660,7 +1691,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	// re-enabled backend gets the full FailureThreshold grace period; without
 	// this the first jittery probe after re-enable instantly re-disables it.
 	//
-	// Lock ordering — s.mu -> hp.mu is safe: the prober's own mutex is a leaf.
+	// Lock ordering: s.mu -> hp.mu is safe: the prober's own mutex is a leaf.
 	// Every hp.mu holder (ProbeTunnel, Start/Stop, the Set* setters) touches
 	// only prober fields plus pool (pool.mu); pool methods never call back
 	// into Service; and the onActiveHook fires with hp.mu already released,
@@ -1670,7 +1701,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		s.prober.ResetFailCount(serverID)
 	}
 
-	return pool.SetTunnelStatus(ctx, serverID, TunnelStatusActive, 10)
+	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
 }
 
 // registerBackendPortalPeers registers the portal's two identities on the
@@ -2075,7 +2106,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDisabled, 0)
+	_ = s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0)
 
 	if s.prober != nil {
 		s.prober.MarkAdminDisabled(serverID)

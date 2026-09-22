@@ -131,8 +131,8 @@ func TestSelfHealing_AdminDisabledSkipped(t *testing.T) {
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
 
-	// Administratively disable tunnel: set status disabled and clear autoDisabled
-	_ = pool.SetTunnelStatus(ctx, s1ID, "disabled", 0)
+	// Administratively disable tunnel: set status disabled with reason admin and clear autoDisabled
+	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0)
 	prober.MarkAdminDisabled(s1ID)
 
 	if prober.IsAutoDisabled(s1ID) {
@@ -180,7 +180,7 @@ func TestSelfHealing_FlapDamping_ProbeFailureResetsCounter(t *testing.T) {
 	}
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
-	_ = pool.SetTunnelStatus(ctx, s1ID, "disabled", 0)
+	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	prober.MarkAutoDisabled(s1ID)
 
 	// Step 1: Probe succeeds once -> successes = 1
@@ -274,6 +274,7 @@ func TestSelfHealing_GracePeriodRestoredAfterRecovery(t *testing.T) {
 
 	// First failure after recovery must set status to degraded, NOT disabled
 	failProbes.Store(true)
+	failProbes.Store(true)
 	_, err = prober.ProbeTunnel(ctx, t1)
 	if err == nil {
 		t.Fatalf("expected probe error")
@@ -322,7 +323,7 @@ func TestSelfHealing_HookFailurePreventsActivation(t *testing.T) {
 	}
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
-	_ = pool.SetTunnelStatus(ctx, s1ID, "disabled", 0)
+	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	prober.MarkAutoDisabled(s1ID)
 
 	// Hook fails
@@ -374,7 +375,7 @@ func TestSelfHealing_DisableSelfHealing(t *testing.T) {
 	}
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
-	_ = pool.SetTunnelStatus(ctx, s1ID, "disabled", 0)
+	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	prober.MarkAutoDisabled(s1ID)
 
 	// Sweep should return 0 when DisableSelfHealing is true
@@ -423,7 +424,7 @@ func TestSelfHealing_DegradedOnHighLatencyRecovery(t *testing.T) {
 	}
 
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
-	_ = pool.SetTunnelStatus(ctx, s1ID, "disabled", 0)
+	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	prober.MarkAutoDisabled(s1ID)
 
 	reconnected := prober.SelfHealSweep(ctx)
@@ -436,5 +437,189 @@ func TestSelfHealing_DegradedOnHighLatencyRecovery(t *testing.T) {
 	}
 	if status.LatencyMS != 350 {
 		t.Fatalf("expected latency 350, got %d", status.LatencyMS)
+	}
+}
+
+func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.8"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = pool.AddTunnel(ctx, s1ID, "192.0.2.8:51820", "pubkey8")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	// Tunnel is auto-disabled due to health failures
+	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     2,
+		SelfHealingThreshold: 1, // Single probe triggers recovery hook
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+	prober.MarkAutoDisabled(s1ID)
+
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+
+	prober.SetOnSelfHealHook(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		close(hookEntered)
+		<-hookRelease
+		return nil
+	})
+
+	sweepDone := make(chan int)
+	go func() {
+		sweepDone <- prober.SelfHealSweep(ctx)
+	}()
+
+	// Wait until the recovery hook is running
+	select {
+	case <-hookEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for hook entry")
+	}
+
+	// While hook is in flight, an administrator manually disables the backend
+	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+		t.Fatalf("admin disable failed: %v", err)
+	}
+	prober.MarkAdminDisabled(s1ID)
+
+	// Release hook to resume SelfHealSweep
+	close(hookRelease)
+
+	var reconnected int
+	select {
+	case reconnected = <-sweepDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sweep completion")
+	}
+
+	if reconnected != 0 {
+		t.Fatalf("expected 0 reconnected when admin disable raced hook, got %d", reconnected)
+	}
+
+	// Verify tunnel remains disabled with reason admin
+	status, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if status.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	}
+	if status.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	}
+
+	// Verify prober does not consider it auto-disabled
+	if prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected IsAutoDisabled to be false after admin disable")
+	}
+
+	// Subsequent sweep must continue skipping it
+	secondReconnected := prober.SelfHealSweep(ctx)
+	if secondReconnected != 0 {
+		t.Fatalf("expected 0 reconnected on subsequent sweep, got %d", secondReconnected)
+	}
+}
+
+func TestSelfHealing_PersistenceFailureRemainsRetryable(t *testing.T) {
+	db := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.9"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	_, err = pool.AddTunnel(ctx, s1ID, "192.0.2.9:51820", "pubkey9")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     2,
+		SelfHealingThreshold: 1,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+	prober.MarkAutoDisabled(s1ID)
+
+	// Cancel the context during hook execution so DB CAS in SelfHealSweep fails
+	prober.SetOnSelfHealHook(func(hookCtx context.Context, tunnel *models.BackendTunnel) error {
+		cancel()
+		return nil
+	})
+
+	// Run sweep with context that gets canceled during hook
+	reconnected := prober.SelfHealSweep(ctx)
+	if reconnected != 0 {
+		t.Fatalf("expected 0 reconnected on DB CAS failure, got %d", reconnected)
+	}
+
+	// Verify tunnel remains in disabled state
+	status, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if status.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected tunnel to remain disabled after persistence failure, got %s", status.Status)
+	}
+	if status.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected disable_reason to remain health, got %s", status.DisableReason)
+	}
+
+	// Verify prober still considers it auto-disabled (retryable)
+	if !prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected IsAutoDisabled to remain true after persistence failure")
+	}
+
+	// Now run sweep with a fresh valid context and normal hook: recovery succeeds!
+	freshCtx := context.Background()
+	prober.SetOnSelfHealHook(func(hookCtx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
+	})
+
+	reconnected = prober.SelfHealSweep(freshCtx)
+	if reconnected != 1 {
+		t.Fatalf("expected 1 reconnected on retry with valid context, got %d", reconnected)
+	}
+
+	status, _ = pool.GetTunnel(s1ID)
+	if status.Status != models.TunnelStatusActive {
+		t.Fatalf("expected tunnel status active after retry, got %s", status.Status)
+	}
+	if status.DisableReason != models.DisableReasonNone {
+		t.Fatalf("expected disable_reason cleared after retry, got %q", status.DisableReason)
+	}
+	if prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected IsAutoDisabled to be false after successful retry")
 	}
 }

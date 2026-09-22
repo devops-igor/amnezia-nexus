@@ -103,6 +103,8 @@ var (
 		"probe_private_key":  true,
 		"endpoint":           true,
 		"status":             true,
+		"disable_reason":     true,
+		"state_version":      true,
 		"last_health_check":  true,
 		"latency_ms":         true,
 		"active_connections": true,
@@ -230,6 +232,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 		return err
 	}
 	if err := d.migrateVPNSessionsConnectionName(ctx); err != nil {
+		return err
+	}
+	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
 		return err
 	}
 	return d.migrateAWGIPAllocations(ctx)
@@ -360,6 +365,50 @@ func (d *DB) migrateVPNSessionsConnectionName(ctx context.Context) error {
 	if !hasConnectionName {
 		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE vpn_sessions ADD COLUMN connection_name TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("failed to add connection_name column: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateBackendTunnelsDisableReason adds disable_reason and state_version columns
+// to backend_tunnels on databases created before persistent disable provenance and
+// state versioning existed (issue #279).
+func (d *DB) migrateBackendTunnelsDisableReason(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasDisableReason := false
+	hasStateVersion := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "disable_reason") {
+			hasDisableReason = true
+		}
+		if strings.EqualFold(name, "state_version") {
+			hasStateVersion = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasDisableReason {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add disable_reason column: %w", err)
+		}
+	}
+	if !hasStateVersion {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("failed to add state_version column: %w", err)
 		}
 	}
 	return nil

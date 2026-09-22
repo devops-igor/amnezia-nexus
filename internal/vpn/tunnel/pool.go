@@ -111,6 +111,9 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 
 	for i := range tunnels {
 		t := tunnels[i]
+		if t.StateVersion <= 0 {
+			t.StateVersion = 1
+		}
 		if t.ProbePrivateKey == "" {
 			// Legacy row from before the dedicated probe key existed
 			// (issue #43): backfill in memory; EnableBackend's peer
@@ -213,6 +216,8 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		ProbePrivateKey:   probePrivKey,
 		Endpoint:          endpoint,
 		Status:            "active",
+		DisableReason:     models.DisableReasonNone,
+		StateVersion:      1,
 		LastHealthCheck:   &now,
 		LatencyMS:         10,
 		ActiveConnections: 0,
@@ -327,6 +332,8 @@ func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 }
 
 // SetTunnelStatus updates the status and latency of a backend tunnel.
+// When status becomes "active", DisableReason is cleared.
+// DB errors are propagated immediately; in-memory state is only updated on DB success.
 func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -336,24 +343,94 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 		return ErrTunnelNotFound
 	}
 
-	tunnel.Status = status
-	tunnel.LatencyMS = latencyMS
-	now := time.Now().UTC()
-	tunnel.LastHealthCheck = &now
+	newReason := tunnel.DisableReason
+	if status == "active" || status == models.TunnelStatusActive {
+		newReason = models.DisableReasonNone
+	}
 
 	if p.db != nil {
-		if err := p.db.UpdateBackendTunnelStatus(ctx, tunnel.ID, status, latencyMS); err != nil {
-			// In-memory state is already updated; persist the failure so
-			// status divergence between pool and DB is observable.
-			slog.Error("failed to persist backend tunnel status",
-				"tunnel_id", tunnel.ID,
-				"server_id", tunnel.ServerID,
-				"status", status,
-				"error", err)
+		var err error
+		if newReason != tunnel.DisableReason {
+			err = p.db.UpdateBackendTunnelStatusWithReason(ctx, tunnel.ID, status, newReason, latencyMS)
+		} else {
+			err = p.db.UpdateBackendTunnelStatus(ctx, tunnel.ID, status, latencyMS)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to persist backend tunnel status: %w", err)
 		}
 	}
 
+	tunnel.Status = status
+	tunnel.DisableReason = newReason
+	tunnel.LatencyMS = latencyMS
+	tunnel.StateVersion++
+	now := time.Now().UTC()
+	tunnel.LastHealthCheck = &now
+
 	return nil
+}
+
+// SetTunnelStatusWithReason updates the status, disable reason, and latency of a backend tunnel.
+// DB errors are propagated immediately; in-memory state is only updated on DB success.
+func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, status, disableReason string, latencyMS int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+
+	if p.db != nil {
+		if err := p.db.UpdateBackendTunnelStatusWithReason(ctx, tunnel.ID, status, disableReason, latencyMS); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel status with reason: %w", err)
+		}
+	}
+
+	tunnel.Status = status
+	tunnel.DisableReason = disableReason
+	tunnel.LatencyMS = latencyMS
+	tunnel.StateVersion++
+	now := time.Now().UTC()
+	tunnel.LastHealthCheck = &now
+
+	return nil
+}
+
+// CompareAndSwapTunnelStatus conditionally updates tunnel status if the current status,
+// disable reason, and state version match expected values.
+// Returns true if the state was updated, false if state did not match.
+func (p *Pool) CompareAndSwapTunnelStatus(ctx context.Context, serverID int64, expectedStatus, expectedReason string, expectedVersion int64, newStatus, newReason string, latencyMS int64) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return false, ErrTunnelNotFound
+	}
+
+	if tunnel.Status != expectedStatus || tunnel.DisableReason != expectedReason || tunnel.StateVersion != expectedVersion {
+		return false, nil
+	}
+
+	if p.db != nil {
+		swapped, err := p.db.CompareAndSwapTunnelStatus(ctx, tunnel.ID, expectedStatus, expectedReason, expectedVersion, newStatus, newReason, latencyMS)
+		if err != nil {
+			return false, fmt.Errorf("failed to execute CAS update on backend tunnel: %w", err)
+		}
+		if !swapped {
+			return false, nil
+		}
+	}
+
+	tunnel.Status = newStatus
+	tunnel.DisableReason = newReason
+	tunnel.LatencyMS = latencyMS
+	tunnel.StateVersion++
+	now := time.Now().UTC()
+	tunnel.LastHealthCheck = &now
+
+	return true, nil
 }
 
 // IncrementConnections increments active connection count on a tunnel.

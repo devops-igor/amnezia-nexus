@@ -19,7 +19,7 @@ func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, err
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, last_health_check, latency_ms, active_connections, created_at
+		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels ORDER BY id`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -51,7 +51,7 @@ func (d *DB) GetBackendTunnel(ctx context.Context, id int64) (*models.BackendTun
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, last_health_check, latency_ms, active_connections, created_at
+		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -102,10 +102,14 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	createdAtStr := formatTime(t.CreatedAt)
 	healthCheckStr := formatTimePtr(t.LastHealthCheck)
 
+	if t.StateVersion <= 0 {
+		t.StateVersion = 1
+	}
+
 	query := `INSERT INTO backend_tunnels (
 		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, last_health_check, latency_ms, active_connections, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
 		t.ServerID,
@@ -115,6 +119,8 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encProbeKey,
 		t.Endpoint,
 		t.Status,
+		t.DisableReason,
+		t.StateVersion,
 		healthCheckStr,
 		t.LatencyMS,
 		t.ActiveConnections,
@@ -194,19 +200,56 @@ func (d *DB) UpdateBackendTunnel(ctx context.Context, id int64, updates map[stri
 	return nil
 }
 
-// UpdateBackendTunnelStatus updates status, latency, and health check timestamp.
+// UpdateBackendTunnelStatus updates status, latency, and health check timestamp, bumping state_version.
 func (d *DB) UpdateBackendTunnelStatus(ctx context.Context, id int64, status string, latencyMS int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ? WHERE id = ?`
+	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
 
 	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status: %w", err)
 	}
 	return nil
+}
+
+// UpdateBackendTunnelStatusWithReason updates status, disable reason, latency, and health check timestamp, bumping state_version.
+func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, status, disableReason string, latencyMS int64) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	nowStr := time.Now().Format(time.RFC3339)
+	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
+
+	_, err := d.sqlDB.ExecContext(ctx, query, status, disableReason, latencyMS, nowStr, id)
+	if err != nil {
+		return fmt.Errorf("failed to update backend tunnel status with reason: %w", err)
+	}
+	return nil
+}
+
+// CompareAndSwapTunnelStatus conditionally updates tunnel status if the current status,
+// disable reason, and state version match expected values.
+// Returns true if a row was updated, false if state had changed or was not matched.
+func (d *DB) CompareAndSwapTunnelStatus(ctx context.Context, id int64, expectedStatus, expectedReason string, expectedVersion int64, newStatus, newReason string, latencyMS int64) (bool, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	nowStr := time.Now().Format(time.RFC3339)
+	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
+		WHERE id = ? AND status = ? AND disable_reason = ? AND state_version = ?`
+
+	res, err := d.sqlDB.ExecContext(ctx, query, newStatus, newReason, latencyMS, nowStr, id, expectedStatus, expectedReason, expectedVersion)
+	if err != nil {
+		return false, fmt.Errorf("failed to execute CAS update on backend tunnel %d: %w", id, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect rows affected on CAS update %d: %w", id, err)
+	}
+	return rowsAffected > 0, nil
 }
 
 // DeleteBackendTunnel removes a backend tunnel record.
@@ -227,7 +270,7 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, last_health_check, latency_ms, active_connections, created_at
+		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE server_id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, serverID)
@@ -567,6 +610,8 @@ func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	var t models.BackendTunnel
 	var privKey, probeKey, healthCheck, createdAt sql.NullString
+	var disableReason sql.NullString
+	var stateVersion sql.NullInt64
 
 	err := s.Scan(
 		&t.ID,
@@ -577,6 +622,8 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 		&probeKey,
 		&t.Endpoint,
 		&t.Status,
+		&disableReason,
+		&stateVersion,
 		&healthCheck,
 		&t.LatencyMS,
 		&t.ActiveConnections,
@@ -584,6 +631,15 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	)
 	if err != nil {
 		return t, err
+	}
+
+	if disableReason.Valid {
+		t.DisableReason = disableReason.String
+	}
+	if stateVersion.Valid && stateVersion.Int64 > 0 {
+		t.StateVersion = stateVersion.Int64
+	} else {
+		t.StateVersion = 1
 	}
 
 	if privKey.Valid && privKey.String != "" {
