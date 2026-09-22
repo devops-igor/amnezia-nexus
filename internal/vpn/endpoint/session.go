@@ -99,6 +99,17 @@ func (sm *SessionManager) BumpLifecycleVersion() uint64 {
 	return sm.lifecycleVersion.Add(1)
 }
 
+// LockLifecycle acquires an exclusive lock on the session manager to fence
+// lifecycle mutations against atomic operations like gauge reconciliation.
+func (sm *SessionManager) LockLifecycle() {
+	sm.mu.Lock()
+}
+
+// UnlockLifecycle releases the exclusive lock on the session manager.
+func (sm *SessionManager) UnlockLifecycle() {
+	sm.mu.Unlock()
+}
+
 // CreateSession allocates a new VPN session and persists it. When a session
 // already exists for the same peer (client rekey/reconnect), the old session
 // is fully replaced: removed from memory, its DB row closed, and the

@@ -156,6 +156,7 @@ type Service struct {
 	lastReconcileByTunnel     map[int64]time.Time
 	reconcilePostSnapshotHook func()
 	reconcilePreApplyHook     func()
+	reconcilePreCommitHook    func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -668,6 +669,14 @@ func (s *Service) SetReconcilePreApplyHook(fn func()) {
 	s.reconcilePreApplyHook = fn
 }
 
+// SetReconcilePreCommitHook registers a test hook called under s.mu and sm.LockLifecycle
+// immediately before applying changes in reconcileConnectionCounts.
+func (s *Service) SetReconcilePreCommitHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcilePreCommitHook = fn
+}
+
 // GetBackendDeviceForTest returns the backend device for a tunnel ID.
 func (s *Service) GetBackendDeviceForTest(tunID int64) BackendDevice {
 	s.mu.RLock()
@@ -950,6 +959,11 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.sessionMgr != nil {
+		s.sessionMgr.LockLifecycle()
+		defer s.sessionMgr.UnlockLifecycle()
+	}
+
 	if s.isLifecycleMutated(versionBefore) {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during DB snapshot (version %d -> %d)",
 			versionBefore, s.sessionMgr.LifecycleVersion())
@@ -972,35 +986,42 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	}
 
 	tunnels := s.pool.ListTunnels()
+	tunnelChanges := make(map[int64]int)
 	stagedReconcile := make(map[int64]time.Time)
-	anyDrift := false
-	allSucceeded := true
 	for _, tun := range tunnels {
-		if s.isLifecycleMutated(versionBefore) {
-			log.Printf("[vpn] warning: connection gauge reconciliation aborted: session lifecycle mutated during tunnel apply (version %d -> %d)",
-				versionBefore, s.sessionMgr.LifecycleVersion())
-			return
-		}
-
 		want := desired[tun.ID]
 		if tun.ActiveConnections == want {
 			stagedReconcile[tun.ID] = dbReadTime
 			continue
 		}
-		anyDrift = true
-		if err := s.pool.SetConnectionCount(ctx, tun.ID, want); err != nil {
-			allSucceeded = false
-			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
-			continue
-		}
+		tunnelChanges[tun.ID] = want
 		stagedReconcile[tun.ID] = dbReadTime
-		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
+	}
+
+	if s.reconcilePreCommitHook != nil {
+		s.reconcilePreCommitHook()
 	}
 
 	if s.isLifecycleMutated(versionBefore) {
-		log.Printf("[vpn] warning: connection gauge reconciliation aborted: session lifecycle mutated before timestamp commit (version %d -> %d)",
+		log.Printf("[vpn] warning: connection gauge reconciliation aborted: session lifecycle mutated before commit (version %d -> %d)",
 			versionBefore, s.sessionMgr.LifecycleVersion())
 		return
+	}
+
+	anyDrift := len(tunnelChanges) > 0
+	allSucceeded := true
+	for _, tun := range tunnels {
+		want, changed := tunnelChanges[tun.ID]
+		if !changed {
+			continue
+		}
+		if err := s.pool.SetConnectionCount(ctx, tun.ID, want); err != nil {
+			allSucceeded = false
+			delete(stagedReconcile, tun.ID)
+			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
+			continue
+		}
+		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
 	}
 
 	if s.lastReconcileByTunnel == nil {

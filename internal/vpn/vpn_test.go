@@ -5424,6 +5424,9 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutDuringApply(t *t
 	vpnSvc.SetReconcilePreApplyHook(func() {
 		hookFired.Store(true)
 
+		vpnSvc.sessionMgr.UnlockLifecycle()
+		defer vpnSvc.sessionMgr.LockLifecycle()
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -5460,6 +5463,128 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutDuringApply(t *t
 
 	if !hookFired.Load() {
 		t.Fatal("expected reconcilePreApplyHook to fire")
+	}
+	if sweepErr != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", sweepErr)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected 1 timed out session %s, got %+v", sessA.ID, timedOut)
+	}
+
+	// 3. Verify reconciliation timestamps were NOT committed
+	vpnSvc.mu.RLock()
+	var tunReconcileTime time.Time
+	if vpnSvc.lastReconcileByTunnel != nil {
+		tunReconcileTime = vpnSvc.lastReconcileByTunnel[tunID]
+	}
+	globalReconcileTime := vpnSvc.lastReconcileTime
+	vpnSvc.mu.RUnlock()
+
+	if !tunReconcileTime.IsZero() {
+		t.Errorf("expected lastReconcileByTunnel[%d] to be zero after abort, got %v", tunID, tunReconcileTime)
+	}
+	if !globalReconcileTime.IsZero() {
+		t.Errorf("expected global lastReconcileTime to remain zero after abort, got %v", globalReconcileTime)
+	}
+
+	// 4. Verify pool gauge is 0 (decremented by reaper, not restored to 1 by reconciliation)
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections to be 0, got %d (stale snapshot restored count)", tunAfter.ActiveConnections)
+	}
+}
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-timeout-commit-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.96", tunID, "conn-commit-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-commit-a", peerKeyA, "10.100.0.96", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// Age session past IdleTimeout (default 3m, age by 10m)
+	vpnSvc.endpoint.SessionManager().SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
+
+	versionBefore := vpnSvc.sessionMgr.LifecycleVersion()
+
+	var wg sync.WaitGroup
+	var hookFired atomic.Bool
+	var sweepErr error
+	var timedOut []*models.VPNSession
+
+	vpnSvc.SetReconcilePreCommitHook(func() {
+		hookFired.Store(true)
+
+		// Temporarily release session lifecycle lock so background sweep can proceed
+		vpnSvc.sessionMgr.UnlockLifecycle()
+		defer vpnSvc.sessionMgr.LockLifecycle()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// SweepTimedOutSessions runs CheckTimeouts under SessionManager.mu,
+			// increments lifecycleVersion, and then invokes registered reaperHook
+			// which calls svc.reapSession(ctx, sess) blocking on Service.mu.
+			timedOut, sweepErr = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+		}()
+
+		// Wait until CheckTimeouts has removed session A and advanced lifecycleVersion
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			_, found := vpnSvc.sessionMgr.GetSessionByID(sessA.ID)
+			if !found && vpnSvc.sessionMgr.LifecycleVersion() > versionBefore {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Yield to allow the reaper goroutine to reach reapSession and block on Service.mu
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	// 2. Run reconcileConnectionCounts:
+	// DB read captured Session A (desired count 1).
+	// Passes initial version check under Service.mu and sm.LockLifecycle.
+	// Drift evaluated in Phase 1 (no changes yet applied).
+	// Pre-commit hook fires: temporarily releases sm.LockLifecycle,
+	// Session A times out, lifecycleVersion advances, reaper blocks on Service.mu,
+	// sm.LockLifecycle re-acquired.
+	// Reconcile resumes from hook: detects lifecycleVersion mutated,
+	// aborts Phase 2 commit immediately (SetConnectionCount never called, timestamps not committed).
+	// Reconcile releases sm.UnlockLifecycle and Service.mu.
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	// Wait for the reaper goroutine to finish
+	wg.Wait()
+
+	if !hookFired.Load() {
+		t.Fatal("expected reconcilePreCommitHook to fire")
 	}
 	if sweepErr != nil {
 		t.Fatalf("SweepTimedOutSessions failed: %v", sweepErr)
