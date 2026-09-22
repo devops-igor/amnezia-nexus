@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Frontend compatibility aliases: removed unused `window.apiCall`, `window.confirmModal`, and `window.DataTable` aliases in favor of `API`, `UI`, and `NexusTable` per `useful_notes/COMPATIBILITY.md` §4.2 (#257, #258, #259).
 - Legacy internal/vpn constructors: removed unused compatibility shims NewService, NewLeastConnectionsLoadBalancer, and type alias LeastConnectionsLoadBalancer per useful_notes/COMPATIBILITY.md (#260).
 
 ## [1.2.1] - Polaris - 2026-09-21
