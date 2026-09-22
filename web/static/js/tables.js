@@ -11,7 +11,6 @@
     } else {
         const NexusTable = factory();
         root.NexusTable = NexusTable;
-        root.DataTable = NexusTable; // Backward-compatible alias
     }
 }(typeof self !== 'undefined' ? self : this, function () {
     'use strict';
