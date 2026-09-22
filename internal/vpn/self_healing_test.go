@@ -500,3 +500,102 @@ func TestSelfHealing_ConcurrentDisableBackendDuringSelfHeal(t *testing.T) {
 		t.Fatal("backend device must not be attached after concurrent admin disable")
 	}
 }
+
+// TestSelfHealing_HighLatencyProductionRecoveryMarkedDegraded verifies that a backend
+// recovering from auto-disable with latency exceeding LatencyThresholdMS (500ms)
+// is committed as degraded (not active) with its measured latency in both pool and database,
+// while its forwarder data-plane device is properly attached.
+func TestSelfHealing_HighLatencyProductionRecoveryMarkedDegraded(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	var probeFails atomic.Bool
+	probeFails.Store(true)
+
+	// Recovered latency is 700ms, which exceeds HealthConfig.LatencyThresholdMS (500ms)
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if probeFails.Load() {
+			return 0, errors.New("simulated probe failure")
+		}
+		return 700 * time.Millisecond, nil
+	})
+
+	tun := tunMust(t, vpnSvc, s1ID)
+
+	// Step 1: 3 probe failures auto-disable the backend
+	for i := 0; i < 3; i++ {
+		if _, err := vpnSvc.prober.ProbeTunnel(ctx, tun); err == nil {
+			t.Fatalf("expected probe failure %d", i+1)
+		}
+	}
+
+	got, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if got.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status disabled, got %q", got.Status)
+	}
+	if !vpnSvc.prober.IsAutoDisabled(s1ID) {
+		t.Fatalf("expected backend %d to be marked auto-disabled", s1ID)
+	}
+
+	// Step 2: Backend recovers with high latency (700ms > 500ms)
+	probeFails.Store(false)
+
+	// Sweep 1: flap damping 1st success (threshold = 2)
+	reconnected := vpnSvc.SelfHealSweep(ctx)
+	if reconnected != 0 {
+		t.Fatalf("expected 0 reconnected on first sweep due to flap damping, got %d", reconnected)
+	}
+
+	tunAfterFirst, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfterFirst.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status to remain disabled after 1 success, got %q", tunAfterFirst.Status)
+	}
+
+	// Sweep 2: flap damping 2nd success triggers recovery
+	reconnected = vpnSvc.SelfHealSweep(ctx)
+	if reconnected != 1 {
+		t.Fatalf("expected 1 reconnected on second sweep, got %d", reconnected)
+	}
+
+	// Step 3: Verify pool tunnel status is "degraded" (NOT "active") and latency is 700ms
+	poolTun, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if poolTun.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected pool status degraded, got %q", poolTun.Status)
+	}
+	if poolTun.LatencyMS != 700 {
+		t.Fatalf("expected pool latency 700ms, got %d", poolTun.LatencyMS)
+	}
+
+	// Step 4: Verify DB tunnel status is "degraded" (NOT "active") and latency is 700ms
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected DB status degraded, got %q", dbTun.Status)
+	}
+	if dbTun.LatencyMS != 700 {
+		t.Fatalf("expected DB latency 700ms, got %d", dbTun.LatencyMS)
+	}
+
+	// Step 5: Verify forwarder device is attached
+	dev := vpnSvc.GetBackendDeviceForTest(poolTun.ID)
+	if dev == nil {
+		t.Fatal("expected backend forwarder device to be attached after high-latency recovery")
+	}
+}

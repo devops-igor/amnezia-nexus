@@ -343,6 +343,10 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 		return ErrTunnelNotFound
 	}
 
+	if tunnel.DisableReason == models.DisableReasonAdmin {
+		return nil
+	}
+
 	newReason := tunnel.DisableReason
 	if status == "active" || status == models.TunnelStatusActive {
 		newReason = models.DisableReasonNone

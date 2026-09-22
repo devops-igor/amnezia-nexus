@@ -802,6 +802,9 @@ func defaultLinuxTunOpener() (endpoint.PacketDevice, error) {
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
 	for _, tun := range s.pool.ListTunnels() {
+		if tun.DisableReason == models.DisableReasonAdmin {
+			continue
+		}
 		if tun.Status != TunnelStatusActive && tun.Status != TunnelStatusDegraded {
 			continue
 		}
@@ -1701,6 +1704,10 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		s.prober.ResetFailCount(serverID)
 	}
 
+	if tunnel.IsSelfHealingContext(ctx) {
+		return nil
+	}
+
 	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
 }
 
@@ -2083,6 +2090,17 @@ execute:
 	}
 }
 
+// SetTunnelStatus updates the status and latency of a backend tunnel in the pool.
+func (s *Service) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
+	s.mu.RLock()
+	pool := s.pool
+	s.mu.RUnlock()
+	if pool == nil {
+		return errors.New("tunnel pool not initialized")
+	}
+	return pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
+}
+
 // DisableBackend disables a backend server and initiates connection draining.
 func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
@@ -2106,7 +2124,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	_ = s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0)
+	if err := s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
+	}
 
 	if s.prober != nil {
 		s.prober.MarkAdminDisabled(serverID)

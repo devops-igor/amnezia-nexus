@@ -5618,3 +5618,179 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *
 		t.Errorf("expected pool ActiveConnections to be 0, got %d (stale snapshot restored count)", tunAfter.ActiveConnections)
 	}
 }
+
+func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) {
+	t.Run("ContextCanceled", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		s1ID, pub1, _ := createTestServerAndKey(t, db, "Backend Srv 1", "127.0.0.1")
+		s2ID, pub2, _ := createTestServerAndKey(t, db, "Backend Srv 2", "127.0.0.1")
+
+		tun1, err := svc.pool.AddTunnel(ctx, s1ID, "127.0.0.1:51821", pub1)
+		if err != nil {
+			t.Fatalf("AddTunnel 1 failed: %v", err)
+		}
+		tun2, err := svc.pool.AddTunnel(ctx, s2ID, "127.0.0.1:51822", pub2)
+		if err != nil {
+			t.Fatalf("AddTunnel 2 failed: %v", err)
+		}
+
+		svc.mu.Lock()
+		err = svc.attachBackendForwarder(tun1, nil)
+		svc.mu.Unlock()
+		if err != nil {
+			t.Fatalf("attachBackendForwarder failed: %v", err)
+		}
+
+		devBefore := svc.GetBackendDeviceForTest(tun1.ID)
+		if devBefore == nil {
+			t.Fatal("expected backend device attached before test, got nil")
+		}
+		if devBefore.IsClosed() {
+			t.Fatal("expected backend device to be open before test")
+		}
+		t.Cleanup(func() { _ = devBefore.Close() })
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "charlie", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser failed: %v", err)
+		}
+		peerKey := "charlie-peer-key"
+		_, err = db.CreateConnection(ctx, &models.UserConnection{
+			UserID:   uID,
+			ServerID: s1ID,
+			Protocol: "awg",
+			ClientID: peerKey,
+			Name:     "charlie-device",
+		})
+		if err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		sess, err := svc.sessionMgr.CreateSession(ctx, uID, peerKey, "10.100.0.10", tun1.ID, "charlie-device")
+		if err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+		svc.pool.IncrementConnections(tun1.ID)
+		svc.stickyMgr.AssignPeerAffinity(peerKey, tun1.ID)
+		svc.forwarder.RegisterSession(sess.ID, "charlie-conn", peerKey, "10.100.0.10", tun1.ID)
+
+		if tun1.ActiveConnections != 1 {
+			t.Fatalf("expected tun1 ActiveConnections == 1, got %d", tun1.ActiveConnections)
+		}
+		if tun2.ActiveConnections != 0 {
+			t.Fatalf("expected tun2 ActiveConnections == 0, got %d", tun2.ActiveConnections)
+		}
+		affPre, ok := svc.stickyMgr.GetPeerAffinity(peerKey)
+		if !ok || affPre != tun1.ID {
+			t.Fatalf("expected peer affinity to tun1 (%d), got ok=%v aff=%d", tun1.ID, ok, affPre)
+		}
+
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err = svc.DisableBackend(canceledCtx, s1ID)
+		if err == nil {
+			t.Fatal("expected DisableBackend to return error on DB persistence failure, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to persist administrative backend disable") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+
+		tunAfter, err := svc.pool.GetTunnel(s1ID)
+		if err != nil {
+			t.Fatalf("GetTunnel failed: %v", err)
+		}
+		if tunAfter.Status != TunnelStatusActive {
+			t.Errorf("expected pool status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+		}
+
+		devAfter := svc.GetBackendDeviceForTest(tun1.ID)
+		if devAfter == nil {
+			t.Fatal("expected backend device to remain attached in service map, got nil")
+		}
+		if devAfter.IsClosed() {
+			t.Error("expected backend device to remain open, but IsClosed() is true")
+		}
+
+		affPost, ok := svc.stickyMgr.GetPeerAffinity(peerKey)
+		if !ok || affPost != tun1.ID {
+			t.Errorf("expected peer affinity preserved for tun1 (%d), got ok=%v aff=%d", tun1.ID, ok, affPost)
+		}
+		if tun1.ActiveConnections != 1 {
+			t.Errorf("expected tun1 ActiveConnections to remain 1, got %d", tun1.ActiveConnections)
+		}
+		if tun2.ActiveConnections != 0 {
+			t.Errorf("expected tun2 ActiveConnections to remain 0, got %d", tun2.ActiveConnections)
+		}
+		liveSess, ok := svc.sessionMgr.GetSession(peerKey)
+		if !ok || liveSess.BackendTunnelID != tun1.ID {
+			t.Errorf("expected session backend to remain tun1 (%d), got ok=%v id=%d", tun1.ID, ok, liveSess.BackendTunnelID)
+		}
+	})
+
+	t.Run("ClosedDB", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		s1ID, pub1, _ := createTestServerAndKey(t, db, "Backend Srv ClosedDB", "127.0.0.1")
+		tun1, err := svc.pool.AddTunnel(ctx, s1ID, "127.0.0.1:51823", pub1)
+		if err != nil {
+			t.Fatalf("AddTunnel failed: %v", err)
+		}
+
+		svc.mu.Lock()
+		err = svc.attachBackendForwarder(tun1, nil)
+		svc.mu.Unlock()
+		if err != nil {
+			t.Fatalf("attachBackendForwarder failed: %v", err)
+		}
+
+		devBefore := svc.GetBackendDeviceForTest(tun1.ID)
+		if devBefore == nil {
+			t.Fatal("expected backend device attached before test, got nil")
+		}
+		if devBefore.IsClosed() {
+			t.Fatal("expected backend device to be open before test")
+		}
+		t.Cleanup(func() { _ = devBefore.Close() })
+
+		// Close DB to inject DB write error
+		_ = db.Close()
+
+		err = svc.DisableBackend(ctx, s1ID)
+		if err == nil {
+			t.Fatal("expected DisableBackend to return error when DB is closed, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to persist administrative backend disable") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+
+		tunAfter, err := svc.pool.GetTunnel(s1ID)
+		if err != nil {
+			t.Fatalf("GetTunnel failed: %v", err)
+		}
+		if tunAfter.Status != TunnelStatusActive {
+			t.Errorf("expected pool status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+		}
+
+		devAfter := svc.GetBackendDeviceForTest(tun1.ID)
+		if devAfter == nil {
+			t.Fatal("expected backend device to remain attached in service map, got nil")
+		}
+		if devAfter.IsClosed() {
+			t.Error("expected backend device to remain open, but IsClosed() is true")
+		}
+	})
+}

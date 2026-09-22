@@ -637,30 +637,28 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		newStatus = "degraded"
 	}
 
-	if tunAfterHook.Status != "active" {
-		swapped, err := hp.pool.CompareAndSwapTunnelStatus(
-			ctx,
-			tun.ServerID,
-			"disabled",
-			tunNow.DisableReason,
-			tunNow.StateVersion,
-			newStatus,
-			models.DisableReasonNone,
-			latencyMS,
+	swapped, err := hp.pool.CompareAndSwapTunnelStatus(
+		ctx,
+		tun.ServerID,
+		"disabled",
+		tunNow.DisableReason,
+		tunNow.StateVersion,
+		newStatus,
+		models.DisableReasonNone,
+		latencyMS,
+	)
+	if err != nil {
+		slog.Error("self-healing CAS status update failed",
+			"server_id", tun.ServerID,
+			"error", err,
 		)
-		if err != nil {
-			slog.Error("self-healing CAS status update failed",
-				"server_id", tun.ServerID,
-				"error", err,
-			)
-			return false
-		}
-		if !swapped {
-			slog.Info("self-healing CAS status update missed: state changed concurrently",
-				"server_id", tun.ServerID,
-			)
-			return false
-		}
+		return false
+	}
+	if !swapped {
+		slog.Info("self-healing CAS status update missed: state changed concurrently",
+			"server_id", tun.ServerID,
+		)
+		return false
 	}
 
 	hp.mu.Lock()

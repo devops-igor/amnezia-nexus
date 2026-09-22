@@ -201,14 +201,15 @@ func (d *DB) UpdateBackendTunnel(ctx context.Context, id int64, updates map[stri
 }
 
 // UpdateBackendTunnelStatus updates status, latency, and health check timestamp, bumping state_version.
+// Protects administratively disabled tunnels from being overwritten.
 func (d *DB) UpdateBackendTunnelStatus(ctx context.Context, id int64, status string, latencyMS int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
+	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ? AND disable_reason != ?`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id)
+	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id, models.DisableReasonAdmin)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status: %w", err)
 	}
