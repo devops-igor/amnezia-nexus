@@ -1264,6 +1264,38 @@ func (el *Listener) SetSessionReaperHook(fn SessionReaperHook) {
 	el.reaperHook = fn
 }
 
+// SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes the registered
+// SessionReaperHook for each reaped session.
+func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
+	if el.sessionMgr == nil {
+		return nil, nil
+	}
+	timedOut, err := el.sessionMgr.CheckTimeouts(ctx, el.config.IdleTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if len(timedOut) == 0 {
+		return nil, nil
+	}
+	el.mu.RLock()
+	hook := el.reaperHook
+	el.mu.RUnlock()
+	for _, sess := range timedOut {
+		if hook != nil {
+			func() {
+				defer func() {
+					// A panicking hook must not kill the sweep.
+					if r := recover(); r != nil {
+						log.Printf("[vpn] recovered from session reaper hook panic: %v", r)
+					}
+				}()
+				hook(ctx, sess)
+			}()
+		}
+	}
+	return timedOut, nil
+}
+
 func (el *Listener) heartbeatLoop(ctx context.Context) {
 	defer el.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
@@ -1274,31 +1306,8 @@ func (el *Listener) heartbeatLoop(ctx context.Context) {
 		case <-el.stopCh:
 			return
 		case <-ticker.C:
-			if el.sessionMgr != nil {
-				timedOut, err := el.sessionMgr.CheckTimeouts(ctx, el.config.IdleTimeout)
-				if err != nil {
-					log.Printf("[vpn] idle-timeout sweep failed: %v", err)
-					continue
-				}
-				if len(timedOut) == 0 {
-					continue
-				}
-				el.mu.RLock()
-				hook := el.reaperHook
-				el.mu.RUnlock()
-				for _, sess := range timedOut {
-					if hook != nil {
-						func() {
-							defer func() {
-								// A panicking hook must not kill the heartbeat loop.
-								if r := recover(); r != nil {
-									log.Printf("[vpn] recovered from session reaper hook panic: %v", r)
-								}
-							}()
-							hook(ctx, sess)
-						}()
-					}
-				}
+			if _, err := el.SweepTimedOutSessions(ctx); err != nil {
+				log.Printf("[vpn] idle-timeout sweep failed: %v", err)
 			}
 		}
 	}

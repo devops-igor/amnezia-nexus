@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -15,10 +16,11 @@ var (
 	ErrInvalidAlgorithm = errors.New("invalid load balancing algorithm")
 )
 
-// CapacityConfig defines capacity limits for routing.
+// CapacityConfig defines capacity limits and affinity duration for routing.
 type CapacityConfig struct {
 	MaxTotalPeers      int
 	MaxPeersPerBackend int
+	AffinityTTL        time.Duration
 }
 
 // RoutingRequest contains contextual information for routing decisions.
@@ -39,17 +41,17 @@ type LoadBalancer interface {
 // FilterHealthy filters tunnels to only healthy ("active") tunnels within capacity limits.
 //
 // Serialization contract (issue #86): the ActiveConnections values read
-// here are a best-effort snapshot — pool GetActiveTunnels returns copies,
+// here are a best-effort snapshot - pool GetActiveTunnels returns copies,
 // so a concurrent increment after selection is invisible to this function.
 // The snapshot is safe for the capacity invariant ONLY because every
 // counter mutator (HandleIncomingPeer select+increment, disconnect
 // decrements, failover moves, rekey ReplacementHook) serializes under the
-// VPN Service's s.mu (or the hook's nested sm.mu regime — see
+// VPN Service's s.mu (or the hook's nested sm.mu regime - see
 // tunnel.Pool.IncrementConnections for the full contract). FilterHealthy
 // itself takes no lock and must stay lock-free: the caller (today only
 // HandleIncomingPeer) already holds the serializing lock when the snapshot
 // is taken. A future caller invoking FilterHealthy outside s.mu reintroduces
-// the check-then-allocate race (two selects both observe cap-1 → cap+1).
+// the check-then-allocate race (two selects both observe cap-1 -> cap+1).
 func FilterHealthy(tunnels []*models.BackendTunnel, maxPeersPerBackend int) []*models.BackendTunnel {
 	var healthy []*models.BackendTunnel
 	for _, t := range tunnels {

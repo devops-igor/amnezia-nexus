@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -19,35 +21,66 @@ type StickyStore interface {
 	CreateVPNSession(ctx context.Context, s *models.VPNSession) error
 }
 
+type affinityRecord struct {
+	tunnelID int64
+	lastSeen time.Time
+}
+
+// DefaultAffinityTTL is the fallback duration for sticky session affinity.
+const DefaultAffinityTTL = 30 * time.Minute
+
 // StickySessionManager manages session affinity and handles automatic failover.
 type StickySessionManager struct {
 	mu           sync.RWMutex
 	db           StickyStore
 	baseBalancer LoadBalancer
 	caps         CapacityConfig
-	userAffinity map[string]int64 // userID -> backendTunnelID
-	peerAffinity map[string]int64 // peerPublicKey -> backendTunnelID
+	affinityTTL  time.Duration
+	nowFunc      func() time.Time
+	userAffinity map[string]affinityRecord // userID -> affinityRecord
+	peerAffinity map[string]affinityRecord // peerPublicKey -> affinityRecord
 
 	// skipCounter counts peers whose migration was skipped during failover
 	// (backend selection failed for them). Issue #85: skips must never be
-	// silent — this counter plus the SkippedPeers result field make stranding
+	// silent - this counter plus the SkippedPeers result field make stranding
 	// observable so callers can retry or alert.
 	skipCounter atomic.Int64
 }
 
 // NewStickySessionManager creates a new StickySessionManager wrapping a base load balancer.
 func NewStickySessionManager(db StickyStore, baseBalancer LoadBalancer, caps CapacityConfig) *StickySessionManager {
+	ttl := caps.AffinityTTL
+	if ttl <= 0 {
+		ttl = DefaultAffinityTTL
+	}
 	return &StickySessionManager{
 		db:           db,
 		baseBalancer: baseBalancer,
 		caps:         caps,
-		userAffinity: make(map[string]int64),
-		peerAffinity: make(map[string]int64),
+		affinityTTL:  ttl,
+		userAffinity: make(map[string]affinityRecord),
+		peerAffinity: make(map[string]affinityRecord),
 	}
 }
 
+// SetNowFunc overrides the time source used for TTL calculations (used in tests).
+func (sm *StickySessionManager) SetNowFunc(fn func() time.Time) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.nowFunc = fn
+}
+
+// now returns the current time, using nowFunc if set.
+// Note: caller should hold sm.mu (Lock or RLock).
+func (sm *StickySessionManager) now() time.Time {
+	if sm.nowFunc != nil {
+		return sm.nowFunc()
+	}
+	return time.Now().UTC()
+}
+
 // SkippedMigrationsTotal returns how many peer migrations have been skipped
-// across all failovers (issue #85: no silent stranding — every skip is
+// across all failovers (issue #85: no silent stranding - every skip is
 // counted here, logged at skip time, and reported per-failover in the result).
 func (sm *StickySessionManager) SkippedMigrationsTotal() int64 {
 	return sm.skipCounter.Load()
@@ -62,29 +95,46 @@ func (sm *StickySessionManager) GetOrAssignBackend(ctx context.Context, req *Rou
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	now := sm.now()
+
 	// Check existing affinity by peerPublicKey first, then by userID
 	var targetTunnelID int64
 	var hasAffinity bool
 
 	if req.PeerPublicKey != "" {
-		if tid, ok := sm.peerAffinity[req.PeerPublicKey]; ok {
-			targetTunnelID = tid
-			hasAffinity = true
+		if rec, ok := sm.peerAffinity[req.PeerPublicKey]; ok {
+			if now.Sub(rec.lastSeen) > sm.affinityTTL {
+				delete(sm.peerAffinity, req.PeerPublicKey)
+			} else {
+				targetTunnelID = rec.tunnelID
+				hasAffinity = true
+			}
 		}
 	}
 	if !hasAffinity && req.UserID != "" {
-		if tid, ok := sm.userAffinity[req.UserID]; ok {
-			targetTunnelID = tid
-			hasAffinity = true
+		if rec, ok := sm.userAffinity[req.UserID]; ok {
+			if now.Sub(rec.lastSeen) > sm.affinityTTL {
+				delete(sm.userAffinity, req.UserID)
+			} else {
+				targetTunnelID = rec.tunnelID
+				hasAffinity = true
+			}
 		}
 	}
 
 	// Verify if the sticky backend is still active and within capacity
 	if hasAffinity {
 		for _, t := range req.AvailableTunnels {
-			if t.ID == targetTunnelID && t.Status == "active" {
+			if t.ID == targetTunnelID && strings.EqualFold(t.Status, "active") {
 				if sm.caps.MaxPeersPerBackend <= 0 || t.ActiveConnections < sm.caps.MaxPeersPerBackend {
-					// Sticky affinity preserved
+					// Sticky affinity preserved: refresh lastSeen
+					rec := affinityRecord{tunnelID: targetTunnelID, lastSeen: now}
+					if req.PeerPublicKey != "" {
+						sm.peerAffinity[req.PeerPublicKey] = rec
+					}
+					if req.UserID != "" {
+						sm.userAffinity[req.UserID] = rec
+					}
 					return t, false, nil
 				}
 			}
@@ -97,11 +147,12 @@ func (sm *StickySessionManager) GetOrAssignBackend(ctx context.Context, req *Rou
 		return nil, false, err
 	}
 
+	rec := affinityRecord{tunnelID: selected.ID, lastSeen: now}
 	if req.UserID != "" {
-		sm.userAffinity[req.UserID] = selected.ID
+		sm.userAffinity[req.UserID] = rec
 	}
 	if req.PeerPublicKey != "" {
-		sm.peerAffinity[req.PeerPublicKey] = selected.ID
+		sm.peerAffinity[req.PeerPublicKey] = rec
 	}
 
 	return selected, true, nil
@@ -109,20 +160,29 @@ func (sm *StickySessionManager) GetOrAssignBackend(ctx context.Context, req *Rou
 
 // AssignAffinity records an explicit affinity for a user.
 func (sm *StickySessionManager) AssignAffinity(userID string, tunnelID int64) {
+	if userID == "" {
+		return
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.userAffinity[userID] = tunnelID
+	sm.userAffinity[userID] = affinityRecord{tunnelID: tunnelID, lastSeen: sm.now()}
 }
 
 // AssignPeerAffinity records an explicit affinity for a peer public key.
 func (sm *StickySessionManager) AssignPeerAffinity(peerKey string, tunnelID int64) {
+	if peerKey == "" {
+		return
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.peerAffinity[peerKey] = tunnelID
+	sm.peerAffinity[peerKey] = affinityRecord{tunnelID: tunnelID, lastSeen: sm.now()}
 }
 
 // ClearAffinity removes sticky affinity for a user.
 func (sm *StickySessionManager) ClearAffinity(userID string) {
+	if userID == "" {
+		return
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.userAffinity, userID)
@@ -130,6 +190,9 @@ func (sm *StickySessionManager) ClearAffinity(userID string) {
 
 // ClearPeerAffinity removes sticky affinity for a peer public key.
 func (sm *StickySessionManager) ClearPeerAffinity(peerKey string) {
+	if peerKey == "" {
+		return
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.peerAffinity, peerKey)
@@ -139,8 +202,28 @@ func (sm *StickySessionManager) ClearPeerAffinity(peerKey string) {
 func (sm *StickySessionManager) GetAffinity(userID string) (int64, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	tid, ok := sm.userAffinity[userID]
-	return tid, ok
+	rec, ok := sm.userAffinity[userID]
+	if !ok {
+		return 0, false
+	}
+	if sm.now().Sub(rec.lastSeen) > sm.affinityTTL {
+		return 0, false
+	}
+	return rec.tunnelID, true
+}
+
+// GetPeerAffinity returns the assigned backend tunnel ID for a peer public key.
+func (sm *StickySessionManager) GetPeerAffinity(peerKey string) (int64, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	rec, ok := sm.peerAffinity[peerKey]
+	if !ok {
+		return 0, false
+	}
+	if sm.now().Sub(rec.lastSeen) > sm.affinityTTL {
+		return 0, false
+	}
+	return rec.tunnelID, true
 }
 
 // FailoverMigration describes one session migrated off a degraded tunnel.
@@ -154,7 +237,7 @@ type FailoverMigration struct {
 // degraded backend during failover (issue #85). Skips are never silent: each
 // one is logged, counted in SkippedMigrationsTotal, and reported here so the
 // caller can retry or alert. The session remains routed to the disabled
-// backend — that is exactly the state this reporting makes explicit.
+// backend - that is exactly the state this reporting makes explicit.
 type FailoverSkippedPeer struct {
 	PeerPublicKey string
 	UserID        string
@@ -190,50 +273,148 @@ type stickyPeerTarget struct {
 // holds Service.mu, serializing failovers against each other; concurrent
 // peers may re-assign their own affinity between snapshot and apply. The
 // apply phase therefore only overwrites entries whose value is still the
-// degraded backend — a peer that moved on in the meantime keeps its newer
+// degraded backend - a peer that moved on in the meantime keeps its newer
 // assignment.
 //
 // No silent stranding: peers whose backend selection fails are logged,
 // counted, and returned in Result.Skipped; DB persist failures are retried
-// once, then the in-memory migration is marked un-persisted in the result —
+// once, then the in-memory migration is marked un-persisted in the result -
 // the reconcilable state stays explicit.
-func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel) (*FailoverResult, error) {
+type failoverSnapshot struct {
+	degradedUsers []string
+	expiredUsers  []string
+	degradedPeers []stickyPeerTarget
+	expiredPeers  []string
+}
+
+func (sm *StickySessionManager) snapshotFailoverTargets(degradedTunnelID int64, availableTunnels []*models.BackendTunnel) ([]*models.BackendTunnel, failoverSnapshot, error) {
 	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	healthy := FilterHealthy(availableTunnels, sm.caps.MaxPeersPerBackend)
 	if len(healthy) == 0 {
-		sm.mu.RUnlock()
-		return nil, ErrNoActiveBackends
+		return nil, failoverSnapshot{}, ErrNoActiveBackends
 	}
 
-	// --- SNAPSHOT: minimal in-memory state, no DB I/O under sm.mu. ---
-	degradedUsers := make([]string, 0)
-	for uID, tid := range sm.userAffinity {
-		if tid == degradedTunnelID {
-			degradedUsers = append(degradedUsers, uID)
+	nowSnap := sm.now()
+	var snap failoverSnapshot
+	for uID, rec := range sm.userAffinity {
+		if rec.tunnelID == degradedTunnelID {
+			if nowSnap.Sub(rec.lastSeen) > sm.affinityTTL {
+				snap.expiredUsers = append(snap.expiredUsers, uID)
+			} else {
+				snap.degradedUsers = append(snap.degradedUsers, uID)
+			}
 		}
 	}
-	sort.Strings(degradedUsers)
+	sort.Strings(snap.degradedUsers)
 
-	degradedPeers := make([]stickyPeerTarget, 0)
-	for pKey, tid := range sm.peerAffinity {
-		if tid == degradedTunnelID {
-			degradedPeers = append(degradedPeers, stickyPeerTarget{peerKey: pKey})
+	for pKey, rec := range sm.peerAffinity {
+		if rec.tunnelID == degradedTunnelID {
+			if nowSnap.Sub(rec.lastSeen) > sm.affinityTTL {
+				snap.expiredPeers = append(snap.expiredPeers, pKey)
+			} else {
+				snap.degradedPeers = append(snap.degradedPeers, stickyPeerTarget{peerKey: pKey})
+			}
 		}
 	}
 	// Stable ordering: failover output must be deterministic run to run
 	// (redirected forwarder routes, connection-count moves).
-	sort.Slice(degradedPeers, func(i, j int) bool {
-		return degradedPeers[i].peerKey < degradedPeers[j].peerKey
+	sort.Slice(snap.degradedPeers, func(i, j int) bool {
+		return snap.degradedPeers[i].peerKey < snap.degradedPeers[j].peerKey
 	})
-	sm.mu.RUnlock()
+
+	return healthy, snap, nil
+}
+
+func (sm *StickySessionManager) applyFailoverMoves(degradedTunnelID int64, snap failoverSnapshot, moves []peerMove) []FailoverMigration {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	now := sm.now()
+	for _, uID := range snap.expiredUsers {
+		if rec, exists := sm.userAffinity[uID]; exists && rec.tunnelID == degradedTunnelID {
+			delete(sm.userAffinity, uID)
+		}
+	}
+	for _, pKey := range snap.expiredPeers {
+		if rec, exists := sm.peerAffinity[pKey]; exists && rec.tunnelID == degradedTunnelID {
+			delete(sm.peerAffinity, pKey)
+		}
+	}
+	for _, uID := range snap.degradedUsers {
+		if sm.userAffinity[uID].tunnelID == degradedTunnelID {
+			delete(sm.userAffinity, uID)
+		}
+	}
+
+	migrations := make([]FailoverMigration, 0, len(moves))
+	for _, mv := range moves {
+		// Re-check: only overwrite if the peer is still on the degraded
+		// backend (it may have re-assigned between snapshot and apply).
+		current, exists := sm.peerAffinity[mv.peerKey]
+		if !exists || current.tunnelID == degradedTunnelID || current.tunnelID == 0 {
+			sm.peerAffinity[mv.peerKey] = affinityRecord{
+				tunnelID: mv.newID,
+				lastSeen: now,
+			}
+		}
+		migrations = append(migrations, FailoverMigration{
+			PeerPublicKey:      mv.peerKey,
+			UserID:             mv.userID,
+			NewBackendTunnelID: mv.newID,
+		})
+	}
+	return migrations
+}
+
+func (sm *StickySessionManager) persistFailoverMoves(ctx context.Context, dbMoves []dbMove, result *FailoverResult) {
+	persistFailures := make(map[string]bool)
+	for _, dm := range dbMoves {
+		sess := dm.sess
+		sess.BackendTunnelID = dm.newID
+		if err := sm.persistSession(ctx, &sess); err != nil {
+			sm.skipCounter.Add(1)
+			persistFailures[sess.PeerPublicKey] = true
+			log.Printf("[vpn] sticky failover: session %s (peer %s) migrated in memory to backend %d but DB row NOT updated after retry: %v (un-persisted, reconcilable)", sess.ID, sess.PeerPublicKey, dm.newID, err)
+			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
+				PeerPublicKey: sess.PeerPublicKey,
+				UserID:        sess.UserID,
+				Reason:        fmt.Sprintf("DB persist failed after retry: %v", err),
+			})
+		}
+	}
+
+	// Migration records: one per peer, from the affinity pass; DB-session-only
+	// peers get their record here. A peer whose persist failed still HAS its
+	// in-memory migration, but the DB/memory divergence is reported via
+	// Skipped above (never silently dropped).
+	migratedPeers := make(map[string]bool, len(result.Migrations))
+	for _, m := range result.Migrations {
+		migratedPeers[m.PeerPublicKey] = true
+	}
+	for _, dm := range dbMoves {
+		if persistFailures[dm.sess.PeerPublicKey] || migratedPeers[dm.sess.PeerPublicKey] {
+			continue
+		}
+		result.Migrations = append(result.Migrations, FailoverMigration{
+			PeerPublicKey:      dm.sess.PeerPublicKey,
+			UserID:             dm.sess.UserID,
+			NewBackendTunnelID: dm.newID,
+		})
+	}
+}
+
+func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel) (*FailoverResult, error) {
+	healthy, snap, err := sm.snapshotFailoverTargets(degradedTunnelID, availableTunnels)
+	if err != nil {
+		return nil, err
+	}
 
 	result := &FailoverResult{}
 
 	// --- COMPUTE: DB reads + backend selection, mutex NOT held. ---
-
-	// Resolve user IDs for degraded peers from the DB session rows (also
-	// yields the full set of connected sessions stuck on the degraded
-	// backend, including peers with no in-memory affinity).
+	degradedPeers := snap.degradedPeers
 	var activeSessions []models.VPNSession
 	if sm.db != nil {
 		sessions, err := sm.db.GetActiveVPNSessions(ctx)
@@ -270,7 +451,7 @@ func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunn
 		if err != nil {
 			sm.skipCounter.Add(1)
 			skippedSeen[dp.peerKey] = true
-			log.Printf("[vpn] sticky failover: peer %s left on degraded backend %d: backend selection failed: %v", dp.peerKey, degradedTunnelID, err)
+			log.Printf("[vpn] sticky failover: peer %s (user %s) backend selection failed off degraded tunnel %d: %v", dp.peerKey, dp.userID, degradedTunnelID, err)
 			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
 				PeerPublicKey: dp.peerKey,
 				UserID:        dp.userID,
@@ -287,63 +468,13 @@ func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunn
 	dbMoves := sm.planDBSessionMoves(ctx, degradedTunnelID, activeSessions, moves, skippedSeen, healthy, result)
 
 	// --- APPLY: short re-lock, re-check, apply. ---
-	sm.mu.Lock()
-	for _, uID := range degradedUsers {
-		if sm.userAffinity[uID] == degradedTunnelID {
-			delete(sm.userAffinity, uID)
-		}
-	}
-	for _, mv := range moves {
-		// Re-check: only overwrite if the peer is still on the degraded
-		// backend (it may have re-assigned between snapshot and apply).
-		if sm.peerAffinity[mv.peerKey] == degradedTunnelID || sm.peerAffinity[mv.peerKey] == 0 {
-			sm.peerAffinity[mv.peerKey] = mv.newID
-		}
-		result.Migrations = append(result.Migrations, FailoverMigration{
-			PeerPublicKey:      mv.peerKey,
-			UserID:             mv.userID,
-			NewBackendTunnelID: mv.newID,
-		})
-	}
-	sm.mu.Unlock()
+	result.Migrations = sm.applyFailoverMoves(degradedTunnelID, snap, moves)
 
 	// --- PERSIST: DB session updates, mutex NOT held. Persist errors are
 	// retried once, then surfaced: the in-memory migration already happened,
 	// so the result must mark the row as un-persisted (reconcilable) rather
 	// than silently dropping the write (issue #85: `_ = CreateVPNSession`). ---
-	persistFailures := make(map[string]bool)
-	for _, dm := range dbMoves {
-		sess := dm.sess
-		sess.BackendTunnelID = dm.newID
-		if err := sm.persistSession(ctx, &sess); err != nil {
-			sm.skipCounter.Add(1)
-			persistFailures[sess.PeerPublicKey] = true
-			log.Printf("[vpn] sticky failover: session %s (peer %s) migrated in memory to backend %d but DB row NOT updated after retry: %v (un-persisted, reconcilable)", sess.ID, sess.PeerPublicKey, dm.newID, err)
-			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
-				PeerPublicKey: sess.PeerPublicKey,
-				UserID:        sess.UserID,
-				Reason:        fmt.Sprintf("DB persist failed after retry: %v", err),
-			})
-		}
-	}
-	// Migration records: one per peer, from the affinity pass; DB-session-only
-	// peers get their record here. A peer whose persist failed still HAS its
-	// in-memory migration, but the DB/memory divergence is reported via
-	// Skipped above (never silently dropped).
-	migratedPeers := make(map[string]bool, len(result.Migrations))
-	for _, m := range result.Migrations {
-		migratedPeers[m.PeerPublicKey] = true
-	}
-	for _, dm := range dbMoves {
-		if persistFailures[dm.sess.PeerPublicKey] || migratedPeers[dm.sess.PeerPublicKey] {
-			continue
-		}
-		result.Migrations = append(result.Migrations, FailoverMigration{
-			PeerPublicKey:      dm.sess.PeerPublicKey,
-			UserID:             dm.sess.UserID,
-			NewBackendTunnelID: dm.newID,
-		})
-	}
+	sm.persistFailoverMoves(ctx, dbMoves, result)
 
 	// Stable contract: records are returned sorted by peer public key.
 	sort.SliceStable(result.Migrations, func(i, j int) bool {
@@ -371,7 +502,7 @@ type dbMove struct {
 // planDBSessionMoves computes target backends for every connected DB session
 // still on the degraded backend (issue #85). Peers with an in-memory move
 // reuse that target; peers without one get a fresh selection. Selection
-// failures are logged, counted, and appended to result.Skipped — never
+// failures are logged, counted, and appended to result.Skipped - never
 // silently dropped. Runs WITHOUT sm.mu held.
 func (sm *StickySessionManager) planDBSessionMoves(ctx context.Context, degradedTunnelID int64, activeSessions []models.VPNSession, moves []peerMove, skippedSeen map[string]bool, healthy []*models.BackendTunnel, result *FailoverResult) []dbMove {
 	dbMoves := make([]dbMove, 0)

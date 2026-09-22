@@ -84,3 +84,46 @@ func testFreePort(t *testing.T) int {
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).Port
 }
+
+func TestListener_SweepTimedOutSessions(t *testing.T) {
+	cfg := ListenerConfig{
+		ListenPort:  testFreePort(t),
+		IdleTimeout: 10 * time.Millisecond,
+	}
+	sm := NewSessionManager(nil, nil)
+	el, err := NewListener(cfg, nil, nil, nil, sm, nil)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	reaped := make(chan *models.VPNSession, 2)
+	el.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
+		reaped <- sess
+	})
+
+	ctx := context.Background()
+	sess, err := sm.CreateSession(ctx, "u-fast", "peer-fast", "10.77.0.2", 1, "sess-fast")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// Age session past IdleTimeout
+	sess.LastSeen = time.Now().UTC().Add(-1 * time.Minute)
+
+	timedOut, err := el.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sess.ID {
+		t.Fatalf("expected 1 timedOut session with ID %s, got %+v", sess.ID, timedOut)
+	}
+
+	select {
+	case got := <-reaped:
+		if got.PeerPublicKey != "peer-fast" {
+			t.Errorf("expected peer-fast, got %s", got.PeerPublicKey)
+		}
+	default:
+		t.Errorf("reaper hook was not invoked")
+	}
+}

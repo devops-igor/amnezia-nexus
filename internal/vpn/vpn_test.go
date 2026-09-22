@@ -4717,3 +4717,904 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 		}
 	}
 }
+
+func TestSessionReaperHook_Teardown(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	var targetTunnel *models.BackendTunnel
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			targetTunnel = tun
+			break
+		}
+	}
+	if targetTunnel == nil {
+		targetTunnel = tunnels[0]
+	}
+	tunID := targetTunnel.ID
+
+	// 1. Establish state simulating an active session:
+	// - session in sessionMgr
+	// - route registered in forwarder
+	// - sticky affinities in stickyMgr
+	// - incremented connection count in pool
+	sessID := "sess-reaper-test-1"
+	assignedIP := "10.100.0.88"
+	createdSess, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIP, tunID, sessID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	vpnSvc.forwarder.RegisterSession(sessID, "conn-1", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// Verify pre-conditions
+	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); !ok {
+		t.Fatalf("expected forwarder route to be registered")
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
+		t.Fatalf("expected user sticky affinity to be %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
+		t.Fatalf("expected peer sticky affinity to be %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+	tunBefore, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunBefore.ActiveConnections != 1 {
+		t.Fatalf("expected pool ActiveConnections=1, got %d (err=%v)", tunBefore.ActiveConnections, err)
+	}
+
+	// 2. Age session past IdleTimeout (default 3m, age by 10m)
+	createdSess.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+
+	// 3. Trigger timeout sweep through listener (which invokes the registered SessionReaperHook)
+	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) == 0 {
+		t.Fatalf("expected at least 1 timed out session, got 0")
+	}
+	if timedOut[0].ID != createdSess.ID {
+		t.Fatalf("expected timed out session %s, got %s", createdSess.ID, timedOut[0].ID)
+	}
+
+	// 4. Verify post-conditions after reaper hook teardown:
+	// a) Session is removed from sessionMgr
+	if _, ok := vpnSvc.sessionMgr.GetSessionByID(createdSess.ID); ok {
+		t.Errorf("session still found in sessionMgr after sweep")
+	}
+
+	// b) Forwarder route unregistered
+	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); ok {
+		t.Errorf("forwarder route for %s still registered after reaper teardown", peerKeyAlice)
+	}
+
+	// c) Sticky affinities cleared
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); ok {
+		t.Errorf("user sticky affinity still present for %s (tid=%d)", uID, tid)
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); ok {
+		t.Errorf("peer sticky affinity still present for %s (tid=%d)", peerKeyAlice, tid)
+	}
+
+	// d) Pool connection count decremented to 0
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections=0 after reaper teardown, got %d (err=%v)", tunAfter.ActiveConnections, err)
+	}
+}
+
+func TestService_ReapSession_EdgeCases(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	// Calling with nil session should not panic or error
+	vpnSvc.reapSession(ctx, nil)
+
+	// Calling with empty/non-existent session fields should not panic
+	dummySess := &models.VPNSession{
+		ID:              "non-existent",
+		UserID:          "",
+		PeerPublicKey:   "no-such-peer",
+		BackendTunnelID: 999999,
+	}
+	vpnSvc.reapSession(ctx, dummySess)
+}
+
+func TestSessionReaperHook_ReconnectRace(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	tunID := tunnels[0].ID
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			tunID = tun.ID
+			break
+		}
+	}
+
+	// 1. Session A is active
+	sessIDA := "sess-reconnect-race-A"
+	assignedIPA := "10.100.0.91"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPA, tunID, sessIDA)
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessIDA, "conn-1", peerKeyAlice, assignedIPA, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// 2. Age session A past idle timeout
+	sessA.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+
+	// 3. Intercept reaper hook execution to simulate delayed reaper execution
+	reaperChan := make(chan *models.VPNSession, 1)
+	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+		reaperChan <- s
+	})
+
+	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected session A to time out, got %+v", timedOut)
+	}
+
+	var reapedSessA *models.VPNSession
+	select {
+	case reapedSessA = <-reaperChan:
+	default:
+		t.Fatalf("expected reaperChan to receive session A")
+	}
+
+	// 4. Client reconnects creating session B before session A's reaper hook executes
+	assignedIPB := "10.100.0.92"
+	sessB, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPB, tunID, "conn-b")
+	if err != nil {
+		t.Fatalf("CreateSession B failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessB.ID, "conn-b", peerKeyAlice, assignedIPB, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tunMid, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunMid.ActiveConnections != 2 {
+		t.Fatalf("expected pool ActiveConnections=2 before reaper A runs, got %d", tunMid.ActiveConnections)
+	}
+
+	// 5. Now execute the delayed reapSession for session A
+	vpnSvc.reapSession(ctx, reapedSessA)
+
+	// 6. Assertions for Session B:
+	// a) Session B must still be active in sessionMgr
+	if current, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice); !ok || current.ID != sessB.ID {
+		t.Errorf("expected session B to still be active in sessionMgr, got ok=%v, sess=%+v", ok, current)
+	}
+
+	// b) Session B's forwarder route must remain intact
+	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); !ok {
+		t.Errorf("expected forwarder route for session B to remain intact")
+	}
+
+	// c) Session B's sticky peer affinity must remain intact
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
+		t.Errorf("expected peer sticky affinity to remain %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+
+	// d) Session B's sticky user affinity must remain intact
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
+		t.Errorf("expected user sticky affinity to remain %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+
+	// e) Tunnel ActiveConnections must be exactly 1
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunAfter.ActiveConnections != 1 {
+		t.Errorf("expected pool ActiveConnections=1 after reaper A runs, got %d", tunAfter.ActiveConnections)
+	}
+}
+
+func TestSessionReaperHook_ReconcileRace(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	tunID := tunnels[0].ID
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			tunID = tun.ID
+			break
+		}
+	}
+
+	// 1. Session A is active
+	sessIDA := "sess-reconcile-race-A"
+	assignedIPA := "10.100.0.93"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPA, tunID, sessIDA)
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-1", peerKeyAlice, assignedIPA, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// 2. Age session A past idle timeout
+	sessA.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+
+	// Intercept reaper hook
+	reaperChan := make(chan *models.VPNSession, 1)
+	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+		reaperChan <- s
+	})
+
+	// 3. Trigger SweepTimedOutSessions
+	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected session A to time out, got %+v", timedOut)
+	}
+	if timedOut[0].TimedOutAt.IsZero() {
+		t.Fatalf("expected TimedOutAt to be set on timed-out session")
+	}
+
+	var reapedSessA *models.VPNSession
+	select {
+	case reapedSessA = <-reaperChan:
+	default:
+		t.Fatalf("expected reaperChan to receive session A")
+	}
+
+	// 4. Session B connects for another peer
+	peerKeyBob := "peer-reconcile-bob"
+	assignedIPB := "10.100.0.94"
+	sessB, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyBob, assignedIPB, tunID, "conn-bob")
+	if err != nil {
+		t.Fatalf("CreateSession B failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessB.ID, "conn-bob", peerKeyBob, assignedIPB, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// 5. Periodic reconciliation runs before session A's reaper hook runs
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	tunReconciled, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunReconciled.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1 after reconciliation, got %d", tunReconciled.ActiveConnections)
+	}
+	if vpnSvc.lastReconcileTime.IsZero() || !vpnSvc.lastReconcileTime.After(reapedSessA.TimedOutAt) {
+		t.Fatalf("expected lastReconcileTime to be after TimedOutAt")
+	}
+
+	// 6. Now the delayed reapSession for session A runs
+	vpnSvc.reapSession(ctx, reapedSessA)
+
+	// 7. Verify pool counter was NOT decremented to 0
+	tunFinal, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tunFinal.ActiveConnections != 1 {
+		t.Errorf("expected pool ActiveConnections to remain 1 after stale reaper, got %d", tunFinal.ActiveConnections)
+	}
+}
+
+func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	peerKeyBob := "peer-deadlock-bob"
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: 1,
+		Protocol: "awg",
+		ClientID: peerKeyBob,
+		Name:     "bob-phone",
+	})
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Worker 1: repeatedly creates sessions and ages them
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		peers := []string{peerKeyAlice, peerKeyBob}
+		for i := 0; i < 50; i++ {
+			p := peers[i%len(peers)]
+			sess, _, err := vpnSvc.HandleIncomingPeer(ctx, p)
+			if err == nil && sess != nil {
+				vpnSvc.endpoint.SessionManager().SetSessionLastSeen(p, time.Now().UTC().Add(-10*time.Minute))
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Worker 2: repeatedly triggers timeout sweeps
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_, _ = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Worker 3: runs periodic reconciliation
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			vpnSvc.reconcileConnectionCounts(ctx)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded without deadlock
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock detected: concurrent timeout sweep, HandleIncomingPeer, and reconciliation did not complete in 10s")
+	}
+}
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-stale-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.91", tunID, "conn-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-a", peerKeyA, "10.100.0.91", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// 2. Configure reconcilePostSnapshotHook:
+	// While reconciliation is paused post-DB read, create a new Session B and increment live pool counter.
+	// This mutates sessionMgr lifecycle version and moves live gauge to 2.
+	// Because DB snapshot only contains Session A (count 1), if the snapshot were applied,
+	// it would clobber the gauge back to 1.
+	hookFired := false
+	vpnSvc.SetReconcilePostSnapshotHook(func() {
+		hookFired = true
+		peerKeyB := "peer-reconcile-stale-b"
+		sessB, errCreate := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyB, "10.100.0.92", tunID, "conn-b")
+		if errCreate != nil {
+			t.Fatalf("hook: CreateSession B failed: %v", errCreate)
+		}
+		vpnSvc.forwarder.RegisterSession(sessB.ID, "conn-b", peerKeyB, "10.100.0.92", tunID)
+		vpnSvc.pool.IncrementConnections(tunID)
+	})
+
+	// 3. Run reconcileConnectionCounts:
+	// Prior to DB read: lifecycleVersion is V1.
+	// DB read returns 1 session (Session A).
+	// Hook fires: Session B created, lifecycleVersion becomes V2, pool gauge is 2.
+	// Reconciliation acquires lock: sees lifecycleVersion V2 != V1 -> aborts!
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	if !hookFired {
+		t.Fatal("expected reconcilePostSnapshotHook to fire")
+	}
+
+	// 4. Verify pool gauge remains 2, not reset to 1
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 2 {
+		t.Errorf("expected pool ActiveConnections to remain 2, got %d (stale snapshot was not rejected)", tunAfter.ActiveConnections)
+	}
+}
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected_ReplacementFailure(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-replace-fail-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.91", tunID, "conn-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-a", peerKeyA, "10.100.0.91", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// 2. Configure reconcilePostSnapshotHook:
+	// While reconciliation is paused post-DB read (which captured Session A with count 1),
+	// trigger a replacement for Session A with a canceled context so persistence fails.
+	// The replacement removes Session A from memory maps and advances lifecycleVersion.
+	// We also adjust live pool gauge (decrement by 1 to 0) to represent Session A being torn down.
+	// If the stale snapshot were applied, it would reset the live gauge back to 1.
+	hookFired := false
+	versionBeforeReconcile := vpnSvc.sessionMgr.LifecycleVersion()
+	vpnSvc.SetReconcilePostSnapshotHook(func() {
+		hookFired = true
+		cancCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, errReplace := vpnSvc.sessionMgr.CreateSession(cancCtx, uID, peerKeyA, "10.100.0.91", tunID, "conn-a-replacement")
+		if errReplace == nil {
+			t.Fatal("expected CreateSession replacement to fail due to canceled context")
+		}
+
+		// Verify that lifecycleVersion was advanced even though CreateSession returned an error
+		if vpnSvc.sessionMgr.LifecycleVersion() <= versionBeforeReconcile {
+			t.Fatalf("expected lifecycleVersion to advance on replacement removal, but got %d (was %d)",
+				vpnSvc.sessionMgr.LifecycleVersion(), versionBeforeReconcile)
+		}
+
+		// Adjust live pool counter to 0
+		vpnSvc.pool.DecrementConnections(tunID)
+	})
+
+	// 3. Run reconcileConnectionCounts:
+	// DB read captured Session A (desired count 1).
+	// Hook fired: replacement failed, but advanced lifecycleVersion. Live gauge is 0.
+	// Reconcile acquires lock: detects lifecycleVersion mutated -> aborts!
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	if !hookFired {
+		t.Fatal("expected reconcilePostSnapshotHook to fire")
+	}
+
+	// 4. Verify pool gauge remains 0, not reset to stale count 1
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections to remain 0, got %d (stale snapshot was not rejected)", tunAfter.ActiveConnections)
+	}
+}
+
+func TestSessionReaperHook_ReconcileFailureDoesNotSuppressReaper(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, s2ID, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) < 2 {
+		t.Fatalf("expected at least 2 active tunnels in pool, got %d", len(tunnels))
+	}
+	var tun1ID, tun2ID int64
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			tun1ID = tun.ID
+		} else if tun.ServerID == s2ID {
+			tun2ID = tun.ID
+		}
+	}
+	if tun1ID == 0 || tun2ID == 0 {
+		t.Fatalf("failed to resolve tunnel IDs for servers %d and %d", s1ID, s2ID)
+	}
+
+	// 1. Session A is active on Tunnel 1
+	sessIDA := "sess-reconcile-fail-A"
+	assignedIPA := "10.100.0.95"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPA, tun1ID, sessIDA)
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-1", peerKeyAlice, assignedIPA, tun1ID)
+	vpnSvc.pool.IncrementConnections(tun1ID)
+
+	// 2. Age session A past idle timeout
+	sessA.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+
+	// Intercept reaper hook so delayed reapSession execution can be controlled
+	reaperChan := make(chan *models.VPNSession, 1)
+	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+		reaperChan <- s
+	})
+
+	// 3. Trigger SweepTimedOutSessions
+	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected session A to time out, got %+v", timedOut)
+	}
+	if timedOut[0].TimedOutAt.IsZero() {
+		t.Fatalf("expected TimedOutAt to be set on timed-out session")
+	}
+
+	var reapedSessA *models.VPNSession
+	select {
+	case reapedSessA = <-reaperChan:
+	default:
+		t.Fatalf("expected reaperChan to receive session A")
+	}
+
+	// 4. Session B connects on Tunnel 1, bringing live ActiveConnections to 2 (1 stale A + 1 live B)
+	peerKeyBob := "peer-reconcile-bob-fail"
+	assignedIPB := "10.100.0.96"
+	sessB, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyBob, assignedIPB, tun1ID, "conn-bob")
+	if err != nil {
+		t.Fatalf("CreateSession B failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessB.ID, "conn-bob", peerKeyBob, assignedIPB, tun1ID)
+	vpnSvc.pool.IncrementConnections(tun1ID)
+
+	tun1Before, err := vpnSvc.pool.GetTunnelByID(tun1ID)
+	if err != nil || tun1Before.ActiveConnections != 2 {
+		t.Fatalf("expected Tunnel 1 ActiveConnections=2 before reconcile, got %d", tun1Before.ActiveConnections)
+	}
+
+	// 5. Run reconcileConnectionCounts with an injected failure during SetConnectionCount:
+	// Reconciliation reads DB (desired count for Tunnel 1 is 1 for Session B).
+	// Hook cancels context so SetConnectionCount DB persistence fails for Tunnel 1.
+	ctxReconcile, cancelReconcile := context.WithCancel(context.Background())
+	vpnSvc.SetReconcilePostSnapshotHook(func() {
+		cancelReconcile()
+	})
+	vpnSvc.reconcileConnectionCounts(ctxReconcile)
+
+	// 6. Verify reconciliation state under lock:
+	// Tunnel 1 failed persistence: lastReconcileByTunnel[tun1ID] must NOT be set!
+	// Tunnel 2 had zero drift: lastReconcileByTunnel[tun2ID] was successfully set.
+	// Because Tunnel 1 failed, global lastReconcileTime must NOT be updated.
+	vpnSvc.mu.RLock()
+	tun1ReconcileTime := vpnSvc.lastReconcileByTunnel[tun1ID]
+	tun2ReconcileTime := vpnSvc.lastReconcileByTunnel[tun2ID]
+	globalReconcileTime := vpnSvc.lastReconcileTime
+	vpnSvc.mu.RUnlock()
+
+	if !tun1ReconcileTime.IsZero() {
+		t.Errorf("expected lastReconcileByTunnel[tun1ID] to be zero after failure, got %v", tun1ReconcileTime)
+	}
+	if tun2ReconcileTime.IsZero() {
+		t.Errorf("expected lastReconcileByTunnel[tun2ID] to be non-zero for successful tunnel, got zero")
+	}
+	if !globalReconcileTime.IsZero() {
+		t.Errorf("expected global lastReconcileTime to remain zero when any tunnel fails, got %v", globalReconcileTime)
+	}
+
+	// 7. Now execute delayed reapSession for session A.
+	// Since Tunnel 1's reconciliation timestamp was not recorded, reaper must NOT skip decrement.
+	vpnSvc.reapSession(ctx, reapedSessA)
+
+	// 8. Verify Tunnel 1 ActiveConnections was decremented to 0
+	tunFinal, err := vpnSvc.pool.GetTunnelByID(tun1ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunFinal.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections to be decremented to 0, got %d (reaper decrement was improperly suppressed)", tunFinal.ActiveConnections)
+	}
+}
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutDuringApply(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-timeout-apply-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.95", tunID, "conn-apply-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-apply-a", peerKeyA, "10.100.0.95", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// Age session past IdleTimeout (default 3m, age by 10m)
+	vpnSvc.endpoint.SessionManager().SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
+
+	versionBefore := vpnSvc.sessionMgr.LifecycleVersion()
+
+	var wg sync.WaitGroup
+	var hookFired atomic.Bool
+	var sweepErr error
+	var timedOut []*models.VPNSession
+
+	vpnSvc.SetReconcilePreApplyHook(func() {
+		hookFired.Store(true)
+
+		vpnSvc.sessionMgr.UnlockLifecycle()
+		defer vpnSvc.sessionMgr.LockLifecycle()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// SweepTimedOutSessions runs CheckTimeouts under SessionManager.mu,
+			// increments lifecycleVersion, and then invokes registered reaperHook
+			// which calls svc.reapSession(ctx, sess) blocking on Service.mu.
+			timedOut, sweepErr = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+		}()
+
+		// Wait until CheckTimeouts has removed session A and advanced lifecycleVersion
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			_, found := vpnSvc.sessionMgr.GetSessionByID(sessA.ID)
+			if !found && vpnSvc.sessionMgr.LifecycleVersion() > versionBefore {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Yield to allow the reaper goroutine to reach reapSession and block on Service.mu
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	// 2. Run reconcileConnectionCounts:
+	// DB read captured Session A (desired count 1).
+	// Passes initial version check under Service.mu.
+	// Hook fires: Session A times out, lifecycleVersion advances, reaper blocks on Service.mu.
+	// Reconcile resumes: detects lifecycleVersion mutated -> refuses to apply snapshot and aborts!
+	// Reconcile releases Service.mu.
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	// Wait for the reaper goroutine to finish
+	wg.Wait()
+
+	if !hookFired.Load() {
+		t.Fatal("expected reconcilePreApplyHook to fire")
+	}
+	if sweepErr != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", sweepErr)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected 1 timed out session %s, got %+v", sessA.ID, timedOut)
+	}
+
+	// 3. Verify reconciliation timestamps were NOT committed
+	vpnSvc.mu.RLock()
+	var tunReconcileTime time.Time
+	if vpnSvc.lastReconcileByTunnel != nil {
+		tunReconcileTime = vpnSvc.lastReconcileByTunnel[tunID]
+	}
+	globalReconcileTime := vpnSvc.lastReconcileTime
+	vpnSvc.mu.RUnlock()
+
+	if !tunReconcileTime.IsZero() {
+		t.Errorf("expected lastReconcileByTunnel[%d] to be zero after abort, got %v", tunID, tunReconcileTime)
+	}
+	if !globalReconcileTime.IsZero() {
+		t.Errorf("expected global lastReconcileTime to remain zero after abort, got %v", globalReconcileTime)
+	}
+
+	// 4. Verify pool gauge is 0 (decremented by reaper, not restored to 1 by reconciliation)
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections to be 0, got %d (stale snapshot restored count)", tunAfter.ActiveConnections)
+	}
+}
+
+func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatal("no active tunnels found")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Create Session A: pool ActiveConnections is 1, DB has 1 active session.
+	peerKeyA := "peer-reconcile-timeout-commit-a"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyA, "10.100.0.96", tunID, "conn-commit-a")
+	if err != nil {
+		t.Fatalf("CreateSession A failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-commit-a", peerKeyA, "10.100.0.96", tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	tun1, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil || tun1.ActiveConnections != 1 {
+		t.Fatalf("expected ActiveConnections=1, got %d", tun1.ActiveConnections)
+	}
+
+	// Age session past IdleTimeout (default 3m, age by 10m)
+	vpnSvc.endpoint.SessionManager().SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
+
+	versionBefore := vpnSvc.sessionMgr.LifecycleVersion()
+
+	var wg sync.WaitGroup
+	var hookFired atomic.Bool
+	var sweepErr error
+	var timedOut []*models.VPNSession
+
+	vpnSvc.SetReconcilePreCommitHook(func() {
+		hookFired.Store(true)
+
+		// Temporarily release session lifecycle lock so background sweep can proceed
+		vpnSvc.sessionMgr.UnlockLifecycle()
+		defer vpnSvc.sessionMgr.LockLifecycle()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// SweepTimedOutSessions runs CheckTimeouts under SessionManager.mu,
+			// increments lifecycleVersion, and then invokes registered reaperHook
+			// which calls svc.reapSession(ctx, sess) blocking on Service.mu.
+			timedOut, sweepErr = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+		}()
+
+		// Wait until CheckTimeouts has removed session A and advanced lifecycleVersion
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			_, found := vpnSvc.sessionMgr.GetSessionByID(sessA.ID)
+			if !found && vpnSvc.sessionMgr.LifecycleVersion() > versionBefore {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Yield to allow the reaper goroutine to reach reapSession and block on Service.mu
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	// 2. Run reconcileConnectionCounts:
+	// DB read captured Session A (desired count 1).
+	// Passes initial version check under Service.mu and sm.LockLifecycle.
+	// Drift evaluated in Phase 1 (no changes yet applied).
+	// Pre-commit hook fires: temporarily releases sm.LockLifecycle,
+	// Session A times out, lifecycleVersion advances, reaper blocks on Service.mu,
+	// sm.LockLifecycle re-acquired.
+	// Reconcile resumes from hook: detects lifecycleVersion mutated,
+	// aborts Phase 2 commit immediately (SetConnectionCount never called, timestamps not committed).
+	// Reconcile releases sm.UnlockLifecycle and Service.mu.
+	vpnSvc.reconcileConnectionCounts(ctx)
+
+	// Wait for the reaper goroutine to finish
+	wg.Wait()
+
+	if !hookFired.Load() {
+		t.Fatal("expected reconcilePreCommitHook to fire")
+	}
+	if sweepErr != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", sweepErr)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sessA.ID {
+		t.Fatalf("expected 1 timed out session %s, got %+v", sessA.ID, timedOut)
+	}
+
+	// 3. Verify reconciliation timestamps were NOT committed
+	vpnSvc.mu.RLock()
+	var tunReconcileTime time.Time
+	if vpnSvc.lastReconcileByTunnel != nil {
+		tunReconcileTime = vpnSvc.lastReconcileByTunnel[tunID]
+	}
+	globalReconcileTime := vpnSvc.lastReconcileTime
+	vpnSvc.mu.RUnlock()
+
+	if !tunReconcileTime.IsZero() {
+		t.Errorf("expected lastReconcileByTunnel[%d] to be zero after abort, got %v", tunID, tunReconcileTime)
+	}
+	if !globalReconcileTime.IsZero() {
+		t.Errorf("expected global lastReconcileTime to remain zero after abort, got %v", globalReconcileTime)
+	}
+
+	// 4. Verify pool gauge is 0 (decremented by reaper, not restored to 1 by reconciliation)
+	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected pool ActiveConnections to be 0, got %d (stale snapshot restored count)", tunAfter.ActiveConnections)
+	}
+}
