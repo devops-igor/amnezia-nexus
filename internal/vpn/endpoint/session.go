@@ -129,6 +129,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 		delete(sm.sessionsByID, oldSess.ID)
 		delete(sm.sessionsByPeer, peerPublicKey)
 		sm.activeCount.Add(-1)
+		sm.lifecycleVersion.Add(1)
 		sm.metrics.ReplacementsTotal.Add(1)
 		if sm.db != nil {
 			// Same teardown primitive as CloseSession: the row must go, or

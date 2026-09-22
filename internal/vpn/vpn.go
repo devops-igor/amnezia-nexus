@@ -153,6 +153,7 @@ type Service struct {
 	dropLogUntil atomic.Int64
 
 	lastReconcileTime         time.Time
+	lastReconcileByTunnel     map[int64]time.Time
 	reconcilePostSnapshotHook func()
 }
 
@@ -531,21 +532,22 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	}
 
 	svc := &Service{
-		db:            db,
-		cfg:           cfg,
-		endpoint:      epListener,
-		sessionMgr:    sessionMgr,
-		ipam:          ipam,
-		auth:          auth,
-		pool:          pool,
-		prober:        prober,
-		reconnectMgr:  reconnectMgr,
-		balancer:      lb,
-		stickyMgr:     stickyMgr,
-		forwarder:     fwd,
-		accountant:    accountant,
-		portalPubKey:  pub,
-		portalPrivKey: priv,
+		db:                    db,
+		cfg:                   cfg,
+		endpoint:              epListener,
+		sessionMgr:            sessionMgr,
+		ipam:                  ipam,
+		auth:                  auth,
+		pool:                  pool,
+		prober:                prober,
+		reconnectMgr:          reconnectMgr,
+		balancer:              lb,
+		stickyMgr:             stickyMgr,
+		forwarder:             fwd,
+		accountant:            accountant,
+		portalPubKey:          pub,
+		portalPrivKey:         priv,
+		lastReconcileByTunnel: make(map[int64]time.Time),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
@@ -939,7 +941,9 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 		return
 	}
 
-	s.lastReconcileTime = dbReadTime
+	if s.lastReconcileByTunnel == nil {
+		s.lastReconcileByTunnel = make(map[int64]time.Time)
+	}
 
 	desired := make(map[int64]int)
 	for i := range sessions {
@@ -948,17 +952,25 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 
 	tunnels := s.pool.ListTunnels()
 	anyDrift := false
+	allSucceeded := true
 	for _, tun := range tunnels {
 		want := desired[tun.ID]
 		if tun.ActiveConnections == want {
+			s.lastReconcileByTunnel[tun.ID] = dbReadTime
 			continue
 		}
 		anyDrift = true
 		if err := s.pool.SetConnectionCount(ctx, tun.ID, want); err != nil {
+			allSucceeded = false
 			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
 			continue
 		}
+		s.lastReconcileByTunnel[tun.ID] = dbReadTime
 		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
+	}
+
+	if allSucceeded {
+		s.lastReconcileTime = dbReadTime
 	}
 
 	// Sessions whose BackendTunnelID is not in the pool: count them as the
@@ -2354,7 +2366,11 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 	if s.pool != nil {
 		shouldDecrement := true
-		if !sess.TimedOutAt.IsZero() && !s.lastReconcileTime.IsZero() && s.lastReconcileTime.After(sess.TimedOutAt) {
+		var tunReconcileTime time.Time
+		if s.lastReconcileByTunnel != nil {
+			tunReconcileTime = s.lastReconcileByTunnel[sess.BackendTunnelID]
+		}
+		if !sess.TimedOutAt.IsZero() && !tunReconcileTime.IsZero() && tunReconcileTime.After(sess.TimedOutAt) {
 			shouldDecrement = false
 		}
 		if shouldDecrement {
