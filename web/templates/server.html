@@ -567,6 +567,7 @@
 {{ define "scripts" }}
 <script>
     const SERVER_ID = {{ .server_id }};
+    const STATS_REFRESH_INTERVAL_MS = 30000;
     let currentInstallProto = 'awg';
     let currentConfig = '';
     let currentVpnLink = '';
@@ -607,17 +608,23 @@
     async function loadServerStats() {
         try {
             const stats = await API.post(`/api/servers/${SERVER_ID}/stats`, null, { silent: true });
+            if (!stats || typeof stats !== 'object' || stats.error || Object.keys(stats).length === 0 || (stats.ram_total === 0 && stats.disk_total === 0)) {
+                throw new Error(stats && stats.error ? stats.error : 'Empty or invalid server stats');
+            }
             const el = document.getElementById('serverStats');
-            if (!el) return;
-            el.style.display = '';
-            el.innerHTML = `
+            if (el) {
+                el.style.display = '';
+                el.innerHTML = `
                 <span class="stat-pill" title="CPU"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-activity"></use></svg> CPU: ${stats.cpu || 0}%</span>
                 <span class="stat-pill" title="RAM: ${UI.formatBytes(stats.ram_used)} / ${UI.formatBytes(stats.ram_total)}"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-server"></use></svg> RAM: ${stats.ram_percent || 0}%</span>
                 <span class="stat-pill" title="Disk: ${UI.formatBytes(stats.disk_used)} / ${UI.formatBytes(stats.disk_total)}"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-server"></use></svg> Disk: ${stats.disk_percent || 0}%</span>
                 <span class="stat-pill" title="Network"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-network"></use></svg> ↓${UI.formatBytes(stats.net_rx)} ↑${UI.formatBytes(stats.net_tx)}</span>
             `;
+            }
+            return stats;
         } catch (err) {
             console.warn('Stats load failed:', err);
+            throw err;
         }
     }
 
@@ -687,8 +694,10 @@
                 if (mimicryBadges) mimicryBadges.innerHTML = badgesHtml;
                 if (awgMimicryBadges) awgMimicryBadges.innerHTML = badgesHtml;
             }
+            return reach;
         } catch (err) {
             console.warn('Reachability update failed:', err);
+            throw err;
         }
     }
 
@@ -1677,8 +1686,7 @@
     }
 
     checkServer();
-    loadServerStats();
-    updateReachability();
-    setInterval(updateReachability, 30000);
+    Telemetry.poll('server-stats-' + SERVER_ID, loadServerStats, STATS_REFRESH_INTERVAL_MS);
+    Telemetry.poll('server-reachability-' + SERVER_ID, updateReachability, STATS_REFRESH_INTERVAL_MS);
 </script>
 {{ end }}
