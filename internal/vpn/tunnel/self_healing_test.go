@@ -623,3 +623,235 @@ func TestSelfHealing_PersistenceFailureRemainsRetryable(t *testing.T) {
 		t.Fatal("expected IsAutoDisabled to be false after successful retry")
 	}
 }
+
+func TestInFlightProbeFailure_DoesNotOverwriteAdminDisable(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.10:51820", "pubkey10")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		select {
+		case <-probeStarted:
+		default:
+			close(probeStarted)
+		}
+		<-releaseProbe
+		return 0, errors.New("simulated probe failure")
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     1,
+		SelfHealingThreshold: 1,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	probeDone := make(chan error, 1)
+	go func() {
+		_, probeErr := prober.ProbeTunnel(ctx, t1)
+		probeDone <- probeErr
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe to start")
+	}
+
+	// While probe is in flight, an administrator disables the backend
+	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+		t.Fatalf("admin disable failed: %v", err)
+	}
+	prober.MarkAdminDisabled(s1ID)
+
+	// Release probe so it returns failure
+	close(releaseProbe)
+
+	select {
+	case err := <-probeDone:
+		if err == nil {
+			t.Fatal("expected probe to return error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe to complete")
+	}
+
+	// Verify tunnel remains disabled with reason admin
+	status, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if status.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	}
+	if status.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	}
+
+	// Verify prober does not consider it auto-disabled
+	if prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected IsAutoDisabled to be false after admin disable")
+	}
+
+	// SelfHealSweep must skip it and return 0
+	reconnected := prober.SelfHealSweep(ctx)
+	if reconnected != 0 {
+		t.Fatalf("expected 0 reconnected for admin-disabled tunnel, got %d", reconnected)
+	}
+}
+
+func TestInFlightProbeSuccess_DoesNotResurrectOrAttachDevice(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.11"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.11:51820", "pubkey11")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		select {
+		case <-probeStarted:
+		default:
+			close(probeStarted)
+		}
+		<-releaseProbe
+		return 20 * time.Millisecond, nil
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     2,
+		SelfHealingThreshold: 1,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	var hookInvoked atomic.Bool
+	prober.SetOnActiveHook(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		hookInvoked.Store(true)
+		return nil
+	})
+
+	probeDone := make(chan error, 1)
+	go func() {
+		_, probeErr := prober.ProbeTunnel(ctx, t1)
+		probeDone <- probeErr
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe to start")
+	}
+
+	// While probe is in flight, an administrator disables the backend
+	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+		t.Fatalf("admin disable failed: %v", err)
+	}
+	prober.MarkAdminDisabled(s1ID)
+
+	// Release probe so it returns success
+	close(releaseProbe)
+
+	select {
+	case err := <-probeDone:
+		if !errors.Is(err, ErrTunnelDisabled) {
+			t.Fatalf("expected ErrTunnelDisabled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe to complete")
+	}
+
+	// Verify onActiveHook was never invoked
+	if hookInvoked.Load() {
+		t.Fatal("expected onActiveHook NOT to be invoked after admin disable")
+	}
+
+	// Verify tunnel remains disabled with reason admin
+	status, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if status.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	}
+	if status.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	}
+}
+
+func TestMarkAdminDisabled_ResetsFailCounts(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.12"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.12:51820", "pubkey12")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 0, errors.New("failing probe")
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     5,
+		SelfHealingThreshold: 2,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	// Run two failing probes to accumulate failCounts = 2
+	_, _ = prober.ProbeTunnel(ctx, t1)
+	_, _ = prober.ProbeTunnel(ctx, t1)
+
+	prober.mu.RLock()
+	fc := prober.failCounts[s1ID]
+	prober.mu.RUnlock()
+	if fc != 2 {
+		t.Fatalf("expected failCounts to be 2, got %d", fc)
+	}
+
+	// MarkAdminDisabled must reset failCounts to 0
+	prober.MarkAdminDisabled(s1ID)
+
+	prober.mu.RLock()
+	fcAfter := prober.failCounts[s1ID]
+	prober.mu.RUnlock()
+	if fcAfter != 0 {
+		t.Fatalf("expected failCounts to be 0 after MarkAdminDisabled, got %d", fcAfter)
+	}
+}

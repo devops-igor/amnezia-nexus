@@ -73,6 +73,8 @@ var (
 	// callers can map a delete of an unknown backend to 404 without
 	// importing the tunnel package.
 	ErrBackendTunnelNotFound = tunnel.ErrTunnelNotFound
+	// ErrTunnelDisabled re-exports tunnel.ErrTunnelDisabled.
+	ErrTunnelDisabled = tunnel.ErrTunnelDisabled
 )
 
 // BackendTunnel is an alias for models.BackendTunnel.
@@ -733,6 +735,14 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.BackendTunnel) error {
 	if t == nil {
 		return nil
+	}
+	if s.pool != nil {
+		tunNow, err := s.pool.GetTunnel(t.ServerID)
+		if err == nil && tunNow != nil {
+			if tunNow.Status == "disabled" || tunNow.DisableReason == models.DisableReasonAdmin {
+				return ErrTunnelDisabled
+			}
+		}
 	}
 	s.mu.RLock()
 	hasDev := s.backendDevices != nil && s.backendDevices[t.ID] != nil
