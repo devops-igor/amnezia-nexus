@@ -198,32 +198,68 @@ func (sm *StickySessionManager) ClearPeerAffinity(peerKey string) {
 	delete(sm.peerAffinity, peerKey)
 }
 
-// GetAffinity returns the assigned backend tunnel ID for a user.
+// GetAffinity returns the assigned backend tunnel ID for a user. If the affinity
+// record is expired, it is physically pruned from memory and (0, false) is returned.
 func (sm *StickySessionManager) GetAffinity(userID string) (int64, bool) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	rec, ok := sm.userAffinity[userID]
 	if !ok {
 		return 0, false
 	}
 	if sm.now().Sub(rec.lastSeen) > sm.affinityTTL {
+		delete(sm.userAffinity, userID)
 		return 0, false
 	}
 	return rec.tunnelID, true
 }
 
 // GetPeerAffinity returns the assigned backend tunnel ID for a peer public key.
+// If the affinity record is expired, it is physically pruned from memory and (0, false) is returned.
 func (sm *StickySessionManager) GetPeerAffinity(peerKey string) (int64, bool) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	rec, ok := sm.peerAffinity[peerKey]
 	if !ok {
 		return 0, false
 	}
 	if sm.now().Sub(rec.lastSeen) > sm.affinityTTL {
+		delete(sm.peerAffinity, peerKey)
 		return 0, false
 	}
 	return rec.tunnelID, true
+}
+
+// PruneExpired scans all user and peer affinity records, removing those that have
+// exceeded affinityTTL. It returns the total number of pruned records.
+func (sm *StickySessionManager) PruneExpired() int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	now := sm.now()
+	pruned := 0
+
+	for uID, rec := range sm.userAffinity {
+		if now.Sub(rec.lastSeen) > sm.affinityTTL {
+			delete(sm.userAffinity, uID)
+			pruned++
+		}
+	}
+	for pKey, rec := range sm.peerAffinity {
+		if now.Sub(rec.lastSeen) > sm.affinityTTL {
+			delete(sm.peerAffinity, pKey)
+			pruned++
+		}
+	}
+
+	return pruned
+}
+
+// AffinityCount returns the current count of user and peer affinity records in memory.
+func (sm *StickySessionManager) AffinityCount() (userCount, peerCount int) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.userAffinity), len(sm.peerAffinity)
 }
 
 // FailoverMigration describes one session migrated off a degraded tunnel.
