@@ -219,3 +219,108 @@ func TestOrchestrator_AdminDisableConcurrentWithProbe_CASFallback(t *testing.T) 
 		t.Errorf("expected DB disable_reason %q, got %q", models.DisableReasonAdmin, dbTun.DisableReason)
 	}
 }
+
+// TestOrchestrator_TunnelStatusUpdater_PoolAndDBSync verifies that when
+// orch.SetTunnelStatusUpdater(vpnSvc) is active, orchestrator health updates
+// update vpnSvc.Pool and DB state_version in sync with no offset between pool and DB.
+func TestOrchestrator_TunnelStatusUpdater_PoolAndDBSync(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Sync Srv", "127.0.0.1")
+
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	tun, err := vpnSvc.pool.AddTunnel(ctx, sID, "127.0.0.1:51822", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	initialVersion := tun.StateVersion
+	dbTunInitial, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTunInitial == nil {
+		t.Fatalf("failed to get initial DB tunnel: %v", err)
+	}
+	if initialVersion != dbTunInitial.StateVersion {
+		t.Fatalf("initial version mismatch: pool=%d, db=%d", initialVersion, dbTunInitial.StateVersion)
+	}
+
+	var probeMu sync.Mutex
+	probeDuration := 35 * time.Millisecond
+	orch := orchestrator.New(db, nil,
+		orchestrator.WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			probeMu.Lock()
+			d := probeDuration
+			probeMu.Unlock()
+			return d, nil
+		}),
+	)
+	orch.SetTunnelStatusUpdater(vpnSvc)
+
+	// Run first probe cycle
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	poolTun1, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTun1 == nil {
+		t.Fatalf("pool GetTunnel failed: %v", err)
+	}
+	dbTun1, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTun1 == nil {
+		t.Fatalf("db GetBackendTunnelByServerID failed: %v", err)
+	}
+
+	if poolTun1.Status != "active" || dbTun1.Status != "active" {
+		t.Errorf("status mismatch: pool=%q, db=%q", poolTun1.Status, dbTun1.Status)
+	}
+	if poolTun1.LatencyMS != 35 || dbTun1.LatencyMS != 35 {
+		t.Errorf("latency mismatch: pool=%d, db=%d", poolTun1.LatencyMS, dbTun1.LatencyMS)
+	}
+	if poolTun1.StateVersion != initialVersion+1 {
+		t.Errorf("expected pool state_version %d, got %d", initialVersion+1, poolTun1.StateVersion)
+	}
+	if dbTun1.StateVersion != initialVersion+1 {
+		t.Errorf("expected db state_version %d, got %d", initialVersion+1, dbTun1.StateVersion)
+	}
+	if poolTun1.StateVersion != dbTun1.StateVersion {
+		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun1.StateVersion, dbTun1.StateVersion)
+	}
+
+	// Run second probe cycle with degraded latency (>2000ms default threshold)
+	probeMu.Lock()
+	probeDuration = 2500 * time.Millisecond
+	probeMu.Unlock()
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth (second cycle) failed: %v", err)
+	}
+
+	poolTun2, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTun2 == nil {
+		t.Fatalf("pool GetTunnel failed: %v", err)
+	}
+	dbTun2, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTun2 == nil {
+		t.Fatalf("db GetBackendTunnelByServerID failed: %v", err)
+	}
+
+	if poolTun2.Status != "degraded" || dbTun2.Status != "degraded" {
+		t.Errorf("status mismatch on degraded: pool=%q, db=%q", poolTun2.Status, dbTun2.Status)
+	}
+	if poolTun2.LatencyMS != 2500 || dbTun2.LatencyMS != 2500 {
+		t.Errorf("latency mismatch on degraded: pool=%d, db=%d", poolTun2.LatencyMS, dbTun2.LatencyMS)
+	}
+	if poolTun2.StateVersion != initialVersion+2 {
+		t.Errorf("expected pool state_version %d, got %d", initialVersion+2, poolTun2.StateVersion)
+	}
+	if dbTun2.StateVersion != initialVersion+2 {
+		t.Errorf("expected db state_version %d, got %d", initialVersion+2, dbTun2.StateVersion)
+	}
+	if poolTun2.StateVersion != dbTun2.StateVersion {
+		t.Fatalf("pool and DB state_version desynchronized after cycle 2: pool=%d, db=%d", poolTun2.StateVersion, dbTun2.StateVersion)
+	}
+}

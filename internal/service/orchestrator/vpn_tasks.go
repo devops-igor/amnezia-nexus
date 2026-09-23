@@ -164,7 +164,6 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	}
 }
 
-// resolvedProbeParams carries the obfuscation parameters used for a raw UDP
 // updateTunnelStatus updates a backend tunnel's status and latency using the configured
 // TunnelStatusUpdater (e.g. VPN service pool) or falls back to an atomic CAS DB update.
 func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) {
@@ -173,8 +172,15 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 	o.mu.RUnlock()
 
 	if updater != nil {
-		_ = updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS)
-		return
+		if err := updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS); err == nil {
+			return
+		} else {
+			slog.Debug("Tunnel status updater failed, falling back to direct DB CAS",
+				"server_id", t.ServerID,
+				"tunnel_id", t.ID,
+				"err", err,
+			)
+		}
 	}
 
 	if o.db != nil {
@@ -182,6 +188,7 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 	}
 }
 
+// resolvedProbeParams carries the obfuscation parameters used for a raw UDP
 // Noise IK probe against a backend tunnel. h1/h2 carry models.HeaderRange
 // (full AWG 3.1 ranges, issue #49); they are typed `any` to match ProbeFunc,
 // which ProbeAWGEndpointRange accepts alongside uint32.

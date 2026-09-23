@@ -216,6 +216,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if vpnStarted {
+		orch.SetTunnelStatusUpdater(vpnSvc)
+	}
 
 	// 9. Initialize HTTP Router and Server
 	r := router.NewRouter(cfg, db, vpnSvc)
