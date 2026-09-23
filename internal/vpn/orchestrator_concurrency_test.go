@@ -9,6 +9,8 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // TestOrchestrator_AdminDisableConcurrentWithProbePreservedOnRestart verifies that:
@@ -426,4 +428,108 @@ func (f *faultyStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int6
 		return f.err
 	}
 	return f.target.SetTunnelStatus(ctx, serverID, status, latencyMS)
+}
+
+// TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync verifies that:
+//  1. When VPN_ENABLED=true but the host has no TUN device (endpoint.ErrTunUnavailable),
+//     vpnSvc.Start still executes Pool.SyncFromDB successfully before failing on TUN initialization.
+//  2. Wiring orch.SetTunnelStatusUpdater(vpnSvc) in management mode keeps in-memory pool
+//     and database records strictly synchronized when Orchestrator runs health updates.
+func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+
+	sID, serverPub, _ := createTestServerAndKey(t, db, "Management Mode Srv", "127.0.0.1")
+	_, clientPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("GenerateCurve25519KeyPair failed: %v", err)
+	}
+	_, probePriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("GenerateCurve25519KeyPair failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	dbTunnel := &models.BackendTunnel{
+		ServerID:          sID,
+		InterfaceName:     "awg-be-1",
+		PublicKey:         serverPub,
+		PrivateKey:        clientPriv,
+		ProbePrivateKey:   probePriv,
+		Endpoint:          "127.0.0.1:51820",
+		Status:            "active",
+		DisableReason:     models.DisableReasonNone,
+		StateVersion:      1,
+		LastHealthCheck:   &now,
+		LatencyMS:         10,
+		ActiveConnections: 0,
+		CreatedAt:         now,
+	}
+	_, err = db.CreateBackendTunnel(ctx, dbTunnel)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.RequireTunDevice()
+	vpnSvc.SetTunOpener(func() (endpoint.PacketDevice, error) {
+		return nil, endpoint.ErrTunUnavailable
+	})
+
+	stErr := vpnSvc.Start(ctx)
+	if !errors.Is(stErr, endpoint.ErrTunUnavailable) {
+		t.Fatalf("expected ErrTunUnavailable from Start, got: %v", stErr)
+	}
+
+	// Verify pool contains tunnel synced from DB at version 1
+	poolTunInitial, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTunInitial == nil {
+		t.Fatalf("pool GetTunnel failed after SyncFromDB: %v", err)
+	}
+	if poolTunInitial.StateVersion != 1 {
+		t.Fatalf("expected initial pool version 1, got %d", poolTunInitial.StateVersion)
+	}
+	if poolTunInitial.Status != "active" {
+		t.Fatalf("expected initial pool status active, got %s", poolTunInitial.Status)
+	}
+
+	orch := orchestrator.New(db, nil,
+		orchestrator.WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			// Return latency > 2000ms threshold to trigger transition to degraded
+			return 2500 * time.Millisecond, nil
+		}),
+	)
+	orch.SetTunnelStatusUpdater(vpnSvc)
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	poolTun, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTun == nil {
+		t.Fatalf("pool GetTunnel after health check failed: %v", err)
+	}
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTun == nil {
+		t.Fatalf("db GetBackendTunnelByServerID after health check failed: %v", err)
+	}
+
+	if poolTun.Status != "degraded" {
+		t.Errorf("expected pool status degraded, got %s", poolTun.Status)
+	}
+	if dbTun.Status != "degraded" {
+		t.Errorf("expected db status degraded, got %s", dbTun.Status)
+	}
+	if poolTun.StateVersion != 2 {
+		t.Errorf("expected pool version 2, got %d", poolTun.StateVersion)
+	}
+	if dbTun.StateVersion != 2 {
+		t.Errorf("expected db version 2, got %d", dbTun.StateVersion)
+	}
+	if poolTun.StateVersion != dbTun.StateVersion {
+		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun.StateVersion, dbTun.StateVersion)
+	}
 }
