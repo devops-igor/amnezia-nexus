@@ -313,6 +313,9 @@ type VPNSession struct {
 	// resolved at handshake time. Legacy rows pre-dating the column carry ""
 	// and are never backfilled.
 	ConnectionName string `json:"connection_name" db:"connection_name"`
+	// Generation tracks monotonic per-peer handshake sequence numbers to prevent
+	// out-of-order handshake commits from clobbering newer keys/endpoints.
+	Generation uint64 `json:"generation,omitempty" db:"-"`
 	// TimedOutAt records when CheckTimeouts detected that the session exceeded
 	// the idle timeout. Used by the session reaper to avoid duplicate counter
 	// decrements if periodic reconciliation ran after this timestamp.

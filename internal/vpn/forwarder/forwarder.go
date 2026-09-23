@@ -526,6 +526,26 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 	return route.limitDownBps, route.limitUpBps, nil
 }
 
+// PeerRegistration returns the registration generation seen for a peer.
+func (f *Forwarder) PeerRegistration(peerKey string) uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.peerRegs == nil {
+		return 0
+	}
+	return f.peerRegs[peerKey]
+}
+
+// RouteSessionID returns the active session ID for a peer's route, or "" if no route exists.
+func (f *Forwarder) RouteSessionID(peerKey string) string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if route, ok := f.routesByPeer[peerKey]; ok && route != nil {
+		return route.sessionID
+	}
+	return ""
+}
+
 // UnregisterSession removes a peer session route, stops its pump goroutine,
 // and drains its queue so in-flight senders cannot block.
 //

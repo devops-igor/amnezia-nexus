@@ -169,6 +169,7 @@ type Service struct {
 
 	lastReconcileTime         time.Time
 	lastReconcileByTunnel     map[int64]time.Time
+	peerGenerations           map[string]uint64
 	reconcilePostSnapshotHook func()
 	reconcilePreApplyHook     func()
 	reconcilePreCommitHook    func()
@@ -591,6 +592,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPubKey:          pub,
 		portalPrivKey:         priv,
 		lastReconcileByTunnel: make(map[int64]time.Time),
+		peerGenerations:       make(map[string]uint64),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
@@ -2785,6 +2787,12 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, fmt.Errorf("session creation failed: %w", err)
 	}
 
+	if s.peerGenerations == nil {
+		s.peerGenerations = make(map[string]uint64)
+	}
+	s.peerGenerations[peerPublicKey]++
+	sess.Generation = s.peerGenerations[peerPublicKey]
+
 	s.pool.IncrementConnections(backend.ID)
 
 	if s.forwarder != nil {
@@ -2796,6 +2804,16 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	}
 
 	return sess, backend, nil
+}
+
+// PeerGeneration returns the latest assigned generation for a peer under s.mu.
+func (s *Service) PeerGeneration(peerKey string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.peerGenerations == nil {
+		return 0
+	}
+	return s.peerGenerations[peerKey]
 }
 
 func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.RoutingRequest) (*models.BackendTunnel, error) {
