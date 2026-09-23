@@ -43,6 +43,7 @@ type Status struct {
 	// client initiations are failing cryptographic verification (issues #39, #288).
 	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
 	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
+	ForwarderDropsPacketTooLarge   uint64                               `json:"forwarder_drops_packet_too_large"`
 	ForwarderDropsTotal            uint64                               `json:"forwarder_drops_total"`
 	ForwarderQueueOccupancy        int                                  `json:"forwarder_queue_occupancy"`
 	ForwarderQueueCapacity         int                                  `json:"forwarder_queue_capacity"`
@@ -1205,6 +1206,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.RxBytes = rx
 		status.TxBytes = tx
 		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
+		status.ForwarderDropsPacketTooLarge = s.forwarder.DropsPacketTooLarge()
 		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
 		allRouteQueues := s.forwarder.AllRouteQueueStats()
 		if len(allRouteQueues) > 0 {
