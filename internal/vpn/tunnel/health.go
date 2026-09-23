@@ -409,12 +409,14 @@ func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel 
 }
 
 func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
+	hp.mu.Lock()
 	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+		hp.failCounts[snapshot.ServerID] = 0
+		delete(hp.autoDisabled, snapshot.ServerID)
+		hp.mu.Unlock()
 		slog.Info("probe failed but tunnel was administratively disabled; ignoring failure", "server_id", snapshot.ServerID)
 		return 0, probeErr
 	}
-
-	hp.mu.Lock()
 	hp.failCounts[snapshot.ServerID]++
 	failures := hp.failCounts[snapshot.ServerID]
 	hp.mu.Unlock()
@@ -456,18 +458,26 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 		if err := hp.pool.SetTunnelStatus(ctx, snapshot.ServerID, "degraded", 0); err != nil {
 			return 0, err
 		}
+		if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+			hp.mu.Lock()
+			hp.failCounts[snapshot.ServerID] = 0
+			delete(hp.autoDisabled, snapshot.ServerID)
+			hp.mu.Unlock()
+		}
 	}
 
 	return 0, probeErr
 }
 
 func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
+	hp.mu.Lock()
 	if errors.Is(hookErr, ErrTunnelDisabled) || hp.isTunnelDisabled(snapshot.ServerID) {
+		hp.failCounts[snapshot.ServerID] = 0
+		delete(hp.autoDisabled, snapshot.ServerID)
+		hp.mu.Unlock()
 		slog.Info("data-plane hook failed because tunnel was administratively disabled", "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
-
-	hp.mu.Lock()
 	hp.failCounts[snapshot.ServerID]++
 	failures := hp.failCounts[snapshot.ServerID]
 	hp.mu.Unlock()
@@ -508,6 +518,12 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 	} else if hp.pool != nil {
 		if err := hp.pool.SetTunnelStatus(ctx, snapshot.ServerID, "degraded", 0); err != nil {
 			return 0, err
+		}
+		if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+			hp.mu.Lock()
+			hp.failCounts[snapshot.ServerID] = 0
+			delete(hp.autoDisabled, snapshot.ServerID)
+			hp.mu.Unlock()
 		}
 	}
 

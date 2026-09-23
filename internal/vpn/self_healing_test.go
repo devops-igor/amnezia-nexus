@@ -802,3 +802,80 @@ func TestInFlightProbe_ConcurrentWithDisableBackend(t *testing.T) {
 		}
 	})
 }
+
+// TestEnsureBackendDeviceAttached_TOCTOURaceWithDisableBackend verifies that if DisableBackend
+// races ensureBackendDeviceAttached after initial validation but before acquiring s.mu,
+// the attachment critical section re-validates the tunnel state under lock, refuses to
+// attach the forwarder device, and returns ErrTunnelDisabled.
+func TestEnsureBackendDeviceAttached_TOCTOURaceWithDisableBackend(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tun := tunMust(t, vpnSvc, s1ID)
+
+	// Ensure device is initially not attached so ensureBackendDeviceAttached attempts attachment
+	if dev := vpnSvc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("expected backend device to be initially nil")
+	}
+
+	// Set the pre-lock hook to simulate an administrator calling DisableBackend right before s.mu.Lock()
+	var hookCalled atomic.Bool
+	vpnSvc.SetEnsureDevicePreLockHook(func() {
+		hookCalled.Store(true)
+		if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
+			t.Errorf("DisableBackend in hook failed: %v", err)
+		}
+	})
+
+	err := vpnSvc.ensureBackendDeviceAttached(ctx, tun)
+	if !errors.Is(err, ErrTunnelDisabled) {
+		t.Fatalf("expected ErrTunnelDisabled, got %v", err)
+	}
+	if !hookCalled.Load() {
+		t.Fatal("expected ensureDevicePreLockHook to be called")
+	}
+
+	// Assert that forwarder device remains detached
+	if dev := vpnSvc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("backend device must not be attached after concurrent admin disable")
+	}
+
+	// Assert pool status remains disabled with reason admin
+	poolTun, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if poolTun.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected pool status disabled, got %q", poolTun.Status)
+	}
+	if poolTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected pool disable_reason admin, got %q", poolTun.DisableReason)
+	}
+
+	// Assert DB status remains disabled with reason admin
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected DB status disabled, got %q", dbTun.Status)
+	}
+	if dbTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected DB disable_reason admin, got %q", dbTun.DisableReason)
+	}
+
+	// Assert prober does not consider it auto-disabled
+	if vpnSvc.prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected IsAutoDisabled to be false after admin disable")
+	}
+
+	// Assert SelfHealSweep does not resurrect it
+	if reconnected := vpnSvc.SelfHealSweep(ctx); reconnected != 0 {
+		t.Fatalf("expected 0 reconnected, got %d", reconnected)
+	}
+}

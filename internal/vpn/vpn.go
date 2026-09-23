@@ -159,6 +159,7 @@ type Service struct {
 	reconcilePostSnapshotHook func()
 	reconcilePreApplyHook     func()
 	reconcilePreCommitHook    func()
+	ensureDevicePreLockHook   func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -730,6 +731,31 @@ func (s *Service) SetHealthProber(prober *tunnel.HealthProber) {
 	}
 }
 
+// SetEnsureDevicePreLockHook sets a hook called immediately before acquiring s.mu in ensureBackendDeviceAttached.
+func (s *Service) SetEnsureDevicePreLockHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureDevicePreLockHook = fn
+}
+
+func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
+	if s.db == nil {
+		return nil, errors.New("database not available")
+	}
+	srv, err := s.db.GetServerByID(ctx, serverID)
+	if err != nil || srv == nil {
+		return nil, fmt.Errorf("failed to load server %d: %w", serverID, err)
+	}
+	if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
+		if p, ok := awgInfo["awg_params"].(map[string]any); ok && p != nil {
+			return p, nil
+		} else if p, ok := awgInfo["params"].(map[string]any); ok && p != nil {
+			return p, nil
+		}
+	}
+	return nil, nil
+}
+
 // ensureBackendDeviceAttached verifies that a data-plane device is attached for the tunnel.
 // If missing, it attempts to attach the device using persisted server AWG credentials.
 func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.BackendTunnel) error {
@@ -751,30 +777,35 @@ func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.Bac
 		return nil
 	}
 
-	var awgParams map[string]any
-	var attachErr error
-	if s.db != nil {
-		srv, err := s.db.GetServerByID(ctx, t.ServerID)
-		if err != nil || srv == nil {
-			attachErr = fmt.Errorf("failed to load server %d: %w", t.ServerID, err)
-		} else if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
-			if p, ok := awgInfo["awg_params"].(map[string]any); ok && p != nil {
-				awgParams = p
-			} else if p, ok := awgInfo["params"].(map[string]any); ok && p != nil {
-				awgParams = p
+	awgParams, loadErr := s.resolveServerAWGParams(ctx, t.ServerID)
+	if loadErr != nil {
+		log.Printf("[vpn] warning: tunnel %d (server %d) probe succeeded but failed to load server credentials: %v", t.ID, t.ServerID, loadErr)
+		return loadErr
+	}
+
+	s.mu.RLock()
+	hook := s.ensureDevicePreLockHook
+	s.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.pool != nil {
+		tunNow, err := s.pool.GetTunnel(t.ServerID)
+		if err == nil && tunNow != nil {
+			if tunNow.Status == "disabled" || tunNow.DisableReason == models.DisableReasonAdmin {
+				return ErrTunnelDisabled
 			}
 		}
-	} else {
-		attachErr = errors.New("database not available")
+	}
+	if s.backendDevices != nil && s.backendDevices[t.ID] != nil {
+		return nil
 	}
 
-	if attachErr == nil {
-		s.mu.Lock()
-		attachErr = s.attachBackendForwarder(t, awgParams)
-		s.mu.Unlock()
-	}
-
-	if attachErr != nil {
+	if attachErr := s.attachBackendForwarder(t, awgParams); attachErr != nil {
 		log.Printf("[vpn] warning: tunnel %d (server %d) probe succeeded but failed to attach data plane: %v", t.ID, t.ServerID, attachErr)
 		return attachErr
 	}
