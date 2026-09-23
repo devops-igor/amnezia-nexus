@@ -135,11 +135,9 @@ type sessionRoute struct {
 	assignedIP      string
 	backendTunnelID int64
 	clientQueue     chan []byte
+	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
-	queueOccupancy  atomic.Int64
 	queueFullDrops  atomic.Uint64
-	queueMu         sync.Mutex
-	writeMu         sync.RWMutex
 	retired         atomic.Bool
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
@@ -179,9 +177,9 @@ type Forwarder struct {
 	// trigger a rebind, and only while unassigned. A claimed srcIP outside
 	// the subnet (or unparseable) is always treated as spoofed and dropped —
 	// an inner packet source outside the portal pool can only be a spoof.
-	portalSubnet   *net.IPNet
-	totalRxBytes   atomic.Int64
-	totalTxBytes   atomic.Int64
+	portalSubnet        *net.IPNet
+	totalRxBytes        atomic.Int64
+	totalTxBytes        atomic.Int64
 	dropsQueueFull      atomic.Uint64 // return packets dropped: per-route queue full
 	dropsNoRoute        atomic.Uint64 // return packets dropped: unroutable / no session registered (issue #151)
 	dropsPacketTooLarge atomic.Uint64 // return packets dropped because they exceed the queued payload bound
@@ -311,6 +309,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByIP:       make(map[string]*sessionRoute),
 		backendQueues:    make(map[int64]chan []byte),
 		clientDevices:    make(map[string]PacketDevice),
+		backendDevices:   make(map[int64]PacketDevice),
 		backendPumpStops: make(map[int64]chan struct{}),
 		backendPumpDones: make(map[int64]chan struct{}),
 		peerRegs:         make(map[string]uint64),
@@ -374,6 +373,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 		assignedIP:      assignedIP,
 		backendTunnelID: backendTunnelID,
 		clientQueue:     make(chan []byte, f.bufSize),
+		queueReady:      make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 		limitDownBps:    limitDownBps,
 		limitUpBps:      limitUpBps,
@@ -418,7 +418,7 @@ func (f *Forwarder) stopRoutePumpLocked(route *sessionRoute) {
 	if route != nil && route.stopCh != nil && !route.stopped {
 		// Retirement is intentionally non-blocking. A client PacketDevice.Write
 		// may be slow or permanently blocked, and this function is called while
-		// holding f.mu. Waiting for writeMu here would serialize the entire
+		// holding f.mu. Waiting for the write here would serialize the entire
 		// forwarder behind one stalled route.
 		route.retired.Store(true)
 		close(route.stopCh)
@@ -434,8 +434,6 @@ func (f *Forwarder) drainRouteQueueLocked(route *sessionRoute) {
 	}
 	f.aggregateQueueMu.Lock()
 	defer f.aggregateQueueMu.Unlock()
-	route.queueMu.Lock()
-	defer route.queueMu.Unlock()
 	for {
 		select {
 		case <-route.clientQueue:
@@ -706,11 +704,9 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
-	route.queueMu.Lock()
 	select {
 	case clientQueue <- pktCopy:
 		routeOccupancy := uint64(len(clientQueue))
-		route.queueOccupancy.Store(int64(len(clientQueue))) // #nosec G115 -- channel length is bounded by the configured queue capacity
 		for current := route.queueHighWater.Load(); routeOccupancy > current; {
 			if route.queueHighWater.CompareAndSwap(current, routeOccupancy) {
 				break
@@ -729,7 +725,10 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 			}
 			current = f.aggregateQueueHighWater.Load()
 		}
-		route.queueMu.Unlock()
+		select {
+		case route.queueReady <- struct{}{}:
+		default:
+		}
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
 		f.totalTxBytes.Add(pktLen)
@@ -738,8 +737,6 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		}
 		return nil
 	default:
-		route.queueOccupancy.Store(int64(len(clientQueue)))
-		route.queueMu.Unlock()
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
 		// Bounded backpressure: the packet is dropped, but every drop is
@@ -901,7 +898,7 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 	f.mu.Unlock()
 }
 
-// ReconfigureClientQueueSize changes the capacity used for subsequently
+// ReconfigureClientQueueConfig changes the capacity used for subsequently
 // registered client routes. Existing route channels cannot be resized safely;
 // reject changes while any route is active so persisted configuration cannot
 // diverge from the running data plane.
@@ -939,6 +936,8 @@ func (f *Forwarder) ReconfigureClientQueueSize(size int) error {
 func (f *Forwarder) RouteQueueStats(peerKey string) (RouteQueueStats, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	f.aggregateQueueMu.Lock()
+	defer f.aggregateQueueMu.Unlock()
 	route, ok := f.routesByPeer[peerKey]
 	if !ok || route == nil {
 		return RouteQueueStats{}, false
@@ -955,6 +954,8 @@ func (f *Forwarder) RouteQueueStats(peerKey string) (RouteQueueStats, bool) {
 func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	f.aggregateQueueMu.Lock()
+	defer f.aggregateQueueMu.Unlock()
 	stats := make(map[string]RouteQueueStats, len(f.routesByPeer))
 	for peerKey, route := range f.routesByPeer {
 		if route == nil {
@@ -976,6 +977,8 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	f.aggregateQueueMu.Lock()
+	defer f.aggregateQueueMu.Unlock()
 	occupancy = 0
 	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- aggregate queue high-water is bounded by active queue capacities.
 	for _, route := range f.routesByPeer {
@@ -1115,21 +1118,29 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 
 	for {
 		var pkt []byte
-		var ok bool
 		select {
 		case <-stopCh:
 			return
 		case <-routeStopCh:
 			return
-		case pkt, ok = <-route.clientQueue:
-			if !ok {
-				return
-			}
+		default:
 		}
+		// Never receive outside the accounting lock: even a receive followed
+		// immediately by a lock can make an enqueue miss its actual peak.
 		f.aggregateQueueMu.Lock()
-		route.queueMu.Lock()
-		route.queueOccupancy.Store(int64(len(route.clientQueue)))
-		route.queueMu.Unlock()
+		select {
+		case pkt = <-route.clientQueue:
+		default:
+			f.aggregateQueueMu.Unlock()
+			select {
+			case <-stopCh:
+				return
+			case <-routeStopCh:
+				return
+			case <-route.queueReady:
+			}
+			continue
+		}
 		f.aggregateQueueMu.Unlock()
 		f.mu.RLock()
 		currentRoute, current := f.routesByPeer[route.peerKey]
@@ -1142,9 +1153,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			dev = f.defaultClientDev
 		}
 		f.mu.RUnlock()
-		route.writeMu.RLock()
 		if route.retired.Load() {
-			route.writeMu.RUnlock()
 			continue
 		}
 
@@ -1173,7 +1182,6 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 				}
 			}
 		}
-		route.writeMu.RUnlock()
 	}
 }
 
