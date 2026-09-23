@@ -781,10 +781,10 @@ func (s *safeLogBuffer) String() string {
 	return s.b.String()
 }
 
-// TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog verifies that
+// TestEndpointListenerHandshakeOverUDP_WrongHPKey_DroppedSilently verifies that
 // handshakes masked with a mismatched HP key fail initiation parsing (ErrNotInitiation)
 // and are dropped without polluting metrics or logging handshake rejection (issue #288).
-func TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog(t *testing.T) {
+func TestEndpointListenerHandshakeOverUDP_WrongHPKey_DroppedSilently(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 

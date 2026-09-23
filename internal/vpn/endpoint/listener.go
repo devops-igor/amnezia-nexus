@@ -683,10 +683,10 @@ func (el *Listener) IsDraining() bool {
 	return el.draining
 }
 
-// HandshakeRejections returns the number of inbound datagrams rejected by
-// handshake-initiation parsing and not consumed as transport data. It is the
-// observability signal for issue #39 defect 2: a rising count means legit
-// client (rekey) initiations are being classified as not-a-handshake. Nil
+// HandshakeRejections returns the number of inbound datagrams failing
+// cryptographic handshake initiation verification (MAC1 failure, static key /
+// timestamp decryption failure, or stale timestamp). Unroutable transport data
+// and non-initiation datagrams are excluded (issues #39, #288, #290). Nil
 // receiver is safe and returns 0.
 func (el *Listener) HandshakeRejections() uint64 {
 	if el == nil {
@@ -822,26 +822,21 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 
 	info, err := ParseInitiation(serverPriv, datagram, el.config.H1, el.config.S1, el.hpKey)
 	if err != nil {
-		// Not a valid handshake initiation for this endpoint: transport data
-		// for an established session (or garbage). Try the transport path.
-		if !el.handleTransportData(datagram, sender) {
-			// Datagrams with ErrNotInitiation (such as unroutable transport data
-			// from unknown senders or after daemon restarts) and too-short datagrams
-			// are unroutable traffic, not rejected handshake initiations.
-			// They must not increment handshakeRejects or emit misleading logs (issue #288).
-			if errors.Is(err, ErrNotInitiation) || errors.Is(err, ErrDatagramTooShort) {
-				return
-			}
+		if errors.Is(err, ErrNotInitiation) || errors.Is(err, ErrDatagramTooShort) {
+			// Only non-initiation datagrams or too-short packets are candidates for transport data
+			// (or unroutable traffic). Try the transport path.
+			_ = el.handleTransportData(datagram, sender)
+			return
+		}
 
-			// Genuine handshake initiation rejections (e.g., ErrMAC1Failed,
-			// ErrDecryptStatic, ErrDecryptTimestamp, ErrTimestampStale)
-			// increment handshakeRejects and emit throttled rejection logs.
-			el.handshakeRejects.Add(1)
-			now := time.Now().Unix()
-			until := el.rejectLogUntil.Load()
-			if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
-				log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
-			}
+		// Genuine handshake initiation failure reached H1 parsing and failed cryptographic
+		// verification (e.g. ErrMAC1Failed, ErrDecryptStatic, ErrDecryptTimestamp, ErrTimestampStale).
+		// It is an initiation rejection regardless of whether the sender address is known.
+		el.handshakeRejects.Add(1)
+		now := time.Now().Unix()
+		until := el.rejectLogUntil.Load()
+		if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
+			log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
 		}
 		return
 	}

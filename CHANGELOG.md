@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Endpoint listener handshake rejection telemetry: excluded unroutable non-initiation datagrams and too-short packets from `handshake_rejections` metric and throttled logs, confining counter increments strictly to genuine cryptographic handshake failures (#288, #290).
+
 ## [1.3.0] - Orion - 2026-09-23
 
 Major feature release introducing backend self-healing reconciliation, sticky session affinity TTL, upstream AmneziaWG release monitoring and admin visibility, periodic server resource telemetry polling, automated Playwright E2E verification, and compatibility policy governance.
