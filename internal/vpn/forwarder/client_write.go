@@ -5,6 +5,15 @@ import (
 	"time"
 )
 
+// Retirement joins writes admitted by a retired route generation. Its zero
+// value is safe. Wait must be called only after releasing all caller locks.
+type Retirement struct {
+	route *sessionRoute
+}
+
+// Wait completes retirement; no write from this generation can begin afterward.
+func (r Retirement) Wait() { r.route.waitForWrite() }
+
 // DeviceWriteStallThreshold defines a slow client-device write. Stalls count
 // each write once, including writes still blocked when telemetry is queried.
 const DeviceWriteStallThreshold = 100 * time.Millisecond
@@ -63,6 +72,7 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev PacketDevice, pac
 	started := time.Now()
 	f.writeMetricsMu.Lock()
 	f.writeMetrics.Count++
+	route.writeMetrics.Count++
 	f.writesInFlight[route] = started
 	f.writeMetricsMu.Unlock()
 
@@ -71,14 +81,20 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev PacketDevice, pac
 	f.writeMetricsMu.Lock()
 	delete(f.writesInFlight, route)
 	f.writeMetrics.TotalDuration += duration
+	route.writeMetrics.TotalDuration += duration
+	if duration > route.writeMetrics.MaxDuration {
+		route.writeMetrics.MaxDuration = duration
+	}
 	if duration > f.writeMetrics.MaxDuration {
 		f.writeMetrics.MaxDuration = duration
 	}
 	if duration >= DeviceWriteStallThreshold {
 		f.writeMetrics.Stalls++
+		route.writeMetrics.Stalls++
 	}
 	if err != nil {
 		f.writeMetrics.Errors++
+		route.writeMetrics.Errors++
 	}
 	f.writeMetricsMu.Unlock()
 	if err != nil {
@@ -88,6 +104,33 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev PacketDevice, pac
 			log.Printf("[vpn/forwarder] return-path device write error (throttled 1/s): peer=%s session=%s: %v",
 				route.peerKey, route.sessionID, err)
 		}
+	}
+}
+
+// routeQueueStatsLocked attributes queue loss and write stalls to the same
+// route generation. The caller holds f.mu and aggregateQueueMu.
+func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
+	f.writeMetricsMu.Lock()
+	defer f.writeMetricsMu.Unlock()
+	writes := route.writeMetrics
+	if started, ok := f.writesInFlight[route]; ok {
+		writes.InFlight = 1
+		writes.OldestInFlight = time.Since(started)
+		if writes.OldestInFlight >= DeviceWriteStallThreshold {
+			writes.Stalls++
+		}
+	}
+	return RouteQueueStats{
+		Occupancy:          len(route.clientQueue),
+		Capacity:           cap(route.clientQueue),
+		HighWater:          int(route.queueHighWater.Load()), // #nosec G115 -- bounded by channel capacity.
+		QueueFullDrops:     route.queueFullDrops.Load(),
+		WriteCount:         writes.Count,
+		WriteErrors:        writes.Errors,
+		WriteStalls:        writes.Stalls,
+		WritesInFlight:     writes.InFlight,
+		OldestWriteMS:      writes.OldestInFlight.Milliseconds(),
+		MaxWriteDurationMS: writes.MaxDuration.Milliseconds(),
 	}
 }
 

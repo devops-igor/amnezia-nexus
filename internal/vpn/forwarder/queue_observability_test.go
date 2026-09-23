@@ -458,7 +458,10 @@ func TestForwarderSustainedDownstreamStallSaturatesAndRecovers(t *testing.T) {
 func TestForwarderConfiguredRouteLimitDerivesQueueBudget(t *testing.T) {
 	const routes = 100
 	want := MaxClientQueuePacketsForRoutes(routes)
-	f := NewForwarderWithLimits(nil, "10.100.0.0/16", want+1, routes)
+	f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", want+1, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
 	queue, ok := f.GetClientPacketChannel("peer-1")
 	if !ok {
@@ -623,7 +626,10 @@ func TestDeviceTelemetryReportsBlockedWriteBeforeCompletion(t *testing.T) {
 }
 
 func TestClientQueueConfigAllowsSafeLiveRouteLimitChanges(t *testing.T) {
-	f := NewForwarderWithLimits(nil, "10.100.0.0/16", 2, 2)
+	f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
 	queue, _ := f.GetClientPacketChannel("peer")
 	for _, limit := range []int{4, 1, 2} {
@@ -642,6 +648,71 @@ func TestClientQueueConfigAllowsSafeLiveRouteLimitChanges(t *testing.T) {
 		if f.bufSize != 2 || f.maxActiveRoutes != 2 {
 			t.Fatal("rejected change mutated live limits")
 		}
+	}
+}
+
+func TestRouteBudgetBoundary(t *testing.T) {
+	for _, routes := range []int{MaxBudgetedActiveRoutes - 1, MaxBudgetedActiveRoutes} {
+		capacity := MaxClientQueuePacketsForRoutes(routes)
+		if capacity != 1 || int64(capacity)*int64(routes)*MaxClientQueuePacketBytes > MaxClientQueueMemoryBytes {
+			t.Fatalf("invalid budget at boundary: routes=%d capacity=%d", routes, capacity)
+		}
+		if _, err := NewForwarderWithLimits(nil, "", 1, routes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, routes := range []int{MaxBudgetedActiveRoutes + 1, 6_000_000} {
+		if got := MaxClientQueuePacketsForRoutes(routes); got != 0 {
+			t.Fatalf("impossible population %d permits %d packets", routes, got)
+		}
+		if _, err := NewForwarderWithLimits(nil, "", 1, routes); err == nil {
+			t.Fatal("constructor accepted impossible budget")
+		}
+		f := NewForwarder(nil, "", 2)
+		if err := f.ReconfigureClientQueueConfig(1, routes); err == nil || f.bufSize != 2 || f.maxActiveRoutes != MaxSupportedActiveRoutes {
+			t.Fatalf("reconfiguration accepted/mutated impossible budget: %v", err)
+		}
+	}
+}
+
+func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 1)
+	blocked := newBlockingWriteDevice()
+	failed := &errDevice{err: errors.New("send failed")}
+	f.RegisterSession("a", "connection", "peer-a", "10.100.0.10", 1)
+	f.RegisterSession("b", "connection", "peer-b", "10.100.0.11", 1)
+	// Queue A is full with no active consumer; B has a genuinely blocked write.
+	if err := f.RouteBackendToClient(1, []byte("queue-a"), "10.100.0.10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.RouteBackendToClient(1, []byte("drop-a"), "10.100.0.10"); !errors.Is(err, ErrQueueFull) {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	defer func() { blocked.release(); <-done }()
+	go func() {
+		f.writeClientPacket(f.routesByPeer["peer-b"], blocked, []byte("blocked-b"))
+		close(done)
+	}()
+	select {
+	case <-blocked.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("write did not start")
+	}
+	time.Sleep(DeviceWriteStallThreshold)
+	stats := f.AllRouteQueueStats()
+	if a := stats["peer-a"]; a.QueueFullDrops != 1 || a.WritesInFlight != 0 || a.WriteStalls != 0 || a.WriteCount != 0 {
+		t.Fatalf("queue A incorrectly attributed B's stall: %+v", a)
+	}
+	if b := stats["peer-b"]; b.QueueFullDrops != 0 || b.WritesInFlight != 1 || b.WriteStalls != 1 || b.OldestWriteMS < DeviceWriteStallThreshold.Milliseconds() {
+		t.Fatalf("blocked B missing route attribution: %+v", b)
+	}
+	blocked.release()
+	<-done
+	f.writeClientPacket(f.routesByPeer["peer-a"], failed, []byte("failed-a"))
+	stats = f.AllRouteQueueStats()
+	if stats["peer-a"].WriteErrors != 1 || stats["peer-b"].WriteErrors != 0 || stats["peer-b"].WriteStalls != 1 || stats["peer-b"].WritesInFlight != 0 {
+		t.Fatalf("completed writes attributed incorrectly: %+v", stats)
 	}
 }
 

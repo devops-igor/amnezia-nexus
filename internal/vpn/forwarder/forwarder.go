@@ -122,10 +122,16 @@ func (tb *TokenBucket) Allow(n int64) bool {
 }
 
 type RouteQueueStats struct {
-	Occupancy      int    `json:"occupancy"`
-	Capacity       int    `json:"capacity"`
-	HighWater      int    `json:"high_water"`
-	QueueFullDrops uint64 `json:"queue_full_drops"`
+	Occupancy          int    `json:"occupancy"`
+	Capacity           int    `json:"capacity"`
+	HighWater          int    `json:"high_water"`
+	QueueFullDrops     uint64 `json:"queue_full_drops"`
+	WriteCount         uint64 `json:"write_count"`
+	WriteErrors        uint64 `json:"write_errors"`
+	WriteStalls        uint64 `json:"write_stalls"`
+	WritesInFlight     int    `json:"writes_in_flight"`
+	OldestWriteMS      int64  `json:"oldest_write_ms"`
+	MaxWriteDurationMS int64  `json:"max_write_duration_ms"`
 }
 
 type sessionRoute struct {
@@ -141,6 +147,7 @@ type sessionRoute struct {
 	queueOccupancy  int        // guarded by aggregateQueueMu; reconciles compatibility drains
 	writeMu         sync.Mutex // admission and completion; never acquired under f.mu
 	retired         atomic.Bool
+	writeMetrics    DeviceWriteTelemetry // guarded by Forwarder.writeMetricsMu
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
 	// deliberately NOT closed because RouteBackendToClient sends to it after
@@ -229,9 +236,9 @@ const DefaultClientQueueSize = 2048
 // tuning does not silently change backend queue memory allocation.
 const DefaultBackendQueueSize = 2048
 
-// MaxSupportedActiveRoutes is the supported upper bound used when budgeting
-// queued client packet memory. It is deliberately independent of the runtime
-// load-balancer configuration so old configurations remain valid.
+// MaxSupportedActiveRoutes is the default route population and the limit on
+// per-route status diagnostics. Explicit populations use MaxBudgetedActiveRoutes
+// as their memory-budget bound.
 const MaxSupportedActiveRoutes = 1000
 
 // MaxClientQueuePacketBytes is the conservative payload size reserved for one
@@ -240,20 +247,33 @@ const MaxClientQueuePacketBytes = 1500
 
 // MaxClientQueueMemoryBytes is the explicit aggregate queued-payload budget
 // for all supported active routes. Per-route queue capacity is derived from
-// this budget and MaxSupportedActiveRoutes, then bounded by this package's
-// public queue limit.
+// this budget and the configured maximum active-route population.
 const MaxClientQueueMemoryBytes = 8 << 30
+
+// MaxBudgetedActiveRoutes is the largest population that can reserve even one
+// maximum-sized packet per client inside the aggregate payload budget.
+const MaxBudgetedActiveRoutes = MaxClientQueueMemoryBytes / MaxClientQueuePacketBytes
+
+// ValidateClientRouteLimit rejects populations that cannot fit the payload
+// budget. Non-positive values select the default route limit.
+func ValidateClientRouteLimit(activeRoutes int) error {
+	if activeRoutes > MaxBudgetedActiveRoutes {
+		return errors.New("maximum active routes exceeds the client queue memory budget")
+	}
+	return nil
+}
 
 // MaxClientQueuePacketsForRoutes returns the largest per-route queue capacity
 // that keeps the configured active-route population within the aggregate
-// queued-payload memory budget. It always permits at least one queued packet.
+// queued-payload memory budget. Zero means the population cannot fit even one
+// packet per route and must be rejected.
 func MaxClientQueuePacketsForRoutes(activeRoutes int) int {
 	if activeRoutes <= 0 {
 		activeRoutes = MaxSupportedActiveRoutes
 	}
 	maxBudgetPackets := MaxClientQueueMemoryBytes / MaxClientQueuePacketBytes
-	if activeRoutes >= maxBudgetPackets {
-		return 1
+	if activeRoutes > maxBudgetPackets {
+		return 0
 	}
 	maxPackets := maxBudgetPackets / activeRoutes
 	if maxPackets < 1 {
@@ -279,14 +299,19 @@ func NewForwarder(accountant *TrafficAccountant, portalSubnetCIDR string, bufSiz
 	if len(bufSize) > 0 && bufSize[0] > 0 {
 		qSize = bufSize[0]
 	}
-	return NewForwarderWithLimits(accountant, portalSubnetCIDR, qSize, MaxSupportedActiveRoutes)
+	f, _ := NewForwarderWithLimits(accountant, portalSubnetCIDR, qSize, MaxSupportedActiveRoutes) // Default route limit always fits the budget.
+	return f
 }
 
 // NewForwarderWithLimits creates a forwarder with an explicit client-queue size
 // and maximum active-route count. The queue size is bounded from the same
 // aggregate payload-memory budget as the route limit, keeping the configured
-// session capacity and the data-plane memory budget aligned.
-func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR string, queueSize, maxActiveRoutes int) *Forwarder {
+// session capacity and the data-plane memory budget aligned. Populations that
+// cannot reserve even one packet per route are rejected.
+func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR string, queueSize, maxActiveRoutes int) (*Forwarder, error) {
+	if err := ValidateClientRouteLimit(maxActiveRoutes); err != nil {
+		return nil, err
+	}
 	if maxActiveRoutes <= 0 {
 		maxActiveRoutes = MaxSupportedActiveRoutes
 	}
@@ -322,7 +347,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		backendBufSize:   DefaultBackendQueueSize,
 		maxActiveRoutes:  maxActiveRoutes,
 		stopCh:           make(chan struct{}),
-	}
+	}, nil
 }
 
 // RegisterSession registers a peer session route with unlimited bandwidth.
@@ -341,12 +366,15 @@ func (f *Forwarder) RegisterSession(sessionID, connectionID, peerKey, assignedIP
 // RouteClientToBackend and are shared by concurrent pumps; they are
 // mutex-guarded and safe for concurrent use.
 func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) {
-	var retiredRoute *sessionRoute
+	f.BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps).Wait()
+}
+
+// BeginRegisterSessionWithLimit installs the new route and stops admission on
+// the old generation without waiting for device I/O. Call Wait on the returned
+// retirement only after releasing caller locks (including Service.mu).
+func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement) {
 	f.mu.Lock()
-	defer func() {
-		f.mu.Unlock()
-		retiredRoute.waitForWrite()
-	}()
+	defer f.mu.Unlock()
 
 	// Registration is intentionally void for API compatibility. A new peer is
 	// rejected when the configured active-route budget is full; callers observe
@@ -392,7 +420,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	// A re-registration for the same peer replaces an existing route: stop
 	// the old route's pump before the maps are overwritten so it cannot leak.
 	if old, ok := f.routesByPeer[peerKey]; ok && old != nil {
-		retiredRoute = old
+		retirement.route = old
 		f.stopRoutePumpLocked(old)
 		f.drainRouteQueueLocked(old)
 		if old.assignedIP != "" {
@@ -417,6 +445,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(f.pumpsStopCh, route)
 	}
+	return retirement
 }
 
 // stopRoutePumpLocked closes the route's per-session stop channel exactly
@@ -508,12 +537,14 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 // the live route survives. Route state is only torn down when a currently
 // held teardown credit is spent on it.
 func (f *Forwarder) UnregisterSession(peerKey string) {
-	var retiredRoute *sessionRoute
+	f.BeginUnregisterSession(peerKey).Wait()
+}
+
+// BeginUnregisterSession removes the route and stops admission without waiting
+// for device I/O. Call Wait after releasing all caller locks to finish teardown.
+func (f *Forwarder) BeginUnregisterSession(peerKey string) (retirement Retirement) {
 	f.mu.Lock()
-	defer func() {
-		f.mu.Unlock()
-		retiredRoute.waitForWrite()
-	}()
+	defer f.mu.Unlock()
 
 	if f.peerUnregs == nil {
 		f.peerUnregs = make(map[string]uint64)
@@ -544,7 +575,7 @@ func (f *Forwarder) UnregisterSession(peerKey string) {
 	}
 
 	if route, ok := f.routesByPeer[peerKey]; ok {
-		retiredRoute = route
+		retirement.route = route
 		// Generation-bounded delete: only remove the routesByIP entry if it
 		// still points at THIS route. A late unregister of an OLD session
 		// (reaper/API race after a client rekey or reconnect re-registered
@@ -564,6 +595,7 @@ func (f *Forwarder) UnregisterSession(peerKey string) {
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 	}
+	return retirement
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
@@ -914,6 +946,9 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 // when it accommodates them and the existing queue size fits the new budget.
 // Resizing live channels still requires all sessions to disconnect first.
 func (f *Forwarder) ReconfigureClientQueueConfig(size, maxActiveRoutes int) error {
+	if err := ValidateClientRouteLimit(maxActiveRoutes); err != nil {
+		return err
+	}
 	if maxActiveRoutes <= 0 {
 		maxActiveRoutes = MaxSupportedActiveRoutes
 	}
@@ -956,12 +991,7 @@ func (f *Forwarder) RouteQueueStats(peerKey string) (RouteQueueStats, bool) {
 	if !ok || route == nil {
 		return RouteQueueStats{}, false
 	}
-	return RouteQueueStats{
-		Occupancy:      len(route.clientQueue),
-		Capacity:       cap(route.clientQueue),
-		HighWater:      int(route.queueHighWater.Load()), // #nosec G115 -- queue high-water is bounded by the configured channel capacity.
-		QueueFullDrops: route.queueFullDrops.Load(),
-	}, true
+	return f.routeQueueStatsLocked(route), true
 }
 
 // AllRouteQueueStats returns point-in-time snapshots for all active peers.
@@ -975,12 +1005,7 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 		if route == nil {
 			continue
 		}
-		stats[peerKey] = RouteQueueStats{
-			Occupancy:      len(route.clientQueue),
-			Capacity:       cap(route.clientQueue),
-			HighWater:      int(route.queueHighWater.Load()), // #nosec G115 -- queue high-water is bounded by the configured channel capacity.
-			QueueFullDrops: route.queueFullDrops.Load(),
-		}
+		stats[peerKey] = f.routeQueueStatsLocked(route)
 	}
 	return stats
 }

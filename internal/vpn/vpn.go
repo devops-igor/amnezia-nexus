@@ -466,6 +466,10 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		applyVPNConfigDefaults(cfg)
 	}
 
+	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
+		return nil, err
+	}
+
 	// Migrate legacy configs whose AWG obfuscation parameters are unset
 	// (H/S all zero) before any subsystem consumes them: the endpoint
 	// listener copies H/S into its config below and EnsureKeypair
@@ -547,7 +551,10 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		queueSize = maxQueue
 	}
 	cfg.ClientQueueSize = queueSize
-	fwd := forwarder.NewForwarderWithLimits(accountant, cfg.SubnetCIDR, queueSize, maxActiveRoutes)
+	fwd, err := forwarder.NewForwarderWithLimits(accountant, cfg.SubnetCIDR, queueSize, maxActiveRoutes)
+	if err != nil {
+		return nil, err
+	}
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -2380,6 +2387,9 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	if cfg == nil {
 		return errors.New("vpn config cannot be nil")
 	}
+	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2560,8 +2570,14 @@ func (s *Service) GetUserConnectionState(ctx context.Context, userID string) (*U
 
 // DisconnectUser disconnects all active VPN sessions for a user.
 func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
+	var retirements []forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		for _, retirement := range retirements {
+			retirement.Wait()
+		}
+	}()
 
 	if s.sessionMgr == nil {
 		return nil
@@ -2571,7 +2587,7 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	for _, sess := range sessions {
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
-			s.forwarder.UnregisterSession(sess.PeerPublicKey)
+			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey))
 		}
 		if s.stickyMgr != nil {
 			s.stickyMgr.ClearAffinity(userID)
@@ -2595,11 +2611,15 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
 	}
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.forwarder != nil {
-		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 	}
 
 	if s.stickyMgr != nil {
@@ -2645,8 +2665,12 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 // DisconnectSession disconnects a specific VPN session by ID.
 func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.sessionMgr == nil {
 		return nil
@@ -2659,7 +2683,7 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
 	if s.forwarder != nil {
-		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 	}
 	if s.stickyMgr != nil {
 		s.stickyMgr.ClearAffinity(sess.UserID)
@@ -2674,14 +2698,18 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 // ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
 func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.sessionMgr != nil && clientPub != "" {
 		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
 			if s.forwarder != nil {
-				s.forwarder.UnregisterSession(sess.PeerPublicKey)
+				retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 			}
 			if s.stickyMgr != nil {
 				s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
@@ -2711,9 +2739,15 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 // rekey hook's nested sm.mu regime — the hook's only production call site
 // today is the CreateSession call here, so it runs nested under s.mu too;
 // full contract on tunnel.Pool.IncrementConnections) reopens the race.
+// A replaced route's device writes are joined only after releasing s.mu;
+// admission, session bookkeeping, and pool counters remain serialized above it.
 func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.auth == nil || s.ipam == nil || s.sessionMgr == nil || s.pool == nil {
 		return nil, nil, errors.New("subsystems not initialized")
@@ -2754,7 +2788,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	s.pool.IncrementConnections(backend.ID)
 
 	if s.forwarder != nil {
-		s.forwarder.RegisterSession(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID)
+		retirement = s.forwarder.BeginRegisterSessionWithLimit(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID, 0, 0)
 		s.forwarder.AttachPeerDevice(peerPublicKey, &peerVirtualDevice{
 			peerKey:  peerPublicKey,
 			endpoint: s.endpoint,
