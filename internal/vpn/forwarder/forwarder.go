@@ -625,7 +625,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	clientQueue := route.clientQueue
 	route.queueMu.Lock()
 	route.queueOccupancy.Store(int64(len(clientQueue)))
-	routeOccupancy := uint64(route.queueOccupancy.Add(1))
+	routeOccupancy := uint64(route.queueOccupancy.Add(1)) // #nosec G115 -- occupancy is non-negative and bounded by channel capacity.
 	if routeOccupancy > uint64(cap(clientQueue)) {
 		routeOccupancy = uint64(cap(clientQueue))
 	}
@@ -852,7 +852,7 @@ func (f *Forwarder) RouteQueueStats(peerKey string) (RouteQueueStats, bool) {
 	return RouteQueueStats{
 		Occupancy:      len(route.clientQueue),
 		Capacity:       cap(route.clientQueue),
-		HighWater:      int(route.queueHighWater.Load()),
+		HighWater:      int(route.queueHighWater.Load()), // #nosec G115 -- queue high-water is bounded by the configured channel capacity.
 		QueueFullDrops: route.queueFullDrops.Load(),
 	}, true
 }
@@ -869,7 +869,7 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 		stats[peerKey] = RouteQueueStats{
 			Occupancy:      len(route.clientQueue),
 			Capacity:       cap(route.clientQueue),
-			HighWater:      int(route.queueHighWater.Load()),
+			HighWater:      int(route.queueHighWater.Load()), // #nosec G115 -- queue high-water is bounded by the configured channel capacity.
 			QueueFullDrops: route.queueFullDrops.Load(),
 		}
 	}
@@ -883,7 +883,7 @@ func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	occupancy = 0
-	highWater = int(f.aggregateQueueHighWater.Load())
+	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- aggregate queue high-water is bounded by active queue capacities.
 	for _, route := range f.routesByPeer {
 		if route == nil {
 			continue
@@ -898,8 +898,8 @@ func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
 // and the slowest observed write.
 func (f *Forwarder) DeviceWriteStats() (errors uint64, total, max time.Duration) {
 	return f.deviceWriteErrors.Load(),
-		time.Duration(f.deviceWriteDurationNS.Load()),
-		time.Duration(f.deviceWriteMaxDurationNS.Load())
+		time.Duration(f.deviceWriteDurationNS.Load()), // #nosec G115 -- accumulated monotonic durations are non-negative.
+		time.Duration(f.deviceWriteMaxDurationNS.Load()) // #nosec G115 -- accumulated monotonic durations are non-negative.
 }
 
 // DropStats returns the number of return packets dropped because a route's
@@ -1046,9 +1046,9 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 				started := time.Now()
 				_, err := dev.Write(pkt)
 				duration := time.Since(started)
-				f.deviceWriteDurationNS.Add(uint64(duration))
-				for current := f.deviceWriteMaxDurationNS.Load(); uint64(duration) > current; {
-					if f.deviceWriteMaxDurationNS.CompareAndSwap(current, uint64(duration)) {
+				f.deviceWriteDurationNS.Add(uint64(duration))                                   // #nosec G115 -- time.Since returns a non-negative duration.
+				for current := f.deviceWriteMaxDurationNS.Load(); uint64(duration) > current; { // #nosec G115 -- time.Since returns a non-negative duration.
+					if f.deviceWriteMaxDurationNS.CompareAndSwap(current, uint64(duration)) { // #nosec G115 -- time.Since returns a non-negative duration.
 						break
 					}
 					current = f.deviceWriteMaxDurationNS.Load()

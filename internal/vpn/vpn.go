@@ -1195,7 +1195,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
 		writeErrors, writeDuration, _ := s.forwarder.DeviceWriteStats()
 		status.ForwarderDeviceWriteErrors = writeErrors
-		status.ForwarderDeviceWriteDurationMS = uint64(writeDuration / time.Millisecond)
+		status.ForwarderDeviceWriteDurationMS = uint64(writeDuration / time.Millisecond) // #nosec G115 -- writeDuration is non-negative and bounded by time.Duration.
 	}
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()
