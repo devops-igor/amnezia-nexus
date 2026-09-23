@@ -408,6 +408,102 @@ func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel 
 	return 0, nil
 }
 
+// reconcileThresholdAutoDisable reconciles a missed threshold auto-disable CAS update
+// caused by reverse failure ordering or concurrent state updates.
+func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serverID int64) (bool, error) {
+	if hp.pool == nil {
+		return false, nil
+	}
+
+	if hp.isTunnelAdminDisabled(serverID) {
+		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	currentTunnel, err := hp.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, ErrTunnelNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if currentTunnel == nil {
+		return false, nil
+	}
+
+	if currentTunnel.DisableReason == models.DisableReasonAdmin {
+		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	if currentTunnel.Status == models.TunnelStatusDisabled && currentTunnel.DisableReason == models.DisableReasonHealth {
+		hp.mu.Lock()
+		hp.autoDisabled[serverID] = true
+		hp.successCounts[serverID] = 0
+		hp.mu.Unlock()
+		return true, nil
+	}
+
+	hp.mu.Lock()
+	count := hp.failCounts[serverID]
+	threshold := hp.cfg.FailureThreshold
+	hp.mu.Unlock()
+
+	if count < threshold {
+		return false, nil
+	}
+
+	swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+		ctx,
+		currentTunnel.ServerID,
+		currentTunnel.Status,
+		currentTunnel.DisableReason,
+		currentTunnel.StateVersion,
+		models.TunnelStatusDisabled,
+		models.DisableReasonHealth,
+		0,
+	)
+	if casErr != nil {
+		return false, casErr
+	}
+	if swapped {
+		hp.mu.Lock()
+		hp.autoDisabled[serverID] = true
+		hp.successCounts[serverID] = 0
+		hp.mu.Unlock()
+		return true, nil
+	}
+
+	if hp.isTunnelAdminDisabled(serverID) {
+		slog.Info("threshold auto-disable reconciliation CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	if cur, err := hp.pool.GetTunnel(serverID); err == nil && cur != nil {
+		if cur.Status == models.TunnelStatusDisabled && cur.DisableReason == models.DisableReasonHealth {
+			hp.mu.Lock()
+			hp.autoDisabled[serverID] = true
+			hp.successCounts[serverID] = 0
+			hp.mu.Unlock()
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
 	hp.mu.Lock()
 	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
@@ -441,12 +537,10 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 				hp.autoDisabled[snapshot.ServerID] = true
 				hp.successCounts[snapshot.ServerID] = 0
 				hp.mu.Unlock()
-			} else if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-				slog.Info("probe auto-disable CAS missed due to concurrent admin disable", "server_id", snapshot.ServerID)
-				hp.mu.Lock()
-				delete(hp.autoDisabled, snapshot.ServerID)
-				hp.failCounts[snapshot.ServerID] = 0
-				hp.mu.Unlock()
+			} else {
+				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID); recErr != nil {
+					return 0, recErr
+				}
 			}
 		} else {
 			hp.mu.Lock()
@@ -519,12 +613,10 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 				hp.autoDisabled[snapshot.ServerID] = true
 				hp.successCounts[snapshot.ServerID] = 0
 				hp.mu.Unlock()
-			} else if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-				slog.Info("hook failure auto-disable CAS missed due to concurrent admin disable", "server_id", snapshot.ServerID)
-				hp.mu.Lock()
-				delete(hp.autoDisabled, snapshot.ServerID)
-				hp.failCounts[snapshot.ServerID] = 0
-				hp.mu.Unlock()
+			} else {
+				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID); recErr != nil {
+					return 0, recErr
+				}
 			}
 		} else {
 			hp.mu.Lock()
