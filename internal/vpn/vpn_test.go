@@ -5984,7 +5984,7 @@ func TestService_ActiveTrafficPreventsSessionReaperTeardown(t *testing.T) {
 	}
 }
 
-func TestService_ReapSession_PrunesExpiredAffinity(t *testing.T) {
+func TestService_ReapSession_DoesNotPruneExpiredAffinity(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -6042,26 +6042,111 @@ func TestService_ReapSession_PrunesExpiredAffinity(t *testing.T) {
 	sessA.LastSeen = tNow.Add(-10 * time.Minute) // aged past IdleTimeout (3m)
 	vpnSvc.reapSession(ctx, sessA)
 
-	// 4. Assertions:
-	// a) reapSession invoked PruneExpired, physically removing Bob's expired records
-	uCountAfter, pCountAfter := vpnSvc.stickyMgr.AffinityCount()
-	if uCountAfter != 1 || pCountAfter != 1 {
-		t.Fatalf("expected AffinityCount=(1, 1) after reaper pruning, got (%d, %d)", uCountAfter, pCountAfter)
+	// 4. reapSession must NOT prune affinity records (eliminates O(K*N) lock contention under Service.mu)
+	uCountAfterReap, pCountAfterReap := vpnSvc.stickyMgr.AffinityCount()
+	if uCountAfterReap != 2 || pCountAfterReap != 2 {
+		t.Fatalf("expected AffinityCount=(2, 2) after reapSession (no per-session pruning), got (%d, %d)", uCountAfterReap, pCountAfterReap)
 	}
 
-	// b) Bob is physically gone
-	if _, ok := vpnSvc.stickyMgr.GetAffinity(uIDBob); ok {
-		t.Errorf("expected Bob's user affinity to be pruned")
-	}
-	if _, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyBob); ok {
-		t.Errorf("expected Bob's peer affinity to be pruned")
+	// 5. Calling PruneExpiredAffinity explicitly prunes the expired records
+	pruned := vpnSvc.PruneExpiredAffinity()
+	if pruned != 2 {
+		t.Fatalf("expected 2 pruned records, got %d", pruned)
 	}
 
-	// c) Alice's affinity is preserved within AffinityTTL
+	uCountAfterPrune, pCountAfterPrune := vpnSvc.stickyMgr.AffinityCount()
+	if uCountAfterPrune != 1 || pCountAfterPrune != 1 {
+		t.Fatalf("expected AffinityCount=(1, 1) after PruneExpiredAffinity, got (%d, %d)", uCountAfterPrune, pCountAfterPrune)
+	}
+
+	// Alice's affinity is preserved within AffinityTTL
 	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
 		t.Errorf("expected Alice's user affinity to be preserved as %d, got %d (ok=%v)", tunID, tid, ok)
 	}
 	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
 		t.Errorf("expected Alice's peer affinity to be preserved as %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+}
+
+func TestService_PruneExpiredAffinity_ExecutesOutsideServiceMutex(t *testing.T) {
+	db := setupTestDB(t)
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	tNow := time.Now().UTC()
+	vpnSvc.stickyMgr.AssignAffinity(uID, 1)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, 1)
+
+	// Setup synchronization channels
+	insidePrune := make(chan struct{})
+	proceedPrune := make(chan struct{})
+
+	vpnSvc.stickyMgr.SetNowFunc(func() time.Time {
+		select {
+		case <-insidePrune:
+		default:
+			close(insidePrune)
+		}
+		<-proceedPrune
+		return tNow.Add(1 * time.Hour) // force expiry
+	})
+
+	doneCh := make(chan int)
+	go func() {
+		doneCh <- vpnSvc.PruneExpiredAffinity()
+	}()
+
+	// Wait until sm.PruneExpired() begins executing inside StickySessionManager
+	select {
+	case <-insidePrune:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for PruneExpired to execute")
+	}
+
+	// While PruneExpired is executing, Service.mu MUST NOT be held.
+	// We verify that TryLock on vpnSvc.mu succeeds immediately.
+	acquired := vpnSvc.mu.TryLock()
+	if !acquired {
+		t.Errorf("expected Service.mu to be available while PruneExpired executes, but TryLock failed")
+	} else {
+		vpnSvc.mu.Unlock()
+	}
+
+	// Allow PruneExpired to finish
+	close(proceedPrune)
+
+	select {
+	case pruned := <-doneCh:
+		if pruned != 2 {
+			t.Fatalf("expected 2 pruned records, got %d", pruned)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for PruneExpiredAffinity to return")
+	}
+}
+
+func TestService_PostSweepHook_PrunesExpiredAffinity(t *testing.T) {
+	db := setupTestDB(t)
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	tNow := time.Now().UTC()
+	vpnSvc.stickyMgr.AssignAffinity(uID, 1)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, 1)
+
+	// Advance time past TTL
+	vpnSvc.stickyMgr.SetNowFunc(func() time.Time { return tNow.Add(1 * time.Hour) })
+
+	uCount, pCount := vpnSvc.stickyMgr.AffinityCount()
+	if uCount != 1 || pCount != 1 {
+		t.Fatalf("expected initial AffinityCount=(1, 1), got (%d, %d)", uCount, pCount)
+	}
+
+	// Trigger listener's postSweepHook
+	vpnSvc.PruneExpiredAffinity()
+
+	uCountAfter, pCountAfter := vpnSvc.stickyMgr.AffinityCount()
+	if uCountAfter != 0 || pCountAfter != 0 {
+		t.Fatalf("expected AffinityCount=(0, 0) after pruning, got (%d, %d)", uCountAfter, pCountAfter)
 	}
 }

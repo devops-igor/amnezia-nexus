@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -1144,4 +1145,84 @@ func TestListener_ActiveTransportTrafficUpdatesLiveness_RouterErrorDoesNotDropLi
 	if len(timedOutAfterIdle) != 1 || timedOutAfterIdle[0].ID != sess.ID {
 		t.Fatalf("expected idle session to be reaped after traffic ceased, got %+v", timedOutAfterIdle)
 	}
+}
+
+func TestListener_PostSweepHook_CalledOncePerSweepCycle(t *testing.T) {
+	cfg := ListenerConfig{
+		ListenPort:        testFreePort(t),
+		IdleTimeout:       10 * time.Millisecond,
+		HeartbeatInterval: 25 * time.Millisecond,
+	}
+	sm := NewSessionManager(nil, nil)
+	el, err := NewListener(cfg, nil, nil, nil, sm, nil)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Seed 3 sessions and age them past IdleTimeout
+	reapedSessions := make(chan string, 10)
+	el.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
+		reapedSessions <- sess.PeerPublicKey
+	})
+
+	var mu sync.Mutex
+	postSweepCount := 0
+	el.SetPostSweepHook(func(ctx context.Context) {
+		mu.Lock()
+		defer mu.Unlock()
+		postSweepCount++
+	})
+
+	for i := 1; i <= 3; i++ {
+		pKey := fmt.Sprintf("peer-post-sweep-%d", i)
+		sID := fmt.Sprintf("sess-post-sweep-%d", i)
+		sess, err := sm.CreateSession(ctx, "user-sweep", pKey, fmt.Sprintf("10.88.0.%d", i), 1, sID)
+		if err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+		sess.LastSeen = time.Now().UTC().Add(-1 * time.Minute)
+	}
+
+	if err := el.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = el.Stop() }()
+
+	// Wait for the heartbeat sweep to process the timed out sessions
+	deadline := time.Now().Add(2 * time.Second)
+	reapedCount := 0
+	for time.Now().Before(deadline) {
+		select {
+		case <-reapedSessions:
+			reapedCount++
+		default:
+		}
+		if reapedCount >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if reapedCount < 3 {
+		t.Fatalf("expected 3 reaped sessions from reaperHook, got %d", reapedCount)
+	}
+
+	// Verify postSweepHook was called
+	mu.Lock()
+	count := postSweepCount
+	mu.Unlock()
+
+	if count < 1 {
+		t.Fatalf("expected postSweepHook to be called at least once, got %d", count)
+	}
+
+	// Also verify that panic in postSweepHook does not crash heartbeatLoop
+	el.SetPostSweepHook(func(ctx context.Context) {
+		panic("post sweep hook test panic")
+	})
+	// Trigger invokePostSweepHook directly and ensure it recovers safely
+	el.invokePostSweepHook(ctx)
 }

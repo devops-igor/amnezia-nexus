@@ -170,6 +170,9 @@ type ListenerConfig struct {
 	// WorkerQueueSize is the capacity of the inbound packet dispatch queue (issue #160).
 	// If <= 0, defaults to 2048.
 	WorkerQueueSize int
+	// HeartbeatInterval is the interval between idle-timeout sweeps in heartbeatLoop.
+	// If <= 0, defaults to 30 seconds.
+	HeartbeatInterval time.Duration
 }
 
 // BackendSelector resolves the backend tunnel a newly authenticated peer's
@@ -232,6 +235,8 @@ type Listener struct {
 	// reaperHook runs on the heartbeat goroutine for each idle-timed-out
 	// session (see SessionReaperHook); guarded by mu, set before Start.
 	reaperHook SessionReaperHook
+	// postSweepHook runs on the heartbeat goroutine after each idle-timeout sweep cycle; guarded by mu.
+	postSweepHook func(ctx context.Context)
 
 	// rejectLogUntil throttles handshake-rejection log lines (log-flood
 	// defense against a garbage-packet source that fails MAC1): at most one
@@ -1330,6 +1335,28 @@ func (el *Listener) SetSessionReaperHook(fn SessionReaperHook) {
 	el.reaperHook = fn
 }
 
+// SetPostSweepHook registers a callback invoked after each idle-timeout sweep cycle.
+// The hook runs on the heartbeat goroutine outside the session manager mutex.
+func (el *Listener) SetPostSweepHook(fn func(ctx context.Context)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.postSweepHook = fn
+}
+
+func (el *Listener) invokePostSweepHook(ctx context.Context) {
+	el.mu.RLock()
+	hook := el.postSweepHook
+	el.mu.RUnlock()
+	if hook != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[vpn] recovered from post-sweep hook panic: %v", r)
+			}
+		}()
+		hook(ctx)
+	}
+}
+
 // SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes the registered
 // SessionReaperHook for each reaped session.
 func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
@@ -1366,7 +1393,11 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 
 func (el *Listener) heartbeatLoop(ctx context.Context) {
 	defer el.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
+	interval := 30 * time.Second
+	if el.config.HeartbeatInterval > 0 {
+		interval = el.config.HeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -1377,6 +1408,7 @@ func (el *Listener) heartbeatLoop(ctx context.Context) {
 			if _, err := el.SweepTimedOutSessions(ctx); err != nil {
 				log.Printf("[vpn] idle-timeout sweep failed: %v", err)
 			}
+			el.invokePostSweepHook(ctx)
 		}
 	}
 }
