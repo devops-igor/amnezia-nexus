@@ -455,14 +455,31 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 			hp.mu.Unlock()
 		}
 	} else if hp.pool != nil {
-		if err := hp.pool.SetTunnelStatus(ctx, snapshot.ServerID, "degraded", 0); err != nil {
-			return 0, err
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+			ctx,
+			snapshot.ServerID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			"degraded",
+			snapshot.DisableReason,
+			0,
+		)
+		if casErr != nil {
+			return 0, casErr
 		}
-		if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-			hp.mu.Lock()
-			hp.failCounts[snapshot.ServerID] = 0
-			delete(hp.autoDisabled, snapshot.ServerID)
-			hp.mu.Unlock()
+		if !swapped {
+			slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
+				"server_id", snapshot.ServerID,
+				"expected_status", snapshot.Status,
+				"expected_version", snapshot.StateVersion,
+			)
+			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+				hp.mu.Lock()
+				hp.failCounts[snapshot.ServerID] = 0
+				delete(hp.autoDisabled, snapshot.ServerID)
+				hp.mu.Unlock()
+			}
 		}
 	}
 
@@ -516,14 +533,31 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 			hp.mu.Unlock()
 		}
 	} else if hp.pool != nil {
-		if err := hp.pool.SetTunnelStatus(ctx, snapshot.ServerID, "degraded", 0); err != nil {
-			return 0, err
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+			ctx,
+			snapshot.ServerID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			"degraded",
+			snapshot.DisableReason,
+			0,
+		)
+		if casErr != nil {
+			return 0, casErr
 		}
-		if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-			hp.mu.Lock()
-			hp.failCounts[snapshot.ServerID] = 0
-			delete(hp.autoDisabled, snapshot.ServerID)
-			hp.mu.Unlock()
+		if !swapped {
+			slog.Debug("hook failure degraded CAS missed due to concurrent tunnel update",
+				"server_id", snapshot.ServerID,
+				"expected_status", snapshot.Status,
+				"expected_version", snapshot.StateVersion,
+			)
+			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+				hp.mu.Lock()
+				hp.failCounts[snapshot.ServerID] = 0
+				delete(hp.autoDisabled, snapshot.ServerID)
+				hp.mu.Unlock()
+			}
 		}
 	}
 

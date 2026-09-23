@@ -855,3 +855,223 @@ func TestMarkAdminDisabled_ResetsFailCounts(t *testing.T) {
 		t.Fatalf("expected failCounts to be 0 after MarkAdminDisabled, got %d", fcAfter)
 	}
 }
+
+func TestConcurrentProbeTunnel_SubThresholdDoesNotOverwriteDisabledState(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.14"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.14:51820", "pubkey14")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     3,
+		SelfHealingThreshold: 1,
+		DisableSelfHealing:   false,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	initialTunnel, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	initialVersion := initialTunnel.StateVersion
+
+	// 1. Simulate Probe A capturing snapshot at version V
+	probeASnapshot := prober.getInitialSnapshot(t1)
+	if probeASnapshot.StateVersion != initialVersion {
+		t.Fatalf("expected snapshot version %d, got %d", initialVersion, probeASnapshot.StateVersion)
+	}
+
+	// 2. Before Probe A executes its status write, simulate Probe B running and reaching FailureThreshold (3),
+	// successfully executing CAS to transition the tunnel to status="disabled", disable_reason="health",
+	// and autoDisabled=true at state_version V+1
+	prober.mu.Lock()
+	prober.failCounts[s1ID] = 2 // will increment to 3 in handleProbeFailure
+	prober.mu.Unlock()
+
+	probeBSnapshot := prober.getInitialSnapshot(t1)
+	_, err = prober.handleProbeFailure(ctx, probeBSnapshot, errors.New("probe B network timeout"))
+	if err == nil {
+		t.Fatal("expected probe B to return error")
+	}
+
+	tunAfterB, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfterB.Status != models.TunnelStatusDisabled || tunAfterB.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected Probe B to disable tunnel with health reason, got status=%s, reason=%s", tunAfterB.Status, tunAfterB.DisableReason)
+	}
+	if tunAfterB.StateVersion != initialVersion+1 {
+		t.Fatalf("expected version %d after Probe B, got %d", initialVersion+1, tunAfterB.StateVersion)
+	}
+	if !prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected server to be auto-disabled after Probe B")
+	}
+
+	// 3. Probe A fails sub-threshold (e.g. fail count 2 < 3) and finishes its failure handling
+	// using the stale snapshot captured at version V
+	prober.mu.Lock()
+	prober.failCounts[s1ID] = 1 // will increment to 2 (< FailureThreshold 3)
+	prober.mu.Unlock()
+
+	_, err = prober.handleProbeFailure(ctx, probeASnapshot, errors.New("probe A failure"))
+	if err == nil {
+		t.Fatal("expected probe A to return error")
+	}
+
+	// 4. Assert: Probe A's sub-threshold degraded CAS misses (swapped == false)
+	// Pool tunnel remains status="disabled", disable_reason="health", and version V+1
+	cur, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if cur.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status %s, got %s (sub-threshold probe overwrote disabled status)", models.TunnelStatusDisabled, cur.Status)
+	}
+	if cur.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected disable reason %s, got %s", models.DisableReasonHealth, cur.DisableReason)
+	}
+	if cur.StateVersion != initialVersion+1 {
+		t.Fatalf("expected state version %d, got %d", initialVersion+1, cur.StateVersion)
+	}
+
+	// Assert: hp.autoDisabled[serverID] remains true
+	if !prober.IsAutoDisabled(s1ID) {
+		t.Fatalf("expected server %d to remain auto-disabled", s1ID)
+	}
+
+	// Assert: SelfHealSweep recognizes the auto-disabled tunnel and includes it in its recovery sweep
+	reconnected := prober.SelfHealSweep(ctx)
+	if reconnected != 1 {
+		t.Fatalf("expected SelfHealSweep to reconnect 1 tunnel, got %d", reconnected)
+	}
+	if prober.IsAutoDisabled(s1ID) {
+		t.Fatalf("expected server %d autoDisabled to be cleared after recovery", s1ID)
+	}
+	recoveredStatus, _ := pool.GetTunnel(s1ID)
+	if recoveredStatus.Status != models.TunnelStatusActive {
+		t.Fatalf("expected recovered status %s, got %s", models.TunnelStatusActive, recoveredStatus.Status)
+	}
+}
+
+func TestConcurrentHookFailure_SubThresholdDoesNotOverwriteDisabledState(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "192.0.2.15"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.15:51820", "pubkey15")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	}
+
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              1 * time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     3,
+		SelfHealingThreshold: 1,
+		DisableSelfHealing:   false,
+	}
+
+	prober := NewHealthProber(pool, db, cfg, mockProbe)
+
+	initialTunnel, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	initialVersion := initialTunnel.StateVersion
+
+	// 1. Hook A captures snapshot at version V
+	hookASnapshot := prober.getInitialSnapshot(t1)
+
+	// 2. Simulate Probe B reaching FailureThreshold (3) and auto-disabling the tunnel at version V+1
+	prober.mu.Lock()
+	prober.failCounts[s1ID] = 2
+	prober.mu.Unlock()
+
+	probeBSnapshot := prober.getInitialSnapshot(t1)
+	_, err = prober.handleProbeFailure(ctx, probeBSnapshot, errors.New("probe B network timeout"))
+	if err == nil {
+		t.Fatal("expected probe B to return error")
+	}
+
+	tunAfterB, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfterB.Status != models.TunnelStatusDisabled || tunAfterB.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected Probe B to disable tunnel, got status=%s, reason=%s", tunAfterB.Status, tunAfterB.DisableReason)
+	}
+	if tunAfterB.StateVersion != initialVersion+1 {
+		t.Fatalf("expected version %d after Probe B, got %d", initialVersion+1, tunAfterB.StateVersion)
+	}
+	if !prober.IsAutoDisabled(s1ID) {
+		t.Fatal("expected server to be auto-disabled after Probe B")
+	}
+
+	// 3. Hook A fails sub-threshold (e.g. fail count 2 < 3) and executes handleHookFailure with stale snapshot
+	prober.mu.Lock()
+	prober.failCounts[s1ID] = 1
+	prober.mu.Unlock()
+
+	_, err = prober.handleHookFailure(ctx, hookASnapshot, errors.New("hook readiness failure"))
+	if err == nil {
+		t.Fatal("expected hook failure to return error")
+	}
+
+	// 4. Assert: Hook A's sub-threshold degraded CAS misses
+	cur, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if cur.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status %s, got %s (sub-threshold hook failure overwrote disabled status)", models.TunnelStatusDisabled, cur.Status)
+	}
+	if cur.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected disable reason %s, got %s", models.DisableReasonHealth, cur.DisableReason)
+	}
+	if cur.StateVersion != initialVersion+1 {
+		t.Fatalf("expected state version %d, got %d", initialVersion+1, cur.StateVersion)
+	}
+
+	if !prober.IsAutoDisabled(s1ID) {
+		t.Fatalf("expected server %d to remain auto-disabled", s1ID)
+	}
+
+	// 5. Assert: SelfHealSweep recovers tunnel
+	reconnected := prober.SelfHealSweep(ctx)
+	if reconnected != 1 {
+		t.Fatalf("expected SelfHealSweep to reconnect 1 tunnel, got %d", reconnected)
+	}
+	if prober.IsAutoDisabled(s1ID) {
+		t.Fatalf("expected server %d autoDisabled to be cleared after recovery", s1ID)
+	}
+	recoveredStatus, _ := pool.GetTunnel(s1ID)
+	if recoveredStatus.Status != models.TunnelStatusActive {
+		t.Fatalf("expected recovered status %s, got %s", models.TunnelStatusActive, recoveredStatus.Status)
+	}
+}
