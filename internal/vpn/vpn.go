@@ -2784,17 +2784,17 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name)
-	if err != nil {
-		_ = s.ipam.Release(peerPublicKey)
-		return nil, nil, fmt.Errorf("session creation failed: %w", err)
-	}
-
 	if s.peerGenerations == nil {
 		s.peerGenerations = make(map[string]uint64)
 	}
 	s.peerGenerations[peerPublicKey]++
-	sess.Generation = s.peerGenerations[peerPublicKey]
+	peerGen := s.peerGenerations[peerPublicKey]
+
+	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name, peerGen)
+	if err != nil {
+		_ = s.ipam.Release(peerPublicKey)
+		return nil, nil, fmt.Errorf("session creation failed: %w", err)
+	}
 
 	s.pool.IncrementConnections(backend.ID)
 

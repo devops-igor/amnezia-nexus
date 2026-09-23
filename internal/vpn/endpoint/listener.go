@@ -256,6 +256,14 @@ type Listener struct {
 	// staleHandshakes counts handshake completions dropped by the commit fence
 	// because a newer handshake for the same peer already completed.
 	staleHandshakes atomic.Uint64
+	// staleResponseDrops counts handshake responses suppressed at the per-peer send
+	// gate because a newer generation committed before response transmission.
+	staleResponseDrops atomic.Uint64
+
+	peerSendLocksMu sync.Mutex
+	peerSendLocks   map[string]*sync.Mutex
+
+	postCommitHook func(peerKey string, gen uint64)
 }
 
 // applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
@@ -364,6 +372,7 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 		noiseKeys:       make(map[string]*TransportKeys),
 		peersByAddr:     make(map[string]*activePeerState),
 		peerGenerations: make(map[string]uint64),
+		peerSendLocks:   make(map[string]*sync.Mutex),
 		tunDev:          NewChannelPacketDevice("awg0", cfg.MTU, 512),
 		stopCh:          make(chan struct{}),
 	}, nil
@@ -655,8 +664,27 @@ func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicK
 	return sess, nil
 }
 
+// peerSendLock returns the dedicated send mutex for serializing handshake responses per peer.
+func (el *Listener) peerSendLock(peerKey string) *sync.Mutex {
+	el.peerSendLocksMu.Lock()
+	defer el.peerSendLocksMu.Unlock()
+	if el.peerSendLocks == nil {
+		el.peerSendLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := el.peerSendLocks[peerKey]
+	if !ok {
+		mu = &sync.Mutex{}
+		el.peerSendLocks[peerKey] = mu
+	}
+	return mu
+}
+
 // DisconnectPeer disconnects a peer and closes their session.
 func (el *Listener) DisconnectPeer(ctx context.Context, peerPublicKey string) error {
+	el.peerSendLocksMu.Lock()
+	delete(el.peerSendLocks, peerPublicKey)
+	el.peerSendLocksMu.Unlock()
+
 	el.mu.RLock()
 	sm := el.sessionMgr
 	el.mu.RUnlock()
@@ -735,6 +763,24 @@ func (el *Listener) StaleHandshakeDrops() uint64 {
 		return 0
 	}
 	return el.staleHandshakes.Load()
+}
+
+// StaleResponseDrops returns the number of handshake responses suppressed at the
+// per-peer send gate because a newer generation committed before response transmission.
+// Nil receiver is safe and returns 0.
+func (el *Listener) StaleResponseDrops() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.staleResponseDrops.Load()
+}
+
+// SetPostCommitHookForTest sets a hook invoked immediately after CommitHandshake commits
+// before entering the per-peer send gate.
+func (el *Listener) SetPostCommitHookForTest(fn func(peerKey string, gen uint64)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.postCommitHook = fn
 }
 
 // PeerGeneration returns the highest committed generation for a peer under el.mu.
@@ -964,6 +1010,25 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 
 	if !el.CommitHandshake(peerKey, gen, transportKeys, sender, info.SenderIndex) {
 		log.Printf("[vpn/endpoint] dropping stale handshake completion for peer %s (gen %d < current %d)", peerKey, gen, el.PeerGeneration(peerKey))
+		return
+	}
+
+	el.mu.RLock()
+	hook := el.postCommitHook
+	el.mu.RUnlock()
+	if hook != nil {
+		hook(peerKey, gen)
+	}
+
+	// Per-peer send gate:
+	sendMu := el.peerSendLock(peerKey)
+	sendMu.Lock()
+	defer sendMu.Unlock()
+
+	if gen < el.PeerGeneration(peerKey) {
+		el.staleResponseDrops.Add(1)
+		log.Printf("[vpn/endpoint] suppressing stale handshake response for peer %s (gen %d < current %d)",
+			peerKey, gen, el.PeerGeneration(peerKey))
 		return
 	}
 

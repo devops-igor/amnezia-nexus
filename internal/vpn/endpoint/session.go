@@ -121,9 +121,14 @@ func (sm *SessionManager) UnlockLifecycle() {
 // authentication lookup; it is stored on the session (memory + DB row) and
 // deliberately carried onto every replacement of the same peer (a rekey
 // re-authenticates the same user_connection, so the fresh name is passed in).
-func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string) (*models.VPNSession, error) {
+func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string, generation ...uint64) (*models.VPNSession, error) {
 	if userID == "" || peerPublicKey == "" || assignedIP == "" {
 		return nil, errors.New("missing required session fields")
+	}
+
+	var gen uint64
+	if len(generation) > 0 {
+		gen = generation[0]
 	}
 
 	sm.mu.Lock()
@@ -176,6 +181,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 		TxBytes:         0,
 		Status:          "connected",
 		ConnectionName:  connectionName,
+		Generation:      gen,
 	}
 
 	if sm.db != nil {
