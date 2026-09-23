@@ -238,12 +238,10 @@ type Listener struct {
 	// goroutine.
 	rejectLogUntil atomic.Int64
 
-	// handshakeRejects counts inbound datagrams that failed handshake-
-	// initiation parsing AND were not transport data for an established
-	// session (handleDatagram's rejection branch). Exposed via
-	// HandshakeRejections so silent rekey rejections (issue #39 defect 2:
-	// legit rekeys rejected as "not an AWG handshake initiation") become
-	// observable in stats instead of only in throttled logs.
+	// handshakeRejects counts inbound datagrams that were genuine handshake
+	// initiations but failed cryptographic verification (e.g., MAC1 failure,
+	// static key / timestamp decryption failure, or stale timestamp).
+	// Unroutable transport data and non-initiation datagrams are excluded (issue #288).
 	handshakeRejects atomic.Uint64
 }
 
@@ -827,18 +825,22 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		// Not a valid handshake initiation for this endpoint: transport data
 		// for an established session (or garbage). Try the transport path.
 		if !el.handleTransportData(datagram, sender) {
-			// Count every rejection that is not transport data (including
-			// too-short datagrams) so the counter reflects the true
-			// rejection volume seen on the wire (issue #39 defect 2).
+			// Datagrams with ErrNotInitiation (such as unroutable transport data
+			// from unknown senders or after daemon restarts) and too-short datagrams
+			// are unroutable traffic, not rejected handshake initiations.
+			// They must not increment handshakeRejects or emit misleading logs (issue #288).
+			if errors.Is(err, ErrNotInitiation) || errors.Is(err, ErrDatagramTooShort) {
+				return
+			}
+
+			// Genuine handshake initiation rejections (e.g., ErrMAC1Failed,
+			// ErrDecryptStatic, ErrDecryptTimestamp, ErrTimestampStale)
+			// increment handshakeRejects and emit throttled rejection logs.
 			el.handshakeRejects.Add(1)
-			if !errors.Is(err, ErrDatagramTooShort) {
-				// Throttle rejection logs: a garbage flood that fails MAC1
-				// would otherwise produce one log line per packet.
-				now := time.Now().Unix()
-				until := el.rejectLogUntil.Load()
-				if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
-					log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
-				}
+			now := time.Now().Unix()
+			until := el.rejectLogUntil.Load()
+			if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
+				log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
 			}
 		}
 		return
