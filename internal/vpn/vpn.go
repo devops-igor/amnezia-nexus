@@ -2457,11 +2457,10 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// reapSession tears down forwarder routes, sticky affinities, and pool counters
-// for an idle-timeout reaped session. To protect against reconnect and reconcile
-// races, peer/user affinity is only cleared if no newer active session exists for
-// the peer/user, and pool connection counter decrement is skipped if periodic
-// reconciliation already re-synchronized the gauge from the database.
+// reapSession tears down forwarder routes and pool counters for an idle-timeout
+// reaped session. Sticky affinity is preserved within AffinityTTL to prevent
+// backend/IP thrashing upon client reconnect (issue #294). Pool connection counter
+// decrement is skipped if periodic reconciliation already re-synchronized the gauge from the database.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
@@ -2471,32 +2470,6 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 	if s.forwarder != nil {
 		s.forwarder.UnregisterSession(sess.PeerPublicKey)
-	}
-
-	if s.stickyMgr != nil {
-		shouldClearPeer := true
-		if s.sessionMgr != nil {
-			if activePeerSess, ok := s.sessionMgr.GetSession(sess.PeerPublicKey); ok && activePeerSess != nil && activePeerSess.ID != sess.ID {
-				shouldClearPeer = false
-			}
-		}
-		if shouldClearPeer {
-			s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
-		}
-
-		shouldClearUser := true
-		if s.sessionMgr != nil {
-			activeUserSessions := s.sessionMgr.GetSessionsByUserID(sess.UserID)
-			for _, us := range activeUserSessions {
-				if us != nil && us.ID != sess.ID {
-					shouldClearUser = false
-					break
-				}
-			}
-		}
-		if shouldClearUser {
-			s.stickyMgr.ClearAffinity(sess.UserID)
-		}
 	}
 
 	if s.pool != nil {

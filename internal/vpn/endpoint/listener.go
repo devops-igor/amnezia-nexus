@@ -193,6 +193,7 @@ type activePeerState struct {
 	receiverIdx     atomic.Uint32
 	sendCount       atomic.Uint64
 	lastSeen        atomic.Int64 // unix nanos
+	lastTouchSec    atomic.Int64 // unix seconds (issue #294: throttles TouchSession calls)
 	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
 }
 
@@ -772,6 +773,21 @@ func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys) {
 	el.noiseKeys[peerKey] = keys
 }
 
+// StoreTransportKeysForTest exposes storeTransportKeys for integration tests.
+func (el *Listener) StoreTransportKeysForTest(peerKey string, keys *TransportKeys) {
+	el.storeTransportKeys(peerKey, keys)
+}
+
+// RememberPeerForTest exposes rememberPeer for integration tests.
+func (el *Listener) RememberPeerForTest(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
+	el.rememberPeer(sender, peerKey, receiverIdx)
+}
+
+// HandleDatagramForTest exposes handleDatagram for integration tests.
+func (el *Listener) HandleDatagramForTest(ctx context.Context, data []byte, sender *net.UDPAddr) {
+	el.handleDatagram(ctx, data, sender)
+}
+
 // serverPrivateKey resolves the endpoint's persistent Noise server private
 // key, loading or creating it via the ServerKeysManager on first use. It
 // returns nil when no keypair is available, in which case handshake
@@ -946,6 +962,23 @@ func (el *Listener) peerByAddr(addr string) (*activePeerState, bool) {
 // failure logs for a given peer (issue #148).
 const decryptLogThrottleSeconds = 5
 
+// touchSessionThrottleSeconds is the minimum interval in seconds between TouchSession
+// invocations for an active peer to minimize SessionManager mutex contention under high throughput (issue #294).
+const touchSessionThrottleSeconds = 2
+
+// touchPeerSession updates session liveness in SessionManager with rate limiting
+// to prevent mutex contention on SessionManager under high packet throughput (issue #294).
+func (el *Listener) touchPeerSession(st *activePeerState) {
+	if el.sessionMgr == nil || st == nil {
+		return
+	}
+	nowSec := time.Now().Unix()
+	last := st.lastTouchSec.Load()
+	if (nowSec-last >= touchSessionThrottleSeconds || nowSec < last) && st.lastTouchSec.CompareAndSwap(last, nowSec) {
+		el.sessionMgr.TouchSession(st.peerKey)
+	}
+}
+
 // transportDataHeaderLen is the AWG/WireGuard transport-data header:
 // 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
 // the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
@@ -1028,12 +1061,15 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	router := el.router
 	el.mu.RUnlock()
 	if router == nil {
+		el.touchPeerSession(st)
 		return true
 	}
 	if err := router(st.peerKey, packet); err != nil {
 		// Congestion/backpressure is expected under load: drop silently at
 		// debug priority; anything else is a routing inconsistency worth a log.
 		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", st.peerKey, err)
+	} else {
+		el.touchPeerSession(st)
 	}
 	return true
 }

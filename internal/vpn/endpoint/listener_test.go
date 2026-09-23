@@ -862,3 +862,171 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 		t.Fatalf("reply mismatch: got %q, want %q", decryptedReply, serverReply)
 	}
 }
+
+func TestListener_ActiveTransportTrafficUpdatesLiveness(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := ListenerConfig{
+		ListenPort:  getFreeUDPPort(t),
+		SubnetCIDR:  "10.100.0.0/24",
+		MTU:         1420,
+		IdleTimeout: 5 * time.Second,
+		S4:          16,
+		H4:          models.DegenerateHeaderRange(health.DefaultH4),
+	}
+
+	ipam, err := NewIPAM(cfg.SubnetCIDR)
+	if err != nil {
+		t.Fatalf("NewIPAM failed: %v", err)
+	}
+	sm := NewSessionManager(nil, ipam)
+
+	el, err := NewListener(cfg, nil, nil, ipam, sm, nil)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	peerKey := "test-peer-key-liveness-1"
+	sess, err := sm.CreateSession(ctx, "user-live-1", peerKey, "10.100.0.50", 1, "conn-live-1")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// Artificially age session LastSeen by 3 seconds (older than touch throttle, within 5s IdleTimeout)
+	initialLastSeen := time.Now().UTC().Add(-3 * time.Second)
+	sm.SetSessionLastSeen(peerKey, initialLastSeen)
+
+	// Set up transport keys and peer endpoint
+	clientAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:48123")
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	clientSendKey := make([]byte, chacha20poly1305.KeySize)
+	clientRecvKey := make([]byte, chacha20poly1305.KeySize)
+	for i := range clientSendKey {
+		clientSendKey[i] = byte(i + 1)
+		clientRecvKey[i] = byte(i + 40)
+	}
+	el.storeTransportKeys(peerKey, &TransportKeys{
+		RecvKey: clientSendKey,
+		SendKey: clientRecvKey,
+	})
+	el.rememberPeer(clientAddr, peerKey, 10001)
+
+	// Route channel to verify decrypted transport packet routing
+	routedCh := make(chan []byte, 10)
+	el.SetClientPacketRouter(func(pk string, pkt []byte) error {
+		routedCh <- pkt
+		return nil
+	})
+
+	// Prepare transport packet
+	clientAEAD, err := chacha20poly1305.New(clientSendKey)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.New failed: %v", err)
+	}
+	clientPayload := []byte("ping-transport-liveness-payload")
+	var counter uint64 = 0
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	ciphertext := clientAEAD.Seal(nil, nonce[:], clientPayload, nil)
+
+	s4Junk := make([]byte, cfg.S4)
+	var hdr [transportDataHeaderLen]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
+	binary.LittleEndian.PutUint32(hdr[4:8], 10001)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+
+	datagram := append(s4Junk, hdr[:]...)
+	datagram = append(datagram, ciphertext...)
+
+	// Send first transport datagram
+	el.handleDatagram(ctx, datagram, clientAddr)
+
+	select {
+	case routed := <-routedCh:
+		if !bytes.Equal(routed, clientPayload) {
+			t.Fatalf("routed packet mismatch: got %q, want %q", routed, clientPayload)
+		}
+	default:
+		t.Fatal("expected transport packet to be routed")
+	}
+
+	// Verify session LastSeen was refreshed by transport traffic
+	currentSess, ok := sm.GetSession(peerKey)
+	if !ok {
+		t.Fatal("session not found in sessionMgr")
+	}
+	if !currentSess.LastSeen.After(initialLastSeen) {
+		t.Fatalf("expected LastSeen to be updated after initial %v, got %v", initialLastSeen, currentSess.LastSeen)
+	}
+
+	// Verify throttle protection: rapid burst of datagrams
+	st, ok := el.peerByAddr(clientAddr.String())
+	if !ok {
+		t.Fatal("peer not found in peersByAddr")
+	}
+	firstTouch := st.lastTouchSec.Load()
+	if firstTouch == 0 {
+		t.Fatal("expected lastTouchSec to be non-zero after packet touch")
+	}
+
+	// Update session LastSeen back to 1 second ago to observe whether second packet touches it
+	markerTime := time.Now().UTC().Add(-1 * time.Second)
+	sm.SetSessionLastSeen(peerKey, markerTime)
+
+	// Send immediate second packet
+	counter++
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+	ciphertext2 := clientAEAD.Seal(nil, nonce[:], clientPayload, nil)
+	datagram2 := append(s4Junk, hdr[:]...)
+	datagram2 = append(datagram2, ciphertext2...)
+
+	el.handleDatagram(ctx, datagram2, clientAddr)
+
+	// Second packet should be throttled (within 2s window)
+	currentSess2, _ := sm.GetSession(peerKey)
+	if !currentSess2.LastSeen.Equal(markerTime) {
+		t.Fatalf("expected LastSeen to remain markerTime due to throttling, got %v", currentSess2.LastSeen)
+	}
+
+	// Advance lastTouchSec past throttle window
+	st.lastTouchSec.Store(time.Now().Unix() - 5)
+
+	// Send third packet
+	counter++
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+	ciphertext3 := clientAEAD.Seal(nil, nonce[:], clientPayload, nil)
+	datagram3 := append(s4Junk, hdr[:]...)
+	datagram3 = append(datagram3, ciphertext3...)
+
+	el.handleDatagram(ctx, datagram3, clientAddr)
+
+	// Third packet should have refreshed LastSeen
+	currentSess3, _ := sm.GetSession(peerKey)
+	if !currentSess3.LastSeen.After(markerTime) {
+		t.Fatalf("expected LastSeen to be refreshed after throttle window elapsed, got %v", currentSess3.LastSeen)
+	}
+
+	// Verify CheckTimeouts / SweepTimedOutSessions does NOT reap the active session
+	timedOut, err := el.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) > 0 {
+		t.Fatalf("expected active session to survive sweep, got %d reaped sessions", len(timedOut))
+	}
+
+	// Now cease traffic and simulate idle timeout: age LastSeen past IdleTimeout (5s)
+	sm.SetSessionLastSeen(peerKey, time.Now().UTC().Add(-10*time.Second))
+	timedOutAfterIdle, err := el.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOutAfterIdle) != 1 || timedOutAfterIdle[0].ID != sess.ID {
+		t.Fatalf("expected idle session to be reaped after traffic ceased, got %+v", timedOutAfterIdle)
+	}
+}
