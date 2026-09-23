@@ -344,8 +344,10 @@ func (f *Forwarder) stopRoutePumpLocked(route *sessionRoute) {
 		route.retired.Store(true)
 		close(route.stopCh)
 		route.writeMu.Lock()
-		route.writeMu.Unlock()
+		// Record the stopped state while holding the exclusive lock so the
+		// critical section also publishes retirement to any in-flight pump.
 		route.stopped = true
+		route.writeMu.Unlock()
 		route.pumpStarted = false
 	}
 }

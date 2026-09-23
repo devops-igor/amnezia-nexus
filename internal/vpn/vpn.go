@@ -2331,6 +2331,8 @@ func (s *Service) GetConfig(ctx context.Context) (*models.VPNConfig, error) {
 }
 
 // UpdateConfig updates the dynamic VPN configuration and reinitializes the load balancer.
+//
+//nolint:gocyclo // transactional validation, persistence, runtime apply, and rollback are intentionally centralized.
 func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return errors.New("vpn config cannot be nil")
