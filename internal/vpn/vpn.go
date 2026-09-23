@@ -2421,13 +2421,20 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		cfg.ClientQueueSize = maxQueue
 	}
 	queueSizeChanged := false
+	routeLimitChanged := false
 	oldQueueSize := forwarder.DefaultClientQueueSize
+	oldMaxActiveRoutes := 1000
 	if s.cfg != nil && s.forwarder != nil {
 		oldQueueSize = s.cfg.ClientQueueSize
 		if oldQueueSize <= 0 {
 			oldQueueSize = forwarder.DefaultClientQueueSize
 		}
+		oldMaxActiveRoutes = s.cfg.MaxTotalPeers
+		if oldMaxActiveRoutes <= 0 {
+			oldMaxActiveRoutes = 1000
+		}
 		queueSizeChanged = cfg.ClientQueueSize != oldQueueSize
+		routeLimitChanged = maxActiveRoutes != oldMaxActiveRoutes
 	}
 
 	caps := loadbalancer.CapacityConfig{
@@ -2445,7 +2452,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 			return fmt.Errorf("failed to persist vpn config: %w", err)
 		}
 	}
-	if queueSizeChanged {
+	if queueSizeChanged || routeLimitChanged {
 		if err := s.forwarder.ReconfigureClientQueueConfig(cfg.ClientQueueSize, maxActiveRoutes); err != nil {
 			if s.db != nil && previousCfg != nil {
 				if rollbackErr := s.db.SaveVPNConfig(ctx, previousCfg); rollbackErr != nil {
@@ -2470,8 +2477,8 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 				s.endpoint.UpdateListenPort(previousCfg.ListenPort)
 			}
 		}
-		if queueSizeChanged {
-			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, previousCfg.MaxTotalPeers); err != nil {
+		if queueSizeChanged || routeLimitChanged {
+			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, oldMaxActiveRoutes); err != nil {
 				rollbackErrs = append(rollbackErrs, err)
 			}
 		}
