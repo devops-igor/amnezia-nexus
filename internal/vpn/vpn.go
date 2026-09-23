@@ -50,6 +50,12 @@ type Status struct {
 	ForwarderQueueHighWater        int                                  `json:"forwarder_queue_high_water"`
 	ForwarderDeviceWriteErrors     uint64                               `json:"forwarder_device_write_errors"`
 	ForwarderDeviceWriteDurationMS uint64                               `json:"forwarder_device_write_duration_ms"`
+	ForwarderDeviceWriteCount      uint64                               `json:"forwarder_device_write_count"`
+	ForwarderDeviceWritesInFlight  int                                  `json:"forwarder_device_writes_in_flight"`
+	ForwarderDeviceWriteOldestMS   int64                                `json:"forwarder_device_write_oldest_in_flight_ms"`
+	ForwarderDeviceWriteMaxMS      int64                                `json:"forwarder_device_write_max_duration_ms"`
+	ForwarderDeviceWriteStalls     uint64                               `json:"forwarder_device_write_stalls"`
+	ForwarderDeviceWriteStallMS    int64                                `json:"forwarder_device_write_stall_threshold_ms"`
 	TransportDecryptionFailures    uint64                               `json:"transport_decryption_failures"`
 	HandshakeRejections            uint64                               `json:"handshake_rejections"`
 	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
@@ -1224,9 +1230,15 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 				status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
 			}
 		}
-		writeErrors, writeDuration, _ := s.forwarder.DeviceWriteStats()
-		status.ForwarderDeviceWriteErrors = writeErrors
-		status.ForwarderDeviceWriteDurationMS = uint64(writeDuration / time.Millisecond) // #nosec G115 -- writeDuration is non-negative and bounded by time.Duration.
+		writes := s.forwarder.DeviceWriteSnapshot()
+		status.ForwarderDeviceWriteErrors = writes.Errors
+		status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
+		status.ForwarderDeviceWriteCount = writes.Count
+		status.ForwarderDeviceWritesInFlight = writes.InFlight
+		status.ForwarderDeviceWriteOldestMS = writes.OldestInFlight.Milliseconds()
+		status.ForwarderDeviceWriteMaxMS = writes.MaxDuration.Milliseconds()
+		status.ForwarderDeviceWriteStalls = writes.Stalls
+		status.ForwarderDeviceWriteStallMS = forwarder.DeviceWriteStallThreshold.Milliseconds()
 	}
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()

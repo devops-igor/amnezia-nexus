@@ -483,6 +483,7 @@ func TestRouteRetirementDoesNotBlockOtherRoutesOnDeviceWrite(t *testing.T) {
 			dev := newBlockingWriteDevice()
 			f.AttachPeerDevice("peer", dev)
 			f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+			oldRoute := f.routesByPeer["peer"]
 			f.StartPumps(t.Context())
 			defer f.StopPumps()
 			defer dev.release()
@@ -501,18 +502,146 @@ func TestRouteRetirementDoesNotBlockOtherRoutesOnDeviceWrite(t *testing.T) {
 				} else {
 					f.UnregisterSession("peer")
 				}
-				f.RegisterSession("other", "connection", "other", "10.100.0.12", 1)
 				close(retired)
 			}()
 			select {
+			case <-oldRoute.stopCh:
+			case <-time.After(time.Second):
+				t.Fatal("route retirement did not begin")
+			}
+			otherRegistered := make(chan struct{})
+			go func() {
+				f.RegisterSession("other", "connection", "other", "10.100.0.12", 1)
+				close(otherRegistered)
+			}()
+			select {
+			case <-otherRegistered:
+			case <-time.After(time.Second):
+				t.Fatal("stalled write blocked unrelated registration")
+			}
+			select {
+			case <-retired:
+				t.Fatal("retirement returned before admitted write completed")
+			default:
+			}
+			if stats := f.DeviceWriteSnapshot(); stats.InFlight != 1 {
+				t.Fatalf("retired in-flight write disappeared: %+v", stats)
+			}
+			dev.release()
+			select {
 			case <-retired:
 			case <-time.After(time.Second):
-				t.Fatal("stalled write blocked route retirement or unrelated registration")
+				t.Fatal("retirement did not finish after write completed")
 			}
 			if _, ok := f.RouteQueueStats("other"); !ok {
 				t.Fatal("unrelated route missing")
 			}
 		})
+	}
+}
+
+func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replace=%t", replace), func(t *testing.T) {
+			f := NewForwarder(nil, "10.100.0.0/16", 2)
+			dev := newBlockingWriteDevice()
+			dev.release()
+			f.AttachPeerDevice("peer", dev)
+			f.RegisterSession("old", "connection", "peer", "10.100.0.10", 1)
+			oldRoute := f.routesByPeer["peer"]
+			resume := make(chan struct{})
+			done := make(chan struct{})
+			// Reproduce a pump that already selected its route and device, then
+			// was suspended immediately before writeClientPacket admission.
+			go func() {
+				<-resume
+				f.writeClientPacket(oldRoute, dev, []byte("stale"))
+				close(done)
+			}()
+			if replace {
+				f.RegisterSession("new", "connection", "peer", "10.100.0.10", 1)
+			} else {
+				f.UnregisterSession("peer")
+			}
+			close(resume) // retirement has returned; old Write must never begin
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("old pump did not finish")
+			}
+			if dev.writeCount() != 0 || f.DeviceWriteSnapshot().Count != 0 {
+				t.Fatal("retired generation admitted a stale write")
+			}
+			if replace {
+				f.writeClientPacket(f.routesByPeer["peer"], dev, []byte("current"))
+				if dev.writeCount() != 1 {
+					t.Fatal("replacement generation cannot write")
+				}
+			}
+		})
+	}
+}
+
+func TestDeviceTelemetryReportsBlockedWriteBeforeCompletion(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 2)
+	dev := newBlockingWriteDevice()
+	f.AttachPeerDevice("peer", dev)
+	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+	f.StartPumps(t.Context())
+	defer f.StopPumps()
+	defer dev.release()
+	if err := f.RouteBackendToClient(1, []byte("first"), "10.100.0.10"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dev.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("write did not start")
+	}
+	for i := 0; i < 2; i++ {
+		if err := f.RouteBackendToClient(1, []byte("queued"), "10.100.0.10"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.RouteBackendToClient(1, []byte("drop"), "10.100.0.10"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("expected saturation, got %v", err)
+	}
+	time.Sleep(DeviceWriteStallThreshold)
+	stats := f.DeviceWriteSnapshot()
+	if stats.Count != 1 || stats.InFlight != 1 || stats.OldestInFlight < DeviceWriteStallThreshold || stats.Stalls != 1 {
+		t.Fatalf("live stalled write missing: %+v", stats)
+	}
+	if stats.TotalDuration != 0 || stats.MaxDuration != 0 || stats.Errors != 0 {
+		t.Fatalf("unfinished write reported a completed outcome: %+v", stats)
+	}
+	dev.release()
+	f.UnregisterSession("peer") // waits for admitted write; drops buffered packets
+	stats = f.DeviceWriteSnapshot()
+	if stats.InFlight != 0 || stats.OldestInFlight != 0 || stats.Stalls < 1 || stats.MaxDuration < DeviceWriteStallThreshold {
+		t.Fatalf("completed stalled write missing: %+v", stats)
+	}
+}
+
+func TestClientQueueConfigAllowsSafeLiveRouteLimitChanges(t *testing.T) {
+	f := NewForwarderWithLimits(nil, "10.100.0.0/16", 2, 2)
+	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+	queue, _ := f.GetClientPacketChannel("peer")
+	for _, limit := range []int{4, 1, 2} {
+		if err := f.ReconfigureClientQueueConfig(2, limit); err != nil {
+			t.Fatalf("safe live limit=%d: %v", limit, err)
+		}
+		if current, _ := f.GetClientPacketChannel("peer"); current != queue {
+			t.Fatal("limit update replaced a live queue")
+		}
+	}
+	f.RegisterSession("second", "connection", "peer2", "10.100.0.11", 1)
+	for _, config := range [][2]int{{2, 1}, {3, 2}, {2, MaxClientQueueMemoryBytes / MaxClientQueuePacketBytes}} {
+		if err := f.ReconfigureClientQueueConfig(config[0], config[1]); err == nil {
+			t.Fatalf("unsafe live configuration accepted: %v", config)
+		}
+		if f.bufSize != 2 || f.maxActiveRoutes != 2 {
+			t.Fatal("rejected change mutated live limits")
+		}
 	}
 }
 

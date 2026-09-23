@@ -249,6 +249,40 @@ cookies are `Secure` automatically (no extra configuration), and
 
 ---
 
+## Diagnosing return-path queue saturation
+
+The authenticated `/api/vpn/status` endpoint exposes aggregate queue occupancy,
+capacity and high-water marks, plus per-route diagnostics in
+`forwarder_route_queues` (up to 1,000 routes). Queue-full drops use a drop-newest
+policy: queued packets are preserved and the incoming packet is counted in
+`forwarder_drops_queue_full`. No-route and oversized-packet drops have separate
+counters.
+
+Use these write metrics to distinguish a draining queue from a blocked consumer:
+
+| Status field | Meaning |
+| --- | --- |
+| `forwarder_device_write_count` | Admitted writes, including unfinished writes |
+| `forwarder_device_writes_in_flight` | Writes that have not returned, including retired routes |
+| `forwarder_device_write_oldest_in_flight_ms` | Age of the oldest unfinished write; zero when none are active |
+| `forwarder_device_write_duration_ms` | Total duration of completed writes |
+| `forwarder_device_write_max_duration_ms` | Longest completed write |
+| `forwarder_device_write_errors` | Completed writes that returned an error |
+| `forwarder_device_write_stalls` | Writes lasting at least 100 ms, including unfinished writes; each write counts once |
+| `forwarder_device_write_stall_threshold_ms` | The stall threshold (100 ms) |
+
+Rising queue-full drops alongside a growing in-flight write age identify a
+blocked downstream consumer even before the write returns. Route retirement
+waits for admitted writes to finish, but releases the global routing lock first
+so other clients can continue forwarding.
+
+`client_queue_size` defaults to 2,048 packets and is capped using an 8 GiB
+aggregate queued-payload budget, `max_total_peers`, and a 1,500-byte packet bound.
+This budget excludes channel/runtime overhead and packets already in flight.
+Changing `max_total_peers` with connected clients is supported when the limit
+accommodates existing routes and their queue capacity still fits the budget.
+Changing the actual queue capacity requires disconnecting active sessions first.
+
 ## Documentation & Specifications
 
 - [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.

@@ -138,6 +138,8 @@ type sessionRoute struct {
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
 	queueFullDrops  atomic.Uint64
+	queueOccupancy  int        // guarded by aggregateQueueMu; reconciles compatibility drains
+	writeMu         sync.Mutex // admission and completion; never acquired under f.mu
 	retired         atomic.Bool
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
@@ -194,11 +196,12 @@ type Forwarder struct {
 	// queue -> client device leg, e.g. "no transport keys for peer", used to
 	// vanish silently). CAS-based on a monotonic deadline, same pattern as
 	// the endpoint listener's rejectLogUntil; safe under concurrent pumps.
-	writeErrLogUntil         atomic.Int64
-	deviceWriteErrors        atomic.Uint64
-	deviceWriteDurationNS    atomic.Uint64
-	deviceWriteMaxDurationNS atomic.Uint64
-	aggregateQueueHighWater  atomic.Uint64
+	writeErrLogUntil        atomic.Int64
+	writeMetricsMu          sync.Mutex
+	writeMetrics            DeviceWriteTelemetry
+	writesInFlight          map[*sessionRoute]time.Time
+	aggregateQueueOccupancy int // guarded by aggregateQueueMu
+	aggregateQueueHighWater atomic.Uint64
 	// aggregateQueueMu serializes managed queue operations so aggregate
 	// high-water is sampled at the same linearization point as enqueue/dequeue.
 	aggregateQueueMu sync.Mutex
@@ -310,6 +313,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		backendQueues:    make(map[int64]chan []byte),
 		clientDevices:    make(map[string]PacketDevice),
 		backendDevices:   make(map[int64]PacketDevice),
+		writesInFlight:   make(map[*sessionRoute]time.Time),
 		backendPumpStops: make(map[int64]chan struct{}),
 		backendPumpDones: make(map[int64]chan struct{}),
 		peerRegs:         make(map[string]uint64),
@@ -337,8 +341,12 @@ func (f *Forwarder) RegisterSession(sessionID, connectionID, peerKey, assignedIP
 // RouteClientToBackend and are shared by concurrent pumps; they are
 // mutex-guarded and safe for concurrent use.
 func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) {
+	var retiredRoute *sessionRoute
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer func() {
+		f.mu.Unlock()
+		retiredRoute.waitForWrite()
+	}()
 
 	// Registration is intentionally void for API compatibility. A new peer is
 	// rejected when the configured active-route budget is full; callers observe
@@ -384,6 +392,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	// A re-registration for the same peer replaces an existing route: stop
 	// the old route's pump before the maps are overwritten so it cannot leak.
 	if old, ok := f.routesByPeer[peerKey]; ok && old != nil {
+		retiredRoute = old
 		f.stopRoutePumpLocked(old)
 		f.drainRouteQueueLocked(old)
 		if old.assignedIP != "" {
@@ -438,6 +447,7 @@ func (f *Forwarder) drainRouteQueueLocked(route *sessionRoute) {
 		select {
 		case <-route.clientQueue:
 		default:
+			f.reconcileQueueOccupancyLocked(route)
 			return
 		}
 	}
@@ -498,8 +508,12 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 // the live route survives. Route state is only torn down when a currently
 // held teardown credit is spent on it.
 func (f *Forwarder) UnregisterSession(peerKey string) {
+	var retiredRoute *sessionRoute
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer func() {
+		f.mu.Unlock()
+		retiredRoute.waitForWrite()
+	}()
 
 	if f.peerUnregs == nil {
 		f.peerUnregs = make(map[string]uint64)
@@ -530,6 +544,7 @@ func (f *Forwarder) UnregisterSession(peerKey string) {
 	}
 
 	if route, ok := f.routesByPeer[peerKey]; ok {
+		retiredRoute = route
 		// Generation-bounded delete: only remove the routesByIP entry if it
 		// still points at THIS route. A late unregister of an OLD session
 		// (reaper/API race after a client rekey or reconnect re-registered
@@ -706,6 +721,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	f.aggregateQueueMu.Lock()
 	select {
 	case clientQueue <- pktCopy:
+		f.reconcileQueueOccupancyLocked(route)
 		routeOccupancy := uint64(len(clientQueue))
 		for current := route.queueHighWater.Load(); routeOccupancy > current; {
 			if route.queueHighWater.CompareAndSwap(current, routeOccupancy) {
@@ -713,12 +729,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 			}
 			current = route.queueHighWater.Load()
 		}
-		aggregateOccupancy := uint64(0)
-		for _, queuedRoute := range f.routesByPeer {
-			if queuedRoute != nil {
-				aggregateOccupancy += uint64(len(queuedRoute.clientQueue))
-			}
-		}
+		aggregateOccupancy := uint64(f.aggregateQueueOccupancy) // #nosec G115 -- maintained sum of non-negative queue lengths.
 		for current := f.aggregateQueueHighWater.Load(); aggregateOccupancy > current; {
 			if f.aggregateQueueHighWater.CompareAndSwap(current, aggregateOccupancy) {
 				break
@@ -899,9 +910,9 @@ func (f *Forwarder) StartPumps(ctx context.Context) {
 }
 
 // ReconfigureClientQueueConfig changes the capacity used for subsequently
-// registered client routes. Existing route channels cannot be resized safely;
-// reject changes while any route is active so persisted configuration cannot
-// diverge from the running data plane.
+// registered client routes. A route-limit change is safe with live sessions
+// when it accommodates them and the existing queue size fits the new budget.
+// Resizing live channels still requires all sessions to disconnect first.
 func (f *Forwarder) ReconfigureClientQueueConfig(size, maxActiveRoutes int) error {
 	if maxActiveRoutes <= 0 {
 		maxActiveRoutes = MaxSupportedActiveRoutes
@@ -916,8 +927,11 @@ func (f *Forwarder) ReconfigureClientQueueConfig(size, maxActiveRoutes int) erro
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.routesByPeer) > 0 {
-		return errors.New("client queue configuration cannot change while sessions are active")
+	if len(f.routesByPeer) > 0 && size != f.bufSize {
+		return errors.New("client queue size cannot change while sessions are active")
+	}
+	if len(f.routesByPeer) > maxActiveRoutes {
+		return errors.New("client route limit cannot be lower than the active route count")
 	}
 	f.bufSize = size
 	f.maxActiveRoutes = maxActiveRoutes
@@ -986,6 +1000,7 @@ func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
 			continue
 		}
 		occupancy += len(route.clientQueue)
+		f.reconcileQueueOccupancyLocked(route)
 		capacity += cap(route.clientQueue)
 	}
 	return
@@ -994,9 +1009,8 @@ func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
 // DeviceWriteStats returns client-device write failures, total write duration,
 // and the slowest observed write.
 func (f *Forwarder) DeviceWriteStats() (errors uint64, total, max time.Duration) {
-	return f.deviceWriteErrors.Load(),
-		time.Duration(f.deviceWriteDurationNS.Load()), // #nosec G115 -- accumulated monotonic durations are non-negative.
-		time.Duration(f.deviceWriteMaxDurationNS.Load()) // #nosec G115 -- accumulated monotonic durations are non-negative.
+	stats := f.DeviceWriteSnapshot()
+	return stats.Errors, stats.TotalDuration, stats.MaxDuration
 }
 
 // DropStats returns the number of return packets dropped because a route's
@@ -1130,6 +1144,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		f.aggregateQueueMu.Lock()
 		select {
 		case pkt = <-route.clientQueue:
+			f.reconcileQueueOccupancyLocked(route)
 		default:
 			f.aggregateQueueMu.Unlock()
 			select {
@@ -1153,34 +1168,8 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			dev = f.defaultClientDev
 		}
 		f.mu.RUnlock()
-		if route.retired.Load() {
-			continue
-		}
-
 		if dev != nil {
-			started := time.Now()
-			_, err := dev.Write(pkt)
-			duration := time.Since(started)
-			f.deviceWriteDurationNS.Add(uint64(duration))                                   // #nosec G115 -- time.Since returns a non-negative duration.
-			for current := f.deviceWriteMaxDurationNS.Load(); uint64(duration) > current; { // #nosec G115 -- time.Since returns a non-negative duration.
-				if f.deviceWriteMaxDurationNS.CompareAndSwap(current, uint64(duration)) { // #nosec G115 -- time.Since returns a non-negative duration.
-					break
-				}
-				current = f.deviceWriteMaxDurationNS.Load()
-			}
-			if err != nil {
-				f.deviceWriteErrors.Add(1)
-				// Issue #43: a failing return-leg device write (e.g.
-				// "no transport keys for peer") must surface somewhere.
-				// Throttle to ~1 line/second like the queue-full drop
-				// counters; the packet itself is dropped either way.
-				now := time.Now().Unix()
-				if f.writeErrLogUntil.Load() <= now {
-					f.writeErrLogUntil.Store(now + 1)
-					log.Printf("[vpn/forwarder] return-path device write error (throttled 1/s): peer=%s session=%s: %v",
-						route.peerKey, route.sessionID, err)
-				}
-			}
+			f.writeClientPacket(route, dev, pkt)
 		}
 	}
 }
