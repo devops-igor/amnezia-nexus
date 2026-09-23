@@ -1031,151 +1031,236 @@ func TestOrchestrator_CheckBackendTunnelHealth_UsesTunnelStatusUpdater(t *testin
 	}
 }
 
-func TestOrchestrator_UpdateTunnelStatus_UpdaterSuccess(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
+func TestOrchestrator_UpdateTunnelStatus_SelectiveFallback(t *testing.T) {
+	t.Run("Case1_UpdaterSuccess_NoDBCAS", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
 
-	ctx := context.Background()
-	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Success", Host: "10.0.0.90", SSHPort: 22})
+		ctx := context.Background()
+		srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Success", Host: "10.0.0.90", SSHPort: 22})
 
-	tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      srvID,
-		InterfaceName: "awg-updater-success",
-		PublicKey:     "pub-success",
-		Endpoint:      "127.0.0.1:55499",
-		Status:        "active",
-		StateVersion:  1,
+		tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      srvID,
+			InterfaceName: "awg-updater-success",
+			PublicKey:     "pub-success",
+			Endpoint:      "127.0.0.1:55499",
+			Status:        "active",
+			StateVersion:  1,
+		})
+		if err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
+
+		updater := &mockStatusUpdater{}
+		orch := New(db, nil, WithTunnelStatusUpdater(updater))
+
+		tun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel failed: %v", err)
+		}
+
+		orch.updateTunnelStatus(ctx, tun, "degraded", 150)
+
+		updater.mu.Lock()
+		defer updater.mu.Unlock()
+		if len(updater.updates) != 1 {
+			t.Fatalf("expected 1 updater call, got %d", len(updater.updates))
+		}
+		if updater.updates[0].serverID != srvID || updater.updates[0].status != "degraded" || updater.updates[0].latencyMS != 150 {
+			t.Errorf("unexpected updater call: %+v", updater.updates[0])
+		}
+
+		// Direct DB CAS was not called, so DB tunnel remains untouched
+		dbTun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel after update failed: %v", err)
+		}
+		if dbTun.Status != "active" {
+			t.Errorf("expected DB status to remain 'active', got %q", dbTun.Status)
+		}
+		if dbTun.StateVersion != 1 {
+			t.Errorf("expected DB state_version to remain 1, got %d", dbTun.StateVersion)
+		}
 	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
 
-	updater := &mockStatusUpdater{}
-	orch := New(db, nil, WithTunnelStatusUpdater(updater))
+	t.Run("Case2_UpdaterOperationalError_SkipsFallback", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
 
-	tun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel failed: %v", err)
-	}
+		ctx := context.Background()
+		srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server OpErr", Host: "10.0.0.91", SSHPort: 22})
 
-	orch.updateTunnelStatus(ctx, tun, "degraded", 150)
+		tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      srvID,
+			InterfaceName: "awg-updater-operr",
+			PublicKey:     "pub-operr",
+			Endpoint:      "127.0.0.1:55500",
+			Status:        "active",
+			StateVersion:  1,
+		})
+		if err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
 
-	updater.mu.Lock()
-	defer updater.mu.Unlock()
-	if len(updater.updates) != 1 {
-		t.Fatalf("expected 1 updater call, got %d", len(updater.updates))
-	}
-	if updater.updates[0].serverID != srvID || updater.updates[0].status != "degraded" || updater.updates[0].latencyMS != 150 {
-		t.Errorf("unexpected updater call: %+v", updater.updates[0])
-	}
+		// Operational error: non-ErrTunnelNotFound
+		updater := &mockStatusUpdater{err: errors.New("db disk I/O failure")}
+		orch := New(db, nil, WithTunnelStatusUpdater(updater))
 
-	// Direct DB CAS was not called, so DB tunnel remains untouched
-	dbTun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel after update failed: %v", err)
-	}
-	if dbTun.Status != "active" {
-		t.Errorf("expected DB status to remain 'active', got %q", dbTun.Status)
-	}
-	if dbTun.StateVersion != 1 {
-		t.Errorf("expected DB state_version to remain 1, got %d", dbTun.StateVersion)
-	}
-}
+		tun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel failed: %v", err)
+		}
 
-func TestOrchestrator_UpdateTunnelStatus_UpdaterFails_FallsBackToDBCAS(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
+		orch.updateTunnelStatus(ctx, tun, "degraded", 250)
 
-	ctx := context.Background()
-	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Fallback", Host: "10.0.0.91", SSHPort: 22})
+		updater.mu.Lock()
+		callCount := len(updater.updates)
+		updater.mu.Unlock()
+		if callCount != 1 {
+			t.Fatalf("expected 1 updater call, got %d", callCount)
+		}
 
-	tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      srvID,
-		InterfaceName: "awg-updater-fallback",
-		PublicKey:     "pub-fallback",
-		Endpoint:      "127.0.0.1:55500",
-		Status:        "active",
-		StateVersion:  1,
+		// Fallback must NOT execute on operational error, DB record must remain untouched
+		dbTun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel after operational error failed: %v", err)
+		}
+		if dbTun.Status != "active" {
+			t.Errorf("expected DB status to remain 'active', got %q", dbTun.Status)
+		}
+		if dbTun.StateVersion != 1 {
+			t.Errorf("expected DB state_version to remain 1, got %d", dbTun.StateVersion)
+		}
 	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
 
-	updater := &mockStatusUpdater{err: tunnel.ErrTunnelNotFound}
-	orch := New(db, nil, WithTunnelStatusUpdater(updater))
+	t.Run("Case3_UpdaterErrTunnelNotFound_FallsBackToDBCAS", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
 
-	tun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel failed: %v", err)
-	}
+		ctx := context.Background()
+		srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Fallback", Host: "10.0.0.92", SSHPort: 22})
 
-	orch.updateTunnelStatus(ctx, tun, "degraded", 250)
+		tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      srvID,
+			InterfaceName: "awg-updater-fallback",
+			PublicKey:     "pub-fallback",
+			Endpoint:      "127.0.0.1:55501",
+			Status:        "active",
+			StateVersion:  1,
+		})
+		if err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
 
-	updater.mu.Lock()
-	callCount := len(updater.updates)
-	updater.mu.Unlock()
-	if callCount != 1 {
-		t.Fatalf("expected 1 updater call, got %d", callCount)
-	}
+		updater := &mockStatusUpdater{err: tunnel.ErrTunnelNotFound}
+		orch := New(db, nil, WithTunnelStatusUpdater(updater))
 
-	// Falls back to direct DB CAS, updating DB record and state_version
-	dbTun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel after fallback failed: %v", err)
-	}
-	if dbTun.Status != "degraded" {
-		t.Errorf("expected DB status 'degraded', got %q", dbTun.Status)
-	}
-	if dbTun.LatencyMS != 250 {
-		t.Errorf("expected DB latency 250, got %d", dbTun.LatencyMS)
-	}
-	if dbTun.StateVersion != 2 {
-		t.Errorf("expected DB state_version 2, got %d", dbTun.StateVersion)
-	}
-}
+		tun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel failed: %v", err)
+		}
 
-func TestOrchestrator_UpdateTunnelStatus_NilUpdater_DirectDBCAS(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
+		orch.updateTunnelStatus(ctx, tun, "degraded", 250)
 
-	ctx := context.Background()
-	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Nil Updater", Host: "10.0.0.92", SSHPort: 22})
+		updater.mu.Lock()
+		callCount := len(updater.updates)
+		updater.mu.Unlock()
+		if callCount != 1 {
+			t.Fatalf("expected 1 updater call, got %d", callCount)
+		}
 
-	tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      srvID,
-		InterfaceName: "awg-nil-updater",
-		PublicKey:     "pub-nil",
-		Endpoint:      "127.0.0.1:55501",
-		Status:        "active",
-		StateVersion:  1,
+		// Falls back to direct DB CAS, updating DB record and state_version
+		dbTun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel after fallback failed: %v", err)
+		}
+		if dbTun.Status != "degraded" {
+			t.Errorf("expected DB status 'degraded', got %q", dbTun.Status)
+		}
+		if dbTun.LatencyMS != 250 {
+			t.Errorf("expected DB latency 250, got %d", dbTun.LatencyMS)
+		}
+		if dbTun.StateVersion != 2 {
+			t.Errorf("expected DB state_version 2, got %d", dbTun.StateVersion)
+		}
 	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
 
-	// updater is nil (management-only mode)
-	orch := New(db, nil)
+	t.Run("Case4_NilUpdater_DirectDBCAS", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
 
-	tun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel failed: %v", err)
-	}
+		ctx := context.Background()
+		srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Nil Updater", Host: "10.0.0.93", SSHPort: 22})
 
-	orch.updateTunnelStatus(ctx, tun, "active", 75)
+		tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      srvID,
+			InterfaceName: "awg-nil-updater",
+			PublicKey:     "pub-nil",
+			Endpoint:      "127.0.0.1:55502",
+			Status:        "active",
+			StateVersion:  1,
+		})
+		if err != nil {
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
 
-	dbTun, err := db.GetBackendTunnel(ctx, tunID)
-	if err != nil {
-		t.Fatalf("GetBackendTunnel after nil updater update failed: %v", err)
-	}
-	if dbTun.Status != "active" {
-		t.Errorf("expected DB status 'active', got %q", dbTun.Status)
-	}
-	if dbTun.LatencyMS != 75 {
-		t.Errorf("expected DB latency 75, got %d", dbTun.LatencyMS)
-	}
-	if dbTun.StateVersion != 2 {
-		t.Errorf("expected DB state_version 2, got %d", dbTun.StateVersion)
-	}
+		// updater is nil (management-only mode)
+		orch := New(db, nil)
+
+		tun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel failed: %v", err)
+		}
+
+		orch.updateTunnelStatus(ctx, tun, "active", 75)
+
+		dbTun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnel after nil updater update failed: %v", err)
+		}
+		if dbTun.Status != "active" {
+			t.Errorf("expected DB status 'active', got %q", dbTun.Status)
+		}
+		if dbTun.LatencyMS != 75 {
+			t.Errorf("expected DB latency 75, got %d", dbTun.LatencyMS)
+		}
+		if dbTun.StateVersion != 2 {
+			t.Errorf("expected DB state_version 2, got %d", dbTun.StateVersion)
+		}
+	})
+
+	t.Run("Case5_DirectDBCAS_ErrorHandledWithoutPanic", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+
+		ctx := context.Background()
+		srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server DBOpErr", Host: "10.0.0.94", SSHPort: 22})
+
+		tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+			ServerID:      srvID,
+			InterfaceName: "awg-db-operr",
+			PublicKey:     "pub-db-operr",
+			Endpoint:      "127.0.0.1:55503",
+			Status:        "active",
+			StateVersion:  1,
+		})
+		if err != nil {
+			cleanup()
+			t.Fatalf("CreateBackendTunnel failed: %v", err)
+		}
+
+		tun, err := db.GetBackendTunnel(ctx, tunID)
+		if err != nil {
+			cleanup()
+			t.Fatalf("GetBackendTunnel failed: %v", err)
+		}
+
+		// Close DB to force CompareAndSwapTunnelStatus to return an error
+		cleanup()
+
+		orch := New(db, nil)
+		// Should log error and return without panic
+		orch.updateTunnelStatus(ctx, tun, "degraded", 300)
+	})
 }
 
 func TestOrchestrator_SyncTraffic_TeleMTAndProtocols(t *testing.T) {

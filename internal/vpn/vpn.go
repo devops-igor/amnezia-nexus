@@ -2106,7 +2106,7 @@ func (s *Service) SetTunnelStatus(ctx context.Context, serverID int64, status st
 	pool := s.pool
 	s.mu.RUnlock()
 	if pool == nil {
-		return errors.New("tunnel pool not initialized")
+		return tunnel.ErrTunnelNotFound
 	}
 	return pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }

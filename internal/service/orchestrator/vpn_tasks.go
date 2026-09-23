@@ -10,6 +10,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // CheckBackendTunnelHealth probes active backend AWG tunnels via pure-Go Noise IK handshakes.
@@ -172,19 +173,42 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 	o.mu.RUnlock()
 
 	if updater != nil {
-		if err := updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS); err == nil {
+		err := updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS)
+		if err == nil {
 			return
-		} else {
-			slog.Debug("Tunnel status updater failed, falling back to direct DB CAS",
+		}
+		if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+			slog.Error("Tunnel status updater failed with operational error, skipping fallback to preserve state consistency",
 				"server_id", t.ServerID,
 				"tunnel_id", t.ID,
 				"err", err,
 			)
+			return
 		}
+		slog.Debug("Tunnel not found in updater pool, falling back to direct DB CAS",
+			"server_id", t.ServerID,
+			"tunnel_id", t.ID,
+			"err", err,
+		)
 	}
 
 	if o.db != nil {
-		_, _ = o.db.CompareAndSwapTunnelStatus(ctx, t.ID, t.Status, t.DisableReason, t.StateVersion, status, t.DisableReason, latencyMS)
+		swapped, err := o.db.CompareAndSwapTunnelStatus(ctx, t.ID, t.Status, t.DisableReason, t.StateVersion, status, t.DisableReason, latencyMS)
+		if err != nil {
+			slog.Error("Direct DB CAS failed to update tunnel status",
+				"server_id", t.ServerID,
+				"tunnel_id", t.ID,
+				"err", err,
+			)
+			return
+		}
+		if !swapped {
+			slog.Debug("Direct DB CAS missed during tunnel status update",
+				"server_id", t.ServerID,
+				"tunnel_id", t.ID,
+				"expected_version", t.StateVersion,
+			)
+		}
 	}
 }
 

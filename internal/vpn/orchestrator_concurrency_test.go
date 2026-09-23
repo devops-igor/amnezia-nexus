@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -323,4 +324,106 @@ func TestOrchestrator_TunnelStatusUpdater_PoolAndDBSync(t *testing.T) {
 	if poolTun2.StateVersion != dbTun2.StateVersion {
 		t.Fatalf("pool and DB state_version desynchronized after cycle 2: pool=%d, db=%d", poolTun2.StateVersion, dbTun2.StateVersion)
 	}
+}
+
+// TestOrchestrator_StartupLifecycleSynchronization verifies that:
+//  1. When startup lifecycle ordering wires orch.SetTunnelStatusUpdater(vpnSvc) before Orchestrator ticks,
+//     Pool and DB state_version remain strictly identical.
+//  2. Operational errors returned by the updater do not trigger direct DB CAS fallback,
+//     preventing out-of-band DB mutation and state desynchronization.
+func TestOrchestrator_StartupLifecycleSynchronization(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Lifecycle Srv", "127.0.0.1")
+
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	tun, err := vpnSvc.pool.AddTunnel(ctx, sID, "127.0.0.1:51823", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	initialVersion := tun.StateVersion
+	dbTunInitial, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTunInitial == nil {
+		t.Fatalf("failed to get initial DB tunnel: %v", err)
+	}
+	if initialVersion != dbTunInitial.StateVersion {
+		t.Fatalf("initial version mismatch: pool=%d, db=%d", initialVersion, dbTunInitial.StateVersion)
+	}
+
+	// 1. Verify startup lifecycle ordering: Orchestrator is configured with updater before probing begins
+	orch := orchestrator.New(db, nil,
+		orchestrator.WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			return 45 * time.Millisecond, nil
+		}),
+	)
+	orch.SetTunnelStatusUpdater(vpnSvc)
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	poolTun1, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTun1 == nil {
+		t.Fatalf("pool GetTunnel failed: %v", err)
+	}
+	dbTun1, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTun1 == nil {
+		t.Fatalf("db GetBackendTunnelByServerID failed: %v", err)
+	}
+
+	if poolTun1.StateVersion != initialVersion+1 || dbTun1.StateVersion != initialVersion+1 {
+		t.Fatalf("expected version %d, got pool=%d, db=%d", initialVersion+1, poolTun1.StateVersion, dbTun1.StateVersion)
+	}
+	if poolTun1.StateVersion != dbTun1.StateVersion {
+		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun1.StateVersion, dbTun1.StateVersion)
+	}
+
+	// 2. Verify operational error prevents out-of-band DB mutation
+	operationalErr := errors.New("simulated operational network error")
+	faultyUpdater := &faultyStatusUpdater{
+		target: vpnSvc,
+		err:    operationalErr,
+	}
+	orch.SetTunnelStatusUpdater(faultyUpdater)
+
+	// Attempt health check with operational error from updater
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	// DB record must NOT be mutated via CAS fallback on operational error
+	dbTunAfterOpErr, err := db.GetBackendTunnelByServerID(ctx, sID)
+	if err != nil || dbTunAfterOpErr == nil {
+		t.Fatalf("db GetBackendTunnelByServerID after operational error failed: %v", err)
+	}
+	if dbTunAfterOpErr.StateVersion != initialVersion+1 {
+		t.Errorf("DB state_version changed despite operational error: expected %d, got %d", initialVersion+1, dbTunAfterOpErr.StateVersion)
+	}
+
+	// Pool also remains at initialVersion+1
+	poolTunAfterOpErr, err := vpnSvc.pool.GetTunnel(sID)
+	if err != nil || poolTunAfterOpErr == nil {
+		t.Fatalf("pool GetTunnel after operational error failed: %v", err)
+	}
+	if poolTunAfterOpErr.StateVersion != dbTunAfterOpErr.StateVersion {
+		t.Fatalf("version mismatch after operational error: pool=%d, db=%d", poolTunAfterOpErr.StateVersion, dbTunAfterOpErr.StateVersion)
+	}
+}
+
+type faultyStatusUpdater struct {
+	target orchestrator.TunnelStatusUpdater
+	err    error
+}
+
+func (f *faultyStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	return f.target.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }

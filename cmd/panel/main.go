@@ -190,18 +190,10 @@ func run(ctx context.Context) error {
 	// 6. User Operations
 	userOps := service.NewUserOpsService(db, reg)
 
-	// 7. Background Orchestrator & Supervisor
+	// 7. Background Orchestrator
 	orch := orchestrator.New(db, reg,
 		orchestrator.WithUserOps(userOps),
 	)
-
-	sup := service.NewSupervisor()
-	sup.RegisterService(orch)
-
-	supErrCh := make(chan error, 1)
-	go func() {
-		supErrCh <- sup.Start(ctx)
-	}()
 
 	// 8. VPN data plane (opt-in via VPN_ENABLED). When the TUN device is
 	// unavailable the panel continues in management-only mode (API up, data
@@ -220,7 +212,16 @@ func run(ctx context.Context) error {
 		orch.SetTunnelStatusUpdater(vpnSvc)
 	}
 
-	// 9. Initialize HTTP Router and Server
+	// 9. Background Supervisor (started strictly after VPN data plane and status updater wiring)
+	sup := service.NewSupervisor()
+	sup.RegisterService(orch)
+
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Start(ctx)
+	}()
+
+	// 10. Initialize HTTP Router and Server
 	r := router.NewRouter(cfg, db, vpnSvc)
 	srv := router.NewServer(cfg, r, db)
 
