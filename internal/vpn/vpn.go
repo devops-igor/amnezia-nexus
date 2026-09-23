@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,17 +41,18 @@ type Status struct {
 	// A rising forwarder_drops_total with stable traffic means a stalled
 	// downstream path or unroutable backend returns; a rising handshake_rejections means
 	// client initiations are failing cryptographic verification (issues #39, #288).
-	ForwarderDropsQueueFull        uint64 `json:"forwarder_drops_queue_full"`
-	ForwarderDropsNoRoute          uint64 `json:"forwarder_drops_no_route"`
-	ForwarderDropsTotal            uint64 `json:"forwarder_drops_total"`
-	ForwarderQueueOccupancy        int    `json:"forwarder_queue_occupancy"`
-	ForwarderQueueCapacity         int    `json:"forwarder_queue_capacity"`
-	ForwarderQueueHighWater        int    `json:"forwarder_queue_high_water"`
-	ForwarderDeviceWriteErrors     uint64 `json:"forwarder_device_write_errors"`
-	ForwarderDeviceWriteDurationMS uint64 `json:"forwarder_device_write_duration_ms"`
-	TransportDecryptionFailures    uint64 `json:"transport_decryption_failures"`
-	HandshakeRejections            uint64 `json:"handshake_rejections"`
-	PublicEndpoint                 string `json:"public_endpoint,omitempty"`
+	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
+	ForwarderDropsTotal            uint64                               `json:"forwarder_drops_total"`
+	ForwarderQueueOccupancy        int                                  `json:"forwarder_queue_occupancy"`
+	ForwarderQueueCapacity         int                                  `json:"forwarder_queue_capacity"`
+	ForwarderQueueHighWater        int                                  `json:"forwarder_queue_high_water"`
+	ForwarderDeviceWriteErrors     uint64                               `json:"forwarder_device_write_errors"`
+	ForwarderDeviceWriteDurationMS uint64                               `json:"forwarder_device_write_duration_ms"`
+	TransportDecryptionFailures    uint64                               `json:"transport_decryption_failures"`
+	HandshakeRejections            uint64                               `json:"handshake_rejections"`
+	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
+	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -1193,6 +1195,22 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.TxBytes = tx
 		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
 		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
+		allRouteQueues := s.forwarder.AllRouteQueueStats()
+		if len(allRouteQueues) > 0 {
+			peers := make([]string, 0, len(allRouteQueues))
+			for peerKey := range allRouteQueues {
+				peers = append(peers, peerKey)
+			}
+			sort.Strings(peers)
+			limit := len(peers)
+			if limit > forwarder.MaxSupportedActiveRoutes {
+				limit = forwarder.MaxSupportedActiveRoutes
+			}
+			status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
+			for _, peerKey := range peers[:limit] {
+				status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+			}
+		}
 		writeErrors, writeDuration, _ := s.forwarder.DeviceWriteStats()
 		status.ForwarderDeviceWriteErrors = writeErrors
 		status.ForwarderDeviceWriteDurationMS = uint64(writeDuration / time.Millisecond) // #nosec G115 -- writeDuration is non-negative and bounded by time.Duration.

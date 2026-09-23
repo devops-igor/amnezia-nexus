@@ -14,7 +14,10 @@ var (
 	ErrSessionNotRegistered = errors.New("session route not registered")
 	ErrBackendNotFound      = errors.New("backend queue not found")
 	ErrQueueFull            = errors.New("packet queue is full")
-	ErrRateLimitExceeded    = errors.New("rate limit exceeded")
+	// ErrPacketTooLarge rejects packets that cannot fit within the payload-size
+	// assumption used by the aggregate client queue memory budget.
+	ErrPacketTooLarge    = errors.New("packet exceeds maximum queued payload size")
+	ErrRateLimitExceeded = errors.New("rate limit exceeded")
 	// ErrSpoofedSourceIP is returned by RouteClientToBackend when the inner
 	// packet's claimed source IP fails the rebind ownership guard (issue
 	// #89): outside the portal subnet, currently assigned to another route,
@@ -168,6 +171,7 @@ type Forwarder struct {
 	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
 	defaultClientDev PacketDevice             // default client packet device
 	bufSize          int
+	backendBufSize   int
 	// portalSubnet is the VPN's own client address pool (same CIDR the IPAM
 	// allocates from). It bounds the srcIP self-heal rebind in
 	// RouteClientToBackend (issue #89): only IPs INSIDE this subnet can ever
@@ -195,11 +199,14 @@ type Forwarder struct {
 	deviceWriteDurationNS    atomic.Uint64
 	deviceWriteMaxDurationNS atomic.Uint64
 	aggregateQueueHighWater  atomic.Uint64
-	running                  bool
-	stopCh                   chan struct{}
-	pumpsRunning             bool
-	pumpsStopCh              chan struct{}
-	pumpsWg                  sync.WaitGroup
+	// aggregateQueueMu serializes managed queue operations so aggregate
+	// high-water is sampled at the same linearization point as enqueue/dequeue.
+	aggregateQueueMu sync.Mutex
+	running          bool
+	stopCh           chan struct{}
+	pumpsRunning     bool
+	pumpsStopCh      chan struct{}
+	pumpsWg          sync.WaitGroup
 	// Generation accounting for teardown races (issue #39): each
 	// registration for a peer key earns one teardown; an UnregisterSession
 	// that arrives while a NEWER registration holds the route (late reaper /
@@ -214,10 +221,30 @@ type Forwarder struct {
 // (2048 packets ~ 2.8 MB @ MTU 1420, issue #151).
 const DefaultClientQueueSize = 2048
 
-// MaxClientQueuePackets is the hard upper bound for a per-route queue. With the
-// 1420-byte VPN MTU this bounds queued packet payloads to roughly 11.6 MiB per
-// route; callers cannot accidentally request an unbounded channel.
-const MaxClientQueuePackets = 8192
+// DefaultBackendQueueSize is the default capacity of each backend packet queue.
+// It is intentionally independent from DefaultClientQueueSize so client queue
+// tuning does not silently change backend queue memory allocation.
+const DefaultBackendQueueSize = 2048
+
+// MaxSupportedActiveRoutes is the supported upper bound used when budgeting
+// queued client packet memory. It is deliberately independent of the runtime
+// load-balancer configuration so old configurations remain valid.
+const MaxSupportedActiveRoutes = 1000
+
+// MaxClientQueuePacketBytes is the conservative payload size reserved for one
+// queued packet (the VPN MTU is 1420 bytes).
+const MaxClientQueuePacketBytes = 1500
+
+// MaxClientQueueMemoryBytes is the explicit aggregate queued-payload budget
+// for all supported active routes. Per-route queue capacity is derived from
+// this budget and MaxSupportedActiveRoutes, then bounded by this package's
+// public queue limit.
+const MaxClientQueueMemoryBytes = 8 << 30
+
+// MaxClientQueuePackets is the hard upper bound for a per-route queue. The
+// derived limit prevents the configured queue size from exceeding the
+// aggregate queued-memory budget at MaxSupportedActiveRoutes.
+const MaxClientQueuePackets = MaxClientQueueMemoryBytes / (MaxSupportedActiveRoutes * MaxClientQueuePacketBytes)
 
 // NewForwarder creates a new Forwarder.
 //
@@ -256,6 +283,7 @@ func NewForwarder(accountant *TrafficAccountant, portalSubnetCIDR string, bufSiz
 		peerRegs:         make(map[string]uint64),
 		peerUnregs:       make(map[string]uint64),
 		bufSize:          qSize,
+		backendBufSize:   DefaultBackendQueueSize,
 		stopCh:           make(chan struct{}),
 	}
 }
@@ -279,9 +307,18 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Registration is intentionally void for API compatibility. A new peer is
+	// rejected when the supported active-route budget is full; callers observe
+	// the rejection through the usual absent-route behavior. Re-registration of
+	// an existing peer is allowed so reconnect/rekey lifecycle semantics remain
+	// unchanged and does not increase the active route count.
+	if _, exists := f.routesByPeer[peerKey]; !exists && len(f.routesByPeer) >= MaxSupportedActiveRoutes {
+		return
+	}
+
 	// Ensure backend queue exists
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.bufSize)
+		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
 	}
 
 	var tbDown, tbUp *TokenBucket
@@ -357,6 +394,8 @@ func (f *Forwarder) drainRouteQueueLocked(route *sessionRoute) {
 	if route == nil {
 		return
 	}
+	f.aggregateQueueMu.Lock()
+	defer f.aggregateQueueMu.Unlock()
 	route.queueMu.Lock()
 	defer route.queueMu.Unlock()
 	for {
@@ -487,7 +526,7 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 	}
 
 	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
-		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.bufSize)
+		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
 	}
 
 	route.backendTunnelID = newBackendTunnelID
@@ -607,6 +646,9 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
+	if len(packet) > MaxClientQueuePacketBytes {
+		return ErrPacketTooLarge
+	}
 	if tbDown != nil && !tbDown.Allow(pktLen) {
 		return ErrRateLimitExceeded
 	}
@@ -623,42 +665,42 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		return ErrSessionNotRegistered
 	}
 	clientQueue := route.clientQueue
+	f.aggregateQueueMu.Lock()
 	route.queueMu.Lock()
-	route.queueOccupancy.Store(int64(len(clientQueue)))
-	routeOccupancy := uint64(route.queueOccupancy.Add(1)) // #nosec G115 -- occupancy is non-negative and bounded by channel capacity.
-	if routeOccupancy > uint64(cap(clientQueue)) {
-		routeOccupancy = uint64(cap(clientQueue))
-	}
-	for current := route.queueHighWater.Load(); routeOccupancy > current; {
-		if route.queueHighWater.CompareAndSwap(current, routeOccupancy) {
-			break
-		}
-		current = route.queueHighWater.Load()
-	}
-	aggregateHighWater := uint64(0)
-	for _, queuedRoute := range f.routesByPeer {
-		if queuedRoute != nil {
-			aggregateHighWater += queuedRoute.queueHighWater.Load()
-		}
-	}
-	for current := f.aggregateQueueHighWater.Load(); aggregateHighWater > current; {
-		if f.aggregateQueueHighWater.CompareAndSwap(current, aggregateHighWater) {
-			break
-		}
-		current = f.aggregateQueueHighWater.Load()
-	}
 	select {
 	case clientQueue <- pktCopy:
+		routeOccupancy := uint64(len(clientQueue))
+		route.queueOccupancy.Store(int64(routeOccupancy))
+		for current := route.queueHighWater.Load(); routeOccupancy > current; {
+			if route.queueHighWater.CompareAndSwap(current, routeOccupancy) {
+				break
+			}
+			current = route.queueHighWater.Load()
+		}
+		aggregateOccupancy := uint64(0)
+		for _, queuedRoute := range f.routesByPeer {
+			if queuedRoute != nil {
+				aggregateOccupancy += uint64(len(queuedRoute.clientQueue))
+			}
+		}
+		for current := f.aggregateQueueHighWater.Load(); aggregateOccupancy > current; {
+			if f.aggregateQueueHighWater.CompareAndSwap(current, aggregateOccupancy) {
+				break
+			}
+			current = f.aggregateQueueHighWater.Load()
+		}
+		route.queueMu.Unlock()
+		f.aggregateQueueMu.Unlock()
+		f.mu.RUnlock()
 		f.totalTxBytes.Add(pktLen)
 		if f.accountant != nil {
 			f.accountant.RecordTx(sID, cID, pktLen)
 		}
-		route.queueMu.Unlock()
-		f.mu.RUnlock()
 		return nil
 	default:
-		route.queueOccupancy.Add(-1)
+		route.queueOccupancy.Store(int64(len(clientQueue)))
 		route.queueMu.Unlock()
+		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
 		// Bounded backpressure: the packet is dropped, but every drop is
 		// counted so the stats API can surface a stalled downstream path
@@ -737,7 +779,7 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 	defer f.mu.Unlock()
 
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.bufSize)
+		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
 	}
 	if dev != nil {
 		f.backendDevices[backendTunnelID] = dev
@@ -1013,62 +1055,66 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 	routeStopCh := route.stopCh
 
 	for {
+		var pkt []byte
+		var ok bool
 		select {
 		case <-stopCh:
 			return
 		case <-routeStopCh:
 			return
-		case pkt, ok := <-route.clientQueue:
+		case pkt, ok = <-route.clientQueue:
 			if !ok {
 				return
 			}
-			route.queueMu.Lock()
-			route.queueOccupancy.Add(-1)
-			route.queueMu.Unlock()
-			f.mu.RLock()
-			currentRoute, current := f.routesByPeer[route.peerKey]
-			if !current || currentRoute != route || route.stopped {
-				f.mu.RUnlock()
-				continue
-			}
-			dev, ok := f.clientDevices[route.peerKey]
-			if !ok || dev == nil {
-				dev = f.defaultClientDev
-			}
-			f.mu.RUnlock()
-			route.writeMu.RLock()
-			if route.retired.Load() {
-				route.writeMu.RUnlock()
-				continue
-			}
-
-			if dev != nil {
-				started := time.Now()
-				_, err := dev.Write(pkt)
-				duration := time.Since(started)
-				f.deviceWriteDurationNS.Add(uint64(duration))                                   // #nosec G115 -- time.Since returns a non-negative duration.
-				for current := f.deviceWriteMaxDurationNS.Load(); uint64(duration) > current; { // #nosec G115 -- time.Since returns a non-negative duration.
-					if f.deviceWriteMaxDurationNS.CompareAndSwap(current, uint64(duration)) { // #nosec G115 -- time.Since returns a non-negative duration.
-						break
-					}
-					current = f.deviceWriteMaxDurationNS.Load()
-				}
-				if err != nil {
-					f.deviceWriteErrors.Add(1)
-					// Issue #43: a failing return-leg device write (e.g.
-					// "no transport keys for peer") must surface somewhere.
-					// Throttle to ~1 line/second like the queue-full drop
-					// counters; the packet itself is dropped either way.
-					now := time.Now().Unix()
-					if f.writeErrLogUntil.Load() <= now {
-						f.writeErrLogUntil.Store(now + 1)
-						log.Printf("[vpn/forwarder] return-path device write error (throttled 1/s): peer=%s session=%s: %v",
-							route.peerKey, route.sessionID, err)
-					}
-				}
-			}
-			route.writeMu.RUnlock()
 		}
+		f.aggregateQueueMu.Lock()
+		route.queueMu.Lock()
+		route.queueOccupancy.Store(int64(len(route.clientQueue)))
+		route.queueMu.Unlock()
+		f.aggregateQueueMu.Unlock()
+		f.mu.RLock()
+		currentRoute, current := f.routesByPeer[route.peerKey]
+		if !current || currentRoute != route || route.stopped {
+			f.mu.RUnlock()
+			continue
+		}
+		dev, ok := f.clientDevices[route.peerKey]
+		if !ok || dev == nil {
+			dev = f.defaultClientDev
+		}
+		f.mu.RUnlock()
+		route.writeMu.RLock()
+		if route.retired.Load() {
+			route.writeMu.RUnlock()
+			continue
+		}
+
+		if dev != nil {
+			started := time.Now()
+			_, err := dev.Write(pkt)
+			duration := time.Since(started)
+			f.deviceWriteDurationNS.Add(uint64(duration))                                   // #nosec G115 -- time.Since returns a non-negative duration.
+			for current := f.deviceWriteMaxDurationNS.Load(); uint64(duration) > current; { // #nosec G115 -- time.Since returns a non-negative duration.
+				if f.deviceWriteMaxDurationNS.CompareAndSwap(current, uint64(duration)) { // #nosec G115 -- time.Since returns a non-negative duration.
+					break
+				}
+				current = f.deviceWriteMaxDurationNS.Load()
+			}
+			if err != nil {
+				f.deviceWriteErrors.Add(1)
+				// Issue #43: a failing return-leg device write (e.g.
+				// "no transport keys for peer") must surface somewhere.
+				// Throttle to ~1 line/second like the queue-full drop
+				// counters; the packet itself is dropped either way.
+				now := time.Now().Unix()
+				if f.writeErrLogUntil.Load() <= now {
+					f.writeErrLogUntil.Store(now + 1)
+					log.Printf("[vpn/forwarder] return-path device write error (throttled 1/s): peer=%s session=%s: %v",
+						route.peerKey, route.sessionID, err)
+				}
+			}
+		}
+		route.writeMu.RUnlock()
 	}
 }
 

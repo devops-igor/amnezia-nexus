@@ -165,7 +165,12 @@ func TestForwarderEdgeCasesAndLifecycle(t *testing.T) {
 	fwdSmall := NewForwarder(accountant, "10.100.0.0/16", 1)
 	fwdSmall.RegisterSession("s2", "c2", "peer2", "10.100.0.11", 300)
 	_ = fwdSmall.RouteClientToBackend("peer2", []byte("p1"))
-	if err := fwdSmall.RouteClientToBackend("peer2", []byte("p2")); err != ErrQueueFull {
+	for i := 1; i < DefaultBackendQueueSize; i++ {
+		if err := fwdSmall.RouteClientToBackend("peer2", []byte("p2")); err != nil {
+			t.Fatalf("unexpected backend queue drop at packet %d: %v", i+1, err)
+		}
+	}
+	if err := fwdSmall.RouteClientToBackend("peer2", []byte("overflow")); err != ErrQueueFull {
 		t.Errorf("expected ErrQueueFull on client to backend overflow, got %v", err)
 	}
 	_ = fwdSmall.RouteBackendToClient(300, []byte("p1"), "10.100.0.11")
