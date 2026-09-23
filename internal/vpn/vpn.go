@@ -432,6 +432,12 @@ func applyVPNConfigDefaults(cfg *models.VPNConfig) {
 	if cfg.MaxPeersPerBackend <= 0 {
 		cfg.MaxPeersPerBackend = 250
 	}
+	if cfg.ClientQueueSize > 0 {
+		maxQueue := forwarder.MaxClientQueuePacketsForRoutes(cfg.MaxTotalPeers)
+		if cfg.ClientQueueSize > maxQueue {
+			cfg.ClientQueueSize = maxQueue
+		}
+	}
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}
@@ -525,11 +531,16 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	if queueSize <= 0 {
 		queueSize = forwarder.DefaultClientQueueSize
 	}
-	if queueSize > forwarder.MaxClientQueuePackets {
-		queueSize = forwarder.MaxClientQueuePackets
+	maxActiveRoutes := cfg.MaxTotalPeers
+	if maxActiveRoutes <= 0 {
+		maxActiveRoutes = 1000
+	}
+	maxQueue := forwarder.MaxClientQueuePacketsForRoutes(maxActiveRoutes)
+	if queueSize > maxQueue {
+		queueSize = maxQueue
 	}
 	cfg.ClientQueueSize = queueSize
-	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, queueSize)
+	fwd := forwarder.NewForwarderWithLimits(accountant, cfg.SubnetCIDR, queueSize, maxActiveRoutes)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -2399,8 +2410,13 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	if cfg.ClientQueueSize <= 0 {
 		cfg.ClientQueueSize = forwarder.DefaultClientQueueSize
 	}
-	if cfg.ClientQueueSize > forwarder.MaxClientQueuePackets {
-		cfg.ClientQueueSize = forwarder.MaxClientQueuePackets
+	maxActiveRoutes := cfg.MaxTotalPeers
+	if maxActiveRoutes <= 0 {
+		maxActiveRoutes = 1000
+	}
+	maxQueue := forwarder.MaxClientQueuePacketsForRoutes(maxActiveRoutes)
+	if cfg.ClientQueueSize > maxQueue {
+		cfg.ClientQueueSize = maxQueue
 	}
 	queueSizeChanged := false
 	oldQueueSize := forwarder.DefaultClientQueueSize
@@ -2428,7 +2444,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		}
 	}
 	if queueSizeChanged {
-		if err := s.forwarder.ReconfigureClientQueueSize(cfg.ClientQueueSize); err != nil {
+		if err := s.forwarder.ReconfigureClientQueueConfig(cfg.ClientQueueSize, maxActiveRoutes); err != nil {
 			if s.db != nil && previousCfg != nil {
 				if rollbackErr := s.db.SaveVPNConfig(ctx, previousCfg); rollbackErr != nil {
 					return fmt.Errorf("cannot apply client queue size: %w; persistence rollback failed: %v", err, rollbackErr)
@@ -2453,7 +2469,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 			}
 		}
 		if queueSizeChanged {
-			if err := s.forwarder.ReconfigureClientQueueSize(oldQueueSize); err != nil {
+			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, previousCfg.MaxTotalPeers); err != nil {
 				rollbackErrs = append(rollbackErrs, err)
 			}
 		}
