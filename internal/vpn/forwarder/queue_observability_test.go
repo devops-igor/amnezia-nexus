@@ -9,6 +9,48 @@ import (
 	"time"
 )
 
+
+
+type blockingWriteDevice struct {
+	mu       sync.Mutex
+	started  int
+	released chan struct{}
+	startedC chan struct{}
+}
+
+func newBlockingWriteDevice() *blockingWriteDevice {
+	return &blockingWriteDevice{
+		released: make(chan struct{}),
+		startedC: make(chan struct{}, 16),
+	}
+}
+
+func (d *blockingWriteDevice) Read(p []byte) (int, error) { return 0, nil }
+func (d *blockingWriteDevice) Close() error               { return nil }
+func (d *blockingWriteDevice) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	d.started++
+	d.mu.Unlock()
+	select {
+	case d.startedC <- struct{}{}:
+	default:
+	}
+	<-d.released
+	return len(p), nil
+}
+func (d *blockingWriteDevice) release() {
+	select {
+	case <-d.released:
+	default:
+		close(d.released)
+	}
+}
+func (d *blockingWriteDevice) writeCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.started
+}
+
 func TestRouteQueueStatsExposeOccupancyHighWaterAndDrops(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 2)
 	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
@@ -349,5 +391,85 @@ func TestForwarderRejectsRegistrationsBeyondActiveRouteLimit(t *testing.T) {
 	f.RegisterSession("accepted-after-unregister", "connection", peer, ip, 1)
 	if _, ok := f.GetClientPacketChannel(peer); !ok {
 		t.Fatal("route was not accepted after an active route was unregistered")
+	}
+}
+
+
+func TestForwarderSustainedDownstreamStallSaturatesAndRecovers(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 4)
+	dev := newBlockingWriteDevice()
+	f.AttachPeerDevice("peer-1", dev)
+	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	f.StartPumps(t.Context())
+	defer f.StopPumps()
+
+	pkt := []byte("packet")
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	select {
+	case <-dev.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("client device write did not start")
+	}
+
+	// The first packet is blocked inside Write, so the remaining three queue
+	// slots can fill and the next packet must be dropped deterministically.
+	for i := 0; i < 3; i++ {
+		if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); err != nil {
+			t.Fatalf("queued packet %d: %v", i, err)
+		}
+	}
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("stalled queue error=%v, want ErrQueueFull", err)
+	}
+
+	stats, ok := f.RouteQueueStats("peer-1")
+	if !ok {
+		t.Fatal("route stats missing")
+	}
+	if stats.Occupancy != 3 || stats.HighWater != 3 || stats.QueueFullDrops != 1 {
+		t.Fatalf("stalled queue stats=%+v, want occupancy/high-water=3 and one drop", stats)
+	}
+
+	dev.release()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		occupancy, _, _ := f.AggregateQueueStats()
+		if occupancy == 0 && dev.writeCount() >= 4 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	occupancy, _, highWater := f.AggregateQueueStats()
+	if occupancy != 0 {
+		t.Fatalf("queue did not recover: occupancy=%d", occupancy)
+	}
+	if highWater != 3 {
+		t.Fatalf("high-water changed during recovery: %d", highWater)
+	}
+	if dev.writeCount() != 4 {
+		t.Fatalf("device writes=%d, want 4 accepted packets", dev.writeCount())
+	}
+}
+
+
+func TestForwarderConfiguredRouteLimitDerivesQueueBudget(t *testing.T) {
+	const routes = 100
+	f := NewForwarderWithLimits(nil, "10.100.0.0/16", MaxClientQueuePackets+1, routes)
+	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	queue, ok := f.GetClientPacketChannel("peer-1")
+	if !ok {
+		t.Fatal("client queue missing")
+	}
+	want := MaxClientQueuePacketsForRoutes(routes)
+	if cap(queue) != want {
+		t.Fatalf("queue capacity=%d, want budget-derived %d for %d routes", cap(queue), want, routes)
+	}
+	for i := 0; i < routes-1; i++ {
+		f.RegisterSession(fmt.Sprintf("session-%d", i+2), "connection", fmt.Sprintf("peer-%d", i+2), fmt.Sprintf("10.102.%d.%d", i/254, i%254+1), 1)
+	}
+	if _, ok := f.GetClientPacketChannel(fmt.Sprintf("peer-%d", routes+1)); ok {
+		t.Fatal("route beyond configured maximum unexpectedly registered")
 	}
 }
