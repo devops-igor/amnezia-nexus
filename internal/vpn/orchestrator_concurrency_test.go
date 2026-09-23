@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -217,5 +218,128 @@ func TestOrchestrator_AdminDisableConcurrentWithProbe_CASFallback(t *testing.T) 
 	}
 	if dbTun.DisableReason != models.DisableReasonAdmin {
 		t.Errorf("expected DB disable_reason %q, got %q", models.DisableReasonAdmin, dbTun.DisableReason)
+	}
+}
+
+// TestOrchestrator_ConcurrentAdminDisableDuringProbe_NeverReceivesMigratedSessions verifies that:
+// 1. Probe for Backend A begins.
+// 2. Administrator concurrently calls DisableBackend on Backend A.
+// 3. Backend A probe finishes successfully, but is not added to healthyTunnels.
+// 4. Backend B probe fails and B is marked degraded.
+// 5. Orchestrator attempts migration for B's active sessions.
+// 6. Sessions from B are NOT assigned to A.
+func TestOrchestrator_ConcurrentAdminDisableDuringProbe_NeverReceivesMigratedSessions(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+
+	sAID, pubA, _ := createTestServerAndKey(t, db, "Backend A", "127.0.0.1")
+	sBID, pubB, _ := createTestServerAndKey(t, db, "Backend B", "127.0.0.1")
+
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	tunA, err := vpnSvc.pool.AddTunnel(ctx, sAID, "127.0.0.1:51830", pubA)
+	if err != nil {
+		t.Fatalf("AddTunnel A failed: %v", err)
+	}
+	tunB, err := vpnSvc.pool.AddTunnel(ctx, sBID, "127.0.0.1:51831", pubB)
+	if err != nil {
+		t.Fatalf("AddTunnel B failed: %v", err)
+	}
+
+	vpnSvc.mu.Lock()
+	_ = vpnSvc.attachBackendForwarder(tunA, nil)
+	_ = vpnSvc.attachBackendForwarder(tunB, nil)
+	vpnSvc.mu.Unlock()
+
+	t.Cleanup(func() {
+		if devA := vpnSvc.GetBackendDeviceForTest(tunA.ID); devA != nil {
+			_ = devA.Close()
+		}
+		if devB := vpnSvc.GetBackendDeviceForTest(tunB.ID); devB != nil {
+			_ = devB.Close()
+		}
+	})
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "test_mig_user", Role: models.RoleUser})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	sessB := &models.VPNSession{
+		ID:              "sess-b-mig-test",
+		UserID:          uID,
+		BackendTunnelID: tunB.ID,
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sessB); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	probeAStarted := make(chan struct{})
+	probeABlock := make(chan struct{})
+	var probeAOnce sync.Once
+
+	customProbe := func(probeCtx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if endpoint == "127.0.0.1:51830" {
+			probeAOnce.Do(func() {
+				close(probeAStarted)
+				<-probeABlock
+			})
+			return 25 * time.Millisecond, nil
+		}
+		return 0, errors.New("backend B probe failed")
+	}
+
+	orch := orchestrator.New(db, nil,
+		orchestrator.WithProbeFunc(customProbe),
+		orchestrator.WithProbeFailureThreshold(1),
+	)
+	orch.SetTunnelStatusUpdater(vpnSvc)
+
+	orchDone := make(chan error, 1)
+	go func() {
+		orchDone <- orch.CheckBackendTunnelHealth(ctx)
+	}()
+
+	select {
+	case <-probeAStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for probe A to start")
+	}
+
+	if err := vpnSvc.DisableBackend(ctx, sAID); err != nil {
+		t.Fatalf("DisableBackend A failed: %v", err)
+	}
+
+	close(probeABlock)
+
+	select {
+	case err := <-orchDone:
+		if err != nil {
+			t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for CheckBackendTunnelHealth")
+	}
+
+	dbTunA, err := db.GetBackendTunnel(ctx, tunA.ID)
+	if err != nil || dbTunA == nil {
+		t.Fatalf("GetBackendTunnel A failed: %v", err)
+	}
+	if dbTunA.Status != "disabled" || dbTunA.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected A to remain disabled/admin, got status=%q reason=%q", dbTunA.Status, dbTunA.DisableReason)
+	}
+
+	sessions, err := db.GetActiveVPNSessions(ctx)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("GetActiveVPNSessions failed: %v", err)
+	}
+	for _, s := range sessions {
+		if s.BackendTunnelID == tunA.ID {
+			t.Fatalf("active session %s was erroneously migrated onto admin-disabled backend A", s.ID)
+		}
 	}
 }

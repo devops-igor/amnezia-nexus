@@ -90,6 +90,12 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					"err", err,
 				)
 				if !strings.EqualFold(t.Status, "degraded") {
+					if o.db != nil {
+						cur, dbErr := o.db.GetBackendTunnel(ctx, t.ID)
+						if dbErr == nil && cur != nil && (strings.EqualFold(cur.Status, "disabled") || cur.DisableReason == models.DisableReasonAdmin) {
+							continue
+						}
+					}
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
 				continue
@@ -118,11 +124,12 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		if latencyMS > latencyThreshold {
 			status = "degraded"
 			degradedTunnels = append(degradedTunnels, t.ID)
-		} else {
-			healthyTunnels = append(healthyTunnels, &tCopy)
 		}
 
-		o.updateTunnelStatus(ctx, &t, status, latencyMS)
+		applied := o.updateTunnelStatus(ctx, &t, status, latencyMS)
+		if status != "degraded" && applied {
+			healthyTunnels = append(healthyTunnels, &tCopy)
+		}
 	}
 
 	// Trigger failover / migration for sessions on degraded tunnels
@@ -131,11 +138,41 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	return nil
 }
 
+// filterHealthyMigrationTargets filters out targets that are disabled or administratively disabled in the database.
+func (o *Orchestrator) filterHealthyMigrationTargets(ctx context.Context, targets []*models.BackendTunnel) []*models.BackendTunnel {
+	if len(targets) == 0 || o.db == nil {
+		return nil
+	}
+
+	var valid []*models.BackendTunnel
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		cur, err := o.db.GetBackendTunnel(ctx, target.ID)
+		if err != nil || cur == nil {
+			continue
+		}
+		if strings.EqualFold(cur.Status, "disabled") || cur.DisableReason == models.DisableReasonAdmin {
+			continue
+		}
+		valid = append(valid, target)
+	}
+	return valid
+}
+
 // migrateDegradedTunnelSessions migrates active sessions off degraded tunnels onto healthy ones.
 func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degradedTunnels []int64, healthyTunnels []*models.BackendTunnel) {
 	if len(degradedTunnels) == 0 || len(healthyTunnels) == 0 || o.db == nil {
 		return
 	}
+
+	validTargets := o.filterHealthyMigrationTargets(ctx, healthyTunnels)
+	if len(validTargets) == 0 {
+		slog.Warn("No healthy migration targets available after filtering disabled tunnels")
+		return
+	}
+
 	sessions, err := o.db.GetActiveVPNSessions(ctx)
 	if err != nil || len(sessions) == 0 {
 		return
@@ -150,7 +187,7 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	hIdx := 0
 	for _, s := range sessions {
 		if degradedMap[s.BackendTunnelID] {
-			target := healthyTunnels[hIdx%len(healthyTunnels)]
+			target := validTargets[hIdx%len(validTargets)]
 			hIdx++
 			s.BackendTunnelID = target.ID
 			s.Status = "connected"
@@ -164,24 +201,41 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	}
 }
 
-// resolvedProbeParams carries the obfuscation parameters used for a raw UDP
 // updateTunnelStatus updates a backend tunnel's status and latency using the configured
 // TunnelStatusUpdater (e.g. VPN service pool) or falls back to an atomic CAS DB update.
-func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) {
+// Returns true if the status update was successfully applied and the tunnel is not admin-disabled.
+func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) bool {
 	o.mu.RLock()
 	updater := o.statusUpdater
 	o.mu.RUnlock()
 
 	if updater != nil {
-		_ = updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS)
-		return
+		if err := updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS); err == nil {
+			if o.db != nil {
+				cur, err := o.db.GetBackendTunnel(ctx, t.ID)
+				if err == nil && cur != nil && (strings.EqualFold(cur.Status, "disabled") || cur.DisableReason == models.DisableReasonAdmin) {
+					return false
+				}
+			}
+			return true
+		} else {
+			slog.Debug("Tunnel status updater failed, falling back to direct DB CAS",
+				"server_id", t.ServerID,
+				"tunnel_id", t.ID,
+				"err", err,
+			)
+		}
 	}
 
 	if o.db != nil {
-		_, _ = o.db.CompareAndSwapTunnelStatus(ctx, t.ID, t.Status, t.DisableReason, t.StateVersion, status, t.DisableReason, latencyMS)
+		swapped, _ := o.db.CompareAndSwapTunnelStatus(ctx, t.ID, t.Status, t.DisableReason, t.StateVersion, status, t.DisableReason, latencyMS)
+		return swapped
 	}
+
+	return false
 }
 
+// resolvedProbeParams carries the obfuscation parameters used for a raw UDP
 // Noise IK probe against a backend tunnel. h1/h2 carry models.HeaderRange
 // (full AWG 3.1 ranges, issue #49); they are typed `any` to match ProbeFunc,
 // which ProbeAWGEndpointRange accepts alongside uint32.

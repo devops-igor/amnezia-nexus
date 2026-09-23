@@ -1595,3 +1595,193 @@ func TestOrchestrator_ResetStrategyAndExpiryVariants(t *testing.T) {
 		t.Error("expected false for non-expired user")
 	}
 }
+
+func TestMigrateDegradedTunnelSessions_SkipsAdminDisabledTarget(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	s1ID, _ := db.CreateServer(ctx, &models.Server{Name: "Srv Degraded", Host: "10.0.0.81", SSHPort: 22})
+	s2ID, _ := db.CreateServer(ctx, &models.Server{Name: "Srv Admin Disabled", Host: "10.0.0.82", SSHPort: 22})
+	s3ID, _ := db.CreateServer(ctx, &models.Server{Name: "Srv Healthy", Host: "10.0.0.83", SSHPort: 22})
+
+	tun1ID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      s1ID,
+		InterfaceName: "awg-be-1",
+		Endpoint:      "127.0.0.1:5101",
+		Status:        "degraded",
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 1 failed: %v", err)
+	}
+
+	tun2ID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      s2ID,
+		InterfaceName: "awg-be-2",
+		Endpoint:      "127.0.0.1:5102",
+		Status:        "disabled",
+		DisableReason: models.DisableReasonAdmin,
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 2 failed: %v", err)
+	}
+
+	tun3ID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      s3ID,
+		InterfaceName: "awg-be-3",
+		Endpoint:      "127.0.0.1:5103",
+		Status:        "active",
+		DisableReason: models.DisableReasonNone,
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 3 failed: %v", err)
+	}
+
+	tun1, _ := db.GetBackendTunnel(ctx, tun1ID)
+	tun2, _ := db.GetBackendTunnel(ctx, tun2ID)
+	tun3, _ := db.GetBackendTunnel(ctx, tun3ID)
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "test_user_migrate", Role: models.RoleUser})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// Create active session on degraded tunnel 1
+	sess := &models.VPNSession{
+		ID:              "sess-degraded-1",
+		UserID:          uID,
+		BackendTunnelID: tun1.ID,
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sess); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	orch := New(db, nil)
+
+	// Subtest 1: migrate with targets [tun2 (admin-disabled), tun3 (healthy)]
+	// tun2 must be skipped, session must migrate to tun3
+	orch.migrateDegradedTunnelSessions(ctx, []int64{tun1.ID}, []*models.BackendTunnel{tun2, tun3})
+
+	activeSessions, err := db.GetActiveVPNSessions(ctx)
+	if err != nil || len(activeSessions) == 0 {
+		t.Fatalf("GetActiveVPNSessions failed: %v", err)
+	}
+	if activeSessions[0].BackendTunnelID != tun3.ID {
+		t.Errorf("expected session to migrate to healthy tunnel %d, got %d", tun3.ID, activeSessions[0].BackendTunnelID)
+	}
+
+	// Subtest 2: all targets are admin-disabled
+	// Reset session back to tun1
+	sess.BackendTunnelID = tun1.ID
+	if err := db.CreateVPNSession(ctx, sess); err != nil {
+		t.Fatalf("re-creating session failed: %v", err)
+	}
+
+	// Should not panic, should log warning, should not migrate to tun2
+	orch.migrateDegradedTunnelSessions(ctx, []int64{tun1.ID}, []*models.BackendTunnel{tun2})
+
+	activeSessions, err = db.GetActiveVPNSessions(ctx)
+	if err != nil || len(activeSessions) == 0 {
+		t.Fatalf("GetActiveVPNSessions failed: %v", err)
+	}
+	if activeSessions[0].BackendTunnelID != tun1.ID {
+		t.Errorf("expected session to remain on tunnel %d when all targets are admin-disabled, got %d", tun1.ID, activeSessions[0].BackendTunnelID)
+	}
+}
+
+func TestCheckBackendTunnelHealth_DoesNotAddAdminDisabledToHealthyTunnels(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Server A: admin disabled during probe
+	sAID, _ := db.CreateServer(ctx, &models.Server{Name: "Srv A", Host: "10.0.0.84", SSHPort: 22})
+	// Server B: degraded server with an active session
+	sBID, _ := db.CreateServer(ctx, &models.Server{Name: "Srv B", Host: "10.0.0.85", SSHPort: 22})
+
+	tunAID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sAID,
+		InterfaceName: "awg-be-a",
+		PublicKey:     "pub-a",
+		Endpoint:      "127.0.0.1:5201",
+		Status:        "active",
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel A failed: %v", err)
+	}
+
+	tunBID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sBID,
+		InterfaceName: "awg-be-b",
+		PublicKey:     "pub-b",
+		Endpoint:      "127.0.0.1:5202",
+		Status:        "active",
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel B failed: %v", err)
+	}
+
+	uIDB, err := db.CreateUser(ctx, &models.User{Username: "test_user_health", Role: models.RoleUser})
+	if err != nil {
+		t.Fatalf("CreateUser B failed: %v", err)
+	}
+
+	// Create an active session on B
+	sessB := &models.VPNSession{
+		ID:              "sess-b-test",
+		UserID:          uIDB,
+		BackendTunnelID: tunBID,
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sessB); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	// Probe function:
+	// When probing A: simulates admin disabling A concurrently before probe returns
+	// When probing B: returns error, marking B degraded
+	probeFn := func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if endpoint == "127.0.0.1:5201" {
+			// Admin disables A in DB
+			_ = db.UpdateBackendTunnelStatusWithReason(ctx, tunAID, "disabled", models.DisableReasonAdmin, 0)
+			return 20 * time.Millisecond, nil
+		}
+		// Endpoint B fails
+		return 0, errors.New("backend B probe failed")
+	}
+
+	orch := New(db, nil,
+		WithProbeFunc(probeFn),
+		WithProbeFailureThreshold(1),
+	)
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	// Verify A remained disabled in DB
+	tunAAfter, err := db.GetBackendTunnel(ctx, tunAID)
+	if err != nil || tunAAfter == nil {
+		t.Fatalf("GetBackendTunnel A failed: %v", err)
+	}
+	if tunAAfter.Status != "disabled" || tunAAfter.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected tunnel A to remain disabled/admin, got status=%q reason=%q", tunAAfter.Status, tunAAfter.DisableReason)
+	}
+
+	// Verify B's session was NOT migrated to A (because A was not in healthyTunnels and was filtered out)
+	sessions, err := db.GetActiveVPNSessions(ctx)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("GetActiveVPNSessions failed: %v", err)
+	}
+	if sessions[0].BackendTunnelID == tunAID {
+		t.Fatalf("session from degraded backend B was erroneously migrated onto admin-disabled backend A")
+	}
+}
