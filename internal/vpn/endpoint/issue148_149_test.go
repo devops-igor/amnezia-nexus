@@ -251,19 +251,35 @@ func TestTransportDecryptionDecoupledFromHandshakeRejects_Issue149(t *testing.T)
 		t.Fatalf("unexpected handshake rejection log for established peer: %s", logBuf.String())
 	}
 
-	// 3. Send invalid datagram from UNKNOWN sender: MUST increment HandshakeRejections
-	// Use full-length plausible datagram (> s1 + 148 bytes) with invalid message type
-	// so ParseInitiation fails with ErrNotInitiation (not ErrDatagramTooShort) and logs rejection.
+	// 3. Send unroutable datagram from UNKNOWN sender: must NOT increment HandshakeRejections
+	// Use full-length plausible datagram (> s1 + 148 bytes) with message type outside H1
+	// so ParseInitiation fails with ErrNotInitiation. Per issue #288, unroutable datagrams
+	// must not increment HandshakeRejections and must not log rejections.
 	unknownAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:49999")
 	unknownDatagram := make([]byte, 200)
 	binary.LittleEndian.PutUint32(unknownDatagram[0:4], 99999)
 	el.handleDatagram(ctx, unknownDatagram, unknownAddr)
 
-	if after := el.HandshakeRejections(); after != initialRejects+1 {
-		t.Fatalf("HandshakeRejections failed to increment on unknown sender datagram: got %d, want %d", after, initialRejects+1)
+	if after := el.HandshakeRejections(); after != initialRejects {
+		t.Fatalf("HandshakeRejections incremented on unroutable datagram: got %d, want %d", after, initialRejects)
 	}
-	if !strings.Contains(logBuf.String(), "rejected handshake initiation from "+unknownAddr.String()) {
-		t.Fatalf("expected handshake rejection log for unknown sender, got:\n%s", logBuf.String())
+	if strings.Contains(logBuf.String(), "rejected handshake initiation from "+unknownAddr.String()) {
+		t.Fatalf("unexpected handshake rejection log for unroutable datagram, got:\n%s", logBuf.String())
+	}
+
+	// 3b. Send genuine handshake initiation failure from UNKNOWN sender (ErrMAC1Failed):
+	// Datagram has valid H1 message type but invalid/zero MAC1. Per issue #288, genuine
+	// initiation failures MUST increment HandshakeRejections and emit a rejection log.
+	failInitAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:49998")
+	failInitDatagram := make([]byte, el.config.S1+initiationWireLen)
+	binary.LittleEndian.PutUint32(failInitDatagram[el.config.S1:el.config.S1+4], health.DefaultH1)
+	el.handleDatagram(ctx, failInitDatagram, failInitAddr)
+
+	if after := el.HandshakeRejections(); after != initialRejects+1 {
+		t.Fatalf("HandshakeRejections failed to increment on genuine initiation failure: got %d, want %d", after, initialRejects+1)
+	}
+	if !strings.Contains(logBuf.String(), "rejected handshake initiation from "+failInitAddr.String()) {
+		t.Fatalf("expected handshake rejection log for genuine initiation failure, got:\n%s", logBuf.String())
 	}
 
 	// 4. Send valid transport datagram from KNOWN peer: MUST decrypt and route normally

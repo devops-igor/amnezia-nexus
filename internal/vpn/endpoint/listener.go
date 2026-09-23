@@ -238,12 +238,10 @@ type Listener struct {
 	// goroutine.
 	rejectLogUntil atomic.Int64
 
-	// handshakeRejects counts inbound datagrams that failed handshake-
-	// initiation parsing AND were not transport data for an established
-	// session (handleDatagram's rejection branch). Exposed via
-	// HandshakeRejections so silent rekey rejections (issue #39 defect 2:
-	// legit rekeys rejected as "not an AWG handshake initiation") become
-	// observable in stats instead of only in throttled logs.
+	// handshakeRejects counts inbound datagrams that were genuine handshake
+	// initiations but failed cryptographic verification (e.g., MAC1 failure,
+	// static key / timestamp decryption failure, or stale timestamp).
+	// Unroutable transport data and non-initiation datagrams are excluded (issue #288).
 	handshakeRejects atomic.Uint64
 }
 
@@ -685,10 +683,10 @@ func (el *Listener) IsDraining() bool {
 	return el.draining
 }
 
-// HandshakeRejections returns the number of inbound datagrams rejected by
-// handshake-initiation parsing and not consumed as transport data. It is the
-// observability signal for issue #39 defect 2: a rising count means legit
-// client (rekey) initiations are being classified as not-a-handshake. Nil
+// HandshakeRejections returns the number of inbound datagrams failing
+// cryptographic handshake initiation verification (MAC1 failure, static key /
+// timestamp decryption failure, or stale timestamp). Unroutable transport data
+// and non-initiation datagrams are excluded (issues #39, #288, #290). Nil
 // receiver is safe and returns 0.
 func (el *Listener) HandshakeRejections() uint64 {
 	if el == nil {
@@ -824,22 +822,32 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 
 	info, err := ParseInitiation(serverPriv, datagram, el.config.H1, el.config.S1, el.hpKey)
 	if err != nil {
-		// Not a valid handshake initiation for this endpoint: transport data
-		// for an established session (or garbage). Try the transport path.
-		if !el.handleTransportData(datagram, sender) {
-			// Count every rejection that is not transport data (including
-			// too-short datagrams) so the counter reflects the true
-			// rejection volume seen on the wire (issue #39 defect 2).
-			el.handshakeRejects.Add(1)
-			if !errors.Is(err, ErrDatagramTooShort) {
-				// Throttle rejection logs: a garbage flood that fails MAC1
-				// would otherwise produce one log line per packet.
-				now := time.Now().Unix()
-				until := el.rejectLogUntil.Load()
-				if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
-					log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
-				}
-			}
+		// Not a valid handshake initiation for this endpoint (or a transport packet
+		// whose ciphertext at offset S1 happens to collide with H1, causing MAC1 failure).
+		// First, check if this datagram is recognized transport data for an established session.
+		if el.handleTransportData(datagram, sender) {
+			// The datagram was recognized as transport data (either successfully decrypted
+			// and routed, or dropped due to AEAD decrypt failure). It must not be counted
+			// as a handshake rejection.
+			return
+		}
+
+		// The datagram was NOT recognized as transport data for an established session.
+		// If ParseInitiation failed because it was not an initiation message (ErrNotInitiation,
+		// e.g. unknown sender transport data or foreign noise) or too short (ErrDatagramTooShort),
+		// drop it silently without polluting metrics or logging.
+		if errors.Is(err, ErrNotInitiation) || errors.Is(err, ErrDatagramTooShort) {
+			return
+		}
+
+		// The datagram was NOT transport data AND was an initiation message that failed
+		// genuine cryptographic verification (e.g. ErrMAC1Failed, ErrDecryptStatic,
+		// ErrDecryptTimestamp, ErrTimestampStale). Increment rejection metric and emit throttled log.
+		el.handshakeRejects.Add(1)
+		now := time.Now().Unix()
+		until := el.rejectLogUntil.Load()
+		if now >= until && el.rejectLogUntil.CompareAndSwap(until, now+1) {
+			log.Printf("[vpn/endpoint] rejected handshake initiation from %s: %v", sender, err)
 		}
 		return
 	}
@@ -944,16 +952,16 @@ const decryptLogThrottleSeconds = 5
 const transportDataHeaderLen = 16
 
 // handleTransportData processes a datagram that failed handshake-initiation
-// parsing. If the sender address belongs to a peer with an established session
-// and stored transport keys, it decrypts the AWG transport-data message and hands
-// the inner IP packet to the installed client packet router. If decryption fails,
-// the packet is dropped and failure logging is rate-limited per-peer (issue #148).
+// parsing (or a transport datagram whose ciphertext caused an initiation parse failure).
+// If the sender address belongs to a peer with an established session and stored transport
+// keys, it checks if the datagram header matches the configured H4 range and attempts
+// AEAD decryption.
 //
-// It returns true if the datagram belongs to an established peer session (even if
-// decryption failed and the packet was dropped), preventing the caller from treating
-// transport data as an invalid handshake initiation (issue #149). It returns false
-// only when the datagram is not transport data for an established session (unknown
-// sender, missing transport keys, or datagram too short).
+// It returns true if the datagram was recognized as transport data for an established
+// peer session (either successfully routed or dropped due to AEAD decryption failure, issue #149),
+// preventing the caller from treating transport data as a rejected handshake initiation.
+// It returns false if the datagram is not recognized as transport data (unknown sender,
+// missing transport keys, too short, or header does not match H4).
 func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bool {
 	s4 := el.config.S4
 	if s4 < 0 {
@@ -995,7 +1003,10 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	payload := datagram[s4:]
 	hpKey := el.headerProtectionKey()
 
-	packet, decErr := decryptTransportPayload(aead, datagram, payload, hpKey, s4, h4)
+	packet, isTransport, decErr := decryptTransportPayload(aead, datagram, payload, hpKey, s4, h4)
+	if !isTransport {
+		return false
+	}
 	if packet == nil {
 		if decErr != nil {
 			now := time.Now().Unix()
@@ -1005,8 +1016,8 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 			}
 		}
 		// Decouple transport data drops from handshake rejection counter (issue #149):
-		// datagram belongs to an established peer session, so return true to prevent
-		// incrementing handshakeRejects or emitting false handshake rejection logs.
+		// datagram belongs to an established peer session and matches H4 framing,
+		// so return true to prevent treating transport drops as handshake rejections.
 		return true
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
@@ -1029,43 +1040,64 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 
 // decryptTransportPayload attempts Header Protection unmasking and AEAD decryption,
 // falling back to plaintext H4 matching if HP unmasking does not match or fails.
-func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) ([]byte, error) {
+// It returns isTransport=true only when the datagram header matches the configured H4 range.
+func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) ([]byte, bool, error) {
 	if len(payload) < transportDataHeaderLen {
-		return nil, nil
+		return nil, false, nil
 	}
-	var packet []byte
-	var decErr error
+
+	plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
 
 	// 1. If HP key is 32 bytes and s4 >= 12, attempt to unmask the 16-byte header:
-	// [msgType 4B][receiverIdx 4B][counter 8B] using ChaCha20 keyed by el.hpKey with nonce = datagram[:12].
+	// [msgType 4B][receiverIdx 4B][counter 8B] using ChaCha20 keyed by hpKey with nonce = datagram[:12].
 	if len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
 		cip := health.NewHeaderProtectionCipher(hpKey, datagram[:health.HeaderCipherNonceSize])
 		if cip != nil {
 			var hdr [transportDataHeaderLen]byte
 			copy(hdr[:], payload[:transportDataHeaderLen])
 			cip.XORKeyStream(hdr[:], hdr[:])
-			if h4.Contains(binary.LittleEndian.Uint32(hdr[0:4])) {
+			obfMsgType := binary.LittleEndian.Uint32(hdr[0:4])
+
+			if h4.Contains(obfMsgType) {
 				counter := binary.LittleEndian.Uint64(hdr[8:16])
 				var nonce [chacha20poly1305.NonceSize]byte
 				binary.LittleEndian.PutUint64(nonce[4:12], counter)
-				packet, decErr = aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+				packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+				if decErr == nil {
+					return packet, true, nil
+				}
+				// Dual-mode fallback: if HP client unmasking decrypt failed, check if plaintext header also matches H4.
+				if h4.Contains(plainMsgType) {
+					plainCounter := binary.LittleEndian.Uint64(payload[8:16])
+					var plainNonce [chacha20poly1305.NonceSize]byte
+					binary.LittleEndian.PutUint64(plainNonce[4:12], plainCounter)
+					if p, err := aead.Open(nil, plainNonce[:], payload[transportDataHeaderLen:], nil); err == nil {
+						return p, true, nil
+					}
+				}
+				return nil, true, decErr
+			} else if h4.Contains(plainMsgType) {
+				// Obfuscated header did not match H4, but plaintext header does: backward-compat plaintext peer.
+				counter := binary.LittleEndian.Uint64(payload[8:16])
+				var nonce [chacha20poly1305.NonceSize]byte
+				binary.LittleEndian.PutUint64(nonce[4:12], counter)
+				packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+				return packet, true, decErr
 			}
+			return nil, false, nil
 		}
 	}
 
-	// 2. Dual-mode fallback: if HP unmasking was not applicable, unmasked header did not match H4,
-	// or unmasked AEAD decryption failed, check if plaintext header matches H4.
-	if packet == nil {
-		plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
-		if h4.Contains(plainMsgType) {
-			counter := binary.LittleEndian.Uint64(payload[8:16])
-			var nonce [chacha20poly1305.NonceSize]byte
-			binary.LittleEndian.PutUint64(nonce[4:12], counter)
-			packet, decErr = aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
-		}
+	// 2. Plaintext path (HP disabled or s4 < 12).
+	if h4.Contains(plainMsgType) {
+		counter := binary.LittleEndian.Uint64(payload[8:16])
+		var nonce [chacha20poly1305.NonceSize]byte
+		binary.LittleEndian.PutUint64(nonce[4:12], counter)
+		packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+		return packet, true, decErr
 	}
 
-	return packet, decErr
+	return nil, false, nil
 }
 
 // trimIPPacketPadding strips trailing content padding by inspecting the IPv4 Total Length

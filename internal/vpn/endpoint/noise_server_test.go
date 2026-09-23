@@ -781,9 +781,10 @@ func (s *safeLogBuffer) String() string {
 	return s.b.String()
 }
 
-// TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog verifies that
-// handshakes with invalid keys trigger diagnostic logging and no response.
-func TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog(t *testing.T) {
+// TestEndpointListenerHandshakeOverUDP_WrongHPKey_DroppedSilently verifies that
+// handshakes masked with a mismatched HP key fail initiation parsing (ErrNotInitiation)
+// and are dropped without polluting metrics or logging handshake rejection (issue #288).
+func TestEndpointListenerHandshakeOverUDP_WrongHPKey_DroppedSilently(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -852,9 +853,16 @@ func TestEndpointListenerHandshakeOverUDP_WrongHPKey_RejectedWithLog(t *testing.
 	// Stop listener to ensure background goroutine is completely done writing logs
 	_ = el.Stop()
 
+	// Per Issue #288, initiation with wrong HP key yields ErrNotInitiation and does not match
+	// any session in handleTransportData. It must be dropped without polluting handshake
+	// rejection metrics or emitting misleading handshake rejection logs.
+	if rejects := el.HandshakeRejections(); rejects != 0 {
+		t.Errorf("expected 0 handshake rejections for wrong HP key, got %d", rejects)
+	}
+
 	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "[vpn/endpoint] rejected handshake initiation") {
-		t.Errorf("expected diagnostic log for rejected initiation, got:\n%s", logOutput)
+	if strings.Contains(logOutput, "[vpn/endpoint] rejected handshake initiation") {
+		t.Errorf("unexpected handshake rejection log for wrong HP key:\n%s", logOutput)
 	}
 }
 

@@ -222,26 +222,37 @@ func TestListenerAcceptsRekeyHandshakeOverUDP(t *testing.T) {
 	}
 }
 
-// TestHandshakeRejectionCounter verifies the exposed rejection counter: a
-// datagram that fails initiation classification (message type outside H1)
-// must increment it — making silent rekey rejections visible in stats.
+// TestHandshakeRejectionCounter verifies the exposed rejection counter:
+// unroutable datagrams outside H1 must not increment it, while genuine
+// handshake initiation verification failures (e.g. invalid MAC1) must increment it (issue #288).
 func TestHandshakeRejectionCounter(t *testing.T) {
 	el, _, _ := newRekeyTestListener(t)
 	ctx := context.Background()
 
 	before := el.HandshakeRejections()
 
-	// Plaintext-shaped datagram whose message type is outside the H1 range:
-	// classified as "not an AWG handshake initiation".
+	// 1. Plaintext-shaped datagram whose message type is outside the H1 range:
+	// classified as ErrNotInitiation and must NOT increment HandshakeRejections (issue #288).
 	pkt := make([]byte, 200)
 	binaryLittleEndianPut(pkt[0:4], 99999)
 	el.handleDatagram(ctx, pkt, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 51516})
 
-	if after := el.HandshakeRejections(); after != before+1 {
-		t.Fatalf("HandshakeRejections = %d after one rejected initiation, want %d", after, before+1)
+	if after := el.HandshakeRejections(); after != before {
+		t.Fatalf("HandshakeRejections = %d after unroutable datagram, want %d", after, before)
 	}
 
-	// Non-handshake noise without a plausible size must not count.
+	// 2. Datagram with valid H1 message type but invalid/zero MAC1 (ErrMAC1Failed):
+	// classified as a genuine handshake initiation failure and MUST increment HandshakeRejections.
+	h1, _, s1, _ := rekeyTestHeaders()
+	failPkt := make([]byte, s1+initiationWireLen)
+	binaryLittleEndianPut(failPkt[s1:s1+4], h1.Lo)
+	el.handleDatagram(ctx, failPkt, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 51516})
+
+	if after := el.HandshakeRejections(); after != before+1 {
+		t.Fatalf("HandshakeRejections = %d after genuine initiation failure, want %d", after, before+1)
+	}
+
+	// 3. Tiny datagram must NOT increment HandshakeRejections.
 	el.handleDatagram(ctx, []byte{0x01}, nil)
 	if after := el.HandshakeRejections(); after != before+1 {
 		t.Fatalf("tiny datagram changed rejection counter to %d, want %d", after, before+1)
@@ -258,7 +269,7 @@ func binaryLittleEndianPut(b []byte, v uint32) {
 // TestPostRestartClientAutoRecovery pins the issue #39 restart-death-spiral
 // contract: after the portal listener restarts (in-memory transport keys and
 // peer addresses lost, server keypair persistent), a connected client must
-// recover within RejectAfterTime by rekeying — its rekey initiation must be
+// recover within RejectAfterTime by rekeying: its rekey initiation must be
 // answered with a fresh handshake response and refreshed transport keys,
 // with NO rejection counted. (In the field, these rekeys were rejected as
 // "not an AWG handshake initiation" and the tunnel died until the user

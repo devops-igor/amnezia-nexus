@@ -35,11 +35,11 @@ type Status struct {
 	RxBytes           int64  `json:"rx_bytes"`
 	TxBytes           int64  `json:"tx_bytes"`
 	DroppedPackets    uint64 `json:"dropped_packets"`
-	// Issue #39 & #151 telemetry: return-path drops inside the forwarder (queue
+	// Issue #39, #151 & #288 telemetry: return-path drops inside the forwarder (queue
 	// full / no route / total) and rejected handshake initiations at the listener.
 	// A rising forwarder_drops_total with stable traffic means a stalled
 	// downstream path or unroutable backend returns; a rising handshake_rejections means
-	// client (rekey) initiations are being classified as not-a-handshake.
+	// client initiations are failing cryptographic verification (issues #39, #288).
 	ForwarderDropsQueueFull uint64 `json:"forwarder_drops_queue_full"`
 	ForwarderDropsNoRoute   uint64 `json:"forwarder_drops_no_route"`
 	ForwarderDropsTotal     uint64 `json:"forwarder_drops_total"`
