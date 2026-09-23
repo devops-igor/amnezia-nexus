@@ -30,7 +30,7 @@ import (
 var (
 	fernetSalt = []byte("amnezia-panel-credential-encryption")
 	fernetInfo = []byte("fernet-credential-key")
-	fernetRe   = regexp.MustCompile(`^g[A-Za-z0-9+/=_-]{20,}$`)
+	fernetRe   = regexp.MustCompile(`^gAAAAA[A-Za-z0-9+/=_-]{70,}$`)
 
 	// SensitiveProtocolFields defines fields that must never be stored in plain JSON or exposed in responses.
 	SensitiveProtocolFields = []string{"reality_private_key"}
