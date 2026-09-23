@@ -170,6 +170,9 @@ type ListenerConfig struct {
 	// WorkerQueueSize is the capacity of the inbound packet dispatch queue (issue #160).
 	// If <= 0, defaults to 2048.
 	WorkerQueueSize int
+	// HeartbeatInterval is the interval between idle-timeout sweeps in heartbeatLoop.
+	// If <= 0, defaults to 30 seconds.
+	HeartbeatInterval time.Duration
 }
 
 // BackendSelector resolves the backend tunnel a newly authenticated peer's
@@ -193,6 +196,7 @@ type activePeerState struct {
 	receiverIdx     atomic.Uint32
 	sendCount       atomic.Uint64
 	lastSeen        atomic.Int64 // unix nanos
+	lastTouchSec    atomic.Int64 // unix seconds (issue #294: throttles TouchSession calls)
 	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
 }
 
@@ -231,6 +235,8 @@ type Listener struct {
 	// reaperHook runs on the heartbeat goroutine for each idle-timed-out
 	// session (see SessionReaperHook); guarded by mu, set before Start.
 	reaperHook SessionReaperHook
+	// postSweepHook runs on the heartbeat goroutine after each idle-timeout sweep cycle; guarded by mu.
+	postSweepHook func(ctx context.Context)
 
 	// rejectLogUntil throttles handshake-rejection log lines (log-flood
 	// defense against a garbage-packet source that fails MAC1): at most one
@@ -772,6 +778,21 @@ func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys) {
 	el.noiseKeys[peerKey] = keys
 }
 
+// StoreTransportKeysForTest exposes storeTransportKeys for integration tests.
+func (el *Listener) StoreTransportKeysForTest(peerKey string, keys *TransportKeys) {
+	el.storeTransportKeys(peerKey, keys)
+}
+
+// RememberPeerForTest exposes rememberPeer for integration tests.
+func (el *Listener) RememberPeerForTest(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
+	el.rememberPeer(sender, peerKey, receiverIdx)
+}
+
+// HandleDatagramForTest exposes handleDatagram for integration tests.
+func (el *Listener) HandleDatagramForTest(ctx context.Context, data []byte, sender *net.UDPAddr) {
+	el.handleDatagram(ctx, data, sender)
+}
+
 // serverPrivateKey resolves the endpoint's persistent Noise server private
 // key, loading or creating it via the ServerKeysManager on first use. It
 // returns nil when no keypair is available, in which case handshake
@@ -946,6 +967,23 @@ func (el *Listener) peerByAddr(addr string) (*activePeerState, bool) {
 // failure logs for a given peer (issue #148).
 const decryptLogThrottleSeconds = 5
 
+// touchSessionThrottleSeconds is the minimum interval in seconds between TouchSession
+// invocations for an active peer to minimize SessionManager mutex contention under high throughput (issue #294).
+const touchSessionThrottleSeconds = 2
+
+// touchPeerSession updates session liveness in SessionManager with rate limiting
+// to prevent mutex contention on SessionManager under high packet throughput (issue #294).
+func (el *Listener) touchPeerSession(st *activePeerState) {
+	if el.sessionMgr == nil || st == nil {
+		return
+	}
+	nowSec := time.Now().Unix()
+	last := st.lastTouchSec.Load()
+	if (nowSec-last >= touchSessionThrottleSeconds || nowSec < last) && st.lastTouchSec.CompareAndSwap(last, nowSec) {
+		el.sessionMgr.TouchSession(st.peerKey)
+	}
+}
+
 // transportDataHeaderLen is the AWG/WireGuard transport-data header:
 // 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
 // the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
@@ -1021,6 +1059,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 		return true
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
+	el.touchPeerSession(st)
 
 	packet = trimIPPacketPadding(packet)
 
@@ -1296,6 +1335,28 @@ func (el *Listener) SetSessionReaperHook(fn SessionReaperHook) {
 	el.reaperHook = fn
 }
 
+// SetPostSweepHook registers a callback invoked after each idle-timeout sweep cycle.
+// The hook runs on the heartbeat goroutine outside the session manager mutex.
+func (el *Listener) SetPostSweepHook(fn func(ctx context.Context)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.postSweepHook = fn
+}
+
+func (el *Listener) invokePostSweepHook(ctx context.Context) {
+	el.mu.RLock()
+	hook := el.postSweepHook
+	el.mu.RUnlock()
+	if hook != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[vpn] recovered from post-sweep hook panic: %v", r)
+			}
+		}()
+		hook(ctx)
+	}
+}
+
 // SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes the registered
 // SessionReaperHook for each reaped session.
 func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
@@ -1313,6 +1374,8 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 	hook := el.reaperHook
 	el.mu.RUnlock()
 	for _, sess := range timedOut {
+		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
+			sess.ID, sess.PeerPublicKey, sess.UserID, sess.LastSeen.Format(time.RFC3339), el.config.IdleTimeout)
 		if hook != nil {
 			func() {
 				defer func() {
@@ -1330,7 +1393,11 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 
 func (el *Listener) heartbeatLoop(ctx context.Context) {
 	defer el.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
+	interval := 30 * time.Second
+	if el.config.HeartbeatInterval > 0 {
+		interval = el.config.HeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -1341,6 +1408,7 @@ func (el *Listener) heartbeatLoop(ctx context.Context) {
 			if _, err := el.SweepTimedOutSessions(ctx); err != nil {
 				log.Printf("[vpn] idle-timeout sweep failed: %v", err)
 			}
+			el.invokePostSweepHook(ctx)
 		}
 	}
 }

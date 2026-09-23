@@ -611,6 +611,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	epListener.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
 		svc.reapSession(ctx, sess)
 	})
+	epListener.SetPostSweepHook(func(ctx context.Context) {
+		svc.PruneExpiredAffinity()
+	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		// Issue #43 (session 8): the previous closure short-circuited here
@@ -889,6 +892,9 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// 5. Start endpoint listener
 	if s.endpoint != nil {
+		s.endpoint.SetPostSweepHook(func(ctx context.Context) {
+			s.PruneExpiredAffinity()
+		})
 		if err := s.endpoint.Start(ctx); err != nil {
 			s.mu.Lock()
 			s.running = false
@@ -1106,6 +1112,7 @@ func (s *Service) StartGaugeReconciler(ctx context.Context) {
 				return
 			case <-ticker.C:
 				s.reconcileConnectionCounts(ctx)
+				s.PruneExpiredAffinity()
 			}
 		}
 	}()
@@ -1268,7 +1275,7 @@ func (s *Service) applyBufferedAccountantDeltas(sessions []models.EnrichedVPNSes
 }
 
 // SessionsLive is the memory-authoritative variant of SessionsEnriched
-// (issue #189 improvement round): the SNAPSHOT — row membership — comes from
+// (issue #189 improvement round): the SNAPSHOT (row membership) comes from
 // the SessionManager's in-memory connected set, the same source the
 // active-sessions card counts, so the card and the admin table can never
 // disagree. Ghost DB rows (peers that vanished without a teardown) cannot
@@ -1278,29 +1285,32 @@ func (s *Service) applyBufferedAccountantDeltas(sessions []models.EnrichedVPNSes
 // row survival: the peer key is the stable connection-config identity
 // (user_connections.client_id, the same key DBAuthenticator authenticates),
 // so a live session keeps its username and server identity even when its
-// vpn_sessions row is displaced — e.g. the UNIQUE assigned_ip collision when
-// another user's config legitimately reclaims the IP. The username comes
+// vpn_sessions row is displaced (e.g. the UNIQUE assigned_ip collision when
+// another user's config legitimately reclaims the IP). The username comes
 // from user_connections -> users, the server identity from the snapshot's
 // backend tunnel -> servers. Identity fallbacks match the DB-enriched path:
 // a peer key with no user_connections row (or a user row gone) renders
 // 'unknown'; a tunnel missing from backend_tunnels renders
 // 'Server #<tunnelID>' with server ID 0.
 //
-// Traffic and last_seen are NOT memory-authoritative: production traffic
-// never updates the manager's per-session counters (UpdateActivity /
-// TouchSession have no production call sites), so rx/tx/last_seen are seeded
-// from the persisted vpn_sessions row by session ID — cumulative-since-
-// connect totals, written incrementally by TrafficAccountant.Flush — and
-// the accountant's un-flushed buffered deltas are added on top. The
-// displayed value is therefore DB cumulative + buffered, continuous across
-// flushes. A session with no DB row (brand-new session, displaced row,
-// enrichment miss) keeps the snapshot's zeros and in-memory last_seen; the
-// buffered deltas still apply to it either way.
+// Traffic counters and displayed last_seen are NOT memory-authoritative:
+// while in-memory session liveness is kept fresh by TouchSession() in
+// handleTransportData to prevent premature idle reaping (issue #294),
+// displayed last_seen and rx/tx counters in SessionsLive reflect accounting
+// activity telemetry persisted by TrafficAccountant.Flush rather than real-time
+// per-packet transport timestamps. rx/tx/last_seen are seeded from the
+// persisted vpn_sessions row by session ID (cumulative-since-connect totals,
+// written incrementally by TrafficAccountant.Flush), and the accountant's
+// un-flushed buffered deltas are added on top. The displayed value is
+// therefore DB cumulative + buffered, continuous across flushes. A session
+// with no DB row (brand-new session, displaced row, enrichment miss) keeps
+// the snapshot's zeros and in-memory last_seen; the buffered deltas still
+// apply to it either way.
 //
 // ConnectionName is the value captured at handshake from the authenticating
-// user_connection — the manager always knows it, so no fallback is needed.
-// Like the DB path, last_seen is accounting activity telemetry (the last
-// flush that moved counters), not transport-level liveness proof.
+// user_connection; the manager always knows it, so no fallback is needed.
+// Like the DB path, displayed last_seen is accounting activity telemetry
+// (the last flush that moved counters), not transport-level liveness proof.
 func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
@@ -2457,11 +2467,13 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// reapSession tears down forwarder routes, sticky affinities, and pool counters
-// for an idle-timeout reaped session. To protect against reconnect and reconcile
-// races, peer/user affinity is only cleared if no newer active session exists for
-// the peer/user, and pool connection counter decrement is skipped if periodic
-// reconciliation already re-synchronized the gauge from the database.
+// reapSession tears down forwarder routes and pool counters for an idle-timeout
+// reaped session. Sticky affinity is preserved within AffinityTTL to prevent
+// backend/IP thrashing upon client reconnect (issue #294). Pool connection counter
+// decrement is skipped if periodic reconciliation already re-synchronized the gauge from the database.
+// Note: sticky affinity pruning is intentionally not executed here to prevent O(K*N)
+// lock contention under Service.mu during mass timeouts; it is amortized post-sweep
+// and during periodic maintenance via PruneExpiredAffinity.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
@@ -2471,32 +2483,6 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 	if s.forwarder != nil {
 		s.forwarder.UnregisterSession(sess.PeerPublicKey)
-	}
-
-	if s.stickyMgr != nil {
-		shouldClearPeer := true
-		if s.sessionMgr != nil {
-			if activePeerSess, ok := s.sessionMgr.GetSession(sess.PeerPublicKey); ok && activePeerSess != nil && activePeerSess.ID != sess.ID {
-				shouldClearPeer = false
-			}
-		}
-		if shouldClearPeer {
-			s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
-		}
-
-		shouldClearUser := true
-		if s.sessionMgr != nil {
-			activeUserSessions := s.sessionMgr.GetSessionsByUserID(sess.UserID)
-			for _, us := range activeUserSessions {
-				if us != nil && us.ID != sess.ID {
-					shouldClearUser = false
-					break
-				}
-			}
-		}
-		if shouldClearUser {
-			s.stickyMgr.ClearAffinity(sess.UserID)
-		}
 	}
 
 	if s.pool != nil {
@@ -2512,6 +2498,23 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 			s.pool.DecrementConnections(sess.BackendTunnelID)
 		}
 	}
+
+	log.Printf("[vpn/service] reaped idle session: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
+		sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
+}
+
+// PruneExpiredAffinity scans and removes expired sticky affinity records
+// from the load balancer. It acquires s.mu with RLock only long enough to
+// retrieve stickyMgr, then executes pruning outside s.mu to eliminate
+// lock contention during mass session reap sweeps.
+func (s *Service) PruneExpiredAffinity() int {
+	s.mu.RLock()
+	sm := s.stickyMgr
+	s.mu.RUnlock()
+	if sm == nil {
+		return 0
+	}
+	return sm.PruneExpired()
 }
 
 // DisconnectSession disconnects a specific VPN session by ID.

@@ -412,3 +412,124 @@ func TestStickySessionManager_Failover_ExpiredAffinityNotRevived(t *testing.T) {
 		t.Errorf("expected active peer-2 to have affinity to tunnel 2, got tid=%d (ok=%v)", tid, ok)
 	}
 }
+
+func TestStickySessionManager_PruneExpired(t *testing.T) {
+	db := setupTestDB(t)
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	// Assign user-1 and peer-1 at t0
+	sm.AssignAffinity("user-1", 1)
+	sm.AssignPeerAffinity("peer-1", 1)
+
+	// Advance time to t0 + 5m and assign user-2 and peer-2
+	currTime = t0.Add(5 * time.Minute)
+	sm.AssignAffinity("user-2", 2)
+	sm.AssignPeerAffinity("peer-2", 2)
+
+	// Verify total count
+	uCount, pCount := sm.AffinityCount()
+	if uCount != 2 || pCount != 2 {
+		t.Fatalf("expected AffinityCount=(2, 2), got (%d, %d)", uCount, pCount)
+	}
+
+	// Advance time to t0 + 12m:
+	// user-1 / peer-1 age = 12m > 10m TTL (expired)
+	// user-2 / peer-2 age = 7m <= 10m TTL (active)
+	currTime = t0.Add(12 * time.Minute)
+
+	pruned := sm.PruneExpired()
+	if pruned != 2 {
+		t.Fatalf("expected 2 pruned records (1 user + 1 peer), got %d", pruned)
+	}
+
+	uCount, pCount = sm.AffinityCount()
+	if uCount != 1 || pCount != 1 {
+		t.Fatalf("expected AffinityCount=(1, 1) after prune, got (%d, %d)", uCount, pCount)
+	}
+
+	// Verify expired records are gone
+	if _, ok := sm.GetAffinity("user-1"); ok {
+		t.Errorf("expected user-1 to be removed from memory")
+	}
+	if _, ok := sm.GetPeerAffinity("peer-1"); ok {
+		t.Errorf("expected peer-1 to be removed from memory")
+	}
+
+	// Verify active records are preserved
+	if tid, ok := sm.GetAffinity("user-2"); !ok || tid != 2 {
+		t.Errorf("expected user-2 affinity to be preserved as 2, got %d (ok=%v)", tid, ok)
+	}
+	if tid, ok := sm.GetPeerAffinity("peer-2"); !ok || tid != 2 {
+		t.Errorf("expected peer-2 affinity to be preserved as 2, got %d (ok=%v)", tid, ok)
+	}
+
+	// Advance past TTL for user-2 / peer-2
+	currTime = t0.Add(20 * time.Minute)
+	pruned2 := sm.PruneExpired()
+	if pruned2 != 2 {
+		t.Fatalf("expected 2 pruned records for second batch, got %d", pruned2)
+	}
+
+	uCount, pCount = sm.AffinityCount()
+	if uCount != 0 || pCount != 0 {
+		t.Fatalf("expected AffinityCount=(0, 0) after final prune, got (%d, %d)", uCount, pCount)
+	}
+}
+
+func TestStickySessionManager_GetAffinity_PhysicalPruneOnLookup(t *testing.T) {
+	db := setupTestDB(t)
+	ttl := 10 * time.Minute
+	caps := CapacityConfig{
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+		AffinityTTL:        ttl,
+	}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(db, base, caps)
+
+	t0 := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	currTime := t0
+	sm.SetNowFunc(func() time.Time { return currTime })
+
+	sm.AssignAffinity("user-lookup", 1)
+	sm.AssignPeerAffinity("peer-lookup", 1)
+
+	uCount, pCount := sm.AffinityCount()
+	if uCount != 1 || pCount != 1 {
+		t.Fatalf("expected initial AffinityCount=(1, 1), got (%d, %d)", uCount, pCount)
+	}
+
+	// Advance time past TTL
+	currTime = t0.Add(15 * time.Minute)
+
+	// Lookup user-lookup: should return false AND physically remove from userAffinity
+	if _, ok := sm.GetAffinity("user-lookup"); ok {
+		t.Errorf("expected GetAffinity to return false for expired user")
+	}
+
+	uCount, pCount = sm.AffinityCount()
+	if uCount != 0 || pCount != 1 {
+		t.Fatalf("expected userAffinity to be physically pruned (0) and peerAffinity untouched (1), got (%d, %d)", uCount, pCount)
+	}
+
+	// Lookup peer-lookup: should return false AND physically remove from peerAffinity
+	if _, ok := sm.GetPeerAffinity("peer-lookup"); ok {
+		t.Errorf("expected GetPeerAffinity to return false for expired peer")
+	}
+
+	uCount, pCount = sm.AffinityCount()
+	if uCount != 0 || pCount != 0 {
+		t.Fatalf("expected both maps to be physically empty (0, 0), got (%d, %d)", uCount, pCount)
+	}
+}
