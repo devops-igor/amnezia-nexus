@@ -538,17 +538,28 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// 3. Corrupt / Invalid Packet: neither unmasked nor plaintext matches H4.
-	// Since clientAddr belongs to an established peer session, handleTransportData
+	// 3. Non-H4 Packet: neither unmasked nor plaintext matches H4.
+	// Must return false so non-transport datagrams (e.g. handshake initiations)
+	// are not swallowed as transport data (issue #288 Round 2).
+	nonH4Datagram := make([]byte, len(datagramMasked))
+	copy(nonH4Datagram, datagramMasked)
+	nonH4Datagram[cfg.S4] ^= 0xFF
+	nonH4Datagram[cfg.S4+1] ^= 0xFF
+
+	if ok := el.handleTransportData(nonH4Datagram, clientAddr); ok {
+		t.Fatal("handleTransportData returned true for non-H4 packet")
+	}
+
+	// 3b. Transport Decryption Failure: valid H4 header with corrupted ciphertext.
+	// Since it is recognized as transport data for an established peer, handleTransportData
 	// returns true (decoupled from handshake rejection counter, issue #149),
 	// but the corrupt packet is dropped and never routed.
-	corruptDatagram := make([]byte, len(datagramMasked))
-	copy(corruptDatagram, datagramMasked)
-	corruptDatagram[cfg.S4] ^= 0xFF
-	corruptDatagram[cfg.S4+1] ^= 0xFF
+	corruptCiphertext := make([]byte, len(datagramMasked))
+	copy(corruptCiphertext, datagramMasked)
+	corruptCiphertext[len(corruptCiphertext)-1] ^= 0xFF
 
-	if ok := el.handleTransportData(corruptDatagram, clientAddr); !ok {
-		t.Fatal("handleTransportData returned false for established peer session")
+	if ok := el.handleTransportData(corruptCiphertext, clientAddr); !ok {
+		t.Fatal("handleTransportData returned false for valid H4 transport packet with decryption failure")
 	}
 	mu.Lock()
 	if len(routedPackets) != 2 {
@@ -558,7 +569,7 @@ func TestHandleTransportData_HeaderProtection_MaskedAndFallback(t *testing.T) {
 
 	// 4. Unknown Sender: not an established session, must return false.
 	unknownAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:49999")
-	if ok := el.handleTransportData(corruptDatagram, unknownAddr); ok {
+	if ok := el.handleTransportData(nonH4Datagram, unknownAddr); ok {
 		t.Fatal("handleTransportData returned true for unknown sender")
 	}
 

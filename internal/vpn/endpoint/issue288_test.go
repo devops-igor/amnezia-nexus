@@ -1,6 +1,7 @@
 package endpoint
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -10,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/chacha20poly1305"
+
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // setupIssue288Listener creates a test listener configured with default AWG headers
@@ -238,4 +242,144 @@ func TestEstablishedPeer_GenuineHandshakeFailure_IncrementsCounterAndLogs(t *tes
 		t.Fatalf("expected 0 routed packets after second failed initiation, got %d", len(routedPackets))
 	}
 	mu.Unlock()
+}
+
+// TestValidTransportPacket_WithS1MatchingH1_DeliveredWithoutLoss verifies that
+// when a legitimate transport data packet happens to have bytes at offset S1 that
+// numerically fall within the configured H1 range (causing ParseInitiation to attempt
+// MAC1 verification and return ErrMAC1Failed), the listener disambiguates it via
+// handleTransportData before rejection and successfully decrypts and delivers the packet,
+// with zero packet loss and zero HandshakeRejections increments (issue #288 Round 2).
+func TestValidTransportPacket_WithS1MatchingH1_DeliveredWithoutLoss(t *testing.T) {
+	ctx := context.Background()
+
+	keysMgr := NewServerKeysManager(nil)
+	_, _, err := keysMgr.EnsureKeypair(ctx)
+	if err != nil {
+		t.Fatalf("EnsureKeypair failed: %v", err)
+	}
+
+	h1 := models.NewHeaderRange(100, 140)
+	h4 := models.NewHeaderRange(200, 240)
+	s1 := 36
+	s4 := 16
+
+	cfg := ListenerConfig{
+		ListenPort:  getFreeUDPPort(t),
+		SubnetCIDR:  "10.100.0.0/24",
+		MTU:         1420,
+		IdleTimeout: 1 * time.Minute,
+		H1:          h1,
+		S1:          s1,
+		H4:          h4,
+		S4:          s4,
+	}
+	el, err := NewListener(cfg, nil, nil, nil, nil, keysMgr)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	var routedPackets [][]byte
+	var mu sync.Mutex
+	el.SetClientPacketRouter(func(pk string, pkt []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		pktCopy := make([]byte, len(pkt))
+		copy(pktCopy, pkt)
+		routedPackets = append(routedPackets, pktCopy)
+		return nil
+	})
+
+	var logBuf safeLogBuffer
+	origOutput := captureLogOutput(&logBuf)
+	defer restoreLogOutput(origOutput)
+
+	peerKey := "established-collision-peer"
+	clientAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 210), Port: 46000}
+	recvKey := make([]byte, chacha20poly1305.KeySize)
+	sendKey := make([]byte, chacha20poly1305.KeySize)
+	for i := range recvKey {
+		recvKey[i] = byte(i + 15)
+		sendKey[i] = byte(i + 45)
+	}
+	el.storeTransportKeys(peerKey, &TransportKeys{
+		RecvKey: recvKey,
+		SendKey: sendKey,
+	})
+	el.rememberPeer(clientAddr, peerKey, 60001)
+
+	// Prepare AEAD cipher for the receiver key
+	aead, err := chacha20poly1305.New(recvKey)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.New failed: %v", err)
+	}
+
+	// Craft transport packet with valid H4 header at offset S4, and craft ciphertext
+	// such that the 4 bytes at offset S1 (which is offset 4 within the ciphertext)
+	// match h1.Lo (100).
+	var nonce [chacha20poly1305.NonceSize]byte
+	var counter uint64 = 7
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+
+	// In transport packet:
+	// datagram = s4Junk (s4 bytes) + transportHeader (16 bytes) + ciphertext
+	// Offset of ciphertext in datagram is s4 + 16 = 32.
+	// We want datagram[s1:s1+4] (offset 36..40, which is ciphertext[4:8]) to equal h1.Lo.
+	cipherOffsetInDatagram := s4 + transportDataHeaderLen
+	targetOffsetInCipher := s1 - cipherOffsetInDatagram // 36 - 32 = 4
+
+	// Determine keystream at targetOffsetInCipher by encrypting a zero buffer
+	payloadLen := 64
+	zeroPlaintext := make([]byte, payloadLen)
+	trialCipher := aead.Seal(nil, nonce[:], zeroPlaintext, nil)
+	keystreamVal := binary.LittleEndian.Uint32(trialCipher[targetOffsetInCipher : targetOffsetInCipher+4])
+
+	// Now craft plaintext so that plaintext ^ keystream == h1.Lo
+	finalPlaintext := make([]byte, payloadLen)
+	copy(finalPlaintext, []byte("valid-ip-payload-data-routed-successfully"))
+	desiredPlainVal := h1.Lo ^ keystreamVal
+	binary.LittleEndian.PutUint32(finalPlaintext[targetOffsetInCipher:targetOffsetInCipher+4], desiredPlainVal)
+
+	ciphertext := aead.Seal(nil, nonce[:], finalPlaintext, nil)
+
+	// Verify our craft: ciphertext[targetOffsetInCipher:targetOffsetInCipher+4] must equal h1.Lo
+	if got := binary.LittleEndian.Uint32(ciphertext[targetOffsetInCipher : targetOffsetInCipher+4]); got != h1.Lo {
+		t.Fatalf("crafted ciphertext mismatch: got %d, want %d", got, h1.Lo)
+	}
+
+	// Build full transport datagram
+	s4Junk := make([]byte, s4)
+	var hdr [transportDataHeaderLen]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], h4.Lo)
+	binary.LittleEndian.PutUint32(hdr[4:8], 60001) // receiver index
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+
+	datagram := append(s4Junk, hdr[:]...)
+	datagram = append(datagram, ciphertext...)
+
+	// Verify datagram[s1:s1+4] matches h1.Lo
+	if got := binary.LittleEndian.Uint32(datagram[s1 : s1+4]); got != h1.Lo {
+		t.Fatalf("datagram at offset s1 mismatch: got %d, want %d", got, h1.Lo)
+	}
+
+	// Dispatch datagram through listener
+	el.handleDatagram(ctx, datagram, clientAddr)
+
+	// Verification 1: packet must NOT be rejected as a failed handshake
+	if rejects := el.HandshakeRejections(); rejects != 0 {
+		t.Fatalf("HandshakeRejections = %d, want 0 (transport packet was falsely counted as handshake rejection)", rejects)
+	}
+	if strings.Contains(logBuf.String(), "rejected handshake initiation") {
+		t.Fatalf("unexpected handshake rejection log emitted for valid transport packet: %s", logBuf.String())
+	}
+
+	// Verification 2: packet must be successfully decrypted and delivered to router
+	mu.Lock()
+	defer mu.Unlock()
+	if len(routedPackets) != 1 {
+		t.Fatalf("expected 1 routed packet, got %d", len(routedPackets))
+	}
+	if !bytes.Equal(routedPackets[0], finalPlaintext) {
+		t.Fatalf("routed packet mismatch: got %x, want %x", routedPackets[0], finalPlaintext)
+	}
 }
