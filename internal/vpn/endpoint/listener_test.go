@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -1021,6 +1022,120 @@ func TestListener_ActiveTransportTrafficUpdatesLiveness(t *testing.T) {
 	}
 
 	// Now cease traffic and simulate idle timeout: age LastSeen past IdleTimeout (5s)
+	sm.SetSessionLastSeen(peerKey, time.Now().UTC().Add(-10*time.Second))
+	timedOutAfterIdle, err := el.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOutAfterIdle) != 1 || timedOutAfterIdle[0].ID != sess.ID {
+		t.Fatalf("expected idle session to be reaped after traffic ceased, got %+v", timedOutAfterIdle)
+	}
+}
+
+func TestListener_ActiveTransportTrafficUpdatesLiveness_RouterErrorDoesNotDropLiveness(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := ListenerConfig{
+		ListenPort:  getFreeUDPPort(t),
+		SubnetCIDR:  "10.100.0.0/24",
+		MTU:         1420,
+		IdleTimeout: 5 * time.Second,
+		S4:          16,
+		H4:          models.DegenerateHeaderRange(health.DefaultH4),
+	}
+
+	ipam, err := NewIPAM(cfg.SubnetCIDR)
+	if err != nil {
+		t.Fatalf("NewIPAM failed: %v", err)
+	}
+	sm := NewSessionManager(nil, ipam)
+
+	el, err := NewListener(cfg, nil, nil, ipam, sm, nil)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	peerKey := "test-peer-key-router-fail-1"
+	sess, err := sm.CreateSession(ctx, "user-live-fail", peerKey, "10.100.0.51", 1, "conn-live-fail")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// Artificially age session LastSeen by 3 seconds
+	initialLastSeen := time.Now().UTC().Add(-3 * time.Second)
+	sm.SetSessionLastSeen(peerKey, initialLastSeen)
+
+	// Set up transport keys and peer endpoint
+	clientAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:48124")
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	clientSendKey := make([]byte, chacha20poly1305.KeySize)
+	clientRecvKey := make([]byte, chacha20poly1305.KeySize)
+	for i := range clientSendKey {
+		clientSendKey[i] = byte(i + 2)
+		clientRecvKey[i] = byte(i + 42)
+	}
+	el.storeTransportKeys(peerKey, &TransportKeys{
+		RecvKey: clientSendKey,
+		SendKey: clientRecvKey,
+	})
+	el.rememberPeer(clientAddr, peerKey, 10002)
+
+	// Configure a router that deliberately returns an error (e.g. queue full, backpressure, or route error)
+	routerCalled := false
+	el.SetClientPacketRouter(func(pk string, pkt []byte) error {
+		routerCalled = true
+		return errors.New("simulated forwarding failure")
+	})
+
+	// Prepare transport packet
+	clientAEAD, err := chacha20poly1305.New(clientSendKey)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.New failed: %v", err)
+	}
+	clientPayload := []byte("ping-transport-router-error-payload")
+	var counter uint64 = 0
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	ciphertext := clientAEAD.Seal(nil, nonce[:], clientPayload, nil)
+
+	s4Junk := make([]byte, cfg.S4)
+	var hdr [transportDataHeaderLen]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], cfg.H4.Lo)
+	binary.LittleEndian.PutUint32(hdr[4:8], 10002)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+
+	datagram := append(s4Junk, hdr[:]...)
+	datagram = append(datagram, ciphertext...)
+
+	// Send datagram into listener
+	el.handleDatagram(ctx, datagram, clientAddr)
+
+	if !routerCalled {
+		t.Fatal("expected router to be invoked")
+	}
+
+	// Verify session LastSeen was refreshed despite the router error
+	currentSess, ok := sm.GetSession(peerKey)
+	if !ok {
+		t.Fatal("session not found in sessionMgr")
+	}
+	if !currentSess.LastSeen.After(initialLastSeen) {
+		t.Fatalf("expected LastSeen to be updated after packet, got %v (initial was %v)", currentSess.LastSeen, initialLastSeen)
+	}
+
+	// Verify SweepTimedOutSessions does NOT reap the session while packets arrive
+	timedOut, err := el.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) > 0 {
+		t.Fatalf("expected active session to survive sweep despite router error, got %d reaped sessions", len(timedOut))
+	}
+
+	// When genuine idleness occurs past IdleTimeout (5s), session must be reaped
 	sm.SetSessionLastSeen(peerKey, time.Now().UTC().Add(-10*time.Second))
 	timedOutAfterIdle, err := el.SweepTimedOutSessions(ctx)
 	if err != nil {

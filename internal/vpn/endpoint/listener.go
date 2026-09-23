@@ -1054,6 +1054,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 		return true
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
+	el.touchPeerSession(st)
 
 	packet = trimIPPacketPadding(packet)
 
@@ -1061,15 +1062,12 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	router := el.router
 	el.mu.RUnlock()
 	if router == nil {
-		el.touchPeerSession(st)
 		return true
 	}
 	if err := router(st.peerKey, packet); err != nil {
 		// Congestion/backpressure is expected under load: drop silently at
 		// debug priority; anything else is a routing inconsistency worth a log.
 		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", st.peerKey, err)
-	} else {
-		el.touchPeerSession(st)
 	}
 	return true
 }
