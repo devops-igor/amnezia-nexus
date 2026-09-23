@@ -5983,3 +5983,85 @@ func TestService_ActiveTrafficPreventsSessionReaperTeardown(t *testing.T) {
 		t.Errorf("expected peer sticky affinity to be preserved within AffinityTTL, got %d (ok=%v)", tid, ok)
 	}
 }
+
+func TestService_ReapSession_PrunesExpiredAffinity(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	tunID := tunnels[0].ID
+	for _, tun := range tunnels {
+		if tun.ServerID == s1ID {
+			tunID = tun.ID
+			break
+		}
+	}
+
+	// 1. Establish session A for Alice (active, unexpired)
+	sessID := "sess-prune-test-a"
+	assignedIP := "10.100.0.199"
+	sessA, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIP, tunID, sessID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	vpnSvc.forwarder.RegisterSession(sessID, "conn-a", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+	vpnSvc.pool.IncrementConnections(tunID)
+
+	// 2. Add an expired affinity record for an older peer/user (Bob)
+	uIDBob := "user-bob-expired"
+	peerKeyBob := "peer-bob-expired"
+	vpnSvc.stickyMgr.AssignAffinity(uIDBob, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyBob, tunID)
+
+	uCount, pCount := vpnSvc.stickyMgr.AffinityCount()
+	if uCount != 2 || pCount != 2 {
+		t.Fatalf("expected initial AffinityCount=(2, 2), got (%d, %d)", uCount, pCount)
+	}
+
+	// Override clock: Bob was assigned 35m ago (> 30m AffinityTTL)
+	tNow := time.Now().UTC().Add(35 * time.Minute)
+	vpnSvc.stickyMgr.SetNowFunc(func() time.Time { return tNow })
+
+	// Refresh Alice's affinity timestamp to tNow (unexpired)
+	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
+	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
+
+	// 3. Trigger reapSession for session A
+	sessA.LastSeen = tNow.Add(-10 * time.Minute) // aged past IdleTimeout (3m)
+	vpnSvc.reapSession(ctx, sessA)
+
+	// 4. Assertions:
+	// a) reapSession invoked PruneExpired, physically removing Bob's expired records
+	uCountAfter, pCountAfter := vpnSvc.stickyMgr.AffinityCount()
+	if uCountAfter != 1 || pCountAfter != 1 {
+		t.Fatalf("expected AffinityCount=(1, 1) after reaper pruning, got (%d, %d)", uCountAfter, pCountAfter)
+	}
+
+	// b) Bob is physically gone
+	if _, ok := vpnSvc.stickyMgr.GetAffinity(uIDBob); ok {
+		t.Errorf("expected Bob's user affinity to be pruned")
+	}
+	if _, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyBob); ok {
+		t.Errorf("expected Bob's peer affinity to be pruned")
+	}
+
+	// c) Alice's affinity is preserved within AffinityTTL
+	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
+		t.Errorf("expected Alice's user affinity to be preserved as %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
+		t.Errorf("expected Alice's peer affinity to be preserved as %d, got %d (ok=%v)", tunID, tid, ok)
+	}
+}

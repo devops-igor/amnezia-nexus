@@ -2459,8 +2459,9 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 
 // reapSession tears down forwarder routes and pool counters for an idle-timeout
 // reaped session. Sticky affinity is preserved within AffinityTTL to prevent
-// backend/IP thrashing upon client reconnect (issue #294). Pool connection counter
-// decrement is skipped if periodic reconciliation already re-synchronized the gauge from the database.
+// backend/IP thrashing upon client reconnect (issue #294), and expired affinity
+// records are physically pruned. Pool connection counter decrement is skipped
+// if periodic reconciliation already re-synchronized the gauge from the database.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
@@ -2470,6 +2471,10 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 
 	if s.forwarder != nil {
 		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+	}
+
+	if s.stickyMgr != nil {
+		s.stickyMgr.PruneExpired()
 	}
 
 	if s.pool != nil {
@@ -2485,6 +2490,9 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 			s.pool.DecrementConnections(sess.BackendTunnelID)
 		}
 	}
+
+	log.Printf("[vpn/service] reaped idle session: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
+		sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
 }
 
 // DisconnectSession disconnects a specific VPN session by ID.

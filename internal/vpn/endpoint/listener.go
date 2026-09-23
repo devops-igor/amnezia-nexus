@@ -1347,6 +1347,8 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 	hook := el.reaperHook
 	el.mu.RUnlock()
 	for _, sess := range timedOut {
+		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
+			sess.ID, sess.PeerPublicKey, sess.UserID, sess.LastSeen.Format(time.RFC3339), el.config.IdleTimeout)
 		if hook != nil {
 			func() {
 				defer func() {
