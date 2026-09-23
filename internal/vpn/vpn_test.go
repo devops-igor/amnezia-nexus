@@ -1178,6 +1178,52 @@ func TestEnableBackend_TypedSentinelErrors(t *testing.T) {
 
 // --- config divergence regression tests (Issue #5 findings 1, 4, 7, 8, 9, 15) ---
 
+func TestUpdateConfig_SaveFailureDoesNotMutateQueueRuntime(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	baseCfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		HealthThresholdMS:  500,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		ClientQueueSize:    2,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+		Weights:            map[int64]int{},
+	}
+	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close test DB: %v", err)
+	}
+
+	changed := *baseCfg
+	changed.ClientQueueSize = 4
+	if err := svc.UpdateConfig(ctx, &changed); err == nil {
+		t.Fatal("UpdateConfig unexpectedly succeeded after DB close")
+	}
+	cfg, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg.ClientQueueSize != 2 {
+		t.Fatalf("service queue size changed after failed save: %d", cfg.ClientQueueSize)
+	}
+	svc.forwarder.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	queue, ok := svc.forwarder.GetClientPacketChannel("peer-1")
+	if !ok {
+		t.Fatal("GetClientPacketChannel did not find registered peer")
+	}
+	if cap(queue) != 2 {
+		t.Fatalf("runtime queue size changed after failed save: %d", cap(queue))
+	}
+}
+
 func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

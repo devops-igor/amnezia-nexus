@@ -40,11 +40,17 @@ type Status struct {
 	// A rising forwarder_drops_total with stable traffic means a stalled
 	// downstream path or unroutable backend returns; a rising handshake_rejections means
 	// client initiations are failing cryptographic verification (issues #39, #288).
-	ForwarderDropsQueueFull uint64 `json:"forwarder_drops_queue_full"`
-	ForwarderDropsNoRoute   uint64 `json:"forwarder_drops_no_route"`
-	ForwarderDropsTotal     uint64 `json:"forwarder_drops_total"`
-	HandshakeRejections     uint64 `json:"handshake_rejections"`
-	PublicEndpoint          string `json:"public_endpoint,omitempty"`
+	ForwarderDropsQueueFull        uint64 `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute          uint64 `json:"forwarder_drops_no_route"`
+	ForwarderDropsTotal            uint64 `json:"forwarder_drops_total"`
+	ForwarderQueueOccupancy        int    `json:"forwarder_queue_occupancy"`
+	ForwarderQueueCapacity         int    `json:"forwarder_queue_capacity"`
+	ForwarderQueueHighWater        int    `json:"forwarder_queue_high_water"`
+	ForwarderDeviceWriteErrors     uint64 `json:"forwarder_device_write_errors"`
+	ForwarderDeviceWriteDurationMS uint64 `json:"forwarder_device_write_duration_ms"`
+	TransportDecryptionFailures    uint64 `json:"transport_decryption_failures"`
+	HandshakeRejections            uint64 `json:"handshake_rejections"`
+	PublicEndpoint                 string `json:"public_endpoint,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -513,7 +519,15 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	stickyMgr := loadbalancer.NewStickySessionManager(db, lb, caps)
 
 	accountant := forwarder.NewTrafficAccountant(db, 2*time.Second)
-	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, 2048)
+	queueSize := cfg.ClientQueueSize
+	if queueSize <= 0 {
+		queueSize = forwarder.DefaultClientQueueSize
+	}
+	if queueSize > forwarder.MaxClientQueuePackets {
+		queueSize = forwarder.MaxClientQueuePackets
+	}
+	cfg.ClientQueueSize = queueSize
+	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, queueSize)
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -1178,9 +1192,14 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.RxBytes = rx
 		status.TxBytes = tx
 		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
+		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
+		writeErrors, writeDuration, _ := s.forwarder.DeviceWriteStats()
+		status.ForwarderDeviceWriteErrors = writeErrors
+		status.ForwarderDeviceWriteDurationMS = uint64(writeDuration / time.Millisecond)
 	}
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()
+		status.TransportDecryptionFailures = s.endpoint.TransportDecryptionFailures()
 	}
 
 	var totalDrops uint64
@@ -2320,12 +2339,20 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var previousCfg *models.VPNConfig
+	if s.cfg != nil {
+		cfgCopy := *s.cfg
+		previousCfg = &cfgCopy
+	}
 	// Preserve obfuscation parameters the incoming config omits (zero
 	// H1..H4 / S1..S4) so partial updates cannot silently clobber the
 	// values already distributed to peers.
 	if s.cfg != nil {
 		preserveObfuscationParams(s.cfg, cfg)
 		enforceMinSValues(cfg)
+		if cfg.ClientQueueSize <= 0 {
+			cfg.ClientQueueSize = s.cfg.ClientQueueSize
+		}
 		// Preserve portal identity the incoming config omits (empty key
 		// fields): an update must never silently wipe the persisted
 		// keypair that distributed client configs rely on.
@@ -2337,48 +2364,32 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		}
 	}
 
-	// Any remaining difference is an explicit obfuscation change. An
-	// idle listener can be re-parameterized safely; a running listener
-	// cannot (its packet-processing paths read config fields without
-	// holding the listener lock), so reject the change explicitly
-	// instead of letting config and listener diverge silently.
-	if s.cfg != nil && obfuscationDiffers(s.cfg, cfg) {
-		if s.endpoint != nil && s.endpoint.IsRunning() {
-			log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
-			return errors.New("obfuscation parameters are immutable while listener is running")
-		}
-		if s.endpoint != nil {
-			if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
-				return err
-			}
-			if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
-				return err
-			}
-			log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
-		}
+	obfuscationChanged := s.cfg != nil && obfuscationDiffers(s.cfg, cfg)
+	if obfuscationChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+		log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
+		return errors.New("obfuscation parameters are immutable while listener is running")
 	}
 
-	// A listen-port change on a RUNNING listener cannot take effect: the
-	// UDP socket is already bound to the old port, so the bound socket and
-	// the persisted config would silently diverge (Issue #16). Mirror the
-	// obfuscation rejection above. The env wiring path in cmd/*/main.go
-	// runs BEFORE service Start, so it never hits this rejection.
-	if s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort {
-		if s.endpoint != nil && s.endpoint.IsRunning() {
-			log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
-			return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
-		}
-		if s.endpoint != nil {
-			s.endpoint.UpdateListenPort(cfg.ListenPort)
-			log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
-		}
+	listenPortChanged := s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort
+	if listenPortChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+		log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
+		return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
 	}
 
-	s.cfg = cfg
-	if s.db != nil {
-		if err := s.db.SaveVPNConfig(ctx, cfg); err != nil {
-			return fmt.Errorf("failed to persist vpn config: %w", err)
+	if cfg.ClientQueueSize <= 0 {
+		cfg.ClientQueueSize = forwarder.DefaultClientQueueSize
+	}
+	if cfg.ClientQueueSize > forwarder.MaxClientQueuePackets {
+		cfg.ClientQueueSize = forwarder.MaxClientQueuePackets
+	}
+	queueSizeChanged := false
+	oldQueueSize := forwarder.DefaultClientQueueSize
+	if s.cfg != nil && s.forwarder != nil {
+		oldQueueSize = s.cfg.ClientQueueSize
+		if oldQueueSize <= 0 {
+			oldQueueSize = forwarder.DefaultClientQueueSize
 		}
+		queueSizeChanged = cfg.ClientQueueSize != oldQueueSize
 	}
 
 	caps := loadbalancer.CapacityConfig{
@@ -2386,13 +2397,74 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
 		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
+	newLB, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
+	if err != nil {
+		return fmt.Errorf("invalid load balancer configuration: %w", err)
+	}
 
-	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
-	if err == nil {
-		s.balancer = lb
-		if s.stickyMgr != nil {
-			s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, lb, caps)
+	if s.db != nil {
+		if err := s.db.SaveVPNConfig(ctx, cfg); err != nil {
+			return fmt.Errorf("failed to persist vpn config: %w", err)
 		}
+	}
+	if queueSizeChanged {
+		if err := s.forwarder.ReconfigureClientQueueSize(cfg.ClientQueueSize); err != nil {
+			if s.db != nil && previousCfg != nil {
+				if rollbackErr := s.db.SaveVPNConfig(ctx, previousCfg); rollbackErr != nil {
+					return fmt.Errorf("cannot apply client queue size: %w; persistence rollback failed: %v", err, rollbackErr)
+				}
+			}
+			return fmt.Errorf("cannot apply client queue size: %w", err)
+		}
+	}
+	rollback := func(cause error) error {
+		var rollbackErrs []error
+		if s.endpoint != nil && previousCfg != nil {
+			if obfuscationChanged {
+				if err := s.endpoint.UpdateObfuscation(previousCfg.H1, previousCfg.H2, previousCfg.H3, previousCfg.H4, previousCfg.S1, previousCfg.S2, previousCfg.S3, previousCfg.S4); err != nil {
+					rollbackErrs = append(rollbackErrs, err)
+				}
+				if err := s.endpoint.UpdateHeaderProtectionKey(previousCfg.HeaderProtectionKey); err != nil {
+					rollbackErrs = append(rollbackErrs, err)
+				}
+			}
+			if listenPortChanged {
+				s.endpoint.UpdateListenPort(previousCfg.ListenPort)
+			}
+		}
+		if queueSizeChanged {
+			if err := s.forwarder.ReconfigureClientQueueSize(oldQueueSize); err != nil {
+				rollbackErrs = append(rollbackErrs, err)
+			}
+		}
+		if s.db != nil && previousCfg != nil {
+			if err := s.db.SaveVPNConfig(ctx, previousCfg); err != nil {
+				rollbackErrs = append(rollbackErrs, err)
+			}
+		}
+		if len(rollbackErrs) > 0 {
+			return fmt.Errorf("%w; rollback failed: %v", cause, errors.Join(rollbackErrs...))
+		}
+		return cause
+	}
+	if s.endpoint != nil && obfuscationChanged {
+		if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
+			return rollback(err)
+		}
+		if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
+			return rollback(err)
+		}
+		log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
+	}
+	if s.endpoint != nil && listenPortChanged {
+		s.endpoint.UpdateListenPort(cfg.ListenPort)
+		log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
+	}
+	s.cfg = cfg
+
+	s.balancer = newLB
+	if s.stickyMgr != nil {
+		s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, newLB, caps)
 	}
 
 	return nil

@@ -243,6 +243,9 @@ type Listener struct {
 	// static key / timestamp decryption failure, or stale timestamp).
 	// Unroutable transport data and non-initiation datagrams are excluded (issue #288).
 	handshakeRejects atomic.Uint64
+	// transportDecryptFailures counts established-peer transport datagrams that
+	// failed AEAD decryption; these are distinct from handshake rejections.
+	transportDecryptFailures atomic.Uint64
 }
 
 // applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
@@ -695,6 +698,15 @@ func (el *Listener) HandshakeRejections() uint64 {
 	return el.handshakeRejects.Load()
 }
 
+// TransportDecryptionFailures returns established-peer transport datagrams
+// dropped after AEAD decryption failed. It excludes handshake rejections.
+func (el *Listener) TransportDecryptionFailures() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.transportDecryptFailures.Load()
+}
+
 // PacketQueueDrops returns the number of inbound datagrams dropped due to a full
 // worker dispatch queue. Nil receiver is safe and returns 0 (issue #160).
 func (el *Listener) PacketQueueDrops() uint64 {
@@ -1009,6 +1021,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	}
 	if packet == nil {
 		if decErr != nil {
+			el.transportDecryptFailures.Add(1)
 			now := time.Now().Unix()
 			until := st.decryptLogUntil.Load()
 			if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
