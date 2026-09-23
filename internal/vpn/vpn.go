@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,11 +41,25 @@ type Status struct {
 	// A rising forwarder_drops_total with stable traffic means a stalled
 	// downstream path or unroutable backend returns; a rising handshake_rejections means
 	// client initiations are failing cryptographic verification (issues #39, #288).
-	ForwarderDropsQueueFull uint64 `json:"forwarder_drops_queue_full"`
-	ForwarderDropsNoRoute   uint64 `json:"forwarder_drops_no_route"`
-	ForwarderDropsTotal     uint64 `json:"forwarder_drops_total"`
-	HandshakeRejections     uint64 `json:"handshake_rejections"`
-	PublicEndpoint          string `json:"public_endpoint,omitempty"`
+	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
+	ForwarderDropsPacketTooLarge   uint64                               `json:"forwarder_drops_packet_too_large"`
+	ForwarderDropsTotal            uint64                               `json:"forwarder_drops_total"`
+	ForwarderQueueOccupancy        int                                  `json:"forwarder_queue_occupancy"`
+	ForwarderQueueCapacity         int                                  `json:"forwarder_queue_capacity"`
+	ForwarderQueueHighWater        int                                  `json:"forwarder_queue_high_water"`
+	ForwarderDeviceWriteErrors     uint64                               `json:"forwarder_device_write_errors"`
+	ForwarderDeviceWriteDurationMS uint64                               `json:"forwarder_device_write_duration_ms"`
+	ForwarderDeviceWriteCount      uint64                               `json:"forwarder_device_write_count"`
+	ForwarderDeviceWritesInFlight  int                                  `json:"forwarder_device_writes_in_flight"`
+	ForwarderDeviceWriteOldestMS   int64                                `json:"forwarder_device_write_oldest_in_flight_ms"`
+	ForwarderDeviceWriteMaxMS      int64                                `json:"forwarder_device_write_max_duration_ms"`
+	ForwarderDeviceWriteStalls     uint64                               `json:"forwarder_device_write_stalls"`
+	ForwarderDeviceWriteStallMS    int64                                `json:"forwarder_device_write_stall_threshold_ms"`
+	TransportDecryptionFailures    uint64                               `json:"transport_decryption_failures"`
+	HandshakeRejections            uint64                               `json:"handshake_rejections"`
+	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
+	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -154,6 +169,7 @@ type Service struct {
 
 	lastReconcileTime         time.Time
 	lastReconcileByTunnel     map[int64]time.Time
+	peerGenerations           map[string]uint64
 	reconcilePostSnapshotHook func()
 	reconcilePreApplyHook     func()
 	reconcilePreCommitHook    func()
@@ -424,6 +440,12 @@ func applyVPNConfigDefaults(cfg *models.VPNConfig) {
 	if cfg.MaxPeersPerBackend <= 0 {
 		cfg.MaxPeersPerBackend = 250
 	}
+	if cfg.ClientQueueSize > 0 {
+		maxQueue := forwarder.MaxClientQueuePacketsForRoutes(cfg.MaxTotalPeers)
+		if cfg.ClientQueueSize > maxQueue {
+			cfg.ClientQueueSize = maxQueue
+		}
+	}
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}
@@ -443,6 +465,10 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		}
 	} else {
 		applyVPNConfigDefaults(cfg)
+	}
+
+	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
+		return nil, err
 	}
 
 	// Migrate legacy configs whose AWG obfuscation parameters are unset
@@ -513,7 +539,23 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	stickyMgr := loadbalancer.NewStickySessionManager(db, lb, caps)
 
 	accountant := forwarder.NewTrafficAccountant(db, 2*time.Second)
-	fwd := forwarder.NewForwarder(accountant, cfg.SubnetCIDR, 2048)
+	queueSize := cfg.ClientQueueSize
+	if queueSize <= 0 {
+		queueSize = forwarder.DefaultClientQueueSize
+	}
+	maxActiveRoutes := cfg.MaxTotalPeers
+	if maxActiveRoutes <= 0 {
+		maxActiveRoutes = 1000
+	}
+	maxQueue := forwarder.MaxClientQueuePacketsForRoutes(maxActiveRoutes)
+	if queueSize > maxQueue {
+		queueSize = maxQueue
+	}
+	cfg.ClientQueueSize = queueSize
+	fwd, err := forwarder.NewForwarderWithLimits(accountant, cfg.SubnetCIDR, queueSize, maxActiveRoutes)
+	if err != nil {
+		return nil, err
+	}
 
 	pub, priv, _ := tunnel.GenerateCurve25519KeyPair()
 	if serverKeys != nil {
@@ -550,6 +592,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPubKey:          pub,
 		portalPrivKey:         priv,
 		lastReconcileByTunnel: make(map[int64]time.Time),
+		peerGenerations:       make(map[string]uint64),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
@@ -1185,9 +1228,37 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.RxBytes = rx
 		status.TxBytes = tx
 		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
+		status.ForwarderDropsPacketTooLarge = s.forwarder.DropsPacketTooLarge()
+		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
+		allRouteQueues := s.forwarder.AllRouteQueueStats()
+		if len(allRouteQueues) > 0 {
+			peers := make([]string, 0, len(allRouteQueues))
+			for peerKey := range allRouteQueues {
+				peers = append(peers, peerKey)
+			}
+			sort.Strings(peers)
+			limit := len(peers)
+			if limit > forwarder.MaxSupportedActiveRoutes {
+				limit = forwarder.MaxSupportedActiveRoutes
+			}
+			status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
+			for _, peerKey := range peers[:limit] {
+				status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+			}
+		}
+		writes := s.forwarder.DeviceWriteSnapshot()
+		status.ForwarderDeviceWriteErrors = writes.Errors
+		status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
+		status.ForwarderDeviceWriteCount = writes.Count
+		status.ForwarderDeviceWritesInFlight = writes.InFlight
+		status.ForwarderDeviceWriteOldestMS = writes.OldestInFlight.Milliseconds()
+		status.ForwarderDeviceWriteMaxMS = writes.MaxDuration.Milliseconds()
+		status.ForwarderDeviceWriteStalls = writes.Stalls
+		status.ForwarderDeviceWriteStallMS = forwarder.DeviceWriteStallThreshold.Milliseconds()
 	}
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()
+		status.TransportDecryptionFailures = s.endpoint.TransportDecryptionFailures()
 	}
 
 	var totalDrops uint64
@@ -2322,20 +2393,33 @@ func (s *Service) GetConfig(ctx context.Context) (*models.VPNConfig, error) {
 }
 
 // UpdateConfig updates the dynamic VPN configuration and reinitializes the load balancer.
+//
+//nolint:gocyclo // transactional validation, persistence, runtime apply, and rollback are intentionally centralized.
 func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return errors.New("vpn config cannot be nil")
+	}
+	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var previousCfg *models.VPNConfig
+	if s.cfg != nil {
+		cfgCopy := *s.cfg
+		previousCfg = &cfgCopy
+	}
 	// Preserve obfuscation parameters the incoming config omits (zero
 	// H1..H4 / S1..S4) so partial updates cannot silently clobber the
 	// values already distributed to peers.
 	if s.cfg != nil {
 		preserveObfuscationParams(s.cfg, cfg)
 		enforceMinSValues(cfg)
+		if cfg.ClientQueueSize <= 0 {
+			cfg.ClientQueueSize = s.cfg.ClientQueueSize
+		}
 		// Preserve portal identity the incoming config omits (empty key
 		// fields): an update must never silently wipe the persisted
 		// keypair that distributed client configs rely on.
@@ -2347,48 +2431,44 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		}
 	}
 
-	// Any remaining difference is an explicit obfuscation change. An
-	// idle listener can be re-parameterized safely; a running listener
-	// cannot (its packet-processing paths read config fields without
-	// holding the listener lock), so reject the change explicitly
-	// instead of letting config and listener diverge silently.
-	if s.cfg != nil && obfuscationDiffers(s.cfg, cfg) {
-		if s.endpoint != nil && s.endpoint.IsRunning() {
-			log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
-			return errors.New("obfuscation parameters are immutable while listener is running")
-		}
-		if s.endpoint != nil {
-			if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
-				return err
-			}
-			if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
-				return err
-			}
-			log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
-		}
+	obfuscationChanged := s.cfg != nil && obfuscationDiffers(s.cfg, cfg)
+	if obfuscationChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+		log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
+		return errors.New("obfuscation parameters are immutable while listener is running")
 	}
 
-	// A listen-port change on a RUNNING listener cannot take effect: the
-	// UDP socket is already bound to the old port, so the bound socket and
-	// the persisted config would silently diverge (Issue #16). Mirror the
-	// obfuscation rejection above. The env wiring path in cmd/*/main.go
-	// runs BEFORE service Start, so it never hits this rejection.
-	if s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort {
-		if s.endpoint != nil && s.endpoint.IsRunning() {
-			log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
-			return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
-		}
-		if s.endpoint != nil {
-			s.endpoint.UpdateListenPort(cfg.ListenPort)
-			log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
-		}
+	listenPortChanged := s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort
+	if listenPortChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+		log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
+		return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
 	}
 
-	s.cfg = cfg
-	if s.db != nil {
-		if err := s.db.SaveVPNConfig(ctx, cfg); err != nil {
-			return fmt.Errorf("failed to persist vpn config: %w", err)
+	if cfg.ClientQueueSize <= 0 {
+		cfg.ClientQueueSize = forwarder.DefaultClientQueueSize
+	}
+	maxActiveRoutes := cfg.MaxTotalPeers
+	if maxActiveRoutes <= 0 {
+		maxActiveRoutes = 1000
+	}
+	maxQueue := forwarder.MaxClientQueuePacketsForRoutes(maxActiveRoutes)
+	if cfg.ClientQueueSize > maxQueue {
+		cfg.ClientQueueSize = maxQueue
+	}
+	queueSizeChanged := false
+	routeLimitChanged := false
+	oldQueueSize := forwarder.DefaultClientQueueSize
+	oldMaxActiveRoutes := 1000
+	if s.cfg != nil && s.forwarder != nil {
+		oldQueueSize = s.cfg.ClientQueueSize
+		if oldQueueSize <= 0 {
+			oldQueueSize = forwarder.DefaultClientQueueSize
 		}
+		oldMaxActiveRoutes = s.cfg.MaxTotalPeers
+		if oldMaxActiveRoutes <= 0 {
+			oldMaxActiveRoutes = 1000
+		}
+		queueSizeChanged = cfg.ClientQueueSize != oldQueueSize
+		routeLimitChanged = maxActiveRoutes != oldMaxActiveRoutes
 	}
 
 	caps := loadbalancer.CapacityConfig{
@@ -2396,13 +2476,74 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		MaxPeersPerBackend: cfg.MaxPeersPerBackend,
 		AffinityTTL:        time.Duration(cfg.AffinityTTLMinutes) * time.Minute,
 	}
+	newLB, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
+	if err != nil {
+		return fmt.Errorf("invalid load balancer configuration: %w", err)
+	}
 
-	lb, err := loadbalancer.NewLoadBalancer(cfg.Algorithm, cfg.Weights, caps)
-	if err == nil {
-		s.balancer = lb
-		if s.stickyMgr != nil {
-			s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, lb, caps)
+	if s.db != nil {
+		if err := s.db.SaveVPNConfig(ctx, cfg); err != nil {
+			return fmt.Errorf("failed to persist vpn config: %w", err)
 		}
+	}
+	if queueSizeChanged || routeLimitChanged {
+		if err := s.forwarder.ReconfigureClientQueueConfig(cfg.ClientQueueSize, maxActiveRoutes); err != nil {
+			if s.db != nil && previousCfg != nil {
+				if rollbackErr := s.db.SaveVPNConfig(ctx, previousCfg); rollbackErr != nil {
+					return fmt.Errorf("cannot apply client queue size: %w; persistence rollback failed: %v", err, rollbackErr)
+				}
+			}
+			return fmt.Errorf("cannot apply client queue size: %w", err)
+		}
+	}
+	rollback := func(cause error) error {
+		var rollbackErrs []error
+		if s.endpoint != nil && previousCfg != nil {
+			if obfuscationChanged {
+				if err := s.endpoint.UpdateObfuscation(previousCfg.H1, previousCfg.H2, previousCfg.H3, previousCfg.H4, previousCfg.S1, previousCfg.S2, previousCfg.S3, previousCfg.S4); err != nil {
+					rollbackErrs = append(rollbackErrs, err)
+				}
+				if err := s.endpoint.UpdateHeaderProtectionKey(previousCfg.HeaderProtectionKey); err != nil {
+					rollbackErrs = append(rollbackErrs, err)
+				}
+			}
+			if listenPortChanged {
+				s.endpoint.UpdateListenPort(previousCfg.ListenPort)
+			}
+		}
+		if queueSizeChanged || routeLimitChanged {
+			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, oldMaxActiveRoutes); err != nil {
+				rollbackErrs = append(rollbackErrs, err)
+			}
+		}
+		if s.db != nil && previousCfg != nil {
+			if err := s.db.SaveVPNConfig(ctx, previousCfg); err != nil {
+				rollbackErrs = append(rollbackErrs, err)
+			}
+		}
+		if len(rollbackErrs) > 0 {
+			return fmt.Errorf("%w; rollback failed: %v", cause, errors.Join(rollbackErrs...))
+		}
+		return cause
+	}
+	if s.endpoint != nil && obfuscationChanged {
+		if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
+			return rollback(err)
+		}
+		if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
+			return rollback(err)
+		}
+		log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
+	}
+	if s.endpoint != nil && listenPortChanged {
+		s.endpoint.UpdateListenPort(cfg.ListenPort)
+		log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
+	}
+	s.cfg = cfg
+
+	s.balancer = newLB
+	if s.stickyMgr != nil {
+		s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, newLB, caps)
 	}
 
 	return nil
@@ -2441,8 +2582,14 @@ func (s *Service) GetUserConnectionState(ctx context.Context, userID string) (*U
 
 // DisconnectUser disconnects all active VPN sessions for a user.
 func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
+	var retirements []forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		for _, retirement := range retirements {
+			retirement.Wait()
+		}
+	}()
 
 	if s.sessionMgr == nil {
 		return nil
@@ -2452,7 +2599,7 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	for _, sess := range sessions {
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
-			s.forwarder.UnregisterSession(sess.PeerPublicKey)
+			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey))
 		}
 		if s.stickyMgr != nil {
 			s.stickyMgr.ClearAffinity(userID)
@@ -2478,11 +2625,15 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
 	}
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.forwarder != nil {
-		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 	}
 
 	if s.pool != nil {
@@ -2519,8 +2670,12 @@ func (s *Service) PruneExpiredAffinity() int {
 
 // DisconnectSession disconnects a specific VPN session by ID.
 func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.sessionMgr == nil {
 		return nil
@@ -2533,7 +2688,7 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
 	if s.forwarder != nil {
-		s.forwarder.UnregisterSession(sess.PeerPublicKey)
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 	}
 	if s.stickyMgr != nil {
 		s.stickyMgr.ClearAffinity(sess.UserID)
@@ -2548,14 +2703,18 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 // ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
 func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.sessionMgr != nil && clientPub != "" {
 		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
 			if s.forwarder != nil {
-				s.forwarder.UnregisterSession(sess.PeerPublicKey)
+				retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
 			}
 			if s.stickyMgr != nil {
 				s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
@@ -2585,9 +2744,15 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 // rekey hook's nested sm.mu regime — the hook's only production call site
 // today is the CreateSession call here, so it runs nested under s.mu too;
 // full contract on tunnel.Pool.IncrementConnections) reopens the race.
+// A replaced route's device writes are joined only after releasing s.mu;
+// admission, session bookkeeping, and pool counters remain serialized above it.
 func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
+	var retirement forwarder.Retirement
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+	}()
 
 	if s.auth == nil || s.ipam == nil || s.sessionMgr == nil || s.pool == nil {
 		return nil, nil, errors.New("subsystems not initialized")
@@ -2619,7 +2784,13 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name)
+	if s.peerGenerations == nil {
+		s.peerGenerations = make(map[string]uint64)
+	}
+	s.peerGenerations[peerPublicKey]++
+	peerGen := s.peerGenerations[peerPublicKey]
+
+	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name, peerGen)
 	if err != nil {
 		_ = s.ipam.Release(peerPublicKey)
 		return nil, nil, fmt.Errorf("session creation failed: %w", err)
@@ -2628,7 +2799,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	s.pool.IncrementConnections(backend.ID)
 
 	if s.forwarder != nil {
-		s.forwarder.RegisterSession(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID)
+		retirement = s.forwarder.BeginRegisterSessionWithLimit(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID, 0, 0)
 		s.forwarder.AttachPeerDevice(peerPublicKey, &peerVirtualDevice{
 			peerKey:  peerPublicKey,
 			endpoint: s.endpoint,
@@ -2636,6 +2807,16 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	}
 
 	return sess, backend, nil
+}
+
+// PeerGeneration returns the latest assigned generation for a peer under s.mu.
+func (s *Service) PeerGeneration(peerKey string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.peerGenerations == nil {
+		return 0
+	}
+	return s.peerGenerations[peerKey]
 }
 
 func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.RoutingRequest) (*models.BackendTunnel, error) {

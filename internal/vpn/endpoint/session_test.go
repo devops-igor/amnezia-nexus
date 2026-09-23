@@ -509,3 +509,68 @@ func runConcurrentReader(t *testing.T, sm *SessionManager, iterations int) {
 		}
 	}
 }
+
+func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatalf("NewIPAM failed: %v", err)
+	}
+
+	sm := NewSessionManager(db, ipam)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "atom-user"})
+
+	// 1. CreateSession without generation defaults to 0
+	sess0, err := sm.CreateSession(ctx, uID, "peer-gen-0", "10.100.0.2", tID, "conn-0")
+	if err != nil {
+		t.Fatalf("CreateSession sess0 failed: %v", err)
+	}
+	if sess0.Generation != 0 {
+		t.Fatalf("expected generation 0, got %d", sess0.Generation)
+	}
+	lookup0, ok := sm.GetSession("peer-gen-0")
+	if !ok || lookup0.Generation != 0 {
+		t.Fatalf("expected published generation 0, got %d (ok=%v)", lookup0.Generation, ok)
+	}
+
+	// 2. CreateSession with explicit generation publishes it atomically under sm.mu
+	var expectedGen uint64 = 42
+	sess1, err := sm.CreateSession(ctx, uID, "peer-gen-1", "10.100.0.3", tID, "conn-1", expectedGen)
+	if err != nil {
+		t.Fatalf("CreateSession sess1 failed: %v", err)
+	}
+	if sess1.Generation != expectedGen {
+		t.Fatalf("expected generation %d, got %d", expectedGen, sess1.Generation)
+	}
+
+	// Immediate lookup from map under sm.mu must see the exact generation (no zero window)
+	lookup1, ok := sm.GetSession("peer-gen-1")
+	if !ok || lookup1.Generation != expectedGen {
+		t.Fatalf("expected published generation %d, got %d (ok=%v)", expectedGen, lookup1.Generation, ok)
+	}
+
+	snap := sm.ListActiveSessionsSnapshot()
+	found := false
+	for _, s := range snap {
+		if s.ID == sess1.ID {
+			found = true
+			if s.Generation != expectedGen {
+				t.Fatalf("snapshot generation mismatch: got %d, want %d", s.Generation, expectedGen)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("session not found in active snapshot")
+	}
+}

@@ -1178,6 +1178,129 @@ func TestEnableBackend_TypedSentinelErrors(t *testing.T) {
 
 // --- config divergence regression tests (Issue #5 findings 1, 4, 7, 8, 9, 15) ---
 
+func TestGetStatus_ExposesBoundedRouteQueueDiagnostics(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.forwarder.RegisterSession("session-1", "connection-1", "peer-secret", "10.100.0.10", 1)
+	if err := svc.forwarder.RouteBackendToClient(1, []byte("packet"), "10.100.0.10"); err != nil {
+		t.Fatalf("RouteBackendToClient failed: %v", err)
+	}
+
+	status, err := svc.GetStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	stats, ok := status.ForwarderRouteQueues["peer-secret"]
+	if !ok {
+		t.Fatalf("route queue diagnostics missing: %+v", status.ForwarderRouteQueues)
+	}
+	if stats.Occupancy != 1 || stats.Capacity != 2048 || stats.HighWater != 1 {
+		t.Fatalf("unexpected route queue diagnostics: %+v", stats)
+	}
+}
+
+func TestUpdateConfig_RollbackPersistenceFailureIsReported(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	baseCfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		HealthThresholdMS:  500,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		ClientQueueSize:    2,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+		Weights:            map[int64]int{},
+	}
+	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	// Force runtime application to fail after persistence succeeds: active
+	// routes make client queue resizing unsafe. The trigger permits that first
+	// save, then rejects the rollback save while the new value is stored.
+	svc.forwarder.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	if _, err := db.SQLDB().ExecContext(ctx, `CREATE TRIGGER fail_vpn_rollback BEFORE UPDATE OF value ON settings
+		WHEN OLD.key = 'vpn_config' AND OLD.value LIKE '%"client_queue_size":4%'
+		BEGIN SELECT RAISE(ABORT, 'rollback persistence unavailable'); END;`); err != nil {
+		t.Fatalf("create rollback trigger: %v", err)
+	}
+
+	changed := *baseCfg
+	changed.ClientQueueSize = 4
+	err = svc.UpdateConfig(ctx, &changed)
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("expected rollback failure in returned error, got: %v", err)
+	}
+
+	runtimeCfg, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if runtimeCfg.ClientQueueSize != 2 {
+		t.Fatalf("runtime config changed despite failed application: %d", runtimeCfg.ClientQueueSize)
+	}
+	storedCfg, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if storedCfg.ClientQueueSize != 4 {
+		t.Fatalf("expected explicit partial state with new persisted config, got %d", storedCfg.ClientQueueSize)
+	}
+}
+
+func TestUpdateConfig_SaveFailureDoesNotMutateQueueRuntime(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	baseCfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		HealthThresholdMS:  500,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		ClientQueueSize:    2,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+		Weights:            map[int64]int{},
+	}
+	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
+		t.Fatalf("SaveVPNConfig failed: %v", err)
+	}
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close test DB: %v", err)
+	}
+
+	changed := *baseCfg
+	changed.ClientQueueSize = 4
+	if err := svc.UpdateConfig(ctx, &changed); err == nil {
+		t.Fatal("UpdateConfig unexpectedly succeeded after DB close")
+	}
+	cfg, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg.ClientQueueSize != 2 {
+		t.Fatalf("service queue size changed after failed save: %d", cfg.ClientQueueSize)
+	}
+	svc.forwarder.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	queue, ok := svc.forwarder.GetClientPacketChannel("peer-1")
+	if !ok {
+		t.Fatal("GetClientPacketChannel did not find registered peer")
+	}
+	if cap(queue) != 2 {
+		t.Fatalf("runtime queue size changed after failed save: %d", cap(queue))
+	}
+}
+
 func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
