@@ -217,13 +217,9 @@ type Forwarder struct {
 	pumpsRunning     bool
 	pumpsStopCh      chan struct{}
 	pumpsWg          sync.WaitGroup
-	// Generation accounting for teardown races (issue #39): each
-	// registration for a peer key earns one teardown; an UnregisterSession
-	// that arrives while a NEWER registration holds the route (late reaper /
-	// API teardown of a superseded rekey generation) is consumed as stale
-	// instead of killing the live route. Guarded by mu.
-	peerRegs   map[string]uint64 // peerKey -> registrations seen
-	peerUnregs map[string]uint64 // peerKey -> stale teardown requests consumed
+	// Diagnostic registration count. Teardown ownership is determined by
+	// sessionRoute.sessionID, never inferred from this counter.
+	peerRegs map[string]uint64 // peerKey -> registrations seen
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -342,7 +338,6 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		backendPumpStops: make(map[int64]chan struct{}),
 		backendPumpDones: make(map[int64]chan struct{}),
 		peerRegs:         make(map[string]uint64),
-		peerUnregs:       make(map[string]uint64),
 		bufSize:          queueSize,
 		backendBufSize:   DefaultBackendQueueSize,
 		maxActiveRoutes:  maxActiveRoutes,
@@ -429,10 +424,9 @@ func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerK
 			}
 		}
 	}
-	// Each registration earns exactly one teardown (generation accounting,
-	// issue #39): if a teardown for a SUPERSEDED registration of this peer
-	// arrives before this one, it was consumed as stale against the older
-	// balance — see UnregisterSession.
+	// Keep the registration count for diagnostics. Route retirement itself
+	// uses the session ID, because rekeys replace routes without a matching
+	// unregister call for each replaced session.
 	f.peerRegs[peerKey]++
 
 	f.routesByPeer[peerKey] = route
@@ -549,52 +543,28 @@ func (f *Forwarder) RouteSessionID(peerKey string) string {
 // UnregisterSession removes a peer session route, stops its pump goroutine,
 // and drains its queue so in-flight senders cannot block.
 //
-// A teardown request is matched against the per-peer registration balance
-// (issue #39): each RegisterSession earns exactly one teardown. When the
-// route currently in the maps is a NEWER generation than the teardown
-// (rekey/reconnect re-registration happened first, then the OLD session's
-// reaper/API teardown arrived late), the request is consumed as stale and
-// the live route survives. Route state is only torn down when a currently
-// held teardown credit is spent on it.
+// This unconditional method is for callers intentionally removing whichever
+// route is currently associated with the peer. Session lifecycle callers
+// must use BeginUnregisterSession with the session ID instead.
 func (f *Forwarder) UnregisterSession(peerKey string) {
-	f.BeginUnregisterSession(peerKey).Wait()
+	f.beginUnregisterSession(peerKey, "").Wait()
 }
 
-// BeginUnregisterSession removes the route and stops admission without waiting
-// for device I/O. Call Wait after releasing all caller locks to finish teardown.
-func (f *Forwarder) BeginUnregisterSession(peerKey string) (retirement Retirement) {
+// BeginUnregisterSession retires the route only if it still belongs to sessionID.
+// A delayed teardown for an old session cannot remove its replacement. Call
+// Wait after releasing caller locks to finish any admitted device writes.
+func (f *Forwarder) BeginUnregisterSession(peerKey, sessionID string) Retirement {
+	if sessionID == "" {
+		return Retirement{}
+	}
+	return f.beginUnregisterSession(peerKey, sessionID)
+}
+
+func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retirement Retirement) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.peerUnregs == nil {
-		f.peerUnregs = make(map[string]uint64)
-	}
-	if f.peerRegs == nil {
-		f.peerRegs = make(map[string]uint64)
-	}
-	// Teardown requests are served strictly in registration order: the
-	// k-th request for a peer belongs to the k-th registration. Three
-	// cases (issue #39):
-	//   unregs+1 > regs: no such generation (unknown peer, or the balance
-	//     was already exhausted) — pure no-op, never counts against a
-	//     future registration.
-	//   unregs+1 < regs: the route was re-registered in the meantime
-	//     (client rekey/reconnect registers the NEW session before the
-	//     OLD session's reaper/API teardown arrives) — the request
-	//     targets a superseded generation: consume as stale so it can
-	//     never kill the live route.
-	//   unregs+1 == regs: request for the current generation — tear down.
-	switch n := f.peerUnregs[peerKey] + 1; {
-	case n > f.peerRegs[peerKey]:
-		return
-	case n < f.peerRegs[peerKey]:
-		f.peerUnregs[peerKey]++
-		return
-	default:
-		f.peerUnregs[peerKey]++
-	}
-
-	if route, ok := f.routesByPeer[peerKey]; ok {
+	if route, ok := f.routesByPeer[peerKey]; ok && route != nil && (sessionID == "" || route.sessionID == sessionID) {
 		retirement.route = route
 		// Generation-bounded delete: only remove the routesByIP entry if it
 		// still points at THIS route. A late unregister of an OLD session

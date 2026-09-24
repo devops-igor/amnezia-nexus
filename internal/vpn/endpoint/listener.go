@@ -2155,6 +2155,20 @@ func (el *Listener) prunePeerTransportStateLocked(peerKey string) {
 	}
 }
 
+// FencePeerGeneration rejects pending handshakes from older generations while
+// leaving transport keys and addresses intact for already-admitted return
+// writes. The caller can prune those resources after route retirement.
+func (el *Listener) FencePeerGeneration(peerKey string, fenceGen uint64) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+	if fenceGen > el.peerGenerations[peerKey] {
+		el.peerGenerations[peerKey] = fenceGen
+	}
+}
+
 // PrunePeerTransportState removes all transport keys, index table entries, and peer endpoints
 // for peerKey, and advances the peer's generation fence to fenceGen (if provided) so that any
 // in-flight handshakes with older generations are rejected.
@@ -2250,11 +2264,6 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 			prePruneHook(sess.PeerPublicKey, sess.Generation)
 		}
 
-		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) {
-			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): active replacement generation exists for peer %s",
-				sess.ID, sess.Generation, sess.PeerPublicKey)
-		}
-
 		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
 			sess.ID, sess.PeerPublicKey, sess.UserID, sess.LastSeen.Format(time.RFC3339), el.config.IdleTimeout)
 		if hook != nil {
@@ -2267,6 +2276,13 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 				}()
 				hook(ctx, sess)
 			}()
+		}
+		// The service hook retires the route and waits for admitted writes.
+		// Keep transport keys alive until those writes have finished. The
+		// generation guard preserves keys installed by a concurrent reconnect.
+		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) && el.HasTransportStateForPeer(sess.PeerPublicKey) {
+			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): newer endpoint generation exists for peer %s",
+				sess.ID, sess.Generation, sess.PeerPublicKey)
 		}
 	}
 	return timedOut, nil

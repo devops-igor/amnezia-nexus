@@ -4880,7 +4880,7 @@ func TestSessionReaperHook_Teardown(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	vpnSvc.forwarder.RegisterSession(sessID, "conn-1", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.forwarder.RegisterSession(createdSess.ID, "conn-1", peerKeyAlice, assignedIP, tunID)
 	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
 	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
 	vpnSvc.pool.IncrementConnections(tunID)
@@ -5002,7 +5002,7 @@ func TestSessionReaperHook_ReconnectRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession A failed: %v", err)
 	}
-	vpnSvc.forwarder.RegisterSession(sessIDA, "conn-1", peerKeyAlice, assignedIPA, tunID)
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-1", peerKeyAlice, assignedIPA, tunID)
 	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
 	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
 	vpnSvc.pool.IncrementConnections(tunID)
@@ -5966,7 +5966,7 @@ func TestService_ActiveTrafficPreventsSessionReaperTeardown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	vpnSvc.forwarder.RegisterSession(sessID, "conn-1", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.forwarder.RegisterSession(sess.ID, "conn-1", peerKeyAlice, assignedIP, tunID)
 	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
 	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
 	vpnSvc.pool.IncrementConnections(tunID)
@@ -6137,7 +6137,7 @@ func TestService_ReapSession_DoesNotPruneExpiredAffinity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	vpnSvc.forwarder.RegisterSession(sessID, "conn-a", peerKeyAlice, assignedIP, tunID)
+	vpnSvc.forwarder.RegisterSession(sessA.ID, "conn-a", peerKeyAlice, assignedIP, tunID)
 	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
 	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
 	vpnSvc.pool.IncrementConnections(tunID)
