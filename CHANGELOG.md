@@ -7,9 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - Orion · Patch 1 - 2026-09-24
+
+Maintenance and stability patch release focusing on VPN data plane reliability, rekey rollover resilience, forwarder queue observability and safe runtime reconfiguration, session liveness tracking, and tunnel state synchronization.
+
+### Added
+
+- Forwarder queue observability: live buffer telemetry, per-route write metrics, queue capacity metrics, stall tracking, and oversized packet drop counters (`oversized_packet_drops`) (#296, #300).
+- Handshake generation fence: monotonic peer generation fencing (`CommitHandshake`) in endpoint listener to eliminate out-of-order cryptographic state commits (#296, #300).
+- Dynamic forwarder reconfiguration: safe runtime reconfiguration of route queues and payload memory budgets, rejecting populations that exceed active route limits (#296, #300).
+
 ### Fixed
 
-- Endpoint listener handshake rejection telemetry: excluded unroutable non-initiation datagrams and too-short packets from `handshake_rejections` metric and throttled logs, confining counter increments strictly to genuine cryptographic handshake failures (#288, #290).
+- Rekey rollover keypair retention: retained previous transport keypair across WireGuard and AmneziaWG handshake rekeys to eliminate in-flight packet loss during rollover (#295, #301).
+- Outbound transport nonce isolation: bound ChaCha20-Poly1305 outbound transport send counter directly to `TransportKeys` rather than per-address state, completely eliminating nonce reuse and client replay rejection during UDP endpoint roaming or NAT rebinding (#295, #301).
+- Atomic timeout pruning: implemented generation-aware transport state pruning under listener lock to prevent idle sweeps from deleting newly committed replacement sessions, indexes, or addresses (#295, #301).
+- Data plane session liveness: refreshed session timestamps upon successful transport decryption with a 2-second atomic CAS throttle, preventing active clients from being falsely reaped as idle (#294, #298).
+- Sticky affinity retention: preserved sticky session affinity across idle sweeps, delegating lifecycle management to StickyManager TTL expiration and preventing egress IP changes on reconnect (#294, #298).
+- Memory reclamation for expired affinities: implemented physical reclamation of expired sticky session records in a post-sweep hook and the gauge reconciler without lock contention (#294, #298).
+- Administrative tunnel disable protection: guarded administrative disable state against concurrent health probe races using CAS updates in failure handlers (#284, #291).
+- Health probe auto-disable CAS reconciliation: added `reconcileThresholdAutoDisable` helper to reconcile out-of-order failure transitions and maintain self-healing eligibility (#284, #291).
+- Tunnel state version synchronization: wired tunnel status updater across both normal and TUN-unavailable management modes to synchronize state versions between in-memory pool and database (#285, #292).
+- Orchestrator database fallback restriction: restricted direct database CAS fallbacks strictly to uninitialized pool errors (`tunnel.ErrTunnelNotFound`) (#285, #292).
+- Endpoint listener handshake rejection telemetry: excluded unroutable non-initiation datagrams and short packets from `handshake_rejections` metric and throttled logs, confining increments strictly to genuine cryptographic handshake failures (#288, #290).
+- Transport packet disambiguation: disambiguated transport packets with H4 framing before initiation parsing to prevent packet loss when payload bytes match handshake headers (#288, #290).
+- Curve25519 token regex false positives: tightened Fernet token regular expression to require `^gAAAAA` prefix and minimum 70-character length, eliminating false positives on raw base64 Curve25519 private keys (#296, #300).
 
 ## [1.3.0] - Orion - 2026-09-23
 
