@@ -1936,3 +1936,296 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	}
 	mu.Unlock()
 }
+
+// TestListener_PrunePeerTransportStateForGeneration_Unit tests the three branches of
+// PrunePeerTransportStateForGeneration:
+// 1. currentGen > timedOutGen: newer generation committed -> do not prune, return false.
+// 2. currentGen == timedOutGen: prune transport state, advance fence to at least timedOutGen + 1, return true.
+// 3. currentGen < timedOutGen: prune transport state, advance fence to at least timedOutGen + 1, return true.
+func TestListener_PrunePeerTransportStateForGeneration_Unit(t *testing.T) {
+	db := setupTestDB(t)
+	cfg := ListenerConfig{
+		ListenPort: getFreeUDPPort(t),
+		SubnetCIDR: "10.100.0.0/24",
+		MTU:        1420,
+	}
+	ipam, _ := NewIPAM(cfg.SubnetCIDR)
+	sm := NewSessionManager(db, ipam)
+	el, err := NewListener(cfg, db, nil, ipam, sm, nil)
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+
+	peerKey := "peer-unit-prune-gen"
+	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:45678")
+
+	// Branch 1: currentGen > timedOutGen -> newer generation committed, do NOT prune
+	k2 := &TransportKeys{LocalIndex: 20202, Generation: 2, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	if !el.CommitHandshake(peerKey, 2, k2, clientAddr, 999) {
+		t.Fatal("CommitHandshake gen 2 failed")
+	}
+	if el.PeerGeneration(peerKey) != 2 {
+		t.Fatalf("expected PeerGeneration 2, got %d", el.PeerGeneration(peerKey))
+	}
+
+	// Attempt to prune with timedOutGen = 1 (stale timeout)
+	if pruned := el.PrunePeerTransportStateForGeneration(peerKey, 1); pruned {
+		t.Fatal("expected PrunePeerTransportStateForGeneration(gen 1) to return false when currentGen is 2")
+	}
+	// Assert K2 and fence survived
+	if el.PeerGeneration(peerKey) != 2 {
+		t.Fatalf("expected PeerGeneration to remain 2, got %d", el.PeerGeneration(peerKey))
+	}
+	if tk, ok := el.TransportKeysFor(peerKey); !ok || tk != k2 {
+		t.Fatal("expected K2 to survive stale timeout pruning")
+	}
+	if _, ok := el.peerByAddr(clientAddr.String()); !ok {
+		t.Fatal("expected peer address mapping to survive stale timeout pruning")
+	}
+	if _, found := el.lookupKeypairByIndex(k2.LocalIndex); !found {
+		t.Fatal("expected indexTable entry to survive stale timeout pruning")
+	}
+
+	// Branch 2: currentGen == timedOutGen -> genuine timeout, PRUNE and advance fence to timedOutGen + 1
+	if pruned := el.PrunePeerTransportStateForGeneration(peerKey, 2); !pruned {
+		t.Fatal("expected PrunePeerTransportStateForGeneration(gen 2) to return true when currentGen is 2")
+	}
+	if el.PeerGeneration(peerKey) != 3 {
+		t.Fatalf("expected PeerGeneration advanced to 3, got %d", el.PeerGeneration(peerKey))
+	}
+	if _, ok := el.TransportKeysFor(peerKey); ok {
+		t.Fatal("expected transport keys to be pruned")
+	}
+	if _, ok := el.peerByAddr(clientAddr.String()); ok {
+		t.Fatal("expected peer address mapping to be pruned")
+	}
+	if _, found := el.lookupKeypairByIndex(k2.LocalIndex); found {
+		t.Fatal("expected indexTable entry to be pruned")
+	}
+
+	// Branch 3: currentGen < timedOutGen -> uninitialized or older fence, PRUNE and advance fence to timedOutGen + 1
+	peerKey2 := "peer-unit-prune-gen-uninit"
+	k1 := &TransportKeys{LocalIndex: 30303, Generation: 1, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	el.storeTransportKeys(peerKey2, k1) // stored without CommitHandshake, peerGenerations is 0
+	if el.PeerGeneration(peerKey2) != 0 {
+		t.Fatalf("expected PeerGeneration 0, got %d", el.PeerGeneration(peerKey2))
+	}
+
+	if pruned := el.PrunePeerTransportStateForGeneration(peerKey2, 5); !pruned {
+		t.Fatal("expected PrunePeerTransportStateForGeneration(gen 5) to return true when currentGen is 0")
+	}
+	if el.PeerGeneration(peerKey2) != 6 {
+		t.Fatalf("expected PeerGeneration advanced to 6, got %d", el.PeerGeneration(peerKey2))
+	}
+	if _, ok := el.TransportKeysFor(peerKey2); ok {
+		t.Fatal("expected transport keys for peerKey2 to be pruned")
+	}
+}
+
+// TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGeneration reproduces
+// the race condition where SweepTimedOutSessions discovers a timed-out session S1 (gen 1),
+// but before pruning executes, a concurrent replacement handshake H2 commits session S2 (gen 2)
+// and transport keys K2. Atomic generation-owned timeout pruning (PrunePeerTransportStateForGeneration)
+// ensures that K2, its indexTable entry, peersByAddr mapping, S2 session, and send gate eligibility
+// survive the sweep without being clobbered or suppressed.
+func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGeneration(t *testing.T) {
+	el, sPub, hpKey, sID := setupIssue295LiveTestListener(t)
+	defer func() { _ = el.Stop() }()
+
+	ctx := context.Background()
+	serverAddr, ok := el.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T", el.GetListenAddr())
+	}
+
+	clientConn1, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP conn1: %v", err)
+	}
+	defer func() { _ = clientConn1.Close() }()
+
+	clientPriv, peerKey := newTestClient(t, el.db, sID, "sweep_barrier_peer")
+
+	// 1. Initial Handshake H1: establishes S1 (gen 1) and commits K1
+	pkt1, state1, err := health.BuildAWGInitiationPacketObfuscated(sPub[:], clientPriv, nil, hpKey, el.config.H1, el.config.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated H1: %v", err)
+	}
+	if _, err := clientConn1.Write(pkt1); err != nil {
+		t.Fatalf("write initiation H1: %v", err)
+	}
+
+	respBuf1 := make([]byte, 2048)
+	_ = clientConn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n1, err := clientConn1.Read(respBuf1)
+	if err != nil {
+		t.Fatalf("failed to read H1 response: %v", err)
+	}
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf1[:n1], state1, hpKey, el.config.H2, el.config.S2) {
+		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H1 response")
+	}
+
+	s1, ok := el.SessionManager().GetSession(peerKey)
+	if !ok || s1 == nil || s1.Generation != 1 {
+		t.Fatalf("expected active session S1 with generation 1, got %+v", s1)
+	}
+	k1Current, _ := el.PeerKeypairsForTest(peerKey)
+	if k1Current == nil {
+		t.Fatal("expected current transport keys K1 for peer after H1")
+	}
+	if el.PeerGeneration(peerKey) != 1 {
+		t.Fatalf("expected committed peer generation 1, got %d", el.PeerGeneration(peerKey))
+	}
+
+	// 2. Mark S1 as timed out in the session manager
+	el.SessionManager().SetSessionLastSeen(peerKey, time.Now().UTC().Add(-10*time.Minute))
+
+	// 3. Configure test barrier hook: pauses sweep after discovering S1 (gen 1)
+	// before PrunePeerTransportStateForGeneration runs.
+	barrierHit := make(chan struct{})
+	resumeSweep := make(chan struct{})
+
+	el.SetPreSweepPruneHookForTest(func(pKey string, timedOutGen uint64) {
+		if pKey == peerKey && timedOutGen == 1 {
+			close(barrierHit)
+			<-resumeSweep
+		}
+	})
+
+	// 4. Trigger SweepTimedOutSessions in a background goroutine
+	sweepDone := make(chan error, 1)
+	go func() {
+		_, sweepErr := el.SweepTimedOutSessions(ctx)
+		sweepDone <- sweepErr
+	}()
+
+	// Wait for sweep to discover S1 and pause at the barrier
+	select {
+	case <-barrierHit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for sweep to pause at preSweepPruneHook barrier")
+	}
+
+	// 5. While sweep is paused at the barrier, replacement handshake H2 arrives from clientConn2
+	clientConn2, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP conn2: %v", err)
+	}
+	defer func() { _ = clientConn2.Close() }()
+
+	pkt2, state2, err := health.BuildAWGInitiationPacketObfuscated(sPub[:], clientPriv, nil, hpKey, el.config.H1, el.config.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated H2: %v", err)
+	}
+	if _, err := clientConn2.Write(pkt2); err != nil {
+		t.Fatalf("write initiation H2: %v", err)
+	}
+
+	respBuf2 := make([]byte, 2048)
+	_ = clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n2, err := clientConn2.Read(respBuf2)
+	if err != nil {
+		t.Fatalf("failed to read H2 response: %v", err)
+	}
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, el.config.H2, el.config.S2) {
+		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
+	}
+
+	// Verify H2 created S2 (gen 2) and CommitHandshake committed K2
+	k2Current, _ := el.PeerKeypairsForTest(peerKey)
+	if k2Current == nil || k2Current.LocalIndex == k1Current.LocalIndex {
+		t.Fatalf("expected K2 committed for peer, got %+v", k2Current)
+	}
+	k2LocalIdx := k2Current.LocalIndex
+
+	s2, ok := el.SessionManager().GetSession(peerKey)
+	if !ok || s2 == nil || s2.Generation != 2 {
+		t.Fatalf("expected active session S2 with generation 2, got %+v", s2)
+	}
+	if el.PeerGeneration(peerKey) != 2 {
+		t.Fatalf("expected committed peer generation 2, got %d", el.PeerGeneration(peerKey))
+	}
+
+	// 6. Resume sweep: PrunePeerTransportStateForGeneration(peerKey, 1) runs.
+	// Since currentGen (2) > timedOutGen (1), pruning must abort and return false!
+	close(resumeSweep)
+
+	select {
+	case err := <-sweepDone:
+		if err != nil {
+			t.Fatalf("SweepTimedOutSessions failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SweepTimedOutSessions to complete after resume")
+	}
+
+	// 7. Assertions:
+	// a. K2 survives:
+	curFinal, prevFinal := el.PeerKeypairsForTest(peerKey)
+	if curFinal == nil || curFinal.LocalIndex != k2LocalIdx {
+		t.Fatalf("expected K2 (index %d) to survive sweep, got %+v", k2LocalIdx, curFinal)
+	}
+	if prevFinal != nil && prevFinal.LocalIndex != k1Current.LocalIndex {
+		t.Fatalf("expected prevKeypair to be K1 (%d), got %+v", k1Current.LocalIndex, prevFinal)
+	}
+	tk, ok := el.TransportKeysFor(peerKey)
+	if !ok || tk == nil || tk.LocalIndex != k2LocalIdx {
+		t.Fatalf("expected TransportKeysFor to retain K2, got %+v (ok=%v)", tk, ok)
+	}
+
+	// b. indexTable entry survives:
+	entry, found := el.lookupKeypairByIndex(k2LocalIdx)
+	if !found || entry == nil || entry.keys == nil || entry.keys.LocalIndex != k2LocalIdx {
+		t.Fatalf("expected indexTable entry for K2 (%d) to survive, found=%v entry=%+v", k2LocalIdx, found, entry)
+	}
+
+	// c. peersByAddr survives:
+	client2Addr := clientConn2.LocalAddr().String()
+	st, ok := el.peerByAddr(client2Addr)
+	if !ok || st == nil || st.peerKey != peerKey {
+		t.Fatalf("expected peersByAddr entry for %s to survive, got %+v (ok=%v)", client2Addr, st, ok)
+	}
+
+	// d. S2 session survives:
+	activeSess, ok := el.SessionManager().GetSession(peerKey)
+	if !ok || activeSess == nil || activeSess.ID != s2.ID || activeSess.Generation != 2 {
+		t.Fatalf("expected active session S2 (gen 2) to survive, got %+v", activeSess)
+	}
+	if sid := el.PeerSessionIDForTest(peerKey); sid != s2.ID {
+		t.Fatalf("expected PeerSessionID to remain S2 (%s), got %s", s2.ID, sid)
+	}
+
+	// e. Send gate eligibility survives:
+	// PeerGeneration must remain 2 (not bumped to 3), so response send gate is NOT suppressed.
+	currentFence := el.PeerGeneration(peerKey)
+	if currentFence != 2 {
+		t.Fatalf("expected generation fence to remain 2, got %d (fence must not be bumped by stale sweep)", currentFence)
+	}
+	if drops := el.StaleResponseDrops(); drops != 0 {
+		t.Fatalf("expected 0 stale response drops, got %d", drops)
+	}
+
+	// f. Data plane routing with K2 succeeds without loss
+	var routedPackets [][]byte
+	var routerMu sync.Mutex
+	el.SetClientPacketRouter(func(pk string, pkt []byte) error {
+		routerMu.Lock()
+		defer routerMu.Unlock()
+		routedPackets = append(routedPackets, append([]byte(nil), pkt...))
+		return nil
+	})
+
+	k2Payload := []byte("payload-using-k2-after-sweep-atomic-prune")
+	d2 := craftClientTransportDatagram(t, curFinal, el.config.H4.Lo, el.config.S4, hpKey, 1, k2Payload)
+	if _, err := clientConn2.Write(d2); err != nil {
+		t.Fatalf("failed to write transport datagram with K2: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	routerMu.Lock()
+	if len(routedPackets) != 1 || !bytes.Equal(routedPackets[0], k2Payload) {
+		t.Fatalf("expected 1 routed packet with K2 payload, got %v", routedPackets)
+	}
+	routerMu.Unlock()
+}

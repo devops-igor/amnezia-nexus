@@ -290,6 +290,10 @@ type Listener struct {
 	// preTransportCommitHook runs in handleDatagram after response and transport keys
 	// are built, but before transport state is committed; used for deterministic testing.
 	preTransportCommitHook func(peerKey string, sessID string)
+
+	// preSweepPruneHook runs in SweepTimedOutSessions after a timed-out session is found
+	// but before PrunePeerTransportStateForGeneration executes; used for deterministic testing.
+	preSweepPruneHook func(peerKey string, timedOutGen uint64)
 }
 
 // applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
@@ -1158,6 +1162,14 @@ func (el *Listener) SetPreTransportCommitHookForTest(fn func(peerKey string, ses
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	el.preTransportCommitHook = fn
+}
+
+// SetPreSweepPruneHookForTest registers a hook invoked in SweepTimedOutSessions
+// after discovering a timed-out session, but before invoking PrunePeerTransportStateForGeneration.
+func (el *Listener) SetPreSweepPruneHookForTest(fn func(peerKey string, timedOutGen uint64)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.preSweepPruneHook = fn
 }
 
 // CommitHandshakeTransportStateForTest exposes commitHandshakeTransportState for tests.
@@ -2119,26 +2131,7 @@ func (el *Listener) sweepExpiredKeypairs() {
 	}
 }
 
-// PrunePeerTransportState removes all transport keys, index table entries, and peer endpoints
-// for peerKey, and advances the peer's generation fence to fenceGen (if provided) so that any
-// in-flight handshakes with older generations are rejected.
-func (el *Listener) PrunePeerTransportState(peerKey string, fenceGen ...uint64) bool {
-	el.mu.Lock()
-	defer el.mu.Unlock()
-
-	if el.peerGenerations == nil {
-		el.peerGenerations = make(map[string]uint64)
-	}
-
-	if len(fenceGen) > 0 && fenceGen[0] > 0 {
-		if fenceGen[0] < el.peerGenerations[peerKey] {
-			return false
-		}
-		el.peerGenerations[peerKey] = fenceGen[0]
-	} else {
-		el.peerGenerations[peerKey]++
-	}
-
+func (el *Listener) prunePeerTransportStateLocked(peerKey string) {
 	if pkp, ok := el.peerKeypairs[peerKey]; ok && pkp != nil {
 		if pkp.current != nil && pkp.current.LocalIndex != 0 {
 			delete(el.indexTable, pkp.current.LocalIndex)
@@ -2162,6 +2155,59 @@ func (el *Listener) PrunePeerTransportState(peerKey string, fenceGen ...uint64) 
 			delete(el.peersByAddr, addr)
 		}
 	}
+}
+
+// PrunePeerTransportState removes all transport keys, index table entries, and peer endpoints
+// for peerKey, and advances the peer's generation fence to fenceGen (if provided) so that any
+// in-flight handshakes with older generations are rejected.
+func (el *Listener) PrunePeerTransportState(peerKey string, fenceGen ...uint64) bool {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+
+	if len(fenceGen) > 0 && fenceGen[0] > 0 {
+		if fenceGen[0] < el.peerGenerations[peerKey] {
+			return false
+		}
+		el.peerGenerations[peerKey] = fenceGen[0]
+	} else {
+		el.peerGenerations[peerKey]++
+	}
+
+	el.prunePeerTransportStateLocked(peerKey)
+	return true
+}
+
+// PrunePeerTransportStateForGeneration atomically prunes transport state for peerKey
+// under el.mu if the peer's current generation has not advanced past timedOutGen.
+// If currentGen > timedOutGen: a newer generation has already committed, so it
+// leaves the transport state untouched and returns false.
+// Otherwise: it prunes the transport state, advances the generation fence to at
+// least timedOutGen + 1, and returns true.
+func (el *Listener) PrunePeerTransportStateForGeneration(peerKey string, timedOutGen uint64) bool {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+
+	currentGen := el.peerGenerations[peerKey]
+	if currentGen > timedOutGen {
+		return false
+	}
+
+	fence := timedOutGen + 1
+	if el.peerGenerations[peerKey] < fence {
+		el.peerGenerations[peerKey] = fence
+	} else {
+		el.peerGenerations[peerKey]++
+	}
+
+	el.prunePeerTransportStateLocked(peerKey)
 	return true
 }
 
@@ -2199,11 +2245,16 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 	hook := el.reaperHook
 	el.mu.RUnlock()
 	for _, sess := range timedOut {
-		if active, err := el.sessionMgr.GetSessionByPeer(ctx, sess.PeerPublicKey); err == nil && active != nil && active.ID != sess.ID {
-			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s: active replacement session %s exists for peer %s",
-				sess.ID, active.ID, sess.PeerPublicKey)
-		} else {
-			el.PrunePeerTransportState(sess.PeerPublicKey)
+		el.mu.RLock()
+		prePruneHook := el.preSweepPruneHook
+		el.mu.RUnlock()
+		if prePruneHook != nil {
+			prePruneHook(sess.PeerPublicKey, sess.Generation)
+		}
+
+		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) {
+			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): active replacement generation exists for peer %s",
+				sess.ID, sess.Generation, sess.PeerPublicKey)
 		}
 
 		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
