@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -172,7 +173,21 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		if req.AWGMimicry != nil {
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
-		_, _ = h.db.CreateConnection(ctx, conn)
+		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
+			if clientID != "" {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+				defer cancel()
+				if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
+					slog.Error("Failed to rollback client on remote server after DB failure",
+						"server_id", server.ID,
+						"client_id", clientID,
+						"err", rbErr,
+					)
+				}
+			}
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+			return
+		}
 	}
 
 	h.audit(r, "server_connection.add", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": clientID, "user_id": req.UserID})

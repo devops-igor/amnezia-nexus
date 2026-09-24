@@ -516,3 +516,229 @@ func TestReconciler_DNSTeleMTErrorsPreserveProtocols(t *testing.T) {
 		t.Errorf("expected telemt protocol to be preserved on error")
 	}
 }
+
+type mockZombiePeerProtocolManager struct {
+	proto         string
+	clients       []map[string]any
+	deleted       []string
+	getClientsErr bool
+	removeErr     bool
+	mu            sync.Mutex
+}
+
+func (m *mockZombiePeerProtocolManager) Protocol() string {
+	return m.proto
+}
+func (m *mockZombiePeerProtocolManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) Uninstall(ctx context.Context, server *models.Server) error {
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getClientsErr {
+		return nil, errors.New("remote get clients error")
+	}
+	return m.clients, nil
+}
+func (m *mockZombiePeerProtocolManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+	return nil, nil
+}
+func (m *mockZombiePeerProtocolManager) RemoveClient(ctx context.Context, server *models.Server, clientID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.removeErr {
+		return errors.New("remote remove client error")
+	}
+	m.deleted = append(m.deleted, clientID)
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {
+	return "", nil
+}
+func (m *mockZombiePeerProtocolManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	return map[string]any{"container_exists": true}, nil
+}
+
+func TestReconciler_CleanupZombiePeers(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	})
+
+	uID, _ := db.CreateUser(ctx, &models.User{
+		Username: "user1",
+		Role:     models.RoleUser,
+	})
+
+	// Valid DB connection
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID:        "conn-valid-1",
+		UserID:    uID,
+		ServerID:  sID,
+		Protocol:  "awg",
+		ClientID:  "peer-valid-db",
+		Name:      "Valid DB Client",
+		CreatedAt: time.Now().UTC(),
+	})
+
+	remoteClients := []map[string]any{
+		{"clientId": "peer-valid-db", "name": "Valid DB Client"},
+		{"clientId": "peer-zombie-1", "name": "Zombie One"},
+		{"clientId": "peer-zombie-2", "userData": map[string]any{"clientName": "Zombie Two"}},
+		{"clientId": "peer-portal-data", "name": "Portal Data Plane"},
+		{"clientId": "peer-portal-probe", "userData": map[string]any{"clientName": "Portal Health Probe"}},
+		{"clientId": "peer-health-probe", "userData": map[string]any{"clientName": "Health Probe"}},
+		{"clientId": "peer-external", "userData": map[string]any{"clientName": "External Peer", "externalClient": true}},
+		{"clientId": "peer-external-top", "clientName": "External Peer Top", "externalClient": true},
+	}
+
+	mgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: remoteClients,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	r := New(db, reg)
+
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	expectedDeleted := map[string]bool{
+		"peer-zombie-1": true,
+		"peer-zombie-2": true,
+	}
+
+	if len(mgr.deleted) != len(expectedDeleted) {
+		t.Fatalf("expected exactly %d deleted peers, got %d: %v", len(expectedDeleted), len(mgr.deleted), mgr.deleted)
+	}
+
+	for _, id := range mgr.deleted {
+		if !expectedDeleted[id] {
+			t.Errorf("unexpected peer was deleted: %s", id)
+		}
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_ToleratesErrors(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg":    map[string]any{"port": 55424},
+			"telemt": map[string]any{"port": 443},
+		},
+	})
+
+	// AWG manager fails to GetClients
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto:         "awg",
+		getClientsErr: true,
+	}
+
+	// TeleMT manager has two zombie peers; one fails on RemoveClient
+	telemtMgr := &mockZombiePeerProtocolManager{
+		proto: "telemt",
+		clients: []map[string]any{
+			{"clientId": "zombie-telemt-1", "name": "ZT1"},
+		},
+		removeErr: true,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+	reg.Register(telemtMgr)
+
+	r := New(db, reg)
+
+	// Must tolerate remote errors gracefully without returning fatal error
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers should tolerate remote errors, got: %v", err)
+	}
+
+	srv, err := db.GetServer(ctx, sID)
+	if err != nil || srv == nil {
+		t.Fatalf("server should still exist after error-tolerant pass")
+	}
+}
+
+func TestReconciler_CleanupStaleProtocols_ExecutesPhase3(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_, _ = db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	})
+
+	remoteClients := []map[string]any{
+		{"clientId": "peer-zombie-phase3", "name": "Zombie In Phase 3"},
+	}
+
+	mgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: remoteClients,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	r := New(db, reg)
+
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("CleanupStaleProtocols failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	if len(mgr.deleted) != 1 || mgr.deleted[0] != "peer-zombie-phase3" {
+		t.Fatalf("expected peer-zombie-phase3 to be removed during Phase 3, got: %v", mgr.deleted)
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_NilDBAndClosedDB(t *testing.T) {
+	ctx := context.Background()
+
+	nilR := New(nil, nil)
+	if err := nilR.CleanupZombiePeers(ctx); err == nil {
+		t.Error("expected error for nil DB in CleanupZombiePeers")
+	}
+
+	db, cleanup := setupTestDB(t)
+	r := New(db, nil)
+	cleanup() // close DB
+
+	if err := r.CleanupZombiePeers(ctx); err == nil {
+		t.Error("expected error when DB is closed in CleanupZombiePeers")
+	}
+}

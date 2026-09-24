@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
@@ -35,9 +36,10 @@ func New(db *database.DB, registry ProtocolResolver) *Reconciler {
 	}
 }
 
-// CleanupStaleProtocols performs a two-phase cleanup:
+// CleanupStaleProtocols performs a three-phase cleanup:
 // Phase 1 (DB-only): Removes user_connections for protocols no longer in server.protocols.
 // Phase 2 (SSH-based): Verifies installed containers/binaries on each server; if missing, removes connections and protocol.
+// Phase 3 (Remote peers): Audits remote container peers against active DB connections and removes unmanaged zombie peers.
 func (r *Reconciler) CleanupStaleProtocols(ctx context.Context) error {
 	if r.db == nil {
 		return errors.New("database is not configured")
@@ -52,6 +54,7 @@ func (r *Reconciler) CleanupStaleProtocols(ctx context.Context) error {
 
 	if r.registry != nil {
 		r.cleanupPhase2Remote(ctx, servers)
+		r.cleanupPhase3ZombiePeers(ctx, servers)
 	}
 
 	return nil
@@ -175,4 +178,142 @@ func (r *Reconciler) isProtocolStale(ctx context.Context, server *models.Server,
 	}
 
 	return !exists
+}
+
+// CleanupZombiePeers audits all remote server containers across installed protocols,
+// removing unmanaged or zombie peers that do not exist in the database, while preserving
+// infrastructure peers (Portal Data Plane, Health Probe) and external unmanaged peers.
+func (r *Reconciler) CleanupZombiePeers(ctx context.Context) error {
+	if r.db == nil {
+		return errors.New("database is not configured")
+	}
+
+	servers, err := r.db.GetAllServers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch servers for zombie peer cleanup: %w", err)
+	}
+
+	if r.registry != nil {
+		r.cleanupPhase3ZombiePeers(ctx, servers)
+	}
+
+	return nil
+}
+
+func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []models.Server) {
+	for _, server := range servers {
+		serverID := server.ID
+		srvCopy := server
+		for protoKey := range server.Protocols {
+			proto := models.NormalizeProtocol(protoKey)
+			mgr, ok := r.registry.Get(proto)
+			if !ok {
+				continue
+			}
+
+			clients, err := mgr.GetClients(ctx, &srvCopy)
+			if err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to fetch remote clients",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+				continue
+			}
+
+			conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
+			if err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to fetch database connections",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+				continue
+			}
+
+			validIDs := make(map[string]bool, len(conns))
+			for _, conn := range conns {
+				if conn.ClientID != "" {
+					validIDs[conn.ClientID] = true
+				}
+			}
+
+			for _, client := range clients {
+				clientID, _ := client["clientId"].(string)
+				if clientID == "" {
+					clientID, _ = client["client_id"].(string)
+				}
+				if clientID == "" {
+					continue
+				}
+
+				if validIDs[clientID] {
+					continue
+				}
+
+				if isInfrastructurePeer(client) {
+					continue
+				}
+
+				if isExternalPeer(client) {
+					continue
+				}
+
+				if err := mgr.RemoveClient(ctx, &srvCopy, clientID); err != nil {
+					slog.Warn("Reconciliation Phase 3: failed to remove zombie peer from remote container",
+						"server_id", serverID,
+						"protocol", proto,
+						"client_id", clientID,
+						"err", err,
+					)
+				} else {
+					slog.Info("Reconciliation: removed zombie peer from remote container",
+						"server_id", serverID,
+						"protocol", proto,
+						"client_id", clientID,
+					)
+				}
+			}
+		}
+	}
+}
+
+func isInfrastructurePeer(client map[string]any) bool {
+	match := func(v any) bool {
+		s, ok := v.(string)
+		if !ok {
+			return false
+		}
+		trimmed := strings.TrimSpace(s)
+		return strings.EqualFold(trimmed, "Portal Data Plane") ||
+			strings.EqualFold(trimmed, "Portal Health Probe") ||
+			strings.EqualFold(trimmed, "Health Probe")
+	}
+
+	if match(client["clientName"]) || match(client["name"]) {
+		return true
+	}
+	if ud, ok := client["userData"].(map[string]any); ok {
+		if match(ud["clientName"]) || match(ud["name"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExternalPeer(client map[string]any) bool {
+	isExt := func(v any) bool {
+		b, ok := v.(bool)
+		return ok && b
+	}
+
+	if isExt(client["externalClient"]) || isExt(client["external_client"]) {
+		return true
+	}
+	if ud, ok := client["userData"].(map[string]any); ok {
+		if isExt(ud["externalClient"]) || isExt(ud["external_client"]) {
+			return true
+		}
+	}
+	return false
 }

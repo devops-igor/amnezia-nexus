@@ -282,7 +282,20 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		AWGMimicry: user.AWGMimicry,
 		CreatedAt:  time.Now(),
 	}
-	_, _ = h.db.CreateConnection(ctx, newConn)
+	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
+		if clientID != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
+				slog.Error("Failed to rollback client on remote server after DB failure",
+					"server_id", server.ID,
+					"client_id", clientID,
+					"err", rbErr,
+				)
+			}
+		}
+		return
+	}
 
 	resp["connection_created"] = true
 	resp["config"] = configStr
@@ -541,6 +554,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	var clientID, configStr string
+	clientCreated := false
 	if req.ClientID != nil && *req.ClientID != "" {
 		clientID = *req.ClientID
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
@@ -574,6 +588,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		if configStr == "" && clientID != "" {
 			configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 		}
+		clientCreated = true
 	}
 
 	vpnLink := GenerateVPNLink(configStr)
@@ -591,7 +606,21 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 	}
 
-	_, _ = h.db.CreateConnection(ctx, newConn)
+	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
+		if clientCreated && clientID != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
+				slog.Error("Failed to rollback client on remote server after DB failure",
+					"server_id", server.ID,
+					"client_id", clientID,
+					"err", rbErr,
+				)
+			}
+		}
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+		return
+	}
 
 	h.audit(r, "user.connection_add", map[string]any{"user_id": userID, "server_id": req.ServerID, "protocol": req.Protocol, "client_id": clientID})
 	h.JSON(w, http.StatusOK, map[string]any{

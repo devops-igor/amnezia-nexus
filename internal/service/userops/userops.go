@@ -295,6 +295,9 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 				}
 
 				clientID, _ := res["client_id"].(string)
+				if clientID == "" {
+					clientID, _ = res["clientId"].(string)
+				}
 				if clientID != "" {
 					newConn := &models.UserConnection{
 						ID:        generateUUID(),
@@ -307,6 +310,21 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 					}
 					if _, err := s.db.CreateConnection(ctx, newConn); err != nil {
 						slog.Error("Failed to insert user connection into DB", "conn_id", newConn.ID, "err", err)
+						cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+						defer cancel()
+						if rbErr := mgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
+							slog.Error("Failed to rollback client on remote server after DB failure",
+								"server_id", server.ID,
+								"client_id", clientID,
+								"err", rbErr,
+							)
+						} else {
+							slog.Info("Rolled back remote client after DB failure",
+								"server_id", server.ID,
+								"protocol", proto,
+								"client_id", clientID,
+							)
+						}
 					}
 				}
 			}
