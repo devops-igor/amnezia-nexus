@@ -707,6 +707,13 @@ func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 	s.backendDevices[tunID] = dev
 }
 
+// SetTunOpener overrides the TUN device opener for testing.
+func (s *Service) SetTunOpener(fn func() (endpoint.PacketDevice, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tunOpener = fn
+}
+
 // SetReconcilePostSnapshotHook registers a test hook called immediately after
 // reading the active session snapshot in reconcileConnectionCounts, before s.mu is acquired.
 func (s *Service) SetReconcilePostSnapshotHook(fn func()) {
@@ -924,13 +931,31 @@ func (s *Service) Start(ctx context.Context) error {
 	// not fail if reconciliation errors.
 	s.reconcileConnectionCounts(ctx)
 
-	// 3. Start forwarder & accountant
+	// 3. Client-facing TUN device (production data plane). When required
+	// (RequireTunDevice) and the TUN device cannot be opened, abort
+	// data-plane startup and fail with an error chain wrapping
+	// endpoint.ErrTunUnavailable -- the panel continues management-only.
+	if s.requireTun && s.tunOpener != nil {
+		dev, tunErr := s.tunOpener()
+		if tunErr != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to open tun device: %w", tunErr)
+		}
+		s.tunDev = dev
+		if s.forwarder != nil {
+			s.forwarder.AttachClientDevice(dev)
+		}
+	}
+
+	// 4. Start forwarder & accountant
 	if s.forwarder != nil {
 		s.forwarder.Start(ctx)
 		s.forwarder.StartPumps(ctx)
 	}
 
-	// 4. Start health prober & reconnect manager
+	// 5. Start health prober & reconnect manager
 	if s.prober != nil {
 		s.prober.Start(ctx)
 	}
@@ -938,29 +963,12 @@ func (s *Service) Start(ctx context.Context) error {
 		s.reconnectMgr.Start(ctx)
 	}
 
-	// 5. Start endpoint listener
+	// 6. Start endpoint listener
 	if s.endpoint != nil {
 		s.endpoint.SetPostSweepHook(func(ctx context.Context) {
 			s.PruneExpiredAffinity()
 		})
 		if err := s.endpoint.Start(ctx); err != nil {
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
-			return fmt.Errorf("failed to start endpoint listener: %w", err)
-		}
-	}
-
-	// 6. Client-facing TUN device (production data plane). When required
-	// (RequireTunDevice) and the TUN device cannot be opened, quiesce
-	// everything Start brought up and fail with an error chain wrapping
-	// endpoint.ErrTunUnavailable — the panel continues management-only.
-	if s.requireTun && s.tunOpener != nil {
-		dev, tunErr := s.tunOpener()
-		if tunErr != nil {
-			if s.endpoint != nil {
-				_ = s.endpoint.Stop()
-			}
 			if s.prober != nil {
 				s.prober.Stop()
 			}
@@ -970,14 +978,14 @@ func (s *Service) Start(ctx context.Context) error {
 			if s.forwarder != nil {
 				_ = s.forwarder.Stop()
 			}
+			if s.tunDev != nil {
+				_ = s.tunDev.Close()
+				s.tunDev = nil
+			}
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
-			return fmt.Errorf("failed to open tun device: %w", tunErr)
-		}
-		s.tunDev = dev
-		if s.forwarder != nil {
-			s.forwarder.AttachClientDevice(dev)
+			return fmt.Errorf("failed to start endpoint listener: %w", err)
 		}
 	}
 
@@ -2182,7 +2190,7 @@ func (s *Service) SetTunnelStatus(ctx context.Context, serverID int64, status st
 	pool := s.pool
 	s.mu.RUnlock()
 	if pool == nil {
-		return errors.New("tunnel pool not initialized")
+		return tunnel.ErrTunnelNotFound
 	}
 	return pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }
