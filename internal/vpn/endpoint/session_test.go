@@ -3,12 +3,92 @@ package endpoint
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout bool
+	}{
+		{name: "close"},
+		{name: "idle timeout", timeout: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			db := setupTestDB(t)
+			ipam, err := NewIPAM("10.100.0.0/24")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sm := NewSessionManager(db, ipam)
+			serverID, err := db.CreateServer(ctx, &models.Server{Name: "remote", Host: "192.0.2.7"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tunnelID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID: serverID, InterfaceName: "awg-be-remote", PublicKey: "backend-public-key",
+				PrivateKey: "backend-private-key", Endpoint: "192.0.2.7:51820",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			userID, err := db.CreateUser(ctx, &models.User{Username: "portal-client", Enabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const peer = "shared-portal-and-remote-key"
+			const portalIP = "10.100.0.2"
+			if _, err := db.CreateConnection(ctx, &models.UserConnection{
+				ID: "remote-first", UserID: userID, ServerID: serverID,
+				Protocol: "awg", ClientID: peer,
+				ClientParams: map[string]any{"assigned_ip": "10.66.66.4"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.CreateConnection(ctx, &models.UserConnection{
+				ID: "portal-second", UserID: userID, ServerID: 0,
+				Protocol: "awg", ClientID: peer,
+				ClientParams: map[string]any{"assigned_ip": portalIP},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Confirm that the old unscoped lookup would inspect the wrong row.
+			unscoped, err := db.GetConnectionByToken(ctx, peer)
+			if err != nil || unscoped == nil || unscoped.ID != "remote-first" {
+				t.Fatalf("test setup did not select remote row first: conn=%+v err=%v", unscoped, err)
+			}
+			if err := ipam.Reserve(net.ParseIP(portalIP), peer); err != nil {
+				t.Fatal(err)
+			}
+			sess, err := sm.CreateSession(ctx, userID, peer, portalIP, tunnelID, "portal-client")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.timeout {
+				sm.SetSessionLastSeen(peer, time.Now().UTC().Add(-2*time.Hour))
+				timedOut, err := sm.CheckTimeouts(ctx, time.Hour)
+				if err != nil || len(timedOut) != 1 || timedOut[0].ID != sess.ID {
+					t.Fatalf("timeout did not close portal session: sessions=%+v err=%v", timedOut, err)
+				}
+			} else if err := sm.CloseSession(ctx, sess.ID, "disconnected"); err != nil {
+				t.Fatal(err)
+			}
+			if ip, ok := ipam.GetAssignedIP(peer); !ok || ip.String() != portalIP || !ipam.IsAllocated(net.ParseIP(portalIP)) {
+				t.Fatalf("teardown freed durable portal IP: assigned=%v present=%t", ip, ok)
+			}
+			portal, err := db.GetConnectionByClientID(ctx, peer, 0)
+			if err != nil || portal == nil || portal.ClientParams["assigned_ip"] != portalIP {
+				t.Fatalf("durable portal assignment changed: conn=%+v err=%v", portal, err)
+			}
+		})
+	}
+}
 
 func TestSessionManagerCRUD(t *testing.T) {
 	db := setupTestDB(t)
