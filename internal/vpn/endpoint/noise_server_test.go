@@ -73,7 +73,7 @@ func TestServerRoleHandshakeRoundTrip(t *testing.T) {
 		t.Errorf("hash/chain key lengths: H=%d CK=%d", len(info.H), len(info.CK))
 	}
 
-	resp, transportKeys, err := BuildResponse(serverPriv, info, health.DefaultH2, health.DefaultS2)
+	resp, transportKeys, err := BuildResponse(serverPriv, info, health.DefaultH2, health.DefaultS2, nil)
 	if err != nil {
 		t.Fatalf("BuildResponse failed: %v", err)
 	}

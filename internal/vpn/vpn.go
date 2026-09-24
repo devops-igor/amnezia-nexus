@@ -452,6 +452,8 @@ func applyVPNConfigDefaults(cfg *models.VPNConfig) {
 }
 
 // NewVPNService initializes the complete unified VPN subsystem.
+// Server-side RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard),
+// providing a stable transition window intentionally independent of client-configured timing ranges.
 func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	if cfg == nil {
 		if db != nil {
@@ -496,10 +498,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	serverKeys := endpoint.NewServerKeysManager(db)
 
 	listenerCfg := endpoint.ListenerConfig{
-		ListenPort:          cfg.ListenPort,
-		SubnetCIDR:          cfg.SubnetCIDR,
-		MTU:                 1420,
-		IdleTimeout:         3 * time.Minute,
+		ListenPort:  cfg.ListenPort,
+		SubnetCIDR:  cfg.SubnetCIDR,
+		MTU:         1420,
+		IdleTimeout: 3 * time.Minute,
+		// RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard)
+		// when zero, providing a stable transition window intentionally independent of client-configured
+		// timing ranges.
 		HeaderProtectionKey: cfg.HeaderProtectionKey,
 		H1:                  cfg.H1,
 		S1:                  cfg.S1,
@@ -2597,6 +2602,14 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 
 	sessions := s.sessionMgr.GetSessionsByUserID(userID)
 	for _, sess := range sessions {
+		if s.peerGenerations == nil {
+			s.peerGenerations = make(map[string]uint64)
+		}
+		s.peerGenerations[sess.PeerPublicKey]++
+		fenceGen := s.peerGenerations[sess.PeerPublicKey]
+		if s.endpoint != nil {
+			s.endpoint.PrunePeerTransportStateIfSession(sess.PeerPublicKey, sess.ID, fenceGen)
+		}
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
 			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey))
@@ -2686,6 +2699,15 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 		return endpoint.ErrSessionNotFound
 	}
 
+	if s.peerGenerations == nil {
+		s.peerGenerations = make(map[string]uint64)
+	}
+	s.peerGenerations[sess.PeerPublicKey]++
+	fenceGen := s.peerGenerations[sess.PeerPublicKey]
+	if s.endpoint != nil {
+		s.endpoint.PrunePeerTransportStateIfSession(sess.PeerPublicKey, sess.ID, fenceGen)
+	}
+
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
 	if s.forwarder != nil {
 		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
@@ -2712,6 +2734,14 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 
 	if s.sessionMgr != nil && clientPub != "" {
 		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
+			if s.peerGenerations == nil {
+				s.peerGenerations = make(map[string]uint64)
+			}
+			s.peerGenerations[sess.PeerPublicKey]++
+			fenceGen := s.peerGenerations[sess.PeerPublicKey]
+			if s.endpoint != nil {
+				s.endpoint.PrunePeerTransportStateIfSession(sess.PeerPublicKey, sess.ID, fenceGen)
+			}
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
 			if s.forwarder != nil {
 				retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey)
@@ -2725,11 +2755,39 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 		}
 	}
 
+	if s.endpoint != nil && clientPub != "" {
+		if s.peerGenerations == nil {
+			s.peerGenerations = make(map[string]uint64)
+		}
+		s.peerGenerations[clientPub]++
+		fenceGen := s.peerGenerations[clientPub]
+		s.endpoint.PrunePeerTransportStateIfSession(clientPub, "", fenceGen)
+	}
+
 	if s.ipam != nil && clientPub != "" {
 		_ = s.ipam.Release(clientPub)
 	}
 
 	return nil
+}
+
+// SetPreTransportCommitHookForTest sets the pre-transport-commit hook on the endpoint listener for testing.
+func (s *Service) SetPreTransportCommitHookForTest(fn func(peerKey string, sessID string)) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.endpoint != nil {
+		s.endpoint.SetPreTransportCommitHookForTest(fn)
+	}
+}
+
+// HasTransportStateForPeer reports whether the endpoint holds any transport state for peerKey.
+func (s *Service) HasTransportStateForPeer(peerKey string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.endpoint == nil {
+		return false
+	}
+	return s.endpoint.HasTransportStateForPeer(peerKey)
 }
 
 // HandleIncomingPeer authenticates a connecting peer, selects a backend tunnel, and registers forwarding routes.

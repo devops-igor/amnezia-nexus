@@ -7,8 +7,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/replay"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/blake2s"
@@ -108,10 +111,52 @@ type InitiationInfo struct {
 // (WireGuard tempK2/tempK1 responder assignment from KDF2(ck, empty)).
 // Pre-instantiated AEAD ciphers eliminate per-packet allocations on hot paths (issue #151).
 type TransportKeys struct {
-	SendKey  []byte
-	RecvKey  []byte
-	SendAEAD cipher.AEAD
-	RecvAEAD cipher.AEAD
+	SendKey     []byte
+	RecvKey     []byte
+	SendAEAD    cipher.AEAD
+	RecvAEAD    cipher.AEAD
+	LocalIndex  uint32
+	RemoteIndex uint32
+	Generation  uint64
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	replay      replay.Filter
+	replayMu    sync.Mutex
+	expiryMu    sync.RWMutex
+}
+
+// ValidateCounter checks whether the transport packet counter is within the
+// RFC 6479 sliding window filter and has not been replayed.
+func (tk *TransportKeys) ValidateCounter(counter uint64) bool {
+	if tk == nil {
+		return false
+	}
+	tk.replayMu.Lock()
+	defer tk.replayMu.Unlock()
+	return tk.replay.ValidateCounter(counter, device.RejectAfterMessages)
+}
+
+// SetExpiresAt safely updates the key validity expiration deadline.
+func (tk *TransportKeys) SetExpiresAt(t time.Time) {
+	if tk == nil {
+		return
+	}
+	tk.expiryMu.Lock()
+	defer tk.expiryMu.Unlock()
+	tk.ExpiresAt = t
+}
+
+// IsExpired reports whether the transport key validity lifetime has elapsed.
+func (tk *TransportKeys) IsExpired() bool {
+	if tk == nil {
+		return true
+	}
+	tk.expiryMu.RLock()
+	defer tk.expiryMu.RUnlock()
+	if tk.ExpiresAt.IsZero() {
+		return false
+	}
+	return time.Now().After(tk.ExpiresAt)
 }
 
 // NewTransportKeys creates a TransportKeys instance with pre-instantiated AEAD ciphers.
@@ -423,16 +468,16 @@ func computeResponseKeys(info *InitiationInfo) (serverEPub, encryptedEmpty []byt
 	return serverEPub, encryptedEmpty, transportKeys, nil
 }
 
-func applyResponseHeaderProtection(resp []byte, s2 int, info *InitiationInfo, hpKeys [][]byte) error {
+func applyResponseHeaderProtection(resp []byte, s2 int, info *InitiationInfo, hpKey []byte) error {
 	if !info.HeaderProtected {
 		return nil
 	}
-	hpKey := info.HPKey
-	if len(hpKey) != 32 && len(hpKeys) > 0 && len(hpKeys[0]) == 32 {
-		hpKey = hpKeys[0]
+	key := info.HPKey
+	if len(key) != 32 && len(hpKey) == 32 {
+		key = hpKey
 	}
-	if len(hpKey) == 32 && s2 >= health.HeaderCipherNonceSize {
-		cip := health.NewHeaderProtectionCipher(hpKey, resp)
+	if len(key) == 32 && s2 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(key, resp)
 		if cip == nil {
 			return errors.New("failed to create header protection cipher for response")
 		}
@@ -442,7 +487,7 @@ func applyResponseHeaderProtection(resp []byte, s2 int, info *InitiationInfo, hp
 	return nil
 }
 
-func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 any, s2 int, hpKeys ...[]byte) (resp []byte, sessionKeys *TransportKeys, err error) {
+func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 any, s2 int, hpKey []byte, preallocatedIdx ...uint32) (resp []byte, sessionKeys *TransportKeys, err error) {
 	if info == nil || len(info.H) != 32 || len(info.CK) != 32 || len(info.ClientStaticPub) != 32 || len(info.ClientEPub) != 32 {
 		return nil, nil, ErrInvalidHandshakeState
 	}
@@ -466,9 +511,25 @@ func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 any, s2 int, hpKe
 	// Assemble the 60-byte response body.
 	var idxBuf [4]byte
 	var serverIdxBuf [4]byte
-	if _, err := rand.Read(serverIdxBuf[:]); err != nil {
-		return nil, nil, fmt.Errorf("failed to generate server session index: %w", err)
+	var serverIdx uint32
+	if len(preallocatedIdx) > 0 && preallocatedIdx[0] > 0 {
+		serverIdx = preallocatedIdx[0]
+		binary.LittleEndian.PutUint32(serverIdxBuf[:], serverIdx)
+	} else {
+		for {
+			if _, err := rand.Read(serverIdxBuf[:]); err != nil {
+				return nil, nil, fmt.Errorf("failed to generate server session index: %w", err)
+			}
+			serverIdx = binary.LittleEndian.Uint32(serverIdxBuf[:])
+			if serverIdx != 0 {
+				break
+			}
+		}
 	}
+
+	transportKeys.LocalIndex = serverIdx
+	transportKeys.RemoteIndex = info.SenderIndex
+	transportKeys.CreatedAt = time.Now()
 
 	body := make([]byte, 0, responseBodyLen)
 	binary.LittleEndian.PutUint32(idxBuf[:], h2Val)
@@ -506,7 +567,7 @@ func BuildResponse(serverPriv []byte, info *InitiationInfo, h2 any, s2 int, hpKe
 	resp = append(resp, mac1...)
 	resp = append(resp, make([]byte, 16)...) // MAC2
 
-	if err := applyResponseHeaderProtection(resp, s2, info, hpKeys); err != nil {
+	if err := applyResponseHeaderProtection(resp, s2, info, hpKey); err != nil {
 		return nil, nil, err
 	}
 

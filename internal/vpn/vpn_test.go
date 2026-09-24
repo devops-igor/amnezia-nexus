@@ -6273,3 +6273,657 @@ func TestService_PostSweepHook_PrunesExpiredAffinity(t *testing.T) {
 		t.Fatalf("expected AffinityCount=(0, 0) after pruning, got (%d, %d)", uCountAfter, pCountAfter)
 	}
 }
+func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
+	if err != nil {
+		t.Fatalf("failed to decode header protection key: %v", err)
+	}
+	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
+	if err != nil {
+		t.Fatalf("failed to decode portal public key: %v", err)
+	}
+
+	// Build initiation packet using AWG header protection
+	packet, state, err := health.BuildAWGInitiationPacketObfuscated(sPub, nil, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("failed to derive client pub: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	// Register peer as user connection in DB
+	_, err = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: s1ID,
+		Protocol: "awg",
+		ClientID: peerKey,
+		Name:     "handshake-peer",
+	})
+	if err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
+	}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send handshake initiation: %v", err)
+	}
+
+	respBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("no handshake response received: %v", err)
+	}
+
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKey, vpnSvc.cfg.H2, vpnSvc.cfg.S2) {
+		t.Fatalf("VerifyAWGResponsePacketObfuscated rejected server response")
+	}
+
+	// 1. Confirm session and transport state exist
+	sess, ok := vpnSvc.sessionMgr.GetSession(peerKey)
+	if !ok || sess == nil {
+		t.Fatalf("expected active session for peer %s after handshake", peerKey)
+	}
+
+	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
+	if cur == nil || cur.LocalIndex == 0 {
+		t.Fatalf("expected current transport keys with non-zero LocalIndex, got %+v", cur)
+	}
+	if prev != nil {
+		t.Fatalf("expected nil previous keys on fresh handshake, got %+v", prev)
+	}
+	localIdx := cur.LocalIndex
+
+	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); !ok {
+		t.Fatalf("expected TransportKeysFor to return keys for %s", peerKey)
+	}
+	if keys, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(localIdx); !ok || keys == nil {
+		t.Fatalf("expected indexTable entry for localIdx %d", localIdx)
+	}
+	if !vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
+		t.Fatalf("expected peersByAddr entry for peer %s", peerKey)
+	}
+	if !vpnSvc.HasTransportStateForPeer(peerKey) {
+		t.Fatalf("expected HasTransportStateForPeer to return true for %s", peerKey)
+	}
+
+	// 2. Disconnect session via Service
+	if err := vpnSvc.DisconnectSession(ctx, sess.ID); err != nil {
+		t.Fatalf("DisconnectSession failed: %v", err)
+	}
+
+	// 3. Verify peerKeypairs, noiseKeys, indexTable entry, and address state are absent
+	curAfter, prevAfter := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
+	if curAfter != nil || prevAfter != nil {
+		t.Fatalf("expected nil peerKeypairs after disconnect, got cur=%+v, prev=%+v", curAfter, prevAfter)
+	}
+	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); ok {
+		t.Fatalf("expected TransportKeysFor to return false after disconnect")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(localIdx); ok {
+		t.Fatalf("expected indexTable entry for localIdx %d to be absent after disconnect", localIdx)
+	}
+	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
+		t.Fatalf("expected peersByAddr entry to be absent after disconnect")
+	}
+	if vpnSvc.HasTransportStateForPeer(peerKey) {
+		t.Fatalf("expected HasTransportStateForPeer to return false after disconnect")
+	}
+	if _, ok := vpnSvc.sessionMgr.GetSession(peerKey); ok {
+		t.Fatalf("expected session to be closed in sessionMgr after disconnect")
+	}
+}
+
+func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	uIDBob, err := db.CreateUser(ctx, &models.User{Username: "bob-multi", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	peerKey1 := "bob-device-1-pubkey"
+	peerKey2 := "bob-device-2-pubkey"
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
+	})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
+	})
+
+	sess1, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey1)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer peerKey1 failed: %v", err)
+	}
+	keys1 := &endpoint.TransportKeys{LocalIndex: 11111, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(peerKey1, keys1, sess1.ID)
+	addr1, _ := net.ResolveUDPAddr("udp", "127.0.0.1:41111")
+	vpnSvc.endpoint.RememberPeerForTest(addr1, peerKey1, keys1.LocalIndex)
+
+	sess2, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey2)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer peerKey2 failed: %v", err)
+	}
+	keys2 := &endpoint.TransportKeys{LocalIndex: 22222, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(peerKey2, keys2, sess2.ID)
+	addr2, _ := net.ResolveUDPAddr("udp", "127.0.0.1:42222")
+	vpnSvc.endpoint.RememberPeerForTest(addr2, peerKey2, keys2.LocalIndex)
+
+	// Verify pre-condition: transport state exists for both peers
+	if !vpnSvc.HasTransportStateForPeer(peerKey1) || !vpnSvc.HasTransportStateForPeer(peerKey2) {
+		t.Fatalf("expected transport state to exist for both peers before DisconnectUser")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(11111); !ok {
+		t.Fatalf("expected indexTable entry for 11111")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(22222); !ok {
+		t.Fatalf("expected indexTable entry for 22222")
+	}
+
+	// Disconnect user
+	if err := vpnSvc.DisconnectUser(ctx, uIDBob); err != nil {
+		t.Fatalf("DisconnectUser failed: %v", err)
+	}
+
+	// Verify all sessions and transport state for user are pruned
+	if vpnSvc.HasTransportStateForPeer(peerKey1) {
+		t.Errorf("expected peerKey1 transport state pruned after DisconnectUser")
+	}
+	if vpnSvc.HasTransportStateForPeer(peerKey2) {
+		t.Errorf("expected peerKey2 transport state pruned after DisconnectUser")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(11111); ok {
+		t.Errorf("expected indexTable entry 11111 to be absent")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(22222); ok {
+		t.Errorf("expected indexTable entry 22222 to be absent")
+	}
+	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey1) || vpnSvc.endpoint.HasPeerAddrForTest(peerKey2) {
+		t.Errorf("expected address state to be pruned for both peers")
+	}
+	if active := vpnSvc.sessionMgr.GetSessionsByUserID(uIDBob); len(active) > 0 {
+		t.Errorf("expected 0 active sessions for user, got %d", len(active))
+	}
+}
+
+func TestService_ReleaseClient_PrunesTransportState(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, _, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	// 1. Test ReleaseClient with an active session
+	sess, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyAlice)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed: %v", err)
+	}
+	keys := &endpoint.TransportKeys{LocalIndex: 33333, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys, sess.ID)
+	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:43333")
+	vpnSvc.endpoint.RememberPeerForTest(clientAddr, peerKeyAlice, keys.LocalIndex)
+
+	if !vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
+		t.Fatalf("expected transport state for peerKeyAlice before ReleaseClient")
+	}
+
+	if err := vpnSvc.ReleaseClient(ctx, peerKeyAlice); err != nil {
+		t.Fatalf("ReleaseClient failed: %v", err)
+	}
+
+	if vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
+		t.Errorf("expected transport state to be pruned after ReleaseClient")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(33333); ok {
+		t.Errorf("expected indexTable entry 33333 to be absent after ReleaseClient")
+	}
+	if vpnSvc.endpoint.HasPeerAddrForTest(peerKeyAlice) {
+		t.Errorf("expected address state to be absent after ReleaseClient")
+	}
+	if _, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice); ok {
+		t.Errorf("expected session to be closed after ReleaseClient")
+	}
+
+	// 2. Test ReleaseClient cleans up orphaned/unindexed transport state without active session
+	orphanPeer := "orphaned-peer-pubkey"
+	orphanKeys := &endpoint.TransportKeys{LocalIndex: 44444, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(orphanPeer, orphanKeys)
+	orphanAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:44444")
+	vpnSvc.endpoint.RememberPeerForTest(orphanAddr, orphanPeer, orphanKeys.LocalIndex)
+
+	if !vpnSvc.HasTransportStateForPeer(orphanPeer) {
+		t.Fatalf("expected transport state for orphanPeer before ReleaseClient")
+	}
+
+	if err := vpnSvc.ReleaseClient(ctx, orphanPeer); err != nil {
+		t.Fatalf("ReleaseClient for orphan failed: %v", err)
+	}
+
+	if vpnSvc.HasTransportStateForPeer(orphanPeer) {
+		t.Errorf("expected orphanPeer transport state to be pruned after ReleaseClient")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(44444); ok {
+		t.Errorf("expected indexTable entry 44444 to be absent after ReleaseClient")
+	}
+	if vpnSvc.endpoint.HasPeerAddrForTest(orphanPeer) {
+		t.Errorf("expected orphanPeer address state to be absent after ReleaseClient")
+	}
+}
+
+func TestService_DisconnectSession_StaleSessionDoesNotPruneReplacement(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunnels := vpnSvc.pool.GetActiveTunnels()
+	if len(tunnels) == 0 {
+		t.Fatalf("expected active tunnels in pool")
+	}
+	tunID := tunnels[0].ID
+
+	// 1. Establish session 1 for peer
+	sess1, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, "10.100.0.50", tunID, "conn-1")
+	if err != nil {
+		t.Fatalf("CreateSession sess1 failed: %v", err)
+	}
+	keys1 := &endpoint.TransportKeys{LocalIndex: 55551, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys1, sess1.ID)
+	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:45551")
+	vpnSvc.endpoint.RememberPeerForTest(addr, peerKeyAlice, keys1.LocalIndex)
+
+	if sessID := vpnSvc.endpoint.PeerSessionIDForTest(peerKeyAlice); sessID != sess1.ID {
+		t.Fatalf("expected session ID %s, got %s", sess1.ID, sessID)
+	}
+
+	// 2. Concurrent rekey establishes replacement session 2
+	sess2, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, "10.100.0.50", tunID, "conn-1")
+	if err != nil {
+		t.Fatalf("CreateSession sess2 failed: %v", err)
+	}
+	keys2 := &endpoint.TransportKeys{LocalIndex: 55552, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys2, sess2.ID)
+
+	if sessID := vpnSvc.endpoint.PeerSessionIDForTest(peerKeyAlice); sessID != sess2.ID {
+		t.Fatalf("expected session ID %s after rekey, got %s", sess2.ID, sessID)
+	}
+
+	// 3. Stale DisconnectSession(sess1.ID) must not prune the new replacement session's transport state
+	// In DisconnectSession, sess1 is no longer in sessionMgr, returning ErrSessionNotFound
+	err = vpnSvc.DisconnectSession(ctx, sess1.ID)
+	if !errors.Is(err, endpoint.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound for stale session disconnect, got: %v", err)
+	}
+
+	// In-flight disconnect scenario: if a caller had already resolved sess1 and invoked PrunePeerTransportStateIfSession
+	pruned := vpnSvc.endpoint.PrunePeerTransportStateIfSession(peerKeyAlice, sess1.ID)
+	if pruned {
+		t.Fatal("PrunePeerTransportStateIfSession should have aborted when expectedSessionID does not match active replacement")
+	}
+
+	// 4. Verify keys2, indexTable entry, and address state are completely preserved
+	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKeyAlice)
+	if cur == nil || cur.LocalIndex != keys2.LocalIndex {
+		t.Fatalf("expected current keys to remain keys2 (55552), got %+v", cur)
+	}
+	if prev == nil || prev.LocalIndex != keys1.LocalIndex {
+		t.Fatalf("expected previous keys to remain keys1 (55551), got %+v", prev)
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(keys2.LocalIndex); !ok {
+		t.Fatalf("expected indexTable entry for replacement keys2 to remain registered")
+	}
+	if !vpnSvc.endpoint.HasPeerAddrForTest(peerKeyAlice) {
+		t.Fatalf("expected address state to remain preserved for peer")
+	}
+	if !vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
+		t.Fatalf("expected HasTransportStateForPeer to remain true for active peer")
+	}
+
+	// 5. Calling DisconnectSession with the active replacement session ID prunes cleanly
+	if err := vpnSvc.DisconnectSession(ctx, sess2.ID); err != nil {
+		t.Fatalf("DisconnectSession for sess2 failed: %v", err)
+	}
+
+	if vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
+		t.Fatalf("expected transport state to be pruned after disconnecting replacement session")
+	}
+	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(keys2.LocalIndex); ok {
+		t.Fatalf("expected indexTable entry for keys2 to be absent after disconnect")
+	}
+}
+
+// TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse verifies that
+// when an active VPN session is disconnected while a handshake is waiting at the pre-transport-commit
+// hook, commitHandshakeTransportState detects the disconnected session, aborts installation,
+// releases the receiver index from indexTable, suppresses endpoint address registration,
+// leaves no transport state in HasTransportStateForPeer or noiseKeys, and transmits no UDP handshake response.
+func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
+	if err != nil {
+		t.Fatalf("failed to decode header protection key: %v", err)
+	}
+	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
+	if err != nil {
+		t.Fatalf("failed to decode portal public key: %v", err)
+	}
+
+	packet, state, err := health.BuildAWGInitiationPacketObfuscated(sPub, nil, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
+	}
+	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("failed to derive client pub: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	_, err = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: s1ID,
+		Protocol: "awg",
+		ClientID: peerKey,
+		Name:     "stale-commit-peer",
+	})
+	if err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
+	}
+	clientConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	hookFired := make(chan string, 1)
+	resumeHook := make(chan struct{})
+
+	vpnSvc.SetPreTransportCommitHookForTest(func(pKey string, sID string) {
+		if pKey == peerKey {
+			hookFired <- sID
+			<-resumeHook
+		}
+	})
+
+	if _, err := clientConn.Write(packet); err != nil {
+		t.Fatalf("failed to send handshake initiation: %v", err)
+	}
+
+	var sessID string
+	select {
+	case sessID = <-hookFired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for preTransportCommitHook to fire")
+	}
+
+	// Session S_1 is connected before DisconnectSession
+	sess, ok := vpnSvc.sessionMgr.GetSessionByID(sessID)
+	if !ok || sess == nil || sess.Status != "connected" {
+		t.Fatalf("expected active connected session S_1 before disconnect, got %+v", sess)
+	}
+
+	// Invoke DisconnectSession(S1.ID) on Service
+	if err := vpnSvc.DisconnectSession(ctx, sessID); err != nil {
+		t.Fatalf("DisconnectSession failed: %v", err)
+	}
+
+	// Resume worker -> commitHandshakeTransportState executes
+	close(resumeHook)
+
+	// Worker drops response; UDP read should timeout
+	_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	respBuf := make([]byte, 2048)
+	n, err := clientConn.Read(respBuf)
+	if err == nil {
+		t.Fatalf("expected no handshake response transmitted over UDP, got %d bytes", n)
+	}
+
+	// Assertions:
+	// 1. commitHandshakeTransportState returned false (directly testable with disconnected session ID)
+	dummyKeys := &endpoint.TransportKeys{LocalIndex: 77771, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	if vpnSvc.endpoint.CommitHandshakeTransportStateForTest(peerKey, sessID, dummyKeys, 77771, serverAddr, 0) {
+		t.Fatal("expected commitHandshakeTransportState to return false for disconnected session")
+	}
+
+	// 2. No transport state exists for the peer (HasTransportStateForPeer is false, noiseKeys has no entry)
+	if vpnSvc.HasTransportStateForPeer(peerKey) {
+		t.Fatal("expected HasTransportStateForPeer to return false")
+	}
+	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); ok {
+		t.Fatal("expected noiseKeys to have no entry for peer")
+	}
+	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
+	if cur != nil || prev != nil {
+		t.Fatalf("expected nil peerKeypairs, got cur=%+v, prev=%+v", cur, prev)
+	}
+
+	// 3. Allocated receiver index was released from indexTable
+	if count := vpnSvc.endpoint.IndexTableCountForTest(); count != 0 {
+		t.Fatalf("expected indexTable to be empty, got %d entries", count)
+	}
+
+	// 4. peersByAddr has no entry for the sender
+	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
+		t.Fatal("expected peersByAddr to have no entry for sender")
+	}
+}
+
+// TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession verifies at the
+// VPN Service level that concurrent handshakes H1 and H2 for the same peer preserve H2's session
+// and transport keys, rejecting H1's stale commit and ensuring K1 does not clobber K2.
+func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
+	if err != nil {
+		t.Fatalf("failed to decode header protection key: %v", err)
+	}
+	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
+	if err != nil {
+		t.Fatalf("failed to decode portal public key: %v", err)
+	}
+
+	// Generate client keypair
+	clientPriv := make([]byte, 32)
+	if _, err := rand.Read(clientPriv); err != nil {
+		t.Fatalf("rand.Read failed: %v", err)
+	}
+	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("curve25519 failed: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	_, err = db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: s1ID,
+		Protocol: "awg",
+		ClientID: peerKey,
+		Name:     "concurrent-handshake-peer",
+	})
+	if err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+
+	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
+	}
+
+	clientConn1, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP conn1: %v", err)
+	}
+	defer func() { _ = clientConn1.Close() }()
+
+	clientConn2, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP conn2: %v", err)
+	}
+	defer func() { _ = clientConn2.Close() }()
+
+	var h1Fired atomic.Bool
+	h1PauseChan := make(chan struct{})
+	h1FiredChan := make(chan string, 1)
+
+	vpnSvc.SetPreTransportCommitHookForTest(func(pKey string, sID string) {
+		if pKey != peerKey {
+			return
+		}
+		if h1Fired.CompareAndSwap(false, true) {
+			h1FiredChan <- sID
+			<-h1PauseChan
+		}
+	})
+
+	// Handshake H1 initiates -> creates session S1
+	pkt1, _, err := health.BuildAWGInitiationPacketObfuscated(sPub, clientPriv, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated H1: %v", err)
+	}
+	if _, err := clientConn1.Write(pkt1); err != nil {
+		t.Fatalf("write initiation H1: %v", err)
+	}
+
+	var h1SessionID string
+	select {
+	case h1SessionID = <-h1FiredChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for H1 worker to pause at preTransportCommitHook")
+	}
+
+	// Handshake H2 initiates for the same peer while H1 is paused
+	pkt2, state2, err := health.BuildAWGInitiationPacketObfuscated(sPub, clientPriv, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
+	if err != nil {
+		t.Fatalf("BuildAWGInitiationPacketObfuscated H2: %v", err)
+	}
+	if _, err := clientConn2.Write(pkt2); err != nil {
+		t.Fatalf("write initiation H2: %v", err)
+	}
+
+	// Worker H2 creates replacement session S2, commits transport keys K2, and sends response
+	respBuf2 := make([]byte, 2048)
+	_ = clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n2, err := clientConn2.Read(respBuf2)
+	if err != nil {
+		t.Fatalf("failed to read H2 response: %v", err)
+	}
+	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, vpnSvc.cfg.H2, vpnSvc.cfg.S2) {
+		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
+	}
+
+	// Verify K2 / S2 state before resuming H1
+	k2Current, k2Prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
+	if k2Current == nil {
+		t.Fatal("expected current transport keys K2 for peer after H2")
+	}
+	if k2Prev != nil {
+		t.Fatalf("expected nil previous keys for peer after replacement H2, got %+v", k2Prev)
+	}
+	s2ID := vpnSvc.endpoint.PeerSessionIDForTest(peerKey)
+	if s2ID == "" || s2ID == h1SessionID {
+		t.Fatalf("expected distinct active session ID for S2, got %s (S1=%s)", s2ID, h1SessionID)
+	}
+	k2LocalIdx := k2Current.LocalIndex
+
+	// Resume H1 with stale S1 -> worker H1 commits
+	close(h1PauseChan)
+
+	// Worker H1 should drop response and not send anything
+	_ = clientConn1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	respBuf1 := make([]byte, 2048)
+	n1, err := clientConn1.Read(respBuf1)
+	if err == nil {
+		t.Fatalf("expected H1 response to be dropped, but read %d bytes", n1)
+	}
+
+	// Assert:
+	// 1. H1 commit is dropped/rejected: CommitHandshakeTransportStateForTest with S1 returns false
+	dummyKeys := &endpoint.TransportKeys{LocalIndex: 88882, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
+	if vpnSvc.endpoint.CommitHandshakeTransportStateForTest(peerKey, h1SessionID, dummyKeys, 88882, serverAddr, 0) {
+		t.Fatal("expected commitHandshakeTransportState to return false for superseded S1")
+	}
+
+	// 2. K2 / S2 remains active current keypair in peerKeypairs and noiseKeys
+	curFinal, prevFinal := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
+	if curFinal == nil || curFinal != k2Current {
+		t.Fatalf("expected current keypair to remain K2, got %+v (want %+v)", curFinal, k2Current)
+	}
+	if curFinal.LocalIndex != k2LocalIdx {
+		t.Fatalf("expected current LocalIndex to remain %d, got %d", k2LocalIdx, curFinal.LocalIndex)
+	}
+	if prevFinal != nil {
+		t.Fatalf("expected prev keypair to remain nil, got %+v", prevFinal)
+	}
+
+	tk, ok := vpnSvc.endpoint.TransportKeysFor(peerKey)
+	if !ok || tk != k2Current {
+		t.Fatalf("expected noiseKeys to retain K2, got %+v (found=%v)", tk, ok)
+	}
+	if sid := vpnSvc.endpoint.PeerSessionIDForTest(peerKey); sid != s2ID {
+		t.Fatalf("expected peer session ID to remain S2 (%s), got %s", s2ID, sid)
+	}
+	if !vpnSvc.HasTransportStateForPeer(peerKey) {
+		t.Fatal("expected HasTransportStateForPeer to remain true for peer with active K2")
+	}
+}
