@@ -385,6 +385,10 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		return ErrTunnelNotFound
 	}
 
+	if disableReason == models.DisableReasonHealth && tunnel.DisableReason == models.DisableReasonAdmin {
+		return nil
+	}
+
 	if p.db != nil {
 		if err := p.db.UpdateBackendTunnelStatusWithReason(ctx, tunnel.ID, status, disableReason, latencyMS); err != nil {
 			return fmt.Errorf("failed to persist backend tunnel status with reason: %w", err)
