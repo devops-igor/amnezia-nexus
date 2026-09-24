@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -89,13 +90,10 @@ func TestStalledHandshakeDoesNotStarveEstablishedTransport(t *testing.T) {
 	defer transportConn.Close()
 	key := make([]byte, chacha20poly1305.KeySize)
 	peerKey := "existing-peer"
-	el.storeTransportKeys(peerKey, &TransportKeys{RecvKey: key, SendKey: key})
-	peerAddr, err := net.ResolveUDPAddr("udp", transportConn.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	el.rememberPeer(peerAddr, peerKey, 1)
+	const localIndex = 7342
+	el.storeTransportKeys(peerKey, &TransportKeys{RecvKey: key, SendKey: key, LocalIndex: localIndex})
 	pkt := buildTestTransportDatagram(t, key, nil, el.config.S4, el.config.H4.Lo, 1, []byte("established traffic"))
+	binary.LittleEndian.PutUint32(pkt[el.config.S4+4:el.config.S4+8], localIndex)
 	if _, err := transportConn.Write(pkt); err != nil {
 		t.Fatal(err)
 	}
