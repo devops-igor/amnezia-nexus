@@ -1102,3 +1102,30 @@ func TestVPNDisableBackend_PersistenceFailureReturns500(t *testing.T) {
 		t.Errorf("expected backend status to remain 'active' in DB, got: %s", tunAfter.Status)
 	}
 }
+
+func TestVPNStatusHandler_ExposesRouteQueueDiagnostics(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	svc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	h.vpnSvc = svc
+
+	req := httptest.NewRequest(http.MethodGet, "/api/vpn/status", nil)
+	w := httptest.NewRecorder()
+	h.VPNStatusHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var status map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	queues, ok := status["forwarder_route_queues"]
+	if ok {
+		t.Fatalf("unexpected route diagnostics without active routes: %v", queues)
+	}
+	if strings.Contains(w.Body.String(), "session-1") || strings.Contains(w.Body.String(), "10.100.0.10") {
+		t.Fatalf("status exposed session/IP secret data: %s", w.Body.String())
+	}
+}

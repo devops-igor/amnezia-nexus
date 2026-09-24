@@ -249,6 +249,9 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if cfg.MinRebalanceSessions == 0 {
 		cfg.MinRebalanceSessions = current.MinRebalanceSessions
 	}
+	if cfg.ClientQueueSize == 0 {
+		cfg.ClientQueueSize = current.ClientQueueSize
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.

@@ -865,6 +865,82 @@ func TestTransportData_EndToEndRoundTrip_HeaderProtection(t *testing.T) {
 	}
 }
 
+func TestListener_CommitHandshakeGenerationFence(t *testing.T) {
+	el := &Listener{
+		noiseKeys:       make(map[string]*TransportKeys),
+		peersByAddr:     make(map[string]*activePeerState),
+		peerGenerations: make(map[string]uint64),
+	}
+
+	peerKey := "test-peer-key"
+	key1 := make([]byte, 32)
+	for i := range key1 {
+		key1[i] = 1
+	}
+	tk1 := &TransportKeys{SendKey: key1, RecvKey: key1}
+	addr1 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111}
+
+	key2 := make([]byte, 32)
+	for i := range key2 {
+		key2[i] = 2
+	}
+	tk2 := &TransportKeys{SendKey: key2, RecvKey: key2}
+	addr2 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222}
+
+	// 1. Initial handshake with gen=1 commits
+	if !el.CommitHandshake(peerKey, 1, tk1, addr1, 101) {
+		t.Fatal("expected gen 1 handshake to commit")
+	}
+	if el.PeerGeneration(peerKey) != 1 {
+		t.Fatalf("PeerGeneration = %d, want 1", el.PeerGeneration(peerKey))
+	}
+	if ep := el.PeerEndpoint(peerKey); ep == nil || ep.Port != 1111 {
+		t.Fatalf("PeerEndpoint mismatch: got %v, want port 1111", ep)
+	}
+	tk, ok := el.TransportKeysFor(peerKey)
+	if !ok || !bytes.Equal(tk.SendKey, key1) {
+		t.Fatal("expected tk1 to be committed")
+	}
+
+	// 2. Newer handshake with gen=2 commits and updates keys & endpoint
+	if !el.CommitHandshake(peerKey, 2, tk2, addr2, 102) {
+		t.Fatal("expected gen 2 handshake to commit")
+	}
+	if el.PeerGeneration(peerKey) != 2 {
+		t.Fatalf("PeerGeneration = %d, want 2", el.PeerGeneration(peerKey))
+	}
+	if ep := el.PeerEndpoint(peerKey); ep == nil || ep.Port != 2222 {
+		t.Fatalf("PeerEndpoint mismatch: got %v, want port 2222", ep)
+	}
+	tk, ok = el.TransportKeysFor(peerKey)
+	if !ok || !bytes.Equal(tk.SendKey, key2) {
+		t.Fatal("expected tk2 to be committed")
+	}
+
+	// 3. Stale handshake with gen=1 is rejected: does not overwrite tk2 or addr2
+	if el.CommitHandshake(peerKey, 1, tk1, addr1, 101) {
+		t.Fatal("expected stale gen 1 handshake to be rejected")
+	}
+	if el.StaleHandshakeDrops() != 1 {
+		t.Fatalf("StaleHandshakeDrops = %d, want 1", el.StaleHandshakeDrops())
+	}
+	if el.PeerGeneration(peerKey) != 2 {
+		t.Fatalf("PeerGeneration = %d, want 2 after stale drop", el.PeerGeneration(peerKey))
+	}
+	if ep := el.PeerEndpoint(peerKey); ep == nil || ep.Port != 2222 {
+		t.Fatalf("PeerEndpoint overwritten by stale handshake: got %v, want port 2222", ep)
+	}
+	tk, ok = el.TransportKeysFor(peerKey)
+	if !ok || !bytes.Equal(tk.SendKey, key2) {
+		t.Fatal("TransportKeys overwritten by stale handshake")
+	}
+
+	// 4. Same generation (gen=2) is accepted
+	if !el.CommitHandshake(peerKey, 2, tk2, addr2, 103) {
+		t.Fatal("expected same-generation handshake to commit")
+	}
+}
+
 func TestListener_ActiveTransportTrafficUpdatesLiveness(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

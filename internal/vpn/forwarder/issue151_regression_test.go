@@ -23,7 +23,26 @@ func TestDefaultClientQueueSize_Capacity(t *testing.T) {
 	}
 }
 
-// TestDownstreamQueueBurstAbsorption verifies that a 2000-packet microburst is absorbed
+func TestBackendQueueCapacityIsIndependentFromClientQueueSize(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 1)
+	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+
+	clientQueue, ok := f.GetClientPacketChannel("peer-1")
+	if !ok {
+		t.Fatal("expected registered client queue")
+	}
+	backendQueue, ok := f.GetBackendPacketChannel(1)
+	if !ok {
+		t.Fatal("expected registered backend queue")
+	}
+	if cap(clientQueue) != 1 {
+		t.Fatalf("client queue capacity = %d, want 1", cap(clientQueue))
+	}
+	if cap(backendQueue) != DefaultBackendQueueSize {
+		t.Fatalf("backend queue capacity = %d, want %d", cap(backendQueue), DefaultBackendQueueSize)
+	}
+}
+
 // without packet loss by the 2048-packet queue, whereas a 256-packet queue drops 1744 packets (issue #151).
 func TestDownstreamQueueBurstAbsorption(t *testing.T) {
 	// 1. Forwarder with default 2048-packet queue:

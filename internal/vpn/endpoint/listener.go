@@ -219,6 +219,7 @@ type Listener struct {
 	serverPriv          []byte
 	noiseKeys           map[string]*TransportKeys
 	peersByAddr         map[string]*activePeerState // sender UDP addr string -> peer state
+	peerGenerations     map[string]uint64           // peerKey -> highest committed generation
 	udpConn             *net.UDPConn
 	tunDev              PacketDevice
 	packetQueue         chan packetJob
@@ -249,6 +250,20 @@ type Listener struct {
 	// static key / timestamp decryption failure, or stale timestamp).
 	// Unroutable transport data and non-initiation datagrams are excluded (issue #288).
 	handshakeRejects atomic.Uint64
+	// transportDecryptFailures counts established-peer transport datagrams that
+	// failed AEAD decryption; these are distinct from handshake rejections.
+	transportDecryptFailures atomic.Uint64
+	// staleHandshakes counts handshake completions dropped by the commit fence
+	// because a newer handshake for the same peer already completed.
+	staleHandshakes atomic.Uint64
+	// staleResponseDrops counts handshake responses suppressed at the per-peer send
+	// gate because a newer generation committed before response transmission.
+	staleResponseDrops atomic.Uint64
+
+	peerSendLocksMu sync.Mutex
+	peerSendLocks   map[string]*sync.Mutex
+
+	postCommitHook func(peerKey string, gen uint64)
 }
 
 // applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
@@ -347,17 +362,19 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 	}
 
 	return &Listener{
-		config:      cfg,
-		hpKey:       hpKeyBytes,
-		db:          db,
-		auth:        auth,
-		ipam:        ipam,
-		sessionMgr:  sessionMgr,
-		serverKeys:  serverKeys,
-		noiseKeys:   make(map[string]*TransportKeys),
-		peersByAddr: make(map[string]*activePeerState),
-		tunDev:      NewChannelPacketDevice("awg0", cfg.MTU, 512),
-		stopCh:      make(chan struct{}),
+		config:          cfg,
+		hpKey:           hpKeyBytes,
+		db:              db,
+		auth:            auth,
+		ipam:            ipam,
+		sessionMgr:      sessionMgr,
+		serverKeys:      serverKeys,
+		noiseKeys:       make(map[string]*TransportKeys),
+		peersByAddr:     make(map[string]*activePeerState),
+		peerGenerations: make(map[string]uint64),
+		peerSendLocks:   make(map[string]*sync.Mutex),
+		tunDev:          NewChannelPacketDevice("awg0", cfg.MTU, 512),
+		stopCh:          make(chan struct{}),
 	}, nil
 }
 
@@ -647,8 +664,27 @@ func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicK
 	return sess, nil
 }
 
+// peerSendLock returns the dedicated send mutex for serializing handshake responses per peer.
+func (el *Listener) peerSendLock(peerKey string) *sync.Mutex {
+	el.peerSendLocksMu.Lock()
+	defer el.peerSendLocksMu.Unlock()
+	if el.peerSendLocks == nil {
+		el.peerSendLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := el.peerSendLocks[peerKey]
+	if !ok {
+		mu = &sync.Mutex{}
+		el.peerSendLocks[peerKey] = mu
+	}
+	return mu
+}
+
 // DisconnectPeer disconnects a peer and closes their session.
 func (el *Listener) DisconnectPeer(ctx context.Context, peerPublicKey string) error {
+	el.peerSendLocksMu.Lock()
+	delete(el.peerSendLocks, peerPublicKey)
+	el.peerSendLocksMu.Unlock()
+
 	el.mu.RLock()
 	sm := el.sessionMgr
 	el.mu.RUnlock()
@@ -701,6 +737,15 @@ func (el *Listener) HandshakeRejections() uint64 {
 	return el.handshakeRejects.Load()
 }
 
+// TransportDecryptionFailures returns established-peer transport datagrams
+// dropped after AEAD decryption failed. It excludes handshake rejections.
+func (el *Listener) TransportDecryptionFailures() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.transportDecryptFailures.Load()
+}
+
 // PacketQueueDrops returns the number of inbound datagrams dropped due to a full
 // worker dispatch queue. Nil receiver is safe and returns 0 (issue #160).
 func (el *Listener) PacketQueueDrops() uint64 {
@@ -708,6 +753,68 @@ func (el *Listener) PacketQueueDrops() uint64 {
 		return 0
 	}
 	return el.packetQueueDrops.Load()
+}
+
+// StaleHandshakeDrops returns the number of handshake completions dropped
+// by the monotonic generation commit fence because a newer handshake for the
+// same peer had already completed. Nil receiver is safe and returns 0.
+func (el *Listener) StaleHandshakeDrops() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.staleHandshakes.Load()
+}
+
+// StaleResponseDrops returns the number of handshake responses suppressed at the
+// per-peer send gate because a newer generation committed before response transmission.
+// Nil receiver is safe and returns 0.
+func (el *Listener) StaleResponseDrops() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.staleResponseDrops.Load()
+}
+
+// SetPostCommitHookForTest sets a hook invoked immediately after CommitHandshake commits
+// before entering the per-peer send gate.
+func (el *Listener) SetPostCommitHookForTest(fn func(peerKey string, gen uint64)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.postCommitHook = fn
+}
+
+// PeerGeneration returns the highest committed generation for a peer under el.mu.
+func (el *Listener) PeerGeneration(peerKey string) uint64 {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	if el.peerGenerations == nil {
+		return 0
+	}
+	return el.peerGenerations[peerKey]
+}
+
+// PeerEndpoint returns the most recently seen UDP endpoint for a peer.
+func (el *Listener) PeerEndpoint(peerKey string) *net.UDPAddr {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	var newest int64 = -1
+	var ep *net.UDPAddr
+	for _, cand := range el.peersByAddr {
+		if cand.peerKey != peerKey {
+			continue
+		}
+		if ls := cand.lastSeen.Load(); ls > newest {
+			newest = ls
+			ep = cand.udpAddr
+		}
+	}
+	return ep
+}
+
+// HandleDatagramForTest processes a single datagram through the handshake/transport
+// pipeline synchronously for testing.
+func (el *Listener) HandleDatagramForTest(ctx context.Context, datagram []byte, sender *net.UDPAddr) {
+	el.handleDatagram(ctx, datagram, sender)
 }
 
 // WorkerPoolStats returns the configured worker count, current queue length,
@@ -786,11 +893,6 @@ func (el *Listener) StoreTransportKeysForTest(peerKey string, keys *TransportKey
 // RememberPeerForTest exposes rememberPeer for integration tests.
 func (el *Listener) RememberPeerForTest(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
 	el.rememberPeer(sender, peerKey, receiverIdx)
-}
-
-// HandleDatagramForTest exposes handleDatagram for integration tests.
-func (el *Listener) HandleDatagramForTest(ctx context.Context, data []byte, sender *net.UDPAddr) {
-	el.handleDatagram(ctx, data, sender)
 }
 
 // serverPrivateKey resolves the endpoint's persistent Noise server private
@@ -889,7 +991,7 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	_, _, err = handler(ctx, peerKey)
+	sess, _, err := handler(ctx, peerKey)
 	if err != nil {
 		log.Printf("[vpn/endpoint] handshake processing failed for peer %s from %s: %v", peerKey, sender, err)
 		return
@@ -901,14 +1003,34 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	if transportKeys != nil {
-		el.storeTransportKeys(peerKey, transportKeys)
+	var gen uint64
+	if sess != nil {
+		gen = sess.Generation
 	}
 
-	// Remember the peer's UDP endpoint so subsequent transport-data
-	// datagrams from the same address can be decrypted and routed, and so
-	// SendToPeer can address them.
-	el.rememberPeer(sender, peerKey, info.SenderIndex)
+	if !el.CommitHandshake(peerKey, gen, transportKeys, sender, info.SenderIndex) {
+		log.Printf("[vpn/endpoint] dropping stale handshake completion for peer %s (gen %d < current %d)", peerKey, gen, el.PeerGeneration(peerKey))
+		return
+	}
+
+	el.mu.RLock()
+	hook := el.postCommitHook
+	el.mu.RUnlock()
+	if hook != nil {
+		hook(peerKey, gen)
+	}
+
+	// Per-peer send gate:
+	sendMu := el.peerSendLock(peerKey)
+	sendMu.Lock()
+	defer sendMu.Unlock()
+
+	if gen < el.PeerGeneration(peerKey) {
+		el.staleResponseDrops.Add(1)
+		log.Printf("[vpn/endpoint] suppressing stale handshake response for peer %s (gen %d < current %d)",
+			peerKey, gen, el.PeerGeneration(peerKey))
+		return
+	}
 
 	el.mu.RLock()
 	udpConn := el.udpConn
@@ -921,6 +1043,63 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 	el.txBytes.Add(int64(len(resp)))
+}
+
+// CommitHandshake atomically commits the handshake transport keys and peer endpoint
+// if gen >= el.peerGenerations[peerKey]. If gen is older than the current generation,
+// it discards the keys, leaves the endpoint and lastSeen untouched, increments staleHandshakes,
+// and returns false.
+func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *TransportKeys, sender *net.UDPAddr, receiverIdx uint32) bool {
+	if transportKeys != nil {
+		_ = transportKeys.InitCiphers()
+	}
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+
+	if gen < el.peerGenerations[peerKey] {
+		el.staleHandshakes.Add(1)
+		return false
+	}
+
+	el.peerGenerations[peerKey] = gen
+
+	if transportKeys != nil {
+		if el.noiseKeys == nil {
+			el.noiseKeys = make(map[string]*TransportKeys)
+		}
+		el.noiseKeys[peerKey] = transportKeys
+	}
+
+	if sender != nil {
+		if el.peersByAddr == nil {
+			el.peersByAddr = make(map[string]*activePeerState)
+		}
+		senderCopy := &net.UDPAddr{
+			IP:   append(net.IP(nil), sender.IP...),
+			Port: sender.Port,
+			Zone: sender.Zone,
+		}
+		st, ok := el.peersByAddr[sender.String()]
+		if !ok {
+			st = &activePeerState{
+				peerKey: peerKey,
+				udpAddr: senderCopy,
+			}
+			st.receiverIdx.Store(receiverIdx)
+			el.peersByAddr[sender.String()] = st
+		} else {
+			st.peerKey = peerKey
+			st.udpAddr = senderCopy
+			st.receiverIdx.Store(receiverIdx)
+		}
+		st.lastSeen.Store(time.Now().UnixNano())
+	}
+
+	return true
 }
 
 // rememberPeer records the sender address and client index of a peer that just completed a
@@ -1047,6 +1226,7 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 	}
 	if packet == nil {
 		if decErr != nil {
+			el.transportDecryptFailures.Add(1)
 			now := time.Now().Unix()
 			until := st.decryptLogUntil.Load()
 			if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
