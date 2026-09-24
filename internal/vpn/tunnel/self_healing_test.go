@@ -1420,7 +1420,11 @@ func TestThresholdReconcile_ConcurrentSuccessAborts(t *testing.T) {
 	prober.failCounts[s1ID] = 0 // concurrent success reset it
 	prober.mu.Unlock()
 
-	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID)
+	current, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1478,7 +1482,11 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 	prober.autoDisabled[s1ID] = true
 	prober.mu.Unlock()
 
-	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID)
+	current, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
