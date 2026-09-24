@@ -133,6 +133,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 }
 
 // migrateDegradedTunnelSessions migrates active sessions off degraded tunnels onto healthy ones.
+// When a SessionMigrator is configured (issue #289), it coordinates live forwarder routes,
+// in-memory session updates, DB persistence, and connection counters. When nil, it falls back
+// to direct DB-only updates.
 func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degradedTunnels []int64, healthyTunnels []*models.BackendTunnel) {
 	if len(degradedTunnels) == 0 || len(healthyTunnels) == 0 || o.db == nil {
 		return
@@ -141,6 +144,10 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	if err != nil || len(sessions) == 0 {
 		return
 	}
+
+	o.mu.RLock()
+	migrator := o.sessionMigrator
+	o.mu.RUnlock()
 
 	degradedMap := make(map[int64]bool, len(degradedTunnels))
 	for _, tid := range degradedTunnels {
@@ -153,9 +160,29 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 		if degradedMap[s.BackendTunnelID] {
 			target := healthyTunnels[hIdx%len(healthyTunnels)]
 			hIdx++
-			s.BackendTunnelID = target.ID
-			s.Status = "connected"
-			if err := o.db.CreateVPNSession(ctx, &s); err == nil {
+			if migrator != nil {
+				if err := migrator.MigrateSession(ctx, s.ID, target.ID); err != nil {
+					slog.Warn("Degraded tunnel session migration failed, skipping session",
+						"session_id", s.ID,
+						"source_tunnel_id", s.BackendTunnelID,
+						"target_tunnel_id", target.ID,
+						"err", err,
+					)
+					continue
+				}
+				migrated++
+			} else {
+				s.BackendTunnelID = target.ID
+				s.Status = "connected"
+				if err := o.db.CreateVPNSession(ctx, &s); err != nil {
+					slog.Warn("Direct DB update for degraded tunnel session failed, skipping session",
+						"session_id", s.ID,
+						"source_tunnel_id", s.BackendTunnelID,
+						"target_tunnel_id", target.ID,
+						"err", err,
+					)
+					continue
+				}
 				migrated++
 			}
 		}
@@ -302,10 +329,11 @@ func (o *Orchestrator) resolveTunnelProbeParams(ctx context.Context, tunnels []m
 // overflow threshold are drained, and moves are in-place UPDATEs that preserve
 // the session ID (UpdateVPNSessionBackendTunnel).
 //
-// DB-only by design (issue #44, R5): the forwarder's live route for a moved
-// session is NOT migrated — route migration is future scope. A moved session is
-// therefore recorded as "draining", which also keeps it out of
-// GetActiveVPNSessions so the next cycle cannot ping-pong it back.
+// Live migration with DB fallback (issue #44, #289): when SessionMigrator is
+// configured, live forwarder routes, in-memory sessions, and database rows are
+// migrated atomically with full rollback. In DB-only mode, the update remains
+// persisted directly to the database. A moved session is recorded as "draining",
+// which keeps it out of GetActiveVPNSessions so the next cycle cannot ping-pong it back.
 func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 	if o.db == nil {
 		return errors.New("database is not configured")
@@ -395,10 +423,15 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 }
 
 // drainTunnelExcess moves up to `excess` sessions from the overloaded tunnel
-// (sourceID) to the currently lightest other active tunnel, using in-place
-// UPDATEs (R4) that mark rows "draining" (R5). Returns the number moved.
+// (sourceID) to the currently lightest other active tunnel, using coordinated
+// live migration when a SessionMigrator is present (issue #289) or in-place DB
+// UPDATEs that mark rows "draining" (R5) when in DB-only mode. Returns the number moved.
 // counts is updated in place so successive callers see consistent numbers.
 func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.VPNSession, activeTunnels []models.BackendTunnel, sourceID int64, counts map[int64]int, excess int) int {
+	o.mu.RLock()
+	migrator := o.sessionMigrator
+	o.mu.RUnlock()
+
 	drained := 0
 	for i := 0; i < len(sessList) && drained < excess; i++ {
 		// Find lighter active backend tunnel
@@ -413,17 +446,21 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 
 		s := sessList[i]
 		if targetTunnelID > 0 {
-			// R4: in-place UPDATE instead of the legacy CreateVPNSession
-			// re-insert (which produced duplicate/history rows per shuffle).
-			// ID and connected_at stay untouched; the row is marked
-			// "draining" by UpdateVPNSessionBackendTunnel (R5).
-			if err := o.db.UpdateVPNSessionBackendTunnel(ctx, s.ID, targetTunnelID); err == nil {
+			var err error
+			if migrator != nil {
+				err = migrator.MigrateSession(ctx, s.ID, targetTunnelID)
+			} else {
+				err = o.db.UpdateVPNSessionBackendTunnel(ctx, s.ID, targetTunnelID)
+			}
+			if err == nil {
 				counts[targetTunnelID]++
 				counts[sourceID]--
 				drained++
 			} else {
-				slog.Warn("Rebalance skipped session no longer connected",
+				slog.Warn("Rebalance skipped session migration failed or no longer connected",
 					"session_id", s.ID,
+					"source_tunnel_id", sourceID,
+					"target_tunnel_id", targetTunnelID,
 					"err", err,
 				)
 			}
