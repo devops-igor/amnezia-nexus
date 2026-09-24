@@ -170,13 +170,14 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	lastReconcileTime         time.Time
-	lastReconcileByTunnel     map[int64]time.Time
-	peerGenerations           map[string]uint64
-	reconcilePostSnapshotHook func()
-	reconcilePreApplyHook     func()
-	reconcilePreCommitHook    func()
-	ensureDevicePreLockHook   func()
+	lastReconcileTime             time.Time
+	lastReconcileByTunnel         map[int64]time.Time
+	peerGenerations               map[string]uint64
+	reconcilePostSnapshotHook     func()
+	reconcilePreApplyHook         func()
+	reconcilePreCommitHook        func()
+	ensureDevicePreLockHook       func()
+	preCommitMigrationHookForTest func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -2227,14 +2228,15 @@ execute:
 }
 
 // SetTunnelStatus updates the status and latency of a backend tunnel in the pool.
+// Invariant (issue #289 rework): callers serialize under s.mu.Lock() against MigrateSession
+// and DisableBackend to prevent check-to-commit races.
 func (s *Service) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
-	s.mu.RLock()
-	pool := s.pool
-	s.mu.RUnlock()
-	if pool == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pool == nil {
 		return tunnel.ErrTunnelNotFound
 	}
-	return pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
+	return s.pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }
 
 // DisableBackend disables a backend server and initiates connection draining.
@@ -2815,8 +2817,45 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	return nil
 }
 
+// SetPreCommitMigrationHookForTest sets a test hook called under s.mu in MigrateSession
+// immediately before committing connection counters to the target tunnel (issue #289 rework).
+func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preCommitMigrationHookForTest = fn
+}
+
+// validateMigrationTarget checks that targetTunnelID exists and is active, returning its StateVersion.
+func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
+	if s.pool == nil {
+		return 0, nil
+	}
+	targetTun, err := s.pool.GetTunnelByID(targetTunnelID)
+	if err != nil {
+		return 0, fmt.Errorf("target backend tunnel %d not found in pool: %w", targetTunnelID, err)
+	}
+	if !strings.EqualFold(targetTun.Status, "active") {
+		return 0, fmt.Errorf("target backend tunnel %d is not active (status=%s)", targetTunnelID, targetTun.Status)
+	}
+	return targetTun.StateVersion, nil
+}
+
+// rollbackMigration reverts mutations across DB, SessionManager, and Forwarder during a failed migration.
+func (s *Service) rollbackMigration(ctx context.Context, sessionID, peerKey string, oldTunnelID int64, oldStatus string, forwarderMigrated, rollbackSessionMgr, rollbackDB bool) {
+	if rollbackDB && s.db != nil {
+		_ = s.db.MigrateVPNSessionBackend(ctx, sessionID, oldTunnelID)
+	}
+	if rollbackSessionMgr && s.sessionMgr != nil {
+		_ = s.sessionMgr.RollbackSessionBackend(sessionID, oldTunnelID, oldStatus)
+	}
+	if forwarderMigrated && s.forwarder != nil {
+		_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
+	}
+}
+
 // MigrateSession migrates an active session to a target backend tunnel, updating
-// the live forwarder route, in-memory session, and database state atomically with rollback (issue #289).
+// the live forwarder route, in-memory session, database state, and pool counters atomically
+// with full rollback across all subsystems if any step fails (issue #289, rework).
 //
 // Invariant (issue #86, #289): caller executes under s.mu.Lock(), maintaining the
 // lock ordering s.mu -> SessionManager.mu (never reversed), and preserving serialization
@@ -2835,14 +2874,9 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.pool != nil {
-		targetTun, err := s.pool.GetTunnelByID(targetTunnelID)
-		if err != nil {
-			return fmt.Errorf("target backend tunnel %d not found in pool: %w", targetTunnelID, err)
-		}
-		if !strings.EqualFold(targetTun.Status, "active") {
-			return fmt.Errorf("target backend tunnel %d is not active (status=%s)", targetTunnelID, targetTun.Status)
-		}
+	expectedVersion, err := s.validateMigrationTarget(targetTunnelID)
+	if err != nil {
+		return err
 	}
 
 	if s.sessionMgr == nil {
@@ -2879,29 +2913,31 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	// Step 2: In-Memory Session Update
 	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "connected"); err != nil {
-		if forwarderMigrated && s.forwarder != nil {
-			_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
-		}
+		s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, false, false)
 		return fmt.Errorf("failed to update in-memory session %s: %w", sessionID, err)
 	}
 
 	// Step 3: Database Persistence
 	if s.db != nil {
 		if err := s.db.MigrateVPNSessionBackend(ctx, sessionID, targetTunnelID); err != nil {
-			// Step 4: Rollback on DB Error
-			if forwarderMigrated && s.forwarder != nil {
-				_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
-			}
-			_ = s.sessionMgr.RollbackSessionBackend(sessionID, oldTunnelID, oldStatus)
+			s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, false)
 			return fmt.Errorf("failed to persist vpn session %s backend migration: %w", sessionID, err)
 		}
 	}
 
-	// Step 5: Post-Commit State Reconciliation
-	if s.pool != nil {
-		s.pool.DecrementConnections(oldTunnelID)
-		s.pool.IncrementConnections(targetTunnelID)
+	// Step 4.5: Pre-commit hook for testing check-to-commit races
+	if s.preCommitMigrationHookForTest != nil {
+		s.preCommitMigrationHookForTest()
 	}
+
+	// Step 5: Transfer Connection Counters
+	if s.pool != nil {
+		if err := s.pool.TransferConnectionsIfActive(oldTunnelID, targetTunnelID, expectedVersion); err != nil {
+			s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, true)
+			return fmt.Errorf("failed to commit connection transfer to target tunnel %d: %w", targetTunnelID, err)
+		}
+	}
+
 	if s.stickyMgr != nil {
 		s.stickyMgr.AssignPeerAffinity(peerKey, targetTunnelID)
 	}

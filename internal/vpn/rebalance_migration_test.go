@@ -693,3 +693,98 @@ func TestVPNRebalanceTargetTunnelDisabledOrInactive(t *testing.T) {
 		t.Errorf("expected error to mention 'not found in pool', got: %v", err)
 	}
 }
+
+// TestVPNRebalanceCheckToCommitRace_TargetBecomesInactive verifies that if the target
+// backend tunnel transitions to degraded (or its state version changes) between initial
+// check and final commit in MigrateSession, the migration is aborted and all subsystems
+// (live forwarder route, in-memory session, database record, and pool counters) are fully
+// rolled back (issue #289 rework).
+func TestVPNRebalanceCheckToCommitRace_TargetBecomesInactive(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	svc, s1ID, s2ID, uID, peerKeyAlice := setupTestVPNService(t, db)
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tun1, err := svc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel(s1ID) failed: %v", err)
+	}
+	tun2, err := svc.pool.GetTunnel(s2ID)
+	if err != nil {
+		t.Fatalf("GetTunnel(s2ID) failed: %v", err)
+	}
+
+	assignedIP := "10.100.0.95"
+	sess, err := svc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIP, tun1.ID, "alice-phone")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	svc.forwarder.RegisterSession(sess.ID, "conn-alice", peerKeyAlice, assignedIP, tun1.ID)
+	svc.pool.IncrementConnections(tun1.ID)
+	svc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tun1.ID)
+
+	q1, ok := svc.forwarder.GetBackendPacketChannel(tun1.ID)
+	if !ok {
+		t.Fatalf("failed to get backend packet channel for tun1")
+	}
+
+	// Register pre-commit hook simulating target tunnel becoming degraded right before counter commit
+	svc.SetPreCommitMigrationHookForTest(func() {
+		if err := svc.pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusDegraded, 500); err != nil {
+			t.Errorf("hook SetTunnelStatus failed: %v", err)
+		}
+	})
+
+	err = svc.MigrateSession(ctx, sess.ID, tun2.ID)
+	if err == nil {
+		t.Fatal("expected MigrateSession to fail due to check-to-commit race when target becomes degraded, got nil")
+	}
+
+	// 1. Verify live route rolled back to Backend 1
+	pkt := createDummyIPv4Packet(assignedIP, "1.1.1.1", []byte("race-rollback-check"))
+	if err := svc.forwarder.RouteClientToBackend(peerKeyAlice, pkt); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+	select {
+	case rec := <-q1:
+		if !bytes.Equal(rec, pkt) {
+			t.Errorf("packet mismatch on backend 1 queue")
+		}
+	default:
+		t.Fatal("expected packet on backend 1 queue, live route was not rolled back")
+	}
+
+	// 2. Verify in-memory session rolled back to tun1 and 'connected'
+	snap, ok := svc.sessionMgr.GetSessionSnapshotByID(sess.ID)
+	if !ok || snap.BackendTunnelID != tun1.ID || snap.Status != "connected" {
+		t.Errorf("in-memory session state not rolled back: %+v", snap)
+	}
+
+	// 3. Verify DB session rolled back to tun1 and 'connected'
+	dbSess, err := db.GetVPNSessionByID(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetVPNSessionByID failed: %v", err)
+	}
+	if dbSess.BackendTunnelID != tun1.ID || dbSess.Status != "connected" {
+		t.Errorf("DB session state not rolled back: %+v", dbSess)
+	}
+
+	// 4. Verify pool counters: tun1 still 1, tun2 still 0
+	tun1Live, err := svc.pool.GetTunnelByID(tun1.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID(tun1) failed: %v", err)
+	}
+	if tun1Live.ActiveConnections != 1 {
+		t.Errorf("tun1 ActiveConnections = %d, want 1", tun1Live.ActiveConnections)
+	}
+	tun2Live, err := svc.pool.GetTunnelByID(tun2.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID(tun2) failed: %v", err)
+	}
+	if tun2Live.ActiveConnections != 0 {
+		t.Errorf("tun2 ActiveConnections = %d, want 0", tun2Live.ActiveConnections)
+	}
+}

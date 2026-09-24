@@ -133,6 +133,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 }
 
 // migrateDegradedTunnelSessions migrates active sessions off degraded tunnels onto healthy ones.
+// When a SessionMigrator is configured (issue #289), it coordinates live forwarder routes,
+// in-memory session updates, DB persistence, and connection counters. When nil, it falls back
+// to direct DB-only updates.
 func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degradedTunnels []int64, healthyTunnels []*models.BackendTunnel) {
 	if len(degradedTunnels) == 0 || len(healthyTunnels) == 0 || o.db == nil {
 		return
@@ -141,6 +144,10 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	if err != nil || len(sessions) == 0 {
 		return
 	}
+
+	o.mu.RLock()
+	migrator := o.sessionMigrator
+	o.mu.RUnlock()
 
 	degradedMap := make(map[int64]bool, len(degradedTunnels))
 	for _, tid := range degradedTunnels {
@@ -153,9 +160,29 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 		if degradedMap[s.BackendTunnelID] {
 			target := healthyTunnels[hIdx%len(healthyTunnels)]
 			hIdx++
-			s.BackendTunnelID = target.ID
-			s.Status = "connected"
-			if err := o.db.CreateVPNSession(ctx, &s); err == nil {
+			if migrator != nil {
+				if err := migrator.MigrateSession(ctx, s.ID, target.ID); err != nil {
+					slog.Warn("Degraded tunnel session migration failed, skipping session",
+						"session_id", s.ID,
+						"source_tunnel_id", s.BackendTunnelID,
+						"target_tunnel_id", target.ID,
+						"err", err,
+					)
+					continue
+				}
+				migrated++
+			} else {
+				s.BackendTunnelID = target.ID
+				s.Status = "connected"
+				if err := o.db.CreateVPNSession(ctx, &s); err != nil {
+					slog.Warn("Direct DB update for degraded tunnel session failed, skipping session",
+						"session_id", s.ID,
+						"source_tunnel_id", s.BackendTunnelID,
+						"target_tunnel_id", target.ID,
+						"err", err,
+					)
+					continue
+				}
 				migrated++
 			}
 		}

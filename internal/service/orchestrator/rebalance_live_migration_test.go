@@ -3,8 +3,10 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type mockSessionMigrator struct {
@@ -145,4 +147,42 @@ func TestRebalanceVPNSessionsFallbackWhenMigratorNil(t *testing.T) {
 
 func fmtSessionID(i int) string {
 	return "sess-rebalance-" + string(rune('a'+i-1))
+}
+
+// TestCheckBackendTunnelHealth_UsesSessionMigrator verifies that CheckBackendTunnelHealth
+// delegates degraded tunnel session migration to SessionMigrator (issue #289).
+func TestCheckBackendTunnelHealth_UsesSessionMigrator(t *testing.T) {
+	f := setupRebalanceFixture(t)
+	// Seed session on t1
+	f.session(t, "sess-health-mig-1", f.t1, "connected")
+
+	migrator := &mockSessionMigrator{}
+	orch := New(f.db, nil,
+		WithSessionMigrator(migrator),
+		WithProbeFailureThreshold(1),
+		WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+			// Fail probe for t1 endpoint (55430)
+			if strings.Contains(endpoint, "55430") {
+				return 0, errors.New("simulated probe failure on t1")
+			}
+			return 10 * time.Millisecond, nil
+		}),
+	)
+
+	ctx := context.Background()
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	migrations := migrator.getMigrations()
+	if len(migrations) != 1 {
+		t.Fatalf("expected 1 migration via SessionMigrator, got %d", len(migrations))
+	}
+
+	if migrations[0].sessionID != "sess-health-mig-1" {
+		t.Errorf("migration session ID = %s, want sess-health-mig-1", migrations[0].sessionID)
+	}
+	if migrations[0].targetTunnelID != f.t2 {
+		t.Errorf("migration target tunnel = %d, want %d (t2)", migrations[0].targetTunnelID, f.t2)
+	}
 }
