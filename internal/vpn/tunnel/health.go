@@ -300,6 +300,37 @@ func (hp *HealthProber) probeEndpoint(ctx context.Context, tunnel *models.Backen
 	return latencyMS, nil
 }
 
+func (hp *HealthProber) isTunnelDisabled(serverID int64) bool {
+	if hp.pool == nil {
+		return false
+	}
+	curTun, err := hp.pool.GetTunnel(serverID)
+	if err != nil || curTun == nil {
+		return false
+	}
+	return curTun.Status == "disabled" || curTun.DisableReason == models.DisableReasonAdmin
+}
+
+func (hp *HealthProber) isTunnelAdminDisabled(serverID int64) bool {
+	if hp.pool == nil {
+		return false
+	}
+	curTun, err := hp.pool.GetTunnel(serverID)
+	if err != nil || curTun == nil {
+		return false
+	}
+	return curTun.DisableReason == models.DisableReasonAdmin
+}
+
+func (hp *HealthProber) getInitialSnapshot(tunnel *models.BackendTunnel) *models.BackendTunnel {
+	if hp.pool != nil {
+		if cur, err := hp.pool.GetTunnel(tunnel.ServerID); err == nil && cur != nil {
+			return cur
+		}
+	}
+	return tunnel
+}
+
 // ProbeTunnel executes a single Noise IK handshake probe against a backend tunnel and returns measured RTT.
 // Administratively disabled tunnels are never probed and never have their status written:
 // a healthy handshake would otherwise resurrect the tunnel (status write + onActiveHook
@@ -309,36 +340,24 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
 	}
-	if tunnel.Status == "disabled" {
-		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", tunnel.ID, "server_id", tunnel.ServerID)
+
+	snapshot := hp.getInitialSnapshot(tunnel)
+	if snapshot.Status == "disabled" || snapshot.DisableReason == models.DisableReasonAdmin {
+		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", snapshot.ID, "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
 
 	latencyMS, err := hp.probeEndpoint(ctx, tunnel)
 	if err != nil {
-		hp.mu.Lock()
-		defer hp.mu.Unlock()
-		hp.failCounts[tunnel.ServerID]++
-		failures := hp.failCounts[tunnel.ServerID]
-
-		status := "degraded"
-		if failures >= hp.cfg.FailureThreshold {
-			status = "disabled"
-			hp.autoDisabled[tunnel.ServerID] = true
-			hp.successCounts[tunnel.ServerID] = 0
-		}
-
-		if hp.pool != nil {
-			if status == "disabled" {
-				_ = hp.pool.SetTunnelStatusWithReason(ctx, tunnel.ServerID, status, models.DisableReasonHealth, 0)
-			} else {
-				_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, 0)
-			}
-		}
-		return 0, err
+		return hp.handleProbeFailure(ctx, snapshot, err)
 	}
 
 	// Probe succeeded
+	if hp.isTunnelDisabled(tunnel.ServerID) {
+		slog.Info("probe succeeded but tunnel is disabled; skipping activation", "server_id", tunnel.ServerID)
+		return 0, ErrTunnelDisabled
+	}
+
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
@@ -346,46 +365,295 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 
 	// If transitioning to active, verify data-plane readiness via hook
 	if status == "active" {
-		hp.mu.RLock()
-		hook := hp.onActiveHook
-		hp.mu.RUnlock()
-		if hook != nil {
-			if hookErr := hook(ctx, tunnel); hookErr != nil {
+		if _, hookErr := hp.executeActiveHook(ctx, snapshot, tunnel); hookErr != nil {
+			return 0, hookErr
+		}
+	}
+
+	// Re-check status before final status write
+	if hp.isTunnelDisabled(tunnel.ServerID) {
+		slog.Info("tunnel was disabled before status write; skipping", "server_id", tunnel.ServerID)
+		return 0, ErrTunnelDisabled
+	}
+
+	hp.mu.Lock()
+	hp.failCounts[tunnel.ServerID] = 0
+	delete(hp.autoDisabled, tunnel.ServerID)
+	delete(hp.successCounts, tunnel.ServerID)
+	hp.mu.Unlock()
+
+	if hp.pool != nil {
+		if err := hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, latencyMS); err != nil {
+			return 0, err
+		}
+	}
+
+	return latencyMS, nil
+}
+
+func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {
+	if hp.isTunnelDisabled(tunnel.ServerID) {
+		slog.Info("aborting onActiveHook: tunnel is disabled", "server_id", tunnel.ServerID)
+		return 0, ErrTunnelDisabled
+	}
+
+	hp.mu.RLock()
+	hook := hp.onActiveHook
+	hp.mu.RUnlock()
+	if hook != nil {
+		if hookErr := hook(ctx, tunnel); hookErr != nil {
+			return hp.handleHookFailure(ctx, snapshot, hookErr)
+		}
+	}
+	return 0, nil
+}
+
+// reconcileThresholdAutoDisable reconciles a missed threshold auto-disable CAS update
+// caused by reverse failure ordering or concurrent state updates.
+func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serverID int64) (bool, error) {
+	if hp.pool == nil {
+		return false, nil
+	}
+
+	if hp.isTunnelAdminDisabled(serverID) {
+		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	currentTunnel, err := hp.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, ErrTunnelNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if currentTunnel == nil {
+		return false, nil
+	}
+
+	if currentTunnel.DisableReason == models.DisableReasonAdmin {
+		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	if currentTunnel.Status == models.TunnelStatusDisabled && currentTunnel.DisableReason == models.DisableReasonHealth {
+		hp.mu.Lock()
+		hp.autoDisabled[serverID] = true
+		hp.successCounts[serverID] = 0
+		hp.mu.Unlock()
+		return true, nil
+	}
+
+	hp.mu.Lock()
+	count := hp.failCounts[serverID]
+	threshold := hp.cfg.FailureThreshold
+	hp.mu.Unlock()
+
+	if count < threshold {
+		return false, nil
+	}
+
+	swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+		ctx,
+		currentTunnel.ServerID,
+		currentTunnel.Status,
+		currentTunnel.DisableReason,
+		currentTunnel.StateVersion,
+		models.TunnelStatusDisabled,
+		models.DisableReasonHealth,
+		0,
+	)
+	if casErr != nil {
+		return false, casErr
+	}
+	if swapped {
+		hp.mu.Lock()
+		hp.autoDisabled[serverID] = true
+		hp.successCounts[serverID] = 0
+		hp.mu.Unlock()
+		return true, nil
+	}
+
+	if hp.isTunnelAdminDisabled(serverID) {
+		slog.Info("threshold auto-disable reconciliation CAS missed due to concurrent admin disable", "server_id", serverID)
+		hp.mu.Lock()
+		delete(hp.autoDisabled, serverID)
+		hp.failCounts[serverID] = 0
+		hp.mu.Unlock()
+		return false, nil
+	}
+
+	if cur, err := hp.pool.GetTunnel(serverID); err == nil && cur != nil {
+		if cur.Status == models.TunnelStatusDisabled && cur.DisableReason == models.DisableReasonHealth {
+			hp.mu.Lock()
+			hp.autoDisabled[serverID] = true
+			hp.successCounts[serverID] = 0
+			hp.mu.Unlock()
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
+	hp.mu.Lock()
+	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+		hp.failCounts[snapshot.ServerID] = 0
+		delete(hp.autoDisabled, snapshot.ServerID)
+		hp.mu.Unlock()
+		slog.Info("probe failed but tunnel was administratively disabled; ignoring failure", "server_id", snapshot.ServerID)
+		return 0, probeErr
+	}
+	hp.failCounts[snapshot.ServerID]++
+	failures := hp.failCounts[snapshot.ServerID]
+	hp.mu.Unlock()
+
+	if failures >= hp.cfg.FailureThreshold {
+		if hp.pool != nil {
+			swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+				ctx,
+				snapshot.ServerID,
+				snapshot.Status,
+				snapshot.DisableReason,
+				snapshot.StateVersion,
+				"disabled",
+				models.DisableReasonHealth,
+				0,
+			)
+			if casErr != nil {
+				return 0, casErr
+			}
+			if swapped {
 				hp.mu.Lock()
-				defer hp.mu.Unlock()
-				hp.failCounts[tunnel.ServerID]++
-				failures := hp.failCounts[tunnel.ServerID]
-
-				hookStatus := "degraded"
-				if failures >= hp.cfg.FailureThreshold {
-					hookStatus = "disabled"
-					hp.autoDisabled[tunnel.ServerID] = true
-					hp.successCounts[tunnel.ServerID] = 0
+				hp.autoDisabled[snapshot.ServerID] = true
+				hp.successCounts[snapshot.ServerID] = 0
+				hp.mu.Unlock()
+			} else {
+				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID); recErr != nil {
+					return 0, recErr
 				}
-
-				if hp.pool != nil {
-					if hookStatus == "disabled" {
-						_ = hp.pool.SetTunnelStatusWithReason(ctx, tunnel.ServerID, hookStatus, models.DisableReasonHealth, 0)
-					} else {
-						_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, hookStatus, 0)
-					}
-				}
-				return 0, fmt.Errorf("data-plane readiness check failed: %w", hookErr)
+			}
+		} else {
+			hp.mu.Lock()
+			hp.autoDisabled[snapshot.ServerID] = true
+			hp.successCounts[snapshot.ServerID] = 0
+			hp.mu.Unlock()
+		}
+	} else if hp.pool != nil {
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+			ctx,
+			snapshot.ServerID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			"degraded",
+			snapshot.DisableReason,
+			0,
+		)
+		if casErr != nil {
+			return 0, casErr
+		}
+		if !swapped {
+			slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
+				"server_id", snapshot.ServerID,
+				"expected_status", snapshot.Status,
+				"expected_version", snapshot.StateVersion,
+			)
+			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+				hp.mu.Lock()
+				hp.failCounts[snapshot.ServerID] = 0
+				delete(hp.autoDisabled, snapshot.ServerID)
+				hp.mu.Unlock()
 			}
 		}
 	}
 
-	hp.mu.Lock()
-	defer hp.mu.Unlock()
+	return 0, probeErr
+}
 
-	hp.failCounts[tunnel.ServerID] = 0
-	delete(hp.autoDisabled, tunnel.ServerID)
-	delete(hp.successCounts, tunnel.ServerID)
-	if hp.pool != nil {
-		_ = hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, latencyMS)
+func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
+	hp.mu.Lock()
+	if errors.Is(hookErr, ErrTunnelDisabled) || hp.isTunnelDisabled(snapshot.ServerID) {
+		hp.failCounts[snapshot.ServerID] = 0
+		delete(hp.autoDisabled, snapshot.ServerID)
+		hp.mu.Unlock()
+		slog.Info("data-plane hook failed because tunnel was administratively disabled", "server_id", snapshot.ServerID)
+		return 0, ErrTunnelDisabled
+	}
+	hp.failCounts[snapshot.ServerID]++
+	failures := hp.failCounts[snapshot.ServerID]
+	hp.mu.Unlock()
+
+	if failures >= hp.cfg.FailureThreshold {
+		if hp.pool != nil {
+			swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+				ctx,
+				snapshot.ServerID,
+				snapshot.Status,
+				snapshot.DisableReason,
+				snapshot.StateVersion,
+				"disabled",
+				models.DisableReasonHealth,
+				0,
+			)
+			if casErr != nil {
+				return 0, casErr
+			}
+			if swapped {
+				hp.mu.Lock()
+				hp.autoDisabled[snapshot.ServerID] = true
+				hp.successCounts[snapshot.ServerID] = 0
+				hp.mu.Unlock()
+			} else {
+				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID); recErr != nil {
+					return 0, recErr
+				}
+			}
+		} else {
+			hp.mu.Lock()
+			hp.autoDisabled[snapshot.ServerID] = true
+			hp.successCounts[snapshot.ServerID] = 0
+			hp.mu.Unlock()
+		}
+	} else if hp.pool != nil {
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatus(
+			ctx,
+			snapshot.ServerID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			"degraded",
+			snapshot.DisableReason,
+			0,
+		)
+		if casErr != nil {
+			return 0, casErr
+		}
+		if !swapped {
+			slog.Debug("hook failure degraded CAS missed due to concurrent tunnel update",
+				"server_id", snapshot.ServerID,
+				"expected_status", snapshot.Status,
+				"expected_version", snapshot.StateVersion,
+			)
+			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+				hp.mu.Lock()
+				hp.failCounts[snapshot.ServerID] = 0
+				delete(hp.autoDisabled, snapshot.ServerID)
+				hp.mu.Unlock()
+			}
+		}
 	}
 
-	return latencyMS, nil
+	return 0, fmt.Errorf("data-plane readiness check failed: %w", hookErr)
 }
 
 // MarkAutoDisabled marks a backend server as auto-disabled due to health probe failures.
@@ -399,13 +667,14 @@ func (hp *HealthProber) MarkAutoDisabled(serverID int64) {
 	hp.successCounts[serverID] = 0
 }
 
-// MarkAdminDisabled clears auto-disabled tracking for a backend server when administratively disabled.
+// MarkAdminDisabled clears auto-disabled tracking and failure counters for a backend server when administratively disabled.
 func (hp *HealthProber) MarkAdminDisabled(serverID int64) {
 	if hp == nil {
 		return
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
+	hp.failCounts[serverID] = 0
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 }
