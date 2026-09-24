@@ -19,7 +19,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 	for _, action := range []string{"disconnect-session", "disconnect-user", "release", "reap", "replace"} {
 		t.Run(action, func(t *testing.T) {
 			db := setupTestDB(t)
-			svc, serverID, _, userID, peer := setupTestVPNService(t, db)
+			svc, _, _, userID, peer := setupTestVPNService(t, db)
 			if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -27,7 +27,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.CreateConnection(t.Context(), &models.UserConnection{UserID: otherUser, ServerID: serverID, Protocol: "awg", ClientID: "bob-peer", Name: "bob"}); err != nil {
+			if _, err := db.CreateConnection(t.Context(), &models.UserConnection{UserID: otherUser, ServerID: 0, Protocol: "awg", ClientID: "bob-peer", Name: "bob"}); err != nil {
 				t.Fatal(err)
 			}
 			sess, _, err := svc.HandleIncomingPeer(t.Context(), peer)
