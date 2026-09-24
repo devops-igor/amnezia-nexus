@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -333,5 +334,57 @@ func TestStartReconcilesConnectionGauge(t *testing.T) {
 	poolTunAfter, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil || poolTunAfter.ActiveConnections != 1 {
 		t.Errorf("after peer handshake: pool active_connections for backend %d = %v, want 1 (err: %v)", backend.ID, poolTunAfter, err)
+	}
+}
+
+// TestComputeDesiredTunnelConnections verifies the pure calculation of desired connection
+// counts, drift detection, and out-of-pool session tracking.
+func TestComputeDesiredTunnelConnections(t *testing.T) {
+	now := time.Now().UTC()
+	tunnels := []*models.BackendTunnel{
+		{ID: 10, ServerID: 1, ActiveConnections: 2}, // Matches desired (2) -> no drift
+		{ID: 20, ServerID: 2, ActiveConnections: 5}, // Desired is 1 -> drifted (want 1)
+		{ID: 30, ServerID: 3, ActiveConnections: 0}, // Desired is 3 -> drifted (want 3)
+	}
+
+	sessions := []models.VPNSession{
+		{ID: "s1", BackendTunnelID: 10, Status: "connected"},
+		{ID: "s2", BackendTunnelID: 10, Status: "connected"},
+		{ID: "s3", BackendTunnelID: 20, Status: "connected"},
+		{ID: "s4", BackendTunnelID: 30, Status: "connected"},
+		{ID: "s5", BackendTunnelID: 30, Status: "connected"},
+		{ID: "s6", BackendTunnelID: 30, Status: "connected"},
+		{ID: "s7", BackendTunnelID: 999, Status: "connected"}, // Unknown / unpooled tunnel
+	}
+
+	plan := computeDesiredTunnelConnections(tunnels, sessions, now)
+
+	// Invariant 1: Desired counts match session breakdown
+	if plan.desired[10] != 2 || plan.desired[20] != 1 || plan.desired[30] != 3 {
+		t.Errorf("unexpected desired counts: %+v", plan.desired)
+	}
+
+	// Invariant 2: Drift detected only for tunnels whose ActiveConnections != desired
+	if _, ok := plan.tunnelChanges[10]; ok {
+		t.Errorf("tunnel 10 should not be in tunnelChanges since count matches (2)")
+	}
+	if want, ok := plan.tunnelChanges[20]; !ok || want != 1 {
+		t.Errorf("tunnel 20 change = %d (present: %v), want 1", want, ok)
+	}
+	if want, ok := plan.tunnelChanges[30]; !ok || want != 3 {
+		t.Errorf("tunnel 30 change = %d (present: %v), want 3", want, ok)
+	}
+
+	// Invariant 3: All known tunnels have staged reconcile timestamp
+	for _, tun := range tunnels {
+		ts, ok := plan.stagedReconcile[tun.ID]
+		if !ok || ts != now {
+			t.Errorf("tunnel %d stagedReconcile = %v, want %v", tun.ID, ts, now)
+		}
+	}
+
+	// Invariant 4: Sessions on unpooled tunnels are identified
+	if plan.unknownSessions != 1 {
+		t.Errorf("unknownSessions = %d, want 1", plan.unknownSessions)
 	}
 }

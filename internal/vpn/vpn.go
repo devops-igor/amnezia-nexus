@@ -1099,6 +1099,48 @@ func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
 	return s.sessionMgr != nil && s.sessionMgr.LifecycleVersion() != versionBefore
 }
 
+type tunnelReconcilePlan struct {
+	desired         map[int64]int
+	tunnelChanges   map[int64]int
+	stagedReconcile map[int64]time.Time
+	unknownSessions int
+}
+
+// computeDesiredTunnelConnections evaluates current active sessions against
+// known pool tunnels to determine desired connection counts, identify tunnels
+// with drifted gauges, and note any sessions associated with unpooled tunnels.
+func computeDesiredTunnelConnections(
+	tunnels []*models.BackendTunnel,
+	sessions []models.VPNSession,
+	dbReadTime time.Time,
+) tunnelReconcilePlan {
+	plan := tunnelReconcilePlan{
+		desired:         make(map[int64]int, len(tunnels)),
+		tunnelChanges:   make(map[int64]int),
+		stagedReconcile: make(map[int64]time.Time, len(tunnels)),
+	}
+
+	for i := range sessions {
+		plan.desired[sessions[i].BackendTunnelID]++
+	}
+
+	knownCount := 0
+	for _, tun := range tunnels {
+		want := plan.desired[tun.ID]
+		knownCount += want
+		plan.stagedReconcile[tun.ID] = dbReadTime
+		if tun.ActiveConnections != want {
+			plan.tunnelChanges[tun.ID] = want
+		}
+	}
+
+	if unknown := len(sessions) - knownCount; unknown > 0 {
+		plan.unknownSessions = unknown
+	}
+
+	return plan
+}
+
 // reconcileConnectionCountsStrict recomputes the active_connections gauge of every
 // tunnel in the pool from the authoritative vpn_sessions table (issue #54).
 // The gauge is a LIVE count of status='connected' sessions per backend
@@ -1155,23 +1197,8 @@ func (s *Service) reconcileConnectionCountsStrict(ctx context.Context) error {
 		return nil
 	}
 
-	desired := make(map[int64]int)
-	for i := range sessions {
-		desired[sessions[i].BackendTunnelID]++
-	}
-
 	tunnels := s.pool.ListTunnels()
-	tunnelChanges := make(map[int64]int)
-	stagedReconcile := make(map[int64]time.Time)
-	for _, tun := range tunnels {
-		want := desired[tun.ID]
-		if tun.ActiveConnections == want {
-			stagedReconcile[tun.ID] = dbReadTime
-			continue
-		}
-		tunnelChanges[tun.ID] = want
-		stagedReconcile[tun.ID] = dbReadTime
-	}
+	plan := computeDesiredTunnelConnections(tunnels, sessions, dbReadTime)
 
 	if s.reconcilePreCommitHook != nil {
 		s.reconcilePreCommitHook()
@@ -1183,11 +1210,32 @@ func (s *Service) reconcileConnectionCountsStrict(ctx context.Context) error {
 		return nil
 	}
 
-	anyDrift := len(tunnelChanges) > 0
+	applyErr := s.applyTunnelConnectionCounts(ctx, tunnels, plan.tunnelChanges, plan.stagedReconcile, dbReadTime)
+
+	if plan.unknownSessions > 0 {
+		log.Printf("[vpn] warning: %d connected session(s) reference backend tunnels outside the pool; left for existing failover/sweeper logic", plan.unknownSessions)
+	}
+
+	if len(plan.tunnelChanges) == 0 && plan.unknownSessions == 0 {
+		log.Printf("[vpn] connection gauge reconciliation: no drift detected across %d tunnel(s)", len(tunnels))
+	}
+
+	return applyErr
+}
+
+// applyTunnelConnectionCounts persists changed active connection counts to the pool
+// and updates reconciliation tracking timestamps. Must be called with s.mu held.
+func (s *Service) applyTunnelConnectionCounts(
+	ctx context.Context,
+	tunnels []*models.BackendTunnel,
+	changes map[int64]int,
+	stagedReconcile map[int64]time.Time,
+	dbReadTime time.Time,
+) error {
 	var firstErr error
 	allSucceeded := true
 	for _, tun := range tunnels {
-		want, changed := tunnelChanges[tun.ID]
+		want, changed := changes[tun.ID]
 		if !changed {
 			continue
 		}
@@ -1212,21 +1260,6 @@ func (s *Service) reconcileConnectionCountsStrict(ctx context.Context) error {
 
 	if allSucceeded {
 		s.lastReconcileTime = dbReadTime
-	}
-
-	// Sessions whose BackendTunnelID is not in the pool: count them as the
-	// total minus everything accounted for by known tunnels.
-	knownCount := 0
-	for _, tun := range tunnels {
-		knownCount += desired[tun.ID]
-	}
-	unknown := len(sessions) - knownCount
-	if unknown > 0 {
-		log.Printf("[vpn] warning: %d connected session(s) reference backend tunnels outside the pool; left for existing failover/sweeper logic", unknown)
-	}
-
-	if !anyDrift && unknown == 0 {
-		log.Printf("[vpn] connection gauge reconciliation: no drift detected across %d tunnel(s)", len(tunnels))
 	}
 
 	return firstErr
