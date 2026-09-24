@@ -2835,6 +2835,16 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.pool != nil {
+		targetTun, err := s.pool.GetTunnelByID(targetTunnelID)
+		if err != nil {
+			return fmt.Errorf("target backend tunnel %d not found in pool: %w", targetTunnelID, err)
+		}
+		if !strings.EqualFold(targetTun.Status, "active") {
+			return fmt.Errorf("target backend tunnel %d is not active (status=%s)", targetTunnelID, targetTun.Status)
+		}
+	}
+
 	if s.sessionMgr == nil {
 		return errors.New("session manager is not initialized")
 	}
@@ -2868,7 +2878,7 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 	}
 
 	// Step 2: In-Memory Session Update
-	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "draining"); err != nil {
+	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "connected"); err != nil {
 		if forwarderMigrated && s.forwarder != nil {
 			_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
 		}
@@ -2877,7 +2887,7 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	// Step 3: Database Persistence
 	if s.db != nil {
-		if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessionID, targetTunnelID); err != nil {
+		if err := s.db.MigrateVPNSessionBackend(ctx, sessionID, targetTunnelID); err != nil {
 			// Step 4: Rollback on DB Error
 			if forwarderMigrated && s.forwarder != nil {
 				_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
@@ -2897,14 +2907,14 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 	}
 	s.sessionMgr.BumpLifecycleVersion()
 
-	log.Printf("[vpn] migrated session %s (peer %s) from backend %d to backend %d (draining)",
+	log.Printf("[vpn] migrated session %s (peer %s) from backend %d to backend %d (connected)",
 		sessionID, peerKey, oldTunnelID, targetTunnelID)
 	slog.Info("Migrated VPN session backend route",
 		"session_id", sessionID,
 		"peer_key", peerKey,
 		"source_tunnel_id", oldTunnelID,
 		"target_tunnel_id", targetTunnelID,
-		"status", "draining",
+		"status", "connected",
 	)
 
 	return nil
