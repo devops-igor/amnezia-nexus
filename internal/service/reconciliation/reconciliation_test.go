@@ -11,6 +11,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/service/supervisor"
 )
 
 type mockStatusProtocolManager struct {
@@ -514,5 +515,787 @@ func TestReconciler_DNSTeleMTErrorsPreserveProtocols(t *testing.T) {
 	}
 	if _, ok := srv.Protocols["telemt"]; !ok {
 		t.Errorf("expected telemt protocol to be preserved on error")
+	}
+}
+
+type mockZombiePeerProtocolManager struct {
+	proto          string
+	clients        []map[string]any
+	deleted        []string
+	getClientsErr  bool
+	removeErr      bool
+	getClientsHook func()
+	getClientsFunc func(ctx context.Context, server *models.Server) ([]map[string]any, error)
+	mu             sync.Mutex
+}
+
+func (m *mockZombiePeerProtocolManager) Protocol() string {
+	return m.proto
+}
+func (m *mockZombiePeerProtocolManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) Uninstall(ctx context.Context, server *models.Server) error {
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getClientsHook != nil {
+		m.getClientsHook()
+	}
+	if m.getClientsFunc != nil {
+		return m.getClientsFunc(ctx, server)
+	}
+	if m.getClientsErr {
+		return nil, errors.New("remote get clients error")
+	}
+	return m.clients, nil
+}
+func (m *mockZombiePeerProtocolManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+	return nil, nil
+}
+func (m *mockZombiePeerProtocolManager) RemoveClient(ctx context.Context, server *models.Server, clientID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.removeErr {
+		return errors.New("remote remove client error")
+	}
+	m.deleted = append(m.deleted, clientID)
+	return nil
+}
+func (m *mockZombiePeerProtocolManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {
+	return "", nil
+}
+func (m *mockZombiePeerProtocolManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	return map[string]any{"container_exists": true}, nil
+}
+
+func TestReconciler_CleanupZombiePeers(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	})
+
+	uID, _ := db.CreateUser(ctx, &models.User{
+		Username: "user1",
+		Role:     models.RoleUser,
+	})
+
+	// Valid DB connection
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID:        "conn-valid-1",
+		UserID:    uID,
+		ServerID:  sID,
+		Protocol:  "awg",
+		ClientID:  "peer-valid-db",
+		Name:      "Valid DB Client",
+		CreatedAt: time.Now().UTC(),
+	})
+
+	// Track peer-zombie-1 as known failed lifecycle operation
+	_ = db.RecordPeerLifecycle(ctx, sID, "awg", "peer-zombie-1", "Zombie One", "", "failed")
+
+	// Track peer-zombie-2 as stale pending creation (> 5 minutes ago)
+	staleTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	_, _ = db.ExecContext(ctx, "INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		sID, "awg", "peer-zombie-2", "Zombie Two", "", "pending", staleTime, staleTime)
+
+	remoteClients := []map[string]any{
+		{"clientId": "peer-valid-db", "name": "Valid DB Client"},
+		{"clientId": "peer-zombie-1", "name": "Zombie One"},
+		{"clientId": "peer-zombie-2", "userData": map[string]any{"clientName": "Zombie Two"}},
+		{"clientId": "peer-portal-data", "name": "Portal Data Plane"},
+		{"clientId": "peer-portal-probe", "userData": map[string]any{"clientName": "Portal Health Probe"}},
+		{"clientId": "peer-health-probe", "userData": map[string]any{"clientName": "Health Probe"}},
+		{"clientId": "peer-external", "userData": map[string]any{"clientName": "External Peer", "externalClient": true}},
+		{"clientId": "peer-external-top", "clientName": "External Peer Top", "externalClient": true},
+	}
+
+	mgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: remoteClients,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	r := New(db, reg)
+
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	expectedDeleted := map[string]bool{
+		"peer-zombie-1": true,
+		"peer-zombie-2": true,
+	}
+
+	if len(mgr.deleted) != len(expectedDeleted) {
+		t.Fatalf("expected exactly %d deleted peers, got %d: %v", len(expectedDeleted), len(mgr.deleted), mgr.deleted)
+	}
+
+	for _, id := range mgr.deleted {
+		if !expectedDeleted[id] {
+			t.Errorf("unexpected peer was deleted: %s", id)
+		}
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_ToleratesErrors(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg":    map[string]any{"port": 55424},
+			"telemt": map[string]any{"port": 443},
+		},
+	})
+
+	// AWG manager fails to GetClients
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto:         "awg",
+		getClientsErr: true,
+	}
+
+	// TeleMT manager has two zombie peers; one fails on RemoveClient
+	_ = db.RecordPeerLifecycle(ctx, sID, "telemt", "zombie-telemt-1", "ZT1", "", "failed")
+	telemtMgr := &mockZombiePeerProtocolManager{
+		proto: "telemt",
+		clients: []map[string]any{
+			{"clientId": "zombie-telemt-1", "name": "ZT1"},
+		},
+		removeErr: true,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+	reg.Register(telemtMgr)
+
+	r := New(db, reg)
+
+	// Must tolerate remote errors gracefully without returning fatal error
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers should tolerate remote errors, got: %v", err)
+	}
+
+	srv, err := db.GetServer(ctx, sID)
+	if err != nil || srv == nil {
+		t.Fatalf("server should still exist after error-tolerant pass")
+	}
+}
+
+func TestReconciler_CleanupStaleProtocols_ExecutesPhase3(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_, _ = db.CreateServer(ctx, &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	})
+
+	_ = db.RecordPeerLifecycle(ctx, 1, "awg", "peer-zombie-phase3", "Zombie In Phase 3", "", "failed")
+	remoteClients := []map[string]any{
+		{"clientId": "peer-zombie-phase3", "name": "Zombie In Phase 3"},
+	}
+
+	mgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: remoteClients,
+	}
+
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	r := New(db, reg)
+
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("CleanupStaleProtocols failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	if len(mgr.deleted) != 1 || mgr.deleted[0] != "peer-zombie-phase3" {
+		t.Fatalf("expected peer-zombie-phase3 to be removed during Phase 3, got: %v", mgr.deleted)
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_NilDBAndClosedDB(t *testing.T) {
+	ctx := context.Background()
+
+	nilR := New(nil, nil)
+	if err := nilR.CleanupZombiePeers(ctx); err == nil {
+		t.Error("expected error for nil DB in CleanupZombiePeers")
+	}
+
+	db, cleanup := setupTestDB(t)
+	r := New(db, nil)
+	cleanup() // close DB
+
+	if err := r.CleanupZombiePeers(ctx); err == nil {
+		t.Error("expected error when DB is closed in CleanupZombiePeers")
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_PreservesUnassignedConnections(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg":    map[string]any{"port": 55424},
+			"telemt": map[string]any{"port": 443},
+		},
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Pre-upgrade legacy untracked unassigned AWG connection (neither in user_connections nor in peer_lifecycle)
+	legacyAWG := "awg-legacy-unassigned-1"
+
+	// 2. Pre-upgrade legacy untracked unassigned TeleMT connection (neither in user_connections nor in peer_lifecycle)
+	legacyTeleMT := "telemt-legacy-unassigned-1"
+
+	// 3. Known failed lifecycle peer (status: "failed") that MUST be purged
+	failedAWG := "awg-failed-peer-2"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", failedAWG, "Failed AWG", "", "failed"); err != nil {
+		t.Fatalf("failed to record failed AWG peer: %v", err)
+	}
+
+	// 4. Stale pending lifecycle peer (status: "pending", created > 5 minutes ago) that MUST be purged
+	stalePendingAWG := "awg-stale-pending-peer-3"
+	staleTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	_, err = db.ExecContext(ctx, "INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		sID, "awg", stalePendingAWG, "Stale Pending AWG", "", "pending", staleTime, staleTime)
+	if err != nil {
+		t.Fatalf("failed to insert stale pending peer: %v", err)
+	}
+
+	// 5. Recent pending lifecycle peer (status: "pending", created < 5m ago) that MUST survive
+	recentPendingAWG := "awg-recent-pending-peer-4"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", recentPendingAWG, "Recent Pending AWG", "", "pending"); err != nil {
+		t.Fatalf("failed to record recent pending peer: %v", err)
+	}
+
+	// 6. Known failed TeleMT peer (status: "failed") that MUST be purged
+	failedTeleMT := "telemt-failed-peer-2"
+	if err := db.RecordPeerLifecycle(ctx, sID, "telemt", failedTeleMT, "Failed TeleMT", "", "failed"); err != nil {
+		t.Fatalf("failed to record failed TeleMT peer: %v", err)
+	}
+
+	// Remote peers reported by managers (older than 2-minute creation grace period to verify lifecycle-based decisions)
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+		clients: []map[string]any{
+			{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+			{"clientId": failedAWG, "clientName": "Failed AWG", "creationDate": oldTimestamp},
+			{"clientId": stalePendingAWG, "clientName": "Stale Pending AWG", "creationDate": oldTimestamp},
+			{"clientId": recentPendingAWG, "clientName": "Recent Pending AWG", "creationDate": time.Now().Format(time.RFC3339)},
+		},
+	}
+
+	telemtMgr := &mockZombiePeerProtocolManager{
+		proto: "telemt",
+		clients: []map[string]any{
+			{"clientId": legacyTeleMT, "clientName": "Legacy Unassigned TeleMT", "creationDate": oldTimestamp},
+			{"clientId": failedTeleMT, "clientName": "Failed TeleMT", "creationDate": oldTimestamp},
+		},
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+	reg.Register(telemtMgr)
+
+	r := New(db, reg)
+
+	// Execute startup reconciliation
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("CleanupStaleProtocols failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedAWG := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	telemtMgr.mu.Lock()
+	deletedTeleMT := append([]string(nil), telemtMgr.deleted...)
+	telemtMgr.mu.Unlock()
+
+	// Assert:
+	// - Legacy unassigned AWG survives and was adopted into peer_lifecycle as active
+	// - Failed AWG was deleted
+	// - Stale pending AWG was deleted
+	// - Recent pending AWG survives
+	expectedDeletedAWG := map[string]bool{
+		failedAWG:       true,
+		stalePendingAWG: true,
+	}
+	if len(deletedAWG) != len(expectedDeletedAWG) {
+		t.Fatalf("expected exactly %d deleted AWG peers, got %d: %v", len(expectedDeletedAWG), len(deletedAWG), deletedAWG)
+	}
+	for _, id := range deletedAWG {
+		if !expectedDeletedAWG[id] {
+			t.Errorf("unexpected AWG peer was deleted: %s", id)
+		}
+	}
+
+	// Assert:
+	// - Legacy unassigned TeleMT survives and was adopted into peer_lifecycle as active
+	// - Failed TeleMT was deleted
+	if len(deletedTeleMT) != 1 || deletedTeleMT[0] != failedTeleMT {
+		t.Fatalf("expected only failed TeleMT peer %s to be deleted, got: %v", failedTeleMT, deletedTeleMT)
+	}
+
+	// Verify adoption in peer_lifecycle
+	activeAWGPeers, err := db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs AWG failed: %v", err)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Errorf("expected legacy AWG peer %s to be adopted into peer_lifecycle with active status", legacyAWG)
+	}
+	if !activeAWGPeers[recentPendingAWG] {
+		t.Errorf("expected recent pending AWG peer %s to remain active in peer_lifecycle", recentPendingAWG)
+	}
+
+	activeTeleMTPeers, err := db.GetActivePeerIDs(ctx, sID, "telemt")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs TeleMT failed: %v", err)
+	}
+	if !activeTeleMTPeers[legacyTeleMT] {
+		t.Errorf("expected legacy TeleMT peer %s to be adopted into peer_lifecycle with active status", legacyTeleMT)
+	}
+}
+
+func TestReconciler_BackgroundService_StartAndStop(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	}
+	if _, err := db.CreateServer(ctx, srv); err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	callCount := 0
+	var mu sync.Mutex
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: []map[string]any{},
+	}
+	awgMgr.getClientsHook = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		callCount++
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg,
+		WithBootDelay(10*time.Millisecond),
+		WithInterval(20*time.Millisecond),
+	)
+
+	if name := r.Name(); name != "protocol_reconciler" {
+		t.Fatalf("expected Name() to be 'protocol_reconciler', got %s", name)
+	}
+
+	sup := supervisor.New(
+		supervisor.WithRestartDelay(10 * time.Millisecond),
+	)
+	sup.RegisterService(r)
+
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Start(ctx)
+	}()
+
+	// Wait for background service to execute at least 2 ticks
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		c := callCount
+		mu.Unlock()
+		if c >= 2 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	mu.Lock()
+	finalCount := callCount
+	mu.Unlock()
+	if finalCount < 1 {
+		t.Fatalf("expected at least 1 execution of reconciler loop, got %d", finalCount)
+	}
+
+	// Stop supervisor and assert clean termination
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := sup.Stop(stopCtx); err != nil {
+		t.Fatalf("supervisor.Stop failed: %v", err)
+	}
+
+	select {
+	case err := <-supErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("supervisor.Start exited with unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("supervisor did not stop within deadline")
+	}
+
+	r.mu.Lock()
+	running := r.running
+	r.mu.Unlock()
+	if running {
+		t.Fatalf("expected reconciler.running to be false after Stop")
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_PurgesUntrackedZombiePostAdoption(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Pre-upgrade legacy untracked unassigned AWG connection
+	legacyAWG := "awg-legacy-unassigned-1"
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+		clients: []map[string]any{
+			{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+		},
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg)
+
+	// Execute initial startup reconciliation: adopts legacyAWG and sets legacy_peers_adopted = true
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("initial CleanupStaleProtocols failed: %v", err)
+	}
+
+	// Verify legacyAWG survived and was adopted into peer_lifecycle
+	activeAWGPeers, err := db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs AWG failed: %v", err)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Fatalf("expected legacy AWG peer %s to be adopted into peer_lifecycle", legacyAWG)
+	}
+
+	// 2. Simulate subsequent failure post-adoption:
+	// A new peer is provisioned on remote container, but DB writes failed and compensating rollback failed.
+	// This peer is older than the 2-minute creation grace period.
+	untrackedZombieAWG := "awg-untracked-zombie-post-adoption"
+	recentInFlightAWG := "awg-recent-in-flight"
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.clients = []map[string]any{
+		{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+		{"clientId": untrackedZombieAWG, "clientName": "Untracked Zombie", "creationDate": oldTimestamp},
+		{"clientId": recentInFlightAWG, "clientName": "Recent In Flight", "creationDate": time.Now().Format(time.RFC3339)},
+	}
+	awgMgr.mu.Unlock()
+
+	// Execute ongoing periodic reconciliation
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedAWG := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	// Assert:
+	// - untrackedZombieAWG was purged!
+	// - recentInFlightAWG survived (within 2-minute grace period)
+	// - legacyAWG survived
+	if len(deletedAWG) != 1 || deletedAWG[0] != untrackedZombieAWG {
+		t.Fatalf("expected only untrackedZombieAWG %s to be deleted, got: %v", untrackedZombieAWG, deletedAWG)
+	}
+
+	// Verify untrackedZombieAWG was NOT adopted into peer_lifecycle
+	activeAWGPeers, err = db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs failed: %v", err)
+	}
+	if activeAWGPeers[untrackedZombieAWG] {
+		t.Errorf("expected untracked zombie %s to NOT be adopted into peer_lifecycle", untrackedZombieAWG)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Errorf("expected legacy AWG %s to remain active in peer_lifecycle", legacyAWG)
+	}
+}
+
+func TestReconciler_MultiServerPartialAdoptionFailure_Regression(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Create Server A (online) and Server B (initially offline / SSH error)
+	srvA := &models.Server{
+		Name:    "Server A",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sIDA, err := db.CreateServer(ctx, srvA)
+	if err != nil {
+		t.Fatalf("failed to create server A: %v", err)
+	}
+
+	srvB := &models.Server{
+		Name:    "Server B",
+		Host:    "10.0.0.2",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sIDB, err := db.CreateServer(ctx, srvB)
+	if err != nil {
+		t.Fatalf("failed to create server B: %v", err)
+	}
+
+	legacyPeerA := "awg-legacy-peer-server-a"
+	legacyPeerB := "awg-legacy-peer-server-b"
+	zombiePeerA := "awg-zombie-peer-server-a"
+	zombiePeerB := "awg-zombie-peer-server-b"
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+
+	var (
+		serverBOnline bool
+		serverAZombie bool
+		serverBZombie bool
+		mu            sync.Mutex
+	)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+	}
+	awgMgr.getClientsFunc = func(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if server.ID == sIDA {
+			clients := []map[string]any{
+				{"clientId": legacyPeerA, "clientName": "Legacy Peer A", "creationDate": oldTimestamp},
+			}
+			if serverAZombie {
+				clients = append(clients, map[string]any{
+					"clientId":     zombiePeerA,
+					"clientName":   "Zombie Peer A",
+					"creationDate": oldTimestamp,
+				})
+			}
+			return clients, nil
+		}
+
+		if server.ID == sIDB {
+			if !serverBOnline {
+				return nil, errors.New("simulated ssh network failure: server B offline")
+			}
+			clients := []map[string]any{
+				{"clientId": legacyPeerB, "clientName": "Legacy Peer B", "creationDate": oldTimestamp},
+			}
+			if serverBZombie {
+				clients = append(clients, map[string]any{
+					"clientId":     zombiePeerB,
+					"clientName":   "Zombie Peer B",
+					"creationDate": oldTimestamp,
+				})
+			}
+			return clients, nil
+		}
+
+		return nil, nil
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg)
+
+	// 2. Run initial legacy adoption: Server A succeeds, Server B fails due to offline error
+	if err := r.AdoptLegacyPeers(ctx); err != nil {
+		t.Fatalf("AdoptLegacyPeers failed: %v", err)
+	}
+
+	// 3. Verify: Server A scope is marked complete; Server B scope is NOT marked complete
+	settingKeyA := legacyPeersAdoptedSettingKey(sIDA, "awg")
+	settingKeyB := legacyPeersAdoptedSettingKey(sIDB, "awg")
+
+	var adoptedA bool
+	if err := db.GetSetting(ctx, settingKeyA, &adoptedA); err != nil || !adoptedA {
+		t.Fatalf("expected Server A scope %s to be marked complete (true), err=%v, val=%v", settingKeyA, err, adoptedA)
+	}
+
+	var adoptedB bool
+	_ = db.GetSetting(ctx, settingKeyB, &adoptedB)
+	if adoptedB {
+		t.Fatalf("expected Server B scope %s to NOT be marked complete", settingKeyB)
+	}
+
+	// Verify Server A's legacy peer was adopted into peer_lifecycle as active
+	activeA, err := db.GetActivePeerIDs(ctx, sIDA, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server A failed: %v", err)
+	}
+	if !activeA[legacyPeerA] {
+		t.Fatalf("expected legacyPeerA to be adopted into peer_lifecycle on Server A")
+	}
+
+	// Verify Server B's legacy peer was NOT yet adopted into peer_lifecycle
+	activeB, err := db.GetActivePeerIDs(ctx, sIDB, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server B failed: %v", err)
+	}
+	if activeB[legacyPeerB] {
+		t.Fatalf("expected legacyPeerB to NOT be in peer_lifecycle yet for Server B")
+	}
+
+	// 4. Server B now becomes reachable!
+	// On Server A, a subsequent untracked peer (> 2m old) appears.
+	mu.Lock()
+	serverBOnline = true
+	serverAZombie = true
+	mu.Unlock()
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.mu.Unlock()
+
+	// 5. Run CleanupZombiePeers()
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deleted := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	// Assert:
+	// - Server B's legacy unassigned peer (legacyPeerB) was NOT deleted!
+	// - Server A's untracked zombie peer (zombiePeerA) WAS deleted!
+	// - Server A's legacy peer (legacyPeerA) was NOT deleted!
+	if len(deleted) != 1 || deleted[0] != zombiePeerA {
+		t.Fatalf("expected only zombiePeerA %s to be deleted, got: %v", zombiePeerA, deleted)
+	}
+
+	// Verify Server B's legacy unassigned peer is now adopted as active in peer_lifecycle
+	activeB, err = db.GetActivePeerIDs(ctx, sIDB, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server B failed: %v", err)
+	}
+	if !activeB[legacyPeerB] {
+		t.Fatalf("expected Server B legacy unassigned peer %s to be adopted as active into peer_lifecycle, not deleted", legacyPeerB)
+	}
+
+	// Verify Server A's legacy peer remains active and zombiePeerA is not in peer_lifecycle
+	activeA, err = db.GetActivePeerIDs(ctx, sIDA, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server A failed: %v", err)
+	}
+	if !activeA[legacyPeerA] {
+		t.Fatalf("expected Server A legacy peer %s to remain active in peer_lifecycle", legacyPeerA)
+	}
+	if activeA[zombiePeerA] {
+		t.Fatalf("expected Server A zombie peer %s to NOT be in peer_lifecycle", zombiePeerA)
+	}
+
+	// Verify Server B scope is now automatically marked complete in settings by CleanupZombiePeers
+	_ = db.GetSetting(ctx, settingKeyB, &adoptedB)
+	if !adoptedB {
+		t.Fatalf("expected Server B scope %s to be marked complete automatically by CleanupZombiePeers", settingKeyB)
+	}
+
+	// 6. Post-adoption on Server B: a new untracked peer (> 2m old) appears on Server B and MUST be purged
+	// Note: zombiePeerA was already removed from Server A's remote container in the previous cleanup.
+	mu.Lock()
+	serverAZombie = false
+	serverBZombie = true
+	mu.Unlock()
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.mu.Unlock()
+
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("second CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedPostAdoption := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	if len(deletedPostAdoption) != 1 || deletedPostAdoption[0] != zombiePeerB {
+		t.Fatalf("expected only zombiePeerB %s to be deleted post-adoption, got: %v", zombiePeerB, deletedPostAdoption)
 	}
 }

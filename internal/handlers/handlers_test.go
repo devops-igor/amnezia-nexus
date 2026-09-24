@@ -90,13 +90,14 @@ func setupTestHandlersWithMockSSH(t *testing.T, client *testMockSSHClient) (*Han
 }
 
 type mockProtocolManager struct {
-	protocol          string
-	installFn         func(ctx context.Context, server *models.Server, params map[string]any) error
-	uninstallFn       func(ctx context.Context, server *models.Server) error
-	getClientsFn      func(ctx context.Context, server *models.Server) ([]map[string]any, error)
-	addClientFn       func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
-	removeClientFn    func(ctx context.Context, server *models.Server, clientID string) error
-	getClientConfigFn func(ctx context.Context, server *models.Server, clientID string) (string, error)
+	protocol            string
+	installFn           func(ctx context.Context, server *models.Server, params map[string]any) error
+	uninstallFn         func(ctx context.Context, server *models.Server) error
+	getClientsFn        func(ctx context.Context, server *models.Server) ([]map[string]any, error)
+	addClientFn         func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
+	removeClientFn      func(ctx context.Context, server *models.Server, clientID string) error
+	rollbackAddClientFn func(ctx context.Context, server *models.Server, addResult map[string]any) error
+	getClientConfigFn   func(ctx context.Context, server *models.Server, clientID string) (string, error)
 }
 
 func (m *mockProtocolManager) Protocol() string {
@@ -147,6 +148,17 @@ func (m *mockProtocolManager) RemoveClient(ctx context.Context, server *models.S
 		return m.removeClientFn(ctx, server, clientID)
 	}
 	return nil
+}
+
+func (m *mockProtocolManager) RollbackAddClient(ctx context.Context, server *models.Server, addResult map[string]any) error {
+	if m.rollbackAddClientFn != nil {
+		return m.rollbackAddClientFn(ctx, server, addResult)
+	}
+	clientID, _ := addResult["client_id"].(string)
+	if clientID == "" {
+		clientID, _ = addResult["clientId"].(string)
+	}
+	return m.RemoveClient(ctx, server, clientID)
 }
 
 func (m *mockProtocolManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {

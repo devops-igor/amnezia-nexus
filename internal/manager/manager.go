@@ -23,6 +23,12 @@ type ProtocolManager interface {
 	GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error)
 }
 
+// RollbackableManager defines an optional extension for protocol managers
+// capable of rolling back client creations, including restoring previous configuration on upsert.
+type RollbackableManager interface {
+	RollbackAddClient(ctx context.Context, server *models.Server, addResult map[string]any) error
+}
+
 // Registry manages protocol manager implementations.
 type Registry struct {
 	mu       sync.RWMutex
@@ -110,6 +116,17 @@ func (m *MockProtocolManager) RemoveClient(ctx context.Context, server *models.S
 		return fmt.Errorf("server cannot be nil")
 	}
 	return nil
+}
+
+func (m *MockProtocolManager) RollbackAddClient(ctx context.Context, server *models.Server, addResult map[string]any) error {
+	if server == nil {
+		return fmt.Errorf("server cannot be nil")
+	}
+	clientID, _ := addResult["client_id"].(string)
+	if clientID == "" {
+		clientID, _ = addResult["clientId"].(string)
+	}
+	return m.RemoveClient(ctx, server, clientID)
 }
 
 func (m *MockProtocolManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {

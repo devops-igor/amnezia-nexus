@@ -30,12 +30,23 @@ func NewOrchestrator(db *database.DB, registry orchestrator.ProtocolResolver, op
 	return orchestrator.New(db, registry, opts...)
 }
 
-// Reconciler coordinates startup protocol reconciliation.
+// Reconciler coordinates startup and periodic protocol reconciliation.
 type Reconciler = reconciliation.Reconciler
+type ReconcilerOption = reconciliation.Option
 
-// NewReconciler creates a new startup Reconciler.
-func NewReconciler(db *database.DB, registry reconciliation.ProtocolResolver) *Reconciler {
-	return reconciliation.New(db, registry)
+// WithReconcilerInterval configures periodic reconciliation interval.
+func WithReconcilerInterval(d time.Duration) ReconcilerOption {
+	return reconciliation.WithInterval(d)
+}
+
+// WithReconcilerBootDelay configures initial delay before first background cleanup.
+func WithReconcilerBootDelay(d time.Duration) ReconcilerOption {
+	return reconciliation.WithBootDelay(d)
+}
+
+// NewReconciler creates a new Reconciler.
+func NewReconciler(db *database.DB, registry reconciliation.ProtocolResolver, opts ...reconciliation.Option) *Reconciler {
+	return reconciliation.New(db, registry, opts...)
 }
 
 // UserOpsService coordinates user mass operations.

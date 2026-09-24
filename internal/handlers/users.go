@@ -243,10 +243,22 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 	}
 	server, err := h.db.GetServer(ctx, *req.ServerID)
 	if err != nil || server == nil {
+		resp["connection_created"] = false
+		if err != nil {
+			resp["connection_error"] = err.Error()
+		} else {
+			resp["connection_error"] = "server not found"
+		}
 		return
 	}
 	protoMgr, err := h.GetProtocolManager(*req.Protocol)
 	if err != nil || protoMgr == nil {
+		resp["connection_created"] = false
+		if err != nil {
+			resp["connection_error"] = err.Error()
+		} else {
+			resp["connection_error"] = "protocol manager not found"
+		}
 		return
 	}
 
@@ -261,6 +273,8 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 
 	connRes, err := protoMgr.AddClient(ctx, server, params)
 	if err != nil {
+		resp["connection_created"] = false
+		resp["connection_error"] = err.Error()
 		return
 	}
 	clientID, _ := connRes["client_id"].(string)
@@ -272,6 +286,8 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 	}
 
+	_ = h.db.RecordPeerLifecycle(ctx, server.ID, *req.Protocol, clientID, connName, user.ID, "active")
+
 	newConn := &models.UserConnection{
 		ID:         uuid.NewString(),
 		UserID:     user.ID,
@@ -282,7 +298,16 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		AWGMimicry: user.AWGMimicry,
 		CreatedAt:  time.Now(),
 	}
-	_, _ = h.db.CreateConnection(ctx, newConn)
+	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, connRes, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, server.ID, *req.Protocol, clientID, "failed")
+		} else {
+			_ = h.db.DeletePeerLifecycle(ctx, server.ID, *req.Protocol, clientID)
+		}
+		resp["connection_created"] = false
+		resp["connection_error"] = err.Error()
+		return
+	}
 
 	resp["connection_created"] = true
 	resp["config"] = configStr
@@ -442,6 +467,7 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 				_ = protoMgr.RemoveClient(ctx, server, c.ClientID)
 			}
 		}
+		_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 	}
 
 	if _, err := h.db.DeleteConnectionsByUser(ctx, userID); err != nil {
@@ -452,6 +478,7 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user")
 		return
 	}
+	_ = h.db.DeletePeerLifecycleByUserID(ctx, userID)
 
 	h.audit(r, "user.delete", map[string]any{"user_id": userID, "username": user.Username})
 	h.JSONOK(w)
@@ -541,6 +568,8 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	var clientID, configStr string
+	var addResult map[string]any
+	clientCreated := false
 	if req.ClientID != nil && *req.ClientID != "" {
 		clientID = *req.ClientID
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
@@ -566,6 +595,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 			h.JSONError(w, http.StatusInternalServerError, "add_client_failed", "Failed to add client")
 			return
 		}
+		addResult = res
 		clientID, _ = res["client_id"].(string)
 		if clientID == "" {
 			clientID, _ = res["clientId"].(string)
@@ -574,6 +604,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		if configStr == "" && clientID != "" {
 			configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 		}
+		clientCreated = true
 	}
 
 	vpnLink := GenerateVPNLink(configStr)
@@ -591,7 +622,21 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 	}
 
-	_, _ = h.db.CreateConnection(ctx, newConn)
+	if clientCreated {
+		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, userID, "active")
+	}
+
+	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
+		if clientCreated && clientID != "" {
+			if rbErr := h.rollbackClient(ctx, protoMgr, server, addResult, clientID); rbErr != nil {
+				_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
+			} else {
+				_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
+			}
+		}
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+		return
+	}
 
 	h.audit(r, "user.connection_add", map[string]any{"user_id": userID, "server_id": req.ServerID, "protocol": req.Protocol, "client_id": clientID})
 	h.JSON(w, http.StatusOK, map[string]any{
