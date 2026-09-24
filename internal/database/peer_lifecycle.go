@@ -34,7 +34,7 @@ func (d *DB) RecordPeerLifecycle(ctx context.Context, serverID int64, protocol, 
 	return nil
 }
 
-// SetPeerLifecycleStatus updates the lifecycle status of a managed peer.
+// SetPeerLifecycleStatus updates the lifecycle status of a managed peer, or inserts it with that status if no record exists yet.
 func (d *DB) SetPeerLifecycleStatus(ctx context.Context, serverID int64, protocol, clientID, status string) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
@@ -42,10 +42,14 @@ func (d *DB) SetPeerLifecycleStatus(ctx context.Context, serverID int64, protoco
 	protocol = models.NormalizeProtocol(protocol)
 	nowStr := formatTime(time.Now().UTC())
 
-	query := `UPDATE peer_lifecycle SET status = ?, updated_at = ? WHERE server_id = ? AND protocol = ? AND client_id = ?`
-	_, err := d.sqlDB.ExecContext(ctx, query, status, nowStr, serverID, protocol, clientID)
+	query := `INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at)
+		VALUES (?, ?, ?, '', '', ?, ?, ?)
+		ON CONFLICT(server_id, protocol, client_id) DO UPDATE SET
+			status = excluded.status,
+			updated_at = excluded.updated_at`
+	_, err := d.sqlDB.ExecContext(ctx, query, serverID, protocol, clientID, status, nowStr, nowStr)
 	if err != nil {
-		return fmt.Errorf("failed to update peer lifecycle status: %w", err)
+		return fmt.Errorf("failed to upsert peer lifecycle status: %w", err)
 	}
 	return nil
 }

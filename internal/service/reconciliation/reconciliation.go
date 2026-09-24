@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -305,6 +306,9 @@ func (r *Reconciler) isProtocolStale(ctx context.Context, server *models.Server,
 	return !exists
 }
 
+// SettingKeyLegacyPeersAdopted is the settings key indicating whether one-time legacy untracked peer adoption has completed.
+const SettingKeyLegacyPeersAdopted = "legacy_peers_adopted"
+
 // AdoptLegacyPeers scans all remote server containers across installed protocols,
 // and adopts any untracked clients (which are not in peer_lifecycle and not in user_connections,
 // and not infrastructure/external) into peer_lifecycle as status: "active", user_id: "".
@@ -313,6 +317,11 @@ func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
 		return errors.New("database is not configured")
 	}
 	if r.registry == nil {
+		return nil
+	}
+
+	var alreadyAdopted bool
+	if err := r.db.GetSetting(ctx, SettingKeyLegacyPeersAdopted, &alreadyAdopted); err == nil && alreadyAdopted {
 		return nil
 	}
 
@@ -408,7 +417,7 @@ func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
 			}
 		}
 	}
-
+	_ = r.db.SetSetting(ctx, SettingKeyLegacyPeersAdopted, true)
 	return nil
 }
 
@@ -519,20 +528,48 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 	serverID := server.ID
 	rec, hasLifecycle := lifecycles[clientID]
 	if !hasLifecycle {
-		clientName := resolveClientNameFromMap(client)
-		if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
-			slog.Warn("Reconciliation Phase 3: failed to adopt untracked peer into peer_lifecycle",
+		var legacyAdopted bool
+		if r.db != nil {
+			_ = r.db.GetSetting(ctx, SettingKeyLegacyPeersAdopted, &legacyAdopted)
+		}
+		if !legacyAdopted {
+			clientName := resolveClientNameFromMap(client)
+			if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to adopt untracked peer into peer_lifecycle",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"err", err,
+				)
+			} else {
+				slog.Info("Reconciliation: adopted untracked legacy peer into peer_lifecycle",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"name", clientName,
+				)
+			}
+			return
+		}
+
+		// Ongoing reconciliation: legacy adoption was already completed!
+		// Allow a 2-minute creation grace period in case creation is currently in flight.
+		if isRecentlyCreatedPeer(client, 2*time.Minute) {
+			return
+		}
+
+		if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to remove unmanaged zombie peer from remote container",
 				"server_id", serverID,
 				"protocol", proto,
 				"client_id", clientID,
 				"err", err,
 			)
 		} else {
-			slog.Info("Reconciliation: adopted untracked legacy peer into peer_lifecycle",
+			slog.Info("Reconciliation: removed unmanaged zombie peer from remote container",
 				"server_id", serverID,
 				"protocol", proto,
 				"client_id", clientID,
-				"name", clientName,
 			)
 		}
 		return
@@ -634,4 +671,58 @@ func isExternalPeer(client map[string]any) bool {
 		}
 	}
 	return false
+}
+
+func isRecentlyCreatedPeer(client map[string]any, gracePeriod time.Duration) bool {
+	keys := []string{"creationDate", "created_at", "creation_date", "createdAt"}
+	for _, k := range keys {
+		if val, ok := client[k]; ok && val != nil {
+			if t := parseClientTimestamp(val); t != nil && time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
+				return true
+			}
+		}
+	}
+	if ud, ok := client["userData"].(map[string]any); ok {
+		for _, k := range keys {
+			if val, ok := ud[k]; ok && val != nil {
+				if t := parseClientTimestamp(val); t != nil && time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func parseClientTimestamp(val any) *time.Time {
+	switch v := val.(type) {
+	case time.Time:
+		return &v
+	case string:
+		str := strings.TrimSpace(v)
+		if str == "" {
+			return nil
+		}
+		if t, err := time.Parse(time.RFC3339, str); err == nil {
+			return &t
+		}
+		if t, err := time.Parse(time.RFC3339Nano, str); err == nil {
+			return &t
+		}
+		if sec, err := strconv.ParseInt(str, 10, 64); err == nil && sec > 0 {
+			t := time.Unix(sec, 0).UTC()
+			return &t
+		}
+	case int64:
+		if v > 0 {
+			t := time.Unix(v, 0).UTC()
+			return &t
+		}
+	case float64:
+		if v > 0 {
+			t := time.Unix(int64(v), 0).UTC()
+			return &t
+		}
+	}
+	return nil
 }

@@ -2466,3 +2466,80 @@ func TestAWGManager_RollbackAddClient_PreservesConcurrentModifications(t *testin
 		t.Errorf("Peer C (concurrent change) missing from clientsTable after rollback!")
 	}
 }
+
+func TestAWGManager_RollbackAddClient_AbstainsOnSupersededPeer(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Initial creation: Peer A = K0 ("tls")
+	res0, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerA (K0) failed: %v", err)
+	}
+	keyK0 := res0["client_id"].(string)
+
+	// 2. Request 1 upserts Peer A -> K1 ("sip")
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "sip",
+	})
+	if err != nil {
+		t.Fatalf("Request 1 upsert PeerA (K1) failed: %v", err)
+	}
+	keyK1 := res1["client_id"].(string)
+
+	// 3. Request 2 upserts same Peer A -> K2 ("quic") and succeeds
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "quic",
+	})
+	if err != nil {
+		t.Fatalf("Request 2 upsert PeerA (K2) failed: %v", err)
+	}
+	keyK2 := res2["client_id"].(string)
+
+	// 4. Request 1's subsequent DB write fails, so Request 1 triggers RollbackAddClient(res1)
+	if err := mgr.RollbackAddClient(ctx, server, res1); err != nil {
+		t.Fatalf("RollbackAddClient Request 1 failed: %v", err)
+	}
+
+	// 5. Assert:
+	// - Rollback for Request 1 detected that Peer A was superseded by Request 2 (K2)
+	// - Newer state K2 remains active in both clientsTable and awg0.conf
+	// - Old K0 was NOT restored over K2!
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confAfterRollback, keyK2) {
+		t.Errorf("Superseding key K2 %s was lost from awg0.conf after Request 1 rollback!", keyK2)
+	}
+	if strings.Contains(confAfterRollback, keyK0) {
+		t.Errorf("Old key K0 %s was erroneously restored over superseding key K2 in awg0.conf!", keyK0)
+	}
+	if strings.Contains(confAfterRollback, keyK1) {
+		t.Errorf("Rolled back key K1 %s is still present in awg0.conf!", keyK1)
+	}
+
+	clientsAfterRollback, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundPeerA bool
+	for _, c := range clientsAfterRollback {
+		cid, _ := c["clientId"].(string)
+		ud, _ := c["userData"].(map[string]any)
+		if ud != nil && ud["clientName"] == "PeerA" {
+			foundPeerA = true
+			if cid != keyK2 {
+				t.Errorf("expected active client to remain K2 %s, got %s", keyK2, cid)
+			}
+		}
+	}
+	if !foundPeerA {
+		t.Errorf("PeerA missing from clientsTable after rollback")
+	}
+}
+

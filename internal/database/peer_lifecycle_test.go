@@ -145,3 +145,31 @@ func TestPeerLifecycle_CRUDAndMigration(t *testing.T) {
 		t.Errorf("expected failed status for client-multi-2, got %s", lifecycles["client-multi-2"].Status)
 	}
 }
+
+func TestDB_SetPeerLifecycleStatus_UpsertsMissingRow(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(":memory:", "")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer db.Close()
+
+	nonExistentPeer := "peer-never-recorded-before"
+	if err := db.SetPeerLifecycleStatus(ctx, 1, "awg", nonExistentPeer, "failed"); err != nil {
+		t.Fatalf("SetPeerLifecycleStatus on non-existent peer failed: %v", err)
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, 1, "awg")
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+
+	rec, exists := lifecycles[nonExistentPeer]
+	if !exists {
+		t.Fatalf("expected peer %s to be upserted into peer_lifecycle", nonExistentPeer)
+	}
+	if rec.Status != "failed" {
+		t.Fatalf("expected status 'failed', got %s", rec.Status)
+	}
+}
+

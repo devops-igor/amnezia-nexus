@@ -992,3 +992,98 @@ func TestReconciler_BackgroundService_StartAndStop(t *testing.T) {
 		t.Fatalf("expected reconciler.running to be false after Stop")
 	}
 }
+
+func TestReconciler_CleanupZombiePeers_PurgesUntrackedZombiePostAdoption(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Pre-upgrade legacy untracked unassigned AWG connection
+	legacyAWG := "awg-legacy-unassigned-1"
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+		clients: []map[string]any{
+			{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+		},
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg)
+
+	// Execute initial startup reconciliation: adopts legacyAWG and sets legacy_peers_adopted = true
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("initial CleanupStaleProtocols failed: %v", err)
+	}
+
+	// Verify legacyAWG survived and was adopted into peer_lifecycle
+	activeAWGPeers, err := db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs AWG failed: %v", err)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Fatalf("expected legacy AWG peer %s to be adopted into peer_lifecycle", legacyAWG)
+	}
+
+	// 2. Simulate subsequent failure post-adoption:
+	// A new peer is provisioned on remote container, but DB writes failed and compensating rollback failed.
+	// This peer is older than the 2-minute creation grace period.
+	untrackedZombieAWG := "awg-untracked-zombie-post-adoption"
+	recentInFlightAWG := "awg-recent-in-flight"
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.clients = []map[string]any{
+		{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+		{"clientId": untrackedZombieAWG, "clientName": "Untracked Zombie", "creationDate": oldTimestamp},
+		{"clientId": recentInFlightAWG, "clientName": "Recent In Flight", "creationDate": time.Now().Format(time.RFC3339)},
+	}
+	awgMgr.mu.Unlock()
+
+	// Execute ongoing periodic reconciliation
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedAWG := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	// Assert:
+	// - untrackedZombieAWG was purged!
+	// - recentInFlightAWG survived (within 2-minute grace period)
+	// - legacyAWG survived
+	if len(deletedAWG) != 1 || deletedAWG[0] != untrackedZombieAWG {
+		t.Fatalf("expected only untrackedZombieAWG %s to be deleted, got: %v", untrackedZombieAWG, deletedAWG)
+	}
+
+	// Verify untrackedZombieAWG was NOT adopted into peer_lifecycle
+	activeAWGPeers, err = db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs failed: %v", err)
+	}
+	if activeAWGPeers[untrackedZombieAWG] {
+		t.Errorf("expected untracked zombie %s to NOT be adopted into peer_lifecycle", untrackedZombieAWG)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Errorf("expected legacy AWG %s to remain active in peer_lifecycle", legacyAWG)
+	}
+}
+

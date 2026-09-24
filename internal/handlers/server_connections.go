@@ -164,7 +164,9 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
-		_ = h.rollbackClient(ctx, protoMgr, server, result, clientID)
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
+		}
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
 		return
 	}
