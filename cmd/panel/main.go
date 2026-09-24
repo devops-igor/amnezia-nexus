@@ -210,6 +210,7 @@ func run(ctx context.Context) error {
 	}
 	if poolSynced {
 		orch.SetTunnelStatusUpdater(vpnSvc)
+		orch.SetSessionMigrator(vpnSvc)
 	}
 
 	// 9. Background Supervisor (started strictly after VPN data plane and status updater wiring)

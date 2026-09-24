@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -625,5 +626,78 @@ func TestTunnelPool_CompareAndSwapTunnelStatus(t *testing.T) {
 	cur, _ = pool.GetTunnel(sID)
 	if cur.Status != models.TunnelStatusActive || cur.StateVersion != 3 {
 		t.Errorf("pool state modified despite error during CAS: %+v", cur)
+	}
+}
+
+func TestTunnelPool_TransferConnectionsIfActive(t *testing.T) {
+	db := setupTestDB(t)
+
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	s1ID, _ := db.CreateServer(ctx, &models.Server{Name: "T1", Host: "10.0.0.1", SSHPort: 22})
+	s2ID, _ := db.CreateServer(ctx, &models.Server{Name: "T2", Host: "10.0.0.2", SSHPort: 22})
+
+	t1, err := pool.AddTunnel(ctx, s1ID, "1.1.1.1:51820", "pub1")
+	if err != nil {
+		t.Fatalf("AddTunnel(1) failed: %v", err)
+	}
+	t2, err := pool.AddTunnel(ctx, s2ID, "2.2.2.2:51820", "pub2")
+	if err != nil {
+		t.Fatalf("AddTunnel(2) failed: %v", err)
+	}
+
+	pool.IncrementConnections(t1.ID)
+	pool.IncrementConnections(t1.ID)
+
+	// 1. Successful transfer
+	curT2, _ := pool.GetTunnelByID(t2.ID)
+	expectedVersion := curT2.StateVersion
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID, expectedVersion); err != nil {
+		t.Fatalf("TransferConnectionsIfActive failed: %v", err)
+	}
+
+	t1Cur, _ := pool.GetTunnelByID(t1.ID)
+	t2Cur, _ := pool.GetTunnelByID(t2.ID)
+	if t1Cur.ActiveConnections != 1 || t2Cur.ActiveConnections != 1 {
+		t.Fatalf("unexpected connection counts: t1=%d, t2=%d", t1Cur.ActiveConnections, t2Cur.ActiveConnections)
+	}
+
+	// 2. Target not found
+	if err := pool.TransferConnectionsIfActive(t1.ID, 99999); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("expected ErrTunnelNotFound, got: %v", err)
+	}
+
+	// 3. Target not active
+	if err := pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusDegraded, 400); err != nil {
+		t.Fatalf("SetTunnelStatus failed: %v", err)
+	}
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); err == nil || !strings.Contains(err.Error(), "not active") {
+		t.Fatalf("expected error for non-active target, got: %v", err)
+	}
+
+	// Restore t2 to active
+	if err := pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("SetTunnelStatus failed: %v", err)
+	}
+	t2Cur, _ = pool.GetTunnelByID(t2.ID)
+
+	// 4. StateVersion mismatch
+	oldVersion := t2Cur.StateVersion - 1
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID, oldVersion); err == nil || !strings.Contains(err.Error(), "state version mismatch") {
+		t.Fatalf("expected error for state version mismatch, got: %v", err)
+	}
+
+	// Counters should not have changed during failed attempts
+	t1Cur, _ = pool.GetTunnelByID(t1.ID)
+	t2Cur, _ = pool.GetTunnelByID(t2.ID)
+	if t1Cur.ActiveConnections != 1 || t2Cur.ActiveConnections != 1 {
+		t.Fatalf("counters mutated on failed transfer: t1=%d, t2=%d", t1Cur.ActiveConnections, t2Cur.ActiveConnections)
+	}
+
+	// 5. Closed pool
+	_ = pool.Close()
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed on closed pool, got: %v", err)
 	}
 }

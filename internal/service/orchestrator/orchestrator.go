@@ -29,6 +29,11 @@ type TunnelStatusUpdater interface {
 	SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error
 }
 
+// SessionMigrator defines the interface for coordinated live VPN session migration across backend tunnels (issue #289).
+type SessionMigrator interface {
+	MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error
+}
+
 type healthProbeKey struct {
 	clientPriv string
 	serverPub  string
@@ -50,6 +55,7 @@ type Orchestrator struct {
 	registry              ProtocolResolver
 	userOps               UserOpsService
 	statusUpdater         TunnelStatusUpdater
+	sessionMigrator       SessionMigrator
 	probeFn               ProbeFunc
 	bootDelay             time.Duration
 	interval              time.Duration
@@ -134,6 +140,13 @@ func WithTunnelStatusUpdater(u TunnelStatusUpdater) Option {
 	}
 }
 
+// WithSessionMigrator configures the session migrator on Orchestrator initialization (issue #289).
+func WithSessionMigrator(m SessionMigrator) Option {
+	return func(o *Orchestrator) {
+		o.sessionMigrator = m
+	}
+}
+
 // New creates a new BackgroundTaskOrchestrator.
 func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrator {
 	var defaultUserOps UserOpsService
@@ -168,6 +181,13 @@ func (o *Orchestrator) SetTunnelStatusUpdater(u TunnelStatusUpdater) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.statusUpdater = u
+}
+
+// SetSessionMigrator configures the session migrator (e.g. VPN service) for live rebalancing (issue #289).
+func (o *Orchestrator) SetSessionMigrator(m SessionMigrator) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.sessionMigrator = m
 }
 
 // Name returns the service identifier for supervisor registration.

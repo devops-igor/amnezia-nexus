@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -591,6 +592,66 @@ func (p *Pool) DecrementConnections(tunnelID int64) {
 	if found {
 		p.persistConnectionCount(persistID, int64(count))
 	}
+}
+
+// TransferConnectionsIfActive atomically transfers an active connection count from fromTunnelID
+// to toTunnelID under p.mu.Lock(). It verifies that toTunnelID exists and is active, and optionally
+// validates that its StateVersion matches expectedTargetVersion (issue #289 rework).
+//
+// If the target tunnel is not active or its StateVersion has changed since inspection, the transfer
+// is rejected without modifying either counter.
+func (p *Pool) TransferConnectionsIfActive(fromTunnelID, toTunnelID int64, expectedTargetVersion ...int64) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrPoolClosed
+	}
+
+	toTun, ok := p.tunnelsByID[toTunnelID]
+	if !ok {
+		p.mu.Unlock()
+		return ErrTunnelNotFound
+	}
+
+	if !strings.EqualFold(toTun.Status, "active") {
+		p.mu.Unlock()
+		return fmt.Errorf("target backend tunnel %d is not active (status=%s)", toTunnelID, toTun.Status)
+	}
+
+	if len(expectedTargetVersion) > 0 && expectedTargetVersion[0] > 0 {
+		if toTun.StateVersion != expectedTargetVersion[0] {
+			p.mu.Unlock()
+			return fmt.Errorf("target backend tunnel %d state version mismatch (expected %d, got %d)",
+				toTunnelID, expectedTargetVersion[0], toTun.StateVersion)
+		}
+	}
+
+	var (
+		fromPersistID int64
+		fromCount     int
+	)
+	if fromTun, ok := p.tunnelsByID[fromTunnelID]; ok {
+		if fromTun.ActiveConnections > 0 {
+			fromTun.ActiveConnections--
+		}
+		fromPersistID = fromTun.ID
+		fromCount = fromTun.ActiveConnections
+	}
+
+	toTun.ActiveConnections++
+	toPersistID := toTun.ID
+	toCount := toTun.ActiveConnections
+
+	p.mu.Unlock()
+
+	if fromPersistID > 0 {
+		p.persistConnectionCount(fromPersistID, int64(fromCount))
+	}
+	if toPersistID > 0 {
+		p.persistConnectionCount(toPersistID, int64(toCount))
+	}
+
+	return nil
 }
 
 // SetConnectionCount sets a tunnel's active connections gauge to count and
