@@ -3,7 +3,6 @@ package endpoint
 import (
 	"context"
 	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -164,56 +163,6 @@ func TestSessionManagerTimeoutsAndDrain(t *testing.T) {
 	// zero timeout (noop)
 	if to, err := sm.CheckTimeouts(ctx, 0); err != nil || len(to) != 0 {
 		t.Errorf("expected noop on zero timeout")
-	}
-}
-
-func TestSessionManagerSyncFromDB(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	ipam, _ := NewIPAM("10.100.0.0/24")
-
-	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
-	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: "awg-be-1",
-		PublicKey:     "tunnel-pubkey",
-		PrivateKey:    "tunnel-privkey",
-		Endpoint:      "10.0.0.1:51820",
-	})
-	uID, _ := db.CreateUser(ctx, &models.User{Username: "sync_user"})
-
-	// Pre-insert into DB
-	_ = db.CreateVPNSession(ctx, &models.VPNSession{
-		ID:              "sync-sess-1",
-		UserID:          uID,
-		BackendTunnelID: tID,
-		PeerPublicKey:   "sync-peer-1",
-		AssignedIP:      "10.100.0.10",
-		Status:          "connected",
-	})
-
-	sm := NewSessionManager(db, ipam)
-	if err := sm.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	if sm.ActiveCount() != 1 {
-		t.Fatalf("expected 1 active session after sync, got %d", sm.ActiveCount())
-	}
-	sess, ok := sm.GetSessionByID("sync-sess-1")
-	if !ok || sess.PeerPublicKey != "sync-peer-1" {
-		t.Errorf("synced session mismatch: %+v", sess)
-	}
-
-	if !ipam.IsAllocated(net.ParseIP("10.100.0.10")) {
-		t.Errorf("expected 10.100.0.10 to be marked allocated in IPAM after sync")
-	}
-
-	// nil DB sync
-	smNil := NewSessionManager(nil, ipam)
-	if err := smNil.SyncFromDB(ctx); err != nil {
-		t.Errorf("SyncFromDB nil db failed: %v", err)
 	}
 }
 

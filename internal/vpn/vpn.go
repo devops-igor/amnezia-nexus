@@ -30,12 +30,14 @@ import (
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
-	ListenerRunning   bool   `json:"listener_running"`
-	ActiveTunnels     int    `json:"active_tunnels"`
-	ConnectedSessions int    `json:"connected_sessions"`
-	RxBytes           int64  `json:"rx_bytes"`
-	TxBytes           int64  `json:"tx_bytes"`
-	DroppedPackets    uint64 `json:"dropped_packets"`
+	ListenerRunning            bool   `json:"listener_running"`
+	ActiveTunnels              int    `json:"active_tunnels"`
+	ConnectedSessions          int    `json:"connected_sessions"`
+	RestartInvalidatedSessions int64  `json:"restart_invalidated_sessions"`
+	FreshSessionRegistrations  int64  `json:"fresh_session_registrations"`
+	RxBytes                    int64  `json:"rx_bytes"`
+	TxBytes                    int64  `json:"tx_bytes"`
+	DroppedPackets             uint64 `json:"dropped_packets"`
 	// Issue #39, #151 & #288 telemetry: return-path drops inside the forwarder (queue
 	// full / no route / total) and rejected handshake initiations at the listener.
 	// A rising forwarder_drops_total with stable traffic means a stalled
@@ -156,13 +158,15 @@ type Service struct {
 	// management-mode (TUN-unavailable) contract hermetically. tunDev is the
 	// attached client-facing device; backendDevices holds the per-backend UDP
 	// devices created by EnableBackend.
-	requireTun       bool
-	tunOpener        func() (endpoint.PacketDevice, error)
-	tunDev           endpoint.PacketDevice
-	backendDevices   map[int64]BackendDevice
-	lastLoggedDrops  atomic.Uint64
-	publicIPMu       sync.RWMutex
-	detectedPublicIP string
+	requireTun                 bool
+	tunOpener                  func() (endpoint.PacketDevice, error)
+	tunDev                     endpoint.PacketDevice
+	backendDevices             map[int64]BackendDevice
+	lastLoggedDrops            atomic.Uint64
+	restartInvalidatedSessions atomic.Int64
+	freshSessionRegistrations  atomic.Int64
+	publicIPMu                sync.RWMutex
+	detectedPublicIP          string
 	// dropLogUntil throttles the backend read loop's queue-full drop log
 	// (log-flood defense; issue #39 produced 7687 lines in 2 h). Shared
 	// across the per-backend read loops: all accesses are atomic, so the
@@ -949,6 +953,22 @@ func (s *Service) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
+	// No client transport keys, endpoints, or forwarder routes survive a process
+	// restart. Atomically discard persisted sessions and their pool gauges
+	// before any backend device or packet pump can receive traffic. If cleanup
+	// fails, do not start with a falsely connected data plane.
+	if s.db != nil {
+		invalidated, err := s.db.InvalidateVPNSessionsForRestart(ctx)
+		if err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to invalidate VPN sessions on restart: %w", err)
+		}
+		s.restartInvalidatedSessions.Store(invalidated)
+		log.Printf("[vpn] restart reconciliation invalidated %d persisted connected session(s); awaiting fresh client handshakes", invalidated)
+	}
+
 	// 1. Sync tunnels from DB
 	if s.pool != nil {
 		if err := s.pool.SyncFromDB(ctx); err != nil {
@@ -968,12 +988,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.restoreBackendDevices(ctx)
 	}
 
-	// 2. Sync sessions from DB
-	if s.sessionMgr != nil {
-		_ = s.sessionMgr.SyncFromDB(ctx)
-	}
-
-	// 2b. Reconcile the active_connections gauge from the authoritative
+	// 2. Reconcile the active_connections gauge from the authoritative
 	// session table (issue #54): the persisted counter drifts when older
 	// deploys kill sessions without decrementing it, and the drift survives
 	// restarts, distorting least-conn routing. Best-effort: startup must
@@ -1058,7 +1073,7 @@ func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
 // tunnel; it drifts when historical deploys kill sessions without
 // decrementing it, and since it is persisted in backend_tunnels the drift
 // survives restarts and distorts least-conn balancing. It runs once during
-// Start after both DB syncs have completed and BEFORE the forwarder and
+// Start after restart cleanup and pool sync but BEFORE the forwarder and
 // endpoint accept traffic, so this read-modify-write over pool snapshots is
 // safe: no live IncrementConnections/DecrementConnections traffic can race
 // it at that point. On any error it logs and returns so the panel still
@@ -1276,7 +1291,9 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	defer s.mu.RUnlock()
 
 	status := &Status{
-		ListenerRunning: s.endpoint != nil && s.endpoint.IsRunning(),
+		ListenerRunning:            s.endpoint != nil && s.endpoint.IsRunning(),
+		RestartInvalidatedSessions: s.restartInvalidatedSessions.Load(),
+		FreshSessionRegistrations:  s.freshSessionRegistrations.Load(),
 	}
 
 	if s.pool != nil {
@@ -2977,6 +2994,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 			endpoint: s.endpoint,
 		})
 	}
+	s.freshSessionRegistrations.Add(1)
 
 	return sess, backend, nil
 }

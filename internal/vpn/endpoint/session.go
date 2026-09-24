@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -438,34 +437,4 @@ func (sm *SessionManager) ListActiveSessionsSnapshot() []models.VPNSession {
 // ActiveCount returns the number of active sessions.
 func (sm *SessionManager) ActiveCount() int {
 	return int(sm.activeCount.Load())
-}
-
-// SyncFromDB restores active sessions from the database on startup.
-func (sm *SessionManager) SyncFromDB(ctx context.Context) error {
-	if sm.db == nil {
-		return nil
-	}
-
-	sessions, err := sm.db.GetActiveVPNSessions(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load active sessions: %w", err)
-	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	for i := range sessions {
-		sess := sessions[i]
-		sm.sessionsByID[sess.ID] = &sess
-		sm.sessionsByPeer[sess.PeerPublicKey] = &sess
-		sm.activeCount.Add(1)
-
-		if sm.ipam != nil && sess.AssignedIP != "" {
-			if ip := net.ParseIP(sess.AssignedIP); ip != nil {
-				_ = sm.ipam.Reserve(ip, sess.PeerPublicKey)
-			}
-		}
-	}
-
-	return nil
 }

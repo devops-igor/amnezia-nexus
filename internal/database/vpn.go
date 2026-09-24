@@ -606,6 +606,38 @@ func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 	return d.DeleteVPNSession(ctx, sessionID)
 }
 
+// InvalidateVPNSessionsForRestart removes sessions whose endpoint keys and
+// forwarder routes died with the previous process. Session rows are ephemeral
+// (normal disconnect also deletes them); removing every row frees the unique
+// peer/IP constraints for the next handshake. Reset the persisted pool gauges
+// in the same transaction so a crash cannot leave stale load-balancer counts.
+// The returned count includes only rows that had been reported as connected.
+func (d *DB) InvalidateVPNSessionsForRestart(ctx context.Context) (int64, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin VPN restart reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var connected int64
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM vpn_sessions WHERE status = 'connected'").Scan(&connected); err != nil {
+		return 0, fmt.Errorf("count persisted connected VPN sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM vpn_sessions"); err != nil {
+		return 0, fmt.Errorf("invalidate persisted VPN sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE backend_tunnels SET active_connections = 0 WHERE active_connections != 0"); err != nil {
+		return 0, fmt.Errorf("reset persisted VPN connection gauges: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit VPN restart reconciliation: %w", err)
+	}
+	return connected, nil
+}
+
 // Helper scanners
 
 func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
