@@ -2841,16 +2841,34 @@ func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 }
 
 // rollbackMigration reverts mutations across DB, SessionManager, and Forwarder during a failed migration.
-func (s *Service) rollbackMigration(ctx context.Context, sessionID, peerKey string, oldTunnelID int64, oldStatus string, forwarderMigrated, rollbackSessionMgr, rollbackDB bool) {
+// The DB compensation executes under a non-cancelable bounded context derived from ctx to guarantee
+// completion even if the request context was canceled (issue #289 rework round 3).
+func (s *Service) rollbackMigration(ctx context.Context, sessionID, peerKey string, oldTunnelID int64, oldStatus string, forwarderMigrated, rollbackSessionMgr, rollbackDB bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	var rollbackErrs []error
+
 	if rollbackDB && s.db != nil {
-		_ = s.db.MigrateVPNSessionBackend(ctx, sessionID, oldTunnelID)
+		if err := s.db.MigrateVPNSessionBackend(rollbackCtx, sessionID, oldTunnelID); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback db session %s to backend %d: %w", sessionID, oldTunnelID, err))
+		}
 	}
 	if rollbackSessionMgr && s.sessionMgr != nil {
-		_ = s.sessionMgr.RollbackSessionBackend(sessionID, oldTunnelID, oldStatus)
+		if err := s.sessionMgr.RollbackSessionBackend(sessionID, oldTunnelID, oldStatus); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback session mgr %s to backend %d: %w", sessionID, oldTunnelID, err))
+		}
 	}
 	if forwarderMigrated && s.forwarder != nil {
-		_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
+		if err := s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback forwarder peer %s to backend %d: %w", peerKey, oldTunnelID, err))
+		}
 	}
+
+	return errors.Join(rollbackErrs...)
 }
 
 // MigrateSession migrates an active session to a target backend tunnel, updating
@@ -2913,15 +2931,15 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	// Step 2: In-Memory Session Update
 	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "connected"); err != nil {
-		s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, false, false)
-		return fmt.Errorf("failed to update in-memory session %s: %w", sessionID, err)
+		rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, false, false)
+		return errors.Join(fmt.Errorf("failed to update in-memory session %s: %w", sessionID, err), rbErr)
 	}
 
 	// Step 3: Database Persistence
 	if s.db != nil {
 		if err := s.db.MigrateVPNSessionBackend(ctx, sessionID, targetTunnelID); err != nil {
-			s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, false)
-			return fmt.Errorf("failed to persist vpn session %s backend migration: %w", sessionID, err)
+			rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, false)
+			return errors.Join(fmt.Errorf("failed to persist vpn session %s backend migration: %w", sessionID, err), rbErr)
 		}
 	}
 
@@ -2933,8 +2951,8 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 	// Step 5: Transfer Connection Counters
 	if s.pool != nil {
 		if err := s.pool.TransferConnectionsIfActive(oldTunnelID, targetTunnelID, expectedVersion); err != nil {
-			s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, true)
-			return fmt.Errorf("failed to commit connection transfer to target tunnel %d: %w", targetTunnelID, err)
+			rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, true)
+			return errors.Join(fmt.Errorf("failed to commit connection transfer to target tunnel %d: %w", targetTunnelID, err), rbErr)
 		}
 	}
 
