@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - Orion · Patch 2 - 2026-09-24
+
+Maintenance and stability patch release addressing VPN forwarder route lifecycle management, session teardown synchronization, and monotonic endpoint handshake fencing.
+
+### Fixed
+
+- Forwarder route retirement by session identity: replaced registration and unregistration counter balance accounting with explicit session ID matching (`BeginUnregisterSession(peerKey, sessionID)`), eliminating stale route removals from delayed teardowns of superseded sessions and ensuring forwarder routes are reliably retired after repeated rekeys (#309, #310).
+- Monotonic endpoint handshake fencing under service lock: advanced and fenced peer handshake generation (`FencePeerGeneration`) under `Service.mu` before awaiting forwarder route retirement, immediately rejecting stale in-flight handshakes from older generations while route teardown waits for admitted device writes to drain (#309, #310).
+- Unified two-phase fence and prune across teardown paths: coordinated generational fencing and delayed transport state pruning across all VPN teardown paths (`DisconnectSession`, `DisconnectUser`, `ReleaseClient`, and idle reaper `reapSession`), ensuring transport keys remain available for active return writes during route retirement and pruning transport state only after retirement finishes while guarding against concurrent reconnect replacement sessions (#309, #310).
+
 ## [1.3.1] - Orion · Patch 1 - 2026-09-24
 
 Maintenance and stability patch release focusing on VPN data plane reliability, rekey rollover resilience, forwarder queue observability and safe runtime reconfiguration, session liveness tracking, and tunnel state synchronization.
