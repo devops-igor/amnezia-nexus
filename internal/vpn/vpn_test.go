@@ -127,7 +127,7 @@ func setupTestVPNService(t *testing.T, db *database.DB, cfgMutators ...func(*mod
 	peerKeyAlice := "alice-awg-peer-public-key"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyAlice,
 		Name:     "alice-phone",
@@ -436,10 +436,10 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 
 	// 13. HandleIncomingPeer no active backends
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "bob", Enabled: true})
-	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Server", Host: "10.0.0.1"})
+	_, _ = db.CreateServer(ctx, &models.Server{Name: "Server", Host: "10.0.0.1"})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: "bob-peer-key",
 	})
@@ -4017,7 +4017,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	peerKeyBob := "bob-awg-peer-key-test"
 	bobConn := &models.UserConnection{
 		UserID:   u2ID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyBob,
 		Name:     "bob-device",
@@ -4056,7 +4056,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	targetIP := "10.100.0.50"
 	charlieConn := &models.UserConnection{
 		UserID:   u3ID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyCharlie,
 		Name:     "charlie-device",
@@ -4159,7 +4159,7 @@ func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
 	}
 	if _, err := db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: clientPubB64,
 		Name:     "device-range",
@@ -5205,7 +5205,7 @@ func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
 	peerKeyBob := "peer-deadlock-bob"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: 1,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyBob,
 		Name:     "bob-phone",
@@ -5817,7 +5817,7 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 		peerKey := "charlie-peer-key"
 		_, err = db.CreateConnection(ctx, &models.UserConnection{
 			UserID:   uID,
-			ServerID: s1ID,
+			ServerID: 0,
 			Protocol: "awg",
 			ClientID: peerKey,
 			Name:     "charlie-device",
@@ -6326,7 +6326,7 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 	// Register peer as user connection in DB
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "handshake-peer",
@@ -6434,10 +6434,10 @@ func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testin
 	peerKey1 := "bob-device-1-pubkey"
 	peerKey2 := "bob-device-2-pubkey"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
+		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
 	})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
+		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
 	})
 
 	sess1, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey1)
@@ -6687,7 +6687,7 @@ func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t 
 
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "stale-commit-peer",
@@ -6815,7 +6815,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "concurrent-handshake-peer",
