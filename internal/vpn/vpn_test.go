@@ -3922,6 +3922,13 @@ func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
 	ctx := context.Background()
 
 	vpnSvc1, s1ID, s2ID, uID, _ := setupTestVPNService(t, db)
+	legacyConns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(legacyConns) != 1 {
+		t.Fatalf("get portal client: connections=%+v err=%v", legacyConns, err)
+	}
+	if updated, err := db.UpdateConnection(ctx, legacyConns[0].ID, map[string]any{"server_id": int64(0)}); err != nil || !updated {
+		t.Fatalf("mark client as portal connection: updated=%t err=%v", updated, err)
+	}
 
 	// 1. Generate client config
 	cfg1, _, err := vpnSvc1.GenerateClientConfig(ctx, uID)
