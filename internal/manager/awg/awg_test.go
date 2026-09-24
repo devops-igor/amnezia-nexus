@@ -2259,3 +2259,287 @@ AllowedIPs = 10.66.66.200/32
 		}
 	})
 }
+
+func TestAWGManager_RollbackAddClient_RestoresUpsertPeer(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Pre-create peer "UpsertTargetUser"
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "UpsertTargetUser",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("initial AddClient failed: %v", err)
+	}
+	if isUpsert, ok := res1["is_upsert"].(bool); ok && isUpsert {
+		t.Fatalf("expected first creation to NOT be upsert")
+	}
+
+	confBeforeUpsert := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableBeforeUpsert := string(client.files["/opt/amnezia/awg/clientsTable"])
+	origClientID := res1["client_id"].(string)
+
+	// 2. Perform upsert with same name and different mimicry
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "UpsertTargetUser",
+		"awg_mimicry": "wireguard",
+	})
+	if err != nil {
+		t.Fatalf("upsert AddClient failed: %v", err)
+	}
+	if isUpsert, ok := res2["is_upsert"].(bool); !ok || !isUpsert {
+		t.Fatalf("expected second creation to be flagged as is_upsert=true, got %v", res2["is_upsert"])
+	}
+
+	// Verify that state actually changed after upsert
+	confAfterUpsert := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableAfterUpsert := string(client.files["/opt/amnezia/awg/clientsTable"])
+	if clientsTableAfterUpsert == clientsTableBeforeUpsert {
+		t.Fatalf("expected clientsTable to change after upsert")
+	}
+	if confAfterUpsert == confBeforeUpsert {
+		t.Fatalf("expected awg0.conf to change after upsert")
+	}
+
+	// 3. Rollback the upsert (simulating DB insert failure)
+	if err := mgr.RollbackAddClient(ctx, server, res2); err != nil {
+		t.Fatalf("RollbackAddClient failed: %v", err)
+	}
+
+	// 4. Verify original peer survived unchanged in awg0.conf and clientsTable
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableAfterRollback := string(client.files["/opt/amnezia/awg/clientsTable"])
+
+	if confAfterRollback != confBeforeUpsert {
+		t.Errorf("expected awg0.conf to be restored to pre-upsert state.\nWant:\n%s\nGot:\n%s", confBeforeUpsert, confAfterRollback)
+	}
+	if clientsTableAfterRollback != clientsTableBeforeUpsert {
+		t.Errorf("expected clientsTable to be restored to pre-upsert state.\nWant:\n%s\nGot:\n%s", clientsTableBeforeUpsert, clientsTableAfterRollback)
+	}
+
+	// 5. Verify the peer is still registered under origClientID
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundOriginal bool
+	for _, c := range clients {
+		cid, _ := c["clientId"].(string)
+		if cid == origClientID {
+			foundOriginal = true
+			if ud, ok := c["userData"].(map[string]any); ok {
+				if ud["awg_mimicry"] != "tls" {
+					t.Errorf("expected mimicry to be restored to tls, got %v", ud["awg_mimicry"])
+				}
+			}
+			break
+		}
+	}
+	if !foundOriginal {
+		t.Errorf("original peer %s was deleted instead of restored!", origClientID)
+	}
+}
+
+func TestAWGManager_RollbackAddClient_PreservesConcurrentModifications(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Pre-create Peer A and Peer B
+	resA, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerA failed: %v", err)
+	}
+	origPeerAKey := resA["client_id"].(string)
+
+	resB, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerB",
+		"awg_mimicry": "wireguard",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerB failed: %v", err)
+	}
+	origPeerBKey := resB["client_id"].(string)
+
+	// 2. Perform upsert on Peer A
+	resAUpsert, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "sip",
+	})
+	if err != nil {
+		t.Fatalf("upsert AddClient PeerA failed: %v", err)
+	}
+	if isUpsert, ok := resAUpsert["is_upsert"].(bool); !ok || !isUpsert {
+		t.Fatalf("expected is_upsert=true for PeerA upsert")
+	}
+
+	// 3. Simulate a concurrent operation on the same server: add Peer C
+	resC, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerC_Concurrent",
+		"awg_mimicry": "quic",
+	})
+	if err != nil {
+		t.Fatalf("concurrent AddClient PeerC failed: %v", err)
+	}
+	peerCKey := resC["client_id"].(string)
+
+	// Verify Peer C is currently in both awg0.conf and clientsTable
+	confBeforeRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confBeforeRollback, peerCKey) {
+		t.Fatalf("expected Peer C key %s in awg0.conf before rollback", peerCKey)
+	}
+
+	// 4. Trigger RollbackAddClient for Peer A (e.g. because DB write for Peer A failed)
+	if err := mgr.RollbackAddClient(ctx, server, resAUpsert); err != nil {
+		t.Fatalf("RollbackAddClient PeerA failed: %v", err)
+	}
+
+	// 5. Assert:
+	// - Peer A is restored to original pre-upsert state ("tls")
+	// - Peer B remains intact ("wireguard")
+	// - Peer C (the concurrent modification) remains intact in BOTH awg0.conf and clientsTable
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confAfterRollback, peerCKey) {
+		t.Errorf("Peer C key %s was clobbered in awg0.conf by Peer A rollback!", peerCKey)
+	}
+	if !strings.Contains(confAfterRollback, origPeerBKey) {
+		t.Errorf("Peer B key %s was clobbered in awg0.conf by Peer A rollback!", origPeerBKey)
+	}
+	if !strings.Contains(confAfterRollback, origPeerAKey) {
+		t.Errorf("Peer A original key %s missing in awg0.conf after rollback!", origPeerAKey)
+	}
+
+	clientsAfterRollback, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundA, foundB, foundC bool
+	for _, c := range clientsAfterRollback {
+		cid, _ := c["clientId"].(string)
+		ud, _ := c["userData"].(map[string]any)
+		var name string
+		if ud != nil {
+			name, _ = ud["clientName"].(string)
+		}
+		switch name {
+		case "PeerA":
+			foundA = true
+			if cid != origPeerAKey {
+				t.Errorf("Peer A key mismatch: want %s, got %s", origPeerAKey, cid)
+			}
+			if ud["awg_mimicry"] != "tls" {
+				t.Errorf("Peer A mimicry want tls, got %v", ud["awg_mimicry"])
+			}
+		case "PeerB":
+			foundB = true
+			if cid != origPeerBKey {
+				t.Errorf("Peer B key mismatch: want %s, got %s", origPeerBKey, cid)
+			}
+			if ud["awg_mimicry"] != "wireguard" {
+				t.Errorf("Peer B mimicry want wireguard, got %v", ud["awg_mimicry"])
+			}
+		case "PeerC_Concurrent":
+			foundC = true
+			if cid != peerCKey {
+				t.Errorf("Peer C key mismatch: want %s, got %s", peerCKey, cid)
+			}
+			if ud["awg_mimicry"] != "quic" {
+				t.Errorf("Peer C mimicry want quic, got %v", ud["awg_mimicry"])
+			}
+		}
+	}
+
+	if !foundA {
+		t.Errorf("Peer A missing from clientsTable after rollback")
+	}
+	if !foundB {
+		t.Errorf("Peer B missing from clientsTable after rollback")
+	}
+	if !foundC {
+		t.Errorf("Peer C (concurrent change) missing from clientsTable after rollback!")
+	}
+}
+
+func TestAWGManager_RollbackAddClient_AbstainsOnSupersededPeer(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Initial creation: Peer A = K0 ("tls")
+	res0, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerA (K0) failed: %v", err)
+	}
+	keyK0 := res0["client_id"].(string)
+
+	// 2. Request 1 upserts Peer A -> K1 ("sip")
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "sip",
+	})
+	if err != nil {
+		t.Fatalf("Request 1 upsert PeerA (K1) failed: %v", err)
+	}
+	keyK1 := res1["client_id"].(string)
+
+	// 3. Request 2 upserts same Peer A -> K2 ("quic") and succeeds
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "quic",
+	})
+	if err != nil {
+		t.Fatalf("Request 2 upsert PeerA (K2) failed: %v", err)
+	}
+	keyK2 := res2["client_id"].(string)
+
+	// 4. Request 1's subsequent DB write fails, so Request 1 triggers RollbackAddClient(res1)
+	if err := mgr.RollbackAddClient(ctx, server, res1); err != nil {
+		t.Fatalf("RollbackAddClient Request 1 failed: %v", err)
+	}
+
+	// 5. Assert:
+	// - Rollback for Request 1 detected that Peer A was superseded by Request 2 (K2)
+	// - Newer state K2 remains active in both clientsTable and awg0.conf
+	// - Old K0 was NOT restored over K2!
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confAfterRollback, keyK2) {
+		t.Errorf("Superseding key K2 %s was lost from awg0.conf after Request 1 rollback!", keyK2)
+	}
+	if strings.Contains(confAfterRollback, keyK0) {
+		t.Errorf("Old key K0 %s was erroneously restored over superseding key K2 in awg0.conf!", keyK0)
+	}
+	if strings.Contains(confAfterRollback, keyK1) {
+		t.Errorf("Rolled back key K1 %s is still present in awg0.conf!", keyK1)
+	}
+
+	clientsAfterRollback, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundPeerA bool
+	for _, c := range clientsAfterRollback {
+		cid, _ := c["clientId"].(string)
+		ud, _ := c["userData"].(map[string]any)
+		if ud != nil && ud["clientName"] == "PeerA" {
+			foundPeerA = true
+			if cid != keyK2 {
+				t.Errorf("expected active client to remain K2 %s, got %s", keyK2, cid)
+			}
+		}
+	}
+	if !foundPeerA {
+		t.Errorf("PeerA missing from clientsTable after rollback")
+	}
+}
+

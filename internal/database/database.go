@@ -237,7 +237,41 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
 		return err
 	}
-	return d.migrateAWGIPAllocations(ctx)
+	if err := d.migrateAWGIPAllocations(ctx); err != nil {
+		return err
+	}
+	return d.migratePeerLifecycle(ctx)
+}
+
+func (d *DB) migratePeerLifecycle(ctx context.Context) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS peer_lifecycle (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_id INTEGER NOT NULL,
+			protocol TEXT NOT NULL,
+			client_id TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			user_id TEXT DEFAULT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(server_id, protocol, client_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_server_proto ON peer_lifecycle(server_id, protocol)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_status ON peer_lifecycle(status)`,
+		`INSERT OR IGNORE INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at)
+		 SELECT server_id, protocol, client_id, COALESCE(name, ''), user_id, 'active',
+		        COALESCE(NULLIF(created_at, ''), datetime('now')),
+		        COALESCE(NULLIF(created_at, ''), datetime('now'))
+		 FROM user_connections
+		 WHERE client_id IS NOT NULL AND client_id != ''`,
+	}
+	for _, q := range queries {
+		if _, err := d.sqlDB.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("failed to migrate peer_lifecycle: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) migrateAWGIPAllocations(ctx context.Context) error {

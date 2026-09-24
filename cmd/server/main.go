@@ -216,6 +216,7 @@ func run(ctx context.Context) error {
 	// 9. Background Supervisor (started strictly after VPN data plane and status updater wiring)
 	sup := service.NewSupervisor()
 	sup.RegisterService(orch)
+	sup.RegisterService(reconciler)
 
 	supErrCh := make(chan error, 1)
 	go func() {

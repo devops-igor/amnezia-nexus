@@ -481,3 +481,69 @@ func TestUserOpsService_PanicRecovery(t *testing.T) {
 		t.Fatalf("PerformMassOperations failed fatally on panic: %v", err)
 	}
 }
+
+func TestUserOpsService_CreateConnection_RollbackOnDBFailure(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{
+		Name:      "Server 1",
+		Host:      "192.168.1.50",
+		SSHPort:   22,
+		Protocols: map[string]any{"awg": map[string]any{"installed": true}},
+	})
+
+	uID, _ := db.CreateUser(ctx, &models.User{
+		Username: "create_fail_user",
+		Role:     models.RoleUser,
+		Enabled:  true,
+	})
+
+	reg := newMockRegistry()
+	awgMgr := newMockProtocolManager("awg")
+	reg.Register(awgMgr)
+
+	svc := NewUserOpsService(db, reg)
+
+	// Inject DB insert failure trigger on user_connections
+	_, err := db.ExecContext(ctx, "CREATE TRIGGER fail_conn_insert_ops BEFORE INSERT ON user_connections BEGIN SELECT RAISE(ABORT, 'simulated connection insert failure'); END;")
+	if err != nil {
+		t.Fatalf("failed to create fail trigger: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS fail_conn_insert_ops")
+	}()
+
+	err = svc.PerformMassOperations(ctx, MassOperationRequest{
+		CreateConns: []ConnectionCreateRequest{
+			{
+				UserID:   uID,
+				ServerID: sID,
+				Protocol: "awg",
+				Name:     "rollback_conn",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+
+	// Verify client was added remotely, but then rolled back (deleted) due to DB failure
+	awgMgr.mu.Lock()
+	defer awgMgr.mu.Unlock()
+	if len(awgMgr.added) != 1 {
+		t.Fatalf("expected 1 remote client added, got %d", len(awgMgr.added))
+	}
+	addedCID := awgMgr.added[0]
+	if len(awgMgr.deleted) != 1 || awgMgr.deleted[0] != addedCID {
+		t.Fatalf("expected remote client %s to be rolled back, got deleted: %v", addedCID, awgMgr.deleted)
+	}
+
+	// Verify no connection was left in DB
+	conns, _ := db.GetConnectionsByUserID(ctx, uID)
+	if len(conns) != 0 {
+		t.Errorf("expected 0 connections in DB, got %d", len(conns))
+	}
+}

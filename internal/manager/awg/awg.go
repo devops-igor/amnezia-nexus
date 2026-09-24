@@ -1437,7 +1437,11 @@ func upsertPeerInConfig(confText, peerSection string, removePubKeys ...string) (
 	replaced := false
 	for i := 0; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) != "[Peer]" {
-			out = append(out, lines[i])
+			line := lines[i]
+			if strings.TrimSpace(line) == "" && len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+				continue
+			}
+			out = append(out, line)
 			continue
 		}
 		// Collect the whole [Peer] block (up to the next section header).
@@ -1463,7 +1467,10 @@ func upsertPeerInConfig(confText, peerSection string, removePubKeys ...string) (
 		}
 		switch {
 		case stale:
-			// Drop the stale block entirely.
+			if !replaced {
+				out = append(out, peerLines...)
+				replaced = true
+			}
 		case blockPub == newPub:
 			if !replaced {
 				out = append(out, peerLines...)
@@ -1478,7 +1485,11 @@ func upsertPeerInConfig(confText, peerSection string, removePubKeys ...string) (
 	if !replaced {
 		// Blank separator line before the appended peer, mirroring the
 		// formatting awg-quick conf files get from the portal.
-		withSep := append([]string{""}, peerLines...)
+		var withSep []string
+		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
+			withSep = append(withSep, "")
+		}
+		withSep = append(withSep, peerLines...)
 		out = append(out, withSep...)
 	}
 	return strings.Join(out, "\n") + "\n", nil
@@ -1648,6 +1659,19 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 	initialClients := append([]AWGClient(nil), clients...)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
+	isUpsert := existingIdx >= 0
+	var previousClient *AWGClient
+	var previousPeerSection string
+	if isUpsert {
+		cCopy := clients[existingIdx]
+		previousClient = &cCopy
+		targetKey := existingPubKey
+		if targetKey == "" {
+			targetKey = clients[existingIdx].ClientID
+		}
+		targetIP := clients[existingIdx].UserData.ClientIP
+		previousPeerSection = extractPeerSection(confText, targetKey, targetIP)
+	}
 
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
@@ -1702,9 +1726,21 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		// terminate keepalive probes on awg0 and never route or masquerade
 		// client traffic, so ensureBackendNATRule is skipped.
 		return map[string]any{
-			"client_id":   clientPubKey,
-			"client_name": clientName,
-			"client_ip":   clientIP,
+			"client_id":             clientPubKey,
+			"client_name":           clientName,
+			"client_ip":             clientIP,
+			"client_pub_key":        clientPubKey,
+			"existing_pub_key":      existingPubKey,
+			"is_upsert":             isUpsert,
+			"previous_client":       previousClient,
+			"previous_peer_section": previousPeerSection,
+			"initial_conf":          initialConfText,
+			"initial_clients":       initialClients,
+			"rekeyed":               rekeyed,
+			"previous_owner":        previousOwner,
+			"rekeyed_ip":            rekeyedIP,
+			"newly_allocated":       newlyAllocated,
+			"effective_client_id":   effectiveClientID,
 		}, nil
 	}
 
@@ -1723,11 +1759,23 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clientConfig := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
 
 	return map[string]any{
-		"client_id":   clientPubKey,
-		"client_name": clientName,
-		"client_ip":   clientIP,
-		"config":      clientConfig,
-		"awg_mimicry": mimicry,
+		"client_id":             clientPubKey,
+		"client_name":           clientName,
+		"client_ip":             clientIP,
+		"client_pub_key":        clientPubKey,
+		"existing_pub_key":      existingPubKey,
+		"config":                clientConfig,
+		"awg_mimicry":           mimicry,
+		"is_upsert":             isUpsert,
+		"previous_client":       previousClient,
+		"previous_peer_section": previousPeerSection,
+		"initial_conf":          initialConfText,
+		"initial_clients":       initialClients,
+		"rekeyed":               rekeyed,
+		"previous_owner":        previousOwner,
+		"rekeyed_ip":            rekeyedIP,
+		"newly_allocated":       newlyAllocated,
+		"effective_client_id":   effectiveClientID,
 	}, nil
 }
 
@@ -1763,6 +1811,69 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 	}
 
 	return false, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
+}
+
+func extractPeerSection(confText, pubKey, ip string) string {
+	lines := strings.Split(strings.TrimRight(confText, "\n"), "\n")
+	var targetIP net.IP
+	if ip != "" {
+		targetIP = net.ParseIP(strings.TrimSpace(ip))
+	}
+
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "[Peer]" {
+			continue
+		}
+		j := i + 1
+		for j < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
+			j++
+		}
+		block := lines[i:j]
+		match := false
+
+		if pubKey != "" {
+			for _, bl := range block {
+				trimmed := strings.TrimSpace(bl)
+				if strings.HasPrefix(trimmed, "PublicKey = ") {
+					if strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey = ")) == pubKey {
+						match = true
+						break
+					}
+				}
+			}
+		}
+		if !match && targetIP != nil {
+			for _, bl := range block {
+				trimmed := strings.TrimSpace(bl)
+				if strings.HasPrefix(trimmed, "AllowedIPs = ") {
+					rawIPs := strings.TrimSpace(strings.TrimPrefix(trimmed, "AllowedIPs = "))
+					for _, part := range strings.Split(rawIPs, ",") {
+						part = strings.TrimSpace(part)
+						if part == "" {
+							continue
+						}
+						parsedIP, _, err := net.ParseCIDR(part)
+						if err != nil {
+							parsedIP = net.ParseIP(part)
+						}
+						if parsedIP != nil && parsedIP.Equal(targetIP) {
+							match = true
+							break
+						}
+					}
+					if match {
+						break
+					}
+				}
+			}
+		}
+
+		if match {
+			return strings.Join(block, "\n")
+		}
+		i = j - 1
+	}
+	return ""
 }
 
 func removePeerFromConfig(confText, pubKey, ip string) string {
@@ -2303,6 +2414,222 @@ func convertStringMapToAny(m map[string]string) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// RollbackAddClient rolls back an AddClient operation. If the operation was an upsert
+// (modifying an existing peer), the prior peer configuration and clientsTable entry are restored
+// on the fresh server state without overwriting concurrent modifications.
+// Otherwise, the newly added peer is removed from the fresh server state.
+func (m *AWGManager) RollbackAddClient(ctx context.Context, server *models.Server, addClientResult map[string]any) error {
+	if addClientResult == nil {
+		return errors.New("addClientResult is nil")
+	}
+
+	isUpsert, _ := addClientResult["is_upsert"].(bool)
+	clientID, _ := addClientResult["client_id"].(string)
+	if clientID == "" {
+		clientID, _ = addClientResult["clientId"].(string)
+	}
+	clientPubKey, _ := addClientResult["client_pub_key"].(string)
+	if clientPubKey == "" {
+		clientPubKey = clientID
+	}
+	clientName, _ := addClientResult["client_name"].(string)
+	clientIP, _ := addClientResult["client_ip"].(string)
+
+	client, err := m.getSSHClient(ctx, server)
+	if err != nil {
+		return err
+	}
+
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	unlockRemote, lockErr := m.acquireRemoteServerLock(ctx, client, serverID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlockRemote()
+
+	var rollbackErrs []error
+	superseded, err := m.rollbackClientsTableSurgically(ctx, client, isUpsert, clientID, clientPubKey, clientName, clientIP, addClientResult)
+	if err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	if err := m.rollbackServerConfigSurgically(ctx, client, isUpsert, superseded, clientPubKey, clientIP, addClientResult); err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	m.rollbackIPLease(ctx, serverID, clientID, clientIP, addClientResult, superseded)
+
+	return errors.Join(rollbackErrs...)
+}
+
+func (m *AWGManager) rollbackClientsTableSurgically(ctx context.Context, client ssh.SSHClient, isUpsert bool, clientID, clientPubKey, clientName, clientIP string, addClientResult map[string]any) (bool, error) {
+	freshClients, err := m.getClientsTable(ctx, client)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch fresh clientsTable during rollback: %w", err)
+	}
+
+	superseded := isClientSuperseded(freshClients, clientName, clientPubKey, clientID)
+
+	var updatedClients []AWGClient
+	if isUpsert && !superseded {
+		previousClient := extractPreviousClient(addClientResult)
+		updatedClients = buildRestoredUpsertClients(freshClients, previousClient, clientPubKey, clientID)
+	} else {
+		filterIP := !isUpsert && !superseded
+		updatedClients = buildFilteredNonUpsertClients(freshClients, clientPubKey, clientID, clientIP, filterIP)
+	}
+
+	if err := m.saveClientsTable(ctx, client, updatedClients); err != nil {
+		return superseded, fmt.Errorf("failed to save clientsTable during rollback: %w", err)
+	}
+	return superseded, nil
+}
+
+func isClientSuperseded(freshClients []AWGClient, clientName, clientPubKey, clientID string) bool {
+	if clientName == "" {
+		return false
+	}
+	for _, c := range freshClients {
+		if c.UserData.ClientName == clientName {
+			if (clientPubKey != "" && c.ClientID != clientPubKey) && (clientID != "" && c.ClientID != clientID) {
+				slog.Info("AWG rollback detected superseding peer; abstaining from restoring previous client",
+					"client_name", clientName,
+					"rollback_client_id", clientPubKey,
+					"current_client_id", c.ClientID,
+				)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractPreviousClient(addClientResult map[string]any) *AWGClient {
+	if prev, ok := addClientResult["previous_client"].(*AWGClient); ok && prev != nil {
+		return prev
+	}
+	if pcVal, ok := addClientResult["previous_client"].(AWGClient); ok {
+		return &pcVal
+	}
+	return nil
+}
+
+func buildRestoredUpsertClients(freshClients []AWGClient, previousClient *AWGClient, clientPubKey, clientID string) []AWGClient {
+	if previousClient == nil {
+		return freshClients
+	}
+	var updatedClients []AWGClient
+	replaced := false
+	for _, c := range freshClients {
+		if (clientPubKey != "" && c.ClientID == clientPubKey) || (clientID != "" && c.ClientID == clientID) {
+			updatedClients = append(updatedClients, *previousClient)
+			replaced = true
+		} else {
+			updatedClients = append(updatedClients, c)
+		}
+	}
+	if !replaced {
+		return freshClients
+	}
+	return updatedClients
+}
+
+func buildFilteredNonUpsertClients(freshClients []AWGClient, clientPubKey, clientID, clientIP string, filterIP bool) []AWGClient {
+	var updatedClients []AWGClient
+	for _, c := range freshClients {
+		if (clientPubKey != "" && c.ClientID == clientPubKey) || (clientID != "" && c.ClientID == clientID) {
+			continue
+		}
+		if filterIP && clientIP != "" && c.UserData.ClientIP == clientIP {
+			continue
+		}
+		updatedClients = append(updatedClients, c)
+	}
+	return updatedClients
+}
+
+func (m *AWGManager) rollbackServerConfigSurgically(ctx context.Context, client ssh.SSHClient, isUpsert, superseded bool, clientPubKey, clientIP string, addClientResult map[string]any) error {
+	freshConf, err := m.getServerConfig(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to fetch fresh server config during rollback: %w", err)
+	}
+
+	var newConf string
+	if isUpsert && !superseded {
+		previousPeerSection, _ := addClientResult["previous_peer_section"].(string)
+		existingPubKey, _ := addClientResult["existing_pub_key"].(string)
+		if previousPeerSection != "" {
+			var removePubKeys []string
+			if clientPubKey != "" && clientPubKey != existingPubKey {
+				removePubKeys = append(removePubKeys, clientPubKey)
+			}
+			var upsertErr error
+			newConf, upsertErr = upsertPeerInConfig(freshConf, previousPeerSection, removePubKeys...)
+			if upsertErr != nil {
+				return fmt.Errorf("failed to restore peer section in config during rollback: %w", upsertErr)
+			}
+		} else {
+			newConf = freshConf
+		}
+	} else {
+		if clientPubKey != "" && strings.Contains(freshConf, clientPubKey) {
+			newConf = removePeerFromConfig(freshConf, clientPubKey, "")
+		} else {
+			newConf = freshConf
+		}
+	}
+
+	if newConf != "" && newConf != freshConf {
+		if _, saveErr := m.saveServerConfigTracked(ctx, client, newConf); saveErr != nil {
+			return fmt.Errorf("failed to save server config during rollback: %w", saveErr)
+		}
+	}
+	return nil
+}
+
+func (m *AWGManager) rollbackIPLease(ctx context.Context, serverID int64, clientID, clientIP string, addClientResult map[string]any, superseded bool) {
+	if superseded {
+		return
+	}
+	rekeyed, _ := addClientResult["rekeyed"].(bool)
+	previousOwner, _ := addClientResult["previous_owner"].(string)
+	effectiveClientID, _ := addClientResult["effective_client_id"].(string)
+	if effectiveClientID == "" {
+		effectiveClientID = clientID
+	}
+	rekeyedIP, _ := addClientResult["rekeyed_ip"].(string)
+	newlyAllocated, _ := addClientResult["newly_allocated"].(bool)
+
+	if rekeyed && m.ipAllocator != nil && previousOwner != "" && rekeyedIP != "" {
+		if relErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); relErr != nil {
+			slog.Error("failed to revert AWG client IP lease to previous owner during upsert rollback",
+				"server_id", serverID,
+				"previous_owner", previousOwner,
+				"client_id", effectiveClientID,
+				"ip", rekeyedIP,
+				"error", relErr,
+			)
+		}
+	} else if newlyAllocated && m.ipAllocator != nil && clientIP != "" {
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP); relErr != nil {
+			slog.Warn("failed to release newly allocated AWG client IP during upsert rollback",
+				"server_id", serverID,
+				"client_id", effectiveClientID,
+				"ip", clientIP,
+				"error", relErr,
+			)
+		}
+	}
 }
 
 // RemoveClient removes a client from the server WireGuard configuration and clientsTable.

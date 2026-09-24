@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -265,4 +266,47 @@ func isProtocolInstalled(server *models.Server, proto string) bool {
 // audit writes an audit log entry for a state-changing action.
 func (h *Handlers) audit(r *http.Request, event string, details ...map[string]any) {
 	middleware.LogAuditEvent(r, event, details...)
+}
+
+// rollbackClient executes compensating rollback for a provisioned client on DB failure.
+// If the manager supports RollbackableManager, it invokes RollbackAddClient (which handles upsert restoration).
+// Otherwise, it falls back to RemoveClient.
+func (h *Handlers) rollbackClient(ctx context.Context, protoMgr manager.ProtocolManager, server *models.Server, result map[string]any, clientID string) error {
+	if clientID == "" && result == nil {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+
+	if rm, ok := protoMgr.(manager.RollbackableManager); ok && result != nil {
+		if rbErr := rm.RollbackAddClient(cleanupCtx, server, result); rbErr != nil {
+			slog.Error("Failed to rollback client on remote server after DB failure",
+				"server_id", server.ID,
+				"client_id", clientID,
+				"err", rbErr,
+			)
+			return rbErr
+		}
+		slog.Info("Rolled back remote client after DB failure",
+			"server_id", server.ID,
+			"client_id", clientID,
+		)
+		return nil
+	}
+
+	if clientID != "" {
+		if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
+			slog.Error("Failed to remove client on remote server after DB failure",
+				"server_id", server.ID,
+				"client_id", clientID,
+				"err", rbErr,
+			)
+			return rbErr
+		}
+		slog.Info("Removed client on remote server after DB failure",
+			"server_id", server.ID,
+			"client_id", clientID,
+		)
+	}
+	return nil
 }

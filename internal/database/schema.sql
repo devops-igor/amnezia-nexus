@@ -160,6 +160,20 @@ CREATE TABLE IF NOT EXISTS awg_ip_allocations (
     UNIQUE(server_id, ip)
 );
 
+-- 12. Peer Lifecycle Tracking
+CREATE TABLE IF NOT EXISTS peer_lifecycle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    name TEXT DEFAULT '',
+    user_id TEXT DEFAULT NULL,
+    status TEXT NOT NULL DEFAULT 'active', -- 'pending', 'active', 'failed'
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(server_id, protocol, client_id)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_user_connections_user_id ON user_connections(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_connections_server_id ON user_connections(server_id);
@@ -174,3 +188,6 @@ CREATE INDEX IF NOT EXISTS idx_vpn_sessions_peer ON vpn_sessions(peer_public_key
 CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server ON awg_ip_allocations(server_id);
 CREATE INDEX IF NOT EXISTS idx_awg_ip_allocations_server_client ON awg_ip_allocations(server_id, client_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON awg_ip_allocations(server_id, client_id) WHERE status = 'allocated';
+CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_server_proto ON peer_lifecycle(server_id, protocol);
+CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_status ON peer_lifecycle(status);
+

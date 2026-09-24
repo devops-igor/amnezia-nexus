@@ -214,6 +214,8 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		_, err := s.db.DeleteUser(ctx, uid)
 		if err != nil {
 			slog.Warn("Failed to delete user record", "user_id", uid, "err", err)
+		} else {
+			_ = s.db.DeletePeerLifecycleByUserID(ctx, uid)
 		}
 	}
 
@@ -253,6 +255,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		}
 		if !removeFailed {
 			_, _ = s.db.DeleteConnection(ctx, c.ID)
+			_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 		}
 	}
 
@@ -295,7 +298,12 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 				}
 
 				clientID, _ := res["client_id"].(string)
+				if clientID == "" {
+					clientID, _ = res["clientId"].(string)
+				}
 				if clientID != "" {
+					_ = s.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, cReq.Name, cReq.UserID, "active")
+
 					newConn := &models.UserConnection{
 						ID:        generateUUID(),
 						UserID:    cReq.UserID,
@@ -307,6 +315,29 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 					}
 					if _, err := s.db.CreateConnection(ctx, newConn); err != nil {
 						slog.Error("Failed to insert user connection into DB", "conn_id", newConn.ID, "err", err)
+						cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+						var rbErr error
+						if rm, ok := mgr.(manager.RollbackableManager); ok && res != nil {
+							rbErr = rm.RollbackAddClient(cleanupCtx, server, res)
+						} else {
+							rbErr = mgr.RemoveClient(cleanupCtx, server, clientID)
+						}
+						cancel()
+						if rbErr != nil {
+							slog.Error("Failed to rollback client on remote server after DB failure",
+								"server_id", server.ID,
+								"client_id", clientID,
+								"err", rbErr,
+							)
+							_ = s.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "failed")
+						} else {
+							slog.Info("Rolled back remote client after DB failure",
+								"server_id", server.ID,
+								"protocol", proto,
+								"client_id", clientID,
+							)
+							_ = s.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
+						}
 					}
 				}
 			}
