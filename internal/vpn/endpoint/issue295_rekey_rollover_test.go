@@ -118,7 +118,7 @@ func newTestClient(t *testing.T, db *database.DB, sID int64, username string) ([
 	}
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 	})
