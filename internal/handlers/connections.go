@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -248,18 +247,11 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 	}
 
+	_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, user.ID, "active")
+
 	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if clientID != "" {
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-			defer cancel()
-			if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
-				slog.Error("Failed to rollback client on remote server after DB failure",
-					"server_id", server.ID,
-					"client_id", clientID,
-					"err", rbErr,
-				)
-			}
-		}
+		_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
+		h.rollbackClient(ctx, protoMgr, server, result, clientID)
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
 	}
@@ -333,6 +325,7 @@ func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Requ
 		"name":      req.Name,
 		"protocol":  "awg",
 	})
+	_ = h.db.RecordPeerLifecycle(ctx, 0, "awg", clientPub, req.Name, user.ID, "active")
 	newConn.ClientID = clientPub
 	newConn.ServerID = 0
 	newConn.Protocol = "awg"
@@ -542,6 +535,7 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	_, _ = h.db.DeleteConnection(ctx, connectionID)
+	_ = h.db.DeletePeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID)
 
 	h.audit(r, "connection.user_delete", map[string]any{"user_id": sess.UserID, "connection_id": connectionID, "name": conn.Name})
 	h.JSONOK(w)

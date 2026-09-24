@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
@@ -22,18 +25,140 @@ type ProtocolResolver interface {
 	Get(proto string) (manager.ProtocolManager, bool)
 }
 
-// Reconciler executes startup synchronization to clean up orphaned connections and stale protocols.
+// Option configures Reconciler periodic background service.
+type Option func(*Reconciler)
+
+// WithInterval configures the periodic zombie peer cleanup interval.
+func WithInterval(interval time.Duration) Option {
+	return func(r *Reconciler) {
+		if interval > 0 {
+			r.interval = interval
+		}
+	}
+}
+
+// WithBootDelay configures initial delay before first background cleanup.
+func WithBootDelay(delay time.Duration) Option {
+	return func(r *Reconciler) {
+		if delay >= 0 {
+			r.bootDelay = delay
+		}
+	}
+}
+
+// Reconciler executes startup synchronization and periodic background audits
+// to clean up orphaned connections, stale protocols, and zombie container peers.
 type Reconciler struct {
-	db       *database.DB
-	registry ProtocolResolver
+	db        *database.DB
+	registry  ProtocolResolver
+	mu        sync.Mutex
+	running   bool
+	cancel    context.CancelFunc
+	stopCh    chan struct{}
+	interval  time.Duration
+	bootDelay time.Duration
 }
 
 // New creates a new Reconciler instance.
-func New(db *database.DB, registry ProtocolResolver) *Reconciler {
-	return &Reconciler{
-		db:       db,
-		registry: registry,
+func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Reconciler {
+	r := &Reconciler{
+		db:        db,
+		registry:  registry,
+		interval:  10 * time.Minute,
+		bootDelay: 30 * time.Second,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// Name returns the background service worker name.
+func (r *Reconciler) Name() string {
+	return "protocol_reconciler"
+}
+
+// Start executes periodic zombie peer cleanup in a loop until stopped or ctx canceled.
+func (r *Reconciler) Start(ctx context.Context) error {
+	r.mu.Lock()
+	if r.running {
+		r.mu.Unlock()
+		return errors.New("protocol_reconciler is already running")
+	}
+	subCtx, cancel := context.WithCancel(ctx)
+	r.cancel = cancel
+	r.running = true
+	r.stopCh = make(chan struct{})
+	interval := r.interval
+	bootDelay := r.bootDelay
+	r.mu.Unlock()
+
+	slog.Info("Protocol reconciler background service started", "interval", interval, "boot_delay", bootDelay)
+
+	// 1. Initial boot delay
+	if bootDelay > 0 {
+		select {
+		case <-subCtx.Done():
+			r.setStopped()
+			return subCtx.Err()
+		case <-r.stopCh:
+			r.setStopped()
+			return nil
+		case <-time.After(bootDelay):
+		}
+	}
+
+	// 2. Main periodic loop
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial run after boot delay
+	if err := r.CleanupZombiePeers(subCtx); err != nil && subCtx.Err() == nil {
+		slog.Warn("Protocol reconciler initial cleanup encountered error", "err", err)
+	}
+
+	for {
+		select {
+		case <-subCtx.Done():
+			r.setStopped()
+			return subCtx.Err()
+		case <-r.stopCh:
+			r.setStopped()
+			return nil
+		case <-ticker.C:
+			if err := r.CleanupZombiePeers(subCtx); err != nil && subCtx.Err() == nil {
+				slog.Warn("Protocol reconciler periodic cleanup encountered error", "err", err)
+			}
+		}
+	}
+}
+
+// Stop stops the periodic reconciler background service.
+func (r *Reconciler) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	if !r.running {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	select {
+	case <-r.stopCh:
+	default:
+		close(r.stopCh)
+	}
+	r.running = false
+	r.mu.Unlock()
+
+	slog.Info("Protocol reconciler background service stopped cleanly")
+	return nil
+}
+
+func (r *Reconciler) setStopped() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.running = false
 }
 
 // CleanupStaleProtocols performs a three-phase cleanup:
@@ -231,11 +356,23 @@ func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []mod
 				continue
 			}
 
-			validIDs := make(map[string]bool, len(conns))
+			activeLifecycleIDs, err := r.db.GetActivePeerIDs(ctx, serverID, proto)
+			if err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to fetch active peer lifecycle IDs",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+			}
+
+			validIDs := make(map[string]bool, len(conns)+len(activeLifecycleIDs))
 			for _, conn := range conns {
 				if conn.ClientID != "" {
 					validIDs[conn.ClientID] = true
 				}
+			}
+			for cid := range activeLifecycleIDs {
+				validIDs[cid] = true
 			}
 
 			for _, client := range clients {
@@ -259,6 +396,10 @@ func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []mod
 					continue
 				}
 
+				if isRecentlyCreatedPeer(client, 2*time.Minute) {
+					continue
+				}
+
 				if err := mgr.RemoveClient(ctx, &srvCopy, clientID); err != nil {
 					slog.Warn("Reconciliation Phase 3: failed to remove zombie peer from remote container",
 						"server_id", serverID,
@@ -276,6 +417,68 @@ func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []mod
 			}
 		}
 	}
+}
+
+func isRecentlyCreatedPeer(client map[string]any, gracePeriod time.Duration) bool {
+	findTime := func(val any) *time.Time {
+		if val == nil {
+			return nil
+		}
+		switch v := val.(type) {
+		case time.Time:
+			return &v
+		case string:
+			str := strings.TrimSpace(v)
+			if str == "" {
+				return nil
+			}
+			if t, err := time.Parse(time.RFC3339, str); err == nil {
+				return &t
+			}
+			if t, err := time.Parse(time.RFC3339Nano, str); err == nil {
+				return &t
+			}
+			if sec, err := strconv.ParseInt(str, 10, 64); err == nil && sec > 0 {
+				t := time.Unix(sec, 0).UTC()
+				return &t
+			}
+		case int64:
+			if v > 0 {
+				t := time.Unix(v, 0).UTC()
+				return &t
+			}
+		case int:
+			if v > 0 {
+				t := time.Unix(int64(v), 0).UTC()
+				return &t
+			}
+		case float64:
+			if v > 0 {
+				t := time.Unix(int64(v), 0).UTC()
+				return &t
+			}
+		}
+		return nil
+	}
+
+	keys := []string{"creationDate", "created_at", "creation_date", "createdAt"}
+	for _, k := range keys {
+		if t := findTime(client[k]); t != nil {
+			if time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
+				return true
+			}
+		}
+	}
+	if ud, ok := client["userData"].(map[string]any); ok {
+		for _, k := range keys {
+			if t := findTime(ud[k]); t != nil {
+				if time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func isInfrastructurePeer(client map[string]any) bool {

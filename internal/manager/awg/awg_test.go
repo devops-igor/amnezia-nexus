@@ -2259,3 +2259,86 @@ AllowedIPs = 10.66.66.200/32
 		}
 	})
 }
+
+func TestAWGManager_RollbackAddClient_RestoresUpsertPeer(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Pre-create peer "UpsertTargetUser"
+	res1, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "UpsertTargetUser",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("initial AddClient failed: %v", err)
+	}
+	if isUpsert, ok := res1["is_upsert"].(bool); ok && isUpsert {
+		t.Fatalf("expected first creation to NOT be upsert")
+	}
+
+	confBeforeUpsert := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableBeforeUpsert := string(client.files["/opt/amnezia/awg/clientsTable"])
+	origClientID := res1["client_id"].(string)
+
+	// 2. Perform upsert with same name and different mimicry
+	res2, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "UpsertTargetUser",
+		"awg_mimicry": "wireguard",
+	})
+	if err != nil {
+		t.Fatalf("upsert AddClient failed: %v", err)
+	}
+	if isUpsert, ok := res2["is_upsert"].(bool); !ok || !isUpsert {
+		t.Fatalf("expected second creation to be flagged as is_upsert=true, got %v", res2["is_upsert"])
+	}
+
+	// Verify that state actually changed after upsert
+	confAfterUpsert := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableAfterUpsert := string(client.files["/opt/amnezia/awg/clientsTable"])
+	if clientsTableAfterUpsert == clientsTableBeforeUpsert {
+		t.Fatalf("expected clientsTable to change after upsert")
+	}
+	if confAfterUpsert == confBeforeUpsert {
+		t.Fatalf("expected awg0.conf to change after upsert")
+	}
+
+	// 3. Rollback the upsert (simulating DB insert failure)
+	if err := mgr.RollbackAddClient(ctx, server, res2); err != nil {
+		t.Fatalf("RollbackAddClient failed: %v", err)
+	}
+
+	// 4. Verify original peer survived unchanged in awg0.conf and clientsTable
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	clientsTableAfterRollback := string(client.files["/opt/amnezia/awg/clientsTable"])
+
+	if confAfterRollback != confBeforeUpsert {
+		t.Errorf("expected awg0.conf to be restored to pre-upsert state.\nWant:\n%s\nGot:\n%s", confBeforeUpsert, confAfterRollback)
+	}
+	if clientsTableAfterRollback != clientsTableBeforeUpsert {
+		t.Errorf("expected clientsTable to be restored to pre-upsert state.\nWant:\n%s\nGot:\n%s", clientsTableBeforeUpsert, clientsTableAfterRollback)
+	}
+
+	// 5. Verify the peer is still registered under origClientID
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundOriginal bool
+	for _, c := range clients {
+		cid, _ := c["clientId"].(string)
+		if cid == origClientID {
+			foundOriginal = true
+			if ud, ok := c["userData"].(map[string]any); ok {
+				if ud["awg_mimicry"] != "tls" {
+					t.Errorf("expected mimicry to be restored to tls, got %v", ud["awg_mimicry"])
+				}
+			}
+			break
+		}
+	}
+	if !foundOriginal {
+		t.Errorf("original peer %s was deleted instead of restored!", origClientID)
+	}
+}

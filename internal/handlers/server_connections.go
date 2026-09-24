@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -158,11 +157,23 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 	vpnLink := GenerateVPNLink(configStr)
 
-	// Persist link to user if requested
+	// Persist in peer_lifecycle (both assigned and unassigned)
+	var assignedUserID string
 	if req.UserID != nil && *req.UserID != "" {
+		assignedUserID = *req.UserID
+	}
+
+	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
+		h.rollbackClient(ctx, protoMgr, server, result, clientID)
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
+		return
+	}
+
+	// Persist link to user if requested
+	if assignedUserID != "" {
 		conn := &models.UserConnection{
 			ID:         uuid.NewString(),
-			UserID:     *req.UserID,
+			UserID:     assignedUserID,
 			ServerID:   serverID,
 			Protocol:   req.Protocol,
 			ClientID:   clientID,
@@ -174,17 +185,8 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
 		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
-			if clientID != "" {
-				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-				defer cancel()
-				if rbErr := protoMgr.RemoveClient(cleanupCtx, server, clientID); rbErr != nil {
-					slog.Error("Failed to rollback client on remote server after DB failure",
-						"server_id", server.ID,
-						"client_id", clientID,
-						"err", rbErr,
-					)
-				}
-			}
+			_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, clientID)
+			h.rollbackClient(ctx, protoMgr, server, result, clientID)
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 			return
 		}
@@ -325,8 +327,10 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
 			return
 		}
+		_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, req.ClientID)
 		if clientPub != req.ClientID {
 			_, _ = h.db.DeleteConnectionByClientID(ctx, clientPub, 0)
+			_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, clientPub)
 		}
 
 		h.audit(r, "server_connection.remove", map[string]any{"server_id": 0, "protocol": req.Protocol, "client_id": req.ClientID})
@@ -354,6 +358,7 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
 		return
 	}
+	_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, req.ClientID)
 
 	h.audit(r, "server_connection.remove", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": req.ClientID})
 	h.JSONOK(w)
@@ -374,8 +379,16 @@ func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req
 }
 
 func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection) error {
+	connName := req.ClientID
+	if req.Name != nil && *req.Name != "" {
+		connName = *req.Name
+	} else if matchingConn != nil && matchingConn.Name != "" {
+		connName = matchingConn.Name
+	}
+
 	if req.UserID != nil {
 		if *req.UserID != "" {
+			_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, connName, *req.UserID, "active")
 			if matchingConn != nil {
 				updates := map[string]any{"user_id": *req.UserID}
 				if req.Name != nil && *req.Name != "" {
@@ -383,10 +396,6 @@ func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, re
 				}
 				_, err := h.db.UpdateConnection(ctx, matchingConn.ID, updates)
 				return err
-			}
-			connName := req.ClientID
-			if req.Name != nil && *req.Name != "" {
-				connName = *req.Name
 			}
 			newConn := &models.UserConnection{
 				ID:         uuid.NewString(),
@@ -401,6 +410,8 @@ func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, re
 			_, err := h.db.CreateConnection(ctx, newConn)
 			return err
 		}
+		// Unbinding connection from user: remains active unassigned connection in peer_lifecycle
+		_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, connName, "", "active")
 		if matchingConn != nil {
 			_, err := h.db.DeleteConnection(ctx, matchingConn.ID)
 			return err
@@ -408,6 +419,7 @@ func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, re
 		return nil
 	}
 	if req.Name != nil && *req.Name != "" && matchingConn != nil {
+		_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, *req.Name, matchingConn.UserID, "active")
 		_, err := h.db.UpdateConnection(ctx, matchingConn.ID, map[string]any{"name": *req.Name})
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/service/supervisor"
 )
 
 type mockStatusProtocolManager struct {
@@ -518,12 +519,13 @@ func TestReconciler_DNSTeleMTErrorsPreserveProtocols(t *testing.T) {
 }
 
 type mockZombiePeerProtocolManager struct {
-	proto         string
-	clients       []map[string]any
-	deleted       []string
-	getClientsErr bool
-	removeErr     bool
-	mu            sync.Mutex
+	proto          string
+	clients        []map[string]any
+	deleted        []string
+	getClientsErr  bool
+	removeErr      bool
+	getClientsHook func()
+	mu             sync.Mutex
 }
 
 func (m *mockZombiePeerProtocolManager) Protocol() string {
@@ -538,6 +540,9 @@ func (m *mockZombiePeerProtocolManager) Uninstall(ctx context.Context, server *m
 func (m *mockZombiePeerProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.getClientsHook != nil {
+		m.getClientsHook()
+	}
 	if m.getClientsErr {
 		return nil, errors.New("remote get clients error")
 	}
@@ -740,5 +745,194 @@ func TestReconciler_CleanupZombiePeers_NilDBAndClosedDB(t *testing.T) {
 
 	if err := r.CleanupZombiePeers(ctx); err == nil {
 		t.Error("expected error when DB is closed in CleanupZombiePeers")
+	}
+}
+
+func TestReconciler_CleanupZombiePeers_PreservesUnassignedConnections(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg":    map[string]any{"port": 55424},
+			"telemt": map[string]any{"port": 443},
+		},
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Unassigned AWG connection recorded in peer_lifecycle
+	unassignedAWG := "awg-unassigned-client-1"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", unassignedAWG, "Unassigned AWG", "", "active"); err != nil {
+		t.Fatalf("failed to record unassigned AWG in peer_lifecycle: %v", err)
+	}
+
+	// 2. Pending AWG connection recorded in peer_lifecycle
+	pendingAWG := "awg-pending-client-2"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", pendingAWG, "Pending AWG", "", "pending"); err != nil {
+		t.Fatalf("failed to record pending AWG in peer_lifecycle: %v", err)
+	}
+
+	// 3. Real zombie AWG peer (neither in user_connections nor in peer_lifecycle)
+	zombieAWG := "awg-zombie-client-3"
+
+	// 4. Unassigned TeleMT connection recorded in peer_lifecycle
+	unassignedTeleMT := "telemt-unassigned-client-1"
+	if err := db.RecordPeerLifecycle(ctx, sID, "telemt", unassignedTeleMT, "Unassigned TeleMT", "", "active"); err != nil {
+		t.Fatalf("failed to record unassigned TeleMT in peer_lifecycle: %v", err)
+	}
+
+	// 5. Real zombie TeleMT peer
+	zombieTeleMT := "telemt-zombie-client-2"
+
+	// Remote peers reported by managers (ensure creationDate is > 2 minutes ago to test peer_lifecycle protection)
+	oldTimestamp := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+		clients: []map[string]any{
+			{"clientId": unassignedAWG, "clientName": "Unassigned AWG", "creationDate": oldTimestamp},
+			{"clientId": pendingAWG, "clientName": "Pending AWG", "creationDate": oldTimestamp},
+			{"clientId": zombieAWG, "clientName": "Zombie AWG", "creationDate": oldTimestamp},
+		},
+	}
+
+	telemtMgr := &mockZombiePeerProtocolManager{
+		proto: "telemt",
+		clients: []map[string]any{
+			{"clientId": unassignedTeleMT, "clientName": "Unassigned TeleMT", "creationDate": oldTimestamp},
+			{"clientId": zombieTeleMT, "clientName": "Zombie TeleMT", "creationDate": oldTimestamp},
+		},
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+	reg.Register(telemtMgr)
+
+	r := New(db, reg)
+
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedAWG := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	telemtMgr.mu.Lock()
+	deletedTeleMT := append([]string(nil), telemtMgr.deleted...)
+	telemtMgr.mu.Unlock()
+
+	// Verify AWG: unassignedAWG and pendingAWG must NOT be deleted; zombieAWG must be deleted
+	if len(deletedAWG) != 1 || deletedAWG[0] != zombieAWG {
+		t.Fatalf("expected only zombie AWG peer %s to be deleted, got deleted: %v", zombieAWG, deletedAWG)
+	}
+
+	// Verify TeleMT: unassignedTeleMT must NOT be deleted; zombieTeleMT must be deleted
+	if len(deletedTeleMT) != 1 || deletedTeleMT[0] != zombieTeleMT {
+		t.Fatalf("expected only zombie TeleMT peer %s to be deleted, got deleted: %v", zombieTeleMT, deletedTeleMT)
+	}
+}
+
+func TestReconciler_BackgroundService_StartAndStop(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := &models.Server{
+		Name:    "Server 1",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	}
+	if _, err := db.CreateServer(ctx, srv); err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	callCount := 0
+	var mu sync.Mutex
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto:   "awg",
+		clients: []map[string]any{},
+	}
+	awgMgr.getClientsHook = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		callCount++
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg,
+		WithBootDelay(10*time.Millisecond),
+		WithInterval(20*time.Millisecond),
+	)
+
+	if name := r.Name(); name != "protocol_reconciler" {
+		t.Fatalf("expected Name() to be 'protocol_reconciler', got %s", name)
+	}
+
+	sup := supervisor.New(
+		supervisor.WithRestartDelay(10 * time.Millisecond),
+	)
+	sup.RegisterService(r)
+
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Start(ctx)
+	}()
+
+	// Wait for background service to execute at least 2 ticks
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		c := callCount
+		mu.Unlock()
+		if c >= 2 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	mu.Lock()
+	finalCount := callCount
+	mu.Unlock()
+	if finalCount < 1 {
+		t.Fatalf("expected at least 1 execution of reconciler loop, got %d", finalCount)
+	}
+
+	// Stop supervisor and assert clean termination
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := sup.Stop(stopCtx); err != nil {
+		t.Fatalf("supervisor.Stop failed: %v", err)
+	}
+
+	select {
+	case err := <-supErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("supervisor.Start exited with unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("supervisor did not stop within deadline")
+	}
+
+	r.mu.Lock()
+	running := r.running
+	r.mu.Unlock()
+	if running {
+		t.Fatalf("expected reconciler.running to be false after Stop")
 	}
 }

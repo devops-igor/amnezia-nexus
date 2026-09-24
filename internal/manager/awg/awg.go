@@ -1648,6 +1648,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	}
 	initialClients := append([]AWGClient(nil), clients...)
 	existingIdx, existingPubKey := findExistingClient(clients, clientPubKey, clientName)
+	isUpsert := existingIdx >= 0
 
 	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
@@ -1702,9 +1703,17 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		// terminate keepalive probes on awg0 and never route or masquerade
 		// client traffic, so ensureBackendNATRule is skipped.
 		return map[string]any{
-			"client_id":   clientPubKey,
-			"client_name": clientName,
-			"client_ip":   clientIP,
+			"client_id":           clientPubKey,
+			"client_name":         clientName,
+			"client_ip":           clientIP,
+			"is_upsert":           isUpsert,
+			"initial_conf":        initialConfText,
+			"initial_clients":     initialClients,
+			"rekeyed":             rekeyed,
+			"previous_owner":      previousOwner,
+			"rekeyed_ip":          rekeyedIP,
+			"newly_allocated":     newlyAllocated,
+			"effective_client_id": effectiveClientID,
 		}, nil
 	}
 
@@ -1723,11 +1732,19 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	clientConfig := m.buildClientConfig(ctx, client, server, serverParams, clientPrivKey, clientIP, serverPubKey, psk, mimicry, clientPubKey, clients)
 
 	return map[string]any{
-		"client_id":   clientPubKey,
-		"client_name": clientName,
-		"client_ip":   clientIP,
-		"config":      clientConfig,
-		"awg_mimicry": mimicry,
+		"client_id":           clientPubKey,
+		"client_name":         clientName,
+		"client_ip":           clientIP,
+		"config":              clientConfig,
+		"awg_mimicry":         mimicry,
+		"is_upsert":           isUpsert,
+		"initial_conf":        initialConfText,
+		"initial_clients":     initialClients,
+		"rekeyed":             rekeyed,
+		"previous_owner":      previousOwner,
+		"rekeyed_ip":          rekeyedIP,
+		"newly_allocated":     newlyAllocated,
+		"effective_client_id": effectiveClientID,
 	}, nil
 }
 
@@ -2303,6 +2320,93 @@ func convertStringMapToAny(m map[string]string) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// RollbackAddClient rolls back an AddClient operation. If the operation was an upsert
+// (modifying an existing peer), the prior configuration and clientsTable state are restored.
+// Otherwise, the newly added peer is removed.
+func (m *AWGManager) RollbackAddClient(ctx context.Context, server *models.Server, addClientResult map[string]any) error {
+	if addClientResult == nil {
+		return errors.New("addClientResult is nil")
+	}
+
+	isUpsert, _ := addClientResult["is_upsert"].(bool)
+	clientID, _ := addClientResult["client_id"].(string)
+	if clientID == "" {
+		clientID, _ = addClientResult["clientId"].(string)
+	}
+
+	if !isUpsert {
+		if clientID == "" {
+			return errors.New("missing client_id for rollback")
+		}
+		return m.RemoveClient(ctx, server, clientID)
+	}
+
+	initialConfText, _ := addClientResult["initial_conf"].(string)
+	if initialConfText == "" {
+		return errors.New("cannot rollback upsert: missing initial server config")
+	}
+	initialClients, _ := addClientResult["initial_clients"].([]AWGClient)
+
+	client, err := m.getSSHClient(ctx, server)
+	if err != nil {
+		return err
+	}
+
+	var serverID int64
+	if server != nil {
+		serverID = server.ID
+	}
+	sLock := m.getServerLock(serverID)
+	sLock.Lock()
+	defer sLock.Unlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	unlockRemote, lockErr := m.acquireRemoteServerLock(ctx, client, serverID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlockRemote()
+
+	// Restore previous peer configuration and clients table
+	_, restoreErr := m.restorePreviousPeer(ctx, client, initialConfText, initialClients)
+
+	// Revert IP lease if rekeyed or newly allocated
+	rekeyed, _ := addClientResult["rekeyed"].(bool)
+	previousOwner, _ := addClientResult["previous_owner"].(string)
+	effectiveClientID, _ := addClientResult["effective_client_id"].(string)
+	if effectiveClientID == "" {
+		effectiveClientID = clientID
+	}
+	rekeyedIP, _ := addClientResult["rekeyed_ip"].(string)
+	clientIP, _ := addClientResult["client_ip"].(string)
+	newlyAllocated, _ := addClientResult["newly_allocated"].(bool)
+
+	if rekeyed && m.ipAllocator != nil && previousOwner != "" && rekeyedIP != "" {
+		if relErr := m.ipAllocator.TransferAWGClientIPLease(ctx, serverID, previousOwner, effectiveClientID, rekeyedIP); relErr != nil {
+			slog.Error("failed to revert AWG client IP lease to previous owner during upsert rollback",
+				"server_id", serverID,
+				"previous_owner", previousOwner,
+				"client_id", effectiveClientID,
+				"ip", rekeyedIP,
+				"error", relErr,
+			)
+		}
+	} else if newlyAllocated && m.ipAllocator != nil && clientIP != "" {
+		if relErr := m.ipAllocator.ReleaseAWGClientIP(ctx, serverID, effectiveClientID, clientIP); relErr != nil {
+			slog.Warn("failed to release newly allocated AWG client IP during upsert rollback",
+				"server_id", serverID,
+				"client_id", effectiveClientID,
+				"ip", clientIP,
+				"error", relErr,
+			)
+		}
+	}
+
+	return restoreErr
 }
 
 // RemoveClient removes a client from the server WireGuard configuration and clientsTable.
