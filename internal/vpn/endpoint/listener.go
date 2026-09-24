@@ -2050,31 +2050,28 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	return nil
 }
 
-// isEstablishedTransport recognizes only transport shaped datagrams that belong
-// to an installed keypair (or an existing sender in the compatibility path).
-// This check performs no authentication or database work; the transport worker
-// still decrypts and validates every packet before delivering it.
-func (el *Listener) isEstablishedTransport(datagram []byte, sender *net.UDPAddr) bool {
+// isTransportCandidate checks the wire header without touching peer state or
+// the database. The transport worker resolves the keypair and authenticates
+// the packet; unrecognized packets return to the bounded handshake queue.
+func (el *Listener) isTransportCandidate(datagram []byte) bool {
 	s4 := el.config.S4
 	if s4 < 0 {
 		s4 = 0
 	}
-	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
+	if len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
 		return false
 	}
 	h4 := el.config.H4
 	if h4.IsZero() {
 		h4 = models.DegenerateHeaderRange(health.DefaultH4)
 	}
-	idx, _, _, ok := parseTransportHeader(datagram, datagram[s4:], el.headerProtectionKey(), s4, h4)
-	if !ok {
-		return false
+	// Plaintext transport needs only a 4-byte comparison. Doing a keypair or
+	// sender lookup here can overflow the kernel UDP receive buffer under load.
+	if len(el.hpKey) != 32 || s4 < health.HeaderCipherNonceSize {
+		return h4.Contains(binary.LittleEndian.Uint32(datagram[s4 : s4+4]))
 	}
-	if entry, found := el.lookupKeypairByIndex(idx); found && entry != nil && entry.keys != nil {
-		return true
-	}
-	_, knownSender := el.peerByAddr(sender.String())
-	return knownSender
+	_, _, _, ok := parseTransportHeader(datagram, datagram[s4:], el.hpKey, s4, h4)
+	return ok
 }
 
 func (el *Listener) enqueueHandshake(job packetJob) {
@@ -2122,7 +2119,7 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 					data:   data,
 					sender: udpAddr,
 				}
-				if el.isEstablishedTransport(data, udpAddr) {
+				if el.isTransportCandidate(data) {
 					select {
 					case <-el.stopCh:
 						return
