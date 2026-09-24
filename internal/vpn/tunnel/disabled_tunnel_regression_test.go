@@ -2,11 +2,51 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+func TestProbeTunnel_DeletedTunnelIsTerminal(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Deleted Probe Host", Host: "192.0.2.12"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, serverID, "192.0.2.12:51820", "pub-deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probes := 0
+	prober := NewHealthProber(pool, db, DefaultHealthConfig(), func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		probes++
+		if err := pool.RemoveTunnel(ctx, serverID); err != nil {
+			return 0, err
+		}
+		return 15 * time.Millisecond, nil
+	})
+	hookCalls := 0
+	prober.SetOnActiveHook(func(context.Context, *models.BackendTunnel) error {
+		hookCalls++
+		return nil
+	})
+	if _, err := prober.ProbeTunnel(ctx, tun); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("probe after concurrent deletion: got %v, want ErrTunnelNotFound", err)
+	}
+	if hookCalls != 0 {
+		t.Fatalf("deleted tunnel's active hook ran %d times", hookCalls)
+	}
+	if _, err := prober.ProbeTunnel(ctx, tun); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("probe of previously deleted tunnel: got %v, want ErrTunnelNotFound", err)
+	}
+	if probes != 1 {
+		t.Fatalf("deleted tunnel was probed again: probes=%d", probes)
+	}
+}
 
 // TestProbeTunnel_DisabledTunnelNotResurrected verifies that ProbeTunnel never
 // changes the status of an administratively disabled tunnel (issues #28/#43):

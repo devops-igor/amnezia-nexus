@@ -1,12 +1,94 @@
 package vpn
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
+
+// A successful probe must not resurrect the device of a backend deleted while
+// the network request was in flight.
+func TestProbeTunnel_DeleteBackendDuringProbe(t *testing.T) {
+	db := setupTestDB(t)
+	svc, serverID, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatal(err)
+	}
+	tun := tunMust(t, svc, serverID)
+	if svc.GetBackendDeviceForTest(tun.ID) == nil {
+		t.Fatal("expected initial backend device")
+	}
+
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	svc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		close(started)
+		<-resume
+		return 15 * time.Millisecond, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.ProbeTunnel(ctx, tun)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("probe did not start")
+	}
+	if err := svc.DeleteBackend(ctx, serverID); err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+	close(resume)
+	select {
+	case err := <-done:
+		if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+			t.Fatalf("stale probe error = %v, want ErrTunnelNotFound", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe did not finish")
+	}
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("deleted backend device was recreated by the stale probe")
+	}
+	if _, err := svc.pool.GetTunnel(serverID); !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Fatalf("deleted backend returned to pool: %v", err)
+	}
+}
+
+// Deletion between the hook's initial lookup and its locked recheck must
+// reject attachment using the stale tunnel credentials.
+func TestEnsureBackendDeviceAttached_DeleteBackendBeforeLock(t *testing.T) {
+	db := setupTestDB(t)
+	svc, serverID, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tun := tunMust(t, svc, serverID)
+	svc.SetEnsureDevicePreLockHook(func() {
+		if err := svc.DeleteBackend(ctx, serverID); err != nil {
+			t.Errorf("DeleteBackend: %v", err)
+		}
+	})
+	if err := svc.ensureBackendDeviceAttached(ctx, tun); !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Fatalf("attachment error = %v, want ErrTunnelNotFound", err)
+	}
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("deleted backend device was attached")
+	}
+}
 
 // TestDeleteBackendRemovesTunnelAndRow pins the Issue #29 contract for
 // Service.DeleteBackend: the tunnel must be gone from the pool, its

@@ -300,15 +300,23 @@ func (hp *HealthProber) probeEndpoint(ctx context.Context, tunnel *models.Backen
 	return latencyMS, nil
 }
 
-func (hp *HealthProber) isTunnelDisabled(serverID int64) bool {
+// checkTunnelAvailable rejects a stale probe if its pool entry was deleted or
+// replaced, as well as tunnels that were disabled while the probe was running.
+func (hp *HealthProber) checkTunnelAvailable(tunnel *models.BackendTunnel) error {
 	if hp.pool == nil {
-		return false
+		return nil
 	}
-	curTun, err := hp.pool.GetTunnel(serverID)
-	if err != nil || curTun == nil {
-		return false
+	curTun, err := hp.pool.GetTunnel(tunnel.ServerID)
+	if err != nil {
+		return err
 	}
-	return curTun.Status == "disabled" || curTun.DisableReason == models.DisableReasonAdmin
+	if curTun == nil || curTun.ID != tunnel.ID {
+		return ErrTunnelNotFound
+	}
+	if curTun.Status == "disabled" || curTun.DisableReason == models.DisableReasonAdmin {
+		return ErrTunnelDisabled
+	}
+	return nil
 }
 
 func (hp *HealthProber) isTunnelAdminDisabled(serverID int64) bool {
@@ -340,6 +348,9 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
 	}
+	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+		return 0, err
+	}
 
 	snapshot := hp.getInitialSnapshot(tunnel)
 	if snapshot.Status == "disabled" || snapshot.DisableReason == models.DisableReasonAdmin {
@@ -349,13 +360,15 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 
 	latencyMS, err := hp.probeEndpoint(ctx, tunnel)
 	if err != nil {
+		if stateErr := hp.checkTunnelAvailable(tunnel); stateErr != nil {
+			return 0, stateErr
+		}
 		return hp.handleProbeFailure(ctx, snapshot, err)
 	}
 
 	// Probe succeeded
-	if hp.isTunnelDisabled(tunnel.ServerID) {
-		slog.Info("probe succeeded but tunnel is disabled; skipping activation", "server_id", tunnel.ServerID)
-		return 0, ErrTunnelDisabled
+	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+		return 0, err
 	}
 
 	status := "active"
@@ -371,30 +384,30 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	}
 
 	// Re-check status before final status write
-	if hp.isTunnelDisabled(tunnel.ServerID) {
-		slog.Info("tunnel was disabled before status write; skipping", "server_id", tunnel.ServerID)
-		return 0, ErrTunnelDisabled
+	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+		return 0, err
 	}
-
-	hp.mu.Lock()
-	hp.failCounts[tunnel.ServerID] = 0
-	delete(hp.autoDisabled, tunnel.ServerID)
-	delete(hp.successCounts, tunnel.ServerID)
-	hp.mu.Unlock()
 
 	if hp.pool != nil {
 		if err := hp.pool.SetTunnelStatus(ctx, tunnel.ServerID, status, latencyMS); err != nil {
 			return 0, err
 		}
 	}
+	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+		return 0, err
+	}
+	hp.mu.Lock()
+	hp.failCounts[tunnel.ServerID] = 0
+	delete(hp.autoDisabled, tunnel.ServerID)
+	delete(hp.successCounts, tunnel.ServerID)
+	hp.mu.Unlock()
 
 	return latencyMS, nil
 }
 
 func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {
-	if hp.isTunnelDisabled(tunnel.ServerID) {
-		slog.Info("aborting onActiveHook: tunnel is disabled", "server_id", tunnel.ServerID)
-		return 0, ErrTunnelDisabled
+	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+		return 0, err
 	}
 
 	hp.mu.RLock()
@@ -402,6 +415,12 @@ func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel 
 	hp.mu.RUnlock()
 	if hook != nil {
 		if hookErr := hook(ctx, tunnel); hookErr != nil {
+			if errors.Is(hookErr, ErrTunnelNotFound) {
+				return 0, hookErr
+			}
+			if err := hp.checkTunnelAvailable(tunnel); errors.Is(err, ErrTunnelNotFound) {
+				return 0, err
+			}
 			return hp.handleHookFailure(ctx, snapshot, hookErr)
 		}
 	}
@@ -582,7 +601,7 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 
 func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
 	hp.mu.Lock()
-	if errors.Is(hookErr, ErrTunnelDisabled) || hp.isTunnelDisabled(snapshot.ServerID) {
+	if errors.Is(hookErr, ErrTunnelDisabled) || errors.Is(hp.checkTunnelAvailable(snapshot), ErrTunnelDisabled) {
 		hp.failCounts[snapshot.ServerID] = 0
 		delete(hp.autoDisabled, snapshot.ServerID)
 		hp.mu.Unlock()
