@@ -428,7 +428,7 @@ func (sm *SessionManager) releaseUnpersistedLease(ctx context.Context, peerKey s
 		return
 	}
 	if sm.db != nil {
-		conn, err := sm.db.GetConnectionByToken(ctx, peerKey)
+		conn, err := sm.db.GetConnectionByClientID(ctx, peerKey, 0)
 		if err != nil {
 			log.Printf("[endpoint] preserving lease for peer %s: cannot check durable assignment: %v", peerKey, err)
 			return
