@@ -2666,6 +2666,9 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 		}
 		s.peerGenerations[sess.PeerPublicKey]++
 		fenceGen := s.peerGenerations[sess.PeerPublicKey]
+		if s.endpoint != nil {
+			s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
+		}
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
 			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID))
@@ -2696,13 +2699,39 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 		return
 	}
 	var retirement forwarder.Retirement
+	var fenceGen uint64
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		retirement.Wait()
+		if fenceGen != 0 {
+			s.mu.Lock()
+			// A reconnect may have installed a new session while the old
+			// route's admitted writes were finishing. Check under Service.mu
+			// so a new session cannot be created between this check and prune.
+			current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey)
+			if !exists || current.ID == sess.ID {
+				s.endpoint.PrunePeerTransportState(sess.PeerPublicKey, fenceGen)
+			}
+			s.mu.Unlock()
+		}
 		log.Printf("[vpn/service] reaped idle session: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
 			sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
 	}()
+
+	if s.endpoint != nil && s.sessionMgr != nil && s.peerGenerations[sess.PeerPublicKey] <= sess.Generation {
+		// CheckTimeouts has already removed this session. Reserve the next
+		// generation before unlocking, so a fresh handshake receives a
+		// generation beyond this fence while an old handshake is rejected.
+		if current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey); !exists || current.ID == sess.ID {
+			fenceGen = sess.Generation + 1
+			if s.peerGenerations == nil {
+				s.peerGenerations = make(map[string]uint64)
+			}
+			s.peerGenerations[sess.PeerPublicKey] = fenceGen
+			s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
+		}
+	}
 
 	if s.forwarder != nil {
 		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
@@ -2721,7 +2750,6 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 			s.pool.DecrementConnections(sess.BackendTunnelID)
 		}
 	}
-
 }
 
 // PruneExpiredAffinity scans and removes expired sticky affinity records
@@ -2767,6 +2795,9 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	s.peerGenerations[sess.PeerPublicKey]++
 	fenceGen = s.peerGenerations[sess.PeerPublicKey]
 	prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
+	if s.endpoint != nil {
+		s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
+	}
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
 	if s.forwarder != nil {
@@ -2803,7 +2834,14 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 			if s.peerGenerations == nil {
 				s.peerGenerations = make(map[string]uint64)
 			}
-			s.peerGenerations[sess.PeerPublicKey]++
+			// ReleaseClient used to advance the generation once for the
+			// session and once for the client. Reserve both before removing
+			// the route so an in-flight handshake cannot commit during Wait.
+			s.peerGenerations[sess.PeerPublicKey] += 2
+			fenceGen = s.peerGenerations[sess.PeerPublicKey]
+			if s.endpoint != nil {
+				s.endpoint.FencePeerGeneration(clientPub, fenceGen)
+			}
 			pruneSession = sess.ID
 			pruneAfterRetirement = true
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
@@ -2819,13 +2857,13 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 		}
 	}
 
-	if clientPub != "" {
+	if clientPub != "" && !pruneAfterRetirement {
 		if s.peerGenerations == nil {
 			s.peerGenerations = make(map[string]uint64)
 		}
 		s.peerGenerations[clientPub]++
 		fenceGen = s.peerGenerations[clientPub]
-		if !pruneAfterRetirement && s.endpoint != nil {
+		if s.endpoint != nil {
 			// No route to retire: keep the existing in-lock cleanup for a
 			// client whose transport state outlived its session.
 			s.endpoint.PrunePeerTransportStateIfSession(clientPub, "", fenceGen)
