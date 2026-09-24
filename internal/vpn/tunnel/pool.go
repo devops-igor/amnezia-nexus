@@ -335,11 +335,24 @@ func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 // When status becomes "active", DisableReason is cleared.
 // DB errors are propagated immediately; in-memory state is only updated on DB success.
 func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
+	return p.setTunnelStatus(ctx, serverID, 0, status, latencyMS)
+}
+
+// SetTunnelStatusIfCurrent applies a probe result only to the tunnel generation
+// that produced it. The identity check and DB/memory update share p.mu.
+func (p *Pool) SetTunnelStatusIfCurrent(ctx context.Context, serverID, expectedTunnelID int64, status string, latencyMS int64) error {
+	if expectedTunnelID == 0 {
+		return ErrTunnelNotFound
+	}
+	return p.setTunnelStatus(ctx, serverID, expectedTunnelID, status, latencyMS)
+}
+
+func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID int64, status string, latencyMS int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	tunnel, ok := p.tunnelsByServerID[serverID]
-	if !ok {
+	if !ok || (expectedTunnelID != 0 && tunnel.ID != expectedTunnelID) {
 		return ErrTunnelNotFound
 	}
 
@@ -409,11 +422,24 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 // disable reason, and state version match expected values.
 // Returns true if the state was updated, false if state did not match.
 func (p *Pool) CompareAndSwapTunnelStatus(ctx context.Context, serverID int64, expectedStatus, expectedReason string, expectedVersion int64, newStatus, newReason string, latencyMS int64) (bool, error) {
+	return p.compareAndSwapTunnelStatus(ctx, serverID, 0, expectedStatus, expectedReason, expectedVersion, newStatus, newReason, latencyMS)
+}
+
+// CompareAndSwapTunnelStatusForTunnel rejects a CAS from an older tunnel
+// generation before it can mutate a replacement with the same server ID.
+func (p *Pool) CompareAndSwapTunnelStatusForTunnel(ctx context.Context, serverID, expectedTunnelID int64, expectedStatus, expectedReason string, expectedVersion int64, newStatus, newReason string, latencyMS int64) (bool, error) {
+	if expectedTunnelID == 0 {
+		return false, ErrTunnelNotFound
+	}
+	return p.compareAndSwapTunnelStatus(ctx, serverID, expectedTunnelID, expectedStatus, expectedReason, expectedVersion, newStatus, newReason, latencyMS)
+}
+
+func (p *Pool) compareAndSwapTunnelStatus(ctx context.Context, serverID, expectedTunnelID int64, expectedStatus, expectedReason string, expectedVersion int64, newStatus, newReason string, latencyMS int64) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	tunnel, ok := p.tunnelsByServerID[serverID]
-	if !ok {
+	if !ok || (expectedTunnelID != 0 && tunnel.ID != expectedTunnelID) {
 		return false, ErrTunnelNotFound
 	}
 
