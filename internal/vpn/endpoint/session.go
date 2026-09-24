@@ -339,6 +339,55 @@ func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, st
 	return nil
 }
 
+// UpdateSessionBackend safely updates a session's backend tunnel ID and status in memory (issue #289).
+// It returns the previous backend tunnel ID, peer public key, and previous status.
+func (sm *SessionManager) UpdateSessionBackend(sessionID string, newBackendTunnelID int64, newStatus string) (oldBackendID int64, peerKey string, oldStatus string, err error) {
+	if sm == nil {
+		return 0, "", "", errors.New("nil session manager")
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sess, ok := sm.sessionsByID[sessionID]
+	if !ok || sess == nil {
+		return 0, "", "", ErrSessionNotFound
+	}
+
+	oldBackendID = sess.BackendTunnelID
+	peerKey = sess.PeerPublicKey
+	oldStatus = sess.Status
+
+	sess.BackendTunnelID = newBackendTunnelID
+	if newStatus != "" {
+		sess.Status = newStatus
+	}
+	sm.lifecycleVersion.Add(1)
+	return oldBackendID, peerKey, oldStatus, nil
+}
+
+// RollbackSessionBackend safely restores a session's previous backend tunnel ID and status in memory (issue #289).
+func (sm *SessionManager) RollbackSessionBackend(sessionID string, oldBackendTunnelID int64, oldStatus string) error {
+	if sm == nil {
+		return errors.New("nil session manager")
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sess, ok := sm.sessionsByID[sessionID]
+	if !ok || sess == nil {
+		return ErrSessionNotFound
+	}
+
+	sess.BackendTunnelID = oldBackendTunnelID
+	if oldStatus != "" {
+		sess.Status = oldStatus
+	} else {
+		sess.Status = "connected"
+	}
+	sm.lifecycleVersion.Add(1)
+	return nil
+}
+
 // CheckTimeouts checks for sessions that have exceeded the idleTimeout and closes them.
 func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Duration) ([]*models.VPNSession, error) {
 	if idleTimeout <= 0 {

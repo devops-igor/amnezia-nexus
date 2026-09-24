@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -2812,6 +2813,106 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	s.pool.DecrementConnections(sess.BackendTunnelID)
 
 	return nil
+}
+
+// MigrateSession migrates an active session to a target backend tunnel, updating
+// the live forwarder route, in-memory session, and database state atomically with rollback (issue #289).
+//
+// Invariant (issue #86, #289): caller executes under s.mu.Lock(), maintaining the
+// lock ordering s.mu -> SessionManager.mu (never reversed), and preserving serialization
+// for pool connection counters and route transitions.
+func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error {
+	if s == nil {
+		return errors.New("vpn service is nil")
+	}
+	if sessionID == "" {
+		return errors.New("empty session id")
+	}
+	if targetTunnelID <= 0 {
+		return errors.New("invalid target tunnel id")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sessionMgr == nil {
+		return errors.New("session manager is not initialized")
+	}
+
+	sess, ok := s.sessionMgr.GetSessionSnapshotByID(sessionID)
+	if !ok {
+		return endpoint.ErrSessionNotFound
+	}
+
+	peerKey := sess.PeerPublicKey
+	oldTunnelID := sess.BackendTunnelID
+	oldStatus := sess.Status
+	if oldStatus == "" {
+		oldStatus = "connected"
+	}
+
+	if oldTunnelID == targetTunnelID {
+		return nil
+	}
+
+	// Step 1: Live Forwarder Route Migration
+	var forwarderMigrated bool
+	if s.forwarder != nil {
+		if err := s.forwarder.UpdateSessionBackend(peerKey, targetTunnelID); err != nil {
+			if !errors.Is(err, forwarder.ErrSessionNotRegistered) {
+				return fmt.Errorf("failed to update live forwarder route for session %s: %w", sessionID, err)
+			}
+		} else {
+			forwarderMigrated = true
+		}
+	}
+
+	// Step 2: In-Memory Session Update
+	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "draining"); err != nil {
+		if forwarderMigrated && s.forwarder != nil {
+			_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
+		}
+		return fmt.Errorf("failed to update in-memory session %s: %w", sessionID, err)
+	}
+
+	// Step 3: Database Persistence
+	if s.db != nil {
+		if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessionID, targetTunnelID); err != nil {
+			// Step 4: Rollback on DB Error
+			if forwarderMigrated && s.forwarder != nil {
+				_ = s.forwarder.UpdateSessionBackend(peerKey, oldTunnelID)
+			}
+			_ = s.sessionMgr.RollbackSessionBackend(sessionID, oldTunnelID, oldStatus)
+			return fmt.Errorf("failed to persist vpn session %s backend migration: %w", sessionID, err)
+		}
+	}
+
+	// Step 5: Post-Commit State Reconciliation
+	if s.pool != nil {
+		s.pool.DecrementConnections(oldTunnelID)
+		s.pool.IncrementConnections(targetTunnelID)
+	}
+	if s.stickyMgr != nil {
+		s.stickyMgr.AssignPeerAffinity(peerKey, targetTunnelID)
+	}
+	s.sessionMgr.BumpLifecycleVersion()
+
+	log.Printf("[vpn] migrated session %s (peer %s) from backend %d to backend %d (draining)",
+		sessionID, peerKey, oldTunnelID, targetTunnelID)
+	slog.Info("Migrated VPN session backend route",
+		"session_id", sessionID,
+		"peer_key", peerKey,
+		"source_tunnel_id", oldTunnelID,
+		"target_tunnel_id", targetTunnelID,
+		"status", "draining",
+	)
+
+	return nil
+}
+
+// MigrateVPNSession is an alias for MigrateSession.
+func (s *Service) MigrateVPNSession(ctx context.Context, sessionID string, targetTunnelID int64) error {
+	return s.MigrateSession(ctx, sessionID, targetTunnelID)
 }
 
 // ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
