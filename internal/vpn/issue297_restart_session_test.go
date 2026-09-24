@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -416,5 +417,122 @@ func TestLeastConnectionBalancingAccurateAfterRestart(t *testing.T) {
 	t2Final, _ := vpnSvc.pool.GetTunnelByID(tun2.ID)
 	if t1Final.ActiveConnections != 1 || t2Final.ActiveConnections != 1 {
 		t.Errorf("expected each backend to have 1 connection, got t1=%d, t2=%d", t1Final.ActiveConnections, t2Final.ActiveConnections)
+	}
+}
+
+// TestRestartFailsClosedOnInvalidationFailure verifies that when session invalidation
+// fails during startup (e.g. read-only database or write failure):
+// 1. Service.Start() fails immediately and returns a wrapped error.
+// 2. Service.IsRunning() remains false.
+// 3. Listener is NOT running.
+// 4. Forwarder and packet pumps are NOT running.
+// 5. No backend devices are attached or leaked.
+// 6. When the write error condition is cleared, subsequent Start() succeeds.
+func TestRestartFailsClosedOnInvalidationFailure(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
+
+	tunnels, err := db.GetBackendTunnels(ctx)
+	if err != nil || len(tunnels) == 0 {
+		t.Fatalf("expected backend tunnels, got %d (err: %v)", len(tunnels), err)
+	}
+	tun1 := tunnels[0]
+
+	// Seed pre-restart state with non-zero active connections and a connected session
+	if err := db.UpdateBackendTunnel(ctx, tun1.ID, map[string]any{"active_connections": 4}); err != nil {
+		t.Fatalf("failed to update tunnel 1 connections: %v", err)
+	}
+	staleSess := &models.VPNSession{
+		ID:              "sess-fail-closed-test",
+		UserID:          uID,
+		BackendTunnelID: tun1.ID,
+		PeerPublicKey:   peerKeyAlice,
+		AssignedIP:      "10.100.0.99",
+		Status:          "connected",
+		ConnectedAt:     time.Now().UTC().Add(-10 * time.Minute),
+		LastSeen:        time.Now().UTC().Add(-1 * time.Minute),
+	}
+	if err := db.CreateVPNSession(ctx, staleSess); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	// Make database read-only via PRAGMA query_only = ON so writes fail
+	if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA query_only = ON;"); err != nil {
+		t.Fatalf("failed to set PRAGMA query_only: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.SQLDB().ExecContext(context.Background(), "PRAGMA query_only = OFF;")
+	})
+
+	// Attempt to start the VPN service: must fail closed
+	startErr := vpnSvc.Start(ctx)
+	if startErr == nil {
+		t.Fatal("expected vpnSvc.Start to fail when database invalidation fails, got nil")
+	}
+
+	// Invariant 1: Start returns an error wrapping the invalidation failure
+	if !strings.Contains(startErr.Error(), "failed to invalidate persisted VPN sessions on restart") {
+		t.Errorf("expected error message to mention invalidation failure, got: %v", startErr)
+	}
+
+	// Invariant 2: Service is NOT running
+	if vpnSvc.IsRunning() {
+		t.Error("expected vpnSvc.IsRunning() to be false after startup failure")
+	}
+
+	// Invariant 3: Listener is NOT running
+	if vpnSvc.endpoint != nil && vpnSvc.endpoint.IsRunning() {
+		t.Error("expected endpoint listener to not be running")
+	}
+
+	// Invariant 4: Forwarder is NOT running
+	if vpnSvc.forwarder != nil && vpnSvc.forwarder.IsRunning() {
+		t.Error("expected forwarder to not be running")
+	}
+
+	// Invariant 5: No backend devices attached or leaked
+	vpnSvc.mu.RLock()
+	devCount := len(vpnSvc.backendDevices)
+	vpnSvc.mu.RUnlock()
+	if devCount != 0 {
+		t.Errorf("expected 0 backend devices attached, got %d", devCount)
+	}
+
+	// Invariant 6: Database state is unmodified due to atomic rollback
+	sessCheck, err := db.GetVPNSessionByID(ctx, staleSess.ID)
+	if err != nil || sessCheck == nil {
+		t.Fatalf("failed to query session after failed start: %v", err)
+	}
+	if sessCheck.Status != "connected" {
+		t.Errorf("expected session to remain 'connected' after transaction rollback, got %q", sessCheck.Status)
+	}
+
+	// Restore database writeability and verify clean start recovery
+	if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA query_only = OFF;"); err != nil {
+		t.Fatalf("failed to clear PRAGMA query_only: %v", err)
+	}
+
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("expected vpnSvc.Start to succeed after clearing read-only, got: %v", err)
+	}
+	defer vpnSvc.Stop()
+
+	if !vpnSvc.IsRunning() {
+		t.Error("expected vpnSvc.IsRunning() to be true after successful start")
+	}
+
+	sessRecovered, err := db.GetVPNSessionByID(ctx, staleSess.ID)
+	if err != nil || sessRecovered == nil {
+		t.Fatalf("failed to query session after recovery start: %v", err)
+	}
+	if sessRecovered.Status != "disconnected" {
+		t.Errorf("expected session status to be 'disconnected' after recovery start, got %q", sessRecovered.Status)
+	}
+
+	tunRecovered, err := vpnSvc.pool.GetTunnelByID(tun1.ID)
+	if err != nil || tunRecovered.ActiveConnections != 0 {
+		t.Errorf("expected tunnel active connections to be reset to 0, got %d (err: %v)", tunRecovered.ActiveConnections, err)
 	}
 }

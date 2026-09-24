@@ -100,11 +100,6 @@ func (sm *SessionManager) RecordStartupInvalidated(count int64) {
 	}
 }
 
-// RecordFreshHandshake increments the fresh handshakes counter after startup.
-func (sm *SessionManager) RecordFreshHandshake() {
-	sm.metrics.FreshHandshakesAfterStartupTotal.Add(1)
-}
-
 // LifecycleVersion returns the monotonically increasing session lifecycle version.
 func (sm *SessionManager) LifecycleVersion() uint64 {
 	return sm.lifecycleVersion.Load()

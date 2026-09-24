@@ -949,7 +949,29 @@ func (s *Service) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
-	// 1. Sync tunnels from DB
+	// 1. Invalidate persisted connected sessions on restart and reset active connection counters (issue #297).
+	// Process restart wipes in-memory endpoint transport state and live forwarder routes.
+	// Persisted connected and draining sessions are transitioned to disconnected and backend
+	// tunnel active_connections gauges are reset to zero atomically before pool sync and device restoration.
+	// If invalidation fails (e.g. read-only DB), fail closed immediately to avoid running with ghost sessions
+	// or leaking initialized backend devices and goroutines.
+	if s.db != nil {
+		invalidated, err := s.db.InvalidateConnectedSessionsOnRestart(ctx)
+		if err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to invalidate persisted VPN sessions on restart: %w", err)
+		}
+		if invalidated > 0 {
+			log.Printf("[vpn] invalidated %d persisted connected session(s) on restart", invalidated)
+			if s.sessionMgr != nil {
+				s.sessionMgr.RecordStartupInvalidated(invalidated)
+			}
+		}
+	}
+
+	// 2. Sync tunnels from DB
 	if s.pool != nil {
 		if err := s.pool.SyncFromDB(ctx); err != nil {
 			s.mu.Lock()
@@ -968,40 +990,36 @@ func (s *Service) Start(ctx context.Context) error {
 		s.restoreBackendDevices(ctx)
 	}
 
-	// 2. Invalidate persisted connected sessions on restart and sync from DB (issue #297).
-	// Process restart wipes in-memory endpoint transport state and live forwarder routes.
-	// Persisted connected and draining sessions are transitioned to disconnected so that
-	// SessionManager and connection count gauges start clean.
-	if s.db != nil {
-		invalidated, err := s.db.InvalidateConnectedSessionsOnRestart(ctx)
-		if err != nil {
-			log.Printf("[vpn] warning: failed to invalidate persisted connected sessions on restart: %v", err)
-		} else if invalidated > 0 {
-			log.Printf("[vpn] invalidated %d persisted connected session(s) on restart", invalidated)
-			if s.sessionMgr != nil {
-				s.sessionMgr.RecordStartupInvalidated(invalidated)
-			}
+	// 3. Sync sessions from DB
+	if s.sessionMgr != nil {
+		if err := s.sessionMgr.SyncFromDB(ctx); err != nil {
+			s.cleanupStartupFailure()
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to sync sessions from DB: %w", err)
 		}
 	}
 
-	if s.sessionMgr != nil {
-		_ = s.sessionMgr.SyncFromDB(ctx)
+	// 4. Reconcile the active_connections gauge from the authoritative
+	// session table (issue #54). Startup reconciliation is strict and fails closed
+	// if any error occurs.
+	if err := s.reconcileConnectionCountsStrict(ctx); err != nil {
+		s.cleanupStartupFailure()
+		s.mu.Lock()
+		s.running = false
+		s.mu.Unlock()
+		return fmt.Errorf("failed to reconcile connection counts on startup: %w", err)
 	}
 
-	// 2b. Reconcile the active_connections gauge from the authoritative
-	// session table (issue #54): the persisted counter drifts when older
-	// deploys kill sessions without decrementing it, and the drift survives
-	// restarts, distorting least-conn routing. Best-effort: startup must
-	// not fail if reconciliation errors.
-	s.reconcileConnectionCounts(ctx)
-
-	// 3. Client-facing TUN device (production data plane). When required
+	// 5. Client-facing TUN device (production data plane). When required
 	// (RequireTunDevice) and the TUN device cannot be opened, abort
 	// data-plane startup and fail with an error chain wrapping
 	// endpoint.ErrTunUnavailable -- the panel continues management-only.
 	if s.requireTun && s.tunOpener != nil {
 		dev, tunErr := s.tunOpener()
 		if tunErr != nil {
+			s.cleanupStartupFailure()
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
@@ -1013,13 +1031,13 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	// 4. Start forwarder & accountant
+	// 6. Start forwarder & accountant
 	if s.forwarder != nil {
 		s.forwarder.Start(ctx)
 		s.forwarder.StartPumps(ctx)
 	}
 
-	// 5. Start health prober & reconnect manager
+	// 7. Start health prober & reconnect manager
 	if s.prober != nil {
 		s.prober.Start(ctx)
 	}
@@ -1027,25 +1045,13 @@ func (s *Service) Start(ctx context.Context) error {
 		s.reconnectMgr.Start(ctx)
 	}
 
-	// 6. Start endpoint listener
+	// 8. Start endpoint listener
 	if s.endpoint != nil {
 		s.endpoint.SetPostSweepHook(func(ctx context.Context) {
 			s.PruneExpiredAffinity()
 		})
 		if err := s.endpoint.Start(ctx); err != nil {
-			if s.prober != nil {
-				s.prober.Stop()
-			}
-			if s.reconnectMgr != nil {
-				s.reconnectMgr.Stop()
-			}
-			if s.forwarder != nil {
-				_ = s.forwarder.Stop()
-			}
-			if s.tunDev != nil {
-				_ = s.tunDev.Close()
-				s.tunDev = nil
-			}
+			s.cleanupStartupFailure()
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
@@ -1054,11 +1060,37 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
-	// Safety net for residual counter drift; gauge-only semantics — it never
+	// Safety net for residual counter drift; gauge-only semantics -- it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
 
 	return nil
+}
+
+func (s *Service) cleanupStartupFailure() {
+	if s.prober != nil {
+		s.prober.Stop()
+	}
+	if s.reconnectMgr != nil {
+		s.reconnectMgr.Stop()
+	}
+	if s.forwarder != nil {
+		_ = s.forwarder.Stop()
+	}
+	if s.tunDev != nil {
+		_ = s.tunDev.Close()
+		s.tunDev = nil
+	}
+	s.mu.Lock()
+	if s.backendDevices != nil {
+		for id, dev := range s.backendDevices {
+			if dev != nil {
+				_ = dev.Close()
+			}
+			delete(s.backendDevices, id)
+		}
+	}
+	s.mu.Unlock()
 }
 
 // isLifecycleMutated returns true if the session manager exists and its
@@ -1067,20 +1099,16 @@ func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
 	return s.sessionMgr != nil && s.sessionMgr.LifecycleVersion() != versionBefore
 }
 
-// reconcileConnectionCounts recomputes the active_connections gauge of every
+// reconcileConnectionCountsStrict recomputes the active_connections gauge of every
 // tunnel in the pool from the authoritative vpn_sessions table (issue #54).
 // The gauge is a LIVE count of status='connected' sessions per backend
 // tunnel; it drifts when historical deploys kill sessions without
 // decrementing it, and since it is persisted in backend_tunnels the drift
-// survives restarts and distorts least-conn balancing. It runs once during
-// Start after both DB syncs have completed and BEFORE the forwarder and
-// endpoint accept traffic, so this read-modify-write over pool snapshots is
-// safe: no live IncrementConnections/DecrementConnections traffic can race
-// it at that point. On any error it logs and returns so the panel still
-// comes up.
-func (s *Service) reconcileConnectionCounts(ctx context.Context) {
+// survives restarts and distorts least-conn balancing. It returns an error
+// if reading active sessions or updating any tunnel connection count fails.
+func (s *Service) reconcileConnectionCountsStrict(ctx context.Context) error {
 	if s.pool == nil || s.db == nil {
-		return
+		return nil
 	}
 
 	var versionBefore uint64
@@ -1092,7 +1120,7 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	dbReadTime := time.Now().UTC()
 	if err != nil {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped, cannot read active sessions: %v", err)
-		return
+		return fmt.Errorf("connection gauge reconciliation failed, cannot read active sessions: %w", err)
 	}
 
 	var postHook func()
@@ -1114,7 +1142,7 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if s.isLifecycleMutated(versionBefore) {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during DB snapshot (version %d -> %d)",
 			versionBefore, s.sessionMgr.LifecycleVersion())
-		return
+		return nil
 	}
 
 	if s.reconcilePreApplyHook != nil {
@@ -1124,7 +1152,7 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if s.isLifecycleMutated(versionBefore) {
 		log.Printf("[vpn] warning: connection gauge reconciliation skipped: session lifecycle mutated during pre-apply hook (version %d -> %d)",
 			versionBefore, s.sessionMgr.LifecycleVersion())
-		return
+		return nil
 	}
 
 	desired := make(map[int64]int)
@@ -1152,10 +1180,11 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 	if s.isLifecycleMutated(versionBefore) {
 		log.Printf("[vpn] warning: connection gauge reconciliation aborted: session lifecycle mutated before commit (version %d -> %d)",
 			versionBefore, s.sessionMgr.LifecycleVersion())
-		return
+		return nil
 	}
 
 	anyDrift := len(tunnelChanges) > 0
+	var firstErr error
 	allSucceeded := true
 	for _, tun := range tunnels {
 		want, changed := tunnelChanges[tun.ID]
@@ -1166,6 +1195,9 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 			allSucceeded = false
 			delete(stagedReconcile, tun.ID)
 			log.Printf("[vpn] warning: failed to reconcile active_connections for tunnel %d (server %d): %v", tun.ID, tun.ServerID, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to reconcile active_connections for tunnel %d (server %d): %w", tun.ID, tun.ServerID, err)
+			}
 			continue
 		}
 		log.Printf("[vpn] reconciled active_connections for tunnel %d (server %d): %d -> %d", tun.ID, tun.ServerID, tun.ActiveConnections, want)
@@ -1195,6 +1227,17 @@ func (s *Service) reconcileConnectionCounts(ctx context.Context) {
 
 	if !anyDrift && unknown == 0 {
 		log.Printf("[vpn] connection gauge reconciliation: no drift detected across %d tunnel(s)", len(tunnels))
+	}
+
+	return firstErr
+}
+
+// reconcileConnectionCounts recomputes the active_connections gauge of every
+// tunnel in the pool from the authoritative vpn_sessions table (issue #54).
+// Best-effort wrapper for periodic hourly reconciliation and tests.
+func (s *Service) reconcileConnectionCounts(ctx context.Context) {
+	if err := s.reconcileConnectionCountsStrict(ctx); err != nil {
+		log.Printf("[vpn] warning: connection gauge reconciliation: %v", err)
 	}
 }
 

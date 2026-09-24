@@ -607,14 +607,25 @@ func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 }
 
 // InvalidateConnectedSessionsOnRestart marks all connected or draining sessions as
-// disconnected on service startup. This prevents stale in-memory transport and forwarder
+// disconnected on service startup and resets backend tunnel active connection gauges to 0
+// in a single atomic transaction. This prevents stale in-memory transport and forwarder
 // state from causing route mismatches and active connection gauge distortion across restarts.
 func (d *DB) InvalidateConnectedSessionsOnRestart(ctx context.Context) (int64, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
-	query := `UPDATE vpn_sessions SET status = 'disconnected' WHERE status = 'connected' OR status = 'draining'`
-	res, err := d.sqlDB.ExecContext(ctx, query)
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin session invalidation transaction on restart: %w", err)
+	}
+	var committed bool
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.ExecContext(ctx, `UPDATE vpn_sessions SET status = 'disconnected' WHERE status = 'connected' OR status = 'draining'`)
 	if err != nil {
 		return 0, fmt.Errorf("failed to invalidate connected sessions on restart: %w", err)
 	}
@@ -623,6 +634,15 @@ func (d *DB) InvalidateConnectedSessionsOnRestart(ctx context.Context) (int64, e
 	if err != nil {
 		return 0, fmt.Errorf("failed to inspect rows affected when invalidating connected sessions on restart: %w", err)
 	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE backend_tunnels SET active_connections = 0 WHERE active_connections != 0`); err != nil {
+		return 0, fmt.Errorf("failed to reset backend tunnel active connections on restart: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit session invalidation transaction on restart: %w", err)
+	}
+	committed = true
 
 	return rows, nil
 }

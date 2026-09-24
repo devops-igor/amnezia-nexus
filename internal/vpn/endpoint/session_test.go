@@ -625,10 +625,13 @@ func TestSessionMetricsStartupAndFreshHandshakes(t *testing.T) {
 		t.Errorf("expected fresh_handshakes_after_startup_total to be 1, got %d", snapAfterSess1["fresh_handshakes_after_startup_total"])
 	}
 
-	// Explicit RecordFreshHandshake
-	sm.RecordFreshHandshake()
-	snapAfterExplicit := sm.MetricsSnapshot()
-	if snapAfterExplicit["fresh_handshakes_after_startup_total"] != 2 {
-		t.Errorf("expected fresh_handshakes_after_startup_total to be 2, got %d", snapAfterExplicit["fresh_handshakes_after_startup_total"])
+	// CreateSession for second peer increments fresh_handshakes_after_startup_total to 2
+	_, err = sm.CreateSession(ctx, uID, "peer-m-2", "10.100.0.11", tID, "conn-2")
+	if err != nil {
+		t.Fatalf("CreateSession 2 failed: %v", err)
+	}
+	snapAfterSess2 := sm.MetricsSnapshot()
+	if snapAfterSess2["fresh_handshakes_after_startup_total"] != 2 {
+		t.Errorf("expected fresh_handshakes_after_startup_total to be 2, got %d", snapAfterSess2["fresh_handshakes_after_startup_total"])
 	}
 }

@@ -753,6 +753,11 @@ func TestInvalidateConnectedSessionsOnRestart(t *testing.T) {
 		t.Fatalf("expected 2 active sessions before invalidation, got %d", len(activeBefore))
 	}
 
+	// 2. Set active_connections on the tunnel to verify atomic reset to 0
+	if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{"active_connections": 5}); err != nil {
+		t.Fatalf("UpdateBackendTunnel active_connections failed: %v", err)
+	}
+
 	// 3. Run InvalidateConnectedSessionsOnRestart: s1, s2 (connected) and s3 (draining) should be updated
 	count, err = db.InvalidateConnectedSessionsOnRestart(ctx)
 	if err != nil {
@@ -760,6 +765,15 @@ func TestInvalidateConnectedSessionsOnRestart(t *testing.T) {
 	}
 	if count != 3 {
 		t.Errorf("expected 3 invalidated sessions, got %d", count)
+	}
+
+	// Verify tunnel active_connections was reset to 0 in the atomic transaction
+	tunAfter, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("expected tunnel active_connections to be reset to 0, got %d", tunAfter.ActiveConnections)
 	}
 
 	// 4. Verify all 4 sessions in DB now have status='disconnected'
@@ -792,5 +806,74 @@ func TestInvalidateConnectedSessionsOnRestart(t *testing.T) {
 	}
 	if countIdempotent != 0 {
 		t.Errorf("expected 0 affected sessions on idempotent call, got %d", countIdempotent)
+	}
+}
+
+func TestInvalidateConnectedSessionsOnRestart_RollbackOnError(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "192.0.2.11"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:          sID,
+		InterfaceName:     "awg-be-rb",
+		PublicKey:         "pub-be-rb",
+		PrivateKey:        "priv-be-rb",
+		Endpoint:          "192.0.2.11:51820",
+		Status:            models.TunnelStatusActive,
+		ActiveConnections: 7,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	uID, err := db.CreateUser(ctx, &models.User{Username: "test-user-rb"})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	sess := &models.VPNSession{
+		ID:              "sess-rb-connected",
+		UserID:          uID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "peer-key-rb",
+		AssignedIP:      "10.100.0.88",
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sess); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	// Set PRAGMA query_only = ON to simulate write failure
+	if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA query_only = ON;"); err != nil {
+		t.Fatalf("set PRAGMA query_only failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.SQLDB().ExecContext(context.Background(), "PRAGMA query_only = OFF;")
+	})
+
+	_, err = db.InvalidateConnectedSessionsOnRestart(ctx)
+	if err == nil {
+		t.Fatal("expected InvalidateConnectedSessionsOnRestart to fail on read-only database, got nil")
+	}
+
+	// Verify transaction rolled back: session is still 'connected'
+	sAfter, err := db.GetVPNSessionByID(ctx, sess.ID)
+	if err != nil || sAfter == nil {
+		t.Fatalf("GetVPNSessionByID failed: %v", err)
+	}
+	if sAfter.Status != "connected" {
+		t.Errorf("expected session to remain 'connected' after rollback, got %q", sAfter.Status)
+	}
+
+	// Verify tunnel active_connections was NOT updated to 0
+	tunAfter, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if tunAfter.ActiveConnections != 7 {
+		t.Errorf("expected tunnel active_connections to remain 7 after rollback, got %d", tunAfter.ActiveConnections)
 	}
 }

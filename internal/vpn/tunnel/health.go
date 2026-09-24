@@ -69,7 +69,7 @@ type HealthProber struct {
 	successCounts  map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
 	// records which tunnel generation owns each server's counters.
-	healthGenerations map[int64]int64
+	healthGenerations    map[int64]int64
 	preStatusCommitHook  func() // test synchronization, after the identity check
 	preFailureCommitHook func() // test synchronization, after the identity check
 	stopCh               chan struct{}
