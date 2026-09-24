@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -4785,6 +4786,45 @@ func TestGenerateClientConfig_NoPhantomOnExistingConnections(t *testing.T) {
 	}
 	if conns[0].Name != "My Phone" {
 		t.Errorf("expected connection Name 'My Phone', got %q", conns[0].Name)
+	}
+}
+
+func TestGenerateClientConfigRejectsSingleRemoteAWGConnection(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err := db.CreateUser(ctx, &models.User{Username: "single-remote-awg", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "remote-awg", Host: "192.0.2.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const remotePeer = "single-remote-peer"
+	remoteParams := map[string]any{"remote_setting": "keep"}
+	remoteID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: remotePeer,
+		ClientParams: remoteParams,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config, filename, err := svc.GenerateClientConfig(ctx, userID); err == nil {
+		t.Fatalf("generated unusable portal config for remote connection: filename=%q config=%q", filename, config)
+	}
+	conns, err := db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conns) != 1 || conns[0].ID != remoteID || conns[0].ServerID != serverID || conns[0].ClientID != remotePeer || !reflect.DeepEqual(conns[0].ClientParams, remoteParams) {
+		t.Fatalf("remote connection changed or portal connection was created: %+v", conns)
+	}
+	if _, ok := svc.ipam.GetAssignedIP(remotePeer); ok {
+		t.Fatal("remote peer reserved a portal IP")
 	}
 }
 
