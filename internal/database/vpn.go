@@ -688,7 +688,8 @@ func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]
 	rows, err := q.QueryContext(ctx, `SELECT c.id, c.protocol, c.client_id, c.client_params, s.assigned_ip
 		FROM user_connections c LEFT JOIN vpn_sessions s
 		ON s.peer_public_key = c.client_id AND s.user_id = c.user_id
-		WHERE c.client_id IS NOT NULL AND c.client_id != '' ORDER BY c.created_at, c.id`)
+		WHERE c.server_id = 0 AND c.client_id IS NOT NULL AND c.client_id != ''
+		ORDER BY c.created_at, c.id`)
 	if err != nil {
 		return nil, err
 	}
