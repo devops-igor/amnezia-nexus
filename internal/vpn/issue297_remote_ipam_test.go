@@ -1,11 +1,37 @@
 package vpn
 
 import (
+	"errors"
 	"net"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
+
+func TestHandleIncomingPeerRejectsRemoteServerConnection(t *testing.T) {
+	db := setupTestDB(t)
+	svc, serverID, _, userID, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	const remotePeer = "remote-server-only-peer"
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: remotePeer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if session, _, err := svc.HandleIncomingPeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrPeerNotFound) {
+		t.Fatalf("remote connection authenticated to portal: session=%+v err=%v", session, err)
+	}
+	if _, ok := svc.ipam.GetAssignedIP(remotePeer); ok {
+		t.Fatal("remote peer received a portal address")
+	}
+	if session, err := svc.sessionMgr.GetSessionByPeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrSessionNotFound) || session != nil {
+		t.Fatalf("remote peer received a portal session: session=%+v err=%v", session, err)
+	}
+}
 
 func TestRestartReservesOnlyPortalClientAddresses(t *testing.T) {
 	db := setupTestDB(t)
