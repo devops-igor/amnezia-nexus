@@ -1,5 +1,6 @@
 """E2E tests for automated clean-slate server onboarding and AWG installation."""
 
+import logging
 import os
 import time
 from typing import Any, Dict
@@ -8,6 +9,8 @@ import pytest
 from playwright.sync_api import Page
 
 from tests.e2e.conftest import api_post
+
+logger = logging.getLogger(__name__)
 
 
 def _get_server_credentials() -> Dict[str, Any]:
@@ -28,8 +31,11 @@ def _get_server_credentials() -> Dict[str, Any]:
                 private_key = f.read()
         elif "\n" in ssh_key_path or "PRIVATE KEY" in ssh_key_path:
             private_key = ssh_key_path
-    elif not password:
-        # 2. Check standard default key paths if neither key nor password was set
+        else:
+            logger.warning("Configured SSH key path does not exist: %s", ssh_key_path)
+
+    # 2. Check standard default key paths if neither key nor password was set
+    if not private_key and not password:
         for default_path in [
             os.path.expanduser("~/.ssh/id_ed25519"),
             os.path.expanduser("~/.ssh/id_rsa"),
@@ -45,6 +51,7 @@ def _get_server_credentials() -> Dict[str, Any]:
         "username": username,
         "password": password,
         "private_key": private_key,
+        "ssh_key_path": ssh_key_path,
         "name": "Server 1",
     }
 
@@ -53,6 +60,12 @@ def _get_server_credentials() -> Dict[str, Any]:
 def test_onboard_server_add(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
     """Register Server 1 and verify SSH fingerprint confirmation."""
     creds = _get_server_credentials()
+    if not creds.get("private_key") and not creds.get("password"):
+        ssh_key_path = creds.get("ssh_key_path", "")
+        pytest.fail(
+            f"No valid SSH key or password found for onboarding Server 1. "
+            f"Configured E2E_SERVER_SSH_KEY='{ssh_key_path}' was not found."
+        )
 
     # Step 1: Add server to initiate SSH connection and capture fingerprint
     add_payload = {
