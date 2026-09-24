@@ -31,12 +31,14 @@ import (
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
-	ListenerRunning   bool   `json:"listener_running"`
-	ActiveTunnels     int    `json:"active_tunnels"`
-	ConnectedSessions int    `json:"connected_sessions"`
-	RxBytes           int64  `json:"rx_bytes"`
-	TxBytes           int64  `json:"tx_bytes"`
-	DroppedPackets    uint64 `json:"dropped_packets"`
+	ListenerRunning            bool   `json:"listener_running"`
+	ActiveTunnels              int    `json:"active_tunnels"`
+	ConnectedSessions          int    `json:"connected_sessions"`
+	RestartInvalidatedSessions int64  `json:"restart_invalidated_sessions"`
+	FreshSessionRegistrations  int64  `json:"fresh_session_registrations"`
+	RxBytes                    int64  `json:"rx_bytes"`
+	TxBytes                    int64  `json:"tx_bytes"`
+	DroppedPackets             uint64 `json:"dropped_packets"`
 	// Issue #39, #151 & #288 telemetry: return-path drops inside the forwarder (queue
 	// full / no route / total) and rejected handshake initiations at the listener.
 	// A rising forwarder_drops_total with stable traffic means a stalled
@@ -134,6 +136,7 @@ type BackendDevice interface {
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
 	mu            sync.RWMutex
+	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
 	db            *database.DB
 	cfg           *models.VPNConfig
 	endpoint      *endpoint.Listener
@@ -157,13 +160,15 @@ type Service struct {
 	// management-mode (TUN-unavailable) contract hermetically. tunDev is the
 	// attached client-facing device; backendDevices holds the per-backend UDP
 	// devices created by EnableBackend.
-	requireTun       bool
-	tunOpener        func() (endpoint.PacketDevice, error)
-	tunDev           endpoint.PacketDevice
-	backendDevices   map[int64]BackendDevice
-	lastLoggedDrops  atomic.Uint64
-	publicIPMu       sync.RWMutex
-	detectedPublicIP string
+	requireTun                 bool
+	tunOpener                  func() (endpoint.PacketDevice, error)
+	tunDev                     endpoint.PacketDevice
+	backendDevices             map[int64]BackendDevice
+	lastLoggedDrops            atomic.Uint64
+	restartInvalidatedSessions atomic.Int64
+	freshSessionRegistrations  atomic.Int64
+	publicIPMu                sync.RWMutex
+	detectedPublicIP          string
 	// dropLogUntil throttles the backend read loop's queue-full drop log
 	// (log-flood defense; issue #39 produced 7687 lines in 2 h). Shared
 	// across the per-backend read loops: all accesses are atomic, so the
@@ -491,6 +496,13 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	ipam, err := endpoint.NewIPAM(cfg.SubnetCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init IPAM: %w", err)
+	}
+	// Config generation is also available before Start. Load both persisted
+	// client leases and legacy session-only leases before exposing this service.
+	if db != nil {
+		if err := reservePersistedClientIPs(context.Background(), db, ipam); err != nil {
+			return nil, fmt.Errorf("restore client IP assignments: %w", err)
+		}
 	}
 
 	var auth *endpoint.DBAuthenticator
@@ -951,6 +963,28 @@ func (s *Service) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
+	// No client transport keys, endpoints, or forwarder routes survive a process
+	// restart. Atomically discard persisted sessions and their pool gauges
+	// before any backend device or packet pump can receive traffic. If cleanup
+	// fails, do not start with a falsely connected data plane.
+	if s.db != nil {
+		s.assignmentMu.Lock()
+		err := reservePersistedClientIPs(ctx, s.db, s.ipam)
+		var invalidated int64
+		if err == nil {
+			invalidated, err = s.db.InvalidateVPNSessionsForRestart(ctx)
+		}
+		s.assignmentMu.Unlock()
+		if err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to invalidate VPN sessions on restart: %w", err)
+		}
+		s.restartInvalidatedSessions.Store(invalidated)
+		log.Printf("[vpn] restart reconciliation invalidated %d persisted connected session(s); awaiting fresh client handshakes", invalidated)
+	}
+
 	// 1. Sync tunnels from DB
 	if s.pool != nil {
 		if err := s.pool.SyncFromDB(ctx); err != nil {
@@ -970,12 +1004,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.restoreBackendDevices(ctx)
 	}
 
-	// 2. Sync sessions from DB
-	if s.sessionMgr != nil {
-		_ = s.sessionMgr.SyncFromDB(ctx)
-	}
-
-	// 2b. Reconcile the active_connections gauge from the authoritative
+	// 2. Reconcile the active_connections gauge from the authoritative
 	// session table (issue #54): the persisted counter drifts when older
 	// deploys kill sessions without decrementing it, and the drift survives
 	// restarts, distorting least-conn routing. Best-effort: startup must
@@ -1048,6 +1077,29 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
+func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpoint.IPAM) error {
+	assignments, err := db.GetVPNClientIPAssignments(ctx)
+	if err != nil {
+		return err
+	}
+	for _, assignment := range assignments {
+		ip := net.ParseIP(assignment.AssignedIP)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		if current, ok := ipam.GetAssignedIP(assignment.PeerKey); ok && !current.Equal(ip) {
+			return fmt.Errorf("connection %s peer %s has conflicting persisted addresses %s and %s", assignment.ConnectionID, assignment.PeerKey, current, ip)
+		}
+		if err := ipam.Reserve(ip, assignment.PeerKey); err != nil {
+			if errors.Is(err, endpoint.ErrIPNotInSubnet) || errors.Is(err, endpoint.ErrIPReserved) {
+				continue
+			}
+			return fmt.Errorf("connection %s peer %s address %s: %w", assignment.ConnectionID, assignment.PeerKey, assignment.AssignedIP, err)
+		}
+	}
+	return nil
+}
+
 // isLifecycleMutated returns true if the session manager exists and its
 // lifecycle version has advanced beyond versionBefore.
 func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
@@ -1060,7 +1112,7 @@ func (s *Service) isLifecycleMutated(versionBefore uint64) bool {
 // tunnel; it drifts when historical deploys kill sessions without
 // decrementing it, and since it is persisted in backend_tunnels the drift
 // survives restarts and distorts least-conn balancing. It runs once during
-// Start after both DB syncs have completed and BEFORE the forwarder and
+// Start after restart cleanup and pool sync but BEFORE the forwarder and
 // endpoint accept traffic, so this read-modify-write over pool snapshots is
 // safe: no live IncrementConnections/DecrementConnections traffic can race
 // it at that point. On any error it logs and returns so the panel still
@@ -1278,7 +1330,9 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	defer s.mu.RUnlock()
 
 	status := &Status{
-		ListenerRunning: s.endpoint != nil && s.endpoint.IsRunning(),
+		ListenerRunning:            s.endpoint != nil && s.endpoint.IsRunning(),
+		RestartInvalidatedSessions: s.restartInvalidatedSessions.Load(),
+		FreshSessionRegistrations:  s.freshSessionRegistrations.Load(),
 	}
 
 	if s.pool != nil {
@@ -3116,7 +3170,15 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	assignedIP, err := s.resolveOrAllocatePeerIP(ctx, conn, peerPublicKey)
+	s.assignmentMu.Lock()
+	if s.db != nil {
+		err = reservePersistedClientIPs(ctx, s.db, s.ipam)
+	}
+	var assignedIP net.IP
+	if err == nil {
+		assignedIP, err = s.resolveOrAllocatePeerIP(ctx, conn, peerPublicKey)
+	}
+	s.assignmentMu.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3129,7 +3191,6 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 
 	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name, peerGen)
 	if err != nil {
-		_ = s.ipam.Release(peerPublicKey)
 		return nil, nil, fmt.Errorf("session creation failed: %w", err)
 	}
 
@@ -3142,6 +3203,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 			endpoint: s.endpoint,
 		})
 	}
+	s.freshSessionRegistrations.Add(1)
 
 	return sess, backend, nil
 }
@@ -3181,12 +3243,11 @@ func (s *Service) resolveOrAllocatePeerIP(ctx context.Context, conn *models.User
 				targetIP := net.ParseIP(strIP)
 				if targetIP != nil && targetIP.To4() != nil {
 					err := s.ipam.Reserve(targetIP, peerPublicKey)
-					if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
-						_ = s.ipam.ReleaseIP(targetIP)
-						err = s.ipam.Reserve(targetIP, peerPublicKey)
-					}
 					if err == nil {
 						return targetIP, nil
+					}
+					if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+						return nil, fmt.Errorf("peer %s persisted IP %s conflicts with another client: %w", peerPublicKey, strIP, err)
 					}
 				}
 			}
@@ -3198,15 +3259,24 @@ func (s *Service) resolveOrAllocatePeerIP(ctx context.Context, conn *models.User
 		return nil, fmt.Errorf("ip allocation failed: %w", err)
 	}
 	if conn != nil {
-		if conn.ClientParams == nil {
-			conn.ClientParams = make(map[string]any)
+		params := make(map[string]any, len(conn.ClientParams)+1)
+		for key, value := range conn.ClientParams {
+			params[key] = value
 		}
-		conn.ClientParams["assigned_ip"] = ip.String()
+		params["assigned_ip"] = ip.String()
 		if s.db != nil && conn.ID != "" {
-			_, _ = s.db.UpdateConnection(ctx, conn.ID, map[string]any{
-				"client_params": conn.ClientParams,
+			updated, err := s.db.UpdateConnection(ctx, conn.ID, map[string]any{
+				"client_params": params,
 			})
+			if err != nil || !updated {
+				_ = s.ipam.Release(peerPublicKey)
+				if err == nil {
+					err = errors.New("connection was removed")
+				}
+				return nil, fmt.Errorf("persist assigned IP for peer %s (updated=%t): %w", peerPublicKey, updated, err)
+			}
 		}
+		conn.ClientParams = params
 	}
 	return ip, nil
 }
@@ -3470,8 +3540,17 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", err
 	}
 
+	s.assignmentMu.Lock()
+	defer s.assignmentMu.Unlock()
+	if err := reservePersistedClientIPs(ctx, db, s.ipam); err != nil {
+		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
+	}
 	clientParams := buildClientParams(awgConn, p)
-	assignedIP := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
+	_, hadLease := s.ipam.GetAssignedIP(p.clientPub)
+	assignedIP, err := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
+	if err != nil {
+		return "", "", err
+	}
 	clientParams["assigned_ip"] = assignedIP
 
 	if isExplicit && awgConn != nil {
@@ -3479,13 +3558,25 @@ func (s *Service) renderClientConfigForConnection(
 			"client_id":     p.clientPub,
 			"client_params": clientParams,
 		}
-		if _, err := db.UpdateConnection(ctx, awgConn.ID, updates); err != nil {
+		updated, err := db.UpdateConnection(ctx, awgConn.ID, updates)
+		if err != nil || !updated {
+			if !hadLease {
+				_ = s.ipam.Release(p.clientPub)
+			}
+			if err == nil {
+				err = errors.New("connection was removed")
+			}
 			return "", "", fmt.Errorf("failed to update connection: %w", err)
 		}
 		awgConn.ClientID = p.clientPub
 		awgConn.ClientParams = clientParams
 	} else {
-		saveOrUpdateAWGConnection(ctx, db, user, awgConn, p.clientPub, clientParams)
+		if err := saveOrUpdateAWGConnection(ctx, db, user, awgConn, p.clientPub, clientParams); err != nil {
+			if !hadLease {
+				_ = s.ipam.Release(p.clientPub)
+			}
+			return "", "", fmt.Errorf("failed to persist client configuration: %w", err)
+		}
 	}
 
 	ud := &awg.AWGClientUserData{
@@ -3567,7 +3658,7 @@ func buildClientParams(awgConn *models.UserConnection, p *clientConfigParameters
 	return clientParams
 }
 
-func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPNConfig, clientPub string) string {
+func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPNConfig, clientPub string) (string, error) {
 	if existingVal, ok := clientParams["assigned_ip"]; ok && existingVal != nil {
 		if existingStr, ok := existingVal.(string); ok && existingStr != "" {
 			parsedIP := net.ParseIP(existingStr)
@@ -3583,15 +3674,14 @@ func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPN
 				if valid {
 					if s.ipam != nil {
 						err := s.ipam.Reserve(parsedIP, clientPub)
-						if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
-							_ = s.ipam.ReleaseIP(parsedIP)
-							err = s.ipam.Reserve(parsedIP, clientPub)
-						}
 						if err == nil {
-							return existingStr
+							return existingStr, nil
+						}
+						if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+							return "", fmt.Errorf("client %s persisted IP %s conflicts with another client: %w", clientPub, existingStr, err)
 						}
 					} else {
-						return existingStr
+						return existingStr, nil
 					}
 				}
 			}
@@ -3599,11 +3689,13 @@ func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPN
 	}
 
 	if s.ipam != nil {
-		if ip, err := s.ipam.Allocate(clientPub); err == nil {
-			return ip.String()
+		ip, err := s.ipam.Allocate(clientPub)
+		if err != nil {
+			return "", fmt.Errorf("allocate client IP: %w", err)
 		}
+		return ip.String(), nil
 	}
-	return "10.100.0.2"
+	return "", errors.New("IP address manager is unavailable")
 }
 
 func findAWGConnection(ctx context.Context, db *database.DB, user *models.User) *models.UserConnection {
@@ -3637,14 +3729,10 @@ func findAWGConnection(ctx context.Context, db *database.DB, user *models.User) 
 		return latestLB
 	}
 
-	// Priority 4: Fallback for single-connection tests / legacy mode
-	if len(conns) == 1 && models.NormalizeProtocol(conns[0].Protocol) == "awg" {
-		return &conns[0]
-	}
 	return nil
 }
 
-func saveOrUpdateAWGConnection(ctx context.Context, db *database.DB, user *models.User, awgConn *models.UserConnection, clientPub string, clientParams map[string]any) {
+func saveOrUpdateAWGConnection(ctx context.Context, db *database.DB, user *models.User, awgConn *models.UserConnection, clientPub string, clientParams map[string]any) error {
 	if awgConn != nil {
 		updates := map[string]any{
 			"client_id": clientPub,
@@ -3652,14 +3740,23 @@ func saveOrUpdateAWGConnection(ctx context.Context, db *database.DB, user *model
 		if clientParams != nil {
 			updates["client_params"] = clientParams
 		}
-		_, _ = db.UpdateConnection(ctx, awgConn.ID, updates)
-		return
+		updated, err := db.UpdateConnection(ctx, awgConn.ID, updates)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return errors.New("connection was removed")
+		}
+		return nil
 	}
 
 	conns, err := db.GetConnectionsByUserID(ctx, user.ID)
-	if err == nil && len(conns) > 0 {
+	if err != nil {
+		return err
+	}
+	if len(conns) > 0 {
 		// User already has connections; do not silently auto-create phantom <username>-awg connection.
-		return
+		return errors.New("no load balancer connection exists for user with existing connections")
 	}
 
 	newConn := &models.UserConnection{
@@ -3671,7 +3768,8 @@ func saveOrUpdateAWGConnection(ctx context.Context, db *database.DB, user *model
 		AWGMimicry:   models.AWGMimicryAuto,
 		ClientParams: clientParams,
 	}
-	_, _ = db.CreateConnection(ctx, newConn)
+	_, err = db.CreateConnection(ctx, newConn)
+	return err
 }
 
 func getTimingParam(m map[string]any, key string) *awg.TimingRange {

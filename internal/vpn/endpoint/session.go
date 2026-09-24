@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -306,7 +305,8 @@ func (sm *SessionManager) SetSessionLastSeen(peerPublicKey string, t time.Time) 
 	}
 }
 
-// CloseSession transitions a session to the specified status and releases IPAM allocation.
+// CloseSession ends a session. Its persisted client address stays reserved
+// until the client connection is removed, including across idle disconnects.
 func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, status string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -326,10 +326,7 @@ func (sm *SessionManager) CloseSession(ctx context.Context, sessionID string, st
 	if sm.db != nil {
 		_ = sm.db.CloseVPNSession(ctx, sess.ID)
 	}
-
-	if sm.ipam != nil {
-		_ = sm.ipam.Release(sess.PeerPublicKey)
-	}
+	sm.releaseUnpersistedLease(ctx, sess.PeerPublicKey)
 
 	delete(sm.sessionsByID, sessionID)
 	delete(sm.sessionsByPeer, sess.PeerPublicKey)
@@ -410,9 +407,7 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 		if sm.db != nil {
 			_ = sm.db.CloseVPNSession(ctx, sess.ID)
 		}
-		if sm.ipam != nil {
-			_ = sm.ipam.Release(sess.PeerPublicKey)
-		}
+		sm.releaseUnpersistedLease(ctx, sess.PeerPublicKey)
 		delete(sm.sessionsByID, sess.ID)
 		delete(sm.sessionsByPeer, sess.PeerPublicKey)
 		sm.activeCount.Add(-1)
@@ -423,6 +418,28 @@ func (sm *SessionManager) CheckTimeouts(ctx context.Context, idleTimeout time.Du
 	sm.mu.Unlock()
 
 	return timedOut, nil
+}
+
+// releaseUnpersistedLease keeps configured addresses reserved even when a
+// session ends; standalone sessions without a durable connection still free
+// their temporary lease. Called with sm.mu held.
+func (sm *SessionManager) releaseUnpersistedLease(ctx context.Context, peerKey string) {
+	if sm.ipam == nil {
+		return
+	}
+	if sm.db != nil {
+		conn, err := sm.db.GetConnectionByClientID(ctx, peerKey, 0)
+		if err != nil {
+			log.Printf("[endpoint] preserving lease for peer %s: cannot check durable assignment: %v", peerKey, err)
+			return
+		}
+		if conn != nil {
+			if ip, ok := sm.ipam.GetAssignedIP(peerKey); ok && conn.ClientParams["assigned_ip"] == ip.String() {
+				return
+			}
+		}
+	}
+	_ = sm.ipam.Release(peerKey)
 }
 
 // Drain marks all active sessions as draining.
@@ -487,34 +504,4 @@ func (sm *SessionManager) ListActiveSessionsSnapshot() []models.VPNSession {
 // ActiveCount returns the number of active sessions.
 func (sm *SessionManager) ActiveCount() int {
 	return int(sm.activeCount.Load())
-}
-
-// SyncFromDB restores active sessions from the database on startup.
-func (sm *SessionManager) SyncFromDB(ctx context.Context) error {
-	if sm.db == nil {
-		return nil
-	}
-
-	sessions, err := sm.db.GetActiveVPNSessions(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load active sessions: %w", err)
-	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	for i := range sessions {
-		sess := sessions[i]
-		sm.sessionsByID[sess.ID] = &sess
-		sm.sessionsByPeer[sess.PeerPublicKey] = &sess
-		sm.activeCount.Add(1)
-
-		if sm.ipam != nil && sess.AssignedIP != "" {
-			if ip := net.ParseIP(sess.AssignedIP); ip != nil {
-				_ = sm.ipam.Reserve(ip, sess.PeerPublicKey)
-			}
-		}
-	}
-
-	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,7 +128,7 @@ func setupTestVPNService(t *testing.T, db *database.DB, cfgMutators ...func(*mod
 	peerKeyAlice := "alice-awg-peer-public-key"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyAlice,
 		Name:     "alice-phone",
@@ -436,10 +437,10 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 
 	// 13. HandleIncomingPeer no active backends
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "bob", Enabled: true})
-	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Server", Host: "10.0.0.1"})
+	_, _ = db.CreateServer(ctx, &models.Server{Name: "Server", Host: "10.0.0.1"})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: "bob-peer-key",
 	})
@@ -3922,6 +3923,13 @@ func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
 	ctx := context.Background()
 
 	vpnSvc1, s1ID, s2ID, uID, _ := setupTestVPNService(t, db)
+	legacyConns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(legacyConns) != 1 {
+		t.Fatalf("get portal client: connections=%+v err=%v", legacyConns, err)
+	}
+	if updated, err := db.UpdateConnection(ctx, legacyConns[0].ID, map[string]any{"server_id": int64(0)}); err != nil || !updated {
+		t.Fatalf("mark client as portal connection: updated=%t err=%v", updated, err)
+	}
 
 	// 1. Generate client config
 	cfg1, _, err := vpnSvc1.GenerateClientConfig(ctx, uID)
@@ -3993,7 +4001,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
 	if err := vpnSvc.Start(ctx); err != nil {
 		t.Fatalf("vpnSvc.Start failed: %v", err)
 	}
@@ -4010,7 +4018,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	peerKeyBob := "bob-awg-peer-key-test"
 	bobConn := &models.UserConnection{
 		UserID:   u2ID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyBob,
 		Name:     "bob-device",
@@ -4036,7 +4044,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 			sessBob.AssignedIP, bobConns[0].ClientParams)
 	}
 
-	// 2. Peer with assigned_ip colliding with stale lease in IPAM:
+	// 2. Peer with assigned_ip colliding with a different peer's lease:
 	// Setup user Charlie with assigned_ip: 10.100.0.50
 	u3ID, err := db.CreateUser(ctx, &models.User{
 		Username: "charlie",
@@ -4049,7 +4057,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	targetIP := "10.100.0.50"
 	charlieConn := &models.UserConnection{
 		UserID:   u3ID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyCharlie,
 		Name:     "charlie-device",
@@ -4066,13 +4074,13 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 		t.Fatalf("failed to setup dummy stale lease: %v", err)
 	}
 
-	// HandleIncomingPeer for Charlie must detect collision, release stale allocation, and reserve targetIP for Charlie
-	sessCharlie, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer for charlie failed on collision: %v", err)
+	// The lease owner cannot be inferred from an IP alone. Refuse the
+	// handshake rather than removing the dummy peer's lease.
+	if _, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie); !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		t.Fatalf("expected collision error for charlie, got %v", err)
 	}
-	if sessCharlie.AssignedIP != targetIP {
-		t.Fatalf("expected charlie to receive %s after resolving collision, got %s", targetIP, sessCharlie.AssignedIP)
+	if ip, ok := vpnSvc.ipam.GetAssignedIP("dummy-stale-peer"); !ok || ip.String() != targetIP {
+		t.Fatalf("collision evicted the existing owner: ip=%v present=%t", ip, ok)
 	}
 }
 
@@ -4152,7 +4160,7 @@ func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
 	}
 	if _, err := db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: clientPubB64,
 		Name:     "device-range",
@@ -4781,6 +4789,45 @@ func TestGenerateClientConfig_NoPhantomOnExistingConnections(t *testing.T) {
 	}
 }
 
+func TestGenerateClientConfigRejectsSingleRemoteAWGConnection(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err := db.CreateUser(ctx, &models.User{Username: "single-remote-awg", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "remote-awg", Host: "192.0.2.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const remotePeer = "single-remote-peer"
+	remoteParams := map[string]any{"remote_setting": "keep"}
+	remoteID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: remotePeer,
+		ClientParams: remoteParams,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config, filename, err := svc.GenerateClientConfig(ctx, userID); err == nil {
+		t.Fatalf("generated unusable portal config for remote connection: filename=%q config=%q", filename, config)
+	}
+	conns, err := db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conns) != 1 || conns[0].ID != remoteID || conns[0].ServerID != serverID || conns[0].ClientID != remotePeer || !reflect.DeepEqual(conns[0].ClientParams, remoteParams) {
+		t.Fatalf("remote connection changed or portal connection was created: %+v", conns)
+	}
+	if _, ok := svc.ipam.GetAssignedIP(remotePeer); ok {
+		t.Fatal("remote peer reserved a portal IP")
+	}
+}
+
 func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -4798,11 +4845,19 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 		t.Fatalf("CreateUser failed: %v", err)
 	}
 
-	// User has 2 remote server connections (ServerID > 0)
+	// User has 2 remote server connections (ServerID > 0).
+	server1, err := db.CreateServer(ctx, &models.Server{Name: "remote-1", Host: "192.0.2.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server2, err := db.CreateServer(ctx, &models.Server{Name: "remote-2", Host: "192.0.2.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	conn1 := &models.UserConnection{
 		ID:        "conn-remote-1",
 		UserID:    uID,
-		ServerID:  1,
+		ServerID:  server1,
 		Protocol:  "awg",
 		ClientID:  "pubkey-remote-1",
 		Name:      "Server 1",
@@ -4811,19 +4866,23 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 	conn2 := &models.UserConnection{
 		ID:        "conn-remote-2",
 		UserID:    uID,
-		ServerID:  2,
+		ServerID:  server2,
 		Protocol:  "vless",
 		ClientID:  "uuid-remote-2",
 		Name:      "Server 2",
 		CreatedAt: time.Now().Add(time.Second),
 	}
-	_, _ = db.CreateConnection(ctx, conn1)
-	_, _ = db.CreateConnection(ctx, conn2)
+	if _, err := db.CreateConnection(ctx, conn1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateConnection(ctx, conn2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Call GenerateClientConfig(ctx, uID)
 	_, _, err = svc.GenerateClientConfig(ctx, uID)
-	if err != nil {
-		t.Fatalf("GenerateClientConfig failed: %v", err)
+	if err == nil {
+		t.Fatal("generated an unpersisted load balancer configuration for a user with only remote connections")
 	}
 
 	// Verify no phantom connection was created
@@ -5186,7 +5245,7 @@ func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
 	peerKeyBob := "peer-deadlock-bob"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: 1,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyBob,
 		Name:     "bob-phone",
@@ -5798,7 +5857,7 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 		peerKey := "charlie-peer-key"
 		_, err = db.CreateConnection(ctx, &models.UserConnection{
 			UserID:   uID,
-			ServerID: s1ID,
+			ServerID: 0,
 			Protocol: "awg",
 			ClientID: peerKey,
 			Name:     "charlie-device",
@@ -6277,7 +6336,7 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -6307,7 +6366,7 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 	// Register peer as user connection in DB
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "handshake-peer",
@@ -6400,7 +6459,7 @@ func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testin
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
@@ -6415,10 +6474,10 @@ func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testin
 	peerKey1 := "bob-device-1-pubkey"
 	peerKey2 := "bob-device-2-pubkey"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
+		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
 	})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: s1ID, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
+		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
 	})
 
 	sess1, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey1)
@@ -6640,7 +6699,7 @@ func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t 
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -6668,7 +6727,7 @@ func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t 
 
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "stale-commit-peer",
@@ -6767,7 +6826,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -6796,7 +6855,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 		Name:     "concurrent-handshake-peer",

@@ -41,7 +41,7 @@ func TestHandleIncomingPeerCapacityStress(t *testing.T) {
 		capLimit = 6 // MaxPeersPerBackend: small on purpose — maximizes contention
 	)
 
-	svc, s1ID, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
 		c.MaxPeersPerBackend = capLimit
 		c.MaxTotalPeers = peers
 	})
@@ -65,7 +65,7 @@ func TestHandleIncomingPeerCapacityStress(t *testing.T) {
 		peerKey := fmt.Sprintf("stress-peer-key-%d", i)
 		if _, err := db.CreateConnection(ctx, &models.UserConnection{
 			UserID:   uID,
-			ServerID: s1ID,
+			ServerID: 0,
 			Protocol: "awg",
 			ClientID: peerKey,
 			Name:     fmt.Sprintf("stress-device-%d", i),

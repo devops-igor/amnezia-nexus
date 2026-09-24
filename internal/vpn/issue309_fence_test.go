@@ -34,7 +34,7 @@ func TestTeardownFencesHandshakeBeforeWaitingForWrite(t *testing.T) {
 	for _, action := range []string{"disconnect-session", "disconnect-user", "release-client", "idle-reap"} {
 		t.Run(action, func(t *testing.T) {
 			ctx := context.Background()
-			svc, serverID, _, userID, _ := setupTestVPNService(t, setupTestDB(t))
+			svc, _, _, userID, _ := setupTestVPNService(t, setupTestDB(t))
 			defer func() { _ = svc.Stop() }()
 			if err := svc.Start(ctx); err != nil {
 				t.Fatal(err)
@@ -58,7 +58,7 @@ func TestTeardownFencesHandshakeBeforeWaitingForWrite(t *testing.T) {
 			}
 			peer := base64.StdEncoding.EncodeToString(clientPub)
 			if _, err := svc.db.CreateConnection(ctx, &models.UserConnection{
-				UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: peer, Name: "fenced-peer",
+				UserID: userID, ServerID: 0, Protocol: "awg", ClientID: peer, Name: "fenced-peer",
 			}); err != nil {
 				t.Fatal(err)
 			}
