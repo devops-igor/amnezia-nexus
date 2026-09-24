@@ -160,7 +160,7 @@ func TestEndpointListenerRegistrationAndDrain(t *testing.T) {
 	peerKey := "client-public-key-test"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 	})
