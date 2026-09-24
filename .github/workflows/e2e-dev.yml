@@ -72,6 +72,16 @@ jobs:
           source ~/e2e-venv/bin/activate
           pip install --quiet -r tests/e2e/requirements.txt
           playwright install --with-deps chromium
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ ! -f ~/.ssh/id_ed25519 ]; then
+            ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
+          fi
+          touch ~/.ssh/authorized_keys
+          grep -q -F -f ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys 2>/dev/null || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519
+          chmod 644 ~/.ssh/id_ed25519.pub
+          chmod 700 ~/.ssh
           E2E_BASE_URL="http://127.0.0.1:8443" \
           E2E_ADMIN_USER="admin" \
           E2E_ADMIN_PASS="AdminE2EPass123!" \
