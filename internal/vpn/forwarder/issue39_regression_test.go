@@ -119,7 +119,7 @@ func TestReregisteredRouteSurvivesLateUnregister(t *testing.T) {
 	// (RegisterSession stops the old pump and replaces the route objects).
 	f.RegisterSession("sess-2", "conn-2", "peer-a", "10.100.0.3", 1)
 	// The OLD session's teardown arrives late.
-	f.UnregisterSession("peer-a")
+	f.BeginUnregisterSession("peer-a", "sess-1").Wait()
 
 	// The NEW route must still carry return traffic.
 	if err := f.RouteBackendToClient(1, ipv4Packet([4]byte{10, 100, 0, 3}), "10.100.0.3"); err != nil {

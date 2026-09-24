@@ -2250,11 +2250,6 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 			prePruneHook(sess.PeerPublicKey, sess.Generation)
 		}
 
-		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) {
-			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): active replacement generation exists for peer %s",
-				sess.ID, sess.Generation, sess.PeerPublicKey)
-		}
-
 		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
 			sess.ID, sess.PeerPublicKey, sess.UserID, sess.LastSeen.Format(time.RFC3339), el.config.IdleTimeout)
 		if hook != nil {
@@ -2267,6 +2262,13 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 				}()
 				hook(ctx, sess)
 			}()
+		}
+		// The service hook retires the route and waits for admitted writes.
+		// Keep transport keys alive until those writes have finished. The
+		// generation guard preserves keys installed by a concurrent reconnect.
+		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) {
+			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): active replacement generation exists for peer %s",
+				sess.ID, sess.Generation, sess.PeerPublicKey)
 		}
 	}
 	return timedOut, nil
