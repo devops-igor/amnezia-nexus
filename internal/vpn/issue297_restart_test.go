@@ -194,6 +194,9 @@ func TestRestartMigratesSessionOnlyClientIPBeforeDeletingSessions(t *testing.T) 
 	if err != nil || conn == nil || conn.ClientParams["assigned_ip"] != nil {
 		t.Fatalf("expected legacy client without durable IP: conn=%+v err=%v", conn, err)
 	}
+	if updated, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"server_id": int64(0)}); err != nil || !updated {
+		t.Fatalf("mark legacy client as portal connection: updated=%t err=%v", updated, err)
+	}
 	tunnels, err := db.GetBackendTunnels(ctx)
 	if err != nil || len(tunnels) == 0 {
 		t.Fatalf("get tunnels: %v", err)
@@ -309,7 +312,7 @@ func TestRestartCleanupFailureDoesNotStartListener(t *testing.T) {
 
 func TestRestartExistingClientRecoversThroughUDPHandshake(t *testing.T) {
 	db := setupTestDB(t)
-	svc, serverID, _, userID, _ := setupTestVPNService(t, db)
+	svc, _, _, userID, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
 	defer func() { _ = svc.Stop() }()
 
@@ -331,7 +334,7 @@ func TestRestartExistingClientRecoversThroughUDPHandshake(t *testing.T) {
 	}
 	peerKey := base64.StdEncoding.EncodeToString(peerBytes)
 	if _, err := db.CreateConnection(ctx, &models.UserConnection{
-		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: peerKey,
+		UserID: userID, ServerID: 0, Protocol: "awg", ClientID: peerKey,
 		Name: "restarting-client", ClientParams: map[string]any{"assigned_ip": "10.100.0.30"},
 	}); err != nil {
 		t.Fatal(err)
