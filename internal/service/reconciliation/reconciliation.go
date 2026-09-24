@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -179,6 +178,7 @@ func (r *Reconciler) CleanupStaleProtocols(ctx context.Context) error {
 
 	if r.registry != nil {
 		r.cleanupPhase2Remote(ctx, servers)
+		_ = r.AdoptLegacyPeers(ctx)
 		r.cleanupPhase3ZombiePeers(ctx, servers)
 	}
 
@@ -305,6 +305,113 @@ func (r *Reconciler) isProtocolStale(ctx context.Context, server *models.Server,
 	return !exists
 }
 
+// AdoptLegacyPeers scans all remote server containers across installed protocols,
+// and adopts any untracked clients (which are not in peer_lifecycle and not in user_connections,
+// and not infrastructure/external) into peer_lifecycle as status: "active", user_id: "".
+func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
+	if r.db == nil {
+		return errors.New("database is not configured")
+	}
+	if r.registry == nil {
+		return nil
+	}
+
+	servers, err := r.db.GetAllServers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch servers for legacy peer adoption: %w", err)
+	}
+
+	for _, server := range servers {
+		serverID := server.ID
+		srvCopy := server
+		for protoKey := range server.Protocols {
+			proto := models.NormalizeProtocol(protoKey)
+			mgr, ok := r.registry.Get(proto)
+			if !ok {
+				continue
+			}
+
+			clients, err := mgr.GetClients(ctx, &srvCopy)
+			if err != nil {
+				slog.Warn("Legacy peer adoption: failed to fetch remote clients",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+				continue
+			}
+
+			conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
+			if err != nil {
+				slog.Warn("Legacy peer adoption: failed to fetch database connections",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+				continue
+			}
+
+			lifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
+			if err != nil {
+				slog.Warn("Legacy peer adoption: failed to fetch peer lifecycles",
+					"server_id", serverID,
+					"protocol", proto,
+					"err", err,
+				)
+				continue
+			}
+
+			connIDs := make(map[string]bool, len(conns))
+			for _, conn := range conns {
+				if conn.ClientID != "" {
+					connIDs[conn.ClientID] = true
+				}
+			}
+
+			for _, client := range clients {
+				clientID, _ := client["clientId"].(string)
+				if clientID == "" {
+					clientID, _ = client["client_id"].(string)
+				}
+				if clientID == "" {
+					continue
+				}
+
+				if connIDs[clientID] {
+					continue
+				}
+
+				if _, exists := lifecycles[clientID]; exists {
+					continue
+				}
+
+				if isInfrastructurePeer(client) || isExternalPeer(client) {
+					continue
+				}
+
+				clientName := resolveClientNameFromMap(client)
+				if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
+					slog.Warn("Legacy peer adoption: failed to adopt untracked peer into peer_lifecycle",
+						"server_id", serverID,
+						"protocol", proto,
+						"client_id", clientID,
+						"err", err,
+					)
+				} else {
+					slog.Info("Startup cleanup: adopted legacy untracked peer into peer_lifecycle",
+						"server_id", serverID,
+						"protocol", proto,
+						"client_id", clientID,
+						"name", clientName,
+					)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // CleanupZombiePeers audits all remote server containers across installed protocols,
 // removing unmanaged or zombie peers that do not exist in the database, while preserving
 // infrastructure peers (Portal Data Plane, Health Probe) and external unmanaged peers.
@@ -327,7 +434,6 @@ func (r *Reconciler) CleanupZombiePeers(ctx context.Context) error {
 
 func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []models.Server) {
 	for _, server := range servers {
-		serverID := server.ID
 		srvCopy := server
 		for protoKey := range server.Protocols {
 			proto := models.NormalizeProtocol(protoKey)
@@ -335,150 +441,159 @@ func (r *Reconciler) cleanupPhase3ZombiePeers(ctx context.Context, servers []mod
 			if !ok {
 				continue
 			}
+			r.reconcileServerProtocolZombiePeers(ctx, &srvCopy, proto, mgr)
+		}
+	}
+}
 
-			clients, err := mgr.GetClients(ctx, &srvCopy)
-			if err != nil {
-				slog.Warn("Reconciliation Phase 3: failed to fetch remote clients",
+func (r *Reconciler) reconcileServerProtocolZombiePeers(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager) {
+	const stalePendingThreshold = 5 * time.Minute
+	serverID := server.ID
+
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		slog.Warn("Reconciliation Phase 3: failed to fetch remote clients",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
+	if err != nil {
+		slog.Warn("Reconciliation Phase 3: failed to fetch database connections",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	lifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
+	if err != nil {
+		slog.Warn("Reconciliation Phase 3: failed to fetch peer lifecycles",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	connIDs := make(map[string]bool, len(conns))
+	for _, conn := range conns {
+		if conn.ClientID != "" {
+			connIDs[conn.ClientID] = true
+		}
+	}
+
+	seenRemoteIDs := make(map[string]bool, len(clients))
+	for _, client := range clients {
+		clientID, _ := client["clientId"].(string)
+		if clientID == "" {
+			clientID, _ = client["client_id"].(string)
+		}
+		if clientID == "" {
+			continue
+		}
+		seenRemoteIDs[clientID] = true
+
+		if isInfrastructurePeer(client) || isExternalPeer(client) || connIDs[clientID] {
+			continue
+		}
+
+		r.reconcileSingleZombiePeer(ctx, server, proto, mgr, client, clientID, lifecycles, stalePendingThreshold)
+	}
+
+	for cid, rec := range lifecycles {
+		if seenRemoteIDs[cid] {
+			continue
+		}
+		if rec.Status == "failed" || (rec.Status == "pending" && time.Since(rec.CreatedAt) > stalePendingThreshold) {
+			_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, cid)
+		}
+	}
+}
+
+func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, client map[string]any, clientID string, lifecycles map[string]database.PeerLifecycleRecord, staleThreshold time.Duration) {
+	serverID := server.ID
+	rec, hasLifecycle := lifecycles[clientID]
+	if !hasLifecycle {
+		clientName := resolveClientNameFromMap(client)
+		if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to adopt untracked peer into peer_lifecycle",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"err", err,
+			)
+		} else {
+			slog.Info("Reconciliation: adopted untracked legacy peer into peer_lifecycle",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"name", clientName,
+			)
+		}
+		return
+	}
+
+	switch rec.Status {
+	case "failed":
+		if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to remove failed zombie peer from remote container",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"err", err,
+			)
+		} else {
+			slog.Info("Reconciliation: removed failed zombie peer from remote container",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+			)
+			_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
+		}
+	case "pending":
+		if time.Since(rec.CreatedAt) > staleThreshold {
+			if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to remove stale pending peer from remote container",
 					"server_id", serverID,
 					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
 					"err", err,
 				)
-				continue
-			}
-
-			conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
-			if err != nil {
-				slog.Warn("Reconciliation Phase 3: failed to fetch database connections",
+			} else {
+				slog.Info("Reconciliation: removed stale pending peer from remote container",
 					"server_id", serverID,
 					"protocol", proto,
-					"err", err,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
 				)
-				continue
-			}
-
-			activeLifecycleIDs, err := r.db.GetActivePeerIDs(ctx, serverID, proto)
-			if err != nil {
-				slog.Warn("Reconciliation Phase 3: failed to fetch active peer lifecycle IDs",
-					"server_id", serverID,
-					"protocol", proto,
-					"err", err,
-				)
-			}
-
-			validIDs := make(map[string]bool, len(conns)+len(activeLifecycleIDs))
-			for _, conn := range conns {
-				if conn.ClientID != "" {
-					validIDs[conn.ClientID] = true
-				}
-			}
-			for cid := range activeLifecycleIDs {
-				validIDs[cid] = true
-			}
-
-			for _, client := range clients {
-				clientID, _ := client["clientId"].(string)
-				if clientID == "" {
-					clientID, _ = client["client_id"].(string)
-				}
-				if clientID == "" {
-					continue
-				}
-
-				if validIDs[clientID] {
-					continue
-				}
-
-				if isInfrastructurePeer(client) {
-					continue
-				}
-
-				if isExternalPeer(client) {
-					continue
-				}
-
-				if isRecentlyCreatedPeer(client, 2*time.Minute) {
-					continue
-				}
-
-				if err := mgr.RemoveClient(ctx, &srvCopy, clientID); err != nil {
-					slog.Warn("Reconciliation Phase 3: failed to remove zombie peer from remote container",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", clientID,
-						"err", err,
-					)
-				} else {
-					slog.Info("Reconciliation: removed zombie peer from remote container",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", clientID,
-					)
-				}
+				_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
 			}
 		}
 	}
 }
 
-func isRecentlyCreatedPeer(client map[string]any, gracePeriod time.Duration) bool {
-	findTime := func(val any) *time.Time {
-		if val == nil {
-			return nil
-		}
-		switch v := val.(type) {
-		case time.Time:
-			return &v
-		case string:
-			str := strings.TrimSpace(v)
-			if str == "" {
-				return nil
-			}
-			if t, err := time.Parse(time.RFC3339, str); err == nil {
-				return &t
-			}
-			if t, err := time.Parse(time.RFC3339Nano, str); err == nil {
-				return &t
-			}
-			if sec, err := strconv.ParseInt(str, 10, 64); err == nil && sec > 0 {
-				t := time.Unix(sec, 0).UTC()
-				return &t
-			}
-		case int64:
-			if v > 0 {
-				t := time.Unix(v, 0).UTC()
-				return &t
-			}
-		case int:
-			if v > 0 {
-				t := time.Unix(int64(v), 0).UTC()
-				return &t
-			}
-		case float64:
-			if v > 0 {
-				t := time.Unix(int64(v), 0).UTC()
-				return &t
-			}
-		}
-		return nil
+func resolveClientNameFromMap(client map[string]any) string {
+	if name, ok := client["clientName"].(string); ok && name != "" {
+		return name
 	}
-
-	keys := []string{"creationDate", "created_at", "creation_date", "createdAt"}
-	for _, k := range keys {
-		if t := findTime(client[k]); t != nil {
-			if time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
-				return true
-			}
-		}
+	if name, ok := client["name"].(string); ok && name != "" {
+		return name
 	}
 	if ud, ok := client["userData"].(map[string]any); ok {
-		for _, k := range keys {
-			if t := findTime(ud[k]); t != nil {
-				if time.Since(*t) < gracePeriod && time.Since(*t) >= 0 {
-					return true
-				}
-			}
+		if name, ok := ud["clientName"].(string); ok && name != "" {
+			return name
+		}
+		if name, ok := ud["name"].(string); ok && name != "" {
+			return name
 		}
 	}
-	return false
+	return ""
 }
 
 func isInfrastructurePeer(client map[string]any) bool {

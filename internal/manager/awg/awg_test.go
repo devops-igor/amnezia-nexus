@@ -2342,3 +2342,127 @@ func TestAWGManager_RollbackAddClient_RestoresUpsertPeer(t *testing.T) {
 		t.Errorf("original peer %s was deleted instead of restored!", origClientID)
 	}
 }
+
+func TestAWGManager_RollbackAddClient_PreservesConcurrentModifications(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 1, Host: "1.2.3.4"}
+
+	// 1. Pre-create Peer A and Peer B
+	resA, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "tls",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerA failed: %v", err)
+	}
+	origPeerAKey := resA["client_id"].(string)
+
+	resB, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerB",
+		"awg_mimicry": "wireguard",
+	})
+	if err != nil {
+		t.Fatalf("AddClient PeerB failed: %v", err)
+	}
+	origPeerBKey := resB["client_id"].(string)
+
+	// 2. Perform upsert on Peer A
+	resAUpsert, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerA",
+		"awg_mimicry": "sip",
+	})
+	if err != nil {
+		t.Fatalf("upsert AddClient PeerA failed: %v", err)
+	}
+	if isUpsert, ok := resAUpsert["is_upsert"].(bool); !ok || !isUpsert {
+		t.Fatalf("expected is_upsert=true for PeerA upsert")
+	}
+
+	// 3. Simulate a concurrent operation on the same server: add Peer C
+	resC, err := mgr.AddClient(ctx, server, map[string]any{
+		"name":        "PeerC_Concurrent",
+		"awg_mimicry": "quic",
+	})
+	if err != nil {
+		t.Fatalf("concurrent AddClient PeerC failed: %v", err)
+	}
+	peerCKey := resC["client_id"].(string)
+
+	// Verify Peer C is currently in both awg0.conf and clientsTable
+	confBeforeRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confBeforeRollback, peerCKey) {
+		t.Fatalf("expected Peer C key %s in awg0.conf before rollback", peerCKey)
+	}
+
+	// 4. Trigger RollbackAddClient for Peer A (e.g. because DB write for Peer A failed)
+	if err := mgr.RollbackAddClient(ctx, server, resAUpsert); err != nil {
+		t.Fatalf("RollbackAddClient PeerA failed: %v", err)
+	}
+
+	// 5. Assert:
+	// - Peer A is restored to original pre-upsert state ("tls")
+	// - Peer B remains intact ("wireguard")
+	// - Peer C (the concurrent modification) remains intact in BOTH awg0.conf and clientsTable
+	confAfterRollback := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if !strings.Contains(confAfterRollback, peerCKey) {
+		t.Errorf("Peer C key %s was clobbered in awg0.conf by Peer A rollback!", peerCKey)
+	}
+	if !strings.Contains(confAfterRollback, origPeerBKey) {
+		t.Errorf("Peer B key %s was clobbered in awg0.conf by Peer A rollback!", origPeerBKey)
+	}
+	if !strings.Contains(confAfterRollback, origPeerAKey) {
+		t.Errorf("Peer A original key %s missing in awg0.conf after rollback!", origPeerAKey)
+	}
+
+	clientsAfterRollback, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	var foundA, foundB, foundC bool
+	for _, c := range clientsAfterRollback {
+		cid, _ := c["clientId"].(string)
+		ud, _ := c["userData"].(map[string]any)
+		var name string
+		if ud != nil {
+			name, _ = ud["clientName"].(string)
+		}
+		switch name {
+		case "PeerA":
+			foundA = true
+			if cid != origPeerAKey {
+				t.Errorf("Peer A key mismatch: want %s, got %s", origPeerAKey, cid)
+			}
+			if ud["awg_mimicry"] != "tls" {
+				t.Errorf("Peer A mimicry want tls, got %v", ud["awg_mimicry"])
+			}
+		case "PeerB":
+			foundB = true
+			if cid != origPeerBKey {
+				t.Errorf("Peer B key mismatch: want %s, got %s", origPeerBKey, cid)
+			}
+			if ud["awg_mimicry"] != "wireguard" {
+				t.Errorf("Peer B mimicry want wireguard, got %v", ud["awg_mimicry"])
+			}
+		case "PeerC_Concurrent":
+			foundC = true
+			if cid != peerCKey {
+				t.Errorf("Peer C key mismatch: want %s, got %s", peerCKey, cid)
+			}
+			if ud["awg_mimicry"] != "quic" {
+				t.Errorf("Peer C mimicry want quic, got %v", ud["awg_mimicry"])
+			}
+		}
+	}
+
+	if !foundA {
+		t.Errorf("Peer A missing from clientsTable after rollback")
+	}
+	if !foundB {
+		t.Errorf("Peer B missing from clientsTable after rollback")
+	}
+	if !foundC {
+		t.Errorf("Peer C (concurrent change) missing from clientsTable after rollback!")
+	}
+}

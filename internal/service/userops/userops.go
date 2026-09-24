@@ -315,7 +315,6 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 					}
 					if _, err := s.db.CreateConnection(ctx, newConn); err != nil {
 						slog.Error("Failed to insert user connection into DB", "conn_id", newConn.ID, "err", err)
-						_ = s.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
 						cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 						var rbErr error
 						if rm, ok := mgr.(manager.RollbackableManager); ok && res != nil {
@@ -330,12 +329,14 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 								"client_id", clientID,
 								"err", rbErr,
 							)
+							_ = s.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "failed")
 						} else {
 							slog.Info("Rolled back remote client after DB failure",
 								"server_id", server.ID,
 								"protocol", proto,
 								"client_id", clientID,
 							)
+							_ = s.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
 						}
 					}
 				}

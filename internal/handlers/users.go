@@ -299,8 +299,11 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		CreatedAt:  time.Now(),
 	}
 	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		_ = h.db.DeletePeerLifecycle(ctx, server.ID, *req.Protocol, clientID)
-		h.rollbackClient(ctx, protoMgr, server, connRes, clientID)
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, connRes, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, server.ID, *req.Protocol, clientID, "failed")
+		} else {
+			_ = h.db.DeletePeerLifecycle(ctx, server.ID, *req.Protocol, clientID)
+		}
 		resp["connection_created"] = false
 		resp["connection_error"] = err.Error()
 		return
@@ -625,8 +628,11 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 
 	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
 		if clientCreated && clientID != "" {
-			_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-			h.rollbackClient(ctx, protoMgr, server, addResult, clientID)
+			if rbErr := h.rollbackClient(ctx, protoMgr, server, addResult, clientID); rbErr != nil {
+				_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
+			} else {
+				_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
+			}
 		}
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return

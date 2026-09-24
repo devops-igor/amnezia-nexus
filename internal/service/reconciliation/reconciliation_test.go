@@ -598,6 +598,14 @@ func TestReconciler_CleanupZombiePeers(t *testing.T) {
 		CreatedAt: time.Now().UTC(),
 	})
 
+	// Track peer-zombie-1 as known failed lifecycle operation
+	_ = db.RecordPeerLifecycle(ctx, sID, "awg", "peer-zombie-1", "Zombie One", "", "failed")
+
+	// Track peer-zombie-2 as stale pending creation (> 5 minutes ago)
+	staleTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	_, _ = db.ExecContext(ctx, "INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		sID, "awg", "peer-zombie-2", "Zombie Two", "", "pending", staleTime, staleTime)
+
 	remoteClients := []map[string]any{
 		{"clientId": "peer-valid-db", "name": "Valid DB Client"},
 		{"clientId": "peer-zombie-1", "name": "Zombie One"},
@@ -665,6 +673,7 @@ func TestReconciler_CleanupZombiePeers_ToleratesErrors(t *testing.T) {
 	}
 
 	// TeleMT manager has two zombie peers; one fails on RemoveClient
+	_ = db.RecordPeerLifecycle(ctx, sID, "telemt", "zombie-telemt-1", "ZT1", "", "failed")
 	telemtMgr := &mockZombiePeerProtocolManager{
 		proto: "telemt",
 		clients: []map[string]any{
@@ -705,6 +714,7 @@ func TestReconciler_CleanupStaleProtocols_ExecutesPhase3(t *testing.T) {
 		},
 	})
 
+	_ = db.RecordPeerLifecycle(ctx, 1, "awg", "peer-zombie-phase3", "Zombie In Phase 3", "", "failed")
 	remoteClients := []map[string]any{
 		{"clientId": "peer-zombie-phase3", "name": "Zombie In Phase 3"},
 	}
@@ -768,47 +778,57 @@ func TestReconciler_CleanupZombiePeers_PreservesUnassignedConnections(t *testing
 		t.Fatalf("failed to create server: %v", err)
 	}
 
-	// 1. Unassigned AWG connection recorded in peer_lifecycle
-	unassignedAWG := "awg-unassigned-client-1"
-	if err := db.RecordPeerLifecycle(ctx, sID, "awg", unassignedAWG, "Unassigned AWG", "", "active"); err != nil {
-		t.Fatalf("failed to record unassigned AWG in peer_lifecycle: %v", err)
+	// 1. Pre-upgrade legacy untracked unassigned AWG connection (neither in user_connections nor in peer_lifecycle)
+	legacyAWG := "awg-legacy-unassigned-1"
+
+	// 2. Pre-upgrade legacy untracked unassigned TeleMT connection (neither in user_connections nor in peer_lifecycle)
+	legacyTeleMT := "telemt-legacy-unassigned-1"
+
+	// 3. Known failed lifecycle peer (status: "failed") that MUST be purged
+	failedAWG := "awg-failed-peer-2"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", failedAWG, "Failed AWG", "", "failed"); err != nil {
+		t.Fatalf("failed to record failed AWG peer: %v", err)
 	}
 
-	// 2. Pending AWG connection recorded in peer_lifecycle
-	pendingAWG := "awg-pending-client-2"
-	if err := db.RecordPeerLifecycle(ctx, sID, "awg", pendingAWG, "Pending AWG", "", "pending"); err != nil {
-		t.Fatalf("failed to record pending AWG in peer_lifecycle: %v", err)
+	// 4. Stale pending lifecycle peer (status: "pending", created > 5 minutes ago) that MUST be purged
+	stalePendingAWG := "awg-stale-pending-peer-3"
+	staleTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	_, err = db.ExecContext(ctx, "INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		sID, "awg", stalePendingAWG, "Stale Pending AWG", "", "pending", staleTime, staleTime)
+	if err != nil {
+		t.Fatalf("failed to insert stale pending peer: %v", err)
 	}
 
-	// 3. Real zombie AWG peer (neither in user_connections nor in peer_lifecycle)
-	zombieAWG := "awg-zombie-client-3"
-
-	// 4. Unassigned TeleMT connection recorded in peer_lifecycle
-	unassignedTeleMT := "telemt-unassigned-client-1"
-	if err := db.RecordPeerLifecycle(ctx, sID, "telemt", unassignedTeleMT, "Unassigned TeleMT", "", "active"); err != nil {
-		t.Fatalf("failed to record unassigned TeleMT in peer_lifecycle: %v", err)
+	// 5. Recent pending lifecycle peer (status: "pending", created < 5m ago) that MUST survive
+	recentPendingAWG := "awg-recent-pending-peer-4"
+	if err := db.RecordPeerLifecycle(ctx, sID, "awg", recentPendingAWG, "Recent Pending AWG", "", "pending"); err != nil {
+		t.Fatalf("failed to record recent pending peer: %v", err)
 	}
 
-	// 5. Real zombie TeleMT peer
-	zombieTeleMT := "telemt-zombie-client-2"
+	// 6. Known failed TeleMT peer (status: "failed") that MUST be purged
+	failedTeleMT := "telemt-failed-peer-2"
+	if err := db.RecordPeerLifecycle(ctx, sID, "telemt", failedTeleMT, "Failed TeleMT", "", "failed"); err != nil {
+		t.Fatalf("failed to record failed TeleMT peer: %v", err)
+	}
 
-	// Remote peers reported by managers (ensure creationDate is > 2 minutes ago to test peer_lifecycle protection)
-	oldTimestamp := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	// Remote peers reported by managers (older than 2-minute creation grace period to verify lifecycle-based decisions)
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
 
 	awgMgr := &mockZombiePeerProtocolManager{
 		proto: "awg",
 		clients: []map[string]any{
-			{"clientId": unassignedAWG, "clientName": "Unassigned AWG", "creationDate": oldTimestamp},
-			{"clientId": pendingAWG, "clientName": "Pending AWG", "creationDate": oldTimestamp},
-			{"clientId": zombieAWG, "clientName": "Zombie AWG", "creationDate": oldTimestamp},
+			{"clientId": legacyAWG, "clientName": "Legacy Unassigned AWG", "creationDate": oldTimestamp},
+			{"clientId": failedAWG, "clientName": "Failed AWG", "creationDate": oldTimestamp},
+			{"clientId": stalePendingAWG, "clientName": "Stale Pending AWG", "creationDate": oldTimestamp},
+			{"clientId": recentPendingAWG, "clientName": "Recent Pending AWG", "creationDate": time.Now().Format(time.RFC3339)},
 		},
 	}
 
 	telemtMgr := &mockZombiePeerProtocolManager{
 		proto: "telemt",
 		clients: []map[string]any{
-			{"clientId": unassignedTeleMT, "clientName": "Unassigned TeleMT", "creationDate": oldTimestamp},
-			{"clientId": zombieTeleMT, "clientName": "Zombie TeleMT", "creationDate": oldTimestamp},
+			{"clientId": legacyTeleMT, "clientName": "Legacy Unassigned TeleMT", "creationDate": oldTimestamp},
+			{"clientId": failedTeleMT, "clientName": "Failed TeleMT", "creationDate": oldTimestamp},
 		},
 	}
 
@@ -818,8 +838,9 @@ func TestReconciler_CleanupZombiePeers_PreservesUnassignedConnections(t *testing
 
 	r := New(db, reg)
 
-	if err := r.CleanupZombiePeers(ctx); err != nil {
-		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	// Execute startup reconciliation
+	if err := r.CleanupStaleProtocols(ctx); err != nil {
+		t.Fatalf("CleanupStaleProtocols failed: %v", err)
 	}
 
 	awgMgr.mu.Lock()
@@ -830,14 +851,49 @@ func TestReconciler_CleanupZombiePeers_PreservesUnassignedConnections(t *testing
 	deletedTeleMT := append([]string(nil), telemtMgr.deleted...)
 	telemtMgr.mu.Unlock()
 
-	// Verify AWG: unassignedAWG and pendingAWG must NOT be deleted; zombieAWG must be deleted
-	if len(deletedAWG) != 1 || deletedAWG[0] != zombieAWG {
-		t.Fatalf("expected only zombie AWG peer %s to be deleted, got deleted: %v", zombieAWG, deletedAWG)
+	// Assert:
+	// - Legacy unassigned AWG survives and was adopted into peer_lifecycle as active
+	// - Failed AWG was deleted
+	// - Stale pending AWG was deleted
+	// - Recent pending AWG survives
+	expectedDeletedAWG := map[string]bool{
+		failedAWG:       true,
+		stalePendingAWG: true,
+	}
+	if len(deletedAWG) != len(expectedDeletedAWG) {
+		t.Fatalf("expected exactly %d deleted AWG peers, got %d: %v", len(expectedDeletedAWG), len(deletedAWG), deletedAWG)
+	}
+	for _, id := range deletedAWG {
+		if !expectedDeletedAWG[id] {
+			t.Errorf("unexpected AWG peer was deleted: %s", id)
+		}
 	}
 
-	// Verify TeleMT: unassignedTeleMT must NOT be deleted; zombieTeleMT must be deleted
-	if len(deletedTeleMT) != 1 || deletedTeleMT[0] != zombieTeleMT {
-		t.Fatalf("expected only zombie TeleMT peer %s to be deleted, got deleted: %v", zombieTeleMT, deletedTeleMT)
+	// Assert:
+	// - Legacy unassigned TeleMT survives and was adopted into peer_lifecycle as active
+	// - Failed TeleMT was deleted
+	if len(deletedTeleMT) != 1 || deletedTeleMT[0] != failedTeleMT {
+		t.Fatalf("expected only failed TeleMT peer %s to be deleted, got: %v", failedTeleMT, deletedTeleMT)
+	}
+
+	// Verify adoption in peer_lifecycle
+	activeAWGPeers, err := db.GetActivePeerIDs(ctx, sID, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs AWG failed: %v", err)
+	}
+	if !activeAWGPeers[legacyAWG] {
+		t.Errorf("expected legacy AWG peer %s to be adopted into peer_lifecycle with active status", legacyAWG)
+	}
+	if !activeAWGPeers[recentPendingAWG] {
+		t.Errorf("expected recent pending AWG peer %s to remain active in peer_lifecycle", recentPendingAWG)
+	}
+
+	activeTeleMTPeers, err := db.GetActivePeerIDs(ctx, sID, "telemt")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs TeleMT failed: %v", err)
+	}
+	if !activeTeleMTPeers[legacyTeleMT] {
+		t.Errorf("expected legacy TeleMT peer %s to be adopted into peer_lifecycle with active status", legacyTeleMT)
 	}
 }
 

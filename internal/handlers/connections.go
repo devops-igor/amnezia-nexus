@@ -250,8 +250,11 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 	_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, user.ID, "active")
 
 	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-		h.rollbackClient(ctx, protoMgr, server, result, clientID)
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
+		} else {
+			_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
+		}
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
 	}

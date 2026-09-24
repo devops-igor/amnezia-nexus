@@ -102,3 +102,46 @@ func (d *DB) DeletePeerLifecycleByUserID(ctx context.Context, userID string) err
 	}
 	return nil
 }
+
+// PeerLifecycleRecord represents a tracked peer lifecycle state.
+type PeerLifecycleRecord struct {
+	ID        int64
+	ServerID  int64
+	Protocol  string
+	ClientID  string
+	Name      string
+	UserID    string
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// GetPeerLifecycles returns all peer lifecycle records for a server and protocol keyed by client_id.
+func (d *DB) GetPeerLifecycles(ctx context.Context, serverID int64, protocol string) (map[string]PeerLifecycleRecord, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	protocol = models.NormalizeProtocol(protocol)
+	query := `SELECT id, server_id, protocol, client_id, name, coalesce(user_id, ''), status, created_at, updated_at
+		FROM peer_lifecycle WHERE server_id = ? AND protocol = ?`
+	rows, err := d.sqlDB.QueryContext(ctx, query, serverID, protocol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query peer lifecycles: %w", err)
+	}
+	defer rows.Close()
+
+	records := make(map[string]PeerLifecycleRecord)
+	for rows.Next() {
+		var rec PeerLifecycleRecord
+		var createdStr, updatedStr string
+		if err := rows.Scan(&rec.ID, &rec.ServerID, &rec.Protocol, &rec.ClientID, &rec.Name, &rec.UserID, &rec.Status, &createdStr, &updatedStr); err != nil {
+			return nil, err
+		}
+		rec.CreatedAt = parseTime(createdStr)
+		rec.UpdatedAt = parseTime(updatedStr)
+		if rec.ClientID != "" {
+			records[rec.ClientID] = rec
+		}
+	}
+	return records, rows.Err()
+}

@@ -271,9 +271,9 @@ func (h *Handlers) audit(r *http.Request, event string, details ...map[string]an
 // rollbackClient executes compensating rollback for a provisioned client on DB failure.
 // If the manager supports RollbackableManager, it invokes RollbackAddClient (which handles upsert restoration).
 // Otherwise, it falls back to RemoveClient.
-func (h *Handlers) rollbackClient(ctx context.Context, protoMgr manager.ProtocolManager, server *models.Server, result map[string]any, clientID string) {
+func (h *Handlers) rollbackClient(ctx context.Context, protoMgr manager.ProtocolManager, server *models.Server, result map[string]any, clientID string) error {
 	if clientID == "" && result == nil {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
@@ -285,13 +285,13 @@ func (h *Handlers) rollbackClient(ctx context.Context, protoMgr manager.Protocol
 				"client_id", clientID,
 				"err", rbErr,
 			)
-		} else {
-			slog.Info("Rolled back remote client after DB failure",
-				"server_id", server.ID,
-				"client_id", clientID,
-			)
+			return rbErr
 		}
-		return
+		slog.Info("Rolled back remote client after DB failure",
+			"server_id", server.ID,
+			"client_id", clientID,
+		)
+		return nil
 	}
 
 	if clientID != "" {
@@ -301,11 +301,12 @@ func (h *Handlers) rollbackClient(ctx context.Context, protoMgr manager.Protocol
 				"client_id", clientID,
 				"err", rbErr,
 			)
-		} else {
-			slog.Info("Removed client on remote server after DB failure",
-				"server_id", server.ID,
-				"client_id", clientID,
-			)
+			return rbErr
 		}
+		slog.Info("Removed client on remote server after DB failure",
+			"server_id", server.ID,
+			"client_id", clientID,
+		)
 	}
+	return nil
 }

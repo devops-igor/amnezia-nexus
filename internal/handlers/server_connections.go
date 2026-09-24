@@ -164,7 +164,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
-		h.rollbackClient(ctx, protoMgr, server, result, clientID)
+		_ = h.rollbackClient(ctx, protoMgr, server, result, clientID)
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
 		return
 	}
@@ -185,8 +185,11 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
 		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
-			_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, clientID)
-			h.rollbackClient(ctx, protoMgr, server, result, clientID)
+			if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
+				_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
+			} else {
+				_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, clientID)
+			}
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 			return
 		}

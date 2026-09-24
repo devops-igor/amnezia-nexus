@@ -123,4 +123,25 @@ func TestPeerLifecycle_CRUDAndMigration(t *testing.T) {
 	if activeIDs["client-seed-101"] {
 		t.Fatalf("expected client-seed-101 to be deleted by user ID")
 	}
+
+	// 8. Test GetPeerLifecycles
+	if err := db.RecordPeerLifecycle(ctx, 1, "awg", "client-multi-1", "Multi 1", "", "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle failed: %v", err)
+	}
+	if err := db.RecordPeerLifecycle(ctx, 1, "awg", "client-multi-2", "Multi 2", "", "failed"); err != nil {
+		t.Fatalf("RecordPeerLifecycle failed: %v", err)
+	}
+	lifecycles, err := db.GetPeerLifecycles(ctx, 1, "awg")
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	if len(lifecycles) != 2 {
+		t.Fatalf("expected 2 lifecycle records, got %d", len(lifecycles))
+	}
+	if lifecycles["client-multi-1"].Status != "active" {
+		t.Errorf("expected active status for client-multi-1, got %s", lifecycles["client-multi-1"].Status)
+	}
+	if lifecycles["client-multi-2"].Status != "failed" {
+		t.Errorf("expected failed status for client-multi-2, got %s", lifecycles["client-multi-2"].Status)
+	}
 }
