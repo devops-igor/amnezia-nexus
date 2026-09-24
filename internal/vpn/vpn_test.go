@@ -4000,7 +4000,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
 	if err := vpnSvc.Start(ctx); err != nil {
 		t.Fatalf("vpnSvc.Start failed: %v", err)
 	}
@@ -6296,7 +6296,7 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -6419,7 +6419,7 @@ func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testin
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
@@ -6659,7 +6659,7 @@ func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t 
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
@@ -6786,7 +6786,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	vpnSvc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
 	if err := vpnSvc.Start(ctx); err != nil {
