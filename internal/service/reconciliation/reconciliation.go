@@ -306,22 +306,24 @@ func (r *Reconciler) isProtocolStale(ctx context.Context, server *models.Server,
 	return !exists
 }
 
-// SettingKeyLegacyPeersAdopted is the settings key indicating whether one-time legacy untracked peer adoption has completed.
+// SettingKeyLegacyPeersAdopted is the legacy prefix key for backward compatibility.
 const SettingKeyLegacyPeersAdopted = "legacy_peers_adopted"
+
+// legacyPeersAdoptedSettingKey returns the settings key indicating whether legacy adoption
+// has completed for a specific server and protocol.
+func legacyPeersAdoptedSettingKey(serverID int64, proto string) string {
+	return fmt.Sprintf("legacy_peers_adopted:%d:%s", serverID, models.NormalizeProtocol(proto))
+}
 
 // AdoptLegacyPeers scans all remote server containers across installed protocols,
 // and adopts any untracked clients (which are not in peer_lifecycle and not in user_connections,
 // and not infrastructure/external) into peer_lifecycle as status: "active", user_id: "".
+// Adoption status is tracked granularly per server and protocol.
 func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
 	if r.db == nil {
 		return errors.New("database is not configured")
 	}
 	if r.registry == nil {
-		return nil
-	}
-
-	var alreadyAdopted bool
-	if err := r.db.GetSetting(ctx, SettingKeyLegacyPeersAdopted, &alreadyAdopted); err == nil && alreadyAdopted {
 		return nil
 	}
 
@@ -340,85 +342,103 @@ func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
 				continue
 			}
 
-			clients, err := mgr.GetClients(ctx, &srvCopy)
-			if err != nil {
-				slog.Warn("Legacy peer adoption: failed to fetch remote clients",
-					"server_id", serverID,
-					"protocol", proto,
-					"err", err,
-				)
+			settingKey := legacyPeersAdoptedSettingKey(serverID, proto)
+			var alreadyAdopted bool
+			if err := r.db.GetSetting(ctx, settingKey, &alreadyAdopted); err == nil && alreadyAdopted {
 				continue
 			}
 
-			conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
-			if err != nil {
-				slog.Warn("Legacy peer adoption: failed to fetch database connections",
-					"server_id", serverID,
-					"protocol", proto,
-					"err", err,
-				)
-				continue
-			}
-
-			lifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
-			if err != nil {
-				slog.Warn("Legacy peer adoption: failed to fetch peer lifecycles",
-					"server_id", serverID,
-					"protocol", proto,
-					"err", err,
-				)
-				continue
-			}
-
-			connIDs := make(map[string]bool, len(conns))
-			for _, conn := range conns {
-				if conn.ClientID != "" {
-					connIDs[conn.ClientID] = true
-				}
-			}
-
-			for _, client := range clients {
-				clientID, _ := client["clientId"].(string)
-				if clientID == "" {
-					clientID, _ = client["client_id"].(string)
-				}
-				if clientID == "" {
-					continue
-				}
-
-				if connIDs[clientID] {
-					continue
-				}
-
-				if _, exists := lifecycles[clientID]; exists {
-					continue
-				}
-
-				if isInfrastructurePeer(client) || isExternalPeer(client) {
-					continue
-				}
-
-				clientName := resolveClientNameFromMap(client)
-				if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
-					slog.Warn("Legacy peer adoption: failed to adopt untracked peer into peer_lifecycle",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", clientID,
-						"err", err,
-					)
-				} else {
-					slog.Info("Startup cleanup: adopted legacy untracked peer into peer_lifecycle",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", clientID,
-						"name", clientName,
-					)
-				}
-			}
+			r.adoptServerProtocolLegacyPeers(ctx, &srvCopy, proto, mgr, settingKey)
 		}
 	}
-	_ = r.db.SetSetting(ctx, SettingKeyLegacyPeersAdopted, true)
+
 	return nil
+}
+
+func (r *Reconciler) adoptServerProtocolLegacyPeers(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, settingKey string) {
+	serverID := server.ID
+
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		slog.Warn("Legacy peer adoption: failed to fetch remote clients",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	conns, err := r.db.GetConnectionsByServerAndProtocol(ctx, serverID, proto)
+	if err != nil {
+		slog.Warn("Legacy peer adoption: failed to fetch database connections",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	lifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
+	if err != nil {
+		slog.Warn("Legacy peer adoption: failed to fetch peer lifecycles",
+			"server_id", serverID,
+			"protocol", proto,
+			"err", err,
+		)
+		return
+	}
+
+	connIDs := make(map[string]bool, len(conns))
+	for _, conn := range conns {
+		if conn.ClientID != "" {
+			connIDs[conn.ClientID] = true
+		}
+	}
+
+	allInsertsSucceeded := true
+	for _, client := range clients {
+		clientID, _ := client["clientId"].(string)
+		if clientID == "" {
+			clientID, _ = client["client_id"].(string)
+		}
+		if clientID == "" {
+			continue
+		}
+
+		if connIDs[clientID] {
+			continue
+		}
+
+		if _, exists := lifecycles[clientID]; exists {
+			continue
+		}
+
+		if isInfrastructurePeer(client) || isExternalPeer(client) {
+			continue
+		}
+
+		clientName := resolveClientNameFromMap(client)
+		if err := r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "active"); err != nil {
+			slog.Warn("Legacy peer adoption: failed to adopt untracked peer into peer_lifecycle",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"err", err,
+			)
+			allInsertsSucceeded = false
+		} else {
+			slog.Info("Startup cleanup: adopted legacy untracked peer into peer_lifecycle",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"name", clientName,
+			)
+		}
+	}
+
+	if allInsertsSucceeded {
+		_ = r.db.SetSetting(ctx, settingKey, true)
+	}
 }
 
 // CleanupZombiePeers audits all remote server containers across installed protocols,
@@ -528,9 +548,10 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 	serverID := server.ID
 	rec, hasLifecycle := lifecycles[clientID]
 	if !hasLifecycle {
+		settingKey := legacyPeersAdoptedSettingKey(serverID, proto)
 		var legacyAdopted bool
 		if r.db != nil {
-			_ = r.db.GetSetting(ctx, SettingKeyLegacyPeersAdopted, &legacyAdopted)
+			_ = r.db.GetSetting(ctx, settingKey, &legacyAdopted)
 		}
 		if !legacyAdopted {
 			clientName := resolveClientNameFromMap(client)

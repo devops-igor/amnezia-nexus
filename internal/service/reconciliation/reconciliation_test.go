@@ -525,6 +525,7 @@ type mockZombiePeerProtocolManager struct {
 	getClientsErr  bool
 	removeErr      bool
 	getClientsHook func()
+	getClientsFunc func(ctx context.Context, server *models.Server) ([]map[string]any, error)
 	mu             sync.Mutex
 }
 
@@ -542,6 +543,9 @@ func (m *mockZombiePeerProtocolManager) GetClients(ctx context.Context, server *
 	defer m.mu.Unlock()
 	if m.getClientsHook != nil {
 		m.getClientsHook()
+	}
+	if m.getClientsFunc != nil {
+		return m.getClientsFunc(ctx, server)
 	}
 	if m.getClientsErr {
 		return nil, errors.New("remote get clients error")
@@ -1087,3 +1091,214 @@ func TestReconciler_CleanupZombiePeers_PurgesUntrackedZombiePostAdoption(t *test
 	}
 }
 
+func TestReconciler_MultiServerPartialAdoptionFailure_Regression(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Create Server A (online) and Server B (initially offline / SSH error)
+	srvA := &models.Server{
+		Name:    "Server A",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sIDA, err := db.CreateServer(ctx, srvA)
+	if err != nil {
+		t.Fatalf("failed to create server A: %v", err)
+	}
+
+	srvB := &models.Server{
+		Name:    "Server B",
+		Host:    "10.0.0.2",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 51820},
+		},
+	}
+	sIDB, err := db.CreateServer(ctx, srvB)
+	if err != nil {
+		t.Fatalf("failed to create server B: %v", err)
+	}
+
+	legacyPeerA := "awg-legacy-peer-server-a"
+	legacyPeerB := "awg-legacy-peer-server-b"
+	zombiePeerA := "awg-zombie-peer-server-a"
+	zombiePeerB := "awg-zombie-peer-server-b"
+	oldTimestamp := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+
+	var (
+		serverBOnline bool
+		serverAZombie bool
+		serverBZombie bool
+		mu            sync.Mutex
+	)
+
+	awgMgr := &mockZombiePeerProtocolManager{
+		proto: "awg",
+	}
+	awgMgr.getClientsFunc = func(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if server.ID == sIDA {
+			clients := []map[string]any{
+				{"clientId": legacyPeerA, "clientName": "Legacy Peer A", "creationDate": oldTimestamp},
+			}
+			if serverAZombie {
+				clients = append(clients, map[string]any{
+					"clientId":     zombiePeerA,
+					"clientName":   "Zombie Peer A",
+					"creationDate": oldTimestamp,
+				})
+			}
+			return clients, nil
+		}
+
+		if server.ID == sIDB {
+			if !serverBOnline {
+				return nil, errors.New("simulated ssh network failure: server B offline")
+			}
+			clients := []map[string]any{
+				{"clientId": legacyPeerB, "clientName": "Legacy Peer B", "creationDate": oldTimestamp},
+			}
+			if serverBZombie {
+				clients = append(clients, map[string]any{
+					"clientId":     zombiePeerB,
+					"clientName":   "Zombie Peer B",
+					"creationDate": oldTimestamp,
+				})
+			}
+			return clients, nil
+		}
+
+		return nil, nil
+	}
+
+	reg := newMockRegistry()
+	reg.Register(awgMgr)
+
+	r := New(db, reg)
+
+	// 2. Run initial legacy adoption: Server A succeeds, Server B fails due to offline error
+	if err := r.AdoptLegacyPeers(ctx); err != nil {
+		t.Fatalf("AdoptLegacyPeers failed: %v", err)
+	}
+
+	// 3. Verify: Server A scope is marked complete; Server B scope is NOT marked complete
+	settingKeyA := legacyPeersAdoptedSettingKey(sIDA, "awg")
+	settingKeyB := legacyPeersAdoptedSettingKey(sIDB, "awg")
+
+	var adoptedA bool
+	if err := db.GetSetting(ctx, settingKeyA, &adoptedA); err != nil || !adoptedA {
+		t.Fatalf("expected Server A scope %s to be marked complete (true), err=%v, val=%v", settingKeyA, err, adoptedA)
+	}
+
+	var adoptedB bool
+	_ = db.GetSetting(ctx, settingKeyB, &adoptedB)
+	if adoptedB {
+		t.Fatalf("expected Server B scope %s to NOT be marked complete", settingKeyB)
+	}
+
+	// Verify Server A's legacy peer was adopted into peer_lifecycle as active
+	activeA, err := db.GetActivePeerIDs(ctx, sIDA, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server A failed: %v", err)
+	}
+	if !activeA[legacyPeerA] {
+		t.Fatalf("expected legacyPeerA to be adopted into peer_lifecycle on Server A")
+	}
+
+	// Verify Server B's legacy peer was NOT yet adopted into peer_lifecycle
+	activeB, err := db.GetActivePeerIDs(ctx, sIDB, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server B failed: %v", err)
+	}
+	if activeB[legacyPeerB] {
+		t.Fatalf("expected legacyPeerB to NOT be in peer_lifecycle yet for Server B")
+	}
+
+	// 4. Server B now becomes reachable!
+	// On Server A, a subsequent untracked peer (> 2m old) appears.
+	mu.Lock()
+	serverBOnline = true
+	serverAZombie = true
+	mu.Unlock()
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.mu.Unlock()
+
+	// 5. Run CleanupZombiePeers()
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deleted := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	// Assert:
+	// - Server B's legacy unassigned peer (legacyPeerB) was NOT deleted!
+	// - Server A's untracked zombie peer (zombiePeerA) WAS deleted!
+	// - Server A's legacy peer (legacyPeerA) was NOT deleted!
+	if len(deleted) != 1 || deleted[0] != zombiePeerA {
+		t.Fatalf("expected only zombiePeerA %s to be deleted, got: %v", zombiePeerA, deleted)
+	}
+
+	// Verify Server B's legacy unassigned peer is now adopted as active in peer_lifecycle
+	activeB, err = db.GetActivePeerIDs(ctx, sIDB, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server B failed: %v", err)
+	}
+	if !activeB[legacyPeerB] {
+		t.Fatalf("expected Server B legacy unassigned peer %s to be adopted as active into peer_lifecycle, not deleted", legacyPeerB)
+	}
+
+	// Verify Server A's legacy peer remains active and zombiePeerA is not in peer_lifecycle
+	activeA, err = db.GetActivePeerIDs(ctx, sIDA, "awg")
+	if err != nil {
+		t.Fatalf("GetActivePeerIDs for Server A failed: %v", err)
+	}
+	if !activeA[legacyPeerA] {
+		t.Fatalf("expected Server A legacy peer %s to remain active in peer_lifecycle", legacyPeerA)
+	}
+	if activeA[zombiePeerA] {
+		t.Fatalf("expected Server A zombie peer %s to NOT be in peer_lifecycle", zombiePeerA)
+	}
+
+	// 6. Complete adoption on Server B: running AdoptLegacyPeers marks Server B complete
+	if err := r.AdoptLegacyPeers(ctx); err != nil {
+		t.Fatalf("subsequent AdoptLegacyPeers failed: %v", err)
+	}
+	_ = db.GetSetting(ctx, settingKeyB, &adoptedB)
+	if !adoptedB {
+		t.Fatalf("expected Server B scope %s to be marked complete after reachable run", settingKeyB)
+	}
+
+	// 7. Post-adoption on Server B: a new untracked peer (> 2m old) appears on Server B and MUST be purged
+	// Note: zombiePeerA was already removed from Server A's remote container in the previous cleanup.
+	mu.Lock()
+	serverAZombie = false
+	serverBZombie = true
+	mu.Unlock()
+
+	awgMgr.mu.Lock()
+	awgMgr.deleted = nil
+	awgMgr.mu.Unlock()
+
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("second CleanupZombiePeers failed: %v", err)
+	}
+
+	awgMgr.mu.Lock()
+	deletedPostAdoption := append([]string(nil), awgMgr.deleted...)
+	awgMgr.mu.Unlock()
+
+	if len(deletedPostAdoption) != 1 || deletedPostAdoption[0] != zombiePeerB {
+		t.Fatalf("expected only zombiePeerB %s to be deleted post-adoption, got: %v", zombiePeerB, deletedPostAdoption)
+	}
+}
