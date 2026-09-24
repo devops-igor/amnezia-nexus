@@ -2053,24 +2053,22 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 // isTransportCandidate checks the wire header without touching peer state or
 // the database. The transport worker resolves the keypair and authenticates
 // the packet; unrecognized packets return to the bounded handshake queue.
-func (el *Listener) isTransportCandidate(datagram []byte) bool {
-	s4 := el.config.S4
+func isTransportCandidate(datagram []byte, s4 int, h4 models.HeaderRange, hpKey []byte) bool {
 	if s4 < 0 {
 		s4 = 0
 	}
 	if len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
 		return false
 	}
-	h4 := el.config.H4
 	if h4.IsZero() {
 		h4 = models.DegenerateHeaderRange(health.DefaultH4)
 	}
 	// Plaintext transport needs only a 4-byte comparison. Doing a keypair or
 	// sender lookup here can overflow the kernel UDP receive buffer under load.
-	if len(el.hpKey) != 32 || s4 < health.HeaderCipherNonceSize {
+	if len(hpKey) != 32 || s4 < health.HeaderCipherNonceSize {
 		return h4.Contains(binary.LittleEndian.Uint32(datagram[s4 : s4+4]))
 	}
-	_, _, _, ok := parseTransportHeader(datagram, datagram[s4:], el.hpKey, s4, h4)
+	_, _, _, ok := parseTransportHeader(datagram, datagram[s4:], hpKey, s4, h4)
 	return ok
 }
 
@@ -2091,6 +2089,9 @@ func (el *Listener) enqueueHandshake(job packetJob) {
 func (el *Listener) udpReadLoop(ctx context.Context) {
 	defer el.wg.Done()
 	buf := make([]byte, 2048)
+	el.mu.RLock()
+	s4, h4, hpKey := el.config.S4, el.config.H4, el.hpKey
+	el.mu.RUnlock()
 
 	for {
 		if el.udpConn == nil {
@@ -2119,7 +2120,7 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 					data:   data,
 					sender: udpAddr,
 				}
-				if el.isTransportCandidate(data) {
+				if isTransportCandidate(data, s4, h4, hpKey) {
 					select {
 					case <-el.stopCh:
 						return
