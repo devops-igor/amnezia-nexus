@@ -174,6 +174,12 @@ type ListenerConfig struct {
 	// WorkerQueueSize is the capacity of the inbound packet dispatch queue (issue #160).
 	// If <= 0, defaults to 2048.
 	WorkerQueueSize int
+	// HandshakeWorkers limits concurrent handshake processing, including database calls.
+	// If <= 0, defaults to 4.
+	HandshakeWorkers int
+	// HandshakeQueueSize bounds pending handshakes independently of transport traffic.
+	// If <= 0, defaults to 128.
+	HandshakeQueueSize int
 	// HeartbeatInterval is the interval between idle-timeout sweeps in heartbeatLoop.
 	// If <= 0, defaults to 30 seconds.
 	HeartbeatInterval time.Duration
@@ -225,32 +231,35 @@ type keypairEntry struct {
 
 // Listener manages the AWG endpoint UDP listener and peer lifecycle.
 type Listener struct {
-	mu                  sync.RWMutex
-	config              ListenerConfig
-	hpKey               []byte
-	db                  *database.DB
-	auth                Authenticator
-	ipam                *IPAM
-	sessionMgr          *SessionManager
-	serverKeys          *ServerKeysManager
-	serverPriv          []byte
-	noiseKeys           map[string]*TransportKeys
-	peerKeypairs        map[string]*peerKeypairs
-	indexTable          map[uint32]*keypairEntry
-	rejectAfterTime     time.Duration
-	peersByAddr         map[string]*activePeerState // sender UDP addr string -> peer state
-	peerGenerations     map[string]uint64           // peerKey -> highest committed generation
-	udpConn             *net.UDPConn
-	tunDev              PacketDevice
-	packetQueue         chan packetJob
-	packetQueueDrops    atomic.Uint64
-	running             bool
-	draining            bool
-	stopCh              chan struct{}
-	wg                  sync.WaitGroup
-	rxBytes             atomic.Int64
-	txBytes             atomic.Int64
-	incomingPeerHandler IncomingPeerHandler
+	mu                    sync.RWMutex
+	config                ListenerConfig
+	hpKey                 []byte
+	db                    *database.DB
+	auth                  Authenticator
+	ipam                  *IPAM
+	sessionMgr            *SessionManager
+	serverKeys            *ServerKeysManager
+	serverPriv            []byte
+	noiseKeys             map[string]*TransportKeys
+	peerKeypairs          map[string]*peerKeypairs
+	indexTable            map[uint32]*keypairEntry
+	rejectAfterTime       time.Duration
+	peersByAddr           map[string]*activePeerState // sender UDP addr string -> peer state
+	peerGenerations       map[string]uint64           // peerKey -> highest committed generation
+	udpConn               *net.UDPConn
+	tunDev                PacketDevice
+	packetQueue           chan packetJob
+	packetQueueDrops      atomic.Uint64
+	handshakeQueue        chan packetJob
+	handshakeQueueDrops   atomic.Uint64
+	handshakeDropLogUntil atomic.Int64
+	running               bool
+	draining              bool
+	stopCh                chan struct{}
+	wg                    sync.WaitGroup
+	rxBytes               atomic.Int64
+	txBytes               atomic.Int64
+	incomingPeerHandler   IncomingPeerHandler
 
 	router ClientPacketRouter
 	// reaperHook runs on the heartbeat goroutine for each idle-timed-out
@@ -343,6 +352,12 @@ func applyListenerConfigDefaults(cfg *ListenerConfig) {
 	}
 	if cfg.WorkerQueueSize <= 0 {
 		cfg.WorkerQueueSize = 2048
+	}
+	if cfg.HandshakeWorkers <= 0 {
+		cfg.HandshakeWorkers = 4
+	}
+	if cfg.HandshakeQueueSize <= 0 {
+		cfg.HandshakeQueueSize = 128
 	}
 }
 
@@ -623,13 +638,17 @@ func (el *Listener) Start(ctx context.Context) error {
 		queueSize = 2048
 	}
 	el.packetQueue = make(chan packetJob, queueSize)
+	el.handshakeQueue = make(chan packetJob, el.config.HandshakeQueueSize)
 	el.mu.Unlock()
 
-	el.wg.Add(2 + numWorkers)
+	el.wg.Add(2 + numWorkers + el.config.HandshakeWorkers)
 	go el.udpReadLoop(ctx)
 	go el.heartbeatLoop(ctx)
 	for i := 0; i < numWorkers; i++ {
 		go el.workerLoop(ctx)
+	}
+	for i := 0; i < el.config.HandshakeWorkers; i++ {
+		go el.handshakeWorkerLoop(ctx)
 	}
 
 	return nil
@@ -842,6 +861,15 @@ func (el *Listener) PacketQueueDrops() uint64 {
 		return 0
 	}
 	return el.packetQueueDrops.Load()
+}
+
+// HandshakeQueueDrops counts inbound datagrams discarded when the bounded
+// handshake/unknown-datagram queue is full.
+func (el *Listener) HandshakeQueueDrops() uint64 {
+	if el == nil {
+		return 0
+	}
+	return el.handshakeQueueDrops.Load()
 }
 
 // StaleHandshakeDrops returns the number of handshake completions dropped
@@ -2022,9 +2050,48 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	return nil
 }
 
+// isTransportCandidate checks the wire header without touching peer state or
+// the database. The transport worker resolves the keypair and authenticates
+// the packet; unrecognized packets return to the bounded handshake queue.
+func isTransportCandidate(datagram []byte, s4 int, h4 models.HeaderRange, hpKey []byte) bool {
+	if s4 < 0 {
+		s4 = 0
+	}
+	if len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
+		return false
+	}
+	if h4.IsZero() {
+		h4 = models.DegenerateHeaderRange(health.DefaultH4)
+	}
+	// Plaintext transport needs only a 4-byte comparison. Doing a keypair or
+	// sender lookup here can overflow the kernel UDP receive buffer under load.
+	if len(hpKey) != 32 || s4 < health.HeaderCipherNonceSize {
+		return h4.Contains(binary.LittleEndian.Uint32(datagram[s4 : s4+4]))
+	}
+	_, _, _, ok := parseTransportHeader(datagram, datagram[s4:], hpKey, s4, h4)
+	return ok
+}
+
+func (el *Listener) enqueueHandshake(job packetJob) {
+	select {
+	case <-el.stopCh:
+	case el.handshakeQueue <- job:
+	default:
+		el.handshakeQueueDrops.Add(1)
+		now := time.Now().Unix()
+		until := el.handshakeDropLogUntil.Load()
+		if now >= until && el.handshakeDropLogUntil.CompareAndSwap(until, now+1) {
+			log.Printf("[vpn/endpoint] handshake queue full; dropped inbound datagram (total=%d)", el.handshakeQueueDrops.Load())
+		}
+	}
+}
+
 func (el *Listener) udpReadLoop(ctx context.Context) {
 	defer el.wg.Done()
 	buf := make([]byte, 2048)
+	el.mu.RLock()
+	s4, h4, hpKey := el.config.S4, el.config.H4, el.hpKey
+	el.mu.RUnlock()
 
 	for {
 		if el.udpConn == nil {
@@ -2053,12 +2120,16 @@ func (el *Listener) udpReadLoop(ctx context.Context) {
 					data:   data,
 					sender: udpAddr,
 				}
-				select {
-				case <-el.stopCh:
-					return
-				case el.packetQueue <- job:
-				default:
-					el.packetQueueDrops.Add(1)
+				if isTransportCandidate(data, s4, h4, hpKey) {
+					select {
+					case <-el.stopCh:
+						return
+					case el.packetQueue <- job:
+					default:
+						el.packetQueueDrops.Add(1)
+					}
+				} else {
+					el.enqueueHandshake(job)
 				}
 			}
 		}
@@ -2075,6 +2146,22 @@ func (el *Listener) workerLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
+			// A peer can rekey while transport is in flight. If the old keypair
+			// disappeared since admission, let the handshake lane classify it.
+			if !el.handleTransportData(job.data, job.sender) {
+				el.enqueueHandshake(job)
+			}
+		}
+	}
+}
+
+func (el *Listener) handshakeWorkerLoop(ctx context.Context) {
+	defer el.wg.Done()
+	for {
+		select {
+		case <-el.stopCh:
+			return
+		case job := <-el.handshakeQueue:
 			el.handleDatagram(ctx, job.data, job.sender)
 		}
 	}
