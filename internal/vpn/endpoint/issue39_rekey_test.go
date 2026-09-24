@@ -176,7 +176,7 @@ func TestListenerAcceptsRekeyHandshakeOverUDP(t *testing.T) {
 	}
 	peerKey := clientPub64(state1)
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "rekey_user", Enabled: true})
-	_, _ = db.CreateConnection(ctx, &models.UserConnection{UserID: uID, ServerID: sID, Protocol: "awg", ClientID: peerKey})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{UserID: uID, ServerID: 0, Protocol: "awg", ClientID: peerKey})
 
 	if _, err := clientConn.Write(pkt1); err != nil {
 		t.Fatalf("send initiation 1: %v", err)
@@ -349,7 +349,7 @@ func TestPostRestartClientAutoRecovery(t *testing.T) {
 		t.Fatalf("derive client pub: %v", err)
 	}
 	peerKey := base64.StdEncoding.EncodeToString(pub1)
-	_, _ = db.CreateConnection(ctx, &models.UserConnection{UserID: uID, ServerID: sID, Protocol: "awg", ClientID: peerKey})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{UserID: uID, ServerID: 0, Protocol: "awg", ClientID: peerKey})
 
 	if _, err := clientConn.Write(pkt1); err != nil {
 		t.Fatalf("send initiation: %v", err)
