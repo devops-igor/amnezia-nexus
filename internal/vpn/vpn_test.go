@@ -4036,7 +4036,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 			sessBob.AssignedIP, bobConns[0].ClientParams)
 	}
 
-	// 2. Peer with assigned_ip colliding with stale lease in IPAM:
+	// 2. Peer with assigned_ip colliding with a different peer's lease:
 	// Setup user Charlie with assigned_ip: 10.100.0.50
 	u3ID, err := db.CreateUser(ctx, &models.User{
 		Username: "charlie",
@@ -4066,13 +4066,13 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 		t.Fatalf("failed to setup dummy stale lease: %v", err)
 	}
 
-	// HandleIncomingPeer for Charlie must detect collision, release stale allocation, and reserve targetIP for Charlie
-	sessCharlie, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer for charlie failed on collision: %v", err)
+	// The lease owner cannot be inferred from an IP alone. Refuse the
+	// handshake rather than removing the dummy peer's lease.
+	if _, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie); !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		t.Fatalf("expected collision error for charlie, got %v", err)
 	}
-	if sessCharlie.AssignedIP != targetIP {
-		t.Fatalf("expected charlie to receive %s after resolving collision, got %s", targetIP, sessCharlie.AssignedIP)
+	if ip, ok := vpnSvc.ipam.GetAssignedIP("dummy-stale-peer"); !ok || ip.String() != targetIP {
+		t.Fatalf("collision evicted the existing owner: ip=%v present=%t", ip, ok)
 	}
 }
 
@@ -4798,11 +4798,19 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 		t.Fatalf("CreateUser failed: %v", err)
 	}
 
-	// User has 2 remote server connections (ServerID > 0)
+	// User has 2 remote server connections (ServerID > 0).
+	server1, err := db.CreateServer(ctx, &models.Server{Name: "remote-1", Host: "192.0.2.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server2, err := db.CreateServer(ctx, &models.Server{Name: "remote-2", Host: "192.0.2.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	conn1 := &models.UserConnection{
 		ID:        "conn-remote-1",
 		UserID:    uID,
-		ServerID:  1,
+		ServerID:  server1,
 		Protocol:  "awg",
 		ClientID:  "pubkey-remote-1",
 		Name:      "Server 1",
@@ -4811,19 +4819,23 @@ func TestGenerateClientConfig_NoPhantomWhenUserHasRemoteServerConnections(t *tes
 	conn2 := &models.UserConnection{
 		ID:        "conn-remote-2",
 		UserID:    uID,
-		ServerID:  2,
+		ServerID:  server2,
 		Protocol:  "vless",
 		ClientID:  "uuid-remote-2",
 		Name:      "Server 2",
 		CreatedAt: time.Now().Add(time.Second),
 	}
-	_, _ = db.CreateConnection(ctx, conn1)
-	_, _ = db.CreateConnection(ctx, conn2)
+	if _, err := db.CreateConnection(ctx, conn1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateConnection(ctx, conn2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Call GenerateClientConfig(ctx, uID)
 	_, _, err = svc.GenerateClientConfig(ctx, uID)
-	if err != nil {
-		t.Fatalf("GenerateClientConfig failed: %v", err)
+	if err == nil {
+		t.Fatal("generated an unpersisted load balancer configuration for a user with only remote connections")
 	}
 
 	// Verify no phantom connection was created

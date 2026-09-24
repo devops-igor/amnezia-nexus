@@ -25,6 +25,12 @@ func TestInvalidateVPNSessionsForRestartAtomicAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: 0, Protocol: "awg", ClientID: "old-peer",
+		ClientParams: map[string]any{"label": "keep-this-field"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct{ id, peer, ip, status string }{
 		{"old-connected", "old-peer", "10.100.0.12", "connected"},
 		{"old-draining", "draining-peer", "10.100.0.13", "draining"},
@@ -52,6 +58,9 @@ func TestInvalidateVPNSessionsForRestartAtomicAndIdempotent(t *testing.T) {
 	if row, err := db.GetBackendTunnel(ctx, tunnelID); err != nil || row == nil || row.ActiveConnections != 4 {
 		t.Fatalf("failed transaction changed gauge: row=%+v err=%v", row, err)
 	}
+	if conn, err := db.GetConnectionByToken(ctx, "old-peer"); err != nil || conn == nil || conn.ClientParams["assigned_ip"] != nil {
+		t.Fatalf("failed transaction migrated a lease: conn=%+v err=%v", conn, err)
+	}
 	if _, err := db.SQLDB().ExecContext(ctx, "DROP TRIGGER block_restart_gauge"); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +73,10 @@ func TestInvalidateVPNSessionsForRestartAtomicAndIdempotent(t *testing.T) {
 		if row, err := db.GetVPNSessionByPeerKey(ctx, peer); err != nil || row != nil {
 			t.Fatalf("retired session %s survived: row=%+v err=%v", peer, row, err)
 		}
+	}
+	if conn, err := db.GetConnectionByToken(ctx, "old-peer"); err != nil || conn == nil ||
+		conn.ClientParams["assigned_ip"] != "10.100.0.12" || conn.ClientParams["label"] != "keep-this-field" {
+		t.Fatalf("session-only lease and existing params were not migrated: conn=%+v err=%v", conn, err)
 	}
 	if row, err := db.GetBackendTunnel(ctx, tunnelID); err != nil || row == nil || row.ActiveConnections != 0 {
 		t.Fatalf("persisted gauge not reset: row=%+v err=%v", row, err)
