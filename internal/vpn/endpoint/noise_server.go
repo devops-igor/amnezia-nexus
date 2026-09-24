@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
@@ -123,6 +124,16 @@ type TransportKeys struct {
 	replay      replay.Filter
 	replayMu    sync.Mutex
 	expiryMu    sync.RWMutex
+	sendCounter atomic.Uint64
+}
+
+// NextSendCounter returns the next monotonic outbound transport packet counter
+// for this key generation.
+func (tk *TransportKeys) NextSendCounter() uint64 {
+	if tk == nil {
+		return 0
+	}
+	return tk.sendCounter.Add(1) - 1
 }
 
 // ValidateCounter checks whether the transport packet counter is within the

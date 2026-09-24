@@ -191,14 +191,12 @@ type IncomingPeerHandler func(ctx context.Context, peerPublicKey string) (*model
 // a peer (the VPN service wires it to forwarder.RouteClientToBackend).
 type ClientPacketRouter func(peerKey string, packet []byte) error
 
-// activePeerState tracks a peer's most recent UDP endpoint and transport
-// send counter so late transport datagrams and server→client sends can find
-// the right socket address.
+// activePeerState tracks a peer's most recent UDP endpoint so late transport
+// datagrams and server→client sends can find the right socket address.
 type activePeerState struct {
 	peerKey         string
 	udpAddr         *net.UDPAddr // cached pre-parsed UDP endpoint (avoids per-packet string resolution, issue #151)
 	receiverIdx     atomic.Uint32
-	sendCount       atomic.Uint64
 	lastSeen        atomic.Int64 // unix nanos
 	lastTouchSec    atomic.Int64 // unix seconds (issue #294: throttles TouchSession calls)
 	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
@@ -1922,7 +1920,7 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 // SendToPeer encrypts an IP packet for a peer with the stored transport
 // SendKey and writes it to the peer's last recorded UDP address using AWG
 // transport framing (S4 padding + H4 magic header). The send counter is a fresh
-// monotonic value per peer.
+// monotonic value per transport key generation.
 func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	keys, ok := el.TransportKeysFor(peerKey)
 	if !ok || keys == nil || keys.SendKey == nil {
@@ -1965,7 +1963,7 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		}
 	}
 
-	counter := st.sendCount.Add(1) - 1
+	counter := keys.NextSendCounter()
 	aead, err := keys.SendCipher()
 	if err != nil {
 		return fmt.Errorf("failed to get transport send cipher: %w", err)

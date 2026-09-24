@@ -861,6 +861,60 @@ func TestTransportKeys_IsExpired_Unit(t *testing.T) {
 	}
 }
 
+// TestTransportKeys_NextSendCounter_Unit verifies that NextSendCounter() starts at 0,
+// increments monotonically, safely handles nil, and generates unique nonces under concurrency.
+func TestTransportKeys_NextSendCounter_Unit(t *testing.T) {
+	key := make([]byte, chacha20poly1305.KeySize)
+	tk, err := NewTransportKeys(key, key)
+	if err != nil {
+		t.Fatalf("NewTransportKeys: %v", err)
+	}
+
+	// Nil receiver safety
+	var nilTK *TransportKeys
+	if c := nilTK.NextSendCounter(); c != 0 {
+		t.Fatalf("nilTK.NextSendCounter() = %d, want 0", c)
+	}
+
+	// Sequential increments
+	for i := uint64(0); i < 100; i++ {
+		got := tk.NextSendCounter()
+		if got != i {
+			t.Fatalf("NextSendCounter() = %d, want %d", got, i)
+		}
+	}
+
+	// Concurrent increments: verify all counters are unique and no gaps
+	const numGoroutines = 20
+	const iters = 100
+	var wg sync.WaitGroup
+	var counters sync.Map
+
+	wg.Add(numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				c := tk.NextSendCounter()
+				if _, loaded := counters.LoadOrStore(c, struct{}{}); loaded {
+					t.Errorf("duplicate counter generated: %d", c)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// tk should now have emitted exactly 100 + 20*100 = 2100 counters (0..2099)
+	for expected := uint64(100); expected < 2100; expected++ {
+		if _, ok := counters.Load(expected); !ok {
+			t.Fatalf("missing counter in concurrent test: %d", expected)
+		}
+	}
+	if next := tk.NextSendCounter(); next != 2100 {
+		t.Fatalf("expected next counter 2100, got %d", next)
+	}
+}
+
 // TestRekeyRollover_BoundedCompatibilityFallback verifies that packets with unknown
 // receiver indices (e.g. synthetic test keys without local index registration) fall back
 // to sender-address based peer lookup, attempting current keys first, then previous keys.
@@ -2228,4 +2282,174 @@ func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGenera
 		t.Fatalf("expected 1 routed packet with K2 payload, got %v", routedPackets)
 	}
 	routerMu.Unlock()
+}
+
+// TestRekeyRollover_EndpointRoaming_PreservesSendCounterNonceUniqueness verifies that
+// UDP endpoint roaming (e.g. NAT remapping or client changing IP/port) preserves the
+// monotonicity and uniqueness of outbound AEAD send counter nonces under the active
+// TransportKeys generation. Because sendCounter is bound to TransportKeys rather than
+// per-address activePeerState, discovering a new source endpoint does not reset the
+// outbound nonce counter to 0, preventing catastrophic nonce reuse under ChaCha20-Poly1305.
+func TestRekeyRollover_EndpointRoaming_PreservesSendCounterNonceUniqueness(t *testing.T) {
+	el, sPub, hpKey, sID := setupIssue295LiveTestListener(t)
+	defer func() { _ = el.Stop() }()
+
+	serverAddr, ok := el.GetListenAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("GetListenAddr returned %T", el.GetListenAddr())
+	}
+
+	var routedPackets [][]byte
+	var routerMu sync.Mutex
+	el.SetClientPacketRouter(func(pk string, pkt []byte) error {
+		routerMu.Lock()
+		defer routerMu.Unlock()
+		routedPackets = append(routedPackets, append([]byte(nil), pkt...))
+		return nil
+	})
+
+	// 1. Establish initial session and keypair K1 with client at socket/address A
+	clientConnA, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP connA: %v", err)
+	}
+	defer func() { _ = clientConnA.Close() }()
+
+	clientPriv, peerKey := newTestClient(t, el.db, sID, "roam_peer_nonce_test")
+	_ = performClientHandshake(t, clientConnA, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+
+	k1Current, _ := el.PeerKeypairsForTest(peerKey)
+	if k1Current == nil || k1Current.SendKey == nil {
+		t.Fatalf("expected active TransportKeys K1 for peer %s", peerKey)
+	}
+
+	clientAEAD, err := chacha20poly1305.New(k1Current.SendKey)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.New failed: %v", err)
+	}
+
+	readOutboundPacket := func(conn *net.UDPConn, wantCounter uint64, wantPayload []byte) {
+		t.Helper()
+		buf := make([]byte, 2048)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("failed to read outbound packet: %v", err)
+		}
+		datagram := buf[:n]
+		s4 := el.config.S4
+		if len(datagram) < s4+transportDataHeaderLen+len(wantPayload)+chacha20poly1305.Overhead {
+			t.Fatalf("outbound datagram too short: %d", len(datagram))
+		}
+
+		recvCip := health.NewHeaderProtectionCipher(hpKey, datagram[:health.HeaderCipherNonceSize])
+		if recvCip == nil {
+			t.Fatal("failed to create client HP cipher")
+		}
+		unmaskedHdr := make([]byte, transportDataHeaderLen)
+		recvCip.XORKeyStream(unmaskedHdr, datagram[s4:s4+transportDataHeaderLen])
+
+		gotCounter := binary.LittleEndian.Uint64(unmaskedHdr[8:16])
+		if gotCounter != wantCounter {
+			t.Fatalf("outbound counter mismatch: got %d, want %d", gotCounter, wantCounter)
+		}
+
+		var nonce [chacha20poly1305.NonceSize]byte
+		binary.LittleEndian.PutUint64(nonce[4:12], gotCounter)
+		decrypted, err := clientAEAD.Open(nil, nonce[:], datagram[s4+transportDataHeaderLen:], nil)
+		if err != nil {
+			t.Fatalf("client failed to decrypt outbound packet with K1: %v", err)
+		}
+		if !bytes.Equal(decrypted, wantPayload) {
+			t.Fatalf("payload mismatch: got %q, want %q", decrypted, wantPayload)
+		}
+	}
+
+	// 2. Call el.SendToPeer() -> verify received at socket A, assert outbound counter is 0, verify client decrypts with K1.
+	outMsg0 := []byte("server-outbound-packet-0")
+	if err := el.SendToPeer(peerKey, outMsg0); err != nil {
+		t.Fatalf("SendToPeer #0 failed: %v", err)
+	}
+	readOutboundPacket(clientConnA, 0, outMsg0)
+
+	// 3. Call el.SendToPeer() again -> verify received at socket A, assert outbound counter is 1, verify client decrypts with K1.
+	outMsg1 := []byte("server-outbound-packet-1")
+	if err := el.SendToPeer(peerKey, outMsg1); err != nil {
+		t.Fatalf("SendToPeer #1 failed: %v", err)
+	}
+	readOutboundPacket(clientConnA, 1, outMsg1)
+
+	// 4. Create new client socket B (simulating client NAT rebinding / roaming).
+	clientConnB, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		t.Fatalf("DialUDP connB: %v", err)
+	}
+	defer func() { _ = clientConnB.Close() }()
+
+	// Send valid inbound K1 transport packet from socket B (same LocalIndex / same K1).
+	inboundMsgB := []byte("client-roamed-to-socket-b")
+	dB := craftClientTransportDatagram(t, k1Current, el.config.H4.Lo, el.config.S4, hpKey, 1, inboundMsgB)
+	if _, err := clientConnB.Write(dB); err != nil {
+		t.Fatalf("write inbound transport from socket B failed: %v", err)
+	}
+
+	// Wait for listener to process inbound datagram and update peer endpoint
+	waitForRoutedPacket := func(want []byte) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			routerMu.Lock()
+			for _, p := range routedPackets {
+				if bytes.Equal(p, want) {
+					routerMu.Unlock()
+					return
+				}
+			}
+			routerMu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for routed packet %q", want)
+	}
+	waitForRoutedPacket(inboundMsgB)
+
+	// Verify B becomes the newest recorded endpoint in Listener.
+	stB, okB := el.peerByAddr(clientConnB.LocalAddr().String())
+	if !okB || stB == nil || stB.peerKey != peerKey {
+		t.Fatalf("expected peersByAddr entry for socket B (%s), got %+v", clientConnB.LocalAddr().String(), stB)
+	}
+	stA, okA := el.peerByAddr(clientConnA.LocalAddr().String())
+	if !okA || stA == nil {
+		t.Fatalf("expected peersByAddr entry for socket A (%s)", clientConnA.LocalAddr().String())
+	}
+	if stB.lastSeen.Load() <= stA.lastSeen.Load() {
+		t.Fatalf("expected socket B lastSeen (%d) > socket A lastSeen (%d)", stB.lastSeen.Load(), stA.lastSeen.Load())
+	}
+
+	// 5. Call el.SendToPeer() -> verify packet is received at socket B, assert outbound counter is 2 (NOT 0!), verify client decrypts with K1.
+	outMsg2 := []byte("server-outbound-packet-2")
+	if err := el.SendToPeer(peerKey, outMsg2); err != nil {
+		t.Fatalf("SendToPeer #2 failed: %v", err)
+	}
+	readOutboundPacket(clientConnB, 2, outMsg2)
+
+	// 6. Send valid inbound K1 packet from socket A again (roaming back to A).
+	// Advance client counter to 2 so anti-replay filter accepts it.
+	inboundMsgA2 := []byte("client-roamed-back-to-socket-a")
+	dA2 := craftClientTransportDatagram(t, k1Current, el.config.H4.Lo, el.config.S4, hpKey, 2, inboundMsgA2)
+	if _, err := clientConnA.Write(dA2); err != nil {
+		t.Fatalf("write inbound transport from socket A failed: %v", err)
+	}
+	waitForRoutedPacket(inboundMsgA2)
+
+	// Verify A is now the newest recorded endpoint in Listener.
+	if stA.lastSeen.Load() <= stB.lastSeen.Load() {
+		t.Fatalf("expected socket A lastSeen (%d) > socket B lastSeen (%d) after roaming back", stA.lastSeen.Load(), stB.lastSeen.Load())
+	}
+
+	// 7. Call el.SendToPeer() -> verify packet is received at socket A, assert outbound counter is 3 (NOT 0, NOT 2!), verify client decrypts with K1.
+	outMsg3 := []byte("server-outbound-packet-3")
+	if err := el.SendToPeer(peerKey, outMsg3); err != nil {
+		t.Fatalf("SendToPeer #3 failed: %v", err)
+	}
+	readOutboundPacket(clientConnA, 3, outMsg3)
 }
