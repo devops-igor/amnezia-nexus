@@ -43,8 +43,8 @@ func (a *DBAuthenticator) AuthenticatePeer(ctx context.Context, peerPublicKey st
 		return nil, nil, ErrPeerNotFound
 	}
 
-	// Look up connection by token (client_id matching peer public key)
-	conn, err := a.db.GetConnectionByToken(ctx, peerPublicKey)
+	// Only portal connections may authenticate to the portal listener.
+	conn, err := a.db.GetConnectionByClientID(ctx, peerPublicKey, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to lookup connection: %w", err)
 	}

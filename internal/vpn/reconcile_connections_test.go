@@ -265,9 +265,9 @@ func TestReconcileConnectionCountsDBErrorDoesNotFail(t *testing.T) {
 	// the point is startup continuation, which reaching this line proves.
 }
 
-// TestStartReconcilesConnectionGauge wires the contract end to end: seeding
-// drift into the DB, then running the real startup sequence, must leave the
-// gauge equal to the true connected-session count.
+// TestStartReconcilesConnectionGauge wires the restart contract end to end:
+// persisted connected sessions have no transport or route after a restart,
+// so startup must invalidate them and reset the gauge instead of counting them.
 func TestStartReconcilesConnectionGauge(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
@@ -281,7 +281,7 @@ func TestStartReconcilesConnectionGauge(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("setup: poison DB counter failed: %v", err)
 	}
-	// One connected session row in the DB (the session manager's own table).
+	// One connected session row from the previous process.
 	if err := db.CreateVPNSession(ctx, &models.VPNSession{
 		UserID:          uID,
 		BackendTunnelID: tun.ID,
@@ -301,14 +301,20 @@ func TestStartReconcilesConnectionGauge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTunnelByID failed: %v", err)
 	}
-	if poolTun.ActiveConnections != 1 {
-		t.Errorf("after Start: pool active_connections = %d, want 1", poolTun.ActiveConnections)
+	if poolTun.ActiveConnections != 0 {
+		t.Errorf("after Start: pool active_connections = %d, want 0", poolTun.ActiveConnections)
 	}
 	row, err := db.GetBackendTunnel(ctx, tun.ID)
 	if err != nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if row.ActiveConnections != 1 {
-		t.Errorf("after Start: DB active_connections = %d, want 1", row.ActiveConnections)
+	if row.ActiveConnections != 0 {
+		t.Errorf("after Start: DB active_connections = %d, want 0", row.ActiveConnections)
+	}
+	if svc.sessionMgr.ActiveCount() != 0 {
+		t.Errorf("after Start: restored session manager count = %d, want 0", svc.sessionMgr.ActiveCount())
+	}
+	if status, err := svc.GetStatus(ctx); err != nil || status.RestartInvalidatedSessions != 1 || status.ConnectedSessions != 0 {
+		t.Errorf("after Start: status=%+v err=%v, want 1 invalidated and 0 connected", status, err)
 	}
 }

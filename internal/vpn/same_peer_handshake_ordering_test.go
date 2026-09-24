@@ -27,7 +27,7 @@ import (
 //   - Control-plane, forwarder, and listener transport generation all agree on G2.
 func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	db := setupTestDB(t)
-	svc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	svc, _, _, uID, _ := setupTestVPNService(t, db)
 
 	clientPub, clientPriv, err := tunnel.GenerateCurve25519KeyPair()
 	if err != nil {
@@ -40,7 +40,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 
 	if _, err := db.CreateConnection(t.Context(), &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: clientPub,
 		Name:     "client-device",
@@ -273,7 +273,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 //   - Transport keys and endpoint remain gen 2.
 func TestSamePeerHandshakeResponseSendRaceRegression(t *testing.T) {
 	db := setupTestDB(t)
-	svc, s1ID, _, uID, _ := setupTestVPNService(t, db)
+	svc, _, _, uID, _ := setupTestVPNService(t, db)
 
 	clientPub, clientPriv, err := tunnel.GenerateCurve25519KeyPair()
 	if err != nil {
@@ -286,7 +286,7 @@ func TestSamePeerHandshakeResponseSendRaceRegression(t *testing.T) {
 
 	if _, err := db.CreateConnection(t.Context(), &models.UserConnection{
 		UserID:   uID,
-		ServerID: s1ID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: clientPub,
 		Name:     "client-device",

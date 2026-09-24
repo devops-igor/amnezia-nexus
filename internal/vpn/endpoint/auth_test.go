@@ -63,7 +63,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKey1 := "valid-peer-public-key"
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u1ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey1,
 		Name:     "laptop",
@@ -79,12 +79,29 @@ func TestDBAuthenticator(t *testing.T) {
 	if u1.ID != u1ID || c1.ClientID != peerKey1 {
 		t.Errorf("mismatch user or conn: u=%+v, c=%+v", u1, c1)
 	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: u1ID, ServerID: sID, Protocol: "awg", ClientID: peerKey1,
+	}); err != nil {
+		t.Fatalf("CreateConnection for duplicate remote peer failed: %v", err)
+	}
+	_, portalConn, err := auth.AuthenticatePeer(ctx, peerKey1)
+	if err != nil || portalConn == nil || portalConn.ServerID != 0 {
+		t.Fatalf("portal peer must resolve to portal connection: conn=%+v err=%v", portalConn, err)
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: u1ID, ServerID: sID, Protocol: "awg", ClientID: "remote-only-peer",
+	}); err != nil {
+		t.Fatalf("CreateConnection for remote peer failed: %v", err)
+	}
+	if _, _, err := auth.AuthenticatePeer(ctx, "remote-only-peer"); err != ErrPeerNotFound {
+		t.Errorf("expected ErrPeerNotFound for remote-only peer, got %v", err)
+	}
 
 	// 2. Non-AWG protocol
 	peerKeyNonAWG := "telemt-peer-key"
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u1ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "telemt",
 		ClientID: peerKeyNonAWG,
 		Name:     "tg",
@@ -104,7 +121,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKeyDisabled := "disabled-peer-key"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u2ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyDisabled,
 	})
@@ -122,7 +139,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKeyExpired1 := "expired-peer-key-1"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u3ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyExpired1,
 	})
@@ -139,7 +156,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKeyExpired2 := "expired-peer-key-2"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u4ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyExpired2,
 	})
@@ -157,7 +174,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKeyOverlimit := "overlimit-peer-key"
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u5ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyOverlimit,
 	})
@@ -170,7 +187,7 @@ func TestDBAuthenticator(t *testing.T) {
 	peerKeyOrphan := "orphan-peer-key"
 	_, err = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   u6ID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKeyOrphan,
 	})

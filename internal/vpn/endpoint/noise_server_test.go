@@ -372,7 +372,7 @@ func TestEndpointListenerHandshakeOverUDP(t *testing.T) {
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "noise_user", Enabled: true})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 	})
@@ -619,7 +619,7 @@ func TestEndpointListenerHandshakeOverUDP_HeaderProtection(t *testing.T) {
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "hp_user", Enabled: true})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 	})
@@ -728,7 +728,7 @@ func TestEndpointListenerHandshakeOverUDP_BackwardCompat_PlaintextPeer(t *testin
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "plain_user", Enabled: true})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
 		UserID:   uID,
-		ServerID: sID,
+		ServerID: 0,
 		Protocol: "awg",
 		ClientID: peerKey,
 	})

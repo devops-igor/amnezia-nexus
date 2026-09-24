@@ -203,9 +203,9 @@ func TestDBWriteFailsAfterInMemoryStateChange(t *testing.T) {
 
 // TestPartialSessionCreationLeavesNoOrphans is scenario 4: the forwarder
 // route registration is skipped/fails after the session row persisted, and
-// the tunnel status persist fails. Invariants: no orphaned route, no phantom
-// session, no leaked IPAM lease, and the tunnel-status divergence stays
-// reconcilable.
+// the tunnel status persist fails. Invariants: no orphaned route or phantom
+// session; a successfully persisted client address remains reserved, and
+// the tunnel-status divergence stays reconcilable.
 func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 	cases := []struct {
 		name string
@@ -268,8 +268,8 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				if err := svc.DisconnectSession(t.Context(), sess.ID); err != nil {
 					t.Fatalf("DisconnectSession (rollback): %v", err)
 				}
-				// Invariants: no route, no session row, gauge back to 0,
-				// IPAM lease released.
+				// Invariants: no route, no session row, gauge back to 0;
+				// the configured client's persisted IP remains reserved.
 				if _, _, active := svc.forwarder.GetStats(); active != 0 {
 					t.Errorf("INVARIANT VIOLATED: %d orphaned route(s) after rollback", active)
 				}
@@ -283,8 +283,12 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				if got, _ := svc.pool.GetTunnelByID(tun.ID); got.ActiveConnections != 0 {
 					t.Errorf("INVARIANT VIOLATED: gauge %d != 0 after rollback", got.ActiveConnections)
 				}
-				if ip, ok := svc.ipam.GetAssignedIP(peerKey); ok {
-					t.Errorf("INVARIANT VIOLATED: IPAM lease %v still held after rollback", ip)
+				conn, err := db.GetConnectionByToken(t.Context(), peerKey)
+				if err != nil || conn == nil || conn.ClientParams["assigned_ip"] != sess.AssignedIP {
+					t.Fatalf("INVARIANT VIOLATED: client lease not persisted: conn=%+v err=%v", conn, err)
+				}
+				if ip, ok := svc.ipam.GetAssignedIP(peerKey); !ok || ip.String() != sess.AssignedIP {
+					t.Errorf("INVARIANT VIOLATED: durable lease lost after route rollback: ip=%v present=%t", ip, ok)
 				}
 			},
 		},

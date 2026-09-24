@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -619,6 +620,120 @@ func (d *DB) DeleteVPNSession(ctx context.Context, sessionID string) error {
 // releasing its assigned_ip to prevent SQLite UNIQUE constraint collisions on IP re-lease.
 func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 	return d.DeleteVPNSession(ctx, sessionID)
+}
+
+// InvalidateVPNSessionsForRestart removes sessions whose endpoint keys and
+// forwarder routes died with the previous process. Session rows are ephemeral
+// (normal disconnect also deletes them); removing every row frees the unique
+// peer/IP constraints for the next handshake. Reset the persisted pool gauges
+// in the same transaction so a crash cannot leave stale load-balancer counts.
+// The returned count includes only rows that had been reported as connected.
+func (d *DB) InvalidateVPNSessionsForRestart(ctx context.Context) (int64, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin VPN restart reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var connected int64
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM vpn_sessions WHERE status = 'connected'").Scan(&connected); err != nil {
+		return 0, fmt.Errorf("count persisted connected VPN sessions: %w", err)
+	}
+	assignments, err := readVPNClientIPAssignments(ctx, tx)
+	if err != nil {
+		return 0, fmt.Errorf("read VPN client IP assignments: %w", err)
+	}
+	for _, assignment := range assignments {
+		if !assignment.NeedsMigration {
+			continue
+		}
+		params, err := json.Marshal(assignment.ClientParams)
+		if err != nil {
+			return 0, fmt.Errorf("encode client IP assignment for connection %s: %w", assignment.ConnectionID, err)
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE user_connections SET client_params = ? WHERE id = ?", string(params), assignment.ConnectionID); err != nil {
+			return 0, fmt.Errorf("migrate client IP assignment for connection %s: %w", assignment.ConnectionID, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM vpn_sessions"); err != nil {
+		return 0, fmt.Errorf("invalidate persisted VPN sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE backend_tunnels SET active_connections = 0 WHERE active_connections != 0"); err != nil {
+		return 0, fmt.Errorf("reset persisted VPN connection gauges: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit VPN restart reconciliation: %w", err)
+	}
+	return connected, nil
+}
+
+// VPNClientIPAssignment describes a durable client lease, including legacy
+// leases which still exist only in the session table before restart cleanup.
+type VPNClientIPAssignment struct {
+	ConnectionID   string
+	PeerKey        string
+	AssignedIP     string
+	ClientParams   map[string]any
+	NeedsMigration bool
+}
+
+type vpnAssignmentQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]VPNClientIPAssignment, error) {
+	rows, err := q.QueryContext(ctx, `SELECT c.id, c.protocol, c.client_id, c.client_params, s.assigned_ip
+		FROM user_connections c LEFT JOIN vpn_sessions s
+		ON s.peer_public_key = c.client_id AND s.user_id = c.user_id
+		WHERE c.server_id = 0 AND c.client_id IS NOT NULL AND c.client_id != ''
+		ORDER BY c.created_at, c.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var assignments []VPNClientIPAssignment
+	for rows.Next() {
+		var a VPNClientIPAssignment
+		var protocol string
+		var params, sessionIP sql.NullString
+		if err := rows.Scan(&a.ConnectionID, &protocol, &a.PeerKey, &params, &sessionIP); err != nil {
+			return nil, err
+		}
+		if protocol != "" && models.NormalizeProtocol(protocol) != "awg" {
+			continue
+		}
+		a.ClientParams = make(map[string]any)
+		if params.Valid && params.String != "" {
+			if err := json.Unmarshal([]byte(params.String), &a.ClientParams); err != nil {
+				return nil, fmt.Errorf("decode client_params for connection %s: %w", a.ConnectionID, err)
+			}
+		}
+		if a.ClientParams == nil {
+			a.ClientParams = make(map[string]any)
+		}
+		if ip, ok := a.ClientParams["assigned_ip"].(string); ok && ip != "" {
+			a.AssignedIP = ip
+		} else if sessionIP.Valid && sessionIP.String != "" {
+			a.AssignedIP = sessionIP.String
+			a.ClientParams["assigned_ip"] = a.AssignedIP
+			a.NeedsMigration = true
+		}
+		if a.AssignedIP != "" {
+			assignments = append(assignments, a)
+		}
+	}
+	return assignments, rows.Err()
+}
+
+// GetVPNClientIPAssignments reads both persisted client leases and session-only
+// legacy leases before startup invalidates the old session rows.
+func (d *DB) GetVPNClientIPAssignments(ctx context.Context) ([]VPNClientIPAssignment, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return readVPNClientIPAssignments(ctx, d.sqlDB)
 }
 
 // Helper scanners
