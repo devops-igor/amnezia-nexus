@@ -249,6 +249,60 @@ cookies are `Secure` automatically (no extra configuration), and
 
 ---
 
+## Diagnosing return-path queue saturation
+
+The authenticated `/api/vpn/status` endpoint exposes aggregate queue occupancy,
+capacity and high-water marks, plus per-route diagnostics in
+`forwarder_route_queues` (up to 1,000 routes). Queue-full drops use a drop-newest
+policy: queued packets are preserved and the incoming packet is counted in
+`forwarder_drops_queue_full`. No-route and oversized-packet drops have separate
+counters.
+
+Use these write metrics to distinguish a draining queue from a blocked consumer:
+
+| Status field | Meaning |
+| --- | --- |
+| `forwarder_device_write_count` | Admitted writes, including unfinished writes |
+| `forwarder_device_writes_in_flight` | Writes that have not returned, including retired routes |
+| `forwarder_device_write_oldest_in_flight_ms` | Age of the oldest unfinished write; zero when none are active |
+| `forwarder_device_write_duration_ms` | Total duration of completed writes |
+| `forwarder_device_write_max_duration_ms` | Longest completed write |
+| `forwarder_device_write_errors` | Completed writes that returned an error |
+| `forwarder_device_write_stalls` | Writes lasting at least 100 ms, including unfinished writes; each write counts once |
+| `forwarder_device_write_stall_threshold_ms` | The stall threshold (100 ms) |
+
+Rising queue-full drops alongside a growing in-flight write age identify a
+blocked downstream consumer even before the write returns. Route retirement
+waits for admitted writes to finish, but releases both the service and routing
+locks first so status queries and unrelated handshakes remain available.
+
+Each entry in `forwarder_route_queues` also includes `write_count`,
+`write_errors`, `write_stalls`, `writes_in_flight`, `oldest_write_ms`, and
+`max_write_duration_ms`. These describe that active route generation, allowing
+queue-full drops to be correlated with the same client's downstream write.
+Aggregate write metrics retain in-flight writes from retired generations too.
+
+`client_queue_size` defaults to 2,048 packets and is capped using an 8 GiB
+aggregate queued-payload budget, `max_total_peers`, and a 1,500-byte packet bound.
+This budget excludes channel/runtime overhead and packets already in flight.
+Changing `max_total_peers` with connected clients is supported when the limit
+accommodates existing routes and their queue capacity still fits the budget.
+Changing the actual queue capacity requires disconnecting active sessions first.
+Populations above 5,726,623 peers cannot reserve even one packet per route and
+are rejected at startup and during configuration updates.
+
+The synthetic healthy-consumer throughput target is **500 Mbps** (62.5 MB/s).
+Measure the complete forwarder pump and `PacketDevice.Write` path with:
+
+```sh
+go test ./internal/vpn/forwarder -run '^$' -bench BenchmarkHealthyClientPacketDevice -benchtime=2s -count=3
+```
+
+The benchmark sends 1,420-byte packets in bounded bursts, waits for every
+device write, and rejects any packet loss. Its `Mbps` result should exceed the
+target on the intended deployment hardware. The sink is in memory: this checks
+forwarder throughput headroom, not UDP, encryption, or end-to-end VPN bandwidth.
+
 ## Documentation & Specifications
 
 - [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.

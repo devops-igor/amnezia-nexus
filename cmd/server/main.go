@@ -67,7 +67,7 @@ func envVPNListenPort() (port int, ok bool) {
 // startVPNDataPlane wires VPN_LISTEN_PORT into the VPN service and starts
 // the VPN data plane.
 //
-// Issue #16: the env value is authoritative per boot — it is applied to the
+// Issue #16: the env value is authoritative per boot - it is applied to the
 // service config BEFORE Start (so the listener binds the port compose maps)
 // and persisted via UpdateConfig, so subsequent boots read the persisted
 // value even if the env var is later removed. If the operator changes the
@@ -77,25 +77,25 @@ func envVPNListenPort() (port int, ok bool) {
 //
 // When the TUN device is unavailable the server continues in management-only
 // mode (API up, data plane down); other startup errors are fatal.
-func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Config) (bool, error) {
+func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Config) (bool, bool, error) {
 	envPort, envPortSet := envVPNListenPort()
 	if envPortSet {
 		cfgVPN, err := vpnSvc.GetConfig(ctx)
 		if err != nil {
-			return false, fmt.Errorf("failed to load VPN config for VPN_LISTEN_PORT wiring: %w", err)
+			return false, false, fmt.Errorf("failed to load VPN config for VPN_LISTEN_PORT wiring: %w", err)
 		}
 		if cfgVPN.ListenPort != envPort {
 			wasPort := cfgVPN.ListenPort
 			cfgVPN.ListenPort = envPort
 			if err := vpnSvc.UpdateConfig(ctx, cfgVPN); err != nil {
-				return false, fmt.Errorf("failed to apply VPN_LISTEN_PORT=%d to VPN config: %w", envPort, err)
+				return false, false, fmt.Errorf("failed to apply VPN_LISTEN_PORT=%d to VPN config: %w", envPort, err)
 			}
 			slog.Info("VPN listen port set from VPN_LISTEN_PORT env", "port", envPort, "was", wasPort)
 		}
 	}
 
 	if !cfg.VPNEnabled {
-		return false, nil
+		return false, false, nil
 	}
 
 	vpnSvc.RequireTunDevice()
@@ -104,18 +104,18 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 	case stErr == nil:
 		// Log the port the service is actually configured to bind, not
 		// cfg.VPNListenPort (a hardcoded 51820 default when the env is
-		// unset — misleading, Issue #16).
+		// unset - misleading, Issue #16).
 		boundPort := 0
 		if boundCfg, cfgErr := vpnSvc.GetConfig(ctx); cfgErr == nil && boundCfg != nil {
 			boundPort = boundCfg.ListenPort
 		}
 		slog.Info("VPN endpoint started", "listen_port", boundPort)
-		return true, nil
+		return true, true, nil
 	case errors.Is(stErr, endpoint.ErrTunUnavailable):
 		slog.Warn("VPN endpoint unavailable (no TUN device): running management-only", "err", stErr)
-		return false, nil
+		return false, true, nil
 	default:
-		return false, fmt.Errorf("failed to start VPN service: %w", stErr)
+		return false, false, fmt.Errorf("failed to start VPN service: %w", stErr)
 	}
 }
 
@@ -190,18 +190,10 @@ func run(ctx context.Context) error {
 	// 6. User Operations
 	userOps := service.NewUserOpsService(db, reg)
 
-	// 7. Background Orchestrator & Supervisor
+	// 7. Background Orchestrator
 	orch := orchestrator.New(db, reg,
 		orchestrator.WithUserOps(userOps),
 	)
-
-	sup := service.NewSupervisor()
-	sup.RegisterService(orch)
-
-	supErrCh := make(chan error, 1)
-	go func() {
-		supErrCh <- sup.Start(ctx)
-	}()
 
 	// 8. VPN data plane (opt-in via VPN_ENABLED). When the TUN device is
 	// unavailable the server continues in management-only mode (API up, data
@@ -212,12 +204,24 @@ func run(ctx context.Context) error {
 	}
 	vpnSvc.SetAWGStatusProvider(awgMgr)
 
-	vpnStarted, err := startVPNDataPlane(ctx, vpnSvc, cfg)
+	vpnStarted, poolSynced, err := startVPNDataPlane(ctx, vpnSvc, cfg)
 	if err != nil {
 		return err
 	}
+	if poolSynced {
+		orch.SetTunnelStatusUpdater(vpnSvc)
+	}
 
-	// 9. Initialize HTTP Router and Server
+	// 9. Background Supervisor (started strictly after VPN data plane and status updater wiring)
+	sup := service.NewSupervisor()
+	sup.RegisterService(orch)
+
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Start(ctx)
+	}()
+
+	// 10. Initialize HTTP Router and Server
 	r := router.NewRouter(cfg, db, vpnSvc)
 	srv := router.NewServer(cfg, r, db)
 
