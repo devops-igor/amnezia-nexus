@@ -159,7 +159,7 @@ func TestRestartExistingClientRecoversThroughUDPHandshake(t *testing.T) {
 	peerKey := base64.StdEncoding.EncodeToString(peerBytes)
 	if _, err := db.CreateConnection(ctx, &models.UserConnection{
 		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: peerKey,
-		Name: "restarting-client",
+		Name: "restarting-client", ClientParams: map[string]any{"assigned_ip": "10.100.0.30"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,8 @@ func TestRestartExistingClientRecoversThroughUDPHandshake(t *testing.T) {
 		t.Fatalf("old client did not receive a fresh handshake response: n=%d err=%v", n, err)
 	}
 	newSession, ok := svc.sessionMgr.GetSession(peerKey)
-	if !ok || newSession.ID == "prior-process-session" || svc.forwarder.RouteSessionID(peerKey) != newSession.ID || !svc.HasTransportStateForPeer(peerKey) {
+	if !ok || newSession.ID == "prior-process-session" || newSession.AssignedIP != "10.100.0.30" ||
+		svc.forwarder.RouteSessionID(peerKey) != newSession.ID || !svc.HasTransportStateForPeer(peerKey) {
 		t.Fatalf("client did not regain a complete data plane: session=%+v found=%v", newSession, ok)
 	}
 }
