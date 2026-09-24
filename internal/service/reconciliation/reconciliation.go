@@ -455,6 +455,7 @@ func (r *Reconciler) CleanupZombiePeers(ctx context.Context) error {
 	}
 
 	if r.registry != nil {
+		_ = r.AdoptLegacyPeers(ctx)
 		r.cleanupPhase3ZombiePeers(ctx, servers)
 	}
 

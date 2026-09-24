@@ -1270,16 +1270,13 @@ func TestReconciler_MultiServerPartialAdoptionFailure_Regression(t *testing.T) {
 		t.Fatalf("expected Server A zombie peer %s to NOT be in peer_lifecycle", zombiePeerA)
 	}
 
-	// 6. Complete adoption on Server B: running AdoptLegacyPeers marks Server B complete
-	if err := r.AdoptLegacyPeers(ctx); err != nil {
-		t.Fatalf("subsequent AdoptLegacyPeers failed: %v", err)
-	}
+	// Verify Server B scope is now automatically marked complete in settings by CleanupZombiePeers
 	_ = db.GetSetting(ctx, settingKeyB, &adoptedB)
 	if !adoptedB {
-		t.Fatalf("expected Server B scope %s to be marked complete after reachable run", settingKeyB)
+		t.Fatalf("expected Server B scope %s to be marked complete automatically by CleanupZombiePeers", settingKeyB)
 	}
 
-	// 7. Post-adoption on Server B: a new untracked peer (> 2m old) appears on Server B and MUST be purged
+	// 6. Post-adoption on Server B: a new untracked peer (> 2m old) appears on Server B and MUST be purged
 	// Note: zombiePeerA was already removed from Server A's remote container in the previous cleanup.
 	mu.Lock()
 	serverAZombie = false
