@@ -665,3 +665,83 @@ func TestMigrateBackendTunnelsDisableReason(t *testing.T) {
 		t.Errorf("expected default state_version 1, got %d", stateVersion)
 	}
 }
+
+func TestMigrateVPNSessionBackend(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	srv, err := db.CreateServer(ctx, &models.Server{Name: "srv1", Host: "198.51.100.1"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	t1ID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srv,
+		InterfaceName: "awg-1",
+		PublicKey:     "pub1",
+		PrivateKey:    "priv1",
+		Endpoint:      "198.51.100.1:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 1 failed: %v", err)
+	}
+
+	t2ID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srv,
+		InterfaceName: "awg-2",
+		PublicKey:     "pub2",
+		PrivateKey:    "priv2",
+		Endpoint:      "198.51.100.1:51821",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel 2 failed: %v", err)
+	}
+
+	user, err := db.CreateUser(ctx, &models.User{Username: "testmig"})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	sess := &models.VPNSession{
+		ID:              "sess-mig-1",
+		UserID:          user,
+		BackendTunnelID: t1ID,
+		PeerPublicKey:   "peer-pub-1",
+		AssignedIP:      "10.100.0.99",
+		Status:          "connected",
+	}
+	if err := db.CreateVPNSession(ctx, sess); err != nil {
+		t.Fatalf("CreateVPNSession failed: %v", err)
+	}
+
+	// 1. Migrate connected session to t2ID: status must remain connected
+	if err := db.MigrateVPNSessionBackend(ctx, sess.ID, t2ID); err != nil {
+		t.Fatalf("MigrateVPNSessionBackend failed: %v", err)
+	}
+
+	migrated, err := db.GetVPNSessionByID(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetVPNSessionByID failed: %v", err)
+	}
+	if migrated.BackendTunnelID != t2ID {
+		t.Errorf("BackendTunnelID = %d, want %d", migrated.BackendTunnelID, t2ID)
+	}
+	if migrated.Status != "connected" {
+		t.Errorf("Status = %q, want 'connected'", migrated.Status)
+	}
+
+	// 2. Cannot migrate a session that is no longer connected (e.g. disconnected or draining)
+	if err := db.CloseVPNSession(ctx, sess.ID); err != nil {
+		t.Fatalf("CloseVPNSession failed: %v", err)
+	}
+	if err := db.MigrateVPNSessionBackend(ctx, sess.ID, t1ID); err == nil {
+		t.Fatal("expected error migrating disconnected session, got nil")
+	}
+
+	// 3. Cannot migrate non-existent session
+	if err := db.MigrateVPNSessionBackend(ctx, "non-existent-id", t1ID); err == nil {
+		t.Fatal("expected error migrating non-existent session, got nil")
+	}
+}

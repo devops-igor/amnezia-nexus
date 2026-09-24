@@ -513,6 +513,21 @@ func (d *DB) UpdateVPNSessionBackendTunnel(ctx context.Context, sessionID string
 	return nil
 }
 
+// MigrateVPNSessionBackend updates a session's backend_tunnel_id while keeping status 'connected' (issue #289).
+func (d *DB) MigrateVPNSessionBackend(ctx context.Context, sessionID string, backendTunnelID int64) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	query := "UPDATE vpn_sessions SET backend_tunnel_id = ? WHERE id = ? AND status = 'connected'"
+	res, err := d.sqlDB.ExecContext(ctx, query, backendTunnelID, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to migrate vpn session %s backend tunnel: %w", sessionID, err)
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return fmt.Errorf("vpn session %s not found or no longer connected", sessionID)
+	}
+	return nil
+}
+
 // GetActiveVPNSessions retrieves all currently connected sessions.
 func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, error) {
 	d.mu.RLock()
