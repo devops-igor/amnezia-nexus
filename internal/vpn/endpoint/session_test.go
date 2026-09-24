@@ -574,3 +574,61 @@ func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
 		t.Fatal("session not found in active snapshot")
 	}
 }
+
+func TestSessionMetricsStartupAndFreshHandshakes(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatalf("NewIPAM failed: %v", err)
+	}
+
+	sm := NewSessionManager(db, ipam)
+
+	// Check initial snapshot values
+	initialSnap := sm.MetricsSnapshot()
+	if initialSnap["startup_invalidated_sessions_total"] != 0 {
+		t.Errorf("expected initial startup_invalidated_sessions_total to be 0, got %d", initialSnap["startup_invalidated_sessions_total"])
+	}
+	if initialSnap["fresh_handshakes_after_startup_total"] != 0 {
+		t.Errorf("expected initial fresh_handshakes_after_startup_total to be 0, got %d", initialSnap["fresh_handshakes_after_startup_total"])
+	}
+
+	// Record startup invalidated sessions
+	sm.RecordStartupInvalidated(5)
+	sm.RecordStartupInvalidated(0) // should be no-op
+	snapAfterInvalidate := sm.MetricsSnapshot()
+	if snapAfterInvalidate["startup_invalidated_sessions_total"] != 5 {
+		t.Errorf("expected startup_invalidated_sessions_total to be 5, got %d", snapAfterInvalidate["startup_invalidated_sessions_total"])
+	}
+
+	// Create a server, tunnel, and user
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-metrics",
+		PublicKey:     "tunnel-pubkey-m",
+		PrivateKey:    "tunnel-privkey-m",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-m"})
+
+	// CreateSession should increment fresh_handshakes_after_startup_total
+	_, err = sm.CreateSession(ctx, uID, "peer-m-1", "10.100.0.10", tID, "conn-1")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	snapAfterSess1 := sm.MetricsSnapshot()
+	if snapAfterSess1["fresh_handshakes_after_startup_total"] != 1 {
+		t.Errorf("expected fresh_handshakes_after_startup_total to be 1, got %d", snapAfterSess1["fresh_handshakes_after_startup_total"])
+	}
+
+	// Explicit RecordFreshHandshake
+	sm.RecordFreshHandshake()
+	snapAfterExplicit := sm.MetricsSnapshot()
+	if snapAfterExplicit["fresh_handshakes_after_startup_total"] != 2 {
+		t.Errorf("expected fresh_handshakes_after_startup_total to be 2, got %d", snapAfterExplicit["fresh_handshakes_after_startup_total"])
+	}
+}

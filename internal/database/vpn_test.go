@@ -665,3 +665,132 @@ func TestMigrateBackendTunnelsDisableReason(t *testing.T) {
 		t.Errorf("expected default state_version 1, got %d", stateVersion)
 	}
 }
+
+func TestInvalidateConnectedSessionsOnRestart(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Empty database returns 0 affected rows without error
+	count, err := db.InvalidateConnectedSessionsOnRestart(ctx)
+	if err != nil {
+		t.Fatalf("expected no error on empty db, got: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 invalidated sessions on empty db, got %d", count)
+	}
+
+	// 2. Set up test server, tunnel, and user
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-inv",
+		PublicKey:     "pub-be-inv",
+		PrivateKey:    "priv-be-inv",
+		Endpoint:      "192.0.2.10:51820",
+		Status:        models.TunnelStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	uID, err := db.CreateUser(ctx, &models.User{Username: "test-user-inv"})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// Insert 4 sessions with distinct statuses:
+	// - s1: connected
+	// - s2: connected
+	// - s3: draining
+	// - s4: disconnected
+	s1 := &models.VPNSession{
+		ID:              "sess-1-connected",
+		UserID:          uID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "peer-key-1",
+		AssignedIP:      "10.100.0.10",
+		Status:          "connected",
+	}
+	s2 := &models.VPNSession{
+		ID:              "sess-2-connected",
+		UserID:          uID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "peer-key-2",
+		AssignedIP:      "10.100.0.11",
+		Status:          "connected",
+	}
+	s3 := &models.VPNSession{
+		ID:              "sess-3-draining",
+		UserID:          uID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "peer-key-3",
+		AssignedIP:      "10.100.0.12",
+		Status:          "draining",
+	}
+	s4 := &models.VPNSession{
+		ID:              "sess-4-disconnected",
+		UserID:          uID,
+		BackendTunnelID: tID,
+		PeerPublicKey:   "peer-key-4",
+		AssignedIP:      "10.100.0.13",
+		Status:          "disconnected",
+	}
+
+	for _, s := range []*models.VPNSession{s1, s2, s3, s4} {
+		if err := db.CreateVPNSession(ctx, s); err != nil {
+			t.Fatalf("CreateVPNSession failed for %s: %v", s.ID, err)
+		}
+	}
+
+	// Verify initial active sessions count is 2 (only connected)
+	activeBefore, err := db.GetActiveVPNSessions(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveVPNSessions before invalidation failed: %v", err)
+	}
+	if len(activeBefore) != 2 {
+		t.Fatalf("expected 2 active sessions before invalidation, got %d", len(activeBefore))
+	}
+
+	// 3. Run InvalidateConnectedSessionsOnRestart: s1, s2 (connected) and s3 (draining) should be updated
+	count, err = db.InvalidateConnectedSessionsOnRestart(ctx)
+	if err != nil {
+		t.Fatalf("InvalidateConnectedSessionsOnRestart failed: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 invalidated sessions, got %d", count)
+	}
+
+	// 4. Verify all 4 sessions in DB now have status='disconnected'
+	for _, id := range []string{"sess-1-connected", "sess-2-connected", "sess-3-draining", "sess-4-disconnected"} {
+		sess, err := db.GetVPNSessionByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetVPNSessionByID(%s) failed: %v", id, err)
+		}
+		if sess == nil {
+			t.Fatalf("expected session %s to exist, got nil", id)
+		}
+		if sess.Status != "disconnected" {
+			t.Errorf("session %s expected status 'disconnected', got %q", id, sess.Status)
+		}
+	}
+
+	// 5. Verify GetActiveVPNSessions now returns 0
+	activeAfter, err := db.GetActiveVPNSessions(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveVPNSessions after invalidation failed: %v", err)
+	}
+	if len(activeAfter) != 0 {
+		t.Errorf("expected 0 active sessions after invalidation, got %d", len(activeAfter))
+	}
+
+	// 6. Test Idempotency: second call returns 0 rows affected
+	countIdempotent, err := db.InvalidateConnectedSessionsOnRestart(ctx)
+	if err != nil {
+		t.Fatalf("second InvalidateConnectedSessionsOnRestart call failed: %v", err)
+	}
+	if countIdempotent != 0 {
+		t.Errorf("expected 0 affected sessions on idempotent call, got %d", countIdempotent)
+	}
+}

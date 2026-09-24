@@ -266,8 +266,10 @@ func TestReconcileConnectionCountsDBErrorDoesNotFail(t *testing.T) {
 }
 
 // TestStartReconcilesConnectionGauge wires the contract end to end: seeding
-// drift into the DB, then running the real startup sequence, must leave the
-// gauge equal to the true connected-session count.
+// drift into the DB, then running the real startup sequence. Under issue #297,
+// startup invalidates pre-existing persisted sessions (since in-memory transport
+// and forwarder routes are wiped on restart) and reconciles the drifted gauge to 0.
+// When the peer reconnects post-startup, the gauge reflects the live session count (1).
 func TestStartReconcilesConnectionGauge(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
@@ -281,11 +283,21 @@ func TestStartReconcilesConnectionGauge(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("setup: poison DB counter failed: %v", err)
 	}
-	// One connected session row in the DB (the session manager's own table).
+	// Seed a persisted connected session row from before restart.
+	peerKey := "peer-start-reconcile"
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   uID,
+		ServerID: tun.ServerID,
+		Protocol: "awg",
+		ClientID: peerKey,
+		Name:     "reconcile-conn",
+	}); err != nil {
+		t.Fatalf("setup: CreateConnection failed: %v", err)
+	}
 	if err := db.CreateVPNSession(ctx, &models.VPNSession{
 		UserID:          uID,
 		BackendTunnelID: tun.ID,
-		PeerPublicKey:   "peer-start-reconcile",
+		PeerPublicKey:   peerKey,
 		AssignedIP:      "10.201.1.50",
 		Status:          "connected",
 	}); err != nil {
@@ -297,18 +309,29 @@ func TestStartReconcilesConnectionGauge(t *testing.T) {
 	}
 	defer func() { _ = svc.Stop() }()
 
+	// Under issue #297, restart invalidates pre-existing sessions and reconciles the gauge to 0
 	poolTun, err := svc.pool.GetTunnelByID(tun.ID)
 	if err != nil {
 		t.Fatalf("GetTunnelByID failed: %v", err)
 	}
-	if poolTun.ActiveConnections != 1 {
-		t.Errorf("after Start: pool active_connections = %d, want 1", poolTun.ActiveConnections)
+	if poolTun.ActiveConnections != 0 {
+		t.Errorf("after Start: pool active_connections = %d, want 0 (invalidated on restart)", poolTun.ActiveConnections)
 	}
 	row, err := db.GetBackendTunnel(ctx, tun.ID)
 	if err != nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if row.ActiveConnections != 1 {
-		t.Errorf("after Start: DB active_connections = %d, want 1", row.ActiveConnections)
+	if row.ActiveConnections != 0 {
+		t.Errorf("after Start: DB active_connections = %d, want 0", row.ActiveConnections)
+	}
+
+	// When the peer performs a fresh handshake post-restart, the gauge updates to 1
+	_, backend, err := svc.HandleIncomingPeer(ctx, peerKey)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed: %v", err)
+	}
+	poolTunAfter, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil || poolTunAfter.ActiveConnections != 1 {
+		t.Errorf("after peer handshake: pool active_connections for backend %d = %v, want 1 (err: %v)", backend.ID, poolTunAfter, err)
 	}
 }

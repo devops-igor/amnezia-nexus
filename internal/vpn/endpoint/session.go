@@ -38,6 +38,8 @@ type SessionMetrics struct {
 	ReplacementCounterMigrationsTotal atomic.Int64
 	ReplacementDBTeardownErrorsTotal  atomic.Int64
 	ReplacementsPersistFailedTotal    atomic.Int64
+	StartupInvalidatedSessionsTotal   atomic.Int64
+	FreshHandshakesAfterStartupTotal  atomic.Int64
 }
 
 // snapshot returns a plain map copy of the counters for stats exposure.
@@ -47,6 +49,8 @@ func (m *SessionMetrics) snapshot() map[string]int64 {
 		"replacement_counter_migrations_total": m.ReplacementCounterMigrationsTotal.Load(),
 		"replacement_db_teardown_errors_total": m.ReplacementDBTeardownErrorsTotal.Load(),
 		"replacements_persist_failed_total":    m.ReplacementsPersistFailedTotal.Load(),
+		"startup_invalidated_sessions_total":   m.StartupInvalidatedSessionsTotal.Load(),
+		"fresh_handshakes_after_startup_total": m.FreshHandshakesAfterStartupTotal.Load(),
 	}
 }
 
@@ -87,6 +91,18 @@ func (sm *SessionManager) SetReplacementHook(fn ReplacementHook) {
 // leak paths (issue #78) stay distinguishable in production telemetry.
 func (sm *SessionManager) MetricsSnapshot() map[string]int64 {
 	return sm.metrics.snapshot()
+}
+
+// RecordStartupInvalidated records the count of persisted sessions invalidated on restart.
+func (sm *SessionManager) RecordStartupInvalidated(count int64) {
+	if count > 0 {
+		sm.metrics.StartupInvalidatedSessionsTotal.Add(count)
+	}
+}
+
+// RecordFreshHandshake increments the fresh handshakes counter after startup.
+func (sm *SessionManager) RecordFreshHandshake() {
+	sm.metrics.FreshHandshakesAfterStartupTotal.Add(1)
 }
 
 // LifecycleVersion returns the monotonically increasing session lifecycle version.
@@ -202,6 +218,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	sm.sessionsByID[sessionID] = sess
 	sm.activeCount.Add(1)
 	sm.lifecycleVersion.Add(1)
+	sm.metrics.FreshHandshakesAfterStartupTotal.Add(1)
 
 	// Fire the replacement hook AFTER the new session is fully registered so
 	// the caller sees a consistent old→new transition. The hook migrates the

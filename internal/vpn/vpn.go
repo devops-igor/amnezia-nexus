@@ -968,7 +968,22 @@ func (s *Service) Start(ctx context.Context) error {
 		s.restoreBackendDevices(ctx)
 	}
 
-	// 2. Sync sessions from DB
+	// 2. Invalidate persisted connected sessions on restart and sync from DB (issue #297).
+	// Process restart wipes in-memory endpoint transport state and live forwarder routes.
+	// Persisted connected and draining sessions are transitioned to disconnected so that
+	// SessionManager and connection count gauges start clean.
+	if s.db != nil {
+		invalidated, err := s.db.InvalidateConnectedSessionsOnRestart(ctx)
+		if err != nil {
+			log.Printf("[vpn] warning: failed to invalidate persisted connected sessions on restart: %v", err)
+		} else if invalidated > 0 {
+			log.Printf("[vpn] invalidated %d persisted connected session(s) on restart", invalidated)
+			if s.sessionMgr != nil {
+				s.sessionMgr.RecordStartupInvalidated(invalidated)
+			}
+		}
+	}
+
 	if s.sessionMgr != nil {
 		_ = s.sessionMgr.SyncFromDB(ctx)
 	}
@@ -2452,6 +2467,19 @@ func (s *Service) GetConfig(ctx context.Context) (*models.VPNConfig, error) {
 	}
 	cfgCopy := *s.cfg
 	return &cfgCopy, nil
+}
+
+// SessionManager returns the service's session manager instance.
+func (s *Service) SessionManager() *endpoint.SessionManager {
+	return s.sessionMgr
+}
+
+// SessionMetrics returns a copy of the session lifecycle counters.
+func (s *Service) SessionMetrics() map[string]int64 {
+	if s.sessionMgr != nil {
+		return s.sessionMgr.MetricsSnapshot()
+	}
+	return nil
 }
 
 // UpdateConfig updates the dynamic VPN configuration and reinitializes the load balancer.

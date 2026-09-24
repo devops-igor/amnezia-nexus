@@ -606,6 +606,27 @@ func (d *DB) CloseVPNSession(ctx context.Context, sessionID string) error {
 	return d.DeleteVPNSession(ctx, sessionID)
 }
 
+// InvalidateConnectedSessionsOnRestart marks all connected or draining sessions as
+// disconnected on service startup. This prevents stale in-memory transport and forwarder
+// state from causing route mismatches and active connection gauge distortion across restarts.
+func (d *DB) InvalidateConnectedSessionsOnRestart(ctx context.Context) (int64, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE vpn_sessions SET status = 'disconnected' WHERE status = 'connected' OR status = 'draining'`
+	res, err := d.sqlDB.ExecContext(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to invalidate connected sessions on restart: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to inspect rows affected when invalidating connected sessions on restart: %w", err)
+	}
+
+	return rows, nil
+}
+
 // Helper scanners
 
 func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
