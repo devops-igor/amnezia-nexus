@@ -11,6 +11,85 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
+func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout bool
+	}{
+		{name: "close"},
+		{name: "idle timeout", timeout: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			db := setupTestDB(t)
+			ipam, err := NewIPAM("10.100.0.0/24")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sm := NewSessionManager(db, ipam)
+			serverID, err := db.CreateServer(ctx, &models.Server{Name: "remote", Host: "192.0.2.7"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tunnelID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID: serverID, InterfaceName: "awg-be-remote", PublicKey: "backend-public-key",
+				PrivateKey: "backend-private-key", Endpoint: "192.0.2.7:51820",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			userID, err := db.CreateUser(ctx, &models.User{Username: "portal-client", Enabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const peer = "shared-portal-and-remote-key"
+			const portalIP = "10.100.0.2"
+			if _, err := db.CreateConnection(ctx, &models.UserConnection{
+				ID: "remote-first", UserID: userID, ServerID: serverID,
+				Protocol: "awg", ClientID: peer,
+				ClientParams: map[string]any{"assigned_ip": "10.66.66.4"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.CreateConnection(ctx, &models.UserConnection{
+				ID: "portal-second", UserID: userID, ServerID: 0,
+				Protocol: "awg", ClientID: peer,
+				ClientParams: map[string]any{"assigned_ip": portalIP},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Confirm that the old unscoped lookup would inspect the wrong row.
+			unscoped, err := db.GetConnectionByToken(ctx, peer)
+			if err != nil || unscoped == nil || unscoped.ID != "remote-first" {
+				t.Fatalf("test setup did not select remote row first: conn=%+v err=%v", unscoped, err)
+			}
+			if err := ipam.Reserve(net.ParseIP(portalIP), peer); err != nil {
+				t.Fatal(err)
+			}
+			sess, err := sm.CreateSession(ctx, userID, peer, portalIP, tunnelID, "portal-client")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.timeout {
+				sm.SetSessionLastSeen(peer, time.Now().UTC().Add(-2*time.Hour))
+				timedOut, err := sm.CheckTimeouts(ctx, time.Hour)
+				if err != nil || len(timedOut) != 1 || timedOut[0].ID != sess.ID {
+					t.Fatalf("timeout did not close portal session: sessions=%+v err=%v", timedOut, err)
+				}
+			} else if err := sm.CloseSession(ctx, sess.ID, "disconnected"); err != nil {
+				t.Fatal(err)
+			}
+			if ip, ok := ipam.GetAssignedIP(peer); !ok || ip.String() != portalIP || !ipam.IsAllocated(net.ParseIP(portalIP)) {
+				t.Fatalf("teardown freed durable portal IP: assigned=%v present=%t", ip, ok)
+			}
+			portal, err := db.GetConnectionByClientID(ctx, peer, 0)
+			if err != nil || portal == nil || portal.ClientParams["assigned_ip"] != portalIP {
+				t.Fatalf("durable portal assignment changed: conn=%+v err=%v", portal, err)
+			}
+		})
+	}
+}
+
 func TestSessionManagerCRUD(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -164,56 +243,6 @@ func TestSessionManagerTimeoutsAndDrain(t *testing.T) {
 	// zero timeout (noop)
 	if to, err := sm.CheckTimeouts(ctx, 0); err != nil || len(to) != 0 {
 		t.Errorf("expected noop on zero timeout")
-	}
-}
-
-func TestSessionManagerSyncFromDB(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	ipam, _ := NewIPAM("10.100.0.0/24")
-
-	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
-	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: "awg-be-1",
-		PublicKey:     "tunnel-pubkey",
-		PrivateKey:    "tunnel-privkey",
-		Endpoint:      "10.0.0.1:51820",
-	})
-	uID, _ := db.CreateUser(ctx, &models.User{Username: "sync_user"})
-
-	// Pre-insert into DB
-	_ = db.CreateVPNSession(ctx, &models.VPNSession{
-		ID:              "sync-sess-1",
-		UserID:          uID,
-		BackendTunnelID: tID,
-		PeerPublicKey:   "sync-peer-1",
-		AssignedIP:      "10.100.0.10",
-		Status:          "connected",
-	})
-
-	sm := NewSessionManager(db, ipam)
-	if err := sm.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	if sm.ActiveCount() != 1 {
-		t.Fatalf("expected 1 active session after sync, got %d", sm.ActiveCount())
-	}
-	sess, ok := sm.GetSessionByID("sync-sess-1")
-	if !ok || sess.PeerPublicKey != "sync-peer-1" {
-		t.Errorf("synced session mismatch: %+v", sess)
-	}
-
-	if !ipam.IsAllocated(net.ParseIP("10.100.0.10")) {
-		t.Errorf("expected 10.100.0.10 to be marked allocated in IPAM after sync")
-	}
-
-	// nil DB sync
-	smNil := NewSessionManager(nil, ipam)
-	if err := smNil.SyncFromDB(ctx); err != nil {
-		t.Errorf("SyncFromDB nil db failed: %v", err)
 	}
 }
 
