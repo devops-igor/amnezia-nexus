@@ -3729,10 +3729,6 @@ func findAWGConnection(ctx context.Context, db *database.DB, user *models.User) 
 		return latestLB
 	}
 
-	// Priority 4: Fallback for single-connection tests / legacy mode
-	if len(conns) == 1 && models.NormalizeProtocol(conns[0].Protocol) == "awg" {
-		return &conns[0]
-	}
 	return nil
 }
 
