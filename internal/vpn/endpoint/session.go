@@ -223,6 +223,20 @@ func (sm *SessionManager) GetSession(peerPublicKey string) (*models.VPNSession, 
 	return sess, ok
 }
 
+// GetSessionByPeer retrieves an active session by peer public key.
+func (sm *SessionManager) GetSessionByPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, error) {
+	if sm == nil {
+		return nil, errors.New("nil session manager")
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	sess, ok := sm.sessionsByPeer[peerPublicKey]
+	if !ok || sess == nil {
+		return nil, ErrSessionNotFound
+	}
+	return sess, nil
+}
+
 // GetSessionByID retrieves a session by session ID.
 func (sm *SessionManager) GetSessionByID(sessionID string) (*models.VPNSession, bool) {
 	sm.mu.RLock()

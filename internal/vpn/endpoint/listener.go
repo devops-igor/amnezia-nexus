@@ -3,6 +3,7 @@ package endpoint
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -137,6 +139,8 @@ type ListenerConfig struct {
 	PrivateKey  string
 	PublicKey   string
 	IdleTimeout time.Duration
+	// RejectAfterTime is the cryptographic validity lifetime of a transport keypair (default 180s).
+	RejectAfterTime time.Duration
 	// HeaderProtectionKey is the AWG 3.x header protection key (hex or base64).
 	HeaderProtectionKey string
 	// H1 is the AWG handshake initiation message type range; zero/empty selects
@@ -187,14 +191,12 @@ type IncomingPeerHandler func(ctx context.Context, peerPublicKey string) (*model
 // a peer (the VPN service wires it to forwarder.RouteClientToBackend).
 type ClientPacketRouter func(peerKey string, packet []byte) error
 
-// activePeerState tracks a peer's most recent UDP endpoint and transport
-// send counter so late transport datagrams and server→client sends can find
-// the right socket address.
+// activePeerState tracks a peer's most recent UDP endpoint so late transport
+// datagrams and server→client sends can find the right socket address.
 type activePeerState struct {
 	peerKey         string
 	udpAddr         *net.UDPAddr // cached pre-parsed UDP endpoint (avoids per-packet string resolution, issue #151)
 	receiverIdx     atomic.Uint32
-	sendCount       atomic.Uint64
 	lastSeen        atomic.Int64 // unix nanos
 	lastTouchSec    atomic.Int64 // unix seconds (issue #294: throttles TouchSession calls)
 	decryptLogUntil atomic.Int64 // unix seconds (issue #148 rate limiting)
@@ -204,6 +206,21 @@ type activePeerState struct {
 type packetJob struct {
 	data   []byte
 	sender *net.UDPAddr
+}
+
+// peerKeypairs tracks the active and previous transport keypair generations for a peer (Issue #295).
+type peerKeypairs struct {
+	peerKey        string
+	nextGeneration uint64
+	current        *TransportKeys
+	previous       *TransportKeys
+	prevLogUntil   atomic.Int64
+}
+
+// keypairEntry maps a local receiver index to its owning peer and transport keyset.
+type keypairEntry struct {
+	peerKey string
+	keys    *TransportKeys
 }
 
 // Listener manages the AWG endpoint UDP listener and peer lifecycle.
@@ -218,6 +235,9 @@ type Listener struct {
 	serverKeys          *ServerKeysManager
 	serverPriv          []byte
 	noiseKeys           map[string]*TransportKeys
+	peerKeypairs        map[string]*peerKeypairs
+	indexTable          map[uint32]*keypairEntry
+	rejectAfterTime     time.Duration
 	peersByAddr         map[string]*activePeerState // sender UDP addr string -> peer state
 	peerGenerations     map[string]uint64           // peerKey -> highest committed generation
 	udpConn             *net.UDPConn
@@ -264,6 +284,14 @@ type Listener struct {
 	peerSendLocks   map[string]*sync.Mutex
 
 	postCommitHook func(peerKey string, gen uint64)
+
+	// preTransportCommitHook runs in handleDatagram after response and transport keys
+	// are built, but before transport state is committed; used for deterministic testing.
+	preTransportCommitHook func(peerKey string, sessID string)
+
+	// preSweepPruneHook runs in SweepTimedOutSessions after a timed-out session is found
+	// but before PrunePeerTransportStateForGeneration executes; used for deterministic testing.
+	preSweepPruneHook func(peerKey string, timedOutGen uint64)
 }
 
 // applyListenerConfigDefaults applies fallback defaults to zero-valued config fields.
@@ -279,6 +307,9 @@ func applyListenerConfigDefaults(cfg *ListenerConfig) {
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 3 * time.Minute
+	}
+	if cfg.RejectAfterTime <= 0 {
+		cfg.RejectAfterTime = device.RejectAfterTime
 	}
 	if cfg.H1.IsZero() {
 		cfg.H1 = models.DegenerateHeaderRange(health.DefaultH1)
@@ -361,6 +392,11 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 		}
 	}
 
+	rejectAfterTime := cfg.RejectAfterTime
+	if rejectAfterTime <= 0 {
+		rejectAfterTime = device.RejectAfterTime
+	}
+
 	return &Listener{
 		config:          cfg,
 		hpKey:           hpKeyBytes,
@@ -370,6 +406,9 @@ func NewListener(cfg ListenerConfig, db *database.DB, auth Authenticator, ipam *
 		sessionMgr:      sessionMgr,
 		serverKeys:      serverKeys,
 		noiseKeys:       make(map[string]*TransportKeys),
+		peerKeypairs:    make(map[string]*peerKeypairs),
+		indexTable:      make(map[uint32]*keypairEntry),
+		rejectAfterTime: rejectAfterTime,
 		peersByAddr:     make(map[string]*activePeerState),
 		peerGenerations: make(map[string]uint64),
 		peerSendLocks:   make(map[string]*sync.Mutex),
@@ -655,7 +694,15 @@ func (el *Listener) AuthenticateAndRegisterPeer(ctx context.Context, peerPublicK
 		return nil, fmt.Errorf("ip allocation failed: %w", err)
 	}
 
-	sess, err := sm.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backendTunnelID, conn.Name)
+	el.mu.Lock()
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+	el.peerGenerations[peerPublicKey]++
+	peerGen := el.peerGenerations[peerPublicKey]
+	el.mu.Unlock()
+
+	sess, err := sm.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backendTunnelID, conn.Name, peerGen)
 	if err != nil {
 		_ = ipam.Release(peerPublicKey)
 		return nil, fmt.Errorf("session creation failed: %w", err)
@@ -681,10 +728,6 @@ func (el *Listener) peerSendLock(peerKey string) *sync.Mutex {
 
 // DisconnectPeer disconnects a peer and closes their session.
 func (el *Listener) DisconnectPeer(ctx context.Context, peerPublicKey string) error {
-	el.peerSendLocksMu.Lock()
-	delete(el.peerSendLocks, peerPublicKey)
-	el.peerSendLocksMu.Unlock()
-
 	el.mu.RLock()
 	sm := el.sessionMgr
 	el.mu.RUnlock()
@@ -698,7 +741,53 @@ func (el *Listener) DisconnectPeer(ctx context.Context, peerPublicKey string) er
 		return ErrPeerNotFound
 	}
 
-	return sm.CloseSession(ctx, sess.ID, "disconnected")
+	err := sm.CloseSession(ctx, sess.ID, "disconnected")
+
+	el.mu.Lock()
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+	fenceGen := sess.Generation + 1
+	if fenceGen <= el.peerGenerations[peerPublicKey] {
+		fenceGen = el.peerGenerations[peerPublicKey] + 1
+	}
+	el.peerGenerations[peerPublicKey] = fenceGen
+	el.mu.Unlock()
+
+	el.PrunePeerTransportState(peerPublicKey, fenceGen)
+	return err
+}
+
+// DisconnectSession disconnects a specific session by ID and prunes its transport state.
+func (el *Listener) DisconnectSession(ctx context.Context, sessionID string) error {
+	el.mu.RLock()
+	sm := el.sessionMgr
+	el.mu.RUnlock()
+
+	if sm == nil {
+		return nil
+	}
+
+	sess, ok := sm.GetSessionByID(sessionID)
+	if !ok {
+		return ErrSessionNotFound
+	}
+
+	err := sm.CloseSession(ctx, sessionID, "disconnected")
+
+	el.mu.Lock()
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+	fenceGen := sess.Generation + 1
+	if fenceGen <= el.peerGenerations[sess.PeerPublicKey] {
+		fenceGen = el.peerGenerations[sess.PeerPublicKey] + 1
+	}
+	el.peerGenerations[sess.PeerPublicKey] = fenceGen
+	el.mu.Unlock()
+
+	el.PrunePeerTransportState(sess.PeerPublicKey, fenceGen)
+	return err
 }
 
 // GetListenAddr returns the bound UDP address or nil.
@@ -871,23 +960,280 @@ func (el *Listener) TransportKeysFor(peerKey string) (*TransportKeys, bool) {
 	return keys, ok
 }
 
+func (el *Listener) getRejectAfterTime() time.Duration {
+	if el.rejectAfterTime > 0 {
+		return el.rejectAfterTime
+	}
+	if el.config.RejectAfterTime > 0 {
+		return el.config.RejectAfterTime
+	}
+	return device.RejectAfterTime
+}
+
 // storeTransportKeys records the transport keys derived for a peer's active
-// handshake, replacing any previous keys from an earlier handshake.
-func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys) {
+// handshake, rotating any previous current keys to previous and registering the
+// keypair in indexTable.
+func (el *Listener) storeTransportKeys(peerKey string, keys *TransportKeys, sessionIDs ...string) {
 	if keys != nil {
 		_ = keys.InitCiphers()
 	}
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	el.storeTransportKeysLocked(peerKey, keys)
+}
+
+func (el *Listener) storeTransportKeysLocked(peerKey string, newKeys *TransportKeys) {
 	if el.noiseKeys == nil {
 		el.noiseKeys = make(map[string]*TransportKeys)
 	}
-	el.noiseKeys[peerKey] = keys
+	if el.peerKeypairs == nil {
+		el.peerKeypairs = make(map[string]*peerKeypairs)
+	}
+	if el.indexTable == nil {
+		el.indexTable = make(map[uint32]*keypairEntry)
+	}
+
+	if newKeys == nil {
+		el.noiseKeys[peerKey] = nil
+		return
+	}
+
+	pkp, ok := el.peerKeypairs[peerKey]
+	if !ok {
+		pkp = &peerKeypairs{
+			peerKey: peerKey,
+		}
+		el.peerKeypairs[peerKey] = pkp
+	}
+	if pkp.nextGeneration == 0 {
+		pkp.nextGeneration = 1
+	}
+
+	if newKeys.Generation == 0 {
+		newKeys.Generation = pkp.nextGeneration
+		pkp.nextGeneration++
+	}
+
+	if newKeys.CreatedAt.IsZero() {
+		newKeys.CreatedAt = time.Now()
+	}
+	if newKeys.ExpiresAt.IsZero() {
+		newKeys.ExpiresAt = newKeys.CreatedAt.Add(el.getRejectAfterTime())
+	}
+
+	if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+		delete(el.indexTable, pkp.previous.LocalIndex)
+	}
+	if pkp.current != nil {
+		pkp.previous = pkp.current
+	}
+	pkp.current = newKeys
+
+	if newKeys.LocalIndex != 0 {
+		el.indexTable[newKeys.LocalIndex] = &keypairEntry{
+			peerKey: peerKey,
+			keys:    newKeys,
+		}
+	}
+	el.noiseKeys[peerKey] = newKeys
+
+	log.Printf("[vpn/endpoint] stored transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d expires_in=%s",
+		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
+}
+
+// allocateReceiverIndex generates an unused, non-zero 32-bit receiver index that
+// does not collide with any active keypair entry in el.indexTable, and reserves
+// the slot in indexTable to avoid races between concurrent handshakes.
+func (el *Listener) allocateReceiverIndex(peerKey string) uint32 {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.indexTable == nil {
+		el.indexTable = make(map[uint32]*keypairEntry)
+	}
+
+	var idxBuf [4]byte
+	for {
+		if _, err := rand.Read(idxBuf[:]); err != nil {
+			// #nosec G404 -- fallback in rare crypto/rand failure
+			val := randv2.Uint32()
+			binary.LittleEndian.PutUint32(idxBuf[:], val)
+		}
+		idx := binary.LittleEndian.Uint32(idxBuf[:])
+		if idx == 0 {
+			continue
+		}
+		if _, exists := el.indexTable[idx]; !exists {
+			el.indexTable[idx] = &keypairEntry{peerKey: peerKey, keys: nil}
+			return idx
+		}
+	}
+}
+
+// releaseReceiverIndex frees a reserved indexTable slot if keys were never committed.
+func (el *Listener) releaseReceiverIndex(idx uint32) {
+	if idx == 0 {
+		return
+	}
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.releaseReceiverIndexLocked(idx)
+}
+
+func (el *Listener) releaseReceiverIndexLocked(idx uint32) {
+	if idx == 0 {
+		return
+	}
+	if entry, ok := el.indexTable[idx]; ok && entry.keys == nil {
+		delete(el.indexTable, idx)
+	}
+}
+
+func (el *Listener) lookupKeypairByIndex(receiverIdx uint32) (*keypairEntry, bool) {
+	if receiverIdx == 0 {
+		return nil, false
+	}
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	entry, ok := el.indexTable[receiverIdx]
+	return entry, ok
+}
+
+// PeerKeypairsForTest returns the current and previous transport keys for a peer.
+func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys, previous *TransportKeys) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	if pkp, ok := el.peerKeypairs[peerKey]; ok {
+		return pkp.current, pkp.previous
+	}
+	return nil, nil
+}
+
+// IndexTableCountForTest returns the number of entries in indexTable.
+func (el *Listener) IndexTableCountForTest() int {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	return len(el.indexTable)
+}
+
+func (el *Listener) keypairStatus(peerKey string, keys *TransportKeys) string {
+	if keys == nil {
+		return "unknown"
+	}
+	if keys.IsExpired() {
+		return "expired"
+	}
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	if pkp, ok := el.peerKeypairs[peerKey]; ok {
+		if pkp.previous == keys {
+			return "previous"
+		}
+		if pkp.current == keys {
+			return "current"
+		}
+	}
+	return "current"
 }
 
 // StoreTransportKeysForTest exposes storeTransportKeys for integration tests.
-func (el *Listener) StoreTransportKeysForTest(peerKey string, keys *TransportKeys) {
+func (el *Listener) StoreTransportKeysForTest(peerKey string, keys *TransportKeys, sessionIDs ...string) {
 	el.storeTransportKeys(peerKey, keys)
+}
+
+// SetPeerSessionIDForTest is preserved for test compatibility.
+func (el *Listener) SetPeerSessionIDForTest(peerKey, sessionID string) {
+}
+
+// PeerSessionIDForTest returns the active session ID from sessionMgr if present.
+func (el *Listener) PeerSessionIDForTest(peerKey string) string {
+	if el.sessionMgr != nil {
+		if s, ok := el.sessionMgr.GetSession(peerKey); ok && s != nil {
+			return s.ID
+		}
+	}
+	return ""
+}
+
+// SetPreTransportCommitHookForTest registers a hook invoked before committing handshake transport state.
+func (el *Listener) SetPreTransportCommitHookForTest(fn func(peerKey string, sessID string)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.preTransportCommitHook = fn
+}
+
+// SetPreSweepPruneHookForTest registers a hook invoked in SweepTimedOutSessions
+// after discovering a timed-out session, but before invoking PrunePeerTransportStateForGeneration.
+func (el *Listener) SetPreSweepPruneHookForTest(fn func(peerKey string, timedOutGen uint64)) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.preSweepPruneHook = fn
+}
+
+// CommitHandshakeTransportStateForTest exposes commitHandshakeTransportState for tests.
+func (el *Listener) CommitHandshakeTransportStateForTest(peerKey string, sessID string, transportKeys *TransportKeys, allocatedIdx uint32, sender *net.UDPAddr, remoteIdx uint32) bool {
+	if el.sessionMgr != nil && sessID != "" {
+		active, ok := el.sessionMgr.GetSession(peerKey)
+		if !ok || active == nil || active.ID != sessID || active.Status != "connected" {
+			el.releaseReceiverIndex(allocatedIdx)
+			return false
+		}
+		return el.CommitHandshake(peerKey, active.Generation, transportKeys, sender, remoteIdx)
+	}
+	return el.CommitHandshake(peerKey, 0, transportKeys, sender, remoteIdx)
+}
+
+// LookupKeypairByIndexForTest returns the transport keys registered for receiverIdx.
+func (el *Listener) LookupKeypairByIndexForTest(receiverIdx uint32) (*TransportKeys, bool) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	entry, ok := el.indexTable[receiverIdx]
+	if !ok || entry == nil {
+		return nil, false
+	}
+	return entry.keys, true
+}
+
+// HasPeerAddrForTest reports whether any peersByAddr mapping exists for peerKey.
+func (el *Listener) HasPeerAddrForTest(peerKey string) bool {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	for _, st := range el.peersByAddr {
+		if st != nil && st.peerKey == peerKey {
+			return true
+		}
+	}
+	return false
+}
+
+// HasTransportStateForPeer reports whether any transport state (keypairs, noiseKeys,
+// indexTable entries, or peersByAddr mappings) currently exists for peerKey.
+func (el *Listener) HasTransportStateForPeer(peerKey string) bool {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+
+	if pkp, ok := el.peerKeypairs[peerKey]; ok && pkp != nil {
+		return true
+	}
+	if k, ok := el.noiseKeys[peerKey]; ok && k != nil {
+		return true
+	}
+	for _, entry := range el.indexTable {
+		if entry != nil && entry.peerKey == peerKey {
+			return true
+		}
+	}
+	for _, st := range el.peersByAddr {
+		if st != nil && st.peerKey == peerKey {
+			return true
+		}
+	}
+	return false
+}
+
+// PrunePeerKeypairsForTest removes keypairs for peerKey.
+func (el *Listener) PrunePeerKeypairsForTest(peerKey string) {
+	el.PrunePeerTransportState(peerKey)
 }
 
 // RememberPeerForTest exposes rememberPeer for integration tests.
@@ -997,15 +1343,26 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	resp, transportKeys, err := BuildResponse(serverPriv, info, el.config.H2, el.config.S2, el.hpKey)
+	allocatedIdx := el.allocateReceiverIndex(peerKey)
+	resp, transportKeys, err := BuildResponse(serverPriv, info, el.config.H2, el.config.S2, el.hpKey, allocatedIdx)
 	if err != nil {
+		el.releaseReceiverIndex(allocatedIdx)
 		log.Printf("[vpn/endpoint] failed to build handshake response for peer %s: %v", peerKey, err)
 		return
 	}
 
 	var gen uint64
+	var sessID string
 	if sess != nil {
 		gen = sess.Generation
+		sessID = sess.ID
+	}
+
+	el.mu.RLock()
+	preCommitHook := el.preTransportCommitHook
+	el.mu.RUnlock()
+	if preCommitHook != nil {
+		preCommitHook(peerKey, sessID)
 	}
 
 	if !el.CommitHandshake(peerKey, gen, transportKeys, sender, info.SenderIndex) {
@@ -1047,8 +1404,8 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 
 // CommitHandshake atomically commits the handshake transport keys and peer endpoint
 // if gen >= el.peerGenerations[peerKey]. If gen is older than the current generation,
-// it discards the keys, leaves the endpoint and lastSeen untouched, increments staleHandshakes,
-// and returns false.
+// it discards the keys, releases any preallocated receiver index, leaves the endpoint
+// and lastSeen untouched, increments staleHandshakes, and returns false.
 func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *TransportKeys, sender *net.UDPAddr, receiverIdx uint32) bool {
 	if transportKeys != nil {
 		_ = transportKeys.InitCiphers()
@@ -1061,6 +1418,9 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 	}
 
 	if gen < el.peerGenerations[peerKey] {
+		if transportKeys != nil && transportKeys.LocalIndex != 0 {
+			el.releaseReceiverIndexLocked(transportKeys.LocalIndex)
+		}
 		el.staleHandshakes.Add(1)
 		return false
 	}
@@ -1068,47 +1428,21 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 	el.peerGenerations[peerKey] = gen
 
 	if transportKeys != nil {
-		if el.noiseKeys == nil {
-			el.noiseKeys = make(map[string]*TransportKeys)
-		}
-		el.noiseKeys[peerKey] = transportKeys
+		transportKeys.Generation = gen
+		el.storeTransportKeysLocked(peerKey, transportKeys)
 	}
 
 	if sender != nil {
-		if el.peersByAddr == nil {
-			el.peersByAddr = make(map[string]*activePeerState)
-		}
-		senderCopy := &net.UDPAddr{
-			IP:   append(net.IP(nil), sender.IP...),
-			Port: sender.Port,
-			Zone: sender.Zone,
-		}
-		st, ok := el.peersByAddr[sender.String()]
-		if !ok {
-			st = &activePeerState{
-				peerKey: peerKey,
-				udpAddr: senderCopy,
-			}
-			st.receiverIdx.Store(receiverIdx)
-			el.peersByAddr[sender.String()] = st
-		} else {
-			st.peerKey = peerKey
-			st.udpAddr = senderCopy
-			st.receiverIdx.Store(receiverIdx)
-		}
-		st.lastSeen.Store(time.Now().UnixNano())
+		el.rememberPeerLocked(sender, peerKey, receiverIdx)
 	}
 
 	return true
 }
 
-// rememberPeer records the sender address and client index of a peer that just completed a
-// handshake (single udpReadLoop caller; map writes guarded by mu).
-func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
+func (el *Listener) rememberPeerLocked(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
 	if sender == nil {
 		return
 	}
-	el.mu.Lock()
 	if el.peersByAddr == nil {
 		el.peersByAddr = make(map[string]*activePeerState)
 	}
@@ -1131,7 +1465,17 @@ func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverId
 		st.receiverIdx.Store(receiverIdx)
 	}
 	st.lastSeen.Store(time.Now().UnixNano())
-	el.mu.Unlock()
+}
+
+// rememberPeer records the sender address and client index of a peer that just completed a
+// handshake (single udpReadLoop caller; map writes guarded by mu).
+func (el *Listener) rememberPeer(sender *net.UDPAddr, peerKey string, receiverIdx uint32) {
+	if sender == nil {
+		return
+	}
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.rememberPeerLocked(sender, peerKey, receiverIdx)
 }
 
 // peerByAddr looks up the peer state recorded for a sender address.
@@ -1152,52 +1496,127 @@ const touchSessionThrottleSeconds = 2
 
 // touchPeerSession updates session liveness in SessionManager with rate limiting
 // to prevent mutex contention on SessionManager under high packet throughput (issue #294).
-func (el *Listener) touchPeerSession(st *activePeerState) {
+func (el *Listener) touchPeerSession(peerKey string, st *activePeerState) {
 	if el.sessionMgr == nil || st == nil {
 		return
 	}
 	nowSec := time.Now().Unix()
 	last := st.lastTouchSec.Load()
 	if (nowSec-last >= touchSessionThrottleSeconds || nowSec < last) && st.lastTouchSec.CompareAndSwap(last, nowSec) {
-		el.sessionMgr.TouchSession(st.peerKey)
+		el.sessionMgr.TouchSession(peerKey)
 	}
 }
 
-// transportDataHeaderLen is the AWG/WireGuard transport-data header:
-// 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
-// the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
-const transportDataHeaderLen = 16
+func (el *Listener) logThrottledDecryptionFailure(sender *net.UDPAddr, peerKey string, keys *TransportKeys, status string, err error) {
+	el.transportDecryptFailures.Add(1)
+	var st *activePeerState
+	if sender != nil {
+		st, _ = el.peerByAddr(sender.String())
+	}
+	now := time.Now().Unix()
+	canLog := false
+	if st != nil {
+		until := st.decryptLogUntil.Load()
+		if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
+			canLog = true
+		}
+	} else {
+		canLog = true
+	}
+	if canLog {
+		idx := uint32(0)
+		gen := uint64(0)
+		if keys != nil {
+			idx = keys.LocalIndex
+			gen = keys.Generation
+		}
+		log.Printf("[vpn/endpoint] transport data decryption failed for peer %s (index=%d, gen=%d, status=%s): %v",
+			peerKey, idx, gen, status, err)
+	}
+}
 
-// handleTransportData processes a datagram that failed handshake-initiation
-// parsing (or a transport datagram whose ciphertext caused an initiation parse failure).
-// If the sender address belongs to a peer with an established session and stored transport
-// keys, it checks if the datagram header matches the configured H4 range and attempts
-// AEAD decryption.
-//
-// It returns true if the datagram was recognized as transport data for an established
-// peer session (either successfully routed or dropped due to AEAD decryption failure, issue #149),
-// preventing the caller from treating transport data as a rejected handshake initiation.
-// It returns false if the datagram is not recognized as transport data (unknown sender,
-// missing transport keys, too short, or header does not match H4).
-func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bool {
-	s4 := el.config.S4
-	if s4 < 0 {
-		s4 = 0
+// logThrottledReplayRejection logs a transport anti-replay rejection.
+func (el *Listener) logThrottledReplayRejection(sender *net.UDPAddr, peerKey string, keys *TransportKeys, counter uint64) {
+	var st *activePeerState
+	if sender != nil {
+		st, _ = el.peerByAddr(sender.String())
 	}
-	h4 := el.config.H4
-	if h4.IsZero() {
-		h4 = models.DegenerateHeaderRange(health.DefaultH4)
+	now := time.Now().Unix()
+	canLog := false
+	if st != nil {
+		until := st.decryptLogUntil.Load()
+		if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
+			canLog = true
+		}
+	} else {
+		canLog = true
 	}
+	if canLog {
+		idx := uint32(0)
+		gen := uint64(0)
+		if keys != nil {
+			idx = keys.LocalIndex
+			gen = keys.Generation
+		}
+		log.Printf("[vpn/endpoint] transport data replay rejected for peer %s (index=%d, gen=%d, counter=%d)",
+			peerKey, idx, gen, counter)
+	}
+}
 
-	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
-		return false
+func (el *Listener) deliverToRouter(peerKey string, packet []byte) {
+	el.mu.RLock()
+	router := el.router
+	el.mu.RUnlock()
+	if router == nil {
+		return
 	}
-	st, ok := el.peerByAddr(sender.String())
+	if err := router(peerKey, packet); err != nil {
+		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", peerKey, err)
+	}
+}
+
+func (el *Listener) logPreviousKeyAccepted(peerKey string, keys *TransportKeys) {
+	el.mu.RLock()
+	pkp := el.peerKeypairs[peerKey]
+	el.mu.RUnlock()
+	if pkp != nil {
+		now := time.Now().Unix()
+		until := pkp.prevLogUntil.Load()
+		if now < until || !pkp.prevLogUntil.CompareAndSwap(until, now+1) {
+			return
+		}
+	}
+	log.Printf("[vpn/endpoint] accepted transport packet with previous keypair for peer %s: gen=%d index=%d",
+		peerKey, keys.Generation, keys.LocalIndex)
+}
+
+func (el *Listener) updatePeerEndpointAfterDecryption(sender *net.UDPAddr, peerKey string, remoteIdx uint32, isCurrent bool) *activePeerState {
+	if sender == nil {
+		return nil
+	}
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if el.peersByAddr == nil {
+		el.peersByAddr = make(map[string]*activePeerState)
+	}
+	st, ok := el.peersByAddr[sender.String()]
 	if !ok {
-		return false
-	}
-	if st.udpAddr == nil {
-		el.mu.Lock()
+		st = &activePeerState{
+			peerKey: peerKey,
+			udpAddr: &net.UDPAddr{
+				IP:   append(net.IP(nil), sender.IP...),
+				Port: sender.Port,
+				Zone: sender.Zone,
+			},
+		}
+		if isCurrent && remoteIdx != 0 {
+			st.receiverIdx.Store(remoteIdx)
+		}
+		el.peersByAddr[sender.String()] = st
+	} else {
+		if st.peerKey != peerKey {
+			st.peerKey = peerKey
+		}
 		if st.udpAddr == nil {
 			st.udpAddr = &net.UDPAddr{
 				IP:   append(net.IP(nil), sender.IP...),
@@ -1205,64 +1624,22 @@ func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bo
 				Zone: sender.Zone,
 			}
 		}
-		el.mu.Unlock()
-	}
-	keys, ok := el.TransportKeysFor(st.peerKey)
-	if !ok || keys == nil || keys.RecvKey == nil {
-		return false
-	}
-
-	aead, err := keys.RecvCipher()
-	if err != nil {
-		return false
-	}
-
-	payload := datagram[s4:]
-	hpKey := el.headerProtectionKey()
-
-	packet, isTransport, decErr := decryptTransportPayload(aead, datagram, payload, hpKey, s4, h4)
-	if !isTransport {
-		return false
-	}
-	if packet == nil {
-		if decErr != nil {
-			el.transportDecryptFailures.Add(1)
-			now := time.Now().Unix()
-			until := st.decryptLogUntil.Load()
-			if now >= until && st.decryptLogUntil.CompareAndSwap(until, now+decryptLogThrottleSeconds) {
-				log.Printf("[vpn/endpoint] transport data decryption failed for peer %s: %v", st.peerKey, decErr)
-			}
+		if isCurrent && remoteIdx != 0 {
+			st.receiverIdx.Store(remoteIdx)
 		}
-		// Decouple transport data drops from handshake rejection counter (issue #149):
-		// datagram belongs to an established peer session and matches H4 framing,
-		// so return true to prevent treating transport drops as handshake rejections.
-		return true
 	}
-	st.lastSeen.Store(time.Now().UnixNano())
-	el.touchPeerSession(st)
-
-	packet = trimIPPacketPadding(packet)
-
-	el.mu.RLock()
-	router := el.router
-	el.mu.RUnlock()
-	if router == nil {
-		return true
-	}
-	if err := router(st.peerKey, packet); err != nil {
-		// Congestion/backpressure is expected under load: drop silently at
-		// debug priority; anything else is a routing inconsistency worth a log.
-		log.Printf("[vpn/endpoint] client packet routing failed for peer %s: %v", st.peerKey, err)
-	}
-	return true
+	return st
 }
 
-// decryptTransportPayload attempts Header Protection unmasking and AEAD decryption,
-// falling back to plaintext H4 matching if HP unmasking does not match or fails.
-// It returns isTransport=true only when the datagram header matches the configured H4 range.
-func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) ([]byte, bool, error) {
+// transportDataHeaderLen is the AWG/WireGuard transport-data header:
+// 4-byte message type + 4-byte receiver index + 8-byte counter, followed by
+// the ChaCha20Poly1305-encrypted packet (>= 16-byte auth tag).
+const transportDataHeaderLen = 16
+
+// parseTransportHeader unmasks the 16-byte AWG transport header and returns receiverIdx and counter.
+func parseTransportHeader(datagram, payload, hpKey []byte, s4 int, h4 models.HeaderRange) (receiverIdx uint32, counter uint64, isHP bool, ok bool) {
 	if len(payload) < transportDataHeaderLen {
-		return nil, false, nil
+		return 0, 0, false, false
 	}
 
 	plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
@@ -1278,45 +1655,54 @@ func decryptTransportPayload(aead cipher.AEAD, datagram, payload, hpKey []byte, 
 			obfMsgType := binary.LittleEndian.Uint32(hdr[0:4])
 
 			if h4.Contains(obfMsgType) {
-				counter := binary.LittleEndian.Uint64(hdr[8:16])
-				var nonce [chacha20poly1305.NonceSize]byte
-				binary.LittleEndian.PutUint64(nonce[4:12], counter)
-				packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
-				if decErr == nil {
-					return packet, true, nil
-				}
-				// Dual-mode fallback: if HP client unmasking decrypt failed, check if plaintext header also matches H4.
-				if h4.Contains(plainMsgType) {
-					plainCounter := binary.LittleEndian.Uint64(payload[8:16])
-					var plainNonce [chacha20poly1305.NonceSize]byte
-					binary.LittleEndian.PutUint64(plainNonce[4:12], plainCounter)
-					if p, err := aead.Open(nil, plainNonce[:], payload[transportDataHeaderLen:], nil); err == nil {
-						return p, true, nil
-					}
-				}
-				return nil, true, decErr
-			} else if h4.Contains(plainMsgType) {
-				// Obfuscated header did not match H4, but plaintext header does: backward-compat plaintext peer.
-				counter := binary.LittleEndian.Uint64(payload[8:16])
-				var nonce [chacha20poly1305.NonceSize]byte
-				binary.LittleEndian.PutUint64(nonce[4:12], counter)
-				packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
-				return packet, true, decErr
+				receiverIdx = binary.LittleEndian.Uint32(hdr[4:8])
+				counter = binary.LittleEndian.Uint64(hdr[8:16])
+				return receiverIdx, counter, true, true
 			}
-			return nil, false, nil
+			if h4.Contains(plainMsgType) {
+				// Obfuscated header did not match H4, but plaintext header does: backward-compat plaintext peer.
+				receiverIdx = binary.LittleEndian.Uint32(payload[4:8])
+				counter = binary.LittleEndian.Uint64(payload[8:16])
+				return receiverIdx, counter, false, true
+			}
+			return 0, 0, false, false
 		}
 	}
 
 	// 2. Plaintext path (HP disabled or s4 < 12).
 	if h4.Contains(plainMsgType) {
-		counter := binary.LittleEndian.Uint64(payload[8:16])
-		var nonce [chacha20poly1305.NonceSize]byte
-		binary.LittleEndian.PutUint64(nonce[4:12], counter)
-		packet, decErr := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
-		return packet, true, decErr
+		receiverIdx = binary.LittleEndian.Uint32(payload[4:8])
+		counter = binary.LittleEndian.Uint64(payload[8:16])
+		return receiverIdx, counter, false, true
 	}
 
-	return nil, false, nil
+	return 0, 0, false, false
+}
+
+// decryptPayload decrypts the transport payload with dual-mode HP fallback.
+func decryptPayload(aead cipher.AEAD, payload []byte, counter uint64, isHP bool, h4 models.HeaderRange) ([]byte, uint64, error) {
+	if len(payload) < transportDataHeaderLen {
+		return nil, counter, errors.New("transport payload too short")
+	}
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], counter)
+	packet, err := aead.Open(nil, nonce[:], payload[transportDataHeaderLen:], nil)
+	if err == nil {
+		return packet, counter, nil
+	}
+	// Dual-mode fallback: if HP header unmasking decrypt failed, check if plaintext header also matched H4.
+	if isHP {
+		plainMsgType := binary.LittleEndian.Uint32(payload[0:4])
+		if h4.Contains(plainMsgType) {
+			plainCounter := binary.LittleEndian.Uint64(payload[8:16])
+			var plainNonce [chacha20poly1305.NonceSize]byte
+			binary.LittleEndian.PutUint64(plainNonce[4:12], plainCounter)
+			if p, err2 := aead.Open(nil, plainNonce[:], payload[transportDataHeaderLen:], nil); err2 == nil {
+				return p, plainCounter, nil
+			}
+		}
+	}
+	return nil, counter, err
 }
 
 // trimIPPacketPadding strips trailing content padding by inspecting the IPv4 Total Length
@@ -1341,10 +1727,200 @@ func trimIPPacketPadding(packet []byte) []byte {
 	return packet
 }
 
+// handleTransportData processes a datagram that failed handshake-initiation
+// parsing (or a transport datagram whose ciphertext caused an initiation parse failure).
+// Inbound packets are resolved by receiver index into the active or previous keypair,
+// or via bounded compatibility fallback for synthetic test sessions.
+func (el *Listener) handleTransportData(datagram []byte, sender *net.UDPAddr) bool {
+	s4 := el.config.S4
+	if s4 < 0 {
+		s4 = 0
+	}
+	h4 := el.config.H4
+	if h4.IsZero() {
+		h4 = models.DegenerateHeaderRange(health.DefaultH4)
+	}
+
+	if sender == nil || len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
+		return false
+	}
+
+	hpKey := el.headerProtectionKey()
+	payload := datagram[s4:]
+
+	receiverIdx, counter, isHP, isTransport := parseTransportHeader(datagram, payload, hpKey, s4, h4)
+	if !isTransport {
+		return false
+	}
+
+	// 1. Primary Keypair Lookup (Index-Aware)
+	if el.handleTransportByIndex(sender, payload, receiverIdx, counter, isHP, h4) {
+		return true
+	}
+
+	// 2. Bounded Compatibility Fallback
+	return el.handleTransportFallback(sender, payload, counter, isHP, h4)
+}
+
+func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, receiverIdx uint32, counter uint64, isHP bool, h4 models.HeaderRange) bool {
+	entry, found := el.lookupKeypairByIndex(receiverIdx)
+	if !found || entry == nil || entry.keys == nil {
+		return false
+	}
+	peerKey := entry.peerKey
+	keys := entry.keys
+
+	if keys.IsExpired() {
+		el.logThrottledDecryptionFailure(sender, peerKey, keys, "expired", errors.New("key expired"))
+		return true
+	}
+
+	aead, err := keys.RecvCipher()
+	if err != nil {
+		el.logThrottledDecryptionFailure(sender, peerKey, keys, el.keypairStatus(peerKey, keys), err)
+		return true
+	}
+
+	packet, usedCounter, decErr := decryptPayload(aead, payload, counter, isHP, h4)
+	if decErr != nil {
+		el.logThrottledDecryptionFailure(sender, peerKey, keys, el.keypairStatus(peerKey, keys), decErr)
+		return true
+	}
+
+	if !keys.ValidateCounter(usedCounter) {
+		el.logThrottledReplayRejection(sender, peerKey, keys, usedCounter)
+		return true
+	}
+
+	status := el.keypairStatus(peerKey, keys)
+	if status == "previous" {
+		el.logPreviousKeyAccepted(peerKey, keys)
+	}
+
+	isCurrent := (status == "current")
+	var remoteIdxToUpdate uint32
+	if isCurrent {
+		remoteIdxToUpdate = keys.RemoteIndex
+	}
+	st := el.updatePeerEndpointAfterDecryption(sender, peerKey, remoteIdxToUpdate, isCurrent)
+	if st != nil {
+		st.lastSeen.Store(time.Now().UnixNano())
+		el.touchPeerSession(peerKey, st)
+	}
+
+	packet = trimIPPacketPadding(packet)
+	el.deliverToRouter(peerKey, packet)
+	return true
+}
+
+// candidateFallbackKeys snapshots the candidate transport keys (current and previous)
+// for a peer under el.mu.RLock to prevent data races with concurrent keypair rotation
+// in storeTransportKeys. Decryption is performed outside the lock.
+func (el *Listener) candidateFallbackKeys(peerKey string) []*TransportKeys {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+
+	var candidates []*TransportKeys
+	if pkp := el.peerKeypairs[peerKey]; pkp != nil {
+		if pkp.current != nil && !pkp.current.IsExpired() {
+			candidates = append(candidates, pkp.current)
+		}
+		if pkp.previous != nil && !pkp.previous.IsExpired() {
+			candidates = append(candidates, pkp.previous)
+		}
+	}
+	if len(candidates) == 0 {
+		if k := el.noiseKeys[peerKey]; k != nil && !k.IsExpired() {
+			candidates = append(candidates, k)
+		}
+	}
+	return candidates
+}
+
+func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte, counter uint64, isHP bool, h4 models.HeaderRange) bool {
+	st, ok := el.peerByAddr(sender.String())
+	if !ok {
+		return false
+	}
+	if st.udpAddr == nil {
+		el.mu.Lock()
+		if st.udpAddr == nil {
+			st.udpAddr = &net.UDPAddr{
+				IP:   append(net.IP(nil), sender.IP...),
+				Port: sender.Port,
+				Zone: sender.Zone,
+			}
+		}
+		el.mu.Unlock()
+	}
+
+	peerKey := st.peerKey
+	candidates := el.candidateFallbackKeys(peerKey)
+
+	var decryptedPacket []byte
+	var successfulKeys *TransportKeys
+	var lastDecErr error
+
+	for _, keys := range candidates {
+		aead, err := keys.RecvCipher()
+		if err != nil {
+			lastDecErr = err
+			continue
+		}
+		p, usedCounter, err := decryptPayload(aead, payload, counter, isHP, h4)
+		if err == nil {
+			if !keys.ValidateCounter(usedCounter) {
+				el.logThrottledReplayRejection(sender, peerKey, keys, usedCounter)
+				return true
+			}
+			decryptedPacket = p
+			successfulKeys = keys
+			break
+		}
+		lastDecErr = err
+	}
+
+	if decryptedPacket == nil {
+		var keysToLog *TransportKeys
+		status := "current"
+		if len(candidates) > 0 {
+			keysToLog = candidates[0]
+			status = el.keypairStatus(peerKey, keysToLog)
+		} else if k, ok := el.TransportKeysFor(peerKey); ok {
+			keysToLog = k
+			status = el.keypairStatus(peerKey, keysToLog)
+		}
+		if lastDecErr == nil {
+			lastDecErr = errors.New("chacha20poly1305: message authentication failed")
+		}
+		el.logThrottledDecryptionFailure(sender, peerKey, keysToLog, status, lastDecErr)
+		return true
+	}
+
+	if el.keypairStatus(peerKey, successfulKeys) == "previous" {
+		el.logPreviousKeyAccepted(peerKey, successfulKeys)
+	}
+
+	isCurrent := (el.keypairStatus(peerKey, successfulKeys) == "current")
+	var remoteIdxToUpdate uint32
+	if isCurrent {
+		remoteIdxToUpdate = successfulKeys.RemoteIndex
+	}
+	updatedSt := el.updatePeerEndpointAfterDecryption(sender, peerKey, remoteIdxToUpdate, isCurrent)
+	if updatedSt != nil {
+		updatedSt.lastSeen.Store(time.Now().UnixNano())
+		el.touchPeerSession(peerKey, updatedSt)
+	}
+
+	decryptedPacket = trimIPPacketPadding(decryptedPacket)
+	el.deliverToRouter(peerKey, decryptedPacket)
+	return true
+}
+
 // SendToPeer encrypts an IP packet for a peer with the stored transport
 // SendKey and writes it to the peer's last recorded UDP address using AWG
 // transport framing (S4 padding + H4 magic header). The send counter is a fresh
-// monotonic value per peer.
+// monotonic value per transport key generation.
 func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 	keys, ok := el.TransportKeysFor(peerKey)
 	if !ok || keys == nil || keys.SendKey == nil {
@@ -1387,7 +1963,7 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		}
 	}
 
-	counter := st.sendCount.Add(1) - 1
+	counter := keys.NextSendCounter()
 	aead, err := keys.SendCipher()
 	if err != nil {
 		return fmt.Errorf("failed to get transport send cipher: %w", err)
@@ -1418,7 +1994,10 @@ func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
 		}
 	}
 
-	receiverIdx := st.receiverIdx.Load()
+	receiverIdx := keys.RemoteIndex
+	if receiverIdx == 0 && st != nil {
+		receiverIdx = st.receiverIdx.Load()
+	}
 
 	var hdr [transportDataHeaderLen]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], h4Val) // AWG H4 transport data
@@ -1537,9 +2116,119 @@ func (el *Listener) invokePostSweepHook(ctx context.Context) {
 	}
 }
 
+func (el *Listener) sweepExpiredKeypairs() {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	for _, pkp := range el.peerKeypairs {
+		if pkp.previous != nil && pkp.previous.IsExpired() {
+			if pkp.previous.LocalIndex != 0 {
+				delete(el.indexTable, pkp.previous.LocalIndex)
+			}
+			pkp.previous = nil
+		}
+	}
+}
+
+func (el *Listener) prunePeerTransportStateLocked(peerKey string) {
+	if pkp, ok := el.peerKeypairs[peerKey]; ok && pkp != nil {
+		if pkp.current != nil && pkp.current.LocalIndex != 0 {
+			delete(el.indexTable, pkp.current.LocalIndex)
+		}
+		if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+			delete(el.indexTable, pkp.previous.LocalIndex)
+		}
+		delete(el.peerKeypairs, peerKey)
+	}
+
+	for idx, entry := range el.indexTable {
+		if entry != nil && entry.peerKey == peerKey {
+			delete(el.indexTable, idx)
+		}
+	}
+
+	delete(el.noiseKeys, peerKey)
+
+	for addr, st := range el.peersByAddr {
+		if st != nil && st.peerKey == peerKey {
+			delete(el.peersByAddr, addr)
+		}
+	}
+}
+
+// PrunePeerTransportState removes all transport keys, index table entries, and peer endpoints
+// for peerKey, and advances the peer's generation fence to fenceGen (if provided) so that any
+// in-flight handshakes with older generations are rejected.
+func (el *Listener) PrunePeerTransportState(peerKey string, fenceGen ...uint64) bool {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+
+	if len(fenceGen) > 0 && fenceGen[0] > 0 {
+		if fenceGen[0] < el.peerGenerations[peerKey] {
+			return false
+		}
+		el.peerGenerations[peerKey] = fenceGen[0]
+	} else {
+		el.peerGenerations[peerKey]++
+	}
+
+	el.prunePeerTransportStateLocked(peerKey)
+	return true
+}
+
+// PrunePeerTransportStateForGeneration atomically prunes transport state for peerKey
+// under el.mu if the peer's current generation has not advanced past timedOutGen.
+// If currentGen > timedOutGen: a newer generation has already committed, so it
+// leaves the transport state untouched and returns false.
+// Otherwise: it prunes the transport state, advances the generation fence to at
+// least timedOutGen + 1, and returns true.
+func (el *Listener) PrunePeerTransportStateForGeneration(peerKey string, timedOutGen uint64) bool {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if el.peerGenerations == nil {
+		el.peerGenerations = make(map[string]uint64)
+	}
+
+	currentGen := el.peerGenerations[peerKey]
+	if currentGen > timedOutGen {
+		return false
+	}
+
+	fence := timedOutGen + 1
+	if el.peerGenerations[peerKey] < fence {
+		el.peerGenerations[peerKey] = fence
+	} else {
+		el.peerGenerations[peerKey]++
+	}
+
+	el.prunePeerTransportStateLocked(peerKey)
+	return true
+}
+
+// PrunePeerTransportStateIfSession removes endpoint transport state for a peer if the current session
+// matches expectedSessionID, or unconditionally if expectedSessionID is empty.
+func (el *Listener) PrunePeerTransportStateIfSession(peerKey string, sessionID string, fenceGen ...uint64) bool {
+	if sessionID != "" && el.sessionMgr != nil {
+		if s, ok := el.sessionMgr.GetSession(peerKey); ok && s != nil && s.ID != sessionID {
+			return false
+		}
+	}
+	return el.PrunePeerTransportState(peerKey, fenceGen...)
+}
+
+func (el *Listener) prunePeerKeypairsIfMatch(peerKey string, expectedSessionID string) bool {
+	return el.PrunePeerTransportStateIfSession(peerKey, expectedSessionID)
+}
+
 // SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes the registered
 // SessionReaperHook for each reaped session.
 func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
+	el.sweepExpiredKeypairs()
+
 	if el.sessionMgr == nil {
 		return nil, nil
 	}
@@ -1554,6 +2243,18 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 	hook := el.reaperHook
 	el.mu.RUnlock()
 	for _, sess := range timedOut {
+		el.mu.RLock()
+		prePruneHook := el.preSweepPruneHook
+		el.mu.RUnlock()
+		if prePruneHook != nil {
+			prePruneHook(sess.PeerPublicKey, sess.Generation)
+		}
+
+		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) {
+			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): active replacement generation exists for peer %s",
+				sess.ID, sess.Generation, sess.PeerPublicKey)
+		}
+
 		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
 			sess.ID, sess.PeerPublicKey, sess.UserID, sess.LastSeen.Format(time.RFC3339), el.config.IdleTimeout)
 		if hook != nil {
