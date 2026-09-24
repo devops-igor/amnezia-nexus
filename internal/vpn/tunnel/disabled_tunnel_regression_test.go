@@ -48,6 +48,150 @@ func TestProbeTunnel_DeletedTunnelIsTerminal(t *testing.T) {
 	}
 }
 
+// Pause after the last successful identity check. A new tunnel for the same
+// server must not inherit either result of the old tunnel's probe.
+func TestProbeTunnel_ReplacementAfterIdentityCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probeErr error
+	}{
+		{name: "success"},
+		{name: "failure", probeErr: errors.New("old tunnel probe timed out")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := setupTestDB(t)
+			pool := NewPool(db)
+			serverID, err := db.CreateServer(ctx, &models.Server{Name: "Replacement Host", Host: "192.0.2.13"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, err := pool.AddTunnel(ctx, serverID, "192.0.2.13:51820", "old-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultHealthConfig()
+			cfg.FailureThreshold = 3
+			prober := NewHealthProber(pool, db, cfg, func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+				return time.Second, tc.probeErr
+			})
+			// A failure from A would reach the disable threshold if it could
+			// modify B's server-keyed counters.
+			if tc.probeErr != nil {
+				prober.mu.Lock()
+				prober.failCounts[serverID] = 2
+				prober.healthGenerations[serverID] = old.ID
+				prober.mu.Unlock()
+			}
+
+			reached := make(chan struct{})
+			resume := make(chan struct{})
+			pause := func() { close(reached); <-resume }
+			if tc.probeErr == nil {
+				prober.preStatusCommitHook = pause
+			} else {
+				prober.preFailureCommitHook = pause
+			}
+			done := make(chan error, 1)
+			go func() { _, err := prober.ProbeTunnel(ctx, old); done <- err }()
+			select {
+			case <-reached:
+			case <-time.After(5 * time.Second):
+				close(resume)
+				t.Fatal("probe did not reach commit boundary")
+			}
+			if err := pool.RemoveTunnel(ctx, serverID); err != nil {
+				close(resume)
+				t.Fatal(err)
+			}
+			replacement, err := pool.AddTunnel(ctx, serverID, "192.0.2.13:51821", "new-key")
+			if err != nil {
+				close(resume)
+				t.Fatal(err)
+			}
+			if replacement.ID == old.ID {
+				close(resume)
+				t.Fatal("replacement did not receive a new tunnel ID")
+			}
+			prober.ResetFailCount(serverID)
+			before, err := pool.GetTunnel(serverID)
+			if err != nil {
+				close(resume)
+				t.Fatal(err)
+			}
+			close(resume)
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrTunnelNotFound) {
+					t.Fatalf("old probe returned %v, want ErrTunnelNotFound", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("old probe did not finish")
+			}
+			after, err := pool.GetTunnel(serverID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.ID != before.ID || after.Status != before.Status || after.DisableReason != before.DisableReason ||
+				after.StateVersion != before.StateVersion || after.LatencyMS != before.LatencyMS {
+				t.Fatalf("replacement changed after stale probe: before=%+v after=%+v", before, after)
+			}
+			prober.mu.RLock()
+			failures, gen, autoDisabled, successes := prober.failCounts[serverID], prober.healthGenerations[serverID], prober.autoDisabled[serverID], prober.successCounts[serverID]
+			prober.mu.RUnlock()
+			if failures != 0 || gen != replacement.ID || autoDisabled || successes != 0 {
+				t.Fatalf("replacement health state contaminated: failures=%d gen=%d autoDisabled=%v successes=%d", failures, gen, autoDisabled, successes)
+			}
+		})
+	}
+}
+
+func TestThresholdReconcile_RejectsReplacedTunnel(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Recreated Host", Host: "192.0.2.14"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := pool.AddTunnel(ctx, serverID, "192.0.2.14:51820", "old-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.RemoveTunnel(ctx, serverID); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := pool.AddTunnel(ctx, serverID, "192.0.2.14:51821", "new-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := *replacement
+	prober := NewHealthProber(pool, db, DefaultHealthConfig())
+	prober.ResetFailCount(serverID)
+	prober.mu.Lock()
+	prober.failCounts[serverID] = prober.cfg.FailureThreshold
+	prober.mu.Unlock()
+
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, serverID, old.ID)
+	if reconciled || !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("stale reconciliation: reconciled=%v err=%v, want false, ErrTunnelNotFound", reconciled, err)
+	}
+	after, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ID != before.ID || after.Status != before.Status || after.DisableReason != before.DisableReason ||
+		after.StateVersion != before.StateVersion || after.LatencyMS != before.LatencyMS || prober.IsAutoDisabled(serverID) {
+		t.Fatalf("stale reconciliation changed replacement: before=%+v after=%+v", before, after)
+	}
+	prober.mu.RLock()
+	count, generation := prober.failCounts[serverID], prober.healthGenerations[serverID]
+	prober.mu.RUnlock()
+	if count != prober.cfg.FailureThreshold || generation != replacement.ID {
+		t.Fatalf("stale reconciliation changed replacement health state: count=%d generation=%d", count, generation)
+	}
+}
+
 // TestProbeTunnel_DisabledTunnelNotResurrected verifies that ProbeTunnel never
 // changes the status of an administratively disabled tunnel (issues #28/#43):
 // a successful handshake probe must not write "active"/"degraded" over the

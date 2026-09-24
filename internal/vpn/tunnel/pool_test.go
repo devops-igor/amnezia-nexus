@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +10,48 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+func TestPoolProbeStatusWritesRejectReplacedTunnel(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Recreated Host", Host: "192.0.2.70"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := pool.AddTunnel(ctx, serverID, "192.0.2.70:51820", "old-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.RemoveTunnel(ctx, serverID); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := pool.AddTunnel(ctx, serverID, "192.0.2.70:51821", "new-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ID == old.ID {
+		t.Fatal("replacement reused old tunnel ID")
+	}
+	before := *replacement
+	if err := pool.SetTunnelStatusIfCurrent(ctx, serverID, old.ID, models.TunnelStatusDegraded, 900); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("stale status write: got %v, want ErrTunnelNotFound", err)
+	}
+	swapped, err := pool.CompareAndSwapTunnelStatusForTunnel(ctx, serverID, old.ID,
+		replacement.Status, replacement.DisableReason, replacement.StateVersion,
+		models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
+	if swapped || !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("stale status CAS: swapped=%v err=%v, want false, ErrTunnelNotFound", swapped, err)
+	}
+	after, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != before.Status || after.DisableReason != before.DisableReason ||
+		after.StateVersion != before.StateVersion || after.LatencyMS != before.LatencyMS {
+		t.Fatalf("stale probe modified replacement: %+v", after)
+	}
+}
 
 func setupTestDB(t *testing.T) *database.DB {
 	t.Helper()
