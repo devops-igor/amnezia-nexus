@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -107,6 +109,11 @@ func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
+	// The browser E2E runner needs the answer for its real slider interaction.
+	// Never expose it unless the explicitly enabled test environment is running.
+	if strings.EqualFold(os.Getenv("E2E_TESTING"), "true") || os.Getenv("E2E_TESTING") == "1" {
+		w.Header().Set("X-E2E-Captcha-Target-X", fmt.Sprint(challenge.TargetX))
+	}
 	h.JSON(w, http.StatusOK, map[string]any{
 		"captcha_id": captchaID,
 		"image":      challenge.Image,

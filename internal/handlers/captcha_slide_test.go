@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,11 +16,15 @@ import (
 )
 
 func TestCaptchaChallengeBoundToCookie(t *testing.T) {
+	t.Setenv("E2E_TESTING", "false")
 	h, _, cfg := setupTestHandlers(t)
 	rec := httptest.NewRecorder()
 	h.CaptchaHandler(rec, httptest.NewRequest(http.MethodGet, "/api/auth/captcha", nil))
 	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("challenge response: %d, %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-E2E-Captcha-Target-X") != "" {
+		t.Fatal("server target leaked outside E2E testing")
 	}
 	var payload struct {
 		CaptchaID string `json:"captcha_id"`
@@ -49,6 +54,30 @@ func TestCaptchaChallengeBoundToCookie(t *testing.T) {
 	data, err := security.DecodeSession(sessionCookie.Value, cfg.SecretKey)
 	if err != nil || data["captcha_id"] != payload.CaptchaID {
 		t.Fatalf("challenge not bound to session cookie: %v", err)
+	}
+}
+
+func TestCaptchaE2ETargetMatchesDisplayedChallenge(t *testing.T) {
+	t.Setenv("E2E_TESTING", "true")
+	h, _, _ := setupTestHandlers(t)
+	rec := httptest.NewRecorder()
+	h.CaptchaHandler(rec, httptest.NewRequest(http.MethodGet, "/api/auth/captcha", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("challenge response: %d, %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		CaptchaID string `json:"captcha_id"`
+		ThumbY    int    `json:"thumb_y"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	targetX, err := strconv.Atoi(rec.Header().Get("X-E2E-Captcha-Target-X"))
+	if err != nil {
+		t.Fatalf("missing E2E target header: %v", err)
+	}
+	if _, ok, err := h.captchaStore().VerifySlide(payload.CaptchaID, targetX, payload.ThumbY); err != nil || !ok {
+		t.Fatalf("E2E target does not match generated puzzle: ok=%v, err=%v", ok, err)
 	}
 }
 
