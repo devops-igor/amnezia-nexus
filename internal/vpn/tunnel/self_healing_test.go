@@ -1144,15 +1144,33 @@ func TestConcurrentProbeTunnel_ReverseOrder_SubThresholdWinsThenThresholdReconci
 		t.Fatal("server should not be auto-disabled after sub-threshold probe A")
 	}
 
-	// 3. Probe B fails (reaching threshold, fail count: 2 -> 3 >= FailureThreshold 3)
-	// Initial CAS with probeBSnapshot (version V) misses because pool is at version V+1.
-	// Probe B reconciles against current tunnel (degraded/V+1) and CAS to disabled/health succeeds.
+	// 3. Probe B fails with stale snapshot (version V while pool is at version V+1)
+	// Generation fencing rejects stale probe B with ErrStaleStateVersion without incrementing failCounts.
 	_, err = prober.handleProbeFailure(ctx, probeBSnapshot, errors.New("probe B network timeout"))
-	if err == nil {
-		t.Fatal("expected probe B to return error")
+	if !errors.Is(err, ErrStaleStateVersion) {
+		t.Fatalf("expected ErrStaleStateVersion for stale probe B, got %v", err)
 	}
 
-	// 4. Assertions:
+	// Assert failCounts is still 2 (probe B did not contaminate or increment counters)
+	prober.mu.Lock()
+	fcBeforeC := prober.failCounts[s1ID]
+	prober.mu.Unlock()
+	if fcBeforeC != 2 {
+		t.Fatalf("expected failCounts to remain 2 after stale probe B, got %d", fcBeforeC)
+	}
+
+	// 4. Probe C fails targeting current version V+1 (reaching threshold, fail count: 2 -> 3 >= FailureThreshold 3)
+	tunAfterStale, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	probeCSnapshot := prober.getInitialSnapshot(tunAfterStale)
+	_, err = prober.handleProbeFailure(ctx, probeCSnapshot, errors.New("probe C network timeout"))
+	if err == nil {
+		t.Fatal("expected probe C to return error")
+	}
+
+	// 5. Assertions:
 	// status == "disabled", disable_reason == models.DisableReasonHealth, version == V+2
 	cur, err := pool.GetTunnel(s1ID)
 	if err != nil {
@@ -1263,15 +1281,33 @@ func TestConcurrentHookFailure_ReverseOrder_SubThresholdWinsThenThresholdReconci
 		t.Fatal("server should not be auto-disabled after sub-threshold hook A")
 	}
 
-	// 3. Hook B fails (reaching threshold, fail count: 2 -> 3 >= 3)
-	// Initial CAS with hookBSnapshot (version V) misses because pool is at version V+1.
-	// Hook B reconciles against current tunnel (degraded/V+1) and CAS to disabled/health succeeds.
+	// 3. Hook B fails with stale snapshot (version V while pool is at version V+1)
+	// Generation fencing rejects stale hook B with ErrStaleStateVersion without incrementing failCounts.
 	_, err = prober.handleHookFailure(ctx, hookBSnapshot, errors.New("hook B readiness failure"))
-	if err == nil {
-		t.Fatal("expected hook B to return error")
+	if !errors.Is(err, ErrStaleStateVersion) {
+		t.Fatalf("expected ErrStaleStateVersion for stale hook B, got %v", err)
 	}
 
-	// 4. Assertions:
+	// Assert failCounts is still 2 (hook B did not contaminate or increment counters)
+	prober.mu.Lock()
+	fcBeforeC := prober.failCounts[s1ID]
+	prober.mu.Unlock()
+	if fcBeforeC != 2 {
+		t.Fatalf("expected failCounts to remain 2 after stale hook B, got %d", fcBeforeC)
+	}
+
+	// 4. Hook C fails targeting current version V+1 (reaching threshold, fail count: 2 -> 3 >= 3)
+	tunAfterStale, err := pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	hookCSnapshot := prober.getInitialSnapshot(tunAfterStale)
+	_, err = prober.handleHookFailure(ctx, hookCSnapshot, errors.New("hook C readiness failure"))
+	if err == nil {
+		t.Fatal("expected hook C to return error")
+	}
+
+	// 5. Assertions:
 	// status == "disabled", disable_reason == models.DisableReasonHealth, version == V+2
 	cur, err := pool.GetTunnel(s1ID)
 	if err != nil {

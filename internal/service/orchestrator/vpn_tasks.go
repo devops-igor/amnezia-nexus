@@ -81,7 +81,15 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		)
 
 		if err != nil {
-			failures := o.recordProbeFailure(t.ID)
+			if o.isTunnelVersionStale(ctx, &t) {
+				slog.Debug("Backend tunnel state version is stale in DB, ignoring probe failure",
+					"tunnel_id", t.ID,
+					"stale_version", t.StateVersion,
+				)
+				continue
+			}
+
+			failures := o.recordProbeFailure(t.ID, t.StateVersion)
 			if failures < threshold {
 				slog.Warn("Backend tunnel health probe failed (below failure threshold)",
 					"tunnel_id", t.ID,
@@ -105,6 +113,13 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			)
 			if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
 				degradedTunnels = append(degradedTunnels, t.ID)
+				o.mu.Lock()
+				if o.probeFailVersions != nil && t.StateVersion > 0 {
+					o.probeFailVersions[t.ID] = t.StateVersion + 1
+				}
+				o.mu.Unlock()
+			} else {
+				o.revertProbeFailure(t.ID, t.StateVersion)
 			}
 			continue
 		}
@@ -194,6 +209,16 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	if migrated > 0 {
 		slog.Info("Migrated VPN sessions from degraded backend tunnels", "count", migrated)
 	}
+}
+
+// isTunnelVersionStale checks whether a tunnel's state version in the database has advanced
+// past the snapshot version used for a probe.
+func (o *Orchestrator) isTunnelVersionStale(ctx context.Context, t *models.BackendTunnel) bool {
+	if o.db == nil || t == nil || t.StateVersion <= 0 {
+		return false
+	}
+	curTun, err := o.db.GetBackendTunnel(ctx, t.ID)
+	return err == nil && curTun != nil && curTun.StateVersion != t.StateVersion
 }
 
 // updateTunnelStatus updates a backend tunnel's status and latency using the configured

@@ -164,6 +164,17 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	hp.recordCurrentGenerationLocked(serverID)
 }
 
+// GetFailCount returns the consecutive failure count for the given server ID.
+// Nil-receiver safe.
+func (hp *HealthProber) GetFailCount(serverID int64) int {
+	if hp == nil {
+		return 0
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.failCounts[serverID]
+}
+
 // recordCurrentGenerationLocked associates server-level state with the pool's
 // current tunnel after an explicit health reset or administrative change.
 func (hp *HealthProber) recordCurrentGenerationLocked(serverID int64) {
@@ -193,6 +204,9 @@ func (hp *HealthProber) checkHealthGenerationLocked(t *models.BackendTunnel) err
 		}
 		if current == nil || current.ID != t.ID {
 			return ErrTunnelNotFound
+		}
+		if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
+			return ErrStaleStateVersion
 		}
 	}
 	if previous := hp.healthGenerations[t.ServerID]; previous != 0 && previous != t.ID {
@@ -459,6 +473,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, tunnel.ServerID, tunnel.ID, expectedVersion, status, latencyMS); err != nil {
 			return 0, err
 		}
+		tunnel.StateVersion = expectedVersion + 1
 	}
 	if err := hp.checkTunnelAvailable(tunnel); err != nil {
 		return 0, err
@@ -559,6 +574,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		return false, casErr
 	}
 	if swapped {
+		currentTunnel.StateVersion++
 		if err := hp.updateHealthIfCurrent(currentTunnel, func() {
 			hp.autoDisabled[serverID] = true
 			hp.successCounts[serverID] = 0
@@ -597,17 +613,18 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 }
 
 func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
-	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
-		hp.mu.Unlock()
-		return 0, err
-	}
 	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+		hp.mu.Lock()
 		hp.failCounts[snapshot.ServerID] = 0
 		delete(hp.autoDisabled, snapshot.ServerID)
 		hp.mu.Unlock()
 		slog.Info("probe failed but tunnel was administratively disabled; ignoring failure", "server_id", snapshot.ServerID)
 		return 0, probeErr
+	}
+	hp.mu.Lock()
+	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
+		hp.mu.Unlock()
+		return 0, err
 	}
 	hp.failCounts[snapshot.ServerID]++
 	failures := hp.failCounts[snapshot.ServerID]
@@ -630,6 +647,7 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 				return 0, casErr
 			}
 			if swapped {
+				snapshot.StateVersion++
 				if err := hp.updateHealthIfCurrent(snapshot, func() {
 					hp.autoDisabled[snapshot.ServerID] = true
 					hp.successCounts[snapshot.ServerID] = 0
@@ -637,8 +655,16 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 					return 0, err
 				}
 			} else {
-				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID); recErr != nil {
+				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
+				if recErr != nil {
 					return 0, recErr
+				}
+				if !reconciled {
+					hp.mu.Lock()
+					if hp.failCounts[snapshot.ServerID] > 0 {
+						hp.failCounts[snapshot.ServerID]--
+					}
+					hp.mu.Unlock()
 				}
 			}
 		} else {
@@ -671,6 +697,11 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 					"expected_status", snapshot.Status,
 					"expected_version", snapshot.StateVersion,
 				)
+				hp.mu.Lock()
+				if hp.failCounts[snapshot.ServerID] > 0 {
+					hp.failCounts[snapshot.ServerID]--
+				}
+				hp.mu.Unlock()
 				if hp.isTunnelAdminDisabled(snapshot.ServerID) {
 					if err := hp.updateHealthIfCurrent(snapshot, func() {
 						hp.failCounts[snapshot.ServerID] = 0
@@ -679,6 +710,8 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 						return 0, err
 					}
 				}
+			} else {
+				snapshot.StateVersion++
 			}
 		}
 	}
@@ -690,17 +723,18 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 }
 
 func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
-	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
-		hp.mu.Unlock()
-		return 0, err
-	}
-	if errors.Is(hookErr, ErrTunnelDisabled) || errors.Is(hp.checkTunnelAvailable(snapshot), ErrTunnelDisabled) {
+	if errors.Is(hookErr, ErrTunnelDisabled) || errors.Is(hp.checkTunnelAvailable(snapshot), ErrTunnelDisabled) || hp.isTunnelAdminDisabled(snapshot.ServerID) {
+		hp.mu.Lock()
 		hp.failCounts[snapshot.ServerID] = 0
 		delete(hp.autoDisabled, snapshot.ServerID)
 		hp.mu.Unlock()
 		slog.Info("data-plane hook failed because tunnel was administratively disabled", "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
+	}
+	hp.mu.Lock()
+	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
+		hp.mu.Unlock()
+		return 0, err
 	}
 	hp.failCounts[snapshot.ServerID]++
 	failures := hp.failCounts[snapshot.ServerID]
@@ -723,6 +757,7 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 				return 0, casErr
 			}
 			if swapped {
+				snapshot.StateVersion++
 				if err := hp.updateHealthIfCurrent(snapshot, func() {
 					hp.autoDisabled[snapshot.ServerID] = true
 					hp.successCounts[snapshot.ServerID] = 0
@@ -730,8 +765,16 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 					return 0, err
 				}
 			} else {
-				if _, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID); recErr != nil {
+				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
+				if recErr != nil {
 					return 0, recErr
+				}
+				if !reconciled {
+					hp.mu.Lock()
+					if hp.failCounts[snapshot.ServerID] > 0 {
+						hp.failCounts[snapshot.ServerID]--
+					}
+					hp.mu.Unlock()
 				}
 			}
 		} else {
@@ -763,6 +806,11 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 				"expected_status", snapshot.Status,
 				"expected_version", snapshot.StateVersion,
 			)
+			hp.mu.Lock()
+			if hp.failCounts[snapshot.ServerID] > 0 {
+				hp.failCounts[snapshot.ServerID]--
+			}
+			hp.mu.Unlock()
 			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
 				if err := hp.updateHealthIfCurrent(snapshot, func() {
 					hp.failCounts[snapshot.ServerID] = 0
@@ -771,6 +819,8 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 					return 0, err
 				}
 			}
+		} else {
+			snapshot.StateVersion++
 		}
 	}
 	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
@@ -1079,6 +1129,7 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		return false
 	}
 
+	tun.StateVersion = tunNow.StateVersion + 1
 	if err := hp.updateHealthIfCurrent(tun, func() {
 		hp.failCounts[tun.ServerID] = 0
 		delete(hp.autoDisabled, tun.ServerID)

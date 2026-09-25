@@ -439,7 +439,7 @@ func TestOrchestrator_ProbeFailoverRetry_ThreadSafety(t *testing.T) {
 				case 2:
 					orch.ResetProbeFailCount(tID)
 				case 3:
-					_ = orch.recordProbeFailure(tID)
+					_ = orch.recordProbeFailure(tID, 0)
 				case 4:
 					WithProbeFailureThreshold(3 + (i % 3))(orch)
 				}

@@ -1880,7 +1880,6 @@ func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
 	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
 		cancelReq()
 	})
-	vpnSvc.SetUpdateBackendServerHostErrorForTest(context.Canceled)
 
 	r := setupFullServerRouter(h)
 
@@ -1892,6 +1891,11 @@ func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
 	// Assert HTTP status is 500
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Assert that request context was genuinely canceled
+	if !errors.Is(reqCtx.Err(), context.Canceled) {
+		t.Fatalf("expected reqCtx.Err() == context.Canceled, got %v", reqCtx.Err())
 	}
 
 	var errResp map[string]any

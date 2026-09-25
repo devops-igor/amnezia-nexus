@@ -2518,6 +2518,10 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		hook()
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

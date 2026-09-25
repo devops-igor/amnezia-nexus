@@ -67,6 +67,7 @@ type Orchestrator struct {
 	reachabilityCache map[int64]map[string]any
 	healthProbeKeys   map[int64]healthProbeKey
 	probeFailCounts   map[int64]int
+	probeFailVersions map[int64]int64
 
 	running     bool
 	cancel      context.CancelFunc
@@ -167,6 +168,7 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		reachabilityCache:     make(map[int64]map[string]any),
 		healthProbeKeys:       make(map[int64]healthProbeKey),
 		probeFailCounts:       make(map[int64]int),
+		probeFailVersions:     make(map[int64]int64),
 		stopCh:                make(chan struct{}),
 	}
 
@@ -381,6 +383,9 @@ func (o *Orchestrator) ResetProbeFailCount(tunnelID int64) {
 	if o.probeFailCounts != nil {
 		delete(o.probeFailCounts, tunnelID)
 	}
+	if o.probeFailVersions != nil {
+		delete(o.probeFailVersions, tunnelID)
+	}
 }
 
 // GetProbeFailCount returns the current consecutive failure count for a backend tunnel.
@@ -394,12 +399,44 @@ func (o *Orchestrator) GetProbeFailCount(tunnelID int64) int {
 }
 
 // recordProbeFailure increments and returns the consecutive failure count for a backend tunnel.
-func (o *Orchestrator) recordProbeFailure(tunnelID int64) int {
+// If the state version advances, the failure count is reset to isolate failure tracking across generations.
+func (o *Orchestrator) recordProbeFailure(tunnelID int64, version int64) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.probeFailCounts == nil {
 		o.probeFailCounts = make(map[int64]int)
 	}
+	if o.probeFailVersions == nil {
+		o.probeFailVersions = make(map[int64]int64)
+	}
+	if version > 0 {
+		curVer := o.probeFailVersions[tunnelID]
+		if curVer > 0 && version < curVer {
+			return o.probeFailCounts[tunnelID]
+		}
+		if curVer > 0 && version > curVer {
+			o.probeFailCounts[tunnelID] = 0
+			o.probeFailVersions[tunnelID] = version
+		} else if curVer == 0 {
+			o.probeFailVersions[tunnelID] = version
+		}
+	}
 	o.probeFailCounts[tunnelID]++
 	return o.probeFailCounts[tunnelID]
+}
+
+// revertProbeFailure decrements the consecutive failure count for a backend tunnel
+// if the failure update was rejected (e.g. stale state version).
+func (o *Orchestrator) revertProbeFailure(tunnelID int64, version int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.probeFailCounts == nil {
+		return
+	}
+	if version > 0 && o.probeFailVersions != nil && o.probeFailVersions[tunnelID] != version {
+		return
+	}
+	if o.probeFailCounts[tunnelID] > 0 {
+		o.probeFailCounts[tunnelID]--
+	}
 }

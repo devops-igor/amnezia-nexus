@@ -84,3 +84,84 @@ func TestProbeTunnel_SetTunnelEndpoint_FencesInFlightSuccess(t *testing.T) {
 		t.Errorf("expected Endpoint = %q, got %q", newEndpoint, curTun.Endpoint)
 	}
 }
+
+// TestHealthProber_InFlightFailedProbe_DoesNotContaminateFailureCount verifies that:
+//  1. A health probe starts against an old endpoint and fails.
+//  2. An endpoint update occurs (via SetTunnelEndpoint), bumping StateVersion.
+//  3. The probe completes its failure path, but handleProbeFailure fences it out
+//     due to ErrStaleStateVersion.
+//  4. The failure counter for the server remains 0 (not contaminated by the stale probe).
+func TestHealthProber_InFlightFailedProbe_DoesNotContaminateFailureCount(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Fail Count Fencing Server", Host: "198.51.100.40"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, serverID, "198.51.100.40:51820", "pubkey-fail-fencing")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+	prober := NewHealthProber(pool, db, cfg, func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 0, errors.New("simulated handshake failure on old endpoint")
+	})
+
+	reached := make(chan struct{})
+	resume := make(chan struct{})
+	prober.preFailureCommitHook = func() {
+		close(reached)
+		<-resume
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := prober.ProbeTunnel(ctx, tun)
+		done <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("probe did not reach preFailureCommitHook")
+	}
+
+	// While probe is paused, endpoint is updated to a new host, advancing StateVersion to 2
+	newEndpoint := "198.51.100.41:51820"
+	if err := pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+
+	// Release probe
+	close(resume)
+	probeErr := <-done
+
+	if !errors.Is(probeErr, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion, got: %v", probeErr)
+	}
+
+	// Verify failCount was NOT incremented by the stale probe failure
+	if fc := prober.GetFailCount(serverID); fc != 0 {
+		t.Errorf("expected failCount = 0 for new endpoint generation, got %d", fc)
+	}
+
+	// Verify tunnel in pool was NOT marked degraded/disabled by the old probe
+	curTun, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if curTun.Status != "active" {
+		t.Errorf("expected status 'active', got %q", curTun.Status)
+	}
+	if curTun.StateVersion != 2 {
+		t.Errorf("expected StateVersion = 2, got %d", curTun.StateVersion)
+	}
+	if curTun.Endpoint != newEndpoint {
+		t.Errorf("expected Endpoint = %q, got %q", newEndpoint, curTun.Endpoint)
+	}
+}

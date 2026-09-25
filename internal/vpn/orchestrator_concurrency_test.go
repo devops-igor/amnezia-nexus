@@ -684,6 +684,9 @@ func TestOrchestrator_InFlightProbe_FencedOnEndpointUpdate_NoStatusMutationOrFai
 			if dbTun1.StateVersion != 2 {
 				t.Errorf("expected DB StateVersion to remain 2, got %d", dbTun1.StateVersion)
 			}
+			if fc := orch.GetProbeFailCount(tun1.ID); fc != 0 {
+				t.Errorf("expected probe fail count = 0 after stale probe fenced, got %d", fc)
+			}
 
 			// Step 5: Verify session was NOT migrated to peer tunnel 2
 			sessions, err := db.GetActiveVPNSessions(ctx)
