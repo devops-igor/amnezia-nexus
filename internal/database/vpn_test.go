@@ -745,3 +745,76 @@ func TestMigrateVPNSessionBackend(t *testing.T) {
 		t.Fatal("expected error migrating non-existent session, got nil")
 	}
 }
+
+func TestMigrateVPNSessionToActiveTunnel_RejectsStaleAssignments(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+	srv, err := db.CreateServer(ctx, &models.Server{Name: "guarded-migration", Host: "198.51.100.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{ServerID: srv, InterfaceName: "awg-source", PublicKey: "guard-src", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{ServerID: srv, InterfaceName: "awg-target", PublicKey: "guard-dst", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.CreateUser(ctx, &models.User{Username: "guarded-migration-user"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "guarded-migration-session"
+	if err := db.CreateVPNSession(ctx, &models.VPNSession{
+		ID: sessionID, UserID: user, BackendTunnelID: source,
+		PeerPublicKey: "guarded-migration-peer", AssignedIP: "10.100.0.90", Status: "connected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertSource := func() {
+		t.Helper()
+		s, err := db.GetVPNSessionByID(ctx, sessionID)
+		if err != nil || s == nil {
+			t.Fatalf("GetVPNSessionByID failed: %v", err)
+		}
+		if s.BackendTunnelID != source || s.Status != "connected" {
+			t.Fatalf("session unexpectedly reassigned: %+v", s)
+		}
+	}
+
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "disabled", models.DisableReasonAdmin, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, source, target); err == nil {
+		t.Fatal("expected migration to disabled target to fail")
+	}
+	assertSource()
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", models.DisableReasonAdmin, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, source, target); err == nil {
+		t.Fatal("expected migration to admin-disabled target to fail even with active status")
+	}
+	assertSource()
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, target, target); err == nil {
+		t.Fatal("expected stale source assignment to fail")
+	}
+	assertSource()
+	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, source, target); err != nil {
+		t.Fatalf("migration to active target failed: %v", err)
+	}
+	s, err := db.GetVPNSessionByID(ctx, sessionID)
+	if err != nil || s == nil || s.BackendTunnelID != target || s.Status != "connected" {
+		t.Fatalf("session not migrated to active target: session=%+v err=%v", s, err)
+	}
+	if err := db.CloseVPNSession(ctx, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, target, source); err == nil {
+		t.Fatal("expected disconnected session migration to fail")
+	}
+}

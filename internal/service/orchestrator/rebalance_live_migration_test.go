@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 type mockSessionMigrator struct {
@@ -184,5 +186,80 @@ func TestCheckBackendTunnelHealth_UsesSessionMigrator(t *testing.T) {
 	}
 	if migrations[0].targetTunnelID != f.t2 {
 		t.Errorf("migration target tunnel = %d, want %d (t2)", migrations[0].targetTunnelID, f.t2)
+	}
+}
+
+// A target may be disabled after its probe succeeded but before migration starts.
+func TestMigrateDegradedTunnelSessions_SkipsDisabledHealthySnapshot(t *testing.T) {
+	for _, withMigrator := range []bool{false, true} {
+		name := "database fallback"
+		if withMigrator {
+			name = "live migrator"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := setupRebalanceFixture(t)
+			ctx := context.Background()
+			f.session(t, "stale-target-session", f.t1, "connected")
+			stale, err := f.db.GetBackendTunnel(ctx, f.t2)
+			if err != nil || stale == nil {
+				t.Fatalf("GetBackendTunnel failed: %v", err)
+			}
+			if err := f.db.UpdateBackendTunnelStatusWithReason(ctx, f.t2, "disabled", models.DisableReasonAdmin, 0); err != nil {
+				t.Fatalf("disable target: %v", err)
+			}
+
+			migrator := &mockSessionMigrator{}
+			orch := New(f.db, nil)
+			if withMigrator {
+				orch.SetSessionMigrator(migrator)
+			}
+			orch.migrateDegradedTunnelSessions(ctx, []int64{f.t1}, []*models.BackendTunnel{stale})
+
+			session, err := f.db.GetVPNSessionByID(ctx, "stale-target-session")
+			if err != nil || session == nil {
+				t.Fatalf("GetVPNSessionByID failed: %v", err)
+			}
+			if session.BackendTunnelID != f.t1 || session.Status != "connected" {
+				t.Fatalf("session moved to disabled tunnel: %+v", session)
+			}
+			if got := migrator.getMigrations(); len(got) != 0 {
+				t.Fatalf("migrator called with disabled target: %+v", got)
+			}
+		})
+	}
+}
+
+func TestMigrateDegradedTunnelSessions_UsesNextActiveTarget(t *testing.T) {
+	f := setupRebalanceFixture(t)
+	ctx := context.Background()
+	f.session(t, "next-target-session", f.t1, "connected")
+	stale, err := f.db.GetBackendTunnel(ctx, f.t2)
+	if err != nil || stale == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	source, err := f.db.GetBackendTunnel(ctx, f.t1)
+	if err != nil || source == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	thirdID, err := f.db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: source.ServerID, InterfaceName: "awg-extra", PublicKey: "reb-pub3", Status: "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	active, err := f.db.GetBackendTunnel(ctx, thirdID)
+	if err != nil || active == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if err := f.db.UpdateBackendTunnelStatusWithReason(ctx, f.t2, "disabled", models.DisableReasonAdmin, 0); err != nil {
+		t.Fatalf("disable target: %v", err)
+	}
+
+	migrator := &mockSessionMigrator{}
+	orch := New(f.db, nil, WithSessionMigrator(migrator))
+	orch.migrateDegradedTunnelSessions(ctx, []int64{f.t1}, []*models.BackendTunnel{stale, active})
+	got := migrator.getMigrations()
+	if len(got) != 1 || got[0].targetTunnelID != thirdID || got[0].sessionID != "next-target-session" {
+		t.Fatalf("migration did not skip disabled candidate: %+v", got)
 	}
 }
