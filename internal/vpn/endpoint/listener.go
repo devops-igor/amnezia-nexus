@@ -1115,21 +1115,11 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 		newKeys.ExpiresAt = newKeys.CreatedAt.Add(el.getRejectAfterTime())
 	}
 
-	// A responder may have only one unconfirmed keypair. Once #329 wires
-	// confirmation, replacing next will simply retire the older unconfirmed
-	// next while preserving current. During the #328 transition, peers whose
-	// real handshake path has not yet promoted a current key keep the prior
-	// staged key in previous so existing old-key rollover behavior remains
-	// merge-safe.
-	if pkp.next != nil {
-		if pkp.current == nil {
-			if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
-				delete(el.indexTable, pkp.previous.LocalIndex)
-			}
-			pkp.previous = pkp.next
-		} else if pkp.next.LocalIndex != 0 {
-			delete(el.indexTable, pkp.next.LocalIndex)
-		}
+	// A responder may have only one unconfirmed keypair. Replacing next
+	// retires only that unconfirmed key and never disturbs confirmed current
+	// or previous state, matching upstream amneziawg-go.
+	if pkp.next != nil && pkp.next.LocalIndex != 0 {
+		delete(el.indexTable, pkp.next.LocalIndex)
 	}
 	pkp.next = newKeys
 	if newKeys.LocalIndex != 0 {
