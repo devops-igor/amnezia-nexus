@@ -15,9 +15,9 @@ func issue328TestKeys(t *testing.T, localIndex uint32, fill byte) *TransportKeys
 		recv[i] = fill + 1
 	}
 	keys := &TransportKeys{
-		SendKey:    send,
-		RecvKey:    recv,
-		LocalIndex: localIndex,
+		SendKey:     send,
+		RecvKey:     recv,
+		LocalIndex:  localIndex,
 		RemoteIndex: localIndex + 1000,
 	}
 	if err := keys.InitCiphers(); err != nil {
