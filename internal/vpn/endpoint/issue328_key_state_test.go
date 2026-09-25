@@ -189,6 +189,20 @@ func TestIssue328_ExpiryRetiresPreviousAndNextButKeepsCurrent(t *testing.T) {
 	if got, ok := el.LookupKeypairByIndexForTest(k1.LocalIndex); !ok || got != k1 {
 		t.Fatalf("current index %d was removed by sweep", k1.LocalIndex)
 	}
+
+	k1.SetExpiresAt(time.Now().Add(-time.Second))
+	el.sweepExpiredKeypairs()
+
+	previous, current, next = el.PeerKeypairStateForTest(peer)
+	if previous != nil || current != nil || next != nil {
+		t.Fatalf("expired current survived second sweep: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if _, ok := el.LookupKeypairByIndexForTest(k1.LocalIndex); ok {
+		t.Fatalf("expired current index %d survived sweep", k1.LocalIndex)
+	}
+	if _, ok := el.TransportKeysFor(peer); ok {
+		t.Fatal("compatibility alias survived after all key slots expired")
+	}
 }
 
 func TestIssue328_PruneRemovesPreviousCurrentNextAndIndexes(t *testing.T) {
