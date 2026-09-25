@@ -2035,6 +2035,14 @@ func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testin
 		t.Fatalf("GetTunnel before update failed: %v", err)
 	}
 
+	devInitial := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devInitial == nil {
+		t.Fatal("expected devInitial to be attached, got nil")
+	}
+	if devInitial.IsClosed() {
+		t.Fatal("expected devInitial to be open initially")
+	}
+
 	// 1. Hook forwarder sync to fail, triggering the rollback path in UpdateBackendServerHost.
 	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
 		return errors.New("simulated sync failure")
@@ -2086,6 +2094,41 @@ func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testin
 	expectedNewEndpoint := fmt.Sprintf("%s:51820", newHost)
 	if tunAfter.Endpoint != expectedNewEndpoint {
 		t.Errorf("expected pool tunnel endpoint to be %q, got %q", expectedNewEndpoint, tunAfter.Endpoint)
+	}
+
+	// 3. Remove fault injections and retry update with the same newHost.
+	vpnSvc.SetSyncBackendForwarderHookForTest(nil)
+	vpnSvc.SetTunnelEndpointHookForTest(nil)
+
+	retryBody, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+	retryReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(retryBody))
+	retryW := httptest.NewRecorder()
+	r.ServeHTTP(retryW, retryReq)
+
+	if retryW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on same-host retry, got %d (body: %s)", retryW.Code, retryW.Body.String())
+	}
+
+	devReconciled := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devReconciled == nil {
+		t.Fatal("expected devReconciled to not be nil")
+	}
+	if devReconciled == devInitial {
+		t.Error("expected devReconciled != devInitial")
+	}
+	if !devInitial.IsClosed() {
+		t.Error("expected devInitial.IsClosed() to be true")
+	}
+	if devReconciled.IsClosed() {
+		t.Error("expected !devReconciled.IsClosed() to be true")
+	}
+
+	serverAfterRetry, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer after retry failed: %v", err)
+	}
+	if serverAfterRetry.Host != newHost {
+		t.Errorf("expected serverAfter.Host == %q, got %q", newHost, serverAfterRetry.Host)
 	}
 }
 

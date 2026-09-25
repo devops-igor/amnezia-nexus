@@ -2809,6 +2809,58 @@ func TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed(t *
 	}
 }
 
+func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Same Endpoint Srv", "198.51.100.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "198.51.100.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("attachBackendForwarder failed: %v", err)
+	}
+
+	dev1 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev1 == nil {
+		t.Fatal("expected dev1 to be attached, got nil")
+	}
+	if dev1.IsClosed() {
+		t.Fatal("expected dev1 to be open initially")
+	}
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.1"); err != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+	}
+
+	dev2 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev2 == nil {
+		t.Fatal("expected dev2 to be attached, got nil")
+	}
+	if dev2 == dev1 {
+		t.Error("expected new device instance to replace dev1")
+	}
+	if !dev1.IsClosed() {
+		t.Error("expected old dev1 to be closed after same-endpoint reconciliation")
+	}
+	if dev2.IsClosed() {
+		t.Error("expected new dev2 to remain open")
+	}
+}
+
 func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

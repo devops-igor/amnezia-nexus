@@ -2490,6 +2490,7 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 		if attachErr != nil {
 			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
 			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
+			return fmt.Errorf("failed to attach backend forwarder: %w", attachErr)
 		}
 	}
 
@@ -2530,7 +2531,22 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	}
 
 	if tun.Endpoint == newEndpoint {
-		return nil
+		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+		s.mu.RLock()
+		hook := s.updateBackendServerHostPreLockHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
 	}
 
 	oldEndpoint := tun.Endpoint
