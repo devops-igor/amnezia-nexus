@@ -183,8 +183,3 @@ func TestIssue329_SendToPeerRejectsUnconfirmedInitialNext(t *testing.T) {
 	}
 }
 
-// Keep the tests independent from randomized H4 ranges while using the
-// production default transport message type.
-func health.DefaultH4 uint32 {
-	return 2528465083
-}
