@@ -3384,7 +3384,9 @@ func (s *Service) HasTransportStateForPeer(peerKey string) bool {
 	return s.endpoint.HasTransportStateForPeer(peerKey)
 }
 
-// HandleIncomingPeer authenticates a connecting peer, selects a backend tunnel, and registers forwarding routes.
+// HandleIncomingPeer authenticates a peer. A healthy live session keeps its
+// backend and route through cryptographic rekeys; only admission/reconnect or
+// an unusable assignment goes through backend selection and route registration.
 //
 // Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
 // select → CreateSession → IncrementConnections sequence below, making the
@@ -3413,6 +3415,24 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	user, conn, err := s.auth.AuthenticatePeer(ctx, peerPublicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("peer authentication failed: %w", err)
+	}
+
+	if s.peerGenerations == nil {
+		s.peerGenerations = make(map[string]uint64)
+	}
+	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
+		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
+		if backendErr == nil && backend.Status == "active" &&
+			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
+			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
+			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {
+				s.peerGenerations[peerPublicKey] = gen
+				if s.stickyMgr != nil {
+					s.stickyMgr.AssignPeerAffinity(peerPublicKey, backend.ID)
+				}
+				return sess, backend, nil
+			}
+		}
 	}
 
 	activeTunnels := s.pool.GetActiveTunnels()
@@ -3444,9 +3464,6 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		return nil, nil, err
 	}
 
-	if s.peerGenerations == nil {
-		s.peerGenerations = make(map[string]uint64)
-	}
 	s.peerGenerations[peerPublicKey]++
 	peerGen := s.peerGenerations[peerPublicKey]
 

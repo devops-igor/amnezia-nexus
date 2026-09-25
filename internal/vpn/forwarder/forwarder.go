@@ -540,6 +540,17 @@ func (f *Forwarder) RouteSessionID(peerKey string) string {
 	return ""
 }
 
+// HasSessionRoute checks that the live route still belongs to the session and
+// its assigned IP/backend. A stale or missing route needs normal admission.
+func (f *Forwarder) HasSessionRoute(peerKey, sessionID, connectionID, assignedIP string, backendTunnelID int64) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	route := f.routesByPeer[peerKey]
+	return route != nil && !route.retired.Load() && route.sessionID == sessionID && route.connectionID == connectionID &&
+		route.assignedIP == assignedIP && route.backendTunnelID == backendTunnelID &&
+		f.routesByIP[assignedIP] == route
+}
+
 // UnregisterSession removes a peer session route, stops its pump goroutine,
 // and drains its queue so in-flight senders cannot block.
 //

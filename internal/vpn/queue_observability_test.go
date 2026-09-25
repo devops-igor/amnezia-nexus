@@ -20,6 +20,9 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			db := setupTestDB(t)
 			svc, _, _, userID, peer := setupTestVPNService(t, db)
+			// Keep the status probe local: external public-IP detection can take
+			// longer than this test's two-second lock-contention deadline.
+			svc.cfg.PublicEndpoint = "198.51.100.1"
 			if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -48,6 +51,17 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			}()
 			if err := svc.forwarder.RouteBackendToClient(sess.BackendTunnelID, []byte("packet"), sess.AssignedIP); err != nil {
 				t.Fatal(err)
+			}
+			if action == "replace" {
+				// Make the old assignment unusable so this is a real route
+				// replacement. Healthy rekeys now keep the existing route.
+				backend, err := svc.pool.GetTunnelByID(sess.BackendTunnelID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := svc.pool.SetTunnelStatus(t.Context(), backend.ServerID, "degraded", 0); err != nil {
+					t.Fatal(err)
+				}
 			}
 			select {
 			case <-dev.started:
