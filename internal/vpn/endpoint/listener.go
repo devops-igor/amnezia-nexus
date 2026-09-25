@@ -1076,8 +1076,8 @@ func (el *Listener) storeTransportKeysLocked(peerKey string, newKeys *TransportK
 }
 
 // stageResponderTransportKeysLocked installs a newly derived responder keypair
-// into the bounded next slot without changing current/previous. It mirrors the
-// state transition performed by upstream amneziawg-go's responder branch.
+// into the bounded next slot while preserving current and retiring previous.
+// It mirrors the responder transition performed by upstream amneziawg-go.
 //
 // #328 intentionally introduces only the state primitive. Production handshake
 // wiring, confirmation-driven promotion, and outbound selection are completed
