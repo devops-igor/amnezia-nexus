@@ -656,14 +656,14 @@ func TestRekeyRollover_ReceiverIndexRouting_MultiPeer(t *testing.T) {
 
 	// Handshake Peer A
 	privA, peerKeyA := newTestClient(t, el.db, sID, "multi_peer_A")
-	performClientHandshake(t, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
-	performClientHandshake(t, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
+	performClientHandshake(t, el, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
 	currA, prevA := el.PeerKeypairsForTest(peerKeyA)
 
 	// Handshake Peer B
 	privB, peerKeyB := newTestClient(t, el.db, sID, "multi_peer_B")
-	performClientHandshake(t, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
-	performClientHandshake(t, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
+	performClientHandshake(t, el, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
 	currB, prevB := el.PeerKeypairsForTest(peerKeyB)
 
 	// IndexTable must contain exactly 4 entries: prevA, currA, prevB, currB
