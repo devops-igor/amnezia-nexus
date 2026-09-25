@@ -636,6 +636,36 @@ func TestUpdateServerHostRequest_Validate(t *testing.T) {
 			errMsg:  "host cannot be empty",
 		},
 		{
+			name:     "valid bracketed IPv6 address",
+			req:      UpdateServerHostRequest{Host: "[2001:db8::1]"},
+			wantErr:  false,
+			wantHost: "2001:db8::1",
+		},
+		{
+			name:     "valid bracketed IPv6 loopback",
+			req:      UpdateServerHostRequest{Host: "[::1]"},
+			wantErr:  false,
+			wantHost: "::1",
+		},
+		{
+			name:     "valid bracketed IPv6 with whitespace trimming",
+			req:      UpdateServerHostRequest{Host: "  [2001:db8::1]  "},
+			wantErr:  false,
+			wantHost: "2001:db8::1",
+		},
+		{
+			name:    "invalid bracketed host",
+			req:     UpdateServerHostRequest{Host: "[invalid]"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
+			name:    "invalid empty bracketed host",
+			req:     UpdateServerHostRequest{Host: "[]"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
 			name:    "invalid host with spaces",
 			req:     UpdateServerHostRequest{Host: "invalid host"},
 			wantErr: true,
@@ -669,6 +699,37 @@ func TestUpdateServerHostRequest_Validate(t *testing.T) {
 				if tt.req.Host != tt.wantHost {
 					t.Errorf("expected trimmed host %q, got %q", tt.wantHost, tt.req.Host)
 				}
+			}
+		})
+	}
+}
+
+func TestValidateHost(t *testing.T) {
+	tests := []struct {
+		host    string
+		wantErr bool
+	}{
+		{"192.168.1.1", false},
+		{"10.0.0.1", false},
+		{"2001:db8::1", false},
+		{"::1", false},
+		{"[2001:db8::1]", false},
+		{"[::1]", false},
+		{"vpn.example.com", false},
+		{"node-1.servers.net", false},
+		{"[invalid]", true},
+		{"[]", true},
+		{"invalid host", true},
+		{"server$name.com", true},
+		{"http://example.com", true},
+		{"", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			err := ValidateHost(tt.host)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateHost(%q) error = %v, wantErr %v", tt.host, err, tt.wantErr)
 			}
 		})
 	}

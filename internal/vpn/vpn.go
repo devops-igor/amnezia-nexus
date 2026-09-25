@@ -175,14 +175,16 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	lastReconcileTime             time.Time
-	lastReconcileByTunnel         map[int64]time.Time
-	peerGenerations               map[string]uint64
-	reconcilePostSnapshotHook     func()
-	reconcilePreApplyHook         func()
-	reconcilePreCommitHook        func()
-	ensureDevicePreLockHook       func()
-	preCommitMigrationHookForTest func()
+	lastReconcileTime                  time.Time
+	lastReconcileByTunnel              map[int64]time.Time
+	peerGenerations                    map[string]uint64
+	reconcilePostSnapshotHook          func()
+	reconcilePreApplyHook              func()
+	reconcilePreCommitHook             func()
+	ensureDevicePreLockHook            func()
+	preCommitMigrationHookForTest      func()
+	updateBackendServerHostPreLockHook func()
+	updateBackendServerHostErr         error
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -805,6 +807,25 @@ func (s *Service) SetEnsureDevicePreLockHook(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureDevicePreLockHook = fn
+}
+
+// SetUpdateBackendServerHostPreLockHook sets a hook called immediately before acquiring s.mu in UpdateBackendServerHost.
+func (s *Service) SetUpdateBackendServerHostPreLockHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateBackendServerHostPreLockHook = fn
+}
+
+// SetUpdateServerHostPreLockHook is an alias for SetUpdateBackendServerHostPreLockHook.
+func (s *Service) SetUpdateServerHostPreLockHook(fn func()) {
+	s.SetUpdateBackendServerHostPreLockHook(fn)
+}
+
+// SetUpdateBackendServerHostErrorForTest sets an error to be returned by UpdateBackendServerHost for testing.
+func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateBackendServerHostErr = err
 }
 
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
@@ -2388,10 +2409,68 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	return nil
 }
 
+func (s *Service) resolveNewBackendEndpoint(ctx context.Context, serverID int64, currentEndpoint, newHost string) (string, error) {
+	cleanHost := strings.Trim(strings.TrimSpace(newHost), "[]")
+	if _, port, splitErr := net.SplitHostPort(currentEndpoint); splitErr == nil && port != "" {
+		return net.JoinHostPort(cleanHost, port), nil
+	}
+	if s.db == nil {
+		return "", fmt.Errorf("database not available to resolve server %d credentials", serverID)
+	}
+	srv, loadErr := s.db.GetServerByID(ctx, serverID)
+	if loadErr != nil || srv == nil {
+		return "", fmt.Errorf("failed to load server %d: %w", serverID, loadErr)
+	}
+	_, p, _, credErr := s.resolveBackendCredentials(ctx, serverID, srv)
+	if credErr != nil {
+		return "", fmt.Errorf("failed to resolve backend credentials for server %d: %w", serverID, credErr)
+	}
+	return net.JoinHostPort(cleanHost, strconv.Itoa(p)), nil
+}
+
+func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, serverID, expectedTunnelID int64, awgParams map[string]any) error {
+	currentTun, err := s.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			return nil
+		}
+		return err
+	}
+	if currentTun == nil || currentTun.ID != expectedTunnelID {
+		return nil
+	}
+
+	if currentTun.DisableReason == models.DisableReasonAdmin || currentTun.Status == TunnelStatusDisabled || currentTun.Status == models.TunnelStatusDisabled {
+		return nil
+	}
+
+	if currentTun.Status == TunnelStatusActive || currentTun.Status == TunnelStatusDegraded ||
+		currentTun.Status == models.TunnelStatusActive || currentTun.Status == models.TunnelStatusDegraded {
+		attachErr := s.attachBackendForwarder(currentTun, awgParams)
+		if attachErr != nil {
+			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
+			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
+		}
+	}
+
+	if s.prober != nil {
+		s.prober.ResetFailCount(serverID)
+	}
+
+	return nil
+}
+
 // UpdateBackendServerHost updates the endpoint of a server in the VPN backend pool.
 func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, newHost string) error {
 	if s == nil || s.pool == nil {
 		return nil
+	}
+
+	s.mu.RLock()
+	injectedErr := s.updateBackendServerHostErr
+	s.mu.RUnlock()
+	if injectedErr != nil {
+		return injectedErr
 	}
 
 	tun, err := s.pool.GetTunnel(serverID)
@@ -2405,63 +2484,33 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		return nil
 	}
 
-	cleanHost := strings.Trim(strings.TrimSpace(newHost), "[]")
-	var newEndpoint string
-	if _, port, splitErr := net.SplitHostPort(tun.Endpoint); splitErr == nil && port != "" {
-		newEndpoint = net.JoinHostPort(cleanHost, port)
-	} else {
-		if s.db == nil {
-			return fmt.Errorf("database not available to resolve server %d credentials: %w", serverID, splitErr)
-		}
-		srv, loadErr := s.db.GetServerByID(ctx, serverID)
-		if loadErr != nil || srv == nil {
-			return fmt.Errorf("failed to load server %d: %w", serverID, loadErr)
-		}
-		_, p, _, credErr := s.resolveBackendCredentials(ctx, serverID, srv)
-		if credErr != nil {
-			return fmt.Errorf("failed to resolve backend credentials for server %d: %w", serverID, credErr)
-		}
-		newEndpoint = net.JoinHostPort(cleanHost, strconv.Itoa(p))
+	newEndpoint, err := s.resolveNewBackendEndpoint(ctx, serverID, tun.Endpoint, newHost)
+	if err != nil {
+		return err
 	}
 
 	if tun.Endpoint == newEndpoint {
 		return nil
 	}
 
-	if s.db != nil {
-		if err := s.db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"endpoint": newEndpoint}); err != nil {
-			return fmt.Errorf("failed to persist backend tunnel endpoint: %w", err)
-		}
-	}
-
-	if err := s.pool.SetTunnelEndpoint(tun.ID, newEndpoint); err != nil {
+	if err := s.pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
 		return fmt.Errorf("failed to update backend tunnel endpoint in pool: %w", err)
 	}
 	tun.Endpoint = newEndpoint
 
-	if tun.DisableReason == models.DisableReasonAdmin || tun.Status == TunnelStatusDisabled || tun.Status == models.TunnelStatusDisabled {
-		return nil
+	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+	s.mu.RLock()
+	hook := s.updateBackendServerHostPreLockHook
+	s.mu.RUnlock()
+	if hook != nil {
+		hook()
 	}
 
-	if tun.Status == TunnelStatusActive || tun.Status == TunnelStatusDegraded ||
-		tun.Status == models.TunnelStatusActive || tun.Status == models.TunnelStatusDegraded {
-		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		s.mu.Lock()
-		attachErr := s.attachBackendForwarder(tun, awgParams)
-		s.mu.Unlock()
-
-		if attachErr != nil {
-			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
-			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
-		}
-	}
-
-	if s.prober != nil {
-		s.prober.ResetFailCount(serverID)
-	}
-
-	return nil
+	return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
 }
 
 // DeleteBackend permanently removes a backend tunnel from the load-balancing

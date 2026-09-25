@@ -716,7 +716,7 @@ func TestTunnelPool_SetTunnelEndpoint(t *testing.T) {
 	}
 
 	newEndpoint := "192.168.1.20:51820"
-	if err := pool.SetTunnelEndpoint(tun.ID, newEndpoint); err != nil {
+	if err := pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
 		t.Fatalf("SetTunnelEndpoint failed: %v", err)
 	}
 
@@ -727,6 +727,9 @@ func TestTunnelPool_SetTunnelEndpoint(t *testing.T) {
 	}
 	if byID.Endpoint != newEndpoint {
 		t.Errorf("GetTunnelByID endpoint = %q, want %q", byID.Endpoint, newEndpoint)
+	}
+	if byID.StateVersion != 2 {
+		t.Errorf("expected StateVersion = 2, got %d", byID.StateVersion)
 	}
 
 	// Verify retrieval by ServerID
@@ -739,7 +742,80 @@ func TestTunnelPool_SetTunnelEndpoint(t *testing.T) {
 	}
 
 	// Verify non-existent tunnel ID returns ErrTunnelNotFound
-	if err := pool.SetTunnelEndpoint(99999, newEndpoint); !errors.Is(err, ErrTunnelNotFound) {
+	if err := pool.SetTunnelEndpoint(ctx, 99999, newEndpoint); !errors.Is(err, ErrTunnelNotFound) {
 		t.Errorf("expected ErrTunnelNotFound for unknown tunnel, got: %v", err)
+	}
+}
+
+func TestTunnelPool_SetTunnelEndpoint_FencesInFlightProbe(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "fencing-test-server", Host: "198.51.100.1"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "198.51.100.1:51820", "pubkey-fencing")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if tun.StateVersion != 1 {
+		t.Fatalf("expected initial StateVersion = 1, got %d", tun.StateVersion)
+	}
+
+	expectedVersion := tun.StateVersion // 1
+	expectedStatus := tun.Status        // "active"
+
+	newEndpoint := "198.51.100.2:51820"
+	if err := pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
+		t.Fatalf("SetTunnelEndpoint failed: %v", err)
+	}
+
+	// Verify tun.StateVersion is incremented to 2 in memory
+	curMem, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if curMem.StateVersion != 2 {
+		t.Errorf("expected memory StateVersion = 2, got %d", curMem.StateVersion)
+	}
+	if curMem.Endpoint != newEndpoint {
+		t.Errorf("expected memory Endpoint = %q, got %q", newEndpoint, curMem.Endpoint)
+	}
+
+	// Verify DB state_version is 2
+	curDB, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if curDB.StateVersion != 2 {
+		t.Errorf("expected DB StateVersion = 2, got %d", curDB.StateVersion)
+	}
+	if curDB.Endpoint != newEndpoint {
+		t.Errorf("expected DB Endpoint = %q, got %q", newEndpoint, curDB.Endpoint)
+	}
+
+	// In-flight probe attempts CompareAndSwapTunnelStatus with expectedVersion = 1
+	swapped, err := pool.CompareAndSwapTunnelStatus(ctx, sID, expectedStatus, models.DisableReasonNone, expectedVersion, models.TunnelStatusActive, models.DisableReasonNone, 25)
+	if err != nil {
+		t.Fatalf("CompareAndSwapTunnelStatus failed: %v", err)
+	}
+	if swapped {
+		t.Fatal("expected CAS to fail due to version mismatch from SetTunnelEndpoint")
+	}
+
+	// Assert tunnel status is unchanged
+	afterCAS, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID after CAS failed: %v", err)
+	}
+	if afterCAS.Status != expectedStatus {
+		t.Errorf("expected tunnel status unchanged (%q), got %q", expectedStatus, afterCAS.Status)
+	}
+	if afterCAS.StateVersion != 2 {
+		t.Errorf("expected StateVersion to remain 2, got %d", afterCAS.StateVersion)
 	}
 }

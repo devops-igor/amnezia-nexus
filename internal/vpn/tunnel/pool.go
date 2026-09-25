@@ -691,15 +691,28 @@ func (p *Pool) SetConnectionCount(ctx context.Context, tunnelID int64, count int
 	return nil
 }
 
-// SetTunnelEndpoint updates the endpoint of a backend tunnel in memory.
-func (p *Pool) SetTunnelEndpoint(tunnelID int64, endpoint string) error {
+// SetTunnelEndpoint updates the endpoint of a backend tunnel in memory and in the database,
+// advancing StateVersion so in-flight health probes targeting the previous endpoint are fenced.
+func (p *Pool) SetTunnelEndpoint(ctx context.Context, tunnelID int64, endpoint string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.closed {
+		return ErrPoolClosed
+	}
 
 	tunnel, ok := p.tunnelsByID[tunnelID]
 	if !ok {
 		return ErrTunnelNotFound
 	}
+
+	if p.db != nil {
+		if err := p.db.UpdateBackendTunnelEndpoint(ctx, tunnel.ID, endpoint); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel endpoint: %w", err)
+		}
+	}
+
+	tunnel.StateVersion++
 	tunnel.Endpoint = endpoint
 	return nil
 }

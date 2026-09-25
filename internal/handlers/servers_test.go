@@ -1768,6 +1768,121 @@ func TestUpdateServerHostHandler_ConcurrencySerialization(t *testing.T) {
 	}
 }
 
+func TestUpdateServerHostHandler_VPNFailureRollback(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "VPN-Rollback-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	// Inject failure into vpnSvc
+	vpnSvc.SetUpdateBackendServerHostErrorForTest(errors.New("injected vpn failure"))
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Assert database record server.Host was rolled back to original IP
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != origHost {
+		t.Errorf("server host was not rolled back: got %q, want %q", serverAfter.Host, origHost)
+	}
+}
+
+func TestUpdateServerHostHandler_BracketedIPv6(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "IPv6-Server",
+		Host:    "10.20.30.40",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(map[string]string{"host": "[2001:db8::1]"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["host"] != "2001:db8::1" {
+		t.Errorf("response host = %v, want '2001:db8::1'", resp["host"])
+	}
+
+	// Assert database record server.Host persists unbracketed IPv6
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != "2001:db8::1" {
+		t.Errorf("persisted server host = %q, want '2001:db8::1'", serverAfter.Host)
+	}
+}
+
 type testSyncWriter struct {
 	buf *bytes.Buffer
 	mu  *sync.Mutex

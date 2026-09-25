@@ -2606,6 +2606,78 @@ func TestUpdateBackendServerHost(t *testing.T) {
 	}
 }
 
+func TestUpdateBackendServerHost_RaceWithDisableBackend(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Race Server", "198.51.100.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "198.51.100.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if err := svc.pool.SetTunnelStatusWithReason(ctx, sID, TunnelStatusActive, models.DisableReasonNone, 10); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("attachBackendForwarder failed: %v", err)
+	}
+
+	// Verify device is attached initially
+	if svc.GetBackendDeviceForTest(tun.ID) == nil {
+		t.Fatal("expected device to be attached initially")
+	}
+
+	// Set hook before acquiring s.mu in UpdateBackendServerHost to simulate concurrent DisableBackend
+	hookCalled := false
+	svc.SetUpdateBackendServerHostPreLockHook(func() {
+		hookCalled = true
+		if err := svc.DisableBackend(ctx, sID); err != nil {
+			t.Errorf("DisableBackend in hook failed: %v", err)
+		}
+	})
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.2"); err != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+	}
+
+	if !hookCalled {
+		t.Fatal("expected pre-lock hook to be called")
+	}
+
+	// Assert tunnel remains TunnelStatusDisabled with DisableReasonAdmin
+	tunAfter, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfter.Status != TunnelStatusDisabled || tunAfter.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected TunnelStatusDisabled with DisableReasonAdmin, got status=%q reason=%q",
+			tunAfter.Status, tunAfter.DisableReason)
+	}
+
+	// Assert forwarder device is detached / not reattached
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Errorf("expected forwarder device to be detached, got %+v", dev)
+	}
+
+	// Assert no data-plane device is registered for the disabled tunnel in s.backendDevices
+	svc.mu.RLock()
+	_, hasDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if hasDev {
+		t.Errorf("expected no device in backendDevices for disabled tunnel %d", tun.ID)
+	}
+}
+
 func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

@@ -255,7 +255,15 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.UpdateBackendServerHost(ctx, serverID, req.Host); err != nil {
-			slog.Warn("failed to update VPN backend endpoint", "server_id", serverID, "err", err)
+			slog.Error("failed to update VPN backend endpoint, rolling back server host", "server_id", serverID, "err", err)
+			if rbErr := h.db.UpdateServer(ctx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
+				slog.Error("failed to rollback server host after VPN failure", "server_id", serverID, "err", rbErr)
+			}
+			if h.sshPool != nil {
+				h.sshPool.Remove(serverID)
+			}
+			h.JSONError(w, http.StatusInternalServerError, "vpn_propagation_failed", "Failed to update VPN backend endpoint")
+			return
 		}
 	}
 
