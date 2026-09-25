@@ -14,6 +14,7 @@ var pwChangeAllowedExact = map[string]bool{
 	"/api/auth/change-password": true,
 	"/api/auth/login":           true,
 	"/api/auth/captcha":         true,
+	"/api/auth/captcha/verify":  true,
 	"/change-password":          true,
 	"/logout":                   true,
 }
