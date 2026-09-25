@@ -44,6 +44,29 @@ func stageIssue328ResponderKeys(t *testing.T, el *Listener, peer string, keys *T
 	el.stageResponderTransportKeysLocked(peer, keys)
 }
 
+func installIssue328KeyStateForTest(t *testing.T, el *Listener, peer string, previous, current, next *TransportKeys) {
+	t.Helper()
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	el.peerKeypairs[peer] = &peerKeypairs{
+		peerKey:  peer,
+		previous: previous,
+		current:  current,
+		next:     next,
+	}
+	for _, keys := range []*TransportKeys{previous, current, next} {
+		if keys != nil && keys.LocalIndex != 0 {
+			el.indexTable[keys.LocalIndex] = &keypairEntry{peerKey: peer, keys: keys}
+		}
+	}
+	if current != nil {
+		el.noiseKeys[peer] = current
+	} else if previous != nil {
+		el.noiseKeys[peer] = previous
+	}
+}
+
 func TestIssue328_InitialResponderKeyUsesNextSlot(t *testing.T) {
 	el := issue328TestListener(t)
 	peer := "issue328-initial"
@@ -71,19 +94,45 @@ func TestIssue328_InitialResponderKeyUsesNextSlot(t *testing.T) {
 	}
 }
 
-func TestIssue328_ReplacingNextPreservesCurrentAndBoundsIndexes(t *testing.T) {
+func TestIssue328_StagingNextRetiresPreviousAndSupersededNext(t *testing.T) {
 	el := issue328TestListener(t)
-	peer := "issue328-replace-next"
+	peer := "issue328-stage-next"
 
+	k0 := issue328TestKeys(t, 2000, 0x11)
 	k1 := issue328TestKeys(t, 2001, 0x21)
-	el.storeTransportKeys(peer, k1) // legacy confirmed-current setup
+	el.storeTransportKeys(peer, k0)
+	el.storeTransportKeys(peer, k1) // k0 -> previous, k1 -> current
+
+	beforePrevious, beforeCurrent, beforeNext := el.PeerKeypairStateForTest(peer)
+	if beforePrevious != k0 || beforeCurrent != k1 || beforeNext != nil {
+		t.Fatalf("unexpected precondition: previous=%p current=%p next=%p", beforePrevious, beforeCurrent, beforeNext)
+	}
 
 	k2 := issue328TestKeys(t, 2002, 0x31)
 	stageIssue328ResponderKeys(t, el, peer, k2)
 
 	previous, current, next := el.PeerKeypairStateForTest(peer)
-	if previous != nil || current != k1 || next != k2 {
-		t.Fatalf("unexpected state after first stage: previous=%p current=%p next=%p", previous, current, next)
+	if previous != nil {
+		t.Fatalf("previous survived responder staging: got %p want nil", previous)
+	}
+	if current != k1 {
+		t.Fatalf("current changed during responder staging: got %p want %p", current, k1)
+	}
+	if next != k2 {
+		t.Fatalf("next = %p, want staged key %p", next, k2)
+	}
+
+	if _, ok := el.LookupKeypairByIndexForTest(k0.LocalIndex); ok {
+		t.Fatalf("retired previous receiver index %d survived staging", k0.LocalIndex)
+	}
+	if got, ok := el.LookupKeypairByIndexForTest(k1.LocalIndex); !ok || got != k1 {
+		t.Fatalf("confirmed current receiver index %d was lost", k1.LocalIndex)
+	}
+	if got, ok := el.LookupKeypairByIndexForTest(k2.LocalIndex); !ok || got != k2 {
+		t.Fatalf("new next receiver index %d was not registered", k2.LocalIndex)
+	}
+	if count := el.IndexTableCountForTest(); count != 2 {
+		t.Fatalf("index table count = %d, want 2 (current + next)", count)
 	}
 
 	k3 := issue328TestKeys(t, 2003, 0x41)
@@ -91,7 +140,7 @@ func TestIssue328_ReplacingNextPreservesCurrentAndBoundsIndexes(t *testing.T) {
 
 	previous, current, next = el.PeerKeypairStateForTest(peer)
 	if previous != nil {
-		t.Fatalf("previous changed while replacing unconfirmed next: %p", previous)
+		t.Fatalf("previous reappeared while replacing unconfirmed next: %p", previous)
 	}
 	if current != k1 {
 		t.Fatalf("current changed while replacing unconfirmed next: got %p want %p", current, k1)
@@ -99,18 +148,11 @@ func TestIssue328_ReplacingNextPreservesCurrentAndBoundsIndexes(t *testing.T) {
 	if next != k3 {
 		t.Fatalf("next = %p, want newest staged key %p", next, k3)
 	}
-
 	if _, ok := el.LookupKeypairByIndexForTest(k2.LocalIndex); ok {
 		t.Fatalf("superseded next receiver index %d leaked", k2.LocalIndex)
 	}
-	if got, ok := el.LookupKeypairByIndexForTest(k1.LocalIndex); !ok || got != k1 {
-		t.Fatalf("confirmed current receiver index %d was lost", k1.LocalIndex)
-	}
-	if got, ok := el.LookupKeypairByIndexForTest(k3.LocalIndex); !ok || got != k3 {
-		t.Fatalf("new next receiver index %d was not registered", k3.LocalIndex)
-	}
 	if count := el.IndexTableCountForTest(); count != 2 {
-		t.Fatalf("index table count = %d, want 2 (current + next)", count)
+		t.Fatalf("index table count after replacing next = %d, want 2", count)
 	}
 }
 
@@ -118,13 +160,12 @@ func TestIssue328_ExpiryRetiresPreviousAndNextButKeepsCurrent(t *testing.T) {
 	el := issue328TestListener(t)
 	peer := "issue328-expiry"
 
+	// Defensive cleanup coverage: construct all three slots synthetically.
+	// Normal responder staging never leaves previous populated alongside next.
 	k0 := issue328TestKeys(t, 3000, 0x51)
 	k1 := issue328TestKeys(t, 3001, 0x61)
-	el.storeTransportKeys(peer, k0)
-	el.storeTransportKeys(peer, k1) // k0 -> previous, k1 -> current
-
 	k2 := issue328TestKeys(t, 3002, 0x71)
-	stageIssue328ResponderKeys(t, el, peer, k2)
+	installIssue328KeyStateForTest(t, el, peer, k0, k1, k2)
 
 	k0.SetExpiresAt(time.Now().Add(-time.Second))
 	k2.SetExpiresAt(time.Now().Add(-time.Second))
@@ -162,7 +203,7 @@ func TestIssue328_ExpiryRetiresPreviousAndNextButKeepsCurrent(t *testing.T) {
 		t.Fatalf("expired current index %d survived sweep", k1.LocalIndex)
 	}
 	if _, ok := el.TransportKeysFor(peer); ok {
-		t.Fatal("compatibility alias survived after all key slots expired")
+		t.Fatal("runtime transport-key alias survived after all key slots expired")
 	}
 }
 
@@ -170,16 +211,15 @@ func TestIssue328_PruneRemovesPreviousCurrentNextAndIndexes(t *testing.T) {
 	el := issue328TestListener(t)
 	peer := "issue328-prune"
 
+	// Defensive cleanup coverage: construct all three slots synthetically.
+	// Normal responder staging is bounded to current+next.
 	k0 := issue328TestKeys(t, 4000, 0x81)
 	k1 := issue328TestKeys(t, 4001, 0x91)
-	el.storeTransportKeys(peer, k0)
-	el.storeTransportKeys(peer, k1)
-
 	k2 := issue328TestKeys(t, 4002, 0xa1)
-	stageIssue328ResponderKeys(t, el, peer, k2)
+	installIssue328KeyStateForTest(t, el, peer, k0, k1, k2)
 
 	if count := el.IndexTableCountForTest(); count != 3 {
-		t.Fatalf("precondition: index table count = %d, want 3", count)
+		t.Fatalf("synthetic precondition: index table count = %d, want 3", count)
 	}
 
 	if !el.PrunePeerTransportState(peer) {
@@ -196,7 +236,7 @@ func TestIssue328_PruneRemovesPreviousCurrentNextAndIndexes(t *testing.T) {
 		}
 	}
 	if _, ok := el.TransportKeysFor(peer); ok {
-		t.Fatal("legacy transport-key alias survived prune")
+		t.Fatal("runtime transport-key alias survived prune")
 	}
 }
 
