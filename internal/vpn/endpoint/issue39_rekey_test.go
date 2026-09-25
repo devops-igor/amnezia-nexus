@@ -191,9 +191,10 @@ func TestListenerAcceptsRekeyHandshakeOverUDP(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(resp1, state1, hpKey, h2, s2) {
 		t.Fatal("initial handshake response failed client verification")
 	}
+	confirmClientHandshake(t, el, clientConn, state1.ClientPriv, hpKey)
 	keys1, ok := el.TransportKeysFor(peerKey)
 	if !ok || keys1 == nil {
-		t.Fatal("no transport keys stored after initial handshake")
+		t.Fatal("no confirmed transport keys after initial keepalive")
 	}
 
 	// --- Rekey: fresh ephemeral + fresh per-packet H1 from the range ---
@@ -213,12 +214,13 @@ func TestListenerAcceptsRekeyHandshakeOverUDP(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(resp2, state2, hpKey, h2, s2) {
 		t.Fatal("rekey response failed client verification against the NEW initiation state")
 	}
+	confirmClientHandshake(t, el, clientConn, state2.ClientPriv, hpKey)
 	keys2, ok := el.TransportKeysFor(peerKey)
 	if !ok || keys2 == nil {
-		t.Fatal("transport keys missing after rekey")
+		t.Fatal("confirmed transport keys missing after rekey keepalive")
 	}
 	if string(keys2.SendKey) == string(keys1.SendKey) {
-		t.Error("transport keys were not refreshed by the rekey handshake")
+		t.Error("transport keys were not refreshed after confirmed rekey")
 	}
 }
 
@@ -398,9 +400,10 @@ func TestPostRestartClientAutoRecovery(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(buf[:n], state2, hpKey, h2, s2) {
 		t.Fatal("post-restart rekey response failed client verification")
 	}
+	confirmClientHandshake(t, el2, clientConn2, state2.ClientPriv, hpKey)
 	keys2, ok := el2.TransportKeysFor(peerKey)
 	if !ok || keys2 == nil {
-		t.Fatal("transport keys not restored on the new listener after rekey")
+		t.Fatal("confirmed transport keys not restored on the new listener after rekey")
 	}
 	if r := el2.HandshakeRejections(); r != rejectionsBefore {
 		t.Fatalf("legit post-restart rekey was rejected (%d rejections), recovery broken", r-rejectionsBefore)
