@@ -1085,6 +1085,10 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 	if newKeys == nil {
 		return
 	}
+	_ = newKeys.InitCiphers()
+	if el.noiseKeys == nil {
+		el.noiseKeys = make(map[string]*TransportKeys)
+	}
 	if el.peerKeypairs == nil {
 		el.peerKeypairs = make(map[string]*peerKeypairs)
 	}
@@ -1111,15 +1115,34 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 		newKeys.ExpiresAt = newKeys.CreatedAt.Add(el.getRejectAfterTime())
 	}
 
-	// A responder may have only one unconfirmed keypair. Replacing next must
-	// never disturb the confirmed current/previous slots.
-	if pkp.next != nil && pkp.next.LocalIndex != 0 {
-		delete(el.indexTable, pkp.next.LocalIndex)
+	// A responder may have only one unconfirmed keypair. Once #329 wires
+	// confirmation, replacing next will simply retire the older unconfirmed
+	// next while preserving current. During the #328 transition, peers whose
+	// real handshake path has not yet promoted a current key keep the prior
+	// staged key in previous so existing old-key rollover behavior remains
+	// merge-safe.
+	if pkp.next != nil {
+		if pkp.current == nil {
+			if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+				delete(el.indexTable, pkp.previous.LocalIndex)
+			}
+			pkp.previous = pkp.next
+		} else if pkp.next.LocalIndex != 0 {
+			delete(el.indexTable, pkp.next.LocalIndex)
+		}
 	}
 	pkp.next = newKeys
 	if newKeys.LocalIndex != 0 {
 		el.indexTable[newKeys.LocalIndex] = &keypairEntry{peerKey: peerKey, keys: newKeys}
 	}
+
+	// Compatibility alias: until #329 changes outbound selection to confirmed
+	// current, preserve existing runtime behavior by exposing the most recently
+	// derived key through TransportKeysFor/SendToPeer.
+	el.noiseKeys[peerKey] = newKeys
+
+	log.Printf("[vpn/endpoint] staged responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d expires_in=%s",
+		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
 }
 
 // allocateReceiverIndex generates an unused, non-zero 32-bit receiver index that
@@ -1180,13 +1203,20 @@ func (el *Listener) lookupKeypairByIndex(receiverIdx uint32) (*keypairEntry, boo
 	return entry, ok
 }
 
-// PeerKeypairsForTest returns the legacy current/previous view used by existing
-// regression tests. New responder-state tests should use PeerKeypairStateForTest.
+// PeerKeypairsForTest returns the legacy effective-current/previous view used
+// by existing regression tests. During the #328 -> #329 transition, a real
+// responder handshake is authoritative in next but remains the effective
+// runtime key through noiseKeys; expose next as current when no confirmed
+// current exists so older tests keep asserting the pre-#329 behavior.
 func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys, previous *TransportKeys) {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
 	if pkp, ok := el.peerKeypairs[peerKey]; ok {
-		return pkp.current, pkp.previous
+		current = pkp.current
+		if current == nil {
+			current = pkp.next
+		}
+		return current, pkp.previous
 	}
 	return nil, nil
 }
@@ -1524,7 +1554,7 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 
 	if transportKeys != nil {
 		transportKeys.Generation = gen
-		el.storeTransportKeysLocked(peerKey, transportKeys)
+		el.stageResponderTransportKeysLocked(peerKey, transportKeys)
 	}
 
 	if sender != nil {
