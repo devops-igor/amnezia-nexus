@@ -17,7 +17,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/tuntest"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -65,30 +64,6 @@ func rekeyTestUDPPacket(src, dst net.IP, sequence uint32) []byte {
 	binary.BigEndian.PutUint32(pkt[28:], sequence)
 	return pkt
 }
-
-// The backend consumes packets from the actual forwarder backend pump and
-// returns them through its normal client queue, preserving packet bytes.
-type rekeyEchoBackend struct {
-	forwarder *forwarder.Forwarder
-	backendID int64
-	received  atomic.Uint64
-}
-
-func (b *rekeyEchoBackend) Write(pkt []byte) (int, error) {
-	if len(pkt) < 32 {
-		return 0, fmt.Errorf("short backend packet")
-	}
-	b.received.Add(1)
-	reply := append([]byte(nil), pkt...)
-	copy(reply[12:16], pkt[16:20])
-	copy(reply[16:20], pkt[12:16])
-	if err := b.forwarder.RouteBackendToClient(b.backendID, reply, net.IP(reply[16:20]).String()); err != nil {
-		return 0, err
-	}
-	return len(pkt), nil
-}
-func (*rekeyEchoBackend) Read([]byte) (int, error) { return 0, nil }
-func (*rekeyEchoBackend) Close() error             { return nil }
 
 // The UDP proxy drops only an upstream responder handshake response; K1
 // transport packets continue along the same path in both directions.
@@ -146,11 +121,11 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 	defer cancel()
 	db := setupTestDB(t)
 	svc, _, _, userID, _ := setupTestVPNService(t, db)
-	serverPub, _, err := tunnel.GenerateCurve25519KeyPair()
+	serverPub, serverPriv, err := tunnel.GenerateCurve25519KeyPair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverID, err := db.CreateServer(ctx, &models.Server{Name: "echo-backend", Host: "127.0.0.1"})
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "upstream-awg-backend", Host: "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,11 +133,109 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	echo := &rekeyEchoBackend{forwarder: svc.forwarder, backendID: backend.ID}
-	svc.forwarder.AttachBackendDevice(backend.ID, echo)
+	// The backend is also an upstream AWG device. A separate header-protected
+	// configuration keeps this local UDP leg identical in shape to a deployed
+	// backend and avoids relying on host treatment of bare WG datagrams.
+	backendHP := make([]byte, 32)
+	for i := range backendHP {
+		backendHP[i] = byte(i + 1)
+	}
+	reserved, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendPort := reserved.LocalAddr().(*net.UDPAddr).Port
+	if err := reserved.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backendServerTUN := tuntest.NewChannelTUN()
+	backendServer := device.NewDevice(backendServerTUN.TUN(), tunnel.NewTunedBind(conn.NewDefaultBind(), tunnel.DefaultUDPSocketBufferSize), device.NewLogger(device.LogLevelSilent, "upstream-backend"))
+	t.Cleanup(backendServer.Close)
+	serverPrivate, err := base64.StdEncoding.DecodeString(serverPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portalDataPublic, err := tunnel.DataDevicePublicKey(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portalPublicBytes, err := base64.StdEncoding.DecodeString(portalDataPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendOptions := fmt.Sprintf("s1=32\ns2=32\ns3=16\ns4=16\nh1=1001\nh2=1002\nh3=1003\nh4=1004\nheader_protection_key=%s\n", hex.EncodeToString(backendHP))
+	if err := backendServer.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n%spublic_key=%s\nallowed_ip=0.0.0.0/0\n", hex.EncodeToString(serverPrivate), backendPort, backendOptions, hex.EncodeToString(portalPublicBytes))); err != nil {
+		t.Fatal(err)
+	}
+	if err := backendServer.Up(); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.pool.SetTunnelEndpoint(ctx, backend.ID, fmt.Sprintf("127.0.0.1:%d", backendPort)); err != nil {
+		t.Fatal(err)
+	}
+	backend, err = svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendClient, err := tunnel.NewAWGClientDevice("nexus-backend-e2e", backend.Endpoint, backend.PrivateKey, backend.PublicKey, 1420,
+		map[string]any{"s1": 32, "s2": 32, "s3": 16, "s4": 16, "h1": 1001, "h2": 1002, "h3": 1003, "h4": 1004, "header_protection_key": base64.StdEncoding.EncodeToString(backendHP), "jc": 0, "rekey_after_time": 2, "rekey_timeout": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backendClient.Close() })
+	svc.forwarder.AttachBackendDevice(backend.ID, backendClient)
 	svc.forwarder.Start(ctx)
 	svc.forwarder.StartPumps(ctx)
 	t.Cleanup(func() { _ = svc.forwarder.Stop() })
+	var backendReceived, backendRouteErrors atomic.Uint64
+	go func() {
+		for {
+			select {
+			case pkt := <-backendServerTUN.Inbound:
+				if len(pkt) < 32 {
+					continue
+				}
+				backendReceived.Add(1)
+				reply := append([]byte(nil), pkt...)
+				copy(reply[12:16], pkt[16:20])
+				copy(reply[16:20], pkt[12:16])
+				select {
+				case backendServerTUN.Outbound <- reply:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, err := backendClient.Read(buf)
+			if err != nil {
+				return
+			}
+			if n < 32 {
+				continue
+			}
+			if err := svc.forwarder.RouteBackendToClient(backend.ID, buf[:n], net.IP(buf[16:20]).String()); err != nil && binary.BigEndian.Uint32(buf[28:32]) != 0 {
+				backendRouteErrors.Add(1)
+			}
+		}
+	}()
+	// Let the backend AWG leg complete its own first handshake before admitting
+	// the upstream frontend peer. Packet zero intentionally has no client route.
+	prime := rekeyTestUDPPacket(net.IPv4(10, 100, 0, 2), net.IPv4(10, 200, 0, 1), 0)
+	for deadline := time.Now().Add(7 * time.Second); time.Now().Before(deadline) && (backendReceived.Load() == 0 || backendClient.LastHandshakeTime().IsZero()); time.Sleep(200 * time.Millisecond) {
+		if _, err := backendClient.Write(prime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if backendReceived.Load() == 0 || backendClient.LastHandshakeTime().IsZero() {
+		t.Fatal("backend AWG handshake/data path did not become ready")
+	}
+	initialBackendHandshake := backendClient.LastHandshakeTime()
 
 	clientPub, clientPriv, err := tunnel.GenerateCurve25519KeyPair()
 	if err != nil {
@@ -190,6 +263,10 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 		pkt := rekeyTestUDPPacket(clientIP, backendIP, seq)
 		deadline := time.Now().Add(budget)
 		for time.Now().Before(deadline) {
+			wait := budget
+			if budget > time.Second {
+				wait = 200 * time.Millisecond
+			}
 			select {
 			case clientTUN.Outbound <- pkt:
 			case <-time.After(time.Second):
@@ -201,7 +278,10 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 					return
 				}
 				t.Fatalf("unexpected backend reply for seq=%d: %x", seq, reply)
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(wait):
+			}
+			if budget <= time.Second {
+				break
 			}
 		}
 		_, current, next := svc.endpoint.PeerKeypairStateForTest(clientPub)
@@ -239,6 +319,9 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 	}
 	for i := uint32(2); i < 7; i++ {
 		roundTrip(i, time.Second)
+	}
+	if timedOut, err := svc.sessionMgr.CheckTimeouts(ctx, 2*time.Second); err != nil || len(timedOut) != 0 {
+		t.Fatalf("active K1 flow was idle-reaped: %d sessions, %v", len(timedOut), err)
 	}
 
 	// Retry from the upstream client, and continue VoIP-sized UDP traffic
@@ -289,13 +372,25 @@ func TestIssue331UpstreamClientNexusBackendLostResponseAndRekeys(t *testing.T) {
 			return 0
 		}(), next != nil)
 	}
+	for deadline := time.Now().Add(3 * time.Second); !backendClient.LastHandshakeTime().After(initialBackendHandshake) && time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		roundTrip(34, time.Second)
+	}
+	if !backendClient.LastHandshakeTime().After(initialBackendHandshake) {
+		t.Fatal("backend AWG leg did not complete its accelerated rekey")
+	}
+	if timedOut, err := svc.sessionMgr.CheckTimeouts(ctx, 2*time.Second); err != nil || len(timedOut) != 0 {
+		t.Fatalf("active flow was idle-reaped after repeated rekeys: %d sessions, %v", len(timedOut), err)
+	}
+	if indexes := svc.endpoint.IndexTableCountForTest(); indexes > 2 {
+		t.Fatalf("responder index table grew across rekeys: %d", indexes)
+	}
 	after, ok := svc.sessionMgr.GetSessionSnapshotByPeer(clientPub)
 	if !ok || after.ID != initial.ID || after.BackendTunnelID != backend.ID || after.AssignedIP != initial.AssignedIP ||
 		svc.forwarder.RouteSessionID(clientPub) != initial.ID || svc.forwarder.PeerRegistration(clientPub) != registration {
 		t.Fatalf("rekey changed logical route/session: before=%+v after=%+v", initial, after)
 	}
-	if echo.received.Load() < 31 {
-		t.Fatalf("backend received only %d packets", echo.received.Load())
+	if backendReceived.Load() < 31 || backendRouteErrors.Load() != 0 {
+		t.Fatalf("backend received %d packets with %d route errors", backendReceived.Load(), backendRouteErrors.Load())
 	}
 	if now, err := svc.pool.GetTunnelByID(backend.ID); err != nil || now.ActiveConnections != 1 {
 		t.Fatalf("backend counter drift: %+v %v", now, err)
