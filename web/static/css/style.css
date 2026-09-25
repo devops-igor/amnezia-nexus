@@ -305,7 +305,7 @@ a:hover {
     min-height: 100vh;
     width: 100%;
     position: relative;
-    z-index: 1;
+    z-index: auto;
 }
 
 .app-sidebar {
@@ -456,6 +456,7 @@ a:hover {
 
 .sidebar-footer {
     padding: var(--space-md);
+    padding-bottom: max(var(--space-md), env(safe-area-inset-bottom));
     border-top: 1px solid var(--border-color);
     display: flex;
     flex-direction: column;
@@ -2108,6 +2109,7 @@ body,
         left: 0;
         bottom: 0;
         height: 100vh;
+        height: 100dvh;
         z-index: 100;
         transform: translateX(-100%);
         box-shadow: var(--shadow-lg);
@@ -2121,6 +2123,7 @@ body,
 
     .app-sidebar.drawer-open {
         transform: translateX(0);
+        z-index: 100;
     }
 
     .app-main {
@@ -2135,6 +2138,10 @@ body,
 
     .app-main {
         padding-bottom: calc(var(--bottombar-height) + var(--space-lg));
+    }
+
+    .app-layout:has(.drawer-open) ~ .mobile-bottom-bar {
+        pointer-events: none;
     }
 }
 
