@@ -232,6 +232,19 @@ func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, 
 	return nil
 }
 
+// UpdateBackendTunnelEndpoint updates the endpoint of a backend tunnel and increments its state_version.
+func (d *DB) UpdateBackendTunnelEndpoint(ctx context.Context, id int64, endpoint string) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE backend_tunnels SET endpoint = ?, state_version = state_version + 1 WHERE id = ?`
+	_, err := d.sqlDB.ExecContext(ctx, query, endpoint, id)
+	if err != nil {
+		return fmt.Errorf("failed to update backend tunnel endpoint: %w", err)
+	}
+	return nil
+}
+
 // CompareAndSwapTunnelStatus conditionally updates tunnel status if the current status,
 // disable reason, and state version match expected values.
 // Returns true if a row was updated, false if state had changed or was not matched.

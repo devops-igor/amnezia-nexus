@@ -54,21 +54,23 @@ type Dependencies struct {
 
 // Handlers encapsulates all HTTP route handlers and business logic.
 type Handlers struct {
-	cfg           *config.Config
-	db            *database.DB
-	registry      *manager.Registry
-	sshPool       SSHPoolProvider
-	awgMgr        *awg.AWGManager
-	mtproxylMgr   *mtproxyl.MTProxyLManager
-	dnsMgr        *dns.DNSManager
-	vpnSvc        *vpn.Service
-	upstreamSvc   UpstreamChecker
-	dialTimeout   func(network, address string, timeout time.Duration) (net.Conn, error)
-	setupMu       sync.Mutex
-	captchaOnce   sync.Once
-	captchaSt     *captcha.Store
-	userConnMu    sync.Mutex
-	userConnLocks map[string]*sync.Mutex
+	cfg             *config.Config
+	db              *database.DB
+	registry        *manager.Registry
+	sshPool         SSHPoolProvider
+	awgMgr          *awg.AWGManager
+	mtproxylMgr     *mtproxyl.MTProxyLManager
+	dnsMgr          *dns.DNSManager
+	vpnSvc          *vpn.Service
+	upstreamSvc     UpstreamChecker
+	dialTimeout     func(network, address string, timeout time.Duration) (net.Conn, error)
+	setupMu         sync.Mutex
+	captchaOnce     sync.Once
+	captchaSt       *captcha.Store
+	userConnMu      sync.Mutex
+	userConnLocks   map[string]*sync.Mutex
+	serverHostMu    sync.Mutex
+	serverHostLocks map[int64]*sync.Mutex
 }
 
 func (h *Handlers) lockUser(userID string) func() {
@@ -82,6 +84,24 @@ func (h *Handlers) lockUser(userID string) func() {
 		h.userConnLocks[userID] = mu
 	}
 	h.userConnMu.Unlock()
+
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
+}
+
+func (h *Handlers) lockServerHost(serverID int64) func() {
+	h.serverHostMu.Lock()
+	if h.serverHostLocks == nil {
+		h.serverHostLocks = make(map[int64]*sync.Mutex)
+	}
+	mu, ok := h.serverHostLocks[serverID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.serverHostLocks[serverID] = mu
+	}
+	h.serverHostMu.Unlock()
 
 	mu.Lock()
 	return func() {

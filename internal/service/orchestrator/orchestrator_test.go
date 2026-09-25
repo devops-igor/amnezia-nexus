@@ -931,9 +931,11 @@ type mockStatusUpdater struct {
 }
 
 type tunnelStatusUpdate struct {
-	serverID  int64
-	status    string
-	latencyMS int64
+	serverID         int64
+	expectedTunnelID int64
+	expectedVersion  int64
+	status           string
+	latencyMS        int64
 }
 
 func (m *mockStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error {
@@ -943,6 +945,19 @@ func (m *mockStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int64,
 		serverID:  serverID,
 		status:    status,
 		latencyMS: latencyMS,
+	})
+	return m.err
+}
+
+func (m *mockStatusUpdater) SetTunnelStatusWithVersion(ctx context.Context, serverID, expectedTunnelID, expectedVersion int64, status string, latencyMS int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updates = append(m.updates, tunnelStatusUpdate{
+		serverID:         serverID,
+		expectedTunnelID: expectedTunnelID,
+		expectedVersion:  expectedVersion,
+		status:           status,
+		latencyMS:        latencyMS,
 	})
 	return m.err
 }
