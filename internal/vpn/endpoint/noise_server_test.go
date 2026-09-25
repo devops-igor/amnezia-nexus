@@ -402,12 +402,18 @@ func TestEndpointListenerHandshakeOverUDP(t *testing.T) {
 		t.Error("VerifyAWGResponsePacket rejected the listener's UDP response")
 	}
 
-	// The accept path must have created a session and stored transport keys.
+	// The handshake response creates/adopts the logical session, but responder
+	// transport keys remain staged in next until the initiator's authenticated
+	// zero-length keepalive confirms them.
 	if _, ok := el.SessionManager().GetSession(peerKey); !ok {
 		t.Error("expected an active session after successful handshake")
 	}
+	if keys, ok := el.TransportKeysFor(peerKey); ok || keys != nil {
+		t.Fatal("unconfirmed handshake exposed transport keys before keepalive")
+	}
+	confirmClientHandshake(t, el, clientConn, state.ClientPriv, nil)
 	if _, ok := el.TransportKeysFor(peerKey); !ok {
-		t.Error("expected transport keys to be stored for the peer")
+		t.Error("expected confirmed transport keys after client keepalive")
 	}
 
 	// Unregistered peer: initiation must be silently dropped (no response).
@@ -650,12 +656,17 @@ func TestEndpointListenerHandshakeOverUDP_HeaderProtection(t *testing.T) {
 		t.Error("VerifyAWGResponsePacketObfuscated rejected the listener's UDP response")
 	}
 
-	// Active session and transport keys must exist.
+	// The logical session exists after the response, but the responder key is
+	// not current until the authenticated HP transport keepalive arrives.
 	if _, ok := el.SessionManager().GetSession(peerKey); !ok {
 		t.Error("expected an active session after successful HP handshake")
 	}
+	if keys, ok := el.TransportKeysFor(peerKey); ok || keys != nil {
+		t.Fatal("unconfirmed HP handshake exposed transport keys before keepalive")
+	}
+	confirmClientHandshake(t, el, clientConn, state.ClientPriv, hpKey)
 	if _, ok := el.TransportKeysFor(peerKey); !ok {
-		t.Error("expected transport keys to be stored for the HP peer")
+		t.Error("expected confirmed transport keys for the HP peer")
 	}
 }
 
@@ -761,6 +772,15 @@ func TestEndpointListenerHandshakeOverUDP_BackwardCompat_PlaintextPeer(t *testin
 
 	if _, ok := el.SessionManager().GetSession(peerKey); !ok {
 		t.Error("expected an active session after successful plaintext handshake")
+	}
+	if keys, ok := el.TransportKeysFor(peerKey); ok || keys != nil {
+		t.Fatal("unconfirmed plaintext handshake exposed transport keys before keepalive")
+	}
+	// This peer negotiated the plaintext compatibility path, so its transport
+	// confirmation is also sent without header protection.
+	confirmClientHandshake(t, el, clientConn, state.ClientPriv, nil)
+	if _, ok := el.TransportKeysFor(peerKey); !ok {
+		t.Error("expected confirmed transport keys for plaintext compatibility peer")
 	}
 }
 

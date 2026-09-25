@@ -172,8 +172,11 @@ func craftClientTransportDatagram(
 	return datagram
 }
 
-// performClientHandshake performs a live handshake initiation over UDP and returns client state and response.
-func performClientHandshake(
+// performClientHandshakeUnconfirmed performs the responder exchange through
+// receipt/verification of the handshake response, but deliberately does not
+// send authenticated transport. Nexus must therefore keep the derived key in
+// next and continue using the previously confirmed current key.
+func performClientHandshakeUnconfirmed(
 	t *testing.T,
 	clientConn *net.UDPConn,
 	serverPub [32]byte,
@@ -205,6 +208,77 @@ func performClientHandshake(
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected response")
 	}
 
+	return state
+}
+
+func confirmClientHandshake(
+	t *testing.T,
+	el *Listener,
+	clientConn *net.UDPConn,
+	clientPriv []byte,
+	hpKey []byte,
+) *TransportKeys {
+	t.Helper()
+
+	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("derive client public key: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var next *TransportKeys
+	for time.Now().Before(deadline) {
+		_, _, next = el.PeerKeypairStateForTest(peerKey)
+		if next != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if next == nil {
+		t.Fatalf("timed out waiting for staged next key for peer %s", peerKey)
+	}
+
+	// Upstream initiators immediately send an authenticated zero-length
+	// transport keepalive after consuming the handshake response. Sending the
+	// real packet through UDP exercises receiver-index lookup, AEAD, anti-replay,
+	// promotion, endpoint adoption, liveness, and keepalive consumption.
+	keepalive := craftClientTransportDatagram(t, next, el.config.H4.Lo, el.config.S4, hpKey, 0, nil)
+	if _, err := clientConn.Write(keepalive); err != nil {
+		t.Fatalf("write confirmation keepalive failed: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, current, staged := el.PeerKeypairStateForTest(peerKey)
+		if current == next && staged == nil {
+			return next
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for next->current promotion for peer %s", peerKey)
+	return nil
+}
+
+// performClientHandshake performs a normal live handshake plus the immediate
+// authenticated zero-length keepalive used by upstream initiators to confirm
+// responder next. Tests that need the unconfirmed window use
+// performClientHandshakeUnconfirmed directly.
+func performClientHandshake(
+	t *testing.T,
+	el *Listener,
+	clientConn *net.UDPConn,
+	serverPub [32]byte,
+	clientPriv []byte,
+	hpKey []byte,
+	h1 models.HeaderRange,
+	s1 int,
+	h2 models.HeaderRange,
+	s2 int,
+) *health.NoiseClientState {
+	t.Helper()
+	state := performClientHandshakeUnconfirmed(t, clientConn, serverPub, clientPriv, hpKey, h1, s1, h2, s2)
+	confirmClientHandshake(t, el, clientConn, clientPriv, hpKey)
 	return state
 }
 
@@ -244,7 +318,7 @@ func TestRekeyRollover_PreviousKeyInFlightAcceptance(t *testing.T) {
 
 	// Step 1: Register client in DB and perform Initial Handshake (Handshake 1, gen 1)
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "rekey_peer_1")
-	state1 := performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	state1 := performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	_ = state1
 
 	curr1, prev1 := el.PeerKeypairsForTest(peerKey)
@@ -263,7 +337,7 @@ func TestRekeyRollover_PreviousKeyInFlightAcceptance(t *testing.T) {
 	keys1 := curr1
 
 	// Step 2: Client performs Rekey (Handshake 2, gen 2)
-	state2 := performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	state2 := performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	_ = state2
 
 	curr2, prev2 := el.PeerKeypairsForTest(peerKey)
@@ -358,11 +432,11 @@ func TestRekeyRollover_ExpiredOldKeyRejected(t *testing.T) {
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "expire_peer")
 
 	// Handshake 1
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	keys1, _ := el.PeerKeypairsForTest(peerKey)
 
 	// Handshake 2 (rekey)
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	keys2, prevKeys := el.PeerKeypairsForTest(peerKey)
 
 	if prevKeys == nil || prevKeys != keys1 {
@@ -449,11 +523,11 @@ func TestRekeyRollover_AntiReplayProtection(t *testing.T) {
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "replay_peer")
 
 	// Handshake 1
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	keys1, _ := el.PeerKeypairsForTest(peerKey)
 
 	// Handshake 2 (rekey)
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	keys2, prevKeys := el.PeerKeypairsForTest(peerKey)
 	if prevKeys != keys1 {
 		t.Fatal("expected prevKeys to match keys1")
@@ -588,14 +662,14 @@ func TestRekeyRollover_ReceiverIndexRouting_MultiPeer(t *testing.T) {
 
 	// Handshake Peer A
 	privA, peerKeyA := newTestClient(t, el.db, sID, "multi_peer_A")
-	performClientHandshake(t, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
-	performClientHandshake(t, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
+	performClientHandshake(t, el, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, connA, sPub, privA, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
 	currA, prevA := el.PeerKeypairsForTest(peerKeyA)
 
 	// Handshake Peer B
 	privB, peerKeyB := newTestClient(t, el.db, sID, "multi_peer_B")
-	performClientHandshake(t, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
-	performClientHandshake(t, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
+	performClientHandshake(t, el, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, connB, sPub, privB, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2) // rekey
 	currB, prevB := el.PeerKeypairsForTest(peerKeyB)
 
 	// IndexTable must contain exactly 4 entries: prevA, currA, prevB, currB
@@ -677,7 +751,7 @@ func TestRekeyRollover_DeterministicRetirementAndBoundedMemory(t *testing.T) {
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "retire_peer")
 
 	// Handshake 1: Gen 1
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	k1, prev1 := el.PeerKeypairsForTest(peerKey)
 	if k1 == nil || prev1 != nil {
 		t.Fatalf("unexpected state after H1: k1=%v prev=%v", k1, prev1)
@@ -688,7 +762,7 @@ func TestRekeyRollover_DeterministicRetirementAndBoundedMemory(t *testing.T) {
 	}
 
 	// Handshake 2: Gen 2
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	k2, prev2 := el.PeerKeypairsForTest(peerKey)
 	if k2.Generation != 2 || prev2 != k1 {
 		t.Fatalf("unexpected state after H2: k2.gen=%d prev=%v", k2.Generation, prev2)
@@ -699,7 +773,7 @@ func TestRekeyRollover_DeterministicRetirementAndBoundedMemory(t *testing.T) {
 	}
 
 	// Handshake 3: Gen 3 -> k1 MUST be retired and purged from indexTable
-	performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 	k3, prev3 := el.PeerKeypairsForTest(peerKey)
 	if k3.Generation != 3 || prev3 != k2 {
 		t.Fatalf("unexpected state after H3: k3.gen=%d prev=%v", k3.Generation, prev3)
@@ -1450,7 +1524,7 @@ func TestRekeyRollover_OutboundReceiverIndex_PrefersCurrentKeysRemoteIndex(t *te
 
 	// Handshake 1: Establish initial keypair K1
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "rekey_peer_r2")
-	_ = performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 
 	k1, prev1 := el.PeerKeypairsForTest(peerKey)
 	if k1 == nil || prev1 != nil {
@@ -1462,7 +1536,7 @@ func TestRekeyRollover_OutboundReceiverIndex_PrefersCurrentKeysRemoteIndex(t *te
 	}
 
 	// Handshake 2: Rekey to K2
-	_ = performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 
 	k2, prev2 := el.PeerKeypairsForTest(peerKey)
 	if k2 == nil || prev2 == nil {
@@ -1699,8 +1773,8 @@ func TestRekeyRollover_PreviousKeyLoggingThrottled(t *testing.T) {
 
 	// Handshake 1 & Handshake 2
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "rekey_peer_throttle")
-	_ = performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
-	_ = performClientHandshake(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 
 	_, prev := el.PeerKeypairsForTest(peerKey)
 	if prev == nil {
@@ -1913,8 +1987,9 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
 	}
+	confirmClientHandshake(t, el, clientConn2, state2.ClientPriv, hpKey)
 
-	// Verify K_2 / S_2 state before resuming H1
+	// Verify confirmed K_2 / S_2 state before resuming H1
 	k2Current, k2Prev := el.PeerKeypairsForTest(peerKey)
 	if k2Current == nil {
 		t.Fatal("expected current transport keys K2 for peer after H2")
@@ -2026,18 +2101,23 @@ func TestListener_PrunePeerTransportStateForGeneration_Unit(t *testing.T) {
 	if pruned := el.PrunePeerTransportStateForGeneration(peerKey, 1); pruned {
 		t.Fatal("expected PrunePeerTransportStateForGeneration(gen 1) to return false when currentGen is 2")
 	}
-	// Assert K2 and fence survived
+	// Assert the newer generation fence and staged K2 survived. CommitHandshake
+	// alone does not confirm K2 or adopt the sender endpoint under #329.
 	if el.PeerGeneration(peerKey) != 2 {
 		t.Fatalf("expected PeerGeneration to remain 2, got %d", el.PeerGeneration(peerKey))
 	}
-	if tk, ok := el.TransportKeysFor(peerKey); !ok || tk != k2 {
-		t.Fatal("expected K2 to survive stale timeout pruning")
+	prev, current, next := el.PeerKeypairStateForTest(peerKey)
+	if prev != nil || current != nil || next != k2 {
+		t.Fatalf("expected staged K2 to survive stale timeout pruning: previous=%p current=%p next=%p", prev, current, next)
 	}
-	if _, ok := el.peerByAddr(clientAddr.String()); !ok {
-		t.Fatal("expected peer address mapping to survive stale timeout pruning")
+	if tk, ok := el.TransportKeysFor(peerKey); ok || tk != nil {
+		t.Fatalf("staged K2 unexpectedly became confirmed during stale pruning: %+v", tk)
 	}
-	if _, found := el.lookupKeypairByIndex(k2.LocalIndex); !found {
-		t.Fatal("expected indexTable entry to survive stale timeout pruning")
+	if _, ok := el.peerByAddr(clientAddr.String()); ok {
+		t.Fatal("unconfirmed handshake unexpectedly adopted peer address")
+	}
+	if entry, found := el.lookupKeypairByIndex(k2.LocalIndex); !found || entry == nil || entry.keys != k2 {
+		t.Fatal("expected staged K2 indexTable entry to survive stale timeout pruning")
 	}
 
 	// Branch 2: currentGen == timedOutGen -> genuine timeout, PRUNE and advance fence to timedOutGen + 1
@@ -2118,6 +2198,7 @@ func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGenera
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf1[:n1], state1, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H1 response")
 	}
+	confirmClientHandshake(t, el, clientConn1, state1.ClientPriv, hpKey)
 
 	s1, ok := el.SessionManager().GetSession(peerKey)
 	if !ok || s1 == nil || s1.Generation != 1 {
@@ -2184,8 +2265,9 @@ func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGenera
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
 	}
+	confirmClientHandshake(t, el, clientConn2, state2.ClientPriv, hpKey)
 
-	// Verify H2 created S2 (gen 2) and CommitHandshake committed K2
+	// Verify H2 created S2 (gen 2) and authenticated keepalive confirmed K2.
 	k2Current, _ := el.PeerKeypairsForTest(peerKey)
 	if k2Current == nil || k2Current.LocalIndex == k1Current.LocalIndex {
 		t.Fatalf("expected K2 committed for peer, got %+v", k2Current)
@@ -2316,7 +2398,7 @@ func TestRekeyRollover_EndpointRoaming_PreservesSendCounterNonceUniqueness(t *te
 	defer func() { _ = clientConnA.Close() }()
 
 	clientPriv, peerKey := newTestClient(t, el.db, sID, "roam_peer_nonce_test")
-	_ = performClientHandshake(t, clientConnA, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	_ = performClientHandshake(t, el, clientConnA, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 
 	k1Current, _ := el.PeerKeypairsForTest(peerKey)
 	if k1Current == nil || k1Current.SendKey == nil {
