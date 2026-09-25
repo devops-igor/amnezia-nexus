@@ -118,7 +118,7 @@ func TestIssue329_AuthenticatedKeepalivePromotesWithoutRouting(t *testing.T) {
 	}
 }
 
-func TestIssue329_FallbackKeepalivePromotesWithoutRouting(t *testing.T) {
+func TestIssue329_FallbackKeepaliveConsumedWithoutRouting(t *testing.T) {
 	el := issue328TestListener(t)
 	peer := "issue329-keepalive-fallback"
 	sender := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42402}
@@ -132,18 +132,15 @@ func TestIssue329_FallbackKeepalivePromotesWithoutRouting(t *testing.T) {
 		return nil
 	})
 
+	// The compatibility fallback is keyed by an already-known peer endpoint.
+	// Use the confirmed current key and force receiver-index lookup to miss so
+	// decryption proceeds through candidateFallbackKeys.
 	k1 := issue328TestKeys(t, 6011, 0x03)
 	k1.RemoteIndex = 7011
 	el.storeTransportKeys(peer, k1)
 	el.rememberPeer(sender, peer, k1.RemoteIndex)
 
-	k2 := issue328TestKeys(t, 6012, 0x05)
-	k2.RemoteIndex = 7012
-	stageIssue328ResponderKeys(t, el, peer, k2)
-
-	keepalive := craftClientTransportDatagram(t, k2, el.config.H4.PickOne(), el.config.S4, nil, 0, nil)
-	// Force receiver-index lookup to miss so the compatibility fallback path
-	// authenticates K2. The transport header is not AEAD associated data.
+	keepalive := craftClientTransportDatagram(t, k1, el.config.H4.PickOne(), el.config.S4, nil, 0, nil)
 	s4 := el.config.S4
 	if s4 < 0 {
 		s4 = 0
@@ -155,8 +152,8 @@ func TestIssue329_FallbackKeepalivePromotesWithoutRouting(t *testing.T) {
 	}
 
 	previous, current, next := el.PeerKeypairStateForTest(peer)
-	if previous != k1 || current != k2 || next != nil {
-		t.Fatalf("fallback keepalive promotion state: previous=%p current=%p next=%p", previous, current, next)
+	if previous != nil || current != k1 || next != nil {
+		t.Fatalf("fallback keepalive changed confirmed state: previous=%p current=%p next=%p", previous, current, next)
 	}
 	if routed != 0 {
 		t.Fatalf("backend router calls = %d, want 0 for fallback keepalive", routed)
