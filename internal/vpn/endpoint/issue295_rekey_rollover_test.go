@@ -211,10 +211,59 @@ func performClientHandshakeUnconfirmed(
 	return state
 }
 
-// performClientHandshake performs a complete test handshake including the
-// initiator's immediate authenticated confirmation of the responder key. Most
-// legacy #295 tests exercise already-confirmed rollover; #329 tests use
-// performClientHandshakeUnconfirmed when they need the pending-next window.
+func confirmClientHandshake(
+	t *testing.T,
+	el *Listener,
+	clientConn *net.UDPConn,
+	clientPriv []byte,
+	hpKey []byte,
+) *TransportKeys {
+	t.Helper()
+
+	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("derive client public key: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var next *TransportKeys
+	for time.Now().Before(deadline) {
+		_, _, next = el.PeerKeypairStateForTest(peerKey)
+		if next != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if next == nil {
+		t.Fatalf("timed out waiting for staged next key for peer %s", peerKey)
+	}
+
+	// Upstream initiators immediately send an authenticated zero-length
+	// transport keepalive after consuming the handshake response. Sending the
+	// real packet through UDP exercises receiver-index lookup, AEAD, anti-replay,
+	// promotion, endpoint adoption, liveness, and keepalive consumption.
+	keepalive := craftClientTransportDatagram(t, next, el.config.H4.Lo, el.config.S4, hpKey, 0, nil)
+	if _, err := clientConn.Write(keepalive); err != nil {
+		t.Fatalf("write confirmation keepalive failed: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, current, staged := el.PeerKeypairStateForTest(peerKey)
+		if current == next && staged == nil {
+			return next
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for next->current promotion for peer %s", peerKey)
+	return nil
+}
+
+// performClientHandshake performs a normal live handshake plus the immediate
+// authenticated zero-length keepalive used by upstream initiators to confirm
+// responder next. Tests that need the unconfirmed window use
+// performClientHandshakeUnconfirmed directly.
 func performClientHandshake(
 	t *testing.T,
 	el *Listener,
@@ -229,35 +278,7 @@ func performClientHandshake(
 ) *health.NoiseClientState {
 	t.Helper()
 	state := performClientHandshakeUnconfirmed(t, clientConn, serverPub, clientPriv, hpKey, h1, s1, h2, s2)
-
-	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("derive client public key: %v", err)
-	}
-	peerKey := base64.StdEncoding.EncodeToString(clientPub)
-
-	var next *TransportKeys
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _, next = el.PeerKeypairStateForTest(peerKey)
-		if next != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if next == nil {
-		t.Fatalf("expected staged responder next key for %s", peerKey)
-	}
-
-	status, ok := el.ConfirmResponderTransportKeyForTest(peerKey, next)
-	if !ok || status != "current" {
-		t.Fatalf("failed to confirm responder next key: status=%q ok=%v", status, ok)
-	}
-	st := el.updatePeerEndpointAfterDecryption(clientConn.LocalAddr().(*net.UDPAddr), peerKey, next.RemoteIndex, true)
-	if st != nil {
-		st.lastSeen.Store(time.Now().UnixNano())
-	}
-
+	confirmClientHandshake(t, el, clientConn, clientPriv, hpKey)
 	return state
 }
 
