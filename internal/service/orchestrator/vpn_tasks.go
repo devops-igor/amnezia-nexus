@@ -103,8 +103,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 				"threshold", threshold,
 				"err", err,
 			)
-			o.updateTunnelStatus(ctx, &t, "degraded", 0)
-			degradedTunnels = append(degradedTunnels, t.ID)
+			if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
+				degradedTunnels = append(degradedTunnels, t.ID)
+			}
 			continue
 		}
 
@@ -118,12 +119,15 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		status := "active"
 		if latencyMS > latencyThreshold {
 			status = "degraded"
-			degradedTunnels = append(degradedTunnels, t.ID)
-		} else {
-			healthyTunnels = append(healthyTunnels, &tCopy)
 		}
 
-		o.updateTunnelStatus(ctx, &t, status, latencyMS)
+		if o.updateTunnelStatus(ctx, &t, status, latencyMS) {
+			if status == "degraded" {
+				degradedTunnels = append(degradedTunnels, t.ID)
+			} else {
+				healthyTunnels = append(healthyTunnels, &tCopy)
+			}
+		}
 	}
 
 	// Trigger failover / migration for sessions on degraded tunnels
@@ -194,15 +198,25 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 
 // updateTunnelStatus updates a backend tunnel's status and latency using the configured
 // TunnelStatusUpdater (e.g. VPN service pool) or falls back to an atomic CAS DB update.
-func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) {
+// Returns true if the update was applied, false if dropped or missed due to stale state version.
+func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.BackendTunnel, status string, latencyMS int64) bool {
 	o.mu.RLock()
 	updater := o.statusUpdater
 	o.mu.RUnlock()
 
 	if updater != nil {
-		err := updater.SetTunnelStatus(ctx, t.ServerID, status, latencyMS)
+		err := updater.SetTunnelStatusWithVersion(ctx, t.ServerID, t.ID, t.StateVersion, status, latencyMS)
 		if err == nil {
-			return
+			return true
+		}
+		if errors.Is(err, tunnel.ErrStaleStateVersion) {
+			slog.Debug("Tunnel state version is stale in updater pool, dropping update",
+				"server_id", t.ServerID,
+				"tunnel_id", t.ID,
+				"expected_version", t.StateVersion,
+				"err", err,
+			)
+			return false
 		}
 		if !errors.Is(err, tunnel.ErrTunnelNotFound) {
 			slog.Error("Tunnel status updater failed with operational error, skipping fallback to preserve state consistency",
@@ -210,7 +224,7 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 				"tunnel_id", t.ID,
 				"err", err,
 			)
-			return
+			return false
 		}
 		slog.Debug("Tunnel not found in updater pool, falling back to direct DB CAS",
 			"server_id", t.ServerID,
@@ -227,7 +241,7 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 				"tunnel_id", t.ID,
 				"err", err,
 			)
-			return
+			return false
 		}
 		if !swapped {
 			slog.Debug("Direct DB CAS missed during tunnel status update",
@@ -235,8 +249,12 @@ func (o *Orchestrator) updateTunnelStatus(ctx context.Context, t *models.Backend
 				"tunnel_id", t.ID,
 				"expected_version", t.StateVersion,
 			)
+			return false
 		}
+		return true
 	}
+
+	return false
 }
 
 // resolvedProbeParams carries the obfuscation parameters used for a raw UDP

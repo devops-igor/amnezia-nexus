@@ -27,6 +27,7 @@ type UserOpsService interface {
 // TunnelStatusUpdater defines the interface for synchronizing backend tunnel health status with the VPN subsystem.
 type TunnelStatusUpdater interface {
 	SetTunnelStatus(ctx context.Context, serverID int64, status string, latencyMS int64) error
+	SetTunnelStatusWithVersion(ctx context.Context, serverID, expectedTunnelID, expectedVersion int64, status string, latencyMS int64) error
 }
 
 // SessionMigrator defines the interface for coordinated live VPN session migration across backend tunnels (issue #289).

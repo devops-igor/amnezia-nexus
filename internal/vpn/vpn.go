@@ -2322,6 +2322,17 @@ func (s *Service) SetTunnelStatus(ctx context.Context, serverID int64, status st
 	return s.pool.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }
 
+// SetTunnelStatusWithVersion updates the status and latency of a backend tunnel in the pool
+// if the expected tunnel ID and state version match.
+func (s *Service) SetTunnelStatusWithVersion(ctx context.Context, serverID, expectedTunnelID, expectedVersion int64, status string, latencyMS int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pool == nil {
+		return tunnel.ErrTunnelNotFound
+	}
+	return s.pool.SetTunnelStatusIfCurrentWithVersion(ctx, serverID, expectedTunnelID, expectedVersion, status, latencyMS)
+}
+
 // DisableBackend disables a backend server and initiates connection draining.
 func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()

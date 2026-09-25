@@ -430,6 +430,13 @@ func (f *faultyStatusUpdater) SetTunnelStatus(ctx context.Context, serverID int6
 	return f.target.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }
 
+func (f *faultyStatusUpdater) SetTunnelStatusWithVersion(ctx context.Context, serverID, expectedTunnelID, expectedVersion int64, status string, latencyMS int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	return f.target.SetTunnelStatusWithVersion(ctx, serverID, expectedTunnelID, expectedVersion, status, latencyMS)
+}
+
 // TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync verifies that:
 //  1. When VPN_ENABLED=true but the host has no TUN device (endpoint.ErrTunUnavailable),
 //     vpnSvc.Start still executes Pool.SyncFromDB successfully before failing on TUN initialization.
@@ -531,5 +538,172 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 	}
 	if poolTun.StateVersion != dbTun.StateVersion {
 		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun.StateVersion, dbTun.StateVersion)
+	}
+}
+
+// TestOrchestrator_InFlightProbe_FencedOnEndpointUpdate_NoStatusMutationOrFailover verifies:
+//  1. A probe starts targeting an old server endpoint while a VPN session is active on that backend tunnel.
+//  2. The server host/endpoint is updated concurrently (via UpdateBackendServerHost), advancing StateVersion to 2.
+//  3. The old probe is released and returns failure (or high latency).
+//  4. The stale probe result is rejected by the version-aware status updater (SetTunnelStatusWithVersion)
+//     and cannot mark the new endpoint degraded or trigger false session failover.
+func TestOrchestrator_InFlightProbe_FencedOnEndpointUpdate_NoStatusMutationOrFailover(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probeRTT time.Duration
+		probeErr error
+		desc     string
+	}{
+		{
+			name:     "probe_failure",
+			probeRTT: 0,
+			probeErr: errors.New("connection timed out on old IP"),
+			desc:     "failed probe targeting old IP cannot mark tunnel degraded or failover sessions",
+		},
+		{
+			name:     "probe_high_latency",
+			probeRTT: 3000 * time.Millisecond,
+			probeErr: nil,
+			desc:     "high-latency probe targeting old IP cannot mark tunnel degraded or failover sessions",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := setupTestDB(t)
+
+			s1ID, pub1, _ := createTestServerAndKey(t, db, "Target Srv 1", "198.51.100.1")
+			s2ID, pub2, _ := createTestServerAndKey(t, db, "Peer Srv 2", "198.51.100.2")
+
+			vpnSvc, err := NewVPNService(db, nil)
+			if err != nil {
+				t.Fatalf("NewVPNService failed: %v", err)
+			}
+			vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+				return 10 * time.Millisecond, nil
+			})
+
+			tun1, err := vpnSvc.pool.AddTunnel(ctx, s1ID, "198.51.100.1:51820", pub1)
+			if err != nil {
+				t.Fatalf("AddTunnel 1 failed: %v", err)
+			}
+			tun2, err := vpnSvc.pool.AddTunnel(ctx, s2ID, "198.51.100.2:51820", pub2)
+			if err != nil {
+				t.Fatalf("AddTunnel 2 failed: %v", err)
+			}
+
+			userID, err := db.CreateUser(ctx, &models.User{Username: "fencing-user-" + tc.name})
+			if err != nil {
+				t.Fatalf("CreateUser failed: %v", err)
+			}
+
+			// Create active VPN session on tunnel 1
+			sess := &models.VPNSession{
+				ID:              "sess-fencing-test-" + tc.name,
+				UserID:          userID,
+				BackendTunnelID: tun1.ID,
+				PeerPublicKey:   "peer-key-fencing",
+				AssignedIP:      "10.8.0.2",
+				Status:          "connected",
+			}
+			if err := db.CreateVPNSession(ctx, sess); err != nil {
+				t.Fatalf("CreateVPNSession failed: %v", err)
+			}
+
+			probe1Started := make(chan struct{})
+			probe1Block := make(chan struct{})
+			var probe1Once sync.Once
+
+			orch := orchestrator.New(db, nil,
+				orchestrator.WithProbeFailureThreshold(1),
+				orchestrator.WithProbeFunc(func(probeCtx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+					if endpoint == "198.51.100.1:51820" {
+						probe1Once.Do(func() {
+							close(probe1Started)
+							<-probe1Block
+						})
+						return tc.probeRTT, tc.probeErr
+					}
+					// Peer server 2 is healthy
+					return 15 * time.Millisecond, nil
+				}),
+			)
+			orch.SetTunnelStatusUpdater(vpnSvc)
+
+			orchDone := make(chan error, 1)
+			go func() {
+				orchDone <- orch.CheckBackendTunnelHealth(ctx)
+			}()
+
+			// Step 1: Wait for probe to start on old endpoint
+			select {
+			case <-probe1Started:
+			case <-time.After(5 * time.Second):
+				close(probe1Block)
+				t.Fatal("timed out waiting for probe 1 to start on old endpoint")
+			}
+
+			// Step 2: Change endpoint via UpdateBackendServerHost, advancing StateVersion to 2
+			newHost := "198.51.100.99"
+			if err := vpnSvc.UpdateBackendServerHost(ctx, s1ID, newHost); err != nil {
+				close(probe1Block)
+				t.Fatalf("UpdateBackendServerHost failed: %v", err)
+			}
+
+			// Verify tunnel 1 version was bumped to 2
+			t1AfterUpdate, err := vpnSvc.pool.GetTunnelByID(tun1.ID)
+			if err != nil || t1AfterUpdate.StateVersion != 2 {
+				close(probe1Block)
+				t.Fatalf("expected tunnel 1 StateVersion = 2 after host update, got %+v", t1AfterUpdate)
+			}
+
+			// Step 3: Release old probe
+			close(probe1Block)
+			if err := <-orchDone; err != nil {
+				t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+			}
+
+			// Step 4: Verify tunnel 1 in pool and DB was NOT marked degraded
+			poolTun1, err := vpnSvc.pool.GetTunnel(s1ID)
+			if err != nil {
+				t.Fatalf("GetTunnel pool failed: %v", err)
+			}
+			if poolTun1.Status != "active" {
+				t.Errorf("expected pool status 'active', got %q", poolTun1.Status)
+			}
+			if poolTun1.StateVersion != 2 {
+				t.Errorf("expected pool StateVersion to remain 2, got %d", poolTun1.StateVersion)
+			}
+
+			dbTun1, err := db.GetBackendTunnel(ctx, tun1.ID)
+			if err != nil {
+				t.Fatalf("GetBackendTunnel DB failed: %v", err)
+			}
+			if dbTun1.Status != "active" {
+				t.Errorf("expected DB status 'active', got %q", dbTun1.Status)
+			}
+			if dbTun1.StateVersion != 2 {
+				t.Errorf("expected DB StateVersion to remain 2, got %d", dbTun1.StateVersion)
+			}
+
+			// Step 5: Verify session was NOT migrated to peer tunnel 2
+			sessions, err := db.GetActiveVPNSessions(ctx)
+			if err != nil {
+				t.Fatalf("GetActiveVPNSessions failed: %v", err)
+			}
+			var foundSess *models.VPNSession
+			for i := range sessions {
+				if sessions[i].ID == sess.ID {
+					foundSess = &sessions[i]
+					break
+				}
+			}
+			if foundSess == nil {
+				t.Fatalf("session %s not found in DB", sess.ID)
+			}
+			if foundSess.BackendTunnelID != tun1.ID {
+				t.Errorf("session was improperly migrated to tunnel %d (want %d on tunnel 1)", foundSess.BackendTunnelID, tun1.ID)
+			}
+			_ = tun2
+		})
 	}
 }

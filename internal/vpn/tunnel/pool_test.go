@@ -819,3 +819,66 @@ func TestTunnelPool_SetTunnelEndpoint_FencesInFlightProbe(t *testing.T) {
 		t.Errorf("expected StateVersion to remain 2, got %d", afterCAS.StateVersion)
 	}
 }
+
+func TestTunnelPool_SetTunnelStatusIfCurrentWithVersion(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "version-status-server", Host: "198.51.100.10"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	tun, err := pool.AddTunnel(ctx, sID, "198.51.100.10:51820", "pubkey-version")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if tun.StateVersion != 1 {
+		t.Fatalf("expected initial StateVersion = 1, got %d", tun.StateVersion)
+	}
+
+	// 1. Zero expectedTunnelID fails with ErrTunnelNotFound
+	if err := pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, 0, 1, models.TunnelStatusActive, 10); !errors.Is(err, ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound on zero expectedTunnelID, got %v", err)
+	}
+
+	// 2. Mismatched tunnel ID fails with ErrTunnelNotFound
+	if err := pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, 9999, 1, models.TunnelStatusActive, 10); !errors.Is(err, ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound on wrong expectedTunnelID, got %v", err)
+	}
+
+	// 3. Stale expectedVersion returns ErrStaleStateVersion and does not mutate state
+	if err := pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, tun.ID, 999, models.TunnelStatusDegraded, 500); !errors.Is(err, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion on mismatched expectedVersion, got %v", err)
+	}
+	memCheck, err := pool.GetTunnelByID(tun.ID)
+	if err != nil || memCheck.Status != models.TunnelStatusActive || memCheck.StateVersion != 1 {
+		t.Fatalf("pool state mutated after stale version update: %+v", memCheck)
+	}
+
+	// 4. Matching expectedVersion succeeds and increments StateVersion in memory and DB
+	if err := pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, tun.ID, 1, models.TunnelStatusDegraded, 150); err != nil {
+		t.Fatalf("SetTunnelStatusIfCurrentWithVersion failed on matching version: %v", err)
+	}
+	memAfter, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if memAfter.Status != models.TunnelStatusDegraded || memAfter.LatencyMS != 150 || memAfter.StateVersion != 2 {
+		t.Errorf("unexpected pool state after valid version update: %+v", memAfter)
+	}
+	dbAfter, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbAfter.Status != models.TunnelStatusDegraded || dbAfter.LatencyMS != 150 || dbAfter.StateVersion != 2 {
+		t.Errorf("unexpected DB state after valid version update: %+v", dbAfter)
+	}
+
+	// 5. Subsequent update with previous version (1) now fails as stale
+	if err := pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, tun.ID, 1, models.TunnelStatusActive, 10); !errors.Is(err, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion on old version 1, got %v", err)
+	}
+}

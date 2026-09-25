@@ -69,7 +69,7 @@ type HealthProber struct {
 	successCounts  map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
 	// records which tunnel generation owns each server's counters.
-	healthGenerations map[int64]int64
+	healthGenerations    map[int64]int64
 	preStatusCommitHook  func() // test synchronization, after the identity check
 	preFailureCommitHook func() // test synchronization, after the identity check
 	stopCh               chan struct{}
@@ -452,7 +452,11 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	}
 
 	if hp.pool != nil {
-		if err := hp.pool.SetTunnelStatusIfCurrent(ctx, tunnel.ServerID, tunnel.ID, status, latencyMS); err != nil {
+		expectedVersion := tunnel.StateVersion
+		if snapshot != nil && snapshot.StateVersion > 0 {
+			expectedVersion = snapshot.StateVersion
+		}
+		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, tunnel.ServerID, tunnel.ID, expectedVersion, status, latencyMS); err != nil {
 			return 0, err
 		}
 	}
@@ -646,32 +650,34 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 			}
 		}
 	} else if hp.pool != nil {
-		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-			ctx,
-			snapshot.ServerID,
-			snapshot.ID,
-			snapshot.Status,
-			snapshot.DisableReason,
-			snapshot.StateVersion,
-			"degraded",
-			snapshot.DisableReason,
-			0,
-		)
-		if casErr != nil {
-			return 0, casErr
-		}
-		if !swapped {
-			slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
-				"server_id", snapshot.ServerID,
-				"expected_status", snapshot.Status,
-				"expected_version", snapshot.StateVersion,
+		if snapshot.Status != "degraded" {
+			swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
+				ctx,
+				snapshot.ServerID,
+				snapshot.ID,
+				snapshot.Status,
+				snapshot.DisableReason,
+				snapshot.StateVersion,
+				"degraded",
+				snapshot.DisableReason,
+				0,
 			)
-			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.failCounts[snapshot.ServerID] = 0
-					delete(hp.autoDisabled, snapshot.ServerID)
-				}); err != nil {
-					return 0, err
+			if casErr != nil {
+				return 0, casErr
+			}
+			if !swapped {
+				slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
+					"server_id", snapshot.ServerID,
+					"expected_status", snapshot.Status,
+					"expected_version", snapshot.StateVersion,
+				)
+				if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+					if err := hp.updateHealthIfCurrent(snapshot, func() {
+						hp.failCounts[snapshot.ServerID] = 0
+						delete(hp.autoDisabled, snapshot.ServerID)
+					}); err != nil {
+						return 0, err
+					}
 				}
 			}
 		}

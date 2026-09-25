@@ -256,7 +256,9 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.UpdateBackendServerHost(ctx, serverID, req.Host); err != nil {
 			slog.Error("failed to update VPN backend endpoint, rolling back server host", "server_id", serverID, "err", err)
-			if rbErr := h.db.UpdateServer(ctx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if rbErr := h.db.UpdateServer(rollbackCtx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
 				slog.Error("failed to rollback server host after VPN failure", "server_id", serverID, "err", rbErr)
 			}
 			if h.sshPool != nil {

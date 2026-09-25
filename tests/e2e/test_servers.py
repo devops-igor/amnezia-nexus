@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
 
@@ -182,15 +182,31 @@ def test_server_edit_host_ui_validation(authenticated_page: Page, base_url: str)
 
     input_el = modal.locator("#editHostInput")
 
-    # Test invalid host inputs
-    for invalid_host in ["invalid host with spaces", "http://bad.example.com"]:
-        input_el.fill(invalid_host)
-        modal.locator("button.btn-primary").click()
+    dispatched_host_requests: list[str] = []
 
-        # Assert client validation error toast appears and modal remains open
-        error_toast = page.locator(".toast-error")
-        expect(error_toast.first).to_be_visible()
-        expect(modal).to_be_visible()
+    def on_request(request: Request) -> None:
+        if "/api/servers/" in request.url and request.url.endswith("/host"):
+            dispatched_host_requests.append(request.url)
+
+    page.on("request", on_request)
+
+    try:
+        # Test invalid host inputs
+        for invalid_host in ["invalid host with spaces", "http://bad.example.com"]:
+            input_el.fill(invalid_host)
+            modal.locator("button.btn-primary").click()
+
+            # Assert client validation error toast appears and modal remains open
+            error_toast = page.locator(".toast-error")
+            expect(error_toast.first).to_be_visible()
+            expect(modal).to_be_visible()
+
+        # Assert no requests were dispatched to /api/servers/*/host
+        assert (
+            len(dispatched_host_requests) == 0
+        ), f"Expected 0 requests to /api/servers/*/host, but got: {dispatched_host_requests}"
+    finally:
+        page.remove_listener("request", on_request)
 
     # Close modal
     modal.locator(".modal-close").click()
@@ -289,4 +305,13 @@ def test_server_edit_host_ui_lifecycle(
         )
         current = next((s for s in cleanup_servers if s.get("id") == server_id), None)
         if current and current.get("host") != orig_host:
-            api_post(page, f"/api/servers/{server_id}/host", {"host": orig_host}, csrf_token)
+            restore_res = api_post(
+                page, f"/api/servers/{server_id}/host", {"host": orig_host}, csrf_token
+            )
+            assert (
+                restore_res.get("status") == 200
+            ), f"Failed to restore original host in cleanup: {restore_res}"
+            body = restore_res.get("body")
+            assert (
+                isinstance(body, dict) and body.get("status") == "ok"
+            ), f"Failed to restore original host in cleanup: {body}"

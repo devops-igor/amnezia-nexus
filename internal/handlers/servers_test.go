@@ -1838,6 +1838,81 @@ func TestUpdateServerHostHandler_VPNFailureRollback(t *testing.T) {
 	}
 }
 
+func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "VPN-Canceled-Ctx-Rollback-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	// Create a request context that is canceled during UpdateBackendServerHost.
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
+		cancelReq()
+	})
+	vpnSvc.SetUpdateBackendServerHostErrorForTest(context.Canceled)
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body)).WithContext(reqCtx)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Assert database record server.Host was successfully restored to origHost
+	// despite reqCtx being canceled.
+	serverAfter, err := db.GetServer(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != origHost {
+		t.Errorf("server host was not restored on canceled context: got %q, want %q", serverAfter.Host, origHost)
+	}
+}
+
 func TestUpdateServerHostHandler_BracketedIPv6(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
 	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)

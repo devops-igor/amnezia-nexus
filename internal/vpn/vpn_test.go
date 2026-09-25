@@ -2965,8 +2965,17 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 		t.Errorf("expected tunnel status to remain 'degraded' before probe, got %s", restoredTun.Status)
 	}
 
+	// Stop background prober to avoid race with manual ProbeTunnel
+	if svc.prober != nil {
+		svc.prober.Stop()
+	}
+
 	// Probe the tunnel - now succeeds and transitions to active
 	probeShouldSucceed.Store(true)
+	restoredTun, err = svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
 	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
 	if err != nil {
 		t.Fatalf("ProbeTunnel failed: %v", err)
