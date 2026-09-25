@@ -940,3 +940,269 @@ func TestReservePersistedClientIPs_PeerAddressMismatch(t *testing.T) {
 		t.Fatalf("expected conflicting assigned_ip cleared from SQLite, got: %v", conn.ClientParams["assigned_ip"])
 	}
 }
+
+func TestStartupIPAMCollision_SamePeerMultipleConnectionsSameIP_RetainsAllUnquarantinedAndHandshakeSucceeds(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Server 8", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      serverID,
+		InterfaceName: "awg0",
+		PublicKey:     "tunnel-pub-multi",
+		PrivateKey:    "tunnel-priv-multi",
+		Endpoint:      "192.0.2.10:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userID, err := db.CreateUser(ctx, &models.User{Username: "user-multi-same", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peerPub, peerPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const sharedIP = "10.100.0.3"
+
+	// Multiple connection rows for the same peer sharing the exact same IP
+	conn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-multi-1",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     peerPub,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": peerPriv},
+		CreatedAt:    now.Add(-5 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-multi-2",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     peerPub,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": peerPriv},
+		CreatedAt:    now.Add(-2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+	}
+
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// Both rows must retain sharedIP without quarantine
+	conn1, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientParams["assigned_ip"] != sharedIP {
+		t.Fatalf("conn1 lost assigned_ip: %v", conn1.ClientParams["assigned_ip"])
+	}
+	if conn1.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn1 falsely quarantined: %v", conn1.ClientParams["config_regeneration_required"])
+	}
+
+	conn2, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2.ClientParams["assigned_ip"] != sharedIP {
+		t.Fatalf("conn2 lost assigned_ip: %v", conn2.ClientParams["assigned_ip"])
+	}
+	if conn2.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn2 falsely quarantined: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+
+	// IPAM must hold sharedIP for peerPub
+	assigned, ok := svc.ipam.GetAssignedIP(peerPub)
+	if !ok || assigned.String() != sharedIP {
+		t.Fatalf("peerPub missing or wrong in IPAM: got %v, want %s", assigned, sharedIP)
+	}
+
+	// Incoming handshake must succeed cleanly
+	sess, _, err := svc.HandleIncomingPeer(ctx, peerPub)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for same-peer multiple connection: %v", err)
+	}
+	if sess == nil || sess.AssignedIP != sharedIP {
+		t.Fatalf("expected session with %s, got: %+v", sharedIP, sess)
+	}
+}
+
+func TestStartupIPAMCollision_SamePeerMultipleDifferentIPs_ResolvesDeterministically(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	userID, err := db.CreateUser(ctx, &models.User{Username: "user-diff-ips", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peerPub, peerPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	// Older connection claims 10.100.0.8 (lexicographically greater than 10.100.0.2)
+	conn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-diff-1",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     peerPub,
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.8", "client_private_key": peerPriv},
+		CreatedAt:    now.Add(-10 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Newer connection claims 10.100.0.2 (lexicographically smaller)
+	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-diff-2",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     peerPub,
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.2", "client_private_key": peerPriv},
+		CreatedAt:    now.Add(-1 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// Winner must be older connection conn-diff-1 (10.100.0.8)
+	assigned, ok := ipam.GetAssignedIP(peerPub)
+	if !ok || assigned.String() != "10.100.0.8" {
+		t.Fatalf("expected winner 10.100.0.8 in IPAM, got: %v", assigned)
+	}
+
+	conn1, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientParams["assigned_ip"] != "10.100.0.8" {
+		t.Fatalf("conn1 lost assigned_ip: %v", conn1.ClientParams["assigned_ip"])
+	}
+	if conn1.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn1 was unexpectedly quarantined: %v", conn1.ClientParams["config_regeneration_required"])
+	}
+
+	// Loser conn-diff-2 (10.100.0.2) must be quarantined
+	conn2, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
+		t.Fatalf("conn2 assigned_ip not cleared: %v", conn2.ClientParams["assigned_ip"])
+	}
+	if conn2.ClientParams["quarantined_ip_collision"] != "10.100.0.2" {
+		t.Fatalf("conn2 quarantined_ip_collision mismatch: %v", conn2.ClientParams["quarantined_ip_collision"])
+	}
+	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+}
+
+func TestStartupIPAMCollision_StorageFailureDuringQuarantine_FailsReconciliation(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u1, err := db.CreateUser(ctx, &models.User{Username: "user-storage-1", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u2, err := db.CreateUser(ctx, &models.User{Username: "user-storage-2", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const collidingIP = "10.100.0.3"
+
+	_, err = db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-stor-1",
+		UserID:       u1,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-stor-1",
+		ClientParams: map[string]any{"assigned_ip": collidingIP},
+		CreatedAt:    now.Add(-5 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-stor-2",
+		UserID:       u2,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-stor-2",
+		ClientParams: map[string]any{"assigned_ip": collidingIP},
+		CreatedAt:    now.Add(-2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fault injection: make SQLite read-only so quarantine UPDATE will fail
+	if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA query_only = ON;"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = db.SQLDB().ExecContext(ctx, "PRAGMA query_only = OFF;")
+	}()
+
+	err = reservePersistedClientIPs(ctx, db, ipam)
+	if err == nil {
+		t.Fatal("expected reservePersistedClientIPs to fail when SQLite write fails during quarantine, got nil")
+	}
+}
