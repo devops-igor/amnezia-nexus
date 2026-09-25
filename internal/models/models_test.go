@@ -578,3 +578,159 @@ func TestRenameServerRequest_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateServerHostRequest_Validate(t *testing.T) {
+	tests := []struct {
+		name     string
+		req      UpdateServerHostRequest
+		wantErr  bool
+		errMsg   string
+		wantHost string
+	}{
+		{
+			name:     "valid IPv4 address",
+			req:      UpdateServerHostRequest{Host: "192.168.1.1"},
+			wantErr:  false,
+			wantHost: "192.168.1.1",
+		},
+		{
+			name:     "valid IPv4 with whitespace trimming",
+			req:      UpdateServerHostRequest{Host: "  10.0.0.1  "},
+			wantErr:  false,
+			wantHost: "10.0.0.1",
+		},
+		{
+			name:     "valid IPv6 address",
+			req:      UpdateServerHostRequest{Host: "2001:db8::1"},
+			wantErr:  false,
+			wantHost: "2001:db8::1",
+		},
+		{
+			name:     "valid IPv6 loopback",
+			req:      UpdateServerHostRequest{Host: "::1"},
+			wantErr:  false,
+			wantHost: "::1",
+		},
+		{
+			name:     "valid hostname domain",
+			req:      UpdateServerHostRequest{Host: "vpn.example.com"},
+			wantErr:  false,
+			wantHost: "vpn.example.com",
+		},
+		{
+			name:     "valid hostname with hyphens and numbers",
+			req:      UpdateServerHostRequest{Host: "node-1.servers.net"},
+			wantErr:  false,
+			wantHost: "node-1.servers.net",
+		},
+		{
+			name:    "empty host",
+			req:     UpdateServerHostRequest{Host: ""},
+			wantErr: true,
+			errMsg:  "host cannot be empty",
+		},
+		{
+			name:    "whitespace only host",
+			req:     UpdateServerHostRequest{Host: "   \t\n  "},
+			wantErr: true,
+			errMsg:  "host cannot be empty",
+		},
+		{
+			name:     "valid bracketed IPv6 address",
+			req:      UpdateServerHostRequest{Host: "[2001:db8::1]"},
+			wantErr:  false,
+			wantHost: "2001:db8::1",
+		},
+		{
+			name:     "valid bracketed IPv6 loopback",
+			req:      UpdateServerHostRequest{Host: "[::1]"},
+			wantErr:  false,
+			wantHost: "::1",
+		},
+		{
+			name:     "valid bracketed IPv6 with whitespace trimming",
+			req:      UpdateServerHostRequest{Host: "  [2001:db8::1]  "},
+			wantErr:  false,
+			wantHost: "2001:db8::1",
+		},
+		{
+			name:    "invalid bracketed host",
+			req:     UpdateServerHostRequest{Host: "[invalid]"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
+			name:    "invalid empty bracketed host",
+			req:     UpdateServerHostRequest{Host: "[]"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
+			name:    "invalid host with spaces",
+			req:     UpdateServerHostRequest{Host: "invalid host"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
+			name:    "invalid host with special characters",
+			req:     UpdateServerHostRequest{Host: "server$name.com"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+		{
+			name:    "invalid host with URL scheme",
+			req:     UpdateServerHostRequest{Host: "http://example.com"},
+			wantErr: true,
+			errMsg:  "host must be a valid IPv4 address or hostname",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error message containing %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if tt.req.Host != tt.wantHost {
+					t.Errorf("expected trimmed host %q, got %q", tt.wantHost, tt.req.Host)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateHost(t *testing.T) {
+	tests := []struct {
+		host    string
+		wantErr bool
+	}{
+		{"192.168.1.1", false},
+		{"10.0.0.1", false},
+		{"2001:db8::1", false},
+		{"::1", false},
+		{"[2001:db8::1]", false},
+		{"[::1]", false},
+		{"vpn.example.com", false},
+		{"node-1.servers.net", false},
+		{"[invalid]", true},
+		{"[]", true},
+		{"invalid host", true},
+		{"server$name.com", true},
+		{"http://example.com", true},
+		{"", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			err := ValidateHost(tt.host)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateHost(%q) error = %v, wantErr %v", tt.host, err, tt.wantErr)
+			}
+		})
+	}
+}

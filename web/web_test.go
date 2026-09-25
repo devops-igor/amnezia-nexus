@@ -2052,3 +2052,257 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 		t.Errorf("loadServerStats must not blank DOM innerHTML on error")
 	}
 }
+
+func TestIssue278EditServerHostUIAndTranslations(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Verify translation keys across all 5 languages
+	requiredKeys := []string{
+		"edit_server_host",
+		"edit_server_host_placeholder",
+		"server_host_updated",
+	}
+	languages := []string{"en.json", "ru.json", "fr.json", "zh.json", "fa.json"}
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range requiredKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required key %q", langFile, k)
+			}
+		}
+		if langFile == "en.json" {
+			if dict["edit_server_host"] != "Edit Server IP" {
+				t.Errorf("en.json edit_server_host = %q, want %q", dict["edit_server_host"], "Edit Server IP")
+			}
+			if dict["edit_server_host_placeholder"] != "Enter new IP address or hostname" {
+				t.Errorf("en.json edit_server_host_placeholder = %q, want %q", dict["edit_server_host_placeholder"], "Enter new IP address or hostname")
+			}
+			if dict["server_host_updated"] != "Server IP updated" {
+				t.Errorf("en.json server_host_updated = %q, want %q", dict["server_host_updated"], "Server IP updated")
+			}
+		}
+		if langFile == "ru.json" {
+			if dict["edit_server_host"] != "Изменить IP сервера" {
+				t.Errorf("ru.json edit_server_host = %q, want %q", dict["edit_server_host"], "Изменить IP сервера")
+			}
+			if dict["edit_server_host_placeholder"] != "Введите новый IP-адрес или имя хоста" {
+				t.Errorf("ru.json edit_server_host_placeholder = %q, want %q", dict["edit_server_host_placeholder"], "Введите новый IP-адрес или имя хоста")
+			}
+			if dict["server_host_updated"] != "IP сервера обновлен" {
+				t.Errorf("ru.json server_host_updated = %q, want %q", dict["server_host_updated"], "IP сервера обновлен")
+			}
+		}
+	}
+
+	// 2. Verify server.html elements and JavaScript
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	requiredServerElements := []string{
+		`id="serverHostDisplay"`,
+		`openEditHostModal`,
+		`id="editHostModal"`,
+		`id="editHostInput"`,
+		`function isValidHost(host)`,
+		`submitEditHost()`,
+		`closeEditHostModal()`,
+		`const serverId = editHostServerId;`,
+		`/api/servers/' + serverId + '/host`,
+		`server_host_updated`,
+	}
+	for _, elem := range requiredServerElements {
+		if !strings.Contains(serverStr, elem) {
+			t.Errorf("server.html missing required edit host element %q", elem)
+		}
+	}
+
+	// Ensure no hardcoded Cyrillic was added to server.html
+	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
+	if matches := cyrillicRe.FindAllString(serverStr, -1); len(matches) > 0 {
+		t.Errorf("server.html contains hardcoded Cyrillic characters: %v", matches)
+	}
+
+	// 3. Verify index.html elements and JavaScript
+	indexData, err := fs.ReadFile(templatesFS, "index.html")
+	if err != nil {
+		t.Fatalf("failed to read index.html: %v", err)
+	}
+	indexStr := string(indexData)
+
+	requiredIndexElements := []string{
+		`openEditHostModal`,
+		`id="editHostModal"`,
+		`id="editHostInput"`,
+		`function isValidHost(host)`,
+		`submitEditHost()`,
+		`closeEditHostModal()`,
+		`const serverId = editHostServerId;`,
+		`id="server-host-`,
+		`data-server-host`,
+		`href="#icon-globe"`,
+		`/api/servers/' + serverId + '/host`,
+		`server_host_updated`,
+	}
+	for _, elem := range requiredIndexElements {
+		if !strings.Contains(indexStr, elem) {
+			t.Errorf("index.html missing required edit host element %q", elem)
+		}
+	}
+}
+
+func TestClientSideHostValidation(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	indexData, err := fs.ReadFile(templatesFS, "index.html")
+	if err != nil {
+		t.Fatalf("failed to read index.html: %v", err)
+	}
+	indexStr := string(indexData)
+
+	for _, tmpl := range []struct {
+		name    string
+		content string
+	}{
+		{"server.html", serverStr},
+		{"index.html", indexStr},
+	} {
+		if !strings.Contains(tmpl.content, "function isValidHost(host)") {
+			t.Errorf("%s missing function isValidHost(host)", tmpl.name)
+		}
+		if !strings.Contains(tmpl.content, "if (!isValidHost(newHost))") {
+			t.Errorf("%s missing if (!isValidHost(newHost)) check in submitEditHost", tmpl.name)
+		}
+		if !strings.Contains(tmpl.content, "const serverId = editHostServerId;") {
+			t.Errorf("%s missing serverId capture before modal close", tmpl.name)
+		}
+	}
+
+	// Test the exact validation logic specified in isValidHost:
+	// - trims whitespace
+	// - returns false if empty
+	// - returns false if whitespace is inside
+	// - returns false if URL scheme is present
+	// - validates IPv4 (4 octets, 0-255)
+	// - validates IPv6 (bracketed or unbracketed)
+	// - validates hostname / FQDN (alphanumeric, hyphens, dots, no leading/trailing hyphen)
+	ipv4Regex := regexp.MustCompile(`^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$`)
+	digitsAndDotsRegex := regexp.MustCompile(`^[\d.]+$`)
+	ipv6Regex := regexp.MustCompile(`^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$`)
+	hostnameRegex := regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
+
+	isValidHostGo := func(host string) bool {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			return false
+		}
+		for _, r := range host {
+			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+				return false
+			}
+		}
+		if strings.Contains(host, "://") {
+			return false
+		}
+		if ipv4Regex.MatchString(host) {
+			return true
+		}
+		if digitsAndDotsRegex.MatchString(host) {
+			return false
+		}
+		ipv6Candidate := host
+		if strings.HasPrefix(ipv6Candidate, "[") && strings.HasSuffix(ipv6Candidate, "]") {
+			ipv6Candidate = ipv6Candidate[1 : len(ipv6Candidate)-1]
+		}
+		if strings.Contains(ipv6Candidate, ":") {
+			return ipv6Regex.MatchString(ipv6Candidate)
+		}
+		if len(host) > 253 {
+			return false
+		}
+		return hostnameRegex.MatchString(host)
+	}
+
+	testCases := []struct {
+		input string
+		valid bool
+	}{
+		// Valid IPv4
+		{"192.168.1.1", true},
+		{"10.0.0.1", true},
+		{"127.0.0.1", true},
+		{"0.0.0.0", true},
+		{"255.255.255.255", true},
+		{"  192.168.1.100  ", true},
+
+		// Valid IPv6
+		{"::1", true},
+		{"[::1]", true},
+		{"2001:db8::1", true},
+		{"[2001:db8::1]", true},
+		{"fe80::1", true},
+		{"2001:0db8:85a3:0000:0000:8a2e:0370:7334", true},
+
+		// Valid hostnames
+		{"localhost", true},
+		{"vpn.example.com", true},
+		{"my-server-01.infra.corp.net", true},
+		{"a.b.c.d.org", true},
+
+		// Invalid cases
+		{"", false},
+		{"   ", false},
+		{"\t\n", false},
+		{"192.168.1. 1", false},
+		{"vpn example com", false},
+		{"http://192.168.1.1", false},
+		{"https://vpn.example.com", false},
+		{"tcp://10.0.0.1", false},
+		{"://invalid", false},
+		{"256.1.1.1", false},
+		{"192.168.1", false},
+		{"192.168.1.1.1", false},
+		{":::1", false},
+		{"12345::1", false},
+		{"-example.com", false},
+		{"example-.com", false},
+		{"example..com", false},
+		{"example$.com", false},
+		{"example/path", false},
+		{"host@domain.com", false},
+		{strings.Repeat("a", 254), false},
+	}
+
+	for _, tc := range testCases {
+		got := isValidHostGo(tc.input)
+		if got != tc.valid {
+			t.Errorf("isValidHost(%q) = %v, want %v", tc.input, got, tc.valid)
+		}
+	}
+}

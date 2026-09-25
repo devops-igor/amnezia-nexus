@@ -2452,6 +2452,436 @@ func TestAttachBackendForwarder_IdempotentClosesOldDevice(t *testing.T) {
 	_ = dev2.Close()
 }
 
+func TestUpdateBackendServerHost(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Update Host Srv", "198.51.100.1")
+
+	// 1. Initial state: server.Host = old_host, tun.Endpoint = old_host:port, backend_tunnels.endpoint = old_host:port
+	tun, err := svc.pool.AddTunnel(ctx, sID, "198.51.100.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("attachBackendForwarder failed: %v", err)
+	}
+
+	dev1 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev1 == nil {
+		t.Fatal("expected dev1 to be attached, got nil")
+	}
+
+	// 2. Host updated: server.Host = new_host
+	if err := db.UpdateServer(ctx, sID, map[string]any{"host": "198.51.100.2"}); err != nil {
+		t.Fatalf("UpdateServer failed: %v", err)
+	}
+
+	// Call UpdateBackendServerHost
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.2"); err != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+	}
+
+	// 3. Assert tun.Endpoint == new_host:port in memory
+	tunMem, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunMem.Endpoint != "198.51.100.2:51820" {
+		t.Errorf("expected memory tunnel endpoint '198.51.100.2:51820', got %q", tunMem.Endpoint)
+	}
+
+	// 4. Assert backend_tunnels.endpoint == new_host:port in DB
+	tunnelsDB, err := db.GetBackendTunnels(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendTunnels failed: %v", err)
+	}
+	var foundInDB *models.BackendTunnel
+	for i := range tunnelsDB {
+		if tunnelsDB[i].ServerID == sID {
+			foundInDB = &tunnelsDB[i]
+			break
+		}
+	}
+	if foundInDB == nil {
+		t.Fatalf("tunnel for server %d not found in DB", sID)
+	}
+	if foundInDB.Endpoint != "198.51.100.2:51820" {
+		t.Errorf("expected DB backend tunnel endpoint '198.51.100.2:51820', got %q", foundInDB.Endpoint)
+	}
+
+	// Verify old device was closed and replaced
+	if !dev1.IsClosed() {
+		t.Error("expected old dev1 to be closed after endpoint update")
+	}
+	dev2 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev2 == nil {
+		t.Fatal("expected dev2 to be attached after endpoint update, got nil")
+	}
+	if dev2 == dev1 {
+		t.Error("expected dev2 to be a newly attached device instance")
+	}
+
+	// 5. Assert admin-disabled tunnel remains disabled with updated endpoint
+	if err := svc.DisableBackend(ctx, sID); err != nil {
+		t.Fatalf("DisableBackend failed: %v", err)
+	}
+	disabledTun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel after disable failed: %v", err)
+	}
+	if disabledTun.Status != TunnelStatusDisabled || disabledTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected admin-disabled tunnel, got status=%s reason=%s", disabledTun.Status, disabledTun.DisableReason)
+	}
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.3"); err != nil {
+		t.Fatalf("UpdateBackendServerHost on disabled tunnel failed: %v", err)
+	}
+	disabledTunUpdated, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel after second host update failed: %v", err)
+	}
+	if disabledTunUpdated.Endpoint != "198.51.100.3:51820" {
+		t.Errorf("expected disabled tunnel endpoint '198.51.100.3:51820', got %q", disabledTunUpdated.Endpoint)
+	}
+	if disabledTunUpdated.Status != TunnelStatusDisabled || disabledTunUpdated.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected tunnel to remain admin-disabled, got status=%s reason=%s", disabledTunUpdated.Status, disabledTunUpdated.DisableReason)
+	}
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Errorf("expected no device attached for admin-disabled tunnel, got %+v", dev)
+	}
+
+	// 6. Assert restarting Service restores devices with new_host:port
+	if err := svc.pool.SetTunnelStatusWithReason(ctx, sID, TunnelStatusActive, models.DisableReasonNone, 10); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.4"); err != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+	}
+	_ = svc.Stop()
+
+	newSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService (restart) failed: %v", err)
+	}
+	newSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	if err := newSvc.Start(ctx); err != nil {
+		t.Fatalf("newSvc.Start failed: %v", err)
+	}
+	defer func() { _ = newSvc.Stop() }()
+
+	restartedTun, err := newSvc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel on restarted service failed: %v", err)
+	}
+	if restartedTun.Endpoint != "198.51.100.4:51820" {
+		t.Errorf("expected restarted tunnel endpoint '198.51.100.4:51820', got %q", restartedTun.Endpoint)
+	}
+	restartedDev := newSvc.GetBackendDeviceForTest(tun.ID)
+	if restartedDev == nil {
+		t.Error("expected restored backend device on restarted service, got nil")
+	}
+
+	// 7. Unmanaged server (not in pool) is a no-op returning nil
+	if err := newSvc.UpdateBackendServerHost(ctx, 99999, "198.51.100.99"); err != nil {
+		t.Errorf("expected nil for unmanaged server, got: %v", err)
+	}
+
+	// 8. Same endpoint is a no-op returning nil
+	if err := newSvc.UpdateBackendServerHost(ctx, sID, "198.51.100.4"); err != nil {
+		t.Errorf("expected nil for unchanged endpoint, got: %v", err)
+	}
+}
+
+func TestUpdateBackendServerHost_RaceWithDisableBackend(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Race Server", "198.51.100.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "198.51.100.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if err := svc.pool.SetTunnelStatusWithReason(ctx, sID, TunnelStatusActive, models.DisableReasonNone, 10); err != nil {
+		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("attachBackendForwarder failed: %v", err)
+	}
+
+	// Verify device is attached initially
+	if svc.GetBackendDeviceForTest(tun.ID) == nil {
+		t.Fatal("expected device to be attached initially")
+	}
+
+	// Set hook before acquiring s.mu in UpdateBackendServerHost to simulate concurrent DisableBackend
+	hookCalled := false
+	svc.SetUpdateBackendServerHostPreLockHook(func() {
+		hookCalled = true
+		if err := svc.DisableBackend(ctx, sID); err != nil {
+			t.Errorf("DisableBackend in hook failed: %v", err)
+		}
+	})
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.2"); err != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+	}
+
+	if !hookCalled {
+		t.Fatal("expected pre-lock hook to be called")
+	}
+
+	// Assert tunnel remains TunnelStatusDisabled with DisableReasonAdmin
+	tunAfter, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfter.Status != TunnelStatusDisabled || tunAfter.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected TunnelStatusDisabled with DisableReasonAdmin, got status=%q reason=%q",
+			tunAfter.Status, tunAfter.DisableReason)
+	}
+
+	// Assert forwarder device is detached / not reattached
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Errorf("expected forwarder device to be detached, got %+v", dev)
+	}
+
+	// Assert no data-plane device is registered for the disabled tunnel in s.backendDevices
+	svc.mu.RLock()
+	_, hasDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if hasDev {
+		t.Errorf("expected no device in backendDevices for disabled tunnel %d", tun.ID)
+	}
+}
+
+// TestEnsureBackendDeviceAttached_FencedOnStaleStateVersion verifies that if an endpoint update
+// races ensureBackendDeviceAttached after initial validation but before acquiring s.mu,
+// the attachment critical section detects the StateVersion mismatch under lock, refuses to
+// attach the forwarder device, and returns tunnel.ErrStaleStateVersion.
+func TestEnsureBackendDeviceAttached_FencedOnStaleStateVersion(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tun := tunMust(t, vpnSvc, s1ID)
+
+	// Ensure device is initially not attached
+	vpnSvc.mu.Lock()
+	delete(vpnSvc.backendDevices, tun.ID)
+	vpnSvc.mu.Unlock()
+
+	var hookCalled atomic.Bool
+	vpnSvc.SetEnsureDevicePreLockHook(func() {
+		hookCalled.Store(true)
+		if err := vpnSvc.pool.SetTunnelEndpoint(ctx, tun.ID, "198.51.100.99:51820"); err != nil {
+			t.Errorf("SetTunnelEndpoint in hook failed: %v", err)
+		}
+	})
+
+	err := vpnSvc.ensureBackendDeviceAttached(ctx, tun)
+	if !errors.Is(err, tunnel.ErrStaleStateVersion) {
+		t.Fatalf("expected ErrStaleStateVersion, got %v", err)
+	}
+	if !hookCalled.Load() {
+		t.Fatal("expected ensureDevicePreLockHook to be called")
+	}
+
+	// Assert that forwarder device was NOT attached for the old tunnel
+	if dev := vpnSvc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("backend device must not be attached after concurrent endpoint update")
+	}
+}
+
+// TestUpdateBackendServerHost_CanceledContextRollback verifies that if context is canceled
+// after SetTunnelEndpoint mutated the pool, UpdateBackendServerHost compensates by reverting
+// the endpoint in both SQLite DB and in-memory pool back to the original endpoint.
+func TestUpdateBackendServerHost_CanceledContextRollback(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunBefore := tunMust(t, vpnSvc, s1ID)
+	origEndpoint := tunBefore.Endpoint
+
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
+		cancelReq()
+	})
+
+	err := vpnSvc.UpdateBackendServerHost(reqCtx, s1ID, "198.51.100.88")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Assert endpoint in memory pool was reverted to origEndpoint
+	tunAfter, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfter.Endpoint != origEndpoint {
+		t.Errorf("expected pool endpoint %q, got %q", origEndpoint, tunAfter.Endpoint)
+	}
+
+	// Assert endpoint in DB was reverted to origEndpoint
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun.Endpoint != origEndpoint {
+		t.Errorf("expected DB endpoint %q, got %q", origEndpoint, dbTun.Endpoint)
+	}
+}
+
+// TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed verifies that
+// if endpoint rollback fails during compensation, UpdateBackendServerHost returns an error
+// joining the original error and ErrVPNRollbackFailed.
+func TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunBefore := tunMust(t, vpnSvc, s1ID)
+	origEndpoint := tunBefore.Endpoint
+
+	// 1. Hook forwarder sync to fail
+	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("forwarder sync failure")
+	})
+
+	// 2. Hook SetTunnelEndpoint so rollback to origEndpoint fails
+	vpnSvc.SetTunnelEndpointHookForTest(func(ctx context.Context, tunnelID int64, endpoint string) error {
+		if endpoint == origEndpoint {
+			return errors.New("simulated disk error during rollback")
+		}
+		return nil
+	})
+
+	newHost := "198.51.100.89"
+	err := vpnSvc.UpdateBackendServerHost(ctx, s1ID, newHost)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrVPNRollbackFailed) {
+		t.Errorf("expected error to wrap ErrVPNRollbackFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "forwarder sync failure") {
+		t.Errorf("expected error to include original error 'forwarder sync failure', got %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated disk error during rollback") {
+		t.Errorf("expected error to include rollback error, got %v", err)
+	}
+}
+
+func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	ctx := context.Background()
+
+	sID, pub, _ := createTestServerAndKey(t, db, "Same Endpoint Srv", "198.51.100.1")
+
+	tun, err := svc.pool.AddTunnel(ctx, sID, "198.51.100.1:51820", pub)
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	err = svc.attachBackendForwarder(tun, nil)
+	svc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("attachBackendForwarder failed: %v", err)
+	}
+
+	dev1 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev1 == nil {
+		t.Fatal("expected dev1 to be attached, got nil")
+	}
+	if dev1.IsClosed() {
+		t.Fatal("expected dev1 to be open initially")
+	}
+
+	// 1. When already synchronized, calling with the same host is an idempotent no-op
+	// that does NOT recreate the device.
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.1"); err != nil {
+		t.Fatalf("UpdateBackendServerHost (synchronized) failed: %v", err)
+	}
+
+	devAfter := svc.GetBackendDeviceForTest(tun.ID)
+	if devAfter != dev1 {
+		t.Errorf("expected device to remain unchanged, but devAfter != dev1")
+	}
+	if dev1.IsClosed() {
+		t.Error("expected dev1 to remain open when already synchronized")
+	}
+
+	// 2. When attachedEndpoint is stale (e.g. set to a different endpoint),
+	// calling with the same host reconciles the backend forwarder.
+	svc.SetBackendDeviceEndpointForTest(tun.ID, "198.51.100.99:51820")
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.1"); err != nil {
+		t.Fatalf("UpdateBackendServerHost (reconciliation) failed: %v", err)
+	}
+
+	dev2 := svc.GetBackendDeviceForTest(tun.ID)
+	if dev2 == nil {
+		t.Fatal("expected dev2 to be attached, got nil")
+	}
+	if dev2 == dev1 {
+		t.Error("expected new device instance to replace dev1")
+	}
+	if !dev1.IsClosed() {
+		t.Error("expected old dev1 to be closed after stale-endpoint reconciliation")
+	}
+	if dev2.IsClosed() {
+		t.Error("expected new dev2 to remain open")
+	}
+	if ep := svc.GetBackendDeviceEndpointForTest(tun.ID); ep != "198.51.100.1:51820" {
+		t.Errorf("expected backendDeviceEndpoint to be %q, got %q", "198.51.100.1:51820", ep)
+	}
+}
+
 func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -2739,8 +3169,17 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 		t.Errorf("expected tunnel status to remain 'degraded' before probe, got %s", restoredTun.Status)
 	}
 
+	// Stop background prober to avoid race with manual ProbeTunnel
+	if svc.prober != nil {
+		svc.prober.Stop()
+	}
+
 	// Probe the tunnel - now succeeds and transitions to active
 	probeShouldSucceed.Store(true)
+	restoredTun, err = svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
 	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
 	if err != nil {
 		t.Fatalf("ProbeTunnel failed: %v", err)

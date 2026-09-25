@@ -439,7 +439,7 @@ func TestOrchestrator_ProbeFailoverRetry_ThreadSafety(t *testing.T) {
 				case 2:
 					orch.ResetProbeFailCount(tID)
 				case 3:
-					_ = orch.recordProbeFailure(tID)
+					_ = orch.recordProbeFailure(tID, 0)
 				case 4:
 					WithProbeFailureThreshold(3 + (i % 3))(orch)
 				}
@@ -448,4 +448,115 @@ func TestOrchestrator_ProbeFailoverRetry_ThreadSafety(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestOrchestrator_IsTunnelVersionStale_DBError verifies that isTunnelVersionStale returns
+// an error on DB lookup failures or missing tunnels, and correct boolean on version comparison.
+func TestOrchestrator_IsTunnelVersionStale_DBError(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server Stale", Host: "10.0.0.100", SSHPort: 22})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srvID,
+		InterfaceName: "awg-stale",
+		PublicKey:     "pub-stale",
+		Endpoint:      "127.0.0.1:55555",
+		Status:        "active",
+		StateVersion:  1,
+	})
+
+	orch := New(db, nil)
+
+	// 1. Valid tunnel version matches -> (false, nil)
+	tun, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	isStale, err := orch.isTunnelVersionStale(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if isStale {
+		t.Errorf("expected isStale=false for matching version, got true")
+	}
+
+	// 2. Tunnel version differs in DB -> (true, nil)
+	if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{"state_version": 2}); err != nil {
+		t.Fatalf("UpdateBackendTunnel failed: %v", err)
+	}
+	isStale, err = orch.isTunnelVersionStale(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if !isStale {
+		t.Errorf("expected isStale=true for mismatched version, got false")
+	}
+
+	// 3. Guards: StateVersion <= 0 or nil -> (false, nil)
+	isStale, err = orch.isTunnelVersionStale(ctx, &models.BackendTunnel{ID: tID, StateVersion: 0})
+	if err != nil || isStale {
+		t.Errorf("expected false, nil for StateVersion <= 0, got isStale=%v err=%v", isStale, err)
+	}
+	isStale, err = orch.isTunnelVersionStale(ctx, nil)
+	if err != nil || isStale {
+		t.Errorf("expected false, nil for nil tunnel, got isStale=%v err=%v", isStale, err)
+	}
+
+	// 4. Missing tunnel in DB -> returns error
+	isStale, err = orch.isTunnelVersionStale(ctx, &models.BackendTunnel{ID: 999999, StateVersion: 1})
+	if err == nil {
+		t.Errorf("expected error for non-existent tunnel in DB, got nil")
+	}
+	if isStale {
+		t.Errorf("expected isStale=false on missing tunnel error, got true")
+	}
+
+	// 5. DB closed / lookup error -> returns error
+	cleanup()
+	isStale, err = orch.isTunnelVersionStale(ctx, tun)
+	if err == nil {
+		t.Errorf("expected error when DB is closed, got nil")
+	}
+	if isStale {
+		t.Errorf("expected isStale=false on DB error, got true")
+	}
+}
+
+// TestOrchestrator_ProbeFailure_DBLookupError_DoesNotIncrementFailureCount verifies that
+// when DB lookup fails during probe failure handling, isTunnelVersionStale returns an error
+// and failure count is dropped (not incremented).
+func TestOrchestrator_ProbeFailure_DBLookupError_DoesNotIncrementFailureCount(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_ = db.SaveVPNConfig(ctx, &models.VPNConfig{HealthThresholdMS: 500})
+
+	srvID, _ := db.CreateServer(ctx, &models.Server{Name: "Server DB Fail", Host: "10.0.0.101", SSHPort: 22})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srvID,
+		InterfaceName: "awg-dbfail",
+		PublicKey:     "pub-dbfail",
+		Endpoint:      "127.0.0.1:55556",
+		Status:        "active",
+		StateVersion:  1,
+	})
+
+	// Probe function fails, and closes DB during execution so that the subsequent
+	// isTunnelVersionStale lookup fails with a DB error.
+	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		// Close DB to simulate database connection loss during probe failure handling
+		cleanup()
+		return 0, errors.New("simulated probe failure: connection timeout")
+	}))
+
+	// Run health check
+	_ = orch.CheckBackendTunnelHealth(ctx)
+
+	// Failure count must NOT be incremented because DB lookup during stale check failed
+	if got := orch.GetProbeFailCount(tID); got != 0 {
+		t.Errorf("expected failure count 0 when DB lookup fails, got %d", got)
+	}
 }

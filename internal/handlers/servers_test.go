@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -1366,6 +1368,858 @@ func TestRenameServerHandler(t *testing.T) {
 			t.Errorf("expected 200 OK for support user, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
 		}
 	})
+}
+
+func TestUpdateServerHostHandler(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server-Host-Test",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+	})
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+	t.Run("Happy path - POST update host with IPv4", func(t *testing.T) {
+		logBuf.Reset()
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.50"})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "192.168.1.50" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		// Verify DB record updated
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "192.168.1.50" {
+			t.Errorf("expected server host '192.168.1.50', got %q", dbSrv.Host)
+		}
+
+		// Verify audit log
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "server.update_ip") || !strings.Contains(logStr, "10.0.0.1") || !strings.Contains(logStr, "192.168.1.50") {
+			t.Errorf("audit log missing expected update_ip event, got: %s", logStr)
+		}
+	})
+
+	t.Run("Happy path - PATCH update host with IPv6", func(t *testing.T) {
+		logBuf.Reset()
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "2001:db8::1"})
+		req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "2001:db8::1" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "2001:db8::1" {
+			t.Errorf("expected server host '2001:db8::1', got %q", dbSrv.Host)
+		}
+
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "server.update_ip") || !strings.Contains(logStr, "192.168.1.50") || !strings.Contains(logStr, "2001:db8::1") {
+			t.Errorf("audit log missing expected update_ip event, got: %s", logStr)
+		}
+	})
+
+	t.Run("Happy path - POST update host with hostname domain and whitespace trimming", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "  vpn.example.com  "})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "vpn.example.com" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "vpn.example.com" {
+			t.Errorf("expected server host 'vpn.example.com', got %q", dbSrv.Host)
+		}
+	})
+
+	t.Run("Validation failure - empty host", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: ""})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - whitespace only host", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "   \t\n  "})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - invalid host syntax", func(t *testing.T) {
+		for _, badHost := range []string{"invalid host with spaces", "server$name.com", "http://example.com"} {
+			body, _ := json.Marshal(models.UpdateServerHostRequest{Host: badHost})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 Bad Request for %q, got %d", badHost, w.Code)
+			}
+		}
+	})
+
+	t.Run("Invalid JSON body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), strings.NewReader("{not-valid-json"))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Invalid server ID parameter", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.1"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/invalid-id/host", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Not found - non-existent server ID", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.1"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/999999/host", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 Not Found, got %d", w.Code)
+		}
+	})
+
+	t.Run("Role-based authorization via RequireAdminOrSupport middleware", func(t *testing.T) {
+		protRouter := chi.NewRouter()
+		protRouter.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAdminOrSupport)
+			r.Post("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
+			r.Patch("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
+		})
+
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.1"})
+
+		// Unauthenticated -> 401 Unauthorized
+		reqUnauth := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		wUnauth := httptest.NewRecorder()
+		protRouter.ServeHTTP(wUnauth, reqUnauth)
+		if wUnauth.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized for unauthenticated request, got %d", wUnauth.Code)
+		}
+
+		// Regular user -> 403 Forbidden
+		reqUser := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		userCtx := middleware.WithSession(reqUser.Context(), &models.SessionData{UserID: "u-regular", Role: models.RoleUser})
+		wUser := httptest.NewRecorder()
+		protRouter.ServeHTTP(wUser, reqUser.WithContext(userCtx))
+		if wUser.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for regular user, got %d", wUser.Code)
+		}
+
+		// Support user -> 200 OK
+		bodySupport, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.2"})
+		reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(bodySupport))
+		supportCtx := middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: "u-support", Role: models.RoleSupport})
+		wSupport := httptest.NewRecorder()
+		protRouter.ServeHTTP(wSupport, reqSupport.WithContext(supportCtx))
+		if wSupport.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for support user, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
+		}
+
+		// Admin user -> 200 OK
+		bodyAdmin, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.3"})
+		reqAdmin := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(bodyAdmin))
+		adminCtx := middleware.WithSession(reqAdmin.Context(), &models.SessionData{UserID: "u-admin", Role: models.RoleAdmin})
+		wAdmin := httptest.NewRecorder()
+		protRouter.ServeHTTP(wAdmin, reqAdmin.WithContext(adminCtx))
+		if wAdmin.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for admin user, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
+		}
+	})
+}
+
+func TestUpdateServerHostHandler_VPNBackendPropagation(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	srv := &models.Server{
+		Name:    "VPN-Backend-Server",
+		Host:    "10.20.30.40",
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify server host updated in DB
+	updatedServer, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if updatedServer.Host != "10.20.30.50" {
+		t.Errorf("server host = %q, want %q", updatedServer.Host, "10.20.30.50")
+	}
+
+	// Verify tunnel endpoint updated in VPN memory pool
+	backends, err := vpnSvc.GetBackends(ctx)
+	if err != nil {
+		t.Fatalf("GetBackends failed: %v", err)
+	}
+	var foundMem *models.BackendTunnel
+	for _, b := range backends {
+		if b.ServerID == serverID {
+			foundMem = b
+			break
+		}
+	}
+	if foundMem == nil {
+		t.Fatalf("backend tunnel for server %d not found in VPN service", serverID)
+	}
+	if foundMem.Endpoint != "10.20.30.50:51820" {
+		t.Errorf("memory tunnel endpoint = %q, want %q", foundMem.Endpoint, "10.20.30.50:51820")
+	}
+
+	// Verify tunnel endpoint updated in DB
+	dbTunnels, err := db.GetBackendTunnels(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendTunnels failed: %v", err)
+	}
+	var foundDB *models.BackendTunnel
+	for i := range dbTunnels {
+		if dbTunnels[i].ServerID == serverID {
+			foundDB = &dbTunnels[i]
+			break
+		}
+	}
+	if foundDB == nil {
+		t.Fatalf("backend tunnel for server %d not found in DB", serverID)
+	}
+	if foundDB.Endpoint != "10.20.30.50:51820" {
+		t.Errorf("DB backend tunnel endpoint = %q, want %q", foundDB.Endpoint, "10.20.30.50:51820")
+	}
+}
+
+func TestUpdateServerHostHandler_ConcurrencySerialization(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Concurrent-Host-Server",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	origLogger := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+	})
+	slog.SetDefault(slog.New(slog.NewTextHandler(&testSyncWriter{buf: &logBuf, mu: &logMu}, nil)))
+
+	const numWorkers = 10
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		go func(workerIndex int) {
+			defer wg.Done()
+			newHost := fmt.Sprintf("10.0.1.%d", workerIndex+1)
+			body, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("worker %d: expected 200 OK, got %d", workerIndex, w.Code)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify server in DB has one of the valid updated hosts
+	finalServer, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if !strings.HasPrefix(finalServer.Host, "10.0.1.") {
+		t.Errorf("unexpected final host: %s", finalServer.Host)
+	}
+
+	// Verify all 10 audit logs were written
+	logMu.Lock()
+	logContent := logBuf.String()
+	logMu.Unlock()
+
+	auditCount := strings.Count(logContent, "server.update_ip")
+	if auditCount != numWorkers {
+		t.Errorf("expected %d server.update_ip audit events, got %d", numWorkers, auditCount)
+	}
+}
+
+func TestUpdateServerHostHandler_VPNFailureRollback(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "VPN-Rollback-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	// Inject failure into vpnSvc
+	vpnSvc.SetUpdateBackendServerHostErrorForTest(errors.New("injected vpn failure"))
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Assert database record server.Host was rolled back to original IP
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != origHost {
+		t.Errorf("server host was not rolled back: got %q, want %q", serverAfter.Host, origHost)
+	}
+}
+
+func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "VPN-Canceled-Ctx-Rollback-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil {
+		t.Fatalf("vpnSvc.GetTunnel before update failed: %v", err)
+	}
+	if tunBefore == nil {
+		t.Fatalf("expected initial backend tunnel to exist")
+	}
+
+	// Create a request context that is canceled during UpdateBackendServerHost.
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
+		cancelReq()
+	})
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body)).WithContext(reqCtx)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Assert that request context was genuinely canceled
+	if !errors.Is(reqCtx.Err(), context.Canceled) {
+		t.Fatalf("expected reqCtx.Err() == context.Canceled, got %v", reqCtx.Err())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Assert database record server.Host was successfully restored to origHost
+	// despite reqCtx being canceled.
+	serverAfter, err := db.GetServer(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != origHost {
+		t.Errorf("server host was not restored on canceled context: got %q, want %q", serverAfter.Host, origHost)
+	}
+
+	dbTun, err := db.GetBackendTunnelByServerID(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun == nil {
+		t.Fatalf("expected backend tunnel to exist in database after rollback")
+	}
+	if dbTun.Endpoint != tunBefore.Endpoint {
+		t.Errorf("backend_tunnels.endpoint in DB was not restored: got %q, want %q", dbTun.Endpoint, tunBefore.Endpoint)
+	}
+
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err != nil {
+		t.Fatalf("vpnSvc.GetTunnel after rollback failed: %v", err)
+	}
+	if tunAfter == nil {
+		t.Fatalf("expected backend tunnel in pool to exist after rollback")
+	}
+	if tunAfter.Endpoint != tunBefore.Endpoint {
+		t.Errorf("in-memory pool tunnel endpoint was not restored: got %q, want %q", tunAfter.Endpoint, tunBefore.Endpoint)
+	}
+}
+
+func TestUpdateServerHostHandler_BracketedIPv6(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "IPv6-Server",
+		Host:    "10.20.30.40",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(map[string]string{"host": "[2001:db8::1]"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["host"] != "2001:db8::1" {
+		t.Errorf("response host = %v, want '2001:db8::1'", resp["host"])
+	}
+
+	// Assert database record server.Host persists unbracketed IPv6
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != "2001:db8::1" {
+		t.Errorf("persisted server host = %q, want '2001:db8::1'", serverAfter.Host)
+	}
+}
+
+func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	newHost := "10.20.30.50"
+	srv := &models.Server{
+		Name:    "VPN-Rollback-Failure-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("GetTunnel before update failed: %v", err)
+	}
+
+	devInitial := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devInitial == nil {
+		t.Fatal("expected devInitial to be attached, got nil")
+	}
+	if devInitial.IsClosed() {
+		t.Fatal("expected devInitial to be open initially")
+	}
+
+	// 1. Hook forwarder sync to fail, triggering the rollback path in UpdateBackendServerHost.
+	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("simulated sync failure")
+	})
+
+	// 2. Hook SetTunnelEndpoint so that restoring oldEndpoint fails.
+	vpnSvc.SetTunnelEndpointHookForTest(func(ctx context.Context, tunnelID int64, endpoint string) error {
+		if strings.Contains(endpoint, origHost) {
+			return errors.New("simulated rollback disk failure")
+		}
+		return nil
+	})
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Verify that handler did NOT leave server.Host = origHost while backend tunnel = newHost.
+	// DB record server.Host must remain newHost (retained to prevent split-brain).
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != newHost {
+		t.Errorf("expected server.Host in DB to be retained as %q to prevent split-brain, got %q", newHost, serverAfter.Host)
+	}
+
+	// In-memory pool endpoint is still newEndpoint (newHost:51820)
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnel after failed rollback failed: %v", err)
+	}
+	expectedNewEndpoint := fmt.Sprintf("%s:51820", newHost)
+	if tunAfter.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected pool tunnel endpoint to be %q, got %q", expectedNewEndpoint, tunAfter.Endpoint)
+	}
+
+	// 3. Remove fault injections and retry update with the same newHost.
+	vpnSvc.SetSyncBackendForwarderHookForTest(nil)
+	vpnSvc.SetTunnelEndpointHookForTest(nil)
+
+	retryBody, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+	retryReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(retryBody))
+	retryW := httptest.NewRecorder()
+	r.ServeHTTP(retryW, retryReq)
+
+	if retryW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on same-host retry, got %d (body: %s)", retryW.Code, retryW.Body.String())
+	}
+
+	devReconciled := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devReconciled == nil {
+		t.Fatal("expected devReconciled to not be nil")
+	}
+	if devReconciled == devInitial {
+		t.Error("expected devReconciled != devInitial")
+	}
+	if !devInitial.IsClosed() {
+		t.Error("expected devInitial.IsClosed() to be true")
+	}
+	if devReconciled.IsClosed() {
+		t.Error("expected !devReconciled.IsClosed() to be true")
+	}
+
+	serverAfterRetry, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer after retry failed: %v", err)
+	}
+	if serverAfterRetry.Host != newHost {
+		t.Errorf("expected serverAfter.Host == %q, got %q", newHost, serverAfterRetry.Host)
+	}
+}
+
+func TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "Unchanged-Host-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("GetTunnel before update failed: %v", err)
+	}
+
+	devInitial := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devInitial == nil {
+		t.Fatal("expected devInitial to be attached, got nil")
+	}
+	if devInitial.IsClosed() {
+		t.Fatal("expected devInitial to be open initially")
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: origHost})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	devAfter := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devAfter == nil {
+		t.Fatal("expected devAfter to not be nil")
+	}
+	if devAfter != devInitial {
+		t.Errorf("expected device to remain unchanged (devAfter == devInitial), but got different device instances")
+	}
+	if devInitial.IsClosed() {
+		t.Errorf("expected devInitial to not be closed on unchanged-host save")
+	}
+
+	if pool, ok := h.sshPool.(*testMockSSHPool); ok {
+		if removed := pool.RemovedIDs(); len(removed) > 0 {
+			t.Errorf("expected sshPool.Remove not to be called for unchanged host, got %v", removed)
+		}
+	}
+}
+
+type testSyncWriter struct {
+	buf *bytes.Buffer
+	mu  *sync.Mutex
+}
+
+func (w *testSyncWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
 }
 
 func TestServerStatsHandler_Failures(t *testing.T) {

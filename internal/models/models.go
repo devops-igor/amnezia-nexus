@@ -461,7 +461,11 @@ func ValidatePasswordComplexity(p string) error {
 
 // ValidateHost checks if a host string is a valid IP or hostname.
 func ValidateHost(host string) error {
-	if ip := net.ParseIP(host); ip != nil {
+	raw := host
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = raw[1 : len(raw)-1]
+	}
+	if ip := net.ParseIP(raw); ip != nil {
 		return nil
 	}
 	if HostnameRegex.MatchString(host) {
@@ -596,6 +600,25 @@ func (r *RenameServerRequest) Validate() error {
 		return err
 	}
 	return nil
+}
+
+// UpdateServerHostRequest defines server host/IP update payload.
+type UpdateServerHostRequest struct {
+	Host string `json:"host"`
+}
+
+func (r *UpdateServerHostRequest) Validate() error {
+	r.Host = strings.TrimSpace(r.Host)
+	if r.Host == "" {
+		return errors.New("host cannot be empty")
+	}
+	if strings.HasPrefix(r.Host, "[") && strings.HasSuffix(r.Host, "]") {
+		inner := r.Host[1 : len(r.Host)-1]
+		if ip := net.ParseIP(inner); ip != nil {
+			r.Host = inner
+		}
+	}
+	return ValidateHost(r.Host)
 }
 
 // InstallProtocolRequest defines protocol deployment options on a server.

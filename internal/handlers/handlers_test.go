@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -279,8 +280,10 @@ func (m *testMockSSHClient) GetLastActive() time.Time {
 }
 
 type testMockSSHPool struct {
-	client *testMockSSHClient
-	err    error
+	client     *testMockSSHClient
+	err        error
+	removedMu  sync.Mutex
+	removedIDs []int64
 }
 
 func (p *testMockSSHPool) Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error) {
@@ -290,7 +293,19 @@ func (p *testMockSSHPool) Get(ctx context.Context, server *models.Server) (ssh.S
 	return p.client, nil
 }
 
-func (p *testMockSSHPool) Remove(serverID int64) {}
+func (p *testMockSSHPool) Remove(serverID int64) {
+	p.removedMu.Lock()
+	defer p.removedMu.Unlock()
+	p.removedIDs = append(p.removedIDs, serverID)
+}
+
+func (p *testMockSSHPool) RemovedIDs() []int64 {
+	p.removedMu.Lock()
+	defer p.removedMu.Unlock()
+	copied := make([]int64, len(p.removedIDs))
+	copy(copied, p.removedIDs)
+	return copied
+}
 
 func setupFullServerRouter(h *Handlers) *chi.Mux {
 	r := chi.NewRouter()
@@ -298,6 +313,8 @@ func setupFullServerRouter(h *Handlers) *chi.Mux {
 	r.Post("/api/servers/confirm-fingerprint", h.ConfirmFingerprintHandler)
 	r.Post("/api/servers/{server_id}/rename", h.RenameServerHandler)
 	r.Patch("/api/servers/{server_id}/rename", h.RenameServerHandler)
+	r.Post("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
+	r.Patch("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
 	r.Post("/api/servers/{server_id}/delete", h.DeleteServerHandler)
 	r.Post("/api/servers/{server_id}/reboot", h.RebootServerHandler)
 	r.Post("/api/servers/{server_id}/clear", h.ClearServerHandler)
