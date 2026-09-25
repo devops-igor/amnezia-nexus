@@ -1875,6 +1875,14 @@ func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
 		t.Fatalf("EnableBackend failed: %v", err)
 	}
 
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil {
+		t.Fatalf("vpnSvc.GetTunnel before update failed: %v", err)
+	}
+	if tunBefore == nil {
+		t.Fatalf("expected initial backend tunnel to exist")
+	}
+
 	// Create a request context that is canceled during UpdateBackendServerHost.
 	reqCtx, cancelReq := context.WithCancel(context.Background())
 	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
@@ -1914,6 +1922,28 @@ func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
 	}
 	if serverAfter.Host != origHost {
 		t.Errorf("server host was not restored on canceled context: got %q, want %q", serverAfter.Host, origHost)
+	}
+
+	dbTun, err := db.GetBackendTunnelByServerID(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun == nil {
+		t.Fatalf("expected backend tunnel to exist in database after rollback")
+	}
+	if dbTun.Endpoint != tunBefore.Endpoint {
+		t.Errorf("backend_tunnels.endpoint in DB was not restored: got %q, want %q", dbTun.Endpoint, tunBefore.Endpoint)
+	}
+
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err != nil {
+		t.Fatalf("vpnSvc.GetTunnel after rollback failed: %v", err)
+	}
+	if tunAfter == nil {
+		t.Fatalf("expected backend tunnel in pool to exist after rollback")
+	}
+	if tunAfter.Endpoint != tunBefore.Endpoint {
+		t.Errorf("in-memory pool tunnel endpoint was not restored: got %q, want %q", tunAfter.Endpoint, tunBefore.Endpoint)
 	}
 }
 

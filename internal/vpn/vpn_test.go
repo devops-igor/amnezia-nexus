@@ -2678,6 +2678,92 @@ func TestUpdateBackendServerHost_RaceWithDisableBackend(t *testing.T) {
 	}
 }
 
+// TestEnsureBackendDeviceAttached_FencedOnStaleStateVersion verifies that if an endpoint update
+// races ensureBackendDeviceAttached after initial validation but before acquiring s.mu,
+// the attachment critical section detects the StateVersion mismatch under lock, refuses to
+// attach the forwarder device, and returns tunnel.ErrStaleStateVersion.
+func TestEnsureBackendDeviceAttached_FencedOnStaleStateVersion(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tun := tunMust(t, vpnSvc, s1ID)
+
+	// Ensure device is initially not attached
+	vpnSvc.mu.Lock()
+	delete(vpnSvc.backendDevices, tun.ID)
+	vpnSvc.mu.Unlock()
+
+	var hookCalled atomic.Bool
+	vpnSvc.SetEnsureDevicePreLockHook(func() {
+		hookCalled.Store(true)
+		if err := vpnSvc.pool.SetTunnelEndpoint(ctx, tun.ID, "198.51.100.99:51820"); err != nil {
+			t.Errorf("SetTunnelEndpoint in hook failed: %v", err)
+		}
+	})
+
+	err := vpnSvc.ensureBackendDeviceAttached(ctx, tun)
+	if !errors.Is(err, tunnel.ErrStaleStateVersion) {
+		t.Fatalf("expected ErrStaleStateVersion, got %v", err)
+	}
+	if !hookCalled.Load() {
+		t.Fatal("expected ensureDevicePreLockHook to be called")
+	}
+
+	// Assert that forwarder device was NOT attached for the old tunnel
+	if dev := vpnSvc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatal("backend device must not be attached after concurrent endpoint update")
+	}
+}
+
+// TestUpdateBackendServerHost_CanceledContextRollback verifies that if context is canceled
+// after SetTunnelEndpoint mutated the pool, UpdateBackendServerHost compensates by reverting
+// the endpoint in both SQLite DB and in-memory pool back to the original endpoint.
+func TestUpdateBackendServerHost_CanceledContextRollback(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunBefore := tunMust(t, vpnSvc, s1ID)
+	origEndpoint := tunBefore.Endpoint
+
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	vpnSvc.SetUpdateBackendServerHostPreLockHook(func() {
+		cancelReq()
+	})
+
+	err := vpnSvc.UpdateBackendServerHost(reqCtx, s1ID, "198.51.100.88")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Assert endpoint in memory pool was reverted to origEndpoint
+	tunAfter, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunAfter.Endpoint != origEndpoint {
+		t.Errorf("expected pool endpoint %q, got %q", origEndpoint, tunAfter.Endpoint)
+	}
+
+	// Assert endpoint in DB was reverted to origEndpoint
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun.Endpoint != origEndpoint {
+		t.Errorf("expected DB endpoint %q, got %q", origEndpoint, dbTun.Endpoint)
+	}
+}
+
 func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

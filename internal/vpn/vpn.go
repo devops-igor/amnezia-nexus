@@ -861,6 +861,12 @@ func (s *Service) backendTunnelReady(t *models.BackendTunnel) error {
 	if current.Status == models.TunnelStatusDisabled || current.DisableReason == models.DisableReasonAdmin {
 		return ErrTunnelDisabled
 	}
+	if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
+		return tunnel.ErrStaleStateVersion
+	}
+	if t.Endpoint != "" && current.Endpoint != t.Endpoint {
+		return tunnel.ErrStaleStateVersion
+	}
 	return nil
 }
 
@@ -2504,10 +2510,19 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		return nil
 	}
 
+	oldEndpoint := tun.Endpoint
 	if err := s.pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
 		return fmt.Errorf("failed to update backend tunnel endpoint in pool: %w", err)
 	}
 	tun.Endpoint = newEndpoint
+
+	rollbackEndpoint := func() {
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if rbErr := s.pool.SetTunnelEndpoint(rbCtx, tun.ID, oldEndpoint); rbErr != nil {
+			log.Printf("[vpn] warning: failed to rollback backend tunnel endpoint for server %d: %v", serverID, rbErr)
+		}
+	}
 
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
@@ -2519,13 +2534,20 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	}
 
 	if err := ctx.Err(); err != nil {
+		rollbackEndpoint()
 		return err
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	s.mu.Unlock()
 
-	return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	if syncErr != nil {
+		rollbackEndpoint()
+		return syncErr
+	}
+
+	return nil
 }
 
 // DeleteBackend permanently removes a backend tunnel from the load-balancing
@@ -2632,6 +2654,14 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
 
 	return nil
+}
+
+// GetTunnel retrieves a backend tunnel by server ID from the pool.
+func (s *Service) GetTunnel(serverID int64) (*models.BackendTunnel, error) {
+	if s.pool == nil {
+		return nil, errors.New("tunnel pool not initialized")
+	}
+	return s.pool.GetTunnel(serverID)
 }
 
 // GetTunnels is an alias for GetBackends.

@@ -72,6 +72,7 @@ type HealthProber struct {
 	healthGenerations    map[int64]int64
 	preStatusCommitHook  func() // test synchronization, after the identity check
 	preFailureCommitHook func() // test synchronization, after the identity check
+	preActiveHookHook    func() // test synchronization, before executeActiveHook
 	stopCh               chan struct{}
 	wg                   sync.WaitGroup
 	running              bool
@@ -143,6 +144,13 @@ func (hp *HealthProber) SetOnActiveHook(fn func(ctx context.Context, tunnel *mod
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	hp.onActiveHook = fn
+}
+
+// SetPreActiveHookHook registers a test hook called immediately before executeActiveHook.
+func (hp *HealthProber) SetPreActiveHookHook(fn func()) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.preActiveHookHook = fn
 }
 
 // ResetFailCount clears the consecutive-failure counter, auto-disabled state,
@@ -387,6 +395,9 @@ func (hp *HealthProber) checkTunnelAvailable(tunnel *models.BackendTunnel) error
 	if curTun.Status == "disabled" || curTun.DisableReason == models.DisableReasonAdmin {
 		return ErrTunnelDisabled
 	}
+	if tunnel.StateVersion > 0 && curTun.StateVersion != tunnel.StateVersion {
+		return ErrStaleStateVersion
+	}
 	return nil
 }
 
@@ -419,15 +430,17 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if tunnel == nil {
 		return 0, errors.New("tunnel is nil")
 	}
-	if err := hp.checkTunnelAvailable(tunnel); err != nil {
-		return 0, err
-	}
 
 	snapshot := hp.getInitialSnapshot(tunnel)
+	if err := hp.checkTunnelAvailable(snapshot); err != nil {
+		return 0, err
+	}
 	if snapshot.Status == "disabled" || snapshot.DisableReason == models.DisableReasonAdmin {
 		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", snapshot.ID, "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
+	tunnel.StateVersion = snapshot.StateVersion
+	tunnel.Endpoint = snapshot.Endpoint
 
 	latencyMS, err := hp.probeEndpoint(ctx, tunnel)
 	if err != nil {
@@ -452,6 +465,12 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 
 	// If transitioning to active, verify data-plane readiness via hook
 	if status == "active" {
+		hp.mu.RLock()
+		preActiveHook := hp.preActiveHookHook
+		hp.mu.RUnlock()
+		if preActiveHook != nil {
+			preActiveHook()
+		}
 		if _, hookErr := hp.executeActiveHook(ctx, snapshot, tunnel); hookErr != nil {
 			return 0, hookErr
 		}
@@ -495,16 +514,29 @@ func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel 
 	if err := hp.checkTunnelAvailable(tunnel); err != nil {
 		return 0, err
 	}
+	if snapshot != nil {
+		if err := hp.checkTunnelAvailable(snapshot); err != nil {
+			return 0, err
+		}
+	}
 
 	hp.mu.RLock()
 	hook := hp.onActiveHook
 	hp.mu.RUnlock()
 	if hook != nil {
+		if err := hp.checkTunnelAvailable(tunnel); err != nil {
+			return 0, err
+		}
+		if snapshot != nil {
+			if err := hp.checkTunnelAvailable(snapshot); err != nil {
+				return 0, err
+			}
+		}
 		if hookErr := hook(ctx, tunnel); hookErr != nil {
-			if errors.Is(hookErr, ErrTunnelNotFound) {
+			if errors.Is(hookErr, ErrTunnelNotFound) || errors.Is(hookErr, ErrStaleStateVersion) {
 				return 0, hookErr
 			}
-			if err := hp.checkTunnelAvailable(tunnel); errors.Is(err, ErrTunnelNotFound) {
+			if err := hp.checkTunnelAvailable(tunnel); errors.Is(err, ErrTunnelNotFound) || errors.Is(err, ErrStaleStateVersion) {
 				return 0, err
 			}
 			return hp.handleHookFailure(ctx, snapshot, hookErr)
