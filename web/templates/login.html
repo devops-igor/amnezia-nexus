@@ -11,6 +11,7 @@
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t) }()</script>
     <script src="/static/js/api.js"></script>
     <script src="/static/js/ui.js"></script>
+    <script src="/static/js/captcha.js" defer></script>
     <style>
         .login-wrapper {
             min-height: 100vh;
@@ -73,6 +74,22 @@
             background: rgba(255, 255, 255, 0.08);
             color: var(--text-secondary);
         }
+
+        .captcha-heading { display: flex; align-items: center; justify-content: space-between; }
+        .captcha-refresh { border: 0; background: none; color: var(--accent); cursor: pointer; font: inherit; }
+        .captcha-stage { position: relative; width: min(100%, 300px); aspect-ratio: 300 / 160; margin: 0 auto var(--space-sm); overflow: hidden; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-surface); }
+        .captcha-stage img { position: absolute; display: block; pointer-events: none; }
+        .captcha-background { width: 100%; height: 100%; }
+        .captcha-piece { width: 21.3333%; height: 40%; }
+        .captcha-track { position: relative; height: 44px; margin: auto; width: min(100%, 300px); border-radius: var(--radius-md); border: 1px solid var(--border-color); background: var(--bg-surface); overflow: hidden; }
+        .captcha-fill { height: 100%; width: 0; background: var(--accent-glow); }
+        .captcha-handle { position: absolute; top: 0; left: 0; height: 42px; width: 44px; border: 0; border-radius: var(--radius-md); background: var(--accent); color: white; font-size: 1.5rem; cursor: grab; touch-action: none; user-select: none; }
+        .captcha-handle:active { cursor: grabbing; }
+        .captcha-handle:focus-visible { outline: 2px solid var(--text-primary); outline-offset: -3px; }
+        .captcha-handle:disabled { opacity: .6; cursor: default; }
+        .captcha-status { display: block; min-height: 1.3em; margin-top: var(--space-xs); font-size: .85rem; color: var(--text-secondary); }
+        .captcha-status.success { color: var(--success); }
+        .captcha-status.error { color: var(--danger); }
     </style>
 </head>
 
@@ -169,15 +186,21 @@
                 </div>
 
                 {{ if .captcha_settings.Enabled }}
-                <div class="form-group">
-                    <label class="form-label" for="captcha">{{ _ "captcha" }}</label>
-                    <div style="display: flex; margin-bottom: var(--space-xs); border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); background: #f8fafc; align-items: center; justify-content: center; min-height: 65px;">
-                        <img id="captchaImage" src="/api/auth/captcha" alt="Captcha"
-                            style="max-width: 100%; height: 60px; object-fit: contain; cursor: pointer;"
-                            onclick="refreshCaptcha()" title="{{ _ "captcha_hint" }}">
+                <div class="form-group" id="captchaPuzzle">
+                    <div class="captcha-heading">
+                        <span class="form-label">{{ _ "captcha" }}</span>
+                        <button class="captcha-refresh" type="button" id="captchaRefresh">{{ _ "captcha_refresh" }}</button>
                     </div>
-                    <input class="form-input" type="text" id="captcha" placeholder="{{ _ "captcha_placeholder" }}"
-                        required autocomplete="off">
+                    <div class="captcha-stage">
+                        <img id="captchaImage" class="captcha-background" alt="">
+                        <img id="captchaPiece" class="captcha-piece" alt="">
+                    </div>
+                    <div class="captcha-track" id="captchaTrack">
+                        <div class="captcha-fill" id="captchaFill"></div>
+                        <button class="captcha-handle" type="button" id="captchaHandle" disabled
+                            role="slider" aria-label="{{ _ "captcha_slide_prompt" }}" aria-valuemin="0" aria-valuemax="236" aria-valuenow="0">›</button>
+                    </div>
+                    <span id="captchaStatus" class="captcha-status" role="status" aria-live="polite">{{ _ "captcha_slide_prompt" }}</span>
                 </div>
                 {{ end }}
 
@@ -277,10 +300,7 @@
         })();
 
         function refreshCaptcha() {
-            const img = document.getElementById('captchaImage');
-            if (img) {
-                img.src = '/api/auth/captcha?' + new Date().getTime();
-            }
+            if (window.CaptchaSlider) return window.CaptchaSlider.refresh();
         }
 
         async function doLogin(e) {
@@ -297,11 +317,13 @@
             errEl.classList.add('hidden');
 
             try {
-                const captchaInput = document.getElementById('captcha');
+                const captchaEnabled = !!document.getElementById('captchaPuzzle');
+                const captchaTicket = captchaEnabled ? window.CaptchaSlider.ticket() : '';
+                if (captchaEnabled && !captchaTicket) throw new Error(_('captcha_slide_prompt'));
                 const payload = {
                     username: document.getElementById('username').value,
                     password: document.getElementById('password').value,
-                    captcha: captchaInput ? captchaInput.value.trim() : null,
+                    captcha_ticket: captchaTicket,
                 };
 
                 const data = await API.post('/api/auth/login', payload, { silent: true });
@@ -314,10 +336,7 @@
             } catch (err) {
                 errText.textContent = err.message || _('login_error');
                 errEl.classList.remove('hidden');
-                refreshCaptcha();
-                if (document.getElementById('captcha')) {
-                    document.getElementById('captcha').value = '';
-                }
+                if (window.CaptchaSlider && window.CaptchaSlider.ticket()) refreshCaptcha();
             } finally {
                 btn.disabled = false;
                 text.textContent = _('login');

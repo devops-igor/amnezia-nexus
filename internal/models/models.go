@@ -503,9 +503,10 @@ func ValidateIdentifierName(name string) error {
 
 // LoginRequest defines credentials for dashboard authentication.
 type LoginRequest struct {
-	Username string  `json:"username"`
-	Password string  `json:"password"`
-	Captcha  *string `json:"captcha,omitempty"`
+	Username      string  `json:"username"`
+	Password      string  `json:"password"`
+	Captcha       *string `json:"captcha,omitempty"` // ignored legacy text field
+	CaptchaTicket string  `json:"captcha_ticket,omitempty"`
 }
 
 func (r *LoginRequest) Validate() error {

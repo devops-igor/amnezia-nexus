@@ -9,12 +9,17 @@ require (
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/google/uuid v1.6.0
 	github.com/pkg/sftp v1.13.7
+	github.com/wenlng/go-captcha/v2 v2.0.5
 	golang.org/x/crypto v0.56.0
 	golang.org/x/sync v0.17.0
 	modernc.org/sqlite v1.34.5
 )
 
-require gvisor.dev/gvisor v0.0.0-20250606233247-e3c4c4cad86f // indirect
+require (
+	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
+	golang.org/x/image v0.16.0 // indirect
+	gvisor.dev/gvisor v0.0.0-20250606233247-e3c4c4cad86f // indirect
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

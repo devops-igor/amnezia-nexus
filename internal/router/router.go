@@ -180,6 +180,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	// 5. Auth API Group
 	r.Route("/api/auth", func(r chi.Router) {
 		r.With(middleware.RateLimit(captchaLimiter)).Get("/captcha", h.CaptchaHandler)
+		r.With(middleware.RateLimit(loginLimiter)).Post("/captcha/verify", h.VerifyCaptchaHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/login", h.APILoginHandler)
 		r.With(middleware.RateLimit(loginLimiter)).Post("/setup", h.APISetupHandler)
 		r.With(middleware.RequireAuth).Post("/change-password", h.APIChangePasswordHandler)

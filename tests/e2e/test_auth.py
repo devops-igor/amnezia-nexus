@@ -3,9 +3,9 @@
 import os
 
 import pytest
-from playwright.sync_api import Page
+from playwright.sync_api import Browser, Page
 
-from tests.e2e.conftest import _do_login, _get_csrf_cookie, assert_response_shape
+from tests.e2e.conftest import _do_login, _get_csrf_cookie, api_get, api_post, assert_response_shape
 
 
 @pytest.mark.e2e
@@ -58,6 +58,103 @@ def test_login_failure(page: Page, base_url: str) -> None:
     page.reload()
     page.wait_for_load_state("networkidle")
     assert "/login" in page.url
+
+
+@pytest.mark.e2e
+def test_slide_captcha_rejects_replay(
+    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str
+) -> None:
+    """Enabled puzzle renders offline assets and refuses an invalid or replayed solve."""
+    admin = authenticated_page
+    original = api_get(admin, "/api/settings")
+    assert isinstance(original, dict)
+    settings = {key: original.get(key, {}) for key in ("appearance", "ssl", "limits", "telegram")}
+    settings["captcha"] = {"enabled": True}
+    guest_context = browser.new_context()
+    try:
+        assert api_post(admin, "/api/settings/save", settings, csrf_token)["status"] == 200
+        guest = guest_context.new_page()
+        with guest.expect_response(lambda response: response.url.endswith("/api/auth/captcha")) as issued:
+            guest.goto(f"{base_url}/login")
+        guest.locator("#captchaHandle:not([disabled])").wait_for()
+        challenge = issued.value.json()
+        assert guest.locator("#captchaImage").get_attribute("src") == challenge["image"]
+        assert guest.locator("#captchaPiece").get_attribute("src") == challenge["thumb"]
+        assert challenge["captcha_id"] and challenge["thumb_y"] >= 0
+        token = guest.locator('meta[name="csrf-token"]').get_attribute("content")
+        attempt = {
+            "captcha_id": challenge["captcha_id"],
+            "point": {"x": challenge["thumb_x"], "y": challenge["thumb_y"]},
+        }
+        assert api_post(guest, "/api/auth/captcha/verify", attempt, token)["status"] == 400
+        assert api_post(guest, "/api/auth/captcha/verify", attempt, token)["status"] == 400
+        no_ticket = guest.request.post(
+            f"{base_url}/api/auth/login",
+            data={"username": "admin", "password": "wrong-password"},
+            headers={"Content-Type": "application/json"},
+        )
+        assert no_ticket.status == 400
+    finally:
+        settings["captcha"] = original.get("captcha", {"enabled": False})
+        api_post(admin, "/api/settings/save", settings, csrf_token)
+        guest_context.close()
+
+
+@pytest.mark.e2e
+@pytest.mark.skipif(
+    os.environ.get("E2E_TESTING", "").lower() not in ("true", "1"),
+    reason="The puzzle's test-only target is available only with E2E_TESTING enabled",
+)
+def test_slide_captcha_browser_login(
+    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str,
+    admin_user: str, admin_pass: str,
+) -> None:
+    """Drag the rendered slider, receive a ticket, and log in through the page."""
+    admin = authenticated_page
+    original = api_get(admin, "/api/settings")
+    assert isinstance(original, dict)
+    settings = {key: original.get(key, {}) for key in ("appearance", "ssl", "limits", "telegram")}
+    settings["captcha"] = {"enabled": True}
+    guest_context = browser.new_context()
+    try:
+        assert api_post(admin, "/api/settings/save", settings, csrf_token)["status"] == 200
+        guest = guest_context.new_page()
+        with guest.expect_response(lambda response: response.url.endswith("/api/auth/captcha")) as issued:
+            guest.goto(f"{base_url}/login")
+        challenge = issued.value.json()
+        target_x = int(issued.value.headers["x-e2e-captcha-target-x"])
+        handle = guest.locator("#captchaHandle:not([disabled])")
+        handle.wait_for()
+        assert guest.locator("#captchaImage").get_attribute("src") == challenge["image"]
+        assert guest.locator("#captchaPiece").get_attribute("src") == challenge["thumb"]
+
+        # Drag the visible handle; the page must verify this exact challenge.
+        travel = guest.locator("#captchaTrack").evaluate(
+            "track => track.clientWidth - track.querySelector('#captchaHandle').offsetWidth"
+        )
+        box = handle.bounding_box()
+        assert box and travel > 0
+        start_x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        end_x = start_x + (target_x - challenge["thumb_x"]) * travel / (236 - challenge["thumb_x"])
+        guest.mouse.move(start_x, y)
+        guest.mouse.down()
+        guest.mouse.move(end_x, y, steps=10)
+        guest.mouse.up()
+
+        guest.locator("#captchaStatus.success").wait_for()
+        assert guest.evaluate("window.CaptchaSlider.ticket()")
+        guest.locator("#username").fill(admin_user)
+        guest.locator("#password").fill(admin_pass)
+        with guest.expect_response(
+            lambda response: response.url.endswith("/api/auth/login") and response.request.method == "POST"
+        ) as login:
+            guest.locator("#loginBtn").click()
+        assert login.value.status == 200, login.value.text()[:200]
+        guest.wait_for_url(lambda url: "/login" not in url)
+    finally:
+        settings["captcha"] = original.get("captcha", {"enabled": False})
+        api_post(admin, "/api/settings/save", settings, csrf_token)
+        guest_context.close()
 
 
 @pytest.mark.e2e
