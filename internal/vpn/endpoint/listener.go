@@ -984,14 +984,45 @@ func (el *Listener) IPAM() *IPAM {
 	return el.ipam
 }
 
-// TransportKeysFor returns the Noise transport keys derived for a peer's most
-// recent successful handshake, if any. Data-plane forwarding (Batch 2) uses
-// these keys to decrypt/encrypt transport data.
+// TransportKeysFor returns the newest retained transport keypair for
+// compatibility/introspection. During an unconfirmed responder rekey this may
+// be next; production outbound traffic must use confirmedTransportKeysFor.
 func (el *Listener) TransportKeysFor(peerKey string) (*TransportKeys, bool) {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
+
+	if pkp := el.peerKeypairs[peerKey]; pkp != nil {
+		if pkp.next != nil && !pkp.next.IsExpired() {
+			return pkp.next, true
+		}
+		if pkp.current != nil && !pkp.current.IsExpired() {
+			return pkp.current, true
+		}
+	}
 	keys, ok := el.noiseKeys[peerKey]
-	return keys, ok
+	if !ok || keys == nil || keys.IsExpired() {
+		return nil, false
+	}
+	return keys, true
+}
+
+func (el *Listener) confirmedTransportKeysFor(peerKey string) (*TransportKeys, bool) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+
+	if pkp := el.peerKeypairs[peerKey]; pkp != nil {
+		if pkp.current == nil || pkp.current.IsExpired() {
+			return nil, false
+		}
+		return pkp.current, true
+	}
+
+	// Legacy/synthetic test state may only populate noiseKeys.
+	keys, ok := el.noiseKeys[peerKey]
+	if !ok || keys == nil || keys.IsExpired() {
+		return nil, false
+	}
+	return keys, true
 }
 
 func (el *Listener) getRejectAfterTime() time.Duration {
@@ -1133,6 +1164,54 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
 }
 
+// acceptAuthenticatedTransportKey revalidates a successfully decrypted,
+// replay-valid keypair against the current peer state. If keys is the staged
+// responder next keypair, it atomically confirms and promotes it to current.
+// Removed/superseded keypairs are rejected so a racing rekey cannot refresh
+// session liveness or route stale authenticated traffic.
+func (el *Listener) acceptAuthenticatedTransportKey(peerKey string, keys *TransportKeys) (string, bool) {
+	if keys == nil {
+		return "unknown", false
+	}
+
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if keys.IsExpired() {
+		return "expired", false
+	}
+	pkp := el.peerKeypairs[peerKey]
+	if pkp == nil {
+		return "unknown", false
+	}
+
+	switch {
+	case pkp.current == keys:
+		return "current", true
+	case pkp.previous == keys:
+		return "previous", true
+	case pkp.next == keys:
+		// Defensive cleanup: upstream staging already retires previous, but
+		// never leak an older previous receiver index if synthetic/racy state
+		// reaches promotion.
+		if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+			delete(el.indexTable, pkp.previous.LocalIndex)
+		}
+		pkp.previous = pkp.current
+		pkp.current = pkp.next
+		pkp.next = nil
+		if el.noiseKeys == nil {
+			el.noiseKeys = make(map[string]*TransportKeys)
+		}
+		el.noiseKeys[peerKey] = pkp.current
+		log.Printf("[vpn/endpoint] confirmed responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d",
+			peerKey, keys.Generation, keys.LocalIndex, keys.RemoteIndex)
+		return "current", true
+	default:
+		return "stale", false
+	}
+}
+
 // allocateReceiverIndex generates an unused, non-zero 32-bit receiver index that
 // does not collide with any active keypair entry in el.indexTable, and reserves
 // the slot in indexTable to avoid races between concurrent handshakes.
@@ -1239,7 +1318,7 @@ func (el *Listener) keypairStatus(peerKey string, keys *TransportKeys) string {
 			return "next"
 		}
 	}
-	return "current"
+	return "unknown"
 }
 
 // StoreTransportKeysForTest exposes storeTransportKeys for integration tests.
@@ -1535,7 +1614,7 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 
 	if transportKeys != nil {
 		transportKeys.Generation = gen
-		el.storeTransportKeysLocked(peerKey, transportKeys)
+		el.stageResponderTransportKeysLocked(peerKey, transportKeys)
 	}
 
 	if sender != nil {
@@ -1898,12 +1977,15 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 		return true
 	}
 
-	status := el.keypairStatus(peerKey, keys)
+	status, accepted := el.acceptAuthenticatedTransportKey(peerKey, keys)
+	if !accepted {
+		return true
+	}
 	if status == "previous" {
 		el.logPreviousKeyAccepted(peerKey, keys)
 	}
 
-	isCurrent := (status == "current")
+	isCurrent := status == "current"
 	var remoteIdxToUpdate uint32
 	if isCurrent {
 		remoteIdxToUpdate = keys.RemoteIndex
@@ -1915,6 +1997,9 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 	}
 
 	packet = trimIPPacketPadding(packet)
+	if len(packet) == 0 {
+		return true
+	}
 	el.deliverToRouter(peerKey, packet)
 	return true
 }
@@ -2007,11 +2092,15 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 		return true
 	}
 
-	if el.keypairStatus(peerKey, successfulKeys) == "previous" {
+	status, accepted := el.acceptAuthenticatedTransportKey(peerKey, successfulKeys)
+	if !accepted {
+		return true
+	}
+	if status == "previous" {
 		el.logPreviousKeyAccepted(peerKey, successfulKeys)
 	}
 
-	isCurrent := (el.keypairStatus(peerKey, successfulKeys) == "current")
+	isCurrent := status == "current"
 	var remoteIdxToUpdate uint32
 	if isCurrent {
 		remoteIdxToUpdate = successfulKeys.RemoteIndex
@@ -2023,6 +2112,9 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 	}
 
 	decryptedPacket = trimIPPacketPadding(decryptedPacket)
+	if len(decryptedPacket) == 0 {
+		return true
+	}
 	el.deliverToRouter(peerKey, decryptedPacket)
 	return true
 }
@@ -2032,9 +2124,9 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 // transport framing (S4 padding + H4 magic header). The send counter is a fresh
 // monotonic value per transport key generation.
 func (el *Listener) SendToPeer(peerKey string, packet []byte) error {
-	keys, ok := el.TransportKeysFor(peerKey)
+	keys, ok := el.confirmedTransportKeysFor(peerKey)
 	if !ok || keys == nil || keys.SendKey == nil {
-		return fmt.Errorf("no transport keys for peer %s", peerKey)
+		return fmt.Errorf("no confirmed transport keys for peer %s", peerKey)
 	}
 
 	// Find the peer's most-recently-seen UDP address. A peer that rehandshakes
