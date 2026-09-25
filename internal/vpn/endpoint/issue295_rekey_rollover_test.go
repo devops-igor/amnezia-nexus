@@ -1493,7 +1493,7 @@ func TestRekeyRollover_DisconnectPeer_ValidatesSessionBeforePruning(t *testing.T
 // When a late K1 packet is accepted, it must NOT overwrite the peer's outbound receiver index with R1.
 // A subsequent SendToPeer() must prefer keys.RemoteIndex (R2), placing R2 in the outbound header,
 // and allowing the client to decrypt successfully with K2 (and failing with K1).
-func TestRekeyRollover_OutboundReceiverIndex_PrefersCurrentKeysRemoteIndex(t *testing.T) {
+func TestRekeyRollover_OutboundUsesConfirmedCurrentUntilNextConfirmed(t *testing.T) {
 	el, sPub, hpKey, sID := setupIssue295LiveTestListener(t)
 	defer func() { _ = el.Stop() }()
 
@@ -1516,118 +1516,121 @@ func TestRekeyRollover_OutboundReceiverIndex_PrefersCurrentKeysRemoteIndex(t *te
 		return nil
 	})
 
-	// Handshake 1: Establish initial keypair K1
-	clientPriv, peerKey := newTestClient(t, el.db, sID, "rekey_peer_r2")
-	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	clientPriv, peerKey := newTestClient(t, el.db, sID, "rekey_peer_confirmed_current")
 
-	k1, prev1 := el.PeerKeypairsForTest(peerKey)
-	if k1 == nil || prev1 != nil {
-		t.Fatalf("unexpected keypairs after Handshake 1: curr=%v prev=%v", k1, prev1)
+	// Handshake 1 follows normal upstream behavior and is immediately confirmed
+	// by the initiator's authenticated keepalive.
+	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	prev, k1, next := el.PeerKeypairStateForTest(peerKey)
+	if prev != nil || k1 == nil || next != nil {
+		t.Fatalf("unexpected state after confirmed K1: previous=%p current=%p next=%p", prev, k1, next)
 	}
 	r1 := k1.RemoteIndex
 	if r1 == 0 {
 		t.Fatal("expected non-zero RemoteIndex for K1")
 	}
 
-	// Handshake 2: Rekey to K2
-	_ = performClientHandshake(t, el, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
+	// Handshake 2 response is consumed by the client, but deliberately do not
+	// send the first K2 transport packet yet. This models a response that Nexus
+	// cannot know was received/installed until authenticated K2 transport arrives.
+	_ = performClientHandshakeUnconfirmed(t, clientConn, sPub, clientPriv, hpKey, el.config.H1, el.config.S1, el.config.H2, el.config.S2)
 
-	k2, prev2 := el.PeerKeypairsForTest(peerKey)
-	if k2 == nil || prev2 == nil {
-		t.Fatalf("unexpected keypairs after Handshake 2: curr=%v prev=%v", k2, prev2)
+	prev, current, k2 := el.PeerKeypairStateForTest(peerKey)
+	if prev != nil || current != k1 || k2 == nil {
+		t.Fatalf("unexpected unconfirmed K2 state: previous=%p current=%p next=%p", prev, current, k2)
 	}
 	r2 := k2.RemoteIndex
-	if r2 == 0 {
-		t.Fatal("expected non-zero RemoteIndex for K2")
-	}
-	if r1 == r2 {
-		t.Fatalf("expected different remote indices for K1 and K2: r1=%d r2=%d", r1, r2)
+	if r2 == 0 || r2 == r1 {
+		t.Fatalf("unexpected K2 remote index: r1=%d r2=%d", r1, r2)
 	}
 
-	// Late K1 packet arrives after rekey
-	latePayload := []byte("late-k1-packet-payload")
+	// While K2 is still unconfirmed, K1 remains current and must continue to
+	// carry bidirectional traffic. This is the lost/delayed-response safety case.
+	latePayload := []byte("k1-still-current-while-k2-unconfirmed")
 	lateDatagram := craftClientTransportDatagram(t, k1, el.config.H4.Lo, el.config.S4, hpKey, 5, latePayload)
 	if _, err := clientConn.Write(lateDatagram); err != nil {
-		t.Fatalf("failed to send late K1 datagram: %v", err)
+		t.Fatalf("failed to send K1 transport packet: %v", err)
 	}
-
-	// Allow worker pool to process inbound packet
 	time.Sleep(50 * time.Millisecond)
 
 	mu.Lock()
 	if len(routedPackets) != 1 || !bytes.Equal(routedPackets[0], latePayload) {
-		t.Fatalf("expected late K1 packet routed successfully, got %v", routedPackets)
+		mu.Unlock()
+		t.Fatalf("expected K1 packet routed successfully, got %v", routedPackets)
 	}
 	mu.Unlock()
 
-	// Verify st.receiverIdx was NOT corrupted with R1
+	readOutbound := func(wantKeys *TransportKeys, wantReceiver uint32, wantPayload []byte) {
+		t.Helper()
+		buf := make([]byte, 2048)
+		_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("client failed to read outbound packet: %v", err)
+		}
+		datagram := buf[:n]
+		s4 := el.config.S4
+		if len(datagram) < s4+transportDataHeaderLen+len(wantPayload)+chacha20poly1305.Overhead {
+			t.Fatalf("outbound datagram too short: %d", len(datagram))
+		}
+
+		recvCip := health.NewHeaderProtectionCipher(hpKey, datagram[:health.HeaderCipherNonceSize])
+		if recvCip == nil {
+			t.Fatal("failed to create client unmask cipher")
+		}
+		hdr := make([]byte, transportDataHeaderLen)
+		recvCip.XORKeyStream(hdr, datagram[s4:s4+transportDataHeaderLen])
+		if got := binary.LittleEndian.Uint32(hdr[4:8]); got != wantReceiver {
+			t.Fatalf("outbound receiver index = %d, want %d", got, wantReceiver)
+		}
+		counter := binary.LittleEndian.Uint64(hdr[8:16])
+		var nonce [chacha20poly1305.NonceSize]byte
+		binary.LittleEndian.PutUint64(nonce[4:12], counter)
+		aead, err := chacha20poly1305.New(wantKeys.SendKey)
+		if err != nil {
+			t.Fatalf("chacha20poly1305.New: %v", err)
+		}
+		plain, err := aead.Open(nil, nonce[:], datagram[s4+transportDataHeaderLen:], nil)
+		if err != nil {
+			t.Fatalf("failed to decrypt outbound packet with generation %d: %v", wantKeys.Generation, err)
+		}
+		if !bytes.Equal(plain, wantPayload) {
+			t.Fatalf("outbound payload = %q, want %q", plain, wantPayload)
+		}
+	}
+
+	outK1 := []byte("reply-before-k2-confirmation")
+	if err := el.SendToPeer(peerKey, outK1); err != nil {
+		t.Fatalf("SendToPeer before K2 confirmation failed: %v", err)
+	}
+	readOutbound(k1, r1, outK1)
+
+	// The first authenticated K2 transport packet confirms the response and must
+	// atomically promote next -> current.
+	confirmedK2 := confirmClientHandshake(t, el, clientConn, clientPriv, hpKey)
+	if confirmedK2 != k2 {
+		t.Fatal("confirmation promoted a different keypair")
+	}
+
+	prev, current, next = el.PeerKeypairStateForTest(peerKey)
+	if prev != k1 || current != k2 || next != nil {
+		t.Fatalf("unexpected state after K2 confirmation: previous=%p current=%p next=%p", prev, current, next)
+	}
+
 	clientSenderAddr := clientConn.LocalAddr().String()
 	st, found := el.peerByAddr(clientSenderAddr)
 	if !found || st == nil {
 		t.Fatalf("expected activePeerState found for sender %s", clientSenderAddr)
 	}
-	if stRecv := st.receiverIdx.Load(); stRecv != r2 {
-		t.Fatalf("st.receiverIdx was overwritten with previous remote index! got %d, want %d", stRecv, r2)
+	if got := st.receiverIdx.Load(); got != r2 {
+		t.Fatalf("confirmed K2 did not update outbound receiver index: got %d want %d", got, r2)
 	}
 
-	// Immediately invoke SendToPeer()
-	outboundMsg := []byte("outbound-reply-after-late-k1")
-	if err := el.SendToPeer(peerKey, outboundMsg); err != nil {
-		t.Fatalf("SendToPeer failed: %v", err)
+	outK2 := []byte("reply-after-k2-confirmation")
+	if err := el.SendToPeer(peerKey, outK2); err != nil {
+		t.Fatalf("SendToPeer after K2 confirmation failed: %v", err)
 	}
-
-	// Read outbound datagram on clientConn
-	replyBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := clientConn.Read(replyBuf)
-	if err != nil {
-		t.Fatalf("client failed to read SendToPeer packet: %v", err)
-	}
-
-	datagramOut := replyBuf[:n]
-	s4 := el.config.S4
-	if len(datagramOut) < s4+transportDataHeaderLen+len(outboundMsg)+chacha20poly1305.Overhead {
-		t.Fatalf("outbound datagram too short: %d", len(datagramOut))
-	}
-
-	// Unmask header using HP key
-	recvCip := health.NewHeaderProtectionCipher(hpKey, datagramOut[:health.HeaderCipherNonceSize])
-	if recvCip == nil {
-		t.Fatal("failed to create client unmask cipher")
-	}
-	unmaskedHdr := make([]byte, transportDataHeaderLen)
-	recvCip.XORKeyStream(unmaskedHdr, datagramOut[s4:s4+transportDataHeaderLen])
-
-	outboundReceiverIdx := binary.LittleEndian.Uint32(unmaskedHdr[4:8])
-	if outboundReceiverIdx != r2 {
-		t.Fatalf("SendToPeer sent incorrect receiverIdx: got %d, want R2=%d (R1=%d)", outboundReceiverIdx, r2, r1)
-	}
-
-	outboundCounter := binary.LittleEndian.Uint64(unmaskedHdr[8:16])
-	var nonce [chacha20poly1305.NonceSize]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], outboundCounter)
-
-	// Client decrypts with K2
-	k2AEAD, err := chacha20poly1305.New(k2.SendKey)
-	if err != nil {
-		t.Fatalf("chacha20poly1305.New for K2 failed: %v", err)
-	}
-	decryptedK2, err := k2AEAD.Open(nil, nonce[:], datagramOut[s4+transportDataHeaderLen:], nil)
-	if err != nil {
-		t.Fatalf("client failed to decrypt outbound packet with K2: %v", err)
-	}
-	if !bytes.Equal(decryptedK2, outboundMsg) {
-		t.Fatalf("decrypted payload mismatch: got %q, want %q", decryptedK2, outboundMsg)
-	}
-
-	// Client decrypts with K1 MUST fail
-	k1AEAD, err := chacha20poly1305.New(k1.SendKey)
-	if err != nil {
-		t.Fatalf("chacha20poly1305.New for K1 failed: %v", err)
-	}
-	if _, err := k1AEAD.Open(nil, nonce[:], datagramOut[s4+transportDataHeaderLen:], nil); err == nil {
-		t.Fatal("client unexpectedly succeeded decrypting K2 ciphertext with K1 key")
-	}
+	readOutbound(k2, r2, outK2)
 }
 
 // TestRekeyRollover_SweepInterleavedRekey_PreservesNewKeys tests Finding 2:
