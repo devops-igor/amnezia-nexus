@@ -84,6 +84,12 @@ func setupIssue295LiveTestListener(t *testing.T) (*Listener, [32]byte, []byte, i
 	if err := el.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
+	issue295HandshakeTestListener = el
+	t.Cleanup(func() {
+		if issue295HandshakeTestListener == el {
+			issue295HandshakeTestListener = nil
+		}
+	})
 
 	_, sPub, err := keysMgr.EnsureKeypair(ctx)
 	if err != nil {
@@ -172,8 +178,11 @@ func craftClientTransportDatagram(
 	return datagram
 }
 
-// performClientHandshake performs a live handshake initiation over UDP and returns client state and response.
-func performClientHandshake(
+// performClientHandshakeUnconfirmed performs the responder exchange through
+// receipt/verification of the handshake response, but deliberately does not
+// send authenticated transport. Nexus must therefore keep the derived key in
+// next and continue using the previously confirmed current key.
+func performClientHandshakeUnconfirmed(
 	t *testing.T,
 	clientConn *net.UDPConn,
 	serverPub [32]byte,
@@ -206,6 +215,81 @@ func performClientHandshake(
 	}
 
 	return state
+}
+
+// performClientHandshake performs a complete test handshake including the
+// initiator's immediate authenticated confirmation of the responder key. Most
+// legacy #295 tests exercise already-confirmed rollover; #329 tests use
+// performClientHandshakeUnconfirmed when they need the pending-next window.
+func performClientHandshake(
+	t *testing.T,
+	clientConn *net.UDPConn,
+	serverPub [32]byte,
+	clientPriv []byte,
+	hpKey []byte,
+	h1 models.HeaderRange,
+	s1 int,
+	h2 models.HeaderRange,
+	s2 int,
+) *health.NoiseClientState {
+	t.Helper()
+	state := performClientHandshakeUnconfirmed(t, clientConn, serverPub, clientPriv, hpKey, h1, s1, h2, s2)
+
+	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("derive client public key: %v", err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(clientPub)
+
+	var next *TransportKeys
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, next = elPeerKeyStateForHandshakeTest(t, peerKey)
+		if next != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if next == nil {
+		t.Fatalf("expected staged responder next key for %s", peerKey)
+	}
+
+	status, ok := confirmPeerKeyForHandshakeTest(t, peerKey, next)
+	if !ok || status != "current" {
+		t.Fatalf("failed to confirm responder next key: status=%q ok=%v", status, ok)
+	}
+	st := updatePeerEndpointForHandshakeTest(t, clientConn.LocalAddr().(*net.UDPAddr), peerKey, next.RemoteIndex)
+	if st != nil {
+		st.lastSeen.Store(time.Now().UnixNano())
+	}
+
+	return state
+}
+
+var issue295HandshakeTestListener *Listener
+
+func elPeerKeyStateForHandshakeTest(t *testing.T, peerKey string) (previous, current, next *TransportKeys) {
+	t.Helper()
+	if issue295HandshakeTestListener == nil {
+		t.Fatal("issue295HandshakeTestListener is nil")
+	}
+	return issue295HandshakeTestListener.PeerKeypairStateForTest(peerKey)
+}
+
+func confirmPeerKeyForHandshakeTest(t *testing.T, peerKey string, keys *TransportKeys) (string, bool) {
+	t.Helper()
+	if issue295HandshakeTestListener == nil {
+		t.Fatal("issue295HandshakeTestListener is nil")
+	}
+	return issue295HandshakeTestListener.ConfirmResponderTransportKeyForTest(peerKey, keys)
+}
+
+func updatePeerEndpointForHandshakeTest(t *testing.T, sender *net.UDPAddr, peerKey string, remoteIdx uint32) *activePeerState {
+	t.Helper()
+	if issue295HandshakeTestListener == nil {
+		t.Fatal("issue295HandshakeTestListener is nil")
+	}
+	return issue295HandshakeTestListener.updatePeerEndpointAfterDecryption(sender, peerKey, remoteIdx, true)
 }
 
 // TestRekeyRollover_PreviousKeyInFlightAcceptance verifies that when a client rekeys,
