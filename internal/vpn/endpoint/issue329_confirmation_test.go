@@ -31,7 +31,7 @@ func issue329ListenerWithUDP(t *testing.T) (*Listener, *net.UDPConn) {
 	return el, clientConn
 }
 
-func issue329ReadOutbound(t *testing.T, conn *net.UDPConn, wantKeys *TransportKeys, wantPayload []byte) {
+func issue329ReadOutbound(t *testing.T, el *Listener, conn *net.UDPConn, wantKeys *TransportKeys, wantPayload []byte) {
 	t.Helper()
 	buf := make([]byte, 2048)
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -42,8 +42,11 @@ func issue329ReadOutbound(t *testing.T, conn *net.UDPConn, wantKeys *TransportKe
 		t.Fatalf("read outbound: %v", err)
 	}
 	datagram := buf[:n]
-	s4 := 0
-	if len(datagram) < transportDataHeaderLen+chacha20poly1305.Overhead {
+	s4 := el.config.S4
+	if s4 < 0 {
+		s4 = 0
+	}
+	if len(datagram) < s4+transportDataHeaderLen+chacha20poly1305.Overhead {
 		t.Fatalf("outbound datagram too short: %d", len(datagram))
 	}
 
@@ -59,7 +62,7 @@ func issue329ReadOutbound(t *testing.T, conn *net.UDPConn, wantKeys *TransportKe
 	}
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
-	plain, err := aead.Open(nil, nonce[:], datagram[transportDataHeaderLen:], nil)
+	plain, err := aead.Open(nil, nonce[:], datagram[s4+transportDataHeaderLen:], nil)
 	if err != nil {
 		t.Fatalf("decrypt outbound with expected key: %v", err)
 	}
@@ -89,11 +92,45 @@ func TestIssue329_UnconfirmedNextKeepsCurrentOutbound(t *testing.T) {
 		t.Fatalf("outbound alias changed before confirmation: got %p want K1 %p", effective, k1)
 	}
 
+	// The client never received/adopted K2, so it continues sending K1.
+	// Nexus must accept that traffic as current and must not promote K2.
+	inboundK1 := craftClientTransportDatagram(t, k1, el.config.H4.PickOne(), el.config.S4, nil, 1, []byte("still-on-k1"))
+	if !el.handleTransportData(inboundK1, clientConn.LocalAddr().(*net.UDPAddr)) {
+		t.Fatal("valid K1 transport was not handled while K2 was pending")
+	}
+	previous, current, next = el.PeerKeypairStateForTest(peer)
+	if previous != nil || current != k1 || next != k2 {
+		t.Fatalf("K1 traffic changed pending K2 state: previous=%p current=%p next=%p", previous, current, next)
+	}
+
 	payload := []byte("reply-while-k2-unconfirmed")
 	if err := el.SendToPeer(peer, payload); err != nil {
 		t.Fatalf("SendToPeer: %v", err)
 	}
-	issue329ReadOutbound(t, clientConn, k1, payload)
+	issue329ReadOutbound(t, el, clientConn, k1, payload)
+}
+
+func TestIssue329_InitialNextPromotesOnFirstAuthenticatedTransport(t *testing.T) {
+	el := issue328TestListener(t)
+	peer := "issue329-initial-confirm"
+	sender := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42501}
+
+	k1 := issue328TestKeys(t, 6051, 0x09)
+	k1.RemoteIndex = 7051
+	stageIssue328ResponderKeys(t, el, peer, k1)
+
+	packet := craftClientTransportDatagram(t, k1, el.config.H4.PickOne(), el.config.S4, nil, 0, []byte("first-authenticated-transport"))
+	if !el.handleTransportData(packet, sender) {
+		t.Fatal("initial confirmation transport was not handled")
+	}
+
+	previous, current, next := el.PeerKeypairStateForTest(peer)
+	if previous != nil || current != k1 || next != nil {
+		t.Fatalf("initial promotion state: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if effective, ok := el.TransportKeysFor(peer); !ok || effective != k1 {
+		t.Fatalf("confirmed initial outbound key = %p, want %p", effective, k1)
+	}
 }
 
 func TestIssue329_AuthenticatedNextPromotesAndSwitchesOutbound(t *testing.T) {
@@ -134,7 +171,7 @@ func TestIssue329_AuthenticatedNextPromotesAndSwitchesOutbound(t *testing.T) {
 	if err := el.SendToPeer(peer, payload); err != nil {
 		t.Fatalf("SendToPeer: %v", err)
 	}
-	issue329ReadOutbound(t, clientConn, k2, payload)
+	issue329ReadOutbound(t, el, clientConn, k2, payload)
 }
 
 func TestIssue329_InvalidReplayAndExpiredNextCannotPromote(t *testing.T) {
