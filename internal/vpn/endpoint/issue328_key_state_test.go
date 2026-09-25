@@ -1,6 +1,7 @@
 package endpoint
 
 import (
+	"net"
 	"testing"
 	"time"
 )
@@ -42,6 +43,44 @@ func stageIssue328ResponderKeys(t *testing.T, el *Listener, peer string, keys *T
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	el.stageResponderTransportKeysLocked(peer, keys)
+}
+
+func TestIssue328_CommitHandshakeStagesResponderKeysWithoutChangingRuntimeAlias(t *testing.T) {
+	el := issue328TestListener(t)
+	peer := "issue328-commit"
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42001}
+
+	k1 := issue328TestKeys(t, 6001, 0xd1)
+	if !el.CommitHandshake(peer, 1, k1, addr, 7001) {
+		t.Fatal("initial CommitHandshake rejected")
+	}
+
+	previous, current, next := el.PeerKeypairStateForTest(peer)
+	if previous != nil || current != nil || next != k1 {
+		t.Fatalf("unexpected authoritative state after initial handshake: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if effective, ok := el.TransportKeysFor(peer); !ok || effective != k1 {
+		t.Fatal("runtime compatibility alias did not preserve initial handshake behavior")
+	}
+
+	k2 := issue328TestKeys(t, 6002, 0xe1)
+	if !el.CommitHandshake(peer, 2, k2, addr, 7002) {
+		t.Fatal("rekey CommitHandshake rejected")
+	}
+
+	previous, current, next = el.PeerKeypairStateForTest(peer)
+	if previous != k1 || current != nil || next != k2 {
+		t.Fatalf("unexpected authoritative state after rekey: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if effective, ok := el.TransportKeysFor(peer); !ok || effective != k2 {
+		t.Fatal("runtime compatibility alias did not preserve pre-#329 outbound behavior")
+	}
+	if got, ok := el.LookupKeypairByIndexForTest(k1.LocalIndex); !ok || got != k1 {
+		t.Fatal("previous responder key lost its receiver-index registration")
+	}
+	if got, ok := el.LookupKeypairByIndexForTest(k2.LocalIndex); !ok || got != k2 {
+		t.Fatal("next responder key missing receiver-index registration")
+	}
 }
 
 func TestIssue328_InitialResponderKeyUsesNextSlot(t *testing.T) {
