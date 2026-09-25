@@ -1395,6 +1395,221 @@ func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesSta
 	}
 }
 
+func TestStartupIPAMCollision_LosingPeerWithMultipleRows_RetiresSharedKeypairAndRegeneratesDeterministically(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Server 8", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      serverID,
+		InterfaceName: "awg0",
+		PublicKey:     "tunnel-pub-multi-loser",
+		PrivateKey:    "tunnel-priv-multi-loser",
+		Endpoint:      "192.0.2.10:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	winnerUserID, err := db.CreateUser(ctx, &models.User{Username: "winner-multi-loser", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loserUserID, err := db.CreateUser(ctx, &models.User{Username: "loser-multi-loser", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	winnerPub, winnerPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loserPub, loserPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const sharedIP = "10.100.0.3"
+
+	winnerConnID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-multi-loser-winner",
+		UserID:       winnerUserID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     winnerPub,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": winnerPriv},
+		CreatedAt:    now.Add(-10 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loserConn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-multi-loser-1",
+		UserID:       loserUserID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     loserPub,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": loserPriv},
+		CreatedAt:    now.Add(-5 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loserConn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-multi-loser-2",
+		UserID:       loserUserID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     loserPub,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": loserPriv},
+		CreatedAt:    now.Add(-2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+	}
+
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	winnerConn, err := db.GetConnection(ctx, winnerConnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winnerConn.ClientID != winnerPub || winnerConn.ClientParams["assigned_ip"] != sharedIP {
+		t.Fatalf("winner connection changed unexpectedly: %+v", winnerConn)
+	}
+
+	for _, connID := range []string{loserConn1ID, loserConn2ID} {
+		conn, err := db.GetConnection(ctx, connID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if conn.ClientID != "" {
+			t.Fatalf("%s retained duplicated losing client_id %q", connID, conn.ClientID)
+		}
+		if conn.ClientParams["client_private_key"] != nil && conn.ClientParams["client_private_key"] != "" {
+			t.Fatalf("%s retained losing client_private_key: %v", connID, conn.ClientParams["client_private_key"])
+		}
+		if conn.ClientParams["assigned_ip"] != nil && conn.ClientParams["assigned_ip"] != "" {
+			t.Fatalf("%s retained conflicting assigned_ip: %v", connID, conn.ClientParams["assigned_ip"])
+		}
+		if conn.ClientParams["quarantined_ip_collision"] != sharedIP {
+			t.Fatalf("%s quarantine marker mismatch: %v", connID, conn.ClientParams["quarantined_ip_collision"])
+		}
+		if req, ok := conn.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+			t.Fatalf("%s config_regeneration_required not true: %v", connID, conn.ClientParams["config_regeneration_required"])
+		}
+	}
+
+	// The original losing peer identity must no longer authenticate at all.
+	if _, _, err := svc.HandleIncomingPeer(ctx, loserPub); !errors.Is(err, endpoint.ErrPeerNotFound) {
+		t.Fatalf("expected retired losing peer to be unknown, got: %v", err)
+	}
+
+	// Regenerate only one of the two retired duplicate rows. It must get a new
+	// peer identity and a fresh lease without touching the winner.
+	cfg1, _, err := svc.GenerateClientConfigForConnection(ctx, loserUserID, loserConn1ID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfigForConnection failed: %v", err)
+	}
+	newIP := extractAddressFromConfig(t, cfg1)
+	if newIP == "" || newIP == sharedIP {
+		t.Fatalf("expected fresh non-colliding IP, got %q", newIP)
+	}
+
+	loser1, err := db.GetConnection(ctx, loserConn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPeer := loser1.ClientID
+	if newPeer == "" || newPeer == loserPub || newPeer == winnerPub {
+		t.Fatalf("expected fresh independent peer identity, got %q", newPeer)
+	}
+	if loser1.ClientParams["assigned_ip"] != newIP {
+		t.Fatalf("regenerated row assigned_ip=%v want %s", loser1.ClientParams["assigned_ip"], newIP)
+	}
+
+	// The second duplicate row remains retired and therefore cannot shadow the
+	// regenerated peer through GetConnectionByClientID.
+	loser2, err := db.GetConnection(ctx, loserConn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loser2.ClientID != "" {
+		t.Fatalf("second duplicate row regained client_id unexpectedly: %q", loser2.ClientID)
+	}
+
+	if sess, _, err := svc.HandleIncomingPeer(ctx, newPeer); err != nil {
+		t.Fatalf("new peer handshake failed: %v", err)
+	} else if sess == nil || sess.AssignedIP != newIP {
+		t.Fatalf("new peer session mismatch: %+v want IP %s", sess, newIP)
+	}
+	if sess, _, err := svc.HandleIncomingPeer(ctx, winnerPub); err != nil {
+		t.Fatalf("winner peer handshake failed after regeneration: %v", err)
+	} else if sess == nil || sess.AssignedIP != sharedIP {
+		t.Fatalf("winner session mismatch: %+v want IP %s", sess, sharedIP)
+	}
+
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("svc.Stop failed: %v", err)
+	}
+
+	svc2, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc2.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc2.Start(ctx); err != nil {
+		t.Fatalf("svc2.Start failed: %v", err)
+	}
+	defer func() { _ = svc2.Stop() }()
+
+	loser2AfterRestart, err := db.GetConnection(ctx, loserConn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loser2AfterRestart.ClientID != "" {
+		t.Fatalf("retired duplicate row unexpectedly regained client_id after restart: %q", loser2AfterRestart.ClientID)
+	}
+
+	if sess, _, err := svc2.HandleIncomingPeer(ctx, newPeer); err != nil {
+		t.Fatalf("regenerated peer handshake failed after restart: %v", err)
+	} else if sess == nil || sess.AssignedIP != newIP {
+		t.Fatalf("regenerated peer session mismatch after restart: %+v want IP %s", sess, newIP)
+	}
+	if sess, _, err := svc2.HandleIncomingPeer(ctx, winnerPub); err != nil {
+		t.Fatalf("winner handshake failed after restart: %v", err)
+	} else if sess == nil || sess.AssignedIP != sharedIP {
+		t.Fatalf("winner session mismatch after restart: %+v want IP %s", sess, sharedIP)
+	}
+}
+
 func TestStartupIPAMCollision_StorageFailureDuringQuarantine_FailsReconciliation(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
