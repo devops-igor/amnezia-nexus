@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,16 +93,14 @@ func confirmSamePeerHandshake(
 // TestSamePeerHandshakeRetirementOrderingRegression reproduces the same-peer
 // handshake completion ordering race:
 //   - G0 has an admitted write blocked on a release channel.
-//   - Handshake H1 arrives, installs G1, and blocks in retirement.Wait().
-//   - Handshake H2 arrives for the same peer, installs G2, and completes handshake.
-//   - Release G0 write.
-//   - H1 completes its wait.
+//   - Handshake H1 arrives, reserves generation G1, and pauses before commit.
+//   - Handshake H2 reserves G2 and commits while the old route has an admitted write.
+//   - Release G0 write and H1; H1's stale generation must be rejected.
 //   - Assert:
-//   - Active session remains G2.
-//   - Active forwarder route remains G2.
+//   - Active logical session and forwarder route remain G0.
 //   - H1 did not overwrite H2 transport keys.
 //   - H1 did not overwrite H2 endpoint.
-//   - Control-plane, forwarder, and listener transport generation all agree on G2.
+//   - Control-plane and listener transport generation agree on G2.
 func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
@@ -175,6 +175,19 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	if !ok {
 		t.Fatal("session G0 not found in SessionManager")
 	}
+	initialGeneration := sess0.Generation
+	initialRouteRegistration := svc.forwarder.PeerRegistration(clientPub)
+	h1Paused := make(chan struct{})
+	h1Resume := make(chan struct{})
+	var h1Fired atomic.Bool
+	var releaseH1 sync.Once
+	defer releaseH1.Do(func() { close(h1Resume) })
+	svc.SetPreTransportCommitHookForTest(func(peer, _ string) {
+		if peer == clientPub && h1Fired.CompareAndSwap(false, true) {
+			close(h1Paused)
+			<-h1Resume
+		}
+	})
 
 	// 2. G0 has an admitted write blocked on a release channel
 	dev := &statusBlockedDevice{started: make(chan struct{}, 1), release: make(chan struct{})}
@@ -196,7 +209,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 		t.Fatal("G0 write did not start")
 	}
 
-	// 3. Handshake H1 arrives, installs G1, and blocks in retirement.Wait()
+	// 3. H1 reserves G1 without replacing the live route, then pauses before commit.
 	clientConn1, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
 		t.Fatalf("dial udp 1: %v", err)
@@ -211,30 +224,28 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 		t.Fatalf("write initiation 1: %v", err)
 	}
 
-	// Wait deterministically for H1 to replace G0 in SessionManager and release s.mu (entering retirement.Wait).
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		sess, ok := svc.sessionMgr.GetSession(clientPub)
-		if ok && sess.ID != sess0.ID {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("H1 session was not installed in SessionManager")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-h1Paused:
+	case <-time.After(3 * time.Second):
+		t.Fatal("H1 did not reach the pre-commit hook")
 	}
+	h1Generation := svc.PeerGeneration(clientPub)
+	if h1Generation <= initialGeneration || svc.forwarder.RouteSessionID(clientPub) != sess0.ID {
+		t.Fatal("H1 did not reserve a generation on the same live route")
+	}
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if svc.mu.TryLock() {
 			svc.mu.Unlock()
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("H1 did not release s.mu (still holding Service.mu)")
+			t.Fatal("H1 retained Service.mu while waiting in pre-commit hook")
 		}
 		time.Sleep(time.Millisecond)
 	}
 
-	// 4. Handshake H2 arrives for the same peer, installs G2, and completes handshake
+	// 4. H2 advances G2 on the same session and completes its handshake.
 	clientConn2, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
 		t.Fatalf("dial udp 2: %v", err)
@@ -263,6 +274,9 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	if !ok {
 		t.Fatal("session G2 not found in SessionManager")
 	}
+	if sess2.ID != sess0.ID || sess2.Generation <= h1Generation {
+		t.Fatalf("H2 replaced the live session or did not advance generation: %+v", sess2)
+	}
 	h2Keys, ok := svc.endpoint.TransportKeysFor(clientPub)
 	if !ok || h2Keys == nil {
 		t.Fatal("H2 transport keys missing from Listener")
@@ -272,10 +286,11 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 		t.Fatalf("H2 endpoint mismatch: got %v, want %v", h2Endpoint, clientConn2.LocalAddr())
 	}
 
-	// 5. Release G0 write
+	// 5. Release G0 write and H1's paused commit.
 	close(dev.release)
+	releaseH1.Do(func() { close(h1Resume) })
 
-	// 6. H1 completes its wait and is dropped by the commit fence
+	// 6. H1's old generation is rejected by the commit fence.
 	deadline = time.Now().Add(3 * time.Second)
 	for svc.endpoint.StaleHandshakeDrops() == 0 {
 		if time.Now().After(deadline) {
@@ -331,8 +346,8 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	if sessGen := activeSess.Generation; sessGen != expectedGen {
 		t.Fatalf("control-plane SessionManager generation mismatch: got %d, want %d", sessGen, expectedGen)
 	}
-	if fwdGen := svc.forwarder.PeerRegistration(clientPub); fwdGen != expectedGen {
-		t.Fatalf("forwarder registration generation mismatch: got %d, want %d", fwdGen, expectedGen)
+	if fwdGen := svc.forwarder.PeerRegistration(clientPub); fwdGen != initialRouteRegistration {
+		t.Fatalf("pure rekey changed route registration: got %d, want %d", fwdGen, initialRouteRegistration)
 	}
 	if epGen := svc.endpoint.PeerGeneration(clientPub); epGen != expectedGen {
 		t.Fatalf("listener transport generation mismatch: got %d, want %d", epGen, expectedGen)

@@ -222,6 +222,34 @@ func (sm *SessionManager) GetSession(peerPublicKey string) (*models.VPNSession, 
 	return sess, ok
 }
 
+// GetSessionSnapshotByPeer returns a copy so callers can inspect session state
+// without racing activity updates or a concurrent idle sweep.
+func (sm *SessionManager) GetSessionSnapshotByPeer(peerPublicKey string) (models.VPNSession, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	sess, ok := sm.sessionsByPeer[peerPublicKey]
+	if !ok || sess == nil {
+		return models.VPNSession{}, false
+	}
+	return *sess, true
+}
+
+// AdvanceLiveSessionGeneration reserves a handshake generation without
+// replacing the logical session. The identity check fences an idle sweep or
+// replacement that may have occurred since the caller inspected the session.
+// A handshake alone does not refresh LastSeen: only authenticated transport does.
+func (sm *SessionManager) AdvanceLiveSessionGeneration(peerKey, sessionID, userID string, generation uint64) (*models.VPNSession, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessionsByPeer[peerKey]
+	if !ok || sess == nil || sess.ID != sessionID || sess.UserID != userID || sess.Status != "connected" || generation <= sess.Generation {
+		return nil, false
+	}
+	sess.Generation = generation
+	copySess := *sess
+	return &copySess, true
+}
+
 // GetSessionByPeer retrieves an active session by peer public key.
 func (sm *SessionManager) GetSessionByPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, error) {
 	if sm == nil {

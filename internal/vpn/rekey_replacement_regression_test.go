@@ -11,12 +11,9 @@ import (
 // later DisconnectSession(oldID) hit ErrSessionNotFound and its mirror
 // decrement never ran either.
 
-// TestRekeyReplacementReturnsGaugeToBaseline forces a rekey (session
-// replacement for the same peer, same backend) through the real
-// HandleIncomingPeer path — the same population as the issue's live evidence
-// (mobile clients waking up rekey frequently) — and asserts the old backend's
-// pool gauge returns to its baseline.
-func TestRekeyReplacementReturnsGaugeToBaseline(t *testing.T) {
+// TestRekeyKeepsGaugeAtBaseline exercises the real admission/rekey path. A
+// healthy rekey leaves the logical session intact and cannot add a counter.
+func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, peerKey := setupTestVPNService(t, db)
 	ctx := t.Context()
@@ -29,14 +26,15 @@ func TestRekeyReplacementReturnsGaugeToBaseline(t *testing.T) {
 	}
 
 	// Initial connect.
-	if _, _, err := svc.HandleIncomingPeer(ctx, peerKey); err != nil {
+	sess1, _, err := svc.HandleIncomingPeer(ctx, peerKey)
+	if err != nil {
 		t.Fatalf("initial HandleIncomingPeer failed: %v", err)
 	}
 	if tun.ActiveConnections != 2 {
 		t.Fatalf("after connect: gauge = %d, want 2", tun.ActiveConnections)
 	}
 
-	// Rekey: the same peer connects again (fresh session, same peer key).
+	// Rekey: the same peer initiates a new handshake on the live session.
 	sess2, backend2, err := svc.HandleIncomingPeer(ctx, peerKey)
 	if err != nil {
 		t.Fatalf("rekey HandleIncomingPeer failed: %v", err)
@@ -44,14 +42,17 @@ func TestRekeyReplacementReturnsGaugeToBaseline(t *testing.T) {
 	if backend2.ID != tun.ID {
 		t.Fatalf("rekey selected backend %d, want %d", backend2.ID, tun.ID)
 	}
+	if sess2.ID != sess1.ID {
+		t.Fatalf("rekey replaced a live logical session: %s -> %s", sess1.ID, sess2.ID)
+	}
 
 	// The gauge must be back to exactly 2 (baseline 1 + the one live
-	// replacement session) — the old session's +1 must have been migrated.
+	// session) — a cryptographic rekey must not increment the counter.
 	if tun.ActiveConnections != baseline+1 {
 		t.Errorf("after rekey: old backend gauge = %d, want %d (leak: replacement did not decrement the old session)", tun.ActiveConnections, baseline+1)
 	}
 
-	// No orphan DB row for the replaced session may survive.
+	// No extra DB row may be created by the rekey.
 	sessions, err := db.GetActiveVPNSessions(ctx)
 	if err != nil {
 		t.Fatalf("GetActiveVPNSessions: %v", err)
@@ -61,7 +62,7 @@ func TestRekeyReplacementReturnsGaugeToBaseline(t *testing.T) {
 		if s.PeerPublicKey == peerKey {
 			count++
 			if s.ID != sess2.ID {
-				t.Errorf("stale session row %s for peer survived replacement", s.ID)
+				t.Errorf("unexpected session row %s for peer after rekey", s.ID)
 			}
 		}
 	}
@@ -69,13 +70,13 @@ func TestRekeyReplacementReturnsGaugeToBaseline(t *testing.T) {
 		t.Errorf("found %d active session rows for the rekeyed peer, want 1", count)
 	}
 
-	// Replacement metrics: exactly one replacement, one counter migration.
+	// Replacement metrics are only for genuine session replacement.
 	metrics := svc.sessionMgr.MetricsSnapshot()
-	if metrics["replacements_total"] != 1 {
-		t.Errorf("replacements_total = %d, want 1", metrics["replacements_total"])
+	if metrics["replacements_total"] != 0 {
+		t.Errorf("replacements_total = %d, want 0", metrics["replacements_total"])
 	}
-	if metrics["replacement_counter_migrations_total"] != 1 {
-		t.Errorf("replacement_counter_migrations_total = %d, want 1", metrics["replacement_counter_migrations_total"])
+	if metrics["replacement_counter_migrations_total"] != 0 {
+		t.Errorf("replacement_counter_migrations_total = %d, want 0", metrics["replacement_counter_migrations_total"])
 	}
 
 	// Clean disconnect of the replacement must land at the true baseline.
