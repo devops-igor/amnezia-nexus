@@ -32,13 +32,14 @@ var setupAllowedPrefixes = []string{
 }
 
 var setupAllowedExact = map[string]bool{
-	"/setup":            true,
-	"/api/auth/setup":   true,
-	"/api/auth/captcha": true,
-	"/api/health":       true,
-	"/api/version":      true,
-	"/login":            true,
-	"/logout":           true,
+	"/setup":                   true,
+	"/api/auth/setup":          true,
+	"/api/auth/captcha":        true,
+	"/api/auth/captcha/verify": true,
+	"/api/health":              true,
+	"/api/version":             true,
+	"/login":                   true,
+	"/logout":                  true,
 }
 
 func isPathAllowedDuringSetup(path string) bool {

@@ -1,17 +1,10 @@
 package handlers
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	"image/png"
-	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -84,24 +77,25 @@ func (h *Handlers) captchaStore() *captcha.Store {
 	return h.captchaSt
 }
 
-// CaptchaHandler generates a new visual CAPTCHA challenge. The answer is
-// stored server-side; only an opaque captcha_id reaches the client session
-// cookie (issue #84).
+// CaptchaHandler issues a new slide puzzle bound to a signed session cookie.
 func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 	if h.cfg == nil || h.cfg.SecretKey == "" {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Session signing key not configured")
 		return
 	}
 
-	captchaAnswer := generateCaptchaDigits(4)
-
-	captchaID, err := h.captchaStore().New(captchaAnswer)
+	challenge, err := captcha.GenerateSlide()
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate captcha")
+		return
+	}
+	captchaID, err := h.captchaStore().NewSlide(challenge.TargetX, challenge.TargetY)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to create captcha")
 		return
 	}
 
-	// Store only the opaque id in the session; the answer never leaves the server.
+	// Only the opaque id is stored in the cookie; coordinates stay server-side.
 	sess := h.GetSession(r)
 	if sess == nil {
 		sess = &models.SessionData{}
@@ -112,28 +106,56 @@ func (h *Handlers) CaptchaHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate image
-	imgBytes := generateCaptchaImage(captchaAnswer)
-	imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
-
-	// Ensure response is never cached
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
+	// The browser E2E runner needs the answer for its real slider interaction.
+	// Never expose it unless the explicitly enabled test environment is running.
+	if strings.EqualFold(os.Getenv("E2E_TESTING"), "true") || os.Getenv("E2E_TESTING") == "1" {
+		w.Header().Set("X-E2E-Captcha-Target-X", fmt.Sprint(challenge.TargetX))
+	}
+	h.JSON(w, http.StatusOK, map[string]any{
+		"captcha_id": captchaID,
+		"image":      challenge.Image,
+		"thumb":      challenge.Thumb,
+		"thumb_x":    challenge.ThumbX,
+		"thumb_y":    challenge.ThumbY,
+	})
+}
 
-	// If client specifically expects JSON response
-	accept := r.Header.Get("Accept")
-	if strings.Contains(accept, "application/json") {
-		h.JSON(w, http.StatusOK, map[string]any{
-			"captcha_id": fmt.Sprintf("captcha-%d", time.Now().UnixNano()),
-			"image":      fmt.Sprintf("data:image/png;base64,%s", imgB64),
-		})
+// VerifyCaptchaHandler consumes one slide attempt and returns a one-time ticket.
+func (h *Handlers) VerifyCaptchaHandler(w http.ResponseWriter, r *http.Request) {
+	if h.cfg == nil || h.cfg.SecretKey == "" {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Session signing key not configured")
 		return
 	}
-
-	// Default: return raw image stream for <img> tags
-	w.Header().Set("Content-Type", "image/png")
-	_, _ = w.Write(imgBytes)
+	var req struct {
+		CaptchaID string `json:"captcha_id"`
+		Point     struct {
+			X *int `json:"x"`
+			Y *int `json:"y"`
+		} `json:"point"`
+	}
+	if err := h.DecodeJSON(r, &req); err != nil || req.Point.X == nil || req.Point.Y == nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid captcha coordinates")
+		return
+	}
+	sess := h.GetSession(r)
+	if sess == nil || sess.CaptchaID == "" || (req.CaptchaID != "" && req.CaptchaID != sess.CaptchaID) {
+		h.JSONError(w, http.StatusBadRequest, "invalid_captcha", h.Translate(r, "invalid_captcha"))
+		return
+	}
+	ticket, ok, err := h.captchaStore().VerifySlide(sess.CaptchaID, *req.Point.X, *req.Point.Y)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to verify captcha")
+		return
+	}
+	if !ok {
+		h.JSONError(w, http.StatusBadRequest, "invalid_captcha", h.Translate(r, "invalid_captcha"))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	h.JSON(w, http.StatusOK, map[string]any{"captcha_ticket": ticket})
 }
 
 // APILoginHandler handles user authentication requests.
@@ -156,10 +178,13 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Check CAPTCHA if enabled
+	// Check CAPTCHA if enabled. A settings read error must not disable the gate.
 	var captchaCfg models.CaptchaSettings
 	if h.db != nil {
-		_ = h.db.GetSetting(ctx, "captcha", &captchaCfg)
+		if err := h.db.GetSetting(ctx, "captcha", &captchaCfg); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to read captcha settings")
+			return
+		}
 	}
 
 	if captchaCfg.Enabled {
@@ -169,27 +194,25 @@ func (h *Handlers) APILoginHandler(w http.ResponseWriter, r *http.Request) {
 			captchaID = sess.CaptchaID
 		}
 
-		// One-time-use: any verify attempt consumes the server-side entry
-		// (issue #84). Unknown, expired or already-used ids are rejected.
-		submitted := ""
-		if req.Captcha != nil {
-			submitted = strings.TrimSpace(*req.Captcha)
-		}
-		if captchaID == "" || submitted == "" || !h.captchaStore().Verify(captchaID, submitted) {
-			// Drop the consumed captcha id from the session so a stale
-			// cookie cannot be replayed against a new challenge.
+		if captchaID == "" || req.CaptchaTicket == "" || !h.captchaStore().ConsumeTicket(captchaID, req.CaptchaTicket) {
 			if sess != nil && sess.CaptchaID != "" {
 				sess.CaptchaID = ""
-				_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600)
+				if err := middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600); err != nil {
+					h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to clear captcha session")
+					return
+				}
 			}
 			h.JSONError(w, http.StatusBadRequest, "invalid_captcha", h.Translate(r, "invalid_captcha"))
 			return
 		}
 
-		// Captcha verified; clear the id from the session.
+		// The ticket is consumed even if credentials fail; clear the challenge id.
 		if sess != nil {
 			sess.CaptchaID = ""
-			_ = middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600)
+			if err := middleware.SetSessionCookieForRequest(w, r, sess, h.cfg.SecretKey, 3600); err != nil {
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to clear captcha session")
+				return
+			}
 		}
 	}
 
@@ -415,176 +438,4 @@ func (h *Handlers) LogoutAllHandler(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "auth.logout_all", map[string]any{"user_id": sess.UserID, "username": sess.Username})
 	middleware.ClearSessionCookie(w)
 	h.JSONOK(w, map[string]any{"message": "Logged out from all devices"})
-}
-
-var digitBitmaps = [10][7]uint8{
-	// 0
-	{0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},
-	// 1
-	{0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
-	// 2
-	{0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},
-	// 3
-	{0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110},
-	// 4
-	{0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
-	// 5
-	{0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},
-	// 6
-	{0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110},
-	// 7
-	{0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
-	// 8
-	{0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
-	// 9
-	{0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110},
-}
-
-var captchaPalette = []color.RGBA{
-	{R: 24, G: 68, B: 154, A: 255},  // Navy Blue
-	{R: 180, G: 35, B: 24, A: 255},  // Crimson Red
-	{R: 21, G: 128, B: 61, A: 255},  // Forest Green
-	{R: 126, G: 34, B: 206, A: 255}, // Purple
-	{R: 194, G: 65, B: 12, A: 255},  // Amber / Orange
-	{R: 15, G: 118, B: 110, A: 255}, // Teal
-}
-
-func captchaRandInt(max int64) int64 {
-	if max <= 0 {
-		return 0
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(max))
-	if err != nil {
-		return 0
-	}
-	return n.Int64()
-}
-
-func drawCaptchaLine(img *image.RGBA, x0, y0, x1, y1 int, col color.Color) {
-	dx := x1 - x0
-	if dx < 0 {
-		dx = -dx
-	}
-	dy := y1 - y0
-	if dy < 0 {
-		dy = -dy
-	}
-	sx, sy := 1, 1
-	if x0 > x1 {
-		sx = -1
-	}
-	if y0 > y1 {
-		sy = -1
-	}
-	err := dx - dy
-	for {
-		if x0 >= 0 && x0 < img.Bounds().Dx() && y0 >= 0 && y0 < img.Bounds().Dy() {
-			img.Set(x0, y0, col)
-		}
-		if x0 == x1 && y0 == y1 {
-			break
-		}
-		e2 := 2 * err
-		if e2 > -dy {
-			err -= dy
-			x0 += sx
-		}
-		if e2 < dx {
-			err += dx
-			y0 += sy
-		}
-	}
-}
-
-func generateCaptchaDigits(n int) string {
-	digits := "0123456789"
-	var sb strings.Builder
-	for i := 0; i < n; i++ {
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(digits))))
-		if err != nil {
-			sb.WriteByte(digits[i%len(digits)])
-			continue
-		}
-		sb.WriteByte(digits[idx.Int64()])
-	}
-	return sb.String()
-}
-
-func generateCaptchaImage(text string) []byte {
-	width, height := 160, 60
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-
-	// Background: light clean fill
-	bg := color.RGBA{R: 248, G: 250, B: 252, A: 255}
-	draw.Draw(img, img.Bounds(), &image.Uniform{C: bg}, image.Point{}, draw.Src)
-
-	// Add background noise dots
-	dotColor := color.RGBA{R: 203, G: 213, B: 225, A: 255}
-	for j := 0; j < 60; j++ {
-		nx := int(captchaRandInt(int64(width)))
-		ny := int(captchaRandInt(int64(height)))
-		img.Set(nx, ny, dotColor)
-	}
-
-	// Add subtle background interference lines
-	lineColor := color.RGBA{R: 203, G: 213, B: 225, A: 200}
-	for l := 0; l < 2; l++ {
-		y0 := int(captchaRandInt(int64(height)))
-		y1 := int(captchaRandInt(int64(height)))
-		drawCaptchaLine(img, 0, y0, width-1, y1, lineColor)
-	}
-
-	// Draw characters using 5x7 bitmap font scaled 4x
-	scale := 4
-	n := len(text)
-	if n == 0 {
-		n = 4
-	}
-	digitWidth := 5 * scale
-	totalDigitWidth := n * digitWidth
-	remainingWidth := width - totalDigitWidth
-	gap := remainingWidth / (n + 1)
-	if gap < 2 {
-		gap = 2
-	}
-
-	baseY := (height - 7*scale) / 2
-
-	for i, c := range text {
-		startX := gap + i*(digitWidth+gap)
-		jitter := int(captchaRandInt(7)) - 3 // -3 to +3 pixels
-		startY := baseY + jitter
-
-		colorIdx := int(captchaRandInt(int64(len(captchaPalette))))
-		fg := captchaPalette[colorIdx]
-
-		var bitmap [7]uint8
-		if c >= '0' && c <= '9' {
-			bitmap = digitBitmaps[c-'0']
-		} else {
-			// Fallback: simple box outline for non-digits
-			bitmap = [7]uint8{0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111}
-		}
-
-		for row := 0; row < 7; row++ {
-			bits := bitmap[row]
-			for col := 0; col < 5; col++ {
-				if (bits>>(4-col))&1 == 1 {
-					for bx := 0; bx < scale; bx++ {
-						for by := 0; by < scale; by++ {
-							px := startX + col*scale + bx
-							py := startY + row*scale + by
-							if px >= 0 && px < width && py >= 0 && py < height {
-								img.Set(px, py, fg)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	var buf bytes.Buffer
-	_ = png.Encode(&buf, img)
-	return buf.Bytes()
 }
