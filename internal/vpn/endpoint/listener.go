@@ -1114,12 +1114,16 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 		newKeys.ExpiresAt = newKeys.CreatedAt.Add(el.getRejectAfterTime())
 	}
 
-	// A responder may have only one unconfirmed keypair. Replacing next
-	// retires only that unconfirmed key and never disturbs confirmed current
-	// or previous state, matching upstream amneziawg-go.
+	// Upstream responder semantics retain confirmed current, but retire both
+	// a superseded unconfirmed next and any previous key when deriving a new
+	// responder keypair. This bounds the responder receive set to current+next.
 	if pkp.next != nil && pkp.next.LocalIndex != 0 {
 		delete(el.indexTable, pkp.next.LocalIndex)
 	}
+	if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+		delete(el.indexTable, pkp.previous.LocalIndex)
+	}
+	pkp.previous = nil
 	pkp.next = newKeys
 	if newKeys.LocalIndex != 0 {
 		el.indexTable[newKeys.LocalIndex] = &keypairEntry{peerKey: peerKey, keys: newKeys}
