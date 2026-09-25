@@ -136,7 +136,8 @@ The JavaScript assets embedded in `web/static/js/*` and referenced in Go HTML te
 
 Amnezia Nexus guarantees seamless, direct automated upgrades across a **rolling two-minor-version window**:
 - Direct upgrades to `v1.2.x` are supported from `v1.0.x` and `v1.1.x`.
-- Direct upgrades to `v1.3.x` will support `v1.1.x` and `v1.2.x`.
+- Direct upgrades to `v1.3.x` support `v1.1.x` and `v1.2.x`.
+- Direct upgrades to `v1.4.x` support `v1.2.x` and `v1.3.x`.
 - Upgrading across gaps larger than two minor versions (for example, upgrading from `v0.9.x` directly to `v1.2.x`) may require stepping through an intermediate minor release (such as upgrading first to `v1.1.x`).
 
 ### 5.2 SQLite Database Schema Migrations

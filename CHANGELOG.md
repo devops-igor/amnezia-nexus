@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - Nebula - 2026-09-25
+
+Minor release introducing server IP address modification via the Web UI, an embedded slide puzzle CAPTCHA, three-slot responder key modeling for seamless AmneziaWG rekey continuity, isolated handshake processing, atomic live forwarder route migration during session rebalancing, and robust remote peer lifecycle reconciliation.
+
+### Added
+
+- Server IP address editing: enabled administrators to update server host and IP addresses via the Web UI, featuring runtime tunnel endpoint propagation, SSH connection pool eviction, symmetrical state rollback on error, and live forwarder reconciliation (#278, #323).
+- Embedded slide puzzle CAPTCHA: replaced legacy bitmap CAPTCHA with an embedded SVG slide puzzle challenge on the login screen, improving user experience and bot resistance without external dependencies (#181, #324).
+
+### Fixed
+
+- AmneziaWG rekey continuity: modeled responder transport keys with a three-slot architecture (previous, current, next), confirmed responder next key before outbound switch, consumed authenticated keepalives locally, and preserved logical VPN sessions across rekeys to ensure zero packet drop during rollover (#326, #328, #329, #330, #331, #332, #333, #335, #336).
+- Handshake and transport isolation: decoupled cryptographic handshake parsing from transport packet workers in the UDP endpoint listener, ensuring established data plane traffic continues uninhibited during handshake storms or stalled handshakes (#82, #320).
+- Live forwarder route migration during rebalancing: atomically migrated live forwarder routes, in-memory sessions, tunnel pool connection counters, and sticky affinities during VPN session rebalancing, eliminating traffic divergence to old backend devices and preserving connected session status (#289, #313).
+- Remote peer rollback and zombie reconciliation: added automatic compensating rollback of remote peers on database failures using decoupled cleanup contexts, tracked peer lifecycles in SQLite, and implemented periodic background zombie peer cleanup with creation grace periods and per-server legacy peer adoption (#128, #318, #319).
+- Data plane restart session invalidation: invalidated stale in-memory and database sessions on daemon startup before activating the data plane while preserving durable client IP leases in portal IPAM (#297, #314).
+- Stale probe abortion on backend deletion: aborted stale probes and fenced mutations to tunnel generations after backend deletion, preventing deleted backends from being falsely reattached (#304, #312).
+- Disabled migration target rejection: prevented the orchestrator from selecting disabled or degraded backend tunnels as migration targets following health probe cycles (#325).
+- Self-healing E2E test SSH provisioning: added idempotent SSH key provisioning and credential fallback resolution in the dev server E2E test workflow (#316, #317).
+
 ## [1.3.2] - Orion · Patch 2 - 2026-09-24
 
 Maintenance and stability patch release addressing VPN forwarder route lifecycle management, session teardown synchronization, and monotonic endpoint handshake fencing.
