@@ -129,7 +129,7 @@ func (s *Store) sweepLocked(force bool) {
 			all = append(all, item{id: id, expires: e.expires})
 		}
 		sort.Slice(all, func(i, j int) bool { return all[i].expires.Before(all[j].expires) })
-		for _, e := range all[maxEntries/2:] {
+		for _, e := range all[:maxEntries/2] {
 			delete(s.entries, e.id)
 		}
 	}

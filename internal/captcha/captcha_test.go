@@ -130,6 +130,57 @@ func TestSlideExpiryAndPressure(t *testing.T) {
 	}
 }
 
+func TestPressureEvictsTicketsBeforeLaterExpiringChallenges(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	// Tickets expire first, even when their corresponding challenges were
+	// created before the remaining active challenges.
+	var ticketID, ticketChallengeID, activeChallengeID string
+	for i := 0; i < maxEntries/2; i++ {
+		id, err := s.NewSlide(120, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket, ok, err := s.VerifySlide(id, 120, 50)
+		if err != nil || !ok {
+			t.Fatalf("verify: ok=%v, err=%v", ok, err)
+		}
+		if i == 0 {
+			ticketID, ticketChallengeID = ticket, id
+		}
+	}
+	for i := 0; i < maxEntries/2; i++ {
+		id, err := s.NewSlide(120, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			activeChallengeID = id
+		}
+	}
+	if got := s.Len(); got != maxEntries {
+		t.Fatalf("expected full store before pressure, got %d entries", got)
+	}
+
+	newID, err := s.NewSlide(120, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Len(); got != maxEntries/2+1 {
+		t.Fatalf("unexpected entry count after pressure: %d", got)
+	}
+	if s.ConsumeTicket(ticketChallengeID, ticketID) {
+		t.Fatal("earliest-expiring ticket survived pressure")
+	}
+	for _, id := range []string{activeChallengeID, newID} {
+		if _, ok, err := s.VerifySlide(id, 120, 50); err != nil || !ok {
+			t.Fatalf("later-expiring challenge %s was evicted: ok=%v, err=%v", id, ok, err)
+		}
+	}
+}
+
 func TestConcurrentTicketConsumption(t *testing.T) {
 	s := NewStore()
 	id, _ := s.NewSlide(100, 50)
