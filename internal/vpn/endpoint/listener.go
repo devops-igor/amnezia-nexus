@@ -2307,18 +2307,38 @@ func (el *Listener) invokePostSweepHook(ctx context.Context) {
 func (el *Listener) sweepExpiredKeypairs() {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	for _, pkp := range el.peerKeypairs {
+	for peerKey, pkp := range el.peerKeypairs {
 		if pkp.previous != nil && pkp.previous.IsExpired() {
 			if pkp.previous.LocalIndex != 0 {
 				delete(el.indexTable, pkp.previous.LocalIndex)
 			}
 			pkp.previous = nil
 		}
+		if pkp.current != nil && pkp.current.IsExpired() {
+			if pkp.current.LocalIndex != 0 {
+				delete(el.indexTable, pkp.current.LocalIndex)
+			}
+			pkp.current = nil
+		}
 		if pkp.next != nil && pkp.next.IsExpired() {
 			if pkp.next.LocalIndex != 0 {
 				delete(el.indexTable, pkp.next.LocalIndex)
 			}
 			pkp.next = nil
+		}
+
+		// #328 keeps noiseKeys as a temporary compatibility alias until #329
+		// switches outbound selection to confirmed current. Never leave that
+		// alias pointing at a key retired by the expiry sweep.
+		switch {
+		case pkp.next != nil:
+			el.noiseKeys[peerKey] = pkp.next
+		case pkp.current != nil:
+			el.noiseKeys[peerKey] = pkp.current
+		case pkp.previous != nil:
+			el.noiseKeys[peerKey] = pkp.previous
+		default:
+			delete(el.noiseKeys, peerKey)
 		}
 	}
 }
