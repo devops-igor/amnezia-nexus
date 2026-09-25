@@ -1,113 +1,150 @@
 package captcha
 
 import (
+	"encoding/base64"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestStoreNewAndVerify(t *testing.T) {
-	s := NewStore()
-	id, err := s.New("1234")
+func TestGenerateSlide(t *testing.T) {
+	challenge, err := GenerateSlide()
 	if err != nil {
-		t.Fatalf("New failed: %v", err)
+		t.Fatal(err)
 	}
-	if id == "" {
-		t.Fatal("expected non-empty captcha id")
-	}
-	// Ids must be opaque/unpredictable enough: two creates differ.
-	id2, _ := s.New("5678")
-	if id == id2 {
-		t.Fatal("expected unique captcha ids")
-	}
-	if !s.Verify(id, "1234") {
-		t.Error("expected correct answer to verify")
-	}
-	if s.Verify(id, "1234") {
-		t.Error("expected one-time-use: second verify must fail")
-	}
-}
-
-func TestStoreVerifyIsCaseInsensitiveAndTrims(t *testing.T) {
-	s := NewStore()
-	id, _ := s.New("1234")
-	if !s.Verify(id, " 1234 ") {
-		t.Error("expected trimmed answer to verify")
-	}
-}
-
-func TestStoreWrongAnswerConsumesEntry(t *testing.T) {
-	s := NewStore()
-	id, _ := s.New("1234")
-	if s.Verify(id, "9999") {
-		t.Error("wrong answer should not verify")
-	}
-	if s.Verify(id, "1234") {
-		t.Error("wrong answer must consume the entry (one-time-use)")
-	}
-}
-
-func TestStoreExpiry(t *testing.T) {
-	s := NewStoreWithTTL(50 * time.Millisecond)
-	id, _ := s.New("1234")
-	s.now = func() time.Time { return time.Now().Add(100 * time.Millisecond) }
-	if s.Verify(id, "1234") {
-		t.Error("expired captcha id must be rejected")
-	}
-	if got := s.Len(); got != 0 {
-		t.Errorf("expected expired entry swept, Len=%d", got)
-	}
-}
-
-func TestStoreUnknownIDRejected(t *testing.T) {
-	s := NewStore()
-	if s.Verify("nonexistent", "1234") {
-		t.Error("unknown id must be rejected")
-	}
-}
-
-func TestStoreMaxAttempts(t *testing.T) {
-	s := NewStoreWithTTL(1 * time.Hour)
-	id, _ := s.New("1234")
-	// Consume via one wrong attempt.
-	if s.Verify(id, "0000") {
-		t.Fatal("setup: wrong attempt should fail")
-	}
-	if s.Verify(id, "1234") {
-		t.Error("entry must be consumed after wrong attempt")
-	}
-}
-
-func TestStoreSweepOnPressure(t *testing.T) {
-	s := NewStore()
-	s.mu.Lock()
-	s.entries = make(map[string]entry, maxEntries+maxEntries/4)
-	s.mu.Unlock()
-	for i := 0; i < maxEntries+maxEntries/4; i++ {
-		if _, err := s.New("9999"); err != nil {
-			t.Fatalf("New failed: %v", err)
+	for _, test := range []struct {
+		src  string
+		w, h int
+	}{
+		{challenge.Image, ImageWidth, ImageHeight},
+		{challenge.Thumb, TileSize, TileSize},
+	} {
+		parts := strings.SplitN(test.src, ",", 2)
+		if len(parts) != 2 {
+			t.Fatal("image must be a data URL")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, _, err := image.Decode(strings.NewReader(string(decoded)))
+		if err != nil || img.Bounds().Dx() != test.w || img.Bounds().Dy() != test.h {
+			t.Fatalf("invalid challenge image: %v", err)
+		}
+		if test.w == TileSize {
+			r, g, b, a := img.At(TileSize/2, TileSize/2).RGBA()
+			if a < 0x8000 || (r > 0xc000 && g > 0xc000 && b > 0xc000) {
+				t.Fatal("tile center lost its background texture")
+			}
 		}
 	}
-	if got := s.Len(); got > maxEntries {
-		t.Errorf("expected sweep under memory pressure to cap entries, got %d", got)
+	if challenge.TargetX <= challenge.ThumbX || challenge.TargetX > ImageWidth-TileSize || challenge.TargetY != challenge.ThumbY {
+		t.Fatalf("invalid slide coordinates: %+v", challenge)
 	}
 }
 
-func TestStoreConcurrentAccess(t *testing.T) {
-	s := NewStore()
-	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			id, err := s.New("1234")
+func TestSlideToleranceAndOneUse(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		x, y  int
+		valid bool
+	}{
+		{"exact", 120, 50, true},
+		{"left edge", 116, 50, true},
+		{"right edge", 124, 50, true},
+		{"vertical edge", 120, 54, true},
+		{"outside horizontal tolerance", 125, 50, false},
+		{"outside vertical tolerance", 120, 45, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewStore()
+			id, err := s.NewSlide(120, 50)
 			if err != nil {
-				t.Errorf("New failed: %v", err)
-				return
+				t.Fatal(err)
 			}
-			_ = s.Verify(id, "1234")
-			_ = s.Len()
-		}()
+			ticket, valid, err := s.VerifySlide(id, test.x, test.y)
+			if err != nil || valid != test.valid {
+				t.Fatalf("verify = %v, %v", valid, err)
+			}
+			if _, retry, _ := s.VerifySlide(id, 120, 50); retry {
+				t.Error("challenge replay succeeded")
+			}
+			if valid {
+				if ticket == "" || !s.ConsumeTicket(id, ticket) {
+					t.Fatal("valid ticket rejected")
+				}
+				if s.ConsumeTicket(id, ticket) {
+					t.Fatal("ticket replay succeeded")
+				}
+			} else if ticket != "" {
+				t.Error("failed verification issued ticket")
+			}
+		})
+	}
+}
+
+func TestTicketBoundToSessionAndExpires(t *testing.T) {
+	s := NewStoreWithTTL(time.Second)
+	id, _ := s.NewSlide(100, 50)
+	ticket, ok, err := s.VerifySlide(id, 100, 50)
+	if err != nil || !ok {
+		t.Fatalf("verify failed: %v", err)
+	}
+	if s.ConsumeTicket("another-session", ticket) {
+		t.Fatal("ticket used in a different session")
+	}
+	if s.ConsumeTicket(id, ticket) {
+		t.Fatal("cross-session attempt did not consume ticket")
+	}
+	id, _ = s.NewSlide(100, 50)
+	ticket, _, _ = s.VerifySlide(id, 100, 50)
+	s.now = func() time.Time { return time.Now().Add(TicketTTL + time.Second) }
+	if s.ConsumeTicket(id, ticket) {
+		t.Fatal("expired ticket accepted")
+	}
+	if s.Len() != 0 {
+		t.Fatal("expired entries were not swept")
+	}
+}
+
+func TestSlideExpiryAndPressure(t *testing.T) {
+	s := NewStoreWithTTL(time.Second)
+	id, _ := s.NewSlide(100, 50)
+	s.now = func() time.Time { return time.Now().Add(2 * time.Second) }
+	if _, ok, _ := s.VerifySlide(id, 100, 50); ok {
+		t.Fatal("expired challenge accepted")
+	}
+	s = NewStoreWithTTL(time.Hour)
+	for i := 0; i < maxEntries+1; i++ {
+		if _, err := s.NewSlide(100, 50); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.Len() > maxEntries {
+		t.Fatal("unbounded challenge store")
+	}
+}
+
+func TestConcurrentTicketConsumption(t *testing.T) {
+	s := NewStore()
+	id, _ := s.NewSlide(100, 50)
+	ticket, _, _ := s.VerifySlide(id, 100, 50)
+	var successful atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Go(func() {
+			if s.ConsumeTicket(id, ticket) {
+				successful.Add(1)
+			}
+		})
 	}
 	wg.Wait()
+	if successful.Load() != 1 {
+		t.Fatalf("%d logins consumed same ticket", successful.Load())
+	}
 }

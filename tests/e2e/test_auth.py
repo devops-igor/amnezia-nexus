@@ -3,9 +3,9 @@
 import os
 
 import pytest
-from playwright.sync_api import Page
+from playwright.sync_api import Browser, Page
 
-from tests.e2e.conftest import _do_login, _get_csrf_cookie, assert_response_shape
+from tests.e2e.conftest import _do_login, _get_csrf_cookie, api_get, api_post, assert_response_shape
 
 
 @pytest.mark.e2e
@@ -58,6 +58,43 @@ def test_login_failure(page: Page, base_url: str) -> None:
     page.reload()
     page.wait_for_load_state("networkidle")
     assert "/login" in page.url
+
+
+@pytest.mark.e2e
+def test_slide_captcha_rejects_replay(
+    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str
+) -> None:
+    """Enabled puzzle renders offline assets and refuses an invalid or replayed solve."""
+    admin = authenticated_page
+    original = api_get(admin, "/api/settings")
+    assert isinstance(original, dict)
+    settings = {key: original.get(key, {}) for key in ("appearance", "ssl", "limits", "telegram")}
+    settings["captcha"] = {"enabled": True}
+    guest_context = browser.new_context()
+    try:
+        assert api_post(admin, "/api/settings/save", settings, csrf_token)["status"] == 200
+        guest = guest_context.new_page()
+        guest.goto(f"{base_url}/login")
+        guest.locator("#captchaHandle:not([disabled])").wait_for()
+        assert guest.locator("#captchaImage").get_attribute("src").startswith("data:image/jpeg;base64,")
+        assert guest.locator("#captchaPiece").get_attribute("src").startswith("data:image/png;base64,")
+
+        challenge = api_get(guest, "/api/auth/captcha")
+        assert challenge["captcha_id"] and challenge["thumb_y"] >= 0
+        token = guest.locator('meta[name="csrf-token"]').get_attribute("content")
+        attempt = {"captcha_id": challenge["captcha_id"], "point": {"x": 0, "y": challenge["thumb_y"]}}
+        assert api_post(guest, "/api/auth/captcha/verify", attempt, token)["status"] == 400
+        assert api_post(guest, "/api/auth/captcha/verify", attempt, token)["status"] == 400
+        no_ticket = guest.request.post(
+            f"{base_url}/api/auth/login",
+            data={"username": "admin", "password": "wrong-password"},
+            headers={"Content-Type": "application/json"},
+        )
+        assert no_ticket.status == 400
+    finally:
+        settings["captcha"] = original.get("captcha", {"enabled": False})
+        api_post(admin, "/api/settings/save", settings, csrf_token)
+        guest_context.close()
 
 
 @pytest.mark.e2e

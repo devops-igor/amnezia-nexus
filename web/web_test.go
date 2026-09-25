@@ -36,6 +36,11 @@ func TestEmbeddedTranslations(t *testing.T) {
 				t.Errorf("embedded translation %s missing key %q", langFile, key)
 			}
 		}
+		for _, key := range []string{"captcha_slide_prompt", "captcha_verified", "captcha_failed", "captcha_refresh"} {
+			if parsed[key] == "" {
+				t.Errorf("embedded translation %s missing captcha key %q", langFile, key)
+			}
+		}
 	}
 }
 
@@ -56,6 +61,7 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"css/style.css",
 		"js/qrcode.min.js",
 		"js/api.js",
+		"js/captcha.js",
 		"js/ui.js",
 		"js/tables.js",
 		"js/telemetry.js",
@@ -96,6 +102,25 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		if len(data) == 0 {
 			t.Errorf("template %s is empty", tmpl)
 		}
+	}
+}
+
+func TestLoginSlideCaptchaWiring(t *testing.T) {
+	tmpl, err := fs.ReadFile(TemplatesFS, "templates/login.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := fs.ReadFile(StaticFS, "static/js/captcha.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{"id=\"captchaPuzzle\"", "id=\"captchaHandle\"", "/static/js/captcha.js", "captcha_ticket"} {
+		if !strings.Contains(string(tmpl), token) {
+			t.Errorf("login page missing %s", token)
+		}
+	}
+	if !strings.Contains(string(js), "/api/auth/captcha/verify") {
+		t.Error("slider is not wired to verification endpoint")
 	}
 }
 
