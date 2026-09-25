@@ -1133,6 +1133,69 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
 }
 
+// confirmResponderTransportKey revalidates an authenticated transport key
+// against the peer's live key state. A packet using next confirms that the
+// initiator received the responder handshake, so next is atomically promoted
+// to current and the former current becomes previous.
+//
+// The caller must invoke this only after AEAD authentication and anti-replay
+// validation have both succeeded.
+func (el *Listener) confirmResponderTransportKey(peerKey string, keys *TransportKeys) (string, bool) {
+	if keys == nil {
+		return "unknown", false
+	}
+
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	pkp := el.peerKeypairs[peerKey]
+	if pkp == nil {
+		// Preserve compatibility for synthetic/test state that only populated
+		// the legacy runtime alias.
+		if el.noiseKeys[peerKey] == keys && !keys.IsExpired() {
+			return "current", true
+		}
+		return "retired", false
+	}
+
+	if keys.IsExpired() {
+		return "expired", false
+	}
+
+	switch {
+	case pkp.next == keys:
+		// Staging already retires previous, but clear it defensively so the
+		// promotion invariant remains identical to upstream even if tests or
+		// future code construct a three-slot state.
+		if pkp.previous != nil && pkp.previous != pkp.current && pkp.previous.LocalIndex != 0 {
+			delete(el.indexTable, pkp.previous.LocalIndex)
+		}
+		pkp.previous = pkp.current
+		pkp.current = keys
+		pkp.next = nil
+		if el.noiseKeys == nil {
+			el.noiseKeys = make(map[string]*TransportKeys)
+		}
+		el.noiseKeys[peerKey] = keys
+		log.Printf("[vpn/endpoint] confirmed responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d",
+			peerKey, keys.Generation, keys.LocalIndex, keys.RemoteIndex)
+		return "current", true
+	case pkp.current == keys:
+		return "current", true
+	case pkp.previous == keys:
+		return "previous", true
+	default:
+		return "retired", false
+	}
+}
+
+// ConfirmResponderTransportKeyForTest exposes confirmation for focused state
+// transition tests. Production callers confirm only after authenticated,
+// replay-valid transport.
+func (el *Listener) ConfirmResponderTransportKeyForTest(peerKey string, keys *TransportKeys) (string, bool) {
+	return el.confirmResponderTransportKey(peerKey, keys)
+}
+
 // allocateReceiverIndex generates an unused, non-zero 32-bit receiver index that
 // does not collide with any active keypair entry in el.indexTable, and reserves
 // the slot in indexTable to avoid races between concurrent handshakes.
@@ -1508,10 +1571,11 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 	el.txBytes.Add(int64(len(resp)))
 }
 
-// CommitHandshake atomically commits the handshake transport keys and peer endpoint
-// if gen >= el.peerGenerations[peerKey]. If gen is older than the current generation,
-// it discards the keys, releases any preallocated receiver index, leaves the endpoint
-// and lastSeen untouched, increments staleHandshakes, and returns false.
+// CommitHandshake atomically stages responder transport keys if
+// gen >= el.peerGenerations[peerKey]. The sender endpoint is intentionally not
+// adopted here: responder keys and endpoint changes become confirmed only after
+// authenticated transport arrives on next. If gen is stale, the reserved index
+// is released and no endpoint/key state is changed.
 func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *TransportKeys, sender *net.UDPAddr, receiverIdx uint32) bool {
 	if transportKeys != nil {
 		_ = transportKeys.InitCiphers()
@@ -1535,11 +1599,7 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 
 	if transportKeys != nil {
 		transportKeys.Generation = gen
-		el.storeTransportKeysLocked(peerKey, transportKeys)
-	}
-
-	if sender != nil {
-		el.rememberPeerLocked(sender, peerKey, receiverIdx)
+		el.stageResponderTransportKeysLocked(peerKey, transportKeys)
 	}
 
 	return true
@@ -1898,7 +1958,10 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 		return true
 	}
 
-	status := el.keypairStatus(peerKey, keys)
+	status, active := el.confirmResponderTransportKey(peerKey, keys)
+	if !active {
+		return true
+	}
 	if status == "previous" {
 		el.logPreviousKeyAccepted(peerKey, keys)
 	}
@@ -1915,6 +1978,12 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 	}
 
 	packet = trimIPPacketPadding(packet)
+	if len(packet) == 0 || packet[0] == 0 {
+		// Mirror upstream WireGuard/AmneziaWG keepalive handling: authenticated
+		// empty/padding-only transport confirms/promotes key state and refreshes
+		// liveness, but is not an IP packet and never enters the backend.
+		return true
+	}
 	el.deliverToRouter(peerKey, packet)
 	return true
 }
@@ -2007,11 +2076,15 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 		return true
 	}
 
-	if el.keypairStatus(peerKey, successfulKeys) == "previous" {
+	status, active := el.confirmResponderTransportKey(peerKey, successfulKeys)
+	if !active {
+		return true
+	}
+	if status == "previous" {
 		el.logPreviousKeyAccepted(peerKey, successfulKeys)
 	}
 
-	isCurrent := (el.keypairStatus(peerKey, successfulKeys) == "current")
+	isCurrent := (status == "current")
 	var remoteIdxToUpdate uint32
 	if isCurrent {
 		remoteIdxToUpdate = successfulKeys.RemoteIndex
@@ -2023,6 +2096,10 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 	}
 
 	decryptedPacket = trimIPPacketPadding(decryptedPacket)
+	if len(decryptedPacket) == 0 || decryptedPacket[0] == 0 {
+		// Same upstream keepalive/padding semantics as the index path.
+		return true
+	}
 	el.deliverToRouter(peerKey, decryptedPacket)
 	return true
 }

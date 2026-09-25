@@ -2,7 +2,9 @@ package vpn
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -10,7 +12,81 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+func confirmSamePeerHandshake(
+	t *testing.T,
+	svc *Service,
+	clientConn *net.UDPConn,
+	clientPub string,
+	hpKey []byte,
+	h4 models.HeaderRange,
+	s4 int,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var nextLocalIndex uint32
+	var nextRecvKey []byte
+	for time.Now().Before(deadline) {
+		_, _, next := svc.endpoint.PeerKeypairStateForTest(clientPub)
+		if next != nil {
+			nextLocalIndex = next.LocalIndex
+			nextRecvKey = append([]byte(nil), next.RecvKey...)
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if nextLocalIndex == 0 || len(nextRecvKey) == 0 {
+		t.Fatalf("timed out waiting for staged responder next for %s", clientPub)
+	}
+
+	aead, err := chacha20poly1305.New(nextRecvKey)
+	if err != nil {
+		t.Fatalf("build confirmation AEAD: %v", err)
+	}
+	var nonce [chacha20poly1305.NonceSize]byte
+	const counter = uint64(0)
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	ciphertext := aead.Seal(nil, nonce[:], nil, nil)
+
+	if s4 < 0 {
+		s4 = 0
+	}
+	s4Junk := make([]byte, s4)
+	if _, err := rand.Read(s4Junk); err != nil {
+		t.Fatalf("rand.Read confirmation S4: %v", err)
+	}
+
+	var hdr [16]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], h4.Lo)
+	binary.LittleEndian.PutUint32(hdr[4:8], nextLocalIndex)
+	binary.LittleEndian.PutUint64(hdr[8:16], counter)
+	if len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
+		cip := health.NewHeaderProtectionCipher(hpKey, s4Junk[:health.HeaderCipherNonceSize])
+		if cip == nil {
+			t.Fatal("failed to create confirmation header-protection cipher")
+		}
+		cip.XORKeyStream(hdr[:], hdr[:])
+	}
+
+	datagram := append(s4Junk, hdr[:]...)
+	datagram = append(datagram, ciphertext...)
+	if _, err := clientConn.Write(datagram); err != nil {
+		t.Fatalf("write confirmation keepalive: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, current, next := svc.endpoint.PeerKeypairStateForTest(clientPub)
+		if current != nil && current.LocalIndex == nextLocalIndex && next == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for responder next->current promotion for %s", clientPub)
+}
 
 // TestSamePeerHandshakeRetirementOrderingRegression reproduces the same-peer
 // handshake completion ordering race:
@@ -93,6 +169,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n0], state0, hpKeyBytes, cfg.H2, cfg.S2) {
 		t.Fatal("response 0 failed verification")
 	}
+	confirmSamePeerHandshake(t, svc, clientConn0, clientPub, hpKeyBytes, cfg.H4, cfg.S4)
 
 	sess0, ok := svc.sessionMgr.GetSession(clientPub)
 	if !ok {
@@ -180,6 +257,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n2], state2, hpKeyBytes, cfg.H2, cfg.S2) {
 		t.Fatal("response H2 failed verification")
 	}
+	confirmSamePeerHandshake(t, svc, clientConn2, clientPub, hpKeyBytes, cfg.H4, cfg.S4)
 
 	sess2, ok := svc.sessionMgr.GetSession(clientPub)
 	if !ok {
@@ -383,6 +461,7 @@ func TestSamePeerHandshakeResponseSendRaceRegression(t *testing.T) {
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n2], state2, hpKeyBytes, cfg.H2, cfg.S2) {
 		t.Fatal("response H2 failed verification")
 	}
+	confirmSamePeerHandshake(t, svc, clientConn2, clientPub, hpKeyBytes, cfg.H4, cfg.S4)
 
 	sess2, ok := svc.sessionMgr.GetSession(clientPub)
 	if !ok {
