@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -1602,6 +1604,179 @@ func TestUpdateServerHostHandler(t *testing.T) {
 			t.Errorf("expected 200 OK for admin user, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
 		}
 	})
+}
+
+func TestUpdateServerHostHandler_VPNBackendPropagation(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	srv := &models.Server{
+		Name:    "VPN-Backend-Server",
+		Host:    "10.20.30.40",
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "10.20.30.50"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Verify server host updated in DB
+	updatedServer, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if updatedServer.Host != "10.20.30.50" {
+		t.Errorf("server host = %q, want %q", updatedServer.Host, "10.20.30.50")
+	}
+
+	// Verify tunnel endpoint updated in VPN memory pool
+	backends, err := vpnSvc.GetBackends(ctx)
+	if err != nil {
+		t.Fatalf("GetBackends failed: %v", err)
+	}
+	var foundMem *models.BackendTunnel
+	for _, b := range backends {
+		if b.ServerID == serverID {
+			foundMem = b
+			break
+		}
+	}
+	if foundMem == nil {
+		t.Fatalf("backend tunnel for server %d not found in VPN service", serverID)
+	}
+	if foundMem.Endpoint != "10.20.30.50:51820" {
+		t.Errorf("memory tunnel endpoint = %q, want %q", foundMem.Endpoint, "10.20.30.50:51820")
+	}
+
+	// Verify tunnel endpoint updated in DB
+	dbTunnels, err := db.GetBackendTunnels(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendTunnels failed: %v", err)
+	}
+	var foundDB *models.BackendTunnel
+	for i := range dbTunnels {
+		if dbTunnels[i].ServerID == serverID {
+			foundDB = &dbTunnels[i]
+			break
+		}
+	}
+	if foundDB == nil {
+		t.Fatalf("backend tunnel for server %d not found in DB", serverID)
+	}
+	if foundDB.Endpoint != "10.20.30.50:51820" {
+		t.Errorf("DB backend tunnel endpoint = %q, want %q", foundDB.Endpoint, "10.20.30.50:51820")
+	}
+}
+
+func TestUpdateServerHostHandler_ConcurrencySerialization(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Concurrent-Host-Server",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	origLogger := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+	})
+	slog.SetDefault(slog.New(slog.NewTextHandler(&testSyncWriter{buf: &logBuf, mu: &logMu}, nil)))
+
+	const numWorkers = 10
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		go func(workerIndex int) {
+			defer wg.Done()
+			newHost := fmt.Sprintf("10.0.1.%d", workerIndex+1)
+			body, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("worker %d: expected 200 OK, got %d", workerIndex, w.Code)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify server in DB has one of the valid updated hosts
+	finalServer, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if !strings.HasPrefix(finalServer.Host, "10.0.1.") {
+		t.Errorf("unexpected final host: %s", finalServer.Host)
+	}
+
+	// Verify all 10 audit logs were written
+	logMu.Lock()
+	logContent := logBuf.String()
+	logMu.Unlock()
+
+	auditCount := strings.Count(logContent, "server.update_ip")
+	if auditCount != numWorkers {
+		t.Errorf("expected %d server.update_ip audit events, got %d", numWorkers, auditCount)
+	}
+}
+
+type testSyncWriter struct {
+	buf *bytes.Buffer
+	mu  *sync.Mutex
+}
+
+func (w *testSyncWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
 }
 
 func TestServerStatsHandler_Failures(t *testing.T) {

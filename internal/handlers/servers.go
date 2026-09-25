@@ -234,6 +234,9 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	unlock := h.lockServerHost(serverID)
+	defer unlock()
+
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
@@ -248,6 +251,12 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 
 	if h.sshPool != nil {
 		h.sshPool.Remove(serverID)
+	}
+
+	if h.vpnSvc != nil {
+		if err := h.vpnSvc.UpdateBackendServerHost(ctx, serverID, req.Host); err != nil {
+			slog.Warn("failed to update VPN backend endpoint", "server_id", serverID, "err", err)
+		}
 	}
 
 	h.audit(r, "server.update_ip", map[string]any{

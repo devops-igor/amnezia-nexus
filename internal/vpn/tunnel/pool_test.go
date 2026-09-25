@@ -701,3 +701,45 @@ func TestTunnelPool_TransferConnectionsIfActive(t *testing.T) {
 		t.Fatalf("expected ErrPoolClosed on closed pool, got: %v", err)
 	}
 }
+
+func TestTunnelPool_SetTunnelEndpoint(t *testing.T) {
+	ctx := context.Background()
+	pool := NewPool(nil)
+
+	tun, err := pool.AddTunnel(ctx, 101, "192.168.1.10:51820", "pubkey101")
+	if err != nil {
+		t.Fatalf("AddTunnel failed: %v", err)
+	}
+
+	if tun.Endpoint != "192.168.1.10:51820" {
+		t.Fatalf("unexpected initial endpoint: %s", tun.Endpoint)
+	}
+
+	newEndpoint := "192.168.1.20:51820"
+	if err := pool.SetTunnelEndpoint(tun.ID, newEndpoint); err != nil {
+		t.Fatalf("SetTunnelEndpoint failed: %v", err)
+	}
+
+	// Verify retrieval by ID
+	byID, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed: %v", err)
+	}
+	if byID.Endpoint != newEndpoint {
+		t.Errorf("GetTunnelByID endpoint = %q, want %q", byID.Endpoint, newEndpoint)
+	}
+
+	// Verify retrieval by ServerID
+	byServer, err := pool.GetTunnel(101)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if byServer.Endpoint != newEndpoint {
+		t.Errorf("GetTunnel endpoint = %q, want %q", byServer.Endpoint, newEndpoint)
+	}
+
+	// Verify non-existent tunnel ID returns ErrTunnelNotFound
+	if err := pool.SetTunnelEndpoint(99999, newEndpoint); !errors.Is(err, ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound for unknown tunnel, got: %v", err)
+	}
+}

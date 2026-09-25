@@ -167,8 +167,8 @@ type Service struct {
 	lastLoggedDrops            atomic.Uint64
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
-	publicIPMu                sync.RWMutex
-	detectedPublicIP          string
+	publicIPMu                 sync.RWMutex
+	detectedPublicIP           string
 	// dropLogUntil throttles the backend read loop's queue-full drop log
 	// (log-flood defense; issue #39 produced 7687 lines in 2 h). Shared
 	// across the per-backend read loops: all accesses are atomic, so the
@@ -2383,6 +2383,82 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		if len(migrations) > 0 && s.sessionMgr != nil {
 			s.sessionMgr.BumpLifecycleVersion()
 		}
+	}
+
+	return nil
+}
+
+// UpdateBackendServerHost updates the endpoint of a server in the VPN backend pool.
+func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, newHost string) error {
+	if s == nil || s.pool == nil {
+		return nil
+	}
+
+	tun, err := s.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			return nil
+		}
+		return err
+	}
+	if tun == nil {
+		return nil
+	}
+
+	cleanHost := strings.Trim(strings.TrimSpace(newHost), "[]")
+	var newEndpoint string
+	if _, port, splitErr := net.SplitHostPort(tun.Endpoint); splitErr == nil && port != "" {
+		newEndpoint = net.JoinHostPort(cleanHost, port)
+	} else {
+		if s.db == nil {
+			return fmt.Errorf("database not available to resolve server %d credentials: %w", serverID, splitErr)
+		}
+		srv, loadErr := s.db.GetServerByID(ctx, serverID)
+		if loadErr != nil || srv == nil {
+			return fmt.Errorf("failed to load server %d: %w", serverID, loadErr)
+		}
+		_, p, _, credErr := s.resolveBackendCredentials(ctx, serverID, srv)
+		if credErr != nil {
+			return fmt.Errorf("failed to resolve backend credentials for server %d: %w", serverID, credErr)
+		}
+		newEndpoint = net.JoinHostPort(cleanHost, strconv.Itoa(p))
+	}
+
+	if tun.Endpoint == newEndpoint {
+		return nil
+	}
+
+	if s.db != nil {
+		if err := s.db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"endpoint": newEndpoint}); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel endpoint: %w", err)
+		}
+	}
+
+	if err := s.pool.SetTunnelEndpoint(tun.ID, newEndpoint); err != nil {
+		return fmt.Errorf("failed to update backend tunnel endpoint in pool: %w", err)
+	}
+	tun.Endpoint = newEndpoint
+
+	if tun.DisableReason == models.DisableReasonAdmin || tun.Status == TunnelStatusDisabled || tun.Status == models.TunnelStatusDisabled {
+		return nil
+	}
+
+	if tun.Status == TunnelStatusActive || tun.Status == TunnelStatusDegraded ||
+		tun.Status == models.TunnelStatusActive || tun.Status == models.TunnelStatusDegraded {
+		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+		s.mu.Lock()
+		attachErr := s.attachBackendForwarder(tun, awgParams)
+		s.mu.Unlock()
+
+		if attachErr != nil {
+			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
+			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
+		}
+	}
+
+	if s.prober != nil {
+		s.prober.ResetFailCount(serverID)
 	}
 
 	return nil

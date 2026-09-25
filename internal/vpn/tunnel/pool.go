@@ -691,6 +691,19 @@ func (p *Pool) SetConnectionCount(ctx context.Context, tunnelID int64, count int
 	return nil
 }
 
+// SetTunnelEndpoint updates the endpoint of a backend tunnel in memory.
+func (p *Pool) SetTunnelEndpoint(tunnelID int64, endpoint string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByID[tunnelID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	tunnel.Endpoint = endpoint
+	return nil
+}
+
 // Close tears down all tunnels and cleans up resources.
 func (p *Pool) Close() error {
 	p.mu.Lock()
