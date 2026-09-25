@@ -2116,7 +2116,7 @@ func TestListener_PrunePeerTransportStateForGeneration_Unit(t *testing.T) {
 	if _, ok := el.peerByAddr(clientAddr.String()); ok {
 		t.Fatal("unconfirmed handshake unexpectedly adopted peer address")
 	}
-	if keys, found := el.lookupKeypairByIndex(k2.LocalIndex); !found || keys != k2 {
+	if entry, found := el.lookupKeypairByIndex(k2.LocalIndex); !found || entry == nil || entry.keys != k2 {
 		t.Fatal("expected staged K2 indexTable entry to survive stale timeout pruning")
 	}
 
