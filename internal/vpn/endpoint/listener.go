@@ -1978,6 +1978,12 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 	}
 
 	packet = trimIPPacketPadding(packet)
+	if len(packet) == 0 {
+		// WireGuard/AmneziaWG authenticated keepalive: it confirms/promotes
+		// responder key state and refreshes liveness, but is not an IP packet
+		// and must never enter the backend data plane.
+		return true
+	}
 	el.deliverToRouter(peerKey, packet)
 	return true
 }
@@ -2090,6 +2096,10 @@ func (el *Listener) handleTransportFallback(sender *net.UDPAddr, payload []byte,
 	}
 
 	decryptedPacket = trimIPPacketPadding(decryptedPacket)
+	if len(decryptedPacket) == 0 {
+		// Same keepalive semantics as the receiver-index path.
+		return true
+	}
 	el.deliverToRouter(peerKey, decryptedPacket)
 	return true
 }
