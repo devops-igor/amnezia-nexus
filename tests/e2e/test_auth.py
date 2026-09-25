@@ -150,7 +150,7 @@ def test_slide_captcha_browser_login(
         ) as login:
             guest.locator("#loginBtn").click()
         assert login.value.status == 200, login.value.text()[:200]
-        guest.wait_for_url(lambda url: "/login" not in url.path)
+        guest.wait_for_url(lambda url: "/login" not in url)
     finally:
         settings["captcha"] = original.get("captcha", {"enabled": False})
         api_post(admin, "/api/settings/save", settings, csrf_token)
