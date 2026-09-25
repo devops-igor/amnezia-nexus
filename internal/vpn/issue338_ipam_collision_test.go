@@ -2,12 +2,15 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
@@ -59,7 +62,7 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Connection 2 has the exact same sharedIP with different peer key (reproducing Issue #338 production collision)
+	// Connection 2 has the exact same sharedIP with different peer key
 	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
 		ID:           "conn-peer-2",
 		UserID:       user2ID,
@@ -89,7 +92,6 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 		MaxPeersPerBackend: 100,
 	}
 
-	// NewVPNService must succeed cleanly without crash loop
 	svc, err := NewVPNService(db, cfg)
 	if err != nil {
 		t.Fatalf("NewVPNService failed on duplicate assigned_ip collision: %v", err)
@@ -109,7 +111,7 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 		t.Fatalf("first connection peer %s lost its IP in IPAM: got %v, want %s", peerKey1, assigned1, sharedIP)
 	}
 
-	// Assert second connection's conflicting assigned_ip is cleared in SQLite
+	// Assert second connection's conflicting assigned_ip is cleared and quarantined in SQLite
 	conn2, err := db.GetConnection(ctx, conn2ID)
 	if err != nil {
 		t.Fatalf("get connection 2: %v", err)
@@ -117,8 +119,14 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 	if conn2.ClientParams != nil && conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
 		t.Fatalf("expected conn2 conflicting assigned_ip to be cleared in SQLite, got: %v", conn2.ClientParams["assigned_ip"])
 	}
+	if conn2.ClientParams["quarantined_ip_collision"] != sharedIP {
+		t.Fatalf("expected conn2 quarantined_ip_collision=%s, got: %v", sharedIP, conn2.ClientParams["quarantined_ip_collision"])
+	}
+	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("expected conn2 config_regeneration_required=true, got: %v", conn2.ClientParams["config_regeneration_required"])
+	}
 
-	// Assert generating config for second client allocates a fresh unique IP
+	// Assert generating config for second client allocates a fresh unique IP and clears quarantine
 	newConfig, _, err := svc.GenerateClientConfig(ctx, user2ID)
 	if err != nil {
 		t.Fatalf("GenerateClientConfig for second connection failed: %v", err)
@@ -131,13 +139,19 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 		t.Fatalf("second connection reused colliding IP %s instead of allocating fresh IP", sharedIP)
 	}
 
-	// Verify new IP is persisted in SQLite for second connection
+	// Verify new IP is persisted in SQLite for second connection and quarantine markers removed
 	conn2Updated, err := db.GetConnection(ctx, conn2ID)
 	if err != nil {
 		t.Fatalf("get updated connection 2: %v", err)
 	}
 	if conn2Updated.ClientParams == nil || conn2Updated.ClientParams["assigned_ip"] != newIP {
 		t.Fatalf("new IP %s was not persisted for conn2: %+v", newIP, conn2Updated.ClientParams)
+	}
+	if conn2Updated.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("expected config_regeneration_required to be cleared, got: %v", conn2Updated.ClientParams["config_regeneration_required"])
+	}
+	if conn2Updated.ClientParams["quarantined_ip_collision"] != nil {
+		t.Fatalf("expected quarantined_ip_collision to be cleared, got: %v", conn2Updated.ClientParams["quarantined_ip_collision"])
 	}
 
 	// Verify first connection is unchanged
@@ -150,7 +164,498 @@ func TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals(t *testing.T) {
 	}
 }
 
-func TestStartupIPAMCollision_ConnectingAllocatesFreshIP(t *testing.T) {
+// Scenario 1: Two different users / two peers / same persisted IP (oldest wins, other quarantined)
+func TestStartupIPAMCollision_Scenario1_TwoUsersTwoPeers_OldestWinsOtherQuarantined(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	user1ID, err := db.CreateUser(ctx, &models.User{Username: "user-sc1-1", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user2ID, err := db.CreateUser(ctx, &models.User{Username: "user-sc1-2", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const targetIP = "10.100.0.3"
+
+	// Conn1 (older)
+	conn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc1-1",
+		UserID:       user1ID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc1-1",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-5 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Conn2 (newer, colliding IP)
+	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc1-2",
+		UserID:       user2ID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc1-2",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// Winner (Conn1) retains targetIP in IPAM
+	assigned, ok := ipam.GetAssignedIP("peer-sc1-1")
+	if !ok || assigned.String() != targetIP {
+		t.Fatalf("winner peer-sc1-1 missing in IPAM: got %v, want %s", assigned, targetIP)
+	}
+
+	// Winner in DB is untouched
+	conn1, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientParams["assigned_ip"] != targetIP {
+		t.Fatalf("winner conn1 assigned_ip modified: %v", conn1.ClientParams["assigned_ip"])
+	}
+
+	// Loser (Conn2) is quarantined in DB
+	conn2, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
+		t.Fatalf("loser conn2 assigned_ip not cleared: %v", conn2.ClientParams["assigned_ip"])
+	}
+	if conn2.ClientParams["quarantined_ip_collision"] != targetIP {
+		t.Fatalf("loser conn2 quarantined_ip_collision mismatch: got %v, want %s", conn2.ClientParams["quarantined_ip_collision"], targetIP)
+	}
+	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("loser conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+}
+
+// Scenario 2: Same user with two valid configurations sharing an IP (oldest wins, second quarantined)
+func TestStartupIPAMCollision_Scenario2_SameUserTwoConfigs_OldestWinsSecondQuarantined(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	userID, err := db.CreateUser(ctx, &models.User{Username: "user-sc2", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const targetIP = "10.100.0.5"
+
+	// Conn1 (older config)
+	conn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc2-1",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc2-1",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-10 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Conn2 (newer config for same user, sharing targetIP)
+	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc2-2",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc2-2",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-1 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// Winner (Conn1) retains targetIP
+	assigned, ok := ipam.GetAssignedIP("peer-sc2-1")
+	if !ok || assigned.String() != targetIP {
+		t.Fatalf("winner peer-sc2-1 missing in IPAM: got %v, want %s", assigned, targetIP)
+	}
+
+	conn1, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientParams["assigned_ip"] != targetIP {
+		t.Fatalf("conn1 lost assigned_ip: %v", conn1.ClientParams["assigned_ip"])
+	}
+
+	// Loser (Conn2) quarantined
+	conn2, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
+		t.Fatalf("conn2 assigned_ip not cleared: %v", conn2.ClientParams["assigned_ip"])
+	}
+	if conn2.ClientParams["quarantined_ip_collision"] != targetIP {
+		t.Fatalf("conn2 quarantined_ip_collision mismatch: got %v, want %s", conn2.ClientParams["quarantined_ip_collision"], targetIP)
+	}
+	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+}
+
+// Scenario 3: Three claimants for one IP (one winner, two quarantined)
+func TestStartupIPAMCollision_Scenario3_ThreeClaimants_OneWinnerTwoQuarantined(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	const targetIP = "10.100.0.7"
+
+	var connIDs []string
+	var peerKeys []string
+	for i := 1; i <= 3; i++ {
+		uID, err := db.CreateUser(ctx, &models.User{Username: "user-sc3-" + string(rune('0'+i)), Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pKey := "peer-sc3-" + string(rune('0'+i))
+		peerKeys = append(peerKeys, pKey)
+		cID, err := db.CreateConnection(ctx, &models.UserConnection{
+			ID:           "conn-sc3-" + string(rune('0'+i)),
+			UserID:       uID,
+			ServerID:     0,
+			Protocol:     "awg",
+			ClientID:     pKey,
+			ClientParams: map[string]any{"assigned_ip": targetIP},
+			CreatedAt:    now.Add(time.Duration(i) * time.Second),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		connIDs = append(connIDs, cID)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// Oldest is connIDs[0] (winner)
+	assigned, ok := ipam.GetAssignedIP(peerKeys[0])
+	if !ok || assigned.String() != targetIP {
+		t.Fatalf("winner %s missing in IPAM: got %v, want %s", peerKeys[0], assigned, targetIP)
+	}
+
+	conn1, err := db.GetConnection(ctx, connIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientParams["assigned_ip"] != targetIP {
+		t.Fatalf("winner conn1 lost assigned_ip: %v", conn1.ClientParams["assigned_ip"])
+	}
+
+	// Losers (connIDs[1] and connIDs[2]) are both quarantined
+	for j := 1; j <= 2; j++ {
+		conn, err := db.GetConnection(ctx, connIDs[j])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if conn.ClientParams["assigned_ip"] != nil && conn.ClientParams["assigned_ip"] != "" {
+			t.Fatalf("loser %s assigned_ip not cleared: %v", connIDs[j], conn.ClientParams["assigned_ip"])
+		}
+		if conn.ClientParams["quarantined_ip_collision"] != targetIP {
+			t.Fatalf("loser %s quarantined_ip_collision mismatch: %v", connIDs[j], conn.ClientParams["quarantined_ip_collision"])
+		}
+		if req, ok := conn.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+			t.Fatalf("loser %s config_regeneration_required not true: %v", connIDs[j], conn.ClientParams["config_regeneration_required"])
+		}
+	}
+}
+
+// Scenario 4: Durable client_params.assigned_ip vs legacy vpn_sessions fallback collision (durable wins, legacy not migrated)
+func TestStartupIPAMCollision_Scenario4_DurableVsLegacyFallback_DurableWinsLegacyNotMigrated(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Server 8", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnelID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      serverID,
+		InterfaceName: "awg0",
+		PublicKey:     "tunnel-pub-sc4",
+		Endpoint:      "192.0.2.10:51820",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacyUserID, err := db.CreateUser(ctx, &models.User{Username: "user-sc4-legacy", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableUserID, err := db.CreateUser(ctx, &models.User{Username: "user-sc4-durable", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	const targetIP = "10.100.0.3"
+
+	// Legacy connection created EARLIER (10s ago), but has NO assigned_ip in client_params
+	legacyConnID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc4-legacy",
+		UserID:       legacyUserID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc4-legacy",
+		ClientParams: map[string]any{"label": "old-client"},
+		CreatedAt:    now.Add(-10 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Active session for legacy client with targetIP
+	if err := db.CreateVPNSession(ctx, &models.VPNSession{
+		ID:              "sess-sc4-legacy",
+		UserID:          legacyUserID,
+		BackendTunnelID: tunnelID,
+		PeerPublicKey:   "peer-sc4-legacy",
+		AssignedIP:      targetIP,
+		Status:          "connected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Durable connection created LATER (1s ago), but has explicit client_params["assigned_ip"]
+	durableConnID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc4-durable",
+		UserID:       durableUserID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc4-durable",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-1 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. reservePersistedClientIPs reconciles
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// 2. InvalidateVPNSessionsForRestart runs
+	if _, err := db.InvalidateVPNSessionsForRestart(ctx); err != nil {
+		t.Fatalf("InvalidateVPNSessionsForRestart failed: %v", err)
+	}
+
+	// Assert Durable connection won despite being newer
+	assigned, ok := ipam.GetAssignedIP("peer-sc4-durable")
+	if !ok || assigned.String() != targetIP {
+		t.Fatalf("durable peer-sc4-durable missing in IPAM: got %v, want %s", assigned, targetIP)
+	}
+
+	connDurable, err := db.GetConnection(ctx, durableConnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connDurable.ClientParams["assigned_ip"] != targetIP {
+		t.Fatalf("durable conn lost assigned_ip: %v", connDurable.ClientParams["assigned_ip"])
+	}
+
+	// Assert Legacy connection was quarantined and NOT migrated to client_params["assigned_ip"]
+	connLegacy, err := db.GetConnection(ctx, legacyConnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connLegacy.ClientParams["assigned_ip"] != nil && connLegacy.ClientParams["assigned_ip"] != "" {
+		t.Fatalf("legacy conn assigned_ip was falsely migrated: %v", connLegacy.ClientParams["assigned_ip"])
+	}
+	if connLegacy.ClientParams["quarantined_ip_collision"] != targetIP {
+		t.Fatalf("legacy conn quarantined_ip_collision mismatch: %v", connLegacy.ClientParams["quarantined_ip_collision"])
+	}
+	if req, ok := connLegacy.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("legacy conn config_regeneration_required not true: %v", connLegacy.ClientParams["config_regeneration_required"])
+	}
+}
+
+// Scenario 5: Second restart after reconciliation is idempotent (no remaining collisions)
+func TestStartupIPAMCollision_Scenario5_SecondRestartIsIdempotent(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u1, _ := db.CreateUser(ctx, &models.User{Username: "user-sc5-1", Enabled: true})
+	u2, _ := db.CreateUser(ctx, &models.User{Username: "user-sc5-2", Enabled: true})
+
+	now := time.Now().UTC()
+	const targetIP = "10.100.0.9"
+
+	c1ID, _ := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc5-1",
+		UserID:       u1,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc5-1",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-5 * time.Second),
+	})
+	c2ID, _ := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-sc5-2",
+		UserID:       u2,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     "peer-sc5-2",
+		ClientParams: map[string]any{"assigned_ip": targetIP},
+		CreatedAt:    now.Add(-2 * time.Second),
+	})
+
+	// First startup restart cycle
+	ipam1, _ := endpoint.NewIPAM("10.100.0.0/16")
+	if err := reservePersistedClientIPs(ctx, db, ipam1); err != nil {
+		t.Fatalf("first reservePersistedClientIPs failed: %v", err)
+	}
+	if _, err := db.InvalidateVPNSessionsForRestart(ctx); err != nil {
+		t.Fatalf("first InvalidateVPNSessionsForRestart failed: %v", err)
+	}
+
+	// Verify Conn1 won, Conn2 quarantined
+	conn1After1, _ := db.GetConnection(ctx, c1ID)
+	conn2After1, _ := db.GetConnection(ctx, c2ID)
+	if conn1After1.ClientParams["assigned_ip"] != targetIP {
+		t.Fatalf("conn1 lost IP in first restart: %v", conn1After1.ClientParams)
+	}
+	if conn2After1.ClientParams["quarantined_ip_collision"] != targetIP {
+		t.Fatalf("conn2 not quarantined in first restart: %v", conn2After1.ClientParams)
+	}
+
+	// Second startup restart cycle (simulating a subsequent restart of the service)
+	ipam2, _ := endpoint.NewIPAM("10.100.0.0/16")
+	if err := reservePersistedClientIPs(ctx, db, ipam2); err != nil {
+		t.Fatalf("second reservePersistedClientIPs failed: %v", err)
+	}
+	count, err := db.InvalidateVPNSessionsForRestart(ctx)
+	if err != nil {
+		t.Fatalf("second InvalidateVPNSessionsForRestart failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("second restart invalidated %d sessions, want 0", count)
+	}
+
+	// In second IPAM, Conn1 is cleanly reserved without collisions
+	assigned, ok := ipam2.GetAssignedIP("peer-sc5-1")
+	if !ok || assigned.String() != targetIP {
+		t.Fatalf("conn1 missing in second IPAM: got %v, want %s", assigned, targetIP)
+	}
+
+	// Conn2 remains quarantined, no further mutations
+	conn2After2, _ := db.GetConnection(ctx, c2ID)
+	if conn2After2.ClientParams["assigned_ip"] != nil {
+		t.Fatalf("conn2 assigned_ip unexpectedly reappeared: %v", conn2After2.ClientParams)
+	}
+	if conn2After2.ClientParams["quarantined_ip_collision"] != targetIP {
+		t.Fatalf("conn2 quarantined_ip_collision corrupted: %v", conn2After2.ClientParams)
+	}
+	if req, ok := conn2After2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("conn2 config_regeneration_required corrupted: %v", conn2After2.ClientParams)
+	}
+}
+
+// Scenario 6: Unrelated valid leases remain unchanged
+func TestStartupIPAMCollision_Scenario6_UnrelatedValidLeasesUnchanged(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u1, _ := db.CreateUser(ctx, &models.User{Username: "user-sc6-1", Enabled: true})
+	u2, _ := db.CreateUser(ctx, &models.User{Username: "user-sc6-2", Enabled: true})
+	u3, _ := db.CreateUser(ctx, &models.User{Username: "user-sc6-3", Enabled: true})
+	u4, _ := db.CreateUser(ctx, &models.User{Username: "user-sc6-4", Enabled: true})
+
+	now := time.Now().UTC()
+
+	// Colliding pair
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc6-1", UserID: u1, ServerID: 0, Protocol: "awg", ClientID: "peer-sc6-1",
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.3"}, CreatedAt: now.Add(-5 * time.Second),
+	})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc6-2", UserID: u2, ServerID: 0, Protocol: "awg", ClientID: "peer-sc6-2",
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.3"}, CreatedAt: now.Add(-2 * time.Second),
+	})
+
+	// Unrelated valid leases
+	c3ID, _ := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc6-3", UserID: u3, ServerID: 0, Protocol: "awg", ClientID: "peer-sc6-3",
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.10"}, CreatedAt: now.Add(-4 * time.Second),
+	})
+	c4ID, _ := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc6-4", UserID: u4, ServerID: 0, Protocol: "awg", ClientID: "peer-sc6-4",
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.20"}, CreatedAt: now.Add(-3 * time.Second),
+	})
+
+	ipam, _ := endpoint.NewIPAM("10.100.0.0/16")
+	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
+		t.Fatalf("reservePersistedClientIPs failed: %v", err)
+	}
+
+	// Verify unrelated connections retained their exact IPs in IPAM
+	if ip, ok := ipam.GetAssignedIP("peer-sc6-3"); !ok || ip.String() != "10.100.0.10" {
+		t.Fatalf("peer-sc6-3 IPAM mismatch: %v", ip)
+	}
+	if ip, ok := ipam.GetAssignedIP("peer-sc6-4"); !ok || ip.String() != "10.100.0.20" {
+		t.Fatalf("peer-sc6-4 IPAM mismatch: %v", ip)
+	}
+
+	// Verify unrelated connections in DB are completely untouched
+	conn3, _ := db.GetConnection(ctx, c3ID)
+	if conn3.ClientParams["assigned_ip"] != "10.100.0.10" || conn3.ClientParams["quarantined_ip_collision"] != nil {
+		t.Fatalf("conn3 corrupted: %+v", conn3.ClientParams)
+	}
+	conn4, _ := db.GetConnection(ctx, c4ID)
+	if conn4.ClientParams["assigned_ip"] != "10.100.0.20" || conn4.ClientParams["quarantined_ip_collision"] != nil {
+		t.Fatalf("conn4 corrupted: %+v", conn4.ClientParams)
+	}
+}
+
+// Scenario 7: Losing peer's old config is not treated as automatically recovered (handshake fails with collision error)
+func TestStartupIPAMCollision_Scenario7_LosingPeerOldConfig_RefusesHandshake(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -161,8 +666,8 @@ func TestStartupIPAMCollision_ConnectingAllocatesFreshIP(t *testing.T) {
 	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 		ServerID:      serverID,
 		InterfaceName: "awg0",
-		PublicKey:     "tunnel-pubkey-338b",
-		PrivateKey:    "tunnel-privkey-338b",
+		PublicKey:     "tunnel-pub-sc7",
+		PrivateKey:    "tunnel-priv-sc7",
 		Endpoint:      "192.0.2.10:51820",
 		Status:        "active",
 	})
@@ -170,47 +675,22 @@ func TestStartupIPAMCollision_ConnectingAllocatesFreshIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	user1ID, err := db.CreateUser(ctx, &models.User{Username: "client-one-b", Enabled: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	user2ID, err := db.CreateUser(ctx, &models.User{Username: "client-two-b", Enabled: true})
-	if err != nil {
-		t.Fatal(err)
-	}
+	u1, _ := db.CreateUser(ctx, &models.User{Username: "user-sc7-1", Enabled: true})
+	u2, _ := db.CreateUser(ctx, &models.User{Username: "user-sc7-2", Enabled: true})
 
 	now := time.Now().UTC()
-	const sharedIP = "10.100.0.3"
-	peerKey1 := "client-one-peer-key-b"
-	peerKey2 := "client-two-peer-key-b"
+	const targetIP = "10.100.0.3"
+	peerKey1 := "peer-sc7-1"
+	peerKey2 := "peer-sc7-2"
 
-	// Conn1 has sharedIP
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		ID:           "conn-peer-1-b",
-		UserID:       user1ID,
-		ServerID:     0,
-		Protocol:     "awg",
-		ClientID:     peerKey1,
-		ClientParams: map[string]any{"assigned_ip": sharedIP},
-		CreatedAt:    now.Add(1 * time.Second),
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc7-1", UserID: u1, ServerID: 0, Protocol: "awg", ClientID: peerKey1,
+		ClientParams: map[string]any{"assigned_ip": targetIP}, CreatedAt: now.Add(-5 * time.Second),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Conn2 has the same sharedIP
-	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
-		ID:           "conn-peer-2-b",
-		UserID:       user2ID,
-		ServerID:     0,
-		Protocol:     "awg",
-		ClientID:     peerKey2,
-		ClientParams: map[string]any{"assigned_ip": sharedIP},
-		CreatedAt:    now.Add(2 * time.Second),
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc7-2", UserID: u2, ServerID: 0, Protocol: "awg", ClientID: peerKey2,
+		ClientParams: map[string]any{"assigned_ip": targetIP}, CreatedAt: now.Add(-2 * time.Second),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	cfg := &models.VPNConfig{
 		Algorithm:          models.LBLeastConnections,
@@ -223,33 +703,133 @@ func TestStartupIPAMCollision_ConnectingAllocatesFreshIP(t *testing.T) {
 
 	svc, err := NewVPNService(db, cfg)
 	if err != nil {
-		t.Fatalf("NewVPNService failed: %v", err)
+		t.Fatal(err)
 	}
 	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
-
 	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("svc.Start failed: %v", err)
+		t.Fatal(err)
 	}
 	defer func() { _ = svc.Stop() }()
 
-	// Connecting peer 2 via HandleIncomingPeer directly
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKey2)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for second peer: %v", err)
-	}
-	if sess.AssignedIP == "" || sess.AssignedIP == sharedIP {
-		t.Fatalf("expected fresh assigned IP, got: %s (sharedIP was %s)", sess.AssignedIP, sharedIP)
+	// Handshake for peer 2 (losing claimant) must be refused
+	_, _, err = svc.HandleIncomingPeer(ctx, peerKey2)
+	if err == nil {
+		t.Fatal("expected HandleIncomingPeer to refuse connection for quarantined peer, got nil error")
 	}
 
-	// Verify the allocated fresh IP is persisted for conn2 in SQLite
+	if !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		t.Fatalf("expected error to wrap ErrIPAlreadyAllocated, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "config regeneration required") {
+		t.Fatalf("expected error to mention config regeneration required, got: %v", err)
+	}
+}
+
+// Scenario 8: Regenerated losing config gets a new collision-free IP and persists it; connecting with new config succeeds
+func TestStartupIPAMCollision_Scenario8_RegenerateLosingConfig_AllocatesNewIPAndHandshakeSucceeds(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Server 8", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      serverID,
+		InterfaceName: "awg0",
+		PublicKey:     "tunnel-pub-sc8",
+		PrivateKey:    "tunnel-priv-sc8",
+		Endpoint:      "192.0.2.10:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u1, _ := db.CreateUser(ctx, &models.User{Username: "user-sc8-1", Enabled: true})
+	u2, _ := db.CreateUser(ctx, &models.User{Username: "user-sc8-2", Enabled: true})
+
+	now := time.Now().UTC()
+	const sharedIP = "10.100.0.3"
+	peerPub1, peerPriv1, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPub2, peerPriv2, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc8-1", UserID: u1, ServerID: 0, Protocol: "awg", ClientID: peerPub1,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": peerPriv1}, CreatedAt: now.Add(-5 * time.Second),
+	})
+	conn2ID, _ := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-sc8-2", UserID: u2, ServerID: 0, Protocol: "awg", ClientID: peerPub2,
+		ClientParams: map[string]any{"assigned_ip": sharedIP, "client_private_key": peerPriv2}, CreatedAt: now.Add(-2 * time.Second),
+	})
+
+	cfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+	}
+
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// 1. Initial handshake fails per Scenario 7
+	if _, _, err := svc.HandleIncomingPeer(ctx, peerPub2); err == nil {
+		t.Fatal("expected initial handshake to fail before regeneration")
+	}
+
+	// 2. Regenerate config for user 2
+	newConfig, _, err := svc.GenerateClientConfig(ctx, u2)
+	if err != nil {
+		t.Fatalf("GenerateClientConfig failed: %v", err)
+	}
+	newIP := extractAddressFromConfig(t, newConfig)
+	if newIP == "" || newIP == sharedIP {
+		t.Fatalf("expected fresh IP, got %s", newIP)
+	}
+
+	// 3. Verify SQLite connection 2 is updated
 	conn2Updated, err := db.GetConnection(ctx, conn2ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conn2Updated.ClientParams == nil || conn2Updated.ClientParams["assigned_ip"] != sess.AssignedIP {
-		t.Fatalf("persisted assigned_ip mismatch: got %v, want %s", conn2Updated.ClientParams["assigned_ip"], sess.AssignedIP)
+	if conn2Updated.ClientParams["assigned_ip"] != newIP {
+		t.Fatalf("conn2 assigned_ip mismatch: got %v, want %s", conn2Updated.ClientParams["assigned_ip"], newIP)
+	}
+	if conn2Updated.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("config_regeneration_required still present: %v", conn2Updated.ClientParams["config_regeneration_required"])
+	}
+	if conn2Updated.ClientParams["quarantined_ip_collision"] != nil {
+		t.Fatalf("quarantined_ip_collision still present: %v", conn2Updated.ClientParams["quarantined_ip_collision"])
+	}
+
+	// 4. Connecting with new config succeeds
+	sess, _, err := svc.HandleIncomingPeer(ctx, peerPub2)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed after config regeneration: %v", err)
+	}
+	if sess == nil || sess.AssignedIP != newIP {
+		t.Fatalf("expected session with assigned IP %s, got: %+v", newIP, sess)
 	}
 }
 

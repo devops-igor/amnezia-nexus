@@ -8,7 +8,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-func TestReadVPNClientIPAssignments_DeduplicatesAndAvoidsCollisions(t *testing.T) {
+func TestReadVPNClientIPAssignments_LosslessReadAndFaithfulScanning(t *testing.T) {
 	db, _ := setupTestDB(t)
 	ctx := context.Background()
 
@@ -66,7 +66,7 @@ func TestReadVPNClientIPAssignments_DeduplicatesAndAvoidsCollisions(t *testing.T
 		t.Fatal(err)
 	}
 
-	// 4. Conn4 has no client_params, but vpn_sessions has valid "10.100.0.20" -> should migrate
+	// 4. Conn4 has no client_params, but vpn_sessions has valid "10.100.0.20"
 	conn4ID, err := db.CreateConnection(ctx, &models.UserConnection{
 		ID: "conn-4", UserID: userID, ServerID: 0, Protocol: "awg", ClientID: "peer-4",
 		ClientParams: map[string]any{},
@@ -82,7 +82,7 @@ func TestReadVPNClientIPAssignments_DeduplicatesAndAvoidsCollisions(t *testing.T
 		t.Fatal(err)
 	}
 
-	// 5. Conn5 has same peer-4: peer already has an IP -> should NOT assign
+	// 5. Conn5 has same peer-4 with another IP
 	conn5ID, err := db.CreateConnection(ctx, &models.UserConnection{
 		ID: "conn-5", UserID: userID, ServerID: 0, Protocol: "awg", ClientID: "peer-4",
 		ClientParams: map[string]any{"assigned_ip": "10.100.0.30"},
@@ -97,43 +97,42 @@ func TestReadVPNClientIPAssignments_DeduplicatesAndAvoidsCollisions(t *testing.T
 		t.Fatalf("GetVPNClientIPAssignments failed: %v", err)
 	}
 
+	if len(assignments) != 5 {
+		t.Fatalf("expected 5 assignments in lossless read, got %d", len(assignments))
+	}
+
 	byConn := make(map[string]VPNClientIPAssignment)
 	for _, a := range assignments {
 		byConn[a.ConnectionID] = a
 	}
 
-	// Conn1 should retain "10.100.0.3"
+	// Conn1 should retain "10.100.0.3", UserID, and NeedsMigration=false
 	a1, ok := byConn[conn1ID]
-	if !ok || a1.AssignedIP != "10.100.0.3" {
-		t.Fatalf("conn1 assignment missing or wrong AssignedIP: %+v", a1)
+	if !ok || a1.AssignedIP != "10.100.0.3" || a1.UserID != userID || a1.NeedsMigration {
+		t.Fatalf("conn1 assignment invalid: %+v", a1)
 	}
 
-	// Conn2 had duplicate "10.100.0.3": AssignedIP must be empty to avoid duplicate reservation
+	// Conn2 should losslessly retain "10.100.0.3", UserID, and NeedsMigration=false
 	a2, ok := byConn[conn2ID]
-	if !ok {
-		t.Fatalf("conn2 should be yielded for self-healing, but missing: %+v", byConn)
-	}
-	if a2.AssignedIP != "" {
-		t.Fatalf("conn2 should have empty AssignedIP to prevent duplicate reservation, got: %s", a2.AssignedIP)
+	if !ok || a2.AssignedIP != "10.100.0.3" || a2.UserID != userID || a2.NeedsMigration {
+		t.Fatalf("conn2 assignment invalid: %+v", a2)
 	}
 
-	// Conn3 had colliding session IP "10.100.0.3": must NOT migrate
-	if a3, ok := byConn[conn3ID]; ok && a3.NeedsMigration {
-		t.Fatalf("conn3 should not migrate colliding session IP: %+v", a3)
+	// Conn3 should scan session IP "10.100.0.3", UserID, and NeedsMigration=true
+	a3, ok := byConn[conn3ID]
+	if !ok || a3.AssignedIP != "10.100.0.3" || a3.UserID != userID || !a3.NeedsMigration {
+		t.Fatalf("conn3 assignment invalid: %+v", a3)
 	}
 
-	// Conn4 was first for "10.100.0.20": should migrate
+	// Conn4 should scan session IP "10.100.0.20", UserID, and NeedsMigration=true
 	a4, ok := byConn[conn4ID]
-	if !ok || !a4.NeedsMigration || a4.AssignedIP != "10.100.0.20" {
-		t.Fatalf("conn4 should migrate first session IP: %+v", a4)
+	if !ok || a4.AssignedIP != "10.100.0.20" || a4.UserID != userID || !a4.NeedsMigration {
+		t.Fatalf("conn4 assignment invalid: %+v", a4)
 	}
 
-	// Conn5 had same peer-4 which already has an IP from Conn4: AssignedIP must be empty
+	// Conn5 should retain "10.100.0.30", UserID, and NeedsMigration=false
 	a5, ok := byConn[conn5ID]
-	if !ok {
-		t.Fatalf("conn5 should be yielded for self-healing, but missing: %+v", byConn)
-	}
-	if a5.AssignedIP != "" {
-		t.Fatalf("conn5 should have empty AssignedIP since peer-4 already has IP, got: %s", a5.AssignedIP)
+	if !ok || a5.AssignedIP != "10.100.0.30" || a5.UserID != userID || a5.NeedsMigration {
+		t.Fatalf("conn5 assignment invalid: %+v", a5)
 	}
 }

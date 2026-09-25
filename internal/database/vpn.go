@@ -688,6 +688,12 @@ func (d *DB) InvalidateVPNSessionsForRestart(ctx context.Context) (int64, error)
 		if !assignment.NeedsMigration {
 			continue
 		}
+		if req, ok := assignment.ClientParams["config_regeneration_required"].(bool); ok && req {
+			continue
+		}
+		if q, ok := assignment.ClientParams["quarantined_ip_collision"]; ok && q != nil && q != "" {
+			continue
+		}
 		params, err := json.Marshal(assignment.ClientParams)
 		if err != nil {
 			return 0, fmt.Errorf("encode client IP assignment for connection %s: %w", assignment.ConnectionID, err)
@@ -712,10 +718,12 @@ func (d *DB) InvalidateVPNSessionsForRestart(ctx context.Context) (int64, error)
 // leases which still exist only in the session table before restart cleanup.
 type VPNClientIPAssignment struct {
 	ConnectionID   string
+	UserID         string
 	PeerKey        string
 	AssignedIP     string
 	ClientParams   map[string]any
 	NeedsMigration bool
+	CreatedAt      time.Time
 }
 
 type vpnAssignmentQuerier interface {
@@ -723,7 +731,7 @@ type vpnAssignmentQuerier interface {
 }
 
 func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]VPNClientIPAssignment, error) {
-	rows, err := q.QueryContext(ctx, `SELECT c.id, c.protocol, c.client_id, c.client_params, s.assigned_ip
+	rows, err := q.QueryContext(ctx, `SELECT c.id, c.user_id, c.protocol, c.client_id, c.client_params, s.assigned_ip, c.created_at
 		FROM user_connections c LEFT JOIN vpn_sessions s
 		ON s.peer_public_key = c.client_id AND s.user_id = c.user_id
 		WHERE c.server_id = 0 AND c.client_id IS NOT NULL AND c.client_id != ''
@@ -733,18 +741,19 @@ func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]
 	}
 	defer rows.Close()
 
-	allocatedIPs := make(map[string]string)
-	peerAssignedIPs := make(map[string]string)
 	var assignments []VPNClientIPAssignment
 	for rows.Next() {
 		var a VPNClientIPAssignment
 		var protocol string
-		var params, sessionIP sql.NullString
-		if err := rows.Scan(&a.ConnectionID, &protocol, &a.PeerKey, &params, &sessionIP); err != nil {
+		var params, sessionIP, createdAt sql.NullString
+		if err := rows.Scan(&a.ConnectionID, &a.UserID, &protocol, &a.PeerKey, &params, &sessionIP, &createdAt); err != nil {
 			return nil, err
 		}
 		if protocol != "" && models.NormalizeProtocol(protocol) != "awg" {
 			continue
+		}
+		if createdAt.Valid && createdAt.String != "" {
+			a.CreatedAt = parseTime(createdAt.String)
 		}
 		a.ClientParams = make(map[string]any)
 		if params.Valid && params.String != "" {
@@ -756,30 +765,14 @@ func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]
 			a.ClientParams = make(map[string]any)
 		}
 		if ip, ok := a.ClientParams["assigned_ip"].(string); ok && ip != "" {
-			owner, allocated := allocatedIPs[ip]
-			_, peerHasIP := peerAssignedIPs[a.PeerKey]
-			if (allocated && owner != a.PeerKey) || peerHasIP {
-				a.AssignedIP = ""
-			} else {
-				a.AssignedIP = ip
-				allocatedIPs[ip] = a.PeerKey
-				peerAssignedIPs[a.PeerKey] = ip
-			}
+			a.AssignedIP = ip
+			a.NeedsMigration = false
 		} else if sessionIP.Valid && sessionIP.String != "" {
-			candIP := sessionIP.String
-			owner, allocated := allocatedIPs[candIP]
-			_, peerHasIP := peerAssignedIPs[a.PeerKey]
-			if (allocated && owner != a.PeerKey) || peerHasIP {
-				a.NeedsMigration = false
-			} else {
-				a.AssignedIP = candIP
-				a.ClientParams["assigned_ip"] = a.AssignedIP
-				a.NeedsMigration = true
-				allocatedIPs[candIP] = a.PeerKey
-				peerAssignedIPs[a.PeerKey] = candIP
-			}
+			a.AssignedIP = sessionIP.String
+			a.ClientParams["assigned_ip"] = a.AssignedIP
+			a.NeedsMigration = true
 		}
-		if a.AssignedIP != "" || (a.ClientParams != nil && a.ClientParams["assigned_ip"] != nil && a.ClientParams["assigned_ip"] != "") {
+		if a.AssignedIP != "" {
 			assignments = append(assignments, a)
 		}
 	}
