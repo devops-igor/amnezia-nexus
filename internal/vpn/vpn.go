@@ -165,6 +165,7 @@ type Service struct {
 	tunOpener                  func() (endpoint.PacketDevice, error)
 	tunDev                     endpoint.PacketDevice
 	backendDevices             map[int64]BackendDevice
+	backendDeviceEndpoints     map[int64]string
 	lastLoggedDrops            atomic.Uint64
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
@@ -602,23 +603,24 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	}
 
 	svc := &Service{
-		db:                    db,
-		cfg:                   cfg,
-		endpoint:              epListener,
-		sessionMgr:            sessionMgr,
-		ipam:                  ipam,
-		auth:                  auth,
-		pool:                  pool,
-		prober:                prober,
-		reconnectMgr:          reconnectMgr,
-		balancer:              lb,
-		stickyMgr:             stickyMgr,
-		forwarder:             fwd,
-		accountant:            accountant,
-		portalPubKey:          pub,
-		portalPrivKey:         priv,
-		lastReconcileByTunnel: make(map[int64]time.Time),
-		peerGenerations:       make(map[string]uint64),
+		db:                     db,
+		cfg:                    cfg,
+		endpoint:               epListener,
+		sessionMgr:             sessionMgr,
+		ipam:                   ipam,
+		auth:                   auth,
+		pool:                   pool,
+		prober:                 prober,
+		reconnectMgr:           reconnectMgr,
+		balancer:               lb,
+		stickyMgr:              stickyMgr,
+		forwarder:              fwd,
+		accountant:             accountant,
+		portalPubKey:           pub,
+		portalPrivKey:          priv,
+		backendDeviceEndpoints: make(map[int64]string),
+		lastReconcileByTunnel:  make(map[int64]time.Time),
+		peerGenerations:        make(map[string]uint64),
 	}
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
@@ -728,6 +730,16 @@ func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 	s.backendDevices[tunID] = dev
 }
 
+// SetBackendDeviceEndpointForTest sets the recorded endpoint for a backend device for testing.
+func (s *Service) SetBackendDeviceEndpointForTest(tunID int64, endpoint string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backendDeviceEndpoints == nil {
+		s.backendDeviceEndpoints = make(map[int64]string)
+	}
+	s.backendDeviceEndpoints[tunID] = endpoint
+}
+
 // SetTunOpener overrides the TUN device opener for testing.
 func (s *Service) SetTunOpener(fn func() (endpoint.PacketDevice, error)) {
 	s.mu.Lock()
@@ -767,6 +779,16 @@ func (s *Service) GetBackendDeviceForTest(tunID int64) BackendDevice {
 		return nil
 	}
 	return s.backendDevices[tunID]
+}
+
+// GetBackendDeviceEndpointForTest returns the recorded endpoint for a backend device for testing.
+func (s *Service) GetBackendDeviceEndpointForTest(tunID int64) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.backendDeviceEndpoints == nil {
+		return ""
+	}
+	return s.backendDeviceEndpoints[tunID]
 }
 
 // ProbeTunnel probes a tunnel using the service's health prober.
@@ -1354,6 +1376,11 @@ func (s *Service) Stop() error {
 				_ = dev.Close()
 			}
 			delete(s.backendDevices, id)
+		}
+	}
+	if s.backendDeviceEndpoints != nil {
+		for id := range s.backendDeviceEndpoints {
+			delete(s.backendDeviceEndpoints, id)
 		}
 	}
 	s.mu.Unlock()
@@ -2197,6 +2224,9 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 				_ = oldDev.Close()
 			}
 			delete(s.backendDevices, tun.ID)
+			if s.backendDeviceEndpoints != nil {
+				delete(s.backendDeviceEndpoints, tun.ID)
+			}
 		}
 	}
 
@@ -2220,6 +2250,10 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		s.backendDevices = make(map[int64]BackendDevice)
 	}
 	s.backendDevices[tun.ID] = dev
+	if s.backendDeviceEndpoints == nil {
+		s.backendDeviceEndpoints = make(map[int64]string)
+	}
+	s.backendDeviceEndpoints[tun.ID] = tun.Endpoint
 
 	// Spawn backend read loop to route packets back to clients
 	go func(backendID int64, serverID int64, device BackendDevice) {
@@ -2398,6 +2432,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		}
 		delete(s.backendDevices, tunnel.ID)
 	}
+	if s.backendDeviceEndpoints != nil {
+		delete(s.backendDeviceEndpoints, tunnel.ID)
+	}
 
 	// Trigger failover for active sessions on this backend
 	if s.stickyMgr != nil {
@@ -2531,6 +2568,21 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	}
 
 	if tun.Endpoint == newEndpoint {
+		s.mu.RLock()
+		dev := s.backendDevices[tun.ID]
+		var attachedEndpoint string
+		if s.backendDeviceEndpoints != nil {
+			attachedEndpoint = s.backendDeviceEndpoints[tun.ID]
+		}
+		s.mu.RUnlock()
+
+		// Genuinely synchronized idempotent no-op: device exists, is open,
+		// and its configured endpoint matches the requested endpoint.
+		if dev != nil && !dev.IsClosed() && attachedEndpoint == newEndpoint {
+			return nil
+		}
+
+		// Runtime device is missing, closed, or attached to a stale endpoint -> reconcile.
 		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
 		s.mu.RLock()

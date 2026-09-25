@@ -2842,8 +2842,26 @@ func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testi
 		t.Fatal("expected dev1 to be open initially")
 	}
 
+	// 1. When already synchronized, calling with the same host is an idempotent no-op
+	// that does NOT recreate the device.
 	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.1"); err != nil {
-		t.Fatalf("UpdateBackendServerHost failed: %v", err)
+		t.Fatalf("UpdateBackendServerHost (synchronized) failed: %v", err)
+	}
+
+	devAfter := svc.GetBackendDeviceForTest(tun.ID)
+	if devAfter != dev1 {
+		t.Errorf("expected device to remain unchanged, but devAfter != dev1")
+	}
+	if dev1.IsClosed() {
+		t.Error("expected dev1 to remain open when already synchronized")
+	}
+
+	// 2. When attachedEndpoint is stale (e.g. set to a different endpoint),
+	// calling with the same host reconciles the backend forwarder.
+	svc.SetBackendDeviceEndpointForTest(tun.ID, "198.51.100.99:51820")
+
+	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.1"); err != nil {
+		t.Fatalf("UpdateBackendServerHost (reconciliation) failed: %v", err)
 	}
 
 	dev2 := svc.GetBackendDeviceForTest(tun.ID)
@@ -2854,10 +2872,13 @@ func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testi
 		t.Error("expected new device instance to replace dev1")
 	}
 	if !dev1.IsClosed() {
-		t.Error("expected old dev1 to be closed after same-endpoint reconciliation")
+		t.Error("expected old dev1 to be closed after stale-endpoint reconciliation")
 	}
 	if dev2.IsClosed() {
 		t.Error("expected new dev2 to remain open")
+	}
+	if ep := svc.GetBackendDeviceEndpointForTest(tun.ID); ep != "198.51.100.1:51820" {
+		t.Errorf("expected backendDeviceEndpoint to be %q, got %q", "198.51.100.1:51820", ep)
 	}
 }
 

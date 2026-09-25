@@ -2132,6 +2132,85 @@ func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testin
 	}
 }
 
+func TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	srv := &models.Server{
+		Name:    "Unchanged-Host-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("GetTunnel before update failed: %v", err)
+	}
+
+	devInitial := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devInitial == nil {
+		t.Fatal("expected devInitial to be attached, got nil")
+	}
+	if devInitial.IsClosed() {
+		t.Fatal("expected devInitial to be open initially")
+	}
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: origHost})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	devAfter := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if devAfter == nil {
+		t.Fatal("expected devAfter to not be nil")
+	}
+	if devAfter != devInitial {
+		t.Errorf("expected device to remain unchanged (devAfter == devInitial), but got different device instances")
+	}
+	if devInitial.IsClosed() {
+		t.Errorf("expected devInitial to not be closed on unchanged-host save")
+	}
+
+	if pool, ok := h.sshPool.(*testMockSSHPool); ok {
+		if removed := pool.RemovedIDs(); len(removed) > 0 {
+			t.Errorf("expected sshPool.Remove not to be called for unchanged host, got %v", removed)
+		}
+	}
+}
+
 type testSyncWriter struct {
 	buf *bytes.Buffer
 	mu  *sync.Mutex

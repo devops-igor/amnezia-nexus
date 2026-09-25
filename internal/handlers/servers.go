@@ -250,7 +250,7 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if h.sshPool != nil {
+	if h.sshPool != nil && server.Host != req.Host {
 		h.sshPool.Remove(serverID)
 	}
 
@@ -288,7 +288,7 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 				if rbErr := h.db.UpdateServer(rollbackCtx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
 					slog.Error("failed to rollback server host after VPN failure", "server_id", serverID, "err", rbErr)
 				}
-				if h.sshPool != nil {
+				if h.sshPool != nil && server.Host != req.Host {
 					h.sshPool.Remove(serverID)
 				}
 			} else {
