@@ -1987,8 +1987,9 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
 	}
+	confirmClientHandshake(t, el, clientConn2, state2.ClientPriv, hpKey)
 
-	// Verify K_2 / S_2 state before resuming H1
+	// Verify confirmed K_2 / S_2 state before resuming H1
 	k2Current, k2Prev := el.PeerKeypairsForTest(peerKey)
 	if k2Current == nil {
 		t.Fatal("expected current transport keys K2 for peer after H2")
@@ -2192,6 +2193,7 @@ func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGenera
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf1[:n1], state1, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H1 response")
 	}
+	confirmClientHandshake(t, el, clientConn1, state1.ClientPriv, hpKey)
 
 	s1, ok := el.SessionManager().GetSession(peerKey)
 	if !ok || s1 == nil || s1.Generation != 1 {
@@ -2258,8 +2260,9 @@ func TestSweepTimedOutSessions_ConcurrentReplacementHandshake_PreservesNewGenera
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, el.config.H2, el.config.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
 	}
+	confirmClientHandshake(t, el, clientConn2, state2.ClientPriv, hpKey)
 
-	// Verify H2 created S2 (gen 2) and CommitHandshake committed K2
+	// Verify H2 created S2 (gen 2) and authenticated keepalive confirmed K2.
 	k2Current, _ := el.PeerKeypairsForTest(peerKey)
 	if k2Current == nil || k2Current.LocalIndex == k1Current.LocalIndex {
 		t.Fatalf("expected K2 committed for peer, got %+v", k2Current)
