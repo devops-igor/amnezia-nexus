@@ -6839,6 +6839,10 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 		t.Fatalf("VerifyAWGResponsePacketObfuscated rejected server response")
 	}
 
+	// Response verification alone only stages responder next. Confirm it with
+	// the authenticated zero-length keepalive a real initiator sends.
+	confirmSamePeerHandshake(t, vpnSvc, clientConn, peerKey, hpKey, vpnSvc.cfg.H4, vpnSvc.cfg.S4)
+
 	// 1. Confirm session and transport state exist
 	sess, ok := vpnSvc.sessionMgr.GetSession(peerKey)
 	if !ok || sess == nil {
@@ -7369,8 +7373,9 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, vpnSvc.cfg.H2, vpnSvc.cfg.S2) {
 		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
 	}
+	confirmSamePeerHandshake(t, vpnSvc, clientConn2, peerKey, hpKey, vpnSvc.cfg.H4, vpnSvc.cfg.S4)
 
-	// Verify K2 / S2 state before resuming H1
+	// Verify confirmed K2 / S2 state before resuming H1.
 	k2Current, k2Prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
 	if k2Current == nil {
 		t.Fatal("expected current transport keys K2 for peer after H2")
