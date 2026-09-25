@@ -108,6 +108,14 @@ func TestIssue329_AuthenticatedKeepalivePromotesWithoutRouting(t *testing.T) {
 	if got := st.receiverIdx.Load(); got != k1.RemoteIndex {
 		t.Fatalf("confirmed receiver index = %d, want %d", got, k1.RemoteIndex)
 	}
+
+	paddingOnly := craftClientTransportDatagram(t, k1, el.config.H4.PickOne(), el.config.S4, nil, 1, []byte{0})
+	if !el.handleTransportData(paddingOnly, sender) {
+		t.Fatal("authenticated padding-only transport was not handled")
+	}
+	if routed != 0 {
+		t.Fatalf("backend router calls after padding-only transport = %d, want 0", routed)
+	}
 }
 
 func TestIssue329_FallbackKeepalivePromotesWithoutRouting(t *testing.T) {
