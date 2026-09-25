@@ -71,6 +71,90 @@ func issue329ReadOutbound(t *testing.T, el *Listener, conn *net.UDPConn, wantKey
 	}
 }
 
+func TestIssue329_AuthenticatedKeepalivePromotesWithoutRouting(t *testing.T) {
+	el := issue328TestListener(t)
+	peer := "issue329-keepalive-index"
+	sender := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42401}
+
+	var routed int
+	el.SetClientPacketRouter(func(_ string, packet []byte) error {
+		routed++
+		if len(packet) == 0 {
+			t.Fatal("authenticated keepalive reached backend router")
+		}
+		return nil
+	})
+
+	k1 := issue328TestKeys(t, 6001, 0x01)
+	k1.RemoteIndex = 7001
+	stageIssue328ResponderKeys(t, el, peer, k1)
+
+	keepalive := craftClientTransportDatagram(t, k1, el.config.H4.PickOne(), el.config.S4, nil, 0, nil)
+	if !el.handleTransportData(keepalive, sender) {
+		t.Fatal("authenticated keepalive was not handled")
+	}
+
+	previous, current, next := el.PeerKeypairStateForTest(peer)
+	if previous != nil || current != k1 || next != nil {
+		t.Fatalf("keepalive promotion state: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if routed != 0 {
+		t.Fatalf("backend router calls = %d, want 0 for keepalive", routed)
+	}
+	st, ok := el.peerByAddr(sender.String())
+	if !ok || st == nil {
+		t.Fatal("keepalive did not establish confirmed endpoint state")
+	}
+	if got := st.receiverIdx.Load(); got != k1.RemoteIndex {
+		t.Fatalf("confirmed receiver index = %d, want %d", got, k1.RemoteIndex)
+	}
+}
+
+func TestIssue329_FallbackKeepalivePromotesWithoutRouting(t *testing.T) {
+	el := issue328TestListener(t)
+	peer := "issue329-keepalive-fallback"
+	sender := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 42402}
+
+	var routed int
+	el.SetClientPacketRouter(func(_ string, packet []byte) error {
+		routed++
+		if len(packet) == 0 {
+			t.Fatal("fallback keepalive reached backend router")
+		}
+		return nil
+	})
+
+	k1 := issue328TestKeys(t, 6011, 0x03)
+	k1.RemoteIndex = 7011
+	el.storeTransportKeys(peer, k1)
+	el.rememberPeer(sender, peer, k1.RemoteIndex)
+
+	k2 := issue328TestKeys(t, 6012, 0x05)
+	k2.RemoteIndex = 7012
+	stageIssue328ResponderKeys(t, el, peer, k2)
+
+	keepalive := craftClientTransportDatagram(t, k2, el.config.H4.PickOne(), el.config.S4, nil, 0, nil)
+	// Force receiver-index lookup to miss so the compatibility fallback path
+	// authenticates K2. The transport header is not AEAD associated data.
+	s4 := el.config.S4
+	if s4 < 0 {
+		s4 = 0
+	}
+	binary.LittleEndian.PutUint32(keepalive[s4+4:s4+8], 0xfefefefe)
+
+	if !el.handleTransportData(keepalive, sender) {
+		t.Fatal("fallback authenticated keepalive was not handled")
+	}
+
+	previous, current, next := el.PeerKeypairStateForTest(peer)
+	if previous != k1 || current != k2 || next != nil {
+		t.Fatalf("fallback keepalive promotion state: previous=%p current=%p next=%p", previous, current, next)
+	}
+	if routed != 0 {
+		t.Fatalf("backend router calls = %d, want 0 for fallback keepalive", routed)
+	}
+}
+
 func TestIssue329_UnconfirmedNextKeepsCurrentOutbound(t *testing.T) {
 	el, clientConn := issue329ListenerWithUDP(t)
 	peer := "issue329-lost-response"
