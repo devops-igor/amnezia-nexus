@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - Nebula · Patch 1 - 2026-09-25
+
+Maintenance and stability patch release resolving VPN daemon startup crashes caused by duplicate persisted client IP assignments in SQLite.
+
+### Fixed
+
+- Startup IPAM collision reconciliation: resolved daemon launch crashes when pre-existing databases contain duplicate connection IP assignments by implementing deterministic multi-claimant tie-breaking, collapsing same-peer redundant rows, and quarantining colliding leases until client configuration regeneration (#338, #339).
+- Losing keypair retirement: retired duplicate cryptographic keypairs on losing connection rows sharing a peer public key, preventing ambiguous runtime peer lookup and ensuring config regeneration allocates a fresh independent keypair and IPAM lease without clearing the winner (#338, #339).
+- Quarantine write safety: enforced synchronous SQLite write verification when persisting lease quarantines, halting startup if quarantine state cannot be reliably committed to disk (#338, #339).
+
 ## [1.4.0] - Nebula - 2026-09-25
 
 Minor release introducing server IP address modification via the Web UI, an embedded slide puzzle CAPTCHA, three-slot responder key modeling for seamless AmneziaWG rekey continuity, isolated handshake processing, atomic live forwarder route migration during session rebalancing, and robust remote peer lifecycle reconciliation.
