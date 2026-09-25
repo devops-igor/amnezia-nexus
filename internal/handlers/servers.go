@@ -15,6 +15,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -258,14 +259,45 @@ func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Reques
 			slog.Error("failed to update VPN backend endpoint, rolling back server host", "server_id", serverID, "err", err)
 			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			if h.vpnSvc != nil {
-				_ = h.vpnSvc.UpdateBackendServerHost(rollbackCtx, serverID, server.Host)
+
+			var vpnRollbackErr error
+			if errors.Is(err, vpn.ErrVPNRollbackFailed) {
+				vpnRollbackErr = err
+			} else if h.vpnSvc != nil {
+				vpnRollbackErr = h.vpnSvc.UpdateBackendServerHost(rollbackCtx, serverID, server.Host)
 			}
-			if rbErr := h.db.UpdateServer(rollbackCtx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
-				slog.Error("failed to rollback server host after VPN failure", "server_id", serverID, "err", rbErr)
+
+			tunnelRestored := true
+			if errors.Is(vpnRollbackErr, vpn.ErrVPNRollbackFailed) {
+				tunnelRestored = false
+			} else if currentTun, getErr := h.vpnSvc.GetTunnel(serverID); getErr == nil && currentTun != nil {
+				expectedEndpointHost, _, splitErr := net.SplitHostPort(currentTun.Endpoint)
+				if splitErr != nil {
+					expectedEndpointHost = currentTun.Endpoint
+				}
+				cleanEndpoint := strings.Trim(strings.TrimSpace(expectedEndpointHost), "[]")
+				cleanServerHost := strings.Trim(strings.TrimSpace(server.Host), "[]")
+				if cleanEndpoint != cleanServerHost {
+					tunnelRestored = false
+				}
+			} else if vpnRollbackErr != nil {
+				tunnelRestored = false
 			}
-			if h.sshPool != nil {
-				h.sshPool.Remove(serverID)
+
+			if tunnelRestored {
+				if rbErr := h.db.UpdateServer(rollbackCtx, serverID, map[string]any{"host": server.Host}); rbErr != nil {
+					slog.Error("failed to rollback server host after VPN failure", "server_id", serverID, "err", rbErr)
+				}
+				if h.sshPool != nil {
+					h.sshPool.Remove(serverID)
+				}
+			} else {
+				slog.Error("CRITICAL: VPN backend rollback failed; refusing to restore server host in database to prevent split-brain state",
+					"server_id", serverID,
+					"server_host_retained", req.Host,
+					"original_host", server.Host,
+					"err", vpnRollbackErr,
+				)
 			}
 			h.JSONError(w, http.StatusInternalServerError, "vpn_propagation_failed", "Failed to update VPN backend endpoint")
 			return

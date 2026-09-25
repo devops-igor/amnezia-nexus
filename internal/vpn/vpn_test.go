@@ -2764,6 +2764,51 @@ func TestUpdateBackendServerHost_CanceledContextRollback(t *testing.T) {
 	}
 }
 
+// TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed verifies that
+// if endpoint rollback fails during compensation, UpdateBackendServerHost returns an error
+// joining the original error and ErrVPNRollbackFailed.
+func TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	tunBefore := tunMust(t, vpnSvc, s1ID)
+	origEndpoint := tunBefore.Endpoint
+
+	// 1. Hook forwarder sync to fail
+	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("forwarder sync failure")
+	})
+
+	// 2. Hook SetTunnelEndpoint so rollback to origEndpoint fails
+	vpnSvc.SetTunnelEndpointHookForTest(func(ctx context.Context, tunnelID int64, endpoint string) error {
+		if endpoint == origEndpoint {
+			return errors.New("simulated disk error during rollback")
+		}
+		return nil
+	})
+
+	newHost := "198.51.100.89"
+	err := vpnSvc.UpdateBackendServerHost(ctx, s1ID, newHost)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if !errors.Is(err, ErrVPNRollbackFailed) {
+		t.Errorf("expected error to wrap ErrVPNRollbackFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "forwarder sync failure") {
+		t.Errorf("expected error to include original error 'forwarder sync failure', got %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated disk error during rollback") {
+		t.Errorf("expected error to include rollback error, got %v", err)
+	}
+}
+
 func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

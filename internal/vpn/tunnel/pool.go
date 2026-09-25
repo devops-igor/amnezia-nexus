@@ -25,12 +25,13 @@ var (
 
 // Pool manages the in-process AWG tunnels connected to backend VPN servers.
 type Pool struct {
-	mu                sync.RWMutex
-	db                *database.DB
-	tunnelsByServerID map[int64]*models.BackendTunnel
-	tunnelsByID       map[int64]*models.BackendTunnel
-	tunnelsByIfName   map[string]*models.BackendTunnel
-	closed            bool
+	mu                    sync.RWMutex
+	db                    *database.DB
+	tunnelsByServerID     map[int64]*models.BackendTunnel
+	tunnelsByID           map[int64]*models.BackendTunnel
+	tunnelsByIfName       map[string]*models.BackendTunnel
+	closed                bool
+	setTunnelEndpointHook func(ctx context.Context, tunnelID int64, endpoint string) error
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -721,6 +722,12 @@ func (p *Pool) SetTunnelEndpoint(ctx context.Context, tunnelID int64, endpoint s
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.setTunnelEndpointHook != nil {
+		if err := p.setTunnelEndpointHook(ctx, tunnelID, endpoint); err != nil {
+			return err
+		}
+	}
+
 	if p.closed {
 		return ErrPoolClosed
 	}
@@ -739,6 +746,13 @@ func (p *Pool) SetTunnelEndpoint(ctx context.Context, tunnelID int64, endpoint s
 	tunnel.StateVersion++
 	tunnel.Endpoint = endpoint
 	return nil
+}
+
+// SetSetTunnelEndpointHookForTest sets a hook invoked at the start of SetTunnelEndpoint for testing.
+func (p *Pool) SetSetTunnelEndpointHookForTest(fn func(ctx context.Context, tunnelID int64, endpoint string) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setTunnelEndpointHook = fn
 }
 
 // Close tears down all tunnels and cleans up resources.

@@ -435,3 +435,62 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Errorf("expected tunnel status 'active' after recovery, got %s", stRec.Status)
 	}
 }
+
+func TestProbeTunnel_DoesNotMutateCallerPointer(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "Server NoMut", Host: "10.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, sID, "10.0.0.1:51820", "pubkey-nomut")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prober := NewHealthProber(pool, db, DefaultHealthConfig(), func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+
+	callerTun := &models.BackendTunnel{
+		ID:           tun.ID,
+		ServerID:     tun.ServerID,
+		Endpoint:     "10.0.0.99:51820", // intentionally different from snapshot in pool
+		StateVersion: 0,
+	}
+
+	lat, err := prober.ProbeTunnel(ctx, callerTun)
+	if err != nil {
+		t.Fatalf("ProbeTunnel failed: %v", err)
+	}
+	if lat != 20 {
+		t.Errorf("expected latency 20, got %d", lat)
+	}
+
+	// Caller's pointer must remain completely unmutated
+	if callerTun.StateVersion != 0 {
+		t.Errorf("expected callerTun.StateVersion to remain 0, got %d", callerTun.StateVersion)
+	}
+	if callerTun.Endpoint != "10.0.0.99:51820" {
+		t.Errorf("expected callerTun.Endpoint to remain '10.0.0.99:51820', got %q", callerTun.Endpoint)
+	}
+
+	// Caller pointer with matching version and endpoint is also not mutated by ProbeTunnel
+	callerTun2 := &models.BackendTunnel{
+		ID:           tun.ID,
+		ServerID:     tun.ServerID,
+		Endpoint:     "10.0.0.1:51820",
+		StateVersion: 1,
+	}
+	_, err = prober.ProbeTunnel(ctx, callerTun2)
+	if err != nil {
+		t.Fatalf("ProbeTunnel on callerTun2 failed: %v", err)
+	}
+	if callerTun2.StateVersion != 1 {
+		t.Errorf("expected callerTun2.StateVersion to remain 1, got %d", callerTun2.StateVersion)
+	}
+	if callerTun2.Endpoint != "10.0.0.1:51820" {
+		t.Errorf("expected callerTun2.Endpoint to remain '10.0.0.1:51820', got %q", callerTun2.Endpoint)
+	}
+}

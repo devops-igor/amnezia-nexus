@@ -439,12 +439,13 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", snapshot.ID, "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
-	tunnel.StateVersion = snapshot.StateVersion
-	tunnel.Endpoint = snapshot.Endpoint
+	probeTarget := *tunnel
+	probeTarget.StateVersion = snapshot.StateVersion
+	probeTarget.Endpoint = snapshot.Endpoint
 
-	latencyMS, err := hp.probeEndpoint(ctx, tunnel)
+	latencyMS, err := hp.probeEndpoint(ctx, &probeTarget)
 	if err != nil {
-		if stateErr := hp.checkTunnelAvailable(tunnel); stateErr != nil {
+		if stateErr := hp.checkTunnelAvailable(&probeTarget); stateErr != nil {
 			return 0, stateErr
 		}
 		if hp.preFailureCommitHook != nil {
@@ -454,7 +455,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	}
 
 	// Probe succeeded
-	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
 	}
 
@@ -471,13 +472,13 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		if preActiveHook != nil {
 			preActiveHook()
 		}
-		if _, hookErr := hp.executeActiveHook(ctx, snapshot, tunnel); hookErr != nil {
+		if _, hookErr := hp.executeActiveHook(ctx, snapshot, &probeTarget); hookErr != nil {
 			return 0, hookErr
 		}
 	}
 
 	// Re-check status before final status write
-	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
 	}
 	if hp.preStatusCommitHook != nil {
@@ -485,26 +486,26 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	}
 
 	if hp.pool != nil {
-		expectedVersion := tunnel.StateVersion
+		expectedVersion := probeTarget.StateVersion
 		if snapshot != nil && snapshot.StateVersion > 0 {
 			expectedVersion = snapshot.StateVersion
 		}
-		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, tunnel.ServerID, tunnel.ID, expectedVersion, status, latencyMS); err != nil {
+		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, status, latencyMS); err != nil {
 			return 0, err
 		}
-		tunnel.StateVersion = expectedVersion + 1
+		probeTarget.StateVersion = expectedVersion + 1
 	}
-	if err := hp.checkTunnelAvailable(tunnel); err != nil {
+	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
 	}
 	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(tunnel); err != nil {
+	if err := hp.checkHealthGenerationLocked(&probeTarget); err != nil {
 		hp.mu.Unlock()
 		return 0, err
 	}
-	hp.failCounts[tunnel.ServerID] = 0
-	delete(hp.autoDisabled, tunnel.ServerID)
-	delete(hp.successCounts, tunnel.ServerID)
+	hp.failCounts[probeTarget.ServerID] = 0
+	delete(hp.autoDisabled, probeTarget.ServerID)
+	delete(hp.successCounts, probeTarget.ServerID)
 	hp.mu.Unlock()
 
 	return latencyMS, nil

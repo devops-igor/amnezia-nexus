@@ -1992,6 +1992,103 @@ func TestUpdateServerHostHandler_BracketedIPv6(t *testing.T) {
 	}
 }
 
+func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	h.vpnSvc = vpnSvc
+
+	origHost := "10.20.30.40"
+	newHost := "10.20.30.50"
+	srv := &models.Server{
+		Name:    "VPN-Rollback-Failure-Server",
+		Host:    origHost,
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "some-public-key",
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("GetTunnel before update failed: %v", err)
+	}
+
+	// 1. Hook forwarder sync to fail, triggering the rollback path in UpdateBackendServerHost.
+	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("simulated sync failure")
+	})
+
+	// 2. Hook SetTunnelEndpoint so that restoring oldEndpoint fails.
+	vpnSvc.SetTunnelEndpointHookForTest(func(ctx context.Context, tunnelID int64, endpoint string) error {
+		if strings.Contains(endpoint, origHost) {
+			return errors.New("simulated rollback disk failure")
+		}
+		return nil
+	})
+
+	r := setupFullServerRouter(h)
+
+	body, _ := json.Marshal(models.UpdateServerHostRequest{Host: newHost})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Assert HTTP status is 500
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp["error"] != "vpn_propagation_failed" {
+		t.Errorf("expected error code 'vpn_propagation_failed', got %v", errResp["error"])
+	}
+
+	// Verify that handler did NOT leave server.Host = origHost while backend tunnel = newHost.
+	// DB record server.Host must remain newHost (retained to prevent split-brain).
+	serverAfter, err := db.GetServer(ctx, serverID)
+	if err != nil {
+		t.Fatalf("GetServer failed: %v", err)
+	}
+	if serverAfter.Host != newHost {
+		t.Errorf("expected server.Host in DB to be retained as %q to prevent split-brain, got %q", newHost, serverAfter.Host)
+	}
+
+	// In-memory pool endpoint is still newEndpoint (newHost:51820)
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnel after failed rollback failed: %v", err)
+	}
+	expectedNewEndpoint := fmt.Sprintf("%s:51820", newHost)
+	if tunAfter.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected pool tunnel endpoint to be %q, got %q", expectedNewEndpoint, tunAfter.Endpoint)
+	}
+}
+
 type testSyncWriter struct {
 	buf *bytes.Buffer
 	mu  *sync.Mutex

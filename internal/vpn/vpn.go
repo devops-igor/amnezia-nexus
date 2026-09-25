@@ -92,7 +92,8 @@ var (
 	// importing the tunnel package.
 	ErrBackendTunnelNotFound = tunnel.ErrTunnelNotFound
 	// ErrTunnelDisabled re-exports tunnel.ErrTunnelDisabled.
-	ErrTunnelDisabled = tunnel.ErrTunnelDisabled
+	ErrTunnelDisabled    = tunnel.ErrTunnelDisabled
+	ErrVPNRollbackFailed = errors.New("vpn rollback failed")
 )
 
 // BackendTunnel is an alias for models.BackendTunnel.
@@ -185,6 +186,7 @@ type Service struct {
 	preCommitMigrationHookForTest      func()
 	updateBackendServerHostPreLockHook func()
 	updateBackendServerHostErr         error
+	syncBackendForwarderHook           func() error
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -826,6 +828,21 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateBackendServerHostErr = err
+}
+
+// SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
+func (s *Service) SetSyncBackendForwarderHookForTest(fn func() error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncBackendForwarderHook = fn
+}
+
+// SetTunnelEndpointHookForTest sets a test hook for SetTunnelEndpoint on the pool.
+func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunnelID int64, endpoint string) error) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	s.pool.SetSetTunnelEndpointHookForTest(fn)
 }
 
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
@@ -2446,6 +2463,12 @@ func (s *Service) resolveNewBackendEndpoint(ctx context.Context, serverID int64,
 }
 
 func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, serverID, expectedTunnelID int64, awgParams map[string]any) error {
+	if s.syncBackendForwarderHook != nil {
+		if err := s.syncBackendForwarderHook(); err != nil {
+			return err
+		}
+	}
+
 	currentTun, err := s.pool.GetTunnel(serverID)
 	if err != nil {
 		if errors.Is(err, tunnel.ErrTunnelNotFound) {
@@ -2516,12 +2539,14 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	}
 	tun.Endpoint = newEndpoint
 
-	rollbackEndpoint := func() {
+	rollbackEndpoint := func(originalErr error) error {
 		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if rbErr := s.pool.SetTunnelEndpoint(rbCtx, tun.ID, oldEndpoint); rbErr != nil {
 			log.Printf("[vpn] warning: failed to rollback backend tunnel endpoint for server %d: %v", serverID, rbErr)
+			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore endpoint to %s: %v", ErrVPNRollbackFailed, oldEndpoint, rbErr))
 		}
+		return originalErr
 	}
 
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
@@ -2534,8 +2559,7 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	}
 
 	if err := ctx.Err(); err != nil {
-		rollbackEndpoint()
-		return err
+		return rollbackEndpoint(err)
 	}
 
 	s.mu.Lock()
@@ -2543,8 +2567,7 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	s.mu.Unlock()
 
 	if syncErr != nil {
-		rollbackEndpoint()
-		return syncErr
+		return rollbackEndpoint(syncErr)
 	}
 
 	return nil
