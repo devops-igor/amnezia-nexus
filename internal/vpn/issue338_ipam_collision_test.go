@@ -1130,10 +1130,16 @@ func TestStartupIPAMCollision_SamePeerMultipleDifferentIPs_ResolvesDeterministic
 		t.Fatalf("conn1 was unexpectedly quarantined: %v", conn1.ClientParams["config_regeneration_required"])
 	}
 
-	// Loser conn-diff-2 (10.100.0.2) must be quarantined
+	// Loser conn-diff-2 (10.100.0.2) must be quarantined and its keypair retired
 	conn2, err := db.GetConnection(ctx, conn2ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if conn2.ClientID != "" {
+		t.Fatalf("conn2 client_id not cleared: got %q, want empty", conn2.ClientID)
+	}
+	if conn2.ClientParams["client_private_key"] != nil && conn2.ClientParams["client_private_key"] != "" {
+		t.Fatalf("conn2 client_private_key not deleted: %v", conn2.ClientParams["client_private_key"])
 	}
 	if conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
 		t.Fatalf("conn2 assigned_ip not cleared: %v", conn2.ClientParams["assigned_ip"])
@@ -1143,6 +1149,249 @@ func TestStartupIPAMCollision_SamePeerMultipleDifferentIPs_ResolvesDeterministic
 	}
 	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
 		t.Fatalf("conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+}
+
+func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesStableRegeneration(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Server 8", Host: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      serverID,
+		InterfaceName: "awg0",
+		PublicKey:     "tunnel-pub-samepeer-diff",
+		PrivateKey:    "tunnel-priv-samepeer-diff",
+		Endpoint:      "192.0.2.10:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userID, err := db.CreateUser(ctx, &models.User{Username: "user-samepeer-diff", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	samePeerPub, samePeerPriv, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	// Step 1: Older connection conn1 claims 10.100.0.8 (T-10s); newer connection conn2 claims 10.100.0.2 (T-1s)
+	conn1ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-samepeer-1",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     samePeerPub,
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.8", "client_private_key": samePeerPriv},
+		CreatedAt:    now.Add(-10 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn2ID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:           "conn-samepeer-2",
+		UserID:       userID,
+		ServerID:     0,
+		Protocol:     "awg",
+		ClientID:     samePeerPub,
+		ClientParams: map[string]any{"assigned_ip": "10.100.0.2", "client_private_key": samePeerPriv},
+		CreatedAt:    now.Add(-1 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51820,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      500,
+		MaxPeersPerBackend: 100,
+	}
+
+	// Step 2: Start svc: assert reconciliation runs. conn1 wins (10.100.0.8).
+	// conn2 is quarantined and its client_id is cleared to "" and client_private_key deleted.
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	conn1, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1.ClientID != samePeerPub {
+		t.Fatalf("conn1 client_id changed: got %v, want %s", conn1.ClientID, samePeerPub)
+	}
+	if conn1.ClientParams["assigned_ip"] != "10.100.0.8" {
+		t.Fatalf("conn1 lost assigned_ip: %v", conn1.ClientParams["assigned_ip"])
+	}
+	if conn1.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn1 unexpectedly quarantined: %v", conn1.ClientParams["config_regeneration_required"])
+	}
+
+	conn2, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2.ClientID != "" {
+		t.Fatalf("conn2 client_id not cleared: got %q, want empty", conn2.ClientID)
+	}
+	if conn2.ClientParams["client_private_key"] != nil && conn2.ClientParams["client_private_key"] != "" {
+		t.Fatalf("conn2 client_private_key not deleted: %v", conn2.ClientParams["client_private_key"])
+	}
+	if conn2.ClientParams["assigned_ip"] != nil && conn2.ClientParams["assigned_ip"] != "" {
+		t.Fatalf("conn2 assigned_ip not cleared: %v", conn2.ClientParams["assigned_ip"])
+	}
+	if conn2.ClientParams["quarantined_ip_collision"] != "10.100.0.2" {
+		t.Fatalf("conn2 quarantined_ip_collision mismatch: %v", conn2.ClientParams["quarantined_ip_collision"])
+	}
+	if req, ok := conn2.ClientParams["config_regeneration_required"].(bool); !ok || !req {
+		t.Fatalf("conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
+	}
+
+	// Step 3: Call svc.HandleIncomingPeer(ctx, samePeer): assert it succeeds deterministically with sess.AssignedIP == "10.100.0.8"
+	sess1, _, err := svc.HandleIncomingPeer(ctx, samePeerPub)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for samePeer: %v", err)
+	}
+	if sess1 == nil || sess1.AssignedIP != "10.100.0.8" {
+		t.Fatalf("expected session with 10.100.0.8, got: %+v", sess1)
+	}
+
+	// Step 4: Call svc.GenerateClientConfigForConnection(ctx, userID, conn2.ID): assert it generates
+	// fresh new peer key newPeer (different from samePeer) and fresh IP newIP (different from .8 and .2),
+	// and updates conn2 with client_id = newPeer and assigned_ip = newIP.
+	conn2Config, _, err := svc.GenerateClientConfigForConnection(ctx, userID, conn2ID)
+	if err != nil {
+		t.Fatalf("GenerateClientConfigForConnection failed for conn2: %v", err)
+	}
+	newIP := extractAddressFromConfig(t, conn2Config)
+	// In IPAM, 10.100.0.8 is reserved for conn1 (samePeerPub).
+	// Because conn2's conflicting claim on 10.100.0.2 was quarantined and unreserved,
+	// 10.100.0.2 is the lowest free IP in the pool and is cleanly allocated to the new peer.
+	// It is guaranteed distinct from winner conn1's IP (10.100.0.8).
+	if newIP == "" || newIP == "10.100.0.8" {
+		t.Fatalf("expected fresh newIP distinct from winner 10.100.0.8, got: %s", newIP)
+	}
+
+	conn2Regenerated, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPeer := conn2Regenerated.ClientID
+	if newPeer == "" || newPeer == samePeerPub {
+		t.Fatalf("expected fresh newPeer distinct from %s, got: %q", samePeerPub, newPeer)
+	}
+	if conn2Regenerated.ClientParams["assigned_ip"] != newIP {
+		t.Fatalf("conn2 assigned_ip mismatch: got %v, want %s", conn2Regenerated.ClientParams["assigned_ip"], newIP)
+	}
+	if conn2Regenerated.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn2 config_regeneration_required not cleared: %v", conn2Regenerated.ClientParams["config_regeneration_required"])
+	}
+	if conn2Regenerated.ClientParams["quarantined_ip_collision"] != nil {
+		t.Fatalf("conn2 quarantined_ip_collision not cleared: %v", conn2Regenerated.ClientParams["quarantined_ip_collision"])
+	}
+
+	// Step 5: Assert connecting with newPeer (svc.HandleIncomingPeer(ctx, newPeer)) succeeds with AssignedIP == newIP.
+	sessNew, _, err := svc.HandleIncomingPeer(ctx, newPeer)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for newPeer: %v", err)
+	}
+	if sessNew == nil || sessNew.AssignedIP != newIP {
+		t.Fatalf("expected session with %s, got: %+v", newIP, sessNew)
+	}
+
+	// Step 6: Assert winner conn1 remains valid in DB (samePeer, 10.100.0.8) and connecting with samePeer still succeeds with AssignedIP == "10.100.0.8".
+	conn1After, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1After.ClientID != samePeerPub {
+		t.Fatalf("conn1 client_id changed: got %v, want %s", conn1After.ClientID, samePeerPub)
+	}
+	if conn1After.ClientParams["assigned_ip"] != "10.100.0.8" {
+		t.Fatalf("conn1 assigned_ip changed: got %v, want 10.100.0.8", conn1After.ClientParams["assigned_ip"])
+	}
+	sessSameAgain, _, err := svc.HandleIncomingPeer(ctx, samePeerPub)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for samePeer after conn2 regeneration: %v", err)
+	}
+	if sessSameAgain == nil || sessSameAgain.AssignedIP != "10.100.0.8" {
+		t.Fatalf("expected session with 10.100.0.8, got: %+v", sessSameAgain)
+	}
+
+	// Step 7: Stop svc. Create svc2 from the same DB and call svc2.Start(). Assert startup reconciliation is idempotent (0 collisions, 0 quarantines),
+	// conn1 and conn2 are both healthy and unquarantined, and handshakes for both samePeer and newPeer succeed.
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("svc.Stop failed: %v", err)
+	}
+
+	svc2, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc2.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if err := svc2.Start(ctx); err != nil {
+		t.Fatalf("svc2.Start failed: %v", err)
+	}
+	defer func() { _ = svc2.Stop() }()
+
+	conn1Restart, err := db.GetConnection(ctx, conn1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn1Restart.ClientID != samePeerPub || conn1Restart.ClientParams["assigned_ip"] != "10.100.0.8" {
+		t.Fatalf("conn1 corrupted after restart: %+v", conn1Restart)
+	}
+	if conn1Restart.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn1 unexpectedly quarantined after restart: %v", conn1Restart.ClientParams["config_regeneration_required"])
+	}
+
+	conn2Restart, err := db.GetConnection(ctx, conn2ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2Restart.ClientID != newPeer || conn2Restart.ClientParams["assigned_ip"] != newIP {
+		t.Fatalf("conn2 corrupted after restart: %+v", conn2Restart)
+	}
+	if conn2Restart.ClientParams["config_regeneration_required"] != nil {
+		t.Fatalf("conn2 unexpectedly quarantined after restart: %v", conn2Restart.ClientParams["config_regeneration_required"])
+	}
+
+	sess1Restart, _, err := svc2.HandleIncomingPeer(ctx, samePeerPub)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for samePeer after restart: %v", err)
+	}
+	if sess1Restart == nil || sess1Restart.AssignedIP != "10.100.0.8" {
+		t.Fatalf("expected session with 10.100.0.8 after restart, got: %+v", sess1Restart)
+	}
+
+	sess2Restart, _, err := svc2.HandleIncomingPeer(ctx, newPeer)
+	if err != nil {
+		t.Fatalf("HandleIncomingPeer failed for newPeer after restart: %v", err)
+	}
+	if sess2Restart == nil || sess2Restart.AssignedIP != newIP {
+		t.Fatalf("expected session with %s after restart, got: %+v", newIP, sess2Restart)
 	}
 }
 

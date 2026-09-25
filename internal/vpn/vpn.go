@@ -1144,15 +1144,24 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-func quarantinePersistedAssignment(ctx context.Context, db *database.DB, claimant database.VPNClientIPAssignment, conflictingIP string) error {
+func quarantinePersistedAssignment(ctx context.Context, db *database.DB, claimant database.VPNClientIPAssignment, conflictingIP string, retireKeypair bool) error {
 	if claimant.ClientParams == nil {
 		claimant.ClientParams = make(map[string]any)
 	}
 	delete(claimant.ClientParams, "assigned_ip")
+	if retireKeypair {
+		delete(claimant.ClientParams, "client_private_key")
+	}
 	claimant.ClientParams["quarantined_ip_collision"] = conflictingIP
 	claimant.ClientParams["config_regeneration_required"] = true
 	if db != nil && claimant.ConnectionID != "" {
-		updated, err := db.UpdateConnection(ctx, claimant.ConnectionID, map[string]any{"client_params": claimant.ClientParams})
+		updates := map[string]any{
+			"client_params": claimant.ClientParams,
+		}
+		if retireKeypair {
+			updates["client_id"] = ""
+		}
+		updated, err := db.UpdateConnection(ctx, claimant.ConnectionID, updates)
 		if err != nil {
 			return fmt.Errorf("update connection %s: %w", claimant.ConnectionID, err)
 		}
@@ -1212,10 +1221,10 @@ func resolvePeerClaims(ctx context.Context, db *database.DB, claims []database.V
 		if c.AssignedIP == winnerIP {
 			active = append(active, c)
 		} else {
-			if err := quarantinePersistedAssignment(ctx, db, c, c.AssignedIP); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, c.AssignedIP, true); err != nil {
 				return nil, err
 			}
-			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (resolved to %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, c.AssignedIP, winnerIP)
+			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (resolved to %s); quarantined conflicting lease and retired keypair (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, c.AssignedIP, winnerIP)
 		}
 	}
 	return active, nil
@@ -1224,7 +1233,7 @@ func resolvePeerClaims(ctx context.Context, db *database.DB, claims []database.V
 func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
 	if current, ok := ipam.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
 		for _, c := range claims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
@@ -1237,7 +1246,7 @@ func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint
 		}
 		if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
 			for _, c := range claims {
-				if err := quarantinePersistedAssignment(ctx, db, c, ipStr); err != nil {
+				if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
 					return err
 				}
 				log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) address already allocated to another peer; quarantined conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey)
@@ -1291,7 +1300,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	// Reserve winner in IPAM
 	if current, ok := ipam.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
 		for _, c := range winner.allClaims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
@@ -1301,7 +1310,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 			if !errors.Is(err, endpoint.ErrIPNotInSubnet) && !errors.Is(err, endpoint.ErrIPReserved) {
 				if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
 					for _, c := range winner.allClaims {
-						if err := quarantinePersistedAssignment(ctx, db, c, ipStr); err != nil {
+						if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
 							return err
 						}
 						log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) address already allocated to another peer; quarantined conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey)
@@ -1316,7 +1325,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	// For every loser peer: quarantine ALL claims for that peer on this IP
 	for _, loser := range losers {
 		for _, c := range loser.allClaims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) conflicts with owner connection %s; quarantined/cleared conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey, winner.bestClaim.ConnectionID)
