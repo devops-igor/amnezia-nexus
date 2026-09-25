@@ -1078,17 +1078,16 @@ func (el *Listener) storeTransportKeysLocked(peerKey string, newKeys *TransportK
 // stageResponderTransportKeysLocked installs a newly derived responder keypair
 // into the bounded next slot without changing current/previous. It mirrors the
 // state transition performed by upstream amneziawg-go's responder branch.
-// Production handshake wiring and confirmation-driven promotion are completed
-// by issue #329; keeping this primitive separate lets #328 land without
-// changing outbound key-selection semantics.
+//
+// #328 intentionally introduces only the state primitive. Production handshake
+// wiring, confirmation-driven promotion, and outbound selection are completed
+// atomically by #329 so this refactor does not create a half-transitioned
+// protocol state in production.
 func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *TransportKeys) {
 	if newKeys == nil {
 		return
 	}
 	_ = newKeys.InitCiphers()
-	if el.noiseKeys == nil {
-		el.noiseKeys = make(map[string]*TransportKeys)
-	}
 	if el.peerKeypairs == nil {
 		el.peerKeypairs = make(map[string]*peerKeypairs)
 	}
@@ -1125,11 +1124,6 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 	if newKeys.LocalIndex != 0 {
 		el.indexTable[newKeys.LocalIndex] = &keypairEntry{peerKey: peerKey, keys: newKeys}
 	}
-
-	// Compatibility alias: until #329 changes outbound selection to confirmed
-	// current, preserve existing runtime behavior by exposing the most recently
-	// derived key through TransportKeysFor/SendToPeer.
-	el.noiseKeys[peerKey] = newKeys
 
 	log.Printf("[vpn/endpoint] staged responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d expires_in=%s",
 		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
@@ -1193,20 +1187,13 @@ func (el *Listener) lookupKeypairByIndex(receiverIdx uint32) (*keypairEntry, boo
 	return entry, ok
 }
 
-// PeerKeypairsForTest returns the legacy effective-current/previous view used
-// by existing regression tests. During the #328 -> #329 transition, a real
-// responder handshake is authoritative in next but remains the effective
-// runtime key through noiseKeys; expose next as current when no confirmed
-// current exists so older tests keep asserting the pre-#329 behavior.
+// PeerKeypairsForTest returns the legacy current/previous transport-key view.
+// New responder-state tests should use PeerKeypairStateForTest.
 func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys, previous *TransportKeys) {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
 	if pkp, ok := el.peerKeypairs[peerKey]; ok {
-		current = pkp.current
-		if current == nil {
-			current = pkp.next
-		}
-		return current, pkp.previous
+		return pkp.current, pkp.previous
 	}
 	return nil, nil
 }
@@ -1544,7 +1531,7 @@ func (el *Listener) CommitHandshake(peerKey string, gen uint64, transportKeys *T
 
 	if transportKeys != nil {
 		transportKeys.Generation = gen
-		el.stageResponderTransportKeysLocked(peerKey, transportKeys)
+		el.storeTransportKeysLocked(peerKey, transportKeys)
 	}
 
 	if sender != nil {
@@ -2317,18 +2304,17 @@ func (el *Listener) sweepExpiredKeypairs() {
 			pkp.next = nil
 		}
 
-		// #328 keeps noiseKeys as a temporary compatibility alias until #329
-		// switches outbound selection to confirmed current. Never leave that
-		// alias pointing at a key retired by the expiry sweep.
-		switch {
-		case pkp.next != nil:
-			el.noiseKeys[peerKey] = pkp.next
-		case pkp.current != nil:
-			el.noiseKeys[peerKey] = pkp.current
-		case pkp.previous != nil:
-			el.noiseKeys[peerKey] = pkp.previous
-		default:
-			delete(el.noiseKeys, peerKey)
+		// Keep the legacy runtime alias consistent if its active key expires.
+		// Staged next is not selected for outbound traffic until #329.
+		if aliased := el.noiseKeys[peerKey]; aliased != nil && aliased.IsExpired() {
+			switch {
+			case pkp.current != nil:
+				el.noiseKeys[peerKey] = pkp.current
+			case pkp.previous != nil:
+				el.noiseKeys[peerKey] = pkp.previous
+			default:
+				delete(el.noiseKeys, peerKey)
+			}
 		}
 	}
 }
