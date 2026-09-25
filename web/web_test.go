@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -2304,5 +2305,182 @@ func TestClientSideHostValidation(t *testing.T) {
 		if got != tc.valid {
 			t.Errorf("isValidHost(%q) = %v, want %v", tc.input, got, tc.valid)
 		}
+	}
+}
+
+func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	css := string(cssBytes)
+
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	baseBytes, err := fs.ReadFile(templatesFS, "base.html")
+	if err != nil {
+		t.Fatalf("failed to read templates/base.html: %v", err)
+	}
+	base := string(baseBytes)
+
+	// 1. Verify .app-layout does not define an integer z-index that forms an isolated stacking context
+	appLayoutRegex := regexp.MustCompile(`(?s)\.app-layout\s*\{([^}]+)\}`)
+	matchLayout := appLayoutRegex.FindStringSubmatch(css)
+	if len(matchLayout) < 2 {
+		t.Fatal("style.css missing .app-layout definition")
+	}
+	layoutBlock := matchLayout[1]
+	integerZIndexRegex := regexp.MustCompile(`z-index\s*:\s*[0-9]+`)
+	if integerZIndexRegex.MatchString(layoutBlock) {
+		t.Errorf(".app-layout defines integer z-index, which creates an isolated stacking context trapping the mobile drawer below .mobile-bottom-bar: %s", layoutBlock)
+	}
+	if !strings.Contains(layoutBlock, "position: relative") {
+		t.Errorf(".app-layout should maintain position: relative, got: %s", layoutBlock)
+	}
+
+	// 2. Verify stacking hierarchy: .mobile-bottom-bar (70) < .drawer-backdrop (95) < .app-sidebar mobile (100)
+	bottomBarRegex := regexp.MustCompile(`(?s)\.mobile-bottom-bar\s*\{([^}]+)\}`)
+	matchBottomBar := bottomBarRegex.FindStringSubmatch(css)
+	if len(matchBottomBar) < 2 {
+		t.Fatal("style.css missing .mobile-bottom-bar definition")
+	}
+	bottomBarBlock := matchBottomBar[1]
+	zIndexExtract := regexp.MustCompile(`z-index\s*:\s*([0-9]+)`)
+
+	bottomBarZMatch := zIndexExtract.FindStringSubmatch(bottomBarBlock)
+	if len(bottomBarZMatch) < 2 {
+		t.Fatal(".mobile-bottom-bar missing numeric z-index")
+	}
+
+	backdropRegex := regexp.MustCompile(`(?s)\.drawer-backdrop\s*\{([^}]+)\}`)
+	matchBackdrop := backdropRegex.FindStringSubmatch(css)
+	if len(matchBackdrop) < 2 {
+		t.Fatal("style.css missing .drawer-backdrop definition")
+	}
+	backdropBlock := matchBackdrop[1]
+	backdropZMatch := zIndexExtract.FindStringSubmatch(backdropBlock)
+	if len(backdropZMatch) < 2 {
+		t.Fatal(".drawer-backdrop missing numeric z-index")
+	}
+
+	mobileQueryIdx := strings.Index(css, "@media (max-width: 1023px)")
+	if mobileQueryIdx == -1 {
+		t.Fatal("style.css missing @media (max-width: 1023px) query")
+	}
+	mobileQueryBlock := css[mobileQueryIdx:]
+	nextMediaOffset := len("@media (max-width: 1023px)")
+	if nextIdx := strings.Index(mobileQueryBlock[nextMediaOffset:], "@media"); nextIdx != -1 {
+		mobileQueryBlock = mobileQueryBlock[:nextMediaOffset+nextIdx]
+	}
+
+	mobileSidebarRegex := regexp.MustCompile(`(?s)\.app-sidebar\s*\{([^}]+)\}`)
+	matchMobileSidebar := mobileSidebarRegex.FindStringSubmatch(mobileQueryBlock)
+	if len(matchMobileSidebar) < 2 {
+		t.Fatal("mobile query missing .app-sidebar definition")
+	}
+	mobileSidebarBlock := matchMobileSidebar[1]
+	mobileSidebarZMatch := zIndexExtract.FindStringSubmatch(mobileSidebarBlock)
+	if len(mobileSidebarZMatch) < 2 {
+		t.Fatal("mobile .app-sidebar missing numeric z-index")
+	}
+
+	bottomBarZ, err := strconv.Atoi(bottomBarZMatch[1])
+	if err != nil {
+		t.Fatalf("failed to parse bottomBarZ: %v", err)
+	}
+	backdropZ, err := strconv.Atoi(backdropZMatch[1])
+	if err != nil {
+		t.Fatalf("failed to parse backdropZ: %v", err)
+	}
+	mobileSidebarZ, err := strconv.Atoi(mobileSidebarZMatch[1])
+	if err != nil {
+		t.Fatalf("failed to parse mobileSidebarZ: %v", err)
+	}
+
+	if !(bottomBarZ < backdropZ) {
+		t.Errorf("expected bottomBarZ (%d) < backdropZ (%d)", bottomBarZ, backdropZ)
+	}
+	if !(backdropZ < mobileSidebarZ) {
+		t.Errorf("expected backdropZ (%d) < mobileSidebarZ (%d)", backdropZ, mobileSidebarZ)
+	}
+	if !(bottomBarZ < mobileSidebarZ) {
+		t.Errorf("expected bottomBarZ (%d) < mobileSidebarZ (%d)", bottomBarZ, mobileSidebarZ)
+	}
+
+	// Verify background body::before is at or below z-index 0
+	bodyBeforeRegex := regexp.MustCompile(`(?s)body::before\s*\{([^}]+)\}`)
+	matchBodyBefore := bodyBeforeRegex.FindStringSubmatch(css)
+	if len(matchBodyBefore) >= 2 {
+		bodyBeforeBlock := matchBodyBefore[1]
+		bodyBeforeZMatch := regexp.MustCompile(`z-index\s*:\s*(-?[0-9]+)`).FindStringSubmatch(bodyBeforeBlock)
+		if len(bodyBeforeZMatch) >= 2 {
+			bodyZ, err := strconv.Atoi(bodyBeforeZMatch[1])
+			if err != nil {
+				t.Fatalf("failed to parse body::before z-index: %v", err)
+			}
+			if bodyZ > 0 {
+				t.Errorf("expected body::before z-index <= 0, got %d", bodyZ)
+			}
+		}
+	}
+
+	// 3. Verify .app-sidebar supports dynamic viewport height (100dvh) with fallback (100vh)
+	if !strings.Contains(mobileSidebarBlock, "height: 100vh;") {
+		t.Errorf("mobile .app-sidebar missing 100vh fallback: %s", mobileSidebarBlock)
+	}
+	if !strings.Contains(mobileSidebarBlock, "height: 100dvh;") {
+		t.Errorf("mobile .app-sidebar missing 100dvh dynamic viewport height: %s", mobileSidebarBlock)
+	}
+
+	// 4. Verify .sidebar-footer has safe-area inset padding
+	sidebarFooterRegex := regexp.MustCompile(`(?s)\.sidebar-footer\s*\{([^}]+)\}`)
+	matchSidebarFooter := sidebarFooterRegex.FindStringSubmatch(css)
+	if len(matchSidebarFooter) < 2 {
+		t.Fatal("style.css missing .sidebar-footer definition")
+	}
+	footerBlock := matchSidebarFooter[1]
+	if !strings.Contains(footerBlock, "env(safe-area-inset-bottom)") {
+		t.Errorf(".sidebar-footer missing env(safe-area-inset-bottom) safe-area padding: %s", footerBlock)
+	}
+
+	// 5. Verify base.html contains the logout button with #icon-logout inside .sidebar-footer
+	if !strings.Contains(base, "class=\"sidebar-footer\"") {
+		t.Error("base.html missing .sidebar-footer")
+	}
+	if !strings.Contains(base, "href=\"/logout\"") {
+		t.Error("base.html missing logout link href=\"/logout\"")
+	}
+	if !strings.Contains(base, "href=\"#icon-logout\"") {
+		t.Error("base.html missing #icon-logout icon")
+	}
+
+	// Verify logout link is inside .sidebar-footer
+	footerIdx := strings.Index(base, "class=\"sidebar-footer\"")
+	if footerIdx == -1 {
+		t.Fatal("could not find .sidebar-footer in base.html")
+	}
+	footerSnippet := base[footerIdx:]
+	endFooterIdx := strings.Index(footerSnippet, "</aside>")
+	if endFooterIdx != -1 {
+		footerSnippet = footerSnippet[:endFooterIdx]
+	}
+	if !strings.Contains(footerSnippet, "href=\"/logout\"") {
+		t.Errorf(".sidebar-footer does not contain logout link: %s", footerSnippet)
+	}
+	if !strings.Contains(footerSnippet, "href=\"#icon-logout\"") {
+		t.Errorf(".sidebar-footer logout link missing #icon-logout icon: %s", footerSnippet)
+	}
+
+	// Verify mobile bottom bar interaction protection when drawer is open
+	if !strings.Contains(css, ".app-layout:has(.drawer-open) ~ .mobile-bottom-bar") {
+		t.Error("style.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
 	}
 }
