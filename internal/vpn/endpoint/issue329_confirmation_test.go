@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 )
 
 func issue329TestKeys(t *testing.T, localIndex uint32, fill byte) *TransportKeys {
@@ -56,7 +58,7 @@ func TestIssue329_AuthenticatedNextPromotesAtomically(t *testing.T) {
 	el.storeTransportKeys(peer, k1)
 	issue329Stage(t, el, peer, k2)
 
-	datagram := craftClientTransportDatagram(t, k2, healthDefaultH4ForIssue329(), el.config.S4, nil, 0, nil)
+	datagram := craftClientTransportDatagram(t, k2, health.DefaultH4, el.config.S4, nil, 0, nil)
 	if !el.handleTransportData(datagram, sender) {
 		t.Fatal("valid K2 transport was not recognized")
 	}
@@ -82,7 +84,7 @@ func TestIssue329_InvalidAEADDoesNotPromoteNext(t *testing.T) {
 
 	forged := issue329TestKeys(t, k2.LocalIndex, 0x51)
 	forged.RemoteIndex = k2.RemoteIndex
-	datagram := craftClientTransportDatagram(t, forged, healthDefaultH4ForIssue329(), el.config.S4, nil, 0, []byte("forged"))
+	datagram := craftClientTransportDatagram(t, forged, health.DefaultH4, el.config.S4, nil, 0, []byte("forged"))
 	if !el.handleTransportData(datagram, sender) {
 		t.Fatal("forged transport was not classified as transport")
 	}
@@ -107,7 +109,7 @@ func TestIssue329_ReplayRejectedNextDoesNotPromote(t *testing.T) {
 	if !k2.ValidateCounter(counter) {
 		t.Fatal("precondition: counter should be accepted once")
 	}
-	datagram := craftClientTransportDatagram(t, k2, healthDefaultH4ForIssue329(), el.config.S4, nil, counter, nil)
+	datagram := craftClientTransportDatagram(t, k2, health.DefaultH4, el.config.S4, nil, counter, nil)
 	if !el.handleTransportData(datagram, sender) {
 		t.Fatal("replayed transport was not classified as transport")
 	}
@@ -129,7 +131,7 @@ func TestIssue329_ExpiredNextDoesNotPromote(t *testing.T) {
 	issue329Stage(t, el, peer, k2)
 	k2.SetExpiresAt(time.Now().Add(-time.Second))
 
-	datagram := craftClientTransportDatagram(t, k2, healthDefaultH4ForIssue329(), el.config.S4, nil, 0, nil)
+	datagram := craftClientTransportDatagram(t, k2, health.DefaultH4, el.config.S4, nil, 0, nil)
 	if !el.handleTransportData(datagram, sender) {
 		t.Fatal("expired transport was not classified as transport")
 	}
@@ -153,7 +155,7 @@ func TestIssue329_SupersededNextCannotPromoteFromStalePacket(t *testing.T) {
 	issue329Stage(t, el, peer, k3)
 	el.rememberPeer(sender, peer, k3.RemoteIndex)
 
-	datagram := craftClientTransportDatagram(t, k2, healthDefaultH4ForIssue329(), el.config.S4, nil, 0, nil)
+	datagram := craftClientTransportDatagram(t, k2, health.DefaultH4, el.config.S4, nil, 0, nil)
 	if !el.handleTransportData(datagram, sender) {
 		t.Fatal("stale K2 packet should still be classified as transport")
 	}
@@ -183,6 +185,6 @@ func TestIssue329_SendToPeerRejectsUnconfirmedInitialNext(t *testing.T) {
 
 // Keep the tests independent from randomized H4 ranges while using the
 // production default transport message type.
-func healthDefaultH4ForIssue329() uint32 {
+func health.DefaultH4 uint32 {
 	return 2528465083
 }
