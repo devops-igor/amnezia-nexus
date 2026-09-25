@@ -33,7 +33,7 @@
                 </div>
                 <div>
                     <div class="server-name" id="server-name-{{ $server.ID }}">{{ $server.Name }}</div>
-                    <div class="server-host">{{ $server.Host }}:{{ $server.SSHPort }}</div>
+                    <div class="server-host"><span id="server-host-{{ $server.ID }}">{{ $server.Host }}</span>:{{ $server.SSHPort }}</div>
                 </div>
             </div>
 
@@ -62,6 +62,10 @@
                 <button class="btn btn-secondary btn-sm btn-icon" onclick="openRenameServerModal({{ $server.ID }}, '{{ $server.Name }}')"
                     title="{{ _ "rename_server" }}">
                     <svg class="icon"><use href="#icon-pencil"></use></svg>
+                </button>
+                <button class="btn btn-secondary btn-sm btn-icon" onclick="openEditHostModal({{ $server.ID }}, '{{ $server.Host }}')"
+                    title="{{ _ "edit_server_host" }}">
+                    <svg class="icon"><use href="#icon-globe"></use></svg>
                 </button>
                 <button class="btn btn-danger btn-sm btn-icon" onclick="deleteServer({{ $server.ID }})"
                     title="{{ _ "delete" }}">
@@ -179,6 +183,31 @@
         <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
             <button class="btn btn-primary" onclick="submitRenameServer()">{{ _ "save" }}</button>
             <button class="btn btn-secondary" onclick="closeRenameServerModal()">{{ _ "cancel" }}</button>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Server Host Modal -->
+<div class="modal-backdrop" id="editHostModal">
+    <div class="modal" style="max-width: 400px;">
+        <div class="modal-header">
+            <h2 class="modal-title">
+                <svg class="icon"><use href="#icon-globe"></use></svg>
+                {{ _ "edit_server_host" }}
+            </h2>
+            <button class="modal-close" onclick="closeEditHostModal()" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
+        </div>
+        <div class="form-group" style="padding: var(--space-sm) 0;">
+            <label class="form-label" for="editHostInput">{{ _ "edit_server_host_placeholder" }}</label>
+            <input type="text" id="editHostInput" class="form-input" maxlength="255"
+                   placeholder="{{ _ "edit_server_host_placeholder" }}"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitEditHost();}">
+        </div>
+        <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
+            <button class="btn btn-primary" onclick="submitEditHost()">{{ _ "save" }}</button>
+            <button class="btn btn-secondary" onclick="closeEditHostModal()">{{ _ "cancel" }}</button>
         </div>
     </div>
 </div>
@@ -351,6 +380,49 @@
                 nameEl.textContent = newName;
                 const card = document.getElementById(`server-${renameServerId}`);
                 if (card) card.setAttribute('data-server-name', newName);
+            } else {
+                setTimeout(() => window.location.reload(), 300);
+            }
+        } catch (err) {
+            UI.toast(err.message, 'error');
+        }
+    }
+
+    let editHostServerId = null;
+
+    function openEditHostModal(serverId, currentHost) {
+        editHostServerId = serverId;
+        const hostEl = document.getElementById(`server-host-${serverId}`);
+        const host = hostEl ? hostEl.textContent.trim() : (currentHost || '');
+        const input = document.getElementById('editHostInput');
+        if (input) {
+            input.value = host;
+        }
+        openModal('editHostModal', '#editHostInput');
+    }
+
+    function closeEditHostModal() {
+        closeModal('editHostModal');
+        editHostServerId = null;
+    }
+
+    async function submitEditHost() {
+        if (!editHostServerId) return;
+        const input = document.getElementById('editHostInput');
+        const newHost = input ? input.value.trim() : '';
+        if (!newHost) {
+            UI.toast(_('validation_failed') || 'Host cannot be empty', 'error');
+            return;
+        }
+        try {
+            await API.post('/api/servers/' + editHostServerId + '/host', { host: newHost });
+            UI.toast(_('server_host_updated') || 'Server IP updated', 'success');
+            closeEditHostModal();
+            const hostEl = document.getElementById(`server-host-${editHostServerId}`);
+            if (hostEl) {
+                hostEl.textContent = newHost;
+                const card = document.getElementById(`server-${editHostServerId}`);
+                if (card) card.setAttribute('data-server-host', newHost);
             } else {
                 setTimeout(() => window.location.reload(), 300);
             }

@@ -230,6 +230,8 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Post("/confirm-fingerprint", h.ConfirmFingerprintHandler)
 				r.Post("/{server_id}/rename", h.RenameServerHandler)
 				r.Patch("/{server_id}/rename", h.RenameServerHandler)
+				r.Post("/{server_id}/host", h.UpdateServerHostHandler)
+				r.Patch("/{server_id}/host", h.UpdateServerHostHandler)
 				r.Post("/{server_id}/delete", h.DeleteServerHandler)
 				r.Post("/{server_id}/reboot", h.RebootServerHandler)
 				r.Post("/{server_id}/clear", h.ClearServerHandler)

@@ -1368,6 +1368,242 @@ func TestRenameServerHandler(t *testing.T) {
 	})
 }
 
+func TestUpdateServerHostHandler(t *testing.T) {
+	mockSSH := &testMockSSHClient{}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:    "Server-Host-Test",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	r := setupFullServerRouter(h)
+
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+	})
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+	t.Run("Happy path - POST update host with IPv4", func(t *testing.T) {
+		logBuf.Reset()
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.50"})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "192.168.1.50" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		// Verify DB record updated
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "192.168.1.50" {
+			t.Errorf("expected server host '192.168.1.50', got %q", dbSrv.Host)
+		}
+
+		// Verify audit log
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "server.update_ip") || !strings.Contains(logStr, "10.0.0.1") || !strings.Contains(logStr, "192.168.1.50") {
+			t.Errorf("audit log missing expected update_ip event, got: %s", logStr)
+		}
+	})
+
+	t.Run("Happy path - PATCH update host with IPv6", func(t *testing.T) {
+		logBuf.Reset()
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "2001:db8::1"})
+		req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "2001:db8::1" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "2001:db8::1" {
+			t.Errorf("expected server host '2001:db8::1', got %q", dbSrv.Host)
+		}
+
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "server.update_ip") || !strings.Contains(logStr, "192.168.1.50") || !strings.Contains(logStr, "2001:db8::1") {
+			t.Errorf("audit log missing expected update_ip event, got: %s", logStr)
+		}
+	})
+
+	t.Run("Happy path - POST update host with hostname domain and whitespace trimming", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "  vpn.example.com  "})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp["status"] != "ok" || resp["host"] != "vpn.example.com" {
+			t.Errorf("unexpected response body: %+v", resp)
+		}
+
+		dbSrv, err := db.GetServer(ctx, serverID)
+		if err != nil {
+			t.Fatalf("failed to get server from db: %v", err)
+		}
+		if dbSrv.Host != "vpn.example.com" {
+			t.Errorf("expected server host 'vpn.example.com', got %q", dbSrv.Host)
+		}
+	})
+
+	t.Run("Validation failure - empty host", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: ""})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - whitespace only host", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "   \t\n  "})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Validation failure - invalid host syntax", func(t *testing.T) {
+		for _, badHost := range []string{"invalid host with spaces", "server$name.com", "http://example.com"} {
+			body, _ := json.Marshal(models.UpdateServerHostRequest{Host: badHost})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 Bad Request for %q, got %d", badHost, w.Code)
+			}
+		}
+	})
+
+	t.Run("Invalid JSON body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), strings.NewReader("{not-valid-json"))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Invalid server ID parameter", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.1"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/invalid-id/host", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("Not found - non-existent server ID", func(t *testing.T) {
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.1.1"})
+		req := httptest.NewRequest(http.MethodPost, "/api/servers/999999/host", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 Not Found, got %d", w.Code)
+		}
+	})
+
+	t.Run("Role-based authorization via RequireAdminOrSupport middleware", func(t *testing.T) {
+		protRouter := chi.NewRouter()
+		protRouter.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAdminOrSupport)
+			r.Post("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
+			r.Patch("/api/servers/{server_id}/host", h.UpdateServerHostHandler)
+		})
+
+		body, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.1"})
+
+		// Unauthenticated -> 401 Unauthorized
+		reqUnauth := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		wUnauth := httptest.NewRecorder()
+		protRouter.ServeHTTP(wUnauth, reqUnauth)
+		if wUnauth.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized for unauthenticated request, got %d", wUnauth.Code)
+		}
+
+		// Regular user -> 403 Forbidden
+		reqUser := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(body))
+		userCtx := middleware.WithSession(reqUser.Context(), &models.SessionData{UserID: "u-regular", Role: models.RoleUser})
+		wUser := httptest.NewRecorder()
+		protRouter.ServeHTTP(wUser, reqUser.WithContext(userCtx))
+		if wUser.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for regular user, got %d", wUser.Code)
+		}
+
+		// Support user -> 200 OK
+		bodySupport, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.2"})
+		reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(bodySupport))
+		supportCtx := middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: "u-support", Role: models.RoleSupport})
+		wSupport := httptest.NewRecorder()
+		protRouter.ServeHTTP(wSupport, reqSupport.WithContext(supportCtx))
+		if wSupport.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for support user, got %d (body: %s)", wSupport.Code, wSupport.Body.String())
+		}
+
+		// Admin user -> 200 OK
+		bodyAdmin, _ := json.Marshal(models.UpdateServerHostRequest{Host: "192.168.2.3"})
+		reqAdmin := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/servers/%d/host", serverID), bytes.NewReader(bodyAdmin))
+		adminCtx := middleware.WithSession(reqAdmin.Context(), &models.SessionData{UserID: "u-admin", Role: models.RoleAdmin})
+		wAdmin := httptest.NewRecorder()
+		protRouter.ServeHTTP(wAdmin, reqAdmin.WithContext(adminCtx))
+		if wAdmin.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for admin user, got %d (body: %s)", wAdmin.Code, wAdmin.Body.String())
+		}
+	})
+}
+
 func TestServerStatsHandler_Failures(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
 	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)

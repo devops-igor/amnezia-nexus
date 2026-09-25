@@ -597,6 +597,19 @@ func (r *RenameServerRequest) Validate() error {
 	return nil
 }
 
+// UpdateServerHostRequest defines server host/IP update payload.
+type UpdateServerHostRequest struct {
+	Host string `json:"host"`
+}
+
+func (r *UpdateServerHostRequest) Validate() error {
+	r.Host = strings.TrimSpace(r.Host)
+	if r.Host == "" {
+		return errors.New("host cannot be empty")
+	}
+	return ValidateHost(r.Host)
+}
+
 // InstallProtocolRequest defines protocol deployment options on a server.
 type InstallProtocolRequest struct {
 	Protocol            string                 `json:"protocol"`

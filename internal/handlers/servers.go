@@ -215,6 +215,53 @@ func (h *Handlers) RenameServerHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateServerHostHandler updates the host / IP address of a server.
+func (h *Handlers) UpdateServerHostHandler(w http.ResponseWriter, r *http.Request) {
+	serverID, err := parseServerID(r)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
+		return
+	}
+
+	var req models.UpdateServerHostRequest
+	if err := h.DecodeJSON(r, &req); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+
+	ctx := r.Context()
+	server, err := h.db.GetServer(ctx, serverID)
+	if err != nil || server == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
+		return
+	}
+
+	if err := h.db.UpdateServer(ctx, serverID, map[string]any{"host": req.Host}); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update server host")
+		return
+	}
+
+	if h.sshPool != nil {
+		h.sshPool.Remove(serverID)
+	}
+
+	h.audit(r, "server.update_ip", map[string]any{
+		"server_id": serverID,
+		"old_host":  server.Host,
+		"new_host":  req.Host,
+	})
+
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"host":   req.Host,
+	})
+}
+
 // RebootServerHandler triggers a remote host reboot via SSH.
 func (h *Handlers) RebootServerHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)

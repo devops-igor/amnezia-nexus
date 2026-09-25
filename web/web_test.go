@@ -2027,3 +2027,114 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 		t.Errorf("loadServerStats must not blank DOM innerHTML on error")
 	}
 }
+
+func TestIssue278EditServerHostUIAndTranslations(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Verify translation keys across all 5 languages
+	requiredKeys := []string{
+		"edit_server_host",
+		"edit_server_host_placeholder",
+		"server_host_updated",
+	}
+	languages := []string{"en.json", "ru.json", "fr.json", "zh.json", "fa.json"}
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range requiredKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required key %q", langFile, k)
+			}
+		}
+		if langFile == "en.json" {
+			if dict["edit_server_host"] != "Edit Server IP" {
+				t.Errorf("en.json edit_server_host = %q, want %q", dict["edit_server_host"], "Edit Server IP")
+			}
+			if dict["edit_server_host_placeholder"] != "Enter new IP address or hostname" {
+				t.Errorf("en.json edit_server_host_placeholder = %q, want %q", dict["edit_server_host_placeholder"], "Enter new IP address or hostname")
+			}
+			if dict["server_host_updated"] != "Server IP updated" {
+				t.Errorf("en.json server_host_updated = %q, want %q", dict["server_host_updated"], "Server IP updated")
+			}
+		}
+		if langFile == "ru.json" {
+			if dict["edit_server_host"] != "Изменить IP сервера" {
+				t.Errorf("ru.json edit_server_host = %q, want %q", dict["edit_server_host"], "Изменить IP сервера")
+			}
+			if dict["edit_server_host_placeholder"] != "Введите новый IP-адрес или имя хоста" {
+				t.Errorf("ru.json edit_server_host_placeholder = %q, want %q", dict["edit_server_host_placeholder"], "Введите новый IP-адрес или имя хоста")
+			}
+			if dict["server_host_updated"] != "IP сервера обновлен" {
+				t.Errorf("ru.json server_host_updated = %q, want %q", dict["server_host_updated"], "IP сервера обновлен")
+			}
+		}
+	}
+
+	// 2. Verify server.html elements and JavaScript
+	serverData, err := fs.ReadFile(templatesFS, "server.html")
+	if err != nil {
+		t.Fatalf("failed to read server.html: %v", err)
+	}
+	serverStr := string(serverData)
+
+	requiredServerElements := []string{
+		`id="serverHostDisplay"`,
+		`openEditHostModal`,
+		`id="editHostModal"`,
+		`id="editHostInput"`,
+		`submitEditHost()`,
+		`closeEditHostModal()`,
+		`/api/servers/' + editHostServerId + '/host`,
+		`server_host_updated`,
+	}
+	for _, elem := range requiredServerElements {
+		if !strings.Contains(serverStr, elem) {
+			t.Errorf("server.html missing required edit host element %q", elem)
+		}
+	}
+
+	// Ensure no hardcoded Cyrillic was added to server.html
+	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
+	if matches := cyrillicRe.FindAllString(serverStr, -1); len(matches) > 0 {
+		t.Errorf("server.html contains hardcoded Cyrillic characters: %v", matches)
+	}
+
+	// 3. Verify index.html elements and JavaScript
+	indexData, err := fs.ReadFile(templatesFS, "index.html")
+	if err != nil {
+		t.Fatalf("failed to read index.html: %v", err)
+	}
+	indexStr := string(indexData)
+
+	requiredIndexElements := []string{
+		`openEditHostModal`,
+		`id="editHostModal"`,
+		`id="editHostInput"`,
+		`submitEditHost()`,
+		`closeEditHostModal()`,
+		`id="server-host-`,
+		`data-server-host`,
+		`href="#icon-globe"`,
+		`/api/servers/' + editHostServerId + '/host`,
+		`server_host_updated`,
+	}
+	for _, elem := range requiredIndexElements {
+		if !strings.Contains(indexStr, elem) {
+			t.Errorf("index.html missing required edit host element %q", elem)
+		}
+	}
+}
