@@ -1270,12 +1270,17 @@ func (el *Listener) lookupKeypairByIndex(receiverIdx uint32) (*keypairEntry, boo
 	return entry, ok
 }
 
-// PeerKeypairsForTest returns the legacy current/previous transport-key view.
-// New responder-state tests should use PeerKeypairStateForTest.
+// PeerKeypairsForTest returns the legacy effective current/previous view used
+// by pre-#329 tests. While a responder key is staged but unconfirmed, it maps
+// next/current to the old current/previous shape. New protocol-state tests must
+// use PeerKeypairStateForTest so they observe authoritative state.
 func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys, previous *TransportKeys) {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
 	if pkp, ok := el.peerKeypairs[peerKey]; ok {
+		if pkp.next != nil {
+			return pkp.next, pkp.current
+		}
 		return pkp.current, pkp.previous
 	}
 	return nil, nil
