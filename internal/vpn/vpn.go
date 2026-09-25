@@ -1231,9 +1231,14 @@ func resolvePeerClaims(ctx context.Context, db *database.DB, claims []database.V
 }
 
 func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
+	// If several durable rows share this peer identity and the peer as a whole
+	// must be quarantined, retire the duplicated keypair on every row. Keeping
+	// the shared client_id would make post-regeneration authentication depend on
+	// whichever duplicate row GetConnectionByClientID happens to return.
+	retireKeypair := len(claims) > 1
 	if current, ok := ipam.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
 		for _, c := range claims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
@@ -1246,7 +1251,7 @@ func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint
 		}
 		if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
 			for _, c := range claims {
-				if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
+				if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 					return err
 				}
 				log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) address already allocated to another peer; quarantined conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey)
@@ -1297,10 +1302,16 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	winner := candidates[0]
 	losers := candidates[1:]
 
+	// If reconciliation has to quarantine an entire peer identity represented
+	// by multiple rows, retire that duplicated keypair on every row. A single
+	// claimant may keep its keypair so explicit config regeneration can preserve
+	// its peer identity while assigning a new IP.
+	retireWinnerKeypair := len(winner.allClaims) > 1
+
 	// Reserve winner in IPAM
 	if current, ok := ipam.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
 		for _, c := range winner.allClaims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
@@ -1310,7 +1321,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 			if !errors.Is(err, endpoint.ErrIPNotInSubnet) && !errors.Is(err, endpoint.ErrIPReserved) {
 				if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
 					for _, c := range winner.allClaims {
-						if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
+						if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 							return err
 						}
 						log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) address already allocated to another peer; quarantined conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey)
@@ -1322,10 +1333,14 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 		}
 	}
 
-	// For every loser peer: quarantine ALL claims for that peer on this IP
+	// For every loser peer: quarantine ALL claims for that peer on this IP.
+	// Multiple rows sharing the losing peer must also retire their shared
+	// keypair, otherwise regenerating only one row would leave another row with
+	// the same client_id and make peer authentication ambiguous again.
 	for _, loser := range losers {
+		retireLoserKeypair := len(loser.allClaims) > 1
 		for _, c := range loser.allClaims {
-			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, false); err != nil {
+			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireLoserKeypair); err != nil {
 				return err
 			}
 			log.Printf("[vpn] warning: startup IP collision on %s: connection %s (user %s, peer %s) conflicts with owner connection %s; quarantined/cleared conflicting lease (requires config regeneration)", ipStr, c.ConnectionID, c.UserID, c.PeerKey, winner.bestClaim.ConnectionID)
