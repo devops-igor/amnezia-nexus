@@ -1148,16 +1148,35 @@ func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpo
 	if err != nil {
 		return err
 	}
+	clearConflictingAssignedIP := func(connID string, clientParams map[string]any) {
+		if db != nil && connID != "" && clientParams != nil {
+			delete(clientParams, "assigned_ip")
+			_, _ = db.UpdateConnection(ctx, connID, map[string]any{"client_params": clientParams})
+		}
+	}
 	for _, assignment := range assignments {
 		ip := net.ParseIP(assignment.AssignedIP)
 		if ip == nil || ip.To4() == nil {
+			if assignment.ClientParams != nil {
+				if conflictingIP, ok := assignment.ClientParams["assigned_ip"].(string); ok && conflictingIP != "" {
+					log.Printf("[vpn] warning: connection %s peer %s address %s already allocated to another peer; clearing conflicting assigned_ip", assignment.ConnectionID, assignment.PeerKey, conflictingIP)
+					clearConflictingAssignedIP(assignment.ConnectionID, assignment.ClientParams)
+				}
+			}
 			continue
 		}
 		if current, ok := ipam.GetAssignedIP(assignment.PeerKey); ok && !current.Equal(ip) {
-			return fmt.Errorf("connection %s peer %s has conflicting persisted addresses %s and %s", assignment.ConnectionID, assignment.PeerKey, current, ip)
+			log.Printf("[vpn] warning: connection %s peer %s has conflicting persisted address %s (already assigned %s); clearing conflicting assigned_ip", assignment.ConnectionID, assignment.PeerKey, ip, current)
+			clearConflictingAssignedIP(assignment.ConnectionID, assignment.ClientParams)
+			continue
 		}
 		if err := ipam.Reserve(ip, assignment.PeerKey); err != nil {
 			if errors.Is(err, endpoint.ErrIPNotInSubnet) || errors.Is(err, endpoint.ErrIPReserved) {
+				continue
+			}
+			if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+				log.Printf("[vpn] warning: connection %s peer %s address %s already allocated to another peer; clearing conflicting assigned_ip", assignment.ConnectionID, assignment.PeerKey, assignment.AssignedIP)
+				clearConflictingAssignedIP(assignment.ConnectionID, assignment.ClientParams)
 				continue
 			}
 			return fmt.Errorf("connection %s peer %s address %s: %w", assignment.ConnectionID, assignment.PeerKey, assignment.AssignedIP, err)

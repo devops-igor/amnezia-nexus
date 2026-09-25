@@ -732,6 +732,9 @@ func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]
 		return nil, err
 	}
 	defer rows.Close()
+
+	allocatedIPs := make(map[string]string)
+	peerAssignedIPs := make(map[string]string)
 	var assignments []VPNClientIPAssignment
 	for rows.Next() {
 		var a VPNClientIPAssignment
@@ -753,13 +756,30 @@ func readVPNClientIPAssignments(ctx context.Context, q vpnAssignmentQuerier) ([]
 			a.ClientParams = make(map[string]any)
 		}
 		if ip, ok := a.ClientParams["assigned_ip"].(string); ok && ip != "" {
-			a.AssignedIP = ip
+			owner, allocated := allocatedIPs[ip]
+			_, peerHasIP := peerAssignedIPs[a.PeerKey]
+			if (allocated && owner != a.PeerKey) || peerHasIP {
+				a.AssignedIP = ""
+			} else {
+				a.AssignedIP = ip
+				allocatedIPs[ip] = a.PeerKey
+				peerAssignedIPs[a.PeerKey] = ip
+			}
 		} else if sessionIP.Valid && sessionIP.String != "" {
-			a.AssignedIP = sessionIP.String
-			a.ClientParams["assigned_ip"] = a.AssignedIP
-			a.NeedsMigration = true
+			candIP := sessionIP.String
+			owner, allocated := allocatedIPs[candIP]
+			_, peerHasIP := peerAssignedIPs[a.PeerKey]
+			if (allocated && owner != a.PeerKey) || peerHasIP {
+				a.NeedsMigration = false
+			} else {
+				a.AssignedIP = candIP
+				a.ClientParams["assigned_ip"] = a.AssignedIP
+				a.NeedsMigration = true
+				allocatedIPs[candIP] = a.PeerKey
+				peerAssignedIPs[a.PeerKey] = candIP
+			}
 		}
-		if a.AssignedIP != "" {
+		if a.AssignedIP != "" || (a.ClientParams != nil && a.ClientParams["assigned_ip"] != nil && a.ClientParams["assigned_ip"] != "") {
 			assignments = append(assignments, a)
 		}
 	}
