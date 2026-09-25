@@ -151,6 +151,7 @@ func TestIssue329_SupersededNextCannotPromoteFromStalePacket(t *testing.T) {
 	el.storeTransportKeys(peer, k1)
 	issue329Stage(t, el, peer, k2)
 	issue329Stage(t, el, peer, k3)
+	el.rememberPeer(sender, peer, k3.RemoteIndex)
 
 	datagram := craftClientTransportDatagram(t, k2, healthDefaultH4ForIssue329(), el.config.S4, nil, 0, nil)
 	if !el.handleTransportData(datagram, sender) {
