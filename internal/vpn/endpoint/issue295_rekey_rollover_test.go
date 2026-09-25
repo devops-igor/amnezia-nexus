@@ -2101,18 +2101,23 @@ func TestListener_PrunePeerTransportStateForGeneration_Unit(t *testing.T) {
 	if pruned := el.PrunePeerTransportStateForGeneration(peerKey, 1); pruned {
 		t.Fatal("expected PrunePeerTransportStateForGeneration(gen 1) to return false when currentGen is 2")
 	}
-	// Assert K2 and fence survived
+	// Assert the newer generation fence and staged K2 survived. CommitHandshake
+	// alone does not confirm K2 or adopt the sender endpoint under #329.
 	if el.PeerGeneration(peerKey) != 2 {
 		t.Fatalf("expected PeerGeneration to remain 2, got %d", el.PeerGeneration(peerKey))
 	}
-	if tk, ok := el.TransportKeysFor(peerKey); !ok || tk != k2 {
-		t.Fatal("expected K2 to survive stale timeout pruning")
+	prev, current, next := el.PeerKeypairStateForTest(peerKey)
+	if prev != nil || current != nil || next != k2 {
+		t.Fatalf("expected staged K2 to survive stale timeout pruning: previous=%p current=%p next=%p", prev, current, next)
 	}
-	if _, ok := el.peerByAddr(clientAddr.String()); !ok {
-		t.Fatal("expected peer address mapping to survive stale timeout pruning")
+	if tk, ok := el.TransportKeysFor(peerKey); ok || tk != nil {
+		t.Fatalf("staged K2 unexpectedly became confirmed during stale pruning: %+v", tk)
 	}
-	if _, found := el.lookupKeypairByIndex(k2.LocalIndex); !found {
-		t.Fatal("expected indexTable entry to survive stale timeout pruning")
+	if _, ok := el.peerByAddr(clientAddr.String()); ok {
+		t.Fatal("unconfirmed handshake unexpectedly adopted peer address")
+	}
+	if keys, found := el.lookupKeypairByIndex(k2.LocalIndex); !found || keys != k2 {
+		t.Fatal("expected staged K2 indexTable entry to survive stale timeout pruning")
 	}
 
 	// Branch 2: currentGen == timedOutGen -> genuine timeout, PRUNE and advance fence to timedOutGen + 1
