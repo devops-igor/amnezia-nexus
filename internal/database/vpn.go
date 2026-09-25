@@ -541,6 +541,31 @@ func (d *DB) MigrateVPNSessionBackend(ctx context.Context, sessionID string, bac
 	return nil
 }
 
+// MigrateVPNSessionToActiveTunnel moves an orchestrator session only while its
+// source is unchanged and the destination is still eligible. The tunnel check
+// and assignment share one SQL statement and serialize with admin disable writes.
+func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID string, sourceID, targetID int64) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?
+		WHERE id = ? AND backend_tunnel_id = ? AND status = 'connected'
+		AND EXISTS (SELECT 1 FROM backend_tunnels
+			WHERE id = ? AND status = 'active' AND disable_reason != ?)`
+	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID, models.DisableReasonAdmin)
+	if err != nil {
+		return fmt.Errorf("failed to migrate vpn session %s to tunnel %d: %w", sessionID, targetID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check migration of vpn session %s: %w", sessionID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("vpn session %s is no longer connected to tunnel %d or target tunnel %d is unavailable", sessionID, sourceID, targetID)
+	}
+	return nil
+}
+
 // GetActiveVPNSessions retrieves all currently connected sessions.
 func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, error) {
 	d.mu.RLock()

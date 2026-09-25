@@ -223,6 +223,99 @@ func TestOrchestrator_AdminDisableConcurrentWithProbe_CASFallback(t *testing.T) 
 	}
 }
 
+// A successful probe started before an administrative disable must not make the
+// disabled backend a destination for sessions on a later degraded backend.
+func TestOrchestrator_AdminDisableDuringProbe_DoesNotReceiveDegradedSessions(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	aServer, aPub, _ := createTestServerAndKey(t, db, "Probe target A", "127.0.0.1")
+	bServer, bPub, _ := createTestServerAndKey(t, db, "Degraded source B", "127.0.0.1")
+	vpnSvc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := vpnSvc.pool.AddTunnel(ctx, aServer, "127.0.0.1:51830", aPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := vpnSvc.pool.AddTunnel(ctx, bServer, "127.0.0.1:51831", bPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vpnSvc.mu.Lock()
+	attachErr := vpnSvc.attachBackendForwarder(a, nil)
+	vpnSvc.mu.Unlock()
+	if attachErr != nil {
+		t.Fatal(attachErr)
+	}
+	t.Cleanup(func() {
+		if dev := vpnSvc.GetBackendDeviceForTest(a.ID); dev != nil {
+			_ = dev.Close()
+		}
+	})
+	user, err := db.CreateUser(ctx, &models.User{Username: "degraded-session-user", Role: models.RoleUser})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "degraded-session-during-disable"
+	if err := db.CreateVPNSession(ctx, &models.VPNSession{
+		ID: sessionID, UserID: user, BackendTunnelID: b.ID,
+		PeerPublicKey: "degraded-peer", AssignedIP: "10.100.0.81", Status: "connected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	orch := orchestrator.New(db, nil,
+		orchestrator.WithProbeFailureThreshold(1),
+		orchestrator.WithProbeFunc(func(_ context.Context, endpoint, _, _, _, _ string, _, _ any, _, _ int, _ time.Duration) (time.Duration, error) {
+			if endpoint == a.Endpoint {
+				close(started)
+				<-release
+				return 25 * time.Millisecond, nil
+			}
+			return 0, errors.New("source probe failed")
+		}),
+	)
+	orch.SetTunnelStatusUpdater(vpnSvc)
+	done := make(chan error, 1)
+	go func() { done <- orch.CheckBackendTunnelHealth(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for target probe")
+	}
+	if err := vpnSvc.DisableBackend(ctx, aServer); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for health check")
+	}
+
+	target, err := db.GetBackendTunnel(ctx, a.ID)
+	if err != nil || target == nil || target.Status != "disabled" || target.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("target lost administrative disable: tunnel=%+v err=%v", target, err)
+	}
+	session, err := db.GetVPNSessionByID(ctx, sessionID)
+	if err != nil || session == nil || session.BackendTunnelID != b.ID || session.Status != "connected" {
+		t.Fatalf("session migrated to disabled target: session=%+v err=%v", session, err)
+	}
+}
+
 // TestOrchestrator_TunnelStatusUpdater_PoolAndDBSync verifies that when
 // orch.SetTunnelStatusUpdater(vpnSvc) is active, orchestrator health updates
 // update vpnSvc.Pool and DB state_version in sync with no offset between pool and DB.

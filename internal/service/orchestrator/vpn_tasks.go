@@ -185,8 +185,29 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	hIdx := 0
 	for _, s := range sessions {
 		if degradedMap[s.BackendTunnelID] {
-			target := healthyTunnels[hIdx%len(healthyTunnels)]
-			hIdx++
+			// The probe result is only a snapshot. An administrator can disable a
+			// target after it was classified as healthy, even before this loop.
+			var target *models.BackendTunnel
+			for checked := 0; checked < len(healthyTunnels); checked++ {
+				idx := (hIdx + checked) % len(healthyTunnels)
+				candidate := healthyTunnels[idx]
+				if candidate == nil {
+					continue
+				}
+				current, err := o.db.GetBackendTunnel(ctx, candidate.ID)
+				if err != nil {
+					slog.Warn("Failed to recheck migration target", "tunnel_id", candidate.ID, "err", err)
+					continue
+				}
+				if current != nil && strings.EqualFold(current.Status, "active") && current.DisableReason != models.DisableReasonAdmin {
+					target = current
+					hIdx = (idx + 1) % len(healthyTunnels)
+					break
+				}
+			}
+			if target == nil {
+				break
+			}
 			if migrator != nil {
 				if err := migrator.MigrateSession(ctx, s.ID, target.ID); err != nil {
 					slog.Warn("Degraded tunnel session migration failed, skipping session",
@@ -199,9 +220,9 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 				}
 				migrated++
 			} else {
-				s.BackendTunnelID = target.ID
-				s.Status = "connected"
-				if err := o.db.CreateVPNSession(ctx, &s); err != nil {
+				// The predicate in this update closes the gap between the DB
+				// recheck above and the actual session assignment.
+				if err := o.db.MigrateVPNSessionToActiveTunnel(ctx, s.ID, s.BackendTunnelID, target.ID); err != nil {
 					slog.Warn("Direct DB update for degraded tunnel session failed, skipping session",
 						"session_id", s.ID,
 						"source_tunnel_id", s.BackendTunnelID,
