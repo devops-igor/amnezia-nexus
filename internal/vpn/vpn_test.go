@@ -7326,6 +7326,8 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 
 	var h1Fired atomic.Bool
 	h1PauseChan := make(chan struct{})
+	var releaseH1 sync.Once
+	defer releaseH1.Do(func() { close(h1PauseChan) })
 	h1FiredChan := make(chan string, 1)
 
 	vpnSvc.SetPreTransportCommitHookForTest(func(pKey string, sID string) {
@@ -7353,6 +7355,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for H1 worker to pause at preTransportCommitHook")
 	}
+	h1Generation := vpnSvc.PeerGeneration(peerKey)
 
 	// Handshake H2 initiates for the same peer while H1 is paused
 	pkt2, state2, err := health.BuildAWGInitiationPacketObfuscated(sPub, clientPriv, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
@@ -7363,7 +7366,7 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 		t.Fatalf("write initiation H2: %v", err)
 	}
 
-	// Worker H2 creates replacement session S2, commits transport keys K2, and sends response
+	// Worker H2 advances the same session's handshake generation, commits K2, and responds.
 	respBuf2 := make([]byte, 2048)
 	_ = clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n2, err := clientConn2.Read(respBuf2)
@@ -7384,13 +7387,13 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 		t.Fatalf("expected nil previous keys for peer after replacement H2, got %+v", k2Prev)
 	}
 	s2ID := vpnSvc.endpoint.PeerSessionIDForTest(peerKey)
-	if s2ID == "" || s2ID == h1SessionID {
-		t.Fatalf("expected distinct active session ID for S2, got %s (S1=%s)", s2ID, h1SessionID)
+	if s2ID == "" || s2ID != h1SessionID {
+		t.Fatalf("live rekey replaced the session: H1=%s H2=%s", h1SessionID, s2ID)
 	}
 	k2LocalIdx := k2Current.LocalIndex
 
 	// Resume H1 with stale S1 -> worker H1 commits
-	close(h1PauseChan)
+	releaseH1.Do(func() { close(h1PauseChan) })
 
 	// Worker H1 should drop response and not send anything
 	_ = clientConn1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
@@ -7401,10 +7404,10 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	}
 
 	// Assert:
-	// 1. H1 commit is dropped/rejected: CommitHandshakeTransportStateForTest with S1 returns false
+	// 1. H1 commit is dropped/rejected by its reserved handshake generation.
 	dummyKeys := &endpoint.TransportKeys{LocalIndex: 88882, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	if vpnSvc.endpoint.CommitHandshakeTransportStateForTest(peerKey, h1SessionID, dummyKeys, 88882, serverAddr, 0) {
-		t.Fatal("expected commitHandshakeTransportState to return false for superseded S1")
+	if vpnSvc.endpoint.CommitHandshake(peerKey, h1Generation, dummyKeys, serverAddr, 0) {
+		t.Fatal("expected stale H1 generation to be rejected")
 	}
 
 	// 2. K2 / S2 remains active current keypair in peerKeypairs and noiseKeys

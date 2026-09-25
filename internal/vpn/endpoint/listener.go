@@ -226,7 +226,11 @@ type peerKeypairs struct {
 	current        *TransportKeys
 	previous       *TransportKeys
 	next           *TransportKeys
-	prevLogUntil   atomic.Int64
+	// Updated only after authenticated, replay-valid transport; used to
+	// correlate the inbound generation with the confirmed outbound key.
+	lastInboundGeneration uint64
+	nextWarningAt         time.Time
+	prevLogUntil          atomic.Int64
 }
 
 // keypairEntry maps a local receiver index to its owning peer and transport keyset.
@@ -1118,19 +1122,31 @@ func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *T
 	// a superseded unconfirmed next and any previous key when deriving a new
 	// responder keypair. This bounds the responder receive set to current+next.
 	if pkp.next != nil && pkp.next.LocalIndex != 0 {
+		log.Printf("[vpn/endpoint] key_transition event=next_replaced peer=%s next_gen=%d next_idx=%d outbound_gen=%d inbound_gen=%d",
+			peerKey, pkp.next.Generation, pkp.next.LocalIndex, keyGeneration(pkp.current), pkp.lastInboundGeneration)
 		delete(el.indexTable, pkp.next.LocalIndex)
 	}
 	if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+		log.Printf("[vpn/endpoint] key_transition event=previous_retired peer=%s previous_gen=%d previous_idx=%d outbound_gen=%d",
+			peerKey, pkp.previous.Generation, pkp.previous.LocalIndex, keyGeneration(pkp.current))
 		delete(el.indexTable, pkp.previous.LocalIndex)
 	}
 	pkp.previous = nil
 	pkp.next = newKeys
+	pkp.nextWarningAt = time.Time{}
 	if newKeys.LocalIndex != 0 {
 		el.indexTable[newKeys.LocalIndex] = &keypairEntry{peerKey: peerKey, keys: newKeys}
 	}
 
-	log.Printf("[vpn/endpoint] staged responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d expires_in=%s",
-		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
+	log.Printf("[vpn/endpoint] key_transition event=derived_next peer=%s next_gen=%d next_idx=%d outbound_gen=%d inbound_gen=%d expires_in=%s",
+		peerKey, newKeys.Generation, newKeys.LocalIndex, keyGeneration(pkp.current), pkp.lastInboundGeneration, time.Until(newKeys.ExpiresAt).Round(time.Second))
+}
+
+func keyGeneration(keys *TransportKeys) uint64 {
+	if keys == nil {
+		return 0
+	}
+	return keys.Generation
 }
 
 // confirmResponderTransportKey revalidates an authenticated transport key
@@ -1164,6 +1180,11 @@ func (el *Listener) confirmResponderTransportKey(peerKey string, keys *Transport
 
 	switch {
 	case pkp.next == keys:
+		oldGeneration := keyGeneration(pkp.current)
+		oldIndex := uint32(0)
+		if pkp.current != nil {
+			oldIndex = pkp.current.LocalIndex
+		}
 		// Staging already retires previous, but clear it defensively so the
 		// promotion invariant remains identical to upstream even if tests or
 		// future code construct a three-slot state.
@@ -1173,16 +1194,21 @@ func (el *Listener) confirmResponderTransportKey(peerKey string, keys *Transport
 		pkp.previous = pkp.current
 		pkp.current = keys
 		pkp.next = nil
+		pkp.nextWarningAt = time.Time{}
+		pkp.lastInboundGeneration = keys.Generation
 		if el.noiseKeys == nil {
 			el.noiseKeys = make(map[string]*TransportKeys)
 		}
 		el.noiseKeys[peerKey] = keys
-		log.Printf("[vpn/endpoint] confirmed responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d",
-			peerKey, keys.Generation, keys.LocalIndex, keys.RemoteIndex)
+		log.Printf("[vpn/endpoint] key_transition event=promoted peer=%s old_gen=%d old_idx=%d new_gen=%d new_idx=%d inbound_gen=%d outbound_gen=%d confirm_age=%s",
+			peerKey, oldGeneration, oldIndex, keys.Generation, keys.LocalIndex, pkp.lastInboundGeneration,
+			keyGeneration(pkp.current), time.Since(keys.CreatedAt).Round(time.Second))
 		return "current", true
 	case pkp.current == keys:
+		pkp.lastInboundGeneration = keys.Generation
 		return "current", true
 	case pkp.previous == keys:
+		pkp.lastInboundGeneration = keys.Generation
 		return "previous", true
 	default:
 		return "retired", false
@@ -1506,7 +1532,7 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 
-	sess, _, err := handler(ctx, peerKey)
+	sess, backend, err := handler(ctx, peerKey)
 	if err != nil {
 		log.Printf("[vpn/endpoint] handshake processing failed for peer %s from %s: %v", peerKey, sender, err)
 		return
@@ -1569,6 +1595,19 @@ func (el *Listener) handleDatagram(ctx context.Context, datagram []byte, sender 
 		return
 	}
 	el.txBytes.Add(int64(len(resp)))
+	el.mu.RLock()
+	var outboundGen, inboundGen uint64
+	if pkp := el.peerKeypairs[peerKey]; pkp != nil {
+		outboundGen = keyGeneration(pkp.current)
+		inboundGen = pkp.lastInboundGeneration
+	}
+	el.mu.RUnlock()
+	var backendID int64
+	if backend != nil {
+		backendID = backend.ID
+	}
+	log.Printf("[vpn/endpoint] key_transition event=response_sent peer=%s session=%s backend=%d next_gen=%d next_idx=%d outbound_gen=%d inbound_gen=%d",
+		peerKey, sessID, backendID, gen, allocatedIdx, outboundGen, inboundGen)
 }
 
 // CommitHandshake atomically stages responder transport keys if
@@ -2365,7 +2404,17 @@ func (el *Listener) invokePostSweepHook(ctx context.Context) {
 func (el *Listener) sweepExpiredKeypairs() {
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	now := time.Now()
 	for peerKey, pkp := range el.peerKeypairs {
+		// Emit at most once per minute per pending generation. This is a
+		// periodic sweep, never a packet-path log.
+		if next := pkp.next; next != nil && !next.IsExpired() && now.Sub(next.CreatedAt) >= time.Minute &&
+			(pkp.nextWarningAt.IsZero() || !now.Before(pkp.nextWarningAt)) {
+			log.Printf("[vpn/endpoint] key_transition event=next_unconfirmed peer=%s next_gen=%d next_idx=%d age=%s outbound_gen=%d inbound_gen=%d",
+				peerKey, next.Generation, next.LocalIndex, now.Sub(next.CreatedAt).Round(time.Second),
+				keyGeneration(pkp.current), pkp.lastInboundGeneration)
+			pkp.nextWarningAt = now.Add(time.Minute)
+		}
 		if pkp.previous != nil && pkp.previous.IsExpired() {
 			if pkp.previous.LocalIndex != 0 {
 				delete(el.indexTable, pkp.previous.LocalIndex)
@@ -2379,10 +2428,13 @@ func (el *Listener) sweepExpiredKeypairs() {
 			pkp.current = nil
 		}
 		if pkp.next != nil && pkp.next.IsExpired() {
+			log.Printf("[vpn/endpoint] key_transition event=next_expired peer=%s next_gen=%d next_idx=%d outbound_gen=%d inbound_gen=%d",
+				peerKey, pkp.next.Generation, pkp.next.LocalIndex, keyGeneration(pkp.current), pkp.lastInboundGeneration)
 			if pkp.next.LocalIndex != 0 {
 				delete(el.indexTable, pkp.next.LocalIndex)
 			}
 			pkp.next = nil
+			pkp.nextWarningAt = time.Time{}
 		}
 
 		// Keep the legacy runtime alias consistent if its active key expires.
@@ -2402,6 +2454,8 @@ func (el *Listener) sweepExpiredKeypairs() {
 
 func (el *Listener) prunePeerTransportStateLocked(peerKey string) {
 	if pkp, ok := el.peerKeypairs[peerKey]; ok && pkp != nil {
+		log.Printf("[vpn/endpoint] key_transition event=teardown peer=%s previous_gen=%d outbound_gen=%d next_gen=%d inbound_gen=%d",
+			peerKey, keyGeneration(pkp.previous), keyGeneration(pkp.current), keyGeneration(pkp.next), pkp.lastInboundGeneration)
 		if pkp.current != nil && pkp.current.LocalIndex != 0 {
 			delete(el.indexTable, pkp.current.LocalIndex)
 		}
