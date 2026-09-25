@@ -214,12 +214,18 @@ type packetJob struct {
 	sender *net.UDPAddr
 }
 
-// peerKeypairs tracks the active and previous transport keypair generations for a peer (Issue #295).
+// peerKeypairs tracks the bounded responder transport key lifecycle for a peer.
+//
+// The authoritative model mirrors upstream amneziawg-go: previous/current/next.
+// Issue #328 introduces the state model and lifecycle helpers; issue #329 wires
+// responder confirmation so newly derived keys are staged in next and promoted
+// only after authenticated transport proves the initiator installed them.
 type peerKeypairs struct {
 	peerKey        string
 	nextGeneration uint64
 	current        *TransportKeys
 	previous       *TransportKeys
+	next           *TransportKeys
 	prevLogUntil   atomic.Int64
 }
 
@@ -1069,6 +1075,64 @@ func (el *Listener) storeTransportKeysLocked(peerKey string, newKeys *TransportK
 		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
 }
 
+// stageResponderTransportKeysLocked installs a newly derived responder keypair
+// into the bounded next slot while preserving current and retiring previous.
+// It mirrors the responder transition performed by upstream amneziawg-go.
+//
+// #328 intentionally introduces only the state primitive. Production handshake
+// wiring, confirmation-driven promotion, and outbound selection are completed
+// atomically by #329 so this refactor does not create a half-transitioned
+// protocol state in production.
+func (el *Listener) stageResponderTransportKeysLocked(peerKey string, newKeys *TransportKeys) {
+	if newKeys == nil {
+		return
+	}
+	_ = newKeys.InitCiphers()
+	if el.peerKeypairs == nil {
+		el.peerKeypairs = make(map[string]*peerKeypairs)
+	}
+	if el.indexTable == nil {
+		el.indexTable = make(map[uint32]*keypairEntry)
+	}
+
+	pkp, ok := el.peerKeypairs[peerKey]
+	if !ok {
+		pkp = &peerKeypairs{peerKey: peerKey}
+		el.peerKeypairs[peerKey] = pkp
+	}
+	if pkp.nextGeneration == 0 {
+		pkp.nextGeneration = 1
+	}
+	if newKeys.Generation == 0 {
+		newKeys.Generation = pkp.nextGeneration
+		pkp.nextGeneration++
+	}
+	if newKeys.CreatedAt.IsZero() {
+		newKeys.CreatedAt = time.Now()
+	}
+	if newKeys.ExpiresAt.IsZero() {
+		newKeys.ExpiresAt = newKeys.CreatedAt.Add(el.getRejectAfterTime())
+	}
+
+	// Upstream responder semantics retain confirmed current, but retire both
+	// a superseded unconfirmed next and any previous key when deriving a new
+	// responder keypair. This bounds the responder receive set to current+next.
+	if pkp.next != nil && pkp.next.LocalIndex != 0 {
+		delete(el.indexTable, pkp.next.LocalIndex)
+	}
+	if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
+		delete(el.indexTable, pkp.previous.LocalIndex)
+	}
+	pkp.previous = nil
+	pkp.next = newKeys
+	if newKeys.LocalIndex != 0 {
+		el.indexTable[newKeys.LocalIndex] = &keypairEntry{peerKey: peerKey, keys: newKeys}
+	}
+
+	log.Printf("[vpn/endpoint] staged responder transport keys for peer %s: gen=%d local_idx=%d remote_idx=%d expires_in=%s",
+		peerKey, newKeys.Generation, newKeys.LocalIndex, newKeys.RemoteIndex, time.Until(newKeys.ExpiresAt).Round(time.Second))
+}
+
 // allocateReceiverIndex generates an unused, non-zero 32-bit receiver index that
 // does not collide with any active keypair entry in el.indexTable, and reserves
 // the slot in indexTable to avoid races between concurrent handshakes.
@@ -1127,7 +1191,8 @@ func (el *Listener) lookupKeypairByIndex(receiverIdx uint32) (*keypairEntry, boo
 	return entry, ok
 }
 
-// PeerKeypairsForTest returns the current and previous transport keys for a peer.
+// PeerKeypairsForTest returns the legacy current/previous transport-key view.
+// New responder-state tests should use PeerKeypairStateForTest.
 func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys, previous *TransportKeys) {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
@@ -1135,6 +1200,16 @@ func (el *Listener) PeerKeypairsForTest(peerKey string) (current *TransportKeys,
 		return pkp.current, pkp.previous
 	}
 	return nil, nil
+}
+
+// PeerKeypairStateForTest returns all bounded responder transport-key slots.
+func (el *Listener) PeerKeypairStateForTest(peerKey string) (previous, current, next *TransportKeys) {
+	el.mu.RLock()
+	defer el.mu.RUnlock()
+	if pkp, ok := el.peerKeypairs[peerKey]; ok {
+		return pkp.previous, pkp.current, pkp.next
+	}
+	return nil, nil, nil
 }
 
 // IndexTableCountForTest returns the number of entries in indexTable.
@@ -1159,6 +1234,9 @@ func (el *Listener) keypairStatus(peerKey string, keys *TransportKeys) string {
 		}
 		if pkp.current == keys {
 			return "current"
+		}
+		if pkp.next == keys {
+			return "next"
 		}
 	}
 	return "current"
@@ -1841,9 +1919,10 @@ func (el *Listener) handleTransportByIndex(sender *net.UDPAddr, payload []byte, 
 	return true
 }
 
-// candidateFallbackKeys snapshots the candidate transport keys (current and previous)
-// for a peer under el.mu.RLock to prevent data races with concurrent keypair rotation
-// in storeTransportKeys. Decryption is performed outside the lock.
+// candidateFallbackKeys snapshots the bounded candidate transport keys for a
+// peer under el.mu.RLock to prevent data races with concurrent keypair rotation.
+// Decryption is performed outside the lock. next is included so the receive path
+// can authenticate a staged responder key before issue #329 promotes it.
 func (el *Listener) candidateFallbackKeys(peerKey string) []*TransportKeys {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
@@ -1852,6 +1931,9 @@ func (el *Listener) candidateFallbackKeys(peerKey string) []*TransportKeys {
 	if pkp := el.peerKeypairs[peerKey]; pkp != nil {
 		if pkp.current != nil && !pkp.current.IsExpired() {
 			candidates = append(candidates, pkp.current)
+		}
+		if pkp.next != nil && !pkp.next.IsExpired() {
+			candidates = append(candidates, pkp.next)
 		}
 		if pkp.previous != nil && !pkp.previous.IsExpired() {
 			candidates = append(candidates, pkp.previous)
@@ -2206,12 +2288,37 @@ func (el *Listener) invokePostSweepHook(ctx context.Context) {
 func (el *Listener) sweepExpiredKeypairs() {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	for _, pkp := range el.peerKeypairs {
+	for peerKey, pkp := range el.peerKeypairs {
 		if pkp.previous != nil && pkp.previous.IsExpired() {
 			if pkp.previous.LocalIndex != 0 {
 				delete(el.indexTable, pkp.previous.LocalIndex)
 			}
 			pkp.previous = nil
+		}
+		if pkp.current != nil && pkp.current.IsExpired() {
+			if pkp.current.LocalIndex != 0 {
+				delete(el.indexTable, pkp.current.LocalIndex)
+			}
+			pkp.current = nil
+		}
+		if pkp.next != nil && pkp.next.IsExpired() {
+			if pkp.next.LocalIndex != 0 {
+				delete(el.indexTable, pkp.next.LocalIndex)
+			}
+			pkp.next = nil
+		}
+
+		// Keep the legacy runtime alias consistent if its active key expires.
+		// Staged next is not selected for outbound traffic until #329.
+		if aliased := el.noiseKeys[peerKey]; aliased != nil && aliased.IsExpired() {
+			switch {
+			case pkp.current != nil:
+				el.noiseKeys[peerKey] = pkp.current
+			case pkp.previous != nil:
+				el.noiseKeys[peerKey] = pkp.previous
+			default:
+				delete(el.noiseKeys, peerKey)
+			}
 		}
 	}
 }
@@ -2223,6 +2330,9 @@ func (el *Listener) prunePeerTransportStateLocked(peerKey string) {
 		}
 		if pkp.previous != nil && pkp.previous.LocalIndex != 0 {
 			delete(el.indexTable, pkp.previous.LocalIndex)
+		}
+		if pkp.next != nil && pkp.next.LocalIndex != 0 {
+			delete(el.indexTable, pkp.next.LocalIndex)
 		}
 		delete(el.peerKeypairs, peerKey)
 	}
