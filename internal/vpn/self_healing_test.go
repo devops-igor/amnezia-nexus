@@ -192,7 +192,13 @@ func TestSelfHealing_AdminDisabledBackendNeverRecovered(t *testing.T) {
 		return 15 * time.Millisecond, nil
 	})
 
-	// Administratively disable backend via DisableBackend
+	// Administratively disable backend via DisableBackend. Administrative
+	// intent changes independently from runtime health (issue #90).
+	beforeDisable, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel before disable failed: %v", err)
+	}
+	healthBeforeDisable := beforeDisable.Status
 	if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
@@ -201,8 +207,11 @@ func TestSelfHealing_AdminDisabledBackendNeverRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if got.Status != "disabled" {
-		t.Fatalf("expected status disabled, got %q", got.Status)
+	if got.Enabled {
+		t.Fatal("expected backend to be administratively disabled")
+	}
+	if got.Status != healthBeforeDisable {
+		t.Fatalf("administrative disable changed runtime health: got %q want %q", got.Status, healthBeforeDisable)
 	}
 	if vpnSvc.prober.IsAutoDisabled(s1ID) {
 		t.Fatalf("administratively disabled backend must not be marked auto-disabled")
@@ -217,8 +226,11 @@ func TestSelfHealing_AdminDisabledBackendNeverRecovered(t *testing.T) {
 	}
 
 	got, _ = vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status != "disabled" {
-		t.Fatalf("administratively disabled backend status changed to %q", got.Status)
+	if got.Enabled {
+		t.Fatal("administratively disabled backend was re-enabled")
+	}
+	if got.Status != healthBeforeDisable {
+		t.Fatalf("administratively disabled backend runtime health changed to %q", got.Status)
 	}
 
 	// Backend device must remain detached
@@ -228,12 +240,10 @@ func TestSelfHealing_AdminDisabledBackendNeverRecovered(t *testing.T) {
 	}
 }
 
-// TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers verifies that an
-// auto-disabled backend's persistent provenance (models.DisableReasonHealth)
-// survives process restart (recreating Service and Pool from the same DB) and
-// that the fresh service's SelfHealSweep recovers it automatically once the
-// server comes back online.
-func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
+// TestSelfHealing_HealthStateResetsOnRestartAndReprobes verifies issue #90
+// restart semantics: administrative enablement persists, while runtime health
+// is reset to connecting and must be re-established by a fresh probe.
+func TestSelfHealing_HealthStateResetsOnRestartAndReprobes(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -242,44 +252,22 @@ func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
-	var probeFails atomic.Bool
-	probeFails.Store(true)
-
-	vpnSvc1.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		if probeFails.Load() {
-			return 0, errors.New("simulated probe timeout")
-		}
-		return 20 * time.Millisecond, nil
+	vpnSvc1.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 0, errors.New("simulated probe timeout")
 	})
-
 	tun := tunMust(t, vpnSvc1, s1ID)
-
-	// Step 1: 3 probe failures auto-disable the backend
 	for i := 0; i < 3; i++ {
 		_, _ = vpnSvc1.prober.ProbeTunnel(ctx, tun)
 	}
 
 	got, err := vpnSvc1.pool.GetTunnel(s1ID)
 	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
+		t.Fatal(err)
 	}
-	if got.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status disabled, got %q", got.Status)
-	}
-	if got.DisableReason != models.DisableReasonHealth {
-		t.Fatalf("expected disable_reason health, got %q", got.DisableReason)
+	if !got.Enabled || got.Status != models.TunnelStatusDisabled || got.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected enabled health-disabled backend before restart, got %+v", got)
 	}
 
-	// Verify DB record also has health disable reason
-	dbTun, err := db.GetBackendTunnel(ctx, got.ID)
-	if err != nil || dbTun == nil {
-		t.Fatalf("GetBackendTunnel failed: %v", err)
-	}
-	if dbTun.Status != models.TunnelStatusDisabled || dbTun.DisableReason != models.DisableReasonHealth {
-		t.Fatalf("DB record mismatch: status=%q, reason=%q", dbTun.Status, dbTun.DisableReason)
-	}
-
-	// Step 2: Simulate service restart: create vpnSvc2 from the same DB
 	cfg := vpnSvc1.cfg
 	_ = vpnSvc1.Stop()
 
@@ -292,48 +280,33 @@ func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
 		t.Fatalf("SyncFromDB on recreated service failed: %v", err)
 	}
 
-	// Verify vpnSvc2 recognizes the backend as auto-disabled even though in-memory map was empty at boot
-	if !vpnSvc2.prober.IsAutoDisabled(s1ID) {
-		t.Fatal("recreated service must recognize backend as auto-disabled from persistent DB provenance")
+	restarted, err := vpnSvc2.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Step 3: Server recovers and SelfHealSweep restores it
-	probeFails.Store(false)
-	vpnSvc2.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		return 20 * time.Millisecond, nil
-	})
-
-	// First sweep: flap damping 1
-	vpnSvc2.SelfHealSweep(ctx)
-	got2, _ := vpnSvc2.pool.GetTunnel(s1ID)
-	if got2.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status to remain disabled after 1 success, got %q", got2.Status)
+	if !restarted.Enabled {
+		t.Fatal("restart lost administrative enabled state")
 	}
-
-	// Second sweep: recovery!
-	reconnected := vpnSvc2.SelfHealSweep(ctx)
-	if reconnected != 1 {
-		t.Fatalf("expected 1 reconnected on second sweep, got %d", reconnected)
-	}
-
-	got2, _ = vpnSvc2.pool.GetTunnel(s1ID)
-	if got2.Status != models.TunnelStatusActive {
-		t.Fatalf("expected status active after recovery, got %q", got2.Status)
-	}
-	if got2.DisableReason != models.DisableReasonNone {
-		t.Fatalf("expected disable_reason none, got %q", got2.DisableReason)
+	if restarted.Status != models.TunnelStatusConnecting || restarted.DisableReason != models.DisableReasonNone {
+		t.Fatalf("restart did not reset runtime health to unknown: status=%q reason=%q", restarted.Status, restarted.DisableReason)
 	}
 	if vpnSvc2.prober.IsAutoDisabled(s1ID) {
-		t.Fatal("expected IsAutoDisabled to be false after recovery")
+		t.Fatal("stale health-disable state survived restart")
 	}
 
-	// DB row must also be active and have empty disable_reason
-	dbTun2, err := db.GetBackendTunnel(ctx, got.ID)
-	if err != nil || dbTun2 == nil {
-		t.Fatalf("GetBackendTunnel after recovery failed: %v", err)
+	vpnSvc2.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if _, err := vpnSvc2.prober.ProbeTunnel(ctx, restarted); err != nil {
+		t.Fatalf("fresh post-restart probe failed: %v", err)
 	}
-	if dbTun2.Status != models.TunnelStatusActive || dbTun2.DisableReason != models.DisableReasonNone {
-		t.Fatalf("DB record not updated after recovery: status=%q, reason=%q", dbTun2.Status, dbTun2.DisableReason)
+
+	recovered, err := vpnSvc2.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.Enabled || recovered.Status != models.TunnelStatusActive || recovered.DisableReason != models.DisableReasonNone {
+		t.Fatalf("fresh probe did not establish active health: %+v", recovered)
 	}
 }
 
@@ -349,7 +322,11 @@ func TestSelfHealing_AdminDisabledSurvivesRestartAndRemainsDisabled(t *testing.T
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
-	// Administratively disable backend via DisableBackend
+	beforeDisable, err := vpnSvc1.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthBeforeDisable := beforeDisable.Status
 	if err := vpnSvc1.DisableBackend(ctx, s1ID); err != nil {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
@@ -358,8 +335,8 @@ func TestSelfHealing_AdminDisabledSurvivesRestartAndRemainsDisabled(t *testing.T
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if got.Status != models.TunnelStatusDisabled || got.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected status disabled and reason admin, got status=%q, reason=%q", got.Status, got.DisableReason)
+	if got.Enabled || got.DisableReason != models.DisableReasonAdmin || got.Status != healthBeforeDisable {
+		t.Fatalf("expected admin-disabled backend with preserved health, got %+v", got)
 	}
 
 	// Simulate restart
@@ -393,8 +370,8 @@ func TestSelfHealing_AdminDisabledSurvivesRestartAndRemainsDisabled(t *testing.T
 	}
 
 	got2, _ := vpnSvc2.pool.GetTunnel(s1ID)
-	if got2.Status != models.TunnelStatusDisabled || got2.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("tunnel resurrected after sweeps: status=%q, reason=%q", got2.Status, got2.DisableReason)
+	if got2.Enabled || got2.DisableReason != models.DisableReasonAdmin || got2.Status != healthBeforeDisable {
+		t.Fatalf("admin-disabled tunnel changed after restart/sweeps: %+v", got2)
 	}
 }
 
