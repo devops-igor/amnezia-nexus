@@ -17,6 +17,9 @@ func TestReconnectManager(t *testing.T) {
 
 	s1ID, _ := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "1.1.1.1"})
 	_, _ = pool.AddTunnel(ctx, s1ID, "1.1.1.1:51820", "pub1")
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 20); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
 
 	var mockLatency time.Duration = 0
 	var mockErr error = errors.New("timeout")
