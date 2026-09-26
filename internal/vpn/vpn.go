@@ -601,12 +601,15 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		priv = base64.StdEncoding.EncodeToString(privArr[:])
 		// Keep only the encrypted representation in the live config. The
 		// decoded key is owned separately by the endpoint and portalPrivKey.
-		stored, err := db.GetVPNConfig(context.Background())
-		if err != nil {
-			return nil, fmt.Errorf("reload portal key after initialization: %w", err)
+		cfg.ServerPrivateKey = ""
+		if db != nil {
+			stored, err := db.GetVPNConfig(context.Background())
+			if err != nil {
+				return nil, fmt.Errorf("reload portal key after initialization: %w", err)
+			}
+			cfg.ServerPrivateKey = stored.ServerPrivateKey
 		}
 		cfg.ServerPublicKey = pub
-		cfg.ServerPrivateKey = stored.ServerPrivateKey
 	}
 
 	svc := &Service{
