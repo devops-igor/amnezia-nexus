@@ -132,7 +132,7 @@ func TestSelfHealing_AdminDisabledSkipped(t *testing.T) {
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
 
 	// Administratively disable tunnel: set status disabled with reason admin and clear autoDisabled
-	_ = pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0)
+	_ = pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin)
 	prober.MarkAdminDisabled(s1ID)
 
 	if prober.IsAutoDisabled(s1ID) {
@@ -456,7 +456,7 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 
 	// Tunnel is auto-disabled due to health failures
 	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
-		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
 	}
 
 	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
@@ -496,7 +496,7 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 	}
 
 	// While hook is in flight, an administrator manually disables the backend
-	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin); err != nil {
 		t.Fatalf("admin disable failed: %v", err)
 	}
 	prober.MarkAdminDisabled(s1ID)
@@ -515,13 +515,16 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 		t.Fatalf("expected 0 reconnected when admin disable raced hook, got %d", reconnected)
 	}
 
-	// Verify tunnel remains disabled with reason admin
+	// Verify administrative disable persisted without overwriting runtime health.
 	status, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if status.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	if status.Enabled {
+		t.Fatal("expected enabled=false after administrative disable")
+	}
+	if status.Status != models.TunnelStatusActive {
+		t.Fatalf("administrative disable changed runtime health: got %s", status.Status)
 	}
 	if status.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
@@ -554,7 +557,7 @@ func TestSelfHealing_PersistenceFailureRemainsRetryable(t *testing.T) {
 	}
 
 	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
-		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
 	}
 
 	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
@@ -674,7 +677,7 @@ func TestInFlightProbeFailure_DoesNotOverwriteAdminDisable(t *testing.T) {
 	}
 
 	// While probe is in flight, an administrator disables the backend
-	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin); err != nil {
 		t.Fatalf("admin disable failed: %v", err)
 	}
 	prober.MarkAdminDisabled(s1ID)
@@ -771,7 +774,7 @@ func TestInFlightProbeSuccess_DoesNotResurrectOrAttachDevice(t *testing.T) {
 	}
 
 	// While probe is in flight, an administrator disables the backend
-	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin); err != nil {
 		t.Fatalf("admin disable failed: %v", err)
 	}
 	prober.MarkAdminDisabled(s1ID)
@@ -1388,8 +1391,8 @@ func TestThresholdReconcile_ConcurrentAdminDisableAborts(t *testing.T) {
 	prober.mu.Unlock()
 
 	// Admin disable occurs concurrently before probe failure handler executes CAS
-	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
-		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	if err := pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin); err != nil {
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
 	}
 
 	// Probe failure handler runs
@@ -1398,13 +1401,13 @@ func TestThresholdReconcile_ConcurrentAdminDisableAborts(t *testing.T) {
 		t.Fatal("expected probe failure error")
 	}
 
-	// Assert: tunnel remains admin-disabled, autoDisabled is false, failCounts reset
+	// Assert: administrative disable remains authoritative; health is unchanged.
 	cur, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if cur.Status != models.TunnelStatusDisabled || cur.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected admin disabled tunnel, got status=%s, reason=%s", cur.Status, cur.DisableReason)
+	if cur.Enabled || cur.Status != models.TunnelStatusActive || cur.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected admin disabled tunnel with preserved health, got enabled=%v status=%s reason=%s", cur.Enabled, cur.Status, cur.DisableReason)
 	}
 	if prober.IsAutoDisabled(s1ID) {
 		t.Fatal("server should not be marked autoDisabled when admin-disabled")
@@ -1508,8 +1511,8 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 	prober := NewHealthProber(pool, db, cfg, mockProbe)
 
 	// Admin disable tunnel in pool
-	if err := pool.SetTunnelStatusWithReason(ctx, s1ID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
-		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
+	if err := pool.SetTunnelEnabled(ctx, s1ID, false, models.DisableReasonAdmin); err != nil {
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
 	}
 
 	// Set failCounts and autoDisabled in prober
@@ -1541,12 +1544,12 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 		t.Fatalf("expected failCounts to be reset to 0, got %d", fc)
 	}
 
-	// Assert: tunnel in pool remains disabled with DisableReasonAdmin
+	// Assert: tunnel remains administratively disabled without health overwrite.
 	cur, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if cur.Status != models.TunnelStatusDisabled || cur.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected status=disabled and reason=admin, got status=%s, reason=%s", cur.Status, cur.DisableReason)
+	if cur.Enabled || cur.Status != models.TunnelStatusActive || cur.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected enabled=false, active health, admin reason; got enabled=%v status=%s reason=%s", cur.Enabled, cur.Status, cur.DisableReason)
 	}
 }
