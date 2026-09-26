@@ -2256,10 +2256,17 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return nil
 	}
 
+	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
 	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
 		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
 	}
-	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
+	if legacyAdminOnlyState {
+		// Legacy rows encoded administrative disable in runtime status. Once
+		// enabled is authoritative, that old status has no trustworthy health
+		// meaning, so make it unknown/connecting and require a fresh probe.
+		return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0)
+	}
+	return nil
 }
 
 // registerBackendPortalPeers registers the portal's two identities on the
