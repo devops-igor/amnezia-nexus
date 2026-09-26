@@ -146,8 +146,11 @@ func TestSelfHealing_AdminDisabledSkipped(t *testing.T) {
 	}
 
 	t1Status, _ := pool.GetTunnel(s1ID)
-	if t1Status.Status != "disabled" {
-		t.Fatalf("expected status to remain disabled, got %s", t1Status.Status)
+	if t1Status.Enabled {
+		t.Fatal("expected backend to remain administratively disabled")
+	}
+	if t1Status.Status != models.TunnelStatusActive {
+		t.Fatalf("administrative disable changed runtime health: got %s, want active", t1Status.Status)
 	}
 }
 
@@ -515,7 +518,8 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 		t.Fatalf("expected 0 reconnected when admin disable raced hook, got %d", reconnected)
 	}
 
-	// Verify administrative disable persisted without overwriting runtime health.
+	// Verify administrative disable persisted without overwriting the
+	// health-disabled runtime state that existed before the race.
 	status, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
@@ -523,8 +527,8 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 	if status.Enabled {
 		t.Fatal("expected enabled=false after administrative disable")
 	}
-	if status.Status != models.TunnelStatusActive {
-		t.Fatalf("administrative disable changed runtime health: got %s", status.Status)
+	if status.Status != models.TunnelStatusDisabled {
+		t.Fatalf("administrative disable changed runtime health: got %s, want disabled", status.Status)
 	}
 	if status.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
@@ -694,13 +698,17 @@ func TestInFlightProbeFailure_DoesNotOverwriteAdminDisable(t *testing.T) {
 		t.Fatal("timed out waiting for probe to complete")
 	}
 
-	// Verify tunnel remains disabled with reason admin
+	// Verify the administrative disable wins without allowing the in-flight
+	// failed probe to overwrite the pre-disable runtime health.
 	status, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if status.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	if status.Enabled {
+		t.Fatal("expected backend to remain administratively disabled")
+	}
+	if status.Status != models.TunnelStatusActive {
+		t.Fatalf("in-flight probe changed runtime health after admin disable: got %s, want active", status.Status)
 	}
 	if status.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
@@ -796,13 +804,17 @@ func TestInFlightProbeSuccess_DoesNotResurrectOrAttachDevice(t *testing.T) {
 		t.Fatal("expected onActiveHook NOT to be invoked after admin disable")
 	}
 
-	// Verify tunnel remains disabled with reason admin
+	// Verify the administrative disable wins without allowing the in-flight
+	// successful probe to resurrect the data plane or alter runtime health.
 	status, err := pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if status.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status to remain disabled, got %s", status.Status)
+	if status.Enabled {
+		t.Fatal("expected backend to remain administratively disabled")
+	}
+	if status.Status != models.TunnelStatusActive {
+		t.Fatalf("in-flight probe changed runtime health after admin disable: got %s, want active", status.Status)
 	}
 	if status.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
