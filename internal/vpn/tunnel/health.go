@@ -409,7 +409,7 @@ func (hp *HealthProber) isTunnelAdminDisabled(serverID int64) bool {
 	if err != nil || curTun == nil {
 		return false
 	}
-	return curTun.DisableReason == models.DisableReasonAdmin
+	return !curTun.AdministrativelyEnabled()
 }
 
 func (hp *HealthProber) getInitialSnapshot(tunnel *models.BackendTunnel) *models.BackendTunnel {
@@ -435,7 +435,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if err := hp.checkTunnelAvailable(snapshot); err != nil {
 		return 0, err
 	}
-	if snapshot.Status == "disabled" || snapshot.DisableReason == models.DisableReasonAdmin {
+	if !snapshot.AdministrativelyEnabled() {
 		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", snapshot.ID, "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
@@ -995,7 +995,7 @@ func (hp *HealthProber) collectSelfHealTargets() []*models.BackendTunnel {
 	tunnels := hp.pool.ListTunnels()
 	var targets []*models.BackendTunnel
 	for _, t := range tunnels {
-		if t.Status != "disabled" || t.DisableReason == models.DisableReasonAdmin {
+		if !t.AdministrativelyEnabled() || t.RuntimeHealth() != models.TunnelStatusDisabled {
 			continue
 		}
 		if t.DisableReason == models.DisableReasonHealth || hp.IsAutoDisabled(t.ServerID) {
@@ -1192,9 +1192,8 @@ func (hp *HealthProber) ProbeAll(ctx context.Context) map[int64]error {
 	var wg sync.WaitGroup
 
 	for _, t := range tunnels {
-		if t.Status == "disabled" {
-			// Administratively disabled tunnels are excluded from health
-			// probing entirely: probing them can only resurrect them.
+		if !t.AdministrativelyEnabled() {
+			// Administratively disabled tunnels are excluded from health probing.
 			continue
 		}
 		tunnel := t
