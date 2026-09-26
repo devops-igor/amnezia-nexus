@@ -20,7 +20,7 @@ func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, err
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels ORDER BY id`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -52,7 +52,7 @@ func (d *DB) GetBackendTunnel(ctx context.Context, id int64) (*models.BackendTun
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -94,6 +94,11 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encProbeKey = ep
 	}
 
+	if !t.Enabled && t.DisableReason != models.DisableReasonAdmin {
+		// Callers written before issue #90 did not populate Enabled. Preserve
+		// the historical default: a newly created backend is administratively enabled.
+		t.Enabled = true
+	}
 	if t.Status == "" {
 		t.Status = "connecting"
 	}
@@ -109,8 +114,8 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 
 	query := `INSERT INTO backend_tunnels (
 		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
 		t.ServerID,
@@ -119,6 +124,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encPrivKey,
 		encProbeKey,
 		t.Endpoint,
+		t.Enabled,
 		t.Status,
 		t.DisableReason,
 		t.StateVersion,
@@ -216,9 +222,9 @@ func (d *DB) UpdateBackendTunnelStatus(ctx context.Context, id int64, status str
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ? AND disable_reason != ?`
+	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ? AND enabled = 1`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id, models.DisableReasonAdmin)
+	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status: %w", err)
 	}
@@ -236,6 +242,23 @@ func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, 
 	_, err := d.sqlDB.ExecContext(ctx, query, status, disableReason, latencyMS, nowStr, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status with reason: %w", err)
+	}
+	return nil
+}
+
+// UpdateBackendTunnelEnabled updates administrative intent without changing runtime health.
+// disableReason is retained as provenance metadata; status, latency, and last_health_check are untouched.
+func (d *DB) UpdateBackendTunnelEnabled(ctx context.Context, id int64, enabled bool, disableReason string) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE backend_tunnels SET enabled = ?, disable_reason = ?, state_version = state_version + 1 WHERE id = ?`
+	res, err := d.sqlDB.ExecContext(ctx, query, enabled, disableReason, id)
+	if err != nil {
+		return fmt.Errorf("failed to update backend tunnel administrative state: %w", err)
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return fmt.Errorf("backend tunnel %d not found", id)
 	}
 	return nil
 }
@@ -262,7 +285,7 @@ func (d *DB) CompareAndSwapTunnelStatus(ctx context.Context, id int64, expectedS
 
 	nowStr := time.Now().Format(time.RFC3339)
 	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
-		WHERE id = ? AND status = ? AND disable_reason = ? AND state_version = ?`
+		WHERE id = ? AND enabled = 1 AND status = ? AND disable_reason = ? AND state_version = ?`
 
 	res, err := d.sqlDB.ExecContext(ctx, query, newStatus, newReason, latencyMS, nowStr, id, expectedStatus, expectedReason, expectedVersion)
 	if err != nil {
@@ -293,7 +316,7 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE server_id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, serverID)
@@ -585,8 +608,8 @@ func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID stri
 	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?
 		WHERE id = ? AND backend_tunnel_id = ? AND status = 'connected'
 		AND EXISTS (SELECT 1 FROM backend_tunnels
-			WHERE id = ? AND status = 'active' AND disable_reason != ?)`
-	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID, models.DisableReasonAdmin)
+			WHERE id = ? AND enabled = 1 AND status = 'active')`
+	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID)
 	if err != nil {
 		return fmt.Errorf("failed to migrate vpn session %s to tunnel %d: %w", sessionID, targetID, err)
 	}
@@ -837,6 +860,7 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 		&privKey,
 		&probeKey,
 		&t.Endpoint,
+		&t.Enabled,
 		&t.Status,
 		&disableReason,
 		&stateVersion,

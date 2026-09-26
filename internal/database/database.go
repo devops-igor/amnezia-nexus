@@ -102,6 +102,7 @@ var (
 		"private_key":        true,
 		"probe_private_key":  true,
 		"endpoint":           true,
+		"enabled":            true,
 		"status":             true,
 		"disable_reason":     true,
 		"state_version":      true,
@@ -235,6 +236,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 		return err
 	}
 	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
+		return err
+	}
+	if err := d.migrateBackendTunnelsEnabled(ctx); err != nil {
 		return err
 	}
 	if err := d.migrateAWGIPAllocations(ctx); err != nil {
@@ -444,6 +448,54 @@ func (d *DB) migrateBackendTunnelsDisableReason(ctx context.Context) error {
 		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1"); err != nil {
 			return fmt.Errorf("failed to add state_version column: %w", err)
 		}
+	}
+	return nil
+}
+
+// migrateBackendTunnelsEnabled separates administrative intent from runtime
+// health (issue #90). Legacy rows disabled by an administrator map to
+// enabled=false; health-disabled rows remain enabled so self-healing can
+// continue to own their runtime status.
+func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels schema: %w", err)
+	}
+
+	hasEnabled := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if strings.EqualFold(name, "enabled") {
+			hasEnabled = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	if !hasEnabled {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("failed to add backend_tunnels enabled column: %w", err)
+		}
+	}
+
+	if _, err := d.sqlDB.ExecContext(ctx,
+		`UPDATE backend_tunnels SET enabled = 0
+		 WHERE disable_reason = ?
+		    OR (status = ? AND (disable_reason = '' OR disable_reason IS NULL))`,
+		models.DisableReasonAdmin,
+		models.TunnelStatusDisabled,
+	); err != nil {
+		return fmt.Errorf("failed to migrate administrative backend state: %w", err)
 	}
 	return nil
 }

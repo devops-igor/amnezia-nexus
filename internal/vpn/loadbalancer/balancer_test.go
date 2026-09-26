@@ -9,10 +9,10 @@ import (
 func TestFilterHealthy(t *testing.T) {
 	tunnels := []*models.BackendTunnel{
 		nil,
-		{ID: 1, InterfaceName: "awg-be-1", Status: "active", ActiveConnections: 10},
+		{ID: 1, InterfaceName: "awg-be-1", Enabled: true, Status: "active", ActiveConnections: 10},
 		{ID: 2, InterfaceName: "awg-be-2", Status: "degraded", ActiveConnections: 0},
 		{ID: 3, InterfaceName: "awg-be-3", Status: "disabled", ActiveConnections: 0},
-		{ID: 4, InterfaceName: "awg-be-4", Status: "ACTIVE", ActiveConnections: 100},
+		{ID: 4, InterfaceName: "awg-be-4", Enabled: true, Status: "ACTIVE", ActiveConnections: 100},
 	}
 
 	// No per-backend limit

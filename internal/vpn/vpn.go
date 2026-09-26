@@ -910,7 +910,7 @@ func (s *Service) backendTunnelReady(t *models.BackendTunnel) error {
 	if current == nil || current.ID != t.ID {
 		return tunnel.ErrTunnelNotFound
 	}
-	if current.Status == models.TunnelStatusDisabled || current.DisableReason == models.DisableReasonAdmin {
+	if !current.Enabled {
 		return ErrTunnelDisabled
 	}
 	if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
@@ -1002,7 +1002,7 @@ func defaultLinuxTunOpener() (endpoint.PacketDevice, error) {
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
 	for _, tun := range s.pool.ListTunnels() {
-		if tun.DisableReason == models.DisableReasonAdmin {
+		if !tun.Enabled {
 			continue
 		}
 		if tun.Status != TunnelStatusActive && tun.Status != TunnelStatusDegraded {
@@ -2218,19 +2218,19 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	if err != nil {
 		return err
 	}
-	if tunnel.IsSelfHealingContext(ctx) && currTun.DisableReason == models.DisableReasonAdmin {
+	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
 	if hasInitial {
 		// If an administrator disabled this backend while enable was in-flight,
 		// or if concurrent state mutation occurred, abort to respect the disable.
-		if currTun.DisableReason == models.DisableReasonAdmin && initialReason != models.DisableReasonAdmin {
+		if !currTun.Enabled && initialReason != models.DisableReasonAdmin {
 			return errors.New("backend was administratively disabled; aborting enable")
 		}
 		if currTun.StateVersion != initialVersion {
 			return errors.New("backend state modified concurrently; aborting enable")
 		}
-	} else if currTun.DisableReason == models.DisableReasonAdmin {
+	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
 
@@ -2256,6 +2256,9 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return nil
 	}
 
+	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
+		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
+	}
 	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
 }
 
@@ -2365,7 +2368,7 @@ func (s *Service) EnsureBackendProbeKeys(ctx context.Context) {
 	}
 
 	for _, tun := range pool.ListTunnels() {
-		if tun.Status == TunnelStatusDisabled {
+		if !tun.Enabled {
 			continue
 		}
 
@@ -2691,7 +2694,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	if err := s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := s.pool.SetTunnelEnabled(ctx, serverID, false, models.DisableReasonAdmin); err != nil {
 		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
 	}
 
@@ -2795,7 +2798,7 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 		return nil
 	}
 
-	if currentTun.DisableReason == models.DisableReasonAdmin || currentTun.Status == TunnelStatusDisabled || currentTun.Status == models.TunnelStatusDisabled {
+	if !currentTun.Enabled {
 		return nil
 	}
 

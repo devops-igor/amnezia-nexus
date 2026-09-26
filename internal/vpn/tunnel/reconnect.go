@@ -148,6 +148,9 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 	cfg := rm.Config()
 
 	for _, t := range tunnels {
+		if !t.Enabled {
+			continue
+		}
 		if t.Status == "disabled" {
 			// Administratively disabled tunnels are never reconnect
 			// candidates: only "degraded"/"connecting" tunnels may be
