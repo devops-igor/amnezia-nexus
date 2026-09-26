@@ -68,6 +68,84 @@ func setupTestDB(t *testing.T) *database.DB {
 	return db
 }
 
+
+func TestTunnelAdminStateIsIndependentFromRuntimeHealth(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "State Split", Host: "192.0.2.90"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, serverID, "192.0.2.90:51820", "server-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetTunnelStatus(ctx, serverID, models.TunnelStatusActive, 12); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pool.SetTunnelAdminDisabled(ctx, serverID, true); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled.AdminDisabled || disabled.RuntimeHealth() != models.TunnelStatusActive {
+		t.Fatalf("admin disable changed runtime health: %+v", disabled)
+	}
+	if disabled.Status != models.TunnelStatusDisabled || disabled.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("legacy projection is inconsistent: %+v", disabled)
+	}
+	if got := pool.GetActiveTunnels(); len(got) != 0 {
+		t.Fatalf("admin-disabled tunnel remained routable: %+v", got)
+	}
+
+	// A probe result cannot overwrite administrative intent.
+	if err := pool.SetTunnelStatus(ctx, serverID, models.TunnelStatusDegraded, 500); err != nil {
+		t.Fatal(err)
+	}
+	stillDisabled, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stillDisabled.AdminDisabled || stillDisabled.RuntimeHealth() != models.TunnelStatusActive {
+		t.Fatalf("probe changed admin-disabled tunnel: %+v", stillDisabled)
+	}
+
+	if err := pool.SetTunnelAdminDisabled(ctx, serverID, false); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.AdminDisabled || enabled.RuntimeHealth() != models.TunnelStatusActive {
+		t.Fatalf("re-enable did not preserve runtime health: %+v", enabled)
+	}
+
+	// Restart semantics: enabled backends start unknown/connecting and are not
+	// routable until a fresh probe writes health.
+	restarted := NewPool(db)
+	if err := restarted.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	afterRestart, err := restarted.GetTunnel(serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterRestart.AdministrativelyEnabled() || afterRestart.RuntimeHealth() != models.TunnelStatusConnecting {
+		t.Fatalf("restart state = %+v, want enabled + connecting", afterRestart)
+	}
+	if got := restarted.GetActiveTunnels(); len(got) != 0 {
+		t.Fatalf("unprobed restarted tunnel is routable: %+v", got)
+	}
+
+	_ = tun
+}
+
 func TestGenerateCurve25519KeyPair(t *testing.T) {
 	pub, priv, err := GenerateCurve25519KeyPair()
 	if err != nil {
