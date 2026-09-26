@@ -456,7 +456,7 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		return ErrTunnelNotFound
 	}
 
-	if disableReason == models.DisableReasonHealth && !tunnel.Enabled {
+	if !tunnel.Enabled {
 		return nil
 	}
 
@@ -490,14 +490,21 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 		return nil
 	}
 
+	effectiveReason := disableReason
+	if tunnel.DisableReason == models.DisableReasonHealth {
+		// Runtime health provenance belongs to the health subsystem. An
+		// administrative toggle must not erase a health-disabled state.
+		effectiveReason = models.DisableReasonHealth
+	}
+
 	if p.db != nil {
-		if err := p.db.UpdateBackendTunnelEnabled(ctx, tunnel.ID, enabled, disableReason); err != nil {
+		if err := p.db.UpdateBackendTunnelEnabled(ctx, tunnel.ID, enabled, effectiveReason); err != nil {
 			return fmt.Errorf("failed to persist backend administrative state: %w", err)
 		}
 	}
 
 	tunnel.Enabled = enabled
-	tunnel.DisableReason = disableReason
+	tunnel.DisableReason = effectiveReason
 	tunnel.StateVersion++
 	return nil
 }
