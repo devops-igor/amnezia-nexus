@@ -523,7 +523,7 @@
         actionsDiv.style.gap = 'var(--space-xs)';
 
         // Toggle Enable/Disable
-        const disabledBackend = b.status === 'disabled';
+        const disabledBackend = b.enabled === false;
         const toggleBtn = document.createElement('button');
         toggleBtn.type = 'button';
         toggleBtn.className = 'btn btn-ghost btn-sm btn-icon' + (disabledBackend ? ' btn-success-hover' : '');
