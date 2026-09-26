@@ -102,6 +102,8 @@ var (
 		"private_key":        true,
 		"probe_private_key":  true,
 		"endpoint":           true,
+		"health_status":      true,
+		"admin_disabled":     true,
 		"status":             true,
 		"disable_reason":     true,
 		"state_version":      true,
@@ -235,6 +237,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 		return err
 	}
 	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
+		return err
+	}
+	if err := d.migrateBackendTunnelStateSplit(ctx); err != nil {
 		return err
 	}
 	if err := d.migrateAWGIPAllocations(ctx); err != nil {
@@ -444,6 +449,76 @@ func (d *DB) migrateBackendTunnelsDisableReason(ctx context.Context) error {
 		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1"); err != nil {
 			return fmt.Errorf("failed to add state_version column: %w", err)
 		}
+	}
+	return nil
+}
+
+// migrateBackendTunnelStateSplit separates administrative intent from runtime
+// health (issue #90). Legacy admin-disabled rows are migrated fail-closed:
+// admin_disabled is persisted while runtime health becomes "connecting" because
+// the pre-split schema overwrote the last known health with "disabled".
+func (d *DB) migrateBackendTunnelStateSplit(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels state split schema: %w", err)
+	}
+
+	hasHealthStatus := false
+	hasAdminDisabled := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if strings.EqualFold(name, "health_status") {
+			hasHealthStatus = true
+		}
+		if strings.EqualFold(name, "admin_disabled") {
+			hasAdminDisabled = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	if !hasHealthStatus {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN health_status TEXT NOT NULL DEFAULT 'connecting'"); err != nil {
+			return fmt.Errorf("failed to add backend_tunnels health_status column: %w", err)
+		}
+	}
+	if !hasAdminDisabled {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN admin_disabled INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add backend_tunnels admin_disabled column: %w", err)
+		}
+	}
+
+	// Normalize both newly migrated and partially migrated databases. Unknown
+	// legacy disabled rows are treated as administrative disables to avoid
+	// accidentally putting a backend back into rotation after upgrade.
+	_, err = d.sqlDB.ExecContext(ctx, `
+		UPDATE backend_tunnels
+		SET admin_disabled = CASE
+				WHEN disable_reason = 'admin' THEN 1
+				WHEN status = 'disabled' AND COALESCE(disable_reason, '') != 'health' THEN 1
+				ELSE admin_disabled
+			END,
+			health_status = CASE
+				WHEN disable_reason = 'admin' THEN 'connecting'
+				WHEN status = 'disabled' AND COALESCE(disable_reason, '') != 'health' THEN 'connecting'
+				WHEN health_status IS NULL OR health_status = '' OR health_status = 'connecting' THEN status
+				ELSE health_status
+			END
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to backfill backend tunnel state split: %w", err)
 	}
 	return nil
 }
