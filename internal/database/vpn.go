@@ -264,6 +264,24 @@ func (d *DB) UpdateBackendTunnelEnabled(ctx context.Context, id int64, enabled b
 	return nil
 }
 
+// ResetEnabledBackendTunnelHealthForStartup clears persisted runtime-health
+// claims for administratively enabled backends. Administrative intent is
+// preserved, while health becomes unknown until the startup probe establishes
+// a fresh result.
+func (d *DB) ResetEnabledBackendTunnelHealthForStartup(ctx context.Context) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE backend_tunnels
+		SET status = ?, disable_reason = ?, latency_ms = 0, last_health_check = NULL,
+		    state_version = state_version + 1
+		WHERE enabled = 1`
+	if _, err := d.sqlDB.ExecContext(ctx, query, models.TunnelStatusConnecting, models.DisableReasonNone); err != nil {
+		return fmt.Errorf("failed to reset enabled backend health for startup: %w", err)
+	}
+	return nil
+}
+
 // UpdateBackendTunnelEndpoint updates the endpoint of a backend tunnel and increments its state_version.
 func (d *DB) UpdateBackendTunnelEndpoint(ctx context.Context, id int64, endpoint string) error {
 	d.writeMu.Lock()
