@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 func TestBackendEnabledMigrationPreservesAdministrativeIntent(t *testing.T) {
@@ -97,5 +99,43 @@ func TestBackendEnabledMigrationPreservesAdministrativeIntent(t *testing.T) {
 	}
 	if !byInterface["active"].enabled {
 		t.Fatal("active legacy row migrated as administratively disabled")
+	}
+
+	// Simulate a valid post-migration intermediate state: administrative
+	// intent is enabled, while runtime health is still disabled and its old
+	// provenance has already been cleared. Reopening the DB must not reinterpret
+	// this modern state as a legacy administrative disable.
+	if _, err := db.SQLDB().ExecContext(ctx,
+		`UPDATE backend_tunnels SET enabled = 1, status = 'disabled', disable_reason = '' WHERE interface_name = 'health'`,
+	); err != nil {
+		t.Fatalf("prepare post-migration state: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close migrated DB: %v", err)
+	}
+
+	reopened, err := Open(dbPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		t.Fatalf("reopen migrated DB: %v", err)
+	}
+	defer reopened.Close()
+
+	reopenedTunnels, err := reopened.GetBackendTunnels(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendTunnels after reopen: %v", err)
+	}
+	var health *models.BackendTunnel
+	for i := range reopenedTunnels {
+		if reopenedTunnels[i].InterfaceName == "health" {
+			health = &reopenedTunnels[i]
+			break
+		}
+	}
+	if health == nil {
+		t.Fatal("health tunnel missing after reopen")
+	}
+	if !health.Enabled || health.Status != "disabled" || health.DisableReason != "" {
+		t.Fatalf("reopen reinterpreted modern state as legacy admin disable: enabled=%v status=%q reason=%q",
+			health.Enabled, health.Status, health.DisableReason)
 	}
 }
