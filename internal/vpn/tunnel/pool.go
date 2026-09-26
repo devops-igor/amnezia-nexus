@@ -138,12 +138,14 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 			// routing can use them (issue #90).
 			if err := p.db.UpdateBackendTunnel(ctx, t.ID, map[string]any{
 				"status":            models.TunnelStatusConnecting,
+				"disable_reason":    models.DisableReasonNone,
 				"latency_ms":        int64(0),
 				"last_health_check": nil,
 			}); err != nil {
 				return fmt.Errorf("failed to reset backend tunnel %d runtime health: %w", t.ID, err)
 			}
 			t.Status = models.TunnelStatusConnecting
+			t.DisableReason = models.DisableReasonNone
 			t.LatencyMS = 0
 			t.LastHealthCheck = nil
 		}
