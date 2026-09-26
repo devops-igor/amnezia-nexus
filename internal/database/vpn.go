@@ -613,7 +613,7 @@ func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID stri
 	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?
 		WHERE id = ? AND backend_tunnel_id = ? AND status = 'connected'
 		AND EXISTS (SELECT 1 FROM backend_tunnels
-			WHERE id = ? AND status = 'active' AND disable_reason != ?)`
+			WHERE id = ? AND admin_disabled = 0 AND health_status = 'active')`
 	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID, models.DisableReasonAdmin)
 	if err != nil {
 		return fmt.Errorf("failed to migrate vpn session %s to tunnel %d: %w", sessionID, targetID, err)
