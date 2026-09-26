@@ -218,3 +218,74 @@ func TestSettingsSchemaVersionAndMarshalErrors(t *testing.T) {
 		t.Errorf("expected error in SetSettingsBulk with unmarshalable value")
 	}
 }
+
+func TestGetSettingRaw(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Absent row returns found=false, err=nil
+	val, found, err := db.GetSettingRaw(ctx, "absent_key")
+	if err != nil {
+		t.Fatalf("unexpected error for absent key: %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false for absent key, got true (val=%+v)", val)
+	}
+
+	// 2. Existing row with SQL NULL returns found=true, val.Valid=false, err=nil
+	if _, err := db.sqlDB.ExecContext(ctx, "INSERT INTO settings (key, value) VALUES ('null_key', NULL)"); err != nil {
+		t.Fatalf("failed to insert NULL setting: %v", err)
+	}
+	val, found, err = db.GetSettingRaw(ctx, "null_key")
+	if err != nil {
+		t.Fatalf("unexpected error for null key: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for null key, got false")
+	}
+	if val.Valid {
+		t.Fatalf("expected val.Valid=false for SQL NULL, got valid: %q", val.String)
+	}
+
+	// 3. Existing row with empty string returns found=true, val.Valid=true, val.String="", err=nil
+	if _, err := db.sqlDB.ExecContext(ctx, "INSERT INTO settings (key, value) VALUES ('empty_key', '')"); err != nil {
+		t.Fatalf("failed to insert empty setting: %v", err)
+	}
+	val, found, err = db.GetSettingRaw(ctx, "empty_key")
+	if err != nil {
+		t.Fatalf("unexpected error for empty key: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for empty key, got false")
+	}
+	if !val.Valid || val.String != "" {
+		t.Fatalf("expected val.Valid=true and empty string, got: %+v", val)
+	}
+
+	// 4. Existing row with value returns found=true, val.Valid=true, val.String="custom", err=nil
+	if _, err := db.sqlDB.ExecContext(ctx, "INSERT INTO settings (key, value) VALUES ('val_key', 'custom')"); err != nil {
+		t.Fatalf("failed to insert custom setting: %v", err)
+	}
+	val, found, err = db.GetSettingRaw(ctx, "val_key")
+	if err != nil {
+		t.Fatalf("unexpected error for val key: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for val key, got false")
+	}
+	if !val.Valid || val.String != "custom" {
+		t.Fatalf("expected val.Valid=true and val.String='custom', got: %+v", val)
+	}
+
+	// 5. Closed DB returns error and found=false
+	if err := db.Close(); err != nil {
+		t.Fatalf("failed to close test db: %v", err)
+	}
+	_, found, err = db.GetSettingRaw(ctx, "val_key")
+	if err == nil {
+		t.Fatal("expected error on closed db, got nil")
+	}
+	if found {
+		t.Fatal("expected found=false on error, got true")
+	}
+}
