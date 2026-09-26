@@ -290,7 +290,6 @@ def test_dataplane_traffic_verification(
     # 3. Client Provisioning via Panel API
     test_user_id = None
     client_container_name = f"e2e-traffic-client-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    container_started = False
 
     try:
         unique_suffix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}"
@@ -373,7 +372,6 @@ def test_dataplane_traffic_verification(
         ]
         start_res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
         assert start_res.returncode == 0, f"Failed to start client container: {start_res.stderr}"
-        container_started = True
 
         # Create dummy /usr/local/bin/sysctl script so awg-quick's check succeeds without --privileged
         dummy_sysctl = "printf '#!/bin/sh\\nexit 0\\n' > /usr/local/bin/sysctl && chmod +x /usr/local/bin/sysctl"
@@ -453,9 +451,22 @@ def test_dataplane_traffic_verification(
         ), f"MTU-boundary probe (1200 bytes) failed: {mtu_ping.stderr} | {mtu_ping.stdout}"
         _assert_zero_packet_loss(mtu_ping.stdout, "MTU boundary probe")
 
-        # 8. Egress NAT & Internet Forwarding
+        # 8. Egress NAT & Internet Forwarding (traversal verification across awg0)
+        route_res = _docker_exec(client_container_name, "ip route get 1.1.1.1")
+        assert (
+            route_res.returncode == 0 and "dev awg0" in route_res.stdout
+        ), f"Route for 1.1.1.1 does not resolve via awg0 interface: {route_res.stdout}"
+
+        rx_before, tx_before = _get_transfer_stats(client_container_name, "awg0")
         nat_forwarding_ok = _verify_egress_nat(client_container_name)
         assert nat_forwarding_ok, "External packet probe failed; server-side egress NAT not active"
+        rx_after, tx_after = _get_transfer_stats(client_container_name, "awg0")
+        assert (
+            tx_after > tx_before
+        ), f"External probe did not transmit packets across awg0: tx_before={tx_before}, tx_after={tx_after}"
+        assert (
+            rx_after > rx_before
+        ), f"External probe did not receive response packets across awg0: rx_before={rx_before}, rx_after={rx_after}"
 
         # 9. Revocation & Disconnection Verification
         client_epoch_before = _get_client_handshake_epoch(client_container_name, "awg0")
@@ -525,19 +536,28 @@ def test_dataplane_traffic_verification(
         # 10. Hardened Hermetic Teardown (independent guarded blocks with error assertions)
         cleanup_errors = []
 
-        if container_started:
+        if client_container_name:
             try:
-                _docker_exec(client_container_name, "awg-quick down /tmp/awg0.conf || true")
-                rm_res = subprocess.run(
-                    ["docker", "rm", "-f", client_container_name],
+                inspect_res = subprocess.run(
+                    ["docker", "container", "inspect", client_container_name],
                     capture_output=True,
                     text=True,
-                    timeout=15,
+                    timeout=10,
                 )
-                assert (
-                    rm_res.returncode == 0 or "No such container" in rm_res.stderr
-                ), f"Failed to remove client container {client_container_name}: {rm_res.stderr}"
-                logger.info("Hermetic teardown: client container %s removed", client_container_name)
+                if inspect_res.returncode == 0:
+                    _docker_exec(client_container_name, "awg-quick down /tmp/awg0.conf || true")
+                    rm_res = subprocess.run(
+                        ["docker", "rm", "-f", client_container_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    assert (
+                        rm_res.returncode == 0
+                    ), f"Failed to remove client container {client_container_name}: {rm_res.stderr}"
+                    logger.info(
+                        "Hermetic teardown: client container %s removed", client_container_name
+                    )
             except Exception as exc:
                 logger.error(
                     "Error tearing down client container %s: %s", client_container_name, exc

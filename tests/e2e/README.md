@@ -96,8 +96,8 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 |------|-------|---------------|
 | `test_setup.py` | 4 | Initial setup wizard, validation, admin creation, lock |
 | `test_onboard.py` | 4 | Server 1 SSH onboarding, fingerprint confirm, AWG 3.1 deploy, health |
-| `test_auth.py` | 6 | Login page, success, failure, rate limiting, CSRF, logout |
-| `test_servers.py` | 7 | Server list, detail, check, install, stats, add form, reboot |
+| `test_auth.py` | 7 | Login page, success, failure, slide captcha, rate limiting, CSRF, logout |
+| `test_servers.py` | 10 | Server list, detail, check, install, stats, add form, reboot, edit host validation & lifecycle |
 | `test_connections.py` | 5 | Connection list, add, config/QR, toggle, delete |
 | `test_users.py` | 7 | User list, add, edit, toggle, add connection, delete, XSS |
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
@@ -105,7 +105,7 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 48 test scenarios across 10 test suites**
+**Total: 52 test scenarios across 10 test suites (4 in Stage 1, 4 in Stage 2, 44 in Stage 3)**
 
 ---
 
@@ -236,9 +236,9 @@ To ensure test hermeticity without polluting host routing tables or requiring ro
 4. **Cryptographic Handshake**: Validates completion of the obfuscated AmneziaWG handshake on both client (`latest handshake > 0`) and server (`GET /api/servers/{id}/connections/?protocol=awg` reports populated `userData.latestHandshake`).
 5. **Bi-Directional ICMP Gateway Connectivity**: Verifies 0% packet loss ping to gateway `10.8.1.1` and asserts positive RX/TX byte counters.
 6. **MTU-Boundary / Fragmentation Probe**: Executes near-MTU 1200-byte ICMP probe (`-s 1200`) to confirm packets pass through without fragmentation rejection.
-7. **Egress NAT & Forwarding**: Transmits external network probes (`1.1.1.1` ICMP/HTTP probe) to verify server-side `iptables MASQUERADE` and forwarding.
+7. **Egress NAT & Forwarding**: Verifies policy routing (`ip route get 1.1.1.1` resolving via `awg0`) and transmits external network probes (`1.1.1.1` ICMP/HTTP probe), validating positive `awg0` TX/RX counter deltas to guarantee packets traverse the VPN tunnel rather than leaking.
 8. **Connection Toggle & Revocation**: Tests disabling the connection via `/api/servers/{server_id}/connections/toggle`, asserts traffic to `10.8.1.1` is immediately terminated (100% loss), verifies server handshake does not advance while disabled, and confirms traffic resumption upon re-enabling.
-9. **Hardened Hermetic Teardown**: Guarantees independent teardown of client container, route rules, and test user in separate guarded blocks with error logging.
+9. **Hardened Hermetic Teardown**: Inspects container existence with `docker container inspect` before teardown, cleanly removing client container, route rules, and test user in separate guarded blocks without masking early setup errors.
 
 ---
 
