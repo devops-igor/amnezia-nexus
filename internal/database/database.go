@@ -489,9 +489,16 @@ func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
 	}
 
 	if _, err := d.sqlDB.ExecContext(ctx,
-		`UPDATE backend_tunnels SET enabled = 0
+		`UPDATE backend_tunnels
+		 SET enabled = 0,
+		     disable_reason = CASE
+		         WHEN status = ? AND (disable_reason = '' OR disable_reason IS NULL) THEN ?
+		         ELSE disable_reason
+		     END
 		 WHERE disable_reason = ?
 		    OR (status = ? AND (disable_reason = '' OR disable_reason IS NULL))`,
+		models.TunnelStatusDisabled,
+		models.DisableReasonAdmin,
 		models.DisableReasonAdmin,
 		models.TunnelStatusDisabled,
 	); err != nil {
