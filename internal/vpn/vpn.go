@@ -1002,10 +1002,11 @@ func defaultLinuxTunOpener() (endpoint.PacketDevice, error) {
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
 	for _, tun := range s.pool.ListTunnels() {
-		if tun.DisableReason == models.DisableReasonAdmin {
+		if !tun.AdministrativelyEnabled() {
 			continue
 		}
-		if tun.Status != TunnelStatusActive && tun.Status != TunnelStatusDegraded {
+		health := tun.RuntimeHealth()
+		if health != TunnelStatusActive && health != TunnelStatusDegraded {
 			continue
 		}
 		var awgParams map[string]any
@@ -2257,7 +2258,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return nil
 	}
 
-	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
+	return pool.SetTunnelAdminDisabled(ctx, serverID, false)
 }
 
 // registerBackendPortalPeers registers the portal's two identities on the
@@ -2692,7 +2693,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	if err := s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := s.pool.SetTunnelAdminDisabled(ctx, serverID, true); err != nil {
 		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
 	}
 
