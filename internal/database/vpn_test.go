@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,22 @@ func TestVPNBackendTunnelsUpdateAndStatus(t *testing.T) {
 	tStatus, _ := db.GetBackendTunnel(ctx, tID)
 	if tStatus.Status != "degraded" || tStatus.LatencyMS != 88 {
 		t.Errorf("UpdateBackendTunnelStatus mismatch: status=%s, latency=%d", tStatus.Status, tStatus.LatencyMS)
+	}
+}
+
+func TestUpdateBackendTunnel_NotFound(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	nonExistentID := int64(999999)
+	err := db.UpdateBackendTunnel(ctx, nonExistentID, map[string]any{
+		"endpoint": "198.51.100.10:51820",
+	})
+	if err == nil {
+		t.Fatal("expected error updating non-existent backend tunnel, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error containing 'not found', got: %v", err)
 	}
 }
 

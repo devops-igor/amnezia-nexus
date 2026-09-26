@@ -32,6 +32,7 @@ type Pool struct {
 	tunnelsByIfName       map[string]*models.BackendTunnel
 	closed                bool
 	setTunnelEndpointHook func(ctx context.Context, tunnelID int64, endpoint string) error
+	generateKeypairFn     func() (string, string, error)
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -98,6 +99,20 @@ func PublicKeyFromPrivateKey(privKeyBase64 string) (string, error) {
 	return DeriveClientPublicKey(privKeyBase64)
 }
 
+func (p *Pool) genKeyPair() (string, string, error) {
+	if p.generateKeypairFn != nil {
+		return p.generateKeypairFn()
+	}
+	return GenerateCurve25519KeyPair()
+}
+
+// SetGenerateKeyPairForTest overrides the keypair generation function for testing.
+func (p *Pool) SetGenerateKeyPairForTest(fn func() (string, string, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.generateKeypairFn = fn
+}
+
 // SyncFromDB loads all backend tunnels from the database into the memory pool.
 func (p *Pool) SyncFromDB(ctx context.Context) error {
 	if p.db == nil {
@@ -155,54 +170,70 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 	}
 
 	if existing, ok := p.tunnelsByServerID[serverID]; ok {
-		existing.Endpoint = endpoint
-		if serverPubKey != "" {
-			existing.PublicKey = serverPubKey
+		candEndpoint := endpoint
+		candPubKey := serverPubKey
+		if candPubKey == "" {
+			candPubKey = existing.PublicKey
 		}
-		if existing.PrivateKey == "" {
-			_, sk, err := GenerateCurve25519KeyPair()
-			if err == nil {
-				existing.PrivateKey = sk
+		candPrivKey := existing.PrivateKey
+		candProbePrivKey := existing.ProbePrivateKey
+
+		if candPrivKey == "" {
+			_, sk, err := p.genKeyPair()
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate backend private key: %w", err)
 			}
+			candPrivKey = sk
 		}
-		if existing.ProbePrivateKey == "" {
+
+		if candProbePrivKey == "" {
 			// Dedicated health-probe identity (issue #43): must differ from
 			// PrivateKey so the prober's socket cannot steal the data peer's
 			// return endpoint on the backend.
-			_, sk, err := GenerateCurve25519KeyPair()
-			if err == nil {
-				existing.ProbePrivateKey = sk
+			_, sk, err := p.genKeyPair()
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate probe private key: %w", err)
+			}
+			candProbePrivKey = sk
+		}
+
+		if p.db != nil {
+			updates := map[string]any{
+				"endpoint":          candEndpoint,
+				"public_key":        candPubKey,
+				"private_key":       candPrivKey,
+				"probe_private_key": candProbePrivKey,
+			}
+			if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
+				return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
 			}
 		}
-		if p.db != nil {
-			_ = p.db.UpdateBackendTunnel(ctx, existing.ID, map[string]any{
-				"endpoint":          endpoint,
-				"public_key":        existing.PublicKey,
-				"private_key":       existing.PrivateKey,
-				"probe_private_key": existing.ProbePrivateKey,
-			})
-		}
+
+		existing.Endpoint = candEndpoint
+		existing.PublicKey = candPubKey
+		existing.PrivateKey = candPrivKey
+		existing.ProbePrivateKey = candProbePrivKey
 		return existing, nil
 	}
 
 	pubKey := serverPubKey
 	var privKey string
 	if pubKey == "" {
-		pk, sk, err := GenerateCurve25519KeyPair()
+		pk, sk, err := p.genKeyPair()
 		if err != nil {
 			return nil, err
 		}
 		pubKey = pk
 		privKey = sk
 	} else {
-		_, sk, err := GenerateCurve25519KeyPair()
+		_, sk, err := p.genKeyPair()
 		if err != nil {
 			return nil, err
 		}
 		privKey = sk
 	}
 
-	probePrivPub, probePrivKey, err := GenerateCurve25519KeyPair()
+	probePrivPub, probePrivKey, err := p.genKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate probe keypair: %w", err)
 	}
