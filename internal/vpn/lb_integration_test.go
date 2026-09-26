@@ -30,7 +30,13 @@ func lbTunnel(t *testing.T, svc *Service, db *database.DB, serverID int64, iface
 	}
 	tun.InterfaceName = iface
 	tun.PrivateKey = priv
-	tun.Status = TunnelStatusActive
+	if err := svc.pool.SetTunnelStatus(t.Context(), sID, TunnelStatusActive, 10); err != nil {
+		t.Fatalf("SetTunnelStatus(%d) failed: %v", serverID, err)
+	}
+	tun, err = svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel(%d) failed: %v", serverID, err)
+	}
 	return tun
 }
 
