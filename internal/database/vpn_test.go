@@ -440,6 +440,64 @@ func TestVPNConfig_NoMigrationOnRead(t *testing.T) {
 	}
 }
 
+func TestGetVPNConfig_ContractVerification(t *testing.T) {
+	ctx := context.Background()
+
+	// Case 1: Absent vpn_config row returns default VPNConfig with nil error (first-boot policy).
+	t.Run("absent_row_returns_defaults", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "DELETE FROM settings WHERE key = 'vpn_config'"); err != nil {
+			t.Fatalf("failed to delete vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err != nil {
+			t.Fatalf("expected nil error for absent vpn_config row, got: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("expected non-nil default VPNConfig for absent row")
+		}
+		if cfg.ListenPort != 51820 {
+			t.Errorf("expected default ListenPort 51820, got %d", cfg.ListenPort)
+		}
+		if cfg.Algorithm != models.LBLeastConnections {
+			t.Errorf("expected default Algorithm %s, got %s", models.LBLeastConnections, cfg.Algorithm)
+		}
+		if cfg.SubnetCIDR != "10.100.0.0/16" {
+			t.Errorf("expected default SubnetCIDR 10.100.0.0/16, got %s", cfg.SubnetCIDR)
+		}
+	})
+
+	// Case 2: Malformed JSON returns a syntax error and nil config.
+	t.Run("malformed_json_returns_error", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '{invalid-json')"); err != nil {
+			t.Fatalf("failed to insert malformed vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on malformed JSON, got nil")
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+
+	// Case 3: Database read error returns query error and nil config.
+	t.Run("database_read_error_returns_error", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if err := db.Close(); err != nil {
+			t.Fatalf("failed to close test db: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on closed db query, got nil")
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+}
+
 func TestCreateVPNSession_AssignedIPConflictResolution(t *testing.T) {
 	db, _ := setupTestDB(t)
 	ctx := context.Background()
