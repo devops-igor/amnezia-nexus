@@ -392,7 +392,7 @@ func (hp *HealthProber) checkTunnelAvailable(tunnel *models.BackendTunnel) error
 	if curTun == nil || curTun.ID != tunnel.ID {
 		return ErrTunnelNotFound
 	}
-	if curTun.Status == "disabled" || curTun.DisableReason == models.DisableReasonAdmin {
+	if !curTun.Enabled {
 		return ErrTunnelDisabled
 	}
 	if tunnel.StateVersion > 0 && curTun.StateVersion != tunnel.StateVersion {
@@ -409,7 +409,7 @@ func (hp *HealthProber) isTunnelAdminDisabled(serverID int64) bool {
 	if err != nil || curTun == nil {
 		return false
 	}
-	return curTun.DisableReason == models.DisableReasonAdmin
+	return !curTun.Enabled
 }
 
 func (hp *HealthProber) getInitialSnapshot(tunnel *models.BackendTunnel) *models.BackendTunnel {
@@ -435,7 +435,7 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if err := hp.checkTunnelAvailable(snapshot); err != nil {
 		return 0, err
 	}
-	if snapshot.Status == "disabled" || snapshot.DisableReason == models.DisableReasonAdmin {
+	if !snapshot.Enabled {
 		slog.Info("skipping probe of administratively disabled tunnel", "tunnel_id", snapshot.ID, "server_id", snapshot.ServerID)
 		return 0, ErrTunnelDisabled
 	}
@@ -561,7 +561,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		return false, ErrTunnelNotFound
 	}
 
-	if currentTunnel.DisableReason == models.DisableReasonAdmin {
+	if !currentTunnel.Enabled {
 		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
 		return false, hp.updateHealthIfCurrent(currentTunnel, func() {
 			delete(hp.autoDisabled, serverID)
@@ -624,7 +624,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 	if cur == nil || cur.ID != expectedTunnelID {
 		return false, ErrTunnelNotFound
 	}
-	if cur.DisableReason == models.DisableReasonAdmin {
+	if !cur.Enabled {
 		slog.Info("threshold auto-disable reconciliation CAS missed due to concurrent admin disable", "server_id", serverID)
 		return false, hp.updateHealthIfCurrent(cur, func() {
 			delete(hp.autoDisabled, serverID)
@@ -896,7 +896,7 @@ func (hp *HealthProber) IsAutoDisabled(serverID int64) bool {
 	var currentID int64
 	if hp.pool != nil {
 		tun, err := hp.pool.GetTunnel(serverID)
-		if err != nil || tun == nil || tun.DisableReason == models.DisableReasonAdmin {
+		if err != nil || tun == nil || !tun.Enabled {
 			return false
 		}
 		if tun.Status == "disabled" && tun.DisableReason == models.DisableReasonHealth {
@@ -995,7 +995,7 @@ func (hp *HealthProber) collectSelfHealTargets() []*models.BackendTunnel {
 	tunnels := hp.pool.ListTunnels()
 	var targets []*models.BackendTunnel
 	for _, t := range tunnels {
-		if t.Status != "disabled" || t.DisableReason == models.DisableReasonAdmin {
+		if !t.Enabled || t.Status != "disabled" {
 			continue
 		}
 		if t.DisableReason == models.DisableReasonHealth || hp.IsAutoDisabled(t.ServerID) {
@@ -1072,8 +1072,8 @@ func (hp *HealthProber) verifyPreHookState(tun *models.BackendTunnel) (*models.B
 		return nil, false
 	}
 	if tunNow.ID != tun.ID ||
+		!tunNow.Enabled ||
 		tunNow.Status != "disabled" ||
-		tunNow.DisableReason == models.DisableReasonAdmin ||
 		(tunNow.DisableReason != models.DisableReasonHealth && !hp.IsAutoDisabled(tun.ServerID)) ||
 		tunNow.StateVersion != tun.StateVersion {
 		slog.Info("self-healing aborted: tunnel state changed before hook",
@@ -1119,7 +1119,7 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 	if err != nil || tunAfterHook == nil || tunAfterHook.ID != tun.ID {
 		return false
 	}
-	if tunAfterHook.DisableReason == models.DisableReasonAdmin {
+	if !tunAfterHook.Enabled {
 		slog.Warn("self-healing aborted: tunnel administratively disabled during hook execution",
 			"server_id", tun.ServerID,
 		)
@@ -1192,9 +1192,10 @@ func (hp *HealthProber) ProbeAll(ctx context.Context) map[int64]error {
 	var wg sync.WaitGroup
 
 	for _, t := range tunnels {
-		if t.Status == "disabled" {
-			// Administratively disabled tunnels are excluded from health
-			// probing entirely: probing them can only resurrect them.
+		if !t.Enabled || t.Status == "disabled" {
+			// Administratively disabled tunnels are excluded from ordinary
+			// probing. Runtime health-disabled tunnels are recovered by the
+			// dedicated self-healing sweep.
 			continue
 		}
 		tunnel := t
