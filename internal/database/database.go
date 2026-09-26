@@ -102,9 +102,9 @@ var (
 		"private_key":        true,
 		"probe_private_key":  true,
 		"endpoint":           true,
-		"enabled":            true,
-		"status":             true,
-		"disable_reason":     true,
+		// Administrative intent and runtime health have dedicated writers
+		// (issue #90). Keep them out of this generic update path so ownership
+		// cannot be bypassed accidentally.
 		"state_version":      true,
 		"last_health_check":  true,
 		"latency_ms":         true,
