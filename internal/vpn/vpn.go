@@ -45,6 +45,7 @@ type Status struct {
 	// A rising forwarder_drops_total with stable traffic means a stalled
 	// downstream path or unroutable backend returns; a rising handshake_rejections means
 	// client initiations are failing cryptographic verification (issues #39, #288).
+	ForwarderAvailable             bool                                 `json:"forwarder_available"`
 	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
 	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
 	ForwarderDropsPacketTooLarge   uint64                               `json:"forwarder_drops_packet_too_large"`
@@ -1671,6 +1672,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
 	if s.forwarder != nil {
+		status.ForwarderAvailable = true
 		rx, tx, _ := s.forwarder.GetStats()
 		status.RxBytes = rx
 		status.TxBytes = tx

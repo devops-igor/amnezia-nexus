@@ -966,7 +966,16 @@
     }
 
     function vpnRenderForwarderHealth(status) {
-        const isAvailable = Boolean(status && typeof status.forwarder_queue_capacity === 'number' && status.forwarder_queue_capacity > 0);
+        let isAvailable = false;
+        if (status && typeof status === 'object') {
+            if (typeof status.forwarder_available === 'boolean') {
+                isAvailable = status.forwarder_available;
+            } else if (typeof status.forwarder_queue_capacity === 'number') {
+                // Backward-compatibility fallback for older status responses lacking the boolean
+                isAvailable = status.forwarder_queue_capacity > 0 ||
+                    (status.forwarder_drops_total !== undefined && status.forwarder_drops_total !== null);
+            }
+        }
 
         const statusBadge = document.getElementById('vpn-fwd-status-badge');
         const statusText = document.getElementById('vpn-fwd-status-text');
@@ -1003,10 +1012,12 @@
             if (tbody) tbody.textContent = '';
             if (table) table.style.display = 'none';
             if (emptyDiv) emptyDiv.style.display = 'block';
+            const detailsElem = document.getElementById('vpn-fwd-routes-details');
+            if (detailsElem) detailsElem.open = false;
             return;
         }
 
-        const cap = Number(status.forwarder_queue_capacity);
+        const cap = Number(status.forwarder_queue_capacity || 0);
         const occ = Number(status.forwarder_queue_occupancy || 0);
         const peak = Number(status.forwarder_queue_high_water || 0);
         const dropsQueueFull = Number(status.forwarder_drops_queue_full || 0);
@@ -1018,9 +1029,9 @@
         // Queue occupancy (instantaneous)
         if (queueElem) {
             queueElem.textContent = occ + ' / ' + cap;
-            if (occ >= cap * 0.8) {
+            if (cap > 0 && occ >= cap * 0.8) {
                 queueElem.style.color = 'var(--danger)';
-            } else if (occ >= cap * 0.5) {
+            } else if (cap > 0 && occ >= cap * 0.5) {
                 queueElem.style.color = 'var(--warning)';
             } else {
                 queueElem.style.color = '';
@@ -1030,9 +1041,9 @@
         // Peak high-water
         if (peakElem) {
             peakElem.textContent = peak + ' / ' + cap;
-            if (peak >= cap * 0.8) {
+            if (cap > 0 && peak >= cap * 0.8) {
                 peakElem.style.color = 'var(--danger)';
-            } else if (peak >= cap * 0.5) {
+            } else if (cap > 0 && peak >= cap * 0.5) {
                 peakElem.style.color = 'var(--warning)';
             } else {
                 peakElem.style.color = '';
@@ -1161,8 +1172,8 @@
 
         // Overall Forwarder Health Badge
         if (statusBadge && statusText) {
-            const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || totalRouteDrops > 0 || occ >= cap * 0.9;
-            const hasWarningIssue = dropsNoRoute > 0 || dropsOversize > 0 || decryptFailures > 0 || occ >= cap * 0.5 || routeHasPressure;
+            const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || totalRouteDrops > 0 || (cap > 0 && occ >= cap * 0.9);
+            const hasWarningIssue = dropsNoRoute > 0 || dropsOversize > 0 || decryptFailures > 0 || (cap > 0 && occ >= cap * 0.5) || routeHasPressure;
 
             if (hasSevereIssue) {
                 statusBadge.className = 'badge badge-danger';

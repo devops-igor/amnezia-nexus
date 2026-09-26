@@ -381,7 +381,7 @@ func TestVPNServiceEdgeCases1(t *testing.T) {
 	// 5. GetStatus with nil sub-components
 	emptySvc := &Service{}
 	st, err := emptySvc.GetStatus(ctx)
-	if err != nil || st.ListenerRunning || st.ActiveTunnels != 0 {
+	if err != nil || st.ListenerRunning || st.ActiveTunnels != 0 || st.ForwarderAvailable {
 		t.Errorf("GetStatus emptySvc mismatch: %+v, err: %v", st, err)
 	}
 }

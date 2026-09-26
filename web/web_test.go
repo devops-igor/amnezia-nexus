@@ -2664,11 +2664,12 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			name        string
 			scenarioKey string
 		}{
-			{"Scenario1_HealthyCompleteTelemetry", "healthy"},
-			{"Scenario2_NonZeroFailureCounters", "failures"},
-			{"Scenario3_SaturatedRouteWithDrops", "saturated_route"},
-			{"Scenario4_OldBackendAbsentFields", "absent_fields"},
-			{"Scenario5_FailedUnavailableStatusSample", "failed_sample"},
+			{"Scenario1_HealthyWithRoutes", "healthy"},
+			{"Scenario2_HealthyZeroRoutesIdleState", "healthy_zero_routes"},
+			{"Scenario3_NonZeroFailureCounters", "failures"},
+			{"Scenario4_SaturatedRouteWithDrops", "saturated_route"},
+			{"Scenario5_OldBackendAbsentFields", "absent_fields"},
+			{"Scenario6_FailedUnavailableStatusSample", "failed_sample"},
 			{"AllScenariosInSequence", "all"},
 		}
 
@@ -2868,6 +2869,7 @@ function runScenario(key) {
     if (key === 'healthy') {
         mockDoc.reset();
         vpnRenderForwarderHealth({
+            forwarder_available: true,
             forwarder_queue_capacity: 2048,
             forwarder_queue_occupancy: 42,
             forwarder_queue_high_water: 1000,
@@ -2898,9 +2900,40 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, '');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'none');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-tbody').children.length, 1);
+    } else if (key === 'healthy_zero_routes') {
+        mockDoc.reset();
+        vpnRenderForwarderHealth({
+            forwarder_available: true,
+            forwarder_queue_capacity: 0,
+            forwarder_queue_occupancy: 0,
+            forwarder_queue_high_water: 0,
+            forwarder_drops_queue_full: 0,
+            forwarder_drops_no_route: 0,
+            forwarder_drops_packet_too_large: 0,
+            forwarder_device_write_errors: 0,
+            transport_decryption_failures: 0,
+            forwarder_route_queues: {}
+        });
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').textContent, '0 / 0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').style.color, '');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '0 / 0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').style.color, '');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-queue-full').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-badge').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'block');
     } else if (key === 'failures') {
         mockDoc.reset();
         vpnRenderForwarderHealth({
+            forwarder_available: true,
             forwarder_queue_capacity: 2048,
             forwarder_queue_occupancy: 100,
             forwarder_queue_high_water: 500,
@@ -2926,6 +2959,7 @@ function runScenario(key) {
     } else if (key === 'saturated_route') {
         mockDoc.reset();
         vpnRenderForwarderHealth({
+            forwarder_available: true,
             forwarder_queue_capacity: 2048,
             forwarder_queue_occupancy: 200,
             forwarder_queue_high_water: 1200,
@@ -2966,7 +3000,8 @@ function runScenario(key) {
         mockDoc.getElementById('vpn-fwd-queue').textContent = '50 / 2048';
         vpnRenderForwarderHealth({
             listener_running: true,
-            active_tunnels: 2
+            active_tunnels: 2,
+            connected_sessions: 2
         });
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Not reported');
@@ -2984,7 +3019,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
         assert(!mockDoc.getElementById('vpn-fwd-status-badge').className.includes('badge-success'));
     } else if (key === 'failed_sample') {
-        const samples = [null, undefined, {}, { forwarder_queue_capacity: 0 }, { forwarder_queue_capacity: -1 }];
+        const samples = [null, undefined, {}, { forwarder_available: false }, { forwarder_available: false, forwarder_queue_capacity: 0 }];
         for (const sample of samples) {
             mockDoc.reset();
             mockDoc.getElementById('vpn-fwd-status-badge').className = 'badge badge-success';
@@ -3010,7 +3045,7 @@ const scenarioArg = process.argv[1];
 if (scenarioArg && scenarioArg !== 'all') {
     runScenario(scenarioArg);
 } else {
-    ['healthy', 'failures', 'saturated_route', 'absent_fields', 'failed_sample'].forEach(runScenario);
+    ['healthy', 'healthy_zero_routes', 'failures', 'saturated_route', 'absent_fields', 'failed_sample'].forEach(runScenario);
 }
 console.log('SCENARIO_PASS');
 `

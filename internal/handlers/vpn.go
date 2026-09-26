@@ -26,9 +26,10 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil || status == nil {
 		status = &vpn.Status{
-			ListenerRunning:   false,
-			ActiveTunnels:     0,
-			ConnectedSessions: 0,
+			ListenerRunning:    false,
+			ActiveTunnels:      0,
+			ConnectedSessions:  0,
+			ForwarderAvailable: false,
 		}
 	}
 
