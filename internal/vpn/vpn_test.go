@@ -3380,7 +3380,7 @@ func TestService_GetStatus_ExposesDroppedPackets(t *testing.T) {
 	}
 }
 
-func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
+func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -3401,83 +3401,90 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 		t.Fatalf("CreateServer failed: %v", err)
 	}
 
-	// Create DEGRADED tunnel
+	// Persist stale degraded health. Service.Start must not trust it.
 	now := time.Now().UTC()
 	tun := &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: fmt.Sprintf("awg-be-%d", sID),
-		PublicKey:     pub,
-		PrivateKey:    priv,
-		Endpoint:      "198.51.100.77:51820",
-		Status:        TunnelStatusDegraded,
-		CreatedAt:     now,
+		ServerID:        sID,
+		InterfaceName:   fmt.Sprintf("awg-be-%d", sID),
+		PublicKey:       pub,
+		PrivateKey:      priv,
+		Endpoint:        "198.51.100.77:51820",
+		Status:          TunnelStatusDegraded,
+		LastHealthCheck: &now,
+		LatencyMS:       444,
+		CreatedAt:       now,
 	}
 	tunID, err := db.CreateBackendTunnel(ctx, tun)
 	if err != nil {
 		t.Fatalf("CreateBackendTunnel failed: %v", err)
 	}
-	tun.ID = tunID
 
 	svc, err := NewVPNService(db, nil)
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	var probeShouldSucceed atomic.Bool
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var once sync.Once
 	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		if !probeShouldSucceed.Load() {
-			return 0, errors.New("probe temporarily disabled during startup")
+		once.Do(func() { close(probeStarted) })
+		select {
+		case <-releaseProbe:
+			return 10 * time.Millisecond, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
 		}
-		return 10 * time.Millisecond, nil
 	})
+
 	if err := svc.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = svc.Stop() }()
+	defer func() {
+		select {
+		case <-releaseProbe:
+		default:
+			close(releaseProbe)
+		}
+		_ = svc.Stop()
+	}()
 
-	// Degraded tunnel should have its backend device restored
-	dev := svc.GetBackendDeviceForTest(tunID)
-	if dev == nil {
-		t.Fatalf("expected backend device for degraded tunnel %d to be restored on Start, got nil", tunID)
-	}
-	if dev.IsClosed() {
-		t.Error("expected restored device to be open")
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup health probe did not begin")
 	}
 
-	// Tunnel status should remain degraded before probe
-	restoredTun, err := svc.pool.GetTunnel(sID)
+	// While the fresh probe is unresolved, stale health must not be routable
+	// and no backend device may be restored from the persisted snapshot.
+	startingTun, err := svc.pool.GetTunnel(sID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if restoredTun.Status != TunnelStatusDegraded {
-		t.Errorf("expected tunnel status to remain 'degraded' before probe, got %s", restoredTun.Status)
+	if !startingTun.Enabled || startingTun.Status != TunnelStatusConnecting {
+		t.Fatalf("expected enabled backend with unknown startup health, got %+v", startingTun)
+	}
+	if startingTun.LastHealthCheck != nil || startingTun.LatencyMS != 0 {
+		t.Fatalf("stale health metadata survived startup reset: %+v", startingTun)
+	}
+	if dev := svc.GetBackendDeviceForTest(tunID); dev != nil {
+		t.Fatalf("stale backend device restored before fresh probe: %v", dev)
 	}
 
-	// Stop background prober to avoid race with manual ProbeTunnel
-	if svc.prober != nil {
-		svc.prober.Stop()
+	close(releaseProbe)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		probedTun, getErr := svc.pool.GetTunnel(sID)
+		if getErr == nil && probedTun.Status == TunnelStatusActive && svc.GetBackendDeviceForTest(tunID) != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Probe the tunnel - now succeeds and transitions to active
-	probeShouldSucceed.Store(true)
-	restoredTun, err = svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
-	}
-	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
-	if err != nil {
-		t.Fatalf("ProbeTunnel failed: %v", err)
-	}
-	if rtt <= 0 {
-		t.Errorf("expected positive rtt, got %d", rtt)
-	}
-
-	probedTun, err := svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
-	}
-	if probedTun.Status != TunnelStatusActive {
-		t.Errorf("expected tunnel status to become 'active' after probe, got %s", probedTun.Status)
-	}
+	probedTun, _ := svc.pool.GetTunnel(sID)
+	t.Fatalf("fresh startup probe did not activate backend and attach device: tunnel=%+v device=%v",
+		probedTun, svc.GetBackendDeviceForTest(tunID))
 }
 
 func TestHealthProber_DegradedTunnel_FailsActivationWithoutDevice(t *testing.T) {
