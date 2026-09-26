@@ -392,7 +392,7 @@ func (hp *HealthProber) checkTunnelAvailable(tunnel *models.BackendTunnel) error
 	if curTun == nil || curTun.ID != tunnel.ID {
 		return ErrTunnelNotFound
 	}
-	if !curTun.Enabled {
+	if !curTun.Enabled || curTun.Status == models.TunnelStatusDisabled {
 		return ErrTunnelDisabled
 	}
 	if tunnel.StateVersion > 0 && curTun.StateVersion != tunnel.StateVersion {
