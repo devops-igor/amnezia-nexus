@@ -285,7 +285,7 @@ func (d *DB) CompareAndSwapTunnelStatus(ctx context.Context, id int64, expectedS
 
 	nowStr := time.Now().Format(time.RFC3339)
 	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
-		WHERE id = ? AND status = ? AND disable_reason = ? AND state_version = ?`
+		WHERE id = ? AND enabled = 1 AND status = ? AND disable_reason = ? AND state_version = ?`
 
 	res, err := d.sqlDB.ExecContext(ctx, query, newStatus, newReason, latencyMS, nowStr, id, expectedStatus, expectedReason, expectedVersion)
 	if err != nil {
@@ -608,8 +608,8 @@ func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID stri
 	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?
 		WHERE id = ? AND backend_tunnel_id = ? AND status = 'connected'
 		AND EXISTS (SELECT 1 FROM backend_tunnels
-			WHERE id = ? AND status = 'active' AND disable_reason != ?)`
-	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID, models.DisableReasonAdmin)
+			WHERE id = ? AND enabled = 1 AND status = 'active')`
+	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID)
 	if err != nil {
 		return fmt.Errorf("failed to migrate vpn session %s to tunnel %d: %w", sessionID, targetID, err)
 	}
