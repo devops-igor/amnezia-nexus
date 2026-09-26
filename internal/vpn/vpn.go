@@ -475,6 +475,7 @@ func applyVPNConfigDefaults(cfg *models.VPNConfig) {
 // NewVPNService initializes the complete unified VPN subsystem.
 // Server-side RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard),
 // providing a stable transition window intentionally independent of client-configured timing ranges.
+//nolint:gocyclo // initialization validates and wires each owned subsystem in order.
 func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	if cfg == nil {
 		if db != nil {
