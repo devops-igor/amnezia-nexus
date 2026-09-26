@@ -58,7 +58,7 @@ func FilterHealthy(tunnels []*models.BackendTunnel, maxPeersPerBackend int) []*m
 		if t == nil {
 			continue
 		}
-		if !strings.EqualFold(t.Status, "active") {
+		if !t.AdministrativelyEnabled() || !strings.EqualFold(t.RuntimeHealth(), models.TunnelStatusActive) {
 			continue
 		}
 		if maxPeersPerBackend > 0 && t.ActiveConnections >= maxPeersPerBackend {
