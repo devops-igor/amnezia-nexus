@@ -125,7 +125,7 @@ func (sm *StickySessionManager) GetOrAssignBackend(ctx context.Context, req *Rou
 	// Verify if the sticky backend is still active and within capacity
 	if hasAffinity {
 		for _, t := range req.AvailableTunnels {
-			if t.ID == targetTunnelID && strings.EqualFold(t.Status, "active") {
+			if t.ID == targetTunnelID && t.AdministrativelyEnabled() && strings.EqualFold(t.RuntimeHealth(), models.TunnelStatusActive) {
 				if sm.caps.MaxPeersPerBackend <= 0 || t.ActiveConnections < sm.caps.MaxPeersPerBackend {
 					// Sticky affinity preserved: refresh lastSeen
 					rec := affinityRecord{tunnelID: targetTunnelID, lastSeen: now}
