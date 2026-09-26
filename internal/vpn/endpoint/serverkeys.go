@@ -25,6 +25,10 @@ type ServerKeysManager struct {
 	loaded bool
 }
 
+// Different service instances can initialize against the same database at
+// once. Serialize the first read and create so they converge on one identity.
+var serverKeysInitMu sync.Mutex
+
 // NewServerKeysManager creates a keys manager bound to the settings store.
 func NewServerKeysManager(db *database.DB) *ServerKeysManager {
 	return &ServerKeysManager{db: db}
@@ -42,7 +46,9 @@ func (m *ServerKeysManager) EnsureKeypair(ctx context.Context) (priv, pub [32]by
 	}
 
 	if m.db != nil {
+		serverKeysInitMu.Lock()
 		priv, pub, err = m.loadOrCreate(ctx)
+		serverKeysInitMu.Unlock()
 	} else {
 		priv, pub, err = generateKeyPair()
 	}
