@@ -319,8 +319,8 @@ func TestOrchestrator_AdminDisableDuringProbe_DoesNotReceiveDegradedSessions(t *
 	}
 
 	target, err := db.GetBackendTunnel(ctx, a.ID)
-	if err != nil || target == nil || target.Status != "disabled" || target.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("target lost administrative disable: tunnel=%+v err=%v", target, err)
+	if err != nil || target == nil || target.Enabled || target.Status != "active" || target.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("target lost independent administrative disable: tunnel=%+v err=%v", target, err)
 	}
 	session, err := db.GetVPNSessionByID(ctx, sessionID)
 	if err != nil || session == nil || session.BackendTunnelID != b.ID || session.Status != "connected" {
