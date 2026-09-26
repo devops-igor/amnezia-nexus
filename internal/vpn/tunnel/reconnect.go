@@ -148,13 +148,11 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 	cfg := rm.Config()
 
 	for _, t := range tunnels {
-		if t.Status == "disabled" {
-			// Administratively disabled tunnels are never reconnect
-			// candidates: only "degraded"/"connecting" tunnels may be
-			// resurrected (issues #28/#43).
+		if !t.AdministrativelyEnabled() {
+			// Administratively disabled tunnels are never reconnect candidates.
 			continue
 		}
-		if t.Status == "active" {
+		if t.RuntimeHealth() == models.TunnelStatusActive {
 			// Clear retry state if tunnel is active
 			rm.mu.Lock()
 			delete(rm.backoffs, t.ServerID)
