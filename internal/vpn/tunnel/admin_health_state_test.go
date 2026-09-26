@@ -149,3 +149,87 @@ func TestSyncFromDBPreservesIndependentAdministrativeAndHealthState(t *testing.T
 		t.Fatalf("admin provenance not restored: %+v", disabled)
 	}
 }
+
+
+func TestResetEnabledHealthForStartupRequiresFreshProbe(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	enabledServer, _ := db.CreateServer(ctx, &models.Server{Name: "startup-enabled", Host: "192.0.2.94"})
+	disabledServer, _ := db.CreateServer(ctx, &models.Server{Name: "startup-disabled", Host: "192.0.2.95"})
+
+	if _, err := pool.AddTunnel(ctx, enabledServer, "192.0.2.94:51820", "key-startup-enabled"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.AddTunnel(ctx, disabledServer, "192.0.2.95:51820", "key-startup-disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetTunnelStatus(ctx, enabledServer, models.TunnelStatusDegraded, 333); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetTunnelStatus(ctx, disabledServer, models.TunnelStatusActive, 27); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetTunnelEnabled(ctx, disabledServer, false, models.DisableReasonAdmin); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewPool(db)
+	if err := restarted.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	beforeDisabled, err := restarted.GetTunnel(disabledServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := restarted.ResetEnabledHealthForStartup(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled, err := restarted.GetTunnel(enabledServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled.Enabled || enabled.Status != models.TunnelStatusConnecting {
+		t.Fatalf("enabled backend did not enter unknown startup health: %+v", enabled)
+	}
+	if enabled.DisableReason != models.DisableReasonNone || enabled.LatencyMS != 0 || enabled.LastHealthCheck != nil {
+		t.Fatalf("enabled backend retained stale health metadata: %+v", enabled)
+	}
+
+	disabled, err := restarted.GetTunnel(disabledServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Enabled {
+		t.Fatal("administratively disabled backend was enabled by startup reset")
+	}
+	if disabled.Status != beforeDisabled.Status ||
+		disabled.DisableReason != beforeDisabled.DisableReason ||
+		disabled.LatencyMS != beforeDisabled.LatencyMS {
+		t.Fatalf("startup reset changed disabled backend health: before=%+v after=%+v", beforeDisabled, disabled)
+	}
+
+	dbEnabled, err := db.GetBackendTunnel(ctx, enabled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbEnabled.Status != models.TunnelStatusConnecting ||
+		dbEnabled.DisableReason != models.DisableReasonNone ||
+		dbEnabled.LatencyMS != 0 ||
+		dbEnabled.LastHealthCheck != nil {
+		t.Fatalf("database retained stale startup health: %+v", dbEnabled)
+	}
+	dbDisabled, err := db.GetBackendTunnel(ctx, disabled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbDisabled.Enabled ||
+		dbDisabled.Status != beforeDisabled.Status ||
+		dbDisabled.DisableReason != beforeDisabled.DisableReason ||
+		dbDisabled.LatencyMS != beforeDisabled.LatencyMS {
+		t.Fatalf("database startup reset changed admin-disabled backend: %+v", dbDisabled)
+	}
+}
