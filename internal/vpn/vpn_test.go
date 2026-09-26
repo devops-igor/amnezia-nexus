@@ -3452,9 +3452,10 @@ func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 		}
 	})
 
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- svc.Start(ctx)
+	}()
 	defer func() {
 		select {
 		case <-releaseProbe:
@@ -3468,6 +3469,11 @@ func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 	case <-probeStarted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("startup health probe did not begin")
+	}
+	select {
+	case err := <-startDone:
+		t.Fatalf("Start returned before fresh health was established: %v", err)
+	default:
 	}
 
 	// While the fresh probe is unresolved, stale health must not be routable
@@ -3488,18 +3494,23 @@ func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 
 	close(releaseProbe)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		probedTun, getErr := svc.pool.GetTunnel(sID)
-		if getErr == nil && probedTun.Status == TunnelStatusActive && svc.GetBackendDeviceForTest(tunID) != nil {
-			return
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatalf("Start failed after fresh probe: %v", err)
 		}
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not complete after fresh probe")
 	}
 
-	probedTun, _ := svc.pool.GetTunnel(sID)
-	t.Fatalf("fresh startup probe did not activate backend and attach device: tunnel=%+v device=%v",
-		probedTun, svc.GetBackendDeviceForTest(tunID))
+	probedTun, getErr := svc.pool.GetTunnel(sID)
+	if getErr != nil {
+		t.Fatalf("GetTunnel after startup probe failed: %v", getErr)
+	}
+	if probedTun.Status != TunnelStatusActive || svc.GetBackendDeviceForTest(tunID) == nil {
+		t.Fatalf("fresh startup probe did not activate backend and attach device: tunnel=%+v device=%v",
+			probedTun, svc.GetBackendDeviceForTest(tunID))
+	}
 }
 
 func TestHealthProber_DegradedTunnel_FailsActivationWithoutDevice(t *testing.T) {
