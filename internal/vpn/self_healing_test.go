@@ -240,10 +240,10 @@ func TestSelfHealing_AdminDisabledBackendNeverRecovered(t *testing.T) {
 	}
 }
 
-// TestSelfHealing_HealthStateResetsOnRestartAndReprobes verifies issue #90
-// restart semantics: administrative enablement persists, while runtime health
-// is reset to connecting and must be re-established by a fresh probe.
-func TestSelfHealing_HealthStateResetsOnRestartAndReprobes(t *testing.T) {
+// TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers verifies that
+// runtime health and administrative intent are restored independently: a
+// health-disabled backend remains administratively enabled and self-healable.
+func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -252,9 +252,15 @@ func TestSelfHealing_HealthStateResetsOnRestartAndReprobes(t *testing.T) {
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
+	var probeFails atomic.Bool
+	probeFails.Store(true)
 	vpnSvc1.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
-		return 0, errors.New("simulated probe timeout")
+		if probeFails.Load() {
+			return 0, errors.New("simulated probe timeout")
+		}
+		return 20 * time.Millisecond, nil
 	})
+
 	tun := tunMust(t, vpnSvc1, s1ID)
 	for i := 0; i < 3; i++ {
 		_, _ = vpnSvc1.prober.ProbeTunnel(ctx, tun)
@@ -284,21 +290,22 @@ func TestSelfHealing_HealthStateResetsOnRestartAndReprobes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !restarted.Enabled {
-		t.Fatal("restart lost administrative enabled state")
+	if !restarted.Enabled || restarted.Status != models.TunnelStatusDisabled || restarted.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("restart did not preserve independent state dimensions: %+v", restarted)
 	}
-	if restarted.Status != models.TunnelStatusConnecting || restarted.DisableReason != models.DisableReasonNone {
-		t.Fatalf("restart did not reset runtime health to unknown: status=%q reason=%q", restarted.Status, restarted.DisableReason)
-	}
-	if vpnSvc2.prober.IsAutoDisabled(s1ID) {
-		t.Fatal("stale health-disable state survived restart")
+	if !vpnSvc2.prober.IsAutoDisabled(s1ID) {
+		t.Fatal("recreated service must recognize persisted health-disabled backend")
 	}
 
+	probeFails.Store(false)
 	vpnSvc2.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
-	if _, err := vpnSvc2.prober.ProbeTunnel(ctx, restarted); err != nil {
-		t.Fatalf("fresh post-restart probe failed: %v", err)
+	if got := vpnSvc2.SelfHealSweep(ctx); got != 0 {
+		t.Fatalf("first flap-damping sweep reconnected %d tunnels, want 0", got)
+	}
+	if got := vpnSvc2.SelfHealSweep(ctx); got != 1 {
+		t.Fatalf("second self-heal sweep reconnected %d tunnels, want 1", got)
 	}
 
 	recovered, err := vpnSvc2.pool.GetTunnel(s1ID)
@@ -306,7 +313,7 @@ func TestSelfHealing_HealthStateResetsOnRestartAndReprobes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !recovered.Enabled || recovered.Status != models.TunnelStatusActive || recovered.DisableReason != models.DisableReasonNone {
-		t.Fatalf("fresh probe did not establish active health: %+v", recovered)
+		t.Fatalf("self-healing did not restore backend: %+v", recovered)
 	}
 }
 
