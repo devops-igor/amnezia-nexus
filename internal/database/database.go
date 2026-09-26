@@ -489,8 +489,11 @@ func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
 	}
 
 	if _, err := d.sqlDB.ExecContext(ctx,
-		"UPDATE backend_tunnels SET enabled = 0 WHERE disable_reason = ?",
+		`UPDATE backend_tunnels SET enabled = 0
+		 WHERE disable_reason = ?
+		    OR (status = ? AND (disable_reason = '' OR disable_reason IS NULL))`,
 		models.DisableReasonAdmin,
+		models.TunnelStatusDisabled,
 	); err != nil {
 		return fmt.Errorf("failed to migrate administrative backend state: %w", err)
 	}
