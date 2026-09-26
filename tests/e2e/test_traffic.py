@@ -46,6 +46,14 @@ def _handle_skip_or_fail(msg: str) -> None:
     pytest.skip(msg)
 
 
+def _assert_zero_packet_loss(ping_stdout: str, label: str = "ping") -> None:
+    """Parse ping stdout and assert strictly 0% packet loss."""
+    match = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", ping_stdout)
+    assert match, f"Could not determine packet loss for {label}: {ping_stdout}"
+    loss = float(match.group(1))
+    assert loss == 0.0, f"Expected 0% packet loss for {label}, got {loss}%: {ping_stdout}"
+
+
 def _check_docker_available() -> bool:
     """Check whether local Docker daemon is reachable."""
     try:
@@ -282,6 +290,7 @@ def test_dataplane_traffic_verification(
     # 3. Client Provisioning via Panel API
     test_user_id = None
     client_container_name = f"e2e-traffic-client-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    container_started = False
 
     try:
         unique_suffix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}"
@@ -364,6 +373,7 @@ def test_dataplane_traffic_verification(
         ]
         start_res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
         assert start_res.returncode == 0, f"Failed to start client container: {start_res.stderr}"
+        container_started = True
 
         # Create dummy /usr/local/bin/sysctl script so awg-quick's check succeeds without --privileged
         dummy_sysctl = "printf '#!/bin/sh\\nexit 0\\n' > /usr/local/bin/sysctl && chmod +x /usr/local/bin/sysctl"
@@ -417,25 +427,31 @@ def test_dataplane_traffic_verification(
         ), f"Server did not record active handshake for peer {client_pubkey} in connections API"
 
         # 6. Bi-Directional ICMP Ping to Gateway
-        ping_res = _docker_exec(client_container_name, f"ping -c 3 -W 3 {GATEWAY_IP}")
+        ping_res = _docker_exec(client_container_name, f"LC_ALL=C ping -c 3 -W 3 {GATEWAY_IP}")
         assert (
             ping_res.returncode == 0
         ), f"Ping to gateway {GATEWAY_IP} failed: {ping_res.stderr}\n{ping_res.stdout}"
+        _assert_zero_packet_loss(ping_res.stdout, "gateway ping")
 
         rx_bytes, tx_bytes = _get_transfer_stats(client_container_name, "awg0")
         assert rx_bytes > 0, f"Expected positive RX bytes through awg0, got {rx_bytes}"
         assert tx_bytes > 0, f"Expected positive TX bytes through awg0, got {tx_bytes}"
 
         # 7. MTU-Boundary / Fragmentation Probe (near MTU)
-        mtu_ping = _docker_exec(client_container_name, f"ping -c 2 -W 2 -M do -s 1200 {GATEWAY_IP}")
+        mtu_ping = _docker_exec(
+            client_container_name, f"LC_ALL=C ping -c 2 -W 2 -M do -s 1200 {GATEWAY_IP}"
+        )
         if mtu_ping.returncode != 0 and "unrecognized option" in (
             mtu_ping.stderr + mtu_ping.stdout
         ):
             # BusyBox ping fallback without -M flag
-            mtu_ping = _docker_exec(client_container_name, f"ping -c 2 -W 2 -s 1200 {GATEWAY_IP}")
+            mtu_ping = _docker_exec(
+                client_container_name, f"LC_ALL=C ping -c 2 -W 2 -s 1200 {GATEWAY_IP}"
+            )
         assert (
             mtu_ping.returncode == 0
         ), f"MTU-boundary probe (1200 bytes) failed: {mtu_ping.stderr} | {mtu_ping.stdout}"
+        _assert_zero_packet_loss(mtu_ping.stdout, "MTU boundary probe")
 
         # 8. Egress NAT & Internet Forwarding
         nat_forwarding_ok = _verify_egress_nat(client_container_name)
@@ -509,7 +525,7 @@ def test_dataplane_traffic_verification(
         # 10. Hardened Hermetic Teardown (independent guarded blocks with error assertions)
         cleanup_errors = []
 
-        if client_container_name:
+        if container_started:
             try:
                 _docker_exec(client_container_name, "awg-quick down /tmp/awg0.conf || true")
                 rm_res = subprocess.run(
@@ -519,7 +535,7 @@ def test_dataplane_traffic_verification(
                     timeout=15,
                 )
                 assert (
-                    rm_res.returncode == 0
+                    rm_res.returncode == 0 or "No such container" in rm_res.stderr
                 ), f"Failed to remove client container {client_container_name}: {rm_res.stderr}"
                 logger.info("Hermetic teardown: client container %s removed", client_container_name)
             except Exception as exc:
