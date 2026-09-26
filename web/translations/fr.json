@@ -443,6 +443,7 @@
   "vpn_forwarder_route_queue": "File",
   "vpn_forwarder_route_writes": "Écritures",
   "vpn_forwarder_routes": "Files des routes et pression",
+  "vpn_forwarder_unavailable": "Non signalé",
   "vpn_forwarder_warning": "Avertissement",
   "vpn_forwarder_write_errors": "Erreurs d'écriture périphérique",
   "vpn_key": "Clé VPN",

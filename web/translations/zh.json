@@ -443,6 +443,7 @@
   "vpn_forwarder_route_queue": "队列",
   "vpn_forwarder_route_writes": "写入次数",
   "vpn_forwarder_routes": "路由队列与压力",
+  "vpn_forwarder_unavailable": "未报告",
   "vpn_forwarder_warning": "警告",
   "vpn_forwarder_write_errors": "设备写入错误",
   "vpn_key": "VPN 密钥",

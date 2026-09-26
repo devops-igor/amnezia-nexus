@@ -443,6 +443,7 @@
   "vpn_forwarder_route_queue": "Очередь",
   "vpn_forwarder_route_writes": "Записи",
   "vpn_forwarder_routes": "Очереди маршрутов и нагрузка",
+  "vpn_forwarder_unavailable": "Не сообщается",
   "vpn_forwarder_warning": "Внимание",
   "vpn_forwarder_write_errors": "Ошибки записи в устройство",
   "vpn_key": "VPN-ключ",

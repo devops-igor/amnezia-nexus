@@ -443,6 +443,7 @@
   "vpn_forwarder_route_queue": "صف",
   "vpn_forwarder_route_writes": "نوشتن‌ها",
   "vpn_forwarder_routes": "صف‌های مسیر و فشار",
+  "vpn_forwarder_unavailable": "گزارش نشده",
   "vpn_forwarder_warning": "هشدار",
   "vpn_forwarder_write_errors": "خطاهای نوشتن روی دستگاه",
   "vpn_key": "کلید VPN",
