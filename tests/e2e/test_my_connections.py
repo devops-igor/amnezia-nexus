@@ -165,14 +165,20 @@ def test_view_connection_config(
         assert connections, f"No connections available: {user_conns}"
 
         conn = connections[0]
-        conn_id = conn["id"]
-        server_id_conn = conn["server_id"]
+        client_id = conn.get("client_id") or conn.get("id")
+        conn_id = conn.get("id")
+        protocol = conn.get("protocol", "awg")
+        server_id_conn = conn.get("server_id") or server_id
 
         # Fetch the connection config via the server API
         config_result = api_post(
             page,
             f"/api/servers/{server_id_conn}/connections/config",
-            {"connection_id": conn_id},
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+            },
             csrf_token,
         )
         assert config_result["status"] == 200, f"Could not fetch connection config: {config_result}"

@@ -151,12 +151,18 @@ def test_connection_config_and_qr(authenticated_page: Page, base_url: str, csrf_
         assert connections, f"No connection created: {user_conns}"
 
         conn = connections[0]
-        conn_id = conn["id"]
+        client_id = conn.get("client_id") or conn.get("id")
+        conn_id = conn.get("id")
+        protocol = conn.get("protocol", "awg")
 
         config_result = api_post(
             page,
             f"/api/servers/{server_id}/connections/config",
-            {"connection_id": conn_id},
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+            },
             csrf_token,
         )
         assert config_result["status"] == 200, f"Could not fetch connection config: {config_result}"
@@ -212,24 +218,39 @@ def test_toggle_connection(authenticated_page: Page, base_url: str, csrf_token: 
         assert connections, f"No connection created: {user_conns}"
 
         conn = connections[0]
-        conn_id = conn["id"]
+        client_id = conn.get("client_id") or conn.get("id")
+        conn_id = conn.get("id")
+        protocol = conn.get("protocol", "awg")
 
         toggle_result = api_post(
             page,
             f"/api/servers/{server_id}/connections/toggle",
-            {"connection_id": conn_id},
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+                "enable": False,
+                "enabled": False,
+            },
             csrf_token,
         )
         assert toggle_result["status"] == 200, f"Could not toggle connection: {toggle_result}"
         assert toggle_result["body"] is not None
 
         # Toggle back to restore original state
-        api_post(
+        restore_result = api_post(
             page,
             f"/api/servers/{server_id}/connections/toggle",
-            {"connection_id": conn_id},
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+                "enable": True,
+                "enabled": True,
+            },
             csrf_token,
         )
+        assert restore_result["status"] == 200, f"Could not restore connection: {restore_result}"
     finally:
         # Clean up
         api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
@@ -285,13 +306,19 @@ def test_delete_connection(authenticated_page: Page, base_url: str, csrf_token: 
         assert user_connections, f"No connection created: {user_conns}"
 
         conn_to_delete = user_connections[0]
-        conn_id = conn_to_delete["id"]
-        server_id_conn = conn_to_delete["server_id"]
+        client_id = conn_to_delete.get("client_id") or conn_to_delete.get("id")
+        conn_id = conn_to_delete.get("id")
+        protocol = conn_to_delete.get("protocol", "awg")
+        server_id_conn = conn_to_delete.get("server_id") or server_id
 
         delete_result = api_post(
             page,
             f"/api/servers/{server_id_conn}/connections/remove",
-            {"connection_id": conn_id},
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+            },
             csrf_token,
         )
         assert delete_result["status"] == 200, f"Could not delete connection: {delete_result}"
