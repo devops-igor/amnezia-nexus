@@ -86,6 +86,7 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `E2E_SERVER_SSH_USER` | `ubuntu` | SSH username for server onboarding |
 | `E2E_SERVER_SSH_KEY` | (empty) | Path to private SSH key for onboarding |
 | `E2E_SERVER_SSH_PASS` | (empty) | SSH password for onboarding (optional fallback) |
+| `E2E_REQUIRE_DATAPLANE` | `true` (CI) / `false` | Fail closed on data plane requirements (`true`/`false`) |
 
 ---
 
@@ -102,8 +103,9 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
+| `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 46 test scenarios across 9 test suites**
+**Total: 48 test scenarios across 10 test suites**
 
 ---
 
@@ -159,6 +161,8 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_share.py` | `test_enable_sharing` | `/users` (Share Setup Modal) | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup` | GET<br>POST<br>POST |
 | `test_share.py` | `test_access_share_link` | `/share/{share_token}` | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST |
 | `test_share.py` | `test_download_config_from_share` | `/share/{share_token}` (Config Download) | `/api/servers/`<br>`/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/share/{token}/auth`<br>`/api/users/{user_id}/delete` | GET<br>GET<br>POST<br>POST<br>POST<br>POST |
+| `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
+| `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
 
 ---
 
@@ -207,6 +211,34 @@ The E2E test suite exercises 26 distinct REST API routes across the platform, in
 ### Additional Utility & Public Endpoints (2 endpoints)
 - `GET /api/settings/backup/download` - Downloads complete JSON database backup archive
 - `POST /api/share/{token}/auth` - Verifies passphrase and authenticates access to shared client configuration
+
+---
+
+## Data Plane Traffic Verification Suite (`test_traffic.py`)
+
+The `test_traffic.py` suite validates the actual network data plane of the AmneziaWG VPN tunnel end-to-end:
+
+### Purpose & Architecture
+While control-plane E2E suites exercise web interfaces, REST APIs, database state, and remote SSH orchestration, `test_traffic.py` verifies that provisioned VPN tunnels successfully transmit encrypted packets across the network.
+
+### Required Capabilities & Docker Isolation
+To ensure test hermeticity without polluting host routing tables or requiring root privileges on the test runner:
+- The test suite launches an ephemeral client container using the pinned multiarch image `devopsigor/amneziawg:v3.1.20260828-1` (matching `internal/manager/awg/awg.go`, with fallback to `devopsigor/amneziawg:ci-test`).
+- Requires local Docker daemon access (`docker info`).
+- The client container runs without `--privileged`, using minimal capabilities: `--cap-add NET_ADMIN --sysctl net.ipv4.conf.all.src_valid_mark=1 --device /dev/net/tun:/dev/net/tun` to provide a dedicated, isolated network namespace (`ip netns`).
+- A dummy `/usr/local/bin/sysctl` script is installed inside the container so `awg-quick`'s check passes against the container's read-only `/proc` without requiring host privileges.
+- Client configuration is written into the container with mode `600`, and `awg-quick up` brings up the `awg0` tunnel interface (with `resolvconf` handling DNS directives) purely inside the container's isolated network namespace.
+
+### Verified Behaviors
+1. **Docker & Image Pre-Flight**: Validates Docker daemon connectivity, multiarch client image presence, and host architecture binary execution (`awg --version`). Fails closed when `E2E_REQUIRE_DATAPLANE=true`.
+2. **Server Discovery**: Dynamically resolves Server 1 and strictly requires live `/check` API to confirm `protocols.awg.container_running is True` (no static metadata fallback).
+3. **Client Provisioning**: Creates an ephemeral user and AmneziaWG connection profile via the panel REST API.
+4. **Cryptographic Handshake**: Validates completion of the obfuscated AmneziaWG handshake on both client (`latest handshake > 0`) and server (`GET /api/servers/{id}/connections/?protocol=awg` reports populated `userData.latestHandshake`).
+5. **Bi-Directional ICMP Gateway Connectivity**: Verifies 0% packet loss ping to gateway `10.8.1.1` and asserts positive RX/TX byte counters.
+6. **MTU-Boundary / Fragmentation Probe**: Executes near-MTU 1200-byte ICMP probe (`-s 1200`) to confirm packets pass through without fragmentation rejection.
+7. **Egress NAT & Forwarding**: Transmits external network probes (`1.1.1.1` ICMP/HTTP probe) to verify server-side `iptables MASQUERADE` and forwarding.
+8. **Connection Toggle & Revocation**: Tests disabling the connection via `/api/servers/{server_id}/connections/toggle`, asserts traffic to `10.8.1.1` is immediately terminated (100% loss), verifies server handshake does not advance while disabled, and confirms traffic resumption upon re-enabling.
+9. **Hardened Hermetic Teardown**: Guarantees independent teardown of client container, route rules, and test user in separate guarded blocks with error logging.
 
 ---
 
