@@ -1129,7 +1129,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// initial sweep has completed.
 	if s.prober != nil {
 		_ = s.prober.ProbeAll(ctx)
-		s.prober.Start(ctx)
+		s.prober.StartAfterInitialProbe(ctx)
 	}
 	if s.reconnectMgr != nil {
 		s.reconnectMgr.Start(ctx)
