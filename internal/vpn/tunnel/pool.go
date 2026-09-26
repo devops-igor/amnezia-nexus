@@ -249,7 +249,9 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		PrivateKey:        privKey,
 		ProbePrivateKey:   probePrivKey,
 		Endpoint:          endpoint,
-		Status:            "active",
+		HealthStatus:      models.TunnelStatusActive,
+		AdminDisabled:     false,
+		Status:            models.TunnelStatusActive,
 		DisableReason:     models.DisableReasonNone,
 		StateVersion:      1,
 		LastHealthCheck:   &now,
@@ -350,7 +352,7 @@ func (p *Pool) ListTunnels() []*models.BackendTunnel {
 	return result
 }
 
-// GetActiveTunnels returns all tunnels currently in "active" status.
+// GetActiveTunnels returns administratively enabled tunnels whose runtime health is active.
 func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -403,7 +405,7 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 		return ErrStaleStateVersion
 	}
 
-	if tunnel.DisableReason == models.DisableReasonAdmin {
+	if !tunnel.AdministrativelyEnabled() {
 		return nil
 	}
 
@@ -434,6 +436,7 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 		}
 	}
 
+	tunnel.HealthStatus = status
 	tunnel.Status = status
 	tunnel.DisableReason = newReason
 	tunnel.LatencyMS = latencyMS
@@ -455,7 +458,7 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		return ErrTunnelNotFound
 	}
 
-	if disableReason == models.DisableReasonHealth && tunnel.DisableReason == models.DisableReasonAdmin {
+	if disableReason == models.DisableReasonHealth && !tunnel.AdministrativelyEnabled() {
 		return nil
 	}
 
@@ -465,8 +468,16 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		}
 	}
 
-	tunnel.Status = status
-	tunnel.DisableReason = disableReason
+	if disableReason == models.DisableReasonAdmin {
+		tunnel.AdminDisabled = true
+		tunnel.Status = models.TunnelStatusDisabled
+		tunnel.DisableReason = models.DisableReasonAdmin
+	} else {
+		tunnel.AdminDisabled = false
+		tunnel.HealthStatus = status
+		tunnel.Status = status
+		tunnel.DisableReason = disableReason
+	}
 	tunnel.LatencyMS = latencyMS
 	tunnel.StateVersion++
 	now := time.Now().UTC()
@@ -514,8 +525,16 @@ func (p *Pool) compareAndSwapTunnelStatus(ctx context.Context, serverID, expecte
 		}
 	}
 
-	tunnel.Status = newStatus
-	tunnel.DisableReason = newReason
+	if newReason == models.DisableReasonAdmin {
+		tunnel.AdminDisabled = true
+		tunnel.Status = models.TunnelStatusDisabled
+		tunnel.DisableReason = models.DisableReasonAdmin
+	} else {
+		tunnel.AdminDisabled = false
+		tunnel.HealthStatus = newStatus
+		tunnel.Status = newStatus
+		tunnel.DisableReason = newReason
+	}
 	tunnel.LatencyMS = latencyMS
 	tunnel.StateVersion++
 	now := time.Now().UTC()
