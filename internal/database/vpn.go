@@ -193,9 +193,17 @@ func (d *DB) UpdateBackendTunnel(ctx context.Context, id int64, updates map[stri
 	// #nosec G201 -- Column names are validated against allowedBackendTunnelColumns allowlist
 	query := fmt.Sprintf("UPDATE backend_tunnels SET %s WHERE id = ?", strings.Join(setClauses, ", "))
 
-	_, err := d.sqlDB.ExecContext(ctx, query, values...)
+	res, err := d.sqlDB.ExecContext(ctx, query, values...)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel %d: %w", id, err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected for backend tunnel %d: %w", id, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("backend tunnel %d not found", id)
 	}
 
 	return nil

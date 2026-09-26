@@ -1113,3 +1113,59 @@ func TestTunnelPool_AddTunnel_ExistingTunnel_NilDB(t *testing.T) {
 		t.Errorf("tunnel ID should match: %d vs %d", updated.ID, tun.ID)
 	}
 }
+
+func TestPoolAddTunnel_ExistingMissingDBRowFailsWithoutMemoryMutation(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "missing-db-row-server", Host: "198.51.100.25"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	oldEndpoint := "198.51.100.25:51820"
+	oldPubKey := "old-server-pubkey"
+
+	tun, err := pool.AddTunnel(ctx, serverID, oldEndpoint, oldPubKey)
+	if err != nil {
+		t.Fatalf("initial AddTunnel failed: %v", err)
+	}
+
+	// Delete the DB row directly, leaving the in-memory pool entry intact
+	if err := db.DeleteBackendTunnel(ctx, tun.ID); err != nil {
+		t.Fatalf("DeleteBackendTunnel failed: %v", err)
+	}
+
+	newEndpoint := "198.51.100.25:51822"
+	newPubKey := "new-server-pubkey"
+
+	_, err = pool.AddTunnel(ctx, serverID, newEndpoint, newPubKey)
+	if err == nil {
+		t.Fatal("expected AddTunnel to fail when DB row is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error containing 'not found', got: %v", err)
+	}
+
+	// Verify pool entry retains oldEndpoint and oldPubKey
+	memTun, err := pool.GetTunnel(serverID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if memTun.Endpoint != oldEndpoint {
+		t.Errorf("in-memory endpoint mutated on missing DB row: got %q, want %q", memTun.Endpoint, oldEndpoint)
+	}
+	if memTun.PublicKey != oldPubKey {
+		t.Errorf("in-memory public key mutated on missing DB row: got %q, want %q", memTun.PublicKey, oldPubKey)
+	}
+
+	// Verify DB row remains absent (db.GetBackendTunnel returns nil)
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun != nil {
+		t.Errorf("expected DB row to remain absent, got %+v", dbTun)
+	}
+}
