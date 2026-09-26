@@ -696,8 +696,9 @@ func TestBackendTunnel_DisableReasonAndStateVersion(t *testing.T) {
 		t.Errorf("expected state_version 1, got %d", tun.StateVersion)
 	}
 
-	// 2. UpdateBackendTunnelStatusWithReason bumps state_version and sets admin disable
-	if err := db.UpdateBackendTunnelStatusWithReason(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	// 2. Runtime-health writer bumps state_version without changing the
+	// administrative dimension.
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0); err != nil {
 		t.Fatalf("UpdateBackendTunnelStatusWithReason failed: %v", err)
 	}
 
@@ -705,15 +706,18 @@ func TestBackendTunnel_DisableReasonAndStateVersion(t *testing.T) {
 	if err != nil || tun == nil {
 		t.Fatalf("GetBackendTunnel after update failed: %v", err)
 	}
-	if tun.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected disable_reason %q, got %q", models.DisableReasonAdmin, tun.DisableReason)
+	if !tun.Enabled {
+		t.Fatal("runtime-health writer changed administrative enabled state")
+	}
+	if tun.DisableReason != models.DisableReasonHealth {
+		t.Errorf("expected disable_reason %q, got %q", models.DisableReasonHealth, tun.DisableReason)
 	}
 	if tun.StateVersion != 2 {
 		t.Errorf("expected state_version 2, got %d", tun.StateVersion)
 	}
 
 	// 3. CompareAndSwapTunnelStatus fails on mismatched version
-	swapped, err := db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 1, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	swapped, err := db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonHealth, 1, models.TunnelStatusActive, models.DisableReasonNone, 15)
 	if err != nil {
 		t.Fatalf("CompareAndSwapTunnelStatus returned unexpected error: %v", err)
 	}
@@ -722,7 +726,7 @@ func TestBackendTunnel_DisableReasonAndStateVersion(t *testing.T) {
 	}
 
 	// 4. CompareAndSwapTunnelStatus fails on mismatched reason
-	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
 	if err != nil {
 		t.Fatalf("CompareAndSwapTunnelStatus returned unexpected error: %v", err)
 	}
@@ -730,8 +734,8 @@ func TestBackendTunnel_DisableReasonAndStateVersion(t *testing.T) {
 		t.Fatal("expected CAS to fail on mismatched expected reason health, but it succeeded")
 	}
 
-	// 5. CompareAndSwapTunnelStatus succeeds on matching state and bumps version
-	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
+	// 5. CompareAndSwapTunnelStatus succeeds on matching health state and bumps version
+	swapped, err = db.CompareAndSwapTunnelStatus(ctx, tID, models.TunnelStatusDisabled, models.DisableReasonHealth, 2, models.TunnelStatusActive, models.DisableReasonNone, 15)
 	if err != nil {
 		t.Fatalf("CompareAndSwapTunnelStatus returned error: %v", err)
 	}
@@ -933,11 +937,11 @@ func TestMigrateVPNSessionToActiveTunnel_RejectsStaleAssignments(t *testing.T) {
 		}
 	}
 
-	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "disabled", models.DisableReasonAdmin, 0); err != nil {
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "disabled", models.DisableReasonHealth, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, source, target); err == nil {
-		t.Fatal("expected migration to disabled target to fail")
+		t.Fatal("expected migration to health-disabled target to fail")
 	}
 	assertSource()
 	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", "", 0); err != nil {
