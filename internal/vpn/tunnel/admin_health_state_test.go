@@ -98,7 +98,7 @@ func TestProbeFailureDoesNotChangeAdministrativeEnabledState(t *testing.T) {
 	}
 }
 
-func TestSyncFromDBResetsEnabledBackendHealthToConnecting(t *testing.T) {
+func TestSyncFromDBPreservesIndependentAdministrativeAndHealthState(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 	pool := NewPool(db)
@@ -112,10 +112,10 @@ func TestSyncFromDBResetsEnabledBackendHealthToConnecting(t *testing.T) {
 	if _, err := pool.AddTunnel(ctx, disabledServer, "192.0.2.93:51820", "key-disabled"); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.SetTunnelStatus(ctx, enabledServer, models.TunnelStatusActive, 15); err != nil {
+	if err := pool.SetTunnelStatus(ctx, enabledServer, models.TunnelStatusDegraded, 250); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.SetTunnelStatus(ctx, disabledServer, models.TunnelStatusDegraded, 400); err != nil {
+	if err := pool.SetTunnelStatus(ctx, disabledServer, models.TunnelStatusActive, 20); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.SetTunnelEnabled(ctx, disabledServer, false, models.DisableReasonAdmin); err != nil {
@@ -131,8 +131,8 @@ func TestSyncFromDBResetsEnabledBackendHealthToConnecting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !enabled.Enabled || enabled.Status != models.TunnelStatusConnecting || enabled.LatencyMS != 0 || enabled.LastHealthCheck != nil {
-		t.Fatalf("enabled backend did not restart unverified: %+v", enabled)
+	if !enabled.Enabled || enabled.Status != models.TunnelStatusDegraded || enabled.LatencyMS != 250 {
+		t.Fatalf("enabled backend dimensions were not restored independently: %+v", enabled)
 	}
 
 	disabled, err := restarted.GetTunnel(disabledServer)
@@ -142,7 +142,10 @@ func TestSyncFromDBResetsEnabledBackendHealthToConnecting(t *testing.T) {
 	if disabled.Enabled {
 		t.Fatal("administratively disabled backend was enabled on restart")
 	}
-	if disabled.Status != models.TunnelStatusDegraded || disabled.LatencyMS != 400 {
-		t.Fatalf("disabled backend runtime health was overwritten on restart: %+v", disabled)
+	if disabled.Status != models.TunnelStatusActive || disabled.LatencyMS != 20 {
+		t.Fatalf("admin state overwrote persisted runtime health on restart: %+v", disabled)
+	}
+	if disabled.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("admin provenance not restored: %+v", disabled)
 	}
 }
