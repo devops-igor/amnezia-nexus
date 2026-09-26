@@ -253,13 +253,14 @@ func (d *DB) UpdateBackendTunnelEnabled(ctx context.Context, id int64, enabled b
 	defer d.writeMu.Unlock()
 
 	query := `UPDATE backend_tunnels SET enabled = ?, disable_reason = ?, state_version = state_version + 1 WHERE id = ?`
-	res, err := d.sqlDB.ExecContext(ctx, query, enabled, disableReason, id)
+	_, err := d.sqlDB.ExecContext(ctx, query, enabled, disableReason, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel administrative state: %w", err)
 	}
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
-		return fmt.Errorf("backend tunnel %d not found", id)
-	}
+	// Match the existing backend update/delete contract: an already-missing
+	// row is a successful no-op. This is required by DeleteBackend's drift
+	// cleanup path, which may intentionally operate on an in-memory tunnel
+	// whose DB row has already disappeared.
 	return nil
 }
 
