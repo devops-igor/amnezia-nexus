@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -33,9 +34,14 @@ func TestServerKeysRecoverLegacyPlaintextAndRejectCorruptIdentity(t *testing.T) 
 				stored = "invalid-key"
 			}
 			// Simulate rows written by older versions; bypass the new save boundary.
-			if err := db.SetSetting(ctx, "vpn_config", &models.VPNConfig{
+			encoded, err := json.Marshal(&models.VPNConfig{
 				ServerPrivateKey: stored, ServerPublicKey: pubB64,
-			}); err != nil {
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx,
+				"INSERT INTO settings (key, value) VALUES ('vpn_config', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", string(encoded)); err != nil {
 				t.Fatal(err)
 			}
 			gotPriv, gotPub, err := NewServerKeysManager(db).EnsureKeypair(ctx)

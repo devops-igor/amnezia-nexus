@@ -283,7 +283,8 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	for name := range raw {
-		if strings.EqualFold(name, "server_private_key") || strings.EqualFold(name, "server_public_key") {
+		if strings.EqualFold(name, "server_private_key") || strings.EqualFold(name, "server_public_key") ||
+			strings.EqualFold(name, "ServerPrivateKey") || strings.EqualFold(name, "ServerPublicKey") {
 			h.JSONError(w, http.StatusBadRequest, "validation_failed", "Portal key fields cannot be updated")
 			return
 		}

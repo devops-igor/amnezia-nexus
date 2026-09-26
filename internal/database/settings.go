@@ -114,6 +114,22 @@ func (d *DB) GetAllSettings(ctx context.Context) (map[string]any, error) {
 
 // SetSetting sets or updates a setting key with JSON serialization and SSL encryption.
 func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
+	if key == "vpn_config" {
+		// Backup restore and other generic settings writers must use the
+		// same portal-key validation and encryption boundary.
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("marshal vpn config setting: %w", err)
+		}
+		if string(encoded) == "null" {
+			return errors.New("vpn config setting cannot be null")
+		}
+		var cfg models.VPNConfig
+		if err := json.Unmarshal(encoded, &cfg); err != nil {
+			return fmt.Errorf("decode vpn config setting: %w", err)
+		}
+		return d.SaveVPNConfig(ctx, &cfg)
+	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
