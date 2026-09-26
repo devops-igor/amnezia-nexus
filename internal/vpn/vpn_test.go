@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -815,6 +816,277 @@ func TestEnableBackend_AddClientErrorFailsLoudly(t *testing.T) {
 	}
 	if tun.Status != "degraded" {
 		t.Errorf("expected tunnel to be degraded after failed registration, got %s", tun.Status)
+	}
+}
+
+func TestEnableBackend_UpdateBackendTunnelErrorAbortsAndLeavesStateIntact(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	initialHost := "198.51.100.45"
+	initialPort := 51820
+	initialPub := "server-endpoint-pubkey-initial"
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "persist-fault-server",
+		Host: initialHost,
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       initialPort,
+				"public_key": initialPub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
+
+	// 1. Initial EnableBackend establishes tunnel in pool and DB
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend failed: %v", err)
+	}
+
+	initialTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil || initialTun == nil {
+		t.Fatalf("expected initial tunnel in pool, got %+v (err=%v)", initialTun, err)
+	}
+	expectedInitialEndpoint := "198.51.100.45:51820"
+	if initialTun.Endpoint != expectedInitialEndpoint || initialTun.PublicKey != initialPub {
+		t.Fatalf("initial tunnel mismatch: endpoint=%s, pub=%s", initialTun.Endpoint, initialTun.PublicKey)
+	}
+	initialPrivKey := initialTun.PrivateKey
+	initialProbePrivKey := initialTun.ProbePrivateKey
+	initialVersion := initialTun.StateVersion
+
+	// 2. Update server configuration in DB with new host, port, and public key
+	newHost := "198.51.100.46"
+	newPort := 51822
+	newPub := "server-endpoint-pubkey-updated"
+	if err := db.UpdateServer(ctx, srvID, map[string]any{"host": newHost}); err != nil {
+		t.Fatalf("UpdateServer host failed: %v", err)
+	}
+	if err := db.UpdateServerProtocols(ctx, srvID, map[string]any{
+		"awg": map[string]any{
+			"installed":  true,
+			"port":       newPort,
+			"public_key": newPub,
+		},
+	}); err != nil {
+		t.Fatalf("UpdateServerProtocols failed: %v", err)
+	}
+
+	// 3. Trigger context cancellation right before pool.AddTunnel inside EnableBackend
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	svc.SetEnableBackendPreAddTunnelHookForTest(func() {
+		cancelReq()
+	})
+
+	initialClientAddCount := adder.addClientCalls
+
+	// EnableBackend must fail when AddTunnel's DB persistence fails
+	err = svc.EnableBackend(reqCtx, srvID)
+	if err == nil {
+		t.Fatal("expected EnableBackend to fail when DB persistence fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to register backend tunnel") {
+		t.Errorf("expected error wrapping failed to register backend tunnel, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "failed to persist backend tunnel updates") {
+		t.Errorf("expected error wrapping failed to persist backend tunnel updates, got: %v", err)
+	}
+
+	// Verify AddClient was not called during this aborted round
+	if adder.addClientCalls != initialClientAddCount {
+		t.Errorf("AddClient was called %d times; expected no new calls on aborted update", adder.addClientCalls-initialClientAddCount)
+	}
+
+	// Verify in-memory pool state is completely untouched
+	curTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if curTun.Endpoint != expectedInitialEndpoint {
+		t.Errorf("in-memory endpoint mutated on DB failure: got %q, want %q", curTun.Endpoint, expectedInitialEndpoint)
+	}
+	if curTun.PublicKey != initialPub {
+		t.Errorf("in-memory public key mutated on DB failure: got %q, want %q", curTun.PublicKey, initialPub)
+	}
+	if curTun.PrivateKey != initialPrivKey {
+		t.Errorf("in-memory private key mutated on DB failure: got %q, want %q", curTun.PrivateKey, initialPrivKey)
+	}
+	if curTun.ProbePrivateKey != initialProbePrivKey {
+		t.Errorf("in-memory probe private key mutated on DB failure: got %q, want %q", curTun.ProbePrivateKey, initialProbePrivKey)
+	}
+	if curTun.StateVersion != initialVersion {
+		t.Errorf("in-memory state version mutated on DB failure: got %d, want %d", curTun.StateVersion, initialVersion)
+	}
+
+	// Verify DB record is also untouched
+	dbTun, err := db.GetBackendTunnel(ctx, initialTun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Endpoint != expectedInitialEndpoint {
+		t.Errorf("DB endpoint mutated on DB failure: got %q, want %q", dbTun.Endpoint, expectedInitialEndpoint)
+	}
+	if dbTun.PublicKey != initialPub {
+		t.Errorf("DB public key mutated on DB failure: got %q, want %q", dbTun.PublicKey, initialPub)
+	}
+
+	// 4. Retry EnableBackend with valid context and verify it cleanly updates memory and DB
+	svc.SetEnableBackendPreAddTunnelHookForTest(nil)
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("subsequent EnableBackend with valid context failed: %v", err)
+	}
+
+	expectedNewEndpoint := "198.51.100.46:51822"
+	updatedTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel after retry failed: %v", err)
+	}
+	if updatedTun.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected updated endpoint %q, got %q", expectedNewEndpoint, updatedTun.Endpoint)
+	}
+	if updatedTun.PublicKey != newPub {
+		t.Errorf("expected updated public key %q, got %q", newPub, updatedTun.PublicKey)
+	}
+
+	updatedDBTun, err := db.GetBackendTunnel(ctx, initialTun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel after retry failed: %v", err)
+	}
+	if updatedDBTun.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected DB endpoint %q, got %q", expectedNewEndpoint, updatedDBTun.Endpoint)
+	}
+	if updatedDBTun.PublicKey != newPub {
+		t.Errorf("expected DB public key %q, got %q", newPub, updatedDBTun.PublicKey)
+	}
+}
+
+func TestVPNEnableBackend_ExistingMissingDBRowFailsWithoutMemoryMutation(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	initialHost := "198.51.100.47"
+	initialPort := 51820
+	initialPub := "server-endpoint-pubkey-initial"
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "missing-db-twin-server",
+		Host: initialHost,
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       initialPort,
+				"public_key": initialPub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
+
+	// 1. Initial EnableBackend establishes tunnel in pool and DB
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend failed: %v", err)
+	}
+
+	initialTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil || initialTun == nil {
+		t.Fatalf("expected initial tunnel in pool, got %+v (err=%v)", initialTun, err)
+	}
+	expectedInitialEndpoint := "198.51.100.47:51820"
+	if initialTun.Endpoint != expectedInitialEndpoint || initialTun.PublicKey != initialPub {
+		t.Fatalf("initial tunnel mismatch: endpoint=%s, pub=%s", initialTun.Endpoint, initialTun.PublicKey)
+	}
+	initialPrivKey := initialTun.PrivateKey
+	initialProbePrivKey := initialTun.ProbePrivateKey
+	initialVersion := initialTun.StateVersion
+
+	// 2. Delete the DB row directly, leaving in-memory pool entry intact
+	if err := db.DeleteBackendTunnel(ctx, initialTun.ID); err != nil {
+		t.Fatalf("DeleteBackendTunnel failed: %v", err)
+	}
+
+	// 3. Update server configuration in DB with new host, port, and public key
+	newHost := "198.51.100.48"
+	newPort := 51822
+	newPub := "server-endpoint-pubkey-updated"
+	if err := db.UpdateServer(ctx, srvID, map[string]any{"host": newHost}); err != nil {
+		t.Fatalf("UpdateServer host failed: %v", err)
+	}
+	if err := db.UpdateServerProtocols(ctx, srvID, map[string]any{
+		"awg": map[string]any{
+			"installed":  true,
+			"port":       newPort,
+			"public_key": newPub,
+		},
+	}); err != nil {
+		t.Fatalf("UpdateServerProtocols failed: %v", err)
+	}
+
+	initialClientAddCalls := adder.addClientCalls
+
+	// 4. Call EnableBackend: must fail because DB row is missing
+	err = svc.EnableBackend(ctx, srvID)
+	if err == nil {
+		t.Fatal("expected EnableBackend to fail when DB row is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to register backend tunnel") {
+		t.Errorf("expected error wrapping failed to register backend tunnel, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error containing 'not found', got: %v", err)
+	}
+
+	// Verify no AddClient calls were made on failed update
+	if adder.addClientCalls != initialClientAddCalls {
+		t.Errorf("AddClient was called %d times; expected no new calls on aborted update", adder.addClientCalls-initialClientAddCalls)
+	}
+
+	// 5. Verify in-memory pool state is not mutated
+	curTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if curTun.Endpoint != expectedInitialEndpoint {
+		t.Errorf("in-memory endpoint mutated on missing DB row: got %q, want %q", curTun.Endpoint, expectedInitialEndpoint)
+	}
+	if curTun.PublicKey != initialPub {
+		t.Errorf("in-memory public key mutated on missing DB row: got %q, want %q", curTun.PublicKey, initialPub)
+	}
+	if curTun.PrivateKey != initialPrivKey {
+		t.Errorf("in-memory private key mutated on missing DB row: got %q, want %q", curTun.PrivateKey, initialPrivKey)
+	}
+	if curTun.ProbePrivateKey != initialProbePrivKey {
+		t.Errorf("in-memory probe private key mutated on missing DB row: got %q, want %q", curTun.ProbePrivateKey, initialProbePrivKey)
+	}
+	if curTun.StateVersion != initialVersion {
+		t.Errorf("in-memory state version mutated on missing DB row: got %d, want %d", curTun.StateVersion, initialVersion)
+	}
+
+	// Verify DB row remains absent
+	dbTun, err := db.GetBackendTunnel(ctx, initialTun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun != nil {
+		t.Errorf("expected DB row to remain absent, got %+v", dbTun)
 	}
 }
 
@@ -1644,9 +1916,14 @@ func TestVPNConfigMigration_FailsLoudly(t *testing.T) {
 		t.Fatalf("failed to seed legacy vpn_config: %v", err)
 	}
 
-	// Break persistence: close the database so SaveVPNConfig fails.
-	if err := db.Close(); err != nil {
-		t.Fatalf("failed to close db: %v", err)
+	// Break persistence for vpn_config saves while keeping the legacy row readable.
+	for _, q := range []string{
+		`CREATE TRIGGER fail_vpn_config_update BEFORE UPDATE ON settings WHEN NEW.key = 'vpn_config' BEGIN SELECT RAISE(FAIL, 'simulated save failure'); END;`,
+		`CREATE TRIGGER fail_vpn_config_insert BEFORE INSERT ON settings WHEN NEW.key = 'vpn_config' BEGIN SELECT RAISE(FAIL, 'simulated save failure'); END;`,
+	} {
+		if _, err := db.SQLDB().ExecContext(ctx, q); err != nil {
+			t.Fatalf("failed to create failure trigger: %v", err)
+		}
 	}
 
 	// NewVPNService must fail explicitly with the obfuscation-persistence
@@ -7432,4 +7709,230 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	if !vpnSvc.HasTransportStateForPeer(peerKey) {
 		t.Fatal("expected HasTransportStateForPeer to remain true for peer with active K2")
 	}
+}
+
+// Issue #344 Regression Tests: Fail startup on unreadable persisted VPN configuration
+
+func TestNewVPNService_MalformedVPNConfigFailsAndPreservesRow(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	const malformedJSON = "{invalid-json"
+	if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', ?)", malformedJSON); err != nil {
+		t.Fatalf("failed to insert malformed vpn_config: %v", err)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err == nil {
+		_ = svc.Stop()
+		t.Fatal("expected NewVPNService to fail on malformed vpn_config")
+	}
+	if !strings.Contains(err.Error(), "failed to load VPN config") {
+		t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+	}
+
+	var rawValue string
+	if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+		t.Fatalf("failed to read raw vpn_config: %v", err)
+	}
+	if rawValue != malformedJSON {
+		t.Fatalf("malformed setting was overwritten: got %q, want %q", rawValue, malformedJSON)
+	}
+}
+
+func TestNewVPNService_DatabaseReadErrorFailsWithoutPersistence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("closed_database", func(t *testing.T) {
+		db := setupTestDB(t)
+		if err := db.Close(); err != nil {
+			t.Fatalf("failed to close test db: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail when database is closed")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+	})
+
+	t.Run("dropped_settings_table", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "DROP TABLE settings"); err != nil {
+			t.Fatalf("failed to drop settings table: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail when settings table is unreadable")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+	})
+}
+
+func TestEnsureObfuscationParams_ReadFailureAbortsWithoutWrite(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	const malformedJSON = "{invalid-json"
+	if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', ?)", malformedJSON); err != nil {
+		t.Fatalf("failed to insert malformed vpn_config: %v", err)
+	}
+
+	cfg := defaultVPNConfig()
+	err := ensureObfuscationParams(ctx, db, cfg)
+	if err == nil {
+		t.Fatal("expected ensureObfuscationParams to fail on unreadable setting")
+	}
+	if !strings.Contains(err.Error(), "failed to read persisted VPN config for obfuscation migration") {
+		t.Fatalf("expected obfuscation migration read error, got: %v", err)
+	}
+
+	// Invariant: Missing obfuscation parameters must NOT be generated on read failure
+	if !cfg.H1.IsZero() {
+		t.Fatalf("expected cfg.H1 to remain zero, got: %v", cfg.H1)
+	}
+	if cfg.HeaderProtectionKey != "" {
+		t.Fatalf("expected cfg.HeaderProtectionKey to remain empty, got: %q", cfg.HeaderProtectionKey)
+	}
+
+	// Invariant: Raw corrupted setting must NOT be overwritten
+	var rawValue string
+	if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+		t.Fatalf("failed to read raw vpn_config: %v", err)
+	}
+	if rawValue != malformedJSON {
+		t.Fatalf("malformed setting was overwritten: got %q, want %q", rawValue, malformedJSON)
+	}
+}
+
+func TestNewVPNService_TrulyAbsentConfigInitializesFirstBoot(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Ensure vpn_config row is completely absent (first boot without pre-seeded row)
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM settings WHERE key = 'vpn_config'"); err != nil {
+		t.Fatalf("failed to delete vpn_config setting: %v", err)
+	}
+
+	var count int
+	if err := db.SQLDB().QueryRowContext(ctx, "SELECT COUNT(*) FROM settings WHERE key = 'vpn_config'").Scan(&count); err != nil {
+		t.Fatalf("failed to count vpn_config rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 vpn_config rows before init, got %d", count)
+	}
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed on absent config: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	persisted, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("expected persisted VPN config to exist")
+	}
+	if persisted.ListenPort != 51820 {
+		t.Errorf("expected ListenPort 51820, got %d", persisted.ListenPort)
+	}
+	if persisted.H1.IsZero() || persisted.H2.IsZero() || persisted.H3.IsZero() || persisted.H4.IsZero() {
+		t.Errorf("expected valid non-zero H values, got H1=%s H2=%s H3=%s H4=%s", persisted.H1, persisted.H2, persisted.H3, persisted.H4)
+	}
+	if persisted.HeaderProtectionKey == "" {
+		t.Errorf("expected non-empty HeaderProtectionKey")
+	}
+
+	// Verify the row actually exists in the database settings table
+	if err := db.SQLDB().QueryRowContext(ctx, "SELECT COUNT(*) FROM settings WHERE key = 'vpn_config'").Scan(&count); err != nil {
+		t.Fatalf("failed to count vpn_config rows after init: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 vpn_config row after init, got %d", count)
+	}
+}
+
+func TestNewVPNService_ExistingEmptySQLNullOrJSONNullConfigFailsAndPreservesRow(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty_string", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '')"); err != nil {
+			t.Fatalf("failed to insert empty vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on empty vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if !rawValue.Valid || rawValue.String != "" {
+			t.Fatalf("expected empty string row preserved, got: %+v", rawValue)
+		}
+	})
+
+	t.Run("sql_null", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', NULL)"); err != nil {
+			t.Fatalf("failed to insert SQL NULL vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on SQL NULL vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if rawValue.Valid {
+			t.Fatalf("expected SQL NULL preserved, got valid string: %q", rawValue.String)
+		}
+	})
+
+	t.Run("json_null", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', 'null')"); err != nil {
+			t.Fatalf("failed to insert json null vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on json null vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if !rawValue.Valid || rawValue.String != "null" {
+			t.Fatalf("expected json null string preserved, got: %+v", rawValue)
+		}
+	})
 }

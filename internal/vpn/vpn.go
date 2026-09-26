@@ -190,6 +190,7 @@ type Service struct {
 	updateBackendServerHostPreLockHook func()
 	updateBackendServerHostErr         error
 	syncBackendForwarderHook           func() error
+	enableBackendPreAddTunnelHook      func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -331,7 +332,10 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 	defer obfuscationMigrationMu.Unlock()
 
 	persisted, err := db.GetVPNConfig(ctx)
-	if err == nil && persisted != nil {
+	if err != nil {
+		return fmt.Errorf("failed to read persisted VPN config for obfuscation migration: %w", err)
+	}
+	if persisted != nil {
 		if isObfuscationConfigComplete(persisted) {
 			cfg.H1, cfg.H2, cfg.H3, cfg.H4 = persisted.H1, persisted.H2, persisted.H3, persisted.H4
 			cfg.S1, cfg.S2, cfg.S3, cfg.S4 = persisted.S1, persisted.S2, persisted.S3, persisted.S4
@@ -477,7 +481,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 			var err error
 			cfg, err = db.GetVPNConfig(context.Background())
 			if err != nil {
-				cfg = defaultVPNConfig()
+				return nil, fmt.Errorf("failed to load VPN config: %w", err)
 			}
 		} else {
 			cfg = defaultVPNConfig()
@@ -852,6 +856,13 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateBackendServerHostErr = err
+}
+
+// SetEnableBackendPreAddTunnelHookForTest sets a hook called immediately before calling pool.AddTunnel in EnableBackend.
+func (s *Service) SetEnableBackendPreAddTunnelHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enableBackendPreAddTunnelHook = fn
 }
 
 // SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
@@ -2161,6 +2172,13 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
+
+	s.mu.RLock()
+	preAddHook := s.enableBackendPreAddTunnelHook
+	s.mu.RUnlock()
+	if preAddHook != nil {
+		preAddHook()
+	}
 
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
