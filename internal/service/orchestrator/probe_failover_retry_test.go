@@ -482,9 +482,9 @@ func TestOrchestrator_IsTunnelVersionStale_DBError(t *testing.T) {
 		t.Errorf("expected isStale=false for matching version, got true")
 	}
 
-	// 2. Tunnel version differs in DB -> (true, nil)
-	if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{"state_version": 2}); err != nil {
-		t.Fatalf("UpdateBackendTunnel failed: %v", err)
+	// 2. A real state mutation advances the DB version -> (true, nil).
+	if err := db.UpdateBackendTunnelEndpoint(ctx, tID, tun.Endpoint); err != nil {
+		t.Fatalf("UpdateBackendTunnelEndpoint failed: %v", err)
 	}
 	isStale, err = orch.isTunnelVersionStale(ctx, tun)
 	if err != nil {
