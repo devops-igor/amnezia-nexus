@@ -233,3 +233,41 @@ func TestResetEnabledHealthForStartupRequiresFreshProbe(t *testing.T) {
 		t.Fatalf("database startup reset changed admin-disabled backend: %+v", dbDisabled)
 	}
 }
+
+func TestTransferConnectionsRejectsAdminDisabledActiveTarget(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	pool := NewPool(db)
+
+	fromServer, _ := db.CreateServer(ctx, &models.Server{Name: "transfer-from", Host: "192.0.2.96"})
+	toServer, _ := db.CreateServer(ctx, &models.Server{Name: "transfer-to", Host: "192.0.2.97"})
+	from, err := pool.AddTunnel(ctx, fromServer, "192.0.2.96:51820", "key-from")
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := pool.AddTunnel(ctx, toServer, "192.0.2.97:51820", "key-to")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool.IncrementConnections(from.ID)
+	if err := pool.SetTunnelEnabled(ctx, toServer, false, models.DisableReasonAdmin); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pool.TransferConnectionsIfActive(from.ID, to.ID, to.StateVersion+1); err == nil {
+		t.Fatal("expected transfer to reject administratively disabled target with active health")
+	}
+
+	fromAfter, err := pool.GetTunnel(fromServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toAfter, err := pool.GetTunnel(toServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromAfter.ActiveConnections != 1 || toAfter.ActiveConnections != 0 {
+		t.Fatalf("rejected transfer changed gauges: from=%d to=%d", fromAfter.ActiveConnections, toAfter.ActiveConnections)
+	}
+}
