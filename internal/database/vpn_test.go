@@ -111,18 +111,19 @@ func TestVPNBackendTunnelsUpdateAndStatus(t *testing.T) {
 		t.Errorf("UpdateBackendTunnel empty map failed: %v", err)
 	}
 
-	newHealth := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	err := db.UpdateBackendTunnel(ctx, tID, map[string]any{
-		"interface_name":    "awg-be-renamed",
-		"private_key":       "new-plaintext-privkey",
-		"latency_ms":        42,
-		"last_health_check": &newHealth,
+		"interface_name": "awg-be-renamed",
+		"private_key":    "new-plaintext-privkey",
 	})
 	if err != nil {
 		t.Fatalf("UpdateBackendTunnel failed: %v", err)
 	}
 
-	_ = db.UpdateBackendTunnel(ctx, tID, map[string]any{"last_health_check": newHealth})
+	for _, ownedColumn := range []string{"enabled", "status", "disable_reason", "state_version", "last_health_check", "latency_ms"} {
+		if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{ownedColumn: 1}); err == nil {
+			t.Errorf("generic UpdateBackendTunnel unexpectedly accepted owned state column %q", ownedColumn)
+		}
+	}
 
 	if err := db.UpdateBackendTunnelStatus(ctx, tID, "degraded", 88); err != nil {
 		t.Fatalf("UpdateBackendTunnelStatus failed: %v", err)
