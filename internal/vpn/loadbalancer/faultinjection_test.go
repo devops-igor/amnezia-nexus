@@ -136,7 +136,7 @@ func TestFailoverBackendDiesMidMigrationMatrix(t *testing.T) {
 		base := NewLeastConnectionsBalancer(caps)
 		lb := &failingBalancer{inner: base, failPeers: map[string]bool{"peer-bad": true}}
 		sm := NewStickySessionManager(db, lb, caps)
-		healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+		healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 		sm.AssignPeerAffinity("peer-bad", t1)
 		res, err := sm.HandleFailover(ctx, t1, healthy)
@@ -170,7 +170,7 @@ func TestFailoverBackendDiesMidMigrationMatrix(t *testing.T) {
 		ctx := context.Background()
 		wrapped := &readFailStore{inner: db, readErr: errInjected("db read died mid-failover")}
 		sm := NewStickySessionManager(wrapped, NewLeastConnectionsBalancer(caps), caps)
-		healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+		healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 		// In-memory peer + a DB-only session the failing read hides.
 		mkSession(t, db, "sess-readfail", "u-rf", "peer-readfail", t1)
@@ -265,7 +265,7 @@ func TestFailoverDBReadBlocksWithReadersUnblocked(t *testing.T) {
 	hanging := &hangingStore{inner: db, gate: make(chan struct{})}
 	caps := CapacityConfig{MaxTotalPeers: 100, MaxPeersPerBackend: 50}
 	sm := NewStickySessionManager(hanging, NewLeastConnectionsBalancer(caps), caps)
-	healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+	healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 	mkSession(t, db, "sess-hang", "u-hang", "peer-hang", t1)
 	sm.AssignPeerAffinity("peer-hang", t1)
