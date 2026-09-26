@@ -50,6 +50,23 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 	return json.Unmarshal([]byte(val.String), target)
 }
 
+// GetSettingRaw retrieves the raw string value of a setting, distinguishing between
+// an absent row (found=false, err=nil) and an existing row with valid or NULL content.
+func (d *DB) GetSettingRaw(ctx context.Context, key string) (val sql.NullString, found bool, err error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	err = d.sqlDB.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = ?", key).Scan(&val)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return val, false, nil
+		}
+		return val, false, fmt.Errorf("failed to get setting %s: %w", key, err)
+	}
+
+	return val, true, nil
+}
+
 // GetAllSettings retrieves all settings as a map, deserializing JSON and decrypting SSL certificates.
 func (d *DB) GetAllSettings(ctx context.Context) (map[string]any, error) {
 	d.mu.RLock()

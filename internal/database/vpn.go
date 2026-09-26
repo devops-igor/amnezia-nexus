@@ -376,10 +376,42 @@ func (d *DB) GetVPNSessionsByUserID(ctx context.Context, userID string) ([]model
 
 // GetVPNConfig retrieves the load balancing and VPN configuration from settings.
 func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
-	var cfg models.VPNConfig
-	if err := d.GetSetting(ctx, "vpn_config", &cfg); err != nil {
+	val, found, err := d.GetSettingRaw(ctx, "vpn_config")
+	if err != nil {
 		return nil, err
 	}
+
+	var cfg models.VPNConfig
+	if !found {
+		fillVPNConfigDefaults(&cfg)
+		return &cfg, nil
+	}
+
+	if !val.Valid {
+		return nil, fmt.Errorf("persisted vpn_config setting is SQL NULL")
+	}
+	trimmed := strings.TrimSpace(val.String)
+	if trimmed == "" {
+		return nil, fmt.Errorf("persisted vpn_config setting is empty")
+	}
+	if trimmed == "null" {
+		return nil, fmt.Errorf("persisted vpn_config setting is JSON null")
+	}
+
+	if err := json.Unmarshal([]byte(val.String), &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse vpn_config JSON: %w", err)
+	}
+
+	fillVPNConfigDefaults(&cfg)
+	// Obfuscation-parameter migration (generating H/S when unset and
+	// persisting them) intentionally does NOT happen here: the database
+	// package must not own obfuscation-parameter derivation. NewVPNService
+	// in internal/vpn owns the migration so a single component derives,
+	// persists, and distributes the parameters to listener and clients.
+	return &cfg, nil
+}
+
+func fillVPNConfigDefaults(cfg *models.VPNConfig) {
 	if cfg.Algorithm == "" {
 		cfg.Algorithm = models.LBLeastConnections
 	}
@@ -407,12 +439,6 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if cfg.Weights == nil {
 		cfg.Weights = make(map[int64]int)
 	}
-	// Obfuscation-parameter migration (generating H/S when unset and
-	// persisting them) intentionally does NOT happen here: the database
-	// package must not own obfuscation-parameter derivation. NewVPNService
-	// in internal/vpn owns the migration so a single component derives,
-	// persists, and distributes the parameters to listener and clients.
-	return &cfg, nil
 }
 
 // SaveVPNConfig persists the VPN configuration to the settings table.

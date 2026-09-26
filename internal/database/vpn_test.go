@@ -444,7 +444,7 @@ func TestGetVPNConfig_ContractVerification(t *testing.T) {
 	ctx := context.Background()
 
 	// Case 1: Absent vpn_config row returns default VPNConfig with nil error (first-boot policy).
-	t.Run("absent_row_returns_defaults", func(t *testing.T) {
+	t.Run("absent_row_returns_defaults_and_nil_error", func(t *testing.T) {
 		db, _ := setupTestDB(t)
 		if _, err := db.sqlDB.ExecContext(ctx, "DELETE FROM settings WHERE key = 'vpn_config'"); err != nil {
 			t.Fatalf("failed to delete vpn_config: %v", err)
@@ -467,8 +467,80 @@ func TestGetVPNConfig_ContractVerification(t *testing.T) {
 		}
 	})
 
-	// Case 2: Malformed JSON returns a syntax error and nil config.
-	t.Run("malformed_json_returns_error", func(t *testing.T) {
+	// Case 2: Persisted SQL NULL returns error and nil config.
+	t.Run("sql_null_returns_error_and_nil_config", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', NULL)"); err != nil {
+			t.Fatalf("failed to insert SQL NULL vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on SQL NULL vpn_config, got nil")
+		}
+		if !strings.Contains(err.Error(), "persisted vpn_config setting is SQL NULL") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+
+	// Case 3: Persisted empty string returns error and nil config.
+	t.Run("empty_string_returns_error_and_nil_config", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '')"); err != nil {
+			t.Fatalf("failed to insert empty vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on empty vpn_config, got nil")
+		}
+		if !strings.Contains(err.Error(), "persisted vpn_config setting is empty") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+
+	// Case 4: Persisted whitespace string returns error and nil config.
+	t.Run("whitespace_string_returns_error_and_nil_config", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '   \t\n  ')"); err != nil {
+			t.Fatalf("failed to insert whitespace vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on whitespace vpn_config, got nil")
+		}
+		if !strings.Contains(err.Error(), "persisted vpn_config setting is empty") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+
+	// Case 5: Persisted JSON null returns error and nil config.
+	t.Run("json_null_returns_error_and_nil_config", func(t *testing.T) {
+		db, _ := setupTestDB(t)
+		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', 'null')"); err != nil {
+			t.Fatalf("failed to insert json null vpn_config: %v", err)
+		}
+		cfg, err := db.GetVPNConfig(ctx)
+		if err == nil {
+			t.Fatal("expected error on json null vpn_config, got nil")
+		}
+		if !strings.Contains(err.Error(), "persisted vpn_config setting is JSON null") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if cfg != nil {
+			t.Fatalf("expected nil config on error, got: %+v", cfg)
+		}
+	})
+
+	// Case 6: Malformed JSON returns a syntax error and nil config.
+	t.Run("malformed_json_returns_error_and_nil_config", func(t *testing.T) {
 		db, _ := setupTestDB(t)
 		if _, err := db.sqlDB.ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '{invalid-json')"); err != nil {
 			t.Fatalf("failed to insert malformed vpn_config: %v", err)
@@ -477,13 +549,16 @@ func TestGetVPNConfig_ContractVerification(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error on malformed JSON, got nil")
 		}
+		if !strings.Contains(err.Error(), "failed to parse vpn_config JSON") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
 		if cfg != nil {
 			t.Fatalf("expected nil config on error, got: %+v", cfg)
 		}
 	})
 
-	// Case 3: Database read error returns query error and nil config.
-	t.Run("database_read_error_returns_error", func(t *testing.T) {
+	// Case 7: Database read error returns query error and nil config.
+	t.Run("database_read_error_returns_error_and_nil_config", func(t *testing.T) {
 		db, _ := setupTestDB(t)
 		if err := db.Close(); err != nil {
 			t.Fatalf("failed to close test db: %v", err)

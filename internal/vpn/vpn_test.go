@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -7858,4 +7859,80 @@ func TestNewVPNService_TrulyAbsentConfigInitializesFirstBoot(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected 1 vpn_config row after init, got %d", count)
 	}
+}
+
+func TestNewVPNService_ExistingEmptySQLNullOrJSONNullConfigFailsAndPreservesRow(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty_string", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', '')"); err != nil {
+			t.Fatalf("failed to insert empty vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on empty vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if !rawValue.Valid || rawValue.String != "" {
+			t.Fatalf("expected empty string row preserved, got: %+v", rawValue)
+		}
+	})
+
+	t.Run("sql_null", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', NULL)"); err != nil {
+			t.Fatalf("failed to insert SQL NULL vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on SQL NULL vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if rawValue.Valid {
+			t.Fatalf("expected SQL NULL preserved, got valid string: %q", rawValue.String)
+		}
+	})
+
+	t.Run("json_null", func(t *testing.T) {
+		db := setupTestDB(t)
+		if _, err := db.SQLDB().ExecContext(ctx, "INSERT OR REPLACE INTO settings (key, value) VALUES ('vpn_config', 'null')"); err != nil {
+			t.Fatalf("failed to insert json null vpn_config: %v", err)
+		}
+
+		svc, err := NewVPNService(db, nil)
+		if err == nil {
+			_ = svc.Stop()
+			t.Fatal("expected NewVPNService to fail on json null vpn_config")
+		}
+		if !strings.Contains(err.Error(), "failed to load VPN config") {
+			t.Fatalf("expected 'failed to load VPN config' in error, got: %v", err)
+		}
+
+		var rawValue sql.NullString
+		if err := db.SQLDB().QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'vpn_config'").Scan(&rawValue); err != nil {
+			t.Fatalf("failed to read raw vpn_config: %v", err)
+		}
+		if !rawValue.Valid || rawValue.String != "null" {
+			t.Fatalf("expected json null string preserved, got: %+v", rawValue)
+		}
+	})
 }
