@@ -424,7 +424,7 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 
 	var activeTunnels []models.BackendTunnel
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "active") {
+		if t.Enabled && strings.EqualFold(t.Status, "active") {
 			activeTunnels = append(activeTunnels, t)
 		}
 	}
