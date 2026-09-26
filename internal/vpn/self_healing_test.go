@@ -478,8 +478,8 @@ func TestSelfHealing_ConcurrentDisableBackendDuringSelfHeal(t *testing.T) {
 	if gotAfter.Status != models.TunnelStatusDisabled {
 		t.Fatalf("administrative disable changed runtime health: got %q, want disabled", gotAfter.Status)
 	}
-	if gotAfter.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected disable_reason admin, got %q", gotAfter.DisableReason)
+	if gotAfter.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected health provenance to survive admin disable, got %q", gotAfter.DisableReason)
 	}
 
 	// Forwarder device must remain detached
