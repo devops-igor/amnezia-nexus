@@ -940,14 +940,17 @@ func TestMigrateVPNSessionToActiveTunnel_RejectsStaleAssignments(t *testing.T) {
 		t.Fatal("expected migration to disabled target to fail")
 	}
 	assertSource()
-	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", models.DisableReasonAdmin, 0); err != nil {
+	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateBackendTunnelEnabled(ctx, target, false, models.DisableReasonAdmin); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, source, target); err == nil {
-		t.Fatal("expected migration to admin-disabled target to fail even with active status")
+		t.Fatal("expected migration to admin-disabled target to fail even with active health")
 	}
 	assertSource()
-	if err := db.UpdateBackendTunnelStatusWithReason(ctx, target, "active", "", 0); err != nil {
+	if err := db.UpdateBackendTunnelEnabled(ctx, target, true, models.DisableReasonNone); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MigrateVPNSessionToActiveTunnel(ctx, sessionID, target, target); err == nil {
