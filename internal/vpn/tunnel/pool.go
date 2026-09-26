@@ -744,9 +744,9 @@ func (p *Pool) TransferConnectionsIfActive(fromTunnelID, toTunnelID int64, expec
 		return ErrTunnelNotFound
 	}
 
-	if !strings.EqualFold(toTun.Status, "active") {
+	if !toTun.Enabled || !strings.EqualFold(toTun.Status, "active") {
 		p.mu.Unlock()
-		return fmt.Errorf("target backend tunnel %d is not active (status=%s)", toTunnelID, toTun.Status)
+		return fmt.Errorf("target backend tunnel %d is not eligible (enabled=%t status=%s)", toTunnelID, toTun.Enabled, toTun.Status)
 	}
 
 	if len(expectedTargetVersion) > 0 && expectedTargetVersion[0] > 0 {
