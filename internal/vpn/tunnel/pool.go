@@ -153,6 +153,34 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 	return nil
 }
 
+// ResetEnabledHealthForStartup invalidates last-known runtime health for
+// administratively enabled backends after SyncFromDB. Disabled backends keep
+// their persisted health snapshot because they are excluded from probing and
+// routing until an administrator re-enables them.
+func (p *Pool) ResetEnabledHealthForStartup(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.db != nil {
+		if err := p.db.ResetEnabledBackendTunnelHealthForStartup(ctx); err != nil {
+			return err
+		}
+	}
+
+	for _, t := range p.tunnelsByServerID {
+		if !t.Enabled {
+			continue
+		}
+		t.Status = models.TunnelStatusConnecting
+		t.DisableReason = models.DisableReasonNone
+		t.LatencyMS = 0
+		t.LastHealthCheck = nil
+		t.StateVersion++
+	}
+
+	return nil
+}
+
 // AddTunnel establishes or registers an in-process AWG backend tunnel for a server.
 func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPubKey string) (*models.BackendTunnel, error) {
 	if serverID <= 0 {
