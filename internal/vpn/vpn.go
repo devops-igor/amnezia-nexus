@@ -910,7 +910,7 @@ func (s *Service) backendTunnelReady(t *models.BackendTunnel) error {
 	if current == nil || current.ID != t.ID {
 		return tunnel.ErrTunnelNotFound
 	}
-	if current.Status == models.TunnelStatusDisabled || current.DisableReason == models.DisableReasonAdmin {
+	if !current.AdministrativelyEnabled() {
 		return ErrTunnelDisabled
 	}
 	if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
@@ -2132,7 +2132,8 @@ func parsePort(val any) int {
 // EnableBackend enables a backend server for load balancing by loading its
 // AWG protocol credentials from the database, registering (or refreshing) the
 // tunnel in the pool, attaching a backend UDP packet device to the forwarder,
-// and marking the tunnel active.
+// and marking the backend administratively enabled. Runtime health remains a
+// separate probe-owned state (issue #90).
 func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	s.mu.RLock()
 	pool := s.pool
@@ -3700,7 +3701,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	}
 	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
-		if backendErr == nil && backend.Status == "active" &&
+		if backendErr == nil && backend.AdministrativelyEnabled() && strings.EqualFold(backend.RuntimeHealth(), models.TunnelStatusActive) &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
 			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
 			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {
