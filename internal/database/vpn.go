@@ -115,7 +115,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	query := `INSERT INTO backend_tunnels (
 		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
 		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
 		t.ServerID,
