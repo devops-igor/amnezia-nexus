@@ -256,6 +256,59 @@ func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, 
 	return nil
 }
 
+// ResetBackendTunnelRuntimeHealth marks an administratively enabled backend
+// as unprobed during pool reconstruction. Persisting the reset keeps DB and
+// in-memory state/version aligned for the next versioned probe CAS.
+func (d *DB) ResetBackendTunnelRuntimeHealth(ctx context.Context, id int64) (bool, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	query := `UPDATE backend_tunnels
+		SET health_status = ?, status = ?, disable_reason = ?, latency_ms = 0,
+			last_health_check = NULL, state_version = state_version + 1
+		WHERE id = ? AND admin_disabled = 0`
+	res, err := d.sqlDB.ExecContext(ctx, query,
+		models.TunnelStatusConnecting, models.TunnelStatusConnecting, models.DisableReasonNone, id)
+	if err != nil {
+		return false, fmt.Errorf("failed to reset backend runtime health: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect backend runtime health reset: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// UpdateBackendTunnelAdminDisabled updates only administrative intent while
+// preserving runtime health. The legacy status/disable_reason columns are kept
+// as a compatibility projection for older consumers.
+func (d *DB) UpdateBackendTunnelAdminDisabled(ctx context.Context, id int64, disabled bool) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	compatStatusExpr := "health_status"
+	reason := models.DisableReasonNone
+	if disabled {
+		compatStatusExpr = "'disabled'"
+		reason = models.DisableReasonAdmin
+	}
+	query := fmt.Sprintf(`UPDATE backend_tunnels
+		SET admin_disabled = ?, status = %s, disable_reason = ?, state_version = state_version + 1
+		WHERE id = ?`, compatStatusExpr)
+	res, err := d.sqlDB.ExecContext(ctx, query, disabled, reason, id)
+	if err != nil {
+		return fmt.Errorf("failed to update backend administrative state: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend administrative update: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("backend tunnel %d not found", id)
+	}
+	return nil
+}
+
 // UpdateBackendTunnelEndpoint updates the endpoint of a backend tunnel and increments its state_version.
 func (d *DB) UpdateBackendTunnelEndpoint(ctx context.Context, id int64, endpoint string) error {
 	d.writeMu.Lock()
