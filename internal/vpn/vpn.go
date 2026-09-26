@@ -1072,6 +1072,12 @@ func (s *Service) Start(ctx context.Context) error {
 			s.mu.Unlock()
 			return fmt.Errorf("failed to sync tunnels from DB: %w", err)
 		}
+		if err := s.pool.ResetEnabledHealthForStartup(ctx); err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to reset backend health for startup: %w", err)
+		}
 
 		// Issue #43 startup migration: backfill dedicated probe keys for
 		// legacy tunnels and (re-)register both portal peers on each backend
@@ -1079,7 +1085,9 @@ func (s *Service) Start(ctx context.Context) error {
 		// with their correct identities. Best-effort; logs on failure.
 		s.EnsureBackendProbeKeys(ctx)
 
-		// Restore backend data-plane devices for active tunnels
+		// Enabled backends are intentionally "connecting" here, so no stale
+		// data-plane device is restored. The health prober's initial sweep
+		// establishes fresh health and attaches devices for successful probes.
 		s.restoreBackendDevices(ctx)
 	}
 
