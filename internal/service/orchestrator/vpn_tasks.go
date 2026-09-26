@@ -47,7 +47,11 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if !t.Enabled {
+		if !t.Enabled || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+			// Administratively disabled backends are ineligible altogether.
+			// Runtime-disabled backends belong to the VPN health prober's
+			// dedicated self-healing path, which applies flap damping and
+			// restores the data plane before making the backend routable.
 			continue
 		}
 
