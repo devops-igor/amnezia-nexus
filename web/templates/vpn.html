@@ -68,6 +68,102 @@
     </div>
 </div>
 
+<!-- FORWARDER HEALTH & DIAGNOSTICS CARD -->
+<div class="card" id="vpn-forwarder-card" style="margin-bottom: var(--space-lg);">
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
+        <div class="flex items-center gap-sm">
+            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-activity"></use></svg>
+            <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_forwarder_health" }}</h3>
+        </div>
+        <span class="badge badge-success" id="vpn-fwd-status-badge">
+            <span class="badge-dot"></span> <span id="vpn-fwd-status-text">{{ _ "vpn_forwarder_healthy" }}</span>
+        </span>
+    </div>
+
+    <div class="stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-sm); margin-bottom: var(--space-md);">
+        <!-- Queue Occupancy -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_queue" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-queue" style="font-size: 1.1rem; margin-top: 4px;">-</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_instantaneous" }}</div>
+        </div>
+
+        <!-- Peak High-Water -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_peak" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-peak" style="font-size: 1.1rem; margin-top: 4px;">-</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_peak_watermark" }}</div>
+        </div>
+
+        <!-- Queue-full Drops -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_drops_queue_full" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-drops-queue-full" style="font-size: 1.1rem; margin-top: 4px;">0</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_cumulative" }}</div>
+        </div>
+
+        <!-- No-route Drops -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_drops_no_route" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-drops-no-route" style="font-size: 1.1rem; margin-top: 4px;">0</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_cumulative" }}</div>
+        </div>
+
+        <!-- Oversize Drops -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_drops_oversize" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-drops-packet-too-large" style="font-size: 1.1rem; margin-top: 4px;">0</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_cumulative" }}</div>
+        </div>
+
+        <!-- Device Write Errors -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_write_errors" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-write-errors" style="font-size: 1.1rem; margin-top: 4px;">0</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_cumulative" }}</div>
+        </div>
+
+        <!-- Transport Decrypt Failures -->
+        <div class="info-card" style="padding: var(--space-sm) var(--space-md);">
+            <div class="info-card-label">{{ _ "vpn_forwarder_decrypt_failures" }}</div>
+            <div class="info-card-value font-mono" id="vpn-fwd-decrypt-failures" style="font-size: 1.1rem; margin-top: 4px;">0</div>
+            <div class="text-muted" style="font-size: 0.75rem; margin-top: 2px;">{{ _ "vpn_forwarder_cumulative" }}</div>
+        </div>
+    </div>
+
+    <!-- Route-level queue pressure expandable details -->
+    <details id="vpn-fwd-routes-details" style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md);">
+        <summary style="cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; font-weight: 600; font-size: 0.875rem;">
+            <div class="flex items-center gap-xs">
+                <svg class="icon text-muted" style="width: 16px; height: 16px;"><use href="#icon-network"></use></svg>
+                <span>{{ _ "vpn_forwarder_routes" }}</span>
+                <span id="vpn-fwd-routes-badge" class="badge badge-secondary" style="font-size: 0.75rem; margin-left: var(--space-xs);">0</span>
+            </div>
+            <span id="vpn-fwd-routes-summary-status" class="text-muted" style="font-size: 0.8rem; font-weight: normal;">
+                {{ _ "vpn_forwarder_no_route_pressure" }}
+            </span>
+        </summary>
+        <div style="margin-top: var(--space-md); overflow-x: auto;">
+            <div id="vpn-fwd-routes-empty" style="text-align: center; color: var(--text-muted); padding: var(--space-md); font-size: 0.85rem;">
+                {{ _ "vpn_forwarder_no_route_pressure" }}
+            </div>
+            <table class="table" id="vpn-fwd-routes-table" style="width: 100%; min-width: 100%; font-size: 0.85rem; display: none;">
+                <thead>
+                    <tr>
+                        <th>{{ _ "vpn_forwarder_route_peer" }}</th>
+                        <th>{{ _ "vpn_forwarder_route_queue" }}</th>
+                        <th>{{ _ "vpn_forwarder_route_peak" }}</th>
+                        <th>{{ _ "vpn_forwarder_route_drops" }}</th>
+                        <th>{{ _ "vpn_forwarder_route_writes" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="vpn-fwd-routes-tbody">
+                </tbody>
+            </table>
+        </div>
+    </details>
+</div>
+
 <!-- BACKENDS TABLE -->
 <div class="card">
     <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
@@ -862,6 +958,212 @@
         });
     }
 
+    function vpnFormatPeerKey(key) {
+        if (!key) return '-';
+        if (typeof key !== 'string') return String(key);
+        if (key.length <= 12) return key;
+        return key.slice(0, 8) + '...' + key.slice(-4);
+    }
+
+    function vpnRenderForwarderHealth(status) {
+        if (!status) return;
+
+        // Graceful handling of missing/undefined fields for backward compatibility
+        const hasCap = typeof status.forwarder_queue_capacity === 'number';
+        const occ = Number(status.forwarder_queue_occupancy || 0);
+        const cap = hasCap ? Number(status.forwarder_queue_capacity) : 0;
+        const peak = Number(status.forwarder_queue_high_water || 0);
+        const dropsQueueFull = Number(status.forwarder_drops_queue_full || 0);
+        const dropsNoRoute = Number(status.forwarder_drops_no_route || 0);
+        const dropsOversize = Number(status.forwarder_drops_packet_too_large || 0);
+        const writeErrors = Number(status.forwarder_device_write_errors || 0);
+        const decryptFailures = Number(status.transport_decryption_failures || 0);
+
+        // Queue occupancy (instantaneous)
+        const queueElem = document.getElementById('vpn-fwd-queue');
+        if (queueElem) {
+            queueElem.textContent = hasCap ? (occ + ' / ' + cap) : (occ ? String(occ) : '-');
+            if (cap > 0 && occ >= cap * 0.8) {
+                queueElem.style.color = 'var(--danger)';
+            } else if (cap > 0 && occ >= cap * 0.5) {
+                queueElem.style.color = 'var(--warning)';
+            } else {
+                queueElem.style.color = '';
+            }
+        }
+
+        // Peak high-water
+        const peakElem = document.getElementById('vpn-fwd-peak');
+        if (peakElem) {
+            peakElem.textContent = hasCap ? (peak + ' / ' + cap) : (peak ? String(peak) : '-');
+            if (cap > 0 && peak >= cap * 0.8) {
+                peakElem.style.color = 'var(--danger)';
+            } else if (cap > 0 && peak >= cap * 0.5) {
+                peakElem.style.color = 'var(--warning)';
+            } else {
+                peakElem.style.color = '';
+            }
+        }
+
+        // Drops & error counters (cumulative)
+        const dropsFullElem = document.getElementById('vpn-fwd-drops-queue-full');
+        if (dropsFullElem) {
+            dropsFullElem.textContent = String(dropsQueueFull);
+            dropsFullElem.style.color = dropsQueueFull > 0 ? 'var(--danger)' : '';
+        }
+
+        const dropsNoRouteElem = document.getElementById('vpn-fwd-drops-no-route');
+        if (dropsNoRouteElem) {
+            dropsNoRouteElem.textContent = String(dropsNoRoute);
+            dropsNoRouteElem.style.color = dropsNoRoute > 0 ? 'var(--warning)' : '';
+        }
+
+        const dropsOversizeElem = document.getElementById('vpn-fwd-drops-packet-too-large');
+        if (dropsOversizeElem) {
+            dropsOversizeElem.textContent = String(dropsOversize);
+            dropsOversizeElem.style.color = dropsOversize > 0 ? 'var(--warning)' : '';
+        }
+
+        const writeErrorsElem = document.getElementById('vpn-fwd-write-errors');
+        if (writeErrorsElem) {
+            writeErrorsElem.textContent = String(writeErrors);
+            writeErrorsElem.style.color = writeErrors > 0 ? 'var(--danger)' : '';
+        }
+
+        const decryptElem = document.getElementById('vpn-fwd-decrypt-failures');
+        if (decryptElem) {
+            decryptElem.textContent = String(decryptFailures);
+            decryptElem.style.color = decryptFailures > 0 ? 'var(--warning)' : '';
+        }
+
+        // Route Queues & Pressure
+        const routeQueues = status.forwarder_route_queues;
+        const routeKeys = routeQueues && typeof routeQueues === 'object' ? Object.keys(routeQueues) : [];
+        const routeCount = routeKeys.length;
+
+        let totalRouteDrops = 0;
+        let routeHasPressure = false;
+
+        const tbody = document.getElementById('vpn-fwd-routes-tbody');
+        const table = document.getElementById('vpn-fwd-routes-table');
+        const emptyDiv = document.getElementById('vpn-fwd-routes-empty');
+        const badgeElem = document.getElementById('vpn-fwd-routes-badge');
+        const summaryStatus = document.getElementById('vpn-fwd-routes-summary-status');
+
+        if (badgeElem) {
+            badgeElem.textContent = String(routeCount);
+        }
+
+        if (tbody) {
+            tbody.textContent = '';
+            for (const peerKey of routeKeys) {
+                const rq = routeQueues[peerKey] || {};
+                const rOcc = Number(rq.occupancy || 0);
+                const rCap = Number(rq.capacity || 0);
+                const rPeak = Number(rq.high_water || 0);
+                const rDrops = Number(rq.queue_full_drops || 0);
+                const rWrites = Number(rq.write_count || 0);
+                const rErrors = Number(rq.write_errors || 0);
+
+                totalRouteDrops += rDrops;
+                if (rDrops > 0 || (rCap > 0 && rOcc >= rCap * 0.8)) {
+                    routeHasPressure = true;
+                }
+
+                const tr = document.createElement('tr');
+
+                // Peer column (truncated + tooltip)
+                const tdPeer = document.createElement('td');
+                tdPeer.className = 'font-mono text-sm';
+                tdPeer.title = peerKey;
+                tdPeer.textContent = vpnFormatPeerKey(peerKey);
+                tr.appendChild(tdPeer);
+
+                // Queue column
+                const tdQueue = document.createElement('td');
+                tdQueue.className = 'font-mono text-sm';
+                tdQueue.textContent = rCap > 0 ? (rOcc + ' / ' + rCap) : String(rOcc);
+                if (rCap > 0 && rOcc >= rCap * 0.8) {
+                    tdQueue.style.color = 'var(--danger)';
+                    tdQueue.style.fontWeight = 'bold';
+                }
+                tr.appendChild(tdQueue);
+
+                // Peak column
+                const tdPeak = document.createElement('td');
+                tdPeak.className = 'font-mono text-sm';
+                tdPeak.textContent = rCap > 0 ? (rPeak + ' / ' + rCap) : String(rPeak);
+                tr.appendChild(tdPeak);
+
+                // Drops column
+                const tdDrops = document.createElement('td');
+                tdDrops.className = 'font-mono text-sm';
+                tdDrops.textContent = String(rDrops);
+                if (rDrops > 0) {
+                    tdDrops.style.color = 'var(--danger)';
+                    tdDrops.style.fontWeight = 'bold';
+                }
+                tr.appendChild(tdDrops);
+
+                // Writes column
+                const tdWrites = document.createElement('td');
+                tdWrites.className = 'font-mono text-sm text-muted';
+                tdWrites.textContent = rErrors > 0 ? (rWrites + ' (' + rErrors + ' err)') : String(rWrites);
+                if (rErrors > 0) {
+                    tdWrites.style.color = 'var(--warning)';
+                }
+                tr.appendChild(tdWrites);
+
+                tbody.appendChild(tr);
+            }
+        }
+
+        if (routeCount > 0 && table && emptyDiv) {
+            table.style.display = '';
+            emptyDiv.style.display = 'none';
+        } else if (table && emptyDiv) {
+            table.style.display = 'none';
+            emptyDiv.style.display = 'block';
+        }
+
+        if (summaryStatus) {
+            if (routeHasPressure || totalRouteDrops > 0) {
+                summaryStatus.textContent = _('vpn_forwarder_pressure') || 'Pressure Detected';
+                summaryStatus.style.color = 'var(--danger)';
+            } else {
+                summaryStatus.textContent = _('vpn_forwarder_no_route_pressure') || 'All route queues clear';
+                summaryStatus.style.color = 'var(--text-muted)';
+            }
+        }
+
+        // Overall Forwarder Health Badge
+        const statusBadge = document.getElementById('vpn-fwd-status-badge');
+        const statusText = document.getElementById('vpn-fwd-status-text');
+        if (statusBadge && statusText) {
+            const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || totalRouteDrops > 0 || (cap > 0 && occ >= cap * 0.9);
+            const hasWarningIssue = dropsNoRoute > 0 || dropsOversize > 0 || decryptFailures > 0 || (cap > 0 && occ >= cap * 0.5) || routeHasPressure;
+
+            if (hasSevereIssue) {
+                statusBadge.className = 'badge badge-danger';
+                statusText.textContent = _('vpn_forwarder_pressure') || 'Pressure Detected';
+            } else if (hasWarningIssue) {
+                statusBadge.className = 'badge badge-warn';
+                statusText.textContent = _('vpn_forwarder_warning') || 'Warning';
+            } else {
+                statusBadge.className = 'badge badge-success';
+                statusText.textContent = _('vpn_forwarder_healthy') || 'Healthy';
+            }
+        }
+
+        // Auto-expand route details if pressure or drops detected
+        if (routeHasPressure || totalRouteDrops > 0) {
+            const detailsElem = document.getElementById('vpn-fwd-routes-details');
+            if (detailsElem) {
+                detailsElem.open = true;
+            }
+        }
+    }
+
     async function vpnLoadData() {
         try {
             const [status, cfg, backendData, sessionsData] = await Promise.all([
@@ -904,6 +1206,7 @@
             document.getElementById('vpn-active-tunnels').textContent = String(status.active_tunnels || 0);
             document.getElementById('vpn-rx').textContent = Telemetry.formatBytes(status.rx_bytes || 0);
             document.getElementById('vpn-tx').textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+            vpnRenderForwarderHealth(status);
 
             const tbody = document.getElementById('vpn-backends-tbody');
             tbody.textContent = '';

@@ -2484,3 +2484,285 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 		t.Error("style.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
 	}
 }
+
+func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	t.Run("RequiredDOMElements", func(t *testing.T) {
+		requiredDOMIDs := []string{
+			"vpn-forwarder-card",
+			"vpn-fwd-status-badge",
+			"vpn-fwd-status-text",
+			"vpn-fwd-queue",
+			"vpn-fwd-peak",
+			"vpn-fwd-drops-queue-full",
+			"vpn-fwd-drops-no-route",
+			"vpn-fwd-drops-packet-too-large",
+			"vpn-fwd-write-errors",
+			"vpn-fwd-decrypt-failures",
+			"vpn-fwd-routes-details",
+			"vpn-fwd-routes-badge",
+			"vpn-fwd-routes-summary-status",
+			"vpn-fwd-routes-empty",
+			"vpn-fwd-routes-table",
+			"vpn-fwd-routes-tbody",
+		}
+		for _, id := range requiredDOMIDs {
+			if !strings.Contains(vpnStr, `id="`+id+`"`) {
+				t.Errorf("vpn.html missing required DOM element id=%q", id)
+			}
+		}
+	})
+
+	t.Run("TranslationKeysInAllLanguages", func(t *testing.T) {
+		requiredKeys := []string{
+			"vpn_forwarder_health",
+			"vpn_forwarder_queue",
+			"vpn_forwarder_peak",
+			"vpn_forwarder_drops_queue_full",
+			"vpn_forwarder_drops_no_route",
+			"vpn_forwarder_drops_oversize",
+			"vpn_forwarder_write_errors",
+			"vpn_forwarder_decrypt_failures",
+			"vpn_forwarder_routes",
+			"vpn_forwarder_no_route_pressure",
+			"vpn_forwarder_route_peer",
+			"vpn_forwarder_route_queue",
+			"vpn_forwarder_route_peak",
+			"vpn_forwarder_route_drops",
+			"vpn_forwarder_route_writes",
+			"vpn_forwarder_healthy",
+			"vpn_forwarder_pressure",
+			"vpn_forwarder_warning",
+			"vpn_forwarder_instantaneous",
+			"vpn_forwarder_peak_watermark",
+			"vpn_forwarder_cumulative",
+		}
+		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
+
+		for _, langFile := range languages {
+			data, err := fs.ReadFile(transFS, langFile)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", langFile, err)
+			}
+			var dict map[string]string
+			if err := json.Unmarshal(data, &dict); err != nil {
+				t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+			}
+			for _, key := range requiredKeys {
+				val, ok := dict[key]
+				if !ok {
+					t.Errorf("%s missing required translation key %q", langFile, key)
+				} else if strings.TrimSpace(val) == "" {
+					t.Errorf("%s has empty translation for key %q", langFile, key)
+				}
+			}
+		}
+	})
+
+	t.Run("NoRawUntranslatedStringsInForwarderCard", func(t *testing.T) {
+		startIdx := strings.Index(vpnStr, `id="vpn-forwarder-card"`)
+		if startIdx == -1 {
+			t.Fatal("could not find #vpn-forwarder-card in vpn.html")
+		}
+		endIdx := strings.Index(vpnStr[startIdx:], `<!-- BACKENDS TABLE -->`)
+		if endIdx == -1 {
+			t.Fatal("could not find end of #vpn-forwarder-card before backends table")
+		}
+		cardHTML := vpnStr[startIdx : startIdx+endIdx]
+
+		// Ensure all visible labels use {{ _ "..." }}
+		expectedTokens := []string{
+			`{{ _ "vpn_forwarder_health" }}`,
+			`{{ _ "vpn_forwarder_healthy" }}`,
+			`{{ _ "vpn_forwarder_queue" }}`,
+			`{{ _ "vpn_forwarder_instantaneous" }}`,
+			`{{ _ "vpn_forwarder_peak" }}`,
+			`{{ _ "vpn_forwarder_peak_watermark" }}`,
+			`{{ _ "vpn_forwarder_drops_queue_full" }}`,
+			`{{ _ "vpn_forwarder_cumulative" }}`,
+			`{{ _ "vpn_forwarder_drops_no_route" }}`,
+			`{{ _ "vpn_forwarder_drops_oversize" }}`,
+			`{{ _ "vpn_forwarder_write_errors" }}`,
+			`{{ _ "vpn_forwarder_decrypt_failures" }}`,
+			`{{ _ "vpn_forwarder_routes" }}`,
+			`{{ _ "vpn_forwarder_no_route_pressure" }}`,
+			`{{ _ "vpn_forwarder_route_peer" }}`,
+			`{{ _ "vpn_forwarder_route_queue" }}`,
+			`{{ _ "vpn_forwarder_route_peak" }}`,
+			`{{ _ "vpn_forwarder_route_drops" }}`,
+			`{{ _ "vpn_forwarder_route_writes" }}`,
+		}
+		for _, token := range expectedTokens {
+			if !strings.Contains(cardHTML, token) {
+				t.Errorf("forwarder card missing translation token %q", token)
+			}
+		}
+
+		// Ensure no hardcoded raw English strings exist in card labels
+		rawEnglishStrings := []string{
+			">Forwarder Health<",
+			">Queue Occupancy<",
+			">Peak High-Water<",
+			">Device Write Errors<",
+			">Transport Decrypt Failures<",
+			">Queue Full Drops<",
+			">No Route Drops<",
+			">Oversize Packet Drops<",
+		}
+		for _, raw := range rawEnglishStrings {
+			if strings.Contains(cardHTML, raw) {
+				t.Errorf("forwarder card contains unlocalized raw English text %q", raw)
+			}
+		}
+	})
+
+	t.Run("SinglePollingLoopAssertion", func(t *testing.T) {
+		pollCount := strings.Count(vpnStr, "NexusTelemetry.poll('vpn-status'")
+		if pollCount != 1 {
+			t.Errorf("expected exactly 1 NexusTelemetry.poll('vpn-status', got %d", pollCount)
+		}
+		apiGetStatusCount := strings.Count(vpnStr, "API.get('/api/vpn/status')")
+		if apiGetStatusCount != 1 {
+			t.Errorf("expected exactly 1 API.get('/api/vpn/status') call, got %d", apiGetStatusCount)
+		}
+		if !strings.Contains(vpnStr, "vpnRenderForwarderHealth(status)") {
+			t.Errorf("vpn.html missing vpnRenderForwarderHealth(status) invocation inside vpnLoadData()")
+		}
+	})
+
+	t.Run("JavaScriptHealthyStateHandling", func(t *testing.T) {
+		requiredJS := []string{
+			"function vpnRenderForwarderHealth(status)",
+			"hasCap ? (occ + ' / ' + cap)",
+			"hasCap ? (peak + ' / ' + cap)",
+			"statusBadge.className = 'badge badge-success'",
+			"_('vpn_forwarder_healthy')",
+			"emptyDiv.style.display = 'block'",
+			"table.style.display = 'none'",
+			"_('vpn_forwarder_no_route_pressure')",
+		}
+		for _, token := range requiredJS {
+			if !strings.Contains(vpnStr, token) {
+				t.Errorf("vpn.html JS missing healthy state logic token %q", token)
+			}
+		}
+	})
+
+	t.Run("JavaScriptNonZeroFailuresHandling", func(t *testing.T) {
+		failureHandlingTokens := []string{
+			"dropsQueueFull > 0 ? 'var(--danger)' : ''",
+			"dropsNoRoute > 0 ? 'var(--warning)' : ''",
+			"dropsOversize > 0 ? 'var(--warning)' : ''",
+			"writeErrors > 0 ? 'var(--danger)' : ''",
+			"decryptFailures > 0 ? 'var(--warning)' : ''",
+			"hasSevereIssue",
+			"hasWarningIssue",
+			"badge-danger",
+			"badge-warn",
+			"_('vpn_forwarder_pressure')",
+			"_('vpn_forwarder_warning')",
+		}
+		for _, token := range failureHandlingTokens {
+			if !strings.Contains(vpnStr, token) {
+				t.Errorf("vpn.html JS missing failure counter handling token %q", token)
+			}
+		}
+	})
+
+	t.Run("JavaScriptRoutePressureHandling", func(t *testing.T) {
+		routePressureTokens := []string{
+			"function vpnFormatPeerKey(key)",
+			"key.slice(0, 8) + '...' + key.slice(-4)",
+			"tdPeer.title = peerKey",
+			"tdPeer.textContent = vpnFormatPeerKey(peerKey)",
+			"rCap > 0 ? (rOcc + ' / ' + rCap) : String(rOcc)",
+			"rCap > 0 ? (rPeak + ' / ' + rCap) : String(rPeak)",
+			"rDrops > 0",
+			"detailsElem.open = true",
+			"table.style.display = ''",
+			"emptyDiv.style.display = 'none'",
+		}
+		for _, token := range routePressureTokens {
+			if !strings.Contains(vpnStr, token) {
+				t.Errorf("vpn.html JS missing route pressure logic token %q", token)
+			}
+		}
+	})
+
+	t.Run("JavaScriptBackwardCompatibilityMissingFields", func(t *testing.T) {
+		compatTokens := []string{
+			"if (!status) return;",
+			"typeof status.forwarder_queue_capacity === 'number'",
+			": (occ ? String(occ) : '-')",
+			": (peak ? String(peak) : '-')",
+			"status.forwarder_route_queues",
+			"typeof routeQueues === 'object' ? Object.keys(routeQueues) : []",
+		}
+		for _, token := range compatTokens {
+			if !strings.Contains(vpnStr, token) {
+				t.Errorf("vpn.html JS missing backward compatibility token %q", token)
+			}
+		}
+	})
+
+	t.Run("NoEmDashCharacters", func(t *testing.T) {
+		// Strict constraint: NEVER use em dash ("\u2014") in new code, HTML, or translations
+		startIdx := strings.Index(vpnStr, `id="vpn-forwarder-card"`)
+		if startIdx == -1 {
+			t.Fatal("could not find #vpn-forwarder-card in vpn.html")
+		}
+		endIdx := strings.Index(vpnStr[startIdx:], `<!-- BACKENDS TABLE -->`)
+		if endIdx == -1 {
+			t.Fatal("could not find end of #vpn-forwarder-card before backends table")
+		}
+		cardHTML := vpnStr[startIdx : startIdx+endIdx]
+		if strings.Contains(cardHTML, "\u2014") {
+			t.Errorf("vpn-forwarder-card HTML contains prohibited em dash (\\u2014)")
+		}
+
+		jsStart := strings.Index(vpnStr, "function vpnRenderForwarderHealth")
+		if jsStart != -1 {
+			jsEnd := strings.Index(vpnStr[jsStart:], "async function vpnLoadData")
+			if jsEnd != -1 {
+				jsCode := vpnStr[jsStart : jsStart+jsEnd]
+				if strings.Contains(jsCode, "\u2014") {
+					t.Errorf("vpnRenderForwarderHealth JS contains prohibited em dash (\\u2014)")
+				}
+			}
+		}
+
+		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
+		for _, langFile := range languages {
+			data, err := fs.ReadFile(transFS, langFile)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", langFile, err)
+			}
+			var dict map[string]string
+			if err := json.Unmarshal(data, &dict); err != nil {
+				t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+			}
+			for k, v := range dict {
+				if strings.HasPrefix(k, "vpn_forwarder_") {
+					if strings.Contains(v, "\u2014") {
+						t.Errorf("%s key %s contains prohibited em dash (\\u2014): %q", langFile, k, v)
+					}
+				}
+			}
+		}
+	})
+}
