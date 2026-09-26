@@ -20,7 +20,7 @@ func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, err
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		health_status, admin_disabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels ORDER BY id`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -52,7 +52,7 @@ func (d *DB) GetBackendTunnel(ctx context.Context, id int64) (*models.BackendTun
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		health_status, admin_disabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -109,7 +109,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 
 	query := `INSERT INTO backend_tunnels (
 		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		health_status, admin_disabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
@@ -119,6 +119,8 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encPrivKey,
 		encProbeKey,
 		t.Endpoint,
+		t.RuntimeHealth(),
+		t.AdminDisabled,
 		t.Status,
 		t.DisableReason,
 		t.StateVersion,
@@ -216,9 +218,12 @@ func (d *DB) UpdateBackendTunnelStatus(ctx context.Context, id int64, status str
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ? AND disable_reason != ?`
+	query := `UPDATE backend_tunnels
+		SET health_status = ?, status = CASE WHEN admin_disabled = 1 THEN 'disabled' ELSE ? END,
+			latency_ms = ?, last_health_check = ?, state_version = state_version + 1
+		WHERE id = ? AND admin_disabled = 0`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, status, latencyMS, nowStr, id, models.DisableReasonAdmin)
+	_, err := d.sqlDB.ExecContext(ctx, query, status, status, latencyMS, nowStr, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status: %w", err)
 	}
@@ -231,9 +236,20 @@ func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, 
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
+	adminDisabled := disableReason == models.DisableReasonAdmin
+	healthStatus := status
+	compatStatus := status
+	if adminDisabled {
+		compatStatus = models.TunnelStatusDisabled
+		row := d.sqlDB.QueryRowContext(ctx, "SELECT health_status FROM backend_tunnels WHERE id = ?", id)
+		_ = row.Scan(&healthStatus)
+		if healthStatus == "" {
+			healthStatus = models.TunnelStatusConnecting
+		}
+	}
+	query := `UPDATE backend_tunnels SET health_status = ?, admin_disabled = ?, status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, status, disableReason, latencyMS, nowStr, id)
+	_, err := d.sqlDB.ExecContext(ctx, query, healthStatus, adminDisabled, compatStatus, disableReason, latencyMS, nowStr, id)
 	if err != nil {
 		return fmt.Errorf("failed to update backend tunnel status with reason: %w", err)
 	}
@@ -261,10 +277,22 @@ func (d *DB) CompareAndSwapTunnelStatus(ctx context.Context, id int64, expectedS
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
+	newAdminDisabled := newReason == models.DisableReasonAdmin
+	newHealthStatus := newStatus
+	newCompatStatus := newStatus
+	if newAdminDisabled {
+		newCompatStatus = models.TunnelStatusDisabled
+		row := d.sqlDB.QueryRowContext(ctx, "SELECT health_status FROM backend_tunnels WHERE id = ?", id)
+		_ = row.Scan(&newHealthStatus)
+		if newHealthStatus == "" {
+			newHealthStatus = models.TunnelStatusConnecting
+		}
+	}
+	query := `UPDATE backend_tunnels
+		SET health_status = ?, admin_disabled = ?, status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
 		WHERE id = ? AND status = ? AND disable_reason = ? AND state_version = ?`
 
-	res, err := d.sqlDB.ExecContext(ctx, query, newStatus, newReason, latencyMS, nowStr, id, expectedStatus, expectedReason, expectedVersion)
+	res, err := d.sqlDB.ExecContext(ctx, query, newHealthStatus, newAdminDisabled, newCompatStatus, newReason, latencyMS, nowStr, id, expectedStatus, expectedReason, expectedVersion)
 	if err != nil {
 		return false, fmt.Errorf("failed to execute CAS update on backend tunnel %d: %w", id, err)
 	}
@@ -293,7 +321,7 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		health_status, admin_disabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
 		FROM backend_tunnels WHERE server_id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, serverID)
@@ -827,6 +855,7 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	var t models.BackendTunnel
 	var privKey, probeKey, healthCheck, createdAt sql.NullString
 	var disableReason sql.NullString
+	var adminDisabled sql.NullBool
 	var stateVersion sql.NullInt64
 
 	err := s.Scan(
@@ -837,6 +866,8 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 		&privKey,
 		&probeKey,
 		&t.Endpoint,
+		&t.HealthStatus,
+		&adminDisabled,
 		&t.Status,
 		&disableReason,
 		&stateVersion,
@@ -851,6 +882,16 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 
 	if disableReason.Valid {
 		t.DisableReason = disableReason.String
+	}
+	if adminDisabled.Valid {
+		t.AdminDisabled = adminDisabled.Bool
+	}
+	if t.HealthStatus == "" {
+		t.HealthStatus = t.Status
+	}
+	if t.AdminDisabled {
+		t.Status = models.TunnelStatusDisabled
+		t.DisableReason = models.DisableReasonAdmin
 	}
 	if stateVersion.Valid && stateVersion.Int64 > 0 {
 		t.StateVersion = stateVersion.Int64
