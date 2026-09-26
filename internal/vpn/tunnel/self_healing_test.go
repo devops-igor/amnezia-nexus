@@ -116,6 +116,9 @@ func TestSelfHealing_AdminDisabledSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
 	}
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
 
 	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 15 * time.Millisecond, nil
@@ -644,6 +647,9 @@ func TestInFlightProbeFailure_DoesNotOverwriteAdminDisable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
 	}
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
 
 	probeStarted := make(chan struct{})
 	releaseProbe := make(chan struct{})
@@ -738,6 +744,9 @@ func TestInFlightProbeSuccess_DoesNotResurrectOrAttachDevice(t *testing.T) {
 	t1, err := pool.AddTunnel(ctx, s1ID, "192.0.2.11:51820", "pubkey11")
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
+	}
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
 	}
 
 	probeStarted := make(chan struct{})
@@ -1378,6 +1387,9 @@ func TestThresholdReconcile_ConcurrentAdminDisableAborts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
 	}
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
 
 	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
@@ -1505,6 +1517,9 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 	_, err = pool.AddTunnel(ctx, s1ID, "192.0.2.20:51820", "pubkey20")
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
+	}
+	if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
 	}
 
 	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
