@@ -67,9 +67,9 @@ func TestServiceAndBalancerSelection(t *testing.T) {
 
 	// Active tunnels selection
 	tunnels = append(tunnels,
-		&BackendTunnel{ID: 3, InterfaceName: "awg-be-3", Status: TunnelStatusActive, ActiveConnections: 5},
-		&BackendTunnel{ID: 4, InterfaceName: "awg-be-4", Status: TunnelStatusActive, ActiveConnections: 2},
-		&BackendTunnel{ID: 5, InterfaceName: "awg-be-5", Status: TunnelStatusActive, ActiveConnections: 8},
+		&BackendTunnel{ID: 3, InterfaceName: "awg-be-3", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 5},
+		&BackendTunnel{ID: 4, InterfaceName: "awg-be-4", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 2},
+		&BackendTunnel{ID: 5, InterfaceName: "awg-be-5", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 8},
 	)
 
 	best, err := lb.SelectBackend(ctx, &loadbalancer.RoutingRequest{AvailableTunnels: tunnels})
@@ -264,8 +264,11 @@ func TestVPNServicePeerConnections(t *testing.T) {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
 	t1Status, _ := vpnSvc.pool.GetTunnel(s1ID)
-	if t1Status.Status != "disabled" {
-		t.Errorf("expected status disabled, got %s", t1Status.Status)
+	if t1Status.Enabled {
+		t.Error("expected backend to be administratively disabled")
+	}
+	if t1Status.Status != "active" {
+		t.Errorf("administrative disable changed runtime health: got %s, want active", t1Status.Status)
 	}
 
 	if err := vpnSvc.EnableBackend(ctx, s1ID); err != nil {
