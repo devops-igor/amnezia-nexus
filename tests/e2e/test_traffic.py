@@ -158,15 +158,22 @@ def _discover_awg_server(page: Page, csrf_token: str) -> Tuple[int, Dict[str, An
     raise RuntimeError("Unreachable")
 
 
+def _get_client_handshake_epoch(container_name: str, iface: str = "awg0") -> int:
+    """Return the client peer's latest handshake unix epoch timestamp, or 0 if none."""
+    res = _docker_exec(container_name, f"awg show {iface} latest-handshakes")
+    if res.returncode == 0 and res.stdout.strip():
+        parts = res.stdout.strip().split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(parts[1])
+    return 0
+
+
 def _wait_for_handshake(container_name: str, iface: str = "awg0", timeout: int = 15) -> bool:
     """Poll awg status inside the client container until latest handshake is established."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        res = _docker_exec(container_name, f"awg show {iface} latest-handshakes")
-        if res.returncode == 0 and res.stdout.strip():
-            parts = res.stdout.strip().split()
-            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 0:
-                return True
+        if _get_client_handshake_epoch(container_name, iface) > 0:
+            return True
 
         res_show = _docker_exec(container_name, f"awg show {iface}")
         if "latest handshake" in res_show.stdout:
@@ -435,6 +442,9 @@ def test_dataplane_traffic_verification(
         assert nat_forwarding_ok, "External packet probe failed; server-side egress NAT not active"
 
         # 9. Revocation & Disconnection Verification
+        client_epoch_before = _get_client_handshake_epoch(client_container_name, "awg0")
+        assert client_epoch_before > 0, "Expected non-zero client handshake epoch before disable"
+
         toggle_disable = api_post(
             page,
             f"/api/servers/{server_id}/connections/toggle",
@@ -455,11 +465,16 @@ def test_dataplane_traffic_verification(
         ping_disabled = _docker_exec(client_container_name, f"ping -c 2 -W 2 {GATEWAY_IP}")
         assert ping_disabled.returncode != 0, "Ping unexpectedly succeeded after peer revocation"
 
-        # Verify that sending probe packets while disabled does not advance server handshake
+        # Verify that sending probe packets while disabled does not advance client or server handshake
         _docker_exec(client_container_name, f"ping -c 1 -W 1 {GATEWAY_IP}")
+        client_epoch_after = _get_client_handshake_epoch(client_container_name, "awg0")
+        assert (
+            client_epoch_after == client_epoch_before
+        ), "Client handshake epoch advanced while connection was disabled"
+
         hs_disabled = _get_server_peer_handshake(page, server_id, client_pubkey)
         assert (
-            hs_disabled is None or hs_disabled == server_handshake
+            hs_disabled is None or hs_disabled == "" or hs_disabled == server_handshake
         ), "Server handshake advanced while connection was disabled"
 
         # Re-enable connection via toggle API
@@ -491,29 +506,37 @@ def test_dataplane_traffic_verification(
         assert resumed, "Traffic did not resume after re-enabling peer connection"
 
     finally:
-        # 10. Hardened Hermetic Teardown (independent try-except blocks)
+        # 10. Hardened Hermetic Teardown (independent guarded blocks with error assertions)
+        cleanup_errors = []
+
         if client_container_name:
             try:
                 _docker_exec(client_container_name, "awg-quick down /tmp/awg0.conf || true")
-                subprocess.run(
+                rm_res = subprocess.run(
                     ["docker", "rm", "-f", client_container_name],
                     capture_output=True,
                     text=True,
                     timeout=15,
                 )
+                assert (
+                    rm_res.returncode == 0
+                ), f"Failed to remove client container {client_container_name}: {rm_res.stderr}"
                 logger.info("Hermetic teardown: client container %s removed", client_container_name)
             except Exception as exc:
                 logger.error(
                     "Error tearing down client container %s: %s", client_container_name, exc
                 )
+                cleanup_errors.append(f"Container removal error: {exc}")
 
         if test_user_id:
             try:
                 del_res = api_post(page, f"/api/users/{test_user_id}/delete", {}, csrf_token)
-                logger.info(
-                    "Hermetic teardown: test user %s deleted (status %s)",
-                    test_user_id,
-                    del_res.get("status"),
-                )
+                assert (
+                    del_res.get("status") == 200
+                ), f"Failed to delete test user {test_user_id}: {del_res}"
+                logger.info("Hermetic teardown: test user %s deleted", test_user_id)
             except Exception as exc:
                 logger.error("Error deleting test user %s: %s", test_user_id, exc)
+                cleanup_errors.append(f"User deletion error: {exc}")
+
+        assert not cleanup_errors, f"Cleanup failures occurred during teardown: {cleanup_errors}"

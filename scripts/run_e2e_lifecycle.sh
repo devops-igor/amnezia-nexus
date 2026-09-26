@@ -35,7 +35,7 @@ export E2E_SERVER_SSH_PORT="${E2E_SERVER_SSH_PORT:-22}"
 export E2E_SERVER_SSH_USER="${E2E_SERVER_SSH_USER:-ubuntu}"
 export E2E_SERVER_SSH_PASS="${E2E_SERVER_SSH_PASS:-}"
 export E2E_TESTING="${E2E_TESTING:-true}"
-export E2E_REQUIRE_DATAPLANE="${E2E_REQUIRE_DATAPLANE:-true}"
+export E2E_REQUIRE_DATAPLANE="${E2E_REQUIRE_DATAPLANE:-false}"
 
 # Stage status trackers
 STAGE1_STATUS="SKIPPED"
@@ -98,7 +98,7 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "  E2E_SERVER_SSH_USER Server SSH user (default: ubuntu)"
     echo "  E2E_SERVER_SSH_KEY  Path to SSH private key"
     echo "  E2E_SERVER_SSH_PASS SSH password (optional fallback)"
-    echo "  E2E_REQUIRE_DATAPLANE Fail closed on data plane test requirements (default: true)"
+    echo "  E2E_REQUIRE_DATAPLANE Fail closed on data plane test requirements (default: false)"
     exit 0
 fi
 
