@@ -476,6 +476,10 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 // SetTunnelStatusWithReason updates the status, disable reason, and latency of a backend tunnel.
 // DB errors are propagated immediately; in-memory state is only updated on DB success.
 func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, status, disableReason string, latencyMS int64) error {
+	if disableReason == models.DisableReasonAdmin {
+		return errors.New("administrative backend state must be changed with SetTunnelEnabled")
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
