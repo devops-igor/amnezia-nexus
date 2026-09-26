@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // ReconnectConfig defines exponential backoff reconnection parameters.
