@@ -331,7 +331,10 @@ func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.V
 	defer obfuscationMigrationMu.Unlock()
 
 	persisted, err := db.GetVPNConfig(ctx)
-	if err == nil && persisted != nil {
+	if err != nil {
+		return fmt.Errorf("failed to read persisted VPN config for obfuscation migration: %w", err)
+	}
+	if persisted != nil {
 		if isObfuscationConfigComplete(persisted) {
 			cfg.H1, cfg.H2, cfg.H3, cfg.H4 = persisted.H1, persisted.H2, persisted.H3, persisted.H4
 			cfg.S1, cfg.S2, cfg.S3, cfg.S4 = persisted.S1, persisted.S2, persisted.S3, persisted.S4
@@ -477,7 +480,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 			var err error
 			cfg, err = db.GetVPNConfig(context.Background())
 			if err != nil {
-				cfg = defaultVPNConfig()
+				return nil, fmt.Errorf("failed to load VPN config: %w", err)
 			}
 		} else {
 			cfg = defaultVPNConfig()
