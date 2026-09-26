@@ -132,23 +132,6 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		if t.StateVersion <= 0 {
 			t.StateVersion = 1
 		}
-		if t.Enabled {
-			// Runtime health is fresh process evidence. Enabled backends restart
-			// as unverified and must earn "active" through a new probe before
-			// routing can use them (issue #90).
-			if err := p.db.UpdateBackendTunnel(ctx, t.ID, map[string]any{
-				"status":            models.TunnelStatusConnecting,
-				"disable_reason":    models.DisableReasonNone,
-				"latency_ms":        int64(0),
-				"last_health_check": nil,
-			}); err != nil {
-				return fmt.Errorf("failed to reset backend tunnel %d runtime health: %w", t.ID, err)
-			}
-			t.Status = models.TunnelStatusConnecting
-			t.DisableReason = models.DisableReasonNone
-			t.LatencyMS = 0
-			t.LastHealthCheck = nil
-		}
 		if t.ProbePrivateKey == "" {
 			// Legacy row from before the dedicated probe key existed
 			// (issue #43): backfill in memory; EnableBackend's peer
