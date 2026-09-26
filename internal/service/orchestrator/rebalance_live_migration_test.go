@@ -204,7 +204,7 @@ func TestMigrateDegradedTunnelSessions_SkipsDisabledHealthySnapshot(t *testing.T
 			if err != nil || stale == nil {
 				t.Fatalf("GetBackendTunnel failed: %v", err)
 			}
-			if err := f.db.UpdateBackendTunnelStatusWithReason(ctx, f.t2, "disabled", models.DisableReasonAdmin, 0); err != nil {
+			if err := f.db.UpdateBackendTunnelEnabled(ctx, f.t2, false, models.DisableReasonAdmin); err != nil {
 				t.Fatalf("disable target: %v", err)
 			}
 
@@ -251,7 +251,7 @@ func TestMigrateDegradedTunnelSessions_UsesNextActiveTarget(t *testing.T) {
 	if err != nil || active == nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if err := f.db.UpdateBackendTunnelStatusWithReason(ctx, f.t2, "disabled", models.DisableReasonAdmin, 0); err != nil {
+	if err := f.db.UpdateBackendTunnelEnabled(ctx, f.t2, false, models.DisableReasonAdmin); err != nil {
 		t.Fatalf("disable target: %v", err)
 	}
 
