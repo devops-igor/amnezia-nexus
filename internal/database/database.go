@@ -479,13 +479,27 @@ func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
 	}
 	_ = rows.Close()
 
-	if !hasEnabled {
-		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"); err != nil {
-			return fmt.Errorf("failed to add backend_tunnels enabled column: %w", err)
-		}
+	// The presence of the column is the migration marker. Once it exists,
+	// enabled is authoritative modern state and must never be re-inferred from
+	// runtime health on later opens.
+	if hasEnabled {
+		return nil
 	}
 
-	if _, err := d.sqlDB.ExecContext(ctx,
+	// Add the marker column and translate legacy rows in one SQLite
+	// transaction. SQLite DDL is transactional, so a crash cannot leave the
+	// column present without the accompanying legacy-state translation.
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin backend enabled migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return fmt.Errorf("failed to add backend_tunnels enabled column: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE backend_tunnels
 		 SET enabled = 0,
 		     disable_reason = CASE
@@ -500,6 +514,10 @@ func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
 		models.TunnelStatusDisabled,
 	); err != nil {
 		return fmt.Errorf("failed to migrate administrative backend state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit backend enabled migration: %w", err)
 	}
 	return nil
 }
