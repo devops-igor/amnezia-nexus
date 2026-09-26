@@ -596,16 +596,18 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 		t.Fatalf("expected ErrTunUnavailable from Start, got: %v", stErr)
 	}
 
-	// Verify pool contains tunnel synced from DB at version 1
+	// Startup sync invalidates persisted health before the TUN open attempt.
+	// Even though Start then fails in management-only mode, the backend stays
+	// enabled with unknown runtime health and a fenced state version.
 	poolTunInitial, err := vpnSvc.pool.GetTunnel(sID)
 	if err != nil || poolTunInitial == nil {
 		t.Fatalf("pool GetTunnel failed after SyncFromDB: %v", err)
 	}
-	if poolTunInitial.StateVersion != 1 {
-		t.Fatalf("expected initial pool version 1, got %d", poolTunInitial.StateVersion)
+	if poolTunInitial.StateVersion != 2 {
+		t.Fatalf("expected startup-reset pool version 2, got %d", poolTunInitial.StateVersion)
 	}
-	if poolTunInitial.Status != "active" {
-		t.Fatalf("expected initial pool status active, got %s", poolTunInitial.Status)
+	if poolTunInitial.Status != models.TunnelStatusConnecting {
+		t.Fatalf("expected startup-reset pool status connecting, got %s", poolTunInitial.Status)
 	}
 
 	orch := orchestrator.New(db, nil,
@@ -635,11 +637,11 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 	if dbTun.Status != "degraded" {
 		t.Errorf("expected db status degraded, got %s", dbTun.Status)
 	}
-	if poolTun.StateVersion != 2 {
-		t.Errorf("expected pool version 2, got %d", poolTun.StateVersion)
+	if poolTun.StateVersion != 3 {
+		t.Errorf("expected pool version 3, got %d", poolTun.StateVersion)
 	}
-	if dbTun.StateVersion != 2 {
-		t.Errorf("expected db version 2, got %d", dbTun.StateVersion)
+	if dbTun.StateVersion != 3 {
+		t.Errorf("expected db version 3, got %d", dbTun.StateVersion)
 	}
 	if poolTun.StateVersion != dbTun.StateVersion {
 		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun.StateVersion, dbTun.StateVersion)
