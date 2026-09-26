@@ -647,25 +647,30 @@ func TestInFlightProbe_ConcurrentWithDisableBackend(t *testing.T) {
 			t.Fatal("timed out waiting for probe completion")
 		}
 
-		// Verify pool status is disabled with reason admin
+		// Administrative disable wins without overwriting runtime health.
 		poolTun, err := vpnSvc.pool.GetTunnel(s1ID)
 		if err != nil {
 			t.Fatalf("GetTunnel failed: %v", err)
 		}
-		if poolTun.Status != models.TunnelStatusDisabled {
-			t.Fatalf("expected status disabled, got %q", poolTun.Status)
+		if poolTun.Enabled {
+			t.Fatal("expected pool enabled=false")
+		}
+		if poolTun.Status != models.TunnelStatusActive {
+			t.Fatalf("administrative disable changed pool health: %q", poolTun.Status)
 		}
 		if poolTun.DisableReason != models.DisableReasonAdmin {
 			t.Fatalf("expected disable_reason admin, got %q", poolTun.DisableReason)
 		}
 
-		// Verify DB status is disabled with reason admin
 		dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
 		if err != nil {
 			t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
 		}
-		if dbTun.Status != models.TunnelStatusDisabled {
-			t.Fatalf("expected DB status disabled, got %q", dbTun.Status)
+		if dbTun.Enabled {
+			t.Fatal("expected DB enabled=false")
+		}
+		if dbTun.Status != models.TunnelStatusActive {
+			t.Fatalf("administrative disable changed DB health: %q", dbTun.Status)
 		}
 		if dbTun.DisableReason != models.DisableReasonAdmin {
 			t.Fatalf("expected DB disable_reason admin, got %q", dbTun.DisableReason)
@@ -746,25 +751,30 @@ func TestInFlightProbe_ConcurrentWithDisableBackend(t *testing.T) {
 			t.Fatal("timed out waiting for probe completion")
 		}
 
-		// Verify pool status is disabled with reason admin
+		// Administrative disable wins without overwriting runtime health.
 		poolTun, err := vpnSvc.pool.GetTunnel(s1ID)
 		if err != nil {
 			t.Fatalf("GetTunnel failed: %v", err)
 		}
-		if poolTun.Status != models.TunnelStatusDisabled {
-			t.Fatalf("expected status disabled, got %q", poolTun.Status)
+		if poolTun.Enabled {
+			t.Fatal("expected pool enabled=false")
+		}
+		if poolTun.Status != models.TunnelStatusActive {
+			t.Fatalf("administrative disable changed pool health: %q", poolTun.Status)
 		}
 		if poolTun.DisableReason != models.DisableReasonAdmin {
 			t.Fatalf("expected disable_reason admin, got %q", poolTun.DisableReason)
 		}
 
-		// Verify DB status is disabled with reason admin
 		dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
 		if err != nil {
 			t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
 		}
-		if dbTun.Status != models.TunnelStatusDisabled {
-			t.Fatalf("expected DB status disabled, got %q", dbTun.Status)
+		if dbTun.Enabled {
+			t.Fatal("expected DB enabled=false")
+		}
+		if dbTun.Status != models.TunnelStatusActive {
+			t.Fatalf("administrative disable changed DB health: %q", dbTun.Status)
 		}
 		if dbTun.DisableReason != models.DisableReasonAdmin {
 			t.Fatalf("expected DB disable_reason admin, got %q", dbTun.DisableReason)
@@ -829,25 +839,30 @@ func TestEnsureBackendDeviceAttached_TOCTOURaceWithDisableBackend(t *testing.T) 
 		t.Fatal("backend device must not be attached after concurrent admin disable")
 	}
 
-	// Assert pool status remains disabled with reason admin
+	// Assert administrative state changed while runtime health stayed intact.
 	poolTun, err := vpnSvc.pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if poolTun.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected pool status disabled, got %q", poolTun.Status)
+	if poolTun.Enabled {
+		t.Fatal("expected pool enabled=false")
+	}
+	if poolTun.Status != tun.Status {
+		t.Fatalf("administrative disable changed pool health: got %q want %q", poolTun.Status, tun.Status)
 	}
 	if poolTun.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected pool disable_reason admin, got %q", poolTun.DisableReason)
 	}
 
-	// Assert DB status remains disabled with reason admin
 	dbTun, err := db.GetBackendTunnelByServerID(ctx, s1ID)
 	if err != nil {
 		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
 	}
-	if dbTun.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected DB status disabled, got %q", dbTun.Status)
+	if dbTun.Enabled {
+		t.Fatal("expected DB enabled=false")
+	}
+	if dbTun.Status != tun.Status {
+		t.Fatalf("administrative disable changed DB health: got %q want %q", dbTun.Status, tun.Status)
 	}
 	if dbTun.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected DB disable_reason admin, got %q", dbTun.DisableReason)
