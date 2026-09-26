@@ -254,8 +254,8 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		Status:            models.TunnelStatusActive,
 		DisableReason:     models.DisableReasonNone,
 		StateVersion:      1,
-		LastHealthCheck:   &now,
-		LatencyMS:         10,
+		LastHealthCheck:   nil,
+		LatencyMS:         0,
 		ActiveConnections: 0,
 		CreatedAt:         now,
 	}
