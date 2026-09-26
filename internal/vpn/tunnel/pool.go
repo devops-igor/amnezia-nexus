@@ -132,6 +132,20 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		if t.StateVersion <= 0 {
 			t.StateVersion = 1
 		}
+		if t.AdministrativelyEnabled() {
+			reset, err := p.db.ResetBackendTunnelRuntimeHealth(ctx, t.ID)
+			if err != nil {
+				return fmt.Errorf("failed to reset backend tunnel %d runtime health on sync: %w", t.ID, err)
+			}
+			if reset {
+				t.StateVersion++
+			}
+			t.HealthStatus = models.TunnelStatusConnecting
+			t.Status = models.TunnelStatusConnecting
+			t.DisableReason = models.DisableReasonNone
+			t.LatencyMS = 0
+			t.LastHealthCheck = nil
+		}
 		if t.ProbePrivateKey == "" {
 			// Legacy row from before the dedicated probe key existed
 			// (issue #43): backfill in memory; EnableBackend's peer
@@ -359,12 +373,48 @@ func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 
 	var result []*models.BackendTunnel
 	for _, t := range p.tunnelsByServerID {
-		if t.Status == "active" {
+		if t.AdministrativelyEnabled() && strings.EqualFold(t.RuntimeHealth(), models.TunnelStatusActive) {
 			copyTunnel := *t
 			result = append(result, &copyTunnel)
 		}
 	}
 	return result
+}
+
+// SetTunnelAdminDisabled updates only persisted administrative intent and does
+// not modify runtime health (issue #90).
+func (p *Pool) SetTunnelAdminDisabled(ctx context.Context, serverID int64, disabled bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	if tunnel.AdminDisabled == disabled &&
+		((disabled && tunnel.DisableReason == models.DisableReasonAdmin) ||
+			(!disabled && tunnel.DisableReason != models.DisableReasonAdmin)) {
+		return nil
+	}
+	if p.db != nil {
+		if err := p.db.UpdateBackendTunnelAdminDisabled(ctx, tunnel.ID, disabled); err != nil {
+			return fmt.Errorf("failed to persist backend administrative state: %w", err)
+		}
+	}
+
+	tunnel.AdminDisabled = disabled
+	if disabled {
+		tunnel.Status = models.TunnelStatusDisabled
+		tunnel.DisableReason = models.DisableReasonAdmin
+	} else {
+		tunnel.Status = tunnel.RuntimeHealth()
+		if tunnel.Status == "" {
+			tunnel.Status = models.TunnelStatusConnecting
+		}
+		tunnel.DisableReason = models.DisableReasonNone
+	}
+	tunnel.StateVersion++
+	return nil
 }
 
 // SetTunnelStatus updates the status and latency of a backend tunnel.
