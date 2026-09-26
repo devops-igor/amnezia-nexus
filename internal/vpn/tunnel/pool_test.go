@@ -668,12 +668,12 @@ func TestTunnelPool_TransferConnectionsIfActive(t *testing.T) {
 		t.Fatalf("expected ErrTunnelNotFound, got: %v", err)
 	}
 
-	// 3. Target not active
+	// 3. Target not eligible because runtime health is not active.
 	if err := pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusDegraded, 400); err != nil {
 		t.Fatalf("SetTunnelStatus failed: %v", err)
 	}
-	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); err == nil || !strings.Contains(err.Error(), "not active") {
-		t.Fatalf("expected error for non-active target, got: %v", err)
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); err == nil || !strings.Contains(err.Error(), "not eligible") {
+		t.Fatalf("expected eligibility error for non-active target, got: %v", err)
 	}
 
 	// Restore t2 to active
