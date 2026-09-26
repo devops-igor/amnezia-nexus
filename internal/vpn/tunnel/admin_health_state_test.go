@@ -255,7 +255,7 @@ func TestTransferConnectionsRejectsAdminDisabledActiveTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := pool.TransferConnectionsIfActive(from.ID, to.ID, to.StateVersion+1); err == nil {
+	if err := pool.TransferConnectionsIfActive(from.ID, to.ID); err == nil {
 		t.Fatal("expected transfer to reject administratively disabled target with active health")
 	}
 
