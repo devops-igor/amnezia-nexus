@@ -132,6 +132,21 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		if t.StateVersion <= 0 {
 			t.StateVersion = 1
 		}
+		if t.Enabled {
+			// Runtime health is fresh process evidence. Enabled backends restart
+			// as unverified and must earn "active" through a new probe before
+			// routing can use them (issue #90).
+			if err := p.db.UpdateBackendTunnel(ctx, t.ID, map[string]any{
+				"status":            models.TunnelStatusConnecting,
+				"latency_ms":        int64(0),
+				"last_health_check": nil,
+			}); err != nil {
+				return fmt.Errorf("failed to reset backend tunnel %d runtime health: %w", t.ID, err)
+			}
+			t.Status = models.TunnelStatusConnecting
+			t.LatencyMS = 0
+			t.LastHealthCheck = nil
+		}
 		if t.ProbePrivateKey == "" {
 			// Legacy row from before the dedicated probe key existed
 			// (issue #43): backfill in memory; EnableBackend's peer
@@ -249,6 +264,7 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		PrivateKey:        privKey,
 		ProbePrivateKey:   probePrivKey,
 		Endpoint:          endpoint,
+		Enabled:           true,
 		Status:            "active",
 		DisableReason:     models.DisableReasonNone,
 		StateVersion:      1,
@@ -357,7 +373,7 @@ func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 
 	var result []*models.BackendTunnel
 	for _, t := range p.tunnelsByServerID {
-		if t.Status == "active" {
+		if t.Enabled && t.Status == "active" {
 			copyTunnel := *t
 			result = append(result, &copyTunnel)
 		}
@@ -403,7 +419,7 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 		return ErrStaleStateVersion
 	}
 
-	if tunnel.DisableReason == models.DisableReasonAdmin {
+	if !tunnel.Enabled {
 		return nil
 	}
 
@@ -455,7 +471,7 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		return ErrTunnelNotFound
 	}
 
-	if disableReason == models.DisableReasonHealth && tunnel.DisableReason == models.DisableReasonAdmin {
+	if disableReason == models.DisableReasonHealth && !tunnel.Enabled {
 		return nil
 	}
 
@@ -472,6 +488,32 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 	now := time.Now().UTC()
 	tunnel.LastHealthCheck = &now
 
+	return nil
+}
+
+// SetTunnelEnabled updates administrative intent without changing runtime health.
+// Persistence succeeds before the in-memory state is changed.
+func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled bool, disableReason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	if tunnel.Enabled == enabled && tunnel.DisableReason == disableReason {
+		return nil
+	}
+
+	if p.db != nil {
+		if err := p.db.UpdateBackendTunnelEnabled(ctx, tunnel.ID, enabled, disableReason); err != nil {
+			return fmt.Errorf("failed to persist backend administrative state: %w", err)
+		}
+	}
+
+	tunnel.Enabled = enabled
+	tunnel.DisableReason = disableReason
+	tunnel.StateVersion++
 	return nil
 }
 
@@ -501,6 +543,9 @@ func (p *Pool) compareAndSwapTunnelStatus(ctx context.Context, serverID, expecte
 	}
 
 	if tunnel.Status != expectedStatus || tunnel.DisableReason != expectedReason || tunnel.StateVersion != expectedVersion {
+		return false, nil
+	}
+	if !tunnel.Enabled {
 		return false, nil
 	}
 
