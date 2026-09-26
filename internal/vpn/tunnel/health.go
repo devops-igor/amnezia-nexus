@@ -1214,7 +1214,19 @@ func (hp *HealthProber) ProbeAll(ctx context.Context) map[int64]error {
 }
 
 // Start launches the periodic background probing loop and self-healing sweep loop.
+// It performs an initial probe sweep before waiting for the first interval.
 func (hp *HealthProber) Start(ctx context.Context) {
+	hp.start(ctx, true)
+}
+
+// StartAfterInitialProbe launches the background loops without an immediate
+// probe sweep. Service.Start uses this after its synchronous startup health
+// gate so failure counters are not consumed twice back-to-back.
+func (hp *HealthProber) StartAfterInitialProbe(ctx context.Context) {
+	hp.start(ctx, false)
+}
+
+func (hp *HealthProber) start(ctx context.Context, initialProbe bool) {
 	hp.mu.Lock()
 	if hp.running {
 		hp.mu.Unlock()
@@ -1225,7 +1237,7 @@ func (hp *HealthProber) Start(ctx context.Context) {
 	hp.mu.Unlock()
 
 	hp.wg.Add(2)
-	go hp.probingLoop(ctx)
+	go hp.probingLoop(ctx, initialProbe)
 	go hp.selfHealingLoop(ctx)
 }
 
@@ -1250,13 +1262,14 @@ func (hp *HealthProber) IsRunning() bool {
 	return hp.running
 }
 
-func (hp *HealthProber) probingLoop(ctx context.Context) {
+func (hp *HealthProber) probingLoop(ctx context.Context, initialProbe bool) {
 	defer hp.wg.Done()
 	ticker := time.NewTicker(hp.cfg.Interval)
 	defer ticker.Stop()
 
-	// Initial probe sweep
-	_ = hp.ProbeAll(ctx)
+	if initialProbe {
+		_ = hp.ProbeAll(ctx)
+	}
 
 	for {
 		select {
