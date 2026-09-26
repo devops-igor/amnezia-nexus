@@ -2129,10 +2129,10 @@ func parsePort(val any) int {
 	}
 }
 
-// EnableBackend enables a backend server for load balancing by loading its
-// AWG protocol credentials from the database, registering (or refreshing) the
-// tunnel in the pool, attaching a backend UDP packet device to the forwarder,
-// and marking the tunnel active.
+// EnableBackend restores administrative eligibility by loading the backend's
+// AWG credentials, registering (or refreshing) the tunnel, and attaching its
+// data-plane device. It does not declare the backend healthy: runtime health
+// remains owned by the prober/self-healing subsystem.
 func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	s.mu.RLock()
 	pool := s.pool
