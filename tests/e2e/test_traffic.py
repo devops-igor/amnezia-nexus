@@ -1,15 +1,16 @@
 """Automated Data Plane Traffic Verification Test Suite.
 
 Verifies end-to-end network traffic through the AmneziaWG tunnel:
-1. Docker daemon reachability and AmneziaWG client container image availability.
-2. Server discovery and AmneziaWG protocol container health verification.
+1. Docker daemon reachability, multiarch client image availability, and architecture verification.
+2. Live server discovery and strict AmneziaWG protocol container health verification.
 3. Client user and connection provisioning via Amnezia Nexus REST API.
-4. Hermetic client tunnel establishment in an isolated Docker container network namespace.
-5. Obfuscated AmneziaWG cryptographic handshake completion.
-6. Bi-directional ICMP connectivity to tunnel gateway (10.8.1.1).
-7. Server-side egress NAT / MASQUERADE internet forwarding.
-8. Connection toggle / revocation verification (packet termination upon disable, resumption upon re-enable).
-9. Hermetic cleanup of test container, routes, and user records.
+4. Hermetic client tunnel in an unprivileged container network namespace (--cap-add NET_ADMIN).
+5. Obfuscated AmneziaWG cryptographic handshake verified on both client and server.
+6. Bi-directional ICMP connectivity to tunnel gateway (10.8.1.1) and positive RX/TX transfer stats.
+7. MTU-boundary / fragmentation probe (near-MTU packet transmission).
+8. Server-side egress NAT / MASQUERADE internet forwarding probe.
+9. Connection toggle / revocation verification (packet termination upon disable, resumption upon re-enable).
+10. Hardened hermetic cleanup of test container, routes, and user records.
 """
 
 import logging
@@ -27,10 +28,22 @@ from tests.e2e.conftest import api_get, api_post
 
 logger = logging.getLogger(__name__)
 
-# Preferred AmneziaWG client container image and fallback image
-PRIMARY_CLIENT_IMAGE = "amneziavpn/amneziawg-go:latest"
+# Pinned multiarch AmneziaWG client container image matching internal/manager/awg/awg.go
+PRIMARY_CLIENT_IMAGE = "devopsigor/amneziawg:v3.1.20260828-1"
 FALLBACK_CLIENT_IMAGE = "devopsigor/amneziawg:ci-test"
 GATEWAY_IP = "10.8.1.1"
+
+
+def _handle_skip_or_fail(msg: str) -> None:
+    """Fail closed when E2E_REQUIRE_DATAPLANE is active; otherwise skip gracefully."""
+    require_dataplane = os.environ.get("E2E_REQUIRE_DATAPLANE", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    if require_dataplane:
+        pytest.fail(f"[FAIL-CLOSED] Data plane requirement unmet: {msg}")
+    pytest.skip(msg)
 
 
 def _check_docker_available() -> bool:
@@ -45,6 +58,21 @@ def _check_docker_available() -> bool:
         return res.returncode == 0
     except Exception as exc:
         logger.warning("Docker daemon reachability check failed: %s", exc)
+        return False
+
+
+def _verify_client_image_architecture(image: str) -> bool:
+    """Verify that the AmneziaWG client image executes on the host architecture."""
+    try:
+        res = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint", "awg", image, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return res.returncode == 0 and "amneziawg-tools" in res.stdout
+    except Exception as exc:
+        logger.warning("Architecture execution check failed for %s: %s", image, exc)
         return False
 
 
@@ -103,11 +131,15 @@ def _normalize_config_endpoint(config_str: str) -> str:
 
 
 def _discover_awg_server(page: Page, csrf_token: str) -> Tuple[int, Dict[str, Any]]:
-    """Discover a server with a healthy AmneziaWG protocol deployment."""
+    """Discover a server with a confirmed live running AmneziaWG protocol container.
+
+    Strictly requires live /check response to confirm container_running is True.
+    Does not fall back to static database metadata.
+    """
     result = api_get(page, "/api/servers/")
     servers = result if isinstance(result, list) else result.get("servers", [])
     if not servers:
-        pytest.skip("No registered servers available in panel")
+        _handle_skip_or_fail("No registered servers available in panel")
 
     for srv in servers:
         srv_id = srv.get("id")
@@ -122,15 +154,8 @@ def _discover_awg_server(page: Page, csrf_token: str) -> Tuple[int, Dict[str, An
                 if isinstance(awg_stat, dict) and awg_stat.get("container_running") is True:
                     return (srv_id, srv)
 
-        srv_protocols = srv.get("protocols", {})
-        if isinstance(srv_protocols, dict):
-            awg_stat = srv_protocols.get("awg", {})
-            if isinstance(awg_stat, dict) and (
-                awg_stat.get("installed") is True or awg_stat.get("container_running") is True
-            ):
-                return (srv_id, srv)
-
-    pytest.skip("No server found with active and running AmneziaWG container")
+    _handle_skip_or_fail("No server found with confirmed live running AmneziaWG container")
+    raise RuntimeError("Unreachable")
 
 
 def _wait_for_handshake(container_name: str, iface: str = "awg0", timeout: int = 15) -> bool:
@@ -152,6 +177,25 @@ def _wait_for_handshake(container_name: str, iface: str = "awg0", timeout: int =
         time.sleep(1)
 
     return False
+
+
+def _get_server_peer_handshake(page: Page, server_id: int, client_pubkey: str) -> Optional[str]:
+    """Retrieve the latestHandshake string for a peer from the server connections endpoint."""
+    res = api_get(page, f"/api/servers/{server_id}/connections/?protocol=awg")
+    if not isinstance(res, dict):
+        return None
+    clients = res.get("clients", [])
+    if not isinstance(clients, list):
+        return None
+    for c in clients:
+        cid = c.get("clientId") or c.get("client_id")
+        if cid == client_pubkey:
+            ud = c.get("userData", {})
+            if isinstance(ud, dict):
+                val = ud.get("latestHandshake")
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+    return None
 
 
 def _get_transfer_stats(container_name: str, iface: str = "awg0") -> Tuple[int, int]:
@@ -186,15 +230,19 @@ def _verify_egress_nat(container_name: str) -> bool:
 
 @pytest.mark.e2e
 def test_docker_preflight() -> None:
-    """Pre-flight check: Docker daemon reachability and AmneziaWG client image presence."""
+    """Pre-flight check: Docker daemon reachability, AmneziaWG client image presence and architecture."""
     if not _check_docker_available():
-        pytest.skip("Docker daemon is unreachable; skipping data plane traffic test")
+        _handle_skip_or_fail("Docker daemon is unreachable; skipping data plane traffic test")
 
     client_image = _resolve_client_image()
     if not client_image:
-        pytest.skip(
+        _handle_skip_or_fail(
             f"Neither {PRIMARY_CLIENT_IMAGE} nor {FALLBACK_CLIENT_IMAGE} available; skipping"
         )
+
+    assert client_image is not None
+    if not _verify_client_image_architecture(client_image):
+        _handle_skip_or_fail(f"Client image {client_image} cannot execute on host architecture")
 
     logger.info("Docker pre-flight passed using client image: %s", client_image)
 
@@ -208,13 +256,17 @@ def test_dataplane_traffic_verification(
 
     # 1. Pre-flight checks
     if not _check_docker_available():
-        pytest.skip("Docker daemon is unreachable; skipping data plane traffic test")
+        _handle_skip_or_fail("Docker daemon is unreachable; skipping data plane traffic test")
 
     client_image = _resolve_client_image()
     if not client_image:
-        pytest.skip("AmneziaWG client container image is unavailable; skipping")
+        _handle_skip_or_fail("AmneziaWG client container image is unavailable; skipping")
 
-    # 2. Server discovery
+    assert client_image is not None
+    if not _verify_client_image_architecture(client_image):
+        _handle_skip_or_fail(f"Client image {client_image} cannot execute on host architecture")
+
+    # 2. Server discovery (strictly requiring live running AWG container)
     server_id, server_data = _discover_awg_server(page, csrf_token)
     logger.info("Selected server ID %d for data plane traffic test", server_id)
 
@@ -280,7 +332,7 @@ def test_dataplane_traffic_verification(
         assert "[Interface]" in config_str, "Configuration missing [Interface] section"
         assert "[Peer]" in config_str, "Configuration missing [Peer] section"
 
-        # 4. Hermetic Client Tunnel Setup
+        # 4. Hermetic Client Tunnel Setup (Unprivileged: no --privileged)
         config_str = _normalize_config_endpoint(config_str)
 
         run_cmd = [
@@ -289,9 +341,10 @@ def test_dataplane_traffic_verification(
             "-d",
             "--name",
             client_container_name,
-            "--privileged",
             "--cap-add",
             "NET_ADMIN",
+            "--sysctl",
+            "net.ipv4.conf.all.src_valid_mark=1",
             "--device",
             "/dev/net/tun:/dev/net/tun",
             "--entrypoint",
@@ -302,6 +355,13 @@ def test_dataplane_traffic_verification(
         ]
         start_res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
         assert start_res.returncode == 0, f"Failed to start client container: {start_res.stderr}"
+
+        # Create dummy /usr/local/bin/sysctl script so awg-quick's check succeeds without --privileged
+        dummy_sysctl = "printf '#!/bin/sh\\nexit 0\\n' > /usr/local/bin/sysctl && chmod +x /usr/local/bin/sysctl"
+        sysctl_res = _docker_exec(client_container_name, dummy_sysctl)
+        assert (
+            sysctl_res.returncode == 0
+        ), f"Failed to install dummy sysctl in container: {sysctl_res.stderr}"
 
         # Write client configuration inside container to /tmp/client.conf and /tmp/awg0.conf
         pipe_cmd = [
@@ -323,7 +383,7 @@ def test_dataplane_traffic_verification(
         )
         assert pipe_res.returncode == 0, f"Failed to write config into container: {pipe_res.stderr}"
 
-        # Bring up AmneziaWG tunnel interface
+        # Bring up AmneziaWG tunnel interface (resolvconf in pinned image handles DNS cleanly)
         up_res = _docker_exec(client_container_name, "awg-quick up /tmp/awg0.conf")
         assert up_res.returncode == 0, f"awg-quick up failed: {up_res.stderr} | {up_res.stdout}"
 
@@ -332,9 +392,20 @@ def test_dataplane_traffic_verification(
         assert link_res.returncode == 0, f"awg0 interface link check failed: {link_res.stderr}"
         assert "UP" in link_res.stdout or "state" in link_res.stdout
 
-        # 5. Handshake Verification
+        # 5. Handshake Verification (Client-side and Server-side)
         handshake_ok = _wait_for_handshake(client_container_name, "awg0", timeout=20)
         assert handshake_ok, "AmneziaWG cryptographic handshake with server was not completed"
+
+        server_handshake = None
+        for _ in range(10):
+            server_handshake = _get_server_peer_handshake(page, server_id, client_pubkey)
+            if server_handshake:
+                break
+            time.sleep(1)
+
+        assert (
+            server_handshake
+        ), f"Server did not record active handshake for peer {client_pubkey} in connections API"
 
         # 6. Bi-Directional ICMP Ping to Gateway
         ping_res = _docker_exec(client_container_name, f"ping -c 3 -W 3 {GATEWAY_IP}")
@@ -346,11 +417,22 @@ def test_dataplane_traffic_verification(
         assert rx_bytes > 0, f"Expected positive RX bytes through awg0, got {rx_bytes}"
         assert tx_bytes > 0, f"Expected positive TX bytes through awg0, got {tx_bytes}"
 
-        # 7. Egress NAT & Internet Forwarding
+        # 7. MTU-Boundary / Fragmentation Probe (near MTU)
+        mtu_ping = _docker_exec(client_container_name, f"ping -c 2 -W 2 -M do -s 1200 {GATEWAY_IP}")
+        if mtu_ping.returncode != 0 and "unrecognized option" in (
+            mtu_ping.stderr + mtu_ping.stdout
+        ):
+            # BusyBox ping fallback without -M flag
+            mtu_ping = _docker_exec(client_container_name, f"ping -c 2 -W 2 -s 1200 {GATEWAY_IP}")
+        assert (
+            mtu_ping.returncode == 0
+        ), f"MTU-boundary probe (1200 bytes) failed: {mtu_ping.stderr} | {mtu_ping.stdout}"
+
+        # 8. Egress NAT & Internet Forwarding
         nat_forwarding_ok = _verify_egress_nat(client_container_name)
         assert nat_forwarding_ok, "External packet probe failed; server-side egress NAT not active"
 
-        # 8. Revocation & Disconnection Verification
+        # 9. Revocation & Disconnection Verification
         toggle_disable = api_post(
             page,
             f"/api/servers/{server_id}/connections/toggle",
@@ -370,6 +452,13 @@ def test_dataplane_traffic_verification(
         # Assert ping immediately fails (100% packet loss)
         ping_disabled = _docker_exec(client_container_name, f"ping -c 2 -W 2 {GATEWAY_IP}")
         assert ping_disabled.returncode != 0, "Ping unexpectedly succeeded after peer revocation"
+
+        # Verify that sending probe packets while disabled does not advance server handshake
+        _docker_exec(client_container_name, f"ping -c 1 -W 1 {GATEWAY_IP}")
+        hs_disabled = _get_server_peer_handshake(page, server_id, client_pubkey)
+        assert (
+            hs_disabled is None or hs_disabled == server_handshake
+        ), "Server handshake advanced while connection was disabled"
 
         # Re-enable connection via toggle API
         toggle_enable = api_post(
@@ -400,13 +489,29 @@ def test_dataplane_traffic_verification(
         assert resumed, "Traffic did not resume after re-enabling peer connection"
 
     finally:
-        # 9. Hermetic Teardown: Stop and delete client container
-        subprocess.run(
-            ["docker", "rm", "-f", client_container_name],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        # Delete test user
+        # 10. Hardened Hermetic Teardown (independent try-except blocks)
+        if client_container_name:
+            try:
+                _docker_exec(client_container_name, "awg-quick down /tmp/awg0.conf || true")
+                subprocess.run(
+                    ["docker", "rm", "-f", client_container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                logger.info("Hermetic teardown: client container %s removed", client_container_name)
+            except Exception as exc:
+                logger.error(
+                    "Error tearing down client container %s: %s", client_container_name, exc
+                )
+
         if test_user_id:
-            api_post(page, f"/api/users/{test_user_id}/delete", {}, csrf_token)
+            try:
+                del_res = api_post(page, f"/api/users/{test_user_id}/delete", {}, csrf_token)
+                logger.info(
+                    "Hermetic teardown: test user %s deleted (status %s)",
+                    test_user_id,
+                    del_res.get("status"),
+                )
+            except Exception as exc:
+                logger.error("Error deleting test user %s: %s", test_user_id, exc)
