@@ -2162,12 +2162,12 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	var (
 		hasInitial     bool
-		initialReason  string
+		initialEnabled bool
 		initialVersion int64
 	)
 	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
 		hasInitial = true
-		initialReason = initTun.DisableReason
+		initialEnabled = initTun.Enabled
 		initialVersion = initTun.StateVersion
 	}
 
@@ -2224,7 +2224,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialReason, initialVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialVersion)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2234,7 +2234,7 @@ func (s *Service) finishEnableBackend(
 	awgParams map[string]any,
 	serverID int64,
 	hasInitial bool,
-	initialReason string,
+	initialEnabled bool,
 	initialVersion int64,
 ) error {
 	s.mu.Lock()
@@ -2248,9 +2248,11 @@ func (s *Service) finishEnableBackend(
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
 	if hasInitial {
-		// If an administrator disabled this backend while enable was in-flight,
-		// or if concurrent state mutation occurred, abort to respect the disable.
-		if !currTun.Enabled && initialReason != models.DisableReasonAdmin {
+		// Reject only a transition from administratively enabled to disabled
+		// while this operation was in flight. A backend that was already
+		// administratively disabled when EnableBackend started is the normal
+		// manual-enable case, regardless of preserved runtime-health provenance.
+		if initialEnabled && !currTun.Enabled {
 			return errors.New("backend was administratively disabled; aborting enable")
 		}
 		if currTun.StateVersion != initialVersion {
