@@ -821,13 +821,16 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 		Status:        "active",
 	})
 
-	// Add disabled tunnel
+	// Add administratively disabled tunnel. Runtime health remains a
+	// separate dimension and must not make this backend rebalance-eligible.
 	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 		ServerID:      srv3ID,
 		InterfaceName: "awg2",
 		PublicKey:     "pub3",
 		Endpoint:      "127.0.0.1:55422",
-		Status:        "disabled",
+		Enabled:       false,
+		Status:        "active",
+		DisableReason: models.DisableReasonAdmin,
 	})
 
 	// Add 10 sessions on tunnel 1, 2 sessions on tunnel 2.
