@@ -288,7 +288,14 @@ type BackendTunnel struct {
 	// roam the peer's return endpoint to whichever socket sent last (issue #43).
 	ProbePrivateKey   string     `json:"-" db:"probe_private_key"` // Encrypted at rest
 	Endpoint          string     `json:"endpoint" db:"endpoint"`
-	Status            string     `json:"status" db:"status"` // connecting, active, degraded, disabled
+	// HealthStatus is the canonical runtime health dimension. It is intentionally
+	// separate from administrative enable/disable intent (issue #90).
+	HealthStatus      string     `json:"health_status" db:"health_status"` // connecting, active, degraded, disabled
+	// AdminDisabled is the canonical persisted administrative intent. Status and
+	// DisableReason remain as a backwards-compatible projection for older API/UI
+	// consumers and must not be used as the source of truth for routing.
+	AdminDisabled     bool       `json:"admin_disabled" db:"admin_disabled"`
+	Status            string     `json:"status" db:"status"` // compatibility projection
 	DisableReason     string     `json:"disable_reason,omitempty" db:"disable_reason"`
 	StateVersion      int64      `json:"state_version" db:"state_version"`
 	LastHealthCheck   *time.Time `json:"last_health_check,omitempty" db:"last_health_check"`
@@ -298,6 +305,28 @@ type BackendTunnel struct {
 }
 
 // VPNSession tracks an active user connection through the portal AWG endpoint.
+// RuntimeHealth returns the canonical runtime health. The Status fallback keeps
+// legacy/test-constructed values compatible while all persisted rows carry
+// health_status after the issue #90 migration.
+func (t *BackendTunnel) RuntimeHealth() string {
+	if t == nil {
+		return ""
+	}
+	if t.HealthStatus != "" {
+		return t.HealthStatus
+	}
+	if strings.EqualFold(t.Status, TunnelStatusDisabled) && t.DisableReason == DisableReasonAdmin {
+		return TunnelStatusConnecting
+	}
+	return t.Status
+}
+
+// AdministrativelyEnabled reports persisted administrative intent. The
+// DisableReason fallback preserves compatibility with legacy in-memory values.
+func (t *BackendTunnel) AdministrativelyEnabled() bool {
+	return t != nil && !t.AdminDisabled && t.DisableReason != DisableReasonAdmin
+}
+
 type VPNSession struct {
 	ID              string    `json:"id" db:"id"`
 	UserID          string    `json:"user_id" db:"user_id"`
