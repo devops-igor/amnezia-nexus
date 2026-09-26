@@ -1122,8 +1122,13 @@ func (s *Service) Start(ctx context.Context) error {
 		s.forwarder.StartPumps(ctx)
 	}
 
-	// 5. Start health prober & reconnect manager
+	// 5. Establish fresh backend health before accepting client traffic.
+	// ResetEnabledHealthForStartup intentionally made every enabled backend
+	// unroutable ("connecting"). Run one synchronous sweep here so the endpoint
+	// cannot accept a handshake in the window before the prober goroutine's
+	// initial sweep has completed.
 	if s.prober != nil {
+		_ = s.prober.ProbeAll(ctx)
 		s.prober.Start(ctx)
 	}
 	if s.reconnectMgr != nil {
