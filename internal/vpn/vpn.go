@@ -2219,6 +2219,19 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialReason, initialVersion)
+}
+
+func (s *Service) finishEnableBackend(
+	ctx context.Context,
+	pool *tunnel.Pool,
+	tun *models.BackendTunnel,
+	awgParams map[string]any,
+	serverID int64,
+	hasInitial bool,
+	initialReason string,
+	initialVersion int64,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2247,15 +2260,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	// Issue #50: clear the prober's consecutive-failure counter so the
-	// re-enabled backend gets the full FailureThreshold grace period; without
-	// this the first jittery probe after re-enable instantly re-disables it.
-	//
-	// Lock ordering: s.mu -> hp.mu is safe: the prober's own mutex is a leaf.
-	// Every hp.mu holder (ProbeTunnel, Start/Stop, the Set* setters) touches
-	// only prober fields plus pool (pool.mu); pool methods never call back
-	// into Service; and the onActiveHook fires with hp.mu already released,
-	// so no code path acquires hp.mu -> s.mu. This ordering already exists in
-	// SetHealthProber and SetProbeFunc.
+	// re-enabled backend gets the full FailureThreshold grace period.
 	if s.prober != nil {
 		s.prober.ResetFailCount(serverID)
 	}
