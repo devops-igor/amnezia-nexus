@@ -30,8 +30,8 @@ func TestWRRStaleSchedulerStateDoesNotCorruptRecreatedBackend(t *testing.T) {
 
 	// Phase 1: two tunnels, traffic flows, scheduler state accumulates.
 	first := []*models.BackendTunnel{
-		{ID: 201, ServerID: 1, Status: "active"},
-		{ID: 202, ServerID: 2, Status: "active"},
+		{ID: 201, ServerID: 1, Enabled: true, Status: "active"},
+		{ID: 202, ServerID: 2, Enabled: true, Status: "active"},
 	}
 	for i := 0; i < 37; i++ {
 		req := &RoutingRequest{AvailableTunnels: first}
@@ -61,7 +61,7 @@ func TestWRRStaleSchedulerStateDoesNotCorruptRecreatedBackend(t *testing.T) {
 	// sequence — assert the exact deterministic sequence instead of merely
 	// "non-nil".
 	recreated := []*models.BackendTunnel{
-		{ID: 999, ServerID: 1, Status: "active"},
+		{ID: 999, ServerID: 1, Enabled: true, Status: "active"},
 	}
 	for i := 0; i < 3; i++ {
 		req := &RoutingRequest{AvailableTunnels: recreated}
@@ -95,9 +95,9 @@ func TestWRRStateSurvivesMembershipUpdateForPresentServers(t *testing.T) {
 	lb := NewWeightedRoundRobinBalancer(weights, caps)
 
 	alive := []*models.BackendTunnel{
-		{ID: 301, ServerID: 1, Status: "active"},
-		{ID: 302, ServerID: 2, Status: "active"},
-		{ID: 303, ServerID: 3, Status: "active"},
+		{ID: 301, ServerID: 1, Enabled: true, Status: "active"},
+		{ID: 302, ServerID: 2, Enabled: true, Status: "active"},
+		{ID: 303, ServerID: 3, Enabled: true, Status: "active"},
 	}
 	// Run exactly one full cycle (100 selections) so smooth state lands in a
 	// known periodic phase; a full cycle returns all counters to the same
@@ -112,9 +112,9 @@ func TestWRRStateSurvivesMembershipUpdateForPresentServers(t *testing.T) {
 	// smooth state for ServerID 2 must survive, and the next full cycle must
 	// still produce the exact 50/25/25 distribution.
 	after := []*models.BackendTunnel{
-		{ID: 301, ServerID: 1, Status: "active"},
-		{ID: 777, ServerID: 2, Status: "active"},
-		{ID: 303, ServerID: 3, Status: "active"},
+		{ID: 301, ServerID: 1, Enabled: true, Status: "active"},
+		{ID: 777, ServerID: 2, Enabled: true, Status: "active"},
+		{ID: 303, ServerID: 3, Enabled: true, Status: "active"},
 	}
 	lb.UpdateBackends(after)
 	lb.mu.Lock()
