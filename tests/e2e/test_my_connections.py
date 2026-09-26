@@ -28,19 +28,15 @@ def _create_test_user(
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create test user")
+    assert add_result["status"] == 200, f"Could not create test user: {add_result}"
 
     # Find the newly created user — API returns {"users": [...], "total": N, ...}
     users_result = api_get(page, "/api/users/?size=100")
     users = users_result if isinstance(users_result, list) else users_result.get("users", [])
 
-    for u in users:
-        if u.get("username") == username:
-            return u
-
-    pytest.skip("Test user not found after creation")
-    return {}  # unreachable, for type checker
+    test_user = next((u for u in users if u.get("username") == username), None)
+    assert test_user is not None, f"Test user {username} not found after creation"
+    return test_user
 
 
 @pytest.mark.e2e
@@ -52,6 +48,7 @@ def test_user_login_and_list(page: Page, base_url: str, admin_user: str, admin_p
 
     # Create test user via admin API
     test_user = _create_test_user(page, base_url, csrf_token, "e2e_my_user")
+    assert test_user is not None, "Test user not found after creation"
     test_username = test_user.get("username", "e2e_my_user")
     test_password = "TestPass123!"
 
@@ -94,9 +91,7 @@ def test_create_connection(
     # Get a server to attach connection to
     result = api_get(page, "/api/servers/")
     servers = result if isinstance(result, list) else result.get("servers", [])
-
-    if not servers:
-        pytest.skip("No servers available for connection test")
+    assert servers, "No servers available for connection test"
 
     server_id = servers[0]["id"]
 
@@ -104,16 +99,17 @@ def test_create_connection(
     test_user = _create_test_user(page, base_url, csrf_token, "e2e_conn_user")
     user_id = test_user["id"]
 
-    conn_result = api_post(
-        page,
-        f"/api/users/{user_id}/connections/add",
-        {"server_id": server_id, "protocol": "awg", "name": "e2e_user_conn"},
-        csrf_token,
-    )
+    try:
+        conn_result = api_post(
+            page,
+            f"/api/users/{user_id}/connections/add",
+            {"server_id": server_id, "protocol": "awg", "name": "e2e_user_conn"},
+            csrf_token,
+        )
+        assert conn_result["status"] == 200, f"Could not create connection: {conn_result}"
 
-    # Connection should be created successfully or return a meaningful response
-    assert conn_result["body"] is not None
-    if conn_result["status"] == 200:
+        # Connection should be created successfully or return a meaningful response
+        assert conn_result["body"] is not None
         assert (
             conn_result["body"].get("status") in ("success", "ok")
             or "connection" in conn_result["body"]
@@ -121,9 +117,9 @@ def test_create_connection(
         )
         if "status" in conn_result["body"]:
             assert_response_shape(conn_result["body"], {"status": str}, "add_connection")
-
-    # Clean up — delete the test user
-    api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+    finally:
+        # Clean up — delete the test user
+        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
 
 
 @pytest.mark.e2e
@@ -138,55 +134,58 @@ def test_view_connection_config(
     test_user = _create_test_user(page, base_url, csrf_token, "e2e_view_user")
     user_id = test_user["id"]
 
-    # Get servers to find a connection
-    servers_result = api_get(page, "/api/servers/")
-    servers = (
-        servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
-    )
+    try:
+        # Get servers to find a connection
+        servers_result = api_get(page, "/api/servers/")
+        servers = (
+            servers_result
+            if isinstance(servers_result, list)
+            else servers_result.get("servers", [])
+        )
+        assert servers, "No servers available for config test"
 
-    if not servers:
+        server_id = servers[0]["id"]
+
+        # Add a connection for the test user
+        conn_result = api_post(
+            page,
+            f"/api/users/{user_id}/connections/add",
+            {"server_id": server_id, "protocol": "awg", "name": "e2e_view_conn"},
+            csrf_token,
+        )
+        assert (
+            conn_result["status"] == 200
+        ), f"Could not create connection for config test: {conn_result}"
+
+        # Get the user's connections to find the connection ID
+        user_conns = api_get(page, f"/api/users/{user_id}/connections")
+        connections = (
+            user_conns if isinstance(user_conns, list) else user_conns.get("connections", [])
+        )
+        assert connections, f"No connections available: {user_conns}"
+
+        conn = connections[0]
+        client_id = conn.get("client_id") or conn.get("id")
+        conn_id = conn.get("id")
+        protocol = conn.get("protocol", "awg")
+        server_id_conn = conn.get("server_id") or server_id
+
+        # Fetch the connection config via the server API
+        config_result = api_post(
+            page,
+            f"/api/servers/{server_id_conn}/connections/config",
+            {
+                "client_id": client_id,
+                "connection_id": conn_id,
+                "protocol": protocol,
+            },
+            csrf_token,
+        )
+        assert config_result["status"] == 200, f"Could not fetch connection config: {config_result}"
+        assert config_result["body"] is not None
+    finally:
+        # Clean up
         api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
-        pytest.skip("No servers available for config test")
-
-    server_id = servers[0]["id"]
-
-    # Add a connection for the test user
-    conn_result = api_post(
-        page,
-        f"/api/users/{user_id}/connections/add",
-        {"server_id": server_id, "protocol": "awg", "name": "e2e_view_conn"},
-        csrf_token,
-    )
-
-    if conn_result["status"] != 200:
-        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
-        pytest.skip("Could not create connection for config test")
-
-    # Get the user's connections to find the connection ID
-    user_conns = api_get(page, f"/api/users/{user_id}/connections/")
-    connections = user_conns if isinstance(user_conns, list) else user_conns.get("connections", [])
-
-    if not connections:
-        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
-        pytest.skip("No connections available for config test")
-
-    conn = connections[0]
-    conn_id = conn["id"]
-    server_id_conn = conn["server_id"]
-
-    # Fetch the connection config via the server API
-    config_result = api_post(
-        page,
-        f"/api/servers/{server_id_conn}/connections/config",
-        {"connection_id": conn_id},
-        csrf_token,
-    )
-
-    # Config endpoint should respond with data
-    assert config_result["body"] is not None
-
-    # Clean up
-    api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
 
 
 @pytest.mark.e2e
