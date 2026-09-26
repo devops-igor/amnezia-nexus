@@ -7,7 +7,7 @@
 #   Stage 1: Initial Setup Wizard (test_setup.py)
 #   Stage 2: Server 1 Onboarding & AWG 3.1 Deployment (test_onboard.py)
 #   Stage 3: Full Functional E2E Suite (auth, settings, users, connections,
-#            my_connections, share, servers)
+#            my_connections, share, servers, traffic)
 #
 # Configurable via environment variables:
 #   E2E_BASE_URL        Panel URL (default: http://127.0.0.1:8000)
@@ -172,7 +172,8 @@ if pytest "$REPO_ROOT/tests/e2e/test_auth.py" \
           "$REPO_ROOT/tests/e2e/test_connections.py" \
           "$REPO_ROOT/tests/e2e/test_my_connections.py" \
           "$REPO_ROOT/tests/e2e/test_share.py" \
-          "$REPO_ROOT/tests/e2e/test_servers.py" -v -m e2e "$@"; then
+          "$REPO_ROOT/tests/e2e/test_servers.py" \
+          "$REPO_ROOT/tests/e2e/test_traffic.py" -v -m e2e "$@"; then
     STAGE3_STATUS="PASSED"
     echo "==> Stage 3 PASSED: All functional E2E tests succeeded."
 else
