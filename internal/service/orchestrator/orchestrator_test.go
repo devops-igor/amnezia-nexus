@@ -978,7 +978,8 @@ func TestOrchestrator_CheckBackendTunnelHealth_SkipsAdminDisabled(t *testing.T) 
 		InterfaceName: "awg-admin-skip",
 		PublicKey:     "pub-admin-skip",
 		Endpoint:      "127.0.0.1:55499",
-		Status:        "disabled",
+		Enabled:       false,
+		Status:        "active",
 		DisableReason: models.DisableReasonAdmin,
 	})
 	if err != nil {
@@ -1003,8 +1004,8 @@ func TestOrchestrator_CheckBackendTunnelHealth_SkipsAdminDisabled(t *testing.T) 
 	if err != nil || tun == nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if tun.Status != "disabled" || tun.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected tunnel to remain disabled/admin, got status=%q reason=%q", tun.Status, tun.DisableReason)
+	if tun.Enabled || tun.Status != "active" || tun.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected admin-disabled tunnel with preserved active health, got enabled=%v status=%q reason=%q", tun.Enabled, tun.Status, tun.DisableReason)
 	}
 }
 
