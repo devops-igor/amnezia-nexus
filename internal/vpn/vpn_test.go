@@ -3165,7 +3165,7 @@ func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testi
 	}
 }
 
-func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
+func TestStart_AdminDisabledBackendStaysDetachedWhileEnabledBackendReprobes(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -3219,14 +3219,17 @@ func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	}
 	tun1.ID = tun1ID
 
-	// Create disabled tunnel for server 2
+	// Create administratively disabled tunnel for server 2. Its runtime
+	// health snapshot is intentionally active and must remain untouched.
 	tun2 := &models.BackendTunnel{
 		ServerID:      s2ID,
 		InterfaceName: fmt.Sprintf("awg-be-%d", s2ID),
 		PublicKey:     pub2,
 		PrivateKey:    priv2,
 		Endpoint:      "198.51.100.52:51820",
-		Status:        TunnelStatusDisabled,
+		Enabled:       false,
+		Status:        TunnelStatusActive,
+		DisableReason: models.DisableReasonAdmin,
 		CreatedAt:     now,
 	}
 	tun2ID, err := db.CreateBackendTunnel(ctx, tun2)
@@ -3249,25 +3252,27 @@ func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	}
 	defer func() { _ = svc.Stop() }()
 
-	// Active tunnel 1 should have its backend device restored
+	// Enabled tunnel 1 is reset to unknown health and then probed. Wait for
+	// the successful startup probe to attach its device.
+	deadline := time.Now().Add(2 * time.Second)
+	for svc.GetBackendDeviceForTest(tun1ID) == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	dev1 := svc.GetBackendDeviceForTest(tun1ID)
 	if dev1 == nil {
-		t.Errorf("expected backend device for active tunnel %d to be restored on Start, got nil", tun1ID)
+		t.Fatalf("enabled backend %d was not attached after fresh startup probe", tun1ID)
 	}
 
-	// Disabled tunnel 2 should NOT have a backend device attached
-	dev2 := svc.GetBackendDeviceForTest(tun2ID)
-	if dev2 != nil {
-		t.Errorf("expected no backend device for disabled tunnel %d on Start, got %+v", tun2ID, dev2)
+	// Administratively disabled tunnel 2 is never probed or attached.
+	if dev2 := svc.GetBackendDeviceForTest(tun2ID); dev2 != nil {
+		t.Errorf("expected no backend device for admin-disabled tunnel %d on Start, got %+v", tun2ID, dev2)
 	}
-
-	// Active tunnel status remains active
-	restoredTun1, err := svc.pool.GetTunnel(s1ID)
+	disabledTun, err := svc.pool.GetTunnel(s2ID)
 	if err != nil {
-		t.Fatalf("GetTunnel 1 failed: %v", err)
+		t.Fatalf("GetTunnel 2 failed: %v", err)
 	}
-	if restoredTun1.Status != TunnelStatusActive {
-		t.Errorf("expected tunnel 1 status 'active', got %s", restoredTun1.Status)
+	if disabledTun.Enabled || disabledTun.Status != TunnelStatusActive || disabledTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("startup changed admin-disabled backend dimensions: %+v", disabledTun)
 	}
 }
 
@@ -3307,13 +3312,23 @@ func TestStart_RestoresBackendDevices_DegradesOnAttachFailure(t *testing.T) {
 		t.Errorf("expected nil device when restore fails, got %+v", dev)
 	}
 
-	// Tunnel status should be marked degraded so it does not report active without a data plane
-	tStatus, err := svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
+	// The initial startup probe succeeds, but data-plane attachment fails,
+	// so health must eventually become degraded rather than trusting the
+	// persisted active snapshot.
+	deadline := time.Now().Add(2 * time.Second)
+	var tStatus *models.BackendTunnel
+	for time.Now().Before(deadline) {
+		tStatus, err = svc.pool.GetTunnel(sID)
+		if err != nil {
+			t.Fatalf("GetTunnel failed: %v", err)
+		}
+		if tStatus.Status == TunnelStatusDegraded {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if tStatus.Status != TunnelStatusDegraded {
-		t.Errorf("expected tunnel status 'degraded' after attach failure, got %s", tStatus.Status)
+	if tStatus == nil || tStatus.Status != TunnelStatusDegraded {
+		t.Fatalf("expected tunnel status degraded after attach failure, got %+v", tStatus)
 	}
 }
 
