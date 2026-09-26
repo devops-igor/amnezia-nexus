@@ -1595,8 +1595,6 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 		S3:                  30,
 		S4:                  20,
 		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-		ServerPrivateKey:    "kept-priv",
-		ServerPublicKey:     "kept-pub",
 	}
 	if err := db.SaveVPNConfig(ctx, baseCfg); err != nil {
 		t.Fatalf("SaveVPNConfig failed: %v", err)
@@ -1607,9 +1605,7 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 
-	// The dummy identity seeded above is not a valid keypair, so
-	// EnsureKeypair regenerates and persists a real one; capture the
-	// post-init identity — THAT is what a partial update must preserve.
+	// Startup generates a real identity; a partial update must preserve it.
 	seedCfg, err := svc.GetConfig(ctx)
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)

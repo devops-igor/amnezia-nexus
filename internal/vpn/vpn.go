@@ -598,14 +598,14 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		}
 		pub = base64.StdEncoding.EncodeToString(pubArr[:])
 		priv = base64.StdEncoding.EncodeToString(privArr[:])
-		// EnsureKeypair may have just created and persisted the portal
-		// identity into the stored VPNConfig via its own copy. Refresh the
-		// in-memory cfg identity fields so partial config updates copy the
-		// real persisted identity instead of empty strings (which would
-		// wipe the keypair on the next save and invalidate every rendered
-		// client config).
+		// Keep only the encrypted representation in the live config. The
+		// decoded key is owned separately by the endpoint and portalPrivKey.
+		stored, err := db.GetVPNConfig(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("reload portal key after initialization: %w", err)
+		}
 		cfg.ServerPublicKey = pub
-		cfg.ServerPrivateKey = priv
+		cfg.ServerPrivateKey = stored.ServerPrivateKey
 	}
 
 	svc := &Service{
@@ -3078,15 +3078,15 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		if cfg.ClientQueueSize <= 0 {
 			cfg.ClientQueueSize = s.cfg.ClientQueueSize
 		}
-		// Preserve portal identity the incoming config omits (empty key
-		// fields): an update must never silently wipe the persisted
-		// keypair that distributed client configs rely on.
-		if cfg.ServerPrivateKey == "" {
-			cfg.ServerPrivateKey = s.cfg.ServerPrivateKey
+		// The portal identity is immutable through ordinary config updates.
+		if cfg.ServerPrivateKey != "" && cfg.ServerPrivateKey != s.cfg.ServerPrivateKey {
+			return errors.New("portal private key cannot be changed by config update")
 		}
-		if cfg.ServerPublicKey == "" {
-			cfg.ServerPublicKey = s.cfg.ServerPublicKey
+		if cfg.ServerPublicKey != "" && cfg.ServerPublicKey != s.cfg.ServerPublicKey {
+			return errors.New("portal public key cannot be changed by config update")
 		}
+		cfg.ServerPrivateKey = s.cfg.ServerPrivateKey
+		cfg.ServerPublicKey = s.cfg.ServerPublicKey
 	}
 
 	obfuscationChanged := s.cfg != nil && obfuscationDiffers(s.cfg, cfg)
