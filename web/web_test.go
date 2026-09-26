@@ -2666,10 +2666,11 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 		}{
 			{"Scenario1_HealthyWithRoutes", "healthy"},
 			{"Scenario2_HealthyZeroRoutesIdleState", "healthy_zero_routes"},
-			{"Scenario3_NonZeroFailureCounters", "failures"},
-			{"Scenario4_SaturatedRouteWithDrops", "saturated_route"},
-			{"Scenario5_OldBackendAbsentFields", "absent_fields"},
-			{"Scenario6_FailedUnavailableStatusSample", "failed_sample"},
+			{"Scenario3_SurvivingPeakAfterRoutesDisconnect", "surviving_peak_after_routes_disconnect"},
+			{"Scenario4_NonZeroFailureCounters", "failures"},
+			{"Scenario5_SaturatedRouteWithDrops", "saturated_route"},
+			{"Scenario6_OldBackendAbsentFields", "absent_fields"},
+			{"Scenario7_FailedUnavailableStatusSample", "failed_sample"},
 			{"AllScenariosInSequence", "all"},
 		}
 
@@ -2892,7 +2893,8 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').textContent, '42 / 2048');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '1000 / 2048');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '1000');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').style.color, '');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-queue-full').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
@@ -2900,6 +2902,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, '');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'none');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-tbody').children.length, 1);
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-tbody').children[0].children[2].textContent, '20');
     } else if (key === 'healthy_zero_routes') {
         mockDoc.reset();
         vpnRenderForwarderHealth({
@@ -2918,7 +2921,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').textContent, '0 / 0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').style.color, '');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '0 / 0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').style.color, '');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-queue-full').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '0');
@@ -2926,6 +2929,37 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-badge').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'block');
+    } else if (key === 'surviving_peak_after_routes_disconnect') {
+        mockDoc.reset();
+        const isAvailable = vpnRenderForwarderHealth({
+            forwarder_available: true,
+            forwarder_queue_capacity: 0,
+            forwarder_queue_occupancy: 0,
+            forwarder_queue_high_water: 1500,
+            forwarder_drops_queue_full: 0,
+            forwarder_drops_no_route: 0,
+            forwarder_drops_packet_too_large: 0,
+            forwarder_drops_total: 0,
+            forwarder_device_write_errors: 0,
+            transport_decryption_failures: 0
+        });
+        assert.strictEqual(isAvailable, true);
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').textContent, '0 / 0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-queue').style.color, '');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '1500');
+        assert.notStrictEqual(mockDoc.getElementById('vpn-fwd-peak').textContent, '1500 / 0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-peak').style.color, '');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-queue-full').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
@@ -2991,6 +3025,7 @@ function runScenario(key) {
         assert.strictEqual(r1.children[0].textContent, 'abcdefgh...2345');
         assert.strictEqual(r1.children[1].textContent, '2048 / 2048');
         assert.strictEqual(r1.children[1].style.color, 'var(--danger)');
+        assert.strictEqual(r1.children[2].textContent, '2048');
         assert.strictEqual(r1.children[3].textContent, '1723');
         assert.strictEqual(r1.children[3].style.color, 'var(--danger)');
     } else if (key === 'absent_fields') {
@@ -3045,7 +3080,7 @@ const scenarioArg = process.argv[1];
 if (scenarioArg && scenarioArg !== 'all') {
     runScenario(scenarioArg);
 } else {
-    ['healthy', 'healthy_zero_routes', 'failures', 'saturated_route', 'absent_fields', 'failed_sample'].forEach(runScenario);
+    ['healthy', 'healthy_zero_routes', 'surviving_peak_after_routes_disconnect', 'failures', 'saturated_route', 'absent_fields', 'failed_sample'].forEach(runScenario);
 }
 console.log('SCENARIO_PASS');
 `

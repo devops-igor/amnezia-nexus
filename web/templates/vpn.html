@@ -1014,7 +1014,7 @@
             if (emptyDiv) emptyDiv.style.display = 'block';
             const detailsElem = document.getElementById('vpn-fwd-routes-details');
             if (detailsElem) detailsElem.open = false;
-            return;
+            return isAvailable;
         }
 
         const cap = Number(status.forwarder_queue_capacity || 0);
@@ -1038,16 +1038,10 @@
             }
         }
 
-        // Peak high-water
+        // Peak high-water (monotonic watermark)
         if (peakElem) {
-            peakElem.textContent = peak + ' / ' + cap;
-            if (cap > 0 && peak >= cap * 0.8) {
-                peakElem.style.color = 'var(--danger)';
-            } else if (cap > 0 && peak >= cap * 0.5) {
-                peakElem.style.color = 'var(--warning)';
-            } else {
-                peakElem.style.color = '';
-            }
+            peakElem.textContent = String(peak);
+            peakElem.style.color = '';
         }
 
         // Drops & error counters (cumulative)
@@ -1126,7 +1120,7 @@
                 // Peak column
                 const tdPeak = document.createElement('td');
                 tdPeak.className = 'font-mono text-sm';
-                tdPeak.textContent = rCap > 0 ? (rPeak + ' / ' + rCap) : String(rPeak);
+                tdPeak.textContent = String(rPeak);
                 tr.appendChild(tdPeak);
 
                 // Drops column
@@ -1194,6 +1188,7 @@
                 detailsElem.open = true;
             }
         }
+        return isAvailable;
     }
 
     async function vpnLoadData() {
