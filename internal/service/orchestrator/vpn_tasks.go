@@ -47,7 +47,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "disabled") || t.DisableReason == models.DisableReasonAdmin {
+		if !t.AdministrativelyEnabled() {
 			continue
 		}
 
@@ -106,7 +106,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					"threshold", threshold,
 					"err", err,
 				)
-				if !strings.EqualFold(t.Status, "degraded") {
+				if !strings.EqualFold(t.RuntimeHealth(), models.TunnelStatusDegraded) {
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
 				continue
@@ -199,7 +199,7 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 					slog.Warn("Failed to recheck migration target", "tunnel_id", candidate.ID, "err", err)
 					continue
 				}
-				if current != nil && strings.EqualFold(current.Status, "active") && current.DisableReason != models.DisableReasonAdmin {
+				if current != nil && current.AdministrativelyEnabled() && strings.EqualFold(current.RuntimeHealth(), models.TunnelStatusActive) {
 					target = current
 					hIdx = (idx + 1) % len(healthyTunnels)
 					break
@@ -424,7 +424,7 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 
 	var activeTunnels []models.BackendTunnel
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "active") {
+		if t.AdministrativelyEnabled() && strings.EqualFold(t.RuntimeHealth(), models.TunnelStatusActive) {
 			activeTunnels = append(activeTunnels, t)
 		}
 	}
