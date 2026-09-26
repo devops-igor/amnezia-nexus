@@ -47,7 +47,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "disabled") || t.DisableReason == models.DisableReasonAdmin {
+		if !t.Enabled {
 			continue
 		}
 
@@ -199,7 +199,7 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 					slog.Warn("Failed to recheck migration target", "tunnel_id", candidate.ID, "err", err)
 					continue
 				}
-				if current != nil && strings.EqualFold(current.Status, "active") && current.DisableReason != models.DisableReasonAdmin {
+				if current != nil && current.Enabled && strings.EqualFold(current.Status, "active") {
 					target = current
 					hIdx = (idx + 1) % len(healthyTunnels)
 					break
