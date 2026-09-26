@@ -2818,8 +2818,8 @@ func TestUpdateBackendServerHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTunnel after disable failed: %v", err)
 	}
-	if disabledTun.Status != TunnelStatusDisabled || disabledTun.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected admin-disabled tunnel, got status=%s reason=%s", disabledTun.Status, disabledTun.DisableReason)
+	if disabledTun.Enabled || disabledTun.Status != TunnelStatusActive || disabledTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected enabled=false with preserved active health, got enabled=%v status=%s reason=%s", disabledTun.Enabled, disabledTun.Status, disabledTun.DisableReason)
 	}
 
 	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.3"); err != nil {
@@ -2832,14 +2832,17 @@ func TestUpdateBackendServerHost(t *testing.T) {
 	if disabledTunUpdated.Endpoint != "198.51.100.3:51820" {
 		t.Errorf("expected disabled tunnel endpoint '198.51.100.3:51820', got %q", disabledTunUpdated.Endpoint)
 	}
-	if disabledTunUpdated.Status != TunnelStatusDisabled || disabledTunUpdated.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected tunnel to remain admin-disabled, got status=%s reason=%s", disabledTunUpdated.Status, disabledTunUpdated.DisableReason)
+	if disabledTunUpdated.Enabled || disabledTunUpdated.Status != TunnelStatusActive || disabledTunUpdated.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected tunnel to remain admin-disabled with preserved health, got enabled=%v status=%s reason=%s", disabledTunUpdated.Enabled, disabledTunUpdated.Status, disabledTunUpdated.DisableReason)
 	}
 	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
 		t.Errorf("expected no device attached for admin-disabled tunnel, got %+v", dev)
 	}
 
-	// 6. Assert restarting Service restores devices with new_host:port
+	// 6. Re-enable administrative intent, then assert restart restores the device.
+	if err := svc.pool.SetTunnelEnabled(ctx, sID, true, models.DisableReasonNone); err != nil {
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
+	}
 	if err := svc.pool.SetTunnelStatusWithReason(ctx, sID, TunnelStatusActive, models.DisableReasonNone, 10); err != nil {
 		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
 	}
@@ -2931,14 +2934,14 @@ func TestUpdateBackendServerHost_RaceWithDisableBackend(t *testing.T) {
 		t.Fatal("expected pre-lock hook to be called")
 	}
 
-	// Assert tunnel remains TunnelStatusDisabled with DisableReasonAdmin
+	// Assert administrative disable won while runtime health stayed active.
 	tunAfter, err := svc.pool.GetTunnel(sID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if tunAfter.Status != TunnelStatusDisabled || tunAfter.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected TunnelStatusDisabled with DisableReasonAdmin, got status=%q reason=%q",
-			tunAfter.Status, tunAfter.DisableReason)
+	if tunAfter.Enabled || tunAfter.Status != TunnelStatusActive || tunAfter.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected enabled=false with active health and admin reason, got enabled=%v status=%q reason=%q",
+			tunAfter.Enabled, tunAfter.Status, tunAfter.DisableReason)
 	}
 
 	// Assert forwarder device is detached / not reattached
