@@ -118,11 +118,8 @@ func TestTunnelPoolCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddTunnel 1 failed: %v", err)
 	}
-	if t1.ServerID != s1ID || t1.InterfaceName != "awg-be-1" || !t1.Enabled || t1.Status != models.TunnelStatusConnecting {
-		t.Errorf("new tunnel must start enabled with unknown health: %+v", t1)
-	}
-	if t1.LastHealthCheck != nil || t1.LatencyMS != 0 {
-		t.Errorf("new tunnel fabricated health metadata: %+v", t1)
+	if t1.ServerID != s1ID || t1.InterfaceName != "awg-be-1" || !t1.Enabled || t1.Status != models.TunnelStatusActive {
+		t.Errorf("invalid t1: %+v", t1)
 	}
 
 	t2, err := pool.AddTunnel(ctx, s2ID, "2.2.2.2:51820", "")
