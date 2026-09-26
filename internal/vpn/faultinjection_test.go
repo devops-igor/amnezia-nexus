@@ -326,7 +326,7 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				}
 				// Divergence is bounded and reconcilable by syncing the
 				// authoritative administrative flag into persistence.
-				if err := db.UpdateBackendTunnel(t.Context(), tun.ID, map[string]any{"enabled": false, "disable_reason": models.DisableReasonAdmin}); err != nil {
+				if err := db.UpdateBackendTunnelEnabled(t.Context(), tun.ID, false, models.DisableReasonAdmin); err != nil {
 					t.Fatalf("manual DB administrative-state sync: %v", err)
 				}
 				row, err := db.GetBackendTunnel(t.Context(), tun.ID)
