@@ -72,21 +72,30 @@ func TestBackendEnabledMigrationPreservesAdministrativeIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byInterface := make(map[string]bool, len(tunnels))
+	byInterface := make(map[string]struct {
+		enabled bool
+		reason  string
+	}, len(tunnels))
 	for _, tun := range tunnels {
-		byInterface[tun.InterfaceName] = tun.Enabled
+		byInterface[tun.InterfaceName] = struct {
+			enabled bool
+			reason  string
+		}{enabled: tun.Enabled, reason: tun.DisableReason}
 	}
 
-	if byInterface["admin"] {
+	if byInterface["admin"].enabled {
 		t.Fatal("explicit admin-disabled legacy row migrated as enabled")
 	}
-	if !byInterface["health"] {
+	if !byInterface["health"].enabled {
 		t.Fatal("health-disabled legacy row must remain administratively enabled")
 	}
-	if byInterface["ambiguous"] {
+	if byInterface["ambiguous"].enabled {
 		t.Fatal("ambiguous legacy disabled row must migrate conservatively as disabled")
 	}
-	if !byInterface["active"] {
+	if byInterface["ambiguous"].reason != "admin" {
+		t.Fatalf("ambiguous legacy disabled row reason = %q, want admin", byInterface["ambiguous"].reason)
+	}
+	if !byInterface["active"].enabled {
 		t.Fatal("active legacy row migrated as administratively disabled")
 	}
 }
