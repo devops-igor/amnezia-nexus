@@ -181,20 +181,22 @@ def _wait_for_handshake(container_name: str, iface: str = "awg0", timeout: int =
 
 def _get_server_peer_handshake(page: Page, server_id: int, client_pubkey: str) -> Optional[str]:
     """Retrieve the latestHandshake string for a peer from the server connections endpoint."""
-    res = api_get(page, f"/api/servers/{server_id}/connections/?protocol=awg")
+    res = api_get(page, f"/api/servers/{server_id}/connections?protocol=awg")
     if not isinstance(res, dict):
         return None
-    clients = res.get("clients", [])
+    clients = res.get("clients") or res.get("connections") or []
     if not isinstance(clients, list):
         return None
+    target_key = client_pubkey.strip()
     for c in clients:
         cid = c.get("clientId") or c.get("client_id")
-        if cid == client_pubkey:
+        if isinstance(cid, str) and cid.strip() == target_key:
             ud = c.get("userData", {})
-            if isinstance(ud, dict):
-                val = ud.get("latestHandshake")
-                if val is not None and str(val).strip():
-                    return str(val).strip()
+            val = ud.get("latestHandshake") if isinstance(ud, dict) else None
+            if val is None:
+                val = c.get("latestHandshake")
+            if val is not None and str(val).strip():
+                return str(val).strip()
     return None
 
 
