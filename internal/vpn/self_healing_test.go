@@ -466,13 +466,17 @@ func TestSelfHealing_ConcurrentDisableBackendDuringSelfHeal(t *testing.T) {
 		t.Fatalf("expected 0 reconnected when admin disable raced self-heal, got %d", reconnected)
 	}
 
-	// Invariant verification: backend MUST be disabled with reason admin
+	// Administrative disable must win the race, while preserving the
+	// health-disabled runtime state that existed before recovery began.
 	gotAfter, err := vpnSvc.pool.GetTunnel(s1ID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
+	if gotAfter.Enabled {
+		t.Fatal("expected backend to remain administratively disabled")
+	}
 	if gotAfter.Status != models.TunnelStatusDisabled {
-		t.Fatalf("expected status disabled, got %q", gotAfter.Status)
+		t.Fatalf("administrative disable changed runtime health: got %q, want disabled", gotAfter.Status)
 	}
 	if gotAfter.DisableReason != models.DisableReasonAdmin {
 		t.Fatalf("expected disable_reason admin, got %q", gotAfter.DisableReason)
