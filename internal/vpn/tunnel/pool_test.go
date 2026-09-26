@@ -525,7 +525,7 @@ func TestTunnelPool_SetTunnelStatusWithReason(t *testing.T) {
 	// 3. Error propagation on DB failure
 	canceledCtx, cancel := context.WithCancel(ctx)
 	cancel()
-	err = pool.SetTunnelStatusWithReason(canceledCtx, sID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0)
+	err = pool.SetTunnelStatusWithReason(canceledCtx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	if err == nil {
 		t.Fatal("expected error on canceled context, got nil")
 	}
