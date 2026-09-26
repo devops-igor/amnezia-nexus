@@ -530,8 +530,8 @@ func TestSelfHealing_ConcurrentAdminDisableDuringHookNeverResurrects(t *testing.
 	if status.Status != models.TunnelStatusDisabled {
 		t.Fatalf("administrative disable changed runtime health: got %s, want disabled", status.Status)
 	}
-	if status.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	if status.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected health provenance to survive admin disable, got %s", status.DisableReason)
 	}
 
 	// Verify prober does not consider it auto-disabled
@@ -710,8 +710,8 @@ func TestInFlightProbeFailure_DoesNotOverwriteAdminDisable(t *testing.T) {
 	if status.Status != models.TunnelStatusActive {
 		t.Fatalf("in-flight probe changed runtime health after admin disable: got %s, want active", status.Status)
 	}
-	if status.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	if status.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected health provenance to survive admin disable, got %s", status.DisableReason)
 	}
 
 	// Verify prober does not consider it auto-disabled
@@ -816,8 +816,8 @@ func TestInFlightProbeSuccess_DoesNotResurrectOrAttachDevice(t *testing.T) {
 	if status.Status != models.TunnelStatusActive {
 		t.Fatalf("in-flight probe changed runtime health after admin disable: got %s, want active", status.Status)
 	}
-	if status.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected disable_reason admin, got %s", status.DisableReason)
+	if status.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected health provenance to survive admin disable, got %s", status.DisableReason)
 	}
 }
 
