@@ -545,6 +545,13 @@ func TestVPNHandlers(t *testing.T) {
 		if wS.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", wS.Code)
 		}
+		var fallbackStatus map[string]any
+		if err := json.NewDecoder(wS.Body).Decode(&fallbackStatus); err != nil {
+			t.Fatalf("decode fallback status: %v", err)
+		}
+		if avail, ok := fallbackStatus["forwarder_available"].(bool); !ok || avail {
+			t.Errorf("expected forwarder_available false on nil service fallback, got %v", fallbackStatus["forwarder_available"])
+		}
 
 		// Backends
 		reqB := httptest.NewRequest(http.MethodGet, "/api/vpn/backends", nil)
@@ -1135,6 +1142,10 @@ func TestVPNStatusHandler_ExposesRouteQueueDiagnostics(t *testing.T) {
 	var status map[string]any
 	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
 		t.Fatalf("decode status: %v", err)
+	}
+	avail, ok := status["forwarder_available"].(bool)
+	if !ok || !avail {
+		t.Fatalf("expected forwarder_available true, got: %v", status["forwarder_available"])
 	}
 	queues, ok := status["forwarder_route_queues"]
 	if ok {
