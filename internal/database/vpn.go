@@ -233,6 +233,10 @@ func (d *DB) UpdateBackendTunnelStatus(ctx context.Context, id int64, status str
 
 // UpdateBackendTunnelStatusWithReason updates status, disable reason, latency, and health check timestamp, bumping state_version.
 func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, status, disableReason string, latencyMS int64) error {
+	if disableReason == models.DisableReasonAdmin {
+		return errors.New("administrative backend state must be changed with UpdateBackendTunnelEnabled")
+	}
+
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
