@@ -437,8 +437,14 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 	}
 
 	newReason := tunnel.DisableReason
-	if status == "active" || status == models.TunnelStatusActive {
+	switch status {
+	case models.TunnelStatusActive:
 		newReason = models.DisableReasonNone
+	case models.TunnelStatusDisabled:
+		// Administrative disable is represented exclusively by Enabled=false.
+		// A runtime status transition to disabled therefore always belongs to
+		// the health subsystem and must carry health provenance.
+		newReason = models.DisableReasonHealth
 	}
 
 	if p.db != nil {
