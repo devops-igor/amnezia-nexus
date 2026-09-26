@@ -34,6 +34,13 @@ func TestOrchestrator_AdminDisableConcurrentWithProbePreservedOnRestart(t *testi
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
 	}
+	if err := vpnSvc.pool.SetTunnelStatus(ctx, sID, TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
+	tun, err = vpnSvc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
 
 	vpnSvc.mu.Lock()
 	err = vpnSvc.attachBackendForwarder(tun, nil)
@@ -173,6 +180,13 @@ func TestOrchestrator_AdminDisableConcurrentWithProbe_CASFallback(t *testing.T) 
 	tun, err := vpnSvc.pool.AddTunnel(ctx, sID, "127.0.0.1:51821", pub)
 	if err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
+	}
+	if err := vpnSvc.pool.SetTunnelStatus(ctx, sID, TunnelStatusActive, 10); err != nil {
+		t.Fatalf("failed to establish healthy fixture: %v", err)
+	}
+	tun, err = vpnSvc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
 	}
 
 	probeStarted := make(chan struct{})
