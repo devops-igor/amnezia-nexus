@@ -818,6 +818,158 @@ func TestEnableBackend_AddClientErrorFailsLoudly(t *testing.T) {
 	}
 }
 
+func TestEnableBackend_UpdateBackendTunnelErrorAbortsAndLeavesStateIntact(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	ctx := context.Background()
+
+	initialHost := "198.51.100.45"
+	initialPort := 51820
+	initialPub := "server-endpoint-pubkey-initial"
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "persist-fault-server",
+		Host: initialHost,
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       initialPort,
+				"public_key": initialPub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
+
+	// 1. Initial EnableBackend establishes tunnel in pool and DB
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend failed: %v", err)
+	}
+
+	initialTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil || initialTun == nil {
+		t.Fatalf("expected initial tunnel in pool, got %+v (err=%v)", initialTun, err)
+	}
+	expectedInitialEndpoint := "198.51.100.45:51820"
+	if initialTun.Endpoint != expectedInitialEndpoint || initialTun.PublicKey != initialPub {
+		t.Fatalf("initial tunnel mismatch: endpoint=%s, pub=%s", initialTun.Endpoint, initialTun.PublicKey)
+	}
+	initialPrivKey := initialTun.PrivateKey
+	initialProbePrivKey := initialTun.ProbePrivateKey
+	initialVersion := initialTun.StateVersion
+
+	// 2. Update server configuration in DB with new host, port, and public key
+	newHost := "198.51.100.46"
+	newPort := 51822
+	newPub := "server-endpoint-pubkey-updated"
+	if err := db.UpdateServer(ctx, srvID, map[string]any{"host": newHost}); err != nil {
+		t.Fatalf("UpdateServer host failed: %v", err)
+	}
+	if err := db.UpdateServerProtocols(ctx, srvID, map[string]any{
+		"awg": map[string]any{
+			"installed":  true,
+			"port":       newPort,
+			"public_key": newPub,
+		},
+	}); err != nil {
+		t.Fatalf("UpdateServerProtocols failed: %v", err)
+	}
+
+	// 3. Trigger context cancellation right before pool.AddTunnel inside EnableBackend
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	svc.SetEnableBackendPreAddTunnelHookForTest(func() {
+		cancelReq()
+	})
+
+	initialClientAddCount := adder.addClientCalls
+
+	// EnableBackend must fail when AddTunnel's DB persistence fails
+	err = svc.EnableBackend(reqCtx, srvID)
+	if err == nil {
+		t.Fatal("expected EnableBackend to fail when DB persistence fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to register backend tunnel") {
+		t.Errorf("expected error wrapping failed to register backend tunnel, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "failed to persist backend tunnel updates") {
+		t.Errorf("expected error wrapping failed to persist backend tunnel updates, got: %v", err)
+	}
+
+	// Verify AddClient was not called during this aborted round
+	if adder.addClientCalls != initialClientAddCount {
+		t.Errorf("AddClient was called %d times; expected no new calls on aborted update", adder.addClientCalls-initialClientAddCount)
+	}
+
+	// Verify in-memory pool state is completely untouched
+	curTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if curTun.Endpoint != expectedInitialEndpoint {
+		t.Errorf("in-memory endpoint mutated on DB failure: got %q, want %q", curTun.Endpoint, expectedInitialEndpoint)
+	}
+	if curTun.PublicKey != initialPub {
+		t.Errorf("in-memory public key mutated on DB failure: got %q, want %q", curTun.PublicKey, initialPub)
+	}
+	if curTun.PrivateKey != initialPrivKey {
+		t.Errorf("in-memory private key mutated on DB failure: got %q, want %q", curTun.PrivateKey, initialPrivKey)
+	}
+	if curTun.ProbePrivateKey != initialProbePrivKey {
+		t.Errorf("in-memory probe private key mutated on DB failure: got %q, want %q", curTun.ProbePrivateKey, initialProbePrivKey)
+	}
+	if curTun.StateVersion != initialVersion {
+		t.Errorf("in-memory state version mutated on DB failure: got %d, want %d", curTun.StateVersion, initialVersion)
+	}
+
+	// Verify DB record is also untouched
+	dbTun, err := db.GetBackendTunnel(ctx, initialTun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Endpoint != expectedInitialEndpoint {
+		t.Errorf("DB endpoint mutated on DB failure: got %q, want %q", dbTun.Endpoint, expectedInitialEndpoint)
+	}
+	if dbTun.PublicKey != initialPub {
+		t.Errorf("DB public key mutated on DB failure: got %q, want %q", dbTun.PublicKey, initialPub)
+	}
+
+	// 4. Retry EnableBackend with valid context and verify it cleanly updates memory and DB
+	svc.SetEnableBackendPreAddTunnelHookForTest(nil)
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("subsequent EnableBackend with valid context failed: %v", err)
+	}
+
+	expectedNewEndpoint := "198.51.100.46:51822"
+	updatedTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel after retry failed: %v", err)
+	}
+	if updatedTun.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected updated endpoint %q, got %q", expectedNewEndpoint, updatedTun.Endpoint)
+	}
+	if updatedTun.PublicKey != newPub {
+		t.Errorf("expected updated public key %q, got %q", newPub, updatedTun.PublicKey)
+	}
+
+	updatedDBTun, err := db.GetBackendTunnel(ctx, initialTun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel after retry failed: %v", err)
+	}
+	if updatedDBTun.Endpoint != expectedNewEndpoint {
+		t.Errorf("expected DB endpoint %q, got %q", expectedNewEndpoint, updatedDBTun.Endpoint)
+	}
+	if updatedDBTun.PublicKey != newPub {
+		t.Errorf("expected DB public key %q, got %q", newPub, updatedDBTun.PublicKey)
+	}
+}
+
 func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)

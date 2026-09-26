@@ -189,6 +189,7 @@ type Service struct {
 	updateBackendServerHostPreLockHook func()
 	updateBackendServerHostErr         error
 	syncBackendForwarderHook           func() error
+	enableBackendPreAddTunnelHook      func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -851,6 +852,13 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateBackendServerHostErr = err
+}
+
+// SetEnableBackendPreAddTunnelHookForTest sets a hook called immediately before calling pool.AddTunnel in EnableBackend.
+func (s *Service) SetEnableBackendPreAddTunnelHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enableBackendPreAddTunnelHook = fn
 }
 
 // SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
@@ -2159,6 +2167,13 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
+
+	s.mu.RLock()
+	preAddHook := s.enableBackendPreAddTunnelHook
+	s.mu.RUnlock()
+	if preAddHook != nil {
+		preAddHook()
+	}
 
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
