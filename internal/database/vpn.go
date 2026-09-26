@@ -237,7 +237,7 @@ func (d *DB) UpdateBackendTunnelStatusWithReason(ctx context.Context, id int64, 
 	defer d.writeMu.Unlock()
 
 	nowStr := time.Now().Format(time.RFC3339)
-	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ?`
+	query := `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1 WHERE id = ? AND enabled = 1`
 
 	_, err := d.sqlDB.ExecContext(ctx, query, status, disableReason, latencyMS, nowStr, id)
 	if err != nil {
