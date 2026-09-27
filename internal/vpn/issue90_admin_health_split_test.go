@@ -22,7 +22,7 @@ import (
 // no healthy failover target exists (the session is stranded) must NOT be
 // reused by the rekey fast path on the next HandleIncomingPeer call. The
 // disabled backend's runtime health is still "active" after the split, so
-// status alone is not sufficient — Enabled must gate the fast path.
+// status alone is not sufficient - Enabled must gate the fast path.
 func TestRekeyFastPathRejectsAdminDisabledBackend(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -143,7 +143,7 @@ func TestRekeyFastPathRejectsAdminDisabledBackend(t *testing.T) {
 // rejected by validateMigrationTarget BEFORE the forwarder route,
 // SessionManager state, or DB session row are mutated. Before this fix the
 // preflight passed on status alone, the mutation steps ran, and the target was
-// only rejected later by TransferConnectionsIfActive — after a rollback cycle.
+// only rejected later by TransferConnectionsIfActive - after a rollback cycle.
 func TestMigrateSessionRejectsAdminDisabledTargetBeforeMutation(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -173,7 +173,7 @@ func TestMigrateSessionRejectsAdminDisabledTargetBeforeMutation(t *testing.T) {
 	svc.pool.IncrementConnections(tun1.ID)
 
 	// Administratively disable the TARGET backend. Per the issue #90 split
-	// its runtime health must remain active — exactly the state the old
+	// its runtime health must remain active - exactly the state the old
 	// status-only preflight let through.
 	if err := svc.DisableBackend(ctx, s2ID); err != nil {
 		t.Fatalf("DisableBackend(target %d) failed: %v", s2ID, err)

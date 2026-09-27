@@ -3457,7 +3457,7 @@ func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
 }
 
 // validateMigrationTarget checks that targetTunnelID exists and is eligible for
-// migration — administratively enabled AND runtime-active (issue #90) —
+// migration - administratively enabled AND runtime-active (issue #90) -
 // returning its StateVersion. The eligibility preflight must run before any
 // migration mutation so a disabled target is rejected without touching the
 // forwarder route, SessionManager state, or the DB session row.
@@ -3737,7 +3737,7 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
 		// Reuse requires both administrative eligibility and runtime health
 		// (issue #90): after the enabled/status split, Enabled=false,
-		// Status=active is a valid state — a stranded live session on an
+		// Status=active is a valid state - a stranded live session on an
 		// admin-disabled backend must fall through to normal backend
 		// selection instead of reusing the disabled backend here.
 		if backendErr == nil &&

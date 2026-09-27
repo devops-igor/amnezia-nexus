@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Backend status semantics (intentional breaking API change): `/api/vpn/backends` and `/api/vpn/tunnels` responses changed meaning of the `status` field — it now reports runtime health only (`connecting`/`active`/`degraded`/`disabled`), while administrative enable/disable intent moved to the new `enabled` field (#90). The combination `{"enabled": false, "status": "active"}` is valid and expected: an administratively disabled backend whose runtime health remains active.
+- Backend status semantics (intentional breaking API change): `/api/vpn/backends` and `/api/vpn/tunnels` responses changed meaning of the `status` field - it now reports runtime health only (`connecting`/`active`/`degraded`/`disabled`), while administrative enable/disable intent moved to the new `enabled` field (#90). The combination `{"enabled": false, "status": "active"}` is valid and expected: an administratively disabled backend whose runtime health remains active.
 
 ## [1.4.1] - Nebula · Patch 1 - 2026-09-25
 
