@@ -16,6 +16,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -384,6 +385,157 @@ func TestOrchestrator_SyncTraffic_AccumulationAndCounterReset(t *testing.T) {
 
 	if !foundDisable {
 		t.Errorf("expected user %s to be queued for disable after exceeding limit", uID)
+	}
+}
+
+func TestOrchestrator_ApplyConnectionUpdates_PreservesPortalFlush(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	monthlyReset := now.Format(time.RFC3339)
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Traffic Server", Host: "10.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err := db.CreateUser(ctx, &models.User{
+		Username: "mixed-traffic", Enabled: true, TrafficLimit: 450,
+		TrafficUsed: 300, TrafficTotal: 300, TrafficTotalRx: 100, TrafficTotalTx: 200,
+		MonthlyRx: 100, MonthlyTx: 200, MonthlyResetAt: &monthlyReset,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "remote", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	portalID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "portal", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The orchestrator has already loaded this user, then the portal flushes
+	// before the orchestrator applies its remote counter delta.
+	snapshot, err := db.GetUser(ctx, userID)
+	if err != nil || snapshot == nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	accountant := forwarder.NewTrafficAccountant(db, time.Second)
+	accountant.RecordRx("", portalID, 25)
+	accountant.RecordTx("", portalID, 45)
+	if err := accountant.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := New(db, nil)
+	usersMap := map[string]*models.User{userID: snapshot}
+	toDisable := make(map[string]bool)
+	orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
+		connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
+	}}, usersMap, toDisable)
+
+	got, err := db.GetUser(ctx, userID)
+	if err != nil || got == nil {
+		t.Fatalf("GetUser after update: %v", err)
+	}
+	for label, counters := range map[string]struct{ got, want int64 }{
+		"used": {got.TrafficUsed, 490}, "total": {got.TrafficTotal, 490},
+		"rx": {got.TrafficTotalRx, 175}, "tx": {got.TrafficTotalTx, 315},
+		"monthly rx": {got.MonthlyRx, 175}, "monthly tx": {got.MonthlyTx, 315},
+	} {
+		if counters.got != counters.want {
+			t.Errorf("%s = %d, want %d", label, counters.got, counters.want)
+		}
+	}
+	if snapshot.TrafficUsed != 490 || !toDisable[userID] {
+		t.Errorf("quota decision missed combined traffic: in-memory used=%d, disable=%v", snapshot.TrafficUsed, toDisable[userID])
+	}
+}
+
+func TestOrchestrator_ApplyConnectionUpdates_AfterMonthlyRollover(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	lastMonth := now.AddDate(0, -1, 0).Format(time.RFC3339)
+
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Rollover Server", Host: "10.0.0.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err := db.CreateUser(ctx, &models.User{
+		Username: "rollover-mixed-traffic", Enabled: true, TrafficUsed: 300, TrafficTotal: 300,
+		TrafficTotalRx: 100, TrafficTotalTx: 200, MonthlyRx: 100, MonthlyTx: 200,
+		TrafficResetStrategy: models.ResetStrategyMonthly, MonthlyResetAt: &lastMonth, LastResetAt: &lastMonth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "remote", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	portalID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "portal", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := db.GetUser(ctx, userID)
+	if err != nil || snapshot == nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	orch := New(db, nil)
+	usersMap := map[string]*models.User{userID: snapshot}
+	orch.handleMonthlyRollover(ctx, now, usersMap)
+
+	accountant := forwarder.NewTrafficAccountant(db, time.Second)
+	accountant.RecordRx("", portalID, 25)
+	accountant.RecordTx("", portalID, 45)
+	if err := accountant.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
+		connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
+	}}, usersMap, make(map[string]bool))
+
+	got, err := db.GetUser(ctx, userID)
+	if err != nil || got == nil {
+		t.Fatalf("GetUser after rollover: %v", err)
+	}
+	if got.TrafficUsed != 190 || got.TrafficTotal != 490 || got.MonthlyRx != 75 || got.MonthlyTx != 115 {
+		t.Errorf("incorrect rollover and current-month accounting: used=%d total=%d monthly=(%d,%d)",
+			got.TrafficUsed, got.TrafficTotal, got.MonthlyRx, got.MonthlyTx)
+	}
+}
+
+func TestOrchestrator_SyncTraffic_PortalOnlyQuota(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	userID, err := db.CreateUser(ctx, &models.User{
+		Username: "portal-quota", Enabled: true, TrafficLimit: 100, TrafficUsed: 90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateUserTraffic(ctx, userID, 10, 0); err != nil {
+		t.Fatal(err)
+	}
+	userOps := &mockUserOps{}
+	if err := New(db, nil, WithUserOps(userOps)).SyncTraffic(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(userOps.toggles) != 1 || userOps.toggles[0].UserID != userID || userOps.toggles[0].Enabled {
+		t.Errorf("portal-only over-quota user was not disabled: %+v", userOps.toggles)
 	}
 }
 

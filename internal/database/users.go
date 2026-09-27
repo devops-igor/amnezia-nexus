@@ -442,8 +442,22 @@ func (d *DB) ToggleUser(ctx context.Context, id string, enabled bool) (bool, err
 	return d.UpdateUser(ctx, id, map[string]any{"enabled": val == 1})
 }
 
-// UpdateUserTraffic increments user traffic totals and period counters.
-func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) error {
+// UserTrafficTotals is the database state immediately after a traffic increment.
+type UserTrafficTotals struct {
+	Used      int64
+	Total     int64
+	TotalRx   int64
+	TotalTx   int64
+	MonthlyRx int64
+	MonthlyTx int64
+	Limit     int64
+	Enabled   bool
+}
+
+// AddUserTraffic increments all user traffic counters and returns the updated
+// totals from the same SQL statement. Concurrent accounting updates cannot be
+// lost between reading and writing these counters.
+func (d *DB) AddUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -455,13 +469,25 @@ func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta 
 		traffic_total_tx = traffic_total_tx + ?,
 		monthly_rx = monthly_rx + ?,
 		monthly_tx = monthly_tx + ?
-		WHERE id = ?`
+		WHERE id = ?
+		RETURNING traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
+			monthly_rx, monthly_tx, traffic_limit, enabled`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, totalDelta, totalDelta, rxDelta, txDelta, rxDelta, txDelta, id)
+	var totals UserTrafficTotals
+	err := d.sqlDB.QueryRowContext(ctx, query, totalDelta, totalDelta, rxDelta, txDelta, rxDelta, txDelta, id).Scan(
+		&totals.Used, &totals.Total, &totals.TotalRx, &totals.TotalTx,
+		&totals.MonthlyRx, &totals.MonthlyTx, &totals.Limit, &totals.Enabled,
+	)
 	if err != nil {
-		return fmt.Errorf("failed to update user traffic: %w", err)
+		return UserTrafficTotals{}, fmt.Errorf("failed to update user traffic for %s: %w", id, err)
 	}
-	return nil
+	return totals, nil
+}
+
+// UpdateUserTraffic increments user traffic totals and period counters.
+func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) error {
+	_, err := d.AddUserTraffic(ctx, id, rxDelta, txDelta)
+	return err
 }
 
 // UpdateUserLimits updates per-user connection limits JSON.

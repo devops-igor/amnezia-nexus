@@ -99,11 +99,18 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 		o.applyConnectionUpdates(ctx, now, updates, usersMap, toDisableUIDs)
 	}
 
+	// Include portal traffic flushed after the user snapshot, even when a user
+	// has no remote connection update in this cycle.
+	overQuota, err := o.db.GetUsersOverQuota(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch users over quota: %w", err)
+	}
+	for _, user := range overQuota {
+		toDisableUIDs[user.ID] = true
+	}
+
 	// === 3. LIMIT & EXPIRATION CHECK: for all users in usersMap ===
 	for _, user := range usersMap {
-		if user.TrafficLimit > 0 && user.TrafficUsed >= user.TrafficLimit && user.Enabled {
-			toDisableUIDs[user.ID] = true
-		}
 		if o.isUserExpired(user, now) && user.Enabled {
 			toDisableUIDs[user.ID] = true
 		}
@@ -161,29 +168,20 @@ func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time
 			user.LastResetAt = &nowStr
 		}
 
-		delta := u.rxDelta + u.txDelta
-		newUsed := user.TrafficUsed + delta
-		newTotal := user.TrafficTotal + delta
-		newTotalRx := user.TrafficTotalRx + u.rxDelta
-		newTotalTx := user.TrafficTotalTx + u.txDelta
-		newMonthlyRx := user.MonthlyRx + u.rxDelta
-		newMonthlyTx := user.MonthlyTx + u.txDelta
+		totals, err := o.db.AddUserTraffic(ctx, user.ID, u.rxDelta, u.txDelta)
+		if err != nil {
+			slog.Error("Failed to apply remote user traffic delta", "user_id", user.ID, "connection_id", u.connID, "err", err)
+			continue
+		}
 
-		_, _ = o.db.UpdateUser(ctx, user.ID, map[string]any{
-			"traffic_used":     newUsed,
-			"traffic_total":    newTotal,
-			"traffic_total_rx": newTotalRx,
-			"traffic_total_tx": newTotalTx,
-			"monthly_rx":       newMonthlyRx,
-			"monthly_tx":       newMonthlyTx,
-		})
-
-		user.TrafficUsed = newUsed
-		user.TrafficTotal = newTotal
-		user.TrafficTotalRx = newTotalRx
-		user.TrafficTotalTx = newTotalTx
-		user.MonthlyRx = newMonthlyRx
-		user.MonthlyTx = newMonthlyTx
+		user.TrafficUsed = totals.Used
+		user.TrafficTotal = totals.Total
+		user.TrafficTotalRx = totals.TotalRx
+		user.TrafficTotalTx = totals.TotalTx
+		user.MonthlyRx = totals.MonthlyRx
+		user.MonthlyTx = totals.MonthlyTx
+		user.TrafficLimit = totals.Limit
+		user.Enabled = totals.Enabled
 
 		// Check traffic quota limit
 		if user.TrafficLimit > 0 && user.TrafficUsed >= user.TrafficLimit && user.Enabled {
