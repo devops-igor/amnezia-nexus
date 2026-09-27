@@ -7,17 +7,19 @@ import (
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
-	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 func TestAWGClientDevice_ReadWrite(t *testing.T) {
-	vtun := &VirtualTUN{
-		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
-		outPackets: make(chan []byte, 1024),
-		events:     make(chan tun.Event, 2),
-		closed:     make(chan struct{}),
-		mtu:        1340,
-		name:       "test-awg",
+	vtun, err := virtualtun.New(virtualtun.Config{
+		Name:             "test-awg",
+		MTU:              1340,
+		InboundCapacity:  DefaultVirtualTUNInboundCapacity,
+		OutboundCapacity: 1024,
+	})
+	if err != nil {
+		t.Fatalf("virtualtun.New failed: %v", err)
 	}
 	dev := &AWGClientDevice{
 		name:      "test-awg",
@@ -48,11 +50,11 @@ func TestAWGClientDevice_ReadWrite(t *testing.T) {
 
 	// Read from vtun's inPackets (as amneziawg-go would via Read)
 
-	dev.vtun.events <- 1 // Avoid block
+	dev.vtun.SendEvent(1) // Avoid block
 
 	// Wait for packet
 	select {
-	case pkt := <-dev.vtun.inPackets:
+	case pkt := <-dev.vtun.Inbound():
 		if !bytes.Equal(pkt, testPkt) {
 			t.Errorf("expected injected packet, got %x", pkt)
 		}
@@ -222,13 +224,14 @@ func TestAWGClientDevice_LastHandshakeTimeHook(t *testing.T) {
 }
 
 func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
-	vtun := &VirtualTUN{
-		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
-		outPackets: make(chan []byte, 1024),
-		events:     make(chan tun.Event, 2),
-		closed:     make(chan struct{}),
-		mtu:        1340,
-		name:       "test-in-drop",
+	vtun, err := virtualtun.New(virtualtun.Config{
+		Name:             "test-in-drop",
+		MTU:              1340,
+		InboundCapacity:  DefaultVirtualTUNInboundCapacity,
+		OutboundCapacity: 1024,
+	})
+	if err != nil {
+		t.Fatalf("virtualtun.New failed: %v", err)
 	}
 	dev := &AWGClientDevice{
 		name:      "test-in-drop",
@@ -239,8 +242,8 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 	}
 	defer dev.Close()
 
-	if cap(dev.vtun.inPackets) != DefaultVirtualTUNInboundCapacity {
-		t.Fatalf("expected inPackets cap %d, got %d", DefaultVirtualTUNInboundCapacity, cap(dev.vtun.inPackets))
+	if cap(dev.vtun.Inbound()) != DefaultVirtualTUNInboundCapacity {
+		t.Fatalf("expected inPackets cap %d, got %d", DefaultVirtualTUNInboundCapacity, cap(dev.vtun.Inbound()))
 	}
 	if dev.DroppedPackets() != 0 {
 		t.Fatalf("expected initial drop count 0, got %d", dev.DroppedPackets())
@@ -291,7 +294,7 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 
 	// Drain 5 packets and verify writing again does not increment drops
 	for i := 0; i < 5; i++ {
-		<-dev.vtun.inPackets
+		<-dev.vtun.Inbound()
 	}
 
 	for i := 0; i < 5; i++ {
@@ -311,13 +314,14 @@ func TestVirtualTUN_InboundCapacityAndDropCounter(t *testing.T) {
 }
 
 func TestAWGClientDevice_WriteBufferIsolation(t *testing.T) {
-	vtun := &VirtualTUN{
-		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
-		outPackets: make(chan []byte, 1024),
-		events:     make(chan tun.Event, 2),
-		closed:     make(chan struct{}),
-		mtu:        1340,
-		name:       "test-buf-isolation",
+	vtun, err := virtualtun.New(virtualtun.Config{
+		Name:             "test-buf-isolation",
+		MTU:              1340,
+		InboundCapacity:  DefaultVirtualTUNInboundCapacity,
+		OutboundCapacity: 1024,
+	})
+	if err != nil {
+		t.Fatalf("virtualtun.New failed: %v", err)
 	}
 	dev := &AWGClientDevice{
 		name:      "test-buf-isolation",
@@ -343,7 +347,7 @@ func TestAWGClientDevice_WriteBufferIsolation(t *testing.T) {
 	}
 
 	select {
-	case receivedPkt := <-dev.vtun.inPackets:
+	case receivedPkt := <-dev.vtun.Inbound():
 		if !bytes.Equal(receivedPkt, expectedPkt) {
 			t.Fatalf("packet corrupted: got %x, want %x", receivedPkt, expectedPkt)
 		}

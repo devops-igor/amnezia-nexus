@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +17,8 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 // AWGClientDevice implements PacketDevice for connecting the portal to a backend AWG server.
@@ -33,80 +34,16 @@ type AWGClientDevice struct {
 	once            sync.Once
 }
 
-// VirtualTUN implements tun.Device in-memory for amneziawg-go.
-type VirtualTUN struct {
-	inPackets  chan []byte
-	outPackets chan []byte
-	events     chan tun.Event
-	closed     chan struct{}
-	mtu        int
-	name       string
-	dropCount  atomic.Uint64
-	once       sync.Once
-}
+// VirtualTUN is the ownership-neutral in-memory tun.Device, extracted into
+// the internal/vpn/virtualtun package. The alias keeps AWGClientDevice and
+// existing signatures compiling.
+type VirtualTUN = virtualtun.VirtualTUN
 
-func (t *VirtualTUN) File() *os.File { return nil }
-
-func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	select {
-	case pkt, ok := <-t.inPackets:
-		if !ok {
-			return 0, os.ErrClosed
-		}
-		if len(bufs) == 0 {
-			return 0, nil
-		}
-		copy(bufs[0][offset:], pkt)
-		sizes[0] = len(pkt)
-		return 1, nil
-	case <-t.closed:
-		return 0, os.ErrClosed
-	}
-}
-
-func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
-	n := 0
-	for _, buf := range bufs {
-		if len(buf) <= offset {
-			continue
-		}
-		pkt := buf[offset:]
-		out := make([]byte, len(pkt))
-		copy(out, pkt)
-		select {
-		case t.outPackets <- out:
-			n++
-		case <-t.closed:
-			return n, os.ErrClosed
-		default:
-			// drop if full to avoid blocking the tun writer
-			t.dropCount.Add(1)
-			n++
-		}
-	}
-	return n, nil
-}
-
-// DroppedPackets returns the total number of packets dropped due to a full queue.
-func (t *VirtualTUN) DroppedPackets() uint64 {
-	return t.dropCount.Load()
-}
-
-// RecordDrop increments the dropped packet counter (issue #160).
-func (t *VirtualTUN) RecordDrop() {
-	t.dropCount.Add(1)
-}
-
-func (t *VirtualTUN) MTU() (int, error)        { return t.mtu, nil }
-func (t *VirtualTUN) Name() (string, error)    { return t.name, nil }
-func (t *VirtualTUN) Events() <-chan tun.Event { return t.events }
-func (t *VirtualTUN) Close() error {
-	t.once.Do(func() {
-		close(t.closed)
-	})
-	return nil
-}
-func (t *VirtualTUN) BatchSize() int { return 1 }
+// DefaultVirtualTUNInboundCapacity is the default buffer capacity for
+// VirtualTUN inbound packets (2048) to absorb bursty upload traffic without
+// drops (issue #160). Re-exported from the virtualtun package for
+// compatibility.
+const DefaultVirtualTUNInboundCapacity = virtualtun.DefaultInboundCapacity
 
 func base64ToHex(b64 string) (string, error) {
 	keyStr := strings.TrimSpace(b64)
@@ -141,10 +78,6 @@ func toInt(v any) int {
 	return 0
 }
 
-// DefaultVirtualTUNInboundCapacity is the default buffer capacity for VirtualTUN inbound packets (2048)
-// to absorb bursty upload traffic without drops (issue #160).
-const DefaultVirtualTUNInboundCapacity = 2048
-
 // DefaultUDPSocketBufferSize is the default SO_RCVBUF and SO_SNDBUF buffer size (4 MB)
 // configured on backend AWG client UDP sockets to prevent kernel-level packet drops (issue #160).
 const DefaultUDPSocketBufferSize = 4 * 1024 * 1024
@@ -171,13 +104,14 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 		return nil, fmt.Errorf("invalid public key: %w", err)
 	}
 
-	vtun := &VirtualTUN{
-		inPackets:  make(chan []byte, DefaultVirtualTUNInboundCapacity),
-		outPackets: make(chan []byte, 1024),
-		events:     make(chan tun.Event, 2),
-		closed:     make(chan struct{}),
-		mtu:        mtu,
-		name:       name,
+	vtun, err := virtualtun.New(virtualtun.Config{
+		Name:             name,
+		MTU:              mtu,
+		InboundCapacity:  virtualtun.DefaultInboundCapacity,
+		OutboundCapacity: virtualtun.DefaultOutboundCapacity,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create virtual tun device: %w", err)
 	}
 
 	logger := device.NewLogger(device.LogLevelSilent, name)
@@ -192,7 +126,7 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 		return nil, fmt.Errorf("failed to configure awg device: %w", err)
 	}
 
-	vtun.events <- tun.EventUp
+	vtun.SendEvent(tun.EventUp)
 
 	err = dev.Up()
 	if err != nil {
@@ -333,7 +267,7 @@ func buildAWGIPCConfig(privateKeyHex, publicKeyHex, endpoint string, awgParams m
 
 func (d *AWGClientDevice) Read(p []byte) (int, error) {
 	select {
-	case pkt, ok := <-d.vtun.outPackets:
+	case pkt, ok := <-d.vtun.Outbound():
 		if !ok {
 			return 0, errors.New("device closed")
 		}
@@ -347,19 +281,17 @@ func (d *AWGClientDevice) Write(p []byte) (int, error) {
 	if d.closed.Load() {
 		return 0, errors.New("device closed")
 	}
-	pkt := make([]byte, len(p))
-	copy(pkt, p)
-	select {
-	case d.vtun.inPackets <- pkt:
-		return len(p), nil
-	case <-d.doneCh:
-		return 0, errors.New("device closed")
-	default:
-		if d.vtun != nil {
-			d.vtun.RecordDrop()
+	// InjectInbound copies the packet and counts a queue-full drop on the
+	// device drop telemetry; like the legacy path, the datagram is
+	// reported as accepted so the forwarder does not tear down the tunnel
+	// over a single counted drop.
+	if err := d.vtun.InjectInbound(p); err != nil {
+		if errors.Is(err, virtualtun.ErrQueueFull) {
+			return len(p), nil
 		}
-		return len(p), nil
+		return 0, errors.New("device closed")
 	}
+	return len(p), nil
 }
 
 func (d *AWGClientDevice) Close() error {
