@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -181,6 +182,11 @@ func (h *Handlers) VPNTunnelsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // VPNGetConfigHandler returns dynamic routing and load balancer configuration.
+type vpnConfigResponse struct {
+	models.VPNConfig
+	ServerPrivateKey string `json:"-"`
+}
+
 func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var cfg *models.VPNConfig
@@ -201,7 +207,9 @@ func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.JSON(w, http.StatusOK, cfg)
+	visible := *cfg
+	visible.ServerPrivateKey = ""
+	h.JSON(w, http.StatusOK, vpnConfigResponse{VPNConfig: visible})
 }
 
 func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicEndpoint bool) {
@@ -211,9 +219,10 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if cfg.H1.IsZero() && cfg.S1 == 0 {
 		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = current.H1, current.H2, current.H3, current.H4
 		cfg.S1, cfg.S2, cfg.S3, cfg.S4 = current.S1, current.S2, current.S3, current.S4
-		cfg.ServerPrivateKey = current.ServerPrivateKey
-		cfg.ServerPublicKey = current.ServerPublicKey
 	}
+	// Portal identity must be preserved even when the caller supplies H/S.
+	cfg.ServerPrivateKey = current.ServerPrivateKey
+	cfg.ServerPublicKey = current.ServerPublicKey
 	if !hasPublicEndpoint {
 		cfg.PublicEndpoint = current.PublicEndpoint
 	}
@@ -273,6 +282,13 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return
 	}
+	for name := range raw {
+		if strings.EqualFold(name, "server_private_key") || strings.EqualFold(name, "server_public_key") ||
+			strings.EqualFold(name, "ServerPrivateKey") || strings.EqualFold(name, "ServerPublicKey") {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", "Portal key fields cannot be updated")
+			return
+		}
+	}
 
 	var cfg models.VPNConfig
 	if err := json.Unmarshal(bodyBytes, &cfg); err != nil {
@@ -295,7 +311,10 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		if current, err := h.db.GetVPNConfig(ctx); err == nil && current != nil {
 			mergeVPNConfig(current, &cfg, hasPublicEndpoint)
 		}
-		_ = h.db.SaveVPNConfig(ctx, &cfg)
+		if err := h.db.SaveVPNConfig(ctx, &cfg); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
+			return
+		}
 	}
 
 	h.audit(r, "vpn.config_update", map[string]any{"algorithm": string(cfg.Algorithm), "listen_port": cfg.ListenPort, "public_endpoint": cfg.PublicEndpoint})
