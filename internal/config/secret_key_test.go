@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestResolveSecretKey_Invariant1_FailedWriteReturnsError tests Invariant 1:
@@ -504,6 +505,45 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 
+	mode := os.Getenv("HELPER_MODE")
+	switch mode {
+	case "process_a_fail_sync":
+		cleanDataDir := filepath.Clean(dataDir)
+		syncDirFunc = func(dirPath string) error {
+			if filepath.Clean(dirPath) == cleanDataDir {
+				// Signal that Process A has placed the file and is paused in syncDir with the lock held
+				markerSync := filepath.Join(dataDir, ".marker_a_in_sync")
+				_ = os.WriteFile(markerSync, []byte("ready"), 0600)
+
+				// Wait for release signal from test coordinator
+				releaseMarker := filepath.Join(dataDir, ".marker_release_a")
+				for attempt := 0; attempt < 500; attempt++ {
+					if _, err := os.Stat(releaseMarker); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return errors.New("simulated syncDir failure in Process A")
+			}
+			return syncDir(dirPath)
+		}
+
+	case "process_b_monitor":
+		markerB := filepath.Join(dataDir, ".marker_b_started")
+		_ = os.WriteFile(markerB, []byte("started"), 0600)
+
+	case "process_b_fail_sync":
+		markerB := filepath.Join(dataDir, ".marker_b_started")
+		_ = os.WriteFile(markerB, []byte("started"), 0600)
+		cleanDataDir := filepath.Clean(dataDir)
+		syncDirFunc = func(dirPath string) error {
+			if filepath.Clean(dirPath) == cleanDataDir {
+				return errors.New("simulated syncDir failure in Process B")
+			}
+			return syncDir(dirPath)
+		}
+	}
+
 	key, err := ResolveSecretKey(dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -613,4 +653,434 @@ func TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_HardLinks(t 
 // even when hard links are unsupported and the fallback to renameat2(RENAME_NOREPLACE) is used.
 func TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_NoHardLinksFallback(t *testing.T) {
 	runConcurrentSubprocessTest(t, "AMNEZIA_TEST_SIMULATE_NO_HARDLINKS=1")
+}
+
+// TestResolveSecretKey_Invariant8_PublishVsDirectorySyncRaceBarrier_MultiProcess tests Invariant 8:
+// When Process A publishes a key and pauses inside syncDir, and Process B is spawned concurrently,
+// if Process A receives a simulated syncDir error and deletes its unpersisted key, it is impossible
+// for Process B to return success with an unpersisted/deleted key.
+func TestResolveSecretKey_Invariant8_PublishVsDirectorySyncRaceBarrier_MultiProcess(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("ProcessBFailsOrGeneratesOwnPersistedKey", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Start Process A
+		cmdA := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		var stdoutA, stderrA bytes.Buffer
+		cmdA.Stdout = &stdoutA
+		cmdA.Stderr = &stderrA
+		envA := make([]string, 0, len(os.Environ())+3)
+		for _, e := range os.Environ() {
+			if !strings.HasPrefix(e, "SECRET_KEY=") &&
+				!strings.HasPrefix(e, "GO_WANT_SECRET_KEY_HELPER=") &&
+				!strings.HasPrefix(e, "HELPER_DATA_DIR=") &&
+				!strings.HasPrefix(e, "HELPER_MODE=") {
+				envA = append(envA, e)
+			}
+		}
+		cmdA.Env = append(envA,
+			"GO_WANT_SECRET_KEY_HELPER=1",
+			"HELPER_DATA_DIR="+tmpDir,
+			"HELPER_MODE=process_a_fail_sync",
+		)
+
+		if err := cmdA.Start(); err != nil {
+			t.Fatalf("failed to start Process A: %v", err)
+		}
+
+		// Wait for Process A to signal it is paused inside syncDir with the file placed
+		markerSyncA := filepath.Join(tmpDir, ".marker_a_in_sync")
+		syncReached := false
+		for attempt := 0; attempt < 500; attempt++ {
+			if _, err := os.Stat(markerSyncA); err == nil {
+				syncReached = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !syncReached {
+			_ = cmdA.Process.Kill()
+			t.Fatalf("Process A failed to reach syncDir pause within timeout; stderr: %s", stderrA.String())
+		}
+
+		// Process A is now holding the process lock inside syncDir.
+		// Spawn Process B concurrently.
+		cmdB := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		var stdoutB, stderrB bytes.Buffer
+		cmdB.Stdout = &stdoutB
+		cmdB.Stderr = &stderrB
+		envB := make([]string, 0, len(envA))
+		envB = append(envB, envA...)
+		envB = append(envB,
+			"GO_WANT_SECRET_KEY_HELPER=1",
+			"HELPER_DATA_DIR="+tmpDir,
+			"HELPER_MODE=process_b_monitor",
+		)
+		cmdB.Env = envB
+
+		if err := cmdB.Start(); err != nil {
+			_ = cmdA.Process.Kill()
+			t.Fatalf("failed to start Process B: %v", err)
+		}
+
+		// Wait for Process B to start and attempt ResolveSecretKey
+		markerB := filepath.Join(tmpDir, ".marker_b_started")
+		bStarted := false
+		for attempt := 0; attempt < 500; attempt++ {
+			if _, err := os.Stat(markerB); err == nil {
+				bStarted = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !bStarted {
+			_ = cmdA.Process.Kill()
+			_ = cmdB.Process.Kill()
+			t.Fatalf("Process B failed to start within timeout; stderr: %s", stderrB.String())
+		}
+
+		// Allow Process B a brief moment to be blocked waiting on .secret_key.lock
+		time.Sleep(50 * time.Millisecond)
+
+		// Release Process A, causing it to return the simulated syncDir error
+		releaseMarker := filepath.Join(tmpDir, ".marker_release_a")
+		if err := os.WriteFile(releaseMarker, []byte("release"), 0600); err != nil {
+			_ = cmdA.Process.Kill()
+			_ = cmdB.Process.Kill()
+			t.Fatalf("failed to write release marker: %v", err)
+		}
+
+		// Wait for Process A to exit. It MUST fail because its syncDir returned an error.
+		errA := cmdA.Wait()
+		if errA == nil {
+			t.Fatalf("Process A was expected to fail with sync error, but exited successfully")
+		}
+		if !strings.Contains(stderrA.String(), "failed to sync data directory") {
+			t.Errorf("Process A stderr expected to mention 'failed to sync data directory', got: %s", stderrA.String())
+		}
+
+		// Wait for Process B to complete
+		errB := cmdB.Wait()
+		keyB := strings.TrimSpace(stdoutB.String())
+
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		diskData, readErr := os.ReadFile(keyPath)
+
+		if errB != nil {
+			// If Process B also failed (e.g. could not obtain key or sync), verify no phantom key exists
+			if readErr == nil && len(diskData) > 0 {
+				t.Errorf("Process B failed, but a key was left on disk: %q", string(diskData))
+			}
+		} else {
+			// If Process B succeeded:
+			// 1. It must have produced a valid 64-char key
+			if len(keyB) != 64 {
+				t.Fatalf("Process B produced invalid key len=%d: %q", len(keyB), keyB)
+			}
+			// 2. The key file MUST exist on disk! It must NOT be deleted or disappeared!
+			if readErr != nil {
+				t.Fatalf("CRITICAL RACE: Process B returned success (%s) but .secret_key is missing on disk (%v)!", keyB, readErr)
+			}
+			// 3. The disk content must strictly match Process B's returned key
+			if strings.TrimSpace(string(diskData)) != keyB {
+				t.Fatalf("CRITICAL RACE: Process B returned key %s, but disk contains different key %s!", keyB, strings.TrimSpace(string(diskData)))
+			}
+			// 4. Verify file permissions 0600
+			fi, statErr := os.Stat(keyPath)
+			if statErr != nil {
+				t.Fatalf("failed to stat key file: %v", statErr)
+			}
+			if fi.Mode().Perm() != 0600 {
+				t.Errorf("expected 0600 permissions, got: %04o", fi.Mode().Perm())
+			}
+		}
+	})
+
+	t.Run("BothProcessesFailSync", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Start Process A
+		cmdA := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		var stdoutA, stderrA bytes.Buffer
+		cmdA.Stdout = &stdoutA
+		cmdA.Stderr = &stderrA
+		envA := make([]string, 0, len(os.Environ())+3)
+		for _, e := range os.Environ() {
+			if !strings.HasPrefix(e, "SECRET_KEY=") &&
+				!strings.HasPrefix(e, "GO_WANT_SECRET_KEY_HELPER=") &&
+				!strings.HasPrefix(e, "HELPER_DATA_DIR=") &&
+				!strings.HasPrefix(e, "HELPER_MODE=") {
+				envA = append(envA, e)
+			}
+		}
+		cmdA.Env = append(envA,
+			"GO_WANT_SECRET_KEY_HELPER=1",
+			"HELPER_DATA_DIR="+tmpDir,
+			"HELPER_MODE=process_a_fail_sync",
+		)
+
+		if err := cmdA.Start(); err != nil {
+			t.Fatalf("failed to start Process A: %v", err)
+		}
+
+		// Wait for Process A to signal it is paused inside syncDir
+		markerSyncA := filepath.Join(tmpDir, ".marker_a_in_sync")
+		syncReached := false
+		for attempt := 0; attempt < 500; attempt++ {
+			if _, err := os.Stat(markerSyncA); err == nil {
+				syncReached = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !syncReached {
+			_ = cmdA.Process.Kill()
+			t.Fatalf("Process A failed to reach syncDir pause within timeout; stderr: %s", stderrA.String())
+		}
+
+		// Spawn Process B with fail_sync
+		cmdB := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		var stdoutB, stderrB bytes.Buffer
+		cmdB.Stdout = &stdoutB
+		cmdB.Stderr = &stderrB
+		envB := make([]string, 0, len(envA))
+		envB = append(envB, envA...)
+		envB = append(envB,
+			"GO_WANT_SECRET_KEY_HELPER=1",
+			"HELPER_DATA_DIR="+tmpDir,
+			"HELPER_MODE=process_b_fail_sync",
+		)
+		cmdB.Env = envB
+
+		if err := cmdB.Start(); err != nil {
+			_ = cmdA.Process.Kill()
+			t.Fatalf("failed to start Process B: %v", err)
+		}
+
+		markerB := filepath.Join(tmpDir, ".marker_b_started")
+		bStarted := false
+		for attempt := 0; attempt < 500; attempt++ {
+			if _, err := os.Stat(markerB); err == nil {
+				bStarted = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !bStarted {
+			_ = cmdA.Process.Kill()
+			_ = cmdB.Process.Kill()
+			t.Fatalf("Process B failed to start within timeout; stderr: %s", stderrB.String())
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		releaseMarker := filepath.Join(tmpDir, ".marker_release_a")
+		if err := os.WriteFile(releaseMarker, []byte("release"), 0600); err != nil {
+			_ = cmdA.Process.Kill()
+			_ = cmdB.Process.Kill()
+			t.Fatalf("failed to write release marker: %v", err)
+		}
+
+		_ = cmdA.Wait()
+		errB := cmdB.Wait()
+
+		if errB == nil {
+			t.Fatalf("expected Process B to fail when syncDir fails, but it succeeded: %s", stdoutB.String())
+		}
+
+		// Verify no unpersisted key file remains on disk
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+			t.Errorf("expected .secret_key to not exist on disk after both failed, statErr: %v", statErr)
+		}
+	})
+}
+
+// TestResolveSecretKey_Invariant8_ReaderDurabilityBarrier verifies that any reader path
+// (initial read of existing key and readWinningKey) enforces directory durability
+// and fails fast if syncDir fails, without deleting the pre-existing file.
+func TestResolveSecretKey_Invariant8_ReaderDurabilityBarrier(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("ExistingKeyReadSyncFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		existingKey := "99887766554433221100aabbccddeeff99887766554433221100aabbccddeeff"
+		if err := os.WriteFile(keyPath, []byte(existingKey+"\n"), 0600); err != nil {
+			t.Fatalf("failed to write existing key: %v", err)
+		}
+
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			return errors.New("simulated syncDir failure during reader check")
+		}
+
+		key, err := ResolveSecretKey(tmpDir)
+		if err == nil {
+			t.Fatalf("expected error when syncDir fails on existing key read, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "failed to sync data directory") {
+			t.Errorf("expected error message to mention 'failed to sync data directory', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+
+		// Crucial: pre-existing file must NOT be deleted by a reader
+		data, readErr := os.ReadFile(keyPath)
+		if readErr != nil {
+			t.Fatalf("pre-existing key file was deleted or unreadable: %v", readErr)
+		}
+		if strings.TrimSpace(string(data)) != existingKey {
+			t.Errorf("pre-existing key content altered: %q vs %q", strings.TrimSpace(string(data)), existingKey)
+		}
+	})
+
+	t.Run("ReadWinningKeySyncFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		winningKey := "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+		if err := os.WriteFile(keyPath, []byte(winningKey+"\n"), 0600); err != nil {
+			t.Fatalf("failed to write winning key: %v", err)
+		}
+
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			return errors.New("simulated syncDir failure in readWinningKey")
+		}
+
+		key, err := readWinningKey(keyPath)
+		if err == nil {
+			t.Fatalf("expected readWinningKey to fail when syncDir fails, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "failed to sync data directory") {
+			t.Errorf("expected error message to mention 'failed to sync data directory', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+	})
+}
+
+// TestResolveSecretKey_Invariant9_ParentDirectoryDurabilityOnDataDirCreation tests Invariant 9:
+// If DATA_DIR is newly created by MkdirAll, its parent directory is also durably synchronized.
+func TestResolveSecretKey_Invariant9_ParentDirectoryDurabilityOnDataDirCreation(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("ParentDirectorySyncedWhenDataDirCreated", func(t *testing.T) {
+		parentDir := t.TempDir()
+		newDataDir := filepath.Join(parentDir, "brand_new_datadir")
+
+		var syncedDirs []string
+		var mu sync.Mutex
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			mu.Lock()
+			syncedDirs = append(syncedDirs, filepath.Clean(dirPath))
+			mu.Unlock()
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(newDataDir)
+		if err != nil {
+			t.Fatalf("ResolveSecretKey failed: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("expected 64-char key, got %d: %q", len(key), key)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		hasParent := false
+		hasData := false
+		for _, d := range syncedDirs {
+			if d == filepath.Clean(parentDir) {
+				hasParent = true
+			}
+			if d == filepath.Clean(newDataDir) {
+				hasData = true
+			}
+		}
+
+		if !hasParent {
+			t.Errorf("parent directory %s was not synced on creation; synced dirs: %v", parentDir, syncedDirs)
+		}
+		if !hasData {
+			t.Errorf("new data directory %s was not synced; synced dirs: %v", newDataDir, syncedDirs)
+		}
+	})
+
+	t.Run("ParentDirectorySyncFailureFailsFast", func(t *testing.T) {
+		parentDir := t.TempDir()
+		newDataDir := filepath.Join(parentDir, "fail_parent_datadir")
+
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			if filepath.Clean(dirPath) == filepath.Clean(parentDir) {
+				return errors.New("simulated parent directory sync failure")
+			}
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(newDataDir)
+		if err == nil {
+			t.Fatalf("expected error when parent directory sync fails, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "failed to sync parent directory") {
+			t.Errorf("expected error message to mention 'failed to sync parent directory', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+
+		// Verify key was not created
+		keyPath := filepath.Join(newDataDir, ".secret_key")
+		if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+			t.Errorf("secret key file should not exist, statErr: %v", statErr)
+		}
+	})
+
+	t.Run("ParentDirectoryNotSyncedWhenDataDirAlreadyExists", func(t *testing.T) {
+		dataDir := t.TempDir() // already exists
+
+		var syncedDirs []string
+		var mu sync.Mutex
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			mu.Lock()
+			syncedDirs = append(syncedDirs, filepath.Clean(dirPath))
+			mu.Unlock()
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(dataDir)
+		if err != nil {
+			t.Fatalf("ResolveSecretKey failed: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("expected 64-char key, got: %q", key)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		parentOfDataDir := filepath.Clean(filepath.Dir(dataDir))
+		for _, d := range syncedDirs {
+			if d == parentOfDataDir {
+				t.Errorf("parent directory %s should NOT have been synced when dataDir already existed", d)
+			}
+		}
+	})
 }
