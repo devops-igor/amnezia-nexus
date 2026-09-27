@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"golang.org/x/sync/errgroup"
@@ -92,7 +93,9 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 	toDisableUIDs := make(map[string]bool)
 
 	// === 1. MONTHLY ROLLOVER: runs unconditionally every cycle ===
-	o.handleMonthlyRollover(ctx, now, usersMap)
+	if err := o.handleMonthlyRollover(ctx, now, usersMap); err != nil {
+		return err
+	}
 
 	// === 2. TRAFFIC DELTA PROCESSING ===
 	if len(updates) > 0 {
@@ -160,12 +163,16 @@ func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time
 		// Check user resettable strategy
 		if o.isTrafficResetNeeded(user, now) {
 			nowStr := now.Format(time.RFC3339)
-			_, _ = o.db.UpdateUser(ctx, user.ID, map[string]any{
-				"traffic_used":  0,
-				"last_reset_at": nowStr,
-			})
-			user.TrafficUsed = 0
-			user.LastResetAt = &nowStr
+			if _, err := o.db.ResetUserPeriodTraffic(ctx, user.ID, user.LastResetAt, string(user.TrafficResetStrategy), user.TrafficUsed, nowStr); err != nil {
+				slog.Error("Failed to reset user period traffic", "user_id", user.ID, "err", err)
+				continue
+			}
+			current, err := o.db.GetUser(ctx, user.ID)
+			if err != nil || current == nil {
+				slog.Error("Failed to refresh user after period reset", "user_id", user.ID, "err", err)
+				continue
+			}
+			*user = *current
 		}
 
 		totals, err := o.db.AddUserTraffic(ctx, user.ID, u.rxDelta, u.txDelta)
@@ -306,7 +313,7 @@ func parseTolerantTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse timestamp: %q", s)
 }
 
-func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time, usersMap map[string]*models.User) {
+func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time, usersMap map[string]*models.User) error {
 	// 1. Take previous month leaderboard snapshot if month changed
 	for _, u := range usersMap {
 		if u.MonthlyResetAt != nil && *u.MonthlyResetAt != "" {
@@ -345,23 +352,24 @@ func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time,
 		}
 
 		if shouldReset {
-			fields := map[string]any{
-				"monthly_rx":       0,
-				"monthly_tx":       0,
-				"monthly_reset_at": nowStr,
+			snapshot := database.UserTrafficTotals{
+				Used: u.TrafficUsed, MonthlyRx: u.MonthlyRx, MonthlyTx: u.MonthlyTx,
 			}
-			if u.TrafficResetStrategy == models.ResetStrategyMonthly {
-				fields["traffic_used"] = 0
-				fields["last_reset_at"] = nowStr
-				u.TrafficUsed = 0
-				u.LastResetAt = &nowStr
+			if _, err := o.db.ResetUserMonthlyTraffic(ctx, u.ID, u.MonthlyResetAt, snapshot, nowStr); err != nil {
+				return fmt.Errorf("failed to roll over monthly traffic for %s: %w", u.ID, err)
 			}
-			_, _ = o.db.UpdateUser(ctx, u.ID, fields)
-			u.MonthlyRx = 0
-			u.MonthlyTx = 0
-			u.MonthlyResetAt = &nowStr
+			current, err := o.db.GetUser(ctx, u.ID)
+			if err != nil {
+				return fmt.Errorf("failed to refresh user %s after monthly rollover: %w", u.ID, err)
+			}
+			if current == nil {
+				delete(usersMap, u.ID)
+				continue
+			}
+			*u = *current
 		}
 	}
+	return nil
 }
 
 func (o *Orchestrator) isTrafficResetNeeded(u *models.User, now time.Time) bool {

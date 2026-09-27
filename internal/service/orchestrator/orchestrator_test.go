@@ -458,7 +458,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PreservesPortalFlush(t *testing.T) 
 	}
 }
 
-func TestOrchestrator_ApplyConnectionUpdates_AfterMonthlyRollover(t *testing.T) {
+func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforeMonthlyRollover(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -470,7 +470,7 @@ func TestOrchestrator_ApplyConnectionUpdates_AfterMonthlyRollover(t *testing.T) 
 		t.Fatal(err)
 	}
 	userID, err := db.CreateUser(ctx, &models.User{
-		Username: "rollover-mixed-traffic", Enabled: true, TrafficUsed: 300, TrafficTotal: 300,
+		Username: "rollover-mixed-traffic", Enabled: true, TrafficLimit: 150, TrafficUsed: 300, TrafficTotal: 300,
 		TrafficTotalRx: 100, TrafficTotalTx: 200, MonthlyRx: 100, MonthlyTx: 200,
 		TrafficResetStrategy: models.ResetStrategyMonthly, MonthlyResetAt: &lastMonth, LastResetAt: &lastMonth,
 	})
@@ -495,25 +495,124 @@ func TestOrchestrator_ApplyConnectionUpdates_AfterMonthlyRollover(t *testing.T) 
 	}
 	orch := New(db, nil)
 	usersMap := map[string]*models.User{userID: snapshot}
-	orch.handleMonthlyRollover(ctx, now, usersMap)
 
+	// The portal commits after the orchestrator snapshot but before rollover.
 	accountant := forwarder.NewTrafficAccountant(db, time.Second)
 	accountant.RecordRx("", portalID, 25)
 	accountant.RecordTx("", portalID, 45)
 	if err := accountant.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := orch.handleMonthlyRollover(ctx, now, usersMap); err != nil {
+		t.Fatal(err)
+	}
+	// A second orchestrator holding the old marker must not subtract again.
+	resetAgain, err := db.ResetUserMonthlyTraffic(ctx, userID, &lastMonth, database.UserTrafficTotals{
+		Used: 300, MonthlyRx: 100, MonthlyTx: 200,
+	}, now.Format(time.RFC3339))
+	if err != nil || resetAgain {
+		t.Fatalf("stale monthly reset = %v, err = %v; want skipped", resetAgain, err)
+	}
+	toDisable := make(map[string]bool)
 	orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
 		connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
-	}}, usersMap, make(map[string]bool))
+	}}, usersMap, toDisable)
 
 	got, err := db.GetUser(ctx, userID)
 	if err != nil || got == nil {
 		t.Fatalf("GetUser after rollover: %v", err)
 	}
-	if got.TrafficUsed != 190 || got.TrafficTotal != 490 || got.MonthlyRx != 75 || got.MonthlyTx != 115 {
+	if got.TrafficUsed != 190 || got.TrafficTotal != 490 || got.TrafficTotalRx != 175 || got.TrafficTotalTx != 315 || got.MonthlyRx != 75 || got.MonthlyTx != 115 {
 		t.Errorf("incorrect rollover and current-month accounting: used=%d total=%d monthly=(%d,%d)",
 			got.TrafficUsed, got.TrafficTotal, got.MonthlyRx, got.MonthlyTx)
+	}
+	if !toDisable[userID] || snapshot.TrafficUsed != 190 {
+		t.Errorf("quota missed traffic across rollover: in-memory used=%d, disable=%v", snapshot.TrafficUsed, toDisable[userID])
+	}
+	overQuota, err := db.GetUsersOverQuota(ctx)
+	if err != nil || len(overQuota) != 1 || overQuota[0].ID != userID {
+		t.Errorf("database quota missed preserved portal traffic: %+v, err=%v", overQuota, err)
+	}
+}
+
+func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		strategy models.TrafficResetStrategy
+	}{
+		{name: "daily", strategy: models.ResetStrategyDaily},
+		{name: "weekly", strategy: "weekly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+			now := time.Now().UTC()
+			lastPeriod := now.AddDate(0, 0, -8).Format(time.RFC3339)
+			thisMonth := now.Format(time.RFC3339)
+			serverID, err := db.CreateServer(ctx, &models.Server{Name: "Period Server", Host: "10.0.0.3"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			userID, err := db.CreateUser(ctx, &models.User{
+				Username: "period-" + tc.name, Enabled: true, TrafficLimit: 150,
+				TrafficUsed: 300, TrafficTotal: 300, TrafficTotalRx: 100, TrafficTotalTx: 200,
+				MonthlyRx: 100, MonthlyTx: 200, MonthlyResetAt: &thisMonth,
+				TrafficResetStrategy: tc.strategy, LastResetAt: &lastPeriod,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			remoteID, err := db.CreateConnection(ctx, &models.UserConnection{
+				UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "remote", CreatedAt: now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			portalID, err := db.CreateConnection(ctx, &models.UserConnection{
+				UserID: userID, ServerID: serverID, Protocol: "awg", ClientID: "portal", CreatedAt: now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := db.GetUser(ctx, userID)
+			if err != nil || snapshot == nil {
+				t.Fatalf("GetUser: %v", err)
+			}
+			accountant := forwarder.NewTrafficAccountant(db, time.Second)
+			accountant.RecordRx("", portalID, 25)
+			accountant.RecordTx("", portalID, 45)
+			if err := accountant.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			orch := New(db, nil)
+			toDisable := make(map[string]bool)
+			orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
+				connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
+			}}, map[string]*models.User{userID: snapshot}, toDisable)
+
+			got, err := db.GetUser(ctx, userID)
+			if err != nil || got == nil {
+				t.Fatalf("GetUser after reset: %v", err)
+			}
+			if got.TrafficUsed != 190 || got.TrafficTotal != 490 ||
+				got.TrafficTotalRx != 175 || got.TrafficTotalTx != 315 ||
+				got.MonthlyRx != 175 || got.MonthlyTx != 315 || !toDisable[userID] {
+				t.Errorf("lost portal traffic across %s reset: %+v, disable=%v", tc.name, got, toDisable[userID])
+			}
+			if got.LastResetAt == nil || *got.LastResetAt != now.Format(time.RFC3339) {
+				t.Errorf("last_reset_at was not advanced: %v", got.LastResetAt)
+			}
+			resetAgain, err := db.ResetUserPeriodTraffic(ctx, userID, &lastPeriod, string(tc.strategy), 300, now.Format(time.RFC3339))
+			if err != nil || resetAgain {
+				t.Fatalf("stale %s reset = %v, err = %v; want skipped", tc.name, resetAgain, err)
+			}
+			after, err := db.GetUser(ctx, userID)
+			if err != nil || after == nil || after.TrafficUsed != 190 {
+				t.Errorf("duplicate reset changed usage: user=%+v, err=%v", after, err)
+			}
+		})
 	}
 }
 
