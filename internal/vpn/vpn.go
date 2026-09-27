@@ -3456,7 +3456,11 @@ func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
 	s.preCommitMigrationHookForTest = fn
 }
 
-// validateMigrationTarget checks that targetTunnelID exists and is active, returning its StateVersion.
+// validateMigrationTarget checks that targetTunnelID exists and is eligible for
+// migration — administratively enabled AND runtime-active (issue #90) —
+// returning its StateVersion. The eligibility preflight must run before any
+// migration mutation so a disabled target is rejected without touching the
+// forwarder route, SessionManager state, or the DB session row.
 func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if s.pool == nil {
 		return 0, nil
@@ -3465,8 +3469,9 @@ func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("target backend tunnel %d not found in pool: %w", targetTunnelID, err)
 	}
-	if !strings.EqualFold(targetTun.Status, "active") {
-		return 0, fmt.Errorf("target backend tunnel %d is not active (status=%s)", targetTunnelID, targetTun.Status)
+	if !targetTun.Enabled || !strings.EqualFold(targetTun.Status, models.TunnelStatusActive) {
+		return 0, fmt.Errorf("target backend tunnel %d is not eligible (enabled=%t status=%s)",
+			targetTunnelID, targetTun.Enabled, targetTun.Status)
 	}
 	return targetTun.StateVersion, nil
 }
@@ -3730,7 +3735,14 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	}
 	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
-		if backendErr == nil && backend.Status == "active" &&
+		// Reuse requires both administrative eligibility and runtime health
+		// (issue #90): after the enabled/status split, Enabled=false,
+		// Status=active is a valid state — a stranded live session on an
+		// admin-disabled backend must fall through to normal backend
+		// selection instead of reusing the disabled backend here.
+		if backendErr == nil &&
+			backend.Enabled &&
+			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
 			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
 			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {

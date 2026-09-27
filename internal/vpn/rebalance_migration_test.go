@@ -641,8 +641,8 @@ func TestVPNRebalanceTargetTunnelDisabledOrInactive(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected MigrateSession to fail for disabled target tunnel, got nil")
 	}
-	if !strings.Contains(err.Error(), "not active") {
-		t.Errorf("expected error to mention 'not active', got: %v", err)
+	if !strings.Contains(err.Error(), "not eligible") {
+		t.Errorf("expected error to mention 'not eligible', got: %v", err)
 	}
 
 	// Verify route remains on tun1
