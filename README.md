@@ -305,4 +305,5 @@ forwarder throughput headroom, not UDP, encryption, or end-to-end VPN bandwidth.
 
 ## Documentation & Specifications
 
+- [AWG Migration Preflight](AWG_PREFLIGHT.md): Read-only audit of durable portal identity and peer assignments before the upstream listener migration.
 - [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.

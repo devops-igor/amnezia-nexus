@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Read-only AWG migration preflight command with portal identity verification, peer/IP collision reporting, preserved quarantine exclusions, and deterministic peer definitions without database or client-config changes (#386).
+
 ## [2.0.0] - Zenith - 2026-09-27
 
 Major release splitting backend administrative state from runtime health. It contains an intentional, documented breaking change to the `/api/vpn/*` response semantics (see Changed).
