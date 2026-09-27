@@ -166,23 +166,17 @@ func ResolveSecretKey(dataDir string) (string, error) {
 	cleanDataDir := filepath.Clean(dataDir)
 	cleanKeyPath := filepath.Clean(filepath.Join(cleanDataDir, ".secret_key"))
 
-	// Check if data directory already exists before creating it
-	// #nosec G703
-	_, statErr := os.Stat(cleanDataDir)
-	dataDirExisted := statErr == nil
-
 	// Ensure directory exists
 	// #nosec G703
 	if err := os.MkdirAll(cleanDataDir, 0750); err != nil {
 		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
 	}
 
-	// If data directory was newly created, flush its parent directory entry to media.
-	if !dataDirExisted {
-		parentDir := filepath.Dir(cleanDataDir)
-		if err := syncDirFunc(parentDir); err != nil {
-			return "", fmt.Errorf("failed to sync parent directory %s of newly created data dir %s: %w", parentDir, cleanDataDir, err)
-		}
+	// Flush parent directory entry to media to guarantee durability of DATA_DIR
+	// across power loss or crashes before acquiring the process lock.
+	parentDir := filepath.Dir(cleanDataDir)
+	if err := syncDirFunc(parentDir); err != nil {
+		return "", fmt.Errorf("failed to sync parent directory %s: %w", parentDir, err)
 	}
 
 	// Acquire cross-process lock to prevent races between publishing the key file
