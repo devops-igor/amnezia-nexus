@@ -9,12 +9,10 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-// TestEnableBackendResetsHealthFailCount is the end-to-end regression for
-// issue #50: a backend auto-disabled by 3 consecutive probe failures, then
-// manually re-enabled via EnableBackend, must get the FULL failure-threshold
-// grace period again. Before the fix, the prober's in-memory failCounts stayed
-// >= threshold after the auto-disable, so the first jittery probe after
-// re-enable instantly re-disabled the backend.
+// TestEnableBackendResetsHealthFailCount verifies that an actual administrative
+// disable/enable cycle clears accumulated health failures without fabricating a
+// healthy status. Two failures first move the backend to degraded; after the
+// admin cycle it must receive the full three-failure grace period again.
 func TestEnableBackendResetsHealthFailCount(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -25,70 +23,145 @@ func TestEnableBackendResetsHealthFailCount(t *testing.T) {
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
-	// Hermetic onActiveHook: the production hook would attempt a real AWG
-	// device attach; the contract under test is the fail-count lifecycle.
 	vpnSvc.prober.SetOnActiveHook(func(ctx context.Context, t *models.BackendTunnel) error {
 		return nil
 	})
 
-	probeShouldFail := true
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		if probeShouldFail {
-			return 0, errors.New("simulated handshake timeout")
-		}
-		return 20 * time.Millisecond, nil
+		return 0, errors.New("simulated handshake timeout")
 	})
 
-	// Disable the backend via the real health path: 3 consecutive failures.
 	tun := tunMust(t, vpnSvc, s1ID)
-	for i := 0; i < 3; i++ {
+
+	// Accumulate two failures (< threshold 3), leaving runtime health degraded.
+	for i := 0; i < 2; i++ {
 		if _, err := vpnSvc.prober.ProbeTunnel(ctx, tun); err == nil {
 			t.Fatalf("failure %d: expected probe error", i+1)
 		}
 	}
 	got, _ := vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status != "disabled" {
-		t.Fatalf("expected backend disabled after 3 failing probes, got %q", got.Status)
+	if got.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected degraded after two failures, got %q", got.Status)
 	}
 
-	// Admin recovers: probe path now healthy, manual re-enable.
-	probeShouldFail = false
+	if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
+		t.Fatalf("DisableBackend failed: %v", err)
+	}
+	disabled, _ := vpnSvc.pool.GetTunnel(s1ID)
+	if disabled.Enabled {
+		t.Fatal("expected backend administratively disabled")
+	}
+	if disabled.Status != models.TunnelStatusDegraded {
+		t.Fatalf("admin disable changed runtime health: got %q", disabled.Status)
+	}
+
 	if err := vpnSvc.EnableBackend(ctx, s1ID); err != nil {
 		t.Fatalf("EnableBackend failed: %v", err)
 	}
 	got, _ = vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status != "active" {
-		t.Fatalf("expected backend active after EnableBackend, got %q", got.Status)
+	if !got.Enabled {
+		t.Fatal("expected backend administratively enabled")
+	}
+	if got.Status != models.TunnelStatusDegraded {
+		t.Fatalf("admin enable changed runtime health: got %q, want degraded", got.Status)
 	}
 
-	// First probe after re-enable must NOT re-disable (grace restored).
-	probeShouldFail = true
+	// Failure 1 after re-enable must not instantly disable the backend.
 	if _, err := vpnSvc.prober.ProbeTunnel(ctx, tun); err == nil {
 		t.Fatal("expected probe error after re-enable")
 	}
 	got, _ = vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status == "disabled" {
-		t.Fatal("first probe after EnableBackend re-disabled the backend: fail count was not reset (issue #50)")
-	}
-	if got.Status != "degraded" {
-		t.Fatalf("expected degraded after 1 post-re-enable failure, got %q", got.Status)
+	if got.Status == models.TunnelStatusDisabled {
+		t.Fatal("first probe after EnableBackend re-disabled the backend: fail count was not reset")
 	}
 
-	// One more failure (2 total < threshold 3) must still not disable.
+	// Failure 2 still remains below threshold.
 	if _, err := vpnSvc.prober.ProbeTunnel(ctx, tun); err == nil {
 		t.Fatal("expected second probe error after re-enable")
 	}
 	got, _ = vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status == "disabled" {
+	if got.Status == models.TunnelStatusDisabled {
 		t.Fatal("backend re-disabled before reaching FailureThreshold after EnableBackend")
 	}
 
-	// A third consecutive failure must disable again (threshold honored).
+	// Failure 3 reaches threshold.
 	if _, err := vpnSvc.prober.ProbeTunnel(ctx, tun); err == nil {
 		t.Fatal("expected third probe error after re-enable")
 	}
 	got, _ = vpnSvc.pool.GetTunnel(s1ID)
-	if got.Status != "disabled" {
-		t.Fatalf("expected disabled after 3 consecutive post-re-enable failures, got %q", got.Status)
+	if got.Status != models.TunnelStatusDisabled || got.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected health-disabled after three failures, got status=%q reason=%q", got.Status, got.DisableReason)
+	}
+}
+
+func TestEnableBackend_ReenablesAdminDisabledHealthState(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 0, errors.New("simulated handshake timeout")
+	})
+
+	tun := tunMust(t, vpnSvc, s1ID)
+	for i := 0; i < 3; i++ {
+		_, _ = vpnSvc.prober.ProbeTunnel(ctx, tun)
+	}
+
+	healthDisabled, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel after health disable failed: %v", err)
+	}
+	if !healthDisabled.Enabled || healthDisabled.Status != models.TunnelStatusDisabled || healthDisabled.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected enabled health-disabled backend, got enabled=%v status=%q reason=%q",
+			healthDisabled.Enabled, healthDisabled.Status, healthDisabled.DisableReason)
+	}
+
+	if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
+		t.Fatalf("DisableBackend failed: %v", err)
+	}
+	adminDisabled, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel after admin disable failed: %v", err)
+	}
+	if adminDisabled.Enabled || adminDisabled.Status != models.TunnelStatusDisabled || adminDisabled.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("admin disable must preserve health provenance, got enabled=%v status=%q reason=%q",
+			adminDisabled.Enabled, adminDisabled.Status, adminDisabled.DisableReason)
+	}
+
+	// Manual re-enable changes only administrative eligibility. Runtime health
+	// remains disabled/health until the dedicated self-healing path succeeds.
+	if err := vpnSvc.EnableBackend(ctx, s1ID); err != nil {
+		t.Fatalf("EnableBackend must allow an already admin-disabled health state: %v", err)
+	}
+	reenabled, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel after re-enable failed: %v", err)
+	}
+	if !reenabled.Enabled || reenabled.Status != models.TunnelStatusDisabled || reenabled.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("manual enable fabricated health or lost provenance: enabled=%v status=%q reason=%q",
+			reenabled.Enabled, reenabled.Status, reenabled.DisableReason)
+	}
+
+	vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	if got := vpnSvc.SelfHealSweep(ctx); got != 0 {
+		t.Fatalf("first self-heal sweep must respect flap damping, got %d recoveries", got)
+	}
+	if got := vpnSvc.SelfHealSweep(ctx); got != 1 {
+		t.Fatalf("second self-heal sweep should recover backend, got %d recoveries", got)
+	}
+	recovered, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel after self-heal failed: %v", err)
+	}
+	if !recovered.Enabled || recovered.Status != models.TunnelStatusActive || recovered.DisableReason != models.DisableReasonNone {
+		t.Fatalf("unexpected recovered state: enabled=%v status=%q reason=%q",
+			recovered.Enabled, recovered.Status, recovered.DisableReason)
 	}
 }

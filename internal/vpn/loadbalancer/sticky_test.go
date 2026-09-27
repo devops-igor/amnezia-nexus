@@ -34,8 +34,8 @@ func TestStickySessionManager(t *testing.T) {
 	sticky := NewStickySessionManager(db, base, caps)
 
 	tunnels := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 10},
-		{ID: 2, Status: "active", ActiveConnections: 5},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 10},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 5},
 	}
 
 	// 1. Nil request check
@@ -123,7 +123,7 @@ func TestStickySessionManager(t *testing.T) {
 	sticky.AssignPeerAffinity("peer-failover-1", t1ID)
 
 	healthyPool := []*models.BackendTunnel{
-		{ID: t2ID, Status: "active", ActiveConnections: 0},
+		{ID: t2ID, Enabled: true, Status: "active", ActiveConnections: 0},
 	}
 
 	failover, err := sticky.HandleFailover(ctx, t1ID, healthyPool)
@@ -191,8 +191,8 @@ func TestStickySessionManager_AffinityTTL_Expires(t *testing.T) {
 	sm.SetNowFunc(func() time.Time { return currTime })
 
 	tunnels := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 10},
-		{ID: 2, Status: "active", ActiveConnections: 2},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 10},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 2},
 	}
 
 	req := &RoutingRequest{
@@ -264,8 +264,8 @@ func TestStickySessionManager_AffinityTTL_RefreshedByActiveUse(t *testing.T) {
 	sm.SetNowFunc(func() time.Time { return currTime })
 
 	tunnels := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 20},
-		{ID: 2, Status: "active", ActiveConnections: 5},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 20},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 5},
 	}
 
 	req := &RoutingRequest{
@@ -374,7 +374,7 @@ func TestStickySessionManager_Failover_ExpiredAffinityNotRevived(t *testing.T) {
 	sm.SetNowFunc(func() time.Time { return currTime })
 
 	// Tunnel 1 and Tunnel 2
-	t2 := &models.BackendTunnel{ID: 2, Status: "active", ActiveConnections: 0}
+	t2 := &models.BackendTunnel{ID: 2, Enabled: true, Status: "active", ActiveConnections: 0}
 
 	// Assign user-1 and peer-1 to tunnel 1 at t0
 	sm.AssignAffinity("user-1", 1)

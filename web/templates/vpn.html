@@ -448,7 +448,8 @@
     function vpnRenderBackendRow(b) {
         const tr = document.createElement('tr');
         const srvId = b.server_id || b.id || '';
-        tr.setAttribute('data-status', b.status || '');
+        const displayStatus = b.enabled === false ? 'disabled' : (b.status || '');
+        tr.setAttribute('data-status', displayStatus);
 
         const tdServer = document.createElement('td');
         const srvMatch = vpnCachedServers.find(function (s) { return String(s.id) === String(srvId); });
@@ -473,12 +474,15 @@
 
         const tdStatus = document.createElement('td');
         const badge = document.createElement('span');
-        badge.className = 'badge ' + vpnStatusBadgeClass(b.status);
-        badge.setAttribute('data-status', b.status || '');
+        badge.className = 'badge ' + vpnStatusBadgeClass(displayStatus);
+        badge.setAttribute('data-status', displayStatus);
         const dot = document.createElement('span');
         dot.className = 'badge-dot';
         badge.appendChild(dot);
-        badge.appendChild(document.createTextNode(' ' + vpnStatusLabel(b.status)));
+        badge.appendChild(document.createTextNode(' ' + vpnStatusLabel(displayStatus)));
+        if (b.enabled === false && b.status) {
+            badge.title = vpnStatusLabel(b.status);
+        }
         tdStatus.appendChild(badge);
         tr.appendChild(tdStatus);
 
@@ -523,7 +527,7 @@
         actionsDiv.style.gap = 'var(--space-xs)';
 
         // Toggle Enable/Disable
-        const disabledBackend = b.status === 'disabled';
+        const disabledBackend = b.enabled === false;
         const toggleBtn = document.createElement('button');
         toggleBtn.type = 'button';
         toggleBtn.className = 'btn btn-ghost btn-sm btn-icon' + (disabledBackend ? ' btn-success-hover' : '');

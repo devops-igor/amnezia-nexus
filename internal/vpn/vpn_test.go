@@ -67,9 +67,9 @@ func TestServiceAndBalancerSelection(t *testing.T) {
 
 	// Active tunnels selection
 	tunnels = append(tunnels,
-		&BackendTunnel{ID: 3, InterfaceName: "awg-be-3", Status: TunnelStatusActive, ActiveConnections: 5},
-		&BackendTunnel{ID: 4, InterfaceName: "awg-be-4", Status: TunnelStatusActive, ActiveConnections: 2},
-		&BackendTunnel{ID: 5, InterfaceName: "awg-be-5", Status: TunnelStatusActive, ActiveConnections: 8},
+		&BackendTunnel{ID: 3, InterfaceName: "awg-be-3", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 5},
+		&BackendTunnel{ID: 4, InterfaceName: "awg-be-4", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 2},
+		&BackendTunnel{ID: 5, InterfaceName: "awg-be-5", Enabled: true, Status: TunnelStatusActive, ActiveConnections: 8},
 	)
 
 	best, err := lb.SelectBackend(ctx, &loadbalancer.RoutingRequest{AvailableTunnels: tunnels})
@@ -264,8 +264,11 @@ func TestVPNServicePeerConnections(t *testing.T) {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
 	t1Status, _ := vpnSvc.pool.GetTunnel(s1ID)
-	if t1Status.Status != "disabled" {
-		t.Errorf("expected status disabled, got %s", t1Status.Status)
+	if t1Status.Enabled {
+		t.Error("expected backend to be administratively disabled")
+	}
+	if t1Status.Status != "active" {
+		t.Errorf("administrative disable changed runtime health: got %s, want active", t1Status.Status)
 	}
 
 	if err := vpnSvc.EnableBackend(ctx, s1ID); err != nil {
@@ -2814,8 +2817,8 @@ func TestUpdateBackendServerHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTunnel after disable failed: %v", err)
 	}
-	if disabledTun.Status != TunnelStatusDisabled || disabledTun.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("expected admin-disabled tunnel, got status=%s reason=%s", disabledTun.Status, disabledTun.DisableReason)
+	if disabledTun.Enabled || disabledTun.Status != TunnelStatusActive || disabledTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected enabled=false with preserved active health, got enabled=%v status=%s reason=%s", disabledTun.Enabled, disabledTun.Status, disabledTun.DisableReason)
 	}
 
 	if err := svc.UpdateBackendServerHost(ctx, sID, "198.51.100.3"); err != nil {
@@ -2828,14 +2831,17 @@ func TestUpdateBackendServerHost(t *testing.T) {
 	if disabledTunUpdated.Endpoint != "198.51.100.3:51820" {
 		t.Errorf("expected disabled tunnel endpoint '198.51.100.3:51820', got %q", disabledTunUpdated.Endpoint)
 	}
-	if disabledTunUpdated.Status != TunnelStatusDisabled || disabledTunUpdated.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected tunnel to remain admin-disabled, got status=%s reason=%s", disabledTunUpdated.Status, disabledTunUpdated.DisableReason)
+	if disabledTunUpdated.Enabled || disabledTunUpdated.Status != TunnelStatusActive || disabledTunUpdated.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected tunnel to remain admin-disabled with preserved health, got enabled=%v status=%s reason=%s", disabledTunUpdated.Enabled, disabledTunUpdated.Status, disabledTunUpdated.DisableReason)
 	}
 	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
 		t.Errorf("expected no device attached for admin-disabled tunnel, got %+v", dev)
 	}
 
-	// 6. Assert restarting Service restores devices with new_host:port
+	// 6. Re-enable administrative intent, then assert restart restores the device.
+	if err := svc.pool.SetTunnelEnabled(ctx, sID, true, models.DisableReasonNone); err != nil {
+		t.Fatalf("SetTunnelEnabled failed: %v", err)
+	}
 	if err := svc.pool.SetTunnelStatusWithReason(ctx, sID, TunnelStatusActive, models.DisableReasonNone, 10); err != nil {
 		t.Fatalf("SetTunnelStatusWithReason failed: %v", err)
 	}
@@ -2927,14 +2933,14 @@ func TestUpdateBackendServerHost_RaceWithDisableBackend(t *testing.T) {
 		t.Fatal("expected pre-lock hook to be called")
 	}
 
-	// Assert tunnel remains TunnelStatusDisabled with DisableReasonAdmin
+	// Assert administrative disable won while runtime health stayed active.
 	tunAfter, err := svc.pool.GetTunnel(sID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if tunAfter.Status != TunnelStatusDisabled || tunAfter.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected TunnelStatusDisabled with DisableReasonAdmin, got status=%q reason=%q",
-			tunAfter.Status, tunAfter.DisableReason)
+	if tunAfter.Enabled || tunAfter.Status != TunnelStatusActive || tunAfter.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected enabled=false with active health and admin reason, got enabled=%v status=%q reason=%q",
+			tunAfter.Enabled, tunAfter.Status, tunAfter.DisableReason)
 	}
 
 	// Assert forwarder device is detached / not reattached
@@ -3155,7 +3161,7 @@ func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testi
 	}
 }
 
-func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
+func TestStart_AdminDisabledBackendStaysDetachedWhileEnabledBackendReprobes(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -3209,14 +3215,17 @@ func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	}
 	tun1.ID = tun1ID
 
-	// Create disabled tunnel for server 2
+	// Create administratively disabled tunnel for server 2. Its runtime
+	// health snapshot is intentionally active and must remain untouched.
 	tun2 := &models.BackendTunnel{
 		ServerID:      s2ID,
 		InterfaceName: fmt.Sprintf("awg-be-%d", s2ID),
 		PublicKey:     pub2,
 		PrivateKey:    priv2,
 		Endpoint:      "198.51.100.52:51820",
-		Status:        TunnelStatusDisabled,
+		Enabled:       false,
+		Status:        TunnelStatusActive,
+		DisableReason: models.DisableReasonAdmin,
 		CreatedAt:     now,
 	}
 	tun2ID, err := db.CreateBackendTunnel(ctx, tun2)
@@ -3239,25 +3248,27 @@ func TestStart_RestoresBackendDevicesForActiveTunnels(t *testing.T) {
 	}
 	defer func() { _ = svc.Stop() }()
 
-	// Active tunnel 1 should have its backend device restored
+	// Enabled tunnel 1 is reset to unknown health and then probed. Wait for
+	// the successful startup probe to attach its device.
+	deadline := time.Now().Add(2 * time.Second)
+	for svc.GetBackendDeviceForTest(tun1ID) == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	dev1 := svc.GetBackendDeviceForTest(tun1ID)
 	if dev1 == nil {
-		t.Errorf("expected backend device for active tunnel %d to be restored on Start, got nil", tun1ID)
+		t.Fatalf("enabled backend %d was not attached after fresh startup probe", tun1ID)
 	}
 
-	// Disabled tunnel 2 should NOT have a backend device attached
-	dev2 := svc.GetBackendDeviceForTest(tun2ID)
-	if dev2 != nil {
-		t.Errorf("expected no backend device for disabled tunnel %d on Start, got %+v", tun2ID, dev2)
+	// Administratively disabled tunnel 2 is never probed or attached.
+	if dev2 := svc.GetBackendDeviceForTest(tun2ID); dev2 != nil {
+		t.Errorf("expected no backend device for admin-disabled tunnel %d on Start, got %+v", tun2ID, dev2)
 	}
-
-	// Active tunnel status remains active
-	restoredTun1, err := svc.pool.GetTunnel(s1ID)
+	disabledTun, err := svc.pool.GetTunnel(s2ID)
 	if err != nil {
-		t.Fatalf("GetTunnel 1 failed: %v", err)
+		t.Fatalf("GetTunnel 2 failed: %v", err)
 	}
-	if restoredTun1.Status != TunnelStatusActive {
-		t.Errorf("expected tunnel 1 status 'active', got %s", restoredTun1.Status)
+	if disabledTun.Enabled || disabledTun.Status != TunnelStatusActive || disabledTun.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("startup changed admin-disabled backend dimensions: %+v", disabledTun)
 	}
 }
 
@@ -3297,13 +3308,23 @@ func TestStart_RestoresBackendDevices_DegradesOnAttachFailure(t *testing.T) {
 		t.Errorf("expected nil device when restore fails, got %+v", dev)
 	}
 
-	// Tunnel status should be marked degraded so it does not report active without a data plane
-	tStatus, err := svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
+	// The initial startup probe succeeds, but data-plane attachment fails,
+	// so health must eventually become degraded rather than trusting the
+	// persisted active snapshot.
+	deadline := time.Now().Add(2 * time.Second)
+	var tStatus *models.BackendTunnel
+	for time.Now().Before(deadline) {
+		tStatus, err = svc.pool.GetTunnel(sID)
+		if err != nil {
+			t.Fatalf("GetTunnel failed: %v", err)
+		}
+		if tStatus.Status == TunnelStatusDegraded {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if tStatus.Status != TunnelStatusDegraded {
-		t.Errorf("expected tunnel status 'degraded' after attach failure, got %s", tStatus.Status)
+	if tStatus == nil || tStatus.Status != TunnelStatusDegraded {
+		t.Fatalf("expected tunnel status degraded after attach failure, got %+v", tStatus)
 	}
 }
 
@@ -3370,7 +3391,7 @@ func TestService_GetStatus_ExposesDroppedPackets(t *testing.T) {
 	}
 }
 
-func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
+func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -3391,82 +3412,100 @@ func TestStart_RestoresBackendDevicesForDegradedTunnels(t *testing.T) {
 		t.Fatalf("CreateServer failed: %v", err)
 	}
 
-	// Create DEGRADED tunnel
+	// Persist stale degraded health. Service.Start must not trust it.
 	now := time.Now().UTC()
 	tun := &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: fmt.Sprintf("awg-be-%d", sID),
-		PublicKey:     pub,
-		PrivateKey:    priv,
-		Endpoint:      "198.51.100.77:51820",
-		Status:        TunnelStatusDegraded,
-		CreatedAt:     now,
+		ServerID:        sID,
+		InterfaceName:   fmt.Sprintf("awg-be-%d", sID),
+		PublicKey:       pub,
+		PrivateKey:      priv,
+		Endpoint:        "198.51.100.77:51820",
+		Status:          TunnelStatusDegraded,
+		LastHealthCheck: &now,
+		LatencyMS:       444,
+		CreatedAt:       now,
 	}
 	tunID, err := db.CreateBackendTunnel(ctx, tun)
 	if err != nil {
 		t.Fatalf("CreateBackendTunnel failed: %v", err)
 	}
-	tun.ID = tunID
 
 	svc, err := NewVPNService(db, nil)
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	var probeShouldSucceed atomic.Bool
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var once sync.Once
 	svc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		if !probeShouldSucceed.Load() {
-			return 0, errors.New("probe temporarily disabled during startup")
+		once.Do(func() { close(probeStarted) })
+		select {
+		case <-releaseProbe:
+			return 10 * time.Millisecond, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
 		}
-		return 10 * time.Millisecond, nil
 	})
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer func() { _ = svc.Stop() }()
 
-	// Degraded tunnel should have its backend device restored
-	dev := svc.GetBackendDeviceForTest(tunID)
-	if dev == nil {
-		t.Fatalf("expected backend device for degraded tunnel %d to be restored on Start, got nil", tunID)
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- svc.Start(ctx)
+	}()
+	defer func() {
+		select {
+		case <-releaseProbe:
+		default:
+			close(releaseProbe)
+		}
+		_ = svc.Stop()
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup health probe did not begin")
 	}
-	if dev.IsClosed() {
-		t.Error("expected restored device to be open")
+	select {
+	case err := <-startDone:
+		t.Fatalf("Start returned before fresh health was established: %v", err)
+	default:
 	}
 
-	// Tunnel status should remain degraded before probe
-	restoredTun, err := svc.pool.GetTunnel(sID)
+	// While the fresh probe is unresolved, stale health must not be routable
+	// and no backend device may be restored from the persisted snapshot.
+	startingTun, err := svc.pool.GetTunnel(sID)
 	if err != nil {
 		t.Fatalf("GetTunnel failed: %v", err)
 	}
-	if restoredTun.Status != TunnelStatusDegraded {
-		t.Errorf("expected tunnel status to remain 'degraded' before probe, got %s", restoredTun.Status)
+	if !startingTun.Enabled || startingTun.Status != TunnelStatusConnecting {
+		t.Fatalf("expected enabled backend with unknown startup health, got %+v", startingTun)
+	}
+	if startingTun.LastHealthCheck != nil || startingTun.LatencyMS != 0 {
+		t.Fatalf("stale health metadata survived startup reset: %+v", startingTun)
+	}
+	if dev := svc.GetBackendDeviceForTest(tunID); dev != nil {
+		t.Fatalf("stale backend device restored before fresh probe: %v", dev)
 	}
 
-	// Stop background prober to avoid race with manual ProbeTunnel
-	if svc.prober != nil {
-		svc.prober.Stop()
+	close(releaseProbe)
+
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatalf("Start failed after fresh probe: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not complete after fresh probe")
 	}
 
-	// Probe the tunnel - now succeeds and transitions to active
-	probeShouldSucceed.Store(true)
-	restoredTun, err = svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
+	probedTun, getErr := svc.pool.GetTunnel(sID)
+	if getErr != nil {
+		t.Fatalf("GetTunnel after startup probe failed: %v", getErr)
 	}
-	rtt, err := svc.ProbeTunnel(ctx, restoredTun)
-	if err != nil {
-		t.Fatalf("ProbeTunnel failed: %v", err)
-	}
-	if rtt <= 0 {
-		t.Errorf("expected positive rtt, got %d", rtt)
-	}
-
-	probedTun, err := svc.pool.GetTunnel(sID)
-	if err != nil {
-		t.Fatalf("GetTunnel failed: %v", err)
-	}
-	if probedTun.Status != TunnelStatusActive {
-		t.Errorf("expected tunnel status to become 'active' after probe, got %s", probedTun.Status)
+	if probedTun.Status != TunnelStatusActive || svc.GetBackendDeviceForTest(tunID) == nil {
+		t.Fatalf("fresh startup probe did not activate backend and attach device: tunnel=%+v device=%v",
+			probedTun, svc.GetBackendDeviceForTest(tunID))
 	}
 }
 

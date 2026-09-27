@@ -29,9 +29,9 @@ func TestLeastConnectionsBalancer(t *testing.T) {
 
 	// 2. Selection of lowest active connections
 	tunnels := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 15, LatencyMS: 50},
-		{ID: 2, Status: "active", ActiveConnections: 5, LatencyMS: 60},
-		{ID: 3, Status: "active", ActiveConnections: 20, LatencyMS: 10},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 15, LatencyMS: 50},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 5, LatencyMS: 60},
+		{ID: 3, Enabled: true, Status: "active", ActiveConnections: 20, LatencyMS: 10},
 	}
 	lb.UpdateBackends(tunnels)
 
@@ -43,9 +43,9 @@ func TestLeastConnectionsBalancer(t *testing.T) {
 
 	// 3. Tie-breaker 1: Latency
 	tunnelsTie := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 10, LatencyMS: 80},
-		{ID: 2, Status: "active", ActiveConnections: 10, LatencyMS: 20}, // Lowest latency
-		{ID: 3, Status: "active", ActiveConnections: 10, LatencyMS: 50},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 10, LatencyMS: 80},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 10, LatencyMS: 20}, // Lowest latency
+		{ID: 3, Enabled: true, Status: "active", ActiveConnections: 10, LatencyMS: 50},
 	}
 	bestTie, err := lb.SelectBackend(ctx, &RoutingRequest{AvailableTunnels: tunnelsTie})
 	if err != nil || bestTie.ID != 2 {
@@ -54,8 +54,8 @@ func TestLeastConnectionsBalancer(t *testing.T) {
 
 	// 4. Tie-breaker 2: ID
 	tunnelsIDTie := []*models.BackendTunnel{
-		{ID: 2, Status: "active", ActiveConnections: 10, LatencyMS: 20},
-		{ID: 1, Status: "active", ActiveConnections: 10, LatencyMS: 20}, // Lowest ID
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 10, LatencyMS: 20},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 10, LatencyMS: 20}, // Lowest ID
 	}
 	bestIDTie, err := lb.SelectBackend(ctx, &RoutingRequest{AvailableTunnels: tunnelsIDTie})
 	if err != nil || bestIDTie.ID != 1 {
@@ -66,8 +66,8 @@ func TestLeastConnectionsBalancer(t *testing.T) {
 	tightCaps := CapacityConfig{MaxTotalPeers: 15}
 	lbTight := NewLeastConnectionsBalancer(tightCaps)
 	tunnelsOver := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 10},
-		{ID: 2, Status: "active", ActiveConnections: 6},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 10},
+		{ID: 2, Enabled: true, Status: "active", ActiveConnections: 6},
 	} // Total = 16 >= 15
 	if _, err := lbTight.SelectBackend(ctx, &RoutingRequest{AvailableTunnels: tunnelsOver}); err != ErrCapacityExceeded {
 		t.Errorf("expected ErrCapacityExceeded, got %v", err)

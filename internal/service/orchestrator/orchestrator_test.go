@@ -1097,13 +1097,16 @@ func TestOrchestrator_VPNTasks_HealthAndRebalance(t *testing.T) {
 		Status:        "active",
 	})
 
-	// Add disabled tunnel
+	// Add administratively disabled tunnel. Runtime health remains a
+	// separate dimension and must not make this backend rebalance-eligible.
 	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 		ServerID:      srv3ID,
 		InterfaceName: "awg2",
 		PublicKey:     "pub3",
 		Endpoint:      "127.0.0.1:55422",
-		Status:        "disabled",
+		Enabled:       false,
+		Status:        "active",
+		DisableReason: models.DisableReasonAdmin,
 	})
 
 	// Add 10 sessions on tunnel 1, 2 sessions on tunnel 2.
@@ -1251,7 +1254,8 @@ func TestOrchestrator_CheckBackendTunnelHealth_SkipsAdminDisabled(t *testing.T) 
 		InterfaceName: "awg-admin-skip",
 		PublicKey:     "pub-admin-skip",
 		Endpoint:      "127.0.0.1:55499",
-		Status:        "disabled",
+		Enabled:       false,
+		Status:        "active",
 		DisableReason: models.DisableReasonAdmin,
 	})
 	if err != nil {
@@ -1276,8 +1280,52 @@ func TestOrchestrator_CheckBackendTunnelHealth_SkipsAdminDisabled(t *testing.T) 
 	if err != nil || tun == nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if tun.Status != "disabled" || tun.DisableReason != models.DisableReasonAdmin {
-		t.Errorf("expected tunnel to remain disabled/admin, got status=%q reason=%q", tun.Status, tun.DisableReason)
+	if tun.Enabled || tun.Status != "active" || tun.DisableReason != models.DisableReasonAdmin {
+		t.Errorf("expected admin-disabled tunnel with preserved active health, got enabled=%v status=%q reason=%q", tun.Enabled, tun.Status, tun.DisableReason)
+	}
+}
+
+func TestOrchestrator_CheckBackendTunnelHealth_SkipsHealthDisabledForSelfHealing(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	srvID, err := db.CreateServer(ctx, &models.Server{Name: "health-disabled", Host: "192.0.2.44"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      srvID,
+		InterfaceName: "awg-health-disabled",
+		PublicKey:     "health-disabled-pub",
+		PrivateKey:    "health-disabled-priv",
+		Endpoint:      "192.0.2.44:51820",
+		Enabled:       true,
+		Status:        models.TunnelStatusDisabled,
+		DisableReason: models.DisableReasonHealth,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	probeCalls := 0
+	orch := New(db, nil, WithProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		probeCalls++
+		return 10 * time.Millisecond, nil
+	}))
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("ordinary orchestrator probe bypassed self-healing for runtime-disabled backend: calls=%d", probeCalls)
+	}
+
+	tun, err := db.GetBackendTunnel(ctx, tunID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if tun == nil || !tun.Enabled || tun.Status != models.TunnelStatusDisabled || tun.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("orchestrator changed health-disabled state: %+v", tun)
 	}
 }
 

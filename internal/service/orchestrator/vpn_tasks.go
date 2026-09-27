@@ -47,7 +47,11 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "disabled") || t.DisableReason == models.DisableReasonAdmin {
+		if !t.Enabled || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+			// Administratively disabled backends are ineligible altogether.
+			// Runtime-disabled backends belong to the VPN health prober's
+			// dedicated self-healing path, which applies flap damping and
+			// restores the data plane before making the backend routable.
 			continue
 		}
 
@@ -199,7 +203,7 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 					slog.Warn("Failed to recheck migration target", "tunnel_id", candidate.ID, "err", err)
 					continue
 				}
-				if current != nil && strings.EqualFold(current.Status, "active") && current.DisableReason != models.DisableReasonAdmin {
+				if current != nil && current.Enabled && strings.EqualFold(current.Status, "active") {
 					target = current
 					hIdx = (idx + 1) % len(healthyTunnels)
 					break
@@ -424,7 +428,7 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 
 	var activeTunnels []models.BackendTunnel
 	for _, t := range tunnels {
-		if strings.EqualFold(t.Status, "active") {
+		if t.Enabled && strings.EqualFold(t.Status, "active") {
 			activeTunnels = append(activeTunnels, t)
 		}
 	}

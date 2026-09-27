@@ -102,11 +102,9 @@ var (
 		"private_key":        true,
 		"probe_private_key":  true,
 		"endpoint":           true,
-		"status":             true,
-		"disable_reason":     true,
-		"state_version":      true,
-		"last_health_check":  true,
-		"latency_ms":         true,
+		// Administrative intent, runtime health, and state-version fencing
+		// have dedicated writers (issue #90). Keep those fields out of this
+		// generic update path so subsystem ownership cannot be bypassed.
 		"active_connections": true,
 		"created_at":         true,
 	}
@@ -235,6 +233,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 		return err
 	}
 	if err := d.migrateBackendTunnelsDisableReason(ctx); err != nil {
+		return err
+	}
+	if err := d.migrateBackendTunnelsEnabled(ctx); err != nil {
 		return err
 	}
 	if err := d.migrateAWGIPAllocations(ctx); err != nil {
@@ -444,6 +445,79 @@ func (d *DB) migrateBackendTunnelsDisableReason(ctx context.Context) error {
 		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1"); err != nil {
 			return fmt.Errorf("failed to add state_version column: %w", err)
 		}
+	}
+	return nil
+}
+
+// migrateBackendTunnelsEnabled separates administrative intent from runtime
+// health (issue #90). Legacy rows disabled by an administrator map to
+// enabled=false; health-disabled rows remain enabled so self-healing can
+// continue to own their runtime status.
+func (d *DB) migrateBackendTunnelsEnabled(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels schema: %w", err)
+	}
+
+	hasEnabled := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if strings.EqualFold(name, "enabled") {
+			hasEnabled = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	// The presence of the column is the migration marker. Once it exists,
+	// enabled is authoritative modern state and must never be re-inferred from
+	// runtime health on later opens.
+	if hasEnabled {
+		return nil
+	}
+
+	// Add the marker column and translate legacy rows in one SQLite
+	// transaction. SQLite DDL is transactional, so a crash cannot leave the
+	// column present without the accompanying legacy-state translation.
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin backend enabled migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return fmt.Errorf("failed to add backend_tunnels enabled column: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE backend_tunnels
+		 SET enabled = 0,
+		     disable_reason = CASE
+		         WHEN status = ? AND (disable_reason = '' OR disable_reason IS NULL) THEN ?
+		         ELSE disable_reason
+		     END
+		 WHERE disable_reason = ?
+		    OR (status = ? AND (disable_reason = '' OR disable_reason IS NULL))`,
+		models.TunnelStatusDisabled,
+		models.DisableReasonAdmin,
+		models.DisableReasonAdmin,
+		models.TunnelStatusDisabled,
+	); err != nil {
+		return fmt.Errorf("failed to migrate administrative backend state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit backend enabled migration: %w", err)
 	}
 	return nil
 }

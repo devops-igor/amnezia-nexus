@@ -288,7 +288,8 @@ type BackendTunnel struct {
 	// roam the peer's return endpoint to whichever socket sent last (issue #43).
 	ProbePrivateKey   string     `json:"-" db:"probe_private_key"` // Encrypted at rest
 	Endpoint          string     `json:"endpoint" db:"endpoint"`
-	Status            string     `json:"status" db:"status"` // connecting, active, degraded, disabled
+	Enabled           bool       `json:"enabled" db:"enabled"` // administrative intent; independent from runtime health
+	Status            string     `json:"status" db:"status"`   // runtime health: connecting, active, degraded, disabled
 	DisableReason     string     `json:"disable_reason,omitempty" db:"disable_reason"`
 	StateVersion      int64      `json:"state_version" db:"state_version"`
 	LastHealthCheck   *time.Time `json:"last_health_check,omitempty" db:"last_health_check"`

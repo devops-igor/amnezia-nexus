@@ -914,7 +914,7 @@ func (s *Service) backendTunnelReady(t *models.BackendTunnel) error {
 	if current == nil || current.ID != t.ID {
 		return tunnel.ErrTunnelNotFound
 	}
-	if current.Status == models.TunnelStatusDisabled || current.DisableReason == models.DisableReasonAdmin {
+	if !current.Enabled {
 		return ErrTunnelDisabled
 	}
 	if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
@@ -1006,7 +1006,7 @@ func defaultLinuxTunOpener() (endpoint.PacketDevice, error) {
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
 	for _, tun := range s.pool.ListTunnels() {
-		if tun.DisableReason == models.DisableReasonAdmin {
+		if !tun.Enabled {
 			continue
 		}
 		if tun.Status != TunnelStatusActive && tun.Status != TunnelStatusDegraded {
@@ -1076,6 +1076,12 @@ func (s *Service) Start(ctx context.Context) error {
 			s.mu.Unlock()
 			return fmt.Errorf("failed to sync tunnels from DB: %w", err)
 		}
+		if err := s.pool.ResetEnabledHealthForStartup(ctx); err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return fmt.Errorf("failed to reset backend health for startup: %w", err)
+		}
 
 		// Issue #43 startup migration: backfill dedicated probe keys for
 		// legacy tunnels and (re-)register both portal peers on each backend
@@ -1083,7 +1089,9 @@ func (s *Service) Start(ctx context.Context) error {
 		// with their correct identities. Best-effort; logs on failure.
 		s.EnsureBackendProbeKeys(ctx)
 
-		// Restore backend data-plane devices for active tunnels
+		// Enabled backends are intentionally "connecting" here, so no stale
+		// data-plane device is restored. The health prober's initial sweep
+		// establishes fresh health and attaches devices for successful probes.
 		s.restoreBackendDevices(ctx)
 	}
 
@@ -1118,9 +1126,14 @@ func (s *Service) Start(ctx context.Context) error {
 		s.forwarder.StartPumps(ctx)
 	}
 
-	// 5. Start health prober & reconnect manager
+	// 5. Establish fresh backend health before accepting client traffic.
+	// ResetEnabledHealthForStartup intentionally made every enabled backend
+	// unroutable ("connecting"). Run one synchronous sweep here so the endpoint
+	// cannot accept a handshake in the window before the prober goroutine's
+	// initial sweep has completed.
 	if s.prober != nil {
-		s.prober.Start(ctx)
+		_ = s.prober.ProbeAll(ctx)
+		s.prober.StartAfterInitialProbe(ctx)
 	}
 	if s.reconnectMgr != nil {
 		s.reconnectMgr.Start(ctx)
@@ -2133,10 +2146,10 @@ func parsePort(val any) int {
 	}
 }
 
-// EnableBackend enables a backend server for load balancing by loading its
-// AWG protocol credentials from the database, registering (or refreshing) the
-// tunnel in the pool, attaching a backend UDP packet device to the forwarder,
-// and marking the tunnel active.
+// EnableBackend restores administrative eligibility by loading the backend's
+// AWG credentials, registering (or refreshing) the tunnel, and attaching its
+// data-plane device. It does not declare the backend healthy: runtime health
+// remains owned by the prober/self-healing subsystem.
 func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	s.mu.RLock()
 	pool := s.pool
@@ -2153,12 +2166,12 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	var (
 		hasInitial     bool
-		initialReason  string
+		initialEnabled bool
 		initialVersion int64
 	)
 	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
 		hasInitial = true
-		initialReason = initTun.DisableReason
+		initialEnabled = initTun.Enabled
 		initialVersion = initTun.StateVersion
 	}
 
@@ -2215,6 +2228,19 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialVersion)
+}
+
+func (s *Service) finishEnableBackend(
+	ctx context.Context,
+	pool *tunnel.Pool,
+	tun *models.BackendTunnel,
+	awgParams map[string]any,
+	serverID int64,
+	hasInitial bool,
+	initialEnabled bool,
+	initialVersion int64,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2222,19 +2248,21 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	if err != nil {
 		return err
 	}
-	if tunnel.IsSelfHealingContext(ctx) && currTun.DisableReason == models.DisableReasonAdmin {
+	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
 	if hasInitial {
-		// If an administrator disabled this backend while enable was in-flight,
-		// or if concurrent state mutation occurred, abort to respect the disable.
-		if currTun.DisableReason == models.DisableReasonAdmin && initialReason != models.DisableReasonAdmin {
+		// Reject only a transition from administratively enabled to disabled
+		// while this operation was in flight. A backend that was already
+		// administratively disabled when EnableBackend started is the normal
+		// manual-enable case, regardless of preserved runtime-health provenance.
+		if initialEnabled && !currTun.Enabled {
 			return errors.New("backend was administratively disabled; aborting enable")
 		}
 		if currTun.StateVersion != initialVersion {
 			return errors.New("backend state modified concurrently; aborting enable")
 		}
-	} else if currTun.DisableReason == models.DisableReasonAdmin {
+	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
 
@@ -2243,15 +2271,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	// Issue #50: clear the prober's consecutive-failure counter so the
-	// re-enabled backend gets the full FailureThreshold grace period; without
-	// this the first jittery probe after re-enable instantly re-disables it.
-	//
-	// Lock ordering: s.mu -> hp.mu is safe: the prober's own mutex is a leaf.
-	// Every hp.mu holder (ProbeTunnel, Start/Stop, the Set* setters) touches
-	// only prober fields plus pool (pool.mu); pool methods never call back
-	// into Service; and the onActiveHook fires with hp.mu already released,
-	// so no code path acquires hp.mu -> s.mu. This ordering already exists in
-	// SetHealthProber and SetProbeFunc.
+	// re-enabled backend gets the full FailureThreshold grace period.
 	if s.prober != nil {
 		s.prober.ResetFailCount(serverID)
 	}
@@ -2260,7 +2280,17 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return nil
 	}
 
-	return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusActive, models.DisableReasonNone, 10)
+	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
+	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
+		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
+	}
+	if legacyAdminOnlyState {
+		// Legacy rows encoded administrative disable in runtime status. Once
+		// enabled is authoritative, that old status has no trustworthy health
+		// meaning, so make it unknown/connecting and require a fresh probe.
+		return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0)
+	}
+	return nil
 }
 
 // registerBackendPortalPeers registers the portal's two identities on the
@@ -2369,7 +2399,7 @@ func (s *Service) EnsureBackendProbeKeys(ctx context.Context) {
 	}
 
 	for _, tun := range pool.ListTunnels() {
-		if tun.Status == TunnelStatusDisabled {
+		if !tun.Enabled {
 			continue
 		}
 
@@ -2695,7 +2725,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	if err := s.pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusDisabled, models.DisableReasonAdmin, 0); err != nil {
+	if err := s.pool.SetTunnelEnabled(ctx, serverID, false, models.DisableReasonAdmin); err != nil {
 		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
 	}
 
@@ -2799,7 +2829,7 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 		return nil
 	}
 
-	if currentTun.DisableReason == models.DisableReasonAdmin || currentTun.Status == TunnelStatusDisabled || currentTun.Status == models.TunnelStatusDisabled {
+	if !currentTun.Enabled {
 		return nil
 	}
 
@@ -3430,7 +3460,11 @@ func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
 	s.preCommitMigrationHookForTest = fn
 }
 
-// validateMigrationTarget checks that targetTunnelID exists and is active, returning its StateVersion.
+// validateMigrationTarget checks that targetTunnelID exists and is eligible for
+// migration - administratively enabled AND runtime-active (issue #90) -
+// returning its StateVersion. The eligibility preflight must run before any
+// migration mutation so a disabled target is rejected without touching the
+// forwarder route, SessionManager state, or the DB session row.
 func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if s.pool == nil {
 		return 0, nil
@@ -3439,8 +3473,9 @@ func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("target backend tunnel %d not found in pool: %w", targetTunnelID, err)
 	}
-	if !strings.EqualFold(targetTun.Status, "active") {
-		return 0, fmt.Errorf("target backend tunnel %d is not active (status=%s)", targetTunnelID, targetTun.Status)
+	if !targetTun.Enabled || !strings.EqualFold(targetTun.Status, models.TunnelStatusActive) {
+		return 0, fmt.Errorf("target backend tunnel %d is not eligible (enabled=%t status=%s)",
+			targetTunnelID, targetTun.Enabled, targetTun.Status)
 	}
 	return targetTun.StateVersion, nil
 }
@@ -3704,7 +3739,14 @@ func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) 
 	}
 	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
-		if backendErr == nil && backend.Status == "active" &&
+		// Reuse requires both administrative eligibility and runtime health
+		// (issue #90): after the enabled/status split, Enabled=false,
+		// Status=active is a valid state - a stranded live session on an
+		// admin-disabled backend must fall through to normal backend
+		// selection instead of reusing the disabled backend here.
+		if backendErr == nil &&
+			backend.Enabled &&
+			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
 			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
 			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {

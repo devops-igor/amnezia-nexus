@@ -299,9 +299,9 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				svc, _, _, _, _ := setupTestVPNService(t, db)
 				tun := lbTunnel(t, svc, db, 985, "awg985", "pub985", "priv985", "10.9.9.185:51820")
 				ctx := t.Context()
-				// Injection seam: status persist failure == nil-DB pool
-				// (in-memory status change, DB keeps old value — the exact
-				// documented divergence-on-error behavior).
+				// Injection seam: administrative-state persistence is unavailable
+				// in the replacement pool, so the in-memory enabled flag changes
+				// while the DB keeps its old value.
 				svc.pool = tunnel.NewPool(nil)
 				if err := svc.pool.SyncFromDB(ctx); err != nil {
 					t.Fatalf("pool SyncFromDB: %v", err)
@@ -309,7 +309,8 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				tun = mustPoolTunnel(t, svc, tun)
 				defer svc.pool.Close()
 
-				// Tunnel created in memory; status persist fails.
+				// Tunnel is administratively disabled in memory; runtime health
+				// must remain untouched.
 				if err := svc.DisableBackend(t.Context(), tun.ServerID); err != nil {
 					t.Fatalf("DisableBackend: %v", err)
 				}
@@ -317,21 +318,26 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				if err != nil {
 					t.Fatalf("GetTunnel: %v", err)
 				}
-				if got.Status != TunnelStatusDisabled {
-					t.Errorf("in-memory status = %s, want disabled (in-memory change is the documented behavior)", got.Status)
+				if got.Enabled {
+					t.Error("in-memory enabled = true, want false after administrative disable")
 				}
-				// Divergence is bounded: exactly one tunnel, one gauge read.
-				// Reconcilable: re-enable persist and reconcile again — the
-				// next status write must land.
-				if err := db.UpdateBackendTunnel(t.Context(), tun.ID, map[string]any{"status": "disabled"}); err != nil {
-					t.Fatalf("manual DB status sync: %v", err)
+				if got.Status != TunnelStatusActive {
+					t.Errorf("administrative disable changed runtime health: got %s, want active", got.Status)
+				}
+				// Divergence is bounded and reconcilable by syncing the
+				// authoritative administrative flag into persistence.
+				if err := db.UpdateBackendTunnelEnabled(t.Context(), tun.ID, false, models.DisableReasonAdmin); err != nil {
+					t.Fatalf("manual DB administrative-state sync: %v", err)
 				}
 				row, err := db.GetBackendTunnel(t.Context(), tun.ID)
 				if err != nil {
 					t.Fatalf("GetBackendTunnel: %v", err)
 				}
-				if row.Status != "disabled" {
-					t.Errorf("INVARIANT VIOLATED: DB row status %s not reconcilable to disabled", row.Status)
+				if row.Enabled {
+					t.Error("INVARIANT VIOLATED: DB enabled flag was not reconcilable to false")
+				}
+				if row.Status != TunnelStatusActive {
+					t.Errorf("INVARIANT VIOLATED: DB runtime health changed during admin reconciliation: %s", row.Status)
 				}
 			},
 		},

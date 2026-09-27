@@ -118,7 +118,7 @@ func TestTunnelPoolCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddTunnel 1 failed: %v", err)
 	}
-	if t1.ServerID != s1ID || t1.InterfaceName != "awg-be-1" || t1.Status != "active" {
+	if t1.ServerID != s1ID || t1.InterfaceName != "awg-be-1" || !t1.Enabled || t1.Status != models.TunnelStatusActive {
 		t.Errorf("invalid t1: %+v", t1)
 	}
 
@@ -522,7 +522,7 @@ func TestTunnelPool_SetTunnelStatusWithReason(t *testing.T) {
 	// 3. Error propagation on DB failure
 	canceledCtx, cancel := context.WithCancel(ctx)
 	cancel()
-	err = pool.SetTunnelStatusWithReason(canceledCtx, sID, models.TunnelStatusDisabled, models.DisableReasonAdmin, 0)
+	err = pool.SetTunnelStatusWithReason(canceledCtx, sID, models.TunnelStatusDisabled, models.DisableReasonHealth, 0)
 	if err == nil {
 		t.Fatal("expected error on canceled context, got nil")
 	}
@@ -668,12 +668,12 @@ func TestTunnelPool_TransferConnectionsIfActive(t *testing.T) {
 		t.Fatalf("expected ErrTunnelNotFound, got: %v", err)
 	}
 
-	// 3. Target not active
+	// 3. Target not eligible because runtime health is not active.
 	if err := pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusDegraded, 400); err != nil {
 		t.Fatalf("SetTunnelStatus failed: %v", err)
 	}
-	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); err == nil || !strings.Contains(err.Error(), "not active") {
-		t.Fatalf("expected error for non-active target, got: %v", err)
+	if err := pool.TransferConnectionsIfActive(t1.ID, t2.ID); err == nil || !strings.Contains(err.Error(), "not eligible") {
+		t.Fatalf("expected eligibility error for non-active target, got: %v", err)
 	}
 
 	// Restore t2 to active

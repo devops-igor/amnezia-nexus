@@ -17,10 +17,10 @@ func TestRoundRobinBalancer(t *testing.T) {
 	}
 
 	tunnels := []*models.BackendTunnel{
-		{ID: 1, Status: "active"},
+		{ID: 1, Enabled: true, Status: "active"},
 		{ID: 2, Status: "degraded"}, // Skipped
-		{ID: 3, Status: "active"},
-		{ID: 4, Status: "active"},
+		{ID: 3, Enabled: true, Status: "active"},
+		{ID: 4, Enabled: true, Status: "active"},
 	}
 
 	// Sequence across 6 requests should be: 1 -> 3 -> 4 -> 1 -> 3 -> 4
@@ -42,7 +42,7 @@ func TestRoundRobinBalancer(t *testing.T) {
 	tightCaps := CapacityConfig{MaxTotalPeers: 5}
 	lbTight := NewRoundRobinBalancer(tightCaps)
 	tunnelsOver := []*models.BackendTunnel{
-		{ID: 1, Status: "active", ActiveConnections: 6},
+		{ID: 1, Enabled: true, Status: "active", ActiveConnections: 6},
 	}
 	if _, err := lbTight.SelectBackend(ctx, &RoutingRequest{AvailableTunnels: tunnelsOver}); err != ErrCapacityExceeded {
 		t.Errorf("expected ErrCapacityExceeded, got %v", err)

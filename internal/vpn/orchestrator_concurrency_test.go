@@ -17,8 +17,8 @@ import (
 // 1. When an active backend is being probed by the Orchestrator,
 // 2. An administrator calls DisableBackend before probe completion,
 // 3. The probe completion does NOT overwrite the administrative disable,
-// 4. In-memory pool status and database records remain disabled with reason "admin",
-// 5. Restarting the VPN service does NOT resurrect the tunnel or attach its forwarder device.
+// 4. Administrative enabled=false persists while runtime health remains unchanged,
+// 5. Restarting the VPN service does NOT re-enable the tunnel or attach its forwarder device.
 func TestOrchestrator_AdminDisableConcurrentWithProbePreservedOnRestart(t *testing.T) {
 	ctx := context.Background()
 	db := setupTestDB(t)
@@ -95,25 +95,31 @@ func TestOrchestrator_AdminDisableConcurrentWithProbePreservedOnRestart(t *testi
 		t.Fatal("timed out waiting for CheckBackendTunnelHealth to complete")
 	}
 
-	// Step 5: Assert DB tunnel record remains status="disabled" and disable_reason="admin"
+	// Step 5: Assert DB administrative state won and runtime health was not overwritten.
 	dbTun, err := db.GetBackendTunnelByServerID(ctx, sID)
 	if err != nil || dbTun == nil {
 		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
 	}
-	if dbTun.Status != "disabled" {
-		t.Errorf("expected DB status 'disabled', got %q", dbTun.Status)
+	if dbTun.Enabled {
+		t.Error("expected DB enabled=false after administrative disable")
+	}
+	if dbTun.Status != TunnelStatusActive {
+		t.Errorf("administrative disable changed DB runtime health: got %q", dbTun.Status)
 	}
 	if dbTun.DisableReason != models.DisableReasonAdmin {
 		t.Errorf("expected DB disable_reason %q, got %q", models.DisableReasonAdmin, dbTun.DisableReason)
 	}
 
-	// Step 6: Assert pool status remains "disabled" and disable_reason="admin"
+	// Step 6: Assert pool administrative state matches DB and health is unchanged.
 	poolTun, err := vpnSvc.pool.GetTunnel(sID)
 	if err != nil || poolTun == nil {
 		t.Fatalf("pool GetTunnel failed: %v", err)
 	}
-	if poolTun.Status != TunnelStatusDisabled {
-		t.Errorf("expected pool status %q, got %q", TunnelStatusDisabled, poolTun.Status)
+	if poolTun.Enabled {
+		t.Error("expected pool enabled=false after administrative disable")
+	}
+	if poolTun.Status != TunnelStatusActive {
+		t.Errorf("administrative disable changed pool runtime health: got %q", poolTun.Status)
 	}
 	if poolTun.DisableReason != models.DisableReasonAdmin {
 		t.Errorf("expected pool disable_reason %q, got %q", models.DisableReasonAdmin, poolTun.DisableReason)
@@ -129,13 +135,16 @@ func TestOrchestrator_AdminDisableConcurrentWithProbePreservedOnRestart(t *testi
 	}
 	vpnSvcRestarted.restoreBackendDevices(ctx)
 
-	// Step 8: Assert backend remains disabled and its data plane device is NOT attached
+	// Step 8: Assert backend remains administratively disabled and its data plane device is NOT attached.
 	restartedTun, err := vpnSvcRestarted.pool.GetTunnel(sID)
 	if err != nil || restartedTun == nil {
 		t.Fatalf("restarted pool GetTunnel failed: %v", err)
 	}
-	if restartedTun.Status != TunnelStatusDisabled {
-		t.Errorf("expected restarted pool status %q, got %q", TunnelStatusDisabled, restartedTun.Status)
+	if restartedTun.Enabled {
+		t.Error("restart re-enabled administratively disabled backend")
+	}
+	if restartedTun.Status != TunnelStatusActive {
+		t.Errorf("restart changed disabled backend's retained runtime health: got %q", restartedTun.Status)
 	}
 	if restartedTun.DisableReason != models.DisableReasonAdmin {
 		t.Errorf("expected restarted pool disable_reason %q, got %q", models.DisableReasonAdmin, restartedTun.DisableReason)
@@ -210,13 +219,16 @@ func TestOrchestrator_AdminDisableConcurrentWithProbe_CASFallback(t *testing.T) 
 		t.Fatal("timed out waiting for CheckBackendTunnelHealth")
 	}
 
-	// Verify DB record remained disabled with reason admin
+	// Verify DB record retained administrative disable despite the stale probe CAS.
 	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
 	if err != nil || dbTun == nil {
 		t.Fatalf("GetBackendTunnel failed: %v", err)
 	}
-	if dbTun.Status != "disabled" {
-		t.Errorf("expected DB status 'disabled', got %q", dbTun.Status)
+	if dbTun.Enabled {
+		t.Error("stale CAS re-enabled administratively disabled backend")
+	}
+	if dbTun.Status != TunnelStatusActive {
+		t.Errorf("administrative disable changed runtime health: got %q", dbTun.Status)
 	}
 	if dbTun.DisableReason != models.DisableReasonAdmin {
 		t.Errorf("expected DB disable_reason %q, got %q", models.DisableReasonAdmin, dbTun.DisableReason)
@@ -307,8 +319,8 @@ func TestOrchestrator_AdminDisableDuringProbe_DoesNotReceiveDegradedSessions(t *
 	}
 
 	target, err := db.GetBackendTunnel(ctx, a.ID)
-	if err != nil || target == nil || target.Status != "disabled" || target.DisableReason != models.DisableReasonAdmin {
-		t.Fatalf("target lost administrative disable: tunnel=%+v err=%v", target, err)
+	if err != nil || target == nil || target.Enabled || target.Status != "active" || target.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("target lost independent administrative disable: tunnel=%+v err=%v", target, err)
 	}
 	session, err := db.GetVPNSessionByID(ctx, sessionID)
 	if err != nil || session == nil || session.BackendTunnelID != b.ID || session.Status != "connected" {
@@ -584,16 +596,18 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 		t.Fatalf("expected ErrTunUnavailable from Start, got: %v", stErr)
 	}
 
-	// Verify pool contains tunnel synced from DB at version 1
+	// Startup sync invalidates persisted health before the TUN open attempt.
+	// Even though Start then fails in management-only mode, the backend stays
+	// enabled with unknown runtime health and a fenced state version.
 	poolTunInitial, err := vpnSvc.pool.GetTunnel(sID)
 	if err != nil || poolTunInitial == nil {
 		t.Fatalf("pool GetTunnel failed after SyncFromDB: %v", err)
 	}
-	if poolTunInitial.StateVersion != 1 {
-		t.Fatalf("expected initial pool version 1, got %d", poolTunInitial.StateVersion)
+	if poolTunInitial.StateVersion != 2 {
+		t.Fatalf("expected startup-reset pool version 2, got %d", poolTunInitial.StateVersion)
 	}
-	if poolTunInitial.Status != "active" {
-		t.Fatalf("expected initial pool status active, got %s", poolTunInitial.Status)
+	if poolTunInitial.Status != models.TunnelStatusConnecting {
+		t.Fatalf("expected startup-reset pool status connecting, got %s", poolTunInitial.Status)
 	}
 
 	orch := orchestrator.New(db, nil,
@@ -623,11 +637,11 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 	if dbTun.Status != "degraded" {
 		t.Errorf("expected db status degraded, got %s", dbTun.Status)
 	}
-	if poolTun.StateVersion != 2 {
-		t.Errorf("expected pool version 2, got %d", poolTun.StateVersion)
+	if poolTun.StateVersion != 3 {
+		t.Errorf("expected pool version 3, got %d", poolTun.StateVersion)
 	}
-	if dbTun.StateVersion != 2 {
-		t.Errorf("expected db version 2, got %d", dbTun.StateVersion)
+	if dbTun.StateVersion != 3 {
+		t.Errorf("expected db version 3, got %d", dbTun.StateVersion)
 	}
 	if poolTun.StateVersion != dbTun.StateVersion {
 		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun.StateVersion, dbTun.StateVersion)

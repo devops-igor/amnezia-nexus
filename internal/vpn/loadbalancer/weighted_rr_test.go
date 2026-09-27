@@ -22,9 +22,9 @@ func TestWeightedRoundRobinBalancer(t *testing.T) {
 	}
 
 	tunnels := []*models.BackendTunnel{
-		{ID: 101, ServerID: 1, Status: "active"},
-		{ID: 102, ServerID: 2, Status: "active"},
-		{ID: 103, ServerID: 3, Status: "active"},
+		{ID: 101, ServerID: 1, Enabled: true, Status: "active"},
+		{ID: 102, ServerID: 2, Enabled: true, Status: "active"},
+		{ID: 103, ServerID: 3, Enabled: true, Status: "active"},
 	}
 
 	// Over 100 requests, check distribution ratio
@@ -52,8 +52,8 @@ func TestWeightedRoundRobinBalancer(t *testing.T) {
 	lb.SetWeights(newWeights)
 
 	tunnels2 := []*models.BackendTunnel{
-		{ID: 101, ServerID: 1, Status: "active"},
-		{ID: 102, ServerID: 2, Status: "active"},
+		{ID: 101, ServerID: 1, Enabled: true, Status: "active"},
+		{ID: 102, ServerID: 2, Enabled: true, Status: "active"},
 	}
 	counts2 := make(map[int64]int)
 	for i := 0; i < 100; i++ {
@@ -78,7 +78,7 @@ func TestWeightedRoundRobinBalancer(t *testing.T) {
 	tightCaps := CapacityConfig{MaxTotalPeers: 10}
 	lbTight := NewWeightedRoundRobinBalancer(weights, tightCaps)
 	tunnelsOver := []*models.BackendTunnel{
-		{ID: 101, ServerID: 1, Status: "active", ActiveConnections: 12},
+		{ID: 101, ServerID: 1, Enabled: true, Status: "active", ActiveConnections: 12},
 	}
 	if _, err := lbTight.SelectBackend(ctx, &RoutingRequest{AvailableTunnels: tunnelsOver}); err != ErrCapacityExceeded {
 		t.Errorf("expected ErrCapacityExceeded, got %v", err)

@@ -24,7 +24,13 @@ func TestDisabledBackendNotResurrectedByProberCycle(t *testing.T) {
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
-	// Administratively disable backend 1 via the real disable path.
+	// Administratively disable backend 1 via the real disable path. Runtime
+	// health must remain unchanged; only Enabled changes (issue #90).
+	beforeDisable, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel(s1) before disable failed: %v", err)
+	}
+	healthBeforeDisable := beforeDisable.Status
 	if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
@@ -58,8 +64,11 @@ func TestDisabledBackendNotResurrectedByProberCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTunnel(s1) failed: %v", err)
 	}
-	if tun1.Status != "disabled" {
-		t.Errorf("disabled backend status changed by prober cycle: got %q, want %q", tun1.Status, "disabled")
+	if tun1.Enabled {
+		t.Error("administratively disabled backend became enabled during prober cycle")
+	}
+	if tun1.Status != healthBeforeDisable {
+		t.Errorf("administrative disable/prober cycle changed runtime health: got %q, want %q", tun1.Status, healthBeforeDisable)
 	}
 	if hookCallsForDisabled != 0 {
 		t.Errorf("expected onActiveHook not to fire for disabled backend, got %d calls", hookCallsForDisabled)
@@ -110,6 +119,11 @@ func TestDisabledBackendStaysDisabledAcrossRepeatedProbeCycles(t *testing.T) {
 		t.Fatalf("SyncFromDB failed: %v", err)
 	}
 
+	beforeDisable, err := vpnSvc.pool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("GetTunnel before disable failed: %v", err)
+	}
+	healthBeforeDisable := beforeDisable.Status
 	if err := vpnSvc.DisableBackend(ctx, s1ID); err != nil {
 		t.Fatalf("DisableBackend failed: %v", err)
 	}
@@ -124,8 +138,11 @@ func TestDisabledBackendStaysDisabledAcrossRepeatedProbeCycles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cycle %d: GetTunnel failed: %v", i, err)
 		}
-		if tun.Status != "disabled" {
-			t.Fatalf("cycle %d: disabled backend resurrected to %q", i, tun.Status)
+		if tun.Enabled {
+			t.Fatalf("cycle %d: administratively disabled backend was re-enabled", i)
+		}
+		if tun.Status != healthBeforeDisable {
+			t.Fatalf("cycle %d: runtime health changed from %q to %q", i, healthBeforeDisable, tun.Status)
 		}
 	}
 
@@ -135,8 +152,11 @@ func TestDisabledBackendStaysDisabledAcrossRepeatedProbeCycles(t *testing.T) {
 		t.Errorf("expected direct ProbeTunnel on disabled tunnel to be refused, got lat=%d err=nil", lat)
 	}
 	tun, _ := vpnSvc.pool.GetTunnel(s1ID)
-	if tun.Status != "disabled" {
-		t.Errorf("direct ProbeTunnel changed disabled status: got %q", tun.Status)
+	if tun.Enabled {
+		t.Error("direct ProbeTunnel re-enabled administratively disabled backend")
+	}
+	if tun.Status != healthBeforeDisable {
+		t.Errorf("direct ProbeTunnel changed runtime health: got %q, want %q", tun.Status, healthBeforeDisable)
 	}
 }
 

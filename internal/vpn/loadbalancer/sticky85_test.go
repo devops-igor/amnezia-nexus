@@ -76,14 +76,14 @@ func failoverFixture(t *testing.T) (*database.DB, int64, int64) {
 	}
 	t1, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 		ServerID: sID, InterfaceName: "awg-t1", PublicKey: "pk1", PrivateKey: "pr1",
-		Endpoint: "10.8.5.5:51820", Status: "active",
+		Endpoint: "10.8.5.5:51820", Enabled: true, Status: "active",
 	})
 	if err != nil {
 		t.Fatalf("CreateBackendTunnel t1: %v", err)
 	}
 	t2, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
 		ServerID: sID, InterfaceName: "awg-t2", PublicKey: "pk2", PrivateKey: "pr2",
-		Endpoint: "10.8.5.5:51821", Status: "active",
+		Endpoint: "10.8.5.5:51821", Enabled: true, Status: "active",
 	})
 	if err != nil {
 		t.Fatalf("CreateBackendTunnel t2: %v", err)
@@ -121,7 +121,7 @@ func TestFailoverSelectionFailureDoesNotStrandOthers(t *testing.T) {
 	caps := CapacityConfig{MaxTotalPeers: 100, MaxPeersPerBackend: 50}
 	sm := NewStickySessionManager(db, lb, caps)
 
-	healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+	healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 	sm.AssignPeerAffinity("peer-ok", t1)
 	sm.AssignPeerAffinity("peer-bad", t1)
@@ -170,7 +170,7 @@ func TestFailoverNoSessionLeftOnDisabledBackendUnlessReported(t *testing.T) {
 	caps := CapacityConfig{MaxTotalPeers: 100, MaxPeersPerBackend: 50}
 	sm := NewStickySessionManager(db, NewLeastConnectionsBalancer(caps), caps)
 
-	healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+	healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 	// One peer with in-memory affinity, one DB-only peer (no affinity).
 	mkSession(t, db, "sess-a", "u85a", "peer-aff", t1)
@@ -234,7 +234,7 @@ func TestFailoverPersistErrorSurfaced(t *testing.T) {
 
 	caps := CapacityConfig{MaxTotalPeers: 100, MaxPeersPerBackend: 50}
 	sm := NewStickySessionManager(pdb, NewLeastConnectionsBalancer(caps), caps)
-	healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+	healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 	mkSession(t, db, "sess-p", "u85p", "peer-persist", t1)
 
@@ -258,7 +258,7 @@ func TestFailoverPersistErrorSurfaced(t *testing.T) {
 	db2, t1b, t2b := failoverFixture(t)
 	pdb2 := &persistFailingDB{DB: db2, failures: 2}
 	sm2 := NewStickySessionManager(pdb2, NewLeastConnectionsBalancer(caps), caps)
-	healthy2 := []*models.BackendTunnel{{ID: t2b, Status: "active", ActiveConnections: 0}}
+	healthy2 := []*models.BackendTunnel{{ID: t2b, Enabled: true, Status: "active", ActiveConnections: 0}}
 	mkSession(t, db2, "sess-q", "uq", "peer-hardfail", t1b)
 
 	res2, err := sm2.HandleFailover(ctx, t1b, healthy2)
@@ -289,7 +289,7 @@ func TestGetAffinityNotBlockedBehindFailoverDBDelay(t *testing.T) {
 
 	caps := CapacityConfig{MaxTotalPeers: 100, MaxPeersPerBackend: 50}
 	sm := NewStickySessionManager(sdb, NewLeastConnectionsBalancer(caps), caps)
-	healthy := []*models.BackendTunnel{{ID: t2, Status: "active", ActiveConnections: 0}}
+	healthy := []*models.BackendTunnel{{ID: t2, Enabled: true, Status: "active", ActiveConnections: 0}}
 
 	mkSession(t, db, "sess-r", "u85r", "peer-reader", t1)
 	sm.AssignPeerAffinity("peer-reader", t1)

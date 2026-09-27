@@ -1041,7 +1041,7 @@ func TestVPNEnableBackendHandler_ContextCancellationResilience(t *testing.T) {
 	}
 	var found bool
 	for _, b := range backends {
-		if b.ServerID == sID && b.Status != "disabled" {
+		if b.ServerID == sID && b.Enabled {
 			found = true
 			break
 		}
