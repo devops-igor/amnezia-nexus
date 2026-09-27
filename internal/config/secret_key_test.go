@@ -1,10 +1,15 @@
 package config
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -361,4 +366,251 @@ func TestResolveSecretKey_ConcurrentFirstBoot(t *testing.T) {
 	if len(matches) > 0 {
 		t.Errorf("leftover temp files found: %v", matches)
 	}
+}
+
+// TestResolveSecretKey_Invariant6_DirectoryDurability tests Invariant 6:
+// Parent directory is durably synchronized (dir.Sync()) before returning success,
+// and returns an error if directory sync fails.
+func TestResolveSecretKey_Invariant6_DirectoryDurability(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("NormalDurabilitySync", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		key, err := ResolveSecretKey(tmpDir)
+		if err != nil {
+			t.Fatalf("expected ResolveSecretKey to succeed with directory sync, got: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("unexpected key length %d: %q", len(key), key)
+		}
+	})
+
+	t.Run("DirectorySyncFailureReturnsError", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncErr := errors.New("simulated I/O error syncing parent directory")
+		syncDirFunc = func(dirPath string) error {
+			return syncErr
+		}
+
+		key, err := ResolveSecretKey(tmpDir)
+		if err == nil {
+			t.Fatalf("expected error when directory sync fails, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "failed to sync data directory") {
+			t.Errorf("expected error message to mention 'failed to sync data directory', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+
+		// Verify un-persisted key file was cleaned up and not left behind
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+			t.Errorf("expected key file to not exist after sync failure, statErr: %v", statErr)
+		}
+	})
+}
+
+// TestResolveSecretKey_FallbackNoHardLinks tests the fallback behavior when hard links
+// are not supported on the underlying filesystem.
+func TestResolveSecretKey_FallbackNoHardLinks(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("SuccessViaRenameNoReplace", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origLink := linkFile
+		defer func() { linkFile = origLink }()
+
+		linkFile = func(oldname, newname string) error {
+			return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EXDEV}
+		}
+
+		key, err := ResolveSecretKey(tmpDir)
+		if err != nil {
+			t.Fatalf("expected success via renameNoReplace, got: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("expected 64-char key, got %d: %q", len(key), key)
+		}
+
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		fi, statErr := os.Stat(keyPath)
+		if statErr != nil {
+			t.Fatalf("stat failed: %v", statErr)
+		}
+		if fi.Mode().Perm() != 0600 {
+			t.Errorf("expected 0600, got: %04o", fi.Mode().Perm())
+		}
+	})
+
+	t.Run("TargetAlreadyExistsDuringFallback", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		keyPath := filepath.Join(tmpDir, ".secret_key")
+		winningKey := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+		if err := os.WriteFile(keyPath, []byte(winningKey+"\n"), 0600); err != nil {
+			t.Fatalf("failed to write key file: %v", err)
+		}
+
+		readKey, readErr := readWinningKey(keyPath)
+		if readErr != nil {
+			t.Fatalf("readWinningKey failed: %v", readErr)
+		}
+		if readKey != winningKey {
+			t.Errorf("expected winning key %q, got %q", winningKey, readKey)
+		}
+	})
+
+	t.Run("FailClosedWhenNoReplaceUnsupported", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		origLink := linkFile
+		origRename := renameNoReplaceFunc
+		defer func() {
+			linkFile = origLink
+			renameNoReplaceFunc = origRename
+		}()
+
+		linkFile = func(oldname, newname string) error {
+			return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EXDEV}
+		}
+		renameNoReplaceFunc = func(src, dst string) error {
+			return errors.ErrUnsupported
+		}
+
+		key, err := ResolveSecretKey(tmpDir)
+		if err == nil {
+			t.Fatalf("expected fail-closed error, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "without clobbering") {
+			t.Errorf("expected error message to mention 'without clobbering', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+	})
+}
+
+// TestHelperProcess provides the entrypoint for child processes spawned during
+// multi-process regression testing of ResolveSecretKey.
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_SECRET_KEY_HELPER") != "1" {
+		return
+	}
+	dataDir := os.Getenv("HELPER_DATA_DIR")
+	if dataDir == "" {
+		fmt.Fprintln(os.Stderr, "HELPER_DATA_DIR not set")
+		os.Exit(2)
+	}
+
+	key, err := ResolveSecretKey(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(key)
+	os.Exit(0)
+}
+
+func runConcurrentSubprocessTest(t *testing.T, extraEnv ...string) {
+	os.Unsetenv("SECRET_KEY")
+	tmpDir := t.TempDir()
+
+	const numProcs = 10
+	type procResult struct {
+		key string
+		err error
+	}
+	results := make([]procResult, numProcs)
+	var wg sync.WaitGroup
+	wg.Add(numProcs)
+
+	barrier := make(chan struct{})
+
+	for i := 0; i < numProcs; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			env := make([]string, 0, len(os.Environ())+len(extraEnv)+2)
+			for _, e := range os.Environ() {
+				if !strings.HasPrefix(e, "SECRET_KEY=") &&
+					!strings.HasPrefix(e, "GO_WANT_SECRET_KEY_HELPER=") &&
+					!strings.HasPrefix(e, "HELPER_DATA_DIR=") {
+					env = append(env, e)
+				}
+			}
+			env = append(env, "GO_WANT_SECRET_KEY_HELPER=1", "HELPER_DATA_DIR="+tmpDir)
+			env = append(env, extraEnv...)
+			cmd.Env = env
+
+			<-barrier // Synchronize start of all child processes
+			err := cmd.Run()
+			if err != nil {
+				results[idx] = procResult{err: fmt.Errorf("subprocess %d failed (%w): %s", idx, err, stderr.String())}
+				return
+			}
+			results[idx] = procResult{key: strings.TrimSpace(stdout.String())}
+		}()
+	}
+
+	close(barrier)
+	wg.Wait()
+
+	for i := 0; i < numProcs; i++ {
+		if results[i].err != nil {
+			t.Fatalf("subprocess %d error: %v", i, results[i].err)
+		}
+		if results[i].key != results[0].key {
+			t.Errorf("subprocess %d produced key %q, but subprocess 0 produced %q", i, results[i].key, results[0].key)
+		}
+	}
+
+	if len(results[0].key) != 64 {
+		t.Errorf("expected 64-character hex key, got len=%d: %q", len(results[0].key), results[0].key)
+	}
+
+	keyPath := filepath.Join(tmpDir, ".secret_key")
+	diskData, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted key file: %v", err)
+	}
+	if strings.TrimSpace(string(diskData)) != results[0].key {
+		t.Errorf("disk key %q does not match subprocess key %q", strings.TrimSpace(string(diskData)), results[0].key)
+	}
+
+	fi, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat failed on key file: %v", err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Errorf("expected file mode 0600, got: %04o", fi.Mode().Perm())
+	}
+
+	matches, err := filepath.Glob(filepath.Join(tmpDir, ".secret_key.tmp.*"))
+	if err != nil {
+		t.Fatalf("glob failed: %v", err)
+	}
+	if len(matches) > 0 {
+		t.Errorf("leftover temporary files found: %v", matches)
+	}
+}
+
+// TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_HardLinks tests Invariant 7:
+// Concurrent startup across multiple separate OS processes converges on a single persisted key;
+// no process overwrites another's key (standard hard link atomic placement).
+func TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_HardLinks(t *testing.T) {
+	runConcurrentSubprocessTest(t)
+}
+
+// TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_NoHardLinksFallback tests Invariant 7:
+// Concurrent startup across multiple separate OS processes converges on a single persisted key
+// even when hard links are unsupported and the fallback to renameat2(RENAME_NOREPLACE) is used.
+func TestResolveSecretKey_Invariant7_ConcurrentSubprocessesConverge_NoHardLinksFallback(t *testing.T) {
+	runConcurrentSubprocessTest(t, "AMNEZIA_TEST_SIMULATE_NO_HARDLINKS=1")
 }
