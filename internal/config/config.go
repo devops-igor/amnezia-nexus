@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -80,11 +81,22 @@ func ResolvePaths() *Paths {
 	}
 }
 
+var secretKeyMu sync.Mutex
+
 // ResolveSecretKey resolves or generates the application SECRET_KEY per specification:
 // 1. SECRET_KEY env variable
 // 2. <DATA_DIR>/.secret_key file
-// 3. Generate 32 crypto random bytes -> 64-char hex string, save with 0600 permissions.
+// 3. Generate 32 crypto random bytes -> 64-char hex string, save atomically with 0600 permissions.
 func ResolveSecretKey(dataDir string) (string, error) {
+	if envKey := strings.TrimSpace(os.Getenv("SECRET_KEY")); envKey != "" {
+		slog.Info("Using SECRET_KEY from environment variable")
+		return envKey, nil
+	}
+
+	secretKeyMu.Lock()
+	defer secretKeyMu.Unlock()
+
+	// Re-check environment variable under lock
 	if envKey := strings.TrimSpace(os.Getenv("SECRET_KEY")); envKey != "" {
 		slog.Info("Using SECRET_KEY from environment variable")
 		return envKey, nil
@@ -94,12 +106,16 @@ func ResolveSecretKey(dataDir string) (string, error) {
 	cleanKeyPath := filepath.Clean(filepath.Join(cleanDataDir, ".secret_key"))
 
 	// #nosec G304 G703 -- Reading secret key from configured data directory is intended
-	if data, err := os.ReadFile(cleanKeyPath); err == nil {
+	data, err := os.ReadFile(cleanKeyPath)
+	if err == nil {
 		key := strings.TrimSpace(string(data))
-		if key != "" {
-			slog.Info("Loaded SECRET_KEY from persistent storage")
-			return key, nil
+		if key == "" {
+			return "", fmt.Errorf("secret key file %s is empty", cleanKeyPath)
 		}
+		slog.Info("Loaded SECRET_KEY from persistent storage")
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("failed to read secret key file %s: %w", cleanKeyPath, err)
 	}
 
 	// Generate 32 bytes (64 hex characters)
@@ -115,14 +131,68 @@ func ResolveSecretKey(dataDir string) (string, error) {
 		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
 	}
 
-	// #nosec G703
-	if err := os.WriteFile(cleanKeyPath, []byte(newKey), 0600); err != nil {
-		slog.Warn("Failed to persist generated SECRET_KEY to file", "err", err)
-	} else {
-		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
+	// Persist key atomically to temporary file with strict 0600 permissions, then move into place.
+	// #nosec G304 G703
+	tmpFile, err := os.CreateTemp(cleanDataDir, ".secret_key.tmp.*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary secret key file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to set permissions on secret key file: %w", err)
 	}
 
-	return newKey, nil
+	if _, err := tmpFile.WriteString(newKey + "\n"); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to write secret key to temporary file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to sync secret key file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temporary secret key file: %w", err)
+	}
+
+	// Atomically place file into target destination.
+	// We try os.Link first because it fails with os.ErrExist if another process
+	// created the key concurrently, preventing silent overwrites.
+	// #nosec G703
+	if linkErr := os.Link(tmpPath, cleanKeyPath); linkErr == nil {
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
+		return newKey, nil
+	} else if errors.Is(linkErr, os.ErrExist) {
+		// Another process created the key concurrently; load and return it.
+		// #nosec G304 G703
+		persistedData, readErr := os.ReadFile(cleanKeyPath)
+		if readErr != nil {
+			return "", fmt.Errorf("failed to read concurrently created secret key file %s: %w", cleanKeyPath, readErr)
+		}
+		persistedKey := strings.TrimSpace(string(persistedData))
+		if persistedKey == "" {
+			return "", fmt.Errorf("concurrently created secret key file %s is empty", cleanKeyPath)
+		}
+		slog.Info("Loaded SECRET_KEY from persistent storage")
+		return persistedKey, nil
+	} else {
+		// If link is not supported across filesystem boundaries or platform, fall back to atomic rename.
+		// #nosec G304 G703
+		if renameErr := os.Rename(tmpPath, cleanKeyPath); renameErr != nil {
+			return "", fmt.Errorf("failed to persist secret key to %s: %w", cleanKeyPath, renameErr)
+		}
+		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
+		return newKey, nil
+	}
 }
 
 // Load initializes configuration from environment variables and local secrets.

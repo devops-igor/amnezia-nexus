@@ -96,12 +96,12 @@ var (
 	}
 
 	allowedBackendTunnelColumns = map[string]bool{
-		"server_id":          true,
-		"interface_name":     true,
-		"public_key":         true,
-		"private_key":        true,
-		"probe_private_key":  true,
-		"endpoint":           true,
+		"server_id":         true,
+		"interface_name":    true,
+		"public_key":        true,
+		"private_key":       true,
+		"probe_private_key": true,
+		"endpoint":          true,
 		// Administrative intent, runtime health, and state-version fencing
 		// have dedicated writers (issue #90). Keep those fields out of this
 		// generic update path so subsystem ownership cannot be bypassed.

@@ -150,7 +150,6 @@ func TestSyncFromDBPreservesIndependentAdministrativeAndHealthState(t *testing.T
 	}
 }
 
-
 func TestResetEnabledHealthForStartupRequiresFreshProbe(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
