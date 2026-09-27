@@ -151,7 +151,7 @@ Create `docker-compose.yaml`:
 ```yaml
 services:
   amnezia-panel:
-    image: ghcr.io/devops-igor/amnezia-nexus:v1.4.1
+    image: ghcr.io/devops-igor/amnezia-nexus:v2.0.0
     container_name: amnezia-panel
     restart: unless-stopped
     user: root
@@ -184,7 +184,7 @@ volumes:
 
 ### 2. Start the container
 
-> **Image tags:** the compose file above pins the **stable release** (`v1.4.1` - Nebula · Patch 1).
+> **Image tags:** the compose file above pins the **stable release** (`v2.0.0` - Zenith).
 > Alternatively, use `:latest` to always track the newest build from `main` (recommended only for testing, since it may include unreleased changes).
 > Available tags: https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus
 

@@ -7,9 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [2.0.0] - Zenith - 2026-09-27
 
-- Backend status semantics (intentional breaking API change): `/api/vpn/backends` and `/api/vpn/tunnels` responses changed meaning of the `status` field - it now reports runtime health only (`connecting`/`active`/`degraded`/`disabled`), while administrative enable/disable intent moved to the new `enabled` field (#90). The combination `{"enabled": false, "status": "active"}` is valid and expected: an administratively disabled backend whose runtime health remains active.
+Major release splitting backend administrative state from runtime health. It contains an intentional, documented breaking change to the `/api/vpn/*` response semantics (see Changed).
+
+### Added
+- VPN forwarder health telemetry surfaced in the admin portal (#362)
+- Automated data plane traffic verification test suite (#239, #369)
+
+### Changed
+- Breaking: `status` in `/api/vpn/backends` and `/api/vpn/tunnels` responses now reports runtime health only (`connecting`/`active`/`degraded`/`disabled`); administrative enable/disable intent moved to the new `enabled` field (#90). The combination `{"enabled": false, "status": "active"}` is valid and expected: an administratively disabled backend whose runtime health remains active.
+
+### Fixed
+- Portal traffic increments preserved across remote sync and monthly rollover (#378)
+- Portal key protected across config API edits and daemon restarts (#376)
+- Startup fails fast on unreadable persisted VPN configuration (#344, #364)
+- Existing-tunnel persistence failures propagate before pool state mutation (#346, #363)
+- Mobile bottom navigation no longer occludes the logout button (#352)
 
 ## [1.4.1] - Nebula · Patch 1 - 2026-09-25
 
