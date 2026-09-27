@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/web"
 )
@@ -81,7 +83,60 @@ func ResolvePaths() *Paths {
 	}
 }
 
-var secretKeyMu sync.Mutex
+var (
+	secretKeyMu sync.Mutex
+
+	linkFile = func(oldname, newname string) error {
+		if os.Getenv("AMNEZIA_TEST_SIMULATE_NO_HARDLINKS") == "1" {
+			return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EXDEV}
+		}
+		return os.Link(oldname, newname)
+	}
+	renameNoReplaceFunc = renameNoReplace
+	syncDirFunc         = syncDir
+)
+
+// syncDir opens the directory and calls Sync (fsync) to ensure directory entries
+// and metadata are durably written to physical media.
+func syncDir(dirPath string) (err error) {
+	// #nosec G304 G703 -- Directory path is derived from clean data directory
+	dir, openErr := os.Open(dirPath)
+	if openErr != nil {
+		return fmt.Errorf("failed to open directory %s for sync: %w", dirPath, openErr)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close directory %s after sync: %w", dirPath, closeErr)
+		}
+	}()
+	if syncErr := dir.Sync(); syncErr != nil {
+		return fmt.Errorf("failed to sync directory %s: %w", dirPath, syncErr)
+	}
+	return nil
+}
+
+// readWinningKey reads the secret key after another process won the creation race.
+// It retries briefly in case of filesystem metadata propagation delay.
+func readWinningKey(cleanKeyPath string) (string, error) {
+	var persistedKey string
+	var readErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		// #nosec G304 G703 -- Reading secret key from configured data directory is intended
+		persistedData, err := os.ReadFile(cleanKeyPath)
+		if err == nil {
+			persistedKey = strings.TrimSpace(string(persistedData))
+			if persistedKey != "" {
+				slog.Info("Loaded SECRET_KEY from persistent storage")
+				return persistedKey, nil
+			}
+			readErr = fmt.Errorf("concurrently created secret key file %s is empty", cleanKeyPath)
+		} else {
+			readErr = err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return "", fmt.Errorf("failed to read concurrently created secret key file %s: %w", cleanKeyPath, readErr)
+}
 
 // ResolveSecretKey resolves or generates the application SECRET_KEY per specification:
 // 1. SECRET_KEY env variable
@@ -162,37 +217,52 @@ func ResolveSecretKey(dataDir string) (string, error) {
 		return "", fmt.Errorf("failed to close temporary secret key file: %w", err)
 	}
 
-	// Atomically place file into target destination.
-	// We try os.Link first because it fails with os.ErrExist if another process
-	// created the key concurrently, preventing silent overwrites.
-	// #nosec G703
-	if linkErr := os.Link(tmpPath, cleanKeyPath); linkErr == nil {
+	// Atomically place file into target destination with strict no-clobber semantics.
+	// We try hard link first. Hard links are atomic and fail with ErrExist if cleanKeyPath exists.
+	placed := false
+	linkErr := linkFile(tmpPath, cleanKeyPath)
+	if linkErr == nil {
+		placed = true
+		// Remove temporary link source
 		// #nosec G703
 		_ = os.Remove(tmpPath)
-		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
-		return newKey, nil
-	} else if errors.Is(linkErr, os.ErrExist) {
-		// Another process created the key concurrently; load and return it.
-		// #nosec G304 G703
-		persistedData, readErr := os.ReadFile(cleanKeyPath)
-		if readErr != nil {
-			return "", fmt.Errorf("failed to read concurrently created secret key file %s: %w", cleanKeyPath, readErr)
-		}
-		persistedKey := strings.TrimSpace(string(persistedData))
-		if persistedKey == "" {
-			return "", fmt.Errorf("concurrently created secret key file %s is empty", cleanKeyPath)
-		}
-		slog.Info("Loaded SECRET_KEY from persistent storage")
-		return persistedKey, nil
+	} else if isErrExist(linkErr) {
+		// Another process won the race and created the key concurrently.
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+		return readWinningKey(cleanKeyPath)
 	} else {
-		// If link is not supported across filesystem boundaries or platform, fall back to atomic rename.
-		// #nosec G304 G703
-		if renameErr := os.Rename(tmpPath, cleanKeyPath); renameErr != nil {
-			return "", fmt.Errorf("failed to persist secret key to %s: %w", cleanKeyPath, renameErr)
+		// Hard links failed (e.g. cross-device link, unsupported on filesystem).
+		// Attempt atomic rename with strict no-replace semantics.
+		renameErr := renameNoReplaceFunc(tmpPath, cleanKeyPath)
+		if renameErr == nil {
+			placed = true
+		} else if isErrExist(renameErr) {
+			// Another process won the race and created the key concurrently.
+			// #nosec G703
+			_ = os.Remove(tmpPath)
+			return readWinningKey(cleanKeyPath)
+		} else {
+			// Neither hard link nor atomic no-replace is available or succeeded.
+			// Fail closed rather than risking clobbering an existing key.
+			// #nosec G703
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("failed to place secret key file %s without clobbering (link err: %v, rename err: %w)", cleanKeyPath, linkErr, renameErr)
+		}
+	}
+
+	if placed {
+		// Durability barrier: durably flush the parent directory entry to media.
+		if err := syncDirFunc(cleanDataDir); err != nil {
+			// #nosec G703
+			_ = os.Remove(cleanKeyPath)
+			return "", fmt.Errorf("failed to sync data directory %s: %w", cleanDataDir, err)
 		}
 		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
 		return newKey, nil
 	}
+
+	return "", fmt.Errorf("unexpected state: failed to place secret key file %s", cleanKeyPath)
 }
 
 // Load initializes configuration from environment variables and local secrets.
