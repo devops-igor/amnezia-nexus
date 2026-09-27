@@ -25,6 +25,10 @@ type ServerKeysManager struct {
 	loaded bool
 }
 
+// Different service instances can initialize against the same database at
+// once. Serialize the first read and create so they converge on one identity.
+var serverKeysInitMu sync.Mutex
+
 // NewServerKeysManager creates a keys manager bound to the settings store.
 func NewServerKeysManager(db *database.DB) *ServerKeysManager {
 	return &ServerKeysManager{db: db}
@@ -42,7 +46,9 @@ func (m *ServerKeysManager) EnsureKeypair(ctx context.Context) (priv, pub [32]by
 	}
 
 	if m.db != nil {
+		serverKeysInitMu.Lock()
 		priv, pub, err = m.loadOrCreate(ctx)
+		serverKeysInitMu.Unlock()
 	} else {
 		priv, pub, err = generateKeyPair()
 	}
@@ -74,21 +80,40 @@ func (m *ServerKeysManager) loadOrCreate(ctx context.Context) (priv, pub [32]byt
 		return priv, pub, fmt.Errorf("failed to load vpn config for server keypair: %w", err)
 	}
 
-	// Existing key: decrypt and verify.
+	// Existing key: recover a legacy plaintext row only when its public key
+	// matches, and never silently rotate an identity already in use.
 	if cfg.ServerPrivateKey != "" {
 		privB64, decErr := security.DecryptCredential(cfg.ServerPrivateKey, m.db.SecretKey())
-		if decErr == nil && privB64 != "" {
-			raw, decErr2 := base64.StdEncoding.DecodeString(privB64)
-			if decErr2 == nil && len(raw) == 32 {
-				copy(priv[:], raw)
-				pubRaw, dhErr := curve25519.X25519(priv[:], curve25519.Basepoint)
-				if dhErr == nil {
-					copy(pub[:], pubRaw)
-					return priv, pub, nil
-				}
+		legacyPlaintext := decErr != nil
+		if legacyPlaintext {
+			privB64 = cfg.ServerPrivateKey
+		}
+		raw, decodeErr := base64.StdEncoding.DecodeString(privB64)
+		if decodeErr != nil || len(raw) != 32 {
+			return priv, pub, fmt.Errorf("invalid stored portal private key")
+		}
+		copy(priv[:], raw)
+		pubRaw, dhErr := curve25519.X25519(priv[:], curve25519.Basepoint)
+		if dhErr != nil {
+			return priv, pub, fmt.Errorf("derive stored portal public key: %w", dhErr)
+		}
+		copy(pub[:], pubRaw)
+		derived := base64.StdEncoding.EncodeToString(pub[:])
+		if cfg.ServerPublicKey != "" && cfg.ServerPublicKey != derived {
+			return priv, pub, fmt.Errorf("stored portal keypair does not match")
+		}
+		if legacyPlaintext {
+			if cfg.ServerPublicKey == "" {
+				return priv, pub, fmt.Errorf("cannot recover plaintext portal key without its public key")
+			}
+			if err := m.db.SaveVPNConfig(ctx, cfg); err != nil {
+				return priv, pub, fmt.Errorf("migrate plaintext portal key: %w", err)
 			}
 		}
-		// Corrupt/undecryptable key: fall through and regenerate below.
+		return priv, pub, nil
+	}
+	if cfg.ServerPublicKey != "" {
+		return priv, pub, fmt.Errorf("stored portal public key has no private key")
 	}
 
 	// Generate a new keypair and persist it (Fernet-encrypted).
