@@ -442,8 +442,22 @@ func (d *DB) ToggleUser(ctx context.Context, id string, enabled bool) (bool, err
 	return d.UpdateUser(ctx, id, map[string]any{"enabled": val == 1})
 }
 
-// UpdateUserTraffic increments user traffic totals and period counters.
-func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) error {
+// UserTrafficTotals is the database state immediately after a traffic increment.
+type UserTrafficTotals struct {
+	Used      int64
+	Total     int64
+	TotalRx   int64
+	TotalTx   int64
+	MonthlyRx int64
+	MonthlyTx int64
+	Limit     int64
+	Enabled   bool
+}
+
+// AddUserTraffic increments all user traffic counters and returns the updated
+// totals from the same SQL statement. Concurrent accounting updates cannot be
+// lost between reading and writing these counters.
+func (d *DB) AddUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -455,13 +469,74 @@ func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta 
 		traffic_total_tx = traffic_total_tx + ?,
 		monthly_rx = monthly_rx + ?,
 		monthly_tx = monthly_tx + ?
-		WHERE id = ?`
+		WHERE id = ?
+		RETURNING traffic_used, traffic_total, traffic_total_rx, traffic_total_tx,
+			monthly_rx, monthly_tx, traffic_limit, enabled`
 
-	_, err := d.sqlDB.ExecContext(ctx, query, totalDelta, totalDelta, rxDelta, txDelta, rxDelta, txDelta, id)
+	var totals UserTrafficTotals
+	err := d.sqlDB.QueryRowContext(ctx, query, totalDelta, totalDelta, rxDelta, txDelta, rxDelta, txDelta, id).Scan(
+		&totals.Used, &totals.Total, &totals.TotalRx, &totals.TotalTx,
+		&totals.MonthlyRx, &totals.MonthlyTx, &totals.Limit, &totals.Enabled,
+	)
 	if err != nil {
-		return fmt.Errorf("failed to update user traffic: %w", err)
+		return UserTrafficTotals{}, fmt.Errorf("failed to update user traffic for %s: %w", id, err)
 	}
-	return nil
+	return totals, nil
+}
+
+// UpdateUserTraffic increments user traffic totals and period counters.
+func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) error {
+	_, err := d.AddUserTraffic(ctx, id, rxDelta, txDelta)
+	return err
+}
+
+// ResetUserMonthlyTraffic removes only the counters present in the orchestrator's
+// snapshot. Traffic added after that snapshot remains in the current period.
+// The reset marker prevents two orchestrators from subtracting the same baseline.
+func (d *DB) ResetUserMonthlyTraffic(ctx context.Context, id string, expectedResetAt *string, snapshot UserTrafficTotals, resetAt string) (bool, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	result, err := d.sqlDB.ExecContext(ctx, `UPDATE users SET
+		monthly_rx = MAX(monthly_rx - ?, 0),
+		monthly_tx = MAX(monthly_tx - ?, 0),
+		traffic_used = CASE WHEN traffic_reset_strategy = ? THEN MAX(traffic_used - ?, 0) ELSE traffic_used END,
+		last_reset_at = CASE WHEN traffic_reset_strategy = ? THEN ? ELSE last_reset_at END,
+		monthly_reset_at = ?
+		WHERE id = ? AND monthly_reset_at IS ?`,
+		snapshot.MonthlyRx, snapshot.MonthlyTx,
+		models.ResetStrategyMonthly, snapshot.Used,
+		models.ResetStrategyMonthly, resetAt, resetAt, id, expectedResetAt)
+	if err != nil {
+		return false, fmt.Errorf("failed to reset monthly traffic for %s: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect monthly reset for %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ResetUserPeriodTraffic removes the snapshotted previous-period usage while
+// retaining traffic committed after the snapshot. A changed marker or strategy
+// means another reset or configuration update won the race.
+func (d *DB) ResetUserPeriodTraffic(ctx context.Context, id string, expectedResetAt *string, expectedStrategy string, snapshotUsed int64, resetAt string) (bool, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	result, err := d.sqlDB.ExecContext(ctx, `UPDATE users SET
+		traffic_used = MAX(traffic_used - ?, 0),
+		last_reset_at = ?
+		WHERE id = ? AND last_reset_at IS ? AND traffic_reset_strategy = ?`,
+		snapshotUsed, resetAt, id, expectedResetAt, expectedStrategy)
+	if err != nil {
+		return false, fmt.Errorf("failed to reset period traffic for %s: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect period reset for %s: %w", id, err)
+	}
+	return rows > 0, nil
 }
 
 // UpdateUserLimits updates per-user connection limits JSON.

@@ -2,11 +2,58 @@ package database
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+func TestAddUserTrafficConcurrentSources(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+	id, err := db.CreateUser(ctx, &models.User{Username: "concurrent-traffic", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			if err := db.UpdateUserTraffic(ctx, id, 2, 3); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			if _, err := db.AddUserTraffic(ctx, id, 7, 11); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	user, err := db.GetUser(ctx, id)
+	if err != nil || user == nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	if user.TrafficUsed != 460 || user.TrafficTotal != 460 ||
+		user.TrafficTotalRx != 180 || user.TrafficTotalTx != 280 ||
+		user.MonthlyRx != 180 || user.MonthlyTx != 280 {
+		t.Errorf("concurrent increments lost: %+v", user)
+	}
+}
 
 func TestUsersEmptyAndNotFound(t *testing.T) {
 	db, _ := setupTestDB(t)
