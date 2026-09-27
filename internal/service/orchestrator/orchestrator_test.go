@@ -426,6 +426,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PreservesPortalFlush(t *testing.T) 
 	if err != nil || snapshot == nil {
 		t.Fatalf("GetUser: %v", err)
 	}
+	resetBaselines := map[string]int64{userID: snapshot.TrafficUsed}
 	accountant := forwarder.NewTrafficAccountant(db, time.Second)
 	accountant.RecordRx("", portalID, 25)
 	accountant.RecordTx("", portalID, 45)
@@ -438,7 +439,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PreservesPortalFlush(t *testing.T) 
 	toDisable := make(map[string]bool)
 	orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
 		connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
-	}}, usersMap, toDisable)
+	}}, usersMap, resetBaselines, toDisable)
 
 	got, err := db.GetUser(ctx, userID)
 	if err != nil || got == nil {
@@ -493,6 +494,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforeMonthlyRollover(t 
 	if err != nil || snapshot == nil {
 		t.Fatalf("GetUser: %v", err)
 	}
+	resetBaselines := map[string]int64{userID: snapshot.TrafficUsed}
 	orch := New(db, nil)
 	usersMap := map[string]*models.User{userID: snapshot}
 
@@ -516,7 +518,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforeMonthlyRollover(t 
 	toDisable := make(map[string]bool)
 	orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
 		connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
-	}}, usersMap, toDisable)
+	}}, usersMap, resetBaselines, toDisable)
 
 	got, err := db.GetUser(ctx, userID)
 	if err != nil || got == nil {
@@ -539,9 +541,12 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 	for _, tc := range []struct {
 		name     string
 		strategy models.TrafficResetStrategy
+		rollover bool
 	}{
 		{name: "daily", strategy: models.ResetStrategyDaily},
 		{name: "weekly", strategy: "weekly"},
+		{name: "daily-with-monthly-rollover", strategy: models.ResetStrategyDaily, rollover: true},
+		{name: "weekly-with-monthly-rollover", strategy: "weekly", rollover: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, cleanup := setupTestDB(t)
@@ -550,6 +555,10 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 			now := time.Now().UTC()
 			lastPeriod := now.AddDate(0, 0, -8).Format(time.RFC3339)
 			thisMonth := now.Format(time.RFC3339)
+			monthlyResetAt := thisMonth
+			if tc.rollover {
+				monthlyResetAt = now.AddDate(0, -1, 0).Format(time.RFC3339)
+			}
 			serverID, err := db.CreateServer(ctx, &models.Server{Name: "Period Server", Host: "10.0.0.3"})
 			if err != nil {
 				t.Fatal(err)
@@ -557,7 +566,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 			userID, err := db.CreateUser(ctx, &models.User{
 				Username: "period-" + tc.name, Enabled: true, TrafficLimit: 150,
 				TrafficUsed: 300, TrafficTotal: 300, TrafficTotalRx: 100, TrafficTotalTx: 200,
-				MonthlyRx: 100, MonthlyTx: 200, MonthlyResetAt: &thisMonth,
+				MonthlyRx: 100, MonthlyTx: 200, MonthlyResetAt: &monthlyResetAt,
 				TrafficResetStrategy: tc.strategy, LastResetAt: &lastPeriod,
 			})
 			if err != nil {
@@ -579,6 +588,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 			if err != nil || snapshot == nil {
 				t.Fatalf("GetUser: %v", err)
 			}
+			resetBaselines := map[string]int64{userID: snapshot.TrafficUsed}
 			accountant := forwarder.NewTrafficAccountant(db, time.Second)
 			accountant.RecordRx("", portalID, 25)
 			accountant.RecordTx("", portalID, 45)
@@ -587,19 +597,34 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 			}
 
 			orch := New(db, nil)
+			usersMap := map[string]*models.User{userID: snapshot}
+			if err := orch.handleMonthlyRollover(ctx, now, usersMap); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rollover && snapshot.TrafficUsed != 370 {
+				t.Fatalf("monthly refresh should include portal traffic: used=%d, want 370", snapshot.TrafficUsed)
+			}
 			toDisable := make(map[string]bool)
 			orch.applyConnectionUpdates(ctx, now, []connTrafficUpdate{{
 				connID: remoteID, rxDelta: 50, txDelta: 70, currRX: 50, currTX: 70,
-			}}, map[string]*models.User{userID: snapshot}, toDisable)
+			}}, usersMap, resetBaselines, toDisable)
 
 			got, err := db.GetUser(ctx, userID)
 			if err != nil || got == nil {
 				t.Fatalf("GetUser after reset: %v", err)
 			}
+			wantMonthlyRx, wantMonthlyTx := int64(175), int64(315)
+			if tc.rollover {
+				wantMonthlyRx, wantMonthlyTx = 75, 115
+			}
 			if got.TrafficUsed != 190 || got.TrafficTotal != 490 ||
 				got.TrafficTotalRx != 175 || got.TrafficTotalTx != 315 ||
-				got.MonthlyRx != 175 || got.MonthlyTx != 315 || !toDisable[userID] {
+				got.MonthlyRx != wantMonthlyRx || got.MonthlyTx != wantMonthlyTx || !toDisable[userID] {
 				t.Errorf("lost portal traffic across %s reset: %+v, disable=%v", tc.name, got, toDisable[userID])
+			}
+			overQuota, err := db.GetUsersOverQuota(ctx)
+			if err != nil || len(overQuota) != 1 || overQuota[0].ID != userID {
+				t.Errorf("database quota missed preserved traffic: %+v, err=%v", overQuota, err)
 			}
 			if got.LastResetAt == nil || *got.LastResetAt != now.Format(time.RFC3339) {
 				t.Errorf("last_reset_at was not advanced: %v", got.LastResetAt)

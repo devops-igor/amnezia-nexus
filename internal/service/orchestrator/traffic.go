@@ -86,8 +86,12 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 	}
 
 	usersMap := make(map[string]*models.User, len(users))
+	// Keep the pre-rollover usage separately: handleMonthlyRollover refreshes
+	// users from the DB, which can already include a concurrent portal flush.
+	resetBaselines := make(map[string]int64, len(users))
 	for i := range users {
 		usersMap[users[i].ID] = &users[i]
+		resetBaselines[users[i].ID] = users[i].TrafficUsed
 	}
 
 	toDisableUIDs := make(map[string]bool)
@@ -99,7 +103,7 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 
 	// === 2. TRAFFIC DELTA PROCESSING ===
 	if len(updates) > 0 {
-		o.applyConnectionUpdates(ctx, now, updates, usersMap, toDisableUIDs)
+		o.applyConnectionUpdates(ctx, now, updates, usersMap, resetBaselines, toDisableUIDs)
 	}
 
 	// Include portal traffic flushed after the user snapshot, even when a user
@@ -134,7 +138,7 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 	return nil
 }
 
-func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time, updates []connTrafficUpdate, usersMap map[string]*models.User, toDisableUIDs map[string]bool) {
+func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time, updates []connTrafficUpdate, usersMap map[string]*models.User, resetBaselines map[string]int64, toDisableUIDs map[string]bool) {
 	for _, u := range updates {
 		uc, err := o.db.GetConnection(ctx, u.connID)
 		if err != nil || uc == nil {
@@ -162,8 +166,13 @@ func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time
 
 		// Check user resettable strategy
 		if o.isTrafficResetNeeded(user, now) {
+			baseline, ok := resetBaselines[user.ID]
+			if !ok {
+				slog.Error("Missing original usage baseline for period reset", "user_id", user.ID)
+				continue
+			}
 			nowStr := now.Format(time.RFC3339)
-			if _, err := o.db.ResetUserPeriodTraffic(ctx, user.ID, user.LastResetAt, string(user.TrafficResetStrategy), user.TrafficUsed, nowStr); err != nil {
+			if _, err := o.db.ResetUserPeriodTraffic(ctx, user.ID, user.LastResetAt, string(user.TrafficResetStrategy), baseline, nowStr); err != nil {
 				slog.Error("Failed to reset user period traffic", "user_id", user.ID, "err", err)
 				continue
 			}
