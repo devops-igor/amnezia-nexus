@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"golang.org/x/sync/errgroup"
@@ -85,25 +86,38 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 	}
 
 	usersMap := make(map[string]*models.User, len(users))
+	// Keep the pre-rollover usage separately: handleMonthlyRollover refreshes
+	// users from the DB, which can already include a concurrent portal flush.
+	resetBaselines := make(map[string]int64, len(users))
 	for i := range users {
 		usersMap[users[i].ID] = &users[i]
+		resetBaselines[users[i].ID] = users[i].TrafficUsed
 	}
 
 	toDisableUIDs := make(map[string]bool)
 
 	// === 1. MONTHLY ROLLOVER: runs unconditionally every cycle ===
-	o.handleMonthlyRollover(ctx, now, usersMap)
+	if err := o.handleMonthlyRollover(ctx, now, usersMap); err != nil {
+		return err
+	}
 
 	// === 2. TRAFFIC DELTA PROCESSING ===
 	if len(updates) > 0 {
-		o.applyConnectionUpdates(ctx, now, updates, usersMap, toDisableUIDs)
+		o.applyConnectionUpdates(ctx, now, updates, usersMap, resetBaselines, toDisableUIDs)
+	}
+
+	// Include portal traffic flushed after the user snapshot, even when a user
+	// has no remote connection update in this cycle.
+	overQuota, err := o.db.GetUsersOverQuota(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch users over quota: %w", err)
+	}
+	for _, user := range overQuota {
+		toDisableUIDs[user.ID] = true
 	}
 
 	// === 3. LIMIT & EXPIRATION CHECK: for all users in usersMap ===
 	for _, user := range usersMap {
-		if user.TrafficLimit > 0 && user.TrafficUsed >= user.TrafficLimit && user.Enabled {
-			toDisableUIDs[user.ID] = true
-		}
 		if o.isUserExpired(user, now) && user.Enabled {
 			toDisableUIDs[user.ID] = true
 		}
@@ -124,7 +138,7 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 	return nil
 }
 
-func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time, updates []connTrafficUpdate, usersMap map[string]*models.User, toDisableUIDs map[string]bool) {
+func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time, updates []connTrafficUpdate, usersMap map[string]*models.User, resetBaselines map[string]int64, toDisableUIDs map[string]bool) {
 	for _, u := range updates {
 		uc, err := o.db.GetConnection(ctx, u.connID)
 		if err != nil || uc == nil {
@@ -152,38 +166,38 @@ func (o *Orchestrator) applyConnectionUpdates(ctx context.Context, now time.Time
 
 		// Check user resettable strategy
 		if o.isTrafficResetNeeded(user, now) {
+			baseline, ok := resetBaselines[user.ID]
+			if !ok {
+				slog.Error("Missing original usage baseline for period reset", "user_id", user.ID)
+				continue
+			}
 			nowStr := now.Format(time.RFC3339)
-			_, _ = o.db.UpdateUser(ctx, user.ID, map[string]any{
-				"traffic_used":  0,
-				"last_reset_at": nowStr,
-			})
-			user.TrafficUsed = 0
-			user.LastResetAt = &nowStr
+			if _, err := o.db.ResetUserPeriodTraffic(ctx, user.ID, user.LastResetAt, string(user.TrafficResetStrategy), baseline, nowStr); err != nil {
+				slog.Error("Failed to reset user period traffic", "user_id", user.ID, "err", err)
+				continue
+			}
+			current, err := o.db.GetUser(ctx, user.ID)
+			if err != nil || current == nil {
+				slog.Error("Failed to refresh user after period reset", "user_id", user.ID, "err", err)
+				continue
+			}
+			*user = *current
 		}
 
-		delta := u.rxDelta + u.txDelta
-		newUsed := user.TrafficUsed + delta
-		newTotal := user.TrafficTotal + delta
-		newTotalRx := user.TrafficTotalRx + u.rxDelta
-		newTotalTx := user.TrafficTotalTx + u.txDelta
-		newMonthlyRx := user.MonthlyRx + u.rxDelta
-		newMonthlyTx := user.MonthlyTx + u.txDelta
+		totals, err := o.db.AddUserTraffic(ctx, user.ID, u.rxDelta, u.txDelta)
+		if err != nil {
+			slog.Error("Failed to apply remote user traffic delta", "user_id", user.ID, "connection_id", u.connID, "err", err)
+			continue
+		}
 
-		_, _ = o.db.UpdateUser(ctx, user.ID, map[string]any{
-			"traffic_used":     newUsed,
-			"traffic_total":    newTotal,
-			"traffic_total_rx": newTotalRx,
-			"traffic_total_tx": newTotalTx,
-			"monthly_rx":       newMonthlyRx,
-			"monthly_tx":       newMonthlyTx,
-		})
-
-		user.TrafficUsed = newUsed
-		user.TrafficTotal = newTotal
-		user.TrafficTotalRx = newTotalRx
-		user.TrafficTotalTx = newTotalTx
-		user.MonthlyRx = newMonthlyRx
-		user.MonthlyTx = newMonthlyTx
+		user.TrafficUsed = totals.Used
+		user.TrafficTotal = totals.Total
+		user.TrafficTotalRx = totals.TotalRx
+		user.TrafficTotalTx = totals.TotalTx
+		user.MonthlyRx = totals.MonthlyRx
+		user.MonthlyTx = totals.MonthlyTx
+		user.TrafficLimit = totals.Limit
+		user.Enabled = totals.Enabled
 
 		// Check traffic quota limit
 		if user.TrafficLimit > 0 && user.TrafficUsed >= user.TrafficLimit && user.Enabled {
@@ -308,7 +322,7 @@ func parseTolerantTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse timestamp: %q", s)
 }
 
-func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time, usersMap map[string]*models.User) {
+func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time, usersMap map[string]*models.User) error {
 	// 1. Take previous month leaderboard snapshot if month changed
 	for _, u := range usersMap {
 		if u.MonthlyResetAt != nil && *u.MonthlyResetAt != "" {
@@ -347,23 +361,24 @@ func (o *Orchestrator) handleMonthlyRollover(ctx context.Context, now time.Time,
 		}
 
 		if shouldReset {
-			fields := map[string]any{
-				"monthly_rx":       0,
-				"monthly_tx":       0,
-				"monthly_reset_at": nowStr,
+			snapshot := database.UserTrafficTotals{
+				Used: u.TrafficUsed, MonthlyRx: u.MonthlyRx, MonthlyTx: u.MonthlyTx,
 			}
-			if u.TrafficResetStrategy == models.ResetStrategyMonthly {
-				fields["traffic_used"] = 0
-				fields["last_reset_at"] = nowStr
-				u.TrafficUsed = 0
-				u.LastResetAt = &nowStr
+			if _, err := o.db.ResetUserMonthlyTraffic(ctx, u.ID, u.MonthlyResetAt, snapshot, nowStr); err != nil {
+				return fmt.Errorf("failed to roll over monthly traffic for %s: %w", u.ID, err)
 			}
-			_, _ = o.db.UpdateUser(ctx, u.ID, fields)
-			u.MonthlyRx = 0
-			u.MonthlyTx = 0
-			u.MonthlyResetAt = &nowStr
+			current, err := o.db.GetUser(ctx, u.ID)
+			if err != nil {
+				return fmt.Errorf("failed to refresh user %s after monthly rollover: %w", u.ID, err)
+			}
+			if current == nil {
+				delete(usersMap, u.ID)
+				continue
+			}
+			*u = *current
 		}
 	}
+	return nil
 }
 
 func (o *Orchestrator) isTrafficResetNeeded(u *models.User, now time.Time) bool {
