@@ -111,6 +111,12 @@ func TestEngineReturnOwnershipFreshReuseReplacementAndLegacyMemo(t *testing.T) {
 // metrics"): every rejected plaintext shape lands in its own counter,
 // accepted packets surface the portal TUN snapshot, and a stopped engine's
 // closed return path rejects submissions.
+//
+// These are DIRECT writeReturnPacket calls: they pin the callback's own
+// fallback classification. The PRODUCTION-path classification contract —
+// forwarder filters reject malformed/unrouted replies before this callback
+// runs and classify them at the rejection sites — is pinned separately by
+// TestEngineReturnClassifiesViaProductionPath (issue #389 rework 2).
 func TestEngineReturnWriteClassifiesDropsAndStats(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db)
