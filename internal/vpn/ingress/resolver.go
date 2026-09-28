@@ -1,29 +1,3 @@
-// Package ingress routes plaintext client packets produced by the upstream
-// client-facing AWG device (clientawg.ClientAWGDevice.ReceiveOutbound) into
-// Nexus backend sessions (issue #388). It provides two components:
-//
-//   - Resolver: the durable assigned-IP -> peer ownership map. Loaded at
-//     startup from the same durable state the portal leases client IPs from
-//     (user_connections.client_params["assigned_ip"], read through
-//     database.DB.GetVPNClientIPAssignments) and kept current through an
-//     explicit mutation API that issue #391's event-driven sync builds on.
-//   - Router: safe IPv4 parsing plus the ownership checks that gate lazy
-//     admission and forwarder route registration for every plaintext packet.
-//     There is no forwarder self-heal on this path: a packet whose source IP
-//     is not exactly the resolved peer's durable assignment is dropped and
-//     counted, never rebound (issue #89's rebind exists only on the legacy
-//     custom-listener path, which stays untouched until #393).
-//
-// Admission is injectable through the Admission interface. Production wiring
-// adapts vpn.Service.HandleIncomingPeer, so the #86 capacity serialization and
-// rekey-stable live-session reuse are reused verbatim rather than
-// reimplemented. The components ship standalone in this session; listener
-// wiring is #393.
-//
-// IP representation: assigned addresses are stored and compared as 4-byte
-// netip.Addr values (netip.AddrFrom4; Is4() holds for every stored entry).
-// String rendering for errors and counters uses netip's canonical dotted
-// form, which matches the persisted lease text.
 package ingress
 
 import (
