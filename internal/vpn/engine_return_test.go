@@ -147,9 +147,10 @@ func TestEngineReturnWriteClassifiesDropsAndStats(t *testing.T) {
 	if stats.AcceptedPackets != 1 {
 		t.Fatalf("accepted=%d, want 1", stats.AcceptedPackets)
 	}
-	if stats.TUN.InboundDepth != 1 {
-		t.Fatalf("portal inbound depth=%d, want 1 (packet must reach the client-facing TUN)", stats.TUN.InboundDepth)
-	}
+	// No InboundDepth assertion: the upstream device.Device consumes the
+	// client-facing TUN concurrently, so instantaneous depth proves nothing
+	// (0 can mean already dequeued for encryption). Delivery is proven by
+	// the E2E TestUpstreamReturnTCPUDPRekeysAndRoaming.
 	for name, got := range map[string]uint64{
 		"malformed": stats.MalformedDrops, "unmapped": stats.UnmappedDrops,
 		"mismatch": stats.OwnershipMismatchDrops, "injection": stats.InjectionErrors,
@@ -188,7 +189,9 @@ func TestEngineReturnWriteClassifiesDropsAndStats(t *testing.T) {
 	if stats.MalformedDrops != 3 || stats.UnmappedDrops != 1 || stats.OwnershipMismatchDrops != 2 {
 		t.Fatalf("misclassified drops: malformed=%d unmapped=%d mismatch=%d", stats.MalformedDrops, stats.UnmappedDrops, stats.OwnershipMismatchDrops)
 	}
-	if stats.AcceptedPackets != 1 || stats.TUN.InboundDepth != 1 {
+	// AcceptedPackets is monotonic: rejections must not have decremented it.
+	// Depth is still not asserted here — same reason as above.
+	if stats.AcceptedPackets != 1 {
 		t.Fatal("rejections corrupted accepted accounting")
 	}
 	if stats.TUN.DropsQueueFull != 0 {
