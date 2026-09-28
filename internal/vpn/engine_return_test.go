@@ -6,8 +6,10 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 func ownedIngressPacket(source string) []byte {
@@ -101,6 +103,105 @@ func TestEngineReturnOwnershipFreshReuseReplacementAndLegacyMemo(t *testing.T) {
 	}
 	if !svc.forwarder.HasSessionRouteWithReturnPath(peer.peerKey, current.ID, peer.connID, peer.ip.String(), newBackend.ID, next) {
 		t.Fatal("old engine stole replacement owner")
+	}
+}
+
+// TestEngineReturnWriteClassifiesDropsAndStats pins the engine seam's
+// classification contract (issue #389 "queue pressure has explicit
+// metrics"): every rejected plaintext shape lands in its own counter,
+// accepted packets surface the portal TUN snapshot, and a stopped engine's
+// closed return path rejects submissions.
+func TestEngineReturnWriteClassifiesDropsAndStats(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// NewIngressEngine fail-closed validates real upstream keys, so this test
+	// mints an actual X25519 identity and seeds the matching durable lease.
+	peerKey, _ := engineKeys(t)
+	peer := seedIngressPeer(t, db, "return-classify", peerKey, "10.100.8.4")
+	engine, err := svc.NewIngressEngine(t.Context(), "return-classify-portal", []clientawg.Peer{
+		{PublicKey: peer.peerKey, AllowedIP: netip.PrefixFrom(peer.ip, 32)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Stop() })
+
+	returnPacket := func(dest netip.Addr) []byte {
+		p := make([]byte, 28)
+		p[0] = 0x45
+		p[9] = 17 // UDP
+		binary.BigEndian.PutUint16(p[2:4], 28)
+		ip := dest.As4()
+		copy(p[16:20], ip[:])
+		return p
+	}
+	accepted := returnPacket(peer.ip)
+	if _, err := engine.writeReturnPacket(peer.peerKey, peer.ip.String(), accepted); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := engine.ReturnStats()
+	if stats.AcceptedPackets != 1 {
+		t.Fatalf("accepted=%d, want 1", stats.AcceptedPackets)
+	}
+	if stats.TUN.InboundDepth != 1 {
+		t.Fatalf("portal inbound depth=%d, want 1 (packet must reach the client-facing TUN)", stats.TUN.InboundDepth)
+	}
+	for name, got := range map[string]uint64{
+		"malformed": stats.MalformedDrops, "unmapped": stats.UnmappedDrops,
+		"mismatch": stats.OwnershipMismatchDrops, "injection": stats.InjectionErrors,
+	} {
+		if got != 0 {
+			t.Fatalf("%s drops=%d after one accepted packet", name, got)
+		}
+	}
+
+	// The shared reader's IPv4 floor: the engine seam must reject shapes the
+	// production backend reader would otherwise forward unchecked.
+	badVersion := returnPacket(peer.ip)
+	badVersion[0] = 0x65
+	badIHL := returnPacket(peer.ip)[:20]
+	badIHL[0] = 0x46 // IHL=6: claimed 24-byte header exceeds the 20-byte packet
+	shortTotal := returnPacket(peer.ip)
+	binary.BigEndian.PutUint16(shortTotal[2:4], 12)
+	for name, p := range map[string][]byte{"bad version": badVersion, "bad IHL": badIHL, "short total length": shortTotal} {
+		if _, err := engine.writeReturnPacket(peer.peerKey, peer.ip.String(), p); !errors.Is(err, errReturnDestination) {
+			t.Fatalf("%s packet accepted: %v", name, err)
+		}
+	}
+
+	other := netip.MustParseAddr("192.0.2.53")
+	if _, err := engine.writeReturnPacket(peer.peerKey, peer.ip.String(), returnPacket(other)); !errors.Is(err, errReturnDestination) {
+		t.Fatal("unmapped destination accepted")
+	}
+	if _, err := engine.writeReturnPacket("not-"+peer.peerKey, peer.ip.String(), returnPacket(peer.ip)); !errors.Is(err, errReturnDestination) {
+		t.Fatal("wrong peer key accepted")
+	}
+	if _, err := engine.writeReturnPacket(peer.peerKey, other.String(), returnPacket(peer.ip)); !errors.Is(err, errReturnDestination) {
+		t.Fatal("assigned-IP divergence accepted")
+	}
+
+	stats = engine.ReturnStats()
+	if stats.MalformedDrops != 3 || stats.UnmappedDrops != 1 || stats.OwnershipMismatchDrops != 2 {
+		t.Fatalf("misclassified drops: malformed=%d unmapped=%d mismatch=%d", stats.MalformedDrops, stats.UnmappedDrops, stats.OwnershipMismatchDrops)
+	}
+	if stats.AcceptedPackets != 1 || stats.TUN.InboundDepth != 1 {
+		t.Fatal("rejections corrupted accepted accounting")
+	}
+	if stats.TUN.DropsQueueFull != 0 {
+		t.Fatalf("unexpected portal TUN drops: %+v", stats.TUN)
+	}
+
+	// Never started: Stop still closes the portal and the return path, but
+	// reports ErrIngressEngineNotStarted by contract.
+	if err := engine.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
+		t.Fatal(err)
+	}
+	if _, err := engine.writeReturnPacket(peer.peerKey, peer.ip.String(), returnPacket(peer.ip)); !errors.Is(err, virtualtun.ErrClosed) {
+		t.Fatalf("stopped engine accepted plaintext: %v", err)
 	}
 }
 
