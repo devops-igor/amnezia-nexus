@@ -78,8 +78,11 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //     existing sticky/LB/capacity primitives and a routing session is
 //     created lazily with the persisted assigned IP. A pre-existing
 //     invalid session (stranded backend, diverged IP) is replaced through
-//     SessionManager's own replacement path, whose hook releases the old
-//     session's backend count on the same primitives.
+//     SessionManager's own replacement path; the new backend's active
+//     count is applied EXACTLY once per admission (issue #388 rework C):
+//     the replacement hook owns the transfer (Dec old, Inc new when they
+//     differ) and the admission increments only when the hook did not —
+//     reported per-call by SessionManager.LastReplacementPoolDelta.
 //
 // Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
 // reuse-check -> select -> CreateSession -> IncrementConnections -> route
@@ -195,15 +198,28 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 		return nil, nil, retirement, fmt.Errorf("ingress admission: session creation failed: %w", err)
 	}
 
-	// Backend accounting. Exactly one increment is attributable to THIS
-	// admission: the rekey ReplacementHook cannot fire for a first session
-	// (no prior session existed — the live-reuse branch above would have
-	// caught any), and when it DOES fire (replacement of a stranded
-	// invalid session) it releases the old session's count on the same
-	// primitives. The rollback decrement below mirrors this increment
-	// exactly; the hook's release of the OLD session's count is that
-	// session's own teardown and is not rolled back.
-	s.pool.IncrementConnections(backend.ID)
+	// Backend accounting, exactly-once across replacement (issue #388 rework
+	// C). CreateSession reports what its replacement hook already moved on
+	// the pool counters (read here under the same s.mu that covered the whole
+	// CreateSession call, so the delta is THIS admission's):
+	//
+	//   - fresh creation (no prior session): the hook fired nothing — THIS
+	//     admission owns the new backend's increment;
+	//   - same-backend replacement (A==B): the hook decremented A (the old
+	//     count moves out) and did NOT increment (new backend == old). This
+	//     admission restores the count by re-incrementing the same backend —
+	//     the peer's live count stays exactly 1, mirroring HandleIncomingPeer;
+	//   - different-backend replacement (A!=B): the hook did BOTH halves of
+	//     the transfer (Dec(A), Inc(B)) — the admission adds NOTHING, or B
+	//     would end at 2 for one session.
+	//
+	// The report is the ground truth even when the live snapshot at the top
+	// of this function went stale before CreateSession acquired the session
+	// manager lock: what matters for exactly-once is what the hook moved for
+	// this call, not what the snapshot predicted.
+	if !s.sessionMgr.LastReplacementPoolDelta().HasInc {
+		s.pool.IncrementConnections(backend.ID)
+	}
 
 	// Route registration LAST (admission-then-register): only a checked,
 	// successful registration makes the admission visible.
@@ -211,6 +227,14 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 		retirement, err = s.forwarder.TryRegisterSessionWithLimit(sess.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, 0, 0)
 		if err != nil {
 			s.rollbackIngressSession(ctx, sess)
+			// Mirror decrement of the count THIS admission left on the NEW
+			// backend, whatever its provenance above: the admission's own
+			// increment (fresh / same-backend) or the hook's transfer
+			// increment (different-backend replacement). One routing session
+			// held that count; both it and the route are gone now. The
+			// hook's Dec of the OLD backend is the old session's own
+			// teardown and is not undone — the old session was invalidated
+			// by the replacement and the admission failed.
 			s.pool.DecrementConnections(backend.ID)
 			s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
 			retirement = forwarder.Retirement{}

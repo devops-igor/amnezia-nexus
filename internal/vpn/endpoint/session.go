@@ -27,6 +27,22 @@ var (
 // old backend's ActiveConnections gauge.
 type ReplacementHook func(ctx context.Context, old, new *models.VPNSession)
 
+// ReplacementPoolDelta reports the backend pool-counter movement the
+// replacement hook performed for ONE CreateSession call (issue #388 rework
+// C). It lets a caller that applies its own backend accounting mirror the
+// hook exactly: Replaced is true whenever an existing session was replaced
+// (the hook decremented DecBackendID, the OLD session's backend), and HasInc
+// is additionally true when the replacement moved the peer to a different
+// backend (the hook also incremented IncBackendID, the NEW backend). The
+// zero value reports "no replacement ran; the hook moved nothing" — the
+// caller then owns the new backend's increment itself.
+type ReplacementPoolDelta struct {
+	Replaced     bool
+	DecBackendID int64
+	IncBackendID int64
+	HasInc       bool
+}
+
 // SessionMetrics instruments the session-lifecycle paths so counter-leak
 // paths are distinguishable in production (issue #78 direction item 2):
 // replacements_total counts session replacements, and the paired
@@ -60,6 +76,13 @@ type SessionManager struct {
 	lifecycleVersion atomic.Uint64
 	metrics          SessionMetrics
 	replacementHook  ReplacementHook
+	// lastReplacementDelta carries the pool-counter movement of the MOST
+	// RECENT CreateSession call, recorded under sm.mu right after the
+	// replacement hook fires (issue #388 rework C). Production CreateSession
+	// call sites hold the VPN Service's s.mu for the whole call (issue #86),
+	// so a caller reading this after its own CreateSession observes its own
+	// replacement — not a concurrent admission's.
+	lastReplacementDelta ReplacementPoolDelta
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
@@ -206,12 +229,39 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	// the caller sees a consistent old→new transition. The hook migrates the
 	// pool connection counter (decrement old backend, increment new) and
 	// updates forwarder/sticky state; it must not re-enter this manager.
+	// Issue #388 rework C: record what the hook actually moved so the
+	// CreateSession caller can own the new backend's increment EXACTLY once —
+	// it increments only when the hook did not (fresh creation, or a
+	// same-backend replacement where the hook only released the old count on
+	// the same backend). The record is (re)written on EVERY CreateSession
+	// under sm.mu — zero when no replacement fired — and read under the
+	// caller's issue-#86 serialization, so a caller never observes another
+	// admission's delta.
 	if replaced != nil && sm.replacementHook != nil {
 		sm.metrics.ReplacementCounterMigrationsTotal.Add(1)
 		sm.replacementHook(ctx, replaced, sess)
+		sm.lastReplacementDelta = ReplacementPoolDelta{
+			Replaced:     true,
+			DecBackendID: replaced.BackendTunnelID,
+			IncBackendID: sess.BackendTunnelID,
+			HasInc:       sess.BackendTunnelID != replaced.BackendTunnelID,
+		}
+	} else {
+		sm.lastReplacementDelta = ReplacementPoolDelta{}
 	}
 
 	return sess, nil
+}
+
+// LastReplacementPoolDelta returns the pool-counter movement the replacement
+// hook performed during the most recent CreateSession call (issue #388 rework
+// C). Must be called under the same capacity serialization that covered the
+// CreateSession call itself (the VPN Service's s.mu, issue #86) — production
+// CreateSession call sites hold it for the whole call, which makes the
+// observed delta the caller's own. The zero value means "no replacement ran;
+// the hook moved nothing".
+func (sm *SessionManager) LastReplacementPoolDelta() ReplacementPoolDelta {
+	return sm.lastReplacementDelta
 }
 
 // GetSession retrieves a session by peer public key.
