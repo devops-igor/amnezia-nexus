@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Client-facing upstream AWG device wrapper with persisted portal identity validation, IPv4 peer management, plaintext VirtualTUN access, sanitized status, and localhost compatibility/restart tests (#387). Production listener selection remains unchanged.
+
 ## [2.0.0] - Zenith - 2026-09-27
 
 Major release splitting backend administrative state from runtime health. It contains an intentional, documented breaking change to the `/api/vpn/*` response semantics (see Changed).
