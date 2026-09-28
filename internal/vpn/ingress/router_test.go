@@ -425,30 +425,31 @@ func TestRouterConcurrentMixedLoad(t *testing.T) {
 	}
 }
 
-func TestRouterPacketLengthFieldIsIgnored(t *testing.T) {
-	// The router reads only the fixed source field; a bogus total-length
-	// field must not affect parsing (defense against crafted headers).
+func TestRouterRejectsImpossibleTotalLength(t *testing.T) {
+	// The strict parse treats a self-declared total length that cannot be
+	// true (0xFFFF bytes received in a 40-byte datagram) as malformed: the
+	// packet is dropped and counted, never routed or admitted.
 	const peer = testPeer1
 	router, _, admission, fwd := fixture(t, peer, "10.40.0.2")
 
 	pkt := buildPacket(t, netip.MustParseAddr("10.40.0.2"), 40)
 	binary.BigEndian.PutUint16(pkt[2:4], 0xFFFF) // impossible total length
-	if err := router.HandlePacket(pkt); err != nil {
-		t.Fatalf("packet with bogus length field: %v", err)
+	if err := router.HandlePacket(pkt); !errors.Is(err, ErrDropMalformed) {
+		t.Fatalf("packet with impossible total length = %v, want malformed drop", err)
+	}
+	if stats := router.StatsSnapshot(); stats.MalformedPacketDrops != 1 {
+		t.Fatalf("MalformedPacketDrops = %d, want 1", stats.MalformedPacketDrops)
+	}
+	if got := admission.calls(peer); got != 0 {
+		t.Fatalf("admission ran %d times, want 0 (packet dropped before admission)", got)
 	}
 	beQueue, ok := fwd.GetBackendPacketChannel(42)
 	if !ok {
 		t.Fatal("backend queue missing")
 	}
-	if got := admission.calls(peer); got != 1 {
-		t.Fatalf("admission ran %d times, want 1", got)
-	}
 	select {
 	case got := <-beQueue:
-		if len(got) != 40 {
-			t.Fatalf("forwarded packet length = %d, want 40 (payload preserved)", len(got))
-		}
+		t.Fatalf("malformed packet reached the backend queue: % x", got)
 	default:
-		t.Fatal("packet missing from backend queue")
 	}
 }

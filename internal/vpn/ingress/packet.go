@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -11,8 +12,10 @@ import (
 type DropReason string
 
 const (
-	// ReasonMalformed marks packets shorter than an IPv4 header or without
-	// an IPv4 version nibble.
+	// ReasonMalformed marks packets rejected by the strict structural IPv4
+	// parse: shorter than a minimum header, wrong version nibble, IHL
+	// below 5, header length beyond the received bytes, or a total-length
+	// field inconsistent with the header or the received bytes.
 	ReasonMalformed DropReason = "malformed_packet_drops"
 	// ReasonUnmappedSource marks packets whose parsed source IP has no
 	// durable owner in the resolver.
@@ -44,16 +47,40 @@ var (
 const ipv4HeaderLen = 20
 
 // ParseIPv4Source extracts the source address of one plaintext IPv4 packet.
-// It is bounded and panic-free: packets shorter than the fixed IPv4 header
-// (IHL options are never read) and non-IPv4 version nibbles are rejected.
-// Packets with IHL > 20 are accepted: the fixed offsets of the source field
-// are identical for every IHL, and the upstream engine already bounded the
-// datagram to the TUN MTU. The returned address is always a 4-byte netip.Addr.
+// It is bounded and panic-free, and structurally strict: a packet is
+// rejected unless
+//
+//   - it carries at least one full header,
+//   - the version nibble is 4,
+//   - IHL is at least 5,
+//   - the IHL-derived header length fits inside the received bytes,
+//   - the total-length field is at least the header length, and
+//   - the total-length field does not exceed the received length.
+//
+// A datagram whose self-declared length disagrees with the bytes actually
+// received is malformed, not routable — the source field of such a packet
+// is never trusted. IHL > 5 stays accepted: the fixed offsets of the source
+// field are identical for every IHL, and the upstream engine already
+// bounded the datagram to the TUN MTU. No checksum validation happens here;
+// the engine has already authenticated the peer. The returned address is
+// always a 4-byte netip.Addr.
 func ParseIPv4Source(packet []byte) (netip.Addr, bool) {
 	if len(packet) < ipv4HeaderLen {
 		return netip.Addr{}, false
 	}
 	if packet[0]>>4 != 4 {
+		return netip.Addr{}, false
+	}
+	ihl := int(packet[0] & 0x0f)
+	if ihl < 5 {
+		return netip.Addr{}, false
+	}
+	headerLen := ihl * 4
+	if headerLen > len(packet) {
+		return netip.Addr{}, false
+	}
+	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLen < headerLen || totalLen > len(packet) {
 		return netip.Addr{}, false
 	}
 	return netip.AddrFrom4([4]byte{packet[12], packet[13], packet[14], packet[15]}), true

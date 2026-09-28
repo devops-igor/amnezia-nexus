@@ -27,6 +27,17 @@ func TestParseIPv4Source(t *testing.T) {
 	src := netip.MustParseAddr("10.40.0.7")
 	other := netip.MustParseAddr("10.40.0.9")
 
+	// setIHL overwrites the IHL nibble of a packet built by buildPacket.
+	setIHL := func(pkt []byte, ihl int) []byte {
+		pkt[0] = byte(pkt[0]&0xf0) | byte(ihl)
+		return pkt
+	}
+	// setTotalLength overwrites the total-length field.
+	setTotalLength := func(pkt []byte, totalLen int) []byte {
+		binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+		return pkt
+	}
+
 	tests := []struct {
 		name   string
 		packet []byte
@@ -35,12 +46,20 @@ func TestParseIPv4Source(t *testing.T) {
 	}{
 		{"minimal header", buildPacket(t, src, 20), src, true},
 		{"payload beyond header", buildPacket(t, src, 40), src, true},
+		{"IHL 6 with options bytes present", setIHL(buildPacket(t, src, 24), 6), src, true},
 		{"nil packet", nil, netip.Addr{}, false},
 		{"zero length", []byte{}, netip.Addr{}, false},
 		{"19 bytes", make([]byte, 19), netip.Addr{}, false},
 		{"truncated header", make([]byte, 12), netip.Addr{}, false},
 		{"IPv6 version nibble", []byte{0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, netip.Addr{}, false},
 		{"version nibble zero", make([]byte, 20), netip.Addr{}, false},
+		{"IHL below 5", setIHL(buildPacket(t, src, 20), 4), netip.Addr{}, false},
+		{"header length beyond packet", setIHL(buildPacket(t, src, 20), 6), netip.Addr{}, false},
+		{"total length below header", setTotalLength(buildPacket(t, src, 40), 12), netip.Addr{}, false},
+		{"total length below IHL=5 header", setTotalLength(buildPacket(t, src, 20), 19), netip.Addr{}, false},
+		{"total length beyond packet", setTotalLength(buildPacket(t, src, 40), 41), netip.Addr{}, false},
+		{"impossible total length 0xFFFF", setTotalLength(buildPacket(t, src, 40), 0xFFFF), netip.Addr{}, false},
+		{"total length zero", setTotalLength(buildPacket(t, src, 20), 0), netip.Addr{}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -73,8 +92,10 @@ func TestParseIPv4SourceFuzzSeeds(t *testing.T) {
 		make([]byte, 19),
 		make([]byte, 20),
 		buildPacket(t, netip.MustParseAddr("10.40.0.7"), 20),
-		{0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0}, // IHL 6, options never read
-		{0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4},             // 16 bytes
+		buildPacket(t, netip.MustParseAddr("10.40.0.7"), 40),
+		{0x46, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0}, // IHL 6, options present
+		{0x44, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0},             // IHL 4
+		{0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4},                          // 16 bytes
 	} {
 		src, ok := ParseIPv4Source(pkt)
 		if ok && !src.IsValid() {
@@ -89,6 +110,7 @@ func FuzzParseIPv4Source(f *testing.F) {
 		make([]byte, 19),
 		make([]byte, 20),
 		buildPacket(&testing.T{}, netip.MustParseAddr("10.40.0.7"), 20),
+		buildPacket(&testing.T{}, netip.MustParseAddr("10.40.0.7"), 40),
 	} {
 		f.Add(pkt)
 	}
@@ -97,8 +119,16 @@ func FuzzParseIPv4Source(f *testing.F) {
 		if !ok {
 			return
 		}
+		// Every accepted packet must satisfy the full structural contract;
+		// anything else accepted is a parser bug.
 		if len(pkt) < ipv4HeaderLen || pkt[0]>>4 != 4 {
 			t.Fatalf("accepted packet len=%d ver=%d despite guards", len(pkt), pkt[0]>>4)
+		}
+		ihl := int(pkt[0] & 0x0f)
+		headerLen := ihl * 4
+		totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
+		if ihl < 5 || headerLen > len(pkt) || totalLen < headerLen || totalLen > len(pkt) {
+			t.Fatalf("accepted structurally invalid packet len=%d ihl=%d headerLen=%d totalLen=%d", len(pkt), ihl, headerLen, totalLen)
 		}
 		if !src.IsValid() || !src.Is4() || src.Unmap() != src {
 			t.Fatalf("accepted non-4-byte address %v", src)

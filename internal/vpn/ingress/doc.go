@@ -28,11 +28,13 @@
 //   - Resolver: the durable assigned-IP -> peer ownership map. Loaded at
 //     startup from the same durable state the portal leases client IPs from
 //     (user_connections.client_params["assigned_ip"], read through
-//     database.DB.GetVPNClientIPAssignments) and kept current through an
-//     explicit mutation API that issue #391's event-driven sync builds on.
+//     database.DB.GetVPNClientIPAssignments, durable rows only) and kept
+//     current through an explicit replacement-semantics mutation API that
+//     issue #391's event-driven sync builds on.
 //
-//   - Router: safe IPv4 parsing plus the ownership checks that gate lazy
-//     admission and forwarder route registration for every plaintext packet.
+//   - Router: strict structural IPv4 parsing plus the ownership checks that
+//     gate lazy admission and forwarder route registration for every
+//     plaintext packet.
 //
 // # Error semantics
 //
@@ -40,8 +42,11 @@
 // backend's queue. Every other outcome wraps exactly one sentinel, so callers
 // classify outcomes with errors.Is, never string matching:
 //
-//   - ErrDropMalformed: packet shorter than the fixed IPv4 header or without
-//     an IPv4 version nibble. Counted as MalformedPacketDrops.
+//   - ErrDropMalformed: the packet failed the strict structural IPv4 parse
+//   - shorter than a minimum header, non-IPv4 version nibble, IHL below
+//     5, header length beyond the received bytes, or a total-length field
+//     inconsistent with the header or the received length. Counted as
+//     MalformedPacketDrops.
 //   - ErrDropUnmapped: the parsed source IP has no durable owner in the
 //     resolver. Counted as UnmappedSourceIPDrops.
 //   - ErrAdmissionRejected: the admission callback refused the peer (unknown
@@ -74,21 +79,29 @@
 // # Resolver API contract (issue #391)
 //
 // The resolver is the single durable-ownership authority on the data path.
-// Every mutation preserves the load-time invariants - one IP per peer, one
-// peer per IP - and fails closed instead of repairing:
+// It holds only durable state: LoadResolver and Reload skip session-only
+// legacy leases (NeedsMigration=true) and rows without a durable
+// assigned_ip, so stale runtime residue can never authorize a source IP;
+// the load report's skip counters (skipped_needs_migration and friends)
+// keep that filtering observable. Every mutation preserves the load-time
+// invariants - one IP per peer, one peer per IP - and fails closed instead
+// of repairing:
 //
-//   - Update registers or replaces one lease; re-asserting a peer's exact
-//     current ownership is a no-op, so an idempotent re-sync cannot fail.
-//     Conflicts (a peer claiming a second IP, a second peer claiming an
-//     owned IP) and malformed input are rejected; error text names the
+//   - Update registers one lease with replacement semantics: a peer whose
+//     lease moves to a different IP is swapped atomically (the previous IP
+//     becomes unmapped, concurrent lookups observe old-or-new, never a
+//     mixture), so an event-driven sync can apply a lease move as a single
+//     step. Re-asserting a peer's exact current ownership is a no-op, so
+//     an idempotent re-sync cannot fail. Conflicts (a second peer claiming
+//     an owned IP) and malformed input are rejected; error text names the
 //     conflicting address and redacts peer keys.
 //   - Remove drops one peer's lease (no-op when unknown) and reports the
 //     removed address; a removed IP immediately becomes unmapped on the
 //     data path and the peer can never re-admit through it.
 //   - Reload atomically replaces the whole map from durable state with
-//     LoadResolver's eligibility and conflict rules; on error the previous
-//     contents stay untouched, on success readers observe old-or-new, never
-//     a mixture.
+//     LoadResolver's durable-only eligibility and conflict rules; on error
+//     the previous contents stay untouched, on success readers observe
+//     old-or-new, never a mixture.
 //
 // The router consults the resolver per packet and forces re-admission
 // whenever a memoized route diverges from the durable record, so #391's
