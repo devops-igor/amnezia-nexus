@@ -206,6 +206,29 @@ type Forwarder struct {
 	// portal subnet or already assigned to another route. Such packets are
 	// dropped (never forwarded, never rebound). Exposed via SpoofedRebinds.
 	spoofedRebinds atomic.Uint64
+	// returnRejectClassifier, when non-nil, receives one call for every
+	// return packet rejected by RouteBackendToClient BEFORE any per-route
+	// handling, together with the reason the filter fired (unrouted,
+	// malformed, or backend mismatch). The ingress engine registers one
+	// classifier for its lifetime and folds these rejections into the
+	// engine-level MalformedDrops/UnmappedDrops/OwnershipMismatchDrops
+	// counters, which would otherwise stay at zero in production because
+	// the filter rejects the packet before the engine's write callback
+	// ever sees it (issue #389 rework 2).
+	//
+	// Single-owner rule per drop reason (both sites enforced HERE, in the
+	// forwarder — the ONLY production rejection sites):
+	//   - UnmappedDrops: unrouted replies are rejected at the routesByIP
+	//     lookup, where no route exists — so no ReturnPath writer exists
+	//     either. Only the service-level classifier counts them; the
+	//     engine's write callback never observes an unmapped packet.
+	//   - MalformedDrops / OwnershipMismatchDrops: those replies are
+	//     rejected at the route.returnPath shape filter, which returns
+	//     before calling the writer. Exactly one of (filter, writer) counts
+	//     a given packet.
+	// The write callback must never classify the same packet as the
+	// filter: validReturnDestination is checked before path.write.
+	returnRejectClassifier func(reason ReturnRejectReason) // guarded by mu; set via SetReturnRejectClassifier
 	// writeErrLogUntil throttles return-path device Write-error log lines to
 	// at most one per second (issue #43: a failed dev.Write on the client
 	// queue -> client device leg, e.g. "no transport keys for peer", used to
@@ -771,15 +794,39 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	route, ok := f.routesByIP[destIP]
 	if !ok {
 		f.mu.RUnlock()
+		// Production rejection site (issue #389 rework 2): the packet is
+		// dropped here, BEFORE any route or ReturnPath writer exists, so
+		// the engine's write callback can never classify it — count the
+		// UnmappedDrops equivalent here (single owner of this reason).
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
+		f.classifyReturnReject(ReturnRejectedUnrouted)
 		return ErrSessionNotRegistered
 	}
-	if route.returnPath != nil && (backendTunnelID != route.backendTunnelID || !validReturnDestination(packet, destIP)) {
-		f.mu.RUnlock()
-		f.dropsNoRoute.Add(1)
-		f.dropsTotal.Add(1)
-		return ErrReturnRouteMismatch
+	if route.returnPath != nil {
+		if backendTunnelID != route.backendTunnelID {
+			f.mu.RUnlock()
+			// Production rejection site (issue #389 rework 2): the reply
+			// arrived on a backend the route does not own. The engine's
+			// write callback never runs for it — count the
+			// OwnershipMismatchDrops equivalent here (single owner).
+			f.dropsNoRoute.Add(1)
+			f.dropsTotal.Add(1)
+			f.classifyReturnReject(ReturnRejectedMismatch)
+			return ErrReturnRouteMismatch
+		}
+		if !validReturnDestination(packet, destIP) {
+			f.mu.RUnlock()
+			// Production rejection site (issue #389 rework 2): a malformed
+			// reply is rejected by the shape filter before the engine's
+			// write callback runs, so the callback cannot classify it —
+			// count the MalformedDrops equivalent here (single owner; no
+			// double-count with the write callback).
+			f.dropsNoRoute.Add(1)
+			f.dropsTotal.Add(1)
+			f.classifyReturnReject(ReturnRejectedMalformed)
+			return ErrReturnRouteMismatch
+		}
 	}
 	sID := route.sessionID
 	cID := route.connectionID

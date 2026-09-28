@@ -81,6 +81,67 @@ func (f *Forwarder) BindSessionReturnPath(sessionID, connectionID, peerKey, assi
 	return retired, err
 }
 
+// ReturnRejectReason classifies a packet rejected by the forwarder's
+// production return-path filters before any per-route handling. The ingress
+// engine folds these rejections into its MalformedDrops/UnmappedDrops
+// counters via SetUnroutedReturnClassifier; see Forwarder.unroutedReturnClassifier
+// for the single-owner rule per drop reason.
+type ReturnRejectReason int
+
+const (
+	// ReturnRejectedUnrouted: no session route was registered for the
+	// reply's destination IP (routesByIP lookup missed).
+	ReturnRejectedUnrouted ReturnRejectReason = iota
+	// ReturnRejectedMalformed: the reply failed the return-path shape filter
+	// (validReturnDestination) for a route that owns a ReturnPath.
+	ReturnRejectedMalformed
+	// ReturnRejectedMismatch: the reply arrived on a backend tunnel that the
+	// destination route does not own — an ownership mismatch, rejected by the
+	// same filter as the malformed shape. It maps to the engine's
+	// OwnershipMismatchDrops so each reason keeps exactly one owner.
+	ReturnRejectedMismatch
+)
+
+// SetReturnRejectClassifier registers exactly one service-level callback
+// invoked for every return packet rejected by RouteBackendToClient's
+// production filters. The callback must be bounded and nonblocking (it runs
+// in the backend reader's goroutine); it is called OUTSIDE f.mu.
+//
+// Classification is owned by the rejection site, never by the engine's write
+// callback, so a packet is counted exactly once per drop reason:
+//   - an UNROUTED reply is rejected at the routesByIP lookup before any
+//     route (and therefore any ReturnPath writer) exists — only the
+//     classifier can count it;
+//   - a MALFORMED or BACKEND-MISMATCHED reply for an owned route is
+//     rejected by the shape filter, which returns before path.write — the
+//     engine's write callback never sees the packet, so only the classifier
+//     counts it.
+//
+// In production the ingress engine registers its classifier once during
+// construction and never swaps it; later calls overwrite the previous
+// callback (test convenience), which intentionally re-targets subsequent
+// classifications.
+func (f *Forwarder) SetReturnRejectClassifier(classify func(reason ReturnRejectReason)) {
+	if classify == nil {
+		return
+	}
+	f.mu.Lock()
+	f.returnRejectClassifier = classify
+	f.mu.Unlock()
+}
+
+// classifyReturnReject snapshots the registered classifier under RLock and
+// invokes it without holding f.mu (the callback is arbitrary user code, e.g.
+// the engine's atomic counter bumps — never lock-ordered with f.mu).
+func (f *Forwarder) classifyReturnReject(reason ReturnRejectReason) {
+	f.mu.RLock()
+	classify := f.returnRejectClassifier
+	f.mu.RUnlock()
+	if classify != nil {
+		classify(reason)
+	}
+}
+
 // HasSessionRouteWithReturnPath includes engine ownership in the router's memo
 // validity check. A same-session legacy replacement cannot preserve that memo.
 func (f *Forwarder) HasSessionRouteWithReturnPath(peerKey, sessionID, connectionID, assignedIP string, backendID int64, path *ReturnPath) bool {
@@ -90,5 +151,5 @@ func (f *Forwarder) HasSessionRouteWithReturnPath(peerKey, sessionID, connection
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	r := f.routesByPeer[peerKey]
-	return r != nil && !r.stopped && r.sessionID == sessionID && r.connectionID == connectionID && r.assignedIP == assignedIP && r.backendTunnelID == backendID && r.returnPath == path
+	return r != nil && !r.stopped && r.sessionID == sessionID && r.connectionID == connectionID && r.assignedIP == assignedIP && r.backendTunnelID == backendID && r.returnPath == path && f.routesByIP[assignedIP] == r
 }

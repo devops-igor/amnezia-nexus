@@ -107,6 +107,13 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 
 	e := &IngressEngine{svc: s, portal: portal, resolver: resolver, liveness: liveness}
 	e.returnPath = forwarder.NewReturnPath(e.writeReturnPacket)
+	// Production classification (issue #389 rework 2): the forwarder's
+	// backend-reader filters reject malformed/unrouted replies before the
+	// write callback runs, so the engine folds those rejections into the
+	// same counters here. Exactly one engine exists per service (dormant
+	// until #393 activation); a second registration would re-target
+	// subsequent classifications to the newer engine.
+	s.forwarder.SetReturnRejectClassifier(e.classifyForwarderReject)
 	e.router = ingress.NewRouterWithReturnPath(resolver, serviceIngressAdmission{svc: s, returnPath: e.returnPath}, s.forwarder, liveness, e.returnPath)
 	return e, nil
 }
