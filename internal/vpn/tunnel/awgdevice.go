@@ -265,6 +265,16 @@ func buildAWGIPCConfig(privateKeyHex, publicKeyHex, endpoint string, awgParams m
 	return b.String()
 }
 
+// Read implements the forwarder's net.Conn-ish reader over the device's
+// outbound queue. It intentionally consumes the raw Outbound() channel rather
+// than virtualtun.ReceiveOutbound: ReceiveOutbound only returns after the
+// queue drain inside VirtualTUN.Close completes, whereas this select also
+// races d.doneCh, which AWGClientDevice.Close signals before calling
+// vtun.Close. Switching would move the close-unblock of the forwarder's read
+// to a later point in the shutdown sequence — a tunnel behavior change outside
+// this rework's sanctioned scope. The device-level drain inside VirtualTUN.Close
+// makes the raw receive safe: after Close returns the queue is empty, so no
+// packet is lost unaccounted.
 func (d *AWGClientDevice) Read(p []byte) (int, error) {
 	select {
 	case pkt, ok := <-d.vtun.Outbound():

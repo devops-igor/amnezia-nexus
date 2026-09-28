@@ -21,26 +21,38 @@
 // Queues are bounded and never block the sender: when the destination queue is
 // full the packet is dropped and DroppedPackets is incremented. Read drops a
 // packet that does not fit the destination buffer (oversized) and reports it
-// through the same counter; Close discards queued packets and accounts them
-// too. RecordDrop lets external owners add drops observed outside the device
-// (issue #160 telemetry).
+// through the same counter; Close drains both queues and accounts every
+// drained packet as a shutdown drop (see Shutdown). RecordDrop lets external
+// owners add drops observed outside the device (issue #160 telemetry).
 //
 // Every internal drop also lands in a per-reason bucket (queue-full,
 // oversized, shutdown); Stats reports the breakdown alongside the queue
 // depths. RecordDrop and RecordDropN increment the total only.
 //
+// DroppedPackets therefore INCLUDES shutdown drops: closing a device with
+// packets still queued raises the counter. This is a deliberate semantic
+// delta versus the legacy backend, where queued-at-shutdown packets were
+// lost uncounted. The vpn.Service aggregation sums the exact per-device
+// totals, so its published dropped_packets figures include the same
+// shutdown-attributed drops.
+//
 // # Shutdown
 //
-// Close is idempotent and never closes the packet channels, so a sender can
-// never panic on a closed channel. Blocked Read and ReceiveOutbound calls are
-// unblocked and return an error wrapping ErrClosed; submissions after close
-// are rejected with ErrClosed. BatchSize is constant for the lifetime of the
-// device.
+// Close has a single linearization point: the moment it acquires the
+// lifecycle write lock. A submission (InjectInbound, Write) racing with
+// Close either completes its enqueue before that point — and its packet is
+// drained and counted as a shutdown drop — or observes the closed state and
+// fails with ErrClosed. Once Close returns, no submission can enqueue
+// anymore: every accepted packet is accounted exactly once, as either a
+// delivered packet or a dropped one.
 //
-// # Defaults
-//
-// New applies DefaultInboundCapacity (2048), DefaultOutboundCapacity (1024)
-// and DefaultBatchSize (1) when the corresponding Config field is zero.
+// During Close both queues are actually drained (depths go to zero) and each
+// drained packet increments DroppedPackets and the shutdown bucket. After
+// Close returns, queue depths are permanently zero and every method rejects
+// with an error wrapping ErrClosed. Close is idempotent and never closes the
+// packet channels, so a sender can never panic on a closed channel. Blocked
+// Read and ReceiveOutbound calls are unblocked and return an error wrapping
+// ErrClosed. BatchSize is constant for the lifetime of the device.
 package virtualtun
 
 import (
@@ -79,8 +91,9 @@ var (
 	ErrClosed = errors.New("virtualtun: device is closed")
 
 	// ErrInvalidBuffer is returned when Read or Write receive malformed
-	// slice arguments (nil bufs, len(sizes) < len(bufs), negative offset).
-	// The device never panics on malformed buffers.
+	// slice arguments (nil bufs, len(sizes) < len(bufs), negative offset,
+	// or a destination buffer that cannot receive even one byte at
+	// offset). The device never panics on malformed buffers.
 	ErrInvalidBuffer = errors.New("virtualtun: invalid buffer arguments")
 
 	// ErrQueueFull is returned by InjectInbound when the inbound queue is
@@ -95,9 +108,23 @@ type VirtualTUN struct {
 	inPackets  chan []byte
 	outPackets chan []byte
 	events     chan tun.Event
-	closed     chan struct{}
-	mtu        int
-	name       string
+	// closed is the shutdown wakeup channel: closed exactly once by
+	// Close while holding closeMu, it unblocks readers and receivers.
+	// Submissions must not test it directly; they consult t.isClosed()
+	// so that the closed check and the enqueue happen atomically with
+	// respect to Close (see closeMu).
+	closed chan struct{}
+	// closeMu guards the lifecycle transition: submissions hold the read
+	// lock across their closed-check-plus-enqueue critical section and
+	// Close holds the write lock while flipping the state and draining,
+	// making Close linearizable with submissions.
+	closeMu sync.RWMutex
+	mtu     int
+	name    string
+	// closedFlag is written only by Close under the write lock and read
+	// by submissions under the read lock; it exists so submissions can
+	// check-and-enqueue atomically without racing on the channel close.
+	closedFlag bool
 	batchSize  int
 	dropCount  atomic.Uint64
 	// Per-reason drop buckets. They are separate atomics, incremented
@@ -176,6 +203,13 @@ func New(cfg Config) (*VirtualTUN, error) {
 	}, nil
 }
 
+// isClosed reports whether the device has been closed. Called by submissions
+// while holding the closeMu read lock so the observation cannot race with the
+// Close transition.
+func (t *VirtualTUN) isClosed() bool {
+	return t.closedFlag
+}
+
 // File implements tun.Device. It always returns nil: the device is in-memory
 // and has no file descriptor.
 func (t *VirtualTUN) File() *os.File { return nil }
@@ -188,14 +222,19 @@ func (t *VirtualTUN) File() *os.File { return nil }
 // immediately available, so a caller is never made to wait for a full batch.
 //
 // Buffer handling: len(sizes) must be at least len(bufs); offset must not be
-// negative; violations return an error wrapping ErrInvalidBuffer and the
-// device never panics. A packet larger than bufs[i][offset:] is dropped as
-// oversized (drop counter incremented, buffer untouched) and Read returns
-// immediately with the packets placed so far; it never blocks waiting for a
-// fitting packet.
+// negative; and every potential destination buffer (the first
+// min(len(bufs), BatchSize) entries) must be able to receive at least one
+// byte at offset — len(bufs[i]) > offset for each such i. A zero-capacity
+// destination (offset == len(bufs[i])) cannot receive a packet and is
+// rejected the same way. Violations return an error wrapping ErrInvalidBuffer
+// without dequeuing anything: queue state and drop counters are untouched,
+// and the device never panics on malformed buffers. A packet larger than
+// bufs[i][offset:] is dropped as oversized (drop counter incremented, buffer
+// untouched) and Read returns immediately with the packets placed so far; it
+// never blocks waiting for a fitting packet.
 //
 // After Close, Read returns an error wrapping ErrClosed; packets still queued
-// are discarded and accounted by Close.
+// are drained and accounted by Close.
 func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	select {
 	case <-t.closed:
@@ -209,6 +248,17 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	max := len(bufs)
 	if t.batchSize < max {
 		max = t.batchSize
+	}
+
+	// Validate every potential destination BEFORE dequeuing anything, so
+	// a malformed offset cannot consume queue packets or skew drop
+	// counters. A buffer with len(bufs[i]) <= offset offers zero or
+	// negative receive capacity at offset (offset == len means a
+	// zero-capacity destination: cannot hold even one byte).
+	for i := 0; i < max; i++ {
+		if len(bufs[i]) <= offset {
+			return 0, fmt.Errorf("%w: read: bufs[%d] len %d cannot receive at offset %d", ErrInvalidBuffer, i, len(bufs[i]), offset)
+		}
 	}
 
 	n := 0
@@ -286,20 +336,28 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 		if len(buf) <= offset {
 			continue
 		}
+		// The read lock makes the closed check and the send a
+		// single atomic step relative to Close: either both happen
+		// before Close's transition (and Close drains the packet),
+		// or isClosed() is true and the submission fails.
+		t.closeMu.RLock()
+		if t.isClosed() {
+			t.closeMu.RUnlock()
+			return n, ErrClosed
+		}
 		pkt := buf[offset:]
 		out := make([]byte, len(pkt))
 		copy(out, pkt)
 		select {
 		case t.outPackets <- out:
 			n++
-		case <-t.closed:
-			return n, ErrClosed
 		default:
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
 			t.dropQueueFull.Add(1)
 			n++
 		}
+		t.closeMu.RUnlock()
 	}
 	return n, nil
 }
@@ -309,14 +367,21 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 // returns. The send is nonblocking: a full inbound queue drops the packet
 // (drop counter incremented) and returns ErrQueueFull. After Close it returns
 // ErrClosed without enqueuing.
+//
+// The closed check and the enqueue happen atomically with respect to Close:
+// if InjectInbound returns nil, the packet is guaranteed to be either
+// delivered to a reader or drained and counted by Close — never silently
+// unaccounted.
 func (t *VirtualTUN) InjectInbound(pkt []byte) error {
-	select {
-	case <-t.closed:
-		return ErrClosed
-	default:
-	}
 	out := make([]byte, len(pkt))
 	copy(out, pkt)
+	// Same critical section as Write: check-and-send under the read lock
+	// is atomic relative to Close's write-locked transition.
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.isClosed() {
+		return ErrClosed
+	}
 	select {
 	case t.inPackets <- out:
 		return nil
@@ -329,16 +394,11 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 
 // ReceiveOutbound blocks until one engine-written packet is available and
 // returns it; ownership of the returned slice passes to the caller. When the
-// device is closed it unblocks and returns ErrClosed. A packet already queued
-// when Close races with the close may still be delivered.
+// device is closed it unblocks and returns ErrClosed. Because Close drains
+// the queues before unblocking waiters, ReceiveOutbound never races a packet
+// away from shutdown accounting: after Close returns it always fails with
+// ErrClosed.
 func (t *VirtualTUN) ReceiveOutbound() ([]byte, error) {
-	select {
-	case <-t.closed:
-		// Deterministic fast path: once Close has completed, never
-		// deliver; queued packets were accounted as discarded.
-		return nil, ErrClosed
-	default:
-	}
 	select {
 	case pkt, ok := <-t.outPackets:
 		if !ok {
@@ -348,6 +408,9 @@ func (t *VirtualTUN) ReceiveOutbound() ([]byte, error) {
 		}
 		return pkt, nil
 	case <-t.closed:
+		// Close drains the queues while holding the lifecycle write
+		// lock and only then closes the wakeup channel, so no
+		// packet can remain here.
 		return nil, ErrClosed
 	}
 }
@@ -369,7 +432,10 @@ func (t *VirtualTUN) Outbound() <-chan []byte {
 // DroppedPackets returns the total number of packets dropped due to a full
 // queue, an oversized destination buffer, or shutdown. RecordDrop and
 // RecordDropN increment this total without touching the per-reason buckets;
-// Stats reports the reason breakdown.
+// Stats reports the reason breakdown. Shutdown drops: every packet drained
+// from the queues by Close is added to this total, so closing a device with
+// queued packets increases it (a deliberate semantic delta versus the legacy
+// backend, where such packets were lost uncounted).
 func (t *VirtualTUN) DroppedPackets() uint64 {
 	return t.dropCount.Load()
 }
@@ -378,15 +444,20 @@ func (t *VirtualTUN) DroppedPackets() uint64 {
 // depths and drop accounting, returned by Stats.
 type StatsSnapshot struct {
 	// InboundDepth is the number of packets currently queued for the
-	// engine's Read path (device -> engine).
+	// engine's Read path (device -> engine). After Close returns it is
+	// permanently zero: Close drains the queue under its linearization
+	// point.
 	InboundDepth int
 
 	// OutboundDepth is the number of engine-written packets currently
-	// queued for ReceiveOutbound (engine -> consumer).
+	// queued for ReceiveOutbound (engine -> consumer). After Close
+	// returns it is permanently zero: Close drains the queue under its
+	// linearization point.
 	OutboundDepth int
 
 	// DropsTotal mirrors DroppedPackets: every drop counted by the
 	// device plus external drops recorded via RecordDrop/RecordDropN.
+	// Includes shutdown drops drained by Close.
 	DropsTotal uint64
 
 	// DropsQueueFull counts packets dropped because the destination
@@ -397,7 +468,8 @@ type StatsSnapshot struct {
 	// not fit the destination buffer.
 	DropsOversized uint64
 
-	// DropsShutdown counts queued packets discarded by Close.
+	// DropsShutdown counts queued packets drained and discarded by
+	// Close. Once Close returns, this bucket is final.
 	DropsShutdown uint64
 }
 
@@ -420,9 +492,10 @@ func (s StatsSnapshot) Sum() uint64 {
 // DropsTotal is loaded before the buckets, so a single racy snapshot can
 // even show a bucket ahead of the total; the underlying counters never
 // diverge this way — every counter is individually monotonic and all of
-// them converge once traffic stops. Do not validate one snapshot against
-// another. The snapshot is safe to call concurrently with all device
-// operations.
+// them converge once traffic stops. After Close returns the snapshot is
+// stable: depths are zero, no counter can increase except through
+// RecordDrop/RecordDropN. The snapshot is safe to call concurrently with all
+// device operations.
 func (t *VirtualTUN) Stats() StatsSnapshot {
 	return StatsSnapshot{
 		InboundDepth:   len(t.inPackets),
@@ -466,23 +539,50 @@ func (t *VirtualTUN) Name() (string, error) { return t.name, nil }
 func (t *VirtualTUN) Events() <-chan tun.Event { return t.events }
 
 // Close implements tun.Device. It is idempotent and never closes the packet
-// channels, so concurrent senders cannot panic on a closed channel. Blocked
-// Read and ReceiveOutbound calls unblock with ErrClosed. Packets still queued
-// in either direction are discarded and accounted: the drop counter is
-// increased by the number of packets queued at close (a snapshot taken after
-// close; a packet delivered by a reader racing with Close may be counted as
-// well).
+// channels, so concurrent senders cannot panic on a closed channel.
+//
+// Linearization: Close acquires the lifecycle write lock, marks the device
+// closed, closes the wakeup channel (unblocking blocked Read and
+// ReceiveOutbound calls, which then fail with ErrClosed), and — with no
+// concurrent senders possible — drains both queues nonblockingly, counting
+// every drained packet as a shutdown drop (DropsShutdown and DroppedPackets).
+// The lock acquisition is the linearization point: any submission racing
+// with Close either enqueued before it (its packet is drained and accounted)
+// or observes the closed state and fails with ErrClosed. Once Close returns,
+// both queue depths are zero and remain zero.
 func (t *VirtualTUN) Close() error {
 	t.once.Do(func() {
+		t.closeMu.Lock()
+		defer t.closeMu.Unlock()
+
+		t.closedFlag = true
 		close(t.closed)
-		// Discard queued packets with accounting. Channels are never
-		// closed, so a sender racing with Close can still enqueue;
-		// submissions after Close are rejected, so at most a
-		// bounded number of in-flight packets can be missed by
-		// this snapshot.
-		if discarded := len(t.inPackets) + len(t.outPackets); discarded > 0 {
-			t.dropCount.Add(uint64(discarded))
-			t.dropShutdown.Add(uint64(discarded))
+
+		// All submitters are excluded by the write lock, so this
+		// drain sees a quiesced pair of queues: every packet pulled
+		// here was accepted before the linearization point and is
+		// accounted exactly once as a shutdown drop. Readers and
+		// receivers never take closeMu, so a dequeue racing this
+		// drain is possible; each packet then resolves to exactly
+		// one side (delivered to the consumer, or counted here).
+		for {
+			select {
+			case <-t.inPackets:
+				t.dropCount.Add(1)
+				t.dropShutdown.Add(1)
+			default:
+			}
+			select {
+			case <-t.outPackets:
+				t.dropCount.Add(1)
+				t.dropShutdown.Add(1)
+			default:
+			}
+			// Done when both queues are empty; a reader cannot
+			// add packets, and submitters are locked out.
+			if len(t.inPackets) == 0 && len(t.outPackets) == 0 {
+				break
+			}
 		}
 	})
 	return nil

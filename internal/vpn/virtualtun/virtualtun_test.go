@@ -800,3 +800,269 @@ func TestStats_SnapshotIsIndependent(t *testing.T) {
 		t.Errorf("pre-Close InboundDepth = %d, want 1", before.InboundDepth)
 	}
 }
+
+// TestRead_OffsetBeyondCapacity: a destination that cannot receive even one
+// byte at offset (offset >= len(bufs[i])) is malformed for every potential
+// destination in the batch. Read must reject with ErrInvalidBuffer BEFORE
+// dequeuing anything: queue state and drop counters stay untouched (review
+// finding 1; the offset > len(buf) case used to panic).
+func TestRead_OffsetBeyondCapacity(t *testing.T) {
+	tests := []struct {
+		name    string
+		batch   int
+		bufLens []int
+		offset  int
+	}{
+		{"offset equals buffer length", 1, []int{8}, 8},
+		{"offset exceeds buffer length", 1, []int{8}, 9},
+		{"zero-length buffer at offset zero", 1, []int{0}, 0},
+		{"later buffer shorter than offset", 4, []int{16, 16, 4, 16}, 8},
+		{"later buffer zero-length", 2, []int{16, 0}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vt := mustNew(t, Config{BatchSize: tt.batch, InboundCapacity: 8})
+			if err := vt.InjectInbound([]byte{1, 2, 3}); err != nil {
+				t.Fatalf("InjectInbound: %v", err)
+			}
+			before := vt.Stats()
+			if before.InboundDepth != 1 || before.DropsTotal != 0 {
+				t.Fatalf("pre-Read stats = %+v, want depth 1, drops 0", before)
+			}
+
+			bufs := make([][]byte, len(tt.bufLens))
+			for i, n := range tt.bufLens {
+				bufs[i] = make([]byte, n)
+			}
+			sizes := make([]int, len(tt.bufLens))
+			for i := range sizes {
+				sizes[i] = 7 // sentinel: must stay untouched on rejection
+			}
+
+			n, err := vt.Read(bufs, sizes, tt.offset)
+			if !errors.Is(err, ErrInvalidBuffer) {
+				t.Errorf("err = %v, want %v", err, ErrInvalidBuffer)
+			}
+			if n != 0 {
+				t.Errorf("n = %d, want 0", n)
+			}
+			for i := range sizes {
+				if sizes[i] != 7 {
+					t.Errorf("sizes[%d] = %d, want untouched sentinel 7", i, sizes[i])
+				}
+			}
+
+			// The rejected call consumed no packet and counted no drop.
+			after := vt.Stats()
+			if after != before {
+				t.Errorf("stats changed by rejected Read: before %+v, after %+v", before, after)
+			}
+
+			// The queue is intact: a valid call still delivers the packet.
+			n, err = vt.Read([][]byte{make([]byte, 16)}, []int{0}, 0)
+			if err != nil || n != 1 {
+				t.Errorf("recovery Read = (%d, %v), want (1, nil)", n, err)
+			}
+		})
+	}
+}
+
+// TestClose_InFlightSubmissionAccounted deterministically constructs the
+// review-finding interleave: a submission is inside its critical section
+// (closed check passed, enqueue not done) while Close runs to completion.
+// The invariant requires the packet to be drained and shutdown-accounted —
+// an accepted-but-unaccounted packet is the bug. Gate = the lifecycle read
+// lock the submission holds; deterministic, no hammering.
+func TestClose_InFlightSubmissionAccounted(t *testing.T) {
+	vt, err := New(Config{InboundCapacity: 4, OutboundCapacity: 4})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = vt.Close() })
+
+	// Hold the submission critical section open (as InjectInbound/Write do
+	// between their closed check and their enqueue).
+	vt.closeMu.RLock()
+
+	closeDone := make(chan struct{})
+	go func() {
+		_ = vt.Close()
+		close(closeDone)
+	}()
+
+	// Close must block behind the in-flight submission, not complete.
+	select {
+	case <-closeDone:
+		vt.closeMu.RUnlock()
+		t.Fatal("Close completed while a submission critical section was in flight: linearization point broken")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Complete the submission: the closed check passes (Close has not run),
+	// the packet enqueues, the lock releases. This is the "passed the check,
+	// got descheduled, enqueued after close" packet from the review finding.
+	vt.inPackets <- []byte{9}
+	vt.closeMu.RUnlock()
+
+	select {
+	case <-closeDone:
+	case <-timeout(t):
+		t.Fatal("Close deadlocked behind a submission critical section")
+	}
+
+	s := vt.Stats()
+	if s.InboundDepth != 0 || s.OutboundDepth != 0 {
+		t.Errorf("post-Close depths = (%d, %d), want (0, 0)", s.InboundDepth, s.OutboundDepth)
+	}
+	if s.DropsShutdown != 1 || s.DropsTotal != 1 {
+		t.Errorf("post-Close drops = shutdown %d total %d, want 1/1 (accepted-but-unaccounted or double-counted)", s.DropsShutdown, s.DropsTotal)
+	}
+}
+
+// TestClose_RacingSubmissionEitherClosedOrAccounted drives real submissions
+// (InjectInbound, Write) through a gate held before their enqueue step, runs
+// Close to completion behind the gate, then releases it. The submission must
+// resolve to exactly one of two outcomes — ErrClosed with nothing enqueued,
+// or success with the packet drained and shutdown-accounted. No third
+// outcome.
+func TestClose_RacingSubmissionEitherClosedOrAccounted(t *testing.T) {
+	tests := []struct {
+		name   string
+		submit func(*VirtualTUN) error
+	}{
+		{"InjectInbound", func(vt *VirtualTUN) error { return vt.InjectInbound([]byte{9}) }},
+		{"Write", func(vt *VirtualTUN) error {
+			_, err := vt.Write([][]byte{bytes.Repeat([]byte{9}, 8)}, 0)
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vt, err := New(Config{InboundCapacity: 4, OutboundCapacity: 4})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = vt.Close() })
+
+			// Gate: hold the lifecycle read lock so the submission
+			// cannot pass its closed check plus enqueue while the gate
+			// is closed.
+			vt.closeMu.RLock()
+			res := make(chan error, 1)
+			go func() { res <- tt.submit(vt) }()
+
+			// Run Close to completion while the gate is held: it must
+			// block behind the gated submission.
+			closeDone := make(chan struct{})
+			go func() {
+				_ = vt.Close()
+				close(closeDone)
+			}()
+			select {
+			case <-closeDone:
+				vt.closeMu.RUnlock()
+				t.Fatal("Close completed behind a gated submission")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			// Release the gate. Whichever wins the lock, the invariant
+			// must hold.
+			vt.closeMu.RUnlock()
+
+			select {
+			case <-closeDone:
+			case <-timeout(t):
+				t.Fatal("Close deadlocked behind the gated submission")
+			}
+			var subErr error
+			select {
+			case subErr = <-res:
+			case <-timeout(t):
+				t.Fatal("submission never resolved")
+			}
+
+			s := vt.Stats()
+			switch {
+			case subErr == nil:
+				// Accepted: must be covered by shutdown accounting.
+				if s.DropsShutdown != 1 || s.DropsTotal != 1 {
+					t.Errorf("accepted submission but drops = shutdown %d total %d, want 1/1 (unaccounted packet)", s.DropsShutdown, s.DropsTotal)
+				}
+			case errors.Is(subErr, ErrClosed):
+				// Rejected: nothing enqueued, nothing counted.
+				if s.DropsShutdown != 0 || s.DropsTotal != 0 {
+					t.Errorf("rejected submission but drops = shutdown %d total %d, want 0/0", s.DropsShutdown, s.DropsTotal)
+				}
+			default:
+				t.Fatalf("third outcome: %v", subErr)
+			}
+			if s.InboundDepth != 0 || s.OutboundDepth != 0 {
+				t.Errorf("post-Close depths = (%d, %d), want (0, 0)", s.InboundDepth, s.OutboundDepth)
+			}
+		})
+	}
+}
+
+// TestStats_AfterClose asserts the documented post-Close semantics exactly:
+// both depths are zero, every queued packet is in the shutdown bucket (and
+// only there), the snapshot is stable, and rejected post-close calls do not
+// perturb it.
+func TestStats_AfterClose(t *testing.T) {
+	vt, err := New(Config{InboundCapacity: 4, OutboundCapacity: 4})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := vt.InjectInbound([]byte{byte(i)}); err != nil {
+			t.Fatalf("InjectInbound #%d: %v", i, err)
+		}
+	}
+	if _, err := vt.Write([][]byte{bytes.Repeat([]byte{7}, 4)}, 0); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Consume one inbound packet so exactly one inbound + one outbound
+	// remain queued at close.
+	if n, err := vt.Read([][]byte{make([]byte, 16)}, []int{0}, 0); err != nil || n != 1 {
+		t.Fatalf("Read = (%d, %v), want (1, nil)", n, err)
+	}
+
+	if err := vt.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	post := vt.Stats()
+	if post.InboundDepth != 0 || post.OutboundDepth != 0 {
+		t.Errorf("post-Close depths = (%d, %d), want (0, 0)", post.InboundDepth, post.OutboundDepth)
+	}
+	if post.DropsShutdown != 2 {
+		t.Errorf("DropsShutdown = %d, want 2 (1 inbound + 1 outbound drained)", post.DropsShutdown)
+	}
+	if post.DropsTotal != 2 || post.Sum() != 2 {
+		t.Errorf("DropsTotal = %d, Sum = %d, want 2/2", post.DropsTotal, post.Sum())
+	}
+	if post.DropsQueueFull != 0 || post.DropsOversized != 0 {
+		t.Errorf("other buckets = (qf %d, ov %d), want (0, 0)", post.DropsQueueFull, post.DropsOversized)
+	}
+
+	// The snapshot is stable after close: nothing can change it except
+	// explicit external telemetry hooks.
+	if post2 := vt.Stats(); post2 != post {
+		t.Errorf("post-Close snapshot drifted: %+v vs %+v", post2, post)
+	}
+
+	// Rejected post-close calls must not perturb the accounting.
+	if err := vt.InjectInbound([]byte{1}); !errors.Is(err, ErrClosed) {
+		t.Errorf("InjectInbound after close = %v, want ErrClosed", err)
+	}
+	if _, err := vt.Write([][]byte{make([]byte, 4)}, 0); !errors.Is(err, ErrClosed) {
+		t.Errorf("Write after close = %v, want ErrClosed", err)
+	}
+	if _, err := vt.Read([][]byte{make([]byte, 4)}, []int{0}, 0); !errors.Is(err, ErrClosed) {
+		t.Errorf("Read after close = %v, want ErrClosed", err)
+	}
+	if _, err := vt.ReceiveOutbound(); !errors.Is(err, ErrClosed) {
+		t.Errorf("ReceiveOutbound after close = %v, want ErrClosed", err)
+	}
+	if post3 := vt.Stats(); post3 != post {
+		t.Errorf("post-Close snapshot perturbed by rejected calls: %+v vs %+v", post3, post)
+	}
+}
