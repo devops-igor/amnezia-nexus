@@ -121,7 +121,6 @@ type interopAdmission struct {
 	totalCalls  int
 	refuseFor   map[string]error // one-shot per-peer refusal
 }
-
 func newInteropAdmission(capacityPerBackend int) *interopAdmission {
 	return &interopAdmission{
 		capacity:    map[int64]int{interopBackend1: capacityPerBackend, interopBackend2: capacityPerBackend},
@@ -152,21 +151,21 @@ func (a *interopAdmission) divergeSessionIP(peerPublicKey, wrongIP string) {
 	a.mismatchIPs[peerPublicKey] = wrongIP
 }
 
-func (a *interopAdmission) EnsureSession(peerPublicKey string) (SessionHandle, BackendHandle, error) {
+func (a *interopAdmission) EnsureSession(o PeerOwnership) (SessionHandle, BackendHandle, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if err, ok := a.refuseFor[peerPublicKey]; ok {
-		delete(a.refuseFor, peerPublicKey)
+	if err, ok := a.refuseFor[o.PeerPublicKey]; ok {
+		delete(a.refuseFor, o.PeerPublicKey)
 		return nil, nil, err
 	}
 	// Rekey-stable: a live session is reused, never recreated — the #86
 	// contract the router's rekey stability relies on.
-	if sess, ok := a.sessions[peerPublicKey]; ok {
-		return sess, &interopBackend{a.byBackend[peerPublicKey]}, nil
+	if sess, ok := a.sessions[o.PeerPublicKey]; ok {
+		return sess, &interopBackend{a.byBackend[o.PeerPublicKey]}, nil
 	}
-	a.calls[peerPublicKey]++
+	a.calls[o.PeerPublicKey]++
 	a.totalCalls++
-	backend := a.byBackend[peerPublicKey]
+	backend := a.byBackend[o.PeerPublicKey]
 	if backend == 0 {
 		panic("interopAdmission: peer has no backend selected")
 	}
@@ -176,8 +175,8 @@ func (a *interopAdmission) EnsureSession(peerPublicKey string) (SessionHandle, B
 		// fails with ErrNoActiveBackends.
 		return nil, nil, fmt.Errorf("admission: %w", loadbalancer.ErrNoActiveBackends)
 	}
-	assignedIP := a.assignedIPs[peerPublicKey]
-	if wrong, ok := a.mismatchIPs[peerPublicKey]; ok {
+	assignedIP := a.assignedIPs[o.PeerPublicKey]
+	if wrong, ok := a.mismatchIPs[o.PeerPublicKey]; ok {
 		assignedIP = wrong
 	}
 	a.capacity[backend]--
@@ -185,7 +184,7 @@ func (a *interopAdmission) EnsureSession(peerPublicKey string) (SessionHandle, B
 		id:         fmt.Sprintf("interop-sess-%d", a.totalCalls),
 		assignedIP: assignedIP,
 	}
-	a.sessions[peerPublicKey] = sess
+	a.sessions[o.PeerPublicKey] = sess
 	return sess, &interopBackend{backend}, nil
 }
 
@@ -243,7 +242,7 @@ func newInteropFixture(t *testing.T, portalPeers []clientawg.Peer, admission *in
 	// same pump production runs).
 	fwd.StartPumps(t.Context())
 
-	router := NewRouter(resolver, admission, fwd)
+	router := NewRouter(resolver, admission, fwd, nil)
 	return &interopFixture{
 		portal:    portal,
 		publicKey: public,

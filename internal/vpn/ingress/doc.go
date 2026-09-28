@@ -110,8 +110,15 @@
 //
 // # Wiring status
 //
-// The components ship standalone: admission is injected through the
-// Admission interface and no listener is modified in this issue. Production
-// wiring (clientawg portal device -> Router, Admission adapted to
-// vpn.Service.HandleIncomingPeer) happens in issue #393.
+// The production integration EXISTS as of issue #388 Rework B and lives in
+// package vpn: Service.EnsureBackendSessionForIngress is the dedicated
+// admission primitive (NOT an adaptation of the custom listener's
+// HandleIncomingPeer, which keeps its handshake-era side effects for the
+// legacy path until #394), and Service.NewIngressEngine owns the upstream
+// chain clientawg.ClientAWGDevice -> receive loop -> Router -> this
+// Admission -> strict forwarder path, wired to the service's real forwarder
+// and SessionLiveness. The engine is DORMANT: nothing in the production
+// startup path constructs or starts it. Engine ACTIVATION, canary,
+// cutover, and rollback are #393's scope. The custom listener and its
+// handshake path are unchanged and keep serving the legacy path.
 package ingress

@@ -22,36 +22,64 @@ type BackendHandle interface {
 	TunnelID() int64
 }
 
-// Admission is the lazily-evaluated admission seam. Production wiring adapts
-// vpn.Service.HandleIncomingPeer, preserving its issue-#86 contract: the
-// implementation holds its own serialization (the service lock) across
-// backend select, session creation, and pool-counter increments, and reuses a
-// healthy live session for a peer across rekeys instead of recreating it. The
-// router relies on both properties; do not point it at an implementation
-// without them.
+// Admission is the lazily-evaluated admission seam. The production
+// implementation is vpn.Service.EnsureBackendSessionForIngress (issue #388):
+// a routing-session admission without handshake-era side effects. The
+// implementation owns the WHOLE admission for the peer — durable
+// authentication, live-session reuse, backend selection, session creation,
+// route creation with rollback, and liveness refresh — under its own
+// serialization (the service lock, issue #86). The router relies on the
+// serialized check-then-allocate semantics and on rekey-stable live-session
+// reuse; do not point it at an implementation without them.
 type Admission interface {
-	// EnsureSession admits the peer: it returns the peer's (possibly already
-	// live) session and the selected backend, or an error when the peer
-	// cannot be admitted. Both handles must be non-nil on success.
-	EnsureSession(peerPublicKey string) (SessionHandle, BackendHandle, error)
+	// EnsureSession admits the peer identified by the resolver's durable
+	// ownership record: it returns the peer's (possibly already live)
+	// session and the selected backend, or an error when the peer cannot
+	// be admitted. Both handles must be non-nil on success, and the
+	// session's assigned IP must equal the resolver's durable record for
+	// the packet to route. Admission owns full rollback: on error, no
+	// session, backend count, sticky assignment, or route created for this
+	// attempt may survive.
+	EnsureSession(ownership PeerOwnership) (SessionHandle, BackendHandle, error)
 }
 
 // AdmissionFunc adapts an ordinary function to the Admission interface.
-type AdmissionFunc func(peerPublicKey string) (SessionHandle, BackendHandle, error)
+type AdmissionFunc func(ownership PeerOwnership) (SessionHandle, BackendHandle, error)
 
 // EnsureSession implements Admission.
-func (f AdmissionFunc) EnsureSession(peerPublicKey string) (SessionHandle, BackendHandle, error) {
-	return f(peerPublicKey)
+func (f AdmissionFunc) EnsureSession(ownership PeerOwnership) (SessionHandle, BackendHandle, error) {
+	return f(ownership)
 }
 
-// routeRegistrar is the forwarder surface the router depends on: route
-// registration plus route verification and the client-to-backend submission.
-// *forwarder.Forwarder implements it. Registration happens only when the
-// live route does not already match the admitted identity — never per packet
-// — because registration replaces the route generation (stopping the old
-// pump), which must not churn on every datagram.
+// Liveness refreshes a peer's backend routing session on accepted plaintext
+// traffic. The production implementation adapts SessionManager.TouchSession.
+// Implementations MUST be cheap and SHOULD throttle internally (see
+// LivenessRefresher); handshakes and rekeys never pass through here — the
+// upstream engine owns them and Nexus never observes them.
+type Liveness interface {
+	Touch(peerPublicKey string)
+}
+
+// LivenessRefresher is implemented by Liveness implementations that throttle
+// refreshes (the production SessionLiveness does): Touch throttled refreshes
+// at most once per interval per peer, mirroring the custom listener's
+// lastTouchSec pattern (issue #294) so the SessionManager mutex stays off the
+// packet hot path.
+type LivenessRefresher interface {
+	// TouchThrottled refreshes liveness only when the peer's throttle
+	// window has elapsed; high packet rates collapse to a few refreshes.
+	TouchThrottled(peerPublicKey string)
+}
+
+// routeRegistrar is the forwarder surface the router depends on: CHECKED
+// route registration (capacity exhaustion is an error, issue #388), route
+// verification, and the client-to-backend submission. *forwarder.Forwarder
+// implements it. Registration happens only when the live route does not
+// already match the admitted identity — never per packet — because
+// registration replaces the route generation (stopping the old pump), which
+// must not churn on every datagram.
 type routeRegistrar interface {
-	BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) forwarder.Retirement
+	TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (forwarder.Retirement, error)
 	RouteClientToBackend(peerKey string, packet []byte) error
 	HasSessionRoute(peerKey, sessionID, connectionID, assignedIP string, backendTunnelID int64) bool
 }
@@ -90,6 +118,7 @@ type Router struct {
 	resolver  *Resolver
 	admission Admission
 	forwarder routeRegistrar
+	liveness  Liveness
 
 	admittedSessions atomic.Uint64
 	malformedDrops   atomic.Uint64
@@ -110,9 +139,13 @@ type Router struct {
 	sessions map[string]admittedRoute
 }
 
-// NewRouter constructs a Router. All dependencies are required; a nil value
-// for any of them is a programming error and panics.
-func NewRouter(resolver *Resolver, admission Admission, fwd *forwarder.Forwarder) *Router {
+// NewRouter constructs a Router. Resolver, admission and forwarder are
+// required; a nil value for any of them is a programming error and panics.
+// Liveness is optional (a nil Liveness refreshes nothing): when present,
+// every ACCEPTED plaintext packet refreshes the peer's backend-session
+// liveness through it — throttled when the implementation supports it —
+// so active sessions survive the idle reaper (issue #388).
+func NewRouter(resolver *Resolver, admission Admission, fwd *forwarder.Forwarder, liveness Liveness) *Router {
 	if resolver == nil || admission == nil || fwd == nil {
 		panic("ingress: NewRouter requires resolver, admission and forwarder")
 	}
@@ -120,6 +153,7 @@ func NewRouter(resolver *Resolver, admission Admission, fwd *forwarder.Forwarder
 		resolver:  resolver,
 		admission: admission,
 		forwarder: fwd,
+		liveness:  liveness,
 		sessions:  make(map[string]admittedRoute),
 	}
 }
@@ -132,6 +166,11 @@ func NewRouter(resolver *Resolver, admission Admission, fwd *forwarder.Forwarder
 // exact ownership -> submit the packet to the backend through the forwarder
 // exactly like the custom listener path does. Every drop is classified and
 // counted.
+//
+// Liveness: only ACCEPTED traffic refreshes the peer's backend routing
+// session — drops (malformed, unmapped, mismatched, rejected) never do, and
+// handshakes/rekeys never reach this path at all. Refreshes go through the
+// Liveness seam and are throttled there.
 func (r *Router) HandlePacket(packet []byte) error {
 	src, ok := ParseIPv4Source(packet)
 	if !ok {
@@ -159,7 +198,7 @@ func (r *Router) HandlePacket(packet []byte) error {
 		r.stateMu.Unlock()
 		return r.submit(owner, packet)
 	}
-	session, backend, err := r.admission.EnsureSession(owner.PeerPublicKey)
+	session, backend, err := r.admission.EnsureSession(owner)
 	if err != nil {
 		r.stateMu.Unlock()
 		r.rejectedDrops.Add(1)
@@ -175,8 +214,8 @@ func (r *Router) HandlePacket(packet []byte) error {
 	// session's assigned IP must equal the resolver's durable record.
 	// Divergence means the resolver and the session store disagree (a
 	// #391 sync gap, a manual DB edit); the packet is dropped and counted,
-	// never routed. Upstream AllowedIPs enforcement should make this
-	// impossible — this check is the second fence.
+	// never routed. Admission has already rolled its own state back
+	// (issue #388 contract), so nothing leaks here either.
 	assigned := session.AssignedIP()
 	if assigned != owner.IP.String() {
 		r.stateMu.Unlock()
@@ -233,15 +272,17 @@ func (r *Router) routeLiveLocked(o PeerOwnership) bool {
 // assigned IP always comes from the resolver's durable record — never from
 // the packet — so srcIP == route.assignedIP by construction and the
 // forwarder's issue-#89 rebind branch cannot trigger on this path.
-// stateMu must be held.
+// Registration is CHECKED (issue #388): capacity exhaustion returns an error
+// so the caller observes the refusal instead of inferring it from an absent
+// route. stateMu must be held.
 func (r *Router) registerLocked(o PeerOwnership, route admittedRoute) (forwarder.Retirement, error) {
 	if r.forwarder.HasSessionRoute(o.PeerPublicKey, route.sessionID, route.connectionID, route.assignedIP, route.backendID) {
 		return forwarder.Retirement{}, nil
 	}
-	retirement := r.forwarder.BeginRegisterSessionWithLimit(route.sessionID, route.connectionID, o.PeerPublicKey, route.assignedIP, route.backendID, 0, 0)
-	if !r.forwarder.HasSessionRoute(o.PeerPublicKey, route.sessionID, route.connectionID, route.assignedIP, route.backendID) {
+	retirement, err := r.forwarder.TryRegisterSessionWithLimit(route.sessionID, route.connectionID, o.PeerPublicKey, route.assignedIP, route.backendID, 0, 0)
+	if err != nil {
 		r.routeRegErrors.Add(1)
-		return forwarder.Retirement{}, fmt.Errorf("ingress: route registration for peer %s did not take effect", RedactKey(o.PeerPublicKey))
+		return forwarder.Retirement{}, fmt.Errorf("ingress: route registration for peer %s: %w", RedactKey(o.PeerPublicKey), err)
 	}
 	return retirement, nil
 }
@@ -249,6 +290,8 @@ func (r *Router) registerLocked(o PeerOwnership, route admittedRoute) (forwarder
 // submit hands the packet to the forwarder's client->backend path — the same
 // primitive the custom listener's packet router uses, with the same fast-path
 // semantics (srcIP equals the route's assigned IP, so no rebind can occur).
+// Success refreshes the peer's routing-session liveness through the Liveness
+// seam (throttled when supported); failures never touch liveness.
 func (r *Router) submit(o PeerOwnership, packet []byte) error {
 	if err := r.forwarder.RouteClientToBackend(o.PeerPublicKey, packet); err != nil {
 		// Forwarder-level rejections (queue full, rate limit, backend
@@ -256,7 +299,23 @@ func (r *Router) submit(o PeerOwnership, packet []byte) error {
 		// surface the cause to the caller.
 		return fmt.Errorf("ingress: forward packet for peer %s: %w", RedactKey(o.PeerPublicKey), err)
 	}
+	r.touchLiveness(o.PeerPublicKey)
 	return nil
+}
+
+// touchLiveness refreshes the peer's backend-session LastSeen through the
+// Liveness seam. Only accepted plaintext reaches this point (see
+// HandlePacket). Throttling is the implementation's job (LivenessRefresher);
+// the router itself never blocks on it.
+func (r *Router) touchLiveness(peerPublicKey string) {
+	switch lv := r.liveness.(type) {
+	case nil:
+		return
+	case LivenessRefresher:
+		lv.TouchThrottled(peerPublicKey)
+	default:
+		lv.Touch(peerPublicKey)
+	}
 }
 
 // StatsSnapshot returns the current counter values.

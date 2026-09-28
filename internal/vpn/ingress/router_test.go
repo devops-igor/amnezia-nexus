@@ -65,25 +65,25 @@ func (a *admissionCounter) assignIP(peerPublicKey, ip string) {
 	a.assignedIPs[peerPublicKey] = ip
 }
 
-func (a *admissionCounter) EnsureSession(peerPublicKey string) (SessionHandle, BackendHandle, error) {
+func (a *admissionCounter) EnsureSession(o PeerOwnership) (SessionHandle, BackendHandle, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.byCalls[peerPublicKey]++
-	if a.nilFor[peerPublicKey] {
+	a.byCalls[o.PeerPublicKey]++
+	if a.nilFor[o.PeerPublicKey] {
 		return nil, nil, nil
 	}
-	if err, ok := a.errFor[peerPublicKey]; ok {
+	if err, ok := a.errFor[o.PeerPublicKey]; ok {
 		return nil, nil, err
 	}
-	sess, ok := a.sessions[peerPublicKey]
+	sess, ok := a.sessions[o.PeerPublicKey]
 	if !ok {
-		sess = &fakeSession{id: fmt.Sprintf("sess-%s", peerPublicKey[:6]), assignedIP: a.assignedIPs[peerPublicKey]}
-		a.sessions[peerPublicKey] = sess
+		sess = &fakeSession{id: fmt.Sprintf("sess-%s", o.PeerPublicKey[:6]), assignedIP: a.assignedIPs[o.PeerPublicKey]}
+		a.sessions[o.PeerPublicKey] = sess
 	}
-	be, ok := a.backends[peerPublicKey]
+	be, ok := a.backends[o.PeerPublicKey]
 	if !ok {
 		be = &fakeBackend{id: 42}
-		a.backends[peerPublicKey] = be
+		a.backends[o.PeerPublicKey] = be
 	}
 	return sess, be, nil
 }
@@ -117,7 +117,7 @@ func fixture(t *testing.T, peerKey, assignedIP string) (*Router, *Resolver, *adm
 	admission.assignIP(peerKey, assignedIP)
 	fwd := forwarder.NewForwarder(nil, "10.40.0.0/24")
 	fwd.AttachBackendDevice(42, nopDevice{})
-	router := NewRouter(r, admission, fwd)
+	router := NewRouter(r, admission, fwd, nil)
 	return router, r, admission, fwd
 }
 
@@ -378,7 +378,7 @@ func TestRouterConcurrentMixedLoad(t *testing.T) {
 		admission.assignIP(peers[i], ip.String())
 	}
 	fwd := forwarder.NewForwarder(nil, "10.40.0.0/24")
-	router := NewRouter(resolver, admission, fwd)
+	router := NewRouter(resolver, admission, fwd, nil)
 
 	packets := make([][]byte, workers)
 	for i := range packets {

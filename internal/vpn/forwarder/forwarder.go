@@ -25,6 +25,13 @@ var (
 	// and the spoofedRebinds counter is incremented; callers (the endpoint
 	// router) treat it as a drop, not a protocol error.
 	ErrSpoofedSourceIP = errors.New("spoofed inner source IP: rebind rejected")
+	// ErrRouteCapacityExhausted is returned by TryRegisterSessionWithLimit
+	// when a NEW route cannot be admitted because the configured
+	// active-route budget is full (issue #388: checked registration —
+	// admission callers must observe the refusal and roll back, instead of
+	// inferring it from an absent route). Re-registering an existing peer
+	// never returns it: replacement does not increase the route count.
+	ErrRouteCapacityExhausted = errors.New("forwarder: active route limit reached")
 )
 
 // PacketDevice abstracts physical Linux TUN / network interfaces and in-memory test devices.
@@ -367,21 +374,41 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 // BeginRegisterSessionWithLimit installs the new route and stops admission on
 // the old generation without waiting for device I/O. Call Wait on the returned
 // retirement only after releasing caller locks (including Service.mu).
+//
+// Void registration for API compatibility: a route-capacity refusal is
+// silent here and observable only through the usual absent-route behavior.
+// Callers that must distinguish capacity exhaustion (the ingress admission
+// path, issue #388) use TryRegisterSessionWithLimit instead; this thin
+// wrapper keeps every existing custom-listener call site unchanged until
+// #394 removes the path.
 func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement) {
+	retirement, _ = f.TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps)
+	return retirement
+}
+
+// TryRegisterSessionWithLimit is BeginRegisterSessionWithLimit with an
+// inspectable success/failure contract (issue #388): it returns the
+// retirement of any replaced route and reports ErrRouteCapacityExhausted
+// — without installing anything — when a new peer's route does not fit the
+// configured active-route budget. Re-registration of an existing peer is
+// allowed (replacement, not growth) and never reports capacity exhaustion.
+//
+// Call Wait on the retirement only after releasing caller locks; on error
+// the returned retirement is always the zero value.
+func (f *Forwarder) TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Registration is intentionally void for API compatibility. A new peer is
-	// rejected when the configured active-route budget is full; callers observe
-	// the rejection through the usual absent-route behavior. Re-registration of
-	// an existing peer is allowed so reconnect/rekey lifecycle semantics remain
-	// unchanged and does not increase the active route count.
+	// A new peer is rejected when the configured active-route budget is
+	// full. Re-registration of an existing peer is allowed so
+	// reconnect/rekey lifecycle semantics remain unchanged and does not
+	// increase the active route count.
 	maxActiveRoutes := f.maxActiveRoutes
 	if maxActiveRoutes <= 0 {
 		maxActiveRoutes = MaxSupportedActiveRoutes
 	}
 	if _, exists := f.routesByPeer[peerKey]; !exists && len(f.routesByPeer) >= maxActiveRoutes {
-		return
+		return Retirement{}, ErrRouteCapacityExhausted
 	}
 
 	// Ensure backend queue exists
@@ -439,7 +466,7 @@ func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerK
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(f.pumpsStopCh, route)
 	}
-	return retirement
+	return retirement, nil
 }
 
 // stopRoutePumpLocked closes the route's per-session stop channel exactly
