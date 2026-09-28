@@ -79,10 +79,11 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //     created lazily with the persisted assigned IP. A pre-existing
 //     invalid session (stranded backend, diverged IP) is replaced through
 //     SessionManager's own replacement path; the new backend's active
-//     count is applied EXACTLY once per admission (issue #388 rework C):
+//     count is applied EXACTLY once per admission (issue #388 rework D):
 //     the replacement hook owns the transfer (Dec old, Inc new when they
 //     differ) and the admission increments only when the hook did not —
-//     reported per-call by SessionManager.LastReplacementPoolDelta.
+//     reported by the ReplacementPoolDelta returned from the admission's
+//     own CreateSessionWithDelta call.
 //
 // Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
 // reuse-check -> select -> CreateSession -> IncrementConnections -> route
@@ -192,16 +193,18 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 		return nil, nil, retirement, fmt.Errorf("ingress admission: backend selection failed: %w", err)
 	}
 
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name)
+	sess, delta, err := s.sessionMgr.CreateSessionWithDelta(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name)
 	if err != nil {
 		s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
 		return nil, nil, retirement, fmt.Errorf("ingress admission: session creation failed: %w", err)
 	}
 
 	// Backend accounting, exactly-once across replacement (issue #388 rework
-	// C). CreateSession reports what its replacement hook already moved on
-	// the pool counters (read here under the same s.mu that covered the whole
-	// CreateSession call, so the delta is THIS admission's):
+	// D). CreateSessionWithDelta returns what its replacement hook already
+	// moved on the pool counters as part of THIS call's result — no shared
+	// state, no serialization needed beyond the s.mu issue-#86 admission
+	// sequence itself, and a concurrent legacy CreateSession (which does not
+	// take s.mu) can no longer influence the decision:
 	//
 	//   - fresh creation (no prior session): the hook fired nothing — THIS
 	//     admission owns the new backend's increment;
@@ -213,11 +216,11 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 	//     the transfer (Dec(A), Inc(B)) — the admission adds NOTHING, or B
 	//     would end at 2 for one session.
 	//
-	// The report is the ground truth even when the live snapshot at the top
-	// of this function went stale before CreateSession acquired the session
-	// manager lock: what matters for exactly-once is what the hook moved for
-	// this call, not what the snapshot predicted.
-	if !s.sessionMgr.LastReplacementPoolDelta().HasInc {
+	// The per-call delta is the ground truth even when the live snapshot at
+	// the top of this function went stale before CreateSession acquired the
+	// session manager lock: what matters for exactly-once is what the hook
+	// moved for this call, not what the snapshot predicted.
+	if !delta.HasInc {
 		s.pool.IncrementConnections(backend.ID)
 	}
 
