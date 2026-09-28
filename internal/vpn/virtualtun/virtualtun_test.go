@@ -570,6 +570,16 @@ func TestConcurrentInjectReadClose(t *testing.T) {
 		}()
 		wg.Wait()
 
+		// Stats must stay sane under concurrent drops: depths never
+		// exceed queue capacity and the drop total never goes backwards.
+		s := vt.Stats()
+		if s.InboundDepth > cap(vt.inPackets) || s.OutboundDepth > cap(vt.outPackets) {
+			t.Errorf("iteration %d: Stats depths exceed queue capacity: %+v", iter, s)
+		}
+		if s2 := vt.Stats(); s2.DropsTotal < s.DropsTotal {
+			t.Errorf("iteration %d: DropsTotal went backwards: %d < %d", iter, s2.DropsTotal, s.DropsTotal)
+		}
+
 		if got := vt.DroppedPackets(); got == 0 {
 			// At close both queues held packets or drops happened on
 			// the way; zero would mean the queues were empty AND no
@@ -605,5 +615,188 @@ func TestRecordDropHooks(t *testing.T) {
 	vt.RecordDropN(41)
 	if got := vt.DroppedPackets(); got != 42 {
 		t.Errorf("DroppedPackets = %d, want 42", got)
+	}
+}
+
+// TestStats_QueueDepths covers depth reporting on both queue directions.
+func TestStats_QueueDepths(t *testing.T) {
+	vt := mustNew(t, Config{InboundCapacity: 4, OutboundCapacity: 4, BatchSize: 2})
+
+	s := vt.Stats()
+	if s.InboundDepth != 0 || s.OutboundDepth != 0 {
+		t.Fatalf("fresh device depths = (%d, %d), want (0, 0)", s.InboundDepth, s.OutboundDepth)
+	}
+	if s.DropsTotal != 0 || s.Sum() != 0 {
+		t.Fatalf("fresh device drops = total %d, buckets %d, want 0", s.DropsTotal, s.Sum())
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := vt.InjectInbound([]byte{byte(i)}); err != nil {
+			t.Fatalf("InjectInbound: %v", err)
+		}
+	}
+	if _, err := vt.Write([][]byte{bytes.Repeat([]byte{7}, 4)}, 0); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	s = vt.Stats()
+	if s.InboundDepth != 2 {
+		t.Errorf("InboundDepth = %d, want 2", s.InboundDepth)
+	}
+	if s.OutboundDepth != 1 {
+		t.Errorf("OutboundDepth = %d, want 1", s.OutboundDepth)
+	}
+
+	// Draining the outbound queue is observable through Stats.
+	if _, err := vt.ReceiveOutbound(); err != nil {
+		t.Fatalf("ReceiveOutbound: %v", err)
+	}
+	if s = vt.Stats(); s.OutboundDepth != 0 {
+		t.Errorf("OutboundDepth after drain = %d, want 0", s.OutboundDepth)
+	}
+
+	// Reading the inbound queue through the tun.Device path too.
+	bufs := [][]byte{make([]byte, 8), make([]byte, 8)}
+	sizes := []int{0, 0}
+	if n, err := vt.Read(bufs, sizes, 0); err != nil || n != 2 {
+		t.Fatalf("Read = (%d, %v), want (2, nil)", n, err)
+	}
+	if s = vt.Stats(); s.InboundDepth != 0 {
+		t.Errorf("InboundDepth after Read = %d, want 0", s.InboundDepth)
+	}
+}
+
+// TestStats_PerReasonAccounting walks the three internal drop sites: one
+// device accumulates one drop of each reason; subtests build on each other
+// (running counters), matching the accounting model.
+func TestStats_PerReasonAccounting(t *testing.T) {
+	vt := mustNew(t, Config{InboundCapacity: 2, OutboundCapacity: 1})
+
+	t.Run("queue-full on InjectInbound", func(t *testing.T) {
+		// Fill the inbound queue with 2-byte packets (they will be
+		// made oversized by the 1-byte read buffer in the next
+		// subtest), then force one queue-full drop.
+		for i := 0; i < 2; i++ {
+			if err := vt.InjectInbound([]byte{byte(i), byte(i)}); err != nil {
+				t.Fatalf("InjectInbound #%d: %v", i, err)
+			}
+		}
+		if err := vt.InjectInbound([]byte{0xFF}); !errors.Is(err, ErrQueueFull) {
+			t.Fatalf("overflow InjectInbound = %v, want ErrQueueFull", err)
+		}
+		s := vt.Stats()
+		if s.DropsQueueFull != 1 || s.DropsOversized != 0 || s.DropsShutdown != 0 {
+			t.Errorf("buckets = (qf %d, ov %d, sd %d), want (1, 0, 0)", s.DropsQueueFull, s.DropsOversized, s.DropsShutdown)
+		}
+		if s.DropsTotal != 1 || s.Sum() != s.DropsTotal {
+			t.Errorf("total %d, sum %d, want both 1", s.DropsTotal, s.Sum())
+		}
+	})
+
+	t.Run("oversized on Read", func(t *testing.T) {
+		// The queued 2-byte packets do not fit a 1-byte buffer: each
+		// Read drops the head packet as oversized and returns
+		// immediately, so two calls drain both via the oversized path.
+		sizes := []int{0}
+		for i := 0; i < 2; i++ {
+			if n, err := vt.Read([][]byte{make([]byte, 1)}, sizes, 0); err != nil || n != 0 {
+				t.Fatalf("oversized Read #%d = (%d, %v), want (0, nil)", i+1, n, err)
+			}
+		}
+		s := vt.Stats()
+		if s.DropsOversized != 2 {
+			t.Errorf("DropsOversized = %d, want 2 (both queued packets exceed the 1-byte buffer)", s.DropsOversized)
+		}
+		if s.DropsQueueFull != 1 || s.DropsShutdown != 0 {
+			t.Errorf("buckets = (qf %d, sd %d), want (1, 0)", s.DropsQueueFull, s.DropsShutdown)
+		}
+		if s.DropsTotal != 3 || s.Sum() != s.DropsTotal {
+			t.Errorf("total %d, sum %d, want both 3", s.DropsTotal, s.Sum())
+		}
+	})
+
+	t.Run("queue-full on Write", func(t *testing.T) {
+		// Fill the single outbound slot, then overflow it once. The
+		// dropped packet still counts as processed (session 1
+		// processed-count semantics).
+		if _, err := vt.Write([][]byte{bytes.Repeat([]byte{7}, 4)}, 0); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		n, err := vt.Write([][]byte{bytes.Repeat([]byte{7}, 4)}, 0)
+		if err != nil || n != 1 {
+			t.Fatalf("overflow Write = (%d, %v), want (1, nil)", n, err)
+		}
+		s := vt.Stats()
+		if s.DropsQueueFull != 2 {
+			t.Errorf("DropsQueueFull = %d, want 2 (1 InjectInbound + 1 Write)", s.DropsQueueFull)
+		}
+		if s.DropsOversized != 2 || s.DropsShutdown != 0 {
+			t.Errorf("buckets = (ov %d, sd %d), want (2, 0)", s.DropsOversized, s.DropsShutdown)
+		}
+		if s.DropsTotal != 4 || s.Sum() != s.DropsTotal {
+			t.Errorf("total %d, sum %d, want both 4", s.DropsTotal, s.Sum())
+		}
+	})
+
+	t.Run("shutdown on Close", func(t *testing.T) {
+		// The outbound queue holds 1 packet; the inbound queue is empty
+		// (both its packets were consumed as oversized drops).
+		if err := vt.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		s := vt.Stats()
+		if s.DropsShutdown != 1 {
+			t.Errorf("DropsShutdown = %d, want 1 (outbound packet queued at close)", s.DropsShutdown)
+		}
+		if s.DropsQueueFull != 2 || s.DropsOversized != 2 {
+			t.Errorf("buckets = (qf %d, ov %d), want (2, 2)", s.DropsQueueFull, s.DropsOversized)
+		}
+		if s.DropsTotal != 5 || s.Sum() != s.DropsTotal {
+			t.Errorf("total %d, sum %d, want both 5", s.DropsTotal, s.Sum())
+		}
+	})
+}
+
+// TestStats_ExternalDropsNotAttributed: RecordDrop/RecordDropN increment the
+// total only, never a reason bucket.
+func TestStats_ExternalDropsNotAttributed(t *testing.T) {
+	vt := mustNew(t, Config{})
+	vt.RecordDrop()
+	vt.RecordDropN(9)
+
+	s := vt.Stats()
+	if s.DropsTotal != 10 {
+		t.Errorf("DropsTotal = %d, want 10", s.DropsTotal)
+	}
+	if s.Sum() != 0 {
+		t.Errorf("per-reason sum = %d, want 0 (external drops have no bucket)", s.Sum())
+	}
+	if s.DropsQueueFull != 0 || s.DropsOversized != 0 || s.DropsShutdown != 0 {
+		t.Errorf("buckets = (qf %d, ov %d, sd %d), want all 0", s.DropsQueueFull, s.DropsOversized, s.DropsShutdown)
+	}
+}
+
+// TestStats_SnapshotIsIndependent: the returned snapshot is a value copy;
+// later drops do not mutate an already-returned snapshot.
+func TestStats_SnapshotIsIndependent(t *testing.T) {
+	vt := mustNew(t, Config{InboundCapacity: 1})
+	if err := vt.InjectInbound([]byte{1}); err != nil {
+		t.Fatalf("InjectInbound: %v", err)
+	}
+
+	before := vt.Stats()
+	if err := vt.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	after := vt.Stats()
+
+	if before.DropsShutdown != 0 || before.DropsTotal != 0 {
+		t.Errorf("snapshot taken before Close changed: shutdown=%d total=%d, want 0/0", before.DropsShutdown, before.DropsTotal)
+	}
+	if after.DropsShutdown != 1 || after.DropsTotal != 1 {
+		t.Errorf("post-Close stats = shutdown %d total %d, want 1/1", after.DropsShutdown, after.DropsTotal)
+	}
+	if before.InboundDepth != 1 {
+		t.Errorf("pre-Close InboundDepth = %d, want 1", before.InboundDepth)
 	}
 }

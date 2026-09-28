@@ -25,6 +25,10 @@
 // too. RecordDrop lets external owners add drops observed outside the device
 // (issue #160 telemetry).
 //
+// Every internal drop also lands in a per-reason bucket (queue-full,
+// oversized, shutdown); Stats reports the breakdown alongside the queue
+// depths. RecordDrop and RecordDropN increment the total only.
+//
 // # Shutdown
 //
 // Close is idempotent and never closes the packet channels, so a sender can
@@ -96,7 +100,14 @@ type VirtualTUN struct {
 	name       string
 	batchSize  int
 	dropCount  atomic.Uint64
-	once       sync.Once
+	// Per-reason drop buckets. They are separate atomics, incremented
+	// alongside dropCount at each internal drop site: the sum of the
+	// buckets can transiently lag or lead the total under concurrency
+	// (see Stats).
+	dropQueueFull atomic.Uint64
+	dropOversized atomic.Uint64
+	dropShutdown  atomic.Uint64
+	once          sync.Once
 }
 
 // Compile-time interface compliance.
@@ -236,6 +247,7 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			// far. Read never waits for a fitting packet: the
 			// caller's next Read re-enters the queue.
 			t.dropCount.Add(1)
+			t.dropOversized.Add(1)
 			return n, nil
 		}
 		copy(dst, pkt)
@@ -285,6 +297,7 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 		default:
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
+			t.dropQueueFull.Add(1)
 			n++
 		}
 	}
@@ -309,6 +322,7 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 		return nil
 	default:
 		t.dropCount.Add(1)
+		t.dropQueueFull.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -353,9 +367,71 @@ func (t *VirtualTUN) Outbound() <-chan []byte {
 }
 
 // DroppedPackets returns the total number of packets dropped due to a full
-// queue, an oversized destination buffer, or shutdown.
+// queue, an oversized destination buffer, or shutdown. RecordDrop and
+// RecordDropN increment this total without touching the per-reason buckets;
+// Stats reports the reason breakdown.
 func (t *VirtualTUN) DroppedPackets() uint64 {
 	return t.dropCount.Load()
+}
+
+// StatsSnapshot is a point-in-time observation of a VirtualTUN's queue
+// depths and drop accounting, returned by Stats.
+type StatsSnapshot struct {
+	// InboundDepth is the number of packets currently queued for the
+	// engine's Read path (device -> engine).
+	InboundDepth int
+
+	// OutboundDepth is the number of engine-written packets currently
+	// queued for ReceiveOutbound (engine -> consumer).
+	OutboundDepth int
+
+	// DropsTotal mirrors DroppedPackets: every drop counted by the
+	// device plus external drops recorded via RecordDrop/RecordDropN.
+	DropsTotal uint64
+
+	// DropsQueueFull counts packets dropped because the destination
+	// queue was full (InjectInbound, Write).
+	DropsQueueFull uint64
+
+	// DropsOversized counts packets dropped by Read because they did
+	// not fit the destination buffer.
+	DropsOversized uint64
+
+	// DropsShutdown counts queued packets discarded by Close.
+	DropsShutdown uint64
+}
+
+// Sum returns the sum of the per-reason drop buckets. External drops
+// recorded through RecordDrop/RecordDropN are intentionally excluded: they
+// have no reason bucket, so Sum equals DropsTotal only when no external
+// drops were recorded and no concurrent drop is in flight.
+func (s StatsSnapshot) Sum() uint64 {
+	return s.DropsQueueFull + s.DropsOversized + s.DropsShutdown
+}
+
+// Stats returns a snapshot of the queue depths and drop accounting.
+//
+// Consistency: each counter is an independent atomic load and each depth a
+// separate channel-length read, so the snapshot is not a globally consistent
+// point in time. Under concurrent traffic the depths may never be observed
+// together, and the per-reason sum (StatsSnapshot.Sum) can transiently lag
+// or lead DropsTotal (a goroutine can be between the two Add calls at one
+// drop site, and loads of separate atomics are not a single operation).
+// DropsTotal is loaded before the buckets, so a single racy snapshot can
+// even show a bucket ahead of the total; the underlying counters never
+// diverge this way — every counter is individually monotonic and all of
+// them converge once traffic stops. Do not validate one snapshot against
+// another. The snapshot is safe to call concurrently with all device
+// operations.
+func (t *VirtualTUN) Stats() StatsSnapshot {
+	return StatsSnapshot{
+		InboundDepth:   len(t.inPackets),
+		OutboundDepth:  len(t.outPackets),
+		DropsTotal:     t.dropCount.Load(),
+		DropsQueueFull: t.dropQueueFull.Load(),
+		DropsOversized: t.dropOversized.Load(),
+		DropsShutdown:  t.dropShutdown.Load(),
+	}
 }
 
 // RecordDrop increments the dropped packet counter (issue #160 telemetry
@@ -406,6 +482,7 @@ func (t *VirtualTUN) Close() error {
 		// this snapshot.
 		if discarded := len(t.inPackets) + len(t.outPackets); discarded > 0 {
 			t.dropCount.Add(uint64(discarded))
+			t.dropShutdown.Add(uint64(discarded))
 		}
 	})
 	return nil
