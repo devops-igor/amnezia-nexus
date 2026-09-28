@@ -27,6 +27,25 @@ var (
 // old backend's ActiveConnections gauge.
 type ReplacementHook func(ctx context.Context, old, new *models.VPNSession)
 
+// ReplacementPoolDelta reports the backend pool-counter movement the
+// replacement hook performed for ONE CreateSessionWithDelta call (issue #388
+// rework D). It lets a caller that applies its own backend accounting mirror
+// the hook exactly: Replaced is true whenever an existing session was
+// replaced (the hook decremented DecBackendID, the OLD session's backend),
+// and HasInc is additionally true when the replacement moved the peer to a
+// different backend (the hook also incremented IncBackendID, the NEW
+// backend). The zero value reports "no replacement ran; the hook moved
+// nothing" — the caller then owns the new backend's increment itself. The
+// delta is part of the call result, not shared manager state, so it is
+// unambiguously THIS call's even when other CreateSession callers run
+// concurrently.
+type ReplacementPoolDelta struct {
+	Replaced     bool
+	DecBackendID int64
+	IncBackendID int64
+	HasInc       bool
+}
+
 // SessionMetrics instruments the session-lifecycle paths so counter-leak
 // paths are distinguishable in production (issue #78 direction item 2):
 // replacements_total counts session replacements, and the paired
@@ -120,9 +139,26 @@ func (sm *SessionManager) UnlockLifecycle() {
 // authentication lookup; it is stored on the session (memory + DB row) and
 // deliberately carried onto every replacement of the same peer (a rekey
 // re-authenticates the same user_connection, so the fresh name is passed in).
+//
+// Compatibility wrapper for legacy callers that do not need the replacement
+// delta (issue #388 rework D): behavior is identical to before — same
+// session result, same error — only the pool-counter movement of this exact
+// call is discarded. Admissions that maintain their own backend accounting
+// must call CreateSessionWithDelta instead.
 func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string, generation ...uint64) (*models.VPNSession, error) {
+	sess, _, err := sm.CreateSessionWithDelta(ctx, userID, peerPublicKey, assignedIP, backendTunnelID, connectionName, generation...)
+	return sess, err
+}
+
+// CreateSessionWithDelta is CreateSession with the replacement accounting
+// delivered as part of the call result (issue #388 rework D). The returned
+// ReplacementPoolDelta reports exactly what THIS call's replacement hook
+// moved on the backend pool counters — there is no shared state, so no
+// serialization between concurrent CreateSession callers is required to
+// attribute the delta to the right call.
+func (sm *SessionManager) CreateSessionWithDelta(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string, generation ...uint64) (*models.VPNSession, ReplacementPoolDelta, error) {
 	if userID == "" || peerPublicKey == "" || assignedIP == "" {
-		return nil, errors.New("missing required session fields")
+		return nil, ReplacementPoolDelta{}, errors.New("missing required session fields")
 	}
 
 	var gen uint64
@@ -193,7 +229,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 				sm.metrics.ReplacementsPersistFailedTotal.Add(1)
 				log.Printf("[endpoint] error: session replacement for peer %s: failed to persist replacement session: %v", peerPublicKey, err)
 			}
-			return nil, fmt.Errorf("failed to persist vpn session: %w", err)
+			return nil, ReplacementPoolDelta{}, fmt.Errorf("failed to persist vpn session: %w", err)
 		}
 	}
 
@@ -206,12 +242,25 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 	// the caller sees a consistent old→new transition. The hook migrates the
 	// pool connection counter (decrement old backend, increment new) and
 	// updates forwarder/sticky state; it must not re-enter this manager.
+	// Issue #388 rework D: the pool-counter movement of THIS call is part of
+	// the call result — the caller owning the new backend's increment EXACTLY
+	// once increments only when the hook did not (fresh creation, or a
+	// same-backend replacement where the hook only released the old count on
+	// the same backend). No shared field: concurrent CreateSession callers
+	// can never observe each other's delta.
+	var delta ReplacementPoolDelta
 	if replaced != nil && sm.replacementHook != nil {
 		sm.metrics.ReplacementCounterMigrationsTotal.Add(1)
 		sm.replacementHook(ctx, replaced, sess)
+		delta = ReplacementPoolDelta{
+			Replaced:     true,
+			DecBackendID: replaced.BackendTunnelID,
+			IncBackendID: sess.BackendTunnelID,
+			HasInc:       sess.BackendTunnelID != replaced.BackendTunnelID,
+		}
 	}
 
-	return sess, nil
+	return sess, delta, nil
 }
 
 // GetSession retrieves a session by peer public key.
