@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
@@ -44,10 +45,13 @@ type IngressEngine struct {
 	liveness *ingress.SessionLiveness
 	router   *ingress.Router
 
-	mu      sync.Mutex
-	stopCh  chan struct{}
-	stopped chan struct{}
-	running bool
+	mu             sync.Mutex
+	stopCh         chan struct{}
+	stopped        chan struct{}
+	running        bool
+	closed         bool
+	returnPath     *forwarder.ReturnPath
+	returnCounters returnCounters
 }
 
 // NewIngressEngine builds the production upstream ingress chain from durable
@@ -101,15 +105,17 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 	// same throttle window (issue #294 pattern).
 	liveness := ingress.NewSessionLiveness(s.sessionMgr.TouchSession)
 
-	router := ingress.NewRouter(resolver, s.IngressAdmission(), s.forwarder, liveness)
-
-	return &IngressEngine{
-		svc:      s,
-		portal:   portal,
-		resolver: resolver,
-		liveness: liveness,
-		router:   router,
-	}, nil
+	e := &IngressEngine{svc: s, portal: portal, resolver: resolver, liveness: liveness}
+	e.returnPath = forwarder.NewReturnPath(e.writeReturnPacket)
+	// Production classification (issue #389 rework 2): the forwarder's
+	// backend-reader filters reject malformed/unrouted replies before the
+	// write callback runs, so the engine folds those rejections into the
+	// same counters here. Exactly one engine exists per service (dormant
+	// until #393 activation); a second registration would re-target
+	// subsequent classifications to the newer engine.
+	s.forwarder.SetReturnRejectClassifier(e.classifyForwarderReject)
+	e.router = ingress.NewRouterWithReturnPath(resolver, serviceIngressAdmission{svc: s, returnPath: e.returnPath}, s.forwarder, liveness, e.returnPath)
+	return e, nil
 }
 
 // Start launches the receive loop: ClientAWGDevice.ReceiveOutbound ->
@@ -119,6 +125,10 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 // Start on a running engine reports ErrIngressEngineStarted.
 func (e *IngressEngine) Start() error {
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return forwarder.ErrReturnPathClosed
+	}
 	if e.running {
 		e.mu.Unlock()
 		return ErrIngressEngineStarted
@@ -159,12 +169,16 @@ func (e *IngressEngine) Start() error {
 // owns it from construction) and reports ErrIngressEngineNotStarted.
 func (e *IngressEngine) Stop() error {
 	e.mu.Lock()
+	e.closed = true
 	wasRunning := e.running
 	stopCh, stopped := e.stopCh, e.stopped
 	e.running = false
 	e.stopCh, e.stopped = nil, nil
 	e.mu.Unlock()
 
+	if e.returnPath != nil {
+		e.returnPath.Close()
+	}
 	if stopCh != nil {
 		close(stopCh)
 	}

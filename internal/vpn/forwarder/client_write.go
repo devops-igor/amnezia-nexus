@@ -63,7 +63,7 @@ func (route *sessionRoute) waitForWrite() {
 // that selected a device before retirement but reaches admission afterward is
 // rejected. If retirement races an admitted write, retirement waits outside
 // f.mu; once it returns, this generation can no longer call dev.Write.
-func (f *Forwarder) writeClientPacket(route *sessionRoute, dev PacketDevice, packet []byte) {
+func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, packet []byte) {
 	route.writeMu.Lock()
 	defer route.writeMu.Unlock()
 	if route.retired.Load() {
