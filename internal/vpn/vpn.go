@@ -475,6 +475,7 @@ func applyVPNConfigDefaults(cfg *models.VPNConfig) {
 // NewVPNService initializes the complete unified VPN subsystem.
 // Server-side RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard),
 // providing a stable transition window intentionally independent of client-configured timing ranges.
+//
 //nolint:gocyclo // initialization validates and wires each owned subsystem in order.
 func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	if cfg == nil {
@@ -2568,37 +2569,40 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	s.backendDeviceEndpoints[tun.ID] = tun.Endpoint
 
 	// Spawn backend read loop to route packets back to clients
-	go func(backendID int64, serverID int64, device BackendDevice) {
-		buf := make([]byte, 2048)
-		for {
-			n, err := device.Read(buf)
-			if err != nil {
-				return
-			}
-			if n >= 20 && (buf[0]>>4) == 4 { // IPv4
-				destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
-				if err := s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP); err != nil {
-					// Throttle drop logs: a stalled route would otherwise
-					// produce one log line per packet (issue #39: 7687
-					// "packet queue is full" lines in 2 h). Counters are
-					// exposed via Forwarder.DropStats / the stats API, so
-					// rate-limiting the log loses no information.
-					now := time.Now().Unix()
-					if s.dropLogUntil.Load() <= now {
-						s.dropLogUntil.Store(now + 1)
-						log.Printf("[vpn/forwarder] dropped backend return packet to %s (backend_tunnel_id=%d server_id=%d): %v",
-							destIP, backendID, serverID, err)
-					}
-				}
-			}
-		}
-	}(tun.ID, tun.ServerID, dev)
+	go s.pumpBackendReturns(tun.ID, tun.ServerID, dev)
 
 	// Trigger backend routing and NAT remediation asynchronously in the background
 	// so tunnel attachment and data-plane startup are never blocked by SSH latency.
 	go s.triggerBackendRoutingRemediation(tun.ServerID)
 
 	return nil
+}
+
+// pumpBackendReturns reads backend plaintext and dispatches through the production forwarder.
+func (s *Service) pumpBackendReturns(backendID, serverID int64, device io.Reader) {
+	buf := make([]byte, 2048)
+	for {
+		n, err := device.Read(buf)
+		if err != nil {
+			return
+		}
+		if n >= 20 && (buf[0]>>4) == 4 { // IPv4
+			destIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
+			if err := s.forwarder.RouteBackendToClient(backendID, buf[:n], destIP); err != nil {
+				// Throttle drop logs: a stalled route would otherwise
+				// produce one log line per packet (issue #39: 7687
+				// "packet queue is full" lines in 2 h). Counters are
+				// exposed via Forwarder.DropStats / the stats API, so
+				// rate-limiting the log loses no information.
+				now := time.Now().Unix()
+				if s.dropLogUntil.Load() <= now {
+					s.dropLogUntil.Store(now + 1)
+					log.Printf("[vpn/forwarder] dropped backend return packet to %s (backend_tunnel_id=%d server_id=%d): %v",
+						destIP, backendID, serverID, err)
+				}
+			}
+		}
+	}
 }
 
 // getPortalSubnet returns the configured portal client subnet CIDR or defaults to "10.100.0.0/16".

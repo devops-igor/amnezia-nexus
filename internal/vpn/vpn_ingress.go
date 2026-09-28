@@ -17,7 +17,10 @@ import (
 // upstream plaintext ingress path (issue #388). The router has no context on
 // its packet hot path, so admission runs under context.Background() — the
 // same shape as the custom listener's incoming-peer handler.
-type serviceIngressAdmission struct{ svc *Service }
+type serviceIngressAdmission struct {
+	svc        *Service
+	returnPath *forwarder.ReturnPath
+}
 
 // Compile-time proof that the adapter satisfies the ingress admission seam.
 var _ ingress.Admission = serviceIngressAdmission{}
@@ -25,7 +28,11 @@ var _ ingress.Admission = serviceIngressAdmission{}
 // EnsureSession implements ingress.Admission by delegating to
 // Service.EnsureBackendSessionForIngress.
 func (a serviceIngressAdmission) EnsureSession(o ingress.PeerOwnership) (ingress.SessionHandle, ingress.BackendHandle, error) {
-	return a.svc.EnsureSessionForIngress(context.Background(), o)
+	sess, backend, _, err := a.svc.ensureBackendSessionForIngress(context.Background(), o, a.returnPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ingressSessionHandle{sess: sess}, ingressBackendHandle{tun: backend}, nil
 }
 
 // ingressSessionHandle adapts *models.VPNSession to ingress.SessionHandle.
@@ -112,6 +119,14 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //
 //nolint:gocyclo // durable revalidation, live-session reuse, selection, creation, and rollback are intentionally one serialized admission (issue #86).
 func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.PeerOwnership) (*models.VPNSession, *models.BackendTunnel, forwarder.Retirement, error) {
+	return s.ensureBackendSessionForIngress(ctx, o, nil)
+}
+
+// ensureBackendSessionForIngress binds fresh and reused routes to the caller's
+// engine lifetime under the same admission serialization as session creation.
+//
+//nolint:gocyclo // one serialized admission preserves capacity and rollback invariants.
+func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.PeerOwnership, path *forwarder.ReturnPath) (*models.VPNSession, *models.BackendTunnel, forwarder.Retirement, error) {
 	var retirement forwarder.Retirement
 	s.mu.Lock()
 	defer func() {
@@ -119,6 +134,9 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 		retirement.Wait()
 	}()
 
+	if path != nil && path.Closed() {
+		return nil, nil, retirement, forwarder.ErrReturnPathClosed
+	}
 	if s.auth == nil || s.sessionMgr == nil || s.pool == nil {
 		return nil, nil, retirement, errIngressSubsystems
 	}
@@ -158,6 +176,12 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(o.PeerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
+			if path != nil && s.forwarder != nil {
+				retirement, err = s.forwarder.BindSessionReturnPath(live.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, path)
+				if err != nil {
+					return nil, nil, retirement, err
+				}
+			}
 			if s.stickyMgr != nil {
 				s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
 			}
@@ -227,7 +251,7 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 	// Route registration LAST (admission-then-register): only a checked,
 	// successful registration makes the admission visible.
 	if s.forwarder != nil {
-		retirement, err = s.forwarder.TryRegisterSessionWithLimit(sess.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, 0, 0)
+		retirement, err = s.forwarder.TryRegisterSessionWithReturnPath(sess.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, 0, 0, path)
 		if err != nil {
 			s.rollbackIngressSession(ctx, sess)
 			// Mirror decrement of the count THIS admission left on the NEW

@@ -147,6 +147,7 @@ type sessionRoute struct {
 	peerKey         string
 	assignedIP      string
 	backendTunnelID int64
+	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
 	clientQueue     chan []byte
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
@@ -396,8 +397,18 @@ func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerK
 // Call Wait on the retirement only after releasing caller locks; on error
 // the returned retirement is always the zero value.
 func (f *Forwarder) TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement, err error) {
+	return f.TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps, nil)
+}
+
+// TryRegisterSessionWithReturnPath installs a route-bound plaintext writer.
+// A nonnil path always takes precedence over legacy devices, including when closed.
+func (f *Forwarder) TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (Retirement, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.registerSessionLocked(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps, path)
+}
+
+func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (retirement Retirement, err error) {
 
 	// A new peer is rejected when the configured active-route budget is
 	// full. Re-registration of an existing peer is allowed so
@@ -425,6 +436,7 @@ func (f *Forwarder) TryRegisterSessionWithLimit(sessionID, connectionID, peerKey
 	}
 
 	route := &sessionRoute{
+		returnPath:      path,
 		sessionID:       sessionID,
 		connectionID:    connectionID,
 		peerKey:         peerKey,
@@ -646,6 +658,18 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 
 // RouteClientToBackend routes a packet from a client peer toward their assigned backend tunnel.
 func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
+	return f.routeClientToBackend(peerKey, packet, nil)
+}
+
+// RouteClientToBackendWithReturnPath fences submissions to one engine owner.
+func (f *Forwarder) RouteClientToBackendWithReturnPath(peerKey string, packet []byte, path *ReturnPath) error {
+	if path == nil || path.Closed() {
+		return ErrReturnPathClosed
+	}
+	return f.routeClientToBackend(peerKey, packet, path)
+}
+
+func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *ReturnPath) error {
 	var srcIP string
 	if len(packet) >= 20 && (packet[0]>>4) == 4 {
 		srcIP = net.IPv4(packet[12], packet[13], packet[14], packet[15]).String()
@@ -653,7 +677,7 @@ func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
 
 	f.mu.RLock()
 	route, ok := f.routesByPeer[peerKey]
-	if !ok {
+	if !ok || (path != nil && route.returnPath != path) {
 		f.mu.RUnlock()
 		return ErrSessionNotRegistered
 	}
@@ -750,6 +774,12 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
 		return ErrSessionNotRegistered
+	}
+	if route.returnPath != nil && (backendTunnelID != route.backendTunnelID || !validReturnDestination(packet, destIP)) {
+		f.mu.RUnlock()
+		f.dropsNoRoute.Add(1)
+		f.dropsTotal.Add(1)
+		return ErrReturnRouteMismatch
 	}
 	sID := route.sessionID
 	cID := route.connectionID
@@ -1216,9 +1246,14 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			f.mu.RUnlock()
 			continue
 		}
-		dev, ok := f.clientDevices[route.peerKey]
-		if !ok || dev == nil {
-			dev = f.defaultClientDev
+		var dev packetWriter
+		if route.returnPath != nil {
+			dev = routeWriter{path: route.returnPath, peerKey: route.peerKey, assignedIP: route.assignedIP}
+		} else {
+			dev = f.clientDevices[route.peerKey]
+			if dev == nil {
+				dev = f.defaultClientDev
+			}
 		}
 		f.mu.RUnlock()
 		if dev != nil {
