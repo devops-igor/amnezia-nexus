@@ -48,6 +48,7 @@ func (d *ClientAWGDevice) Status() (Status, error) {
 	return status, nil
 }
 
+//nolint:gocyclo // Linear single-pass allowlist parser over upstream IpcGet output; splitting the key switch would obscure the security-reviewed field mapping.
 func parseStatus(raw string) (Status, error) {
 	var status Status
 	var current *PeerStatus

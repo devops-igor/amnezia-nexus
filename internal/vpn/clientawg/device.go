@@ -21,6 +21,8 @@ var (
 // ClientAWGDevice owns exactly one upstream engine and VirtualTUN. Its lock
 // serializes peer mutations, status and shutdown, never blocking plaintext reads.
 // Protocol sessions, replay state, timers and roaming remain upstream-owned.
+//
+//nolint:revive // Stutter is permitted to strictly adhere to task specification
 type ClientAWGDevice struct {
 	mu        sync.Mutex
 	dev       *device.Device

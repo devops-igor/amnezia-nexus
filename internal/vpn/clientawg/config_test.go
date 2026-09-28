@@ -11,6 +11,28 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
+// seedVPNConfigRaw writes a vpn_config row exactly as given, bypassing the
+// settings API guard: SetSetting routes the vpn_config key through
+// SaveVPNConfig, which validates the portal identity and round-trips
+// models.VPNConfig, dropping the clientawg-only random_trailers and
+// disable_cookies fields. Legacy pre-guard databases and backup restores
+// hand the loader rows in exactly this raw shape, so the loader tests must
+// be able to persist one. Corrupt fixtures are expected to fail LOADER
+// validation; any error here is a test setup failure.
+func seedVPNConfigRaw(t *testing.T, db *database.DB, value map[string]any) {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal vpn_config fixture: %v", err)
+	}
+	if _, err := db.SQLDB().Exec(
+		"INSERT INTO settings (key, value) VALUES ('vpn_config', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+		string(encoded),
+	); err != nil {
+		t.Fatalf("seed raw vpn_config row: %v", err)
+	}
+}
+
 func TestLoadConfigPreservesSnapshotAndDecryptsIdentity(t *testing.T) {
 	const secret = "loader-test-secret"
 	db, err := database.Open(filepath.Join(t.TempDir(), "panel.db"), secret)
@@ -29,9 +51,7 @@ func TestLoadConfigPreservesSnapshotAndDecryptsIdentity(t *testing.T) {
 				}
 			}
 			stored := map[string]any{"server_private_key": private, "server_public_key": cfg.PublicKey, "listen_port": 12345, "h1": "100-110", "h2": "200-210", "h3": "300-310", "h4": "400-410", "s1": 12, "s2": 13, "s3": 14, "s4": 15, "header_protection_key": cfg.PrivateKey, "content_padding_addition": "true", "random_trailers": true, "disable_cookies": true}
-			if err := db.SetSetting(t.Context(), "vpn_config", stored); err != nil {
-				t.Fatal(err)
-			}
+			seedVPNConfigRaw(t, db, stored)
 			before, _, err := db.GetSettingRaw(t.Context(), "vpn_config")
 			if err != nil {
 				t.Fatal(err)
@@ -58,6 +78,24 @@ func TestLoadConfigPreservesSnapshotAndDecryptsIdentity(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDefaultsAbsentFlagsToFalse(t *testing.T) {
+	cfg := testConfig()
+	db, err := database.Open(filepath.Join(t.TempDir(), "panel.db"), "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	stored := map[string]any{"server_private_key": cfg.PrivateKey, "server_public_key": cfg.PublicKey, "listen_port": 1234, "h1": 1, "h2": 2, "h3": 3, "h4": 4}
+	seedVPNConfigRaw(t, db, stored)
+	got, err := LoadConfig(t.Context(), db, cfg.TUN, cfg.Peers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Parameters.RandomTrailers || got.Parameters.DisableCookies {
+		t.Fatal("absent or null flags must load as false")
+	}
+}
+
 func TestLoadConfigRejectsIncompleteSnapshotWithoutWrites(t *testing.T) {
 	cfg := testConfig()
 	tests := map[string]func(map[string]any){
@@ -77,9 +115,7 @@ func TestLoadConfigRejectsIncompleteSnapshotWithoutWrites(t *testing.T) {
 			t.Cleanup(func() { _ = db.Close() })
 			stored := map[string]any{"server_private_key": cfg.PrivateKey, "server_public_key": cfg.PublicKey, "listen_port": 1234, "h1": 1, "h2": 2, "h3": 3, "h4": 4}
 			change(stored)
-			if err := db.SetSetting(t.Context(), "vpn_config", stored); err != nil {
-				t.Fatal(err)
-			}
+			seedVPNConfigRaw(t, db, stored)
 			before, _, err := db.GetSettingRaw(t.Context(), "vpn_config")
 			if err != nil {
 				t.Fatal(err)

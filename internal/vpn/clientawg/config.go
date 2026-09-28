@@ -51,9 +51,15 @@ type Config struct {
 	Peers      []Peer
 }
 
-// LoadConfig reads existing identity and settings without repairing or writing
-// them. Legacy plaintext keys are accepted only when they strictly decode and
-// match the recorded public key. Missing identities are never generated.
+// LoadConfig reads existing identity and settings without repairing or
+// writing them. The persisted snapshot must already be complete and
+// consistent: a missing private key, a key that neither decrypts nor
+// canonically decodes, and any key not deriving the recorded public key
+// are rejected with fail-closed errors. Legacy plaintext private keys are
+// accepted only when they strictly validate against the stored public key.
+// The random_trailers and disable_cookies fields must be JSON booleans;
+// any other JSON type is rejected instead of coerced. Missing identities
+// are never generated.
 func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Config, peers []Peer) (Config, error) {
 	if db == nil {
 		return Config{}, errors.New("clientawg: nil configuration database")
@@ -64,10 +70,14 @@ func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Confi
 	}
 	// Read the stored snapshot directly: GetVPNConfig fills missing port and
 	// subnet defaults, which would conceal an incomplete migration snapshot.
+	// Flags are decoded through pointers so a present-but-non-boolean JSON
+	// type (string/number/object) fails unmarshalling instead of being
+	// silently coerced; an absent or null field decodes as nil and stays
+	// false. models.VPNConfig deliberately does not carry these fields.
 	var persisted struct {
 		models.VPNConfig
-		RandomTrailers bool `json:"random_trailers"`
-		DisableCookies bool `json:"disable_cookies"`
+		RandomTrailers *bool `json:"random_trailers"`
+		DisableCookies *bool `json:"disable_cookies"`
 	}
 	if err := json.Unmarshal([]byte(raw.String), &persisted); err != nil {
 		return Config{}, errors.New("clientawg: invalid persisted VPN configuration")
@@ -75,12 +85,35 @@ func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Confi
 	if persisted.ListenPort < 1 {
 		return Config{}, errors.New("clientawg: persisted listen port is missing or invalid")
 	}
+	// Fail-closed identity resolution. A missing private key is rejected
+	// outright. Otherwise decrypt it; only when decryption fails may a
+	// legacy PLAINTEXT key be used, and even then only when it canonically
+	// decodes. Derivation against the recorded public key happens once,
+	// below, for both paths.
+	if persisted.ServerPrivateKey == "" {
+		return Config{}, errors.New("clientawg: portal public key has no private key")
+	}
 	private, err := security.DecryptCredential(persisted.ServerPrivateKey, db.SecretKey())
 	if err != nil {
-		if _, parseErr := decodeKey(persisted.ServerPrivateKey); parseErr != nil {
-			return Config{}, errors.New("clientawg: cannot decrypt persisted portal identity")
+		if _, decodeErr := decodeKey(persisted.ServerPrivateKey); decodeErr != nil {
+			return Config{}, errors.New("clientawg: invalid portal private key in vpn config")
 		}
 		private = persisted.ServerPrivateKey
+	}
+	// Derive from the decoded 32 raw bytes, never from the base64 text.
+	rawPrivate, err := decodeKey(private)
+	if err != nil {
+		return Config{}, errors.New("clientawg: invalid portal private key in vpn config")
+	}
+	public, err := curve25519.X25519(rawPrivate, curve25519.Basepoint)
+	if err != nil {
+		return Config{}, errors.New("clientawg: invalid portal private key in vpn config")
+	}
+	// Exact string compare is safe: decodeKey has already proven the
+	// private key canonical, and the stored public key must be canonical
+	// base64-32 to have survived validate() on any prior accepted load.
+	if base64.StdEncoding.EncodeToString(public) != persisted.ServerPublicKey {
+		return Config{}, errors.New("clientawg: portal private key does not match stored public key")
 	}
 	cfg := Config{
 		PrivateKey: private, PublicKey: persisted.ServerPublicKey, ListenPort: persisted.ListenPort,
@@ -89,11 +122,15 @@ func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Confi
 			H1: persisted.H1.String(), H2: persisted.H2.String(), H3: persisted.H3.String(), H4: persisted.H4.String(),
 			S1: persisted.S1, S2: persisted.S2, S3: persisted.S3, S4: persisted.S4,
 			HeaderProtectionKey: persisted.HeaderProtectionKey, ContentPaddingAddition: persisted.ContentPaddingAddition,
-			RandomTrailers: persisted.RandomTrailers, DisableCookies: persisted.DisableCookies,
+			// Absent or null flag fields decode as false; a present
+			// non-boolean type already failed unmarshalling above.
+			RandomTrailers: persisted.RandomTrailers != nil && *persisted.RandomTrailers,
+			DisableCookies: persisted.DisableCookies != nil && *persisted.DisableCookies,
 		},
 	}
 	// Preserve the existing renderer's effective meaning of legacy boolean
-	// padding aliases; this changes no stored setting or client configuration.
+	// padding aliases: "true"/"yes"/"1" -> "16-64", "false"/"0" -> "".
+	// This changes no stored setting or client configuration.
 	switch cfg.Parameters.ContentPaddingAddition {
 	case "true", "yes", "1":
 		cfg.Parameters.ContentPaddingAddition = "16-64"
