@@ -856,3 +856,85 @@ func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
 		t.Fatalf("ActiveConnections = %d, want 0 after disconnect", tunAfter.ActiveConnections)
 	}
 }
+
+// TestEndpointSweepTimedOutSessionsPreservesIngressCryptoState verifies that when the
+// legacy endpoint listener sweeps timed-out sessions, an upstream ingress session
+// receives routing-only teardown without advancing peer generations or pruning
+// endpoint transport state (issue #390).
+func TestEndpointSweepTimedOutSessionsPreservesIngressCryptoState(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "sweep-crypto-user", "sweep-crypto-peer", "10.100.6.70")
+	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	if err != nil {
+		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// Seed transport state in the endpoint listener
+	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
+		SendKey: make([]byte, 32),
+		RecvKey: make([]byte, 32),
+	})
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("endpoint transport state not seeded")
+	}
+
+	genBefore := svc.endpoint.PeerGeneration(peer.peerKey)
+
+	tun, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tun.ActiveConnections != 1 {
+		t.Fatalf("ActiveConnections = %d, want 1 before sweep", tun.ActiveConnections)
+	}
+
+	// Backdate LastSeen past the listener's idle timeout threshold
+	svc.sessionMgr.SetSessionLastSeen(peer.peerKey, time.Now().UTC().Add(-10*time.Minute))
+
+	// Directly exercise the legacy endpoint listener sweep
+	timedOut, err := svc.endpoint.SweepTimedOutSessions(ctx)
+	if err != nil {
+		t.Fatalf("SweepTimedOutSessions failed: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ID != sess.ID {
+		t.Fatalf("SweepTimedOutSessions returned %d sessions (want [%s])", len(timedOut), sess.ID)
+	}
+
+	// Assert session is removed from SessionManager
+	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok {
+		t.Fatalf("session still in SessionManager after sweep: %+v", snap)
+	}
+
+	// Assert route is retired from forwarder
+	if route := svc.forwarder.RouteSessionID(peer.peerKey); route != "" {
+		t.Fatalf("route survived sweep: %q", route)
+	}
+
+	// Assert backend active connection count was decremented
+	tunAfter, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Fatalf("ActiveConnections = %d, want 0 after sweep", tunAfter.ActiveConnections)
+	}
+
+	// Assert svc.endpoint.PeerGeneration(peer.peerKey) did NOT advance
+	if genAfter := svc.endpoint.PeerGeneration(peer.peerKey); genAfter != genBefore {
+		t.Fatalf("endpoint PeerGeneration advanced %d -> %d", genBefore, genAfter)
+	}
+
+	// Assert svc.endpoint.HasTransportStateForPeer(peer.peerKey) remains true
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("SweepTimedOutSessions pruned endpoint transport state for ingress session")
+	}
+}
