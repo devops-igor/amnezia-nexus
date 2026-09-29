@@ -15,6 +15,9 @@ package vpn
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"net/netip"
 	"sync"
 	"testing"
@@ -477,27 +480,77 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 // to the ingress path fails loudly.
 func TestUpstreamRekeyDoesNotCreateBackendSessionWithoutTraffic(t *testing.T) {
 	db := setupTestDB(t)
-	svc, _, _, _, _ := setupTestVPNService(t, db)
+	svc := newIngressEngineService(t, db)
 	ctx := t.Context()
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	for _, tun := range svc.pool.ListTunnels() {
+		svc.forwarder.AttachBackendDevice(tun.ID, nil)
+	}
 
-	peer := seedIngressPeer(t, db, "rekey-nosession-nina", "rekey-nosession-peer-1", "10.100.6.32")
-	// No admission has run: no backend session exists for the peer, and the
-	// ONLY production writer of upstream sessions is the admission primitive.
-	if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok {
-		t.Fatal("a backend session exists without any plaintext admission")
+	peer, saved := newEnginePeer(t, svc, db, "rekey-nosession-nina")
+	ip := netip.MustParseAddr(peer.assignedIP)
+
+	engine, err := svc.NewIngressEngine(ctx, "rekey-nosession-portal", []clientawg.Peer{
+		{PublicKey: peer.publicKey, AllowedIP: netip.PrefixFrom(ip, 32)},
+	})
+	if err != nil {
+		t.Fatalf("engine construction: %v", err)
+	}
+	t.Cleanup(func() { _ = engine.Stop() })
+	if err := engine.Start(); err != nil {
+		t.Fatalf("engine start: %v", err)
+	}
+
+	client := startEngineUpstreamClient(t, saved, "rekey-client")
+	serverPubB64 := configField(t, saved, "PublicKey")
+	serverPubBytes, err := base64.StdEncoding.DecodeString(serverPubB64)
+	if err != nil {
+		t.Fatalf("decode server public key: %v", err)
+	}
+	serverPubHex := hex.EncodeToString(serverPubBytes)
+	if err := client.dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", serverPubHex)); err != nil {
+		t.Fatalf("IpcSet persistent_keepalive_interval: %v", err)
+	}
+
+	// Poll until handshake completes without application traffic
+	handshakeDeadline := time.Now().Add(10 * time.Second)
+	for {
+		status := portalPeerStatus(t, engine, peer.publicKey)
+		if !status.LastHandshake.IsZero() {
+			break
+		}
+		if time.Now().After(handshakeDeadline) {
+			t.Fatal("timed out waiting for upstream WireGuard handshake without traffic")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Assert: zero backend session in SessionManager, empty route in forwarder, freshSessionRegistrations == 0
+	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey); ok {
+		t.Fatalf("session exists in SessionManager without application traffic: %+v", snap)
+	}
+	if route := svc.forwarder.RouteSessionID(peer.publicKey); route != "" {
+		t.Fatalf("forwarder route exists without application traffic: %q", route)
 	}
 	if got := svc.freshSessionRegistrations.Load(); got != 0 {
-		t.Fatalf("freshSessionRegistrations = %d without any admission, want 0", got)
+		t.Fatalf("freshSessionRegistrations = %d without application traffic, want 0", got)
 	}
-	// The rekey scenario itself (a fresh upstream transport session with the
-	// same identity) is covered production-shape by
-	// TestIngressEngineRekeyStableThroughServiceHandshake: the rekey's packets
-	// reuse the live session. What must never happen — a session appearing
-	// without ANY packet — is pinned above via the admission-only writer
-	// invariant and the zero registration counter.
+
+	// Inject a plaintext UDP packet to trigger admission
+	client.inject(t, engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 0x42))
+
+	sess, ok := waitForSession(t, svc, peer.publicKey)
+	if !ok {
+		t.Fatal("session was not admitted after injecting application traffic")
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("sess.AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+	if got := svc.freshSessionRegistrations.Load(); got != 1 {
+		t.Fatalf("freshSessionRegistrations = %d after admission, want 1", got)
+	}
 }
 
 // TestUpstreamPeerSurvivesReapWithIdentityIntact is spec item 7, the

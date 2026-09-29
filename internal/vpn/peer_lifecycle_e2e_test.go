@@ -364,7 +364,10 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	// ---- Phase 2: go idle; the REAL reap loop retires the session ----
 	reapDeadline := time.Now().Add(15 * time.Second)
 	for {
-		if _, exists := svc.sessionMgr.GetSessionSnapshotByPeer(lc.publicKey); !exists {
+		_, sessionExists := svc.sessionMgr.GetSessionSnapshotByPeer(lc.publicKey)
+		routeID := svc.forwarder.RouteSessionID(lc.publicKey)
+		tun, err := svc.pool.GetTunnelByID(backendID)
+		if !sessionExists && routeID == "" && err == nil && tun.ActiveConnections == 0 {
 			break
 		}
 		if time.Now().After(reapDeadline) {
