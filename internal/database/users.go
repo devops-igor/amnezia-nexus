@@ -310,7 +310,7 @@ func buildUserUpdateClauses(updates map[string]any, skipCols map[string]bool) ([
 }
 
 // UpdateUser dynamically updates fields on a user record. Returns true if user existed and was updated.
-func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
+func (d *DB) updateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -350,7 +350,7 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 
 // UpdateUserAndBumpSession updates user attributes and increments session_version
 // by 1 in a single database transaction. Returns whether the user existed and the new session_version.
-func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
+func (d *DB) updateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -400,7 +400,7 @@ func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates ma
 }
 
 // DeleteUser deletes a user and all associated connections in a transaction.
-func (d *DB) DeleteUser(ctx context.Context, id string) (bool, error) {
+func (d *DB) deleteUser(ctx context.Context, id string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -457,7 +457,7 @@ type UserTrafficTotals struct {
 // AddUserTraffic increments all user traffic counters and returns the updated
 // totals from the same SQL statement. Concurrent accounting updates cannot be
 // lost between reading and writing these counters.
-func (d *DB) AddUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
+func (d *DB) addUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -493,7 +493,7 @@ func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta 
 // ResetUserMonthlyTraffic removes only the counters present in the orchestrator's
 // snapshot. Traffic added after that snapshot remains in the current period.
 // The reset marker prevents two orchestrators from subtracting the same baseline.
-func (d *DB) ResetUserMonthlyTraffic(ctx context.Context, id string, expectedResetAt *string, snapshot UserTrafficTotals, resetAt string) (bool, error) {
+func (d *DB) resetUserMonthlyTraffic(ctx context.Context, id string, expectedResetAt *string, snapshot UserTrafficTotals, resetAt string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -520,7 +520,7 @@ func (d *DB) ResetUserMonthlyTraffic(ctx context.Context, id string, expectedRes
 // ResetUserPeriodTraffic removes the snapshotted previous-period usage while
 // retaining traffic committed after the snapshot. A changed marker or strategy
 // means another reset or configuration update won the race.
-func (d *DB) ResetUserPeriodTraffic(ctx context.Context, id string, expectedResetAt *string, expectedStrategy string, snapshotUsed int64, resetAt string) (bool, error) {
+func (d *DB) resetUserPeriodTraffic(ctx context.Context, id string, expectedResetAt *string, expectedStrategy string, snapshotUsed int64, resetAt string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 

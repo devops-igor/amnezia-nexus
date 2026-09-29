@@ -242,3 +242,22 @@ func (r *Resolver) Reload(ctx context.Context, db *database.DB) error {
 	r.byIP, r.byPeer = byIP, byPeer
 	return nil
 }
+
+// Replace installs one validated desired ownership snapshot atomically. It is
+// used with the exact durable peer set given to the upstream device, so a
+// revoked peer cannot keep a stale plaintext route while removal is retried.
+func (r *Resolver) Replace(owners []PeerOwnership) error {
+	fresh := NewResolver()
+	for _, owner := range owners {
+		if !owner.IP.IsValid() || !owner.IP.Is4() || owner.PeerPublicKey == "" {
+			return fmt.Errorf("ingress: invalid desired peer ownership")
+		}
+		if err := fresh.insert(owner); err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	r.byIP, r.byPeer = fresh.byIP, fresh.byPeer
+	r.mu.Unlock()
+	return nil
+}

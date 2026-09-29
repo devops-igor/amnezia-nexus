@@ -493,7 +493,7 @@ func fillVPNConfigDefaults(cfg *models.VPNConfig) {
 }
 
 // SaveVPNConfig persists the VPN configuration to the settings table.
-func (d *DB) SaveVPNConfig(ctx context.Context, cfg *models.VPNConfig) error {
+func (d *DB) saveVPNConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return errors.New("vpn config is nil")
 	}

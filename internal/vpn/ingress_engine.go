@@ -51,17 +51,21 @@ var ErrIngressEngineNotStarted = errors.New("ingress engine is not started")
 // ReceiveOutbound through the engine-owned VirtualTUN closure), then waits
 // for the loop goroutine to exit. A stopped engine leaks no goroutines.
 type IngressEngine struct {
-	svc      *Service
-	portal   *clientawg.ClientAWGDevice
-	resolver *ingress.Resolver
-	liveness *ingress.SessionLiveness
-	router   *ingress.Router
+	svc                    *Service
+	portal                 *clientawg.ClientAWGDevice
+	peerSync               *peerSynchronizer
+	unsubscribePeerChanges func()
+	resolver               *ingress.Resolver
+	liveness               *ingress.SessionLiveness
+	router                 *ingress.Router
 
 	mu             sync.Mutex
 	stopCh         chan struct{}
 	stopped        chan struct{}
 	reapStopCh     chan struct{}
 	reapDoneCh     chan struct{}
+	peerSyncStopCh chan struct{}
+	peerSyncDoneCh chan struct{}
 	closed         bool
 	running        bool
 	returnPath     *forwarder.ReturnPath
@@ -81,13 +85,15 @@ type IngressEngine struct {
 	// heartbeat. Like reapIdleTimeoutFn, tests assign it directly (same
 	// package) BEFORE Start; reapLoop reads it once at loop entry, and the
 	// field is never written after Start.
-	reapInterval time.Duration
+	reapInterval     time.Duration
+	peerSyncInterval time.Duration
 }
 
 // reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
 // custom listener's heartbeat interval (30s) so idle sessions are retired
 // with the same latency the transport path has always had.
 const reapLoopInterval = 30 * time.Second
+const peerSyncLoopInterval = 30 * time.Second
 
 // reapLoopIntervalFor is the loop's ticker cadence: the engine's test seam
 // when assigned, the production 30s constant otherwise. Must be called
@@ -109,10 +115,10 @@ func (e *IngressEngine) reapLoopIntervalFor() time.Duration {
 //	       (EnsureBackendSessionForIngress — clean, handshake-free)
 //	  -> ingress.Router
 //
-// tunName labels the in-memory portal TUN; peers authorizes the upstream
-// client identities (each a /32 lease mirrored in the resolver's durable
-// record). The listen port in the persisted configuration is reused; the
-// custom listener must NOT be running on it when the engine activates (#393
+// tunName labels the in-memory portal TUN. Peers is an optional compatibility
+// assertion for callers that supplied a startup list before #391; durable DB
+// connections now determine the actual peer set. The persisted listen port is
+// reused; the custom listener must NOT be running when the engine activates (#393
 // owns that cutover). Construction validates everything and closes owned
 // resources on failure; a constructed engine is Start-able.
 func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []clientawg.Peer) (*IngressEngine, error) {
@@ -128,29 +134,54 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 
 	// The portal device's plaintext boundary: same MTU the listener uses,
 	// bounded queues from the virtualtun defaults.
-	cfg, err := clientawg.LoadConfig(ctx, db, virtualtun.Config{Name: tunName, MTU: 1420}, peers)
+	cfg, err := clientawg.LoadConfig(ctx, db, virtualtun.Config{Name: tunName, MTU: 1420}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ingress engine: load portal configuration: %w", err)
+	}
+	vpnCfg, err := db.GetVPNConfig(ctx)
+	if err != nil || vpnCfg == nil {
+		return nil, errors.New("ingress engine: cannot load portal subnet")
 	}
 	portal, err := clientawg.NewDevice(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ingress engine: create portal device: %w", err)
 	}
 
-	resolver, stats, err := ingress.LoadResolver(ctx, db)
+	resolver := ingress.NewResolver()
+	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg)
+	unsubscribe, err := db.SubscribePeerChanges(peerSync)
 	if err != nil {
 		_ = portal.Close()
-		return nil, fmt.Errorf("ingress engine: load ownership resolver: %w", err)
+		return nil, fmt.Errorf("ingress engine: subscribe peer changes: %w", err)
 	}
-	log.Printf("[vpn/ingress] resolver loaded: %d durable leases (skipped: legacy=%d no-ip=%d unparseable=%d)",
-		stats.Loaded, stats.SkippedNeedsMigration, stats.SkippedWithoutDurableIP, stats.SkippedUnparseableIP)
+	if err := peerSync.ReconcilePeers(ctx); err != nil {
+		unsubscribe()
+		_ = portal.Close()
+		return nil, fmt.Errorf("ingress engine: initial peer reconciliation: %w", err)
+	}
+	if peers != nil {
+		desired, _, err := peerSync.desired(ctx)
+		if err != nil || len(desired) != len(peers) {
+			unsubscribe()
+			_ = portal.Close()
+			return nil, errors.New("ingress engine: supplied peers differ from durable peer registry")
+		}
+		for _, peer := range peers {
+			entry, ok := desired[peer.PublicKey]
+			if !ok || entry.peer.AllowedIP != peer.AllowedIP {
+				unsubscribe()
+				_ = portal.Close()
+				return nil, errors.New("ingress engine: supplied peers differ from durable peer registry")
+			}
+		}
+	}
 
 	// Accepted plaintext refreshes the backend routing session's LastSeen
 	// through the same SessionManager the transport path touches, with the
 	// same throttle window (issue #294 pattern).
 	liveness := ingress.NewSessionLiveness(s.sessionMgr.TouchSession)
 
-	e := &IngressEngine{svc: s, portal: portal, resolver: resolver, liveness: liveness}
+	e := &IngressEngine{svc: s, portal: portal, peerSync: peerSync, unsubscribePeerChanges: unsubscribe, resolver: resolver, liveness: liveness}
 	e.returnPath = forwarder.NewReturnPath(e.writeReturnPacket)
 	// Production classification (issue #389 rework 2): the forwarder's
 	// backend-reader filters reject malformed/unrouted replies before the
@@ -187,9 +218,13 @@ func (e *IngressEngine) Start() error {
 	reapStop := make(chan struct{})
 	reapDone := make(chan struct{})
 	e.reapStopCh, e.reapDoneCh = reapStop, reapDone
+	peerSyncStop := make(chan struct{})
+	peerSyncDone := make(chan struct{})
+	e.peerSyncStopCh, e.peerSyncDoneCh = peerSyncStop, peerSyncDone
 	e.mu.Unlock()
 
 	go e.reapLoop(reapStop, reapDone)
+	go e.peerSyncLoop(peerSyncStop, peerSyncDone)
 
 	go func() {
 		defer close(stopped)
@@ -244,6 +279,26 @@ func (e *IngressEngine) reapLoop(stopCh <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
+// peerSyncLoop retries post-commit failures and repairs device drift even when
+// the backend-session reaper is delayed by unrelated routing work.
+func (e *IngressEngine) peerSyncLoop(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	interval := e.peerSyncInterval
+	if interval <= 0 {
+		interval = peerSyncLoopInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			_ = e.peerSync.ReconcilePeers(context.Background())
+		}
+	}
+}
+
 // sweepOnce runs one upstream-mode idle sweep. Split from reapLoop so tests
 // drive single deterministic sweeps instead of waiting on the cadence.
 func (e *IngressEngine) sweepOnce(ctx context.Context) {
@@ -290,19 +345,30 @@ func (e *IngressEngine) Stop() error {
 	wasRunning := e.running
 	stopCh, stopped := e.stopCh, e.stopped
 	reapStop, reapDone := e.reapStopCh, e.reapDoneCh
+	peerSyncStop, peerSyncDone := e.peerSyncStopCh, e.peerSyncDoneCh
 	e.running = false
 	e.stopCh, e.stopped = nil, nil
 	e.reapStopCh, e.reapDoneCh = nil, nil
+	e.peerSyncStopCh, e.peerSyncDoneCh = nil, nil
 	e.mu.Unlock()
 
 	if e.returnPath != nil {
 		e.returnPath.Close()
+	}
+	if e.unsubscribePeerChanges != nil {
+		e.unsubscribePeerChanges()
 	}
 	if stopCh != nil {
 		close(stopCh)
 	}
 	if reapStop != nil {
 		close(reapStop)
+	}
+	if peerSyncStop != nil {
+		close(peerSyncStop)
+	}
+	if peerSyncDone != nil {
+		<-peerSyncDone
 	}
 	// Close the portal so a receiver parked in ReceiveOutbound wakes up
 	// (virtualtun.ErrClosed); the loop then exits via the receive error
@@ -330,6 +396,14 @@ func (e *IngressEngine) Router() *ingress.Router { return e.router }
 // event-driven sync (and tests) can apply lease updates to the LIVE engine
 // rather than a detached copy.
 func (e *IngressEngine) Resolver() *ingress.Resolver { return e.resolver }
+
+// PeerSyncStatus reports desired versus upstream peer state and repair errors.
+func (e *IngressEngine) PeerSyncStatus() PeerSyncStatus { return e.peerSync.Status() }
+
+// ReconcilePeers repairs runtime drift on demand from durable state.
+func (e *IngressEngine) ReconcilePeers(ctx context.Context) error {
+	return e.peerSync.ReconcilePeers(ctx)
+}
 
 // Portal exposes the engine's upstream device for identity (public key) and
 // listener status inspection.

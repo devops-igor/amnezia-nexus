@@ -547,11 +547,7 @@ func TestIngressEngineDoubleStartRejected(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 
-	private, public := engineKeys(t)
-	lease := "10.100.7.9"
-	engine := startEngine(t, svc, "engine-lifecycle-portal", []clientawg.Peer{
-		{PublicKey: public, AllowedIP: netip.PrefixFrom(netip.MustParseAddr(lease), 32)},
-	})
+	engine := startEngine(t, svc, "engine-lifecycle-portal", nil)
 	if err := engine.Start(); err == nil {
 		t.Fatal("double Start accepted")
 	} else if !strings.Contains(err.Error(), "already started") {
@@ -566,5 +562,4 @@ func TestIngressEngineDoubleStartRejected(t *testing.T) {
 	if err := engine.Stop(); err == nil {
 		t.Fatal("second Stop accepted")
 	}
-	_ = private // the portal authorizes the public key only; the private half stays with the client
 }

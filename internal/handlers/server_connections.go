@@ -323,18 +323,24 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 			if conn.ClientID != "" {
 				clientPub = conn.ClientID
 			}
-			_, _ = h.db.DeleteConnection(ctx, conn.ID)
+			if _, err := h.db.DeleteConnection(ctx, conn.ID); err != nil {
+				h.peerChangeError(w, err)
+				return
+			}
 		}
 		if h.vpnSvc != nil && clientPub != "" {
 			_ = h.vpnSvc.ReleaseClient(ctx, clientPub)
 		}
 		if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, 0); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
+			h.peerChangeError(w, err)
 			return
 		}
 		_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, req.ClientID)
 		if clientPub != req.ClientID {
-			_, _ = h.db.DeleteConnectionByClientID(ctx, clientPub, 0)
+			if _, err := h.db.DeleteConnectionByClientID(ctx, clientPub, 0); err != nil {
+				h.peerChangeError(w, err)
+				return
+			}
 			_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, clientPub)
 		}
 

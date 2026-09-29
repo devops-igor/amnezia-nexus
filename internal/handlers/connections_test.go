@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,13 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+type failingPeerSyncListener struct{}
+
+func (failingPeerSyncListener) ReconcilePeers(context.Context) error {
+	return errors.New("injected runtime failure")
+}
+func (failingPeerSyncListener) ValidatePortalConfig(*models.VPNConfig) error { return nil }
 
 func TestConnectionsHandlers(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
@@ -912,6 +920,34 @@ func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
 	}
 	if deleted != nil {
 		t.Errorf("expected connection to be deleted from DB, but still found")
+	}
+}
+
+func TestUserDeleteConnectionReportsCommittedRuntimeSyncFailure(t *testing.T) {
+	h, db, _ := setupTestHandlersWithMockSSH(t, &testMockSSHClient{})
+	ctx := t.Context()
+	u := &models.User{ID: "u-sync-delete", Username: "syncdelete", Role: models.RoleUser, Enabled: true}
+	if _, err := db.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	conn := &models.UserConnection{ID: "conn-sync-delete", UserID: u.ID, ServerID: 0, Protocol: "awg", ClientID: "test-peer", Name: "To delete"}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	unsubscribe, err := db.SubscribePeerChanges(failingPeerSyncListener{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unsubscribe)
+	sess := &models.SessionData{UserID: u.ID, Role: models.RoleUser}
+	req := httptest.NewRequest(http.MethodPost, "/api/connections/"+conn.ID+"/delete", nil)
+	w := httptest.NewRecorder()
+	setupFullConnectionsRouter(h).ServeHTTP(w, req.WithContext(middleware.WithSession(req.Context(), sess)))
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "runtime_sync_failed") {
+		t.Fatalf("committed runtime failure reported as %d: %s", w.Code, w.Body.String())
+	}
+	if stored, err := db.GetConnection(ctx, conn.ID); err != nil || stored != nil {
+		t.Fatalf("delete was not committed: %+v err=%v", stored, err)
 	}
 }
 

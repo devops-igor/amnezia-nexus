@@ -235,6 +235,10 @@ func validatePeer(p Peer, portalKey string) error {
 	return nil
 }
 
+// ValidatePeer checks a durable peer before it is considered for runtime
+// installation. It uses the same rules as device creation and AddPeer.
+func ValidatePeer(p Peer, portalKey string) error { return validatePeer(p, portalKey) }
+
 func (p Parameters) validate() error {
 	headers := []string{p.H1, p.H2, p.H3, p.H4}
 	ranges := make([]device.UintRange, len(headers))

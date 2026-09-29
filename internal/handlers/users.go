@@ -411,7 +411,7 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	if passwordUpdated {
 		ok, newVer, err := h.db.UpdateUserAndBumpSession(ctx, userID, updates)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			h.peerChangeError(w, err)
 			return
 		}
 		if !ok {
@@ -425,7 +425,7 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	} else if len(updates) > 0 {
 		ok, err := h.db.UpdateUser(ctx, userID, updates)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			h.peerChangeError(w, err)
 			return
 		}
 		if !ok {
@@ -471,11 +471,11 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := h.db.DeleteConnectionsByUser(ctx, userID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user connections")
+		h.peerChangeError(w, err)
 		return
 	}
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user")
+		h.peerChangeError(w, err)
 		return
 	}
 	_ = h.db.DeletePeerLifecycleByUserID(ctx, userID)
@@ -508,7 +508,7 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.db.UpdateUser(ctx, userID, map[string]any{
 		"enabled": req.Enabled,
 	}); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update user status")
+		h.peerChangeError(w, err)
 		return
 	}
 
