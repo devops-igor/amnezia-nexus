@@ -227,6 +227,7 @@ func startEngineUpstreamClient(t *testing.T, saved, name string) *engineUpstream
 	if err := dev.IpcSet(configToUAPI(t, saved)); err != nil {
 		t.Fatal("upstream rejected saved generated configuration")
 	}
+	_ = dev.IpcSet("rekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
 	}
@@ -486,11 +487,30 @@ func TestIngressEngineRoutesEachPeerToOwnBackend(t *testing.T) {
 
 	ucA := startEngineUpstreamClient(t, savedA, "engine-be-client-a")
 	ucB := startEngineUpstreamClient(t, savedB, "engine-be-client-b")
-	ucA.inject(t, pktA)
-	ucB.inject(t, pktB)
+	injectDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		ucA.inject(t, pktA)
+		ucB.inject(t, pktB)
+		for {
+			select {
+			case <-injectDone:
+				return
+			case <-ticker.C:
+				if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerA.publicKey); !ok {
+					_ = ucA.vt.InjectInbound(pktA)
+				}
+				if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerB.publicKey); !ok {
+					_ = ucB.vt.InjectInbound(pktB)
+				}
+			}
+		}
+	}()
 
 	sessA, okA := waitForSession(t, svc, peerA.publicKey)
 	sessB, okB := waitForSession(t, svc, peerB.publicKey)
+	close(injectDone)
 	if !okA || !okB {
 		t.Fatal("admission never ran for both peers")
 	}
