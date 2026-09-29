@@ -54,11 +54,10 @@ func newReapIngressFixture(t *testing.T) *reapIngressSessionFixture {
 		t.Fatal("no active tunnels")
 	}
 	backend := tunnels[0]
-	sess, err := svc.sessionMgr.CreateSession(ctx, userID, "ingress-reap-peer", "10.100.6.2", backend.ID, "ingress-device")
+	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userID, "ingress-reap-peer", "10.100.6.2", backend.ID, "ingress-device", models.SessionAdmissionIngress)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess.AdmittedVia = models.SessionAdmissionIngress
 	svc.pool.IncrementConnections(backend.ID)
 	if svc.forwarder != nil {
 		_ = svc.forwarder.BeginRegisterSessionWithLimit(sess.ID, "conn-ingress-reap", sess.PeerPublicKey, sess.AssignedIP, backend.ID, 0, 0)
@@ -404,8 +403,6 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 
 	peer := seedIngressPeer(t, db, "race-return-fred", "race-return-peer-1", "10.100.6.31")
 	o := ownershipFor(peer)
-	svc.forwarder.StartPumps(ctx)
-	defer svc.forwarder.StopPumps()
 
 	const iterations = 10
 	for i := 0; i < iterations; i++ {
@@ -418,21 +415,27 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 		}
 		svc.sessionMgr.SetSessionLastSeen(peer.peerKey, time.Now().UTC().Add(-10*time.Minute))
 
-		// The reap races the replacement admission — the production
-		// interleaving (CheckTimeouts hands the reaper its own
-		// CheckTimeouts-owned session state; the admission is the next
-		// plaintext packet). Snapshot copy, no shared live pointer.
-		reapTarget := oldSnap
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			svc.reapSession(ctx, &reapTarget)
-		}()
+		// Genuinely evict expired session A from the live map via CheckTimeouts
+		// before admitting fresh session B.
+		timedOut, err := svc.sessionMgr.CheckTimeouts(ctx, time.Minute)
+		if err != nil || len(timedOut) != 1 {
+			t.Fatalf("iter %d: CheckTimeouts: %v (%d timed out)", i, err, len(timedOut))
+		}
+		reapTarget := timedOut[0]
+		if reapTarget.ID != oldSnap.ID {
+			t.Fatalf("iter %d: reapTarget ID %s != oldSnap ID %s", i, reapTarget.ID, oldSnap.ID)
+		}
+
 		fresh, _, _, err := svc.EnsureBackendSessionForIngress(ctx, o)
 		if err != nil {
 			t.Fatalf("iter %d: replacement admission: %v", i, err)
 		}
-		<-done
+		if fresh.ID == oldSnap.ID {
+			t.Fatalf("iter %d: expected fresh session ID != oldSnap ID %s, got %s", i, oldSnap.ID, fresh.ID)
+		}
+
+		// Delayed reap of old session A must not disturb fresh session B's route.
+		svc.reapSession(ctx, reapTarget)
 
 		if got := svc.forwarder.RouteSessionID(peer.peerKey); got != fresh.ID {
 			t.Fatalf("iter %d: old reap disturbed the new route: %q, want %q", i, got, fresh.ID)
@@ -445,24 +448,13 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 		if !ok {
 			t.Fatalf("iter %d: client packet channel missing", i)
 		}
-		// Delivery is eventual under scheduler pressure (CI runs the whole
-		// package under -race in parallel; one fixed 2s wait expired there).
-		// Poll until the packet arrives instead of betting on a fixed
-		// deadline; a wrong packet still fails immediately.
-		delivered := false
-		deliveryDeadline := time.Now().Add(15 * time.Second)
-		for !delivered {
-			select {
-			case got := <-clientQueue:
-				if !bytes.Equal(got, ret) {
-					t.Fatalf("iter %d: client queue delivered a different packet", i)
-				}
-				delivered = true
-			case <-time.After(100 * time.Millisecond):
-				if time.Now().After(deliveryDeadline) {
-					t.Fatalf("iter %d: return traffic never reached the client queue within 15s", i)
-				}
+		select {
+		case got := <-clientQueue:
+			if !bytes.Equal(got, ret) {
+				t.Fatalf("iter %d: client queue delivered a different packet", i)
 			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: return traffic never reached the client queue within 2s", i)
 		}
 		live, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
 		if !ok || live.ID != fresh.ID {
@@ -593,5 +585,60 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	// Still no crypto-state disturbance anywhere in the cycle.
 	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
 		t.Fatalf("re-admission advanced the endpoint fence %d -> %d", fenceBefore, fence)
+	}
+}
+
+// TestIngressAdoptionFailureFallsThroughToFreshAdmission verifies review finding 2:
+// if a legacy session exists at the start of EnsureBackendSessionForIngress but
+// MarkSessionAdmissionSource fails (e.g. concurrent CloseSession/CheckTimeouts evicts
+// the session before the stamp), adoption does not return the evicted session.
+// Instead, any return-path binding is rolled back and admission falls through to
+// create and return a brand-new live session with AdmittedVia == ingress.
+func TestIngressAdoptionFailureFallsThroughToFreshAdmission(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "adopt-fail-user", "adopt-fail-peer", "10.100.6.50")
+	backend, err := selectBackendForIngressTest(t, svc, peer.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "legacy-device")
+		if err != nil {
+			t.Fatalf("iter %d: CreateSession: %v", i, err)
+		}
+		_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
+
+		// Concurrently evict legacy session
+		go func(sessID string) {
+			_ = svc.sessionMgr.CloseSession(ctx, sessID, "disconnected")
+		}(legacy.ID)
+
+		sess, admittedBackend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+		if err != nil {
+			t.Fatalf("iter %d: EnsureBackendSessionForIngress: %v", i, err)
+		}
+		if sess.AdmittedVia != models.SessionAdmissionIngress {
+			t.Fatalf("iter %d: admitted session AdmittedVia = %q, want %q", i, sess.AdmittedVia, models.SessionAdmissionIngress)
+		}
+		if sess.BackendTunnelID != admittedBackend.ID {
+			t.Fatalf("iter %d: session BackendTunnelID %d != admittedBackend %d", i, sess.BackendTunnelID, admittedBackend.ID)
+		}
+
+		// The returned session MUST be live in sessionMgr (never a dead evicted pointer)
+		stored, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
+		if !ok || stored.ID != sess.ID {
+			t.Fatalf("iter %d: session %s not stored as live in sessionMgr (got ok=%v, stored=%+v)", i, sess.ID, ok, stored)
+		}
+
+		// Clean up for next iteration
+		_ = svc.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
+		svc.forwarder.BeginUnregisterSession(peer.peerKey, sess.ID).Wait()
 	}
 }

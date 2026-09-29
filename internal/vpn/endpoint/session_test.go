@@ -603,3 +603,94 @@ func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
 		t.Fatal("session not found in active snapshot")
 	}
 }
+
+func TestCreateSessionWithDeltaAndSource(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(db, ipam)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-source"})
+
+	sess, delta, err := sm.CreateSessionWithDeltaAndSource(ctx, uID, "peer-source-test", "10.100.0.20", tID, "device-2", models.SessionAdmissionIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta.Replaced {
+		t.Fatal("expected fresh creation, not replacement")
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("returned sess.AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// Verify the snapshot under RLock immediately has AdmittedVia set (no publication race)
+	snap, ok := sm.GetSessionSnapshotByPeer("peer-source-test")
+	if !ok {
+		t.Fatal("session not found in snapshot")
+	}
+	if snap.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("snapshot AdmittedVia = %q, want %q", snap.AdmittedVia, models.SessionAdmissionIngress)
+	}
+}
+
+func TestMarkSessionAdmissionSource(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(db, ipam)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-mark"})
+
+	sess, err := sm.CreateSession(ctx, uID, "peer-mark", "10.100.0.10", tID, "device-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionHandshake {
+		t.Fatalf("initial AdmittedVia = %q, want empty", sess.AdmittedVia)
+	}
+
+	// 1. Success transition
+	if !sm.MarkSessionAdmissionSource("peer-mark", sess.ID, models.SessionAdmissionIngress) {
+		t.Fatal("MarkSessionAdmissionSource failed on valid live session")
+	}
+	snap, ok := sm.GetSessionSnapshotByPeer("peer-mark")
+	if !ok || snap.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("GetSessionSnapshotByPeer returned %+v, ok=%v", snap, ok)
+	}
+
+	// 2. Mismatched sessionID returns false and preserves existing provenance
+	if sm.MarkSessionAdmissionSource("peer-mark", "wrong-id", "some-source") {
+		t.Fatal("MarkSessionAdmissionSource succeeded with wrong session ID")
+	}
+	snap, ok = sm.GetSessionSnapshotByPeer("peer-mark")
+	if !ok || snap.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("GetSessionSnapshotByPeer mutated on failure: %+v", snap)
+	}
+
+	// 3. Unknown peerKey returns false
+	if sm.MarkSessionAdmissionSource("unknown-peer", sess.ID, models.SessionAdmissionIngress) {
+		t.Fatal("MarkSessionAdmissionSource succeeded with unknown peer key")
+	}
+}

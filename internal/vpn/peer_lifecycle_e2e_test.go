@@ -31,10 +31,13 @@ package vpn
 // registration happens across the reap → re-admit cycle.
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,6 +120,9 @@ func startDatagramOnlyClient(t *testing.T, peer enginePeer, saved string, destin
 	if err := dev.IpcSet(configToUAPI(t, saved)); err != nil {
 		t.Fatal("client configuration rejected")
 	}
+	if err := dev.IpcSet("rekey_after_time=2\nrekey_timeout=1\n"); err != nil {
+		t.Fatal("test timing configuration rejected")
+	}
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +143,24 @@ func startDatagramOnlyClient(t *testing.T, peer enginePeer, saved string, destin
 func (c *lifecycleClient) verifySameConfigStillValid(t *testing.T, peer engineLifecyclePeer) {
 	t.Helper()
 	udp := startDatagramOnlyClient(t, peer.enginePeer, peer.savedConfig, c.dest)
-	returnExchange(t, udp, []byte("same-config-probe"), true, c.marker)
+	deadline := time.Now().Add(10 * time.Second)
+	payload := []byte("same-config-probe")
+	want := append([]byte{c.marker}, payload...)
+	buf := make([]byte, len(want))
+	for {
+		_ = udp.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+		if _, err := udp.Write(payload); err != nil {
+			t.Fatalf("application write: %v", err)
+		}
+		n, err := udp.Read(buf)
+		if err == nil && n == len(want) && bytes.Equal(buf, want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("verifySameConfigStillValid failed within 10s: n=%d err=%v match=%v", n, err, bytes.Equal(buf, want))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // waitBackendGaugeEqual polls until the backend's active-connection gauge
@@ -265,6 +288,7 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	backends := svc.pool.ListTunnels()
+	sort.Slice(backends, func(i, j int) bool { return backends[i].ID < backends[j].ID })
 	if len(backends) == 0 {
 		t.Fatal("no active backends")
 	}
@@ -288,7 +312,9 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	// Issue the REAL reap loop its short idle threshold and 50ms cadence:
 	// the ticker must be the component that performs the reap (spec: at
 	// least one test drives the actual reapLoop, not a direct sweepOnce).
-	engine.reapIdleTimeoutFn = func(*Service) time.Duration { return 150 * time.Millisecond }
+	var currentReapTimeout atomic.Int64
+	currentReapTimeout.Store(int64(3 * time.Minute))
+	engine.reapIdleTimeoutFn = func(*Service) time.Duration { return time.Duration(currentReapTimeout.Load()) }
 	engine.reapInterval = 50 * time.Millisecond
 	if err := engine.Start(); err != nil {
 		t.Fatal(err)
@@ -325,6 +351,7 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	// TouchSessionThrottleSeconds (2s) — coarser than this test's 150ms
 	// threshold — so the busy phase drives SessionManager.TouchSession
 	// directly, the way a real sub-2s traffic cadence reaches it.
+	currentReapTimeout.Store(int64(150 * time.Millisecond))
 	busyDeadline := time.Now().Add(300 * time.Millisecond) // > idle threshold + margin
 	for time.Now().Before(busyDeadline) {
 		svc.sessionMgr.TouchSession(lc.publicKey)
@@ -373,6 +400,10 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	if gen := svc.PeerGeneration(lc.publicKey); gen != 0 {
 		t.Fatalf("reap advanced peerGenerations to %d, want 0", gen)
 	}
+
+	// Reset reap timeout to default before Phase 3 so the re-admitted session
+	// is not prematurely reaped while assertions and probe exchange run.
+	currentReapTimeout.Store(int64(3 * time.Minute))
 
 	// ---- Phase 3: the SAME running client sends traffic again ----
 	if peers := portalPeerStatusPeers(t, engine); len(peers) != 1 {

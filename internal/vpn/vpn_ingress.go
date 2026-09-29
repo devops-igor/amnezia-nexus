@@ -176,14 +176,13 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(o.PeerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
+			var boundPath bool
 			if path != nil && s.forwarder != nil {
 				retirement, err = s.forwarder.BindSessionReturnPath(live.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, path)
 				if err != nil {
 					return nil, nil, retirement, err
 				}
-			}
-			if s.stickyMgr != nil {
-				s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
+				boundPath = true
 			}
 			// Provenance seam (issue #390 part 1): the returned session is
 			// served by the ingress path, so its idle reap must be
@@ -195,9 +194,22 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			// its transport state down for that session (CloseSession
 			// removed it from the live map), so a routing-only reap cannot
 			// strand listener state.
-			s.sessionMgr.MarkSessionAdmissionSource(o.PeerPublicKey, live.ID, models.SessionAdmissionIngress)
-			live.AdmittedVia = models.SessionAdmissionIngress
-			return &live, backend, retirement, nil
+			// If the session was concurrently reaped or replaced
+			// (MarkSessionAdmissionSource returns false), adoption has
+			// failed: roll back any return-path binding done for live.ID and
+			// fall through to fresh admission.
+			if !s.sessionMgr.MarkSessionAdmissionSource(o.PeerPublicKey, live.ID, models.SessionAdmissionIngress) {
+				if boundPath && s.forwarder != nil {
+					_, _ = s.forwarder.BindSessionReturnPath(live.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, nil)
+				}
+				retirement = forwarder.Retirement{}
+			} else {
+				if s.stickyMgr != nil {
+					s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
+				}
+				live.AdmittedVia = models.SessionAdmissionIngress
+				return &live, backend, retirement, nil
+			}
 		}
 	}
 
@@ -229,18 +241,11 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		return nil, nil, retirement, fmt.Errorf("ingress admission: backend selection failed: %w", err)
 	}
 
-	sess, delta, err := s.sessionMgr.CreateSessionWithDelta(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name)
+	sess, delta, err := s.sessionMgr.CreateSessionWithDeltaAndSource(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionIngress)
 	if err != nil {
 		s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
 		return nil, nil, retirement, fmt.Errorf("ingress admission: session creation failed: %w", err)
 	}
-	// Provenance seam (issue #390 part 1): this session was created by the
-	// upstream engine's admission, so its idle reap must be routing-only.
-	// The stamp is a plain store under the admission's s.mu; the session
-	// pointer is not yet reachable by any reaper (registration below is the
-	// last admission step, and CheckTimeouts runs under sm.mu which this
-	// call sequence does not overlap for this brand-new session).
-	sess.AdmittedVia = models.SessionAdmissionIngress
 
 	// Backend accounting, exactly-once across replacement (issue #388 rework
 	// D). CreateSessionWithDelta returns what its replacement hook already
