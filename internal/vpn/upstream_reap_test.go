@@ -22,6 +22,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
@@ -535,6 +536,16 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	if _, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer)); err != nil {
 		t.Fatalf("first admission: %v", err)
 	}
+	// Seed transport state in the endpoint listener to verify that the upstream
+	// routing-only reap leaves transport state intact (Finding 5).
+	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
+		SendKey: make([]byte, 32),
+		RecvKey: make([]byte, 32),
+	})
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("endpoint transport state not seeded before reap")
+	}
+
 	svc.sessionMgr.SetSessionLastSeen(peer.peerKey, time.Now().UTC().Add(-10*time.Minute))
 	timedOut, err := svc.sessionMgr.CheckTimeouts(ctx, time.Minute)
 	if err != nil || len(timedOut) != 1 {
@@ -557,8 +568,8 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
 		t.Fatalf("reap advanced the endpoint fence %d -> %d", fenceBefore, fence)
 	}
-	if svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("reap left transport state behind for the peer")
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("routing-only reap pruned pre-existing endpoint transport state")
 	}
 
 	// Phase 3: new plaintext traffic re-admits the SAME peer with the SAME
@@ -588,11 +599,11 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	}
 }
 
-// TestIngressAdoptionFailureFallsThroughToFreshAdmission verifies review finding 2:
+// TestIngressAdoptionFailureFallsThroughToFreshAdmission verifies review finding 2 & 3:
 // if a legacy session exists at the start of EnsureBackendSessionForIngress but
-// MarkSessionAdmissionSource fails (e.g. concurrent CloseSession/CheckTimeouts evicts
-// the session before the stamp), adoption does not return the evicted session.
-// Instead, any return-path binding is rolled back and admission falls through to
+// AdoptSessionForIngress fails (e.g. concurrent CloseSession/CheckTimeouts evicts
+// the session before the adoption), adoption does not return the evicted session.
+// Instead, no return path is bound and admission falls through cleanly to
 // create and return a brand-new live session with AdmittedVia == ingress.
 func TestIngressAdoptionFailureFallsThroughToFreshAdmission(t *testing.T) {
 	db := setupTestDB(t)
@@ -608,37 +619,240 @@ func TestIngressAdoptionFailureFallsThroughToFreshAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
-		legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "legacy-device")
-		if err != nil {
-			t.Fatalf("iter %d: CreateSession: %v", i, err)
-		}
-		_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
+	// Deterministic eviction hook right before AdoptSessionForIngress
+	svc.SetPreAdoptHookForTest(func(peerKey, sessionID string) {
+		_ = svc.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
+	})
+	defer svc.SetPreAdoptHookForTest(nil)
 
-		// Concurrently evict legacy session
-		go func(sessID string) {
-			_ = svc.sessionMgr.CloseSession(ctx, sessID, "disconnected")
-		}(legacy.ID)
+	legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "legacy-device")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
 
-		sess, admittedBackend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
-		if err != nil {
-			t.Fatalf("iter %d: EnsureBackendSessionForIngress: %v", i, err)
-		}
-		if sess.AdmittedVia != models.SessionAdmissionIngress {
-			t.Fatalf("iter %d: admitted session AdmittedVia = %q, want %q", i, sess.AdmittedVia, models.SessionAdmissionIngress)
-		}
-		if sess.BackendTunnelID != admittedBackend.ID {
-			t.Fatalf("iter %d: session BackendTunnelID %d != admittedBackend %d", i, sess.BackendTunnelID, admittedBackend.ID)
-		}
+	sess, admittedBackend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	if err != nil {
+		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
+	}
+	if sess.ID == legacy.ID {
+		t.Fatalf("expected fresh session ID != legacy ID %s, got %s", legacy.ID, sess.ID)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("admitted session AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+	if sess.BackendTunnelID != admittedBackend.ID {
+		t.Fatalf("session BackendTunnelID %d != admittedBackend %d", sess.BackendTunnelID, admittedBackend.ID)
+	}
 
-		// The returned session MUST be live in sessionMgr (never a dead evicted pointer)
-		stored, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
-		if !ok || stored.ID != sess.ID {
-			t.Fatalf("iter %d: session %s not stored as live in sessionMgr (got ok=%v, stored=%+v)", i, sess.ID, ok, stored)
-		}
+	// The returned session MUST be live in sessionMgr (never a dead evicted pointer)
+	stored, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
+	if !ok || stored.ID != sess.ID {
+		t.Fatalf("session %s not stored as live in sessionMgr (got ok=%v, stored=%+v)", sess.ID, ok, stored)
+	}
+	if stored.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("stored session AdmittedVia = %q, want %q", stored.AdmittedVia, models.SessionAdmissionIngress)
+	}
+}
 
-		// Clean up for next iteration
-		_ = svc.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
-		svc.forwarder.BeginUnregisterSession(peer.peerKey, sess.ID).Wait()
+// TestIngressAdoptionRefreshesLivenessAgainstImmediateReap verifies review finding 1:
+// adopting an existing session atomically refreshes LastSeen so that an immediate
+// CheckTimeouts sweep does not evict the session before traffic touches it.
+func TestIngressAdoptionRefreshesLivenessAgainstImmediateReap(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "adopt-refresh-user", "adopt-refresh-peer", "10.100.6.51")
+	backend, err := selectBackendForIngressTest(t, svc, peer.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create legacy session A with backdated LastSeen (e.g. 10m ago).
+	legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "legacy-device")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
+	backdated := time.Now().UTC().Add(-10 * time.Minute)
+	svc.sessionMgr.SetSessionLastSeen(peer.peerKey, backdated)
+
+	// 2. Adopt A via EnsureBackendSessionForIngress.
+	adopted, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	if err != nil {
+		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
+	}
+	if adopted.ID != legacy.ID {
+		t.Fatalf("expected adoption of legacy session %s, got %s", legacy.ID, adopted.ID)
+	}
+	if adopted.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("adopted session AdmittedVia = %q, want %q", adopted.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// 3. Immediately call CheckTimeouts with 1m idle timeout.
+	timedOut, err := svc.sessionMgr.CheckTimeouts(ctx, time.Minute)
+	if err != nil {
+		t.Fatalf("CheckTimeouts: %v", err)
+	}
+
+	// 4. Assert len(timedOut) == 0 (A was not evicted because LastSeen was refreshed).
+	if len(timedOut) != 0 {
+		t.Fatalf("session was evicted by CheckTimeouts despite adoption refresh: %d timed out", len(timedOut))
+	}
+
+	// 5. Assert A remains connected and live in sessionMgr.
+	stored, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
+	if !ok || stored.ID != legacy.ID || stored.Status != "connected" {
+		t.Fatalf("session not live in sessionMgr after CheckTimeouts: ok=%v, stored=%+v", ok, stored)
+	}
+}
+
+// TestDisconnectSessionUpstreamIsRoutingOnly verifies review finding 4:
+// DisconnectSession on an upstream-admitted session performs routing-only teardown
+// without advancing peer generations, fencing the endpoint, or pruning transport state.
+func TestDisconnectSessionUpstreamIsRoutingOnly(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "dc-sess-user", "dc-sess-peer", "10.100.6.60")
+	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	if err != nil {
+		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// Seed transport state on endpoint
+	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
+		SendKey: make([]byte, 32),
+		RecvKey: make([]byte, 32),
+	})
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("endpoint transport state not seeded")
+	}
+
+	genBefore := svc.PeerGeneration(peer.peerKey)
+	fenceBefore := svc.endpoint.PeerGeneration(peer.peerKey)
+
+	tun, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tun.ActiveConnections != 1 {
+		t.Fatalf("ActiveConnections = %d, want 1 before disconnect", tun.ActiveConnections)
+	}
+
+	if err := svc.DisconnectSession(ctx, sess.ID); err != nil {
+		t.Fatalf("DisconnectSession: %v", err)
+	}
+
+	// Invariant: generation and endpoint fence MUST NOT advance for upstream sessions
+	if gen := svc.PeerGeneration(peer.peerKey); gen != genBefore {
+		t.Fatalf("service peerGenerations advanced %d -> %d", genBefore, gen)
+	}
+	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
+		t.Fatalf("endpoint fence advanced %d -> %d", fenceBefore, fence)
+	}
+
+	// Invariant: transport state MUST NOT be pruned
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("DisconnectSession pruned endpoint transport state for upstream session")
+	}
+
+	// Invariant: routing teardown performed
+	if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok {
+		t.Fatal("session was not closed in sessionMgr")
+	}
+	if route := svc.forwarder.RouteSessionID(peer.peerKey); route != "" {
+		t.Fatalf("route survived disconnect: %q", route)
+	}
+	tunAfter, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Fatalf("ActiveConnections = %d, want 0 after disconnect", tunAfter.ActiveConnections)
+	}
+}
+
+// TestDisconnectUserUpstreamIsRoutingOnly verifies review finding 4:
+// DisconnectUser on an upstream-admitted session performs routing-only teardown
+// without advancing peer generations, fencing the endpoint, or pruning transport state.
+func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "dc-user-user", "dc-user-peer", "10.100.6.61")
+	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	if err != nil {
+		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// Seed transport state on endpoint
+	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
+		SendKey: make([]byte, 32),
+		RecvKey: make([]byte, 32),
+	})
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("endpoint transport state not seeded")
+	}
+
+	genBefore := svc.PeerGeneration(peer.peerKey)
+	fenceBefore := svc.endpoint.PeerGeneration(peer.peerKey)
+
+	tun, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tun.ActiveConnections != 1 {
+		t.Fatalf("ActiveConnections = %d, want 1 before disconnect", tun.ActiveConnections)
+	}
+
+	if err := svc.DisconnectUser(ctx, peer.userID); err != nil {
+		t.Fatalf("DisconnectUser: %v", err)
+	}
+
+	// Invariant: generation and endpoint fence MUST NOT advance for upstream sessions
+	if gen := svc.PeerGeneration(peer.peerKey); gen != genBefore {
+		t.Fatalf("service peerGenerations advanced %d -> %d", genBefore, gen)
+	}
+	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
+		t.Fatalf("endpoint fence advanced %d -> %d", fenceBefore, fence)
+	}
+
+	// Invariant: transport state MUST NOT be pruned
+	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
+		t.Fatal("DisconnectUser pruned endpoint transport state for upstream session")
+	}
+
+	// Invariant: routing teardown performed
+	if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok {
+		t.Fatal("session was not closed in sessionMgr")
+	}
+	if route := svc.forwarder.RouteSessionID(peer.peerKey); route != "" {
+		t.Fatalf("route survived disconnect: %q", route)
+	}
+	tunAfter, err := svc.pool.GetTunnelByID(backend.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Fatalf("ActiveConnections = %d, want 0 after disconnect", tunAfter.ActiveConnections)
 	}
 }

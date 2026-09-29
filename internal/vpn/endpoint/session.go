@@ -334,6 +334,24 @@ func (sm *SessionManager) MarkSessionAdmissionSource(peerKey, sessionID, source 
 	return true
 }
 
+// AdoptSessionForIngress atomically verifies that a live session for peerKey
+// exists, has matching sessionID, and has "connected" status. If valid, it
+// marks AdmittedVia = models.SessionAdmissionIngress and refreshes LastSeen to
+// time.Now().UTC() under sm.mu.Lock() (issue #390). Returns a value copy of
+// the adopted session and true on success, or an empty VPNSession and false if
+// the session was not found, had a mismatched ID, or was not connected.
+func (sm *SessionManager) AdoptSessionForIngress(peerKey, sessionID string) (models.VPNSession, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessionsByPeer[peerKey]
+	if !ok || sess == nil || sess.ID != sessionID || sess.Status != "connected" {
+		return models.VPNSession{}, false
+	}
+	sess.AdmittedVia = models.SessionAdmissionIngress
+	sess.LastSeen = time.Now().UTC()
+	return *sess, true
+}
+
 // GetSessionByPeer retrieves an active session by peer public key.
 func (sm *SessionManager) GetSessionByPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, error) {
 	if sm == nil {

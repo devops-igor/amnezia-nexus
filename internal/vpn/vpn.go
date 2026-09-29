@@ -187,6 +187,7 @@ type Service struct {
 	reconcilePreCommitHook             func()
 	ensureDevicePreLockHook            func()
 	preCommitMigrationHookForTest      func()
+	preAdoptHookForTest                func(peerKey, sessionID string)
 	updateBackendServerHostPreLockHook func()
 	updateBackendServerHostErr         error
 	syncBackendForwarderHook           func() error
@@ -3303,19 +3304,21 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 
 	sessions := s.sessionMgr.GetSessionsByUserID(userID)
 	for _, sess := range sessions {
-		if s.peerGenerations == nil {
-			s.peerGenerations = make(map[string]uint64)
-		}
-		s.peerGenerations[sess.PeerPublicKey]++
-		fenceGen := s.peerGenerations[sess.PeerPublicKey]
-		if s.endpoint != nil {
-			s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
+		if sess.AdmittedVia != models.SessionAdmissionIngress {
+			if s.peerGenerations == nil {
+				s.peerGenerations = make(map[string]uint64)
+			}
+			s.peerGenerations[sess.PeerPublicKey]++
+			fenceGen := s.peerGenerations[sess.PeerPublicKey]
+			if s.endpoint != nil {
+				s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
+			}
+			prunes = append(prunes, pendingPrune{sess.PeerPublicKey, sess.ID, fenceGen})
 		}
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
 			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID))
 		}
-		prunes = append(prunes, pendingPrune{sess.PeerPublicKey, sess.ID, fenceGen})
 		if s.stickyMgr != nil {
 			s.stickyMgr.ClearAffinity(userID)
 			s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
@@ -3397,12 +3400,21 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 // (gauge sum 2 for one live session; found by the same test pair).
 func (s *Service) reapIngressSession(sess *models.VPNSession) {
 	var retirement forwarder.Retirement
+	var reaped bool
 	s.mu.Lock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+		if reaped {
+			log.Printf("[vpn/service] reaped idle upstream session (routing-only): id=%s peer=%s user=%s ip=%s tunnel_id=%d",
+				sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
+		}
+	}()
+
 	skipRoute := false
 	if live, exists := s.sessionMgr.GetSessionSnapshotByPeer(sess.PeerPublicKey); exists {
 		if live.ID == sess.ID {
 			// Refreshed/reuse won the race: still live, owns everything.
-			s.mu.Unlock()
 			log.Printf("[vpn/service] skip idle reap of upstream session id=%s peer=%s: session is live again",
 				sess.ID, sess.PeerPublicKey)
 			return
@@ -3413,12 +3425,8 @@ func (s *Service) reapIngressSession(sess *models.VPNSession) {
 		log.Printf("[vpn/service] reap of upstream session id=%s peer=%s: peer already re-admitted as %s; retiring the old count only",
 			sess.ID, sess.PeerPublicKey, live.ID)
 	}
-	defer func() {
-		s.mu.Unlock()
-		retirement.Wait()
-		log.Printf("[vpn/service] reaped idle upstream session (routing-only): id=%s peer=%s user=%s ip=%s tunnel_id=%d",
-			sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
-	}()
+
+	reaped = true
 
 	if !skipRoute && s.forwarder != nil {
 		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
@@ -3539,14 +3547,16 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 		return endpoint.ErrSessionNotFound
 	}
 
-	if s.peerGenerations == nil {
-		s.peerGenerations = make(map[string]uint64)
-	}
-	s.peerGenerations[sess.PeerPublicKey]++
-	fenceGen = s.peerGenerations[sess.PeerPublicKey]
-	prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
-	if s.endpoint != nil {
-		s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		if s.peerGenerations == nil {
+			s.peerGenerations = make(map[string]uint64)
+		}
+		s.peerGenerations[sess.PeerPublicKey]++
+		fenceGen = s.peerGenerations[sess.PeerPublicKey]
+		prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
+		if s.endpoint != nil {
+			s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
+		}
 	}
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
@@ -3562,6 +3572,14 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	s.pool.DecrementConnections(sess.BackendTunnelID)
 
 	return nil
+}
+
+// SetPreAdoptHookForTest sets a test hook called under s.mu in ensureBackendSessionForIngress
+// immediately before calling AdoptSessionForIngress (issue #390).
+func (s *Service) SetPreAdoptHookForTest(fn func(peerKey, sessionID string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preAdoptHookForTest = fn
 }
 
 // SetPreCommitMigrationHookForTest sets a test hook called under s.mu in MigrateSession
