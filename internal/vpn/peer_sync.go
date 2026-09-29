@@ -111,38 +111,22 @@ func (s *peerSynchronizer) desired(ctx context.Context) (map[string]desiredPeer,
 			continue
 		}
 		u, exists := userByID[c.UserID]
-		if !exists || !u.Enabled || (u.ExpiresAt != nil && !u.ExpiresAt.IsZero() && now.After(*u.ExpiresAt)) ||
-			(u.ExpirationDate != nil && !u.ExpirationDate.IsZero() && now.After(*u.ExpirationDate)) ||
-			(u.TrafficLimit > 0 && u.TrafficUsed >= u.TrafficLimit) || c.ClientParams["disabled"] == true ||
-			c.ClientParams["config_regeneration_required"] == true || c.ClientParams["quarantined_ip_collision"] != nil {
+		if !exists || !eligiblePeer(u, c, now) {
 			continue
 		}
-		ipText, _ := c.ClientParams["assigned_ip"].(string)
+		candidate, present, valid := s.peerFromConnection(c, block)
 		// An entirely blank row is normal during config issuance. A
 		// half-populated row is excluded and reported for repair.
-		if c.ClientID == "" && ipText == "" {
+		if !present {
 			continue
 		}
-		if c.ClientID == "" || ipText == "" {
-			invalid++
-			continue
-		}
-		ip, parseErr := netip.ParseAddr(ipText)
-		if parseErr != nil || !ip.Is4() || !block.Contains(ip) || ip == block.Addr() ||
-			ip == block.Addr().Next() || isIPv4Broadcast(block, ip) {
-			invalid++
-			continue
-		}
-		peer := clientawg.Peer{PublicKey: c.ClientID, AllowedIP: netip.PrefixFrom(ip, 32)}
-		if err := clientawg.ValidatePeer(peer, s.config.PublicKey); err != nil {
+		if !valid {
 			invalid++
 			continue
 		}
 		keyCount[c.ClientID]++
-		ipCount[ip]++
-		result[c.ID] = desiredPeer{peer: peer, owner: ingress.PeerOwnership{
-			PeerPublicKey: c.ClientID, ConnectionID: c.ID, UserID: c.UserID, IP: ip,
-		}}
+		ipCount[candidate.owner.IP]++
+		result[c.ID] = candidate
 	}
 	byKey := make(map[string]desiredPeer, len(result))
 	for _, candidate := range result {
@@ -153,6 +137,37 @@ func (s *peerSynchronizer) desired(ctx context.Context) (map[string]desiredPeer,
 		byKey[candidate.peer.PublicKey] = candidate
 	}
 	return byKey, invalid, nil
+}
+
+func eligiblePeer(u models.User, c models.UserConnection, now time.Time) bool {
+	return u.Enabled &&
+		(u.ExpiresAt == nil || u.ExpiresAt.IsZero() || !now.After(*u.ExpiresAt)) &&
+		(u.ExpirationDate == nil || u.ExpirationDate.IsZero() || !now.After(*u.ExpirationDate)) &&
+		(u.TrafficLimit <= 0 || u.TrafficUsed < u.TrafficLimit) &&
+		c.ClientParams["disabled"] != true && c.ClientParams["config_regeneration_required"] != true &&
+		c.ClientParams["quarantined_ip_collision"] == nil
+}
+
+func (s *peerSynchronizer) peerFromConnection(c models.UserConnection, block netip.Prefix) (desiredPeer, bool, bool) {
+	ipText, _ := c.ClientParams["assigned_ip"].(string)
+	if c.ClientID == "" && ipText == "" {
+		return desiredPeer{}, false, false
+	}
+	if c.ClientID == "" || ipText == "" {
+		return desiredPeer{}, true, false
+	}
+	ip, err := netip.ParseAddr(ipText)
+	if err != nil || !ip.Is4() || !block.Contains(ip) || ip == block.Addr() ||
+		ip == block.Addr().Next() || isIPv4Broadcast(block, ip) {
+		return desiredPeer{}, true, false
+	}
+	peer := clientawg.Peer{PublicKey: c.ClientID, AllowedIP: netip.PrefixFrom(ip, 32)}
+	if clientawg.ValidatePeer(peer, s.config.PublicKey) != nil {
+		return desiredPeer{}, true, false
+	}
+	return desiredPeer{peer: peer, owner: ingress.PeerOwnership{
+		PeerPublicKey: c.ClientID, ConnectionID: c.ID, UserID: c.UserID, IP: ip,
+	}}, true, true
 }
 
 func isIPv4Broadcast(block netip.Prefix, ip netip.Addr) bool {
@@ -175,15 +190,7 @@ func isIPv4Broadcast(block netip.Prefix, ip netip.Addr) bool {
 func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var configDrift error
-	currentConfig, configErr := clientawg.LoadConfig(ctx, s.db, s.config.TUN, nil)
-	storedVPNConfig, subnetErr := s.db.GetVPNConfig(ctx)
-	if configErr != nil || subnetErr != nil || storedVPNConfig == nil ||
-		currentConfig.PrivateKey != s.config.PrivateKey || currentConfig.PublicKey != s.config.PublicKey ||
-		currentConfig.ListenPort != s.config.ListenPort || currentConfig.Parameters != s.config.Parameters ||
-		(storedVPNConfig != nil && storedVPNConfig.SubnetCIDR != s.subnet) {
-		configDrift = errors.New("persisted portal AWG parameters differ from the running device; controlled restart required")
-	}
+	configDrift := s.portalConfigDrift(ctx)
 	s.status.PortalConfigRestartRequired = configDrift != nil
 	desired, invalid, err := s.desired(ctx)
 	if err != nil {
@@ -212,10 +219,34 @@ func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
 		actual[peer.PublicKey] = peer
 	}
 	s.status.ActualPeers = len(actual)
-	var failures []error
+	failures := s.removeDriftedPeers(actual, desired)
+	failures = append(failures, s.addMissingPeers(actual, desired)...)
+	failures = append(failures, s.verifyPeers(desired)...)
 	if configDrift != nil {
 		failures = append(failures, configDrift)
 	}
+	if len(failures) != 0 {
+		return s.fail(errors.Join(failures...))
+	}
+	s.status.LastSuccessfulReconcile = time.Now().UTC()
+	s.status.LastError = ""
+	return nil
+}
+
+func (s *peerSynchronizer) portalConfigDrift(ctx context.Context) error {
+	current, configErr := clientawg.LoadConfig(ctx, s.db, s.config.TUN, nil)
+	stored, subnetErr := s.db.GetVPNConfig(ctx)
+	if configErr != nil || subnetErr != nil || stored == nil ||
+		current.PrivateKey != s.config.PrivateKey || current.PublicKey != s.config.PublicKey ||
+		current.ListenPort != s.config.ListenPort || current.Parameters != s.config.Parameters ||
+		(stored != nil && stored.SubnetCIDR != s.subnet) {
+		return errors.New("persisted portal AWG parameters differ from the running device; controlled restart required")
+	}
+	return nil
+}
+
+func (s *peerSynchronizer) removeDriftedPeers(actual map[string]clientawg.PeerStatus, desired map[string]desiredPeer) []error {
+	var failures []error
 	// Remove all stale and changed assignments before adding. This also
 	// handles two peers swapping IPs without stealing either AllowedIP.
 	keys := make([]string, 0, len(actual))
@@ -237,7 +268,12 @@ func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("remove peer %s: %w", ingress.RedactKey(key), err))
 		}
 	}
-	keys = keys[:0]
+	return failures
+}
+
+func (s *peerSynchronizer) addMissingPeers(actual map[string]clientawg.PeerStatus, desired map[string]desiredPeer) []error {
+	var failures []error
+	keys := make([]string, 0, len(desired))
 	for key := range desired {
 		keys = append(keys, key)
 	}
@@ -256,28 +292,24 @@ func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("add peer %s: %w", ingress.RedactKey(key), err))
 		}
 	}
+	return failures
+}
+
+func (s *peerSynchronizer) verifyPeers(desired map[string]desiredPeer) []error {
 	after, err := s.portal.Status()
 	if err != nil {
-		failures = append(failures, err)
-	} else {
-		s.status.ActualPeers = len(after.Peers)
-		if len(after.Peers) != len(desired) {
-			failures = append(failures, errors.New("upstream peer count differs from durable state"))
-		} else {
-			for _, peer := range after.Peers {
-				want, ok := desired[peer.PublicKey]
-				if !ok || want.peer.AllowedIP != peer.AllowedIP {
-					failures = append(failures, errors.New("upstream peer assignment differs from durable state"))
-					break
-				}
-			}
+		return []error{err}
+	}
+	s.status.ActualPeers = len(after.Peers)
+	if len(after.Peers) != len(desired) {
+		return []error{errors.New("upstream peer count differs from durable state")}
+	}
+	for _, peer := range after.Peers {
+		want, ok := desired[peer.PublicKey]
+		if !ok || want.peer.AllowedIP != peer.AllowedIP {
+			return []error{errors.New("upstream peer assignment differs from durable state")}
 		}
 	}
-	if len(failures) != 0 {
-		return s.fail(errors.Join(failures...))
-	}
-	s.status.LastSuccessfulReconcile = time.Now().UTC()
-	s.status.LastError = ""
 	return nil
 }
 
