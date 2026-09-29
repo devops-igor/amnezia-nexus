@@ -112,10 +112,8 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 // cleared). On any error no state reports a connected session without a
 // usable route.
 //
-// The returned retirement (empty except on success) must be Wait()ed by the
-// caller AFTER releasing its own admission serialization, mirroring
-// HandleIncomingPeer's unlock-then-wait ordering; EnsureSessionForIngress
-// (the Admission seam below) does this on the caller's behalf.
+// The returned retirement is executed internally upon releasing s.mu prior
+// to returning, mirroring HandleIncomingPeer's unlock-then-wait ordering.
 //
 //nolint:gocyclo // durable revalidation, live-session reuse, selection, creation, and rollback are intentionally one serialized admission (issue #86).
 func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.PeerOwnership) (*models.VPNSession, *models.BackendTunnel, forwarder.Retirement, error) {
@@ -176,16 +174,32 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(o.PeerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
-			if path != nil && s.forwarder != nil {
-				retirement, err = s.forwarder.BindSessionReturnPath(live.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, path)
-				if err != nil {
-					return nil, nil, retirement, err
+			if s.preAdoptHookForTest != nil {
+				s.preAdoptHookForTest(o.PeerPublicKey, live.ID)
+			}
+			// Provenance seam (issue #390 part 1): the returned session is
+			// served by the ingress path, so its idle reap must be
+			// routing-only even when it was CREATED by the legacy
+			// handshake-era admission and adopted for reuse here. The stamp
+			// goes through the manager (identity-guarded, under sm.mu) so a
+			// reaper sweeping the live map concurrently observes it, not
+			// just this returned copy.
+			// AdoptSessionForIngress verifies session identity and connected status,
+			// stamps AdmittedVia = ingress, and refreshes LastSeen under sm.mu.Lock().
+			// If adoption fails (concurrent reap/replace), do not bind return path or
+			// drop retirement handles; fall through cleanly to fresh admission.
+			if adopted, ok := s.sessionMgr.AdoptSessionForIngress(o.PeerPublicKey, live.ID); ok {
+				if path != nil && s.forwarder != nil {
+					retirement, err = s.forwarder.BindSessionReturnPath(adopted.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, path)
+					if err != nil {
+						return nil, nil, retirement, err
+					}
 				}
+				if s.stickyMgr != nil {
+					s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
+				}
+				return &adopted, backend, retirement, nil
 			}
-			if s.stickyMgr != nil {
-				s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
-			}
-			return &live, backend, retirement, nil
 		}
 	}
 
@@ -217,7 +231,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		return nil, nil, retirement, fmt.Errorf("ingress admission: backend selection failed: %w", err)
 	}
 
-	sess, delta, err := s.sessionMgr.CreateSessionWithDelta(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name)
+	sess, delta, err := s.sessionMgr.CreateSessionWithDeltaAndSource(ctx, user.ID, o.PeerPublicKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionIngress)
 	if err != nil {
 		s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
 		return nil, nil, retirement, fmt.Errorf("ingress admission: session creation failed: %w", err)

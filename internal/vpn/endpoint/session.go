@@ -157,6 +157,16 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 // serialization between concurrent CreateSession callers is required to
 // attribute the delta to the right call.
 func (sm *SessionManager) CreateSessionWithDelta(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string, generation ...uint64) (*models.VPNSession, ReplacementPoolDelta, error) {
+	return sm.CreateSessionWithDeltaAndSource(ctx, userID, peerPublicKey, assignedIP, backendTunnelID, connectionName, models.SessionAdmissionHandshake, generation...)
+}
+
+// CreateSessionWithDeltaAndSource is CreateSessionWithDelta with explicit
+// admission provenance populated at construction time (issue #390). Setting
+// AdmittedVia inside createSessionLocked ensures the provenance field is
+// fully initialized before the pointer is published to sm.sessionsByPeer and
+// sm.sessionsByID, eliminating publication data races with concurrent
+// readers (e.g. GetSessionSnapshotByPeer).
+func (sm *SessionManager) CreateSessionWithDeltaAndSource(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName, source string, generation ...uint64) (*models.VPNSession, ReplacementPoolDelta, error) {
 	if userID == "" || peerPublicKey == "" || assignedIP == "" {
 		return nil, ReplacementPoolDelta{}, errors.New("missing required session fields")
 	}
@@ -169,6 +179,10 @@ func (sm *SessionManager) CreateSessionWithDelta(ctx context.Context, userID, pe
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	return sm.createSessionLocked(ctx, userID, peerPublicKey, assignedIP, backendTunnelID, connectionName, source, gen)
+}
+
+func (sm *SessionManager) createSessionLocked(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName, source string, gen uint64) (*models.VPNSession, ReplacementPoolDelta, error) {
 	// If session already exists for this peer, close it before creating a new
 	// one. The DB row is deleted here (same primitive the clean-disconnect
 	// path uses) so no orphan row for a dead session ID survives - a later
@@ -217,6 +231,7 @@ func (sm *SessionManager) CreateSessionWithDelta(ctx context.Context, userID, pe
 		Status:          "connected",
 		ConnectionName:  connectionName,
 		Generation:      gen,
+		AdmittedVia:     source,
 	}
 
 	if sm.db != nil {
@@ -297,6 +312,24 @@ func (sm *SessionManager) AdvanceLiveSessionGeneration(peerKey, sessionID, userI
 	sess.Generation = generation
 	copySess := *sess
 	return &copySess, true
+}
+
+// AdoptSessionForIngress atomically verifies that a live session for peerKey
+// exists, has matching sessionID, and has "connected" status. If valid, it
+// marks AdmittedVia = models.SessionAdmissionIngress and refreshes LastSeen to
+// time.Now().UTC() under sm.mu.Lock() (issue #390). Returns a value copy of
+// the adopted session and true on success, or an empty VPNSession and false if
+// the session was not found, had a mismatched ID, or was not connected.
+func (sm *SessionManager) AdoptSessionForIngress(peerKey, sessionID string) (models.VPNSession, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessionsByPeer[peerKey]
+	if !ok || sess == nil || sess.ID != sessionID || sess.Status != "connected" {
+		return models.VPNSession{}, false
+	}
+	sess.AdmittedVia = models.SessionAdmissionIngress
+	sess.LastSeen = time.Now().UTC()
+	return *sess, true
 }
 
 // GetSessionByPeer retrieves an active session by peer public key.

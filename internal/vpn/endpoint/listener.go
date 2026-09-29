@@ -2585,11 +2585,13 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 	hook := el.reaperHook
 	el.mu.RUnlock()
 	for _, sess := range timedOut {
-		el.mu.RLock()
-		prePruneHook := el.preSweepPruneHook
-		el.mu.RUnlock()
-		if prePruneHook != nil {
-			prePruneHook(sess.PeerPublicKey, sess.Generation)
+		if sess.AdmittedVia != models.SessionAdmissionIngress {
+			el.mu.RLock()
+			prePruneHook := el.preSweepPruneHook
+			el.mu.RUnlock()
+			if prePruneHook != nil {
+				prePruneHook(sess.PeerPublicKey, sess.Generation)
+			}
 		}
 
 		log.Printf("[vpn/endpoint] idle session timed out: id=%s peer=%s user=%s last_seen=%s (idle threshold=%s)",
@@ -2608,9 +2610,13 @@ func (el *Listener) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSes
 		// The service hook retires the route and waits for admitted writes.
 		// Keep transport keys alive until those writes have finished. The
 		// generation guard preserves keys installed by a concurrent reconnect.
-		if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) && el.HasTransportStateForPeer(sess.PeerPublicKey) {
-			log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): newer endpoint generation exists for peer %s",
-				sess.ID, sess.Generation, sess.PeerPublicKey)
+		// For upstream ingress sessions, legacy generation advancement and custom
+		// transport pruning are completely bypassed (issue #390).
+		if sess.AdmittedVia != models.SessionAdmissionIngress {
+			if !el.PrunePeerTransportStateForGeneration(sess.PeerPublicKey, sess.Generation) && el.HasTransportStateForPeer(sess.PeerPublicKey) {
+				log.Printf("[vpn/endpoint] skipping keypair pruning for timed-out session %s (gen %d): newer endpoint generation exists for peer %s",
+					sess.ID, sess.Generation, sess.PeerPublicKey)
+			}
 		}
 	}
 	return timedOut, nil

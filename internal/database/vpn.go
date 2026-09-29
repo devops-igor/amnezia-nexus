@@ -356,6 +356,9 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 }
 
 // GetVPNSessionByPeerKey retrieves an active VPN session by peer public key.
+// vpn_sessions holds ACTIVE BACKEND-ROUTING SESSIONS of this portal process —
+// not configured peers: a peer with no row is idle/healthy (its next traffic
+// lazily re-admits it), not disconnected or broken. See models.VPNSession.
 func (d *DB) GetVPNSessionByPeerKey(ctx context.Context, key string) (*models.VPNSession, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -560,7 +563,9 @@ func (d *DB) SaveVPNConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	return nil
 }
 
-// CreateVPNSession records an active VPN session.
+// CreateVPNSession records an active backend-routing session (vpn_sessions
+// semantics: see models.VPNSession — this is not a peer registry; the
+// durable peer identity is user_connections).
 func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
@@ -711,7 +716,10 @@ func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID stri
 	return nil
 }
 
-// GetActiveVPNSessions retrieves all currently connected sessions.
+// GetActiveVPNSessions retrieves all currently connected sessions — the
+// active backend-routing rows of this process only (vpn_sessions semantics:
+// see models.VPNSession; rows never survive a restart, and a configured peer
+// without a row is idle, not broken).
 func (d *DB) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

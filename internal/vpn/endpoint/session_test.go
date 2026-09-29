@@ -603,3 +603,106 @@ func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
 		t.Fatal("session not found in active snapshot")
 	}
 }
+
+func TestCreateSessionWithDeltaAndSource(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(db, ipam)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-source"})
+
+	sess, delta, err := sm.CreateSessionWithDeltaAndSource(ctx, uID, "peer-source-test", "10.100.0.20", tID, "device-2", models.SessionAdmissionIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta.Replaced {
+		t.Fatal("expected fresh creation, not replacement")
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("returned sess.AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	// Verify the snapshot under RLock immediately has AdmittedVia set (no publication race)
+	snap, ok := sm.GetSessionSnapshotByPeer("peer-source-test")
+	if !ok {
+		t.Fatal("session not found in snapshot")
+	}
+	if snap.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("snapshot AdmittedVia = %q, want %q", snap.AdmittedVia, models.SessionAdmissionIngress)
+	}
+}
+
+func TestAdoptSessionForIngress(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	ipam, err := NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(db, ipam)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-adopt"})
+
+	sess, err := sm.CreateSession(ctx, uID, "peer-adopt", "10.100.0.10", tID, "device-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().UTC().Add(-10 * time.Minute)
+	sm.SetSessionLastSeen("peer-adopt", oldTime)
+
+	// 1. Success adoption: updates AdmittedVia and refreshes LastSeen
+	adopted, ok := sm.AdoptSessionForIngress("peer-adopt", sess.ID)
+	if !ok {
+		t.Fatal("AdoptSessionForIngress failed on valid live session")
+	}
+	if adopted.ID != sess.ID {
+		t.Fatalf("adopted ID = %q, want %q", adopted.ID, sess.ID)
+	}
+	if adopted.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("adopted AdmittedVia = %q, want %q", adopted.AdmittedVia, models.SessionAdmissionIngress)
+	}
+	if !adopted.LastSeen.After(oldTime) {
+		t.Fatalf("adopted LastSeen was not refreshed: old=%v, new=%v", oldTime, adopted.LastSeen)
+	}
+
+	snap, ok := sm.GetSessionSnapshotByPeer("peer-adopt")
+	if !ok || snap.AdmittedVia != models.SessionAdmissionIngress || !snap.LastSeen.After(oldTime) {
+		t.Fatalf("stored session not updated properly: %+v", snap)
+	}
+
+	// 2. Mismatched session ID returns false
+	if _, ok := sm.AdoptSessionForIngress("peer-adopt", "wrong-id"); ok {
+		t.Fatal("AdoptSessionForIngress succeeded with wrong session ID")
+	}
+
+	// 3. Unknown peer returns false
+	if _, ok := sm.AdoptSessionForIngress("unknown-peer", sess.ID); ok {
+		t.Fatal("AdoptSessionForIngress succeeded with unknown peer key")
+	}
+
+	// 4. Disconnected status returns false
+	_ = sm.CloseSession(ctx, sess.ID, "disconnected")
+	if _, ok := sm.AdoptSessionForIngress("peer-adopt", sess.ID); ok {
+		t.Fatal("AdoptSessionForIngress succeeded on disconnected session")
+	}
+}
