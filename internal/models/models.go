@@ -406,6 +406,8 @@ type VPNConfig struct {
 	S4                     int                    `json:"s4"`
 	HeaderProtectionKey    string                 `json:"header_protection_key,omitempty"`
 	ContentPaddingAddition string                 `json:"content_padding_addition,omitempty"`
+	RandomTrailers         bool                   `json:"random_trailers,omitempty"`
+	DisableCookies         bool                   `json:"disable_cookies,omitempty"`
 }
 
 // AppearanceSettings holds UI display configuration.

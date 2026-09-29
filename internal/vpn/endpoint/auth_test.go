@@ -202,4 +202,38 @@ func TestDBAuthenticator(t *testing.T) {
 	if _, _, err := auth.AuthenticatePeer(ctx, peerKeyOrphan); err != ErrUserNotFound {
 		t.Errorf("expected ErrUserNotFound, got %v", err)
 	}
+
+	// 8. Disabled Connection
+	u8ID, _ := db.CreateUser(ctx, &models.User{
+		Username: "disabled_conn_user",
+		Enabled:  true,
+	})
+	peerKeyDisabledConn := "disabled-conn-peer-key"
+	disabledConnID, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID:   u8ID,
+		ServerID: 0,
+		Protocol: "awg",
+		ClientID: peerKeyDisabledConn,
+		ClientParams: map[string]any{
+			"disabled": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+	if _, _, err := auth.AuthenticatePeer(ctx, peerKeyDisabledConn); err != ErrConnectionDisabled {
+		t.Errorf("expected ErrConnectionDisabled, got %v", err)
+	}
+
+	// Re-enable and verify authentication passes
+	if ok, err := db.ToggleConnection(ctx, disabledConnID, true); !ok || err != nil {
+		t.Fatalf("ToggleConnection enable failed: %v", err)
+	}
+	u8, c8, err := auth.AuthenticatePeer(ctx, peerKeyDisabledConn)
+	if err != nil {
+		t.Fatalf("AuthenticatePeer failed after enabling connection: %v", err)
+	}
+	if u8.ID != u8ID || c8.ID != disabledConnID {
+		t.Errorf("mismatch user or conn after enabling: u=%+v, c=%+v", u8, c8)
+	}
 }

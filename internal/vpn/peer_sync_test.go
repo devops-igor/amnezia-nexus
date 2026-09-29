@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -338,5 +339,128 @@ func TestPeerSyncConcurrentRevokeAndClientTraffic(t *testing.T) {
 	}
 	if syncHasPeer(t, e, peer.publicKey, "") {
 		t.Fatal("peer active after concurrent revoke")
+	}
+}
+
+func TestPeerSyncConcurrentRevokeTrafficRekey(t *testing.T) {
+	ctx := t.Context()
+	db := setupTestDB(t)
+	svc := newIngressEngineService(t, db)
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, tun := range svc.pool.ListTunnels() {
+		svc.forwarder.AttachBackendDevice(tun.ID, nil)
+	}
+
+	peer, saved := newEnginePeer(t, svc, db, "sync-rekey-user")
+	conn, err := db.GetConnectionByClientID(ctx, peer.publicKey, 0)
+	if err != nil || conn == nil {
+		t.Fatalf("durable connection: %v", err)
+	}
+
+	e, err := svc.NewIngressEngine(ctx, "sync-rekey-portal", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop() })
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	uc := startEngineUpstreamClient(t, saved, "sync-rekey-client")
+	if err := uc.dev.IpcSet("rekey_after_time=1\nrekey_timeout=1\n"); err != nil {
+		t.Fatalf("IpcSet test rekey timing: %v", err)
+	}
+
+	// Initial packet admits backend session and establishes route
+	firstPkt := engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 1)
+	uc.inject(t, firstPkt)
+	var sess models.VPNSession
+	var ok bool
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, found := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey); found && s.Status == "connected" {
+			sess = s
+			ok = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+		_ = uc.vt.InjectInbound(firstPkt)
+	}
+	if !ok {
+		t.Fatal("session not admitted before concurrent test")
+	}
+	if route := svc.forwarder.RouteSessionID(peer.publicKey); route != sess.ID {
+		t.Fatalf("route session mismatch: got %q, want %q", route, sess.ID)
+	}
+	tun, err := svc.pool.GetTunnelByID(sess.BackendTunnelID)
+	if err != nil || tun.ActiveConnections != 1 {
+		t.Fatalf("active connections before revoke = %d, want 1", tun.ActiveConnections)
+	}
+
+	// Concurrently stream packets while rekeying via test timing
+	var stopStreaming atomic.Bool
+	var streamWg sync.WaitGroup
+	streamWg.Add(1)
+	go func() {
+		defer streamWg.Done()
+		var seq uint32 = 2
+		for !stopStreaming.Load() {
+			_ = uc.vt.InjectInbound(engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), seq))
+			seq++
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// Wait for rekey timing window while traffic streams
+	time.Sleep(1200 * time.Millisecond)
+
+	// Concurrently invoke durable revocation
+	if ok, err := db.ToggleConnection(ctx, conn.ID, false); !ok || err != nil {
+		t.Fatalf("ToggleConnection disable failed: %v", err)
+	}
+
+	stopStreaming.Store(true)
+	streamWg.Wait()
+
+	if err := e.ReconcilePeers(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert: peer removed from portal device
+	if syncHasPeer(t, e, peer.publicKey, "") {
+		t.Fatal("peer still present on portal device after revocation")
+	}
+
+	// Assert: peer unauthorized in resolver
+	if _, ok := e.Resolver().Lookup(netip.MustParseAddr(peer.assignedIP)); ok {
+		t.Fatal("peer still authorized in plaintext resolver")
+	}
+
+	// Assert: routing session closed/absent from SessionManager
+	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey); ok {
+		t.Fatalf("routing session still exists in SessionManager: %+v", snap)
+	}
+
+	// Assert: forwarder route absent
+	if route := svc.forwarder.RouteSessionID(peer.publicKey); route != "" {
+		t.Fatalf("forwarder route survived revocation: %q", route)
+	}
+
+	// Assert: backend active connection count decremented back to 0
+	tunAfter, err := svc.pool.GetTunnelByID(sess.BackendTunnelID)
+	if err != nil || tunAfter.ActiveConnections != 0 {
+		t.Fatalf("backend active connections = %d, want 0", tunAfter.ActiveConnections)
+	}
+
+	// Assert: additional packets do NOT resurrect session or route
+	_ = uc.vt.InjectInbound(engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 99999))
+	time.Sleep(50 * time.Millisecond)
+	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey); ok {
+		t.Fatalf("packet resurrected session: %+v", snap)
+	}
+	if route := svc.forwarder.RouteSessionID(peer.publicKey); route != "" {
+		t.Fatalf("packet resurrected route: %q", route)
 	}
 }

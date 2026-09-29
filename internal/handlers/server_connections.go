@@ -587,6 +587,30 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 	enableState := req.Enable || req.Enabled
 
 	ctx := r.Context()
+	if serverID == 0 {
+		conn, err := h.db.GetConnection(ctx, req.ClientID)
+		if err != nil || conn == nil || conn.ServerID != 0 {
+			conn, err = h.db.GetConnectionByClientID(ctx, req.ClientID, 0)
+		}
+		if err != nil || conn == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+			return
+		}
+
+		_, err = h.db.ToggleConnection(ctx, conn.ID, enableState)
+		if err != nil {
+			h.peerChangeError(w, err)
+			return
+		}
+
+		h.audit(r, "server_connection.toggle", map[string]any{"server_id": 0, "protocol": req.Protocol, "client_id": req.ClientID, "enabled": enableState})
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"enabled": enableState,
+		})
+		return
+	}
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")

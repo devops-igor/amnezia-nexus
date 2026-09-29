@@ -148,7 +148,7 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 	}
 
 	resolver := ingress.NewResolver()
-	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg)
+	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg, s.RevokeUpstreamPeerSession)
 	unsubscribe, err := db.SubscribePeerChanges(peerSync)
 	if err != nil {
 		_ = portal.Close()

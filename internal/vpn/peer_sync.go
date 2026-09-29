@@ -38,18 +38,27 @@ type portalPeerDevice interface {
 }
 
 type peerSynchronizer struct {
-	mu       sync.Mutex
-	db       *database.DB
-	portal   portalPeerDevice
-	resolver *ingress.Resolver
-	config   clientawg.Config
-	subnet   string
-	settings models.VPNConfig
-	status   PeerSyncStatus
+	mu            sync.Mutex
+	db            *database.DB
+	portal        portalPeerDevice
+	resolver      *ingress.Resolver
+	config        clientawg.Config
+	subnet        string
+	settings      models.VPNConfig
+	status        PeerSyncStatus
+	revokeSession func(ctx context.Context, peerKey string) error
 }
 
-func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ingress.Resolver, cfg clientawg.Config, settings *models.VPNConfig) *peerSynchronizer {
-	return &peerSynchronizer{db: db, portal: portal, resolver: resolver, config: cfg, subnet: settings.SubnetCIDR, settings: *settings}
+func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ingress.Resolver, cfg clientawg.Config, settings *models.VPNConfig, revokeSession func(ctx context.Context, peerKey string) error) *peerSynchronizer {
+	return &peerSynchronizer{
+		db:            db,
+		portal:        portal,
+		resolver:      resolver,
+		config:        cfg,
+		subnet:        settings.SubnetCIDR,
+		settings:      *settings,
+		revokeSession: revokeSession,
+	}
 }
 
 func (s *peerSynchronizer) Status() PeerSyncStatus {
@@ -72,7 +81,8 @@ func (s *peerSynchronizer) ValidatePortalConfig(cfg *models.VPNConfig) error {
 		cfg.SubnetCIDR != p.SubnetCIDR || cfg.H1.String() != p.H1.String() || cfg.H2.String() != p.H2.String() ||
 		cfg.H3.String() != p.H3.String() || cfg.H4.String() != p.H4.String() || cfg.S1 != p.S1 || cfg.S2 != p.S2 ||
 		cfg.S3 != p.S3 || cfg.S4 != p.S4 || cfg.HeaderProtectionKey != p.HeaderProtectionKey ||
-		cfg.ContentPaddingAddition != p.ContentPaddingAddition {
+		cfg.ContentPaddingAddition != p.ContentPaddingAddition ||
+		cfg.RandomTrailers != p.RandomTrailers || cfg.DisableCookies != p.DisableCookies {
 		return errors.New("portal AWG parameters require stopping the upstream listener before update and restarting it afterward")
 	}
 	return nil
@@ -219,7 +229,7 @@ func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
 		actual[peer.PublicKey] = peer
 	}
 	s.status.ActualPeers = len(actual)
-	failures := s.removeDriftedPeers(actual, desired)
+	failures := s.removeDriftedPeers(ctx, actual, desired)
 	failures = append(failures, s.addMissingPeers(actual, desired)...)
 	failures = append(failures, s.verifyPeers(desired)...)
 	if configDrift != nil {
@@ -245,7 +255,7 @@ func (s *peerSynchronizer) portalConfigDrift(ctx context.Context) error {
 	return nil
 }
 
-func (s *peerSynchronizer) removeDriftedPeers(actual map[string]clientawg.PeerStatus, desired map[string]desiredPeer) []error {
+func (s *peerSynchronizer) removeDriftedPeers(ctx context.Context, actual map[string]clientawg.PeerStatus, desired map[string]desiredPeer) []error {
 	var failures []error
 	// Remove all stale and changed assignments before adding. This also
 	// handles two peers swapping IPs without stealing either AllowedIP.
@@ -258,6 +268,9 @@ func (s *peerSynchronizer) removeDriftedPeers(actual map[string]clientawg.PeerSt
 		want, exists := desired[key]
 		if exists && want.peer.AllowedIP == actual[key].AllowedIP {
 			continue
+		}
+		if s.revokeSession != nil {
+			_ = s.revokeSession(ctx, key)
 		}
 		if err := s.portal.RemovePeer(key); err != nil {
 			if exists {

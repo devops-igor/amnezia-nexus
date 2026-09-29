@@ -3574,6 +3574,47 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 	return nil
 }
 
+// RevokeUpstreamPeerSession performs immediate routing-only teardown for an
+// upstream peer whose durable connection was removed or disabled (issue #391).
+// It closes the active session in SessionManager with reason "revoked", retires
+// the forwarder route, clears sticky affinity, and decrements backend pool
+// active connections. It does NOT advance endpoint peer generations, touch
+// upstream transport keys, or release the peer's durable IP allocation.
+func (s *Service) RevokeUpstreamPeerSession(ctx context.Context, peerKey string) error {
+	if s == nil || s.sessionMgr == nil {
+		return nil
+	}
+	var retirement forwarder.Retirement
+	var reapedSess *models.VPNSession
+	s.mu.Lock()
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+		if reapedSess != nil {
+			log.Printf("[vpn/service] revoked upstream peer session (routing-only): id=%s peer=%s user=%s ip=%s tunnel_id=%d",
+				reapedSess.ID, reapedSess.PeerPublicKey, reapedSess.UserID, reapedSess.AssignedIP, reapedSess.BackendTunnelID)
+		}
+	}()
+
+	sess, ok := s.sessionMgr.GetSession(peerKey)
+	if !ok {
+		return nil
+	}
+	reapedSess = sess
+	_ = s.sessionMgr.CloseSession(ctx, sess.ID, "revoked")
+	if s.forwarder != nil {
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
+	}
+	if s.stickyMgr != nil {
+		s.stickyMgr.ClearAffinity(sess.UserID)
+		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
+	}
+	if s.pool != nil {
+		s.pool.DecrementConnections(sess.BackendTunnelID)
+	}
+	return nil
+}
+
 // SetPreAdoptHookForTest sets a test hook called under s.mu in ensureBackendSessionForIngress
 // immediately before calling AdoptSessionForIngress (issue #390).
 func (s *Service) SetPreAdoptHookForTest(fn func(peerKey, sessionID string)) {
