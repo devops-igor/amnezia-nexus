@@ -34,7 +34,10 @@ var ErrIngressEngineNotStarted = errors.New("ingress engine is not started")
 // selected reapSession (routing-only for ingress-admitted sessions). The
 // custom listener's heartbeat keeps its own sweep — the two never run the
 // same session twice (CheckTimeouts removes a session exactly once), and
-// in the dormant-engine reality the listener remains the only sweeper.
+// in the dormant-engine reality the listener remains the only sweeper. The
+// sweep's idle threshold is the reapIdleTimeoutFn field (issue #390 part
+// 2): it defaults to reapLoopIdleTimeout — the same 3-minute constant the
+// listener config is built with — and tests override it per engine.
 //
 // The engine is DORMANT by default: nothing in the production startup path
 // constructs or starts it. Engine ACTIVATION/canary/cutover/rollback is
@@ -63,12 +66,38 @@ type IngressEngine struct {
 	running        bool
 	returnPath     *forwarder.ReturnPath
 	returnCounters returnCounters
+
+	// reapIdleTimeoutFn is the upstream sweep's idle threshold (issue #390
+	// part 2 test seam). Production leaves it nil: sweepOnce then uses
+	// reapLoopIdleTimeout — the same 3-minute constant the service's
+	// listener config is built with. Tests assign it directly (same
+	// package) BEFORE Start, so the reap loop's reads are ordered by
+	// goroutine creation; the field is never written after Start.
+	reapIdleTimeoutFn func(*Service) time.Duration
+
+	// reapInterval is the upstream-mode idle reap ticker cadence (issue #390
+	// part 2 test seam). Production leaves it 0: reapLoop then uses
+	// reapLoopInterval — the same 30s cadence as the custom listener's
+	// heartbeat. Like reapIdleTimeoutFn, tests assign it directly (same
+	// package) BEFORE Start; reapLoop reads it once at loop entry, and the
+	// field is never written after Start.
+	reapInterval time.Duration
 }
 
 // reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
 // custom listener's heartbeat interval (30s) so idle sessions are retired
 // with the same latency the transport path has always had.
 const reapLoopInterval = 30 * time.Second
+
+// reapLoopIntervalFor is the loop's ticker cadence: the engine's test seam
+// when assigned, the production 30s constant otherwise. Must be called
+// before launching reapLoop (read-once-at-entry contract).
+func (e *IngressEngine) reapLoopIntervalFor() time.Duration {
+	if e.reapInterval > 0 {
+		return e.reapInterval
+	}
+	return reapLoopInterval
+}
 
 // NewIngressEngine builds the production upstream ingress chain from durable
 // state:
@@ -199,7 +228,11 @@ func (e *IngressEngine) Start() error {
 // for each reaped peer so it does not retain dead peers.
 func (e *IngressEngine) reapLoop(stopCh <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(reapLoopInterval)
+	// Read-once at loop entry: the cadence seam (like the threshold seam)
+	// is assigned before Start and never written afterwards, so capturing
+	// it here orders the read before the goroutine's first tick without
+	// further synchronization.
+	ticker := time.NewTicker(e.reapLoopIntervalFor())
 	defer ticker.Stop()
 	for {
 		select {
@@ -217,7 +250,7 @@ func (e *IngressEngine) sweepOnce(ctx context.Context) {
 	if e.svc == nil || e.svc.sessionMgr == nil {
 		return
 	}
-	timedOut, err := e.svc.sessionMgr.CheckTimeouts(ctx, reapLoopIdleTimeout(e.svc))
+	timedOut, err := e.svc.sessionMgr.CheckTimeouts(ctx, e.reapIdleTimeout())
 	if err != nil {
 		log.Printf("[vpn/ingress] upstream idle sweep failed: %v", err)
 		return
@@ -230,10 +263,20 @@ func (e *IngressEngine) sweepOnce(ctx context.Context) {
 	}
 }
 
+// reapIdleTimeout is the sweep's idle threshold: the engine's test seam when
+// assigned, the production 3-minute constant otherwise.
+func (e *IngressEngine) reapIdleTimeout() time.Duration {
+	if e.reapIdleTimeoutFn != nil {
+		return e.reapIdleTimeoutFn(e.svc)
+	}
+	return reapLoopIdleTimeout(e.svc)
+}
+
 // reapLoopIdleTimeout is the idle threshold for the upstream sweep. It uses
 // the same constant the service's listener config is built with (vpn.go
 // NewVPNService: IdleTimeout 3m), so engine mode and legacy mode reap at
-// identical latency; a config-driven knob is Part 2 scope.
+// identical latency; tests shorten it per engine via the IngressEngine's
+// reapIdleTimeoutFn field (issue #390 part 2).
 func reapLoopIdleTimeout(*Service) time.Duration {
 	return 3 * time.Minute
 }
