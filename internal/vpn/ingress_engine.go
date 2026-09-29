@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
@@ -26,6 +27,14 @@ var ErrIngressEngineNotStarted = errors.New("ingress engine is not started")
 // using PRODUCTION Nexus components — the service's real forwarder, the
 // service's real admission primitive (EnsureBackendSessionForIngress), and
 // the service's real session liveness.
+//
+// The engine also owns the upstream-mode idle reap driver (issue #390 part
+// 1): reapLoop runs SessionManager.CheckTimeouts on the engine's reap
+// cadence and hands each timed-out session to the service's provenance-
+// selected reapSession (routing-only for ingress-admitted sessions). The
+// custom listener's heartbeat keeps its own sweep — the two never run the
+// same session twice (CheckTimeouts removes a session exactly once), and
+// in the dormant-engine reality the listener remains the only sweeper.
 //
 // The engine is DORMANT by default: nothing in the production startup path
 // constructs or starts it. Engine ACTIVATION/canary/cutover/rollback is
@@ -48,11 +57,18 @@ type IngressEngine struct {
 	mu             sync.Mutex
 	stopCh         chan struct{}
 	stopped        chan struct{}
-	running        bool
+	reapStopCh     chan struct{}
+	reapDoneCh     chan struct{}
 	closed         bool
+	running        bool
 	returnPath     *forwarder.ReturnPath
 	returnCounters returnCounters
 }
+
+// reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
+// custom listener's heartbeat interval (30s) so idle sessions are retired
+// with the same latency the transport path has always had.
+const reapLoopInterval = 30 * time.Second
 
 // NewIngressEngine builds the production upstream ingress chain from durable
 // state:
@@ -122,7 +138,9 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 // ingress.Router.HandlePacket, forever, until Stop or portal closure.
 // Drops are the router's classified, counted outcomes and never kill the
 // loop; only a portal-device failure (ErrClosed after Stop/Close) ends it.
-// Start on a running engine reports ErrIngressEngineStarted.
+// Start also launches the upstream-mode idle reap driver (issue #390 part 1),
+// which owns reaping for engine-admitted backend sessions. Start on a running
+// engine reports ErrIngressEngineStarted.
 func (e *IngressEngine) Start() error {
 	e.mu.Lock()
 	if e.closed {
@@ -137,7 +155,12 @@ func (e *IngressEngine) Start() error {
 	stopCh := make(chan struct{})
 	stopped := make(chan struct{})
 	e.stopCh, e.stopped = stopCh, stopped
+	reapStop := make(chan struct{})
+	reapDone := make(chan struct{})
+	e.reapStopCh, e.reapDoneCh = reapStop, reapDone
 	e.mu.Unlock()
+
+	go e.reapLoop(reapStop, reapDone)
 
 	go func() {
 		defer close(stopped)
@@ -164,6 +187,57 @@ func (e *IngressEngine) Start() error {
 	return nil
 }
 
+// reapLoop is the upstream-mode idle reap driver (issue #390 part 1):
+// upstream-only operation has no listener heartbeat, so the engine sweeps
+// SessionManager.CheckTimeouts on its own cadence and hands each timed-out
+// session to the service's provenance-selected reapSession — routing-only
+// teardown for ingress-admitted sessions, legacy teardown for anything the
+// handshake-era admission created (rollback safety). CheckTimeouts removes a
+// session from the live map exactly once, so the engine's sweep and the
+// custom listener's (both live only during a #394-adjacent overlap) never
+// reap the same session twice. The liveness throttle map is Forget-cleaned
+// for each reaped peer so it does not retain dead peers.
+func (e *IngressEngine) reapLoop(stopCh <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(reapLoopInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			e.sweepOnce(context.Background())
+		}
+	}
+}
+
+// sweepOnce runs one upstream-mode idle sweep. Split from reapLoop so tests
+// drive single deterministic sweeps instead of waiting on the cadence.
+func (e *IngressEngine) sweepOnce(ctx context.Context) {
+	if e.svc == nil || e.svc.sessionMgr == nil {
+		return
+	}
+	timedOut, err := e.svc.sessionMgr.CheckTimeouts(ctx, reapLoopIdleTimeout(e.svc))
+	if err != nil {
+		log.Printf("[vpn/ingress] upstream idle sweep failed: %v", err)
+		return
+	}
+	for _, sess := range timedOut {
+		e.svc.reapSession(ctx, sess)
+		if e.liveness != nil {
+			e.liveness.Forget(sess.PeerPublicKey)
+		}
+	}
+}
+
+// reapLoopIdleTimeout is the idle threshold for the upstream sweep. It uses
+// the same constant the service's listener config is built with (vpn.go
+// NewVPNService: IdleTimeout 3m), so engine mode and legacy mode reap at
+// identical latency; a config-driven knob is Part 2 scope.
+func reapLoopIdleTimeout(*Service) time.Duration {
+	return 3 * time.Minute
+}
+
 // Stop terminates the receive loop and closes the upstream device. Idempotent;
 // stopping a never-started engine still closes the portal device (the engine
 // owns it from construction) and reports ErrIngressEngineNotStarted.
@@ -172,8 +246,10 @@ func (e *IngressEngine) Stop() error {
 	e.closed = true
 	wasRunning := e.running
 	stopCh, stopped := e.stopCh, e.stopped
+	reapStop, reapDone := e.reapStopCh, e.reapDoneCh
 	e.running = false
 	e.stopCh, e.stopped = nil, nil
+	e.reapStopCh, e.reapDoneCh = nil, nil
 	e.mu.Unlock()
 
 	if e.returnPath != nil {
@@ -182,12 +258,19 @@ func (e *IngressEngine) Stop() error {
 	if stopCh != nil {
 		close(stopCh)
 	}
+	if reapStop != nil {
+		close(reapStop)
+	}
 	// Close the portal so a receiver parked in ReceiveOutbound wakes up
 	// (virtualtun.ErrClosed); the loop then exits via the receive error
-	// even without observing stopCh.
+	// even without observing stopCh. Unconditional: without it the loop
+	// never exits and Stop would block forever on <-stopped.
 	_ = e.portal.Close()
 	if stopped != nil {
 		<-stopped
+	}
+	if reapDone != nil {
+		<-reapDone
 	}
 	if !wasRunning {
 		return ErrIngressEngineNotStarted

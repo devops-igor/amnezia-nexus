@@ -185,6 +185,18 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			if s.stickyMgr != nil {
 				s.stickyMgr.AssignPeerAffinity(o.PeerPublicKey, backend.ID)
 			}
+			// Provenance seam (issue #390 part 1): the returned session is
+			// served by the ingress path, so its idle reap must be
+			// routing-only even when it was CREATED by the legacy
+			// handshake-era admission and adopted for reuse here. The stamp
+			// goes through the manager (identity-guarded, under sm.mu) so a
+			// reaper sweeping the live map concurrently observes it, not
+			// just this returned copy. The custom listener has already torn
+			// its transport state down for that session (CloseSession
+			// removed it from the live map), so a routing-only reap cannot
+			// strand listener state.
+			s.sessionMgr.MarkSessionAdmissionSource(o.PeerPublicKey, live.ID, models.SessionAdmissionIngress)
+			live.AdmittedVia = models.SessionAdmissionIngress
 			return &live, backend, retirement, nil
 		}
 	}
@@ -222,6 +234,13 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
 		return nil, nil, retirement, fmt.Errorf("ingress admission: session creation failed: %w", err)
 	}
+	// Provenance seam (issue #390 part 1): this session was created by the
+	// upstream engine's admission, so its idle reap must be routing-only.
+	// The stamp is a plain store under the admission's s.mu; the session
+	// pointer is not yet reachable by any reaper (registration below is the
+	// last admission step, and CheckTimeouts runs under sm.mu which this
+	// call sequence does not overlap for this brand-new session).
+	sess.AdmittedVia = models.SessionAdmissionIngress
 
 	// Backend accounting, exactly-once across replacement (issue #388 rework
 	// D). CreateSessionWithDelta returns what its replacement hook already

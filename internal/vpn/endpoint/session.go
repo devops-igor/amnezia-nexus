@@ -299,6 +299,26 @@ func (sm *SessionManager) AdvanceLiveSessionGeneration(peerKey, sessionID, userI
 	return &copySess, true
 }
 
+// MarkSessionAdmissionSource stamps the admission provenance on the LIVE
+// session for peerKey, but only while sessionID still names the peer's live
+// session (issue #390 part 1). It exists for the ingress admission's reuse
+// branch: EnsureBackendSessionForIngress stamps its own fresh sessions via
+// the returned pointer, but an adopted (handshake-era) session must be
+// stamped in the manager's map so a concurrently sweeping reaper sees the
+// provenance — otherwise an overlapping engine sweep could run the legacy
+// fence+prune teardown against a session now served by the ingress path.
+// Reports whether the stamp was applied.
+func (sm *SessionManager) MarkSessionAdmissionSource(peerKey, sessionID, source string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessionsByPeer[peerKey]
+	if !ok || sess == nil || sess.ID != sessionID {
+		return false
+	}
+	sess.AdmittedVia = source
+	return true
+}
+
 // GetSessionByPeer retrieves an active session by peer public key.
 func (sm *SessionManager) GetSessionByPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, error) {
 	if sm == nil {

@@ -3329,14 +3329,117 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// reapSession tears down forwarder routes and pool counters for an idle-timeout
-// reaped session. Sticky affinity is preserved within AffinityTTL to prevent
-// backend/IP thrashing upon client reconnect (issue #294). Pool connection counter
-// decrement is skipped if periodic reconciliation already re-synchronized the gauge from the database.
+// reapSession tears down an idle-timed-out session, selecting the teardown
+// class by admission provenance (issue #390 part 1):
+//
+//   - Sessions admitted by the upstream engine (AdmittedVia == ingress) are
+//     reaped ROUTING-ONLY via reapIngressSession: forwarder route retirement
+//     and the pool decrement — never a generation fence, never
+//     PrunePeerTransportState, never any endpoint transport-state mutation.
+//     Upstream peer crypto/transport state belongs to the upstream engine's
+//     own rekey lifecycle; touching it here would force the client into a
+//     full re-handshake on a mere idle reap.
+//
+//   - Every other session (AdmittedVia == "", the handshake-era
+//     custom-listener admission) keeps the legacy teardown byte-for-byte:
+//     generation fence + deferred guarded transport prune, forwarder route
+//     retirement, and the guarded pool decrement. The contracts exercised by
+//     the issue-295/309/39 reaper tests depend on it.
+//
+// Sticky affinity is preserved within AffinityTTL on both paths to prevent
+// backend/IP thrashing upon client reconnect (issue #294). Pool connection
+// counter decrement is skipped if periodic reconciliation already
+// re-synchronized the gauge from the database.
 // Note: sticky affinity pruning is intentionally not executed here to prevent O(K*N)
 // lock contention under Service.mu during mass timeouts; it is amortized post-sweep
 // and during periodic maintenance via PruneExpiredAffinity.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
+	if sess == nil {
+		return
+	}
+	if sess.AdmittedVia == models.SessionAdmissionIngress {
+		s.reapIngressSession(sess)
+		return
+	}
+	s.reapLegacySession(ctx, sess)
+}
+
+// reapIngressSession performs the routing-only teardown of an idle upstream
+// backend session (issue #390 part 1). It holds the same s.mu admission
+// serialization regime reapSession always held, retires the forwarder route
+// with the session-identity guard (a recreated session's route is never
+// removed by an old reap — the forwarder's generation-bounded delete holds),
+// and applies the same reconciliation-guarded pool decrement as the legacy
+// path. It MUST NOT touch endpoint transport state or generation fences: the
+// upstream peer's crypto state outlives any number of Nexus backend sessions.
+//
+// Liveness guard: CheckTimeouts removes the session it reaps, so a live
+// session for the peer under s.mu means a concurrent admission raced this
+// reap. Two sub-cases:
+//
+//   - Same ID still live: the admission's LastSeen-based reuse refreshed the
+//     session (traffic won the race); it still owns its route and pool
+//     count — this reap is a full no-op.
+//   - Different live ID: the admission created a fresh session (CheckTimeouts
+//     had already removed this one, so no replacement hook moved its count).
+//     This reap still owns the OLD pool decrement, but must not touch the
+//     route — the new session's registration owns it now.
+//
+// Without the same-ID no-op, a reused session's freshly re-validated route
+// could be retired by the racing reap (route == "" while the session reports
+// connected — every return packet lost; found by the reap/recreate race
+// test). Without the different-ID decrement, the old session's count leaks
+// (gauge sum 2 for one live session; found by the same test pair).
+func (s *Service) reapIngressSession(sess *models.VPNSession) {
+	var retirement forwarder.Retirement
+	s.mu.Lock()
+	skipRoute := false
+	if live, exists := s.sessionMgr.GetSessionSnapshotByPeer(sess.PeerPublicKey); exists {
+		if live.ID == sess.ID {
+			// Refreshed/reuse won the race: still live, owns everything.
+			s.mu.Unlock()
+			log.Printf("[vpn/service] skip idle reap of upstream session id=%s peer=%s: session is live again",
+				sess.ID, sess.PeerPublicKey)
+			return
+		}
+		// Fresh-creation replacement won: skip route retirement, keep the
+		// old session's pool decrement (no hook moved it).
+		skipRoute = true
+		log.Printf("[vpn/service] reap of upstream session id=%s peer=%s: peer already re-admitted as %s; retiring the old count only",
+			sess.ID, sess.PeerPublicKey, live.ID)
+	}
+	defer func() {
+		s.mu.Unlock()
+		retirement.Wait()
+		log.Printf("[vpn/service] reaped idle upstream session (routing-only): id=%s peer=%s user=%s ip=%s tunnel_id=%d",
+			sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
+	}()
+
+	if !skipRoute && s.forwarder != nil {
+		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
+	}
+
+	if s.pool != nil {
+		shouldDecrement := true
+		var tunReconcileTime time.Time
+		if s.lastReconcileByTunnel != nil {
+			tunReconcileTime = s.lastReconcileByTunnel[sess.BackendTunnelID]
+		}
+		if !sess.TimedOutAt.IsZero() && !tunReconcileTime.IsZero() && tunReconcileTime.After(sess.TimedOutAt) {
+			shouldDecrement = false
+		}
+		if shouldDecrement {
+			s.pool.DecrementConnections(sess.BackendTunnelID)
+		}
+	}
+}
+
+// reapLegacySession is the pre-#390 reapSession body, byte-for-byte: reserved
+// generation fence, deferred identity-guarded transport prune, forwarder
+// route retirement, guarded pool decrement. Do not "modernize" it — the
+// custom-listener reaper contracts (issues #295, #309, #39) are pinned to
+// exactly this behavior for handshake-era sessions.
+func (s *Service) reapLegacySession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
 	}

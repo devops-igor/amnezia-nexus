@@ -317,11 +317,33 @@ type VPNSession struct {
 	// Generation tracks monotonic per-peer handshake sequence numbers to prevent
 	// out-of-order handshake commits from clobbering newer keys/endpoints.
 	Generation uint64 `json:"generation,omitempty" db:"-"`
+	// AdmittedVia records which admission path created this session so the
+	// idle reaper can select the session's teardown class (issue #390 part
+	// 1): "ingress" sessions are reaped routing-only, "" (the zero value,
+	// the handshake-era custom-listener admission) keeps the legacy
+	// fence+prune teardown. In-memory state like Generation — vpn_sessions
+	// has no column; DB semantics are owned by #390 part 2.
+	AdmittedVia string `json:"admitted_via,omitempty" db:"-"`
 	// TimedOutAt records when CheckTimeouts detected that the session exceeded
 	// the idle timeout. Used by the session reaper to avoid duplicate counter
 	// decrements if periodic reconciliation ran after this timestamp.
 	TimedOutAt time.Time `json:"-" db:"-"`
 }
+
+// Session admission provenance values for VPNSession.AdmittedVia.
+const (
+	// SessionAdmissionHandshake marks sessions created by the handshake-era
+	// custom-listener admission. Never stamped explicitly: the empty string
+	// is the handshake-era value, so sessions created before the provenance
+	// field existed (and by any caller that does not stamp) reap through the
+	// legacy path.
+	SessionAdmissionHandshake = ""
+	// SessionAdmissionIngress marks sessions created by the upstream
+	// engine's admission (EnsureBackendSessionForIngress). Their idle reap
+	// is routing-only: no generation fence, no endpoint transport prune,
+	// no client re-handshake.
+	SessionAdmissionIngress = "ingress"
+)
 
 // EnrichedVPNSession is an active VPN session with identity joins resolved:
 // username from users, backend tunnel and server identity from backend
