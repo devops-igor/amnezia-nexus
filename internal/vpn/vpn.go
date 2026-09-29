@@ -3336,9 +3336,11 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 //     reaped ROUTING-ONLY via reapIngressSession: forwarder route retirement
 //     and the pool decrement — never a generation fence, never
 //     PrunePeerTransportState, never any endpoint transport-state mutation.
-//     Upstream peer crypto/transport state belongs to the upstream engine's
-//     own rekey lifecycle; touching it here would force the client into a
-//     full re-handshake on a mere idle reap.
+//     The configured upstream peer is untouched: its crypto/transport state
+//     belongs to the upstream engine's own rekey lifecycle, and its next
+//     plaintext packet lazily creates a fresh backend session — so an idle
+//     reap never forces the client into a re-handshake and never makes a
+//     configured peer unavailable.
 //
 //   - Every other session (AdmittedVia == "", the handshake-era
 //     custom-listener admission) keeps the legacy teardown byte-for-byte:
@@ -3370,8 +3372,11 @@ func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 // with the session-identity guard (a recreated session's route is never
 // removed by an old reap — the forwarder's generation-bounded delete holds),
 // and applies the same reconciliation-guarded pool decrement as the legacy
-// path. It MUST NOT touch endpoint transport state or generation fences: the
-// upstream peer's crypto state outlives any number of Nexus backend sessions.
+// path. It MUST NOT touch endpoint transport state or generation fences, and
+// it never removes the configured upstream peer (durable user_connections /
+// clientawg identity): the peer stays configured and idle after its backend
+// routing session is retired; the peer's crypto state outlives any number of
+// Nexus backend sessions.
 //
 // Liveness guard: CheckTimeouts removes the session it reaps, so a live
 // session for the peer under s.mu means a concurrent admission raced this

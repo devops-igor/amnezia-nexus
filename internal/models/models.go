@@ -299,6 +299,15 @@ type BackendTunnel struct {
 }
 
 // VPNSession tracks an active user connection through the portal AWG endpoint.
+//
+// vpn_sessions is a table of ACTIVE NEXUS BACKEND-ROUTING SESSIONS, not a
+// peer registry: a row exists only while this portal process is routing that
+// peer's traffic to a backend. It does NOT track configured upstream peers
+// (durable: user_connections) or AWG transport/crypto sessions (upstream,
+// invisible to Nexus). A configured peer with no row is the healthy idle
+// state — its next plaintext packet lazily creates a fresh session
+// (EnsureBackendSessionForIngress) — and every row dies with the process
+// (InvalidateVPNSessionsForRestart) or with the peer's idle reap.
 type VPNSession struct {
 	ID              string    `json:"id" db:"id"`
 	UserID          string    `json:"user_id" db:"user_id"`
@@ -322,7 +331,9 @@ type VPNSession struct {
 	// 1): "ingress" sessions are reaped routing-only, "" (the zero value,
 	// the handshake-era custom-listener admission) keeps the legacy
 	// fence+prune teardown. In-memory state like Generation — vpn_sessions
-	// has no column; DB semantics are owned by #390 part 2.
+	// has no column, and rows do not survive a process restart
+	// (InvalidateVPNSessionsForRestart), so in-memory provenance is
+	// complete (issue #390 part 2).
 	AdmittedVia string `json:"admitted_via,omitempty" db:"-"`
 	// TimedOutAt records when CheckTimeouts detected that the session exceeded
 	// the idle timeout. Used by the session reaper to avoid duplicate counter
