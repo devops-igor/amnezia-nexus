@@ -445,13 +445,24 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 		if !ok {
 			t.Fatalf("iter %d: client packet channel missing", i)
 		}
-		select {
-		case got := <-clientQueue:
-			if !bytes.Equal(got, ret) {
-				t.Fatalf("iter %d: client queue delivered a different packet", i)
+		// Delivery is eventual under scheduler pressure (CI runs the whole
+		// package under -race in parallel; one fixed 2s wait expired there).
+		// Poll until the packet arrives instead of betting on a fixed
+		// deadline; a wrong packet still fails immediately.
+		delivered := false
+		deliveryDeadline := time.Now().Add(15 * time.Second)
+		for !delivered {
+			select {
+			case got := <-clientQueue:
+				if !bytes.Equal(got, ret) {
+					t.Fatalf("iter %d: client queue delivered a different packet", i)
+				}
+				delivered = true
+			case <-time.After(100 * time.Millisecond):
+				if time.Now().After(deliveryDeadline) {
+					t.Fatalf("iter %d: return traffic never reached the client queue within 15s", i)
+				}
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("iter %d: return traffic never reached the client queue", i)
 		}
 		live, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
 		if !ok || live.ID != fresh.ID {
