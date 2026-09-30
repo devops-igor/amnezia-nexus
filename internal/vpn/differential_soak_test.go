@@ -120,10 +120,10 @@ func TestDifferential_Soak_BoundedVerification(t *testing.T) {
 
 // TestDifferential_Soak_Unaccelerated10Rekey executes the full production-timing soak test
 // requiring at least 10 natural, unforced rekeys under standard WireGuard timing (120s rekey_after_time).
-// Gated behind NEXUS_SOAK_FULL=true because the unaccelerated run requires ~20-25 minutes.
+// Gated behind NEXUS_SOAK_FULL=true because the unaccelerated run on both Reference and Subject requires ~40-50 minutes total (~20-25m each).
 func TestDifferential_Soak_Unaccelerated10Rekey(t *testing.T) {
 	if os.Getenv("NEXUS_SOAK_FULL") != "true" {
-		t.Skip("Skipping unaccelerated 10-rekey soak test; set NEXUS_SOAK_FULL=true to run (requires ~20-25m runtime)")
+		t.Skip("Skipping unaccelerated 10-rekey soak test; set NEXUS_SOAK_FULL=true to run (requires ~40-50m total runtime across Reference and Subject)")
 	}
 
 	harness := NewDifferentialHarness(t)
@@ -225,6 +225,7 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 
 	stopCh := make(chan struct{})
 	var isIdle atomic.Bool
+	var idleBarrierMu sync.RWMutex
 	var eventsMu sync.Mutex
 	var events []SoakMetricEvent
 
@@ -263,12 +264,18 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 				if isIdle.Load() {
 					continue
 				}
+				idleBarrierMu.RLock()
+				if isIdle.Load() {
+					idleBarrierMu.RUnlock()
+					continue
+				}
 				seq++
 				payload := []byte(fmt.Sprintf("tcp-soak-seq-%08d-time-%d", seq, time.Now().UnixNano()))
 				tcpPacketsSent.Add(1)
 
 				echo, err := client.ExchangeTCP(connTCP, payload)
 				if err != nil || !bytes.Equal(echo, payload) {
+					idleBarrierMu.RUnlock()
 					tcpContinuityPassed.Store(false)
 					addEvent("tcp_error", fmt.Sprintf("tcp exchange error at seq %d: %v", seq, err))
 					return
@@ -276,11 +283,13 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 
 				// Assert identical TCP socket identity
 				if connTCP.LocalAddr().String() != tcpLocalAddr || connTCP.RemoteAddr().String() != tcpRemoteAddr {
+					idleBarrierMu.RUnlock()
 					tcpContinuityPassed.Store(false)
 					addEvent("tcp_socket_changed", "local or remote TCP address mutated during soak")
 					return
 				}
 				tcpPacketsReceived.Add(1)
+				idleBarrierMu.RUnlock()
 			}
 		}
 	}()
@@ -307,13 +316,27 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 		var lastEchoRecv time.Time
 		var prevDiff float64
 		magic := []byte("SQUD")
+		receivedSeqs := make(map[uint64]struct{})
 
 		for {
 			select {
 			case <-stopCh:
+				if seqRecv.Load() == 0 {
+					seqMaxInterruptionNs.Store(time.Since(startTime).Nanoseconds())
+				} else if !lastEchoRecv.IsZero() {
+					gap := time.Since(lastEchoRecv).Nanoseconds()
+					if gap > seqMaxInterruptionNs.Load() {
+						seqMaxInterruptionNs.Store(gap)
+					}
+				}
 				return
 			case <-ticker.C:
 				if isIdle.Load() {
+					continue
+				}
+				idleBarrierMu.RLock()
+				if isIdle.Load() {
+					idleBarrierMu.RUnlock()
 					continue
 				}
 				seq++
@@ -331,6 +354,15 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 				_, writeErr := connSeqUDP.Write(pkt)
 				if writeErr != nil {
 					seqLost.Add(1)
+					base := lastEchoRecv
+					if base.IsZero() {
+						base = startTime
+					}
+					gap := time.Since(base).Nanoseconds()
+					if gap > seqMaxInterruptionNs.Load() {
+						seqMaxInterruptionNs.Store(gap)
+					}
+					idleBarrierMu.RUnlock()
 					continue
 				}
 
@@ -342,6 +374,13 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					echoSeq := binary.BigEndian.Uint64(resp[4:12])
 					echoSendNs := binary.BigEndian.Uint64(resp[12:20])
 					if echoSeq > 0 && echoSeq <= seq {
+						if _, dup := receivedSeqs[echoSeq]; dup {
+							// Prevent duplicate counting
+							idleBarrierMu.RUnlock()
+							continue
+						}
+						receivedSeqs[echoSeq] = struct{}{}
+
 						seqRecv.Add(1)
 						seqTotalBytes.Add(32)
 
@@ -377,16 +416,20 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 						curJitter := float64(seqJitterNs.Load())
 						newJitter := curJitter + (diff-curJitter)/16.0
 						seqJitterNs.Store(int64(newJitter))
+						idleBarrierMu.RUnlock()
 						continue
 					}
 				}
 				seqLost.Add(1)
-				if !lastEchoRecv.IsZero() {
-					gap := time.Since(lastEchoRecv).Nanoseconds()
-					if gap > seqMaxInterruptionNs.Load() {
-						seqMaxInterruptionNs.Store(gap)
-					}
+				base := lastEchoRecv
+				if base.IsZero() {
+					base = startTime
 				}
+				gap := time.Since(base).Nanoseconds()
+				if gap > seqMaxInterruptionNs.Load() {
+					seqMaxInterruptionNs.Store(gap)
+				}
+				idleBarrierMu.RUnlock()
 			}
 		}
 	}()
@@ -413,13 +456,27 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 		var lastVoipRecv time.Time
 		var prevDiff float64
 		magic := []byte("VOIP")
+		receivedSeqs := make(map[uint64]struct{})
 
 		for {
 			select {
 			case <-stopCh:
+				if voipRecv.Load() == 0 {
+					voipMaxInterruptionNs.Store(time.Since(startTime).Nanoseconds())
+				} else if !lastVoipRecv.IsZero() {
+					gap := time.Since(lastVoipRecv).Nanoseconds()
+					if gap > voipMaxInterruptionNs.Load() {
+						voipMaxInterruptionNs.Store(gap)
+					}
+				}
 				return
 			case <-ticker.C:
 				if isIdle.Load() {
+					continue
+				}
+				idleBarrierMu.RLock()
+				if isIdle.Load() {
+					idleBarrierMu.RUnlock()
 					continue
 				}
 				seq++
@@ -440,6 +497,15 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 				_, writeErr := connVoIP.Write(pkt)
 				if writeErr != nil {
 					voipLost.Add(1)
+					base := lastVoipRecv
+					if base.IsZero() {
+						base = startTime
+					}
+					gap := time.Since(base).Nanoseconds()
+					if gap > voipMaxInterruptionNs.Load() {
+						voipMaxInterruptionNs.Store(gap)
+					}
+					idleBarrierMu.RUnlock()
 					continue
 				}
 
@@ -451,6 +517,13 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					echoSeq := binary.BigEndian.Uint64(resp[4:12])
 					echoSendNs := binary.BigEndian.Uint64(resp[12:20])
 					if echoSeq > 0 && echoSeq <= seq {
+						if _, dup := receivedSeqs[echoSeq]; dup {
+							// Prevent duplicate counting
+							idleBarrierMu.RUnlock()
+							continue
+						}
+						receivedSeqs[echoSeq] = struct{}{}
+
 						voipRecv.Add(1)
 						voipTotalBytes.Add(160)
 
@@ -484,16 +557,20 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 						curJitter := float64(voipJitterNs.Load())
 						newJitter := curJitter + (diff-curJitter)/16.0
 						voipJitterNs.Store(int64(newJitter))
+						idleBarrierMu.RUnlock()
 						continue
 					}
 				}
 				voipLost.Add(1)
-				if !lastVoipRecv.IsZero() {
-					gap := time.Since(lastVoipRecv).Nanoseconds()
-					if gap > voipMaxInterruptionNs.Load() {
-						voipMaxInterruptionNs.Store(gap)
-					}
+				base := lastVoipRecv
+				if base.IsZero() {
+					base = startTime
 				}
+				gap := time.Since(base).Nanoseconds()
+				if gap > voipMaxInterruptionNs.Load() {
+					voipMaxInterruptionNs.Store(gap)
+				}
+				idleBarrierMu.RUnlock()
 			}
 		}
 	}()
@@ -556,9 +633,8 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					addEvent("idle_start", "pausing traffic for keepalive-only idle phase")
 					isIdle.Store(true)
 
-					// Allow in-flight worker iterations to finish
-					time.Sleep(100 * time.Millisecond)
-
+					// Strict sync barrier: ensure all in-flight worker iterations complete before idle phase
+					idleBarrierMu.Lock()
 					idleWait := 3 * time.Second
 					if unaccelerated {
 						idleWait = 26 * time.Second // Exceeds keepalive interval (25s)
@@ -576,6 +652,7 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					}
 
 					isIdle.Store(false)
+					idleBarrierMu.Unlock()
 					addEvent("idle_end", "idle phase completed; active application traffic resumed")
 				}
 
@@ -595,6 +672,12 @@ SoakDone:
 	voipWg.Wait()
 
 	totalDuration := time.Since(startTime)
+	if seqRecv.Load() == 0 && seqMaxInterruptionNs.Load() == 0 {
+		seqMaxInterruptionNs.Store(totalDuration.Nanoseconds())
+	}
+	if voipRecv.Load() == 0 && voipMaxInterruptionNs.Load() == 0 {
+		voipMaxInterruptionNs.Store(totalDuration.Nanoseconds())
+	}
 	addEvent("end", fmt.Sprintf("soak test ended: duration=%.2fs completedRekeys=%d", totalDuration.Seconds(), rekeyCount))
 
 	// Compile StreamStats for Sequenced UDP

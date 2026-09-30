@@ -825,6 +825,25 @@ func (h *DifferentialHarness) SetClientRekeyAfterTime(seconds int) {
 	h.rawClientConfig = strings.Join(lines, "\n")
 }
 
+// SetClientRekeyTimeout modifies the raw client config's RekeyTimeout parameter.
+func (h *DifferentialHarness) SetClientRekeyTimeout(seconds int) {
+	var lines []string
+	found := false
+	for _, line := range strings.Split(h.rawClientConfig, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RekeyTimeout") && strings.Contains(trimmed, "=") {
+			lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", seconds))
+			found = true
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	if !found {
+		lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", seconds))
+	}
+	h.rawClientConfig = strings.Join(lines, "\n")
+}
+
 // NewClient constructs an upstream AWG client device using the exact frozen client config.
 func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 	assignedAddr := netip.MustParseAddr(h.clientPeer.AllowedIP.Addr().String())

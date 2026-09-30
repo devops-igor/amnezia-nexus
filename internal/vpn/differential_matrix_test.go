@@ -862,6 +862,7 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 		randomTrailers         bool
 		contentPaddingAddition string
 		rekeyAfterTime         int
+		rekeyTimeout           int
 	}{
 		{
 			name:                   "Standard_Profile",
@@ -944,6 +945,30 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 			contentPaddingAddition: "16-64",
 			rekeyAfterTime:         2,
 		},
+		{
+			name:                   "Production_Lower_Timing_Boundary",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
+			rekeyAfterTime:         100,
+			rekeyTimeout:           4,
+		},
+		{
+			name:                   "Production_Upper_Timing_Boundary",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
+			rekeyAfterTime:         140,
+			rekeyTimeout:           6,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -974,6 +999,9 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 
 			if tc.rekeyAfterTime > 0 {
 				harness.SetClientRekeyAfterTime(tc.rekeyAfterTime)
+			}
+			if tc.rekeyTimeout > 0 {
+				harness.SetClientRekeyTimeout(tc.rekeyTimeout)
 			}
 
 			payload := []byte(fmt.Sprintf("matrix-test-%s-payload", tc.name))

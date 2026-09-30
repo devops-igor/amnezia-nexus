@@ -71,7 +71,7 @@ Fast qualification suites run in under one minute and can be executed during loc
 | Option | Description | Default |
 |---|---|---|
 | `-s, --suite <suite>` | Test suite to execute (`baseline`, `matrix`, `soak`, `lifecycle`, `all`) | `all` |
-| `--soak-full` | Run full unaccelerated 10+-rekey soak (~20-25m) instead of bounded soak | `false` |
+| `--soak-full` | Run full unaccelerated 10+-rekey soak (~40-50m total, ~20-25m each) instead of bounded soak | `false` |
 | `--race` | Enable Go race detector (`-race`) | Auto-detected |
 | `--no-race` | Force disable Go race detector | `false` |
 | `-t, --timeout <dur>` | Test timeout duration (e.g. `20m`, `60m`) | `20m` (`60m` for soak-full) |
@@ -95,8 +95,8 @@ The soak qualification suite verifies protocol durability across extended operat
    - Exercises the complete metrics engine, continuous TCP streaming, sequenced UDP stream, VoIP stream, and keepalive idle phase with a bounded rekey verification window.
 2. **Full Unaccelerated 10+-Rekey Soak (`TestDifferential_Soak_Unaccelerated10Rekey`)**:
    - Gated behind `NEXUS_SOAK_FULL=true` or `--soak-full`.
-   - Runs for ~20-25 minutes under natural production timing parameters.
-   - Observes at least 10 unforced natural rekeys on the Subject Nexus IngressEngine.
+   - Runs both Reference standalone AWG and Subject Nexus IngressEngine sequentially (~40-50m total, ~20-25m each) under natural production timing parameters.
+   - Observes at least 10 unforced natural rekeys on both Reference and Subject engines.
 
 ### Running Full Soak Locally
 
@@ -109,7 +109,7 @@ The soak qualification suite verifies protocol durability across extended operat
 
 - **Long-Lived TCP Continuity (`tcp_continuity_passed`)**: Confirms the exact same TCP socket and connection remain open and able to exchange echo payloads across all rekey events and idle phases.
 - **Sequenced UDP Stream (`sequenced_udp_stats`)**: 20 packets/sec with sequence numbers and timestamps, measuring packet delivery, loss rate, and maximum interruption gap.
-- **VoIP Small-Datagram Stream (`voip_udp_stats`)**: 50 packets/sec (160-byte payload simulating G.711 / Opus voice frames) calculating RFC 3550 interarrival jitter:
+- **VoIP Small-Datagram Stream (`voip_udp_stats`)**: 50 packets/sec (160-byte payload simulating G.711 / Opus voice frames) measuring Round-Trip Time (RTT) delay variation (`rtt_jitter_ns`) / RTT jitter based on consecutive response arrival variance:
   $$J = J + \frac{|D(i-1, i)| - J}{16}$$
 - **Idle Keepalive Phase (`idle_phase_passed`)**: Confirms session survival and immediate traffic resumption after silent periods where only persistent keepalives are exchanged.
 
@@ -151,11 +151,11 @@ gh run download --name "differential-qualification-evidence-*" --dir ./downloade
 ```
 
 Downloaded artifacts include:
-- `qualification_summary.json` — overall qualification status, durations, and privacy audit results.
-- `evidence_manifest.json` — environment details and redacted client configuration schema.
-- `soak_report_reference_*.json` — reference standalone AWG soak report.
-- `soak_report_subject_*.json` — Nexus IngressEngine soak report.
-- `non_netstack_qualification.json` — Linux client network namespace qualification report.
+- `qualification_summary.json`: overall qualification status, durations, and privacy audit results.
+- `evidence_manifest.json`: environment details and redacted client configuration schema.
+- `soak_report_reference_*.json`: reference standalone AWG soak report.
+- `soak_report_subject_*.json`: Nexus IngressEngine soak report.
+- `non_netstack_qualification.json`: Linux client network namespace qualification report.
 
 ---
 
