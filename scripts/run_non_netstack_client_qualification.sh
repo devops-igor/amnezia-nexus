@@ -34,7 +34,9 @@ CLIENT_PRIVATE_KEY=""
 SERVER_ENDPOINT=""
 ALLOWED_IPS=""
 TEMP_KEY_FILE=""
+TEMP_HP_FILE=""
 CLIENT_IP_FLAG_SET=""
+HP_KEY_FLAG_SET=""
 
 # AmneziaWG protocol parameters
 JC=4
@@ -49,34 +51,53 @@ H2="3288052141"
 H3="2528465083"
 H4="1766607858"
 HEADER_PROTECTION_KEY="AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+CONTENT_PADDING_ADDITION=""
+RANDOM_TRAILERS=""
+DISABLE_COOKIES=""
+REKEY_AFTER_TIME=""
+REKEY_TIMEOUT=""
+REJECT_AFTER_TIME=""
+KEEPALIVE_TIMEOUT=""
+MAX_HANDSHAKE_ATTEMPTS=""
+PERSISTENT_KEEPALIVE=""
 
 show_help() {
     cat << 'EOF'
 Usage: ./scripts/run_non_netstack_client_qualification.sh [OPTIONS]
 
 Options:
-  -d, --dry-run                 Simulate execution plan without requiring root/sudo
-                                (Default: false)
-  --config <path>               Path to client .conf configuration file
-  --server-public-key <key>     Server AmneziaWG public key (base64)
-  --client-private-key <key>    Client AmneziaWG private key (base64)
-  --server-endpoint <endpoint>  Server outer UDP endpoint (host:port or IP:port)
-  --underlay-host-ip <ip/cidr>  Host veth underlay IP address
-                                (Default: 10.254.250.1/30)
-  --underlay-client-ip <ip/cidr> Client veth underlay IP inside namespace
-                                (Default: 10.254.250.2/30)
-  -i, --interface <name>        AmneziaWG client interface name
-                                (Default: awg-client0)
-  -n, --netns <name>            Isolated Linux network namespace name
-                                (Default: nexus-client-ns)
-  -p, --server-port <port>      Subject/reference server UDP listen port
-                                (Default: 51820)
-  -c, --client-ip <ip/cidr>     Client tunnel IP address
-                                (Default: 10.100.9.2/32)
-  -o, --output-dir <path>       Directory to save qualification report
-                                (Default: ./test-artifacts)
-  -v, --verbose                 Enable verbose debugging output
-  -h, --help                    Show this help message and exit
+  -d, --dry-run                     Simulate execution plan without requiring root/sudo
+                                    (Default: false)
+  --config <path>                   Path to client .conf configuration file
+  --server-public-key <key>         Server AmneziaWG public key (base64)
+  --client-private-key <key>        Client AmneziaWG private key (base64)
+  --server-endpoint <endpoint>      Server outer UDP endpoint (host:port or IP:port)
+  --underlay-host-ip <ip/cidr>      Host veth underlay IP address
+                                    (Default: 10.254.250.1/30)
+  --underlay-client-ip <ip/cidr>    Client veth underlay IP inside namespace
+                                    (Default: 10.254.250.2/30)
+  -i, --interface <name>            AmneziaWG client interface name
+                                    (Default: awg-client0)
+  -n, --netns <name>                Isolated Linux network namespace name
+                                    (Default: nexus-client-ns)
+  -p, --server-port <port>          Subject/reference server UDP listen port
+                                    (Default: 51820)
+  -c, --client-ip <ip/cidr>         Client tunnel IP address
+                                    (Default: 10.100.9.2/32)
+  --header-protection-key <key>     Header protection key (base64)
+  --content-padding-addition <val>  Content padding addition range (e.g. 16-64)
+  --random-trailers <val>           Random trailers setting (e.g. on, true, 1)
+  --disable-cookies <val>           Disable cookies setting (e.g. on, true, 1)
+  --rekey-after-time <val>          Rekey after time in seconds
+  --rekey-timeout <val>             Rekey timeout in seconds
+  --reject-after-time <val>         Reject after time in seconds
+  --keepalive-timeout <val>         Keepalive timeout in seconds
+  --max-handshake-attempts <val>    Max handshake attempts count
+  --persistent-keepalive <val>      Persistent keepalive interval in seconds
+  -o, --output-dir <path>           Directory to save qualification report
+                                    (Default: ./test-artifacts)
+  -v, --verbose                     Enable verbose debugging output
+  -h, --help                        Show this help message and exit
 
 Description:
   This script qualifies the client-facing AmneziaWG engine with a real Linux
@@ -85,13 +106,14 @@ Description:
 
   In live mode with root/sudo, it:
     1. Creates an isolated network namespace ($NETNS).
-    2. Establishes host-netns veth underlay ($VETH_HOST <-> $VETH_CLIENT).
-    3. Instantiates a real AmneziaWG interface ($IFACE) inside $NETNS.
-    4. Configures peer via awg set with obfuscation parameters and keys.
-    5. Validates handshake completion via awg show latest-handshakes.
+    2. Establishes host-netns veth underlay ($VETH_HOST <-> $VETH_CLIENT) and outer route.
+    3. Instantiates AmneziaWG interface ($IFACE) and configures peer via awg set
+       with device options strictly before peer options.
+    4. Brings interface up, installs inner tunnel route ($PORTAL_IP/32 dev $IFACE).
+    5. Sends initial trigger traffic into tunnel and polls for genuine handshake completion.
     6. Executes payload-verified TCP and UDP echo against portal IP:40001.
-    7. Verifies interface link down/up reconnect resilience.
-    8. Atomically tears down namespace, veth, and interface resources via trap cleanup.
+    7. Validates interface reconnect resilience via down/up bounce and post-bounce echo.
+    8. Atomically tears down namespace, veth, interface, and key files via trap cleanup.
 
   In --dry-run mode, it simulates the underlay, peer configuration, and traffic
   plans, and produces a sanitized qualification report with SKIPPED status.
@@ -116,47 +138,75 @@ parse_config() {
             local key val
             key="$(echo "${BASH_REMATCH[1]}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             val="$(echo "${BASH_REMATCH[2]}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            val="$(echo "$val" | sed -e 's/[[:space:]]*[#;].*$//')"
             case "$key" in
-                Address)
+                Address|address)
                     if [[ -z "$CLIENT_IP_FLAG_SET" ]]; then
                         CLIENT_IP="$val"
                     fi
                     ;;
-                PrivateKey)
+                PrivateKey|private-key|private_key)
                     if [[ -z "$CLIENT_PRIVATE_KEY" ]]; then
                         CLIENT_PRIVATE_KEY="$val"
                     fi
                     ;;
-                PublicKey)
+                PublicKey|public-key|public_key)
                     if [[ -z "$SERVER_PUBLIC_KEY" ]]; then
                         SERVER_PUBLIC_KEY="$val"
                     fi
                     ;;
-                Endpoint)
+                Endpoint|endpoint)
                     if [[ -z "$SERVER_ENDPOINT" ]]; then
                         SERVER_ENDPOINT="$val"
                     fi
                     ;;
-                AllowedIPs)
+                AllowedIPs|allowed-ips|allowed_ips)
                     if [[ -z "$ALLOWED_IPS" ]]; then
                         ALLOWED_IPS="$val"
                     fi
                     ;;
-                Jc) JC="$val" ;;
-                Jmin) JMIN="$val" ;;
-                Jmax) JMAX="$val" ;;
-                S1) S1="$val" ;;
-                S2) S2="$val" ;;
-                S3) S3="$val" ;;
-                S4) S4="$val" ;;
-                H1) H1="$val" ;;
-                H2) H2="$val" ;;
-                H3) H3="$val" ;;
-                H4) H4="$val" ;;
-                HeaderProtectionKey)
-                    if [[ -n "$val" ]]; then
+                Jc|jc) JC="$val" ;;
+                Jmin|jmin) JMIN="$val" ;;
+                Jmax|jmax) JMAX="$val" ;;
+                S1|s1) S1="$val" ;;
+                S2|s2) S2="$val" ;;
+                S3|s3) S3="$val" ;;
+                S4|s4) S4="$val" ;;
+                H1|h1) H1="$val" ;;
+                H2|h2) H2="$val" ;;
+                H3|h3) H3="$val" ;;
+                H4|h4) H4="$val" ;;
+                HeaderProtectionKey|header-protection-key|header_protection_key)
+                    if [[ -z "$HP_KEY_FLAG_SET" ]]; then
                         HEADER_PROTECTION_KEY="$val"
                     fi
+                    ;;
+                ContentPaddingAddition|content-padding-addition|content_padding_addition)
+                    CONTENT_PADDING_ADDITION="$val"
+                    ;;
+                RandomTrailers|random-trailers|random_trailers)
+                    RANDOM_TRAILERS="$val"
+                    ;;
+                DisableCookies|disable-cookies|disable_cookies)
+                    DISABLE_COOKIES="$val"
+                    ;;
+                RekeyAfterTime|rekey-after-time|rekey_after_time)
+                    REKEY_AFTER_TIME="$val"
+                    ;;
+                RekeyTimeout|rekey-timeout|rekey_timeout)
+                    REKEY_TIMEOUT="$val"
+                    ;;
+                RejectAfterTime|reject-after-time|reject_after_time)
+                    REJECT_AFTER_TIME="$val"
+                    ;;
+                KeepaliveTimeout|keepalive-timeout|keepalive_timeout)
+                    KEEPALIVE_TIMEOUT="$val"
+                    ;;
+                MaxHandshakeAttempts|max-handshake-attempts|max_handshake_attempts)
+                    MAX_HANDSHAKE_ATTEMPTS="$val"
+                    ;;
+                PersistentKeepalive|persistent-keepalive|persistent_keepalive)
+                    PERSISTENT_KEEPALIVE="$val"
                     ;;
             esac
         fi
@@ -211,6 +261,91 @@ while [[ $# -gt 0 ]]; do
             CLIENT_IP_FLAG_SET=true
             shift 2
             ;;
+        --header-protection-key)
+            HEADER_PROTECTION_KEY="$2"
+            HP_KEY_FLAG_SET=true
+            shift 2
+            ;;
+        --content-padding-addition)
+            CONTENT_PADDING_ADDITION="$2"
+            shift 2
+            ;;
+        --random-trailers)
+            RANDOM_TRAILERS="$2"
+            shift 2
+            ;;
+        --disable-cookies)
+            DISABLE_COOKIES="$2"
+            shift 2
+            ;;
+        --rekey-after-time)
+            REKEY_AFTER_TIME="$2"
+            shift 2
+            ;;
+        --rekey-timeout)
+            REKEY_TIMEOUT="$2"
+            shift 2
+            ;;
+        --reject-after-time)
+            REJECT_AFTER_TIME="$2"
+            shift 2
+            ;;
+        --keepalive-timeout)
+            KEEPALIVE_TIMEOUT="$2"
+            shift 2
+            ;;
+        --max-handshake-attempts)
+            MAX_HANDSHAKE_ATTEMPTS="$2"
+            shift 2
+            ;;
+        --persistent-keepalive)
+            PERSISTENT_KEEPALIVE="$2"
+            shift 2
+            ;;
+        --jc)
+            JC="$2"
+            shift 2
+            ;;
+        --jmin)
+            JMIN="$2"
+            shift 2
+            ;;
+        --jmax)
+            JMAX="$2"
+            shift 2
+            ;;
+        --s1)
+            S1="$2"
+            shift 2
+            ;;
+        --s2)
+            S2="$2"
+            shift 2
+            ;;
+        --s3)
+            S3="$2"
+            shift 2
+            ;;
+        --s4)
+            S4="$2"
+            shift 2
+            ;;
+        --h1)
+            H1="$2"
+            shift 2
+            ;;
+        --h2)
+            H2="$2"
+            shift 2
+            ;;
+        --h3)
+            H3="$2"
+            shift 2
+            ;;
+        --h4)
+            H4="$2"
+            shift 2
+            ;;
         -o|--output-dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -236,6 +371,11 @@ if [[ -n "$CONFIG_FILE" ]]; then
         echo "ERROR: Configuration file '$CONFIG_FILE' not found." >&2
         exit 1
     fi
+    # If header protection key was not explicitly provided on the CLI, reset it
+    # so we faithfully derive HP presence/absence from the configuration file.
+    if [[ -z "$HP_KEY_FLAG_SET" ]]; then
+        HEADER_PROTECTION_KEY=""
+    fi
     parse_config "$CONFIG_FILE"
 fi
 
@@ -245,6 +385,8 @@ UNDERLAY_CLIENT_ADDR="${UNDERLAY_CLIENT_IP%/*}"
 if [[ -z "$SERVER_ENDPOINT" ]]; then
     SERVER_ENDPOINT="${UNDERLAY_HOST_ADDR}:${SERVER_PORT}"
 fi
+
+SERVER_ENDPOINT_IP="${SERVER_ENDPOINT%:*}"
 
 if [[ -z "$ALLOWED_IPS" ]]; then
     ALLOWED_IPS="${PORTAL_IP}/32"
@@ -299,6 +441,9 @@ cleanup() {
         if [[ -n "${TEMP_KEY_FILE:-}" && -f "$TEMP_KEY_FILE" ]]; then
             rm -f "$TEMP_KEY_FILE"
         fi
+        if [[ -n "${TEMP_HP_FILE:-}" && -f "$TEMP_HP_FILE" ]]; then
+            rm -f "$TEMP_HP_FILE"
+        fi
         if [[ -n "$NETNS" ]]; then
             if $SUDO_CMD ip netns list 2>/dev/null | grep -qw "$NETNS"; then
                 echo "    Deleting interface '$IFACE' in namespace '$NETNS'..."
@@ -340,37 +485,85 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "    Status: OK (Dry-Run: Prerequisites checked)"
 
     echo ""
-    echo "==> [Step 2/6] Planning host-netns veth underlay..."
+    echo "==> [Step 2/6] Planning host-netns veth underlay and outer routing..."
     echo "    Command: ip link add $VETH_HOST type veth peer name $VETH_CLIENT"
     echo "    Command: ip link set $VETH_CLIENT netns $NETNS"
     echo "    Command: ip addr add $UNDERLAY_HOST_IP dev $VETH_HOST"
     echo "    Command: ip link set $VETH_HOST up"
     echo "    Command: ip -netns $NETNS addr add $UNDERLAY_CLIENT_IP dev $VETH_CLIENT"
     echo "    Command: ip -netns $NETNS link set $VETH_CLIENT up"
-    echo "    Command: ip -netns $NETNS route add default via $UNDERLAY_HOST_ADDR dev $VETH_CLIENT"
-    echo "    Status: OK (Dry-Run: Underlay network planned)"
+    echo "    Command: ip -netns $NETNS route add $UNDERLAY_HOST_ADDR/32 dev $VETH_CLIENT"
+    if [[ "$SERVER_ENDPOINT_IP" != "$UNDERLAY_HOST_ADDR" ]]; then
+        echo "    Command: ip -netns $NETNS route add $SERVER_ENDPOINT_IP/32 via $UNDERLAY_HOST_ADDR dev $VETH_CLIENT"
+    fi
+    echo "    Status: OK (Dry-Run: Underlay network and outer endpoint route planned)"
 
     echo ""
     echo "==> [Step 3/6] Planning client interface creation with AmneziaWG obfuscation..."
     echo "    Command: ip link add dev $IFACE type amneziawg (or amneziawg-go $IFACE)"
     echo "    Command: ip link set $IFACE netns $NETNS"
     echo "    Command: ip -netns $NETNS addr add $CLIENT_IP dev $IFACE"
-    echo "    Command: awg set $IFACE private-key <ephemeral-key> listen-port 0 peer <server-pubkey> endpoint $SERVER_ENDPOINT allowed-ips $ALLOWED_IPS jc $JC jmin $JMIN jmax $JMAX s1 $S1 s2 $S2 s3 $S3 s4 $S4 h1 $H1 h2 $H2 h3 $H3 h4 $H4"
+
+    sim_awg_cmd="awg set $IFACE private-key <ephemeral-key> listen-port 0 jc $JC jmin $JMIN jmax $JMAX s1 $S1 s2 $S2 s3 $S3 s4 $S4 h1 $H1 h2 $H2 h3 $H3 h4 $H4"
+    if [[ -n "$HEADER_PROTECTION_KEY" ]]; then
+        sim_awg_cmd+=" header-protection-key <hp-key-file>"
+    fi
+    if [[ -n "$CONTENT_PADDING_ADDITION" ]]; then
+        sim_awg_cmd+=" content-padding-addition $CONTENT_PADDING_ADDITION"
+    fi
+    if [[ -n "$RANDOM_TRAILERS" ]]; then
+        sim_awg_cmd+=" random-trailers $RANDOM_TRAILERS"
+    fi
+    if [[ -n "$DISABLE_COOKIES" ]]; then
+        sim_awg_cmd+=" disable-cookies $DISABLE_COOKIES"
+    fi
+    if [[ -n "$REKEY_AFTER_TIME" ]]; then
+        sim_awg_cmd+=" rekey-after-time $REKEY_AFTER_TIME"
+    fi
+    if [[ -n "$REKEY_TIMEOUT" ]]; then
+        sim_awg_cmd+=" rekey-timeout $REKEY_TIMEOUT"
+    fi
+    if [[ -n "$REJECT_AFTER_TIME" ]]; then
+        sim_awg_cmd+=" reject-after-time $REJECT_AFTER_TIME"
+    fi
+    if [[ -n "$KEEPALIVE_TIMEOUT" ]]; then
+        sim_awg_cmd+=" keepalive-timeout $KEEPALIVE_TIMEOUT"
+    fi
+    if [[ -n "$MAX_HANDSHAKE_ATTEMPTS" ]]; then
+        sim_awg_cmd+=" max-handshake-attempts $MAX_HANDSHAKE_ATTEMPTS"
+    fi
+    sim_awg_cmd+=" peer <server-pubkey> endpoint $SERVER_ENDPOINT allowed-ips $ALLOWED_IPS"
+    if [[ -n "$PERSISTENT_KEEPALIVE" ]]; then
+        sim_awg_cmd+=" persistent-keepalive $PERSISTENT_KEEPALIVE"
+    fi
+
+    echo "    Command: $sim_awg_cmd"
     echo "    Command: ip -netns $NETNS link set $IFACE up"
+    echo "    Command: ip -netns $NETNS route add $PORTAL_IP/32 dev $IFACE"
+    if [[ "$ALLOWED_IPS" == "0.0.0.0/0" ]]; then
+        echo "    Command: ip -netns $NETNS route add default dev $IFACE"
+    fi
     echo "    AmneziaWG Parameters: Jc=$JC, Jmin=$JMIN, Jmax=$JMAX, S1=$S1, S2=$S2, S3=$S3, S4=$S4, H1=$H1, H2=$H2, H3=$H3, H4=$H4"
     echo "    Status: OK (Dry-Run: Simulated plan verified)"
 
     echo ""
-    echo "==> [Step 4/6] Simulating handshake and payload-verified traffic exchange..."
+    echo "==> [Step 4/6] Simulating handshake trigger and payload-verified traffic exchange..."
     echo "    AmneziaWG Outer Endpoint:   $SERVER_ENDPOINT"
     echo "    Target Portal IP:           $PORTAL_IP:40001"
+    echo "    Handshake Trigger:          Initial tunnel packet into $IFACE"
+    echo "    Handshake Verification:     Poll awg show $IFACE latest-handshakes"
     echo "    Probe Payload Verification: Unique random token comparison (TCP and UDP echo)"
     echo "    Status: SKIPPED (Dry-Run: Live traffic not executed in simulation mode)"
 
     echo ""
-    echo "==> [Step 5/6] Simulating interface bounce plan..."
+    echo "==> [Step 5/6] Simulating interface bounce and reconnect resilience..."
     echo "    Command: ip -netns $NETNS link set $IFACE down"
     echo "    Command: ip -netns $NETNS link set $IFACE up"
+    echo "    Command: ip -netns $NETNS route add $PORTAL_IP/32 dev $IFACE"
+    if [[ "$ALLOWED_IPS" == "0.0.0.0/0" ]]; then
+        echo "    Command: ip -netns $NETNS route add default dev $IFACE"
+    fi
+    echo "    Post-Bounce Traffic Check:  Payload-verified echo over reconnected interface"
     echo "    Status: SKIPPED (Dry-Run: Interface bounce simulated)"
 
     echo ""
@@ -427,8 +620,12 @@ else
         $SUDO_CMD ip link set "$VETH_HOST" up
         $SUDO_CMD ip -netns "$NETNS" addr add "$UNDERLAY_CLIENT_IP" dev "$VETH_CLIENT"
         $SUDO_CMD ip -netns "$NETNS" link set "$VETH_CLIENT" up
-        $SUDO_CMD ip -netns "$NETNS" route add "$UNDERLAY_HOST_ADDR" dev "$VETH_CLIENT" 2>/dev/null || true
-        $SUDO_CMD ip -netns "$NETNS" route add default via "$UNDERLAY_HOST_ADDR" dev "$VETH_CLIENT" 2>/dev/null || true
+
+        # Route outer endpoint specifically through $VETH_CLIENT (do NOT add default route to $VETH_CLIENT):
+        $SUDO_CMD ip -netns "$NETNS" route add "$UNDERLAY_HOST_ADDR/32" dev "$VETH_CLIENT" 2>/dev/null || true
+        if [[ "$SERVER_ENDPOINT_IP" != "$UNDERLAY_HOST_ADDR" ]]; then
+            $SUDO_CMD ip -netns "$NETNS" route add "$SERVER_ENDPOINT_IP/32" via "$UNDERLAY_HOST_ADDR" dev "$VETH_CLIENT" 2>/dev/null || true
+        fi
         echo "    Underlay established: host ($VETH_HOST: $UNDERLAY_HOST_IP) <-> netns ($VETH_CLIENT: $UNDERLAY_CLIENT_IP)."
 
         echo ""
@@ -460,64 +657,134 @@ else
             echo "$CLIENT_PRIVATE_KEY" > "$TEMP_KEY_FILE"
             chmod 600 "$TEMP_KEY_FILE"
 
-            $SUDO_CMD ip netns exec "$NETNS" awg set "$IFACE" \
-                private-key "$TEMP_KEY_FILE" \
-                listen-port 0 \
-                peer "$SERVER_PUBLIC_KEY" \
-                endpoint "$SERVER_ENDPOINT" \
-                allowed-ips "$ALLOWED_IPS" \
-                jc "$JC" \
-                jmin "$JMIN" \
-                jmax "$JMAX" \
-                s1 "$S1" \
-                s2 "$S2" \
-                s3 "$S3" \
-                s4 "$S4" \
-                h1 "$H1" \
-                h2 "$H2" \
-                h3 "$H3" \
-                h4 "$H4"
-
-            rm -f "$TEMP_KEY_FILE"
-            TEMP_KEY_FILE=""
-
-            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" up
-            echo "    Peer configured via awg set with obfuscation parameters."
-
-            echo ""
-            echo "==> [Step 4/6] Validating interface down/up reconnect..."
-            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" down
-            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" up
-            if [[ $($SUDO_CMD ip -netns "$NETNS" link show dev "$IFACE" 2>/dev/null | grep -c "state UP") -ge 1 ]]; then
-                RECONNECT_VERIFIED=true
-                echo "    Interface successfully cycled down and up."
+            if [[ -n "$HEADER_PROTECTION_KEY" ]]; then
+                TEMP_HP_FILE=$(mktemp -p "$OUTPUT_DIR" .awg-hp-XXXXXX 2>/dev/null || echo "${OUTPUT_DIR}/.awg-hp-$$-${RANDOM}")
+                echo "$HEADER_PROTECTION_KEY" > "$TEMP_HP_FILE"
+                chmod 600 "$TEMP_HP_FILE"
             fi
 
-            echo ""
-            echo "==> [Step 5/6] Probing handshake and payload-verified traffic..."
-            sleep 1
+            AWG_DEVICE_ARGS=(
+                private-key "$TEMP_KEY_FILE"
+                listen-port 0
+                jc "$JC"
+                jmin "$JMIN"
+                jmax "$JMAX"
+                s1 "$S1"
+                s2 "$S2"
+                s3 "$S3"
+                s4 "$S4"
+                h1 "$H1"
+                h2 "$H2"
+                h3 "$H3"
+                h4 "$H4"
+            )
 
-            if command -v awg >/dev/null 2>&1; then
-                latest_hs=$($SUDO_CMD ip netns exec "$NETNS" awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
-                if [[ -n "$latest_hs" && "$latest_hs" -gt 0 ]]; then
+            if [[ -n "$TEMP_HP_FILE" ]]; then
+                AWG_DEVICE_ARGS+=(header-protection-key "$TEMP_HP_FILE")
+            fi
+            if [[ -n "$CONTENT_PADDING_ADDITION" ]]; then
+                AWG_DEVICE_ARGS+=(content-padding-addition "$CONTENT_PADDING_ADDITION")
+            fi
+            if [[ -n "$RANDOM_TRAILERS" ]]; then
+                AWG_DEVICE_ARGS+=(random-trailers "$RANDOM_TRAILERS")
+            fi
+            if [[ -n "$DISABLE_COOKIES" ]]; then
+                AWG_DEVICE_ARGS+=(disable-cookies "$DISABLE_COOKIES")
+            fi
+            if [[ -n "$REKEY_AFTER_TIME" ]]; then
+                AWG_DEVICE_ARGS+=(rekey-after-time "$REKEY_AFTER_TIME")
+            fi
+            if [[ -n "$REKEY_TIMEOUT" ]]; then
+                AWG_DEVICE_ARGS+=(rekey-timeout "$REKEY_TIMEOUT")
+            fi
+            if [[ -n "$REJECT_AFTER_TIME" ]]; then
+                AWG_DEVICE_ARGS+=(reject-after-time "$REJECT_AFTER_TIME")
+            fi
+            if [[ -n "$KEEPALIVE_TIMEOUT" ]]; then
+                AWG_DEVICE_ARGS+=(keepalive-timeout "$KEEPALIVE_TIMEOUT")
+            fi
+            if [[ -n "$MAX_HANDSHAKE_ATTEMPTS" ]]; then
+                AWG_DEVICE_ARGS+=(max-handshake-attempts "$MAX_HANDSHAKE_ATTEMPTS")
+            fi
+
+            AWG_PEER_ARGS=(
+                peer "$SERVER_PUBLIC_KEY"
+                endpoint "$SERVER_ENDPOINT"
+                allowed-ips "$ALLOWED_IPS"
+            )
+            if [[ -n "$PERSISTENT_KEEPALIVE" ]]; then
+                AWG_PEER_ARGS+=(persistent-keepalive "$PERSISTENT_KEEPALIVE")
+            fi
+
+            $SUDO_CMD ip netns exec "$NETNS" awg set "$IFACE" \
+                "${AWG_DEVICE_ARGS[@]}" \
+                "${AWG_PEER_ARGS[@]}"
+
+            if [[ -n "$TEMP_KEY_FILE" && -f "$TEMP_KEY_FILE" ]]; then
+                rm -f "$TEMP_KEY_FILE"
+                TEMP_KEY_FILE=""
+            fi
+            if [[ -n "$TEMP_HP_FILE" && -f "$TEMP_HP_FILE" ]]; then
+                rm -f "$TEMP_HP_FILE"
+                TEMP_HP_FILE=""
+            fi
+
+            # Bring interface UP
+            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" up
+
+            # Install inner tunnel route
+            $SUDO_CMD ip -netns "$NETNS" route add "$PORTAL_IP/32" dev "$IFACE" 2>/dev/null || true
+            if [[ "$ALLOWED_IPS" == "0.0.0.0/0" ]]; then
+                $SUDO_CMD ip -netns "$NETNS" route add default dev "$IFACE" 2>/dev/null || true
+            fi
+            echo "    Peer configured via awg set with device options strictly before peer options."
+            echo "    Interface '$IFACE' brought up and inner tunnel route to $PORTAL_IP/32 installed."
+
+            echo ""
+            echo "==> [Step 4/6] Triggering handshake and verifying bidirectional traffic..."
+
+            # Send initial trigger traffic into tunnel to prompt WireGuard/AmneziaWG handshake initiation
+            echo "    Sending initial tunnel packet to trigger handshake initiation..."
+            $SUDO_CMD ip netns exec "$NETNS" ping -c 1 -W 1 "$PORTAL_IP" >/dev/null 2>&1 || true
+            if command -v nc >/dev/null 2>&1; then
+                echo -n "handshake-trigger" | $SUDO_CMD ip netns exec "$NETNS" timeout 1 nc -u -w 1 "$PORTAL_IP" 40001 >/dev/null 2>&1 || true
+            fi
+
+            # Poll awg show "$IFACE" latest-handshakes until timestamp > 0 (timeout ~10s)
+            echo "    Polling for AmneziaWG handshake completion (timeout 10s)..."
+            HS_START=$(date +%s)
+            while [[ $(( $(date +%s) - HS_START )) -lt 10 ]]; do
+                latest_hs=0
+                if command -v awg >/dev/null 2>&1; then
+                    latest_hs=$($SUDO_CMD ip netns exec "$NETNS" awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
+                elif command -v wg >/dev/null 2>&1; then
+                    latest_hs=$($SUDO_CMD ip netns exec "$NETNS" wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
+                fi
+
+                if [[ -n "$latest_hs" && "$latest_hs" =~ ^[0-9]+$ && "$latest_hs" -gt 0 ]]; then
                     HANDSHAKE_VERIFIED=true
                     echo "    Genuine latest handshake verified: timestamp $latest_hs."
+                    break
                 fi
+
+                # Retrigger packet if handshake not yet completed
+                $SUDO_CMD ip netns exec "$NETNS" ping -c 1 -W 1 "$PORTAL_IP" >/dev/null 2>&1 || true
+                sleep 1
+            done
+
+            if [[ "$HANDSHAKE_VERIFIED" != "true" ]]; then
+                echo "    WARNING: Handshake was not completed within timeout."
             fi
 
-            # Real ICMP ping check to portal IP (1 count, 1s timeout)
-            PING_OK=false
-            if $SUDO_CMD ip netns exec "$NETNS" ping -c 1 -W 1 "$PORTAL_IP" >/dev/null 2>&1; then
-                PING_OK=true
-            fi
-
-            # Payload-verified TCP and UDP echo
+            # Verify TCP and UDP echo payloads against unique probe tokens
             if command -v nc >/dev/null 2>&1; then
                 TCP_PROBE_TOKEN="probe-tcp-$(date +%s%N)-$RANDOM"
                 TCP_RECEIVED=$(echo -n "$TCP_PROBE_TOKEN" | $SUDO_CMD ip netns exec "$NETNS" timeout 3 nc -w 2 "$PORTAL_IP" 40001 2>/dev/null || true)
                 if [[ "$TCP_RECEIVED" == "$TCP_PROBE_TOKEN" ]]; then
                     TCP_ECHO_VERIFIED=true
                     echo "    Payload-verified TCP echo: PASS (returned bytes match probe token)."
+                else
+                    echo "    Payload-verified TCP echo: FAIL (token mismatch or timeout)."
                 fi
 
                 UDP_PROBE_TOKEN="probe-udp-$(date +%s%N)-$RANDOM"
@@ -528,21 +795,87 @@ else
                 if [[ "$UDP_RECEIVED" == "$UDP_PROBE_TOKEN" ]]; then
                     UDP_ECHO_VERIFIED=true
                     echo "    Payload-verified UDP echo: PASS (returned bytes match probe token)."
+                else
+                    echo "    Payload-verified UDP echo: FAIL (token mismatch or timeout)."
+                fi
+            else
+                echo "    Notice: nc (netcat) tool not available for TCP/UDP echo verification."
+            fi
+
+            echo ""
+            echo "==> [Step 5/6] Validating interface down/up bounce and reconnect resilience..."
+            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" down
+            sleep 1
+            $SUDO_CMD ip -netns "$NETNS" link set "$IFACE" up
+
+            # Re-ensure inner tunnel route after bounce
+            $SUDO_CMD ip -netns "$NETNS" route add "$PORTAL_IP/32" dev "$IFACE" 2>/dev/null || true
+            if [[ "$ALLOWED_IPS" == "0.0.0.0/0" ]]; then
+                $SUDO_CMD ip -netns "$NETNS" route add default dev "$IFACE" 2>/dev/null || true
+            fi
+
+            LINK_UP=false
+            if [[ $($SUDO_CMD ip -netns "$NETNS" link show dev "$IFACE" 2>/dev/null | grep -c "state UP") -ge 1 ]]; then
+                LINK_UP=true
+                echo "    Interface successfully brought back UP."
+            fi
+
+            # Send post-bounce probes, and set reconnect_resilience_verified=true only if post-bounce echo succeeds and link is UP
+            POST_BOUNCE_ECHO_OK=false
+            if [[ "$LINK_UP" == "true" ]] && command -v nc >/dev/null 2>&1; then
+                # Trigger packet
+                $SUDO_CMD ip netns exec "$NETNS" ping -c 1 -W 1 "$PORTAL_IP" >/dev/null 2>&1 || true
+
+                POST_TCP_PROBE_TOKEN="probe-post-tcp-$(date +%s%N)-$RANDOM"
+                POST_TCP_RECEIVED=$(echo -n "$POST_TCP_PROBE_TOKEN" | $SUDO_CMD ip netns exec "$NETNS" timeout 3 nc -w 2 "$PORTAL_IP" 40001 2>/dev/null || true)
+                POST_TCP_OK=false
+                if [[ "$POST_TCP_RECEIVED" == "$POST_TCP_PROBE_TOKEN" ]]; then
+                    POST_TCP_OK=true
+                fi
+
+                POST_UDP_PROBE_TOKEN="probe-post-udp-$(date +%s%N)-$RANDOM"
+                POST_UDP_RECEIVED=$(echo -n "$POST_UDP_PROBE_TOKEN" | $SUDO_CMD ip netns exec "$NETNS" timeout 3 nc -u -w 2 "$PORTAL_IP" 40001 2>/dev/null || true)
+                if [[ -z "$POST_UDP_RECEIVED" ]]; then
+                    POST_UDP_RECEIVED=$(echo -n "$POST_UDP_PROBE_TOKEN" | $SUDO_CMD ip netns exec "$NETNS" timeout 3 nc -u -w 2 -W 1 "$PORTAL_IP" 40001 2>/dev/null || true)
+                fi
+                POST_UDP_OK=false
+                if [[ "$POST_UDP_RECEIVED" == "$POST_UDP_PROBE_TOKEN" ]]; then
+                    POST_UDP_OK=true
+                fi
+
+                if [[ "$POST_TCP_OK" == "true" && "$POST_UDP_OK" == "true" ]]; then
+                    POST_BOUNCE_ECHO_OK=true
+                    echo "    Post-bounce echo payload verification: PASS (TCP and UDP echo match tokens)."
+                else
+                    echo "    Post-bounce echo payload verification: FAIL (post_tcp=$POST_TCP_OK, post_udp=$POST_UDP_OK)."
                 fi
             fi
 
-            if [[ "$HANDSHAKE_VERIFIED" == "true" && "$TCP_ECHO_VERIFIED" == "true" && "$UDP_ECHO_VERIFIED" == "true" ]]; then
+            if [[ "$LINK_UP" == "true" && "$POST_BOUNCE_ECHO_OK" == "true" ]]; then
+                RECONNECT_VERIFIED=true
+                echo "    Reconnect resilience: PASS (link UP and post-bounce echo verified)."
+            else
+                RECONNECT_VERIFIED=false
+                echo "    Reconnect resilience: FAIL (link_up=$LINK_UP, post_bounce_echo=$POST_BOUNCE_ECHO_OK)."
+            fi
+
+            if [[ "$HANDSHAKE_VERIFIED" == "true" && "$TCP_ECHO_VERIFIED" == "true" && "$UDP_ECHO_VERIFIED" == "true" && "$RECONNECT_VERIFIED" == "true" ]]; then
                 TEST_STATUS="PASS"
-                REPORT_NOTE="Live network namespace client traffic verified."
+                REPORT_NOTE="Live network namespace client traffic and reconnect resilience verified."
             else
                 TEST_STATUS="FAIL"
-                REPORT_NOTE="Live network namespace initialized but no traffic or handshake was completed against server."
+                REPORT_NOTE="Live network namespace client qualification failed (handshake=$HANDSHAKE_VERIFIED, tcp=$TCP_ECHO_VERIFIED, udp=$UDP_ECHO_VERIFIED, reconnect=$RECONNECT_VERIFIED)."
             fi
         fi
     fi
 fi
 
 TOTAL_DURATION=$(( $(date +%s) - START_EPOCH ))
+
+HP_REPORT_STATUS="<absent>"
+if [[ -n "$HEADER_PROTECTION_KEY" ]]; then
+    HP_REPORT_STATUS="<present-32B>"
+fi
 
 # Write Qualification Report Artifact
 cat > "$REPORT_FILE" << EOF
@@ -574,7 +907,7 @@ cat > "$REPORT_FILE" << EOF
     "h2": "$H2",
     "h3": "$H3",
     "h4": "$H4",
-    "header_protection": "<present-32B>"
+    "header_protection": "$HP_REPORT_STATUS"
   },
   "handshake_verified": $HANDSHAKE_VERIFIED,
   "tcp_echo_verified": $TCP_ECHO_VERIFIED,
