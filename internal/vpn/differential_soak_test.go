@@ -338,42 +338,54 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 				n, readErr := connSeqUDP.Read(resp)
 				recvTime := time.Now()
 
-				if readErr == nil && n == 32 && bytes.Equal(resp[:32], pkt) {
-					seqRecv.Add(1)
-					seqTotalBytes.Add(32)
+				if readErr == nil && n == 32 && bytes.Equal(resp[:4], magic) {
+					echoSeq := binary.BigEndian.Uint64(resp[4:12])
+					echoSendNs := binary.BigEndian.Uint64(resp[12:20])
+					if echoSeq > 0 && echoSeq <= seq {
+						seqRecv.Add(1)
+						seqTotalBytes.Add(32)
 
-					rtt := recvTime.Sub(sendTime)
-					rttNs := rtt.Nanoseconds()
-					seqRTTTotalNs.Add(rttNs)
-					seqRTTCount.Add(1)
-
-					if rttNs > seqMaxRTTNs.Load() {
-						seqMaxRTTNs.Store(rttNs)
-					}
-					for {
-						curMin := seqMinRTTNs.Load()
-						if rttNs >= curMin || seqMinRTTNs.CompareAndSwap(curMin, rttNs) {
-							break
+						rttNs := recvTime.Sub(time.Unix(0, int64(echoSendNs))).Nanoseconds()
+						if rttNs < 0 {
+							rttNs = 0
 						}
-					}
+						seqRTTTotalNs.Add(rttNs)
+						seqRTTCount.Add(1)
 
-					// Interruption calculation
-					if !lastEchoRecv.IsZero() {
-						interruption := recvTime.Sub(lastEchoRecv).Nanoseconds()
-						if interruption > seqMaxInterruptionNs.Load() {
-							seqMaxInterruptionNs.Store(interruption)
+						if rttNs > seqMaxRTTNs.Load() {
+							seqMaxRTTNs.Store(rttNs)
 						}
-					}
-					lastEchoRecv = recvTime
+						for {
+							curMin := seqMinRTTNs.Load()
+							if rttNs >= curMin || seqMinRTTNs.CompareAndSwap(curMin, rttNs) {
+								break
+							}
+						}
 
-					// RTT delay variance (rtt_jitter_ns) estimation
-					diff := math.Abs(float64(rttNs) - prevDiff)
-					prevDiff = float64(rttNs)
-					curJitter := float64(seqJitterNs.Load())
-					newJitter := curJitter + (diff-curJitter)/16.0
-					seqJitterNs.Store(int64(newJitter))
-				} else {
-					seqLost.Add(1)
+						// Interruption calculation
+						if !lastEchoRecv.IsZero() {
+							interruption := recvTime.Sub(lastEchoRecv).Nanoseconds()
+							if interruption > seqMaxInterruptionNs.Load() {
+								seqMaxInterruptionNs.Store(interruption)
+							}
+						}
+						lastEchoRecv = recvTime
+
+						// RTT delay variance (rtt_jitter_ns) estimation
+						diff := math.Abs(float64(rttNs) - prevDiff)
+						prevDiff = float64(rttNs)
+						curJitter := float64(seqJitterNs.Load())
+						newJitter := curJitter + (diff-curJitter)/16.0
+						seqJitterNs.Store(int64(newJitter))
+						continue
+					}
+				}
+				seqLost.Add(1)
+				if !lastEchoRecv.IsZero() {
+					gap := time.Since(lastEchoRecv).Nanoseconds()
+					if gap > seqMaxInterruptionNs.Load() {
+						seqMaxInterruptionNs.Store(gap)
+					}
 				}
 			}
 		}
@@ -435,40 +447,52 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 				n, readErr := connVoIP.Read(resp)
 				recvTime := time.Now()
 
-				if readErr == nil && n == 160 && bytes.Equal(resp[:160], pkt) {
-					voipRecv.Add(1)
-					voipTotalBytes.Add(160)
+				if readErr == nil && n == 160 && bytes.Equal(resp[:4], magic) {
+					echoSeq := binary.BigEndian.Uint64(resp[4:12])
+					echoSendNs := binary.BigEndian.Uint64(resp[12:20])
+					if echoSeq > 0 && echoSeq <= seq {
+						voipRecv.Add(1)
+						voipTotalBytes.Add(160)
 
-					rtt := recvTime.Sub(sendTime)
-					rttNs := rtt.Nanoseconds()
-					voipRTTTotalNs.Add(rttNs)
-					voipRTTCount.Add(1)
-
-					if rttNs > voipMaxRTTNs.Load() {
-						voipMaxRTTNs.Store(rttNs)
-					}
-					for {
-						curMin := voipMinRTTNs.Load()
-						if rttNs >= curMin || voipMinRTTNs.CompareAndSwap(curMin, rttNs) {
-							break
+						rttNs := recvTime.Sub(time.Unix(0, int64(echoSendNs))).Nanoseconds()
+						if rttNs < 0 {
+							rttNs = 0
 						}
-					}
+						voipRTTTotalNs.Add(rttNs)
+						voipRTTCount.Add(1)
 
-					if !lastVoipRecv.IsZero() {
-						interruption := recvTime.Sub(lastVoipRecv).Nanoseconds()
-						if interruption > voipMaxInterruptionNs.Load() {
-							voipMaxInterruptionNs.Store(interruption)
+						if rttNs > voipMaxRTTNs.Load() {
+							voipMaxRTTNs.Store(rttNs)
 						}
-					}
-					lastVoipRecv = recvTime
+						for {
+							curMin := voipMinRTTNs.Load()
+							if rttNs >= curMin || voipMinRTTNs.CompareAndSwap(curMin, rttNs) {
+								break
+							}
+						}
 
-					diff := math.Abs(float64(rttNs) - prevDiff)
-					prevDiff = float64(rttNs)
-					curJitter := float64(voipJitterNs.Load())
-					newJitter := curJitter + (diff-curJitter)/16.0
-					voipJitterNs.Store(int64(newJitter))
-				} else {
-					voipLost.Add(1)
+						if !lastVoipRecv.IsZero() {
+							interruption := recvTime.Sub(lastVoipRecv).Nanoseconds()
+							if interruption > voipMaxInterruptionNs.Load() {
+								voipMaxInterruptionNs.Store(interruption)
+							}
+						}
+						lastVoipRecv = recvTime
+
+						diff := math.Abs(float64(rttNs) - prevDiff)
+						prevDiff = float64(rttNs)
+						curJitter := float64(voipJitterNs.Load())
+						newJitter := curJitter + (diff-curJitter)/16.0
+						voipJitterNs.Store(int64(newJitter))
+						continue
+					}
+				}
+				voipLost.Add(1)
+				if !lastVoipRecv.IsZero() {
+					gap := time.Since(lastVoipRecv).Nanoseconds()
+					if gap > voipMaxInterruptionNs.Load() {
+						voipMaxInterruptionNs.Store(gap)
+					}
 				}
 			}
 		}
@@ -532,16 +556,17 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					addEvent("idle_start", "pausing traffic for keepalive-only idle phase")
 					isIdle.Store(true)
 
+					// Allow in-flight worker iterations to finish
+					time.Sleep(100 * time.Millisecond)
+
 					idleWait := 3 * time.Second
 					if unaccelerated {
 						idleWait = 26 * time.Second // Exceeds keepalive interval (25s)
 					}
 					time.Sleep(idleWait)
 
-					isIdle.Store(false)
-					addEvent("idle_end", "idle phase completed; active application traffic resumed")
-
 					// Probe TCP immediately to verify connection survived idle keepalive phase
+					// BEFORE resuming worker traffic, avoiding concurrent socket access
 					idleProbe := []byte("tcp-idle-recovery-probe")
 					echo, err := client.ExchangeTCP(connTCP, idleProbe)
 					if err == nil && bytes.Equal(echo, idleProbe) {
@@ -549,6 +574,9 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					} else {
 						t.Errorf("[%s] TCP exchange failed after idle phase: %v", serverType, err)
 					}
+
+					isIdle.Store(false)
+					addEvent("idle_end", "idle phase completed; active application traffic resumed")
 				}
 
 				if rekeyCount >= targetRekeys {

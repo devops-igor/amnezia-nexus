@@ -96,7 +96,7 @@ The soak qualification suite verifies protocol durability across extended operat
 2. **Full Unaccelerated 10+-Rekey Soak (`TestDifferential_Soak_Unaccelerated10Rekey`)**:
    - Gated behind `NEXUS_SOAK_FULL=true` or `--soak-full`.
    - Runs for ~20-25 minutes under natural production timing parameters.
-   - Observes at least 10 unforced natural rekeys on both reference and subject engines.
+   - Observes at least 10 unforced natural rekeys on the Subject Nexus IngressEngine.
 
 ### Running Full Soak Locally
 
