@@ -30,6 +30,14 @@ type PeerSyncStatus struct {
 	LastSuccessfulReconcile     time.Time `json:"last_successful_reconcile"`
 	LastError                   string    `json:"last_error,omitempty"`
 	PortalConfigRestartRequired bool      `json:"portal_config_restart_required"`
+	// EnqueueFailures and LastEnqueueError fold the post-commit enqueue
+	// telemetry into the SAME observable state as the reconciliation
+	// telemetry (issue #391 round 4b, finding 4): a durable change whose
+	// enforcement could not even be queued is a failure of that change's
+	// enforcement, and it must never be a counter that only exists
+	// outside the status a reader already consults.
+	EnqueueFailures  uint64 `json:"enqueue_failures"`
+	LastEnqueueError string `json:"last_enqueue_error,omitempty"`
 }
 
 type portalPeerDevice interface {
@@ -58,21 +66,48 @@ type peerSynchronizer struct {
 	// attached; cleanup then falls back to the durable enumeration alone.
 	listActiveSessions func() []models.VPNSession
 
-	// Async post-commit reconciliation (issue #391 round 4a, finding 2).
-	// notify wakes the serialized worker with coalescing semantics
-	// (capacity 1: a burst of N commits triggers at most one pending
-	// reconcile). notifyListener is the PeerChangeListener notification
-	// target: once the engine arms it, DB notifications enqueue onto the
-	// worker instead of reconciling on the committing goroutine. Before
-	// arming (the construction window) the notification entry point falls
-	// back to running the reconciliation directly.
-	notify             chan struct{}
-	kick               func()
-	notifyListener     func()
-	pending            atomic.Int64 // queued-not-yet-started reconciles
-	running            atomic.Bool  // worker currently inside reconcileNow
-	enqueueFailures    atomic.Uint64
-	lastEnqueueFailure atomic.Value // string
+	// Async post-commit reconciliation (issue #391 round 4a, finding 2;
+	// round 4b, findings 2 and 4).
+	//
+	// kick is the wake function of the serialized worker. It is written
+	// once by startNotifyWorker and cleared by the stop closure, and read
+	// by every database commit goroutine, so it is GUARDED BY lcMu (never
+	// a bare function field: an unsynchronized read/write here is both a
+	// data race and the round-4a lifecycle defect).
+	//
+	// armed records that the enqueue path is live. It is set by
+	// armEnqueue and cleared by the stop closure, under lcMu, and read
+	// through armedFlag. The engine arms the enqueue path BEFORE it makes
+	// the PeerChangeListener visible to the database, so there is no
+	// instant at which a durable commit can reach this synchronizer and
+	// find the enqueue path unarmed.
+	lcMu      sync.Mutex
+	lcState   peerSyncLifecycle
+	armedFlag atomic.Bool
+	notifySeq atomic.Int64 // notifications accepted (armed or rejected)
+	doneSeq   atomic.Int64 // notifications whose enforcement has finished
+	// convergeErr is the outcome of the most recently completed
+	// enforcement pass, published together with doneSeq under lcMu so a
+	// convergence waiter never reads a sequence and an error from
+	// different passes.
+	convergeErr error
+	// convergeCh is the convergence broadcast channel, guarded by lcMu.
+	// Each publication closes it and installs a fresh one, so a waiter
+	// always selects on a channel the next completion closes.
+	convergeCh    chan struct{}
+	stoppedFlag   atomic.Bool
+	timeouts      atomic.Uint64
+	pending       atomic.Int64 // queued-not-yet-started reconciles
+	running       atomic.Bool  // worker currently inside reconcileNow
+	enqueueFails  atomic.Uint64
+	lastEnqueueEr atomic.Value // string
+}
+
+// peerSyncLifecycle is the enqueue path's mutable state, guarded by
+// peerSynchronizer.lcMu.
+type peerSyncLifecycle struct {
+	kick  func()
+	armed bool
 }
 
 func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ingress.Resolver, cfg clientawg.Config, settings *models.VPNConfig, revokeSession func(ctx context.Context, peerKey string) error, listActiveSessions func() []models.VPNSession) *peerSynchronizer {
@@ -89,24 +124,29 @@ func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ing
 }
 
 // startNotifyWorker launches the serialized post-commit reconcile worker and
-// arms the non-blocking enqueue callback (issue #391 round 4a, finding 2).
+// arms the non-blocking enqueue path in the same critical section
+// (issue #391 round 4b, finding 2). Arming is not a separate step the engine
+// performs later: worker and enqueue path become live together, so there is no
+// instant at which the enqueue path exists but is disarmed, and no instant at
+// which it is armed before the worker can serve it.
+//
 // The worker owns one reconcile at a time; a burst of commits coalesces into
-// at most one queued reconcile. The returned stop function detaches the
+// at most one queued reconcile. The returned stop function invalidates the
 // enqueue path, wakes the worker, and waits for the current reconcile to
 // finish, so no reconcile runs after the portal closes. The drain is
 // deadline-bounded: a reconcile stuck on an unresponsive portal device must
-// never make Stop unreturnable, so stop reports a drain-timeout error
-// instead of waiting forever. Stop is idempotent: an engine that never armed
-// or already stopped the worker may still be asked to stop through the same
+// never make Stop unreturnable, so stop reports a drain-timeout error instead
+// of waiting forever. Stop is idempotent: an engine that never started or
+// already stopped the worker may still be asked to stop through the same
 // teardown path.
+//
+// The engine MUST detach the database listener before calling stop (see
+// IngressEngine.Stop): the enqueue path is what a database notification uses,
+// and it must never be found disarmed while a notification can still arrive.
 func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
-	defer func() {
-		if err != nil {
-			s.kick = nil
-			s.notify = nil
-		}
-	}()
-	if s.notify != nil || s.kick != nil {
+	s.lcMu.Lock()
+	if s.lcState.kick != nil {
+		s.lcMu.Unlock()
 		return nil, errors.New("peer sync notify worker already started")
 	}
 	// wake is the capacity-1 coalescing token channel: kick's non-blocking
@@ -116,17 +156,22 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 	// sender can rewrite or close, so the drain cannot hang on a nil or
 	// closed-channel receive race (the round-4a Stop hang).
 	wake := make(chan struct{}, 1)
-	s.notify = wake
-	s.kick = func() {
-		select {
-		case wake <- struct{}{}:
-		default:
-			// A reconcile is already queued or running: coalesced. The
-			// queued run re-reads durable state afresh, so it observes
-			// every commit that happened before it started. Never
-			// blocks: safe from under Service.mu.
-		}
+	s.lcState = peerSyncLifecycle{
+		kick: func() {
+			select {
+			case wake <- struct{}{}:
+			default:
+				// A reconcile is already queued or running: coalesced.
+				// The queued run re-reads durable state afresh, so it
+				// observes every commit that happened before it
+				// started. Never blocks: safe from under Service.mu.
+			}
+		},
+		armed: true,
 	}
+	s.armedFlag.Store(true)
+	s.lcMu.Unlock()
+
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -136,13 +181,19 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 			case <-stopCh:
 				return
 			case <-wake:
-				// This run serves exactly one enqueued notification;
-				// counts whose kick coalesced into this token are
-				// re-armed after the run so the backlog always drains.
+				// This run serves exactly one enqueued token; counts
+				// whose kick coalesced into it are re-armed after the
+				// run so the backlog always drains. The pass re-reads
+				// durable state, so it covers every notification
+				// accepted before it started: snapshot the sequence
+				// here, before the pass, and publish that watermark
+				// with the pass outcome below.
+				covered := s.notifySeq.Load()
 				s.running.Store(true)
 				s.pending.Add(-1)
-				_ = s.reconcileNow(context.Background())
+				err := s.reconcileNow(context.Background())
 				s.running.Store(false)
+				s.publishConvergence(covered, err)
 				if s.pending.Load() > 0 {
 					select {
 					case wake <- struct{}{}:
@@ -156,13 +207,25 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 	return func() error {
 		// Idempotent: teardown paths may stop an already-stopped worker.
 		stopOnce.Do(func() {
-			s.kick = nil
-			s.notifyListener = nil
+			// Invalidate the enqueue path under lcMu, so a concurrent
+			// notification either observed the armed state and enqueued
+			// before this point, or observes the disarmed state and
+			// records a visible enqueue failure. There is no unsynchronized
+			// window in which kick is read half-written.
+			s.lcMu.Lock()
+			s.lcState = peerSyncLifecycle{}
+			s.lcMu.Unlock()
+			s.armedFlag.Store(false)
+			s.stoppedFlag.Store(true)
 			// Closing stopCh releases a parked worker immediately; an
 			// in-flight reconcile is awaited below up to
 			// peerSyncDrainTimeout so a portal device wedged in a
 			// blocking call cannot hang Stop.
 			close(stopCh)
+			// Release any convergence waiter: no further pass will ever
+			// cover the notifications still outstanding, so they must be
+			// failed explicitly rather than waited out to a timeout.
+			s.failOutstandingConvergence()
 		})
 		select {
 		case <-done:
@@ -179,31 +242,101 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 // (issue #391 round 4a). It is a variable so tests can shorten it.
 var peerSyncDrainTimeout = 30 * time.Second
 
+// peerSyncConvergeTimeout bounds the caller-visible convergence wait
+// (issue #391 round 4b, finding 4). A handler asks the worker to confirm the
+// enforcement of the change it just committed; the worker does the device
+// I/O, so the handler only ever waits, and it waits for at most this long.
+// Exceeding it is reported to the caller as an unconfirmed enforcement (the
+// same runtime_sync_failed envelope a failed pass produces), never as a hang
+// and never as a silent success.
+var peerSyncConvergeTimeout = 10 * time.Second
+
 // enqueuePeerReconcile is the PeerChangeListener notification
-// implementation (issue #391 round 4a, finding 2): it only enqueues the
-// serialized reconcile worker and returns immediately, so the database
-// commit goroutine, which may hold Service.mu during legacy admission,
-// never blocks on runtime device I/O. It is called from database commit
-// paths, including under Service.mu during legacy admission
-// (HandleIncomingPeer -> resolveOrAllocatePeerIP -> UpdateConnection), so it
-// only does a channel send and atomic counter updates; the worker goroutine
-// performs the actual reconcile, taking peerSync.mu and then (via
-// revokeSession) Service.mu. A failed enqueue is visible, never silent: it
-// is counted and recorded even though the periodic 30s reconcile loop still
-// retries the drift, which remains the retry path for any drift.
+// implementation (issue #391 round 4a, finding 2; round 4b, findings 2 and
+// 4): it only records the notification and wakes the serialized worker, then
+// returns immediately, so the database commit goroutine — which may hold
+// Service.mu during legacy admission (HandleIncomingPeer ->
+// resolveOrAllocatePeerIP -> UpdateConnection) — never blocks on runtime
+// device I/O and never re-enters a runtime lock.
+//
+// It NEVER falls back to reconciling inline. The round-4b invariant is
+// absolute: while the database can see this synchronizer, the enqueue path is
+// armed, so the fallback could only ever be reached from the shutdown window
+// (listener still attached, worker already stopped), where running the
+// reconciliation on the committing goroutine is exactly the deadlock and
+// post-close device I/O this design exists to prevent. A disarmed enqueue is
+// therefore recorded as a visible failure, both in the enqueue telemetry and
+// as the outcome of a convergence wait, so a caller is told the truth.
 func (s *peerSynchronizer) enqueuePeerReconcile() {
-	kick := s.kick
-	if kick == nil {
-		s.recordEnqueueFailure("no notify worker")
+	seq := s.notifySeq.Add(1)
+	s.lcMu.Lock()
+	kick, armed := s.lcState.kick, s.lcState.armed
+	s.lcMu.Unlock()
+	if !armed || kick == nil {
+		reason := "peer sync notify worker is not running"
+		if s.stoppedFlag.Load() {
+			reason = "peer sync notify worker stopped before enforcement"
+		}
+		s.recordEnqueueFailure(reason)
+		// The notification is accounted for as FAILED, not merely
+		// dropped: a convergence waiter must not block until its timeout
+		// on a notification that will never be served.
+		s.publishConvergence(seq, errPeerSyncNotEnqueued(reason))
 		return
 	}
 	s.pending.Add(1)
 	kick()
 }
 
+// errPeerSyncNotEnqueued marks a notification whose enforcement could not be
+// queued at all (the worker is not running). It is a runtime enforcement
+// failure of that durable change, exactly like a failed pass, so it reaches
+// the caller through the same runtime_sync_failed envelope.
+func errPeerSyncNotEnqueued(reason string) error {
+	return fmt.Errorf("%w: %s", database.ErrPeerRuntimeSync, reason)
+}
+
+// publishConvergence records the outcome of one enforcement pass and wakes
+// every convergence waiter. The sequence watermark and the error are published
+// together under lcMu so a waiter can never observe a watermark from one pass
+// with an error from another.
+func (s *peerSynchronizer) publishConvergence(covered int64, err error) {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+	if covered > s.doneSeq.Load() {
+		s.convergeErr = err
+		s.doneSeq.Store(covered)
+	}
+	s.signalConvergenceLocked()
+}
+
+// failOutstandingConvergence fails every notification that no pass will ever
+// cover, because the worker is stopping. Waiters are released immediately
+// with the stop reason instead of waiting out their timeout.
+func (s *peerSynchronizer) failOutstandingConvergence() {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+	if outstanding := s.notifySeq.Load(); outstanding > s.doneSeq.Load() {
+		s.convergeErr = errPeerSyncNotEnqueued("peer sync notify worker stopped before enforcement completed")
+		s.doneSeq.Store(outstanding)
+	}
+	s.signalConvergenceLocked()
+}
+
+// signalConvergenceLocked wakes blocked convergence waiters. The broadcast
+// channel is closed and replaced under lcMu, so a waiter always selects on a
+// channel that the next publication closes.
+func (s *peerSynchronizer) signalConvergenceLocked() {
+	if s.convergeCh == nil {
+		return
+	}
+	close(s.convergeCh)
+	s.convergeCh = make(chan struct{})
+}
+
 func (s *peerSynchronizer) recordEnqueueFailure(reason string) {
-	s.enqueueFailures.Add(1)
-	s.lastEnqueueFailure.Store(reason)
+	s.enqueueFails.Add(1)
+	s.lastEnqueueEr.Store(reason)
 	log.Printf("[vpn/peer-sync] post-commit reconcile enqueue failed: %s", reason)
 }
 
@@ -219,9 +352,11 @@ func (s *peerSynchronizer) setPortalDeviceForTest(device portalPeerDevice) {
 
 // EnqueueFailures reports how many post-commit reconcile requests could not
 // be queued and the most recent reason. Never silently zero when nonzero.
+// The same numbers are folded into PeerSyncStatus, which is the state an
+// operator (and the caller-visible reporting of finding 4) reads.
 func (s *peerSynchronizer) EnqueueFailures() (uint64, string) {
-	reason, _ := s.lastEnqueueFailure.Load().(string)
-	return s.enqueueFailures.Load(), reason
+	reason, _ := s.lastEnqueueEr.Load().(string)
+	return s.enqueueFails.Load(), reason
 }
 
 // quiesceNotifyWorker waits until every notification enqueued so far has
@@ -240,22 +375,122 @@ func (s *peerSynchronizer) quiesceNotifyWorker() {
 func (s *peerSynchronizer) Status() PeerSyncStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.status
+	status := s.status
+	// Enqueue telemetry converges into the same observable state as the
+	// reconciliation telemetry (finding 4): one status, not a counter that
+	// only a test can reach.
+	status.EnqueueFailures = s.enqueueFails.Load()
+	status.LastEnqueueError, _ = s.lastEnqueueEr.Load().(string)
+	return status
 }
 
-// ReconcilePeers is the PeerChangeListener notification entry point. Before
-// the engine arms the async worker (the construction window) it runs the
-// reconciliation directly; afterwards it only enqueues onto the serialized
-// worker (issue #391 round 4a, finding 2). The construction-time initial
-// reconcile and the periodic reconcile loop call reconcileNow directly, so
-// they keep executing synchronously without Service.mu held.
-func (s *peerSynchronizer) ReconcilePeers(ctx context.Context) error {
-	if notify := s.notifyListener; notify != nil {
-		notify()
+// ReconcilePeers is the PeerChangeListener notification entry point
+// (issue #391 round 4b, finding 2). It NEVER reconciles inline and NEVER
+// blocks: it records the notification, wakes the serialized worker, and
+// returns. A database notification can arrive on a commit goroutine that
+// holds Service.mu (legacy admission) and during the construction and
+// shutdown windows, so there is no arrangement of this method in which
+// running the reconciliation on the caller's goroutine would be correct.
+//
+// It reports no error: the commit is already durable, and the outcome of the
+// enforcement it requested is reported through AwaitPeerRuntimeSync, which
+// the caller invokes AFTER releasing every lock (finding 4).
+func (s *peerSynchronizer) ReconcilePeers(context.Context) error {
+	s.enqueuePeerReconcile()
+	return nil
+}
+
+// AwaitPeerRuntimeSync blocks until the enforcement of every notification
+// accepted so far has completed, and reports its outcome
+// (issue #391 round 4b, finding 4). It is the caller-visible half of the
+// asynchronous design: the durable commit path stays non-blocking and
+// lock-free, and the caller learns the truth from a path that runs on its own
+// goroutine, after the commit and after any locks were released.
+//
+// The call performs NO runtime device I/O itself: the worker goroutine does,
+// which is what keeps this deadlock-free. It is bounded by
+// peerSyncConvergenceTimeout and by ctx, so it can never block
+// indefinitely; a bound that is exceeded is reported as an unconfirmed
+// enforcement (a database.ErrPeerRuntimeSync-wrapped error), never as a
+// silent success.
+//
+// It MUST NOT be called while holding peerSync.mu or Service.mu: the worker
+// it waits for takes exactly those locks.
+// AwaitPeerRuntimeSync implements database.PeerRuntimeConvergence on the
+// synchronizer itself (not only on the engine wrapper), so the database's
+// convergence confirmation reaches the live worker through the very listener
+// it already holds. See the method on IngressEngine for the caller contract.
+func (s *peerSynchronizer) AwaitPeerRuntimeSync(ctx context.Context) error {
+	return s.AwaitPeerRuntimeSyncWithin(ctx, 0)
+}
+
+// AwaitPeerRuntimeSyncWithin is AwaitPeerRuntimeSync with an explicit bound;
+// a non-positive timeout selects peerSyncConvergeTimeout. It exists so the
+// engine can delegate without re-deciding the deadline, and so tests can pin a
+// short bound.
+func (s *peerSynchronizer) AwaitPeerRuntimeSyncWithin(ctx context.Context, timeout time.Duration) error {
+	if s == nil {
 		return nil
 	}
-	return s.reconcileNow(ctx)
+	if timeout <= 0 {
+		timeout = peerSyncConvergeTimeout
+	}
+	target := s.notifySeq.Load()
+	// GLOBAL WATERMARK (reviewed and accepted for round 4b): the target is
+	// every notification accepted so far, not strictly this caller's own.
+	// A caller therefore confirms enforcement of all commits that preceded
+	// its own call, and may be told about a CONCURRENT change's enforcement
+	// failure as if it were its own. That is deliberate and conservative: it
+	// can only ever cause a handler to report a failure that genuinely
+	// happened, never to swallow one. A notification accepted after this
+	// snapshot belongs to a later change and is not waited for.
+	if s.doneSeq.Load() >= target {
+		return s.convergenceOutcome()
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		s.lcMu.Lock()
+		ch := s.convergeCh
+		if ch == nil {
+			ch = make(chan struct{})
+			s.convergeCh = ch
+		}
+		done := s.doneSeq.Load()
+		s.lcMu.Unlock()
+		if done >= target {
+			return s.convergenceOutcome()
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return fmt.Errorf("%w: convergence wait canceled: %v", database.ErrPeerRuntimeSync, ctx.Err())
+		case <-deadline.C:
+			s.timeouts.Add(1)
+			log.Printf("[vpn/peer-sync] post-commit enforcement did not converge within %s", timeout)
+			return fmt.Errorf("%w: post-commit enforcement did not converge within %s", database.ErrPeerRuntimeSync, timeout)
+		}
+	}
 }
+
+// convergenceOutcome reads the published outcome of the pass that covered the
+// caller's notification.
+func (s *peerSynchronizer) convergenceOutcome() error {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+	err := s.convergeErr
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, database.ErrPeerRuntimeSync) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", database.ErrPeerRuntimeSync, err)
+}
+
+// ConvergeTimeouts reports how many caller-visible convergence waits hit their
+// bound without the enforcement completing. Never silently zero when nonzero.
+func (s *peerSynchronizer) ConvergeTimeouts() uint64 { return s.timeouts.Load() }
 
 // ValidatePortalConfig requires a controlled stop/restart for changes to
 // upstream listener parameters. Ordinary LB and queue setting changes remain

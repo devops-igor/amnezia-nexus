@@ -699,7 +699,7 @@ func TestPeerSyncStopDrainsQueuedNotification(t *testing.T) {
 	}
 	// Enqueue a reconcile and immediately stop: the drain must complete
 	// whether or not the worker is mid-reconcile.
-	e.peerSync.notifyListener()
+	e.peerSync.ReconcilePeers(ctx)
 	if err := e.Stop(); err != nil {
 		t.Fatalf("stop did not drain cleanly: %v", err)
 	}

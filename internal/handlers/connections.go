@@ -333,6 +333,11 @@ func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Requ
 		h.peerChangeError(w, err)
 		return
 	}
+	// The commit only queued the runtime enforcement; confirm it converged
+	// before reporting success (issue #391 round 4b, finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
+	}
 	_ = h.db.RecordPeerLifecycle(ctx, 0, "awg", clientPub, req.Name, user.ID, "active")
 	newConn.ClientID = clientPub
 	newConn.ServerID = 0
@@ -544,6 +549,12 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 
 	if _, err := h.db.DeleteConnection(ctx, connectionID); err != nil {
 		h.peerChangeError(w, err)
+		return
+	}
+	// The commit only queued the runtime enforcement; confirm the peer's live
+	// access was actually withdrawn before reporting success (issue #391
+	// round 4b, finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
 		return
 	}
 	_ = h.db.DeletePeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID)

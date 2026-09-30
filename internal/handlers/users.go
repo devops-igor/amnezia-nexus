@@ -434,6 +434,14 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The commit only queued the runtime enforcement of this user's access
+	// change; confirm it converged before reporting success (issue #391
+	// round 4b, finding 4). An access change is exactly the case where a
+	// silent unenforced commit would leave a revoked user connected.
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
+	}
+
 	h.audit(r, "user.update", map[string]any{"user_id": userID, "username": user.Username, "fields": len(updates)})
 	h.JSONOK(w)
 }
@@ -478,6 +486,14 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.peerChangeError(w, err)
 		return
 	}
+	// The commits only queued the runtime enforcement; confirm the deleted
+	// user's live access was actually withdrawn before reporting success
+	// (issue #391 round 4b, finding 4). The convergence wait is placed after
+	// the user row is gone, so it observes the enforcement of the full
+	// deletion rather than a partial one.
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
+	}
 	_ = h.db.DeletePeerLifecycleByUserID(ctx, userID)
 
 	h.audit(r, "user.delete", map[string]any{"user_id": userID, "username": user.Username})
@@ -509,6 +525,13 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		"enabled": req.Enabled,
 	}); err != nil {
 		h.peerChangeError(w, err)
+		return
+	}
+	// Disabling a user revokes access: the commit only queued that
+	// enforcement, so confirm it converged before reporting success and
+	// before toggling the per-server clients (issue #391 round 4b,
+	// finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
 		return
 	}
 
