@@ -25,6 +25,7 @@ bin/
 .ssh
 
 # Test and Python artifacts
+test-artifacts/
 tests/e2e/screenshots/
 .pytest_cache/
 .mypy_cache/

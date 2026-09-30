@@ -179,6 +179,16 @@ func TestDifferential_ConfigFreezingAndRedactedManifest(t *testing.T) {
 	if err := os.WriteFile(taskArtifactPath, evidenceJSON, 0o600); err != nil {
 		t.Fatalf("failed to write evidence manifest to %s: %v", taskArtifactPath, err)
 	}
+	if customDir := os.Getenv("NEXUS_ARTIFACT_DIR"); customDir != "" {
+		if !filepath.IsAbs(customDir) {
+			customDir = filepath.Join(repoRoot, customDir)
+		}
+		_ = os.MkdirAll(customDir, 0o755)
+		customPath := filepath.Join(customDir, "evidence_manifest.json")
+		if err := os.WriteFile(customPath, evidenceJSON, 0o600); err != nil {
+			t.Logf("warning: failed to write custom evidence manifest to %s: %v", customPath, err)
+		}
+	}
 }
 
 // TestDifferential_SequentialReferenceVsSubjectBaseline runs reference server, connects client,

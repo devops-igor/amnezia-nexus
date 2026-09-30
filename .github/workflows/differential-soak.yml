@@ -1,0 +1,87 @@
+name: Differential & Long-Duration Soak Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Differential suite to execute'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'soak-full'
+          - 'soak-bounded'
+          - 'matrix'
+          - 'lifecycle'
+          - 'baseline'
+      race:
+        description: 'Enable Go race detector (-race)'
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    # Run full unaccelerated soak weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+
+concurrency:
+  group: differential-soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  differential-qualification:
+    name: Differential Qualification (${{ github.event.inputs.suite || 'scheduled-soak-full' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Create Test Artifacts Directory
+        run: mkdir -p test-artifacts
+
+      - name: Run Differential Qualification Suite
+        env:
+          INPUT_SUITE: ${{ github.event.inputs.suite || 'all' }}
+          INPUT_RACE: ${{ github.event.inputs.race != 'false' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          chmod +x ./scripts/run_differential_qualification.sh
+
+          RACE_FLAG="--race"
+          if [[ "$INPUT_RACE" == "false" ]]; then
+            RACE_FLAG="--no-race"
+          fi
+
+          if [[ "$EVENT_NAME" == "schedule" || "$INPUT_SUITE" == "all" ]]; then
+            echo "==> Executing full differential suite with 10-rekey unaccelerated soak..."
+            ./scripts/run_differential_qualification.sh --suite all --soak-full $RACE_FLAG --output-dir test-artifacts
+          elif [[ "$INPUT_SUITE" == "soak-full" ]]; then
+            echo "==> Executing unaccelerated 10-rekey soak suite..."
+            ./scripts/run_differential_qualification.sh --suite soak --soak-full $RACE_FLAG --output-dir test-artifacts
+          elif [[ "$INPUT_SUITE" == "soak-bounded" ]]; then
+            echo "==> Executing bounded soak verification suite..."
+            ./scripts/run_differential_qualification.sh --suite soak $RACE_FLAG --output-dir test-artifacts
+          else
+            echo "==> Executing suite: $INPUT_SUITE..."
+            ./scripts/run_differential_qualification.sh --suite "$INPUT_SUITE" $RACE_FLAG --output-dir test-artifacts
+          fi
+
+      - name: Run Non-Netstack Client Qualification (Dry-Run)
+        run: |
+          chmod +x ./scripts/run_non_netstack_client_qualification.sh
+          ./scripts/run_non_netstack_client_qualification.sh --dry-run --output-dir test-artifacts
+
+      - name: Upload Qualification Evidence Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: differential-qualification-evidence-${{ github.run_id }}
+          path: test-artifacts/
+          retention-days: 30
