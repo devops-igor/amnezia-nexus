@@ -194,7 +194,11 @@ func TestLifecycle_IdleSessionReapAndRecreation(t *testing.T) {
 		t.Fatal("no active backends")
 	}
 	backend := backends[0]
-	dest := startLifecycleEchoBackend(t, svc, backend, 0x33)
+	dest := netip.MustParseAddr("198.51.100.73")
+	for _, b := range backends {
+		startConcurrentEchoBackend(t, svc, b, dest, 0x33)
+	}
+	svc.stickyMgr.AssignPeerAffinity(lc.publicKey, backend.ID)
 
 	svc.forwarder.StartPumps(ctx)
 	t.Cleanup(svc.forwarder.StopPumps)
@@ -281,7 +285,9 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 		t.Fatal("no backends")
 	}
 	backend := backends[0]
-	dest := startLifecycleEchoBackend(t, svc1, backend, 0x44)
+	dest := netip.MustParseAddr("198.51.100.74")
+	startConcurrentEchoBackend(t, svc1, backend, dest, 0x44)
+	svc1.stickyMgr.AssignPeerAffinity(peer.publicKey, backend.ID)
 
 	svc1.forwarder.StartPumps(ctx)
 
@@ -331,7 +337,8 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 	if err := svc2.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	dest2 := startLifecycleEchoBackend(t, svc2, backend, 0x44)
+	dest2 := netip.MustParseAddr("198.51.100.74")
+	startConcurrentEchoBackend(t, svc2, backend, dest2, 0x44)
 	svc2.forwarder.StartPumps(ctx)
 	t.Cleanup(svc2.forwarder.StopPumps)
 
