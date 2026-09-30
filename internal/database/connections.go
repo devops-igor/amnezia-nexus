@@ -448,22 +448,32 @@ func portalPeerKeysForUser(ctx context.Context, q vpnAssignmentQuerier, userID s
 	var keys []string
 	seen := make(map[string]struct{})
 	for rows.Next() {
-		var clientID, protocol string
+		// client_id is NULLABLE (schema.sql): imported/partial connection rows
+		// carry no peer identity. Scan it as sql.NullString — the same
+		// convention as scanConnection below — so a NULL is read as the empty
+		// string and the existing guard skips the row. Scanning it into a plain
+		// string aborted the whole capture on the first NULL, which blocked
+		// DeleteConnectionsByUserID and deleteUser outright (issue #391 round
+		// 4c, F4). protocol is declared NOT NULL and stays a plain string.
+		var clientID sql.NullString
+		var protocol string
 		var serverID int64
 		if err := rows.Scan(&clientID, &serverID, &protocol); err != nil {
 			return nil, fmt.Errorf("failed to scan user connection for revocation: %w", err)
 		}
-		if clientID == "" || serverID != 0 || models.NormalizeProtocol(protocol) != "awg" {
-			// Regular server peers and non-AWG protocols are outside the
+		if !clientID.Valid || clientID.String == "" || serverID != 0 || models.NormalizeProtocol(protocol) != "awg" {
+			// A NULL or empty client_id is not a peer identity at all, and
+			// regular server peers and non-AWG protocols are outside the
 			// ingress engine's domain; the engine-aware dispatcher must
 			// never tear their sessions down.
 			continue
 		}
-		if _, dup := seen[clientID]; dup {
+		key := clientID.String
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		seen[clientID] = struct{}{}
-		keys = append(keys, clientID)
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read user connections for revocation: %w", err)
