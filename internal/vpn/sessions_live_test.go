@@ -85,6 +85,15 @@ func TestSessionsLiveMatchesActiveCount(t *testing.T) {
 // in-memory session, keeping the same fallbacks as the DB-enriched path —
 // 'unknown' username, 'Server #<tunnelID>' naming, server ID 0 — while the
 // manager-known connection name survives.
+//
+// The rows are removed with raw SQL on purpose (issue #391 round 4b, finding
+// 1). The production DeleteUser/DeleteBackendTunnel primitives now tear the
+// live portal session down immediately — the session outliving its deleted
+// user IS the leak that finding fixed, so driving this test through the
+// production primitives would assert the bug. What this test owns is the
+// SessionsLive fallback behaviour for a session whose durable identity rows
+// are missing, which an out-of-band deletion (restore from a backup, manual
+// maintenance, a partially applied migration) still produces.
 func TestSessionsLiveDBMissFallback(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
@@ -100,12 +109,14 @@ func TestSessionsLiveDBMissFallback(t *testing.T) {
 	// vpn_sessions row) and the user row (the production DeleteUser
 	// primitive removes vpn_sessions rows itself). The in-memory session
 	// survives both — exactly the ghost-row scenario SessionsLive exists
-	// to handle.
-	if err := db.DeleteBackendTunnel(ctx, tun.ID); err != nil {
-		t.Fatalf("DeleteBackendTunnel failed: %v", err)
+	// to handle. Raw SQL: the production primitives now revoke the live
+	// session (issue #391 round 4b, finding 1), and this test owns the
+	// SessionsLive fallback, not the revocation.
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM backend_tunnels WHERE id = ?", tun.ID); err != nil {
+		t.Fatalf("delete backend tunnel row failed: %v", err)
 	}
-	if _, err := db.DeleteUser(ctx, uID); err != nil {
-		t.Fatalf("DeleteUser failed: %v", err)
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM users WHERE id = ?", uID); err != nil {
+		t.Fatalf("delete user row failed: %v", err)
 	}
 
 	// Precondition: the DB row is really gone, so the row below can only

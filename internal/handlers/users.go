@@ -411,7 +411,7 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	if passwordUpdated {
 		ok, newVer, err := h.db.UpdateUserAndBumpSession(ctx, userID, updates)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			h.peerChangeError(w, err)
 			return
 		}
 		if !ok {
@@ -425,13 +425,21 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	} else if len(updates) > 0 {
 		ok, err := h.db.UpdateUser(ctx, userID, updates)
 		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update user")
+			h.peerChangeError(w, err)
 			return
 		}
 		if !ok {
 			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 			return
 		}
+	}
+
+	// The commit only queued the runtime enforcement of this user's access
+	// change; confirm it converged before reporting success (issue #391
+	// round 4b, finding 4). An access change is exactly the case where a
+	// silent unenforced commit would leave a revoked user connected.
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
 	}
 
 	h.audit(r, "user.update", map[string]any{"user_id": userID, "username": user.Username, "fields": len(updates)})
@@ -471,11 +479,19 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := h.db.DeleteConnectionsByUser(ctx, userID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user connections")
+		h.peerChangeError(w, err)
 		return
 	}
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete user")
+		h.peerChangeError(w, err)
+		return
+	}
+	// The commits only queued the runtime enforcement; confirm the deleted
+	// user's live access was actually withdrawn before reporting success
+	// (issue #391 round 4b, finding 4). The convergence wait is placed after
+	// the user row is gone, so it observes the enforcement of the full
+	// deletion rather than a partial one.
+	if !h.peerChangeConvergedContext(w, ctx) {
 		return
 	}
 	_ = h.db.DeletePeerLifecycleByUserID(ctx, userID)
@@ -508,7 +524,14 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.db.UpdateUser(ctx, userID, map[string]any{
 		"enabled": req.Enabled,
 	}); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update user status")
+		h.peerChangeError(w, err)
+		return
+	}
+	// Disabling a user revokes access: the commit only queued that
+	// enforcement, so confirm it converged before reporting success and
+	// before toggling the per-server clients (issue #391 round 4b,
+	// finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
 		return
 	}
 

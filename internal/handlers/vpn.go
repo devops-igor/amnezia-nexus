@@ -212,7 +212,36 @@ func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSON(w, http.StatusOK, vpnConfigResponse{VPNConfig: visible})
 }
 
-func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicEndpoint bool) {
+// vpnConfigPresence records which keys the caller actually SENT, as opposed
+// to which ones merely decoded to a zero value. It is what makes a partial
+// update a PATCH for booleans: a bool cannot distinguish "explicitly false"
+// from "omitted", so absent `random_trailers` would otherwise be persisted as
+// false and silently erase the stored protocol flag
+// (issue #391 round 4b, finding 3).
+type vpnConfigPresence struct {
+	publicEndpoint bool
+	randomTrailers bool
+	disableCookies bool
+}
+
+// hasRawKey reports whether the caller sent the named JSON key, matching the
+// encoding/json field lookup case-insensitively (json.Unmarshal applies field
+// names case-insensitively, so presence must be tracked the same way or
+// `{"RandomTrailers": true}` would decode into the field while registering as
+// absent here).
+func hasRawKey(raw map[string]json.RawMessage, name string) bool {
+	if _, ok := raw[name]; ok {
+		return true
+	}
+	for key := range raw {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vpnConfigPresence) {
 	if current == nil || cfg == nil {
 		return
 	}
@@ -223,7 +252,7 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	// Portal identity must be preserved even when the caller supplies H/S.
 	cfg.ServerPrivateKey = current.ServerPrivateKey
 	cfg.ServerPublicKey = current.ServerPublicKey
-	if !hasPublicEndpoint {
+	if !present.publicEndpoint {
 		cfg.PublicEndpoint = current.PublicEndpoint
 	}
 	if cfg.Algorithm == "" {
@@ -262,6 +291,19 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, hasPublicE
 	if cfg.ClientQueueSize == 0 {
 		cfg.ClientQueueSize = current.ClientQueueSize
 	}
+	// Protocol-parameter booleans follow PRESENCE semantics, not zero-value
+	// semantics (issue #391 round 4b, finding 3): absent preserves the stored
+	// value, present applies the caller's value verbatim. Without this an
+	// unrelated partial update such as {"health_threshold_ms": 750} unmarshals
+	// both flags to false and SaveVPNConfig persists false — and, with a peer
+	// synchronizer active, that omission is indistinguishable from a
+	// prohibited protocol-parameter change and rejects the update outright.
+	if !present.randomTrailers {
+		cfg.RandomTrailers = current.RandomTrailers
+	}
+	if !present.disableCookies {
+		cfg.DisableCookies = current.DisableCookies
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
@@ -296,12 +338,16 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_, hasPublicEndpoint := raw["public_endpoint"]
+	present := vpnConfigPresence{
+		publicEndpoint: hasRawKey(raw, "public_endpoint"),
+		randomTrailers: hasRawKey(raw, "random_trailers"),
+		disableCookies: hasRawKey(raw, "disable_cookies"),
+	}
 
 	ctx := r.Context()
 	if h.vpnSvc != nil {
 		if current, err := h.vpnSvc.GetConfig(ctx); err == nil && current != nil {
-			mergeVPNConfig(current, &cfg, hasPublicEndpoint)
+			mergeVPNConfig(current, &cfg, present)
 		}
 		if err := h.vpnSvc.UpdateConfig(ctx, &cfg); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
@@ -309,7 +355,7 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		}
 	} else if h.db != nil {
 		if current, err := h.db.GetVPNConfig(ctx); err == nil && current != nil {
-			mergeVPNConfig(current, &cfg, hasPublicEndpoint)
+			mergeVPNConfig(current, &cfg, present)
 		}
 		if err := h.db.SaveVPNConfig(ctx, &cfg); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")

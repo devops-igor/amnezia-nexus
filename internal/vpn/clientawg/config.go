@@ -74,11 +74,7 @@ func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Confi
 	// type (string/number/object) fails unmarshalling instead of being
 	// silently coerced; an absent or null field decodes as nil and stays
 	// false. models.VPNConfig deliberately does not carry these fields.
-	var persisted struct {
-		models.VPNConfig
-		RandomTrailers *bool `json:"random_trailers"`
-		DisableCookies *bool `json:"disable_cookies"`
-	}
+	var persisted models.VPNConfig
 	if err := json.Unmarshal([]byte(raw.String), &persisted); err != nil {
 		return Config{}, errors.New("clientawg: invalid persisted VPN configuration")
 	}
@@ -122,10 +118,8 @@ func LoadConfig(ctx context.Context, db *database.DB, tunConfig virtualtun.Confi
 			H1: persisted.H1.String(), H2: persisted.H2.String(), H3: persisted.H3.String(), H4: persisted.H4.String(),
 			S1: persisted.S1, S2: persisted.S2, S3: persisted.S3, S4: persisted.S4,
 			HeaderProtectionKey: persisted.HeaderProtectionKey, ContentPaddingAddition: persisted.ContentPaddingAddition,
-			// Absent or null flag fields decode as false; a present
-			// non-boolean type already failed unmarshalling above.
-			RandomTrailers: persisted.RandomTrailers != nil && *persisted.RandomTrailers,
-			DisableCookies: persisted.DisableCookies != nil && *persisted.DisableCookies,
+			RandomTrailers: persisted.RandomTrailers,
+			DisableCookies: persisted.DisableCookies,
 		},
 	}
 	// Preserve the existing renderer's effective meaning of legacy boolean
@@ -234,6 +228,10 @@ func validatePeer(p Peer, portalKey string) error {
 	}
 	return nil
 }
+
+// ValidatePeer checks a durable peer before it is considered for runtime
+// installation. It uses the same rules as device creation and AddPeer.
+func ValidatePeer(p Peer, portalKey string) error { return validatePeer(p, portalKey) }
 
 func (p Parameters) validate() error {
 	headers := []string{p.H1, p.H2, p.H3, p.H4}

@@ -101,10 +101,16 @@ type Stats struct {
 }
 
 // admittedRoute is the memoized identity of one peer's admission: the exact
-// tuple HasSessionRoute validates the live forwarder route against.
+// tuple HasSessionRoute validates the live forwarder route against. It also
+// carries the durable OWNER the admission ran under, because a routing
+// session is attributed to a user, not just to a key: when the durable owner
+// moves while key and assigned IP stay identical (issue #391 round 4c, F1),
+// the memo must not certify the previous owner's session as the current
+// owner's live route.
 type admittedRoute struct {
 	sessionID    string
 	connectionID string
+	userID       string
 	assignedIP   string
 	backendID    int64
 }
@@ -226,6 +232,7 @@ func (r *Router) HandlePacket(packet []byte) error {
 	route := admittedRoute{
 		sessionID:    session.SessionID(),
 		connectionID: owner.ConnectionID,
+		userID:       owner.UserID,
 		assignedIP:   assigned,
 		backendID:    backend.TunnelID(),
 	}
@@ -259,9 +266,13 @@ func (r *Router) routeLiveLocked(o PeerOwnership) bool {
 	if !ok {
 		return false
 	}
-	// The memo must agree with the resolver's durable record; divergence
-	// (e.g. a #391 revocation after admission) forces re-admission.
-	if route.assignedIP != o.IP.String() || route.connectionID != o.ConnectionID {
+	// The memo must agree with the resolver's durable record in every field
+	// that names an owner; divergence (a #391 revocation after admission, or
+	// a routing-ownership transition to another user or connection) forces
+	// re-admission. Comparing only IP and connection id let a reassigned
+	// peer's memo keep certifying the PREVIOUS owner's session as this
+	// owner's live route (issue #391 round 4c, F1).
+	if route.assignedIP != o.IP.String() || route.connectionID != o.ConnectionID || route.userID != o.UserID {
 		return false
 	}
 	return r.forwarder.HasSessionRoute(o.PeerPublicKey, route.sessionID, route.connectionID, route.assignedIP, route.backendID)

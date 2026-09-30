@@ -121,6 +121,7 @@ type interopAdmission struct {
 	totalCalls  int
 	refuseFor   map[string]error // one-shot per-peer refusal
 }
+
 func newInteropAdmission(capacityPerBackend int) *interopAdmission {
 	return &interopAdmission{
 		capacity:    map[int64]int{interopBackend1: capacityPerBackend, interopBackend2: capacityPerBackend},
@@ -480,6 +481,58 @@ func assertNoBackendPacket(t *testing.T, sink *recordingDevice, want []byte, lab
 	}
 }
 
+// interopPumpPacketUntil re-injects pkt into uc every 100ms until done
+// reports the awaited condition is observed, or until the returned stop
+// function is called.
+//
+// A single injection with no retry is not enough on this path: the upstream
+// engine may still be retransmitting its handshake initiation when the first
+// datagram reaches the TUN, so the plaintext can be dropped while the session
+// is still settling (issue #391 round 4b, finding 3). That is load-dependent,
+// not a real defect, so the robust form is to keep offering the packet until
+// the delivery/admission condition is actually observed — the same pattern the
+// capacity race below already uses. The caller's await helpers keep their own
+// deadlines and every original assertion is unchanged.
+//
+// The returned stop function is safe to call more than once, and a cleanup
+// guard releases the pump even if the caller fails before stopping it.
+//
+// A nil done means "never satisfied, pump until stopped": that is the mode
+// used when the caller pumps across the whole admission-plus-delivery wait.
+func interopPumpPacketUntil(t *testing.T, uc *upstreamClient, pkt []byte, done func() bool) func() {
+	t.Helper()
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	stopPump := func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		<-stopped
+	}
+	t.Cleanup(stopPump)
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if done != nil && done() {
+					return
+				}
+				// A transient inject failure (a session tearing down) is
+				// not the condition under test; the next tick retries.
+				_ = uc.vt.InjectInbound(pkt)
+			}
+		}
+	}()
+	return stopPump
+}
+
 // TestInteropMultiPeerRoutingToRealForwarder is acceptance criterion 1: three
 // peers with distinct assigned /32s, each behind its own REAL upstream engine;
 // application traffic from each peer crosses the real portal device, is
@@ -722,8 +775,23 @@ func TestInteropWrongSourceAndRevokedLeaseDefense(t *testing.T) {
 	pktB := interopUDPPacket(ipB, dst, 0x388000B1)
 	ucA.inject(t, pktA)
 	ucB.inject(t, pktB)
+	// Keep re-injecting each first packet until it actually reaches the
+	// backend sink. A single injection with no retry can be dropped while
+	// the upstream handshake initiation is still being retransmitted,
+	// which showed up as load-dependent flakiness in this test rather than a
+	// real failure (issue #391 round 4b, finding 3). The pump runs across
+	// BOTH the admission and the delivery wait and is stopped explicitly
+	// once both first packets have been observed at the sink, so the
+	// exactly-once admission assertions below still hold: every re-injected
+	// copy is byte-identical and, once the route exists, a plain forward.
+	stopA := interopPumpPacketUntil(t, ucA, pktA, nil)
+	defer stopA()
+	stopB := interopPumpPacketUntil(t, ucB, pktB, nil)
+	defer stopB()
 	awaitBackendPacket(t, fx.backend1, pktA, interopHandshakeTimeout)
 	awaitBackendPacket(t, fx.backend1, pktB, interopHandshakeTimeout)
+	stopA()
+	stopB()
 	routeA, routeB := fx.fwd.RouteSessionID(pubA), fx.fwd.RouteSessionID(pubB)
 
 	// Scenario 2: fence #1 at the engine boundary. A real portal engine

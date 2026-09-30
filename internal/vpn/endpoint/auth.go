@@ -17,6 +17,7 @@ var (
 	ErrUserExpired          = errors.New("user account has expired")
 	ErrTrafficLimitExceeded = errors.New("user traffic limit exceeded")
 	ErrInvalidProtocol      = errors.New("invalid protocol for connection")
+	ErrConnectionDisabled   = errors.New("connection is disabled")
 )
 
 // Authenticator validates connecting peer public keys and retrieves user credentials.
@@ -54,6 +55,12 @@ func (a *DBAuthenticator) AuthenticatePeer(ctx context.Context, peerPublicKey st
 
 	if models.NormalizeProtocol(conn.Protocol) != "awg" {
 		return nil, nil, ErrInvalidProtocol
+	}
+
+	if conn.ClientParams != nil {
+		if disabled, ok := conn.ClientParams["disabled"].(bool); ok && disabled {
+			return nil, nil, ErrConnectionDisabled
+		}
 	}
 
 	user, err := a.db.GetUser(ctx, conn.UserID)

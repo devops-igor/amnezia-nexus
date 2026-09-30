@@ -313,6 +313,43 @@ func TestVPNConfig(t *testing.T) {
 	}
 }
 
+func TestSaveVPNConfig_PreservesRandomTrailersAndDisableCookies(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	cfg, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+
+	cfg.RandomTrailers = true
+	cfg.DisableCookies = true
+	if err := db.SaveVPNConfig(ctx, cfg); err != nil {
+		t.Fatalf("SaveVPNConfig with flags failed: %v", err)
+	}
+
+	// Update an unrelated setting field
+	cfg.HealthThresholdMS = 750
+	cfg.Weights = map[int64]int{1: 70, 2: 30}
+	if err := db.SaveVPNConfig(ctx, cfg); err != nil {
+		t.Fatalf("SaveVPNConfig unrelated update failed: %v", err)
+	}
+
+	loaded, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig reload failed: %v", err)
+	}
+	if !loaded.RandomTrailers {
+		t.Errorf("RandomTrailers was not preserved across unrelated save: got false, want true")
+	}
+	if !loaded.DisableCookies {
+		t.Errorf("DisableCookies was not preserved across unrelated save: got false, want true")
+	}
+	if loaded.HealthThresholdMS != 750 {
+		t.Errorf("HealthThresholdMS mismatch: got %d, want 750", loaded.HealthThresholdMS)
+	}
+}
+
 func TestVPNQueries(t *testing.T) {
 	db, _ := setupTestDB(t)
 	ctx := context.Background()

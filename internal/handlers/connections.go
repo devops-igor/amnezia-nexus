@@ -319,15 +319,25 @@ func (h *Handlers) addLoadBalancedConnection(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	if clientPub == "" {
-		clientPub = uuid.NewString()
+		_, _ = h.db.DeleteConnection(ctx, newConn.ID)
+		h.JSONError(w, http.StatusInternalServerError, "vpn_config_error", "Generated configuration has no client public key")
+		return
 	}
 
-	_, _ = h.db.UpdateConnection(ctx, newConn.ID, map[string]any{
+	if _, err := h.db.UpdateConnection(ctx, newConn.ID, map[string]any{
 		"client_id": clientPub,
 		"server_id": int64(0),
 		"name":      req.Name,
 		"protocol":  "awg",
-	})
+	}); err != nil {
+		h.peerChangeError(w, err)
+		return
+	}
+	// The commit only queued the runtime enforcement; confirm it converged
+	// before reporting success (issue #391 round 4b, finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
+	}
 	_ = h.db.RecordPeerLifecycle(ctx, 0, "awg", clientPub, req.Name, user.ID, "active")
 	newConn.ClientID = clientPub
 	newConn.ServerID = 0
@@ -537,7 +547,16 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	_, _ = h.db.DeleteConnection(ctx, connectionID)
+	if _, err := h.db.DeleteConnection(ctx, connectionID); err != nil {
+		h.peerChangeError(w, err)
+		return
+	}
+	// The commit only queued the runtime enforcement; confirm the peer's live
+	// access was actually withdrawn before reporting success (issue #391
+	// round 4b, finding 4).
+	if !h.peerChangeConvergedContext(w, ctx) {
+		return
+	}
 	_ = h.db.DeletePeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID)
 
 	h.audit(r, "connection.user_delete", map[string]any{"user_id": sess.UserID, "connection_id": connectionID, "name": conn.Name})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 
@@ -223,6 +224,43 @@ func (r *Resolver) Remove(peerPublicKey string) (netip.Addr, bool) {
 	return ip, true
 }
 
+// Snapshot returns a copy of every ownership record currently installed,
+// ordered by assigned address so a caller that acts on the result acts
+// deterministically. It is the read side a fail-closed enforcement needs
+// when it must decide what to withdraw from the durable state ALONE: the
+// installed set is exactly the set of peers that can still authorize a
+// source IP, and it remains answerable when the upstream device cannot be
+// read. Mutating through the returned records is not possible; use
+// Remove, Update or Replace.
+func (r *Resolver) Snapshot() []PeerOwnership {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PeerOwnership, 0, len(r.byIP))
+	for _, o := range r.byIP {
+		out = append(out, o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IP.Less(out[j].IP) })
+	return out
+}
+
+// FilterIPs reports the ownership entries currently installed for the given
+// addresses, in the same order as the input, skipping addresses with no
+// tracked owner. Read-only snapshot for targeted withdrawal during fail-closed
+// identity transitions: a caller removes the reported owners by key when the
+// address must become unauthorized. Concurrent Replace or Update can swap the
+// entries afterwards, so callers treat the result as a snapshot, not a lease.
+func (r *Resolver) FilterIPs(ips []netip.Addr) []PeerOwnership {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PeerOwnership, 0, len(ips))
+	for _, ip := range ips {
+		if o, ok := r.byIP[ip]; ok {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // Reload atomically replaces the resolver contents from durable state using
 // the same durable-only eligibility and conflict rules as LoadResolver. On
 // success the backing maps are swapped in one step: concurrent lookups
@@ -240,5 +278,24 @@ func (r *Resolver) Reload(ctx context.Context, db *database.DB) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.byIP, r.byPeer = byIP, byPeer
+	return nil
+}
+
+// Replace installs one validated desired ownership snapshot atomically. It is
+// used with the exact durable peer set given to the upstream device, so a
+// revoked peer cannot keep a stale plaintext route while removal is retried.
+func (r *Resolver) Replace(owners []PeerOwnership) error {
+	fresh := NewResolver()
+	for _, owner := range owners {
+		if !owner.IP.IsValid() || !owner.IP.Is4() || owner.PeerPublicKey == "" {
+			return fmt.Errorf("ingress: invalid desired peer ownership")
+		}
+		if err := fresh.insert(owner); err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	r.byIP, r.byPeer = fresh.byIP, fresh.byPeer
+	r.mu.Unlock()
 	return nil
 }

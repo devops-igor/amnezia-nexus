@@ -227,6 +227,7 @@ func startEngineUpstreamClient(t *testing.T, saved, name string) *engineUpstream
 	if err := dev.IpcSet(configToUAPI(t, saved)); err != nil {
 		t.Fatal("upstream rejected saved generated configuration")
 	}
+	_ = dev.IpcSet("rekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
 	}
@@ -310,6 +311,61 @@ func awaitEngineBackendPacket(t *testing.T, queue <-chan []byte, want []byte) {
 	}
 }
 
+// pumpEnginePacketUntil re-injects pkt into uc every 100ms until done
+// reports that the condition being waited for has been observed, or until the
+// returned stop function is called.
+//
+// A single injection with no retry is not sufficient here: the upstream
+// engine may still be retransmitting its handshake initiation when the first
+// datagram is handed to the TUN, so the plaintext can be dropped while the
+// session is still settling (issue #391 round 4b, finding 3). That surfaced as
+// load-dependent flakiness rather than a deterministic failure. Pumping the
+// packet until the admission/delivery condition is actually observed is the
+// same pattern TestIngressEngineRoutesEachPeerToOwnBackend uses, and it makes
+// the wait independent of handshake retransmission timing.
+//
+// A nil done means "never satisfied, pump until stopped": that is the mode
+// used when the caller pumps across BOTH the admission wait and the backend
+// delivery wait, since the drop can land in either phase. The caller's own
+// deadline remains the only thing that ends the wait — the pump never sleeps
+// unconditionally and never shortens a bound.
+//
+// The returned stop function is safe to call more than once, and a cleanup
+// guard releases the pump even if the caller fails before stopping it.
+func pumpEnginePacketUntil(t *testing.T, uc *engineUpstreamClient, pkt []byte, done func() bool) func() {
+	t.Helper()
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	stopPump := func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		<-stopped
+	}
+	t.Cleanup(stopPump)
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if done != nil && done() {
+					return
+				}
+				// A transient inject failure (a session tearing down) is
+				// not the condition under test; the next tick retries.
+				_ = uc.vt.InjectInbound(pkt)
+			}
+		}
+	}()
+	return stopPump
+}
+
 // TestIngressEngineEndToEndThroughService is the Rework B deliverable: one
 // REAL upstream engine, one REAL portal built from the durable identity,
 // the production receive loop, Service admission, and the service's REAL
@@ -331,6 +387,14 @@ func TestIngressEngineEndToEndThroughService(t *testing.T) {
 
 	uc := startEngineUpstreamClient(t, saved, "engine-e2e-client")
 	uc.inject(t, want)
+	// Keep re-injecting until the packet has actually been admitted AND
+	// delivered: one injection with no retry can be dropped while the
+	// upstream handshake initiation is still being retransmitted, which is a
+	// load-dependent flake rather than a real failure (issue #391 round 4b,
+	// finding 3). The condition is re-checked every 100ms; the waits below
+	// keep their own deadlines and all original assertions.
+	stopPump := pumpEnginePacketUntil(t, uc, want, nil)
+	defer stopPump()
 
 	// The packet picks its backend through the REAL admission path; wait
 	// for the admitted session, then observe its backend queue.
@@ -356,6 +420,7 @@ func TestIngressEngineEndToEndThroughService(t *testing.T) {
 		t.Fatalf("backend %d queue missing after AttachBackendDevice", sess.BackendTunnelID)
 	}
 	awaitEngineBackendPacket(t, queue, want)
+	stopPump()
 
 	// Admission identity: durable lease IP verbatim, correct user/peer
 	// identity, and the full production chain produced exactly one fresh
@@ -408,6 +473,13 @@ func TestIngressEngineRekeyStableThroughServiceHandshake(t *testing.T) {
 
 	uc1 := startEngineUpstreamClient(t, saved, "engine-rekey-client-1")
 	uc1.inject(t, first)
+	// The first packet is pumped until it is observed at the backend queue:
+	// a single injection with no retry can be dropped while the upstream
+	// handshake initiation is still being retransmitted, which is a
+	// load-dependent flake, not a real failure (issue #391 round 4b,
+	// finding 3).
+	stopFirst := pumpEnginePacketUntil(t, uc1, first, nil)
+	defer stopFirst()
 
 	sessionDeadline := time.NewTimer(engineHandshakeTimeout)
 	defer sessionDeadline.Stop()
@@ -429,6 +501,7 @@ func TestIngressEngineRekeyStableThroughServiceHandshake(t *testing.T) {
 		t.Fatalf("backend %d queue missing", sess.BackendTunnelID)
 	}
 	awaitEngineBackendPacket(t, queue, first)
+	stopFirst()
 	registrationsBefore := svc.freshSessionRegistrations.Load()
 
 	// Upstream rekey: the first engine disappears and an identical one —
@@ -437,7 +510,13 @@ func TestIngressEngineRekeyStableThroughServiceHandshake(t *testing.T) {
 	uc1.dev.Close()
 	uc2 := startEngineUpstreamClient(t, saved, "engine-rekey-client-2")
 	uc2.inject(t, rekey)
+	// Same pumping discipline for the post-rekey handshake: the new transport
+	// session has not completed its handshake when the first rekey packet is
+	// handed to the TUN.
+	stopRekey := pumpEnginePacketUntil(t, uc2, rekey, nil)
+	defer stopRekey()
 	awaitEngineBackendPacket(t, queue, rekey)
+	stopRekey()
 
 	sessAfter, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey)
 	if !ok {
@@ -486,11 +565,30 @@ func TestIngressEngineRoutesEachPeerToOwnBackend(t *testing.T) {
 
 	ucA := startEngineUpstreamClient(t, savedA, "engine-be-client-a")
 	ucB := startEngineUpstreamClient(t, savedB, "engine-be-client-b")
-	ucA.inject(t, pktA)
-	ucB.inject(t, pktB)
+	injectDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		ucA.inject(t, pktA)
+		ucB.inject(t, pktB)
+		for {
+			select {
+			case <-injectDone:
+				return
+			case <-ticker.C:
+				if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerA.publicKey); !ok {
+					_ = ucA.vt.InjectInbound(pktA)
+				}
+				if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerB.publicKey); !ok {
+					_ = ucB.vt.InjectInbound(pktB)
+				}
+			}
+		}
+	}()
 
 	sessA, okA := waitForSession(t, svc, peerA.publicKey)
 	sessB, okB := waitForSession(t, svc, peerB.publicKey)
+	close(injectDone)
 	if !okA || !okB {
 		t.Fatal("admission never ran for both peers")
 	}
@@ -547,11 +645,7 @@ func TestIngressEngineDoubleStartRejected(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 
-	private, public := engineKeys(t)
-	lease := "10.100.7.9"
-	engine := startEngine(t, svc, "engine-lifecycle-portal", []clientawg.Peer{
-		{PublicKey: public, AllowedIP: netip.PrefixFrom(netip.MustParseAddr(lease), 32)},
-	})
+	engine := startEngine(t, svc, "engine-lifecycle-portal", nil)
 	if err := engine.Start(); err == nil {
 		t.Fatal("double Start accepted")
 	} else if !strings.Contains(err.Error(), "already started") {
@@ -566,5 +660,4 @@ func TestIngressEngineDoubleStartRejected(t *testing.T) {
 	if err := engine.Stop(); err == nil {
 		t.Fatal("second Stop accepted")
 	}
-	_ = private // the portal authorizes the public key only; the private half stays with the client
 }

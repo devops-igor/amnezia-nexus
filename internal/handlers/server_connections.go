@@ -323,19 +323,32 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 			if conn.ClientID != "" {
 				clientPub = conn.ClientID
 			}
-			_, _ = h.db.DeleteConnection(ctx, conn.ID)
+			if _, err := h.db.DeleteConnection(ctx, conn.ID); err != nil {
+				h.peerChangeError(w, err)
+				return
+			}
 		}
 		if h.vpnSvc != nil && clientPub != "" {
 			_ = h.vpnSvc.ReleaseClient(ctx, clientPub)
 		}
 		if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, 0); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
+			h.peerChangeError(w, err)
 			return
 		}
 		_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, req.ClientID)
 		if clientPub != req.ClientID {
-			_, _ = h.db.DeleteConnectionByClientID(ctx, clientPub, 0)
+			if _, err := h.db.DeleteConnectionByClientID(ctx, clientPub, 0); err != nil {
+				h.peerChangeError(w, err)
+				return
+			}
 			_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, clientPub)
+		}
+		// Every commit above only queued the runtime enforcement; confirm it
+		// converged once, after the last of them, so the caller is told
+		// whether the peer's portal access was actually withdrawn (issue
+		// #391 round 4b, finding 4).
+		if !h.peerChangeConvergedContext(w, ctx) {
+			return
 		}
 
 		h.audit(r, "server_connection.remove", map[string]any{"server_id": 0, "protocol": req.Protocol, "client_id": req.ClientID})
@@ -581,6 +594,37 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 	enableState := req.Enable || req.Enabled
 
 	ctx := r.Context()
+	if serverID == 0 {
+		conn, err := h.db.GetConnection(ctx, req.ClientID)
+		if err != nil || conn == nil || conn.ServerID != 0 {
+			conn, err = h.db.GetConnectionByClientID(ctx, req.ClientID, 0)
+		}
+		if err != nil || conn == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+			return
+		}
+
+		_, err = h.db.ToggleConnection(ctx, conn.ID, enableState)
+		if err != nil {
+			h.peerChangeError(w, err)
+			return
+		}
+		// The commit only queued the runtime enforcement of the toggle;
+		// confirm it converged before answering, so a toggle that did not
+		// take effect at the portal is not reported as applied (issue #391
+		// round 4b, finding 4).
+		if !h.peerChangeConvergedContext(w, ctx) {
+			return
+		}
+
+		h.audit(r, "server_connection.toggle", map[string]any{"server_id": 0, "protocol": req.Protocol, "client_id": req.ClientID, "enabled": enableState})
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"enabled": enableState,
+		})
+		return
+	}
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
