@@ -64,9 +64,22 @@ type PeerRevokeEvent struct {
 	// PORTAL-scope connection (server_id 0, awg protocol), the ingress
 	// engine's domain. It is authoritative for connection-level events: the
 	// row is already gone by the time the recorder runs. For user-level
-	// events the database cannot classify the user's individual sessions, so
-	// it stays false and the recorder resolves scope per session.
+	// events it stays false and the recorder uses PortalPeers.
 	PortalScope bool
+	// PortalPeers carries the peer public keys of the user's PORTAL-scope
+	// connections, captured by the database BEFORE the deleting statement
+	// destroyed their rows (issue #391 round 4b, finding 1). It is
+	// authoritative for bulk user-level revocations (user delete, delete a
+	// user's connections): without it the recorder could only re-derive
+	// scope from durable state that no longer exists, and the established
+	// session, its forwarder route and its backend accounting leaked.
+	//
+	// It is empty for a user-level revocation that does NOT delete rows
+	// (user disable): the connections are still there, so the recorder
+	// resolves each live session against its own durable connection as
+	// before. Backward compatible: a recorder that ignores this field
+	// behaves exactly as it did before.
+	PortalPeers []string
 }
 
 // PeerRevokeRecorder receives one event per committed durable access
@@ -266,10 +279,20 @@ func (d *DB) DeleteConnectionByClientID(ctx context.Context, clientID string, se
 }
 
 // DeleteConnectionsByUserID removes a user's rows and reconciles portal access.
+// The PORTAL-scope peer identities are captured BEFORE the deleting statement
+// and carried on the revoke event, so an established portal session is torn
+// down immediately instead of leaking (issue #391 round 4b, finding 1).
 func (d *DB) DeleteConnectionsByUserID(ctx context.Context, userID string) (int, error) {
-	n, err := d.deleteConnectionsByUserID(ctx, userID)
+	n, portalKeys, err := d.deleteConnectionsByUserID(ctx, userID)
 	if err != nil || n == 0 {
 		return n, err
+	}
+	if len(portalKeys) != 0 {
+		d.recordPeerRevoke(ctx, PeerRevokeEvent{
+			Kind:        PeerRevokeUser,
+			UserID:      userID,
+			PortalPeers: portalKeys,
+		})
 	}
 	return n, d.notifyPeerChange(ctx)
 }
@@ -334,13 +357,20 @@ func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates ma
 	return ok, version, nil
 }
 
-// DeleteUser removes a user and reconciles any portal peer revocations.
+// DeleteUser removes a user and reconciles any portal peer revocations. The
+// PORTAL-scope peer identities are captured inside the deleting transaction
+// and carried on the revoke event, so an established portal session is torn
+// down immediately instead of leaking (issue #391 round 4b, finding 1).
 func (d *DB) DeleteUser(ctx context.Context, id string) (bool, error) {
-	ok, err := d.deleteUser(ctx, id)
+	ok, portalKeys, err := d.deleteUser(ctx, id)
 	if err != nil || !ok {
 		return ok, err
 	}
-	d.recordPeerRevoke(ctx, PeerRevokeEvent{Kind: PeerRevokeUser, UserID: id})
+	d.recordPeerRevoke(ctx, PeerRevokeEvent{
+		Kind:        PeerRevokeUser,
+		UserID:      id,
+		PortalPeers: portalKeys,
+	})
 	return ok, d.notifyPeerChange(ctx)
 }
 

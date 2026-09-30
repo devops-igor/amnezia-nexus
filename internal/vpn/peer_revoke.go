@@ -142,11 +142,44 @@ func (s *Service) revokeDurableAccess(ctx context.Context, peerKey string) {
 // engine's domain and their lifecycle has its own pre-existing delete paths.
 // It never touches durable IP allocations.
 func (s *Service) RevokeUserSessions(ctx context.Context, userID string) {
+	s.revokeUserSessions(ctx, userID, nil)
+}
+
+// revokeUserSessions is the shared body of the user-level revocation. When
+// captured is non-empty it is the authoritative set of PORTAL-scope peer keys
+// the database captured BEFORE the deleting statement destroyed their rows
+// (issue #391 round 4b, finding 1): the durable connection is already gone, so
+// portalSession cannot classify those sessions any more and the per-session
+// durable lookup is both useless and wrong to rely on. Sessions outside the
+// captured set are still resolved against their own durable connection, which
+// keeps the user-disable path (no rows deleted, captured empty) working
+// exactly as before.
+func (s *Service) revokeUserSessions(ctx context.Context, userID string, captured []string) {
 	if s == nil || s.sessionMgr == nil {
 		return
 	}
+	capturedSet := make(map[string]struct{}, len(captured))
+	for _, key := range captured {
+		if key != "" {
+			capturedSet[key] = struct{}{}
+		}
+	}
 	sessions := s.sessionMgr.GetSessionsByUserID(userID)
 	for _, sess := range sessions {
+		if _, ok := capturedSet[sess.PeerPublicKey]; ok {
+			// The durable row is gone; the captured identity is the
+			// authority. This is the ingress engine's domain by
+			// construction: only portal-scope keys were captured.
+			s.revokeDurableAccess(ctx, sess.PeerPublicKey)
+			continue
+		}
+		if len(capturedSet) != 0 {
+			// A bulk delete captured the user's portal identities: a
+			// session whose peer is NOT among them is either a regular
+			// server peer, a legacy server tunnel, or a connection that
+			// was never captured. All are outside this path's domain.
+			continue
+		}
 		if !s.portalSession(ctx, sess) {
 			continue
 		}
@@ -183,11 +216,14 @@ func (s *Service) SetPostCommitRevokeHookForTest(fn func(kind database.PeerRevok
 // Portal scoping (issue #391 round 4a, finding 3): the dispatcher owns only
 // PORTAL-scope sessions, the ingress engine's domain. A connection-level
 // event is already classified by the database layer, which saw the row
-// before the commit deleted it. A user-level event cannot be classified
-// there, so each candidate session is classified here against its own
-// durable connection (server_id 0, awg) and sessions of regular server peers
-// or legacy server tunnels are left untouched: their lifecycle has its own
-// pre-existing delete paths.
+// before the commit deleted it. A user-level event that DELETES rows carries
+// the same pre-commit classification in PortalPeers (issue #391 round 4b,
+// finding 1), because there is nothing left to classify against afterwards.
+// A user-level event that leaves the rows in place (user disable) cannot
+// classify in the database, so each candidate session is classified here
+// against its own durable connection (server_id 0, awg) and sessions of
+// regular server peers or legacy server tunnels are left untouched: their
+// lifecycle has its own pre-existing delete paths.
 func (s *Service) runPostCommitRevoke(ctx context.Context, event database.PeerRevokeEvent) {
 	s.mu.RLock()
 	hook := s.postCommitRevokeHookForTest
@@ -202,7 +238,7 @@ func (s *Service) runPostCommitRevoke(ctx context.Context, event database.PeerRe
 		}
 	case database.PeerRevokeUser:
 		if event.UserID != "" {
-			s.RevokeUserSessions(ctx, event.UserID)
+			s.revokeUserSessions(ctx, event.UserID, event.PortalPeers)
 		}
 	}
 }

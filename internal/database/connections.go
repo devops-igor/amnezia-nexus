@@ -427,20 +427,70 @@ func (d *DB) GetConnectionsForSync(ctx context.Context, serverID int64) ([]model
 	return d.GetConnectionsByServerID(ctx, serverID)
 }
 
-// DeleteConnectionsByUserID deletes all connections belonging to a user. Returns count deleted.
-func (d *DB) deleteConnectionsByUserID(ctx context.Context, userID string) (int, error) {
+// portalPeerKeysForUser captures the peer public keys of a user's PORTAL-scope
+// connections (server_id 0, awg protocol) as they exist RIGHT NOW.
+//
+// It is the capture step of the bulk-deletion revocation protocol (issue #391
+// round 4b, finding 1): the identity MUST be read before the deleting
+// statement destroys the row, because afterwards the revoke dispatcher can no
+// longer classify the user's live sessions against durable state and the
+// established session, its forwarder route and its backend accounting leak.
+//
+// It runs on the caller's querier, so the caller owns the transaction: inside
+// deleteUser's transaction the capture and the delete are one atomic unit.
+func portalPeerKeysForUser(ctx context.Context, q vpnAssignmentQuerier, userID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT client_id, server_id, protocol FROM user_connections WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read user connections for revocation: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var keys []string
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var clientID, protocol string
+		var serverID int64
+		if err := rows.Scan(&clientID, &serverID, &protocol); err != nil {
+			return nil, fmt.Errorf("failed to scan user connection for revocation: %w", err)
+		}
+		if clientID == "" || serverID != 0 || models.NormalizeProtocol(protocol) != "awg" {
+			// Regular server peers and non-AWG protocols are outside the
+			// ingress engine's domain; the engine-aware dispatcher must
+			// never tear their sessions down.
+			continue
+		}
+		if _, dup := seen[clientID]; dup {
+			continue
+		}
+		seen[clientID] = struct{}{}
+		keys = append(keys, clientID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read user connections for revocation: %w", err)
+	}
+	return keys, nil
+}
+
+// deleteConnectionsByUserID deletes all connections belonging to a user. It
+// returns the count deleted together with the PORTAL-scope peer public keys
+// captured BEFORE the deleting statement ran (issue #391 round 4b, finding 1).
+func (d *DB) deleteConnectionsByUserID(ctx context.Context, userID string) (int, []string, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	keys, err := portalPeerKeysForUser(ctx, d.sqlDB, userID)
+	if err != nil {
+		return 0, nil, err
+	}
 	res, err := d.sqlDB.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", userID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to delete user connections: %w", err)
+		return 0, nil, fmt.Errorf("failed to delete user connections: %w", err)
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return int(rows), nil
+	return int(rows), keys, nil
 }
 
 // DeleteConnectionsByUser is an alias for DeleteConnectionsByUserID.

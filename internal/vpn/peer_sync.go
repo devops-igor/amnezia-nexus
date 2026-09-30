@@ -48,6 +48,15 @@ type peerSynchronizer struct {
 	settings      models.VPNConfig
 	status        PeerSyncStatus
 	revokeSession func(ctx context.Context, peerKey string) error
+	// listActiveSessions is the live-session side of the Nexus routing
+	// cleanup reconciliation (issue #391 round 4b, S1). It snapshots the
+	// SessionManager under its own RLock, so cleanup can compare live
+	// sessions against the desired durable peers without enumerating
+	// user_connections: a DELETED connection has no row left, and both the
+	// durable enumeration and removeDriftedPeers (which walks the upstream
+	// device) would miss its session. Nil when no session manager is
+	// attached; cleanup then falls back to the durable enumeration alone.
+	listActiveSessions func() []models.VPNSession
 
 	// Async post-commit reconciliation (issue #391 round 4a, finding 2).
 	// notify wakes the serialized worker with coalescing semantics
@@ -66,15 +75,16 @@ type peerSynchronizer struct {
 	lastEnqueueFailure atomic.Value // string
 }
 
-func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ingress.Resolver, cfg clientawg.Config, settings *models.VPNConfig, revokeSession func(ctx context.Context, peerKey string) error) *peerSynchronizer {
+func newPeerSynchronizer(db *database.DB, portal portalPeerDevice, resolver *ingress.Resolver, cfg clientawg.Config, settings *models.VPNConfig, revokeSession func(ctx context.Context, peerKey string) error, listActiveSessions func() []models.VPNSession) *peerSynchronizer {
 	return &peerSynchronizer{
-		db:            db,
-		portal:        portal,
-		resolver:      resolver,
-		config:        cfg,
-		subnet:        settings.SubnetCIDR,
-		settings:      *settings,
-		revokeSession: revokeSession,
+		db:                 db,
+		portal:             portal,
+		resolver:           resolver,
+		config:             cfg,
+		subnet:             settings.SubnetCIDR,
+		settings:           *settings,
+		revokeSession:      revokeSession,
+		listActiveSessions: listActiveSessions,
 	}
 }
 
@@ -523,20 +533,54 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 // or backend accounting alive. Only portal-scope sessions are considered:
 // sessions of regular server peers and legacy server tunnels are not this
 // engine's domain.
+//
+// The reconciliation is between the LIVE sessions in the SessionManager and
+// the desired durable peers, NOT between user_connections and the desired set
+// (issue #391 round 4b, S1). A DELETED connection has no user_connections
+// row left, so a durable-row-driven enumeration never saw its peer key, and
+// with the upstream peer also gone removeDriftedPeers never saw it either:
+// neither path revoked, so the session, its forwarder route and the backend
+// ActiveConnections counter leaked while reconciliation reported success.
+// A missing upstream peer AND a missing durable row must never suppress
+// exactly-once Nexus-side teardown, so live sessions are enumerated in their
+// own right here.
+//
+// Portal scope of a live session is resolved without the durable row when the
+// row can no longer answer: an ingress-admitted session is by construction an
+// ingress-engine peer, and a handshake-admitted session is classified against
+// its durable connection (server_id 0, awg) exactly as before. A handshake
+// session whose durable row is gone is NOT revoked here: it belongs to the
+// post-commit revoke path, which captured the identity before the delete
+// (issue #391 round 4b, finding 1).
 func (s *peerSynchronizer) cleanupOrphanedRouting(ctx context.Context, desired map[string]desiredPeer, alreadyRevoked []string) []error {
-	if s.db == nil || s.revokeSession == nil {
+	if s.revokeSession == nil {
 		return nil
 	}
-	assignments, err := s.db.GetVPNClientIPAssignments(ctx)
-	if err != nil {
-		return []error{fmt.Errorf("enumerate portal client assignments: %w", err)}
-	}
-	portalKeys := make(map[string]struct{}, len(assignments))
-	for _, a := range assignments {
-		if a.PeerKey == "" {
-			continue
+	// The durable portal-key set still contributes: it covers a live session
+	// whose peer is no longer desired while its row is still present (the
+	// toggle-to-disabled case) and keeps the classification authoritative
+	// for handshake-admitted sessions.
+	portalKeys := make(map[string]struct{})
+	if s.db != nil {
+		assignments, err := s.db.GetVPNClientIPAssignments(ctx)
+		if err != nil {
+			return []error{fmt.Errorf("enumerate portal client assignments: %w", err)}
 		}
-		portalKeys[a.PeerKey] = struct{}{}
+		for _, a := range assignments {
+			if a.PeerKey == "" {
+				continue
+			}
+			portalKeys[a.PeerKey] = struct{}{}
+		}
+	}
+	// The live session set is the other side of the reconciliation and is
+	// independent of the durable rows.
+	liveKeys, err := s.livePortalSessionKeys(ctx, portalKeys)
+	if err != nil {
+		return []error{err}
+	}
+	for key := range liveKeys {
+		portalKeys[key] = struct{}{}
 	}
 	revoked := make(map[string]struct{}, len(alreadyRevoked))
 	for _, key := range alreadyRevoked {
@@ -560,6 +604,50 @@ func (s *peerSynchronizer) cleanupOrphanedRouting(ctx context.Context, desired m
 		}
 	}
 	return failures
+}
+
+// livePortalSessionKeys returns the peer keys of the currently live sessions
+// that are this engine's domain. It is the live-session side of
+// cleanupOrphanedRouting's reconciliation (issue #391 round 4b, S1) and is
+// what makes a DELETED connection's session visible to cleanup at all.
+//
+// A session is in scope when it is connected, has a peer key, and either
+// already appears in known (a portal durable connection is present) or is
+// ingress-admitted (the ingress engine only ever admits its own portal
+// peers, so this needs no durable row). Every other session — a regular
+// server peer, a legacy server tunnel, a handshake session whose row is gone
+// — is left to its own lifecycle.
+func (s *peerSynchronizer) livePortalSessionKeys(ctx context.Context, known map[string]struct{}) (map[string]struct{}, error) {
+	if s.listActiveSessions == nil {
+		return nil, nil
+	}
+	keys := make(map[string]struct{})
+	for _, sess := range s.listActiveSessions() {
+		if sess.Status != "connected" || sess.PeerPublicKey == "" {
+			continue
+		}
+		if _, ok := known[sess.PeerPublicKey]; ok {
+			keys[sess.PeerPublicKey] = struct{}{}
+			continue
+		}
+		if sess.AdmittedVia == models.SessionAdmissionIngress {
+			keys[sess.PeerPublicKey] = struct{}{}
+			continue
+		}
+		// Handshake-admitted with no known portal row: classify against
+		// durable state, which is still authoritative for rows that exist.
+		if s.db == nil {
+			continue
+		}
+		conn, err := s.db.GetConnectionByClientID(ctx, sess.PeerPublicKey, 0)
+		if err != nil || conn == nil {
+			continue
+		}
+		if conn.ServerID == 0 && models.NormalizeProtocol(conn.Protocol) == "awg" {
+			keys[sess.PeerPublicKey] = struct{}{}
+		}
+	}
+	return keys, nil
 }
 
 func (s *peerSynchronizer) portalConfigDrift(ctx context.Context) error {

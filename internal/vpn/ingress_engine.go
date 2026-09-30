@@ -149,7 +149,12 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 	}
 
 	resolver := ingress.NewResolver()
-	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg, s.RevokeUpstreamPeerSession)
+	// The live-session snapshot is the live side of the Nexus routing cleanup
+	// reconciliation (issue #391 round 4b, S1): a DELETED connection leaves no
+	// user_connections row, so durable enumeration alone would never see its
+	// session. It reads the SessionManager under its own RLock and never
+	// mutates it.
+	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg, s.RevokeUpstreamPeerSession, s.sessionMgr.ListActiveSessionsSnapshot)
 	// The async post-commit reconcile worker must exist BEFORE the initial
 	// synchronous reconciliation subscribes the DB listener: every later
 	// notification is a non-blocking enqueue onto this worker (issue #391

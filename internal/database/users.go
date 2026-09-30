@@ -399,38 +399,51 @@ func (d *DB) updateUserAndBumpSession(ctx context.Context, id string, updates ma
 	return true, newVersion, nil
 }
 
-// DeleteUser deletes a user and all associated connections in a transaction.
-func (d *DB) deleteUser(ctx context.Context, id string) (bool, error) {
+// deleteUser deletes a user and all associated connections in a transaction.
+// It returns the PORTAL-scope peer public keys of the deleted connections,
+// captured INSIDE the transaction immediately BEFORE the deleting statement
+// ran (issue #391 round 4b, finding 1). The post-commit revoke event must
+// carry them: once the rows are gone the dispatcher can no longer classify
+// the user's live sessions and the established portal session, its forwarder
+// route and its backend accounting leak. Capturing inside the same
+// transaction keeps the identity and the delete atomic.
+func (d *DB) deleteUser(ctx context.Context, id string) (bool, []string, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	tx, err := d.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("failed to begin delete user tx: %w", err)
+		return false, nil, fmt.Errorf("failed to begin delete user tx: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback()
 	}()
 
-	_, _ = tx.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", id)
+	portalKeys, err := portalPeerKeysForUser(ctx, tx, id)
+	if err != nil {
+		return false, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", id); err != nil {
+		return false, nil, fmt.Errorf("failed to delete user connections for user %s: %w", id, err)
+	}
 	_, _ = tx.ExecContext(ctx, "DELETE FROM connection_creation_log WHERE user_id = ?", id)
 	_, _ = tx.ExecContext(ctx, "DELETE FROM vpn_sessions WHERE user_id = ?", id)
 
 	res, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id)
 	if err != nil {
-		return false, fmt.Errorf("failed to delete user %s: %w", id, err)
+		return false, nil, fmt.Errorf("failed to delete user %s: %w", id, err)
 	}
 
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit delete user: %w", err)
+		return false, nil, fmt.Errorf("failed to commit delete user: %w", err)
 	}
 
-	return rows > 0, nil
+	return rows > 0, portalKeys, nil
 }
 
 // ToggleUser toggles a user's enabled status.
