@@ -365,7 +365,9 @@ func (d *DB) deleteConnectionByClientID(ctx context.Context, clientID string, se
 	return rows > 0, nil
 }
 
-// ToggleConnection toggles or enables/disables a connection.
+// ToggleConnection toggles or enables/disables a connection. Disabling
+// revokes access: the immediate live-session teardown runs after the commit
+// (issue #391 round 4a, finding 3), then reconciliation is requested.
 func (d *DB) ToggleConnection(ctx context.Context, id string, enabled bool) (bool, error) {
 	d.writeMu.Lock()
 	var query string
@@ -383,6 +385,16 @@ func (d *DB) ToggleConnection(ctx context.Context, id string, enabled bool) (boo
 	d.writeMu.Unlock()
 	if err != nil || rows == 0 {
 		return false, err
+	}
+	if !enabled {
+		if conn, getErr := d.GetConnection(ctx, id); getErr == nil && conn != nil {
+			d.recordPeerRevoke(ctx, PeerRevokeEvent{
+				Kind:        PeerRevokeConnection,
+				UserID:      conn.UserID,
+				ClientID:    conn.ClientID,
+				PortalScope: portalScopedConnection(conn),
+			})
+		}
 	}
 	return true, d.notifyPeerChange(ctx)
 }

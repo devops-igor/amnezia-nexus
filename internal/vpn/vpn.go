@@ -188,6 +188,8 @@ type Service struct {
 	ensureDevicePreLockHook            func()
 	preCommitMigrationHookForTest      func()
 	preAdoptHookForTest                func(peerKey, sessionID string)
+	preRevokeCloseHookForTest          func(peerKey, sessionID string)
+	postCommitRevokeHookForTest        func(kind database.PeerRevokeKind, userID string, clientID string)
 	updateBackendServerHostPreLockHook func()
 	updateBackendServerHostErr         error
 	syncBackendForwarderHook           func() error
@@ -528,6 +530,17 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 
 	serverKeys := endpoint.NewServerKeysManager(db)
 
+	// Finding 3 (issue #391 round 4a): committed durable access revocations
+	// tear down live sessions immediately, engine-aware, instead of waiting
+	// for the reconciliation worker or the idle reaper. The dispatcher is
+	// subscribed before the listener exists so no revocation commit can slip
+	// past it during startup; it binds the real service below, once built.
+	// It never runs under Service.mu (see revokeDispatcher).
+	revokeDispatch := newRevokeDispatcher()
+	if db != nil {
+		db.SubscribePeerRevokes(revokeDispatch)
+	}
+
 	listenerCfg := endpoint.ListenerConfig{
 		ListenPort:  cfg.ListenPort,
 		SubnetCIDR:  cfg.SubnetCIDR,
@@ -634,9 +647,20 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		peerGenerations:        make(map[string]uint64),
 	}
+	revokeDispatch.bind(svc)
 
 	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
 	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
+	// Finding 3 (issue #391 round 4a): committed durable access revocations
+	// tear down live sessions immediately, engine-aware, instead of waiting
+	// for the reconciliation worker or the idle reaper. Service implements
+	// database.PeerRevokeRecorder; the callback never runs under Service.mu.
+	// Constructing a service without a database is a supported path (the
+	// subscription is a no-op then): there are no durable access changes to
+	// observe, so there is nothing for the dispatcher to revoke.
+	if db != nil {
+		db.SubscribePeerRevokes(svc)
+	}
 	// Issue #78: session replacement (client rekey/reconnect) must migrate the
 	// pool connection counter off the old backend - without this every rekey
 	// leaked +1 on the old backend's ActiveConnections gauge (the original
@@ -3600,8 +3624,17 @@ func (s *Service) RevokeUpstreamPeerSession(ctx context.Context, peerKey string)
 	if !ok {
 		return nil
 	}
+	if s.preRevokeCloseHookForTest != nil {
+		s.preRevokeCloseHookForTest(sess.PeerPublicKey, sess.ID)
+	}
+	if err := s.sessionMgr.CloseSession(ctx, sess.ID, "revoked"); err != nil {
+		if errors.Is(err, endpoint.ErrSessionNotFound) {
+			// The session was already evicted (e.g. by CheckTimeouts); the idle reaper owns teardown.
+			return nil
+		}
+		return fmt.Errorf("close revoked session %s: %w", sess.ID, err)
+	}
 	reapedSess = sess
-	_ = s.sessionMgr.CloseSession(ctx, sess.ID, "revoked")
 	if s.forwarder != nil {
 		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
 	}
@@ -3613,6 +3646,14 @@ func (s *Service) RevokeUpstreamPeerSession(ctx context.Context, peerKey string)
 		s.pool.DecrementConnections(sess.BackendTunnelID)
 	}
 	return nil
+}
+
+// SetPreRevokeCloseHookForTest sets a test hook called under s.mu in RevokeUpstreamPeerSession
+// immediately after GetSession and before CloseSession to deterministically test eviction races.
+func (s *Service) SetPreRevokeCloseHookForTest(fn func(peerKey, sessionID string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preRevokeCloseHookForTest = fn
 }
 
 // SetPreAdoptHookForTest sets a test hook called under s.mu in ensureBackendSessionForIngress

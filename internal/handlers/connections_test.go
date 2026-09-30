@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,13 +16,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
-
-type failingPeerSyncListener struct{}
-
-func (failingPeerSyncListener) ReconcilePeers(context.Context) error {
-	return errors.New("injected runtime failure")
-}
-func (failingPeerSyncListener) ValidatePortalConfig(*models.VPNConfig) error { return nil }
 
 func TestConnectionsHandlers(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
@@ -923,7 +915,57 @@ func TestUserDeleteConnectionHandler_LoadBalanced(t *testing.T) {
 	}
 }
 
-func TestUserDeleteConnectionReportsCommittedRuntimeSyncFailure(t *testing.T) {
+// asyncEnforcingPeerSyncListener models the production post-commit contract
+// of issue #391 round 4a finding 2: ReconcilePeers is a NON-BLOCKING enqueue
+// onto a serialized worker, so a commit path never runs the reconciliation
+// inline and never sees a runtime error. The fake enforcement path always
+// fails, and that failure is observable only through the listener's own
+// status telemetry (the production PeerSyncStatus SyncFailures/LastError),
+// exactly as the real peerSynchronizer reports it.
+type asyncEnforcingPeerSyncListener struct {
+	enqueued    atomic.Int64
+	workerDone  chan struct{}
+	failures    atomic.Uint64
+	lastFailure atomic.Value // string
+}
+
+func newAsyncEnforcingPeerSyncListener() *asyncEnforcingPeerSyncListener {
+	l := &asyncEnforcingPeerSyncListener{workerDone: make(chan struct{}, 8)}
+	l.lastFailure.Store("")
+	return l
+}
+
+func (l *asyncEnforcingPeerSyncListener) ReconcilePeers(context.Context) error {
+	l.enqueued.Add(1)
+	l.workerDone <- struct{}{}
+	return nil
+}
+
+func (l *asyncEnforcingPeerSyncListener) ValidatePortalConfig(*models.VPNConfig) error { return nil }
+
+// runEnforcement simulates the serialized worker: the enforcement path fails
+// and the failure is recorded in status telemetry only.
+func (l *asyncEnforcingPeerSyncListener) runEnforcement() {
+	<-l.workerDone
+	l.failures.Add(1)
+	l.lastFailure.Store("injected runtime enforcement failure")
+}
+
+// status mirrors the fields of the production PeerSyncStatus that carry
+// enforcement failures.
+func (l *asyncEnforcingPeerSyncListener) status() (uint64, string) {
+	reason, _ := l.lastFailure.Load().(string)
+	return l.failures.Load(), reason
+}
+
+// TestUserDeleteConnectionDurableSuccessWithAsyncEnforcement pins the
+// post-round-4a contract on the connection-delete path: the durable delete
+// commits and the API reports HTTP success, the post-commit notification only
+// ENQUEUES the asynchronous reconcile (so no runtime device I/O and no
+// runtime error can reach the committing goroutine), and a failing
+// enforcement path is observable through peer sync status telemetry rather
+// than through a synchronous HTTP error.
+func TestUserDeleteConnectionDurableSuccessWithAsyncEnforcement(t *testing.T) {
 	h, db, _ := setupTestHandlersWithMockSSH(t, &testMockSSHClient{})
 	ctx := t.Context()
 	u := &models.User{ID: "u-sync-delete", Username: "syncdelete", Role: models.RoleUser, Enabled: true}
@@ -934,7 +976,8 @@ func TestUserDeleteConnectionReportsCommittedRuntimeSyncFailure(t *testing.T) {
 	if _, err := db.CreateConnection(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
-	unsubscribe, err := db.SubscribePeerChanges(failingPeerSyncListener{})
+	listener := newAsyncEnforcingPeerSyncListener()
+	unsubscribe, err := db.SubscribePeerChanges(listener)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,11 +986,31 @@ func TestUserDeleteConnectionReportsCommittedRuntimeSyncFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/connections/"+conn.ID+"/delete", nil)
 	w := httptest.NewRecorder()
 	setupFullConnectionsRouter(h).ServeHTTP(w, req.WithContext(middleware.WithSession(req.Context(), sess)))
-	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "runtime_sync_failed") {
-		t.Fatalf("committed runtime failure reported as %d: %s", w.Code, w.Body.String())
+
+	// Durable success is reported as HTTP success, and no runtime_sync_failed
+	// envelope is produced any more: the notification path returns no runtime
+	// error because it only enqueues.
+	if w.Code != http.StatusOK {
+		t.Fatalf("durable delete reported as %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "runtime_sync_failed") {
+		t.Fatalf("post-commit enforcement leaked a synchronous runtime error: %s", w.Body.String())
 	}
 	if stored, err := db.GetConnection(ctx, conn.ID); err != nil || stored != nil {
 		t.Fatalf("delete was not committed: %+v err=%v", stored, err)
+	}
+	// The commit requested an asynchronous reconcile instead of running it.
+	if got := listener.enqueued.Load(); got < 1 {
+		t.Fatalf("post-commit notification did not enqueue a reconcile: %d enqueues", got)
+	}
+	// The failing enforcement path surfaces through status telemetry only.
+	listener.runEnforcement()
+	failures, lastError := listener.status()
+	if failures == 0 || lastError == "" {
+		t.Fatalf("asynchronous enforcement failure is not observable: failures=%d last=%q", failures, lastError)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("async enforcement failure changed the already-sent response: %d", w.Code)
 	}
 }
 

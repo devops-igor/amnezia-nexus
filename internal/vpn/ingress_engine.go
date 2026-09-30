@@ -55,6 +55,7 @@ type IngressEngine struct {
 	portal                 *clientawg.ClientAWGDevice
 	peerSync               *peerSynchronizer
 	unsubscribePeerChanges func()
+	stopPeerSyncWorker     func() error
 	resolver               *ingress.Resolver
 	liveness               *ingress.SessionLiveness
 	router                 *ingress.Router
@@ -149,20 +150,57 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 
 	resolver := ingress.NewResolver()
 	peerSync := newPeerSynchronizer(db, portal, resolver, cfg, vpnCfg, s.RevokeUpstreamPeerSession)
+	// The async post-commit reconcile worker must exist BEFORE the initial
+	// synchronous reconciliation subscribes the DB listener: every later
+	// notification is a non-blocking enqueue onto this worker (issue #391
+	// round 4a, finding 2). The initial reconcile below stays synchronous:
+	// it runs without Service.mu held and its failure aborts construction.
+	stopPeerSyncWorker, err := peerSync.startNotifyWorker()
+	if err != nil {
+		_ = portal.Close()
+		return nil, fmt.Errorf("ingress engine: start peer sync notify worker: %w", err)
+	}
+	// abortWorker stops the notify worker on a construction failure. The
+	// drain is deadline-bounded, so a wedged portal device reports a timeout
+	// instead of blocking construction; the construction error below is the
+	// one that matters, so the drain result is logged, not returned.
+	abortWorker := func() {
+		if stopErr := stopPeerSyncWorker(); stopErr != nil {
+			log.Printf("[vpn/ingress] peer sync worker drain during aborted construction: %v", stopErr)
+		}
+	}
 	unsubscribe, err := db.SubscribePeerChanges(peerSync)
 	if err != nil {
+		abortWorker()
 		_ = portal.Close()
 		return nil, fmt.Errorf("ingress engine: subscribe peer changes: %w", err)
 	}
+	// From this point notifications may arrive at any time, so the engine
+	// method becomes the listener target: post-commit notifications enqueue
+	// onto the worker instead of ever reconciling on the committing
+	// goroutine (issue #391 round 4a, finding 2). peerSync.ReconcilePeers
+	// remains the direct entry point for the construction-time initial
+	// reconcile and the periodic reconcile loop, both of which run without
+	// Service.mu held. ReconcilePeers routes by notifyListener, so the
+	// initial reconcile below MUST run before the listener is armed: with
+	// the listener set it would enqueue and return nil, and construction
+	// would report success without the portal ever receiving the durable
+	// peer set (the round-4a startup-install defect).
+	peerSync.notifyListener = nil
 	if err := peerSync.ReconcilePeers(ctx); err != nil {
 		unsubscribe()
+		abortWorker()
 		_ = portal.Close()
 		return nil, fmt.Errorf("ingress engine: initial peer reconciliation: %w", err)
 	}
+	// Arm the async post-commit notification path only after the initial
+	// reconciliation succeeded.
+	peerSync.notifyListener = peerSync.enqueuePeerReconcile
 	if peers != nil {
 		desired, _, err := peerSync.desired(ctx)
 		if err != nil || len(desired) != len(peers) {
 			unsubscribe()
+			abortWorker()
 			_ = portal.Close()
 			return nil, errors.New("ingress engine: supplied peers differ from durable peer registry")
 		}
@@ -170,6 +208,7 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 			entry, ok := desired[peer.PublicKey]
 			if !ok || entry.peer.AllowedIP != peer.AllowedIP {
 				unsubscribe()
+				abortWorker()
 				_ = portal.Close()
 				return nil, errors.New("ingress engine: supplied peers differ from durable peer registry")
 			}
@@ -181,7 +220,7 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 	// same throttle window (issue #294 pattern).
 	liveness := ingress.NewSessionLiveness(s.sessionMgr.TouchSession)
 
-	e := &IngressEngine{svc: s, portal: portal, peerSync: peerSync, unsubscribePeerChanges: unsubscribe, resolver: resolver, liveness: liveness}
+	e := &IngressEngine{svc: s, portal: portal, peerSync: peerSync, unsubscribePeerChanges: unsubscribe, stopPeerSyncWorker: stopPeerSyncWorker, resolver: resolver, liveness: liveness}
 	e.returnPath = forwarder.NewReturnPath(e.writeReturnPacket)
 	// Production classification (issue #389 rework 2): the forwarder's
 	// backend-reader filters reject malformed/unrouted replies before the
@@ -280,7 +319,10 @@ func (e *IngressEngine) reapLoop(stopCh <-chan struct{}, done chan<- struct{}) {
 }
 
 // peerSyncLoop retries post-commit failures and repairs device drift even when
-// the backend-session reaper is delayed by unrelated routing work.
+// the backend-session reaper is delayed by unrelated routing work. It calls
+// reconcileNow directly (never the enqueue-style notification entry point) and
+// runs on its own goroutine without Service.mu held (issue #391 round 4a,
+// finding 2).
 func (e *IngressEngine) peerSyncLoop(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	interval := e.peerSyncInterval
@@ -294,7 +336,7 @@ func (e *IngressEngine) peerSyncLoop(stop <-chan struct{}, done chan<- struct{})
 		case <-stop:
 			return
 		case <-ticker.C:
-			_ = e.peerSync.ReconcilePeers(context.Background())
+			_ = e.peerSync.reconcileNow(context.Background())
 		}
 	}
 }
@@ -355,6 +397,21 @@ func (e *IngressEngine) Stop() error {
 	if e.returnPath != nil {
 		e.returnPath.Close()
 	}
+	// Drain the post-commit reconcile worker FIRST (issue #391 round 4a,
+	// finding 2): it may hold peerSync.mu and be mid-upstream-call, so it
+	// must reach quiescence before the unsubscribe below lets a late DB
+	// commit enqueue a fresh reconcile and before the portal closes under
+	// an in-flight reconcile. The stop closure unsubscribes (its own
+	// SubscribePeerChanges release) and waits for the current reconcile.
+	// The drain is deadline-bounded: a reconcile wedged on the portal
+	// device must not hang Stop, so a timeout is reported and teardown
+	// proceeds (issue #391 round 4a; the worker's ctx is Background by
+	// design so a portal stall cannot mask its own failure).
+	if e.stopPeerSyncWorker != nil {
+		if err := e.stopPeerSyncWorker(); err != nil {
+			log.Printf("[vpn/ingress] peer sync worker drain timed out during stop: %v", err)
+		}
+	}
 	if e.unsubscribePeerChanges != nil {
 		e.unsubscribePeerChanges()
 	}
@@ -400,9 +457,14 @@ func (e *IngressEngine) Resolver() *ingress.Resolver { return e.resolver }
 // PeerSyncStatus reports desired versus upstream peer state and repair errors.
 func (e *IngressEngine) PeerSyncStatus() PeerSyncStatus { return e.peerSync.Status() }
 
-// ReconcilePeers repairs runtime drift on demand from durable state.
+// ReconcilePeers repairs runtime drift on demand from durable state. It runs
+// synchronously without Service.mu held: it is the operators' and tests' "do
+// one full reconciliation now and report the outcome" entry point, distinct
+// from the async post-commit notification path (notifyPeerChange ->
+// peerSynchronizer.ReconcilePeers), which only enqueues onto the serialized
+// worker (issue #391 round 4a, finding 2).
 func (e *IngressEngine) ReconcilePeers(ctx context.Context) error {
-	return e.peerSync.ReconcilePeers(ctx)
+	return e.peerSync.reconcileNow(ctx)
 }
 
 // Portal exposes the engine's upstream device for identity (public key) and

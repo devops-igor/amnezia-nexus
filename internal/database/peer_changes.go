@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -11,16 +10,132 @@ import (
 
 // PeerChangeListener is called after a durable access change has committed.
 // Implementations must read the database afresh; the notification is a hint,
-// not a second peer registry. A returned error reports that the commit has
-// succeeded but its runtime enforcement has not.
+// not a second peer registry.
+//
+// ReconcilePeers must never run synchronously on the notifying goroutine:
+// production implementations enqueue serialized background work and return
+// immediately (issue #391 round 4a, finding 2), so a database commit path can
+// never block on runtime device I/O or re-enter runtime locks. Because the
+// notification is only a hint, it reports no runtime error: a failed or
+// dropped enqueue is observable on the implementation's own telemetry, and
+// the periodic reconcile loop retries any drift. The commit itself is already
+// durable when this method is called.
 type PeerChangeListener interface {
 	ReconcilePeers(context.Context) error
 	ValidatePortalConfig(*models.VPNConfig) error
 }
 
 // ErrPeerRuntimeSync means the database commit succeeded but the live upstream
-// device could not be confirmed synchronized. A later reconciliation retries.
+// device could not be confirmed synchronized. The construction-time initial
+// reconciliation reports it (aborting construction); the periodic reconcile
+// loop and the enqueue worker's failures surface it through peer sync status
+// telemetry and retry it. The post-commit notification path no longer returns
+// it: enforcement is asynchronous (issue #391 round 4a, finding 2).
 var ErrPeerRuntimeSync = errors.New("durable change committed but AWG runtime synchronization failed")
+
+// PeerRevokeKind classifies one committed durable access revocation for the
+// immediate live-session teardown trigger (issue #391 round 4a, finding 3).
+type PeerRevokeKind int
+
+const (
+	// PeerRevokeNone reports that the committed change revokes no access.
+	PeerRevokeNone PeerRevokeKind = iota
+	// PeerRevokeConnection marks a connection-level revocation: toggle to
+	// disabled, delete by id, or delete by client id. clientID carries the
+	// peer public key when known.
+	PeerRevokeConnection
+	// PeerRevokeUser marks a user-level revocation: user disable or user
+	// delete. Every session of the user loses live access.
+	PeerRevokeUser
+)
+
+// PeerRevokeEvent describes one committed durable access revocation. The
+// database layer owns the classification because it is the only place that
+// can see the connection row both before and after the commit that destroyed
+// it.
+type PeerRevokeEvent struct {
+	// Kind classifies the revocation.
+	Kind PeerRevokeKind
+	// UserID is the revoked user, for a user-level revocation.
+	UserID string
+	// ClientID is the revoked connection's peer public key, when known.
+	ClientID string
+	// PortalScope reports that the revoked durable connection is a
+	// PORTAL-scope connection (server_id 0, awg protocol), the ingress
+	// engine's domain. It is authoritative for connection-level events: the
+	// row is already gone by the time the recorder runs. For user-level
+	// events the database cannot classify the user's individual sessions, so
+	// it stays false and the recorder resolves scope per session.
+	PortalScope bool
+}
+
+// PeerRevokeRecorder receives one event per committed durable access
+// revocation, immediately after the commit and before reconciliation is
+// requested. Implementations must be non-blocking: they run on database
+// commit goroutines, which may hold runtime locks and must never wait on
+// runtime device I/O (issue #391 round 4a, finding 2).
+type PeerRevokeRecorder interface {
+	RecordPeerRevoke(ctx context.Context, event PeerRevokeEvent)
+}
+
+// The revoke recorder lives beside the change listener and follows the same
+// out-of-write-lock discipline.
+type peerRevokeSlot struct {
+	mu       sync.RWMutex
+	recorder PeerRevokeRecorder
+}
+
+func (d *DB) peerRevokeSlot() *peerRevokeSlot {
+	return &d.peerRevokeListener
+}
+
+// SubscribePeerRevokes installs the immediate live-teardown trigger for
+// committed durable access revocations. The returned function detaches it.
+// A nil database has no durable access changes to observe, so subscribing
+// one is a no-op and the returned detach function is a no-op too:
+// constructing a service without a database is a supported path.
+func (d *DB) SubscribePeerRevokes(recorder PeerRevokeRecorder) func() {
+	if d == nil {
+		return func() {}
+	}
+	slot := d.peerRevokeSlot()
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	slot.recorder = recorder
+	return func() {
+		slot.mu.Lock()
+		if slot.recorder == recorder {
+			slot.recorder = nil
+		}
+		slot.mu.Unlock()
+	}
+}
+
+// portalScopedConnection reports whether a durable connection belongs to the
+// portal (server_id 0, awg), the ingress engine's domain. Sessions of
+// regular server peers and legacy server tunnels are not portal-scope and are
+// never torn down by the engine-aware revoke dispatcher.
+func portalScopedConnection(c *models.UserConnection) bool {
+	return c != nil && c.ServerID == 0 && models.NormalizeProtocol(c.Protocol) == "awg"
+}
+
+// recordPeerRevoke reports one committed access revocation to the recorder,
+// if installed. It never blocks on the recorder and never fails: the commit
+// is already durable when this runs, and missed immediate enforcement is
+// retried by the reconciliation worker and loop.
+func (d *DB) recordPeerRevoke(ctx context.Context, event PeerRevokeEvent) {
+	if event.Kind == PeerRevokeNone || d == nil {
+		return
+	}
+	slot := d.peerRevokeSlot()
+	slot.mu.RLock()
+	recorder := slot.recorder
+	slot.mu.RUnlock()
+	if recorder == nil {
+		return
+	}
+	recorder.RecordPeerRevoke(ctx, event)
+}
 
 // The listener is kept outside DB's write lock so a reconciliation callback
 // can read durable state without deadlocking on a database writer.
@@ -55,16 +170,29 @@ func (d *DB) SubscribePeerChanges(listener PeerChangeListener) (func(), error) {
 	}, nil
 }
 
+// notifyPeerChange requests post-commit enforcement of a durable access
+// change. It NEVER runs the reconciliation inline: the listener enqueues
+// serialized background work (issue #391 round 4a, finding 2), so database
+// commit callers, including legacy admission running under Service.mu, never
+// block on runtime device I/O or re-enter runtime locks. A dropped or failed
+// enqueue is not silent: the listener implementation is required to expose it
+// through its own telemetry, and the periodic reconcile loop retries the
+// drift. The commit is already durable when this runs, so success here means
+// "persisted"; runtime convergence is observed through peer sync status.
 func (d *DB) notifyPeerChange(ctx context.Context) error {
 	slot := d.peerListenerSlot()
 	slot.mu.RLock()
-	defer slot.mu.RUnlock()
-	if slot.listener == nil {
+	listener := slot.listener
+	slot.mu.RUnlock()
+	if listener == nil {
 		return nil
 	}
-	if err := slot.listener.ReconcilePeers(ctx); err != nil {
-		return fmt.Errorf("%w: %v", ErrPeerRuntimeSync, err)
-	}
+	// The notification target is required to be non-blocking and to report no
+	// runtime error (it enqueues; enforcement is asynchronous), so its result
+	// is deliberately not inspected here. A listener that does return an
+	// error is a contract violation surfaced by the caller's own telemetry,
+	// not by the durable commit path.
+	_ = listener.ReconcilePeers(ctx)
 	return nil
 }
 
@@ -103,18 +231,36 @@ func (d *DB) UpdateConnection(ctx context.Context, id string, updates map[string
 
 // DeleteConnection removes the durable row, then revokes its runtime peer.
 func (d *DB) DeleteConnection(ctx context.Context, id string) (bool, error) {
+	conn, _ := d.GetConnection(ctx, id)
 	ok, err := d.deleteConnection(ctx, id)
 	if err != nil || !ok {
 		return ok, err
+	}
+	if conn != nil {
+		d.recordPeerRevoke(ctx, PeerRevokeEvent{
+			Kind:        PeerRevokeConnection,
+			UserID:      conn.UserID,
+			ClientID:    conn.ClientID,
+			PortalScope: portalScopedConnection(conn),
+		})
 	}
 	return ok, d.notifyPeerChange(ctx)
 }
 
 // DeleteConnectionByClientID removes matching durable rows and portal access.
 func (d *DB) DeleteConnectionByClientID(ctx context.Context, clientID string, serverID int64) (bool, error) {
+	conn, _ := d.GetConnectionByClientID(ctx, clientID, serverID)
 	ok, err := d.deleteConnectionByClientID(ctx, clientID, serverID)
-	if err != nil || !ok || serverID != 0 {
+	if err != nil || !ok {
 		return ok, err
+	}
+	if conn != nil {
+		d.recordPeerRevoke(ctx, PeerRevokeEvent{
+			Kind:        PeerRevokeConnection,
+			UserID:      conn.UserID,
+			ClientID:    conn.ClientID,
+			PortalScope: portalScopedConnection(conn),
+		})
 	}
 	return ok, d.notifyPeerChange(ctx)
 }
@@ -146,7 +292,9 @@ func (d *DB) DeleteConnectionsByServerAndProtocol(ctx context.Context, serverID 
 	return n, d.notifyPeerChange(ctx)
 }
 
-// UpdateUser reconciles peers when a user access field changes.
+// UpdateUser reconciles peers when a user access field changes. Disabling a
+// user revokes access: the immediate live-session teardown runs after the
+// commit (issue #391 round 4a, finding 3).
 func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
 	ok, err := d.updateUser(ctx, id, updates)
 	if err != nil || !ok {
@@ -154,6 +302,11 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 	}
 	for _, field := range []string{"enabled", "traffic_limit", "traffic_used", "expires_at", "expiration_date"} {
 		if _, changed := updates[field]; changed {
+			if field == "enabled" {
+				if enabled, isBool := updates["enabled"].(bool); isBool && !enabled {
+					d.recordPeerRevoke(ctx, PeerRevokeEvent{Kind: PeerRevokeUser, UserID: id})
+				}
+			}
 			return ok, d.notifyPeerChange(ctx)
 		}
 	}
@@ -161,6 +314,8 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 }
 
 // UpdateUserAndBumpSession reconciles peers after an access change commits.
+// Disabling a user revokes access: the immediate live-session teardown runs
+// after the commit (issue #391 round 4a, finding 3).
 func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
 	ok, version, err := d.updateUserAndBumpSession(ctx, id, updates)
 	if err != nil || !ok {
@@ -168,6 +323,11 @@ func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates ma
 	}
 	for _, field := range []string{"enabled", "traffic_limit", "traffic_used", "expires_at", "expiration_date"} {
 		if _, changed := updates[field]; changed {
+			if field == "enabled" {
+				if enabled, isBool := updates["enabled"].(bool); isBool && !enabled {
+					d.recordPeerRevoke(ctx, PeerRevokeEvent{Kind: PeerRevokeUser, UserID: id})
+				}
+			}
 			return ok, version, d.notifyPeerChange(ctx)
 		}
 	}
@@ -180,6 +340,7 @@ func (d *DB) DeleteUser(ctx context.Context, id string) (bool, error) {
 	if err != nil || !ok {
 		return ok, err
 	}
+	d.recordPeerRevoke(ctx, PeerRevokeEvent{Kind: PeerRevokeUser, UserID: id})
 	return ok, d.notifyPeerChange(ctx)
 }
 

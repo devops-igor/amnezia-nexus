@@ -223,6 +223,24 @@ func (r *Resolver) Remove(peerPublicKey string) (netip.Addr, bool) {
 	return ip, true
 }
 
+// FilterIPs reports the ownership entries currently installed for the given
+// addresses, in the same order as the input, skipping addresses with no
+// tracked owner. Read-only snapshot for targeted withdrawal during fail-closed
+// identity transitions: a caller removes the reported owners by key when the
+// address must become unauthorized. Concurrent Replace or Update can swap the
+// entries afterwards, so callers treat the result as a snapshot, not a lease.
+func (r *Resolver) FilterIPs(ips []netip.Addr) []PeerOwnership {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PeerOwnership, 0, len(ips))
+	for _, ip := range ips {
+		if o, ok := r.byIP[ip]; ok {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // Reload atomically replaces the resolver contents from durable state using
 // the same durable-only eligibility and conflict rules as LoadResolver. On
 // success the backing maps are swapped in one step: concurrent lookups
