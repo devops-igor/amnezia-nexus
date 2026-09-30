@@ -160,8 +160,20 @@ type PeerRevokeRecorder interface {
 
 // The revoke recorder lives beside the change listener and follows the same
 // out-of-write-lock discipline.
+//
+// Subscription identity is a MONOTONIC TOKEN, never the recorder value itself
+// (issue #391 round 4b, finding 2). Comparing two interface values whose
+// dynamic type is uncomparable — any recorder implemented as a func adapter,
+// or as a struct holding a slice, map or func — panics at runtime, so the
+// previous `slot.recorder == recorder` identity check crashed the detach path
+// of a perfectly valid recorder. The token makes identity a plain integer
+// comparison and keeps the "detach only if this subscription is still current"
+// semantics exact: a stale detach (one whose subscription has already been
+// superseded) leaves the newer recorder installed.
 type peerRevokeSlot struct {
 	mu       sync.RWMutex
+	next     uint64
+	id       uint64
 	recorder PeerRevokeRecorder
 }
 
@@ -174,17 +186,23 @@ func (d *DB) peerRevokeSlot() *peerRevokeSlot {
 // A nil database has no durable access changes to observe, so subscribing
 // one is a no-op and the returned detach function is a no-op too:
 // constructing a service without a database is a supported path.
+//
+// The returned function is safe to call for ANY recorder implementation,
+// including uncomparable ones, and is safe to call more than once.
 func (d *DB) SubscribePeerRevokes(recorder PeerRevokeRecorder) func() {
 	if d == nil {
 		return func() {}
 	}
 	slot := d.peerRevokeSlot()
 	slot.mu.Lock()
-	defer slot.mu.Unlock()
+	slot.next++
+	subID := slot.next
+	slot.id = subID
 	slot.recorder = recorder
+	slot.mu.Unlock()
 	return func() {
 		slot.mu.Lock()
-		if slot.recorder == recorder {
+		if slot.id == subID {
 			slot.recorder = nil
 		}
 		slot.mu.Unlock()
