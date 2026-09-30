@@ -425,8 +425,24 @@ func NewDifferentialHarness(t *testing.T, opts ...func(*models.VPNConfig)) *Diff
 	}
 	cfg.ListenPort = listenPort
 	cfg.PublicEndpoint = fmt.Sprintf("127.0.0.1:%d", listenPort)
-	if err := svc.UpdateConfig(ctx, cfg); err != nil {
-		t.Fatalf("update config: %v", err)
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.HeaderProtectionKey == "" {
+		svc.mu.Lock()
+		svc.cfg.HeaderProtectionKey = ""
+		svc.cfg.S1 = cfg.S1
+		svc.cfg.S2 = cfg.S2
+		svc.cfg.S3 = cfg.S3
+		svc.cfg.S4 = cfg.S4
+		svc.mu.Unlock()
+		_ = svc.endpoint.UpdateHeaderProtectionKey("")
+		_ = svc.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4)
+		_ = db.SaveVPNConfig(ctx, cfg)
+	} else {
+		if err := svc.UpdateConfig(ctx, cfg); err != nil {
+			t.Fatalf("update config: %v", err)
+		}
 	}
 
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
