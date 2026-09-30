@@ -39,7 +39,7 @@ The differential and long-duration compatibility suite proves that previously is
 ### Core Design Rules
 1. **Configuration Freezing:** Client configurations are rendered once (`svc.GenerateClientConfig`) and frozen with their SHA-256 digest before testing starts. Neither the reference server nor the Nexus subject server may regenerate client credentials.
 2. **Sequential Port Binding:** The reference standalone server and Nexus `IngressEngine` run sequentially on the same localhost test port to eliminate port binding collisions while guaranteeing identical network conditions.
-3. **Strict Privacy Invariants:** Zero private keys, zero raw server IPs, and zero local filesystem paths are ever written to disk, committed, or emitted into test output logs.
+3. **Strict Privacy Invariants:** Zero private keys, zero raw server IPs, and zero local filesystem paths are ever persisted in artifacts, committed, or emitted into test output logs.
 
 ---
 
@@ -209,9 +209,10 @@ sudo ./scripts/run_non_netstack_client_qualification.sh \
 
 All differential test suites and scripts adhere to non-negotiable privacy rules:
 
-1. **Zero Private Keys**:
-   - Private keys and raw secrets are never logged via `t.Logf`, written to files, or stored in artifacts.
-   - Verification manifests record only `<present-32B>` or public keys.
+1. **Zero Private Keys & Secrets Retention**:
+   - Private keys and raw secrets are never persisted in artifacts or emitted in logs (`t.Logf`, stderr, JSON manifests).
+   - In live interface qualification, ephemeral 0600 temporary files may be created solely for `awg set` (which requires file inputs for keys) and are removed immediately after configuration and by the cleanup trap.
+   - Verification manifests record only `<present-32B>`, `<absent>`, or public keys.
 2. **Zero Real Server IPs**:
    - Real production/development server IPs are strictly prohibited in tests, scripts, and logs.
    - Leak detection patterns in audit scripts are constructed dynamically to prevent scanner false positives.
