@@ -173,8 +173,15 @@ The script `scripts/run_non_netstack_client_qualification.sh` qualifies the clie
 ### Live Network Namespace Mode (Root / Sudo)
 
 ```bash
-# Execute real interface test in dedicated namespace
+# Execute real interface test in dedicated namespace with client configuration
 sudo ./scripts/run_non_netstack_client_qualification.sh \
+  --config ./client.conf \
+  --output-dir ./test-artifacts
+
+# Or specify individual credentials and server parameters
+sudo ./scripts/run_non_netstack_client_qualification.sh \
+  --server-public-key <server-pubkey> \
+  --client-private-key <client-privkey> \
   --interface awg-client0 \
   --netns nexus-client-ns \
   --server-port 51820 \

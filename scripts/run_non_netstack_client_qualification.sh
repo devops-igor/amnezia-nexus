@@ -480,8 +480,8 @@ REPORT_NOTE=""
 if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     echo "==> [Step 1/6] Validating command prerequisites & toolchain..."
-    echo "    ip route2 tool: $(command -v ip || echo 'simulated')"
-    echo "    AmneziaWG tool: $(command -v awg || echo 'simulated userspace (amneziawg-go)')"
+    echo "    ip route2 tool:     $(command -v ip || echo 'simulated')"
+    echo "    AmneziaWG CLI tool: $(command -v awg || echo 'simulated (amneziawg-tools)')"
     echo "    Status: OK (Dry-Run: Prerequisites checked)"
 
     echo ""
@@ -504,7 +504,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "    Command: ip link set $IFACE netns $NETNS"
     echo "    Command: ip -netns $NETNS addr add $CLIENT_IP dev $IFACE"
 
-    sim_awg_cmd="awg set $IFACE private-key <ephemeral-key> listen-port 0 jc $JC jmin $JMIN jmax $JMAX s1 $S1 s2 $S2 s3 $S3 s4 $S4 h1 $H1 h2 $H2 h3 $H3 h4 $H4"
+    sim_awg_cmd="awg set $IFACE private-key <client-key> listen-port 0 jc $JC jmin $JMIN jmax $JMAX s1 $S1 s2 $S2 s3 $S3 s4 $S4 h1 $H1 h2 $H2 h3 $H3 h4 $H4"
     if [[ -n "$HEADER_PROTECTION_KEY" ]]; then
         sim_awg_cmd+=" header-protection-key <hp-key-file>"
     fi
@@ -591,10 +591,12 @@ else
     MISSING_PREREQ=""
     if [[ "$IS_ROOT" == "false" && -z "$SUDO_CMD" ]]; then
         MISSING_PREREQ="missing CAP_NET_ADMIN / sudo permissions"
-    elif ! command -v awg >/dev/null 2>&1 && ! command -v amneziawg-go >/dev/null 2>&1; then
-        MISSING_PREREQ="missing amneziawg tools (neither awg nor amneziawg-go found)"
+    elif ! command -v awg >/dev/null 2>&1; then
+        MISSING_PREREQ="missing awg CLI tool (amneziawg-tools required for peer configuration)"
     elif [[ -z "$SERVER_PUBLIC_KEY" ]]; then
         MISSING_PREREQ="missing server configuration / public key"
+    elif [[ -z "$CLIENT_PRIVATE_KEY" && -z "$CONFIG_FILE" ]]; then
+        MISSING_PREREQ="missing client credentials (provide --config <client.conf> or --client-private-key <key> matching server peer)"
     fi
 
     if [[ -n "$MISSING_PREREQ" ]]; then
@@ -608,7 +610,7 @@ else
         TEST_STATUS="SKIPPED"
         REPORT_NOTE="SKIPPED: $MISSING_PREREQ"
     else
-        echo "    Prerequisites satisfied: CAP_NET_ADMIN verified, AmneziaWG tools present, server key available."
+        echo "    Prerequisites satisfied: CAP_NET_ADMIN verified, awg CLI tool present, server key and client credentials available."
         echo ""
         echo "==> [Step 2/6] Establishing host-netns veth underlay and namespace '$NETNS'..."
         $SUDO_CMD ip netns add "$NETNS"
@@ -648,11 +650,11 @@ else
             echo "    SKIPPED: missing amneziawg / CAP_NET_ADMIN (kernel module or userspace daemon unavailable)."
             TEST_STATUS="SKIPPED"
             REPORT_NOTE="SKIPPED: missing amneziawg / CAP_NET_ADMIN"
+        elif [[ -z "$CLIENT_PRIVATE_KEY" ]]; then
+            echo "    SKIPPED: missing client private key (credentials must match server peer configuration)."
+            TEST_STATUS="SKIPPED"
+            REPORT_NOTE="SKIPPED: missing client private key"
         else
-            if [[ -z "$CLIENT_PRIVATE_KEY" ]]; then
-                CLIENT_PRIVATE_KEY=$($SUDO_CMD ip netns exec "$NETNS" awg genkey 2>/dev/null || awg genkey 2>/dev/null || wg genkey 2>/dev/null || echo "")
-            fi
-
             TEMP_KEY_FILE=$(mktemp -p "$OUTPUT_DIR" .awg-key-XXXXXX 2>/dev/null || echo "${OUTPUT_DIR}/.awg-key-$$-${RANDOM}")
             echo "$CLIENT_PRIVATE_KEY" > "$TEMP_KEY_FILE"
             chmod 600 "$TEMP_KEY_FILE"
@@ -815,9 +817,9 @@ else
             fi
 
             LINK_UP=false
-            if [[ $($SUDO_CMD ip -netns "$NETNS" link show dev "$IFACE" 2>/dev/null | grep -c "state UP") -ge 1 ]]; then
+            if $SUDO_CMD ip -netns "$NETNS" link show up dev "$IFACE" 2>/dev/null | grep -E -q '<[^>]*\bUP\b[^>]*>'; then
                 LINK_UP=true
-                echo "    Interface successfully brought back UP."
+                echo "    Interface successfully brought back UP (administrative UP verified)."
             fi
 
             # Send post-bounce probes, and set reconnect_resilience_verified=true only if post-bounce echo succeeds and link is UP
