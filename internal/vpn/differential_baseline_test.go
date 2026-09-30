@@ -173,6 +173,9 @@ func TestDifferential_ConfigFreezingAndRedactedManifest(t *testing.T) {
 	}
 
 	taskArtifactPath := filepath.Join(repoRoot, "tasks", "issue-392-differential-compatibility", "evidence_manifest.json")
+	if err := os.MkdirAll(filepath.Dir(taskArtifactPath), 0o755); err != nil {
+		t.Fatalf("failed to create directory for evidence manifest: %v", err)
+	}
 	if err := os.WriteFile(taskArtifactPath, evidenceJSON, 0o600); err != nil {
 		t.Fatalf("failed to write evidence manifest to %s: %v", taskArtifactPath, err)
 	}
