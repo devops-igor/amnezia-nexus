@@ -178,11 +178,12 @@ func (s *UDPFaultShim) SetHook(fn func(dir PacketDirection, pktType PacketType, 
 	s.customHook = fn
 }
 
-// ClassifyPacket determines packet type based on wire length, padding parameters, and direction.
-// Initiation: 148 + S1 bytes (Client -> Server)
-// Response: 92 + S2 bytes (Server -> Client)
-// Cookie reply: 64 + S3 bytes (Server -> Client)
-// Transport: >= 32 + S4 bytes (16-byte header + payload + 16-byte Poly1305 MAC)
+// ClassifyPacket determines packet type strictly calibrated to AmneziaWG wire framing
+// with HeaderProtection (148+S1 initiation, 92+S2 response, 64+S3 cookie, >=32+S4 transport):
+// Initiation: 148 + S1 bytes (Client -> Server) with HeaderProtection
+// Response: 92 + S2 bytes (Server -> Client) with HeaderProtection
+// Cookie reply: 64 + S3 bytes (Server -> Client) with HeaderProtection
+// Transport: >= 32 + S4 bytes (16-byte header + payload + 16-byte Poly1305 MAC, plus trailers/padding) with HeaderProtection
 func (s *UDPFaultShim) ClassifyPacket(dir PacketDirection, length int) PacketType {
 	if dir == DirClientToServer && length == 148+s.s1 {
 		return PacketTypeInitiation
@@ -280,16 +281,11 @@ func (s *UDPFaultShim) forwardLoop() {
 				s.InitiationsForwarded.Add(2)
 			}
 			s.TotalPacketsForwarded.Add(2)
-			if dir == DirClientToServer {
-				_, _ = s.conn.WriteToUDP(pkt, s.serverAddr)
-				_, _ = s.conn.WriteToUDP(pkt, s.serverAddr)
-			} else {
-				client := s.clientAddr.Load()
-				if client != nil {
-					_, _ = s.conn.WriteToUDP(pkt, client)
-					_, _ = s.conn.WriteToUDP(pkt, client)
-				}
-			}
+			s.deliver(dir, pkt)
+			go func(d PacketDirection, p []byte) {
+				time.Sleep(10 * time.Millisecond)
+				s.deliver(d, p)
+			}(dir, pkt)
 
 		case ActionForward:
 			if pktType == PacketTypeInitiation {
@@ -339,6 +335,187 @@ func (s *UDPFaultShim) Close() error {
 	return err
 }
 
+// OuterNATRoamingShim proxies client WireGuard packets towards the server and supports
+// genuine outer UDP endpoint roaming via Roam().
+// Initially, outbound packets to the server originate from ephemeral local UDP port A.
+// When Roam() is called, the shim allocates a new ephemeral local UDP port B.
+// Subsequent packets sent by the client arrive at the server from port B, prompting
+// the server to update the peer's outer roaming endpoint and return responses to port B.
+type OuterNATRoamingShim struct {
+	t          testing.TB
+	clientConn *net.UDPConn
+	clientPort int
+	serverAddr *net.UDPAddr
+
+	mu         sync.Mutex
+	activeConn *net.UDPConn
+	allConns   []*net.UDPConn
+	portA      int
+	portB      int
+	clientAddr atomic.Pointer[net.UDPAddr]
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	closed   atomic.Bool
+}
+
+// NewOuterNATRoamingShim binds a client-facing UDP listener and an initial server-facing UDP socket.
+func NewOuterNATRoamingShim(t testing.TB, serverPort int) (*OuterNATRoamingShim, error) {
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("listen client udp shim: %w", err)
+	}
+	clientLocalAddr := clientConn.LocalAddr().(*net.UDPAddr)
+
+	upstreamConnA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		_ = clientConn.Close()
+		return nil, fmt.Errorf("listen upstream udp conn a: %w", err)
+	}
+	portA := upstreamConnA.LocalAddr().(*net.UDPAddr).Port
+
+	shim := &OuterNATRoamingShim{
+		t:          t,
+		clientConn: clientConn,
+		clientPort: clientLocalAddr.Port,
+		serverAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: serverPort},
+		activeConn: upstreamConnA,
+		allConns:   []*net.UDPConn{upstreamConnA},
+		portA:      portA,
+		stopCh:     make(chan struct{}),
+	}
+
+	shim.wg.Add(1)
+	go shim.clientForwardLoop()
+
+	shim.wg.Add(1)
+	go shim.upstreamReturnLoop(upstreamConnA)
+
+	return shim, nil
+}
+
+// Endpoint returns the host:port string of the client-facing listener.
+func (s *OuterNATRoamingShim) Endpoint() string {
+	return fmt.Sprintf("127.0.0.1:%d", s.clientPort)
+}
+
+// InitialUpstreamPort returns the original local UDP port A facing the server.
+func (s *OuterNATRoamingShim) InitialUpstreamPort() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.portA
+}
+
+// CurrentUpstreamPort returns the currently active local UDP port facing the server.
+func (s *OuterNATRoamingShim) CurrentUpstreamPort() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.portB != 0 {
+		return s.portB
+	}
+	return s.portA
+}
+
+// Roam allocates a new local UDP socket (Port B) facing the server.
+// Subsequent packets from the client are forwarded from Port B.
+func (s *OuterNATRoamingShim) Roam() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return 0, errors.New("shim closed")
+	}
+
+	newConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		return 0, fmt.Errorf("roam listen udp: %w", err)
+	}
+	portB := newConn.LocalAddr().(*net.UDPAddr).Port
+
+	s.activeConn = newConn
+	s.allConns = append(s.allConns, newConn)
+	s.portB = portB
+
+	s.wg.Add(1)
+	go s.upstreamReturnLoop(newConn)
+
+	return portB, nil
+}
+
+func (s *OuterNATRoamingShim) clientForwardLoop() {
+	defer s.wg.Done()
+	buf := make([]byte, 65535)
+
+	for {
+		n, src, err := s.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if n == 0 {
+			continue
+		}
+
+		s.clientAddr.Store(src)
+		pkt := append([]byte(nil), buf[:n]...)
+
+		s.mu.Lock()
+		conn := s.activeConn
+		s.mu.Unlock()
+
+		if conn != nil {
+			_, _ = conn.WriteToUDP(pkt, s.serverAddr)
+		}
+	}
+}
+
+func (s *OuterNATRoamingShim) upstreamReturnLoop(uConn *net.UDPConn) {
+	defer s.wg.Done()
+	buf := make([]byte, 65535)
+
+	for {
+		n, _, err := uConn.ReadFromUDP(buf)
+		if err != nil {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if n == 0 {
+			continue
+		}
+
+		pkt := append([]byte(nil), buf[:n]...)
+		client := s.clientAddr.Load()
+		if client != nil {
+			_, _ = s.clientConn.WriteToUDP(pkt, client)
+		}
+	}
+}
+
+// Close terminates all listening sockets and waits for forwarder goroutines to stop.
+func (s *OuterNATRoamingShim) Close() error {
+	s.closed.Store(true)
+	var errs []error
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		if err := s.clientConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.mu.Lock()
+		for _, conn := range s.allConns {
+			if err := conn.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		s.mu.Unlock()
+	})
+	s.wg.Wait()
+	return errors.Join(errs...)
+}
+
 // NewClientViaShim constructs an upstream AWG client device configured to target the UDPFaultShim.
 func (h *DifferentialHarness) NewClientViaShim(shim *UDPFaultShim) (*HarnessClient, error) {
 	return h.NewClientWithEndpoint(shim.Endpoint())
@@ -370,7 +547,6 @@ func (h *DifferentialHarness) NewClientWithEndpoint(endpoint string) (*HarnessCl
 		_ = vt.Close()
 		return nil, fmt.Errorf("client uapi: %w", err)
 	}
-	_ = dev.IpcSet("rekey_after_time=120\nrekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		dev.Close()
 		_ = vt.Close()

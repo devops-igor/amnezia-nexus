@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -391,7 +392,7 @@ func TestDifferential_FaultSchedule_DuplicateInitiation(t *testing.T) {
 // assigned backend and zero crosstalk occurs.
 func TestDifferential_TwoPeerIsolation(t *testing.T) {
 	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
+	svc := newIngressEngineService(t, db, fullAmneziaWGOpts())
 	ctx := t.Context()
 
 	peerA, savedA := newEnginePeer(t, svc, db, "diff-peer-a")
@@ -509,100 +510,192 @@ func TestDifferential_TwoPeerIsolation(t *testing.T) {
 	<-b2.done
 }
 
-// TestDifferential_NATRoaming verifies that when a client's outer endpoint/socket changes
-// during active traffic, both reference and subject update the peer endpoint and continue delivery.
+// TestDifferential_NATRoaming verifies that when a client's outer UDP endpoint roams
+// to a new socket/port during active traffic, both reference and subject update the
+// peer's roaming endpoint, return responses to the new port, and continue delivery
+// without packet drop or re-handshake.
 func TestDifferential_NATRoaming(t *testing.T) {
 	harness := NewDifferentialHarness(t)
 
 	payload1 := []byte("nat-roaming-pre-migration-payload")
 	payload2 := []byte("nat-roaming-post-migration-payload")
 
-	// Phase 1: Reference Server NAT Roaming
+	// Phase 1: Reference Server Outer NAT Roaming
 	refServer, err := harness.StartReferenceServer()
 	if err != nil {
 		t.Fatalf("StartReferenceServer: %v", err)
 	}
 
-	refClient, err := harness.NewClient()
+	refShim, err := NewOuterNATRoamingShim(t, harness.listenPort)
 	if err != nil {
 		_ = harness.StopReferenceServer(refServer)
-		t.Fatalf("NewClient: %v", err)
+		t.Fatalf("NewOuterNATRoamingShim ref: %v", err)
+	}
+
+	refClient, err := harness.NewClientWithEndpoint(refShim.Endpoint())
+	if err != nil {
+		_ = refShim.Close()
+		_ = harness.StopReferenceServer(refServer)
+		t.Fatalf("NewClientWithEndpoint ref: %v", err)
 	}
 
 	refUDP, err := refClient.DialUDP()
 	if err != nil {
 		_ = refClient.Close()
+		_ = refShim.Close()
 		_ = harness.StopReferenceServer(refServer)
-		t.Fatalf("DialUDP: %v", err)
+		t.Fatalf("DialUDP ref: %v", err)
 	}
+
 	echo1, err := refClient.ExchangeUDP(refUDP, payload1)
 	if err != nil || !bytes.Equal(echo1, payload1) {
 		_ = refUDP.Close()
 		_ = refClient.Close()
+		_ = refShim.Close()
 		_ = harness.StopReferenceServer(refServer)
-		t.Fatalf("ExchangeUDP pre-roam: got %q, err %v", echo1, err)
+		t.Fatalf("ExchangeUDP pre-roam ref: got %q, err %v", echo1, err)
 	}
 
-	// Simulate NAT Roaming by binding a new client socket and continuing traffic
-	_ = refUDP.Close()
-	refUDP2, err := refClient.DialUDP()
+	ep1, err := refServer.PeerEndpoint()
 	if err != nil {
-		_ = refClient.Close()
-		_ = harness.StopReferenceServer(refServer)
-		t.Fatalf("DialUDP 2: %v", err)
+		t.Fatalf("ref PeerEndpoint pre-roam: %v", err)
 	}
-	echo2, err := refClient.ExchangeUDP(refUDP2, payload2)
-	_ = refUDP2.Close()
-	if err != nil || !bytes.Equal(echo2, payload2) {
-		_ = refClient.Close()
-		_ = harness.StopReferenceServer(refServer)
-		t.Fatalf("ExchangeUDP post-roam: got %q, err %v", echo2, err)
+	wantPort1 := fmt.Sprintf(":%d", refShim.InitialUpstreamPort())
+	if !strings.HasSuffix(ep1, wantPort1) {
+		t.Fatalf("ref endpoint pre-roam: got %q, want suffix %q", ep1, wantPort1)
 	}
 
+	hsBefore := refClient.LastHandshakeTime()
+
+	// Roam outer UDP endpoint to port B
+	portB, err := refShim.Roam()
+	if err != nil {
+		_ = refUDP.Close()
+		_ = refClient.Close()
+		_ = refShim.Close()
+		_ = harness.StopReferenceServer(refServer)
+		t.Fatalf("refShim.Roam: %v", err)
+	}
+
+	// Exchange traffic on SAME inner socket across outer roam
+	echo2, err := refClient.ExchangeUDP(refUDP, payload2)
+	if err != nil || !bytes.Equal(echo2, payload2) {
+		_ = refUDP.Close()
+		_ = refClient.Close()
+		_ = refShim.Close()
+		_ = harness.StopReferenceServer(refServer)
+		t.Fatalf("ExchangeUDP post-roam ref: got %q, err %v", echo2, err)
+	}
+
+	var ep2 string
+	wantPort2 := fmt.Sprintf(":%d", portB)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		ep2, err = refServer.PeerEndpoint()
+		if err == nil && strings.HasSuffix(ep2, wantPort2) {
+			break
+		}
+	}
+	if !strings.HasSuffix(ep2, wantPort2) {
+		t.Fatalf("ref endpoint post-roam: got %q, want suffix %q", ep2, wantPort2)
+	}
+	if ep1 == ep2 {
+		t.Fatalf("ref endpoint did not change after roam: %s", ep1)
+	}
+
+	// Verify no re-handshake occurred during roam
+	if hsAfter := refClient.LastHandshakeTime(); !hsAfter.Equal(hsBefore) {
+		t.Fatalf("ref re-handshake observed during roam: before=%v after=%v", hsBefore, hsAfter)
+	}
+
+	_ = refUDP.Close()
 	_ = refClient.Close()
+	_ = refShim.Close()
 	_ = harness.StopReferenceServer(refServer)
 	harness.AssertPortFree(5 * time.Second)
 
-	// Phase 2: Subject Server NAT Roaming
+	// Phase 2: Subject Server Outer NAT Roaming
 	subServer, err := harness.StartSubjectServer()
 	if err != nil {
 		t.Fatalf("StartSubjectServer: %v", err)
 	}
 
-	subClient, err := harness.NewClient()
+	subShim, err := NewOuterNATRoamingShim(t, harness.listenPort)
 	if err != nil {
 		_ = harness.StopSubjectServer(subServer)
-		t.Fatalf("NewClient sub: %v", err)
+		t.Fatalf("NewOuterNATRoamingShim sub: %v", err)
+	}
+
+	subClient, err := harness.NewClientWithEndpoint(subShim.Endpoint())
+	if err != nil {
+		_ = subShim.Close()
+		_ = harness.StopSubjectServer(subServer)
+		t.Fatalf("NewClientWithEndpoint sub: %v", err)
 	}
 
 	subUDP, err := subClient.DialUDP()
 	if err != nil {
 		_ = subClient.Close()
+		_ = subShim.Close()
 		_ = harness.StopSubjectServer(subServer)
 		t.Fatalf("DialUDP sub: %v", err)
 	}
+
 	subEcho1, err := subClient.ExchangeUDP(subUDP, payload1)
 	if err != nil || !bytes.Equal(subEcho1, payload1) {
 		_ = subUDP.Close()
 		_ = subClient.Close()
+		_ = subShim.Close()
 		_ = harness.StopSubjectServer(subServer)
-		t.Fatalf("sub ExchangeUDP pre-roam: got %q, err %v", subEcho1, err)
+		t.Fatalf("ExchangeUDP pre-roam sub: got %q, err %v", subEcho1, err)
 	}
 
-	// NAT roam on subject
-	_ = subUDP.Close()
-	subUDP2, err := subClient.DialUDP()
+	subEP1, err := subServer.PeerEndpoint()
 	if err != nil {
-		_ = subClient.Close()
-		_ = harness.StopSubjectServer(subServer)
-		t.Fatalf("sub DialUDP 2: %v", err)
+		t.Fatalf("sub PeerEndpoint pre-roam: %v", err)
 	}
-	subEcho2, err := subClient.ExchangeUDP(subUDP2, payload2)
-	_ = subUDP2.Close()
-	if err != nil || !bytes.Equal(subEcho2, payload2) {
+	wantSubPort1 := fmt.Sprintf(":%d", subShim.InitialUpstreamPort())
+	if !strings.HasSuffix(subEP1, wantSubPort1) {
+		t.Fatalf("sub endpoint pre-roam: got %q, want suffix %q", subEP1, wantSubPort1)
+	}
+
+	subHSBefore := subClient.LastHandshakeTime()
+
+	// Roam outer UDP endpoint on subject
+	subPortB, err := subShim.Roam()
+	if err != nil {
+		_ = subUDP.Close()
 		_ = subClient.Close()
+		_ = subShim.Close()
 		_ = harness.StopSubjectServer(subServer)
-		t.Fatalf("sub ExchangeUDP post-roam: got %q, err %v", subEcho2, err)
+		t.Fatalf("subShim.Roam: %v", err)
+	}
+
+	subEcho2, err := subClient.ExchangeUDP(subUDP, payload2)
+	if err != nil || !bytes.Equal(subEcho2, payload2) {
+		_ = subUDP.Close()
+		_ = subClient.Close()
+		_ = subShim.Close()
+		_ = harness.StopSubjectServer(subServer)
+		t.Fatalf("ExchangeUDP post-roam sub: got %q, err %v", subEcho2, err)
+	}
+
+	var subEP2 string
+	wantSubPort2 := fmt.Sprintf(":%d", subPortB)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		subEP2, err = subServer.PeerEndpoint()
+		if err == nil && strings.HasSuffix(subEP2, wantSubPort2) {
+			break
+		}
+	}
+	if !strings.HasSuffix(subEP2, wantSubPort2) {
+		t.Fatalf("sub endpoint post-roam: got %q, want suffix %q", subEP2, wantSubPort2)
+	}
+	if subEP1 == subEP2 {
+		t.Fatalf("sub endpoint did not change after roam: %s", subEP1)
+	}
+
+	if subHSAfter := subClient.LastHandshakeTime(); !subHSAfter.Equal(subHSBefore) {
+		t.Fatalf("sub re-handshake observed during roam: before=%v after=%v", subHSBefore, subHSAfter)
 	}
 
 	// Confirm parity
@@ -610,7 +703,9 @@ func TestDifferential_NATRoaming(t *testing.T) {
 		t.Fatalf("Roam parity mismatch: ref=(%q, %q) sub=(%q, %q)", echo1, echo2, subEcho1, subEcho2)
 	}
 
+	_ = subUDP.Close()
 	_ = subClient.Close()
+	_ = subShim.Close()
 	_ = harness.StopSubjectServer(subServer)
 	harness.AssertPortFree(5 * time.Second)
 }
@@ -645,15 +740,42 @@ func TestDifferential_NaturalRekey(t *testing.T) {
 		t.Fatalf("DialTCP: %v", err)
 	}
 
-	start := time.Now()
-	rekeyObserved := false
-	for time.Since(start) < 4*time.Second {
+	initialHS := refClient.LastHandshakeTime()
+	if initialHS.IsZero() {
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			initialHS = refClient.LastHandshakeTime()
+			if !initialHS.IsZero() {
+				break
+			}
+		}
+	}
+	if initialHS.IsZero() {
+		t.Fatal("refClient initial handshake not recorded")
+	}
+
+	refRekeyObserved := false
+	refDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(refDeadline) {
 		payload := []byte(fmt.Sprintf("tcp-rekey-stream-%d", time.Now().UnixNano()))
 		echo, err := refClient.ExchangeTCP(refTCP, payload)
 		if err != nil || !bytes.Equal(echo, payload) {
 			t.Fatalf("refClient TCP exchange during rekey window: %v", err)
 		}
+		if hs := refClient.LastHandshakeTime(); !hs.IsZero() && hs.After(initialHS) {
+			refRekeyObserved = true
+			break
+		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if !refRekeyObserved {
+		t.Fatal("reference server did not perform natural rekey")
+	}
+
+	// Verify post-rekey traffic continues cleanly
+	postPayload := []byte("ref-post-rekey-data")
+	postEcho, err := refClient.ExchangeTCP(refTCP, postPayload)
+	if err != nil || !bytes.Equal(postEcho, postPayload) {
+		t.Fatalf("refClient post-rekey TCP exchange: %v", err)
 	}
 	_ = refTCP.Close()
 
@@ -684,22 +806,48 @@ func TestDifferential_NaturalRekey(t *testing.T) {
 		t.Fatalf("sub DialTCP: %v", err)
 	}
 
-	subStart := time.Now()
-	for time.Since(subStart) < 4*time.Second {
+	subInitialHS := subClient.LastHandshakeTime()
+	if subInitialHS.IsZero() {
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			subInitialHS = subClient.LastHandshakeTime()
+			if !subInitialHS.IsZero() {
+				break
+			}
+		}
+	}
+	if subInitialHS.IsZero() {
+		t.Fatal("subClient initial handshake not recorded")
+	}
+
+	subRekeyObserved := false
+	subDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(subDeadline) {
 		payload := []byte(fmt.Sprintf("sub-tcp-rekey-stream-%d", time.Now().UnixNano()))
 		echo, err := subClient.ExchangeTCP(subTCP, payload)
 		if err != nil || !bytes.Equal(echo, payload) {
 			t.Fatalf("subClient TCP exchange during rekey window: %v", err)
 		}
+		if hs := subClient.LastHandshakeTime(); !hs.IsZero() && hs.After(subInitialHS) {
+			subRekeyObserved = true
+			break
+		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if !subRekeyObserved {
+		t.Fatal("subject server did not perform natural rekey")
+	}
+
+	// Verify post-rekey traffic continues cleanly on subject
+	subPostPayload := []byte("sub-post-rekey-data")
+	subPostEcho, err := subClient.ExchangeTCP(subTCP, subPostPayload)
+	if err != nil || !bytes.Equal(subPostEcho, subPostPayload) {
+		t.Fatalf("subClient post-rekey TCP exchange: %v", err)
 	}
 	_ = subTCP.Close()
 
 	_ = subClient.Close()
 	_ = harness.StopSubjectServer(subServer)
 	harness.AssertPortFree(5 * time.Second)
-
-	_ = rekeyObserved
 }
 
 // TestDifferential_ParameterMatrixAndS4Regression executes table-driven parameter boundary cases
@@ -707,41 +855,94 @@ func TestDifferential_NaturalRekey(t *testing.T) {
 // upstream amneziawg-go v3.1.20260828 artifact.
 func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 	testCases := []struct {
-		name           string
-		s1, s2, s3, s4 int
-		headerProtect  bool
+		name                   string
+		s1, s2, s3, s4         int
+		headerProtect          bool
+		h1, h2, h3, h4         *models.HeaderRange
+		randomTrailers         bool
+		contentPaddingAddition string
+		rekeyAfterTime         int
 	}{
 		{
-			name:          "Standard_Profile",
-			s1:            50,
-			s2:            100,
-			s3:            150,
-			s4:            200,
-			headerProtect: true,
+			name:                   "Standard_Profile",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
 		},
 		{
-			name:          "Floor_Constraints_12B",
-			s1:            12,
-			s2:            24,
-			s3:            36,
-			s4:            48,
-			headerProtect: true,
+			name:                   "Floor_Constraints_12B",
+			s1:                     12,
+			s2:                     24,
+			s3:                     36,
+			s4:                     48,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
 		},
 		{
-			name:          "High_Padding_S4_Boundary",
-			s1:            64,
-			s2:            128,
-			s3:            192,
-			s4:            512,
-			headerProtect: true,
+			name:                   "High_Padding_S4_Boundary",
+			s1:                     64,
+			s2:                     128,
+			s3:                     192,
+			s4:                     512,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
 		},
 		{
-			name:          "HeaderProtection_Disabled",
+			name:          "AmneziaWG_Legacy_HeaderProtection_Omitted",
 			s1:            20,
 			s2:            40,
 			s3:            60,
 			s4:            80,
 			headerProtect: false,
+		},
+		{
+			name:                   "Custom_H1_H4_Headers",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			h1:                     func() *models.HeaderRange { r := models.NewHeaderRange(150000000, 250000000); return &r }(),
+			h2:                     func() *models.HeaderRange { r := models.NewHeaderRange(350000000, 450000000); return &r }(),
+			h3:                     func() *models.HeaderRange { r := models.NewHeaderRange(550000000, 650000000); return &r }(),
+			h4:                     func() *models.HeaderRange { r := models.NewHeaderRange(750000000, 850000000); return &r }(),
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
+		},
+		{
+			name:           "RandomTrailers_Enabled",
+			s1:             50,
+			s2:             100,
+			s3:             150,
+			s4:             200,
+			headerProtect:  true,
+			randomTrailers: true,
+		},
+		{
+			name:                   "ContentPaddingAddition_Enabled",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			contentPaddingAddition: "16-64",
+		},
+		{
+			name:                   "Fast_Timing_Boundary",
+			s1:                     50,
+			s2:                     100,
+			s3:                     150,
+			s4:                     200,
+			headerProtect:          true,
+			randomTrailers:         true,
+			contentPaddingAddition: "16-64",
+			rekeyAfterTime:         2,
 		},
 	}
 
@@ -755,7 +956,25 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 				if !tc.headerProtect {
 					cfg.HeaderProtectionKey = ""
 				}
+				if tc.h1 != nil {
+					cfg.H1 = *tc.h1
+				}
+				if tc.h2 != nil {
+					cfg.H2 = *tc.h2
+				}
+				if tc.h3 != nil {
+					cfg.H3 = *tc.h3
+				}
+				if tc.h4 != nil {
+					cfg.H4 = *tc.h4
+				}
+				cfg.RandomTrailers = tc.randomTrailers
+				cfg.ContentPaddingAddition = tc.contentPaddingAddition
 			})
+
+			if tc.rekeyAfterTime > 0 {
+				harness.SetClientRekeyAfterTime(tc.rekeyAfterTime)
+			}
 
 			payload := []byte(fmt.Sprintf("matrix-test-%s-payload", tc.name))
 

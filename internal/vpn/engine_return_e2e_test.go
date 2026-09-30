@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,12 +115,31 @@ func returnEchoServers(t *testing.T, stack *netstack.Net, addr netip.Addr, backe
 type returnStreamClient struct {
 	peer      enginePeer
 	dev       *device.Device
+	stack     *netstack.Net
 	tcp       net.Conn
 	udp       net.Conn
 	session   models.VPNSession
 	handshake time.Time
 	rekeys    int
 	endpoint  string
+}
+
+// LastHandshakeTime returns the timestamp of the last successful handshake recorded by the client device.
+func (c *returnStreamClient) LastHandshakeTime() time.Time {
+	raw, err := c.dev.IpcGet()
+	if err != nil {
+		return time.Time{}
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if ok && k == "last_handshake_time_sec" {
+			sec, _ := strconv.ParseInt(v, 10, 64)
+			if sec > 0 {
+				return time.Unix(sec, 0)
+			}
+		}
+	}
+	return time.Time{}
 }
 
 func newReturnStreamClient(t *testing.T, peer enginePeer, saved string, destination netip.Addr, backendMarker byte) *returnStreamClient {
@@ -159,7 +180,7 @@ func newReturnStreamClient(t *testing.T, peer enginePeer, saved string, destinat
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = udpConn.Close() })
-	return &returnStreamClient{peer: peer, dev: dev, tcp: tcpConn, udp: udpConn}
+	return &returnStreamClient{peer: peer, dev: dev, stack: stack, tcp: tcpConn, udp: udpConn}
 }
 
 func returnExchange(t *testing.T, c net.Conn, payload []byte, datagram bool, backendMarker byte) {

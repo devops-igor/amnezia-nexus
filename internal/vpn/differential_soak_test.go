@@ -18,6 +18,8 @@ import (
 )
 
 // StreamStats captures traffic delivery, latency, loss, and jitter metrics for a soak stream.
+// Note: Jitter metrics measure Round-Trip Time (RTT) delay variance (rtt_jitter_ns) rather than
+// RFC 3550 one-way interarrival jitter, as measurements are calculated at the single-ended client.
 type StreamStats struct {
 	PacketsSent        int64   `json:"packets_sent"`
 	PacketsReceived    int64   `json:"packets_received"`
@@ -28,6 +30,7 @@ type StreamStats struct {
 	MinRTTMs           float64 `json:"min_rtt_ms"`
 	MaxRTTMs           float64 `json:"max_rtt_ms"`
 	JitterMs           float64 `json:"jitter_ms"`
+	RTTJitterNs        int64   `json:"rtt_jitter_ns"`
 	ThroughputBytesSec float64 `json:"throughput_bytes_sec"`
 }
 
@@ -125,13 +128,20 @@ func TestDifferential_Soak_Unaccelerated10Rekey(t *testing.T) {
 
 	harness := NewDifferentialHarness(t)
 
-	// Execute unaccelerated 10+ natural rekey soak on subject server
+	// 1. Reference Server Unaccelerated 10-Rekey Soak
+	t.Log("Starting Reference Server Unaccelerated 10-Rekey Soak...")
+	refReport := runSoakSuite(t, harness, true, 10, true)
+	assertSoakReportCriteria(t, refReport, "reference")
+	if refReport.CompletedRekeys < 10 {
+		t.Fatalf("reference unaccelerated soak completed %d rekeys, want >= 10", refReport.CompletedRekeys)
+	}
+
+	// 2. Subject Server Unaccelerated 10-Rekey Soak
 	t.Log("Starting Subject Server Unaccelerated 10-Rekey Soak...")
 	subReport := runSoakSuite(t, harness, false, 10, true)
 	assertSoakReportCriteria(t, subReport, "subject")
-
 	if subReport.CompletedRekeys < 10 {
-		t.Fatalf("unaccelerated soak completed %d rekeys, want >= 10", subReport.CompletedRekeys)
+		t.Fatalf("subject unaccelerated soak completed %d rekeys, want >= 10", subReport.CompletedRekeys)
 	}
 }
 
@@ -356,7 +366,7 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 					}
 					lastEchoRecv = recvTime
 
-					// RFC 3550 Interarrival Jitter estimation
+					// RTT delay variance (rtt_jitter_ns) estimation
 					diff := math.Abs(float64(rttNs) - prevDiff)
 					prevDiff = float64(rttNs)
 					curJitter := float64(seqJitterNs.Load())
@@ -467,7 +477,16 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 	// 6. Monitor Loop: Observe Natural Rekeys and Execute Idle Keepalive Phase
 	var rekeyTimestamps []string
 	rekeyCount := 0
-	lastRecordedHandshake := time.Time{}
+	initialHS := client.LastHandshakeTime()
+	if initialHS.IsZero() {
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			initialHS = client.LastHandshakeTime()
+			if !initialHS.IsZero() {
+				break
+			}
+		}
+	}
+	lastRecordedHandshake := initialHS
 	idlePhasePassed := false
 
 	// Timeout boundary
@@ -496,7 +515,7 @@ func runSoakSuite(t *testing.T, harness *DifferentialHarness, isReference bool, 
 			t.Fatal("soak test canceled by context")
 		case <-rekeyCheckTicker.C:
 			hs := client.LastHandshakeTime()
-			if !hs.IsZero() && (lastRecordedHandshake.IsZero() || hs.Sub(lastRecordedHandshake) >= 1*time.Second) {
+			if !hs.IsZero() && hs.After(initialHS) && (lastRecordedHandshake.IsZero() || hs.Sub(lastRecordedHandshake) >= 1*time.Second) {
 				lastRecordedHandshake = hs
 				rekeyCount++
 				ts := hs.UTC().Format(time.RFC3339Nano)
@@ -577,6 +596,7 @@ SoakDone:
 		MinRTTMs:           minRTTMs,
 		MaxRTTMs:           float64(seqMaxRTTNs.Load()) / 1e6,
 		JitterMs:           float64(seqJitterNs.Load()) / 1e6,
+		RTTJitterNs:        seqJitterNs.Load(),
 		ThroughputBytesSec: float64(seqTotalBytes.Load()) / totalDuration.Seconds(),
 	}
 
@@ -607,6 +627,7 @@ SoakDone:
 		MinRTTMs:           voipMinMs,
 		MaxRTTMs:           float64(voipMaxRTTNs.Load()) / 1e6,
 		JitterMs:           float64(voipJitterNs.Load()) / 1e6,
+		RTTJitterNs:        voipJitterNs.Load(),
 		ThroughputBytesSec: float64(voipTotalBytes.Load()) / totalDuration.Seconds(),
 	}
 
