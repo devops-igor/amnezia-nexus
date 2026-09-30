@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 
@@ -221,6 +222,25 @@ func (r *Resolver) Remove(peerPublicKey string) (netip.Addr, bool) {
 	}
 	delete(r.byPeer, peerPublicKey)
 	return ip, true
+}
+
+// Snapshot returns a copy of every ownership record currently installed,
+// ordered by assigned address so a caller that acts on the result acts
+// deterministically. It is the read side a fail-closed enforcement needs
+// when it must decide what to withdraw from the durable state ALONE: the
+// installed set is exactly the set of peers that can still authorize a
+// source IP, and it remains answerable when the upstream device cannot be
+// read. Mutating through the returned records is not possible; use
+// Remove, Update or Replace.
+func (r *Resolver) Snapshot() []PeerOwnership {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PeerOwnership, 0, len(r.byIP))
+	for _, o := range r.byIP {
+		out = append(out, o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IP.Less(out[j].IP) })
+	return out
 }
 
 // FilterIPs reports the ownership entries currently installed for the given

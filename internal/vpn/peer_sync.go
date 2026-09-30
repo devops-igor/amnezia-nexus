@@ -663,7 +663,20 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 
 	current, err := s.portal.Status()
 	if err != nil {
-		return s.fail(err)
+		// Fail CLOSED (issue #391 round 4c, F2). The upstream peer set is
+		// UNKNOWN here, so nothing about the device may be assumed or
+		// mutated: no AddPeer, no RemovePeer, no verification. But the
+		// DURABLE desired set is known, and it alone decides who is
+		// authorized. Withdrawal of newly-ineligible authorization, and
+		// retirement of the Nexus routing sessions that authorization
+		// backed, therefore run BEFORE returning, so an upstream status
+		// failure can never be the reason a peer the durable state has
+		// stopped authorizing keeps passing traffic. Only the withdrawal
+		// half runs here: the device converges on the next pass that can
+		// actually read it.
+		failures := s.failClosedWithoutStatus(ctx, desired)
+		failures = append(failures, err)
+		return s.fail(errors.Join(failures...))
 	}
 	actual := make(map[string]clientawg.PeerStatus, len(current.Peers))
 	for _, peer := range current.Peers {
@@ -673,20 +686,34 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 
 	// Classify actual upstream peers (finding 1, step 1):
 	//   stable  - same key, same AllowedIP, present in desired
+	//   handoff - same key, same AllowedIP, present in desired, but the
+	//             durable OWNER moved (issue #391 round 4c, F1: a live
+	//             connection reassigned to another user, or its durable row
+	//             recreated under a new connection id). Key and AllowedIP
+	//             are byte-identical across such a move, so an
+	//             AllowedIP-only comparison cannot see it and the previous
+	//             owner's live session looked stable. A handoff is NOT
+	//             stable and NOT retired: the upstream peer is already
+	//             exactly right, so it is neither removed nor re-added.
 	//   retired - everything else: not desired at all, or desired with a
 	//             different AllowedIP (a key-stable transition whose old
 	//             assignment must be withdrawn before the new install).
 	stableActual := make(map[string]clientawg.PeerStatus, len(actual))
 	var retireKeys []string
+	var handoffKeys []string
 	for key, have := range actual {
 		want, isDesired := desired[key]
-		if isDesired && want.peer.AllowedIP == have.AllowedIP {
+		switch {
+		case !isDesired || want.peer.AllowedIP != have.AllowedIP:
+			retireKeys = append(retireKeys, key)
+		case !s.ownershipUnchanged(want.owner):
+			handoffKeys = append(handoffKeys, key)
+		default:
 			stableActual[key] = have
-			continue
 		}
-		retireKeys = append(retireKeys, key)
 	}
 	sort.Strings(retireKeys)
+	sort.Strings(handoffKeys)
 
 	// Withdraw resolver ownership only for IPs involved in transitions
 	// (finding 1, step 2): retired upstream keys and pending-new desired
@@ -724,7 +751,14 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 		s.resolver.Remove(owner.PeerPublicKey)
 	}
 
-	failures := s.removeDriftedPeers(ctx, actual, desired, stableActual)
+	// Retire the previous owner's routing session for every handoff, using
+	// the same revokeSession callback the retirement path uses so the
+	// session, its forwarder route and the backend gauge move exactly once
+	// (F1). Their upstream peers are already correct, so nothing is removed
+	// or re-added for them: the handoff costs one Nexus-side re-admission,
+	// not an AWG protocol churn.
+	failures := s.retireHandoffSessions(ctx, handoffKeys)
+	failures = append(failures, s.removeDriftedPeers(ctx, actual, desired, stableActual)...)
 	failures = append(failures, s.addMissingPeers(actual, desired)...)
 
 	// Verify the upstream device against the desired set (finding 1,
@@ -757,6 +791,131 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 	s.status.LastSuccessfulReconcile = time.Now().UTC()
 	s.status.LastError = ""
 	return nil
+}
+
+// ownershipAgrees reports whether a resolver record and a desired owner are
+// the SAME authorization: same peer, same connection, same user, and —
+// critically — the same assigned address.
+//
+// The assigned address is part of the answer, not decoration. A record is
+// looked up by the address it authorizes, so a record whose address the
+// durable state has since given to a DIFFERENT peer is not agreement even when
+// key, connection and user all match: leaving it installed would keep
+// authorizing a source IP the durable state has reassigned to someone else.
+//
+// Both ownership decision sites (the F1 classification and the F2
+// fail-closed withdrawal) go through this one predicate on purpose. When they
+// were written separately the withdrawal path compared user and connection
+// only, and a peer whose address merely MOVED kept its authorization under a
+// status failure — the same cross-user attribution F1 exists to prevent.
+func ownershipAgrees(published, want ingress.PeerOwnership) bool {
+	return published.PeerPublicKey == want.PeerPublicKey &&
+		published.UserID == want.UserID &&
+		published.ConnectionID == want.ConnectionID &&
+		published.IP == want.IP
+}
+
+// ownershipUnchanged reports whether the resolver's currently published
+// record for this peer's desired address already is the desired ownership
+// (issue #391 round 4c, F1). The upstream device says nothing about
+// ownership — a peer key and its AllowedIP are byte-identical across a user
+// reassignment and across a connection-row recreation — so the resolver is
+// the only place the PREVIOUS owner is still observable.
+//
+// A peer the resolver does not track at all has no published owner and
+// therefore nothing to transition away from: it is treated as unchanged, so
+// the normal pending-install path (withdraw, install, verify, publish)
+// handles it. That is the first-install and post-crash case, and it must
+// not be mistaken for an ownership transition. "Unchanged" here therefore
+// means "no previous owner to move away from", NOT "already verified".
+func (s *peerSynchronizer) ownershipUnchanged(want ingress.PeerOwnership) bool {
+	published, tracked := s.resolver.Lookup(want.IP)
+	if !tracked {
+		return true
+	}
+	// A record for this address under a DIFFERENT peer key fails the
+	// comparison inside ownershipAgrees: the address now answers for
+	// someone else.
+	return ownershipAgrees(published, want)
+}
+
+// retireHandoffSessions revokes the routing session of every peer whose
+// durable owner moved while its upstream identity stayed identical (F1).
+// The keys arrive already sorted, so the teardown order is deterministic and
+// two handoffs can never interleave.
+//
+// The withdrawal of the previous owner's authorization has already happened
+// (the handoff's assigned IP is in transitionIPs), so at this point the old
+// session can no longer admit or forward anything: revoking it is pure
+// cleanup, and the next packet re-admits under the new owner once the
+// verified desired map is published.
+func (s *peerSynchronizer) retireHandoffSessions(ctx context.Context, keys []string) []error {
+	if s.revokeSession == nil {
+		return nil
+	}
+	var failures []error
+	for _, key := range keys {
+		if err := s.revokeSession(ctx, key); err != nil {
+			failures = append(failures, fmt.Errorf("retire reassigned session %s: %w", ingress.RedactKey(key), err))
+		}
+	}
+	return failures
+}
+
+// failClosedWithoutStatus withdraws the authorization the durable state no
+// longer supports, and retires the Nexus routing sessions that authorization
+// backed, WITHOUT consulting the upstream device (issue #391 round 4c, F2).
+// It is the fail-closed half of a pass whose Status read failed.
+//
+// Why this placement is fail-closed: the durable desired set is authoritative
+// for WHO may be authorized, and it is available on this path — it is derived
+// before the device is ever called. The upstream peer set is not available,
+// and this function never guesses it: it makes no AddPeer, RemovePeer or
+// verify call, so it cannot install, evict or mis-attribute anything it
+// cannot see. Authorization is therefore narrowed to exactly what durable
+// state still endorses, and every routing session belonging to a withdrawn or
+// reassigned peer is revoked through the same revokeSession callback the
+// success path uses (so accounting moves exactly once, under the same
+// Service.mu discipline). Peers that remain durably eligible keep their
+// ownership and their sessions: a status failure is not a reason to
+// disconnect everyone.
+//
+// On the next successful pass the device converges normally: peers the
+// durable state still desires are verified and republished, and the ones it
+// no longer desires are removed upstream then. Nothing here needs undoing.
+func (s *peerSynchronizer) failClosedWithoutStatus(ctx context.Context, desired map[string]desiredPeer) []error {
+	// The installed set is exactly the set of peers that can still authorize
+	// a source IP, and unlike the upstream peer set it is fully answerable
+	// here. Every record in it that disagrees with the durable desired set is
+	// authorization the durable state no longer endorses — either the peer is
+	// not desired at all, or it is desired under a different owner — and both
+	// are withdrawn.
+	withdrawn := make([]string, 0)
+	for _, published := range s.resolver.Snapshot() {
+		want, stillDesired := desired[published.PeerPublicKey]
+		// The SAME predicate the success path classifies with, so the two
+		// can never disagree about who is authorized. The assigned address
+		// is compared too: a record whose address the durable state has
+		// given to another peer is not agreement.
+		if stillDesired && ownershipAgrees(published, want.owner) {
+			continue
+		}
+		withdrawn = append(withdrawn, published.PeerPublicKey)
+	}
+	sort.Strings(withdrawn)
+	var failures []error
+	for _, key := range withdrawn {
+		if _, tracked := s.resolver.Remove(key); !tracked {
+			continue
+		}
+		if s.revokeSession == nil {
+			continue
+		}
+		if err := s.revokeSession(ctx, key); err != nil {
+			failures = append(failures, fmt.Errorf("revoke session %s: %w", ingress.RedactKey(key), err))
+		}
+	}
+	return failures
 }
 
 // cleanupOrphanedRouting runs the routing-only teardown for live
