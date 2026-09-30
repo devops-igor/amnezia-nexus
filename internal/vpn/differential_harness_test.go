@@ -523,7 +523,6 @@ func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
 	ref.startEchoWorkers()
 
 	ipc := h.buildReferenceServerIPC()
-	h.t.Logf("REFERENCE SERVER IPC:\n%s", ipc)
 	if err := dev.IpcSet(ipc); err != nil {
 		_ = ref.Close()
 		return nil, fmt.Errorf("reference ipc set: %w", err)
@@ -756,7 +755,6 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 
 	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "client"))
 	uapi := configToUAPI(h.t.(*testing.T), h.rawClientConfig)
-	h.t.Logf("CLIENT UAPI:\n%s", uapi)
 	if err := dev.IpcSet(uapi); err != nil {
 		dev.Close()
 		_ = vt.Close()
