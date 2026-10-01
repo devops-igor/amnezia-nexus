@@ -102,7 +102,7 @@ func TestRestartReservesExistingClientIPBeforeNewConfigAndReconnect(t *testing.T
 	db := setupTestDB(t)
 	original, _, _, userID, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
-	const oldPeer = "existing-client-with-config"
+	_, oldPeer := engineKeys(t)
 	const oldIP = "10.100.0.2"
 	oldConn := &models.UserConnection{
 		UserID: userID, ServerID: 0, Protocol: "awg", ClientID: oldPeer,
