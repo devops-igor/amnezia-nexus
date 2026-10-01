@@ -144,22 +144,15 @@ jobs:
             go build -o bin/amneziawg-go github.com/amnezia-vpn/amneziawg-go/v3
             sudo install -m 755 bin/amneziawg-go /usr/local/bin/amneziawg-go
           fi
-          # Ensure awg CLI tool is available
-          if ! command -v awg >/dev/null 2>&1; then
-            echo "Checking system package or container image for awg CLI..."
-            if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update -y && sudo apt-get install -y amneziawg-tools musl 2>/dev/null || true
+          # Ensure functional awg CLI tool is available
+          if ! awg --version >/dev/null 2>&1; then
+            echo "Installing functional awg CLI tool and musl runtime..."
+            if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
+              sudo chmod 755 /lib/ld-musl-aarch64.so.1
             fi
-            if ! command -v awg >/dev/null 2>&1; then
-              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
-              sudo chmod 755 /usr/local/bin/awg
-              if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
-                MUSL_LIB=$(find /usr/lib -name "libc.so" 2>/dev/null | grep -i musl | head -n 1)
-                if [ -n "$MUSL_LIB" ]; then
-                  sudo ln -sf "$MUSL_LIB" /lib/ld-musl-aarch64.so.1
-                fi
-              fi
-            fi
+            sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
+            sudo chmod 755 /usr/local/bin/awg
           fi
           echo "Toolchain status:"
           command -v go && go version
