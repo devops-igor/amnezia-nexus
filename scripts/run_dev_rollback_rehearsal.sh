@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # ==============================================================================
-# Dual-Engine Rollback Rehearsal on DEV Linux Target
-# Tracking Issue: #393 (Phases 393-B, 393-C, 393-D)
+# Upstream Engine Durability Rehearsal on DEV Linux Target
+# Tracking Issue: #394 (Phase 394-E / Issue #422)
 #
 # Proves that a real Linux WireGuard/AmneziaWG client inside an isolated network
 # namespace (nexus-client-ns) can establish bidirectional TCP/UDP traffic across
-# a 3-step engine transition:
-#   Leg 1: Custom Engine (baseline fresh DB)
-#   Leg 2: Upstream Engine (cutover with reused DB)
-#   Leg 3: Custom Engine (rollback with reused DB)
+# upstream engine restarts:
+#   Leg 1: Upstream Engine (baseline fresh DB)
+#   Leg 2: Upstream Engine (restart 1 with reused DB)
+#   Leg 3: Upstream Engine (restart 2 with reused DB)
 #
 # Invariants strictly verified:
 #   1. Exact same listen port and UDP underlay endpoint across all 3 legs.
@@ -150,7 +150,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "===================================================================="
-echo " Amnezia Nexus - Dual-Engine Rollback Rehearsal (PR 393-C / PR 393-D)"
+echo " Amnezia Nexus - Upstream Durability Rehearsal (Phase 394-E / #422)"
 echo "===================================================================="
 echo " Runtime Dir:       $(display_path "$RUNTIME_DIR")"
 echo " Output Dir:        $(display_path "$OUTPUT_DIR")"
@@ -273,13 +273,13 @@ run_client_qualification_leg() {
 }
 
 # ==============================================================================
-# Step 1: Leg 1 — Custom Engine (Baseline)
+# Step 1: Leg 1 — Upstream Engine (Baseline)
 # ==============================================================================
 echo ""
 echo "####################################################################"
-echo " Step 1: Leg 1 — Custom Engine (Baseline)"
+echo " Step 1: Leg 1 — Upstream Engine (Baseline Fresh DB)"
 echo "####################################################################"
-start_subject "custom" "false"
+start_subject "upstream" "false"
 
 if [[ ! -f "$FROZEN_CONFIG" ]]; then
     echo "ERROR: Frozen config file not created by subject" >&2
@@ -289,16 +289,16 @@ FROZEN_CONFIG_HASH="$(sha256sum "$FROZEN_CONFIG" | awk '{print $1}')"
 echo "    Frozen client config SHA-256: ${FROZEN_CONFIG_HASH:0:16}..."
 
 LEG1_REPORT="$OUTPUT_DIR/non_netstack_qualification_leg1.json"
-run_client_qualification_leg "Leg 1 (custom)" "$LEG1_REPORT"
+run_client_qualification_leg "Leg 1 (upstream baseline)" "$LEG1_REPORT"
 stop_subject
-verify_db_integrity "Leg 1 (custom)"
+verify_db_integrity "Leg 1 (upstream baseline)"
 
 # ==============================================================================
-# Step 2: Leg 2 — Upstream Engine (Cutover)
+# Step 2: Leg 2 — Upstream Engine (Restart 1 with Reused DB)
 # ==============================================================================
 echo ""
 echo "####################################################################"
-echo " Step 2: Leg 2 — Upstream Engine (Cutover with Reused DB)"
+echo " Step 2: Leg 2 — Upstream Engine (Restart 1 with Reused DB)"
 echo "####################################################################"
 
 # Verify config unchanged before starting Leg 2
@@ -311,16 +311,16 @@ fi
 start_subject "upstream" "true"
 
 LEG2_REPORT="$OUTPUT_DIR/non_netstack_qualification_leg2.json"
-run_client_qualification_leg "Leg 2 (upstream)" "$LEG2_REPORT"
+run_client_qualification_leg "Leg 2 (upstream restart 1)" "$LEG2_REPORT"
 stop_subject
-verify_db_integrity "Leg 2 (upstream)"
+verify_db_integrity "Leg 2 (upstream restart 1)"
 
 # ==============================================================================
-# Step 3: Leg 3 — Custom Engine (Rollback)
+# Step 3: Leg 3 — Upstream Engine (Restart 2 with Reused DB)
 # ==============================================================================
 echo ""
 echo "####################################################################"
-echo " Step 3: Leg 3 — Custom Engine (Rollback with Reused DB)"
+echo " Step 3: Leg 3 — Upstream Engine (Restart 2 with Reused DB)"
 echo "####################################################################"
 
 # Verify config unchanged before starting Leg 3
@@ -330,22 +330,22 @@ if [[ "$CURRENT_HASH" != "$FROZEN_CONFIG_HASH" ]]; then
     exit 1
 fi
 
-start_subject "custom" "true"
+start_subject "upstream" "true"
 
 LEG3_REPORT="$OUTPUT_DIR/non_netstack_qualification_leg3.json"
-run_client_qualification_leg "Leg 3 (custom rollback)" "$LEG3_REPORT"
+run_client_qualification_leg "Leg 3 (upstream restart 2)" "$LEG3_REPORT"
 stop_subject
-verify_db_integrity "Leg 3 (custom rollback)"
+verify_db_integrity "Leg 3 (upstream restart 2)"
 
 # Final config hash verification
 FINAL_HASH="$(sha256sum "$FROZEN_CONFIG" | awk '{print $1}')"
 if [[ "$FINAL_HASH" != "$FROZEN_CONFIG_HASH" ]]; then
-    echo "ERROR: Frozen config altered at end of rollback ($FINAL_HASH != $FROZEN_CONFIG_HASH)" >&2
+    echo "ERROR: Frozen config altered at end of rehearsal ($FINAL_HASH != $FROZEN_CONFIG_HASH)" >&2
     exit 1
 fi
 
 echo ""
-echo "==> [Aggregation] Generating dual-engine rollback rehearsal summary report..."
+echo "==> [Aggregation] Generating upstream durability rehearsal summary report..."
 
 # Aggregate JSON reports
 python3 - "$OUTPUT_DIR" "$FROZEN_CONFIG_HASH" "$REPORT_FILE" "$DRY_RUN" << 'PYEOF'
@@ -387,8 +387,8 @@ summary = {
     "config_hash_matched": True,
     "db_integrity_verified": True,
     "legs": {
-        "leg1_custom": {
-            "engine": "custom",
+        "leg1_upstream": {
+            "engine": "upstream",
             "status": leg1.get("status", "UNKNOWN"),
             "handshake_verified": leg1.get("handshake_verified", False),
             "tcp_echo_verified": leg1.get("tcp_echo_verified", False),
@@ -403,8 +403,8 @@ summary = {
             "udp_echo_verified": leg2.get("udp_echo_verified", False),
             "reconnect_resilience_verified": leg2.get("reconnect_resilience_verified", False),
         },
-        "leg3_custom_rollback": {
-            "engine": "custom",
+        "leg3_upstream": {
+            "engine": "upstream",
             "status": leg3.get("status", "UNKNOWN"),
             "handshake_verified": leg3.get("handshake_verified", False),
             "tcp_echo_verified": leg3.get("tcp_echo_verified", False),
@@ -424,6 +424,6 @@ PYEOF
 
 echo ""
 echo "===================================================================="
-echo " Dual-Engine Rollback Rehearsal Completed: PASS"
+echo " Upstream Durability Rehearsal Completed: PASS"
 echo " Report: $(display_path "$REPORT_FILE")"
 echo "===================================================================="

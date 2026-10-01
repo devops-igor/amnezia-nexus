@@ -18,7 +18,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
-type rollbackTestClient struct {
+type durabilityTestClient struct {
 	dev   *device.Device
 	stack *netstack.Net
 	tun   tun.Device
@@ -26,7 +26,7 @@ type rollbackTestClient struct {
 	udp   net.Conn
 }
 
-func (c *rollbackTestClient) Close() {
+func (c *durabilityTestClient) Close() {
 	if c == nil {
 		return
 	}
@@ -48,13 +48,13 @@ func (c *rollbackTestClient) Close() {
 	}
 }
 
-func newRollbackRealClient(t *testing.T, peer enginePeer, rawConfig string, destination netip.Addr, backendMarker byte) *rollbackTestClient {
+func newDurabilityRealClient(t *testing.T, peer enginePeer, rawConfig string, destination netip.Addr, backendMarker byte) *durabilityTestClient {
 	t.Helper()
 	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(peer.assignedIP)}, nil, 1280)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "rollback-client"))
+	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "durability-client"))
 	uapi := configToUAPI(t, rawConfig)
 	if err := dev.IpcSet(uapi); err != nil {
 		dev.Close()
@@ -74,7 +74,7 @@ func newRollbackRealClient(t *testing.T, peer enginePeer, rawConfig string, dest
 	tcpConn, err := stack.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(destination, 40001))
 	if err != nil {
 		dev.Close()
-		t.Fatalf("TCP over rollback return path: %v", err)
+		t.Fatalf("TCP over durability return path: %v", err)
 	}
 	_ = tcpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	marker := make([]byte, 1)
@@ -90,19 +90,18 @@ func newRollbackRealClient(t *testing.T, peer enginePeer, rawConfig string, dest
 		t.Fatalf("DialUDPAddrPort failed: %v", err)
 	}
 
-	c := &rollbackTestClient{dev: dev, stack: stack, tun: vt, tcp: tcpConn, udp: udpConn}
+	c := &durabilityTestClient{dev: dev, stack: stack, tun: vt, tcp: tcpConn, udp: udpConn}
 	t.Cleanup(func() { c.Close() })
 	return c
 }
 
-// TestDualEngine_SameDBSamePortSameConfigRollback implements the end-to-end integration
-// verification required by PR 393-C: proving that a service can transition from
-// custom -> upstream -> custom across fresh Service instances backed by the EXACT SAME
-// database, binding the EXACT SAME UDP port, and serving the EXACT SAME frozen client
-// configuration without key rotation, IP reassignment, or database migrations.
-// Real userspace AmneziaWG clients connect on all three legs, executing bidirectional
-// TCP and UDP echo against the backend tunnel.
-func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
+// TestUpstream_SameDBSamePortSameConfigDurability verifies that a client-facing
+// service running in upstream mode survives multiple clean process restarts backed
+// by the EXACT SAME SQLite database, binding the EXACT SAME UDP port, and serving
+// the EXACT SAME frozen client configuration without key rotation, IP reassignment,
+// or database migrations. Real userspace AmneziaWG clients connect on all legs,
+// executing bidirectional TCP and UDP echo against the backend tunnel.
+func TestUpstream_SameDBSamePortSameConfigDurability(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
 
@@ -126,7 +125,7 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	}
 
 	// Register a test user and connection with pre-generated client AWG credentials
-	peer, rawConfig := newEnginePeer(t, svc1, db, "rollback-user")
+	peer, rawConfig := newEnginePeer(t, svc1, db, "durability-user")
 	initialAssignedIP := peer.assignedIP
 	initialClientPubKey := peer.publicKey
 	initialClientPrivKey := peer.privateKey
@@ -190,7 +189,7 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	dest := netip.MustParseAddr("198.51.100.99")
 
 	// Track ReturnRouteOwner transitions: must progress strictly:
-	// none -> custom -> none -> upstream -> none -> custom -> none
+	// none -> upstream -> none -> none -> upstream -> none -> none -> upstream -> none
 	var ownerTransitions []string
 
 	// Mock probe function for restarted services
@@ -261,8 +260,8 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	}
 
 	// Connect real userspace AmneziaWG client on Leg 1
-	client1 := newRollbackRealClient(t, peer, rawConfig, dest, 0x11)
-	payload1 := []byte("rollback-rehearsal-traffic-leg-1-upstream")
+	client1 := newDurabilityRealClient(t, peer, rawConfig, dest, 0x11)
+	payload1 := []byte("durability-traffic-leg-1-upstream")
 	returnExchange(t, client1.tcp, payload1, false, 0x11)
 	returnExchange(t, client1.udp, payload1, true, 0x11)
 
@@ -321,7 +320,7 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	assertDBIntegrity("post-step-1")
 
 	// =========================================================================
-	// Step 2: Upstream Engine (First Process Restart)
+	// Step 2: Upstream Engine (First Process Restart with Same DB & Same Port)
 	// =========================================================================
 	t.Log("=== Step 2: Starting Service 2 in Upstream Engine Mode (Restart 1) ===")
 
@@ -345,7 +344,7 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 
 	// Verify frozen client configuration digest remains 100% identical
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
-		t.Fatalf("client config digest mutated before cutover: got %x, want %x", sum, frozenConfigHash)
+		t.Fatalf("client config digest mutated before restart 1: got %x, want %x", sum, frozenConfigHash)
 	}
 
 	if err := svc2.Start(ctx); err != nil {
@@ -383,8 +382,8 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	}
 
 	// Connect real userspace AmneziaWG client on Leg 2 using EXACT SAME frozen config
-	client2 := newRollbackRealClient(t, peer, rawConfig, dest, 0x22)
-	payload2 := []byte("rollback-rehearsal-traffic-leg-2-upstream")
+	client2 := newDurabilityRealClient(t, peer, rawConfig, dest, 0x22)
+	payload2 := []byte("durability-traffic-leg-2-upstream")
 	returnExchange(t, client2.tcp, payload2, false, 0x22)
 	returnExchange(t, client2.udp, payload2, true, 0x22)
 
@@ -412,10 +411,10 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 
 	// Assert portal public/private keys, client assigned IP, and config hash unchanged
 	if svc2.portalPubKey != initialPortalPubKey || svc2.portalPrivKey != initialPortalPrivKey {
-		t.Fatal("svc2 portal keypair mutated during upstream cutover")
+		t.Fatal("svc2 portal keypair mutated during restart 1")
 	}
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
-		t.Fatalf("client config digest mutated during upstream execution: got %x, want %x", sum, frozenConfigHash)
+		t.Fatalf("client config digest mutated during restart 1 execution: got %x, want %x", sum, frozenConfigHash)
 	}
 
 	// Disconnect client 2
@@ -446,7 +445,7 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	assertDBIntegrity("post-step-2")
 
 	// =========================================================================
-	// Step 3: Upstream Engine (Second Process Restart)
+	// Step 3: Upstream Engine (Second Process Restart with Same DB & Same Port)
 	// =========================================================================
 	t.Log("=== Step 3: Starting Service 3 in Upstream Engine Mode (Second Restart) ===")
 
@@ -508,8 +507,8 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	}
 
 	// Connect real userspace AmneziaWG client on Leg 3 using EXACT SAME frozen config
-	client3 := newRollbackRealClient(t, peer, rawConfig, dest, 0x33)
-	payload3 := []byte("rollback-rehearsal-traffic-leg-3-upstream")
+	client3 := newDurabilityRealClient(t, peer, rawConfig, dest, 0x33)
+	payload3 := []byte("durability-traffic-leg-3-upstream")
 	returnExchange(t, client3.tcp, payload3, false, 0x33)
 	returnExchange(t, client3.udp, payload3, true, 0x33)
 
@@ -537,10 +536,10 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 
 	// Assert portal public/private keys and client assigned IP match frozen state
 	if svc3.portalPubKey != initialPortalPubKey || svc3.portalPrivKey != initialPortalPrivKey {
-		t.Fatal("svc3 portal keypair mutated during rollback")
+		t.Fatal("svc3 portal keypair mutated during restart 2")
 	}
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
-		t.Fatalf("client config digest mutated during rollback execution: got %x, want %x", sum, frozenConfigHash)
+		t.Fatalf("client config digest mutated during restart 2 execution: got %x, want %x", sum, frozenConfigHash)
 	}
 
 	// Disconnect client 3
@@ -632,4 +631,10 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if activeSessions != 0 {
 		t.Fatalf("expected 0 connected sessions in DB after restart invalidation, got %d", activeSessions)
 	}
+}
+
+// TestDualEngine_SameDBSamePortSameConfigRollback preserves backward-compatibility
+// with any test runners or scripts referencing the legacy name.
+func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
+	TestUpstream_SameDBSamePortSameConfigDurability(t)
 }

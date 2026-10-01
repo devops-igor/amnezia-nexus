@@ -19,7 +19,7 @@ func main() {
 	echoPort := flag.Int("echo-port", 40001, "TCP/UDP echo port")
 	underlayIP := flag.String("underlay-ip", "10.254.250.1", "Underlay host IP for public endpoint")
 	destIP := flag.String("dest-ip", "10.100.0.1", "Destination IP for echo services")
-	engine := flag.String("engine", "upstream", "Client AWG engine (custom or upstream)")
+	engine := flag.String("engine", "upstream", "Client AWG engine (upstream)")
 	reuseDB := flag.Bool("reuse-db", false, "Reuse existing database and frozen client configuration")
 	flag.Parse()
 
@@ -29,11 +29,8 @@ func main() {
 	if *echoPort <= 0 || *echoPort > 65535 {
 		log.Fatalf("[qualification-subject] invalid echo port: %d (must be 1-65535)", *echoPort)
 	}
-	if *engine == "custom" {
-		log.Fatalf("[qualification-subject] custom engine is no longer supported: upstream is the only runtime engine")
-	}
-	if *engine != "upstream" {
-		log.Fatalf("[qualification-subject] invalid engine: %q (must be 'upstream')", *engine)
+	if *engine != "" && *engine != "upstream" {
+		log.Fatalf("[qualification-subject] invalid engine: %q (upstream is the only runtime engine)", *engine)
 	}
 
 	cfg := vpn.QualificationSubjectConfig{

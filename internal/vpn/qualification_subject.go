@@ -90,11 +90,8 @@ func normalizeSubjectConfig(cfg QualificationSubjectConfig) (QualificationSubjec
 	if cfg.Engine == "" {
 		cfg.Engine = "upstream"
 	}
-	if cfg.Engine == "custom" {
-		return cfg, fmt.Errorf("client AWG engine 'custom' is no longer supported: upstream is the only runtime engine")
-	}
 	if cfg.Engine != "upstream" {
-		return cfg, fmt.Errorf("invalid subject engine %q: must be 'upstream'", cfg.Engine)
+		return cfg, fmt.Errorf("invalid subject engine %q: upstream is the only runtime engine", cfg.Engine)
 	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = "test-artifacts/runtime/panel_test.db"
