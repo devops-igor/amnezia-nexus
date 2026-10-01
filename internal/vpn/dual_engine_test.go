@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -620,4 +621,406 @@ func TestDualEngine_Telemetry(t *testing.T) {
 	if stat.ReturnRouteOwner != "none" {
 		t.Errorf("expected return_route_owner 'none' after stop, got %q", stat.ReturnRouteOwner)
 	}
+}
+
+// TestDualEngine_ServiceStopRetiresForwarderRoutes tests that Service.Stop cleanly
+// retires and drains forwarder routes in both custom and upstream engine modes,
+// leaving zero active routes and 'none' return route owner.
+func TestDualEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
+	t.Run("custom engine mode stop retires forwarder routes and drains queues", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc := newIngressEngineService(t, db)
+		ctx := t.Context()
+
+		if err := svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Register custom routes on forwarder
+		ret1 := svc.forwarder.BeginRegisterSessionWithLimit("sess-c1", "conn-c1", "peer-c1", "10.100.0.10", 1, 0, 0)
+		ret1.Wait()
+		ret2 := svc.forwarder.BeginRegisterSessionWithLimit("sess-c2", "conn-c2", "peer-c2", "10.100.0.11", 1, 0, 0)
+		ret2.Wait()
+
+		// Stop pumps so enqueued packets remain buffered in client queues for drain verification
+		svc.forwarder.StopPumps()
+
+		// Enqueue packets into client queue
+		pkt1 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("10.100.0.10"), 1)
+		pkt2 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("10.100.0.11"), 2)
+		if err := svc.forwarder.RouteBackendToClient(1, pkt1, "10.100.0.10"); err != nil {
+			t.Fatalf("RouteBackendToClient: %v", err)
+		}
+		if err := svc.forwarder.RouteBackendToClient(1, pkt2, "10.100.0.11"); err != nil {
+			t.Fatalf("RouteBackendToClient: %v", err)
+		}
+
+		occ, _, _ := svc.forwarder.AggregateQueueStats()
+		if occ == 0 {
+			t.Fatal("expected positive aggregate queue occupancy before Stop")
+		}
+		_, _, active := svc.forwarder.GetStats()
+		if active != 2 {
+			t.Fatalf("expected 2 active routes, got %d", active)
+		}
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineCustom {
+			t.Fatalf("expected return route owner custom, got %q", owner)
+		}
+
+		// Calling Service.Stop() must cleanly retire forwarder routes and drain queues
+		if err := svc.Stop(); err != nil {
+			t.Fatalf("svc.Stop: %v", err)
+		}
+
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+			t.Errorf("expected return route owner 'none' after Stop, got %q", owner)
+		}
+		_, _, activeAfter := svc.forwarder.GetStats()
+		if activeAfter != 0 {
+			t.Errorf("expected 0 active routes in forwarder after Stop, got %d", activeAfter)
+		}
+		occAfter, _, _ := svc.forwarder.AggregateQueueStats()
+		if occAfter != 0 {
+			t.Errorf("expected 0 aggregate queue occupancy after Stop, got %d", occAfter)
+		}
+		if svc.IsRunning() {
+			t.Error("expected service IsRunning false after Stop")
+		}
+	})
+
+	t.Run("upstream engine mode stop retires forwarder routes and drains queues", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc := newIngressEngineService(t, db)
+		ctx := t.Context()
+
+		if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if svc.ingressEngine == nil || svc.ingressEngine.returnPath == nil {
+			t.Fatal("expected non-nil ingressEngine and returnPath in upstream mode")
+		}
+
+		// Register upstream routes on forwarder bound to engine.returnPath
+		ret1, err := svc.forwarder.TryRegisterSessionWithReturnPath("sess-u1", "conn-u1", "peer-u1", "10.100.0.20", 1, 0, 0, svc.ingressEngine.returnPath)
+		if err != nil {
+			t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
+		}
+		ret1.Wait()
+		ret2, err := svc.forwarder.TryRegisterSessionWithReturnPath("sess-u2", "conn-u2", "peer-u2", "10.100.0.21", 1, 0, 0, svc.ingressEngine.returnPath)
+		if err != nil {
+			t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
+		}
+		ret2.Wait()
+
+		// Stop pumps so enqueued packets remain buffered in client queues for drain verification
+		svc.forwarder.StopPumps()
+
+		// Enqueue packets into client queue
+		pkt1 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("10.100.0.20"), 1)
+		pkt2 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("10.100.0.21"), 2)
+		if err := svc.forwarder.RouteBackendToClient(1, pkt1, "10.100.0.20"); err != nil {
+			t.Fatalf("RouteBackendToClient: %v", err)
+		}
+		if err := svc.forwarder.RouteBackendToClient(1, pkt2, "10.100.0.21"); err != nil {
+			t.Fatalf("RouteBackendToClient: %v", err)
+		}
+
+		occ, _, _ := svc.forwarder.AggregateQueueStats()
+		if occ == 0 {
+			t.Fatal("expected positive aggregate queue occupancy before Stop")
+		}
+		_, _, active := svc.forwarder.GetStats()
+		if active != 2 {
+			t.Fatalf("expected 2 active routes, got %d", active)
+		}
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineUpstream {
+			t.Fatalf("expected return route owner upstream, got %q", owner)
+		}
+
+		// Calling Service.Stop() must cleanly retire forwarder routes and drain queues
+		if err := svc.Stop(); err != nil {
+			t.Fatalf("svc.Stop: %v", err)
+		}
+
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+			t.Errorf("expected return route owner 'none' after Stop, got %q", owner)
+		}
+		_, _, activeAfter := svc.forwarder.GetStats()
+		if activeAfter != 0 {
+			t.Errorf("expected 0 active routes in forwarder after Stop, got %d", activeAfter)
+		}
+		occAfter, _, _ := svc.forwarder.AggregateQueueStats()
+		if occAfter != 0 {
+			t.Errorf("expected 0 aggregate queue occupancy after Stop, got %d", occAfter)
+		}
+		if svc.IsRunning() {
+			t.Error("expected service IsRunning false after Stop")
+		}
+	})
+
+	t.Run("dual engine mixed routes stop leaves zero routes and none owner", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc := newIngressEngineService(t, db)
+		ctx := t.Context()
+
+		if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Register custom route (nil returnPath)
+		retC := svc.forwarder.BeginRegisterSessionWithLimit("sess-cm", "conn-cm", "peer-cm", "10.100.0.30", 1, 0, 0)
+		retC.Wait()
+
+		// Register upstream route
+		retU, err := svc.forwarder.TryRegisterSessionWithReturnPath("sess-um", "conn-um", "peer-um", "10.100.0.31", 1, 0, 0, svc.ingressEngine.returnPath)
+		if err != nil {
+			t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
+		}
+		retU.Wait()
+
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != "mixed" {
+			t.Fatalf("expected return route owner 'mixed', got %q", owner)
+		}
+		_, _, active := svc.forwarder.GetStats()
+		if active != 2 {
+			t.Fatalf("expected 2 active routes, got %d", active)
+		}
+
+		if err := svc.Stop(); err != nil {
+			t.Fatalf("svc.Stop: %v", err)
+		}
+
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+			t.Errorf("expected return route owner 'none' after Stop, got %q", owner)
+		}
+		_, _, activeAfter := svc.forwarder.GetStats()
+		if activeAfter != 0 {
+			t.Errorf("expected 0 active routes after Stop, got %d", activeAfter)
+		}
+		occAfter, _, _ := svc.forwarder.AggregateQueueStats()
+		if occAfter != 0 {
+			t.Errorf("expected 0 queue occupancy after Stop, got %d", occAfter)
+		}
+	})
+}
+
+// TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes tests that IngressEngine.Stop
+// explicitly retires forwarder routes bound to its returnPath and executes the retirement callback.
+func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
+	db := setupTestDB(t)
+	svc := newIngressEngineService(t, db)
+	ctx := t.Context()
+
+	engine, err := svc.NewIngressEngine(ctx, "stop-portal", nil)
+	if err != nil {
+		t.Fatalf("NewIngressEngine: %v", err)
+	}
+
+	// Register an upstream route bound to engine.returnPath
+	retU, err := svc.forwarder.TryRegisterSessionWithReturnPath("sess-u", "conn-u", "peer-u", "10.100.0.50", 1, 0, 0, engine.returnPath)
+	if err != nil {
+		t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
+	}
+	retU.Wait()
+
+	// Register a custom route on forwarder
+	retC := svc.forwarder.BeginRegisterSessionWithLimit("sess-c", "conn-c", "peer-c", "10.100.0.51", 1, 0, 0)
+	retC.Wait()
+
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "mixed" {
+		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	}
+	_, _, active := svc.forwarder.GetStats()
+	if active != 2 {
+		t.Fatalf("expected 2 active routes, got %d", active)
+	}
+
+	callbackCalled := false
+	engine.SetRouteRetirementCallbackForTest(func() {
+		callbackCalled = true
+		wait := svc.forwarder.RetireRoutesByReturnPath(engine.returnPath)
+		_ = wait(context.Background())
+	})
+
+	if err := engine.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
+		t.Fatalf("engine.Stop: %v", err)
+	}
+
+	if !callbackCalled {
+		t.Error("expected route retirement callback to be called")
+	}
+
+	// Verify upstream route was retired, custom route remains
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineCustom {
+		t.Errorf("expected return route owner custom, got %q", owner)
+	}
+	_, _, activeAfter := svc.forwarder.GetStats()
+	if activeAfter != 1 {
+		t.Errorf("expected 1 active route remaining, got %d", activeAfter)
+	}
+
+	// Verify default (non-callback) Stop path on a second engine
+	engine2, err := svc.NewIngressEngine(ctx, "stop-portal-2", nil)
+	if err != nil {
+		t.Fatalf("NewIngressEngine: %v", err)
+	}
+	retU2, err := svc.forwarder.TryRegisterSessionWithReturnPath("sess-u2", "conn-u2", "peer-u2", "10.100.0.52", 1, 0, 0, engine2.returnPath)
+	if err != nil {
+		t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
+	}
+	retU2.Wait()
+
+	if err := engine2.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
+		t.Fatalf("engine2.Stop: %v", err)
+	}
+
+	// engine2 route retired, custom route still remains
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineCustom {
+		t.Errorf("expected return route owner custom, got %q", owner)
+	}
+	_, _, activeAfter2 := svc.forwarder.GetStats()
+	if activeAfter2 != 1 {
+		t.Errorf("expected 1 active route remaining, got %d", activeAfter2)
+	}
+
+	// Clean up remaining custom route
+	_ = svc.forwarder.RetireCustomRoutes()(context.Background())
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+		t.Errorf("expected return route owner 'none', got %q", owner)
+	}
+}
+
+// TestDualEngine_ConcurrentAdmissionDuringEngineStop verifies that if session admission
+// is already in progress when IngressEngine.Stop starts:
+//  1. ReturnPath is closed early as an admission fence.
+//  2. The in-progress admission fails closed with ErrReturnPathClosed.
+//  3. After Stop() returns: active_routes == 0, return_route_owner == "none",
+//     and no route in the forwarder references the closed path.
+func TestDualEngine_ConcurrentAdmissionDuringEngineStop(t *testing.T) {
+	db := setupTestDB(t)
+	svc := newIngressEngineService(t, db)
+	ctx := t.Context()
+
+	if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "user-admit-stop", "peer-admit-stop-pubkey1", "10.100.12.5")
+	o := ownershipFor(peer)
+
+	engine := svc.IngressEngine()
+	if engine == nil {
+		t.Fatal("expected non-nil IngressEngine")
+	}
+
+	admissionReachedHook := make(chan struct{})
+	resumeAdmission := make(chan struct{})
+
+	// Set hook that fires right before route registration inside ensureBackendSessionForIngress
+	svc.SetPreIngressRouteRegistrationHookForTest(func() {
+		close(admissionReachedHook)
+		<-resumeAdmission
+	})
+
+	type admissionResult struct {
+		sess    *models.VPNSession
+		backend *models.BackendTunnel
+		err     error
+	}
+	admitCh := make(chan admissionResult, 1)
+
+	// Launch concurrent admission with the engine's returnPath
+	go func() {
+		sess, backend, _, err := svc.ensureBackendSessionForIngress(context.Background(), o, engine.returnPath)
+		admitCh <- admissionResult{sess: sess, backend: backend, err: err}
+	}()
+
+	// Wait until admission has selected backend, created session, but NOT yet registered route
+	select {
+	case <-admissionReachedHook:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for admission to reach hook")
+	}
+
+	// Now stop the engine in a separate goroutine while admission is parked in hook
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- engine.Stop()
+	}()
+
+	// Wait for engine.returnPath to be closed by engine.Stop (step b of teardown ordering)
+	deadline := time.Now().Add(3 * time.Second)
+	closed := false
+	for time.Now().Before(deadline) {
+		if engine.returnPath.Closed() {
+			closed = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !closed {
+		t.Fatal("timed out waiting for engine.returnPath to be closed")
+	}
+
+	// Resume the paused admission so it attempts to register the route on the now-closed returnPath
+	close(resumeAdmission)
+
+	// Admission must fail closed with ErrReturnPathClosed
+	var res admissionResult
+	select {
+	case res = <-admitCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for admission to complete")
+	}
+
+	if !errors.Is(res.err, forwarder.ErrReturnPathClosed) {
+		t.Fatalf("expected ErrReturnPathClosed from admission, got %v", res.err)
+	}
+
+	// Wait for engine.Stop to finish
+	select {
+	case err := <-stopDone:
+		if err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
+			t.Fatalf("engine.Stop failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for engine.Stop")
+	}
+
+	// Verify required invariants:
+	// 1. active_routes == 0
+	_, _, active := svc.forwarder.GetStats()
+	if active != 0 {
+		t.Fatalf("expected 0 active routes, got %d", active)
+	}
+
+	// 2. return_route_owner == "none"
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return_route_owner 'none', got %q", owner)
+	}
+
+	// 3. no route references the closed path
+	if svc.forwarder.HasRoutesForReturnPath(engine.returnPath) {
+		t.Fatal("expected no route to reference closed returnPath")
+	}
+
+	// 4. Session rolled back cleanly (not left connected)
+	if sess, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok && sess.Status == "connected" {
+		t.Fatalf("session for peer was not rolled back: %+v", sess)
+	}
+
+	_ = svc.Stop()
 }

@@ -1,18 +1,34 @@
 package forwarder
 
 import (
+	"context"
+	"errors"
 	"log"
 	"time"
 )
 
+// ErrRetirementTimeout is returned when waiting for in-flight writes to complete exceeds the deadline.
+var ErrRetirementTimeout = errors.New("forwarder: retirement wait timed out joining in-flight writes")
+
 // Retirement joins writes admitted by a retired route generation. Its zero
-// value is safe. Wait must be called only after releasing all caller locks.
+// value is safe. Wait or WaitContext must be called only after releasing all caller locks.
 type Retirement struct {
 	route *sessionRoute
 }
 
+// WaitContext waits for admitted writes of this route generation to complete,
+// or until ctx is done.
+func (r Retirement) WaitContext(ctx context.Context) error {
+	if r.route == nil {
+		return nil
+	}
+	return r.route.waitForWriteContext(ctx)
+}
+
 // Wait completes retirement; no write from this generation can begin afterward.
-func (r Retirement) Wait() { r.route.waitForWrite() }
+func (r Retirement) Wait() {
+	_ = r.WaitContext(context.Background())
+}
 
 // DeviceWriteStallThreshold defines a slow client-device write. Stalls count
 // each write once, including writes still blocked when telemetry is queried.
@@ -50,12 +66,30 @@ func (f *Forwarder) DeviceWriteSnapshot() DeviceWriteTelemetry {
 	return stats
 }
 
-// waitForWrite completes retirement after any admitted write returns. Callers
-// MUST release f.mu first: a stuck device must not block unrelated routes.
-func (route *sessionRoute) waitForWrite() {
-	if route != nil {
+// waitForWriteContext completes retirement after any admitted write returns,
+// or when ctx expires. Callers MUST release f.mu first: a stuck device must not
+// block unrelated routes.
+func (route *sessionRoute) waitForWriteContext(ctx context.Context) error {
+	if route == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ErrRetirementTimeout
+	}
+	done := make(chan struct{})
+	go func() {
 		route.writeMu.Lock()
 		route.writeMu.Unlock() //nolint:staticcheck // The empty critical section joins any admitted write before retirement returns.
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ErrRetirementTimeout
 	}
 }
 

@@ -162,15 +162,18 @@ func TestReturnPathClosedNeverFallsBackAndTUNPressureIsBounded(t *testing.T) {
 	if vt.Stats().DropsQueueFull != 1 {
 		t.Fatalf("missing TUN drop: %+v", vt.Stats())
 	}
-	path.Close()
-	if _, err := writer.Write(packet); !errors.Is(err, ErrReturnPathClosed) {
-		t.Fatalf("closed writer: %v", err)
-	}
 	f := NewForwarder(nil, "10.100.0.0/16", 2)
 	legacy := newMockPacketDev()
 	f.AttachClientDevice(legacy)
 	if _, err := f.TryRegisterSessionWithReturnPath("s", "c", "a", "10.100.0.2", 1, 0, 0, path); err != nil {
 		t.Fatal(err)
+	}
+	path.Close()
+	if _, err := writer.Write(packet); !errors.Is(err, ErrReturnPathClosed) {
+		t.Fatalf("closed writer: %v", err)
+	}
+	if _, err := f.TryRegisterSessionWithReturnPath("s2", "c2", "a2", "10.100.0.3", 1, 0, 0, path); !errors.Is(err, ErrReturnPathClosed) {
+		t.Fatalf("expected ErrReturnPathClosed for new registration on closed path, got %v", err)
 	}
 	f.StartPumps(t.Context())
 	t.Cleanup(f.StopPumps)

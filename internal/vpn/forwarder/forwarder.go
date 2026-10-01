@@ -250,7 +250,8 @@ type Forwarder struct {
 	pumpsWg          sync.WaitGroup
 	// Diagnostic registration count. Teardown ownership is determined by
 	// sessionRoute.sessionID, never inferred from this counter.
-	peerRegs map[string]uint64 // peerKey -> registrations seen
+	peerRegs    map[string]uint64 // peerKey -> registrations seen
+	stopTimeout time.Duration
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -426,12 +427,18 @@ func (f *Forwarder) TryRegisterSessionWithLimit(sessionID, connectionID, peerKey
 // TryRegisterSessionWithReturnPath installs a route-bound plaintext writer.
 // A nonnil path always takes precedence over legacy devices, including when closed.
 func (f *Forwarder) TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (Retirement, error) {
+	if path != nil && path.Closed() {
+		return Retirement{}, ErrReturnPathClosed
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.registerSessionLocked(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps, path)
 }
 
 func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (retirement Retirement, err error) {
+	if path != nil && path.Closed() {
+		return Retirement{}, ErrReturnPathClosed
+	}
 
 	// A new peer is rejected when the configured active-route budget is
 	// full. Re-registration of an existing peer is allowed so
@@ -659,6 +666,90 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.drainRouteQueueLocked(route)
 	}
 	return retirement
+}
+
+func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) bool) []Retirement {
+	var matches []*sessionRoute
+	for _, route := range f.routesByPeer {
+		if route != nil && (predicate == nil || predicate(route)) {
+			matches = append(matches, route)
+		}
+	}
+	retirements := make([]Retirement, 0, len(matches))
+	for _, route := range matches {
+		retirements = append(retirements, Retirement{route: route})
+		if cur, ok := f.routesByIP[route.assignedIP]; ok && cur == route {
+			delete(f.routesByIP, route.assignedIP)
+		}
+		delete(f.routesByPeer, route.peerKey)
+		delete(f.clientDevices, route.peerKey)
+		f.stopRoutePumpLocked(route)
+		f.drainRouteQueueLocked(route)
+	}
+	return retirements
+}
+
+// RetireAllRoutes stops pumps, drains queues, removes all routes from forwarder
+// routing tables, and returns a wait function that callers execute outside forwarder
+// locks to join in-flight writes with a bounded context.
+func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
+	if f == nil {
+		return func(ctx context.Context) error { return nil }
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(nil)
+	clear(f.routesByPeer)
+	clear(f.routesByIP)
+	clear(f.clientDevices)
+	f.aggregateQueueMu.Lock()
+	f.aggregateQueueOccupancy = 0
+	f.aggregateQueueMu.Unlock()
+	f.mu.Unlock()
+
+	return func(ctx context.Context) error {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		for _, ret := range retirements {
+			if err := ret.WaitContext(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// RetireRoutesByReturnPath stops pumps, drains queues, and removes routes associated
+// with the specified ReturnPath. Routes belonging to other engines remain untouched.
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func(ctx context.Context) error) {
+	if f == nil {
+		return func(ctx context.Context) error { return nil }
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(func(route *sessionRoute) bool {
+		return route.returnPath == path
+	})
+	f.mu.Unlock()
+
+	return func(ctx context.Context) error {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		for _, ret := range retirements {
+			if err := ret.WaitContext(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// RetireCustomRoutes stops pumps, drains queues, and removes routes belonging to
+// the custom/legacy engine (routes where returnPath == nil).
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireCustomRoutes() (wait func(ctx context.Context) error) {
+	return f.RetireRoutesByReturnPath(nil)
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
@@ -1196,8 +1287,7 @@ func (f *Forwarder) SpoofedRebinds() uint64 {
 	return f.spoofedRebinds.Load()
 }
 
-// StopPumps terminates background packet pump routines.
-func (f *Forwarder) StopPumps() {
+func (f *Forwarder) stopPumpsSignalOnly() {
 	f.mu.Lock()
 	if !f.pumpsRunning {
 		f.mu.Unlock()
@@ -1218,7 +1308,11 @@ func (f *Forwarder) StopPumps() {
 		route.pumpStarted = false
 	}
 	f.mu.Unlock()
+}
 
+// StopPumps terminates background packet pump routines.
+func (f *Forwarder) StopPumps() {
+	f.stopPumpsSignalOnly()
 	f.pumpsWg.Wait()
 }
 
@@ -1365,18 +1459,70 @@ func (f *Forwarder) Start(ctx context.Context) {
 	}
 }
 
-// Stop terminates the forwarder, pumps, and flushes accountant.
+// HasRoutesForReturnPath reports whether any active route in the forwarder references path.
+func (f *Forwarder) HasRoutesForReturnPath(path *ReturnPath) bool {
+	if f == nil || path == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, route := range f.routesByPeer {
+		if route != nil && route.returnPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+// SetStopTimeoutForTest sets the quiescence wait timeout for route retirement during Stop.
+func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopTimeout = d
+}
+
+func (f *Forwarder) getStopTimeout() time.Duration {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.stopTimeout > 0 {
+		return f.stopTimeout
+	}
+	return 5 * time.Second
+}
+
+// Stop terminates the forwarder, retires and drains all routes, joins in-flight
+// writes, stops pumps, and flushes the accountant.
 func (f *Forwarder) Stop() error {
+	if f == nil {
+		return nil
+	}
+	var retireErr error
+	if wait := f.RetireAllRoutes(); wait != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), f.getStopTimeout())
+		retireErr = wait(ctx)
+		cancel()
+	}
+	if retireErr != nil {
+		f.stopPumpsSignalOnly()
+		f.mu.Lock()
+		f.running = false
+		f.mu.Unlock()
+		if f.accountant != nil {
+			_ = f.accountant.Stop()
+		}
+		return retireErr
+	}
 	f.StopPumps()
 
 	f.mu.Lock()
 	f.running = false
 	f.mu.Unlock()
 
+	var accountantErr error
 	if f.accountant != nil {
-		return f.accountant.Stop()
+		accountantErr = f.accountant.Stop()
 	}
-	return nil
+	return accountantErr
 }
 
 // IsRunning returns true if the forwarder is active.
