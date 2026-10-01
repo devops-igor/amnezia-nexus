@@ -43,12 +43,21 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
 
+	activeConns := func(tunnelID int64) int {
+		t.Helper()
+		cur, err := svc.pool.GetTunnelByID(tunnelID)
+		if err != nil {
+			t.Fatalf("GetTunnelByID(%d) failed: %v", tunnelID, err)
+		}
+		return cur.ActiveConnections
+	}
+
 	oldTun := lbTunnel(t, svc, db, 901, "awg901", "pub901", "priv901", "10.9.9.91:51820")
 
 	// Path 1: DisconnectSession
 	svc.pool.IncrementConnections(oldTun.ID)
-	if oldTun.ActiveConnections != 1 {
-		t.Fatalf("setup: expected 1 active connection, got %d", oldTun.ActiveConnections)
+	if got := activeConns(oldTun.ID); got != 1 {
+		t.Fatalf("setup: expected 1 active connection, got %d", got)
 	}
 	if _, err := svc.sessionMgr.CreateSession(t.Context(), uID, "peer-pool-1", "10.200.0.1", oldTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
@@ -60,8 +69,8 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 	if err := svc.DisconnectSession(t.Context(), sess.ID); err != nil {
 		t.Fatalf("DisconnectSession failed: %v", err)
 	}
-	if oldTun.ActiveConnections != 0 {
-		t.Fatalf("DisconnectSession: ActiveConnections = %d, want 0", oldTun.ActiveConnections)
+	if got := activeConns(oldTun.ID); got != 0 {
+		t.Fatalf("DisconnectSession: ActiveConnections = %d, want 0", got)
 	}
 
 	// Path 2: DisconnectUser
@@ -72,8 +81,8 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 	if err := svc.DisconnectUser(t.Context(), uID); err != nil {
 		t.Fatalf("DisconnectUser failed: %v", err)
 	}
-	if oldTun.ActiveConnections != 0 {
-		t.Fatalf("DisconnectUser: ActiveConnections = %d, want 0", oldTun.ActiveConnections)
+	if got := activeConns(oldTun.ID); got != 0 {
+		t.Fatalf("DisconnectUser: ActiveConnections = %d, want 0", got)
 	}
 
 	// Path 3: ReleaseClient
@@ -84,8 +93,8 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 	if err := svc.ReleaseClient(t.Context(), "peer-pool-3"); err != nil {
 		t.Fatalf("ReleaseClient failed: %v", err)
 	}
-	if oldTun.ActiveConnections != 0 {
-		t.Fatalf("ReleaseClient: ActiveConnections = %d, want 0", oldTun.ActiveConnections)
+	if got := activeConns(oldTun.ID); got != 0 {
+		t.Fatalf("ReleaseClient: ActiveConnections = %d, want 0", got)
 	}
 }
 
@@ -95,6 +104,15 @@ func TestDisconnectPathsDecrementPoolCounter(t *testing.T) {
 func TestDisableBackendRedirectsLiveRoutes(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db)
+
+	activeConns := func(tunnelID int64) int {
+		t.Helper()
+		cur, err := svc.pool.GetTunnelByID(tunnelID)
+		if err != nil {
+			t.Fatalf("GetTunnelByID(%d) failed: %v", tunnelID, err)
+		}
+		return cur.ActiveConnections
+	}
 
 	oldTun := lbTunnel(t, svc, db, 901, "awg901", "pub901", "priv901", "10.9.9.91:51820")
 	newTun := lbTunnel(t, svc, db, 902, "awg902", "pub902", "priv902", "10.9.9.92:51820")
@@ -122,15 +140,15 @@ func TestDisableBackendRedirectsLiveRoutes(t *testing.T) {
 
 	// The connection count must have moved with the session (DisableBackend
 	// decrements old and increments new for each migration).
-	if oldTun.ActiveConnections != 0 {
-		t.Errorf("old backend ActiveConnections = %d, want 0 after migration", oldTun.ActiveConnections)
+	if got := activeConns(oldTun.ID); got != 0 {
+		t.Errorf("old backend ActiveConnections = %d, want 0 after migration", got)
 	}
-	if newTun.ActiveConnections != 1 {
-		t.Errorf("new backend ActiveConnections = %d, want 1 after migration", newTun.ActiveConnections)
+	if got := activeConns(newTun.ID); got != 1 {
+		t.Errorf("new backend ActiveConnections = %d, want 1 after migration", got)
 	}
 
 	// Sticky peer affinity must follow: a routing request for the peer must
-	// resolve to the new backend. Pass the new tunnel in AvailableTunnels —
+	// resolve to the new backend. Pass the new tunnel in AvailableTunnels -
 	// in production the caller supplies the live tunnel list; here the new
 	// tunnel is the only healthy one after the old was disabled.
 	tun, _, err := svc.stickyMgr.GetOrAssignBackend(t.Context(), &loadbalancer.RoutingRequest{

@@ -348,14 +348,20 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	// Keep application traffic flowing past the idle threshold to prove
 	// liveness refresh keeps a busy session out of the reaper, then go
 	// idle. Traffic-driven liveness is throttled to one refresh per
-	// TouchSessionThrottleSeconds (2s) — coarser than this test's 150ms
-	// threshold — so the busy phase drives SessionManager.TouchSession
+	// TouchSessionThrottleSeconds (2s) - coarser than this test's 150ms
+	// threshold - so the busy phase drives SessionManager.TouchSession
 	// directly, the way a real sub-2s traffic cadence reaches it.
-	currentReapTimeout.Store(int64(150 * time.Millisecond))
-	busyDeadline := time.Now().Add(300 * time.Millisecond) // > idle threshold + margin
+	reapThreshold := 150 * time.Millisecond
+	touchInterval := 25 * time.Millisecond
+	if raceDetectorEnabled {
+		reapThreshold = 600 * time.Millisecond
+		touchInterval = 20 * time.Millisecond
+	}
+	currentReapTimeout.Store(int64(reapThreshold))
+	busyDeadline := time.Now().Add(2 * reapThreshold)
 	for time.Now().Before(busyDeadline) {
 		svc.sessionMgr.TouchSession(lc.publicKey)
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(touchInterval)
 	}
 	if live, ok := svc.sessionMgr.GetSessionSnapshotByPeer(lc.publicKey); !ok || live.ID != sess1.ID {
 		t.Fatalf("idle threshold elapsed while touching the busy session, yet session changed: %+v ok=%v", live, ok)

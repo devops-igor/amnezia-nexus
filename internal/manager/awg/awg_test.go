@@ -2542,4 +2542,3 @@ func TestAWGManager_RollbackAddClient_AbstainsOnSupersededPeer(t *testing.T) {
 		t.Errorf("PeerA missing from clientsTable after rollback")
 	}
 }
-

@@ -172,4 +172,3 @@ func TestDB_SetPeerLifecycleStatus_UpsertsMissingRow(t *testing.T) {
 		t.Fatalf("expected status 'failed', got %s", rec.Status)
 	}
 }
-

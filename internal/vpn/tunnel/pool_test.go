@@ -1036,13 +1036,15 @@ func TestTunnelPool_AddTunnel_ExistingTunnel_KeyGenerationFailurePropagation(t *
 	}
 
 	origEndpoint := "198.51.100.22:51820"
-	tun, err := pool.AddTunnel(ctx, sID, origEndpoint, "orig-pub")
+	_, err = pool.AddTunnel(ctx, sID, origEndpoint, "orig-pub")
 	if err != nil {
 		t.Fatalf("initial AddTunnel failed: %v", err)
 	}
 
 	// Case A: Missing PrivateKey and keygen fails
-	tun.PrivateKey = ""
+	pool.mu.Lock()
+	pool.tunnelsByServerID[sID].PrivateKey = ""
+	pool.mu.Unlock()
 	pool.SetGenerateKeyPairForTest(func() (string, string, error) {
 		return "", "", errors.New("entropy source depleted")
 	})
@@ -1068,8 +1070,10 @@ func TestTunnelPool_AddTunnel_ExistingTunnel_KeyGenerationFailurePropagation(t *
 	}
 
 	// Case B: Valid PrivateKey, missing ProbePrivateKey, and keygen fails
-	tun.PrivateKey = "existing-valid-private-key"
-	tun.ProbePrivateKey = ""
+	pool.mu.Lock()
+	pool.tunnelsByServerID[sID].PrivateKey = "existing-valid-private-key"
+	pool.tunnelsByServerID[sID].ProbePrivateKey = ""
+	pool.mu.Unlock()
 
 	_, err = pool.AddTunnel(ctx, sID, "198.51.100.22:51839", "attempted-pub-2")
 	if err == nil {

@@ -260,7 +260,8 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		if changed {
 			existing.StateVersion = candStateVersion
 		}
-		return existing, nil
+		copyTunnel := *existing
+		return &copyTunnel, nil
 	}
 
 	pubKey := serverPubKey
@@ -320,7 +321,8 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[ifName] = tunnel
 
-	return tunnel, nil
+	copyTunnel := *tunnel
+	return &copyTunnel, nil
 }
 
 // RemoveTunnel removes a backend tunnel by server ID.

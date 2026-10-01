@@ -202,6 +202,7 @@ type Service struct {
 	updateBackendServerHostErr             error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
+	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
 }
 
@@ -853,6 +854,13 @@ func (s *Service) SetEnableBackendPreAddTunnelHookForTest(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.enableBackendPreAddTunnelHook = fn
+}
+
+// SetEnableBackendPostAddTunnelHookForTest sets a hook called immediately after calling pool.AddTunnel in EnableBackend.
+func (s *Service) SetEnableBackendPostAddTunnelHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enableBackendPostAddTunnelHook = fn
 }
 
 // SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
@@ -2263,16 +2271,27 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
+	var postRefreshVersion int64
+	if err == nil && tun != nil {
+		postRefreshVersion = tun.StateVersion
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
 	}
 
+	s.mu.RLock()
+	postAddHook := s.enableBackendPostAddTunnelHook
+	s.mu.RUnlock()
+	if postAddHook != nil {
+		postAddHook()
+	}
+
 	// Register the portal peers on the backend server (issue #43):
-	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) — the DATA
+	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) - the DATA
 	//     device key with AllowedIPs scoped to portal client subnet so the backend accepts data
 	//     traffic from the portal subnet and routes replies to the data device (never 0.0.0.0/0).
-	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) — a
+	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) - a
 	//     dedicated probe key so prober handshakes never roam the data peer's
 	//     return endpoint (per-peer endpoint roaming: last sender wins).
 	// AddClient is an idempotent upsert on the caller-supplied key, so repeat
@@ -2292,7 +2311,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, tun.StateVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2323,11 +2342,11 @@ func (s *Service) finishEnableBackend(
 		if initialEnabled && !currTun.Enabled {
 			return errors.New("backend was administratively disabled; aborting enable")
 		}
-		if currTun.StateVersion != initialVersion {
-			return errors.New("backend state modified concurrently; aborting enable")
-		}
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
+	}
+	if currTun.StateVersion != initialVersion {
+		return errors.New("backend state modified concurrently; aborting enable")
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {

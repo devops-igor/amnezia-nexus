@@ -153,7 +153,8 @@ func TestDBWriteFailsAfterInMemoryStateChange(t *testing.T) {
 	}
 
 	svc2.pool.IncrementConnections(tun2.ID) // baseline probe gauge, matches handleIncomingPeer precondition
-	gaugeBefore := tun2.ActiveConnections
+	tun2Cur, _ := svc2.pool.GetTunnelByID(tun2.ID)
+	gaugeBefore := tun2Cur.ActiveConnections
 	_, _, err = svc2.HandleIncomingPeerForTest(ctx, peerKey)
 	if err == nil {
 		t.Fatalf("expected HandleIncomingPeerForTest to fail on injected CreateVPNSession failure")
