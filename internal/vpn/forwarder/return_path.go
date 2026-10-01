@@ -29,21 +29,30 @@ func NewReturnPath(write func(peerKey, assignedIP string, packet []byte) (int, e
 func (p *ReturnPath) Close()       { p.mu.Lock(); p.closed = true; p.mu.Unlock() }
 func (p *ReturnPath) Closed() bool { p.mu.RLock(); defer p.mu.RUnlock(); return p.closed }
 
+// Write attempts to write a return packet to peerKey and assignedIP. If the path
+// is nil, closed, or uninitialized, ErrReturnPathClosed is returned.
+func (p *ReturnPath) Write(peerKey, assignedIP string, packet []byte) (int, error) {
+	if p == nil {
+		return 0, ErrReturnPathClosed
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed || p.write == nil {
+		return 0, ErrReturnPathClosed
+	}
+	return p.write(peerKey, assignedIP, packet)
+}
+
 type routeWriter struct {
 	path                *ReturnPath
 	peerKey, assignedIP string
 }
 
 func (w routeWriter) Write(packet []byte) (int, error) {
-	w.path.mu.RLock()
-	defer w.path.mu.RUnlock()
-	if w.path.closed || w.path.write == nil {
-		return 0, ErrReturnPathClosed
-	}
 	if !validReturnDestination(packet, w.assignedIP) {
 		return 0, ErrReturnRouteMismatch
 	}
-	return w.path.write(w.peerKey, w.assignedIP, packet)
+	return w.path.Write(w.peerKey, w.assignedIP, packet)
 }
 
 func validReturnDestination(packet []byte, destination string) bool {

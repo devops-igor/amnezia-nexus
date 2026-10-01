@@ -348,3 +348,144 @@ All differential test suites and scripts adhere to non-negotiable privacy rules:
 ### Handshake Timeout / Retransmission Failure
 - **Cause**: Local firewall or packet filter dropping UDP datagrams on loopback.
 - **Fix**: Ensure loopback (`lo`) interface is up and local UDP traffic on ports 50000-60000 is permitted.
+
+---
+
+## 11. Dual-Engine Switch, Canary & Restart Rollback Runbook (PR 393-A)
+
+This section provides step-by-step operational procedures for selecting between the legacy custom client AWG listener (`custom`) and the upstream AmneziaWG ingress engine (`upstream`), executing canary restarts, and triggering controlled rollback without configuration regeneration.
+
+> [!NOTE]
+> PR 393-A implements startup-time engine selection, mutual exclusion, return path write fencing, and accurate lifecycle telemetry. Controlled engine changes are executed via process restart. Dynamic in-flight live traffic rollback without restart is part of PR 393-C.
+
+### 11.1 Engine Invariants & Configuration
+
+- **Configuration Key**: `VPN_CLIENT_AWG_ENGINE` (in `.env` or container environment).
+  - Supported values: `custom` (default), `upstream`.
+  - Strictly canonical: No alias fallback variables are accepted.
+  - Unset, empty `""`, or whitespace defaults to `custom`.
+  - Invalid values fail closed at startup with an immediate error (`invalid client AWG engine`).
+- **Mutual Exclusion Invariant**: Only one engine is active at a time. The custom endpoint and upstream `IngressEngine` share the same external UDP listen port. In-process double start or overlap fails closed.
+- **Legacy TUN Bypass Invariant**: In `upstream` mode, the client-facing Linux TUN device (`/dev/net/tun`) is NOT opened or attached (`s.requireTun` and `s.tunOpener` are skipped). Packet routing flows via `VirtualTUN` and `forwarder.ReturnPath`.
+- **Zero Config Regeneration Invariant**: Client keypairs, assigned IPs, and WireGuard credentials stored in SQLite remain 100% identical across engines. Neither cutover nor rollback modifies `user_connections`.
+
+### 11.2 Pre-Flight Checks
+
+Before performing a cutover or canary switch:
+
+1. **Verify Database Integrity**:
+   ```bash
+   sqlite3 /data/nexus.db "PRAGMA integrity_check;"
+   # Expected output: ok
+   ```
+2. **Verify Client Connection Records**:
+   ```bash
+   sqlite3 /data/nexus.db "SELECT count(*), count(DISTINCT client_id) FROM user_connections;"
+   ```
+3. **Check Port Availability & Current Process**:
+   ```bash
+   ss -ulpn 'sport = :51820'
+   ```
+4. **Baseline Health Check**:
+   ```bash
+   curl -s http://127.0.0.1:8080/api/health | jq .
+   # Verify status is "ok" and active_engine / configured_engine are reported
+   ```
+
+### 11.3 Canary Cutover Procedure (`custom` -> `upstream`)
+
+1. **Update Engine Environment Variable**:
+   In `/etc/amnezia-nexus/nexus.env` or `docker-compose.yml`:
+   ```bash
+   VPN_CLIENT_AWG_ENGINE=upstream
+   ```
+2. **Execute Controlled Restart**:
+   ```bash
+   # Docker Compose deployment:
+   docker compose restart nexus-vpn
+
+   # Or systemd deployment:
+   systemctl restart nexus-vpn
+   ```
+3. **Verify Startup Log Output**:
+   Check service logs for the canonical engine startup marker:
+   ```bash
+   docker compose logs --tail=50 nexus-vpn | grep "active client AWG engine"
+   # Expected output:
+   # [vpn] active client AWG engine=upstream listen_port=51820
+   ```
+4. **Inspect Health and Status Endpoints**:
+   ```bash
+   # System Health:
+   curl -s http://127.0.0.1:8080/api/health | jq '{status, configured_engine, active_engine, return_route_owner, engine_running}'
+   # Expected response:
+   # {
+   #   "status": "ok",
+   #   "configured_engine": "upstream",
+   #   "active_engine": "upstream",
+   #   "return_route_owner": "upstream",
+   #   "engine_running": true
+   # }
+   # Note: return_route_owner reports "none" if no client sessions have routed yet.
+
+   # VPN Data Plane Status:
+   curl -s http://127.0.0.1:8080/api/vpn/status | jq '{configured_engine, active_engine, return_route_owner, engine_running, peer_sync}'
+   # Expected response:
+   # {
+   #   "configured_engine": "upstream",
+   #   "active_engine": "upstream",
+   #   "return_route_owner": "upstream",
+   #   "engine_running": true,
+   #   "peer_sync": {
+   #     "desired_peers": N,
+   #     "actual_peers": N,
+   #     "in_sync": true
+   #   }
+   # }
+   ```
+5. **Verify Data Plane Traffic**:
+   - Establish connection from a test client using an existing `.conf` file.
+   - Confirm handshake completion in logs: `[vpn/ingress] admitted peer <key>...`.
+   - Verify bidirectional payload forwarding (e.g., `ping 198.51.100.1` or `curl https://example.com`).
+
+### 11.4 Controlled Rollback Procedure (`upstream` -> `custom`)
+
+If anomalous handshake latency, packet drops, or routing issues occur during canary:
+
+1. **Revert Engine Variable**:
+   In `/etc/amnezia-nexus/nexus.env` or `docker-compose.yml`:
+   ```bash
+   VPN_CLIENT_AWG_ENGINE=custom
+   ```
+2. **Execute Controlled Restart**:
+   ```bash
+   # Docker Compose deployment:
+   docker compose restart nexus-vpn
+
+   # Or systemd deployment:
+   systemctl restart nexus-vpn
+   ```
+3. **Verify Rollback Startup Log**:
+   ```bash
+   docker compose logs --tail=50 nexus-vpn | grep "active client AWG engine"
+   # Expected output:
+   # [vpn] active client AWG engine=custom listen_port=51820
+   ```
+4. **Inspect Health and Status Endpoints**:
+   ```bash
+   curl -s http://127.0.0.1:8080/api/health | jq '{status, configured_engine, active_engine, return_route_owner, engine_running}'
+   # Expected response:
+   # {
+   #   "status": "ok",
+   #   "configured_engine": "custom",
+   #   "active_engine": "custom",
+   #   "return_route_owner": "custom",
+   #   "engine_running": true
+   # }
+   # Note: return_route_owner reports "none" if no client sessions have routed yet.
+   ```
+5. **Client Continuity Verification**:
+   - Test clients automatically resume communication upon next packet transmission / handshake renegotiation.
+   - No client configuration re-issuance, key rotation, or database modification is required.
+
+

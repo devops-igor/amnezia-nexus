@@ -98,6 +98,14 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 		return false, false, nil
 	}
 
+	engine := cfg.ClientAWGEngine
+	if engine == "" {
+		engine = config.ClientAWGEngineCustom
+	}
+	if err := vpnSvc.SetClientAWGEngine(engine); err != nil {
+		return false, false, fmt.Errorf("failed to set client AWG engine: %w", err)
+	}
+
 	vpnSvc.RequireTunDevice()
 	stErr := vpnSvc.Start(ctx)
 	switch {
@@ -109,7 +117,7 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 		if boundCfg, cfgErr := vpnSvc.GetConfig(ctx); cfgErr == nil && boundCfg != nil {
 			boundPort = boundCfg.ListenPort
 		}
-		slog.Info("VPN endpoint started", "listen_port", boundPort)
+		slog.Info("VPN endpoint started", "engine", vpnSvc.ClientAWGEngine(), "listen_port", boundPort)
 		return true, true, nil
 	case errors.Is(stErr, endpoint.ErrTunUnavailable):
 		slog.Warn("VPN endpoint unavailable (no TUN device): running management-only", "err", stErr)
