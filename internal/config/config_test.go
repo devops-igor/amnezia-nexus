@@ -16,8 +16,6 @@ func TestConfigDefaults(t *testing.T) {
 	os.Unsetenv("LOG_LEVEL")
 	os.Unsetenv("VPN_ENABLED")
 	os.Unsetenv("VPN_CLIENT_AWG_ENGINE")
-	os.Unsetenv("CLIENT_AWG_ENGINE")
-	os.Unsetenv("VPN_CLIENT_ENGINE")
 
 	tmpDir := t.TempDir()
 	os.Setenv("DATA_DIR", tmpDir)
@@ -57,8 +55,6 @@ func TestConfigDefaults(t *testing.T) {
 func TestClientAWGEngineConfig(t *testing.T) {
 	cleanup := func() {
 		os.Unsetenv("VPN_CLIENT_AWG_ENGINE")
-		os.Unsetenv("CLIENT_AWG_ENGINE")
-		os.Unsetenv("VPN_CLIENT_ENGINE")
 	}
 	defer cleanup()
 
@@ -71,6 +67,16 @@ func TestClientAWGEngineConfig(t *testing.T) {
 		{
 			name:       "default to custom when unset",
 			setEnvs:    map[string]string{},
+			wantEngine: ClientAWGEngineCustom,
+		},
+		{
+			name:       "default to custom when empty",
+			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": ""},
+			wantEngine: ClientAWGEngineCustom,
+		},
+		{
+			name:       "empty after trim defaults to custom",
+			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "   "},
 			wantEngine: ClientAWGEngineCustom,
 		},
 		{
@@ -89,33 +95,14 @@ func TestClientAWGEngineConfig(t *testing.T) {
 			wantEngine: ClientAWGEngineUpstream,
 		},
 		{
-			name:       "CLIENT_AWG_ENGINE fallback",
-			setEnvs:    map[string]string{"CLIENT_AWG_ENGINE": "upstream"},
-			wantEngine: ClientAWGEngineUpstream,
-		},
-		{
-			name:       "VPN_CLIENT_ENGINE fallback",
-			setEnvs:    map[string]string{"VPN_CLIENT_ENGINE": "upstream"},
-			wantEngine: ClientAWGEngineUpstream,
-		},
-		{
-			name: "primary overrides fallbacks",
-			setEnvs: map[string]string{
-				"VPN_CLIENT_AWG_ENGINE": "custom",
-				"CLIENT_AWG_ENGINE":     "upstream",
-				"VPN_CLIENT_ENGINE":     "upstream",
-			},
-			wantEngine: ClientAWGEngineCustom,
-		},
-		{
 			name:    "invalid engine value fails closed",
 			setEnvs: map[string]string{"VPN_CLIENT_AWG_ENGINE": "kernel"},
 			wantErr: true,
 		},
 		{
-			name:       "empty after trim defaults to custom",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "   "},
-			wantEngine: ClientAWGEngineCustom,
+			name:    "invalid typo fails closed",
+			setEnvs: map[string]string{"VPN_CLIENT_AWG_ENGINE": "up-stream"},
+			wantErr: true,
 		},
 	}
 

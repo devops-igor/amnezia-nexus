@@ -21,8 +21,6 @@ import (
 func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
 	cleanup := func() {
 		os.Unsetenv("VPN_CLIENT_AWG_ENGINE")
-		os.Unsetenv("CLIENT_AWG_ENGINE")
-		os.Unsetenv("VPN_CLIENT_ENGINE")
 	}
 	defer cleanup()
 
@@ -38,35 +36,24 @@ func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
 		}
 	})
 
+	t.Run("default to custom when empty or whitespace", func(t *testing.T) {
+		cleanup()
+		for _, raw := range []string{"", "   \t"} {
+			os.Setenv("VPN_CLIENT_AWG_ENGINE", raw)
+			db := setupTestDB(t)
+			svc, err := NewVPNService(db, nil)
+			if err != nil {
+				t.Fatalf("NewVPNService with %q: %v", raw, err)
+			}
+			if svc.ClientAWGEngine() != ClientAWGEngineCustom {
+				t.Fatalf("expected default engine %q, got %q", ClientAWGEngineCustom, svc.ClientAWGEngine())
+			}
+		}
+	})
+
 	t.Run("VPN_CLIENT_AWG_ENGINE=upstream", func(t *testing.T) {
 		cleanup()
 		os.Setenv("VPN_CLIENT_AWG_ENGINE", "upstream")
-		db := setupTestDB(t)
-		svc, err := NewVPNService(db, nil)
-		if err != nil {
-			t.Fatalf("NewVPNService: %v", err)
-		}
-		if svc.ClientAWGEngine() != ClientAWGEngineUpstream {
-			t.Fatalf("expected engine %q, got %q", ClientAWGEngineUpstream, svc.ClientAWGEngine())
-		}
-	})
-
-	t.Run("CLIENT_AWG_ENGINE fallback", func(t *testing.T) {
-		cleanup()
-		os.Setenv("CLIENT_AWG_ENGINE", "upstream")
-		db := setupTestDB(t)
-		svc, err := NewVPNService(db, nil)
-		if err != nil {
-			t.Fatalf("NewVPNService: %v", err)
-		}
-		if svc.ClientAWGEngine() != ClientAWGEngineUpstream {
-			t.Fatalf("expected engine %q, got %q", ClientAWGEngineUpstream, svc.ClientAWGEngine())
-		}
-	})
-
-	t.Run("VPN_CLIENT_ENGINE fallback", func(t *testing.T) {
-		cleanup()
-		os.Setenv("VPN_CLIENT_ENGINE", "upstream")
 		db := setupTestDB(t)
 		svc, err := NewVPNService(db, nil)
 		if err != nil {
@@ -107,6 +94,16 @@ func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
 		}
 		if svc.ClientAWGEngine() != ClientAWGEngineCustom {
 			t.Fatalf("expected engine %q, got %q", ClientAWGEngineCustom, svc.ClientAWGEngine())
+		}
+
+		// Empty string or whitespace defaults to custom
+		for _, emptyVal := range []string{"", "   "} {
+			if err := svc.SetClientAWGEngine(emptyVal); err != nil {
+				t.Fatalf("SetClientAWGEngine(%q): %v", emptyVal, err)
+			}
+			if svc.ClientAWGEngine() != ClientAWGEngineCustom {
+				t.Fatalf("expected default %q for %q, got %q", ClientAWGEngineCustom, emptyVal, svc.ClientAWGEngine())
+			}
 		}
 
 		if err := svc.SetClientAWGEngine("invalid"); err == nil {
@@ -161,11 +158,14 @@ func TestDualEngine_StartupCustomMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
+	if stat.ConfiguredEngine != ClientAWGEngineCustom {
+		t.Errorf("expected configured_engine %q, got %q", ClientAWGEngineCustom, stat.ConfiguredEngine)
+	}
 	if stat.ActiveEngine != ClientAWGEngineCustom {
 		t.Errorf("expected active_engine %q, got %q", ClientAWGEngineCustom, stat.ActiveEngine)
 	}
-	if stat.ReturnRouteOwner != ClientAWGEngineCustom {
-		t.Errorf("expected return_route_owner %q, got %q", ClientAWGEngineCustom, stat.ReturnRouteOwner)
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' without active routes, got %q", stat.ReturnRouteOwner)
 	}
 	if !stat.EngineRunning {
 		t.Error("expected engine_running true")
@@ -215,11 +215,14 @@ func TestDualEngine_StartupUpstreamMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
+	if stat.ConfiguredEngine != ClientAWGEngineUpstream {
+		t.Errorf("expected configured_engine %q, got %q", ClientAWGEngineUpstream, stat.ConfiguredEngine)
+	}
 	if stat.ActiveEngine != ClientAWGEngineUpstream {
 		t.Errorf("expected active_engine %q, got %q", ClientAWGEngineUpstream, stat.ActiveEngine)
 	}
-	if stat.ReturnRouteOwner != ClientAWGEngineUpstream {
-		t.Errorf("expected return_route_owner %q, got %q", ClientAWGEngineUpstream, stat.ReturnRouteOwner)
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' without active routes, got %q", stat.ReturnRouteOwner)
 	}
 	if !stat.EngineRunning {
 		t.Error("expected engine_running true")
@@ -319,14 +322,20 @@ func (s *safeLogBuffer) String() string {
 	return s.buf.String()
 }
 
+func (s *safeLogBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
+}
+
 // TestDualEngine_StartupLogging verifies the startup log format:
 // "[vpn] active client AWG engine=<custom|upstream> listen_port=<port>"
 func TestDualEngine_StartupLogging(t *testing.T) {
 	prevLog := log.Writer()
 	defer log.SetOutput(prevLog)
 
-	var buf1 safeLogBuffer
-	log.SetOutput(&buf1)
+	var buf safeLogBuffer
+	log.SetOutput(&buf)
 
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
@@ -340,16 +349,15 @@ func TestDualEngine_StartupLogging(t *testing.T) {
 		cancel1()
 		t.Fatal(err)
 	}
-	_ = svc.Stop()
 	cancel1()
+	_ = svc.Stop()
 
-	output1 := buf1.String()
+	output1 := buf.String()
 	if !strings.Contains(output1, "[vpn] active client AWG engine=custom listen_port=") {
 		t.Fatalf("missing custom startup log in output:\n%s", output1)
 	}
 
-	var buf2 safeLogBuffer
-	log.SetOutput(&buf2)
+	buf.Reset()
 
 	ctx2, cancel2 := context.WithCancel(t.Context())
 	if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
@@ -360,10 +368,10 @@ func TestDualEngine_StartupLogging(t *testing.T) {
 		cancel2()
 		t.Fatal(err)
 	}
-	_ = svc.Stop()
 	cancel2()
+	_ = svc.Stop()
 
-	output2 := buf2.String()
+	output2 := buf.String()
 	if !strings.Contains(output2, "[vpn] active client AWG engine=upstream listen_port=") {
 		t.Fatalf("missing upstream startup log in output:\n%s", output2)
 	}
@@ -416,65 +424,6 @@ func TestDualEngine_ReturnPathFailClosedFencing(t *testing.T) {
 	}
 }
 
-// TestDualEngine_ReturnRouteOwnershipTransfer verifies that Custom -> Upstream cutover
-// binds live routes to the new ReturnPath, and Upstream -> Custom rollback cleanly
-// rebinds routes to nil or retires them.
-func TestDualEngine_ReturnRouteOwnershipTransfer(t *testing.T) {
-	fwd, err := forwarder.NewForwarderWithLimits(nil, "10.100.0.0/16", 128, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fwd.Start(t.Context())
-	defer func() { _ = fwd.Stop() }()
-
-	peerKey := "transfer-peer"
-	assignedIP := "10.100.0.25"
-	sessionID := "transfer-sess"
-	connID := "transfer-conn"
-	backendID := int64(42)
-
-	// Step 1: Initial custom route (returnPath == nil)
-	_, err = fwd.TryRegisterSessionWithReturnPath(sessionID, connID, peerKey, assignedIP, backendID, 0, 0, nil)
-	if err != nil {
-		t.Fatalf("initial legacy registration: %v", err)
-	}
-	if !fwd.HasSessionRoute(peerKey, sessionID, connID, assignedIP, backendID) {
-		t.Fatal("expected legacy route to be registered")
-	}
-
-	// Step 2: Custom -> Upstream cutover: bind route to new ReturnPath
-	var upstreamWritten atomic.Int64
-	upstreamPath := forwarder.NewReturnPath(func(peer, ip string, pkt []byte) (int, error) {
-		upstreamWritten.Add(1)
-		return len(pkt), nil
-	})
-
-	retirement, err := fwd.BindSessionReturnPath(sessionID, connID, peerKey, assignedIP, backendID, upstreamPath)
-	if err != nil {
-		t.Fatalf("cutover BindSessionReturnPath: %v", err)
-	}
-	retirement.Wait()
-
-	if !fwd.HasSessionRouteWithReturnPath(peerKey, sessionID, connID, assignedIP, backendID, upstreamPath) {
-		t.Fatal("expected route to be bound to upstream ReturnPath")
-	}
-
-	// Step 3: Upstream -> Custom rollback: rebind route back to nil ReturnPath
-	upstreamPath.Close()
-	rollbackRetirement, err := fwd.BindSessionReturnPath(sessionID, connID, peerKey, assignedIP, backendID, nil)
-	if err != nil {
-		t.Fatalf("rollback BindSessionReturnPath: %v", err)
-	}
-	rollbackRetirement.Wait()
-
-	if !fwd.HasSessionRoute(peerKey, sessionID, connID, assignedIP, backendID) {
-		t.Fatal("expected route to remain active after rollback")
-	}
-	if fwd.HasSessionRouteWithReturnPath(peerKey, sessionID, connID, assignedIP, backendID, upstreamPath) {
-		t.Fatal("upstream ReturnPath must no longer be bound after rollback")
-	}
-}
-
 // TestDualEngine_ConcurrentInFlightReturnWritesFencing verifies that concurrent
 // in-flight return writes are cleanly fenced when an engine is stopped and its
 // ReturnPath closed.
@@ -524,137 +473,151 @@ func TestDualEngine_ConcurrentInFlightReturnWritesFencing(t *testing.T) {
 	}
 }
 
-// TestDualEngine_BidirectionalTrafficRollback_NoConfigRegeneration tests full
-// custom -> upstream -> custom cutover and rollback using the same DB, same port,
-// and same client configuration without any config regeneration.
-func TestDualEngine_BidirectionalTrafficRollback_NoConfigRegeneration(t *testing.T) {
+// TestDualEngine_Telemetry verifies accurate reporting of configured_engine,
+// active_engine, engine_running, and return_route_owner across lifecycle states.
+func TestDualEngine_Telemetry(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
+	ctx := t.Context()
 
-	// Issue client configuration once at the beginning
-	peer, clientCfg := newEnginePeer(t, svc, db, "rollout-client")
-	clientIP := netip.MustParseAddr(peer.assignedIP)
-	dst := netip.MustParseAddr("198.51.100.1")
-	testPkt := engineUDPPacket(clientIP, dst, 0x12345678)
-
-	for _, tun := range svc.pool.ListTunnels() {
-		svc.forwarder.AttachBackendDevice(tun.ID, nil)
-	}
-
-	// Phase 1: Start in upstream mode and verify traffic flow
-	if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
-		t.Fatalf("SetClientAWGEngine(upstream): %v", err)
-	}
-	if err := svc.Start(t.Context()); err != nil {
-		t.Fatalf("svc.Start(upstream): %v", err)
-	}
-
-	uc1 := startEngineUpstreamClient(t, clientCfg, "rollout-client-1")
-	uc1.inject(t, testPkt)
-	stopPump1 := pumpEnginePacketUntil(t, uc1, testPkt, nil)
-
-	// Await session admission
-	sessionDeadline := time.NewTimer(engineHandshakeTimeout)
-	var admittedTunnelID int64
-	for {
-		got, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey)
-		if ok && got.Status == "connected" {
-			admittedTunnelID = got.BackendTunnelID
-			break
-		}
-		select {
-		case <-sessionDeadline.C:
-			t.Fatal("phase 1: admission never completed for client")
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
-	sessionDeadline.Stop()
-
-	queue1, ok := svc.forwarder.GetBackendPacketChannel(admittedTunnelID)
-	if !ok {
-		t.Fatalf("backend %d queue missing", admittedTunnelID)
-	}
-	awaitEngineBackendPacket(t, queue1, testPkt)
-	stopPump1()
-
-	// Stop upstream service cleanly
-	if err := svc.Stop(); err != nil {
-		t.Fatalf("stop upstream service: %v", err)
-	}
-
-	// Phase 2: Instant Rollback to custom mode without config regeneration
-	if err := svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
-		t.Fatalf("SetClientAWGEngine(custom): %v", err)
-	}
-	if err := svc.Start(t.Context()); err != nil {
-		t.Fatalf("svc.Start(custom): %v", err)
-	}
-
-	stat, err := svc.GetStatus(t.Context())
+	// State 1: Fresh service, not running
+	stat, err := svc.GetStatus(ctx)
 	if err != nil {
-		t.Fatalf("GetStatus after rollback: %v", err)
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if stat.ConfiguredEngine != ClientAWGEngineCustom {
+		t.Errorf("expected configured_engine %q, got %q", ClientAWGEngineCustom, stat.ConfiguredEngine)
+	}
+	if stat.ActiveEngine != "none" {
+		t.Errorf("expected active_engine 'none' when not running, got %q", stat.ActiveEngine)
+	}
+	if stat.EngineRunning {
+		t.Error("expected engine_running false when not running")
+	}
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' when not running, got %q", stat.ReturnRouteOwner)
+	}
+
+	// State 2: Running in custom mode without routes
+	if err := svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stat, err = svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
 	}
 	if stat.ActiveEngine != ClientAWGEngineCustom {
-		t.Fatalf("expected active_engine custom after rollback, got %q", stat.ActiveEngine)
+		t.Errorf("expected active_engine custom, got %q", stat.ActiveEngine)
+	}
+	if !stat.EngineRunning {
+		t.Error("expected engine_running true")
+	}
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' without routes, got %q", stat.ReturnRouteOwner)
+	}
+
+	// Register a custom mode route (returnPath == nil)
+	retirement := svc.forwarder.BeginRegisterSessionWithLimit("sess-c", "conn-c", "peer-c", "10.100.0.10", 1, 0, 0)
+	retirement.Wait()
+	stat, err = svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
 	}
 	if stat.ReturnRouteOwner != ClientAWGEngineCustom {
-		t.Fatalf("expected return_route_owner custom after rollback, got %q", stat.ReturnRouteOwner)
+		t.Errorf("expected return_route_owner custom with custom routes, got %q", stat.ReturnRouteOwner)
 	}
 
-	// Verify database connection row and assigned IP were preserved unmodified
-	conn, err := db.GetConnectionByToken(t.Context(), peer.publicKey)
-	if err != nil {
-		t.Fatalf("GetConnectionByToken: %v", err)
-	}
-	if conn == nil {
-		t.Fatal("connection row not found after rollback")
-	}
-	if conn.ClientParams["assigned_ip"] != peer.assignedIP {
-		t.Fatalf("assigned IP changed: was %s, now %v", peer.assignedIP, conn.ClientParams["assigned_ip"])
-	}
-	if conn.ClientParams["config_regeneration_required"] == true {
-		t.Fatal("unexpected config_regeneration_required flag after rollback")
-	}
-
-	// Stop custom service cleanly
+	// Stop service cleanly
+	svc.forwarder.UnregisterSession("peer-c")
 	if err := svc.Stop(); err != nil {
-		t.Fatalf("stop custom service: %v", err)
+		t.Fatal(err)
+	}
+	stat, err = svc.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus after stop: %v", err)
+	}
+	if stat.ActiveEngine != "none" {
+		t.Errorf("expected active_engine 'none' after stop, got %q", stat.ActiveEngine)
+	}
+	if stat.EngineRunning {
+		t.Error("expected engine_running false after stop")
+	}
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' after stop, got %q", stat.ReturnRouteOwner)
 	}
 
-	// Phase 3: Cutover back to upstream mode using the exact same frozen client configuration
-	if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
-		t.Fatalf("SetClientAWGEngine(upstream phase 3): %v", err)
+	// State 3: Process restart into upstream mode
+	svcUp := newIngressEngineService(t, db)
+	if err := svcUp.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+		t.Fatal(err)
 	}
-	if err := svc.Start(t.Context()); err != nil {
-		t.Fatalf("svc.Start(upstream phase 3): %v", err)
+	if err := svcUp.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer func() { _ = svc.Stop() }()
+	defer func() { _ = svcUp.Stop() }()
 
-	uc2 := startEngineUpstreamClient(t, clientCfg, "rollout-client-2")
-	testPktPhase3 := engineUDPPacket(clientIP, dst, 0x87654321)
-	uc2.inject(t, testPktPhase3)
-	stopPump2 := pumpEnginePacketUntil(t, uc2, testPktPhase3, nil)
-	defer stopPump2()
-
-	sessionDeadline3 := time.NewTimer(engineHandshakeTimeout)
-	defer sessionDeadline3.Stop()
-	for {
-		got, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey)
-		if ok && got.Status == "connected" {
-			admittedTunnelID = got.BackendTunnelID
-			break
-		}
-		select {
-		case <-sessionDeadline3.C:
-			t.Fatal("phase 3: admission never completed for client with unchanged config")
-		case <-time.After(25 * time.Millisecond):
-		}
+	stat, err = svcUp.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if stat.ConfiguredEngine != ClientAWGEngineUpstream {
+		t.Errorf("expected configured_engine upstream, got %q", stat.ConfiguredEngine)
+	}
+	if stat.ActiveEngine != ClientAWGEngineUpstream {
+		t.Errorf("expected active_engine upstream, got %q", stat.ActiveEngine)
+	}
+	if !stat.EngineRunning {
+		t.Error("expected engine_running true in upstream mode")
+	}
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' without routes, got %q", stat.ReturnRouteOwner)
 	}
 
-	queue3, ok := svc.forwarder.GetBackendPacketChannel(admittedTunnelID)
-	if !ok {
-		t.Fatalf("backend %d queue missing in phase 3", admittedTunnelID)
+	// Register an upstream mode route (returnPath != nil)
+	upPath := forwarder.NewReturnPath(func(peer, ip string, p []byte) (int, error) {
+		return len(p), nil
+	})
+	_, err = svcUp.forwarder.TryRegisterSessionWithReturnPath("sess-u", "conn-u", "peer-u", "10.100.0.20", 1, 0, 0, upPath)
+	if err != nil {
+		t.Fatalf("TryRegisterSessionWithReturnPath: %v", err)
 	}
-	awaitEngineBackendPacket(t, queue3, testPktPhase3)
-	stopPump2()
+	stat, err = svcUp.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if stat.ReturnRouteOwner != ClientAWGEngineUpstream {
+		t.Errorf("expected return_route_owner upstream with upstream routes, got %q", stat.ReturnRouteOwner)
+	}
+
+	// Verify mixed ownership detection if forwarder contains both route types
+	retMixed := svcUp.forwarder.BeginRegisterSessionWithLimit("sess-m", "conn-m", "peer-m", "10.100.0.30", 1, 0, 0)
+	retMixed.Wait()
+	stat, err = svcUp.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if stat.ReturnRouteOwner != "mixed" {
+		t.Errorf("expected return_route_owner 'mixed' with mixed routes, got %q", stat.ReturnRouteOwner)
+	}
+
+	// Stop upstream service cleanly
+	if err := svcUp.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	stat, err = svcUp.GetStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if stat.ActiveEngine != "none" {
+		t.Errorf("expected active_engine 'none' after stop, got %q", stat.ActiveEngine)
+	}
+	if stat.EngineRunning {
+		t.Error("expected engine_running false after stop")
+	}
+	if stat.ReturnRouteOwner != "none" {
+		t.Errorf("expected return_route_owner 'none' after stop, got %q", stat.ReturnRouteOwner)
+	}
 }

@@ -247,12 +247,6 @@ func parseTrustedProxies(rawProxies string) ([]string, []*net.IPNet, []net.IP) {
 
 func resolveClientAWGEngine() (string, error) {
 	rawEngine := os.Getenv("VPN_CLIENT_AWG_ENGINE")
-	if rawEngine == "" {
-		rawEngine = os.Getenv("CLIENT_AWG_ENGINE")
-	}
-	if rawEngine == "" {
-		rawEngine = os.Getenv("VPN_CLIENT_ENGINE")
-	}
 	clientAWGEngine := strings.ToLower(strings.TrimSpace(rawEngine))
 	if clientAWGEngine == "" {
 		clientAWGEngine = ClientAWGEngineCustom

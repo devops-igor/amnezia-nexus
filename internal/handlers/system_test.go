@@ -26,11 +26,17 @@ func TestSystemHandlers(t *testing.T) {
 		if resp.Status != "ok" || resp.Version != cfg.AppVersion {
 			t.Errorf("unexpected health response: %+v", resp)
 		}
-		if resp.ActiveEngine != "custom" {
-			t.Errorf("expected active_engine custom, got %q", resp.ActiveEngine)
+		if resp.ConfiguredEngine != "custom" {
+			t.Errorf("expected configured_engine custom, got %q", resp.ConfiguredEngine)
 		}
-		if resp.ReturnRouteOwner != "custom" {
-			t.Errorf("expected return_route_owner custom, got %q", resp.ReturnRouteOwner)
+		if resp.ActiveEngine != "none" {
+			t.Errorf("expected active_engine none when not running, got %q", resp.ActiveEngine)
+		}
+		if resp.EngineRunning != false {
+			t.Errorf("expected engine_running false when not running, got %v", resp.EngineRunning)
+		}
+		if resp.ReturnRouteOwner != "none" {
+			t.Errorf("expected return_route_owner none when not running, got %q", resp.ReturnRouteOwner)
 		}
 	})
 
@@ -52,11 +58,20 @@ func TestSystemHandlers(t *testing.T) {
 		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
-		if resp.ActiveEngine != "upstream" {
-			t.Errorf("expected active_engine upstream, got %q", resp.ActiveEngine)
+		if resp.Status != "ok" {
+			t.Errorf("expected status ok, got %q", resp.Status)
 		}
-		if resp.ReturnRouteOwner != "upstream" {
-			t.Errorf("expected return_route_owner upstream, got %q", resp.ReturnRouteOwner)
+		if resp.ConfiguredEngine != "upstream" {
+			t.Errorf("expected configured_engine upstream, got %q", resp.ConfiguredEngine)
+		}
+		if resp.ActiveEngine != "none" {
+			t.Errorf("expected active_engine none when not running, got %q", resp.ActiveEngine)
+		}
+		if resp.EngineRunning != false {
+			t.Errorf("expected engine_running false when not running, got %v", resp.EngineRunning)
+		}
+		if resp.ReturnRouteOwner != "none" {
+			t.Errorf("expected return_route_owner none when not running, got %q", resp.ReturnRouteOwner)
 		}
 	})
 

@@ -1319,6 +1319,42 @@ func (f *Forwarder) GetStats() (rx int64, tx int64, activeRoutes int) {
 	return
 }
 
+// ReturnRouteOwner returns the return route owner ("upstream", "custom", or "none")
+// based on currently registered active routes in the forwarder. If no routes are registered,
+// "none" is returned.
+func (f *Forwarder) ReturnRouteOwner() string {
+	if f == nil {
+		return "none"
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(f.routesByPeer) == 0 {
+		return "none"
+	}
+	hasUpstream := false
+	hasCustom := false
+	for _, route := range f.routesByPeer {
+		if route.stopped {
+			continue
+		}
+		if route.returnPath != nil && !route.returnPath.Closed() {
+			hasUpstream = true
+		} else {
+			hasCustom = true
+		}
+	}
+	if hasUpstream && !hasCustom {
+		return "upstream"
+	}
+	if hasCustom && !hasUpstream {
+		return "custom"
+	}
+	if hasUpstream && hasCustom {
+		return "mixed"
+	}
+	return "none"
+}
+
 // Start marks the forwarder active.
 func (f *Forwarder) Start(ctx context.Context) {
 	f.mu.Lock()

@@ -10,7 +10,9 @@ import (
 type HealthResponse struct {
 	Status           string `json:"status"`
 	Version          string `json:"version"`
+	ConfiguredEngine string `json:"configured_engine,omitempty"`
 	ActiveEngine     string `json:"active_engine,omitempty"`
+	EngineRunning    bool   `json:"engine_running"`
 	ReturnRouteOwner string `json:"return_route_owner,omitempty"`
 }
 
@@ -21,18 +23,32 @@ func (h *Handlers) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		version = h.cfg.AppVersion
 	}
 
-	activeEngine := config.ClientAWGEngineCustom
+	configuredEngine := config.ClientAWGEngineCustom
 	if h.vpnSvc != nil {
-		activeEngine = h.vpnSvc.ClientAWGEngine()
+		configuredEngine = h.vpnSvc.ClientAWGEngine()
 	} else if h.cfg != nil && h.cfg.ClientAWGEngine != "" {
-		activeEngine = h.cfg.ClientAWGEngine
+		configuredEngine = h.cfg.ClientAWGEngine
+	}
+
+	activeEngine := "none"
+	engineRunning := false
+	returnRouteOwner := "none"
+
+	if h.vpnSvc != nil {
+		engineRunning = h.vpnSvc.IsRunning()
+		if engineRunning {
+			activeEngine = configuredEngine
+			returnRouteOwner = h.vpnSvc.ReturnRouteOwner()
+		}
 	}
 
 	h.JSON(w, http.StatusOK, HealthResponse{
 		Status:           "ok",
 		Version:          version,
+		ConfiguredEngine: configuredEngine,
 		ActiveEngine:     activeEngine,
-		ReturnRouteOwner: activeEngine,
+		EngineRunning:    engineRunning,
+		ReturnRouteOwner: returnRouteOwner,
 	})
 }
 

@@ -32,6 +32,7 @@ import (
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
+	ConfiguredEngine           string `json:"configured_engine"`
 	ActiveEngine               string `json:"active_engine"`
 	EngineRunning              bool   `json:"engine_running"`
 	ListenPort                 int    `json:"listen_port"`
@@ -643,12 +644,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	}
 
 	rawEngine := os.Getenv("VPN_CLIENT_AWG_ENGINE")
-	if rawEngine == "" {
-		rawEngine = os.Getenv("CLIENT_AWG_ENGINE")
-	}
-	if rawEngine == "" {
-		rawEngine = os.Getenv("VPN_CLIENT_ENGINE")
-	}
 	engine := strings.ToLower(strings.TrimSpace(rawEngine))
 	if engine == "" {
 		engine = ClientAWGEngineCustom
@@ -1895,6 +1890,17 @@ func (s *Service) IsRunning() bool {
 	return s.running
 }
 
+// ReturnRouteOwner returns the actual forwarder return route owner ("upstream", "custom", or "none").
+// If the service is not running or has no registered routes, it returns "none".
+func (s *Service) ReturnRouteOwner() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.running || s.forwarder == nil {
+		return "none"
+	}
+	return s.forwarder.ReturnRouteOwner()
+}
+
 // GetStatus returns the operational status and telemetry of the VPN subsystem.
 func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	s.mu.RLock()
@@ -1918,23 +1924,36 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	var upstreamDesiredPeers, upstreamActualPeers int
 	var peerSync *PeerSyncStatus
 
-	if engine == ClientAWGEngineUpstream {
-		if s.ingressEngine != nil {
-			engineRunning = s.ingressEngine.Running()
-			syncStat := s.ingressEngine.PeerSyncStatus()
-			upstreamDesiredPeers = syncStat.DesiredPeers
-			upstreamActualPeers = syncStat.ActualPeers
-			peerSync = &syncStat
+	if s.running {
+		if engine == ClientAWGEngineUpstream {
+			if s.ingressEngine != nil && s.ingressEngine.Running() {
+				engineRunning = true
+				syncStat := s.ingressEngine.PeerSyncStatus()
+				upstreamDesiredPeers = syncStat.DesiredPeers
+				upstreamActualPeers = syncStat.ActualPeers
+				peerSync = &syncStat
+			}
+		} else {
+			engineRunning = s.endpoint != nil && s.endpoint.IsRunning()
 		}
-	} else {
-		engineRunning = s.endpoint != nil && s.endpoint.IsRunning()
+	}
+
+	activeEngine := "none"
+	if engineRunning {
+		activeEngine = engine
+	}
+
+	returnRouteOwner := "none"
+	if engineRunning && s.forwarder != nil {
+		returnRouteOwner = s.forwarder.ReturnRouteOwner()
 	}
 
 	status := &Status{
-		ActiveEngine:               engine,
+		ConfiguredEngine:           engine,
+		ActiveEngine:               activeEngine,
 		EngineRunning:              engineRunning,
 		ListenPort:                 listenPort,
-		ReturnRouteOwner:           engine,
+		ReturnRouteOwner:           returnRouteOwner,
 		ListenerRunning:            engineRunning,
 		RestartInvalidatedSessions: s.restartInvalidatedSessions.Load(),
 		FreshSessionRegistrations:  s.freshSessionRegistrations.Load(),
@@ -1949,40 +1968,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	if s.sessionMgr != nil {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
-	if s.forwarder != nil {
-		status.ForwarderAvailable = true
-		rx, tx, _ := s.forwarder.GetStats()
-		status.RxBytes = rx
-		status.TxBytes = tx
-		status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = s.forwarder.DropStats()
-		status.ForwarderDropsPacketTooLarge = s.forwarder.DropsPacketTooLarge()
-		status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = s.forwarder.AggregateQueueStats()
-		allRouteQueues := s.forwarder.AllRouteQueueStats()
-		if len(allRouteQueues) > 0 {
-			peers := make([]string, 0, len(allRouteQueues))
-			for peerKey := range allRouteQueues {
-				peers = append(peers, peerKey)
-			}
-			sort.Strings(peers)
-			limit := len(peers)
-			if limit > forwarder.MaxSupportedActiveRoutes {
-				limit = forwarder.MaxSupportedActiveRoutes
-			}
-			status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
-			for _, peerKey := range peers[:limit] {
-				status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
-			}
-		}
-		writes := s.forwarder.DeviceWriteSnapshot()
-		status.ForwarderDeviceWriteErrors = writes.Errors
-		status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
-		status.ForwarderDeviceWriteCount = writes.Count
-		status.ForwarderDeviceWritesInFlight = writes.InFlight
-		status.ForwarderDeviceWriteOldestMS = writes.OldestInFlight.Milliseconds()
-		status.ForwarderDeviceWriteMaxMS = writes.MaxDuration.Milliseconds()
-		status.ForwarderDeviceWriteStalls = writes.Stalls
-		status.ForwarderDeviceWriteStallMS = forwarder.DeviceWriteStallThreshold.Milliseconds()
-	}
+	populateForwarderStatus(status, s.forwarder)
 	if s.endpoint != nil {
 		status.HandshakeRejections = s.endpoint.HandshakeRejections()
 		status.TransportDecryptionFailures = s.endpoint.TransportDecryptionFailures()
@@ -2008,6 +1994,44 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
 
 	return status, nil
+}
+
+func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
+	if f == nil {
+		return
+	}
+	status.ForwarderAvailable = true
+	rx, tx, _ := f.GetStats()
+	status.RxBytes = rx
+	status.TxBytes = tx
+	status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = f.DropStats()
+	status.ForwarderDropsPacketTooLarge = f.DropsPacketTooLarge()
+	status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = f.AggregateQueueStats()
+	allRouteQueues := f.AllRouteQueueStats()
+	if len(allRouteQueues) > 0 {
+		peers := make([]string, 0, len(allRouteQueues))
+		for peerKey := range allRouteQueues {
+			peers = append(peers, peerKey)
+		}
+		sort.Strings(peers)
+		limit := len(peers)
+		if limit > forwarder.MaxSupportedActiveRoutes {
+			limit = forwarder.MaxSupportedActiveRoutes
+		}
+		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
+		for _, peerKey := range peers[:limit] {
+			status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+		}
+	}
+	writes := f.DeviceWriteSnapshot()
+	status.ForwarderDeviceWriteErrors = writes.Errors
+	status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
+	status.ForwarderDeviceWriteCount = writes.Count
+	status.ForwarderDeviceWritesInFlight = writes.InFlight
+	status.ForwarderDeviceWriteOldestMS = writes.OldestInFlight.Milliseconds()
+	status.ForwarderDeviceWriteMaxMS = writes.MaxDuration.Milliseconds()
+	status.ForwarderDeviceWriteStalls = writes.Stalls
+	status.ForwarderDeviceWriteStallMS = forwarder.DeviceWriteStallThreshold.Milliseconds()
 }
 
 // TotalDroppedPackets returns the sum of dropped packets across all active backend devices.
