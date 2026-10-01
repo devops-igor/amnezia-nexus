@@ -202,6 +202,44 @@ func TestVPNHandlers(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
+		var stat vpn.Status
+		if err := json.NewDecoder(w.Body).Decode(&stat); err != nil {
+			t.Fatalf("failed to decode vpn status response: %v", err)
+		}
+		if stat.ActiveEngine != "custom" {
+			t.Errorf("expected active_engine custom, got %q", stat.ActiveEngine)
+		}
+		if stat.ReturnRouteOwner != "custom" {
+			t.Errorf("expected return_route_owner custom, got %q", stat.ReturnRouteOwner)
+		}
+		if stat.ListenPort <= 0 {
+			t.Errorf("expected positive listen_port, got %d", stat.ListenPort)
+		}
+	})
+
+	t.Run("VPNStatusHandler_UpstreamEngine", func(t *testing.T) {
+		if h.vpnSvc != nil {
+			_ = h.vpnSvc.SetClientAWGEngine("upstream")
+			defer func() { _ = h.vpnSvc.SetClientAWGEngine("custom") }()
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/api/vpn/status", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var stat vpn.Status
+		if err := json.NewDecoder(w.Body).Decode(&stat); err != nil {
+			t.Fatalf("failed to decode vpn status response: %v", err)
+		}
+		if stat.ActiveEngine != "upstream" {
+			t.Errorf("expected active_engine upstream, got %q", stat.ActiveEngine)
+		}
+		if stat.ReturnRouteOwner != "upstream" {
+			t.Errorf("expected return_route_owner upstream, got %q", stat.ReturnRouteOwner)
+		}
 	})
 
 	t.Run("VPNBackendsHandler", func(t *testing.T) {

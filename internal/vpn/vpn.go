@@ -32,6 +32,10 @@ import (
 
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
+	ActiveEngine               string `json:"active_engine"`
+	EngineRunning              bool   `json:"engine_running"`
+	ListenPort                 int    `json:"listen_port"`
+	ReturnRouteOwner           string `json:"return_route_owner"`
 	ListenerRunning            bool   `json:"listener_running"`
 	ActiveTunnels              int    `json:"active_tunnels"`
 	ConnectedSessions          int    `json:"connected_sessions"`
@@ -65,6 +69,9 @@ type Status struct {
 	HandshakeRejections            uint64                               `json:"handshake_rejections"`
 	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
 	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
+	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
+	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
+	PeerSync                       *PeerSyncStatus                      `json:"peer_sync,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -75,6 +82,12 @@ type UserVPNState struct {
 	BackendEndpoint string             `json:"backend_endpoint,omitempty"`
 	LatencyMS       int64              `json:"latency_ms,omitempty"`
 }
+
+// Client AWG engines.
+const (
+	ClientAWGEngineCustom   = "custom"
+	ClientAWGEngineUpstream = "upstream"
+)
 
 // BackendTunnelStatus type alias for backwards compatibility.
 type BackendTunnelStatus = string
@@ -138,25 +151,27 @@ type BackendDevice interface {
 // check-then-allocate capacity decision is only safe under this
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
-	mu            sync.RWMutex
-	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
-	db            *database.DB
-	cfg           *models.VPNConfig
-	endpoint      *endpoint.Listener
-	sessionMgr    *endpoint.SessionManager
-	ipam          *endpoint.IPAM
-	auth          *endpoint.DBAuthenticator
-	pool          *tunnel.Pool
-	prober        *tunnel.HealthProber
-	reconnectMgr  *tunnel.ReconnectManager
-	balancer      loadbalancer.LoadBalancer
-	stickyMgr     *loadbalancer.StickySessionManager
-	forwarder     *forwarder.Forwarder
-	accountant    *forwarder.TrafficAccountant
-	running       bool
-	portalPubKey  string
-	portalPrivKey string
-	awgProvider   AWGStatusProvider
+	mu              sync.RWMutex
+	assignmentMu    sync.Mutex // serialize durable lease creation and restart migration
+	db              *database.DB
+	cfg             *models.VPNConfig
+	endpoint        *endpoint.Listener
+	sessionMgr      *endpoint.SessionManager
+	ipam            *endpoint.IPAM
+	auth            *endpoint.DBAuthenticator
+	pool            *tunnel.Pool
+	prober          *tunnel.HealthProber
+	reconnectMgr    *tunnel.ReconnectManager
+	balancer        loadbalancer.LoadBalancer
+	stickyMgr       *loadbalancer.StickySessionManager
+	forwarder       *forwarder.Forwarder
+	accountant      *forwarder.TrafficAccountant
+	running         bool
+	portalPubKey    string
+	portalPrivKey   string
+	awgProvider     AWGStatusProvider
+	clientAWGEngine string
+	ingressEngine   *IngressEngine
 	// requireTun switches Start to the real Linux TUN data plane (production
 	// mode; cmd opts in via RequireTunDevice when VPN_ENABLED). tunOpener is
 	// the injectable device constructor used by tests to prove the
@@ -627,6 +642,21 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		cfg.ServerPublicKey = pub
 	}
 
+	rawEngine := os.Getenv("VPN_CLIENT_AWG_ENGINE")
+	if rawEngine == "" {
+		rawEngine = os.Getenv("CLIENT_AWG_ENGINE")
+	}
+	if rawEngine == "" {
+		rawEngine = os.Getenv("VPN_CLIENT_ENGINE")
+	}
+	engine := strings.ToLower(strings.TrimSpace(rawEngine))
+	if engine == "" {
+		engine = ClientAWGEngineCustom
+	}
+	if engine != ClientAWGEngineCustom && engine != ClientAWGEngineUpstream {
+		return nil, fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
+	}
+
 	svc := &Service{
 		db:                     db,
 		cfg:                    cfg,
@@ -643,6 +673,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		accountant:             accountant,
 		portalPubKey:           pub,
 		portalPrivKey:          priv,
+		clientAWGEngine:        engine,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		peerGenerations:        make(map[string]uint64),
@@ -1069,6 +1100,15 @@ func (s *Service) Start(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
+	engine := s.clientAWGEngine
+	if engine == "" {
+		engine = ClientAWGEngineCustom
+	}
+	if err := s.validateEngineStartupLocked(engine); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+
 	s.running = true
 	s.mu.Unlock()
 
@@ -1132,17 +1172,16 @@ func (s *Service) Start(ctx context.Context) error {
 	// (RequireTunDevice) and the TUN device cannot be opened, abort
 	// data-plane startup and fail with an error chain wrapping
 	// endpoint.ErrTunUnavailable -- the panel continues management-only.
-	if s.requireTun && s.tunOpener != nil {
-		dev, tunErr := s.tunOpener()
-		if tunErr != nil {
+	//
+	// CRITICAL INVARIANT: In upstream mode, do NOT open or attach the legacy
+	// client-facing Linux TUN device. IngressEngine owns VirtualTUN and ReturnPath;
+	// retaining a legacy default client device would create an unwanted fallback surface.
+	if engine == ClientAWGEngineCustom {
+		if err := s.startLegacyClientTun(); err != nil {
 			s.mu.Lock()
 			s.running = false
 			s.mu.Unlock()
-			return fmt.Errorf("failed to open tun device: %w", tunErr)
-		}
-		s.tunDev = dev
-		if s.forwarder != nil {
-			s.forwarder.AttachClientDevice(dev)
+			return err
 		}
 	}
 
@@ -1165,31 +1204,19 @@ func (s *Service) Start(ctx context.Context) error {
 		s.reconnectMgr.Start(ctx)
 	}
 
-	// 6. Start endpoint listener
-	if s.endpoint != nil {
-		s.endpoint.SetPostSweepHook(func(ctx context.Context) {
-			s.PruneExpiredAffinity()
-		})
-		if err := s.endpoint.Start(ctx); err != nil {
-			if s.prober != nil {
-				s.prober.Stop()
-			}
-			if s.reconnectMgr != nil {
-				s.reconnectMgr.Stop()
-			}
-			if s.forwarder != nil {
-				_ = s.forwarder.Stop()
-			}
-			if s.tunDev != nil {
-				_ = s.tunDev.Close()
-				s.tunDev = nil
-			}
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
-			return fmt.Errorf("failed to start endpoint listener: %w", err)
+	// 6. Start active client AWG engine (mutually exclusive)
+	if engine == ClientAWGEngineCustom {
+		if err := s.startCustomClientEngine(ctx); err != nil {
+			return err
+		}
+	} else if engine == ClientAWGEngineUpstream {
+		if err := s.startUpstreamClientEngine(ctx); err != nil {
+			return err
 		}
 	}
+
+	listenPort := s.resolveActiveListenPort(ctx)
+	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", engine, listenPort)
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
 	// Safety net for residual counter drift; gauge-only semantics — it never
@@ -1197,6 +1224,110 @@ func (s *Service) Start(ctx context.Context) error {
 	s.StartGaugeReconciler(ctx)
 
 	return nil
+}
+
+func (s *Service) validateEngineStartupLocked(engine string) error {
+	if engine != ClientAWGEngineCustom && engine != ClientAWGEngineUpstream {
+		return fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
+	}
+	if engine == ClientAWGEngineUpstream {
+		if s.endpoint != nil && s.endpoint.IsRunning() {
+			return errors.New("cannot start upstream ingress engine: custom endpoint listener is already running")
+		}
+	} else {
+		if s.ingressEngine != nil && s.ingressEngine.Running() {
+			return errors.New("cannot start custom endpoint listener: upstream ingress engine is already running")
+		}
+	}
+	return nil
+}
+
+func (s *Service) startLegacyClientTun() error {
+	if !s.requireTun || s.tunOpener == nil {
+		return nil
+	}
+	dev, tunErr := s.tunOpener()
+	if tunErr != nil {
+		return fmt.Errorf("failed to open tun device: %w", tunErr)
+	}
+	s.tunDev = dev
+	if s.forwarder != nil {
+		s.forwarder.AttachClientDevice(dev)
+	}
+	return nil
+}
+
+func (s *Service) cleanupEngineStartupFailure() {
+	if s.prober != nil {
+		s.prober.Stop()
+	}
+	if s.reconnectMgr != nil {
+		s.reconnectMgr.Stop()
+	}
+	if s.forwarder != nil {
+		_ = s.forwarder.Stop()
+	}
+	if s.tunDev != nil {
+		_ = s.tunDev.Close()
+		s.tunDev = nil
+	}
+	s.mu.Lock()
+	s.running = false
+	s.mu.Unlock()
+}
+
+func (s *Service) startCustomClientEngine(ctx context.Context) error {
+	if s.endpoint == nil {
+		return nil
+	}
+	s.endpoint.SetPostSweepHook(func(ctx context.Context) {
+		s.PruneExpiredAffinity()
+	})
+	if err := s.endpoint.Start(ctx); err != nil {
+		s.cleanupEngineStartupFailure()
+		return fmt.Errorf("failed to start endpoint listener: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) startUpstreamClientEngine(ctx context.Context) error {
+	s.mu.Lock()
+	ingressEng := s.ingressEngine
+	s.mu.Unlock()
+
+	if ingressEng == nil {
+		var err error
+		ingressEng, err = s.NewIngressEngine(ctx, "nexus-portal", nil)
+		if err != nil {
+			s.cleanupEngineStartupFailure()
+			return fmt.Errorf("failed to construct upstream ingress engine: %w", err)
+		}
+		s.mu.Lock()
+		s.ingressEngine = ingressEng
+		s.mu.Unlock()
+	}
+
+	if err := ingressEng.Start(); err != nil {
+		_ = ingressEng.Stop()
+		s.mu.Lock()
+		s.ingressEngine = nil
+		s.mu.Unlock()
+		s.cleanupEngineStartupFailure()
+		return fmt.Errorf("failed to start upstream ingress engine: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) resolveActiveListenPort(ctx context.Context) int {
+	if s.cfg != nil && s.cfg.ListenPort > 0 {
+		return s.cfg.ListenPort
+	}
+	if s.db != nil {
+		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
+			return dbCfg.ListenPort
+		}
+	}
+	return 51820
 }
 
 func quarantinePersistedAssignment(ctx context.Context, db *database.DB, claimant database.VPNClientIPAssignment, conflictingIP string, retireKeypair bool) error {
@@ -1664,8 +1795,13 @@ func (s *Service) Stop() error {
 		return nil
 	}
 	s.running = false
+	ingressEng := s.ingressEngine
+	s.ingressEngine = nil
 	s.mu.Unlock()
 
+	if ingressEng != nil {
+		_ = ingressEng.Stop()
+	}
 	if s.endpoint != nil {
 		_ = s.endpoint.Stop()
 	}
@@ -1677,6 +1813,10 @@ func (s *Service) Stop() error {
 	}
 	if s.forwarder != nil {
 		_ = s.forwarder.Stop()
+	}
+	if s.tunDev != nil {
+		_ = s.tunDev.Close()
+		s.tunDev = nil
 	}
 	if s.pool != nil {
 		_ = s.pool.Close()
@@ -1701,6 +1841,50 @@ func (s *Service) Stop() error {
 	return nil
 }
 
+// ClientAWGEngine returns the configured client-facing AWG engine ("custom" or "upstream").
+func (s *Service) ClientAWGEngine() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.clientAWGEngine == "" {
+		return ClientAWGEngineCustom
+	}
+	return s.clientAWGEngine
+}
+
+// SetClientAWGEngine sets the client-facing AWG engine ("custom" or "upstream").
+// Must be called before Start.
+func (s *Service) SetClientAWGEngine(engine string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return errors.New("cannot change client AWG engine while service is running")
+	}
+	normalized := strings.ToLower(strings.TrimSpace(engine))
+	if normalized != ClientAWGEngineCustom && normalized != ClientAWGEngineUpstream {
+		return fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
+	}
+	s.clientAWGEngine = normalized
+	return nil
+}
+
+// IngressEngine returns the active IngressEngine when running in upstream mode.
+func (s *Service) IngressEngine() *IngressEngine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ingressEngine
+}
+
+// SetIngressEngine sets an IngressEngine instance on the service before Start (e.g. for testing).
+func (s *Service) SetIngressEngine(e *IngressEngine) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return errors.New("cannot set ingress engine while service is running")
+	}
+	s.ingressEngine = e
+	return nil
+}
+
 // IsRunning returns true if the VPN service is active.
 func (s *Service) IsRunning() bool {
 	s.mu.RLock()
@@ -1713,10 +1897,47 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	engine := s.clientAWGEngine
+	if engine == "" {
+		engine = ClientAWGEngineCustom
+	}
+
+	listenPort := 51820
+	if s.cfg != nil && s.cfg.ListenPort > 0 {
+		listenPort = s.cfg.ListenPort
+	} else if s.db != nil {
+		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
+			listenPort = dbCfg.ListenPort
+		}
+	}
+
+	engineRunning := false
+	var upstreamDesiredPeers, upstreamActualPeers int
+	var peerSync *PeerSyncStatus
+
+	if engine == ClientAWGEngineUpstream {
+		if s.ingressEngine != nil {
+			engineRunning = s.ingressEngine.Running()
+			syncStat := s.ingressEngine.PeerSyncStatus()
+			upstreamDesiredPeers = syncStat.DesiredPeers
+			upstreamActualPeers = syncStat.ActualPeers
+			peerSync = &syncStat
+		}
+	} else {
+		engineRunning = s.endpoint != nil && s.endpoint.IsRunning()
+	}
+
 	status := &Status{
-		ListenerRunning:            s.endpoint != nil && s.endpoint.IsRunning(),
+		ActiveEngine:               engine,
+		EngineRunning:              engineRunning,
+		ListenPort:                 listenPort,
+		ReturnRouteOwner:           engine,
+		ListenerRunning:            engineRunning,
 		RestartInvalidatedSessions: s.restartInvalidatedSessions.Load(),
 		FreshSessionRegistrations:  s.freshSessionRegistrations.Load(),
+		UpstreamDesiredPeers:       upstreamDesiredPeers,
+		UpstreamActualPeers:        upstreamActualPeers,
+		PeerSync:                   peerSync,
 	}
 
 	if s.pool != nil {
@@ -1781,10 +2002,6 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		}
 	}
 
-	listenPort := 51820
-	if s.cfg != nil && s.cfg.ListenPort > 0 {
-		listenPort = s.cfg.ListenPort
-	}
 	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
 
 	return status, nil

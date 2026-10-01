@@ -348,3 +348,131 @@ All differential test suites and scripts adhere to non-negotiable privacy rules:
 ### Handshake Timeout / Retransmission Failure
 - **Cause**: Local firewall or packet filter dropping UDP datagrams on loopback.
 - **Fix**: Ensure loopback (`lo`) interface is up and local UDP traffic on ports 50000-60000 is permitted.
+
+---
+
+## 11. Dual-Engine Switch, Canary & Rollback Runbook (PR 393-A)
+
+This section provides step-by-step operational procedures for toggling between the legacy custom client AWG listener (`custom`) and the upstream AmneziaWG ingress engine (`upstream`), executing safe canary cutovers, and triggering instant zero-downtime rollback without configuration regeneration.
+
+### 11.1 Engine Invariants & Configuration
+
+- **Configuration Key**: `VPN_CLIENT_AWG_ENGINE` (in `.env` or container environment).
+  - Supported values: `custom` (default), `upstream`.
+  - Fallback environment variables: `CLIENT_AWG_ENGINE`, `VPN_CLIENT_ENGINE`.
+  - Invalid values fail closed at startup with an immediate error (`invalid client AWG engine`).
+- **Mutual Exclusion Invariant**: Only one engine is active at a time. The custom endpoint and upstream `IngressEngine` share the same external UDP listen port. In-process double start or overlap fails closed.
+- **Legacy TUN Bypass Invariant**: In `upstream` mode, the client-facing Linux TUN device (`/dev/net/tun`) is NOT opened or attached (`s.requireTun` and `s.tunOpener` are skipped). Packet routing flows via `VirtualTUN` and `forwarder.ReturnPath`.
+- **Zero Config Regeneration Invariant**: Client keypairs, assigned IPs, and WireGuard credentials stored in SQLite remain 100% identical across engines. Neither cutover nor rollback modifies `user_connections`.
+
+### 11.2 Pre-Flight Checks
+
+Before performing a cutover or canary switch:
+
+1. **Verify Database Integrity**:
+   ```bash
+   sqlite3 /data/nexus.db "PRAGMA integrity_check;"
+   # Expected output: ok
+   ```
+2. **Verify Client Connection Records**:
+   ```bash
+   sqlite3 /data/nexus.db "SELECT count(*), count(DISTINCT client_id) FROM user_connections;"
+   ```
+3. **Check Port Availability & Current Process**:
+   ```bash
+   ss -ulpn 'sport = :51820'
+   ```
+4. **Baseline Health Check**:
+   ```bash
+   curl -s http://127.0.0.1:8080/api/health | jq .
+   # Verify active_engine is reported (e.g. "custom")
+   ```
+
+### 11.3 Canary Cutover Procedure (`custom` -> `upstream`)
+
+1. **Update Engine Environment Variable**:
+   In `/etc/amnezia-nexus/nexus.env` or `docker-compose.yml`:
+   ```bash
+   VPN_CLIENT_AWG_ENGINE=upstream
+   ```
+2. **Execute Controlled Restart**:
+   ```bash
+   # Docker Compose deployment:
+   docker compose restart nexus-vpn
+
+   # Or systemd deployment:
+   systemctl restart nexus-vpn
+   ```
+3. **Verify Startup Log Output**:
+   Check service logs for the canonical engine startup marker:
+   ```bash
+   docker compose logs --tail=50 nexus-vpn | grep "active client AWG engine"
+   # Expected output:
+   # [vpn] active client AWG engine=upstream listen_port=51820
+   ```
+4. **Inspect Health and Status Endpoints**:
+   ```bash
+   # System Health:
+   curl -s http://127.0.0.1:8080/api/health | jq '{status, active_engine, return_route_owner, engine_running}'
+   # Expected response:
+   # {
+   #   "status": "healthy",
+   #   "active_engine": "upstream",
+   #   "return_route_owner": "upstream",
+   #   "engine_running": true
+   # }
+
+   # VPN Data Plane Status:
+   curl -s http://127.0.0.1:8080/api/vpn/status | jq '{active_engine, return_route_owner, peer_sync, upstream_desired_peers, upstream_actual_peers}'
+   # Expected response:
+   # {
+   #   "active_engine": "upstream",
+   #   "return_route_owner": "upstream",
+   #   "peer_sync": "in_sync",
+   #   "upstream_desired_peers": N,
+   #   "upstream_actual_peers": N
+   # }
+   ```
+5. **Verify Data Plane Traffic**:
+   - Establish connection from a test client using an existing `.conf` file.
+   - Confirm handshake completion in logs: `[vpn/ingress] admitted peer <key>...`.
+   - Verify bidirectional payload forwarding (e.g., `ping 198.51.100.1` or `curl https://example.com`).
+
+### 11.4 Instant Rollback Procedure (`upstream` -> `custom`)
+
+If anomalous handshake latency, packet drops, or routing issues occur during canary:
+
+1. **Revert Engine Variable**:
+   In `/etc/amnezia-nexus/nexus.env` or `docker-compose.yml`:
+   ```bash
+   VPN_CLIENT_AWG_ENGINE=custom
+   ```
+2. **Execute Controlled Restart**:
+   ```bash
+   # Docker Compose deployment:
+   docker compose restart nexus-vpn
+
+   # Or systemd deployment:
+   systemctl restart nexus-vpn
+   ```
+3. **Verify Rollback Startup Log**:
+   ```bash
+   docker compose logs --tail=50 nexus-vpn | grep "active client AWG engine"
+   # Expected output:
+   # [vpn] active client AWG engine=custom listen_port=51820
+   ```
+4. **Inspect Health and Status Endpoints**:
+   ```bash
+   curl -s http://127.0.0.1:8080/api/health | jq '{status, active_engine, return_route_owner, engine_running}'
+   # Expected response:
+   # {
+   #   "status": "healthy",
+   #   "active_engine": "custom",
+   #   "return_route_owner": "custom",
+   #   "engine_running": true
+   # }
+   ```
+5. **Client Continuity Verification**:
+   - Test clients automatically resume communication upon next packet transmission / handshake renegotiation.
+   - No client configuration re-issuance, key rotation, or database modification is required.
+

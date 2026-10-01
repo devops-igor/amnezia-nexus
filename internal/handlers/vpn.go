@@ -26,8 +26,17 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil || status == nil {
+		activeEngine := vpn.ClientAWGEngineCustom
+		if h.vpnSvc != nil {
+			activeEngine = h.vpnSvc.ClientAWGEngine()
+		} else if h.cfg != nil && h.cfg.ClientAWGEngine != "" {
+			activeEngine = h.cfg.ClientAWGEngine
+		}
 		status = &vpn.Status{
+			ActiveEngine:       activeEngine,
+			ReturnRouteOwner:   activeEngine,
 			ListenerRunning:    false,
+			EngineRunning:      false,
 			ActiveTunnels:      0,
 			ConnectedSessions:  0,
 			ForwarderAvailable: false,
