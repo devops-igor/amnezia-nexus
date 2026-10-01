@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"net/netip"
@@ -301,42 +302,70 @@ func TestDualEngine_MutualPortExclusion(t *testing.T) {
 	})
 }
 
+type safeLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // TestDualEngine_StartupLogging verifies the startup log format:
 // "[vpn] active client AWG engine=<custom|upstream> listen_port=<port>"
 func TestDualEngine_StartupLogging(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	prevLog := log.Writer()
+	defer log.SetOutput(prevLog)
+
+	var buf1 safeLogBuffer
+	log.SetOutput(&buf1)
 
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
-	ctx := t.Context()
 
+	ctx1, cancel1 := context.WithCancel(t.Context())
 	if err := svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
+		cancel1()
 		t.Fatal(err)
 	}
-	if err := svc.Start(ctx); err != nil {
+	if err := svc.Start(ctx1); err != nil {
+		cancel1()
 		t.Fatal(err)
 	}
 	_ = svc.Stop()
+	cancel1()
 
-	output := buf.String()
-	if !strings.Contains(output, "[vpn] active client AWG engine=custom listen_port=") {
-		t.Fatalf("missing custom startup log in output:\n%s", output)
+	output1 := buf1.String()
+	if !strings.Contains(output1, "[vpn] active client AWG engine=custom listen_port=") {
+		t.Fatalf("missing custom startup log in output:\n%s", output1)
 	}
 
-	buf.Reset()
+	var buf2 safeLogBuffer
+	log.SetOutput(&buf2)
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
 	if err := svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+		cancel2()
 		t.Fatal(err)
 	}
-	if err := svc.Start(ctx); err != nil {
+	if err := svc.Start(ctx2); err != nil {
+		cancel2()
 		t.Fatal(err)
 	}
 	_ = svc.Stop()
+	cancel2()
 
-	output = buf.String()
-	if !strings.Contains(output, "[vpn] active client AWG engine=upstream listen_port=") {
-		t.Fatalf("missing upstream startup log in output:\n%s", output)
+	output2 := buf2.String()
+	if !strings.Contains(output2, "[vpn] active client AWG engine=upstream listen_port=") {
+		t.Fatalf("missing upstream startup log in output:\n%s", output2)
 	}
 }
 

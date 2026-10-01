@@ -1860,6 +1860,9 @@ func (s *Service) SetClientAWGEngine(engine string) error {
 		return errors.New("cannot change client AWG engine while service is running")
 	}
 	normalized := strings.ToLower(strings.TrimSpace(engine))
+	if normalized == "" {
+		normalized = ClientAWGEngineCustom
+	}
 	if normalized != ClientAWGEngineCustom && normalized != ClientAWGEngineUpstream {
 		return fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
 	}

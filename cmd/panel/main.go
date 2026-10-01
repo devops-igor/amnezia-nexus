@@ -98,7 +98,11 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 		return false, false, nil
 	}
 
-	if err := vpnSvc.SetClientAWGEngine(cfg.ClientAWGEngine); err != nil {
+	engine := cfg.ClientAWGEngine
+	if engine == "" {
+		engine = config.ClientAWGEngineCustom
+	}
+	if err := vpnSvc.SetClientAWGEngine(engine); err != nil {
 		return false, false, fmt.Errorf("failed to set client AWG engine: %w", err)
 	}
 
