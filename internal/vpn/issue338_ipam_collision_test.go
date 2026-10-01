@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -209,7 +210,7 @@ func TestStartupIPAMCollision_Scenario1_TwoUsersTwoPeers_OldestWinsOtherQuaranti
 		t.Fatal(err)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +291,7 @@ func TestStartupIPAMCollision_Scenario2_SameUserTwoConfigs_OldestWinsSecondQuara
 		t.Fatal(err)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +362,7 @@ func TestStartupIPAMCollision_Scenario3_ThreeClaimants_OneWinnerTwoQuarantined(t
 		connIDs = append(connIDs, cID)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +473,7 @@ func TestStartupIPAMCollision_Scenario4_DurableVsLegacyFallback_DurableWinsLegac
 		t.Fatal(err)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +549,7 @@ func TestStartupIPAMCollision_Scenario5_SecondRestartIsIdempotent(t *testing.T) 
 	})
 
 	// First startup restart cycle
-	ipam1, _ := endpoint.NewIPAM("10.100.0.0/16")
+	ipam1, _ := ipam.NewIPAM("10.100.0.0/16")
 	if err := reservePersistedClientIPs(ctx, db, ipam1); err != nil {
 		t.Fatalf("first reservePersistedClientIPs failed: %v", err)
 	}
@@ -567,7 +568,7 @@ func TestStartupIPAMCollision_Scenario5_SecondRestartIsIdempotent(t *testing.T) 
 	}
 
 	// Second startup restart cycle (simulating a subsequent restart of the service)
-	ipam2, _ := endpoint.NewIPAM("10.100.0.0/16")
+	ipam2, _ := ipam.NewIPAM("10.100.0.0/16")
 	if err := reservePersistedClientIPs(ctx, db, ipam2); err != nil {
 		t.Fatalf("second reservePersistedClientIPs failed: %v", err)
 	}
@@ -630,7 +631,7 @@ func TestStartupIPAMCollision_Scenario6_UnrelatedValidLeasesUnchanged(t *testing
 		ClientParams: map[string]any{"assigned_ip": "10.100.0.20"}, CreatedAt: now.Add(-3 * time.Second),
 	})
 
-	ipam, _ := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, _ := ipam.NewIPAM("10.100.0.0/16")
 	if err := reservePersistedClientIPs(ctx, db, ipam); err != nil {
 		t.Fatalf("reservePersistedClientIPs failed: %v", err)
 	}
@@ -719,7 +720,7 @@ func TestStartupIPAMCollision_Scenario7_LosingPeerOldConfig_RefusesHandshake(t *
 		t.Fatal("expected HandleIncomingPeerForTest to refuse connection for quarantined peer, got nil error")
 	}
 
-	if !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+	if !errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 		t.Fatalf("expected error to wrap ErrIPAlreadyAllocated, got: %v", err)
 	}
 
@@ -837,7 +838,7 @@ func TestReservePersistedClientIPs_IPAlreadyAllocated(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +892,7 @@ func TestReservePersistedClientIPs_PeerAddressMismatch(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1104,7 +1105,7 @@ func TestStartupIPAMCollision_SamePeerMultipleDifferentIPs_ResolvesDeterministic
 		t.Fatal(err)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1526,7 +1527,7 @@ func TestStartupIPAMCollision_LosingPeerWithMultipleRows_RetiresSharedKeypairAnd
 	}
 
 	// The original losing peer identity must no longer authenticate at all.
-	if _, _, err := svc.auth.AuthenticatePeer(ctx, loserPub); !errors.Is(err, endpoint.ErrPeerNotFound) {
+	if _, _, err := svc.auth.AuthenticatePeer(ctx, loserPub); !errors.Is(err, auth.ErrPeerNotFound) {
 		t.Fatalf("expected retired losing peer to be unknown, got: %v", err)
 	}
 
@@ -1652,7 +1653,7 @@ func TestStartupIPAMCollision_StorageFailureDuringQuarantine_FailsReconciliation
 		t.Fatal(err)
 	}
 
-	ipam, err := endpoint.NewIPAM("10.100.0.0/16")
+	ipam, err := ipam.NewIPAM("10.100.0.0/16")
 	if err != nil {
 		t.Fatal(err)
 	}

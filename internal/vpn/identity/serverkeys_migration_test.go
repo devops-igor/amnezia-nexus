@@ -1,13 +1,29 @@
-package endpoint
+package identity
 
 import (
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
+
+func setupTestDB(tb testing.TB) *database.DB {
+	tb.Helper()
+	dir := tb.TempDir()
+	dbPath := filepath.Join(dir, "test_vpn_identity.db")
+	db, err := database.Open(dbPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		tb.Fatalf("failed to open test db: %v", err)
+	}
+	tb.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db
+}
 
 func TestServerKeysRecoverLegacyPlaintextAndRejectCorruptIdentity(t *testing.T) {
 	for _, scenario := range []string{"plaintext", "encrypted", "mismatch", "corrupt"} {

@@ -24,9 +24,12 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -156,9 +159,9 @@ type Service struct {
 	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
 	db            *database.DB
 	cfg           *models.VPNConfig
-	sessionMgr    *endpoint.SessionManager
-	ipam          *endpoint.IPAM
-	auth          *endpoint.DBAuthenticator
+	sessionMgr    *session.SessionManager
+	ipam          *ipam.IPAM
+	auth          *auth.DBAuthenticator
 	pool          *tunnel.Pool
 	prober        *tunnel.HealthProber
 	reconnectMgr  *tunnel.ReconnectManager
@@ -516,26 +519,26 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		return nil, err
 	}
 
-	ipam, err := endpoint.NewIPAM(cfg.SubnetCIDR)
+	ipamMgr, err := ipam.NewIPAM(cfg.SubnetCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init IPAM: %w", err)
 	}
 	// Config generation is also available before Start. Load both persisted
 	// client leases and legacy session-only leases before exposing this service.
 	if db != nil {
-		if err := reservePersistedClientIPs(context.Background(), db, ipam); err != nil {
+		if err := reservePersistedClientIPs(context.Background(), db, ipamMgr); err != nil {
 			return nil, fmt.Errorf("restore client IP assignments: %w", err)
 		}
 	}
 
-	var auth *endpoint.DBAuthenticator
+	var dbAuth *auth.DBAuthenticator
 	if db != nil {
-		auth = endpoint.NewDBAuthenticator(db)
+		dbAuth = auth.NewDBAuthenticator(db)
 	}
 
-	sessionMgr := endpoint.NewSessionManager(db, ipam)
+	sessionMgr := session.NewSessionManager(db, ipamMgr)
 
-	serverKeys := endpoint.NewServerKeysManager(db)
+	serverKeys := identity.NewServerKeysManager(db)
 
 	// Finding 3 (issue #391 round 4a): committed durable access revocations
 	// tear down live sessions immediately, engine-aware, instead of waiting
@@ -614,8 +617,8 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		db:                     db,
 		cfg:                    cfg,
 		sessionMgr:             sessionMgr,
-		ipam:                   ipam,
-		auth:                   auth,
+		ipam:                   ipamMgr,
+		auth:                   dbAuth,
 		pool:                   pool,
 		prober:                 prober,
 		reconnectMgr:           reconnectMgr,
@@ -1245,13 +1248,13 @@ func resolvePeerClaims(ctx context.Context, db *database.DB, claims []database.V
 	return active, nil
 }
 
-func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
+func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
 	// If several durable rows share this peer identity and the peer as a whole
 	// must be quarantined, retire the duplicated keypair on every row. Keeping
 	// the shared client_id would make post-regeneration authentication depend on
 	// whichever duplicate row GetConnectionByClientID happens to return.
 	retireKeypair := len(claims) > 1
-	if current, ok := ipam.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
+	if current, ok := ipamMgr.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
 		for _, c := range claims {
 			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 				return err
@@ -1260,11 +1263,11 @@ func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint
 		}
 		return nil
 	}
-	if err := ipam.Reserve(ip, peerKey); err != nil {
-		if errors.Is(err, endpoint.ErrIPNotInSubnet) || errors.Is(err, endpoint.ErrIPReserved) {
+	if err := ipamMgr.Reserve(ip, peerKey); err != nil {
+		if errors.Is(err, ipam.ErrIPNotInSubnet) || errors.Is(err, ipam.ErrIPReserved) {
 			return nil
 		}
-		if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 			for _, c := range claims {
 				if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 					return err
@@ -1284,7 +1287,7 @@ type candidatePeer struct {
 	allClaims []database.VPNClientIPAssignment
 }
 
-func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peersForIP map[string][]database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
+func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM, peersForIP map[string][]database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
 	peerKeys := make([]string, 0, len(peersForIP))
 	for pKey := range peersForIP {
 		peerKeys = append(peerKeys, pKey)
@@ -1324,7 +1327,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	retireWinnerKeypair := len(winner.allClaims) > 1
 
 	// Reserve winner in IPAM
-	if current, ok := ipam.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
+	if current, ok := ipamMgr.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
 		for _, c := range winner.allClaims {
 			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 				return err
@@ -1332,9 +1335,9 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
 		}
 	} else {
-		if err := ipam.Reserve(ip, winner.peerKey); err != nil {
-			if !errors.Is(err, endpoint.ErrIPNotInSubnet) && !errors.Is(err, endpoint.ErrIPReserved) {
-				if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		if err := ipamMgr.Reserve(ip, winner.peerKey); err != nil {
+			if !errors.Is(err, ipam.ErrIPNotInSubnet) && !errors.Is(err, ipam.ErrIPReserved) {
+				if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 					for _, c := range winner.allClaims {
 						if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 							return err
@@ -1364,8 +1367,8 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	return nil
 }
 
-func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpoint.IPAM) error {
-	if ipam == nil || db == nil {
+func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM) error {
+	if ipamMgr == nil || db == nil {
 		return nil
 	}
 	assignments, err := db.GetVPNClientIPAssignments(ctx)
@@ -1426,13 +1429,13 @@ func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpo
 				singlePeerKey = pk
 				singleClaims = cl
 			}
-			if err := reserveSinglePeerForIP(ctx, db, ipam, singlePeerKey, singleClaims, ip, ipStr); err != nil {
+			if err := reserveSinglePeerForIP(ctx, db, ipamMgr, singlePeerKey, singleClaims, ip, ipStr); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := reconcileCollidingPeersForIP(ctx, db, ipam, peersForIP, ip, ipStr); err != nil {
+		if err := reconcileCollidingPeersForIP(ctx, db, ipamMgr, peersForIP, ip, ipStr); err != nil {
 			return err
 		}
 	}
@@ -3452,7 +3455,7 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 	sess, ok := s.sessionMgr.GetSessionByID(sessionID)
 	if !ok {
-		return endpoint.ErrSessionNotFound
+		return session.ErrSessionNotFound
 	}
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
@@ -3500,7 +3503,7 @@ func (s *Service) RevokeUpstreamPeerSession(ctx context.Context, peerKey string)
 		s.preRevokeCloseHookForTest(sess.PeerPublicKey, sess.ID)
 	}
 	if err := s.sessionMgr.CloseSession(ctx, sess.ID, "revoked"); err != nil {
-		if errors.Is(err, endpoint.ErrSessionNotFound) {
+		if errors.Is(err, session.ErrSessionNotFound) {
 			// The session was already evicted (e.g. by CheckTimeouts); the idle reaper owns teardown.
 			return nil
 		}
@@ -3635,7 +3638,7 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	sess, ok := s.sessionMgr.GetSessionSnapshotByID(sessionID)
 	if !ok {
-		return endpoint.ErrSessionNotFound
+		return session.ErrSessionNotFound
 	}
 
 	peerKey := sess.PeerPublicKey
@@ -4202,7 +4205,7 @@ func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPN
 							if err == nil {
 								return existingStr, nil
 							}
-							if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+							if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 								return "", fmt.Errorf("client %s persisted IP %s conflicts with another client: %w", clientPub, existingStr, err)
 							}
 						} else {

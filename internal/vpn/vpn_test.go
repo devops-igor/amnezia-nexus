@@ -19,8 +19,8 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
@@ -4428,7 +4428,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 
 	// The lease owner cannot be inferred from an IP alone. Refuse the
 	// handshake rather than removing the dummy peer's lease.
-	if _, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyCharlie); !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+	if _, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyCharlie); !errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 		t.Fatalf("expected collision error for charlie, got %v", err)
 	}
 	if ip, ok := vpnSvc.ipam.GetAssignedIP("dummy-stale-peer"); !ok || ip.String() != targetIP {

@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 )
 
 func TestAuthenticatePeerRejectsRemoteServerConnection(t *testing.T) {
@@ -22,14 +23,14 @@ func TestAuthenticatePeerRejectsRemoteServerConnection(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if user, conn, err := svc.auth.AuthenticatePeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrPeerNotFound) {
+	if user, conn, err := svc.auth.AuthenticatePeer(ctx, remotePeer); !errors.Is(err, auth.ErrPeerNotFound) {
 		t.Fatalf("remote connection authenticated to portal: user=%+v conn=%+v err=%v", user, conn, err)
 	}
 	if _, ok := svc.ipam.GetAssignedIP(remotePeer); ok {
 		t.Fatal("remote peer received a portal address")
 	}
-	if session, err := svc.sessionMgr.GetSessionByPeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrSessionNotFound) || session != nil {
-		t.Fatalf("remote peer received a portal session: session=%+v err=%v", session, err)
+	if sess, err := svc.sessionMgr.GetSessionByPeer(ctx, remotePeer); !errors.Is(err, session.ErrSessionNotFound) || sess != nil {
+		t.Fatalf("remote peer received a portal session: session=%+v err=%v", sess, err)
 	}
 }
 

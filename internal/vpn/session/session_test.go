@@ -1,15 +1,32 @@
-package endpoint
+package session
 
 import (
 	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 )
+
+func setupTestDB(tb testing.TB) *database.DB {
+	tb.Helper()
+	dir := tb.TempDir()
+	dbPath := filepath.Join(dir, "test_vpn_session.db")
+	db, err := database.Open(dbPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		tb.Fatalf("failed to open test db: %v", err)
+	}
+	tb.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db
+}
 
 func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T) {
 	for _, tc := range []struct {
@@ -22,11 +39,11 @@ func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			db := setupTestDB(t)
-			ipam, err := NewIPAM("10.100.0.0/24")
+			ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 			if err != nil {
 				t.Fatal(err)
 			}
-			sm := NewSessionManager(db, ipam)
+			sm := NewSessionManager(db, ipamMgr)
 			serverID, err := db.CreateServer(ctx, &models.Server{Name: "remote", Host: "192.0.2.7"})
 			if err != nil {
 				t.Fatal(err)
@@ -63,7 +80,7 @@ func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T
 			if err != nil || unscoped == nil || unscoped.ID != "remote-first" {
 				t.Fatalf("test setup did not select remote row first: conn=%+v err=%v", unscoped, err)
 			}
-			if err := ipam.Reserve(net.ParseIP(portalIP), peer); err != nil {
+			if err := ipamMgr.Reserve(net.ParseIP(portalIP), peer); err != nil {
 				t.Fatal(err)
 			}
 			sess, err := sm.CreateSession(ctx, userID, peer, portalIP, tunnelID, "portal-client")
@@ -79,7 +96,7 @@ func TestSessionTeardownPreservesPortalLeaseWhenRemoteSharesPeerKey(t *testing.T
 			} else if err := sm.CloseSession(ctx, sess.ID, "disconnected"); err != nil {
 				t.Fatal(err)
 			}
-			if ip, ok := ipam.GetAssignedIP(peer); !ok || ip.String() != portalIP || !ipam.IsAllocated(net.ParseIP(portalIP)) {
+			if ip, ok := ipamMgr.GetAssignedIP(peer); !ok || ip.String() != portalIP || !ipamMgr.IsAllocated(net.ParseIP(portalIP)) {
 				t.Fatalf("teardown freed durable portal IP: assigned=%v present=%t", ip, ok)
 			}
 			portal, err := db.GetConnectionByClientID(ctx, peer, 0)
@@ -94,12 +111,12 @@ func TestSessionManagerCRUD(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, err := NewIPAM("10.100.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 	if err != nil {
 		t.Fatalf("NewIPAM failed: %v", err)
 	}
 
-	sm := NewSessionManager(db, ipam)
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -180,8 +197,8 @@ func TestSessionManagerTimeoutsAndDrain(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, _ := NewIPAM("10.100.0.0/24")
-	sm := NewSessionManager(db, ipam)
+	ipamMgr, _ := ipam.NewIPAM("10.100.0.0/24")
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -250,8 +267,8 @@ func TestSessionManagerPeerReconnectDBSync(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, _ := NewIPAM("10.100.0.0/24")
-	sm := NewSessionManager(db, ipam)
+	ipamMgr, _ := ipam.NewIPAM("10.100.0.0/24")
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -543,12 +560,12 @@ func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, err := NewIPAM("10.100.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 	if err != nil {
 		t.Fatalf("NewIPAM failed: %v", err)
 	}
 
-	sm := NewSessionManager(db, ipam)
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -607,11 +624,11 @@ func TestSessionManager_GenerationPublishedAtomically(t *testing.T) {
 func TestCreateSessionWithDeltaAndSource(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
-	ipam, err := NewIPAM("10.100.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sm := NewSessionManager(db, ipam)
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -647,11 +664,11 @@ func TestCreateSessionWithDeltaAndSource(t *testing.T) {
 func TestAdoptSessionForIngress(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
-	ipam, err := NewIPAM("10.100.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sm := NewSessionManager(db, ipam)
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{

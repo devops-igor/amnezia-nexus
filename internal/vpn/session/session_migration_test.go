@@ -1,4 +1,4 @@
-package endpoint
+package session
 
 import (
 	"context"
@@ -6,18 +6,19 @@ import (
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 )
 
 func TestSessionManagerUpdateAndRollbackSessionBackend(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	ipam, err := NewIPAM("10.100.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
 	if err != nil {
 		t.Fatalf("NewIPAM failed: %v", err)
 	}
 
-	sm := NewSessionManager(db, ipam)
+	sm := NewSessionManager(db, ipamMgr)
 
 	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
 	tID1, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{

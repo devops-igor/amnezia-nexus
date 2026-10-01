@@ -8,8 +8,8 @@ import (
 	"net/netip"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 )
 
 // HandleIncomingPeerForTest is a test helper that simulates client peer connection admission
@@ -29,10 +29,10 @@ func (s *Service) HandleIncomingPeerForTest(ctx context.Context, peerPublicKey s
 	var assignedIP net.IP
 	if conn != nil && conn.ClientParams != nil {
 		if req, ok := conn.ClientParams["config_regeneration_required"].(bool); ok && req {
-			return nil, nil, fmt.Errorf("peer %s IP was quarantined: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
+			return nil, nil, fmt.Errorf("peer %s IP was quarantined: %w (config regeneration required)", peerPublicKey, ipam.ErrIPAlreadyAllocated)
 		}
 		if qIP, ok := conn.ClientParams["quarantined_ip_collision"]; ok && qIP != nil && qIP != "" {
-			return nil, nil, fmt.Errorf("peer %s IP was quarantined: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
+			return nil, nil, fmt.Errorf("peer %s IP was quarantined: %w (config regeneration required)", peerPublicKey, ipam.ErrIPAlreadyAllocated)
 		}
 		if rawIP, ok := conn.ClientParams["assigned_ip"].(string); ok && rawIP != "" {
 			assignedIP = net.ParseIP(rawIP)
