@@ -113,3 +113,148 @@ func TestQualificationSubject_LifecycleAndConfigFreezing(t *testing.T) {
 		t.Errorf("second subject.Stop() returned error: %v", err)
 	}
 }
+
+func TestQualificationSubject_RollbackTransitions(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "panel_test.db")
+	configPath := filepath.Join(tempDir, "frozen-client.conf")
+	readyPath := filepath.Join(tempDir, "subject.ready")
+
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen ephemeral udp: %v", err)
+	}
+	listenPort := socket.LocalAddr().(*net.UDPAddr).Port
+	_ = socket.Close()
+
+	// Step 1: Start Leg 1 in Custom Engine Mode
+	cfg1 := QualificationSubjectConfig{
+		DBPath:           dbPath,
+		FrozenConfigPath: configPath,
+		ReadyPath:        readyPath,
+		ListenPort:       listenPort,
+		EchoPort:         40001,
+		UnderlayHostIP:   "10.254.250.1",
+		DestinationIP:    "10.100.0.1",
+		Engine:           "custom",
+		ReuseDB:          false,
+	}
+
+	sub1, err := NewQualificationSubject(cfg1)
+	if err != nil {
+		t.Fatalf("NewQualificationSubject custom failed: %v", err)
+	}
+	if !sub1.Service().IsRunning() {
+		t.Error("expected sub1 service to be running in custom mode")
+	}
+
+	confBytes1, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read frozen-client.conf leg 1: %v", err)
+	}
+	readyBytes1, err := os.ReadFile(readyPath)
+	if err != nil {
+		t.Fatalf("read subject.ready leg 1: %v", err)
+	}
+	var ready1 map[string]any
+	if err := json.Unmarshal(readyBytes1, &ready1); err != nil {
+		t.Fatalf("unmarshal ready 1: %v", err)
+	}
+	if ready1["engine"] != "custom" {
+		t.Errorf("leg 1 ready engine = %v, want custom", ready1["engine"])
+	}
+
+	if err := sub1.Stop(); err != nil {
+		t.Fatalf("sub1.Stop failed: %v", err)
+	}
+
+	// Step 2: Start Leg 2 in Upstream Engine Mode with ReuseDB = true
+	cfg2 := QualificationSubjectConfig{
+		DBPath:           dbPath,
+		FrozenConfigPath: configPath,
+		ReadyPath:        readyPath,
+		ListenPort:       listenPort,
+		EchoPort:         40001,
+		UnderlayHostIP:   "10.254.250.1",
+		DestinationIP:    "10.100.0.1",
+		Engine:           "upstream",
+		ReuseDB:          true,
+	}
+
+	sub2, err := NewQualificationSubject(cfg2)
+	if err != nil {
+		t.Fatalf("NewQualificationSubject upstream with ReuseDB failed: %v", err)
+	}
+	if sub2.Engine() == nil {
+		t.Error("expected sub2 IngressEngine to be initialized")
+	}
+
+	confBytes2, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read frozen-client.conf leg 2: %v", err)
+	}
+	if string(confBytes1) != string(confBytes2) {
+		t.Fatal("frozen-client.conf mutated during transition to upstream")
+	}
+
+	readyBytes2, err := os.ReadFile(readyPath)
+	if err != nil {
+		t.Fatalf("read subject.ready leg 2: %v", err)
+	}
+	var ready2 map[string]any
+	if err := json.Unmarshal(readyBytes2, &ready2); err != nil {
+		t.Fatalf("unmarshal ready 2: %v", err)
+	}
+	if ready2["engine"] != "upstream" {
+		t.Errorf("leg 2 ready engine = %v, want upstream", ready2["engine"])
+	}
+
+	if err := sub2.Stop(); err != nil {
+		t.Fatalf("sub2.Stop failed: %v", err)
+	}
+
+	// Step 3: Start Leg 3 in Custom Engine Mode (Rollback) with ReuseDB = true
+	cfg3 := QualificationSubjectConfig{
+		DBPath:           dbPath,
+		FrozenConfigPath: configPath,
+		ReadyPath:        readyPath,
+		ListenPort:       listenPort,
+		EchoPort:         40001,
+		UnderlayHostIP:   "10.254.250.1",
+		DestinationIP:    "10.100.0.1",
+		Engine:           "custom",
+		ReuseDB:          true,
+	}
+
+	sub3, err := NewQualificationSubject(cfg3)
+	if err != nil {
+		t.Fatalf("NewQualificationSubject custom rollback with ReuseDB failed: %v", err)
+	}
+	if !sub3.Service().IsRunning() {
+		t.Error("expected sub3 service to be running in custom rollback mode")
+	}
+
+	confBytes3, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read frozen-client.conf leg 3: %v", err)
+	}
+	if string(confBytes1) != string(confBytes3) {
+		t.Fatal("frozen-client.conf mutated during rollback to custom")
+	}
+
+	readyBytes3, err := os.ReadFile(readyPath)
+	if err != nil {
+		t.Fatalf("read subject.ready leg 3: %v", err)
+	}
+	var ready3 map[string]any
+	if err := json.Unmarshal(readyBytes3, &ready3); err != nil {
+		t.Fatalf("unmarshal ready 3: %v", err)
+	}
+	if ready3["engine"] != "custom" {
+		t.Errorf("leg 3 ready engine = %v, want custom", ready3["engine"])
+	}
+
+	if err := sub3.Stop(); err != nil {
+		t.Fatalf("sub3.Stop failed: %v", err)
+	}
+}

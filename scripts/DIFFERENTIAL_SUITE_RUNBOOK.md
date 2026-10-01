@@ -451,19 +451,31 @@ Prior to production cutover, execute a full same-port, same-DB rehearsal (`custo
      sed -i 's/^VPN_CLIENT_AWG_ENGINE=.*/VPN_CLIENT_AWG_ENGINE=upstream/' /etc/amnezia-nexus/nexus.env
      systemctl restart nexus-vpn
      curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
-     # Expected: {"active_engine": "upstream", "return_route_owner": "upstream"}
+     # Expected immediately post-restart (0 active sessions):
+     # {"active_engine": "upstream", "return_route_owner": "none"}
      ```
    - **Step C (Verify Client Traffic on Upstream)**:
      Transmit bidirectional test packets from test client; verify 0 packet loss.
+     ```bash
+     curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
+     # Expected after client traffic admitted:
+     # {"active_engine": "upstream", "return_route_owner": "upstream"}
+     ```
    - **Step D (Roll Back to Custom)**:
      ```bash
      sed -i 's/^VPN_CLIENT_AWG_ENGINE=.*/VPN_CLIENT_AWG_ENGINE=custom/' /etc/amnezia-nexus/nexus.env
      systemctl restart nexus-vpn
      curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
-     # Expected: {"active_engine": "custom", "return_route_owner": "custom"}
+     # Expected immediately post-restart (0 active sessions):
+     # {"active_engine": "custom", "return_route_owner": "none"}
      ```
    - **Step E (Assert Client Unchanged & Connected)**:
      Verify `./client-hash.txt` matches current client config. Re-transmit test packets.
+     ```bash
+     curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
+     # Expected after client reconnects:
+     # {"active_engine": "custom", "return_route_owner": "custom"}
+     ```
 
 ### 11.5 Production Pre-Cutover Checklist & Operational Gates
 
@@ -501,24 +513,24 @@ All five gates MUST be satisfied and signed off before switching `VPN_CLIENT_AWG
    ```
 4. **Inspect Health and Status Endpoints**:
    ```bash
-   # System Health:
+   # System Health (immediately post-restart with 0 active sessions):
    curl -s http://127.0.0.1:8080/api/health | jq '{status, configured_engine, active_engine, return_route_owner, engine_running}'
    # Expected response:
    # {
    #   "status": "ok",
    #   "configured_engine": "upstream",
    #   "active_engine": "upstream",
-   #   "return_route_owner": "upstream",
+   #   "return_route_owner": "none",
    #   "engine_running": true
    # }
 
-   # VPN Data Plane Status:
+   # VPN Data Plane Status (immediately post-restart with 0 active sessions):
    curl -s http://127.0.0.1:8080/api/vpn/status | jq '{configured_engine, active_engine, return_route_owner, engine_running, peer_sync}'
    # Expected response:
    # {
    #   "configured_engine": "upstream",
    #   "active_engine": "upstream",
-   #   "return_route_owner": "upstream",
+   #   "return_route_owner": "none",
    #   "engine_running": true,
    #   "peer_sync": {
    #     "desired_peers": N,
@@ -531,6 +543,11 @@ All five gates MUST be satisfied and signed off before switching `VPN_CLIENT_AWG
    - Confirm handshake completions: `[vpn/ingress] admitted peer <key>...`.
    - Verify bidirectional payload forwarding across active peers.
    - Confirm aggregate queue occupancy and route counts via `/api/vpn/status`.
+   - Confirm return route owner transitions to `"upstream"` once active routes are registered:
+     ```bash
+     curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
+     # Expected response: {"active_engine": "upstream", "return_route_owner": "upstream"}
+     ```
 
 ### 11.7 Concrete Rollback Trigger Thresholds
 
@@ -538,12 +555,12 @@ If ANY of the following conditions occur post-cutover, immediately abort cutover
 
 | Trigger ID | Failure Condition | Threshold | Monitoring Source |
 |---|---|---|---|
-| **TR-01** | Handshake Failure Rate | `> 1.0%` over 5-minute rolling window or `> 5` consecutive failures | Service logs (`[vpn/ingress]`) & Prometheus |
+| **TR-01** | Synthetic Client Connectivity Failure | Known-good synthetic probe fails bidirectional traffic within `30s` or `> 3` consecutive connection timeouts | Automated synthetic probe / test client |
 | **TR-02** | Unrouted / Return Route Drops | `> 10 drops/min` for active client sessions | `/api/vpn/status` (`return_counters`) |
 | **TR-03** | Peer Sync Divergence | `in_sync == false` or `desired != actual` for `> 60s` | `/api/vpn/status` (`peer_sync`) |
 | **TR-04** | Client Queue Full Drops | `> 50 drops/min` across forwarder client queues | Forwarder metrics (`drops_queue_full`) |
 | **TR-05** | Service Crash / Panic Loop | Any panic, unexpected exit, or crash restart | Systemd / Docker daemon restart logs |
-| **TR-06** | Blackhole / Stalled Handshake | Known-good test client fails bidirectional traffic within `30s` | Automated prober / synthetic probe |
+| **TR-06** | Packet Loss Spike | `> 5.0%` sustained UDP packet loss across active tunnels over 5-minute rolling window | Prometheus / node exporter metrics |
 
 ### 11.8 Controlled Rollback Procedure (`upstream` -> `custom`)
 
@@ -571,18 +588,23 @@ When triggered by any threshold in Section 11.7:
 4. **Inspect Health and Status Endpoints**:
    ```bash
    curl -s http://127.0.0.1:8080/api/health | jq '{status, configured_engine, active_engine, return_route_owner, engine_running}'
-   # Expected response:
+   # Expected response immediately post-restart (0 active sessions):
    # {
    #   "status": "ok",
    #   "configured_engine": "custom",
    #   "active_engine": "custom",
-   #   "return_route_owner": "custom",
+   #   "return_route_owner": "none",
    #   "engine_running": true
    # }
    ```
 5. **Client Continuity Verification**:
    - Clients automatically re-establish communication upon their next keepalive or packet transmission.
    - Zero client configuration re-issuance, key rotation, or database modification is required.
+   - Confirm return route owner transitions to `"custom"` once client sessions reconnect and register routes:
+     ```bash
+     curl -s http://127.0.0.1:8080/api/health | jq '{active_engine, return_route_owner}'
+     # Expected response: {"active_engine": "custom", "return_route_owner": "custom"}
+     ```
 
 ### 11.9 Production Bake Window & Legacy Decommissioning Roadmap
 

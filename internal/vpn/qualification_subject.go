@@ -62,6 +62,8 @@ type QualificationSubjectConfig struct {
 	EchoPort         uint16 `json:"echo_port"`
 	UnderlayHostIP   string `json:"underlay_host_ip"`
 	DestinationIP    string `json:"destination_ip"`
+	Engine           string `json:"engine"`
+	ReuseDB          bool   `json:"reuse_db"`
 }
 
 // QualificationSubject manages an isolated upstream qualification subject instance.
@@ -85,6 +87,12 @@ type QualificationSubject struct {
 // freezes the rendered client configuration before engine startup, starts backend TCP/UDP
 // echo services, constructs Service.NewIngressEngine, and starts the real dataplane path.
 func normalizeSubjectConfig(cfg QualificationSubjectConfig) (QualificationSubjectConfig, error) {
+	if cfg.Engine == "" {
+		cfg.Engine = "upstream"
+	}
+	if cfg.Engine != "upstream" && cfg.Engine != "custom" {
+		return cfg, fmt.Errorf("invalid subject engine %q: must be 'upstream' or 'custom'", cfg.Engine)
+	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = "test-artifacts/runtime/panel_test.db"
 	}
@@ -112,15 +120,87 @@ func normalizeSubjectConfig(cfg QualificationSubjectConfig) (QualificationSubjec
 			return cfg, fmt.Errorf("create directory for %s: %w", p, err)
 		}
 	}
-	_ = os.Remove(cfg.DBPath)
-	_ = os.Remove(cfg.DBPath + "-shm")
-	_ = os.Remove(cfg.DBPath + "-wal")
-	_ = os.Remove(cfg.FrozenConfigPath)
+	if !cfg.ReuseDB {
+		_ = os.Remove(cfg.DBPath)
+		_ = os.Remove(cfg.DBPath + "-shm")
+		_ = os.Remove(cfg.DBPath + "-wal")
+		_ = os.Remove(cfg.FrozenConfigPath)
+	}
 	_ = os.Remove(cfg.ReadyPath)
 	return cfg, nil
 }
 
 func initSubjectPortal(ctx context.Context, cfg QualificationSubjectConfig) (*database.DB, *Service, int64, int64, clientawg.Peer, error) {
+	if cfg.ReuseDB {
+		return loadReusedSubjectPortal(ctx, cfg)
+	}
+	return createFreshSubjectPortal(ctx, cfg)
+}
+
+func loadReusedSubjectPortal(ctx context.Context, cfg QualificationSubjectConfig) (*database.DB, *Service, int64, int64, clientawg.Peer, error) {
+	db, err := database.Open(cfg.DBPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("open qualification database: %w", err)
+	}
+
+	servers, err := db.GetAllServers(ctx)
+	if err != nil || len(servers) == 0 {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("retrieve qualification servers: %w", err)
+	}
+	sID := servers[0].ID
+
+	tunnels, err := db.GetAllBackendTunnels(ctx)
+	if err != nil || len(tunnels) == 0 {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("retrieve qualification tunnels: %w", err)
+	}
+	tunnelID := tunnels[0].ID
+
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("initialize vpn service with reused db: %w", err)
+	}
+
+	users, err := db.GetAllUsers(ctx)
+	if err != nil || len(users) == 0 {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("retrieve qualification users: %w", err)
+	}
+	uID := users[0].ID
+
+	conns, err := db.GetConnectionsByUserID(ctx, uID)
+	if err != nil || len(conns) == 0 {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("retrieve qualification connection: %w", err)
+	}
+	clientPubKey := conns[0].ClientID
+	assignedIPStr, ok := conns[0].ClientParams["assigned_ip"].(string)
+	if !ok || assignedIPStr == "" {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, errors.New("missing assigned IP in qualification connection")
+	}
+	assignedIP := netip.MustParseAddr(assignedIPStr)
+	clientPeer := clientawg.Peer{
+		PublicKey: clientPubKey,
+		AllowedIP: netip.PrefixFrom(assignedIP, 32),
+	}
+
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("sync backend pool: %w", err)
+	}
+
+	if _, err := os.Stat(cfg.FrozenConfigPath); err != nil {
+		_ = db.Close()
+		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("frozen client config missing: %w", err)
+	}
+
+	return db, svc, sID, tunnelID, clientPeer, nil
+}
+
+func createFreshSubjectPortal(ctx context.Context, cfg QualificationSubjectConfig) (*database.DB, *Service, int64, int64, clientawg.Peer, error) {
 	db, err := database.Open(cfg.DBPath, "test-secret-key-1234567890123456")
 	if err != nil {
 		return nil, nil, 0, 0, clientawg.Peer{}, fmt.Errorf("open qualification database: %w", err)
@@ -275,6 +355,7 @@ func setupEchoStack(destinationIP string, echoPort uint16) (tun.Device, *netstac
 func writeSubjectReadiness(cfg QualificationSubjectConfig) error {
 	readyData := map[string]any{
 		"status":         "ready",
+		"engine":         cfg.Engine,
 		"listen_port":    cfg.ListenPort,
 		"echo_port":      cfg.EchoPort,
 		"underlay_ip":    cfg.UnderlayHostIP,
@@ -314,6 +395,12 @@ func NewQualificationSubject(cfg QualificationSubjectConfig) (*QualificationSubj
 		svc: svc,
 	}
 
+	// Mock probe function so Service startup/sweeps do not block or fail on mock backend
+	mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	}
+	sub.svc.SetProbeFunc(mockProbe)
+
 	backendVT, backendStack, tcpListeners, udpConns, err := setupEchoStack(normCfg.DestinationIP, normCfg.EchoPort)
 	if err != nil {
 		_ = sub.Stop()
@@ -334,18 +421,35 @@ func NewQualificationSubject(cfg QualificationSubjectConfig) (*QualificationSubj
 	}()
 	sub.svc.forwarder.StartPumps(ctx)
 
-	engine, err := sub.svc.NewIngressEngine(ctx, "nexus-subject", []clientawg.Peer{clientPeer})
-	if err != nil {
-		_ = sub.Stop()
-		return nil, fmt.Errorf("construct ingress engine: %w", err)
-	}
-	sub.engine = engine
+	if normCfg.Engine == "custom" {
+		if err := sub.svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
+			_ = sub.Stop()
+			return nil, fmt.Errorf("set custom client awg engine: %w", err)
+		}
+		if err := sub.svc.Start(ctx); err != nil {
+			_ = sub.Stop()
+			return nil, fmt.Errorf("start custom vpn service: %w", err)
+		}
+		sub.svc.forwarder.AttachBackendDevice(tunnelID, sub.adapter)
+		sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
+	} else {
+		if err := sub.svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
+			_ = sub.Stop()
+			return nil, fmt.Errorf("set upstream client awg engine: %w", err)
+		}
+		engine, err := sub.svc.NewIngressEngine(ctx, "nexus-subject", []clientawg.Peer{clientPeer})
+		if err != nil {
+			_ = sub.Stop()
+			return nil, fmt.Errorf("construct ingress engine: %w", err)
+		}
+		sub.engine = engine
 
-	if err := sub.engine.Start(); err != nil {
-		_ = sub.Stop()
-		return nil, fmt.Errorf("start ingress engine: %w", err)
+		if err := sub.engine.Start(); err != nil {
+			_ = sub.Stop()
+			return nil, fmt.Errorf("start ingress engine: %w", err)
+		}
+		sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
 	}
-	sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
 
 	if err := writeSubjectReadiness(normCfg); err != nil {
 		_ = sub.Stop()
@@ -392,8 +496,14 @@ func (s *QualificationSubject) Stop() error {
 				errs = append(errs, err)
 			}
 		}
-		if s.svc != nil && s.svc.forwarder != nil {
-			s.svc.forwarder.StopPumps()
+		if s.svc != nil {
+			if s.cfg.Engine == "custom" {
+				if err := s.svc.Stop(); err != nil {
+					errs = append(errs, err)
+				}
+			} else if s.svc.forwarder != nil {
+				s.svc.forwarder.StopPumps()
+			}
 		}
 		if s.adapter != nil {
 			_ = s.adapter.Close()

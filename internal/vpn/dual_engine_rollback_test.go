@@ -1,68 +1,98 @@
 package vpn
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"sort"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
-// rollbackSinkDevice captures packets routed to a backend or peer device
-// for deterministic verification.
-type rollbackSinkDevice struct {
-	mu      sync.Mutex
-	packets [][]byte
+type rollbackTestClient struct {
+	dev   *device.Device
+	stack *netstack.Net
+	tun   tun.Device
+	tcp   net.Conn
+	udp   net.Conn
 }
 
-func (d *rollbackSinkDevice) Write(p []byte) (int, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	cp := make([]byte, len(p))
-	copy(cp, p)
-	d.packets = append(d.packets, cp)
-	return len(p), nil
-}
-
-func (d *rollbackSinkDevice) Read(p []byte) (int, error)   { return 0, io.EOF }
-func (d *rollbackSinkDevice) Close() error                 { return nil }
-func (d *rollbackSinkDevice) LastHandshakeTime() time.Time { return time.Time{} }
-func (d *rollbackSinkDevice) CreatedAt() time.Time         { return time.Time{} }
-func (d *rollbackSinkDevice) DroppedPackets() uint64       { return 0 }
-func (d *rollbackSinkDevice) IsClosed() bool               { return false }
-
-func (d *rollbackSinkDevice) packetCount() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.packets)
-}
-
-func (d *rollbackSinkDevice) awaitPacketCount(target int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if d.packetCount() >= target {
-			return true
-		}
-		time.Sleep(2 * time.Millisecond)
+func (c *rollbackTestClient) Close() {
+	if c == nil {
+		return
 	}
-	return d.packetCount() >= target
+	if c.tcp != nil {
+		_ = c.tcp.Close()
+		c.tcp = nil
+	}
+	if c.udp != nil {
+		_ = c.udp.Close()
+		c.udp = nil
+	}
+	if c.dev != nil {
+		c.dev.Close()
+		c.dev = nil
+		c.tun = nil
+	} else if c.tun != nil {
+		_ = c.tun.Close()
+		c.tun = nil
+	}
 }
 
-func (d *rollbackSinkDevice) lastPacket() []byte {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.packets) == 0 {
-		return nil
+func newRollbackRealClient(t *testing.T, peer enginePeer, rawConfig string, destination netip.Addr, backendMarker byte) *rollbackTestClient {
+	t.Helper()
+	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(peer.assignedIP)}, nil, 1280)
+	if err != nil {
+		t.Fatal(err)
 	}
-	res := make([]byte, len(d.packets[len(d.packets)-1]))
-	copy(res, d.packets[len(d.packets)-1])
-	return res
+	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "rollback-client"))
+	uapi := configToUAPI(t, rawConfig)
+	if err := dev.IpcSet(uapi); err != nil {
+		dev.Close()
+		t.Fatalf("client configuration rejected: %v", err)
+	}
+	if err := dev.IpcSet("rekey_after_time=120\nrekey_timeout=5\n"); err != nil {
+		dev.Close()
+		t.Fatalf("timing configuration rejected: %v", err)
+	}
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		t.Fatalf("client device up failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	tcpConn, err := stack.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(destination, 40001))
+	if err != nil {
+		dev.Close()
+		t.Fatalf("TCP over rollback return path: %v", err)
+	}
+	_ = tcpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	marker := make([]byte, 1)
+	if _, err := io.ReadFull(tcpConn, marker); err != nil || marker[0] != backendMarker {
+		_ = tcpConn.Close()
+		dev.Close()
+		t.Fatalf("TCP reached wrong backend: marker=%v err=%v", marker, err)
+	}
+	udpConn, err := stack.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(destination, 40001))
+	if err != nil {
+		_ = tcpConn.Close()
+		dev.Close()
+		t.Fatalf("DialUDPAddrPort failed: %v", err)
+	}
+
+	c := &rollbackTestClient{dev: dev, stack: stack, tun: vt, tcp: tcpConn, udp: udpConn}
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
 // TestDualEngine_SameDBSamePortSameConfigRollback implements the end-to-end integration
@@ -70,6 +100,8 @@ func (d *rollbackSinkDevice) lastPacket() []byte {
 // custom -> upstream -> custom across fresh Service instances backed by the EXACT SAME
 // database, binding the EXACT SAME UDP port, and serving the EXACT SAME frozen client
 // configuration without key rotation, IP reassignment, or database migrations.
+// Real userspace AmneziaWG clients connect on all three legs, executing bidirectional
+// TCP and UDP echo against the backend tunnel.
 func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
@@ -154,6 +186,8 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatal("expected at least 1 backend tunnel")
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].ID < backends[j].ID })
+	backend := backends[0]
+	dest := netip.MustParseAddr("198.51.100.99")
 
 	// Track ReturnRouteOwner transitions: must progress strictly:
 	// none -> custom -> none -> upstream -> none -> custom -> none
@@ -196,9 +230,16 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if err := svc1.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
 		t.Fatalf("svc1.SetClientAWGEngine(custom): %v", err)
 	}
+
 	if err := svc1.Start(ctx); err != nil {
 		t.Fatalf("svc1.Start failed: %v", err)
 	}
+
+	// Assign peer affinity to ensure deterministic backend selection
+	svc1.stickyMgr.AssignPeerAffinity(peer.publicKey, backend.ID)
+
+	// Attach backend echo adapter
+	startConcurrentEchoBackend(t, svc1, backend, dest, 0x11)
 
 	// Verify initial state before traffic
 	ownerTransitions = append(ownerTransitions, svc1.forwarder.ReturnRouteOwner())
@@ -216,48 +257,11 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatalf("svc1 listen port changed: got %d, want %d", stat1.ListenPort, initialListenPort)
 	}
 
-	// Attach backend recording sink to all available tunnels
-	sink1 := &rollbackSinkDevice{}
-	for _, b := range backends {
-		svc1.forwarder.AttachBackendDevice(b.ID, sink1)
-	}
-
-	// Attach client return sink
-	clientSink1 := &rollbackSinkDevice{}
-	svc1.forwarder.AttachPeerDevice(initialClientPubKey, clientSink1)
-
-	// Client admission in custom mode
-	sess1, be1, err := svc1.HandleIncomingPeer(ctx, initialClientPubKey)
-	if err != nil {
-		t.Fatalf("svc1.HandleIncomingPeer: %v", err)
-	}
-	if sess1.AssignedIP != initialAssignedIP {
-		t.Fatalf("svc1 admitted IP %s != frozen %s", sess1.AssignedIP, initialAssignedIP)
-	}
-	if be1 == nil || be1.ID <= 0 {
-		t.Fatalf("svc1 admitted invalid backend: %+v", be1)
-	}
-	if !svc1.forwarder.HasSessionRoute(initialClientPubKey, sess1.ID, initialConnectionID, initialAssignedIP, be1.ID) {
-		t.Fatal("svc1 forwarder route not registered")
-	}
-
-	// Bidirectional Packet Flow (Client -> Backend)
-	clientPkt1 := engineUDPPacket(netip.MustParseAddr(initialAssignedIP), netip.MustParseAddr("198.51.100.1"), 0x1101)
-	if err := svc1.forwarder.RouteClientToBackend(initialClientPubKey, clientPkt1); err != nil {
-		t.Fatalf("svc1 RouteClientToBackend: %v", err)
-	}
-	if !sink1.awaitPacketCount(1, 2*time.Second) {
-		t.Fatalf("svc1 backend sink expected 1 packet, got %d", sink1.packetCount())
-	}
-	if !bytes.Equal(sink1.lastPacket(), clientPkt1) {
-		t.Fatal("svc1 backend sink payload corrupted")
-	}
-
-	// Bidirectional Packet Flow (Backend -> Client)
-	returnPkt1 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr(initialAssignedIP), 0x1102)
-	if err := svc1.forwarder.RouteBackendToClient(be1.ID, returnPkt1, initialAssignedIP); err != nil {
-		t.Fatalf("svc1 RouteBackendToClient: %v", err)
-	}
+	// Connect real userspace AmneziaWG client on Leg 1
+	client1 := newRollbackRealClient(t, peer, rawConfig, dest, 0x11)
+	payload1 := []byte("rollback-rehearsal-traffic-leg-1-custom")
+	returnExchange(t, client1.tcp, payload1, false, 0x11)
+	returnExchange(t, client1.udp, payload1, true, 0x11)
 
 	// Verify owner transition to custom
 	ownerTransitions = append(ownerTransitions, svc1.forwarder.ReturnRouteOwner())
@@ -273,6 +277,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if svc1.portalPubKey != initialPortalPubKey || svc1.portalPrivKey != initialPortalPrivKey {
 		t.Fatal("svc1 portal keypair mutated during execution")
 	}
+
+	// Disconnect client 1
+	client1.Close()
 
 	// Clean shutdown of Service 1
 	if err := svc1.Stop(); err != nil {
@@ -334,6 +341,12 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatalf("svc2.Start failed: %v", err)
 	}
 
+	// Assign peer affinity to ensure deterministic backend selection
+	svc2.stickyMgr.AssignPeerAffinity(peer.publicKey, backend.ID)
+
+	// Attach backend echo adapter
+	startConcurrentEchoBackend(t, svc2, backend, dest, 0x22)
+
 	// Verify initial state before traffic
 	ownerTransitions = append(ownerTransitions, svc2.forwarder.ReturnRouteOwner())
 	if svc2.forwarder.ReturnRouteOwner() != "none" {
@@ -358,25 +371,11 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatal("svc2 expected non-nil engine ReturnPath")
 	}
 
-	// Attach backend recording sink to all available tunnels
-	sink2 := &rollbackSinkDevice{}
-	for _, b := range backends {
-		svc2.forwarder.AttachBackendDevice(b.ID, sink2)
-	}
-
-	// Ingress session admission and client packet routing via IngressEngine.Router
-	clientPkt2 := engineUDPPacket(netip.MustParseAddr(initialAssignedIP), netip.MustParseAddr("198.51.100.1"), 0x2201)
-	if err := engine2.Router().HandlePacket(clientPkt2); err != nil {
-		t.Fatalf("svc2 engine.Router.HandlePacket failed: %v", err)
-	}
-
-	// Verify packet reached backend sink
-	if !sink2.awaitPacketCount(1, 2*time.Second) {
-		t.Fatalf("svc2 backend sink expected 1 packet, got %d", sink2.packetCount())
-	}
-	if !bytes.Equal(sink2.lastPacket(), clientPkt2) {
-		t.Fatal("svc2 backend sink payload corrupted")
-	}
+	// Connect real userspace AmneziaWG client on Leg 2 using EXACT SAME frozen config
+	client2 := newRollbackRealClient(t, peer, rawConfig, dest, 0x22)
+	payload2 := []byte("rollback-rehearsal-traffic-leg-2-upstream")
+	returnExchange(t, client2.tcp, payload2, false, 0x22)
+	returnExchange(t, client2.udp, payload2, true, 0x22)
 
 	// Verify session and route were admitted under upstream ReturnPath
 	sess2, ok := svc2.sessionMgr.GetSessionSnapshotByPeer(initialClientPubKey)
@@ -388,12 +387,6 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	}
 	if !svc2.forwarder.HasSessionRouteWithReturnPath(initialClientPubKey, sess2.ID, initialConnectionID, initialAssignedIP, sess2.BackendTunnelID, engine2.returnPath) {
 		t.Fatal("svc2 forwarder route with returnPath missing")
-	}
-
-	// Bidirectional Packet Flow (Backend -> Client via ReturnPath)
-	returnPkt2 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr(initialAssignedIP), 0x2202)
-	if err := svc2.forwarder.RouteBackendToClient(sess2.BackendTunnelID, returnPkt2, initialAssignedIP); err != nil {
-		t.Fatalf("svc2 RouteBackendToClient: %v", err)
 	}
 
 	// Verify owner transition to upstream
@@ -413,6 +406,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
 		t.Fatalf("client config digest mutated during upstream execution: got %x, want %x", sum, frozenConfigHash)
 	}
+
+	// Disconnect client 2
+	client2.Close()
 
 	// Clean shutdown of Service 2
 	if err := svc2.Stop(); err != nil {
@@ -474,6 +470,12 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatalf("svc3.Start failed: %v", err)
 	}
 
+	// Assign peer affinity to ensure deterministic backend selection
+	svc3.stickyMgr.AssignPeerAffinity(peer.publicKey, backend.ID)
+
+	// Attach backend echo adapter
+	startConcurrentEchoBackend(t, svc3, backend, dest, 0x33)
+
 	// Verify initial state before traffic
 	ownerTransitions = append(ownerTransitions, svc3.forwarder.ReturnRouteOwner())
 	if svc3.forwarder.ReturnRouteOwner() != "none" {
@@ -490,47 +492,22 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatalf("svc3 listen port changed: got %d, want %d", stat3.ListenPort, initialListenPort)
 	}
 
-	// Attach backend recording sink to all available tunnels
-	sink3 := &rollbackSinkDevice{}
-	for _, b := range backends {
-		svc3.forwarder.AttachBackendDevice(b.ID, sink3)
-	}
-
-	// Attach client return sink
-	clientSink3 := &rollbackSinkDevice{}
-	svc3.forwarder.AttachPeerDevice(initialClientPubKey, clientSink3)
+	// Connect real userspace AmneziaWG client on Leg 3 using EXACT SAME frozen config
+	client3 := newRollbackRealClient(t, peer, rawConfig, dest, 0x33)
+	payload3 := []byte("rollback-rehearsal-traffic-leg-3-custom")
+	returnExchange(t, client3.tcp, payload3, false, 0x33)
+	returnExchange(t, client3.udp, payload3, true, 0x33)
 
 	// Client admission in rolled-back custom mode (using EXACT SAME frozen credentials)
-	sess3, be3, err := svc3.HandleIncomingPeer(ctx, initialClientPubKey)
-	if err != nil {
-		t.Fatalf("svc3.HandleIncomingPeer: %v", err)
+	sess3, ok := svc3.sessionMgr.GetSessionSnapshotByPeer(initialClientPubKey)
+	if !ok {
+		t.Fatal("svc3 expected active session for peer")
 	}
 	if sess3.AssignedIP != initialAssignedIP {
 		t.Fatalf("svc3 admitted IP %s != frozen %s", sess3.AssignedIP, initialAssignedIP)
 	}
-	if be3 == nil || be3.ID <= 0 {
-		t.Fatalf("svc3 admitted invalid backend: %+v", be3)
-	}
-	if !svc3.forwarder.HasSessionRoute(initialClientPubKey, sess3.ID, initialConnectionID, initialAssignedIP, be3.ID) {
+	if !svc3.forwarder.HasSessionRoute(initialClientPubKey, sess3.ID, initialConnectionID, initialAssignedIP, sess3.BackendTunnelID) {
 		t.Fatal("svc3 forwarder route not registered")
-	}
-
-	// Bidirectional Packet Flow (Client -> Backend)
-	clientPkt3 := engineUDPPacket(netip.MustParseAddr(initialAssignedIP), netip.MustParseAddr("198.51.100.1"), 0x3301)
-	if err := svc3.forwarder.RouteClientToBackend(initialClientPubKey, clientPkt3); err != nil {
-		t.Fatalf("svc3 RouteClientToBackend: %v", err)
-	}
-	if !sink3.awaitPacketCount(1, 2*time.Second) {
-		t.Fatalf("svc3 backend sink expected 1 packet, got %d", sink3.packetCount())
-	}
-	if !bytes.Equal(sink3.lastPacket(), clientPkt3) {
-		t.Fatal("svc3 backend sink payload corrupted")
-	}
-
-	// Bidirectional Packet Flow (Backend -> Client)
-	returnPkt3 := engineUDPPacket(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr(initialAssignedIP), 0x3302)
-	if err := svc3.forwarder.RouteBackendToClient(be3.ID, returnPkt3, initialAssignedIP); err != nil {
-		t.Fatalf("svc3 RouteBackendToClient: %v", err)
 	}
 
 	// Verify owner transition to custom
@@ -550,6 +527,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
 		t.Fatalf("client config digest mutated during rollback execution: got %x, want %x", sum, frozenConfigHash)
 	}
+
+	// Disconnect client 3
+	client3.Close()
 
 	// Clean shutdown of Service 3
 	if err := svc3.Stop(); err != nil {

@@ -223,6 +223,14 @@ jobs:
             fi
           fi
 
+      - name: Run Dual-Engine Rollback Rehearsal
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          chmod +x ./scripts/run_dev_rollback_rehearsal.sh
+          sudo env "PATH=$PATH" ./scripts/run_dev_rollback_rehearsal.sh \
+            --runtime-dir test-artifacts/runtime \
+            --output-dir test-artifacts/public
+
       - name: Verify Issue #392 Qualification Evidence
         if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
         run: |

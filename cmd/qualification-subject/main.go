@@ -19,6 +19,8 @@ func main() {
 	echoPort := flag.Int("echo-port", 40001, "TCP/UDP echo port")
 	underlayIP := flag.String("underlay-ip", "10.254.250.1", "Underlay host IP for public endpoint")
 	destIP := flag.String("dest-ip", "10.100.0.1", "Destination IP for echo services")
+	engine := flag.String("engine", "upstream", "Client AWG engine (custom or upstream)")
+	reuseDB := flag.Bool("reuse-db", false, "Reuse existing database and frozen client configuration")
 	flag.Parse()
 
 	if *listenPort <= 0 || *listenPort > 65535 {
@@ -26,6 +28,9 @@ func main() {
 	}
 	if *echoPort <= 0 || *echoPort > 65535 {
 		log.Fatalf("[qualification-subject] invalid echo port: %d (must be 1-65535)", *echoPort)
+	}
+	if *engine != "custom" && *engine != "upstream" {
+		log.Fatalf("[qualification-subject] invalid engine: %q (must be 'custom' or 'upstream')", *engine)
 	}
 
 	cfg := vpn.QualificationSubjectConfig{
@@ -36,6 +41,8 @@ func main() {
 		EchoPort:         uint16(*echoPort), // #nosec G115 -- validated 1 <= *echoPort <= 65535
 		UnderlayHostIP:   *underlayIP,
 		DestinationIP:    *destIP,
+		Engine:           *engine,
+		ReuseDB:          *reuseDB,
 	}
 
 	subject, err := vpn.NewQualificationSubject(cfg)
