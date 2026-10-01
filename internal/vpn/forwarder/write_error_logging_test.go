@@ -46,9 +46,9 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 	defer f.StopPumps()
 
 	dev := &errDevice{err: errors.New("no transport keys for peer")}
-	f.AttachPeerDevice("peer-a", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 	f.StartPumps(t.Context())
-	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 
 	// Capture the standard logger for the duration of the burst.
 	var buf bytes.Buffer

@@ -23,19 +23,16 @@ func returnPacket(destination string) []byte {
 
 func TestReturnPathRoutesOnlyMatchingBackendAndDestination(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 4)
-	legacy := newMockPacketDev()
-	f.AttachClientDevice(legacy)
 	received := make(chan string, 4)
 	path := NewReturnPath(func(peer, ip string, p []byte) (int, error) { received <- peer + ":" + ip; return len(p), nil })
 	for _, r := range []struct {
 		key, ip string
 		backend int64
-	}{{"a", "10.100.0.2", 11}, {"b", "10.100.0.3", 12}} {
+	}{{"a", "10.100.0.2", 11}, {"b", "10.100.0.3", 12}, {"c", "10.100.0.4", 13}} {
 		if _, err := f.TryRegisterSessionWithReturnPath(r.key, r.key, r.key, r.ip, r.backend, 0, 0, path); err != nil {
 			t.Fatal(err)
 		}
 	}
-	f.RegisterSession("legacy", "legacy", "legacy", "10.100.0.4", 13)
 	f.StartPumps(t.Context())
 	t.Cleanup(f.StopPumps)
 	for _, bad := range []struct {
@@ -53,7 +50,7 @@ func TestReturnPathRoutesOnlyMatchingBackendAndDestination(t *testing.T) {
 	for _, r := range []struct {
 		be         int64
 		ip, expect string
-	}{{11, "10.100.0.2", "a:10.100.0.2"}, {12, "10.100.0.3", "b:10.100.0.3"}} {
+	}{{11, "10.100.0.2", "a:10.100.0.2"}, {12, "10.100.0.3", "b:10.100.0.3"}, {13, "10.100.0.4", "c:10.100.0.4"}} {
 		if err := f.RouteBackendToClient(r.be, returnPacket(r.ip), r.ip); err != nil {
 			t.Fatal(err)
 		}
@@ -65,17 +62,6 @@ func TestReturnPathRoutesOnlyMatchingBackendAndDestination(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("no upstream return")
 		}
-	}
-	if len(legacy.getPackets()) != 0 {
-		t.Fatal("upstream return fell back to legacy")
-	}
-	if err := f.RouteBackendToClient(13, returnPacket("10.100.0.4"), "10.100.0.4"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-legacy.notifyCh:
-	case <-time.After(time.Second):
-		t.Fatal("legacy coexistence broken")
 	}
 	_, tx, _ := f.GetStats()
 	if tx != 3*28 {
@@ -139,7 +125,7 @@ func TestReturnPathBindingRetiresOldWriterAndPreservesReuse(t *testing.T) {
 	}
 }
 
-func TestReturnPathClosedNeverFallsBackAndTUNPressureIsBounded(t *testing.T) {
+func TestReturnPathClosedAndTUNPressureIsBounded(t *testing.T) {
 	vt, err := virtualtun.New(virtualtun.Config{Name: "return-test", MTU: 1280, InboundCapacity: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -163,8 +149,6 @@ func TestReturnPathClosedNeverFallsBackAndTUNPressureIsBounded(t *testing.T) {
 		t.Fatalf("missing TUN drop: %+v", vt.Stats())
 	}
 	f := NewForwarder(nil, "10.100.0.0/16", 2)
-	legacy := newMockPacketDev()
-	f.AttachClientDevice(legacy)
 	if _, err := f.TryRegisterSessionWithReturnPath("s", "c", "a", "10.100.0.2", 1, 0, 0, path); err != nil {
 		t.Fatal(err)
 	}
@@ -189,9 +173,6 @@ func TestReturnPathClosedNeverFallsBackAndTUNPressureIsBounded(t *testing.T) {
 		case <-deadline:
 			t.Fatal("closed write not observed")
 		}
-	}
-	if len(legacy.getPackets()) != 0 {
-		t.Fatal("closed upstream route fell back to legacy")
 	}
 }
 
