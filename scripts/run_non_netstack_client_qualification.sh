@@ -699,7 +699,7 @@ else
             TEST_STATUS="SKIPPED"
             REPORT_NOTE="SKIPPED: missing client private key"
         else
-            local _xtrace_active=false
+            _xtrace_active=false
             if [[ "$-" == *x* ]]; then
                 _xtrace_active=true
                 set +x

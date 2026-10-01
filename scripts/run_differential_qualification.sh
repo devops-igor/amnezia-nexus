@@ -142,7 +142,7 @@ if [[ "$ENABLE_RACE" == "true" ]]; then
     RACE_FLAG="-race"
     # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA, missing CGO)
     RACE_TEST_ERR="$(go test -race -run "^$" ./cmd/panel 2>&1 || true)"
-    if echo "$RACE_TEST_ERR" | grep -Eq "unsupported VMA range|requires cgo"; then
+    if echo "$RACE_TEST_ERR" | grep -E -q "unsupported VMA range|requires cgo"; then
         echo "NOTICE: Host environment does not support Go race detector: $(echo "$RACE_TEST_ERR" | tr '\n' ' ')"
         echo "        Disabling -race for host environment (authoritative -race runs in CI on x86_64)."
         RACE_FLAG=""
