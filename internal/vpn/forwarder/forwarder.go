@@ -661,6 +661,78 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 	return retirement
 }
 
+func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) bool) []Retirement {
+	var matches []*sessionRoute
+	for _, route := range f.routesByPeer {
+		if route != nil && (predicate == nil || predicate(route)) {
+			matches = append(matches, route)
+		}
+	}
+	retirements := make([]Retirement, 0, len(matches))
+	for _, route := range matches {
+		retirements = append(retirements, Retirement{route: route})
+		if cur, ok := f.routesByIP[route.assignedIP]; ok && cur == route {
+			delete(f.routesByIP, route.assignedIP)
+		}
+		delete(f.routesByPeer, route.peerKey)
+		delete(f.clientDevices, route.peerKey)
+		f.stopRoutePumpLocked(route)
+		f.drainRouteQueueLocked(route)
+	}
+	return retirements
+}
+
+// RetireAllRoutes stops pumps, drains queues, removes all routes from forwarder
+// routing tables, and returns a wait function that callers execute outside forwarder
+// locks to join in-flight writes.
+func (f *Forwarder) RetireAllRoutes() (wait func()) {
+	if f == nil {
+		return func() {}
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(nil)
+	clear(f.routesByPeer)
+	clear(f.routesByIP)
+	clear(f.clientDevices)
+	f.aggregateQueueMu.Lock()
+	f.aggregateQueueOccupancy = 0
+	f.aggregateQueueMu.Unlock()
+	f.mu.Unlock()
+
+	return func() {
+		for _, ret := range retirements {
+			ret.Wait()
+		}
+	}
+}
+
+// RetireRoutesByReturnPath stops pumps, drains queues, and removes routes associated
+// with the specified ReturnPath. Routes belonging to other engines remain untouched.
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func()) {
+	if f == nil {
+		return func() {}
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(func(route *sessionRoute) bool {
+		return route.returnPath == path
+	})
+	f.mu.Unlock()
+
+	return func() {
+		for _, ret := range retirements {
+			ret.Wait()
+		}
+	}
+}
+
+// RetireCustomRoutes stops pumps, drains queues, and removes routes belonging to
+// the custom/legacy engine (routes where returnPath == nil).
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireCustomRoutes() (wait func()) {
+	return f.RetireRoutesByReturnPath(nil)
+}
+
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
 func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int64) error {
 	f.mu.Lock()
@@ -1365,8 +1437,15 @@ func (f *Forwarder) Start(ctx context.Context) {
 	}
 }
 
-// Stop terminates the forwarder, pumps, and flushes accountant.
+// Stop terminates the forwarder, retires and drains all routes, joins in-flight
+// writes, stops pumps, and flushes the accountant.
 func (f *Forwarder) Stop() error {
+	if f == nil {
+		return nil
+	}
+	if wait := f.RetireAllRoutes(); wait != nil {
+		wait()
+	}
 	f.StopPumps()
 
 	f.mu.Lock()

@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
@@ -142,5 +143,235 @@ func TestSessionRouteStopChannelNeverClosedQueue(t *testing.T) {
 	select {
 	case route.clientQueue <- []byte{1}:
 	default:
+	}
+}
+
+func TestRetireAllRoutes_DrainsQueuesAndJoinsWrites(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 10)
+	dev := newBlockingWriteDevice()
+	f.AttachPeerDevice("peer-1", dev)
+
+	f.RegisterSession("sess-1", "conn-1", "peer-1", "10.100.0.11", 1)
+	f.RegisterSession("sess-2", "conn-2", "peer-2", "10.100.0.12", 1)
+	f.RegisterSession("sess-3", "conn-3", "peer-3", "10.100.0.13", 1)
+
+	// Send packets to all three routes
+	pkt := returnPacket("10.100.0.11")
+	for i := 0; i < 5; i++ {
+		if err := f.RouteBackendToClient(1, pkt, "10.100.0.11"); err != nil {
+			t.Fatalf("RouteBackendToClient peer-1: %v", err)
+		}
+		if err := f.RouteBackendToClient(1, returnPacket("10.100.0.12"), "10.100.0.12"); err != nil {
+			t.Fatalf("RouteBackendToClient peer-2: %v", err)
+		}
+		if err := f.RouteBackendToClient(1, returnPacket("10.100.0.13"), "10.100.0.13"); err != nil {
+			t.Fatalf("RouteBackendToClient peer-3: %v", err)
+		}
+	}
+
+	occ, _, _ := f.AggregateQueueStats()
+	if occ == 0 {
+		t.Fatal("expected positive aggregate queue occupancy before retirement")
+	}
+
+	// Start pumps so peer-1 begins writing and blocks in dev.Write
+	f.StartPumps(t.Context())
+	defer f.StopPumps()
+	defer dev.release()
+
+	select {
+	case <-dev.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("device write did not start")
+	}
+
+	// An in-flight write is now active on peer-1.
+	// RetireAllRoutes must clear maps and return a wait func that joins the write outside f.mu.
+	waitRetired := make(chan struct{})
+	go func() {
+		wait := f.RetireAllRoutes()
+		wait()
+		close(waitRetired)
+	}()
+
+	// Verify that wait() does not return while the write is blocked
+	select {
+	case <-waitRetired:
+		t.Fatal("RetireAllRoutes wait returned before admitted write completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// While waiting, maps must already be cleared
+	f.mu.RLock()
+	routesCount := len(f.routesByPeer)
+	ipCount := len(f.routesByIP)
+	devCount := len(f.clientDevices)
+	f.mu.RUnlock()
+	if routesCount != 0 || ipCount != 0 || devCount != 0 {
+		t.Fatalf("expected route maps to be cleared, got routes=%d ips=%d devs=%d", routesCount, ipCount, devCount)
+	}
+
+	// Unblock device write
+	dev.release()
+
+	select {
+	case <-waitRetired:
+	case <-time.After(time.Second):
+		t.Fatal("RetireAllRoutes wait timed out after releasing device")
+	}
+
+	// Post-retirement assertions
+	_, _, activeRoutes := f.GetStats()
+	if activeRoutes != 0 {
+		t.Fatalf("expected 0 active routes, got %d", activeRoutes)
+	}
+	if owner := f.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return route owner 'none', got %q", owner)
+	}
+	occAfter, _, _ := f.AggregateQueueStats()
+	if occAfter != 0 {
+		t.Fatalf("expected 0 aggregate queue occupancy, got %d", occAfter)
+	}
+	if err := f.RouteClientToBackend("peer-1", pkt); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for client->backend, got %v", err)
+	}
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.11"); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for backend->client, got %v", err)
+	}
+}
+
+func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 10)
+	beChan := make(chan []byte, 10)
+	f.backendQueues[1] = beChan
+
+	upReceived := make(chan []byte, 10)
+	upPath := NewReturnPath(func(peer, ip string, p []byte) (int, error) {
+		upReceived <- append([]byte(nil), p...)
+		return len(p), nil
+	})
+
+	// Register 2 custom routes
+	f.RegisterSession("sess-c1", "conn-c1", "peer-c1", "10.100.0.11", 1)
+	f.RegisterSession("sess-c2", "conn-c2", "peer-c2", "10.100.0.12", 1)
+
+	// Register 2 upstream routes
+	if _, err := f.TryRegisterSessionWithReturnPath("sess-u1", "conn-u1", "peer-u1", "10.100.0.21", 1, 0, 0, upPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.TryRegisterSessionWithReturnPath("sess-u2", "conn-u2", "peer-u2", "10.100.0.22", 1, 0, 0, upPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, active := f.GetStats()
+	if active != 4 {
+		t.Fatalf("expected 4 active routes, got %d", active)
+	}
+	if owner := f.ReturnRouteOwner(); owner != "mixed" {
+		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	}
+
+	// Retire only upstream routes
+	wait := f.RetireRoutesByReturnPath(upPath)
+	wait()
+
+	// Upstream routes are removed
+	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.21"), "10.100.0.21"); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for upstream route 1, got %v", err)
+	}
+	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.22"), "10.100.0.22"); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for upstream route 2, got %v", err)
+	}
+
+	// Custom routes remain intact
+	_, _, active = f.GetStats()
+	if active != 2 {
+		t.Fatalf("expected 2 active routes after retiring upstream, got %d", active)
+	}
+	if owner := f.ReturnRouteOwner(); owner != "custom" {
+		t.Fatalf("expected return route owner 'custom', got %q", owner)
+	}
+
+	// Custom routes still functional
+	customPkt := returnPacket("10.100.0.11")
+	if err := f.RouteBackendToClient(1, customPkt, "10.100.0.11"); err != nil {
+		t.Fatalf("RouteBackendToClient custom route failed: %v", err)
+	}
+
+	// Retire custom routes
+	waitCustom := f.RetireCustomRoutes()
+	waitCustom()
+
+	_, _, active = f.GetStats()
+	if active != 0 {
+		t.Fatalf("expected 0 active routes after retiring custom, got %d", active)
+	}
+	if owner := f.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return route owner 'none', got %q", owner)
+	}
+}
+
+func TestForwarder_Stop_FullCleanupAndDrain(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 10)
+	upPath := NewReturnPath(func(peer, ip string, p []byte) (int, error) {
+		return len(p), nil
+	})
+
+	f.RegisterSession("sess-c", "conn-c", "peer-c", "10.100.0.11", 1)
+	if _, err := f.TryRegisterSessionWithReturnPath("sess-u", "conn-u", "peer-u", "10.100.0.21", 1, 0, 0, upPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send packets to populate queue
+	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.11"), "10.100.0.11"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.21"), "10.100.0.21"); err != nil {
+		t.Fatal(err)
+	}
+
+	occ, _, _ := f.AggregateQueueStats()
+	if occ == 0 {
+		t.Fatal("expected positive aggregate queue occupancy before stop")
+	}
+	if owner := f.ReturnRouteOwner(); owner != "mixed" {
+		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	}
+
+	if err := f.Stop(); err != nil {
+		t.Fatalf("Forwarder.Stop: %v", err)
+	}
+
+	if f.IsRunning() {
+		t.Fatal("expected IsRunning false after Stop")
+	}
+	_, _, active := f.GetStats()
+	if active != 0 {
+		t.Fatalf("expected 0 active routes after Stop, got %d", active)
+	}
+	if owner := f.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return route owner 'none' after Stop, got %q", owner)
+	}
+	occAfter, _, _ := f.AggregateQueueStats()
+	if occAfter != 0 {
+		t.Fatalf("expected 0 queue occupancy after Stop, got %d", occAfter)
+	}
+
+	// Verify route rejection
+	pkt := returnPacket("10.100.0.11")
+	if err := f.RouteClientToBackend("peer-c", pkt); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for RouteClientToBackend, got %v", err)
+	}
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.11"); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for RouteBackendToClient, got %v", err)
+	}
+
+	f.mu.RLock()
+	rByPeer := len(f.routesByPeer)
+	rByIP := len(f.routesByIP)
+	cDevs := len(f.clientDevices)
+	f.mu.RUnlock()
+	if rByPeer != 0 || rByIP != 0 || cDevs != 0 {
+		t.Fatalf("expected maps empty: routesByPeer=%d routesByIP=%d clientDevices=%d", rByPeer, rByIP, cDevs)
 	}
 }

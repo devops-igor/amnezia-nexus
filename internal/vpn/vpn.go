@@ -1800,6 +1800,11 @@ func (s *Service) Stop() error {
 	if s.endpoint != nil {
 		_ = s.endpoint.Stop()
 	}
+	if s.forwarder != nil {
+		if wait := s.forwarder.RetireCustomRoutes(); wait != nil {
+			wait()
+		}
+	}
 	if s.prober != nil {
 		s.prober.Stop()
 	}

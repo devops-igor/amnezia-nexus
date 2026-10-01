@@ -88,6 +88,7 @@ type IngressEngine struct {
 	// field is never written after Start.
 	reapInterval     time.Duration
 	peerSyncInterval time.Duration
+	retireRoutes     func()
 }
 
 // reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
@@ -395,10 +396,18 @@ func (e *IngressEngine) Stop() error {
 	e.stopCh, e.stopped = nil, nil
 	e.reapStopCh, e.reapDoneCh = nil, nil
 	e.peerSyncStopCh, e.peerSyncDoneCh = nil, nil
+	retireRoutes := e.retireRoutes
 	e.mu.Unlock()
 
 	if e.returnPath != nil {
 		e.returnPath.Close()
+		if retireRoutes != nil {
+			retireRoutes()
+		} else if e.svc != nil && e.svc.forwarder != nil {
+			if wait := e.svc.forwarder.RetireRoutesByReturnPath(e.returnPath); wait != nil {
+				wait()
+			}
+		}
 	}
 	// Detach the DB listener FIRST, then invalidate the enqueue path, then
 	// drain the worker (issue #391 round 4b, finding 2). Order matters:
@@ -447,6 +456,13 @@ func (e *IngressEngine) Stop() error {
 		return ErrIngressEngineNotStarted
 	}
 	return nil
+}
+
+// SetRouteRetirementCallbackForTest configures a test hook for forwarder route retirement.
+func (e *IngressEngine) SetRouteRetirementCallbackForTest(fn func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.retireRoutes = fn
 }
 
 // Router exposes the engine's router for observability (StatsSnapshot) and
