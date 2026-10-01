@@ -87,9 +87,8 @@ type UserVPNState struct {
 	LatencyMS       int64              `json:"latency_ms,omitempty"`
 }
 
-// Client AWG engines.
+// Client AWG engines. Upstream is the sole, permanent client-facing engine.
 const (
-	ClientAWGEngineCustom   = "custom"
 	ClientAWGEngineUpstream = "upstream"
 )
 
@@ -1643,13 +1642,6 @@ func (s *Service) Stop() error {
 			recordErr(err)
 		}
 	}
-	if s.forwarder != nil {
-		if wait := s.forwarder.RetireCustomRoutes(); wait != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			recordErr(wait(ctx))
-			cancel()
-		}
-	}
 	if s.prober != nil {
 		s.prober.Stop()
 	}
@@ -1707,7 +1699,7 @@ func (s *Service) IsRunning() bool {
 	return s.running
 }
 
-// ReturnRouteOwner returns the actual forwarder return route owner ("upstream", "custom", or "none").
+// ReturnRouteOwner returns the actual forwarder return route owner ("upstream" or "none").
 // If the service is not running or has no registered routes, it returns "none".
 func (s *Service) ReturnRouteOwner() string {
 	s.mu.RLock()

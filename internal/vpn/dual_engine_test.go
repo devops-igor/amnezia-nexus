@@ -42,7 +42,7 @@ func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
 }
 
 // TestDualEngine_StartupUpstreamMode verifies that upstream mode boots IngressEngine,
-// does NOT start endpoint.Listener, and populates status.
+// does not use legacy client listeners, and populates status.
 func TestDualEngine_StartupUpstreamMode(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
@@ -140,8 +140,8 @@ func TestDualEngine_StartupLogging(t *testing.T) {
 	}
 }
 
-// TestDualEngine_ReturnPathFailClosedFencing verifies PR #398 mandate:
-// Upstream-owned ReturnPath must fail closed on Close and never silently fall back to SendToPeer.
+// TestDualEngine_ReturnPathFailClosedFencing verifies:
+// Upstream-owned ReturnPath must fail closed on Close and never silently fall back to legacy writes.
 func TestDualEngine_ReturnPathFailClosedFencing(t *testing.T) {
 	var writes atomic.Int64
 	path := forwarder.NewReturnPath(func(peer, ip string, pkt []byte) (int, error) {
@@ -496,7 +496,7 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 	}
 
 	// Verify upstream route was retired, custom route remains
-	if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineCustom {
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
 		t.Errorf("expected return route owner custom, got %q", owner)
 	}
 	_, _, activeAfter := svc.forwarder.GetStats()
@@ -520,7 +520,7 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 	}
 
 	// engine2 route retired, custom route still remains
-	if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineCustom {
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
 		t.Errorf("expected return route owner custom, got %q", owner)
 	}
 	_, _, activeAfter2 := svc.forwarder.GetStats()

@@ -9,7 +9,7 @@ import (
 
 // gatedDevice is a PacketDevice whose Write blocks until the device is
 // closed; it records every frame written to it. It models a slow downstream
-// consumer (e.g. SendToPeer blocked on a contended lock or a slow UDP write)
+// consumer (e.g. transport writer blocked on a contended lock or a slow UDP write)
 // that later recovers: closing the device opens the gate and releases any
 // in-flight Write, so StopPumps can always complete.
 type gatedDevice struct {

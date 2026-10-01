@@ -27,20 +27,78 @@ When users connect directly to a foreign VPS, an IP block takes down everyone's 
 
 ## How it works
 
+### Data Plane Architecture
+
+Amnezia Nexus employs a high-performance, userspace in-memory data plane architecture powered by upstream `amneziawg-go` for both client ingress and backend egress:
+
 ```text
-[Users Inside the Country] 
-     │  (Domestic connection - stays unblocked)
-     ▼
-[Nexus Portal (Hosted Locally)] 
-     │  1. Terminates client handshake & decrypts traffic
-     │  2. Picks a healthy foreign exit node
-     │  3. Re-encrypts traffic for that backend
-     ▼
-[Backend Node A (Foreign)]   [Backend Node B (Foreign)]
-     │  (If Node A gets blocked by DPI, Nexus fails over to Node B)
-     ▼
-[Open Internet]
+Ingress Path:
+
+[Client / AmneziaWG Official App]
+               │ (AWG 3.x Obfuscated UDP Handshake & Transport)
+               ▼
+   [Nexus Ingress Engine (amneziawg-go)]
+               │ (Decrypted IP Packets via In-Memory Channel Ring)
+               ▼
+     [VirtualTUN (Userspace Memory)]
+               │ (Zero Kernel Copies, Zero /dev/net/tun Dependency)
+               ▼
+   [Nexus Forwarder & Load Balancer]
+               │ (Least Connections / Sticky / Round-Robin L3 Routing)
+               ▼
+     [VirtualTUN (Userspace Memory)]
+               │ (Decrypted IP Packets via In-Memory Channel Ring)
+               ▼
+   [Nexus Egress Engine (amneziawg-go)]
+               │ (AWG 3.x Obfuscated UDP Encrypted Tunnel)
+               ▼
+[Backend Server Container (Foreign Node)]
+               │
+               ▼
+         [Open Internet]
+
+Return Path:
+
+[Backend Server Container (Foreign Node)]
+               │ (AWG 3.x Encrypted Tunnel)
+               ▼
+   [Nexus Egress Engine (amneziawg-go)]
+               │ (Decrypted IP Packets via VirtualTUN)
+               ▼
+   [Nexus Forwarder]
+               │ (Explicit Route Lookup by Destination IP)
+               ▼
+   [ReturnPath Writer]
+               │ (Direct Write via In-Memory Ring)
+               ▼
+     [VirtualTUN (Userspace Memory)]
+               │
+               ▼
+   [Nexus Ingress Engine (amneziawg-go)]
+               │ (AWG 3.x Encrypted UDP Transport)
+               ▼
+[Client / AmneziaWG Official App]
 ```
+
+1. **Client Termination**: Nexus terminates client-facing AmneziaWG handshakes and transport encryption using official upstream `amneziawg-go` running in userspace. All cryptographic operations, replay windows, handshake timers, key rotations, and NAT roaming are handled by upstream WireGuard/AmneziaWG protocol logic.
+2. **In-Memory VirtualTUN**: Ingress and egress engines interface with the Nexus router via `VirtualTUN`, an ownership-neutral userspace in-memory ring buffer with bounded capacity and zero-allocation fast paths. Zero kernel TUN interfaces or `/dev/net/tun` devices are required.
+3. **L3 Routing & Forwarding**: Nexus routes raw L3 IP packets to assigned backend tunnels based on load balancing policy and dynamic health monitoring.
+4. **Backend Egress**: Backends run upstream `amneziawg-go` in containers on foreign exit nodes, completely decoupling user configurations from foreign IP addresses.
+
+### Structural Reliability & Issue #383 Resolution
+
+Prior to the upstream migration (Epic #384 / Epic #394), Nexus maintained a custom Go implementation of the WireGuard/AmneziaWG state machine. In production, this resulted in edge-case state desynchronizations cataloged in issue #383. Under the upstream-only architecture, these failure classes are **structurally impossible**:
+
+| #383 Failure Class | Upstream Architecture Elimination Guarantee |
+|---|---|
+| **Replay misclassification** | Upstream `amneziawg-go` owns all anti-replay bitmap and counter validation. Nexus operates exclusively on decrypted L3 packets via `VirtualTUN`. |
+| **Missing return-path transport keys** | Upstream `amneziawg-go` owns and selects client transport keys. Nexus forwarder writes raw IP return packets directly to the explicit `ReturnPath` bound to the IngressEngine. |
+| **Key-expiry vs idle-timeout coupling** | AWG key timers, rekey exchanges, and keepalives belong entirely to upstream protocol logic. Nexus session reaping is strictly routing-only and cannot destroy transport key state. |
+| **previous/current/next key rollover defects** | Those key slots no longer exist in Nexus; upstream handles the complete Noise IK state machine. |
+| **Receiver-index lifecycle defects** | Nexus maintains zero receiver-index tables. Upstream maps incoming receiver indices to peer sessions. |
+| **Custom transport decryption failures** | Nexus performs zero client transport encryption/decryption. `amneziawg-go` decrypts all transport packets before passing IP payloads to `VirtualTUN`. |
+| **Endpoint roaming defects** | Upstream WireGuard peer state automatically updates peer UDP endpoints on authenticated transport packets. |
+| **Self-rebind rejection cycle** | Packet-driven source IP rebinding is permanently deleted. Inbound packet source IPs must match the durable route assigned IP; mismatches are dropped immediately without mutating routing tables. |
 
 ---
 
@@ -75,20 +133,9 @@ sysctl net.ipv4.ip_forward
 
 > **Why `rp_filter = 2`?** By default, Linux drops packets if their return route does not match the incoming interface. Because VPN traffic enters through a tunnel interface and leaves through your WAN interface, strict filtering will silently drop return traffic. Loose mode (`2`) fixes this.
 
-### 2. Make sure the TUN device is available
+### 2. Configure firewall and forwarding
 
-Nexus needs `/dev/net/tun` to handle tunnel traffic:
-
-```bash
-sudo modprobe tun
-echo "tun" | sudo tee -a /etc/modules-load.d/tun.conf
-ls -l /dev/net/tun
-# Should show: crw-rw-rw- 1 root root ... /dev/net/tun
-```
-
-### 3. Configure firewall and forwarding
-
-Your firewall needs to let forwarded traffic through.
+Your firewall needs to let incoming connections through.
 
 #### If you use UFW:
 
@@ -114,8 +161,6 @@ WAN_IFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
 
 # Allow forwarded traffic
 sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -i amn+ -o "$WAN_IFACE" -j ACCEPT
-sudo iptables -A FORWARD -i "$WAN_IFACE" -o amn+ -j ACCEPT
 
 # Enable NAT masquerade so packets leave with the server's public IP
 sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
@@ -124,7 +169,7 @@ sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
 sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
-### 4. Install Docker
+### 3. Install Docker
 
 If you don't already have Docker installed:
 
@@ -154,11 +199,6 @@ services:
     image: ghcr.io/devops-igor/amnezia-nexus:v2.0.0
     container_name: amnezia-panel
     restart: unless-stopped
-    user: root
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
     ports:
       - "8080:5000"           # Web panel
       - "51820:51820/udp"     # VPN port
