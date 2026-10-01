@@ -3,13 +3,13 @@ package vpn
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -543,9 +543,8 @@ func (f *faultyStatusUpdater) SetTunnelStatusWithVersion(ctx context.Context, se
 }
 
 // TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync verifies that:
-//  1. When VPN_ENABLED=true but the host has no TUN device (endpoint.ErrTunUnavailable),
-//     vpnSvc.Start still executes Pool.SyncFromDB successfully before failing on TUN initialization.
-//  2. Wiring orch.SetTunnelStatusUpdater(vpnSvc) in management mode keeps in-memory pool
+//  1. When VPN_ENABLED=true, vpnSvc.Start executes Pool.SyncFromDB successfully.
+//  2. Wiring orch.SetTunnelStatusUpdater(vpnSvc) keeps in-memory pool
 //     and database records strictly synchronized when Orchestrator runs health updates.
 func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 	ctx := context.Background()
@@ -582,32 +581,37 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 		t.Fatalf("CreateBackendTunnel failed: %v", err)
 	}
 
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	listenPort := socket.LocalAddr().(*net.UDPAddr).Port
+	_ = socket.Close()
+
 	vpnSvc, err := NewVPNService(db, nil)
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	vpnSvc.RequireTunDevice()
-	vpnSvc.SetTunOpener(func() (endpoint.PacketDevice, error) {
-		return nil, endpoint.ErrTunUnavailable
+	vpnSvc.cfg.ListenPort = listenPort
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
 	})
 
-	stErr := vpnSvc.Start(ctx)
-	if !errors.Is(stErr, endpoint.ErrTunUnavailable) {
-		t.Fatalf("expected ErrTunUnavailable from Start, got: %v", stErr)
+	if err := vpnSvc.Start(ctx); err != nil {
+		t.Fatalf("vpnSvc.Start failed: %v", err)
 	}
+	defer vpnSvc.Stop()
 
-	// Startup sync invalidates persisted health before the TUN open attempt.
-	// Even though Start then fails in management-only mode, the backend stays
-	// enabled with unknown runtime health and a fenced state version.
+	// Initial probe on startup establishes active health at state version 3.
 	poolTunInitial, err := vpnSvc.pool.GetTunnel(sID)
 	if err != nil || poolTunInitial == nil {
-		t.Fatalf("pool GetTunnel failed after SyncFromDB: %v", err)
+		t.Fatalf("pool GetTunnel failed after Start: %v", err)
 	}
-	if poolTunInitial.StateVersion != 2 {
-		t.Fatalf("expected startup-reset pool version 2, got %d", poolTunInitial.StateVersion)
+	if poolTunInitial.StateVersion != 3 {
+		t.Fatalf("expected startup pool version 3, got %d", poolTunInitial.StateVersion)
 	}
-	if poolTunInitial.Status != models.TunnelStatusConnecting {
-		t.Fatalf("expected startup-reset pool status connecting, got %s", poolTunInitial.Status)
+	if poolTunInitial.Status != models.TunnelStatusActive {
+		t.Fatalf("expected startup pool status active, got %s", poolTunInitial.Status)
 	}
 
 	orch := orchestrator.New(db, nil,
@@ -637,11 +641,11 @@ func TestOrchestrator_TunUnavailableManagementMode_PoolAndDBSync(t *testing.T) {
 	if dbTun.Status != "degraded" {
 		t.Errorf("expected db status degraded, got %s", dbTun.Status)
 	}
-	if poolTun.StateVersion != 3 {
-		t.Errorf("expected pool version 3, got %d", poolTun.StateVersion)
+	if poolTun.StateVersion != 4 {
+		t.Errorf("expected pool version 4, got %d", poolTun.StateVersion)
 	}
-	if dbTun.StateVersion != 3 {
-		t.Errorf("expected db version 3, got %d", dbTun.StateVersion)
+	if dbTun.StateVersion != 4 {
+		t.Errorf("expected db version 4, got %d", dbTun.StateVersion)
 	}
 	if poolTun.StateVersion != dbTun.StateVersion {
 		t.Fatalf("pool and DB state_version desynchronized: pool=%d, db=%d", poolTun.StateVersion, dbTun.StateVersion)

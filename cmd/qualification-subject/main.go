@@ -29,8 +29,11 @@ func main() {
 	if *echoPort <= 0 || *echoPort > 65535 {
 		log.Fatalf("[qualification-subject] invalid echo port: %d (must be 1-65535)", *echoPort)
 	}
-	if *engine != "custom" && *engine != "upstream" {
-		log.Fatalf("[qualification-subject] invalid engine: %q (must be 'custom' or 'upstream')", *engine)
+	if *engine == "custom" {
+		log.Fatalf("[qualification-subject] custom engine is no longer supported: upstream is the only runtime engine")
+	}
+	if *engine != "upstream" {
+		log.Fatalf("[qualification-subject] invalid engine: %q (must be 'upstream')", *engine)
 	}
 
 	cfg := vpn.QualificationSubjectConfig{

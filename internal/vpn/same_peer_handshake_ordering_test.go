@@ -124,7 +124,7 @@ func TestSamePeerHandshakeRetirementOrderingRegression(t *testing.T) {
 		t.Fatalf("create connection: %v", err)
 	}
 
-	if err := svc.Start(t.Context()); err != nil {
+	if err := svc.StartCustomEndpointForTest(t.Context()); err != nil {
 		t.Fatalf("start vpn service: %v", err)
 	}
 	defer func() { _ = svc.Stop() }()
@@ -408,7 +408,7 @@ func TestSamePeerHandshakeResponseSendRaceRegression(t *testing.T) {
 		}
 	})
 
-	if err := svc.Start(t.Context()); err != nil {
+	if err := svc.StartCustomEndpointForTest(t.Context()); err != nil {
 		t.Fatalf("start vpn service: %v", err)
 	}
 	defer func() { _ = svc.Stop() }()

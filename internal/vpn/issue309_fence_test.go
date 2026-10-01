@@ -36,7 +36,7 @@ func TestTeardownFencesHandshakeBeforeWaitingForWrite(t *testing.T) {
 			ctx := context.Background()
 			svc, _, _, userID, _ := setupTestVPNService(t, setupTestDB(t))
 			defer func() { _ = svc.Stop() }()
-			if err := svc.Start(ctx); err != nil {
+			if err := svc.StartCustomEndpointForTest(ctx); err != nil {
 				t.Fatal(err)
 			}
 

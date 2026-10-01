@@ -223,14 +223,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	assertDBIntegrity("pre-flight")
 
 	// =========================================================================
-	// Step 1: Custom Engine (Baseline)
+	// Step 1: Upstream Engine (Initial Run)
 	// =========================================================================
-	t.Log("=== Step 1: Starting Service 1 in Custom Engine Mode ===")
-	t.Setenv("VPN_CLIENT_AWG_ENGINE", ClientAWGEngineCustom)
-	if err := svc1.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
-		t.Fatalf("svc1.SetClientAWGEngine(custom): %v", err)
-	}
-
+	t.Log("=== Step 1: Starting Service 1 in Upstream Engine Mode ===")
 	if err := svc1.Start(ctx); err != nil {
 		t.Fatalf("svc1.Start failed: %v", err)
 	}
@@ -250,27 +245,47 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("svc1.GetStatus: %v", err)
 	}
-	if stat1.ConfiguredEngine != ClientAWGEngineCustom || stat1.ActiveEngine != ClientAWGEngineCustom {
+	if stat1.ConfiguredEngine != ClientAWGEngineUpstream || stat1.ActiveEngine != ClientAWGEngineUpstream {
 		t.Fatalf("svc1 status engine mismatch: configured=%s, active=%s", stat1.ConfiguredEngine, stat1.ActiveEngine)
 	}
 	if stat1.ListenPort != initialListenPort {
 		t.Fatalf("svc1 listen port changed: got %d, want %d", stat1.ListenPort, initialListenPort)
 	}
 
+	engine1 := svc1.IngressEngine()
+	if engine1 == nil || !engine1.Running() {
+		t.Fatal("svc1 expected running IngressEngine")
+	}
+	if engine1.returnPath == nil {
+		t.Fatal("svc1 expected non-nil engine ReturnPath")
+	}
+
 	// Connect real userspace AmneziaWG client on Leg 1
 	client1 := newRollbackRealClient(t, peer, rawConfig, dest, 0x11)
-	payload1 := []byte("rollback-rehearsal-traffic-leg-1-custom")
+	payload1 := []byte("rollback-rehearsal-traffic-leg-1-upstream")
 	returnExchange(t, client1.tcp, payload1, false, 0x11)
 	returnExchange(t, client1.udp, payload1, true, 0x11)
 
-	// Verify owner transition to custom
+	// Verify session and route were admitted under upstream ReturnPath
+	sess1, ok := svc1.sessionMgr.GetSessionSnapshotByPeer(initialClientPubKey)
+	if !ok {
+		t.Fatal("svc1 expected active session for peer")
+	}
+	if sess1.AssignedIP != initialAssignedIP {
+		t.Fatalf("svc1 session IP %s != frozen %s", sess1.AssignedIP, initialAssignedIP)
+	}
+	if !svc1.forwarder.HasSessionRouteWithReturnPath(initialClientPubKey, sess1.ID, initialConnectionID, initialAssignedIP, sess1.BackendTunnelID, engine1.returnPath) {
+		t.Fatal("svc1 forwarder route with returnPath missing")
+	}
+
+	// Verify owner transition to upstream
 	ownerTransitions = append(ownerTransitions, svc1.forwarder.ReturnRouteOwner())
-	if svc1.forwarder.ReturnRouteOwner() != ClientAWGEngineCustom {
-		t.Fatalf("svc1 expected ReturnRouteOwner custom, got %q", svc1.forwarder.ReturnRouteOwner())
+	if svc1.forwarder.ReturnRouteOwner() != ClientAWGEngineUpstream {
+		t.Fatalf("svc1 expected ReturnRouteOwner upstream, got %q", svc1.forwarder.ReturnRouteOwner())
 	}
 	stat1After, _ := svc1.GetStatus(ctx)
-	if stat1After.ReturnRouteOwner != ClientAWGEngineCustom {
-		t.Fatalf("svc1 status return route owner expected custom, got %q", stat1After.ReturnRouteOwner)
+	if stat1After.ReturnRouteOwner != ClientAWGEngineUpstream {
+		t.Fatalf("svc1 status return route owner expected upstream, got %q", stat1After.ReturnRouteOwner)
 	}
 
 	// Assert portal public/private keys and client assigned IP match frozen state
@@ -306,10 +321,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	assertDBIntegrity("post-step-1")
 
 	// =========================================================================
-	// Step 2: Custom -> Upstream Cutover
+	// Step 2: Upstream Engine (First Process Restart)
 	// =========================================================================
-	t.Log("=== Step 2: Starting Service 2 in Upstream Engine Mode (Cutover) ===")
-	t.Setenv("VPN_CLIENT_AWG_ENGINE", ClientAWGEngineUpstream)
+	t.Log("=== Step 2: Starting Service 2 in Upstream Engine Mode (Restart 1) ===")
 
 	// Create fresh Service against the EXACT SAME database
 	svc2, err := NewVPNService(db, nil)
@@ -334,9 +348,6 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 		t.Fatalf("client config digest mutated before cutover: got %x, want %x", sum, frozenConfigHash)
 	}
 
-	if err := svc2.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
-		t.Fatalf("svc2.SetClientAWGEngine(upstream): %v", err)
-	}
 	if err := svc2.Start(ctx); err != nil {
 		t.Fatalf("svc2.Start failed: %v", err)
 	}
@@ -435,10 +446,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	assertDBIntegrity("post-step-2")
 
 	// =========================================================================
-	// Step 3: Upstream -> Custom Rollback
+	// Step 3: Upstream Engine (Second Process Restart)
 	// =========================================================================
-	t.Log("=== Step 3: Starting Service 3 in Custom Engine Mode (Rollback) ===")
-	t.Setenv("VPN_CLIENT_AWG_ENGINE", ClientAWGEngineCustom)
+	t.Log("=== Step 3: Starting Service 3 in Upstream Engine Mode (Second Restart) ===")
 
 	// Create fresh Service against the EXACT SAME database
 	svc3, err := NewVPNService(db, nil)
@@ -460,12 +470,9 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 
 	// Verify frozen client configuration digest remains 100% identical
 	if sum := sha256.Sum256([]byte(rawConfig)); sum != frozenConfigHash {
-		t.Fatalf("client config digest mutated before rollback: got %x, want %x", sum, frozenConfigHash)
+		t.Fatalf("client config digest mutated before restart 2: got %x, want %x", sum, frozenConfigHash)
 	}
 
-	if err := svc3.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
-		t.Fatalf("svc3.SetClientAWGEngine(custom): %v", err)
-	}
 	if err := svc3.Start(ctx); err != nil {
 		t.Fatalf("svc3.Start failed: %v", err)
 	}
@@ -485,20 +492,28 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("svc3.GetStatus: %v", err)
 	}
-	if stat3.ConfiguredEngine != ClientAWGEngineCustom || stat3.ActiveEngine != ClientAWGEngineCustom {
+	if stat3.ConfiguredEngine != ClientAWGEngineUpstream || stat3.ActiveEngine != ClientAWGEngineUpstream {
 		t.Fatalf("svc3 status engine mismatch: configured=%s, active=%s", stat3.ConfiguredEngine, stat3.ActiveEngine)
 	}
 	if stat3.ListenPort != initialListenPort {
 		t.Fatalf("svc3 listen port changed: got %d, want %d", stat3.ListenPort, initialListenPort)
 	}
 
+	engine3 := svc3.IngressEngine()
+	if engine3 == nil || !engine3.Running() {
+		t.Fatal("svc3 expected running IngressEngine")
+	}
+	if engine3.returnPath == nil {
+		t.Fatal("svc3 expected non-nil engine ReturnPath")
+	}
+
 	// Connect real userspace AmneziaWG client on Leg 3 using EXACT SAME frozen config
 	client3 := newRollbackRealClient(t, peer, rawConfig, dest, 0x33)
-	payload3 := []byte("rollback-rehearsal-traffic-leg-3-custom")
+	payload3 := []byte("rollback-rehearsal-traffic-leg-3-upstream")
 	returnExchange(t, client3.tcp, payload3, false, 0x33)
 	returnExchange(t, client3.udp, payload3, true, 0x33)
 
-	// Client admission in rolled-back custom mode (using EXACT SAME frozen credentials)
+	// Client admission in upstream mode (using EXACT SAME frozen credentials)
 	sess3, ok := svc3.sessionMgr.GetSessionSnapshotByPeer(initialClientPubKey)
 	if !ok {
 		t.Fatal("svc3 expected active session for peer")
@@ -506,18 +521,18 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if sess3.AssignedIP != initialAssignedIP {
 		t.Fatalf("svc3 admitted IP %s != frozen %s", sess3.AssignedIP, initialAssignedIP)
 	}
-	if !svc3.forwarder.HasSessionRoute(initialClientPubKey, sess3.ID, initialConnectionID, initialAssignedIP, sess3.BackendTunnelID) {
-		t.Fatal("svc3 forwarder route not registered")
+	if !svc3.forwarder.HasSessionRouteWithReturnPath(initialClientPubKey, sess3.ID, initialConnectionID, initialAssignedIP, sess3.BackendTunnelID, engine3.returnPath) {
+		t.Fatal("svc3 forwarder route with returnPath missing")
 	}
 
-	// Verify owner transition to custom
+	// Verify owner transition to upstream
 	ownerTransitions = append(ownerTransitions, svc3.forwarder.ReturnRouteOwner())
-	if svc3.forwarder.ReturnRouteOwner() != ClientAWGEngineCustom {
-		t.Fatalf("svc3 expected ReturnRouteOwner custom, got %q", svc3.forwarder.ReturnRouteOwner())
+	if svc3.forwarder.ReturnRouteOwner() != ClientAWGEngineUpstream {
+		t.Fatalf("svc3 expected ReturnRouteOwner upstream, got %q", svc3.forwarder.ReturnRouteOwner())
 	}
 	stat3After, _ := svc3.GetStatus(ctx)
-	if stat3After.ReturnRouteOwner != ClientAWGEngineCustom {
-		t.Fatalf("svc3 status return route owner expected custom, got %q", stat3After.ReturnRouteOwner)
+	if stat3After.ReturnRouteOwner != ClientAWGEngineUpstream {
+		t.Fatalf("svc3 status return route owner expected upstream, got %q", stat3After.ReturnRouteOwner)
 	}
 
 	// Assert portal public/private keys and client assigned IP match frozen state
@@ -561,16 +576,16 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	t.Log("=== Verifying Global Lifecycle Invariants ===")
 
 	// 1. ReturnRouteOwner Transition Progression:
-	//    none -> custom -> none -> upstream -> none -> custom -> none
+	//    none -> upstream -> none -> none -> upstream -> none -> none -> upstream -> none
 	wantTransitions := []string{
 		"none",     // svc1 started, no traffic
-		"custom",   // svc1 traffic routed
+		"upstream", // svc1 traffic routed
 		"none",     // svc1 stopped
 		"none",     // svc2 started, no traffic
 		"upstream", // svc2 traffic routed
 		"none",     // svc2 stopped
 		"none",     // svc3 started, no traffic
-		"custom",   // svc3 traffic routed
+		"upstream", // svc3 traffic routed
 		"none",     // svc3 stopped
 	}
 	if len(ownerTransitions) != len(wantTransitions) {
@@ -594,8 +609,8 @@ func TestDualEngine_SameDBSamePortSameConfigRollback(t *testing.T) {
 	if activeRoutes != 0 {
 		t.Fatalf("expected 0 active routes in forwarder, got %d", activeRoutes)
 	}
-	if svc3.forwarder.HasRoutesForReturnPath(nil) {
-		t.Fatal("expected no custom routes remaining in forwarder")
+	if svc3.forwarder.HasRoutesForReturnPath(engine3.returnPath) {
+		t.Fatal("expected no upstream routes remaining in forwarder")
 	}
 
 	// 4. Database session restart reconciliation invariant:

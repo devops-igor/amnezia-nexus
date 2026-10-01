@@ -23,22 +23,24 @@ func (h *Handlers) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		version = h.cfg.AppVersion
 	}
 
-	configuredEngine := config.ClientAWGEngineCustom
-	if h.vpnSvc != nil {
-		configuredEngine = h.vpnSvc.ClientAWGEngine()
-	} else if h.cfg != nil && h.cfg.ClientAWGEngine != "" {
-		configuredEngine = h.cfg.ClientAWGEngine
-	}
-
+	configuredEngine := "upstream"
 	activeEngine := "none"
 	engineRunning := false
 	returnRouteOwner := "none"
 
 	if h.vpnSvc != nil {
-		engineRunning = h.vpnSvc.IsRunning()
-		if engineRunning {
-			activeEngine = configuredEngine
-			returnRouteOwner = h.vpnSvc.ReturnRouteOwner()
+		stat, err := h.vpnSvc.GetStatus(r.Context())
+		if err == nil && stat != nil {
+			configuredEngine = stat.ConfiguredEngine
+			activeEngine = stat.ActiveEngine
+			engineRunning = stat.EngineRunning
+			returnRouteOwner = stat.ReturnRouteOwner
+		} else {
+			engineRunning = h.vpnSvc.IsRunning()
+			if engineRunning {
+				activeEngine = "upstream"
+				returnRouteOwner = h.vpnSvc.ReturnRouteOwner()
+			}
 		}
 	}
 

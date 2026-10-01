@@ -602,15 +602,9 @@ func TestUpstreamPeerSurvivesServiceRestart(t *testing.T) {
 
 	// (b) The configured peer is reconstructed from durable state, not from
 	// any vpn_sessions row: resolver lease + portal identity, both durable.
-	freshEngine, err := started.NewIngressEngine(ctx, "restart-portal", []clientawg.Peer{
-		{PublicKey: peer.publicKey, AllowedIP: netip.PrefixFrom(ip, 32)},
-	})
-	if err != nil {
-		t.Fatalf("engine reconstruction from restarted service: %v", err)
-	}
-	t.Cleanup(func() { _ = freshEngine.Stop() })
-	if err := freshEngine.Start(); err != nil {
-		t.Fatal(err)
+	freshEngine := started.ingressEngine
+	if freshEngine == nil {
+		t.Fatal("expected ingressEngine to be initialized after Start")
 	}
 	ownership, ok := freshEngine.Resolver().Lookup(ip)
 	if !ok || ownership.PeerPublicKey != peer.publicKey {

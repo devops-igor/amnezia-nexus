@@ -472,10 +472,14 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 	if err == nil {
 		defer occConn.Close()
 		occPort := occConn.LocalAddr().(*net.UDPAddr).Port
-		// Create a listener with the already occupied port
-		listenerCfg := endpoint.ListenerConfig{ListenPort: occPort}
-		occListener, _ := endpoint.NewListener(listenerCfg, db, nil, nil, nil, nil)
-		invalidListenerSvc.endpoint = occListener
+		cfg, err := invalidListenerSvc.GetConfig(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ListenPort = occPort
+		if err := invalidListenerSvc.UpdateConfig(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
 		if err := invalidListenerSvc.Start(ctx); err == nil {
 			t.Errorf("expected error from Start when port is occupied")
 		}
@@ -1202,8 +1206,8 @@ func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
-	if err := vpnSvc.Start(ctx); err != nil {
-		t.Fatalf("vpnSvc.Start failed: %v", err)
+	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("vpnSvc.StartCustomEndpointForTest failed: %v", err)
 	}
 	defer func() { _ = vpnSvc.Stop() }()
 
@@ -4460,15 +4464,29 @@ func TestGenerateClientConfig_ListenerKeyAgreement_ObfuscatedHandshake(t *testin
 		t.Fatalf("CreateBackendTunnel failed: %v", err)
 	}
 
-	svc, err := NewVPNService(db, nil)
+	tempConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	testPort := 51820
+	if err == nil {
+		testPort = tempConn.LocalAddr().(*net.UDPAddr).Port
+		_ = tempConn.Close()
+	}
+	vCfg, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vCfg.ListenPort = testPort
+	if err := db.SaveVPNConfig(ctx, vCfg); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := NewVPNService(db, vCfg)
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("svc.Start failed: %v", err)
+	if err := svc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("svc.StartCustomEndpointForTest failed: %v", err)
 	}
 	defer func() { _ = svc.Stop() }()
 
@@ -4889,8 +4907,8 @@ func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 5 * time.Millisecond, nil
 	})
-	if err := vpnSvc.Start(ctx); err != nil {
-		t.Fatalf("vpnSvc.Start failed: %v", err)
+	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("vpnSvc.StartCustomEndpointForTest failed: %v", err)
 	}
 	defer func() { _ = vpnSvc.Stop() }()
 
@@ -5165,8 +5183,8 @@ func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
 	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("svc.Start failed: %v", err)
+	if err := svc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("svc.StartCustomEndpointForTest failed: %v", err)
 	}
 	defer func() { _ = svc.Stop() }()
 
@@ -7090,8 +7108,8 @@ func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing
 	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
-	if err := vpnSvc.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
 	}
 
 	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
@@ -7457,8 +7475,8 @@ func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t 
 	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
-	if err := vpnSvc.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
 	}
 
 	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
@@ -7584,8 +7602,8 @@ func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *t
 	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
 	defer func() { _ = vpnSvc.Stop() }()
 
-	if err := vpnSvc.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
+		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
 	}
 
 	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)

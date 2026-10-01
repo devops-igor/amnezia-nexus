@@ -206,8 +206,8 @@ func TestVPNHandlers(t *testing.T) {
 		if err := json.NewDecoder(w.Body).Decode(&stat); err != nil {
 			t.Fatalf("failed to decode vpn status response: %v", err)
 		}
-		if stat.ConfiguredEngine != "custom" {
-			t.Errorf("expected configured_engine custom, got %q", stat.ConfiguredEngine)
+		if stat.ConfiguredEngine != "upstream" {
+			t.Errorf("expected configured_engine upstream, got %q", stat.ConfiguredEngine)
 		}
 		if stat.ActiveEngine != "none" {
 			t.Errorf("expected active_engine 'none' when not running, got %q", stat.ActiveEngine)
@@ -223,15 +223,15 @@ func TestVPNHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("VPNStatusHandler_UpstreamEngine", func(t *testing.T) {
-		if h.vpnSvc != nil {
-			_ = h.vpnSvc.SetClientAWGEngine("upstream")
-			defer func() { _ = h.vpnSvc.SetClientAWGEngine("custom") }()
-		}
+	t.Run("VPNStatusHandler_NilVPNService", func(t *testing.T) {
+		hNil := NewHandlers(Dependencies{
+			Config: h.cfg,
+			DB:     nil,
+		})
 
 		req := httptest.NewRequest(http.MethodGet, "/api/vpn/status", nil)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		hNil.VPNStatusHandler(w, req)
 
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
@@ -1197,8 +1197,8 @@ func TestVPNStatusHandler_ExposesRouteQueueDiagnostics(t *testing.T) {
 	if !ok || !avail {
 		t.Fatalf("expected forwarder_available true, got: %v", status["forwarder_available"])
 	}
-	if status["configured_engine"] != "custom" {
-		t.Fatalf("expected configured_engine custom, got: %v", status["configured_engine"])
+	if status["configured_engine"] != "upstream" {
+		t.Fatalf("expected configured_engine upstream, got: %v", status["configured_engine"])
 	}
 	if status["active_engine"] != "none" {
 		t.Fatalf("expected active_engine none when not running, got: %v", status["active_engine"])

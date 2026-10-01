@@ -350,7 +350,7 @@ func TestRestartExistingClientRecoversThroughUDPHandshake(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.Start(ctx); err != nil {
+	if err := svc.StartCustomEndpointForTest(ctx); err != nil {
 		t.Fatal(err)
 	}
 	addr, ok := svc.endpoint.GetListenAddr().(*net.UDPAddr)
