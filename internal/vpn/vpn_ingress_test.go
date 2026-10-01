@@ -124,11 +124,6 @@ func TestEnsureBackendSessionForIngressCreatesSessionWithDurableIP(t *testing.T)
 	if got := svc.forwarder.RouteSessionID(peer.peerKey); got != sess.ID {
 		t.Fatalf("route session %q, want admitted session %q", got, sess.ID)
 	}
-
-	// Handshake-era side effects must be absent: no generation advance.
-	if gen := svc.PeerGeneration(peer.peerKey); gen != 0 {
-		t.Fatalf("ingress admission advanced peerGenerations to %d, want 0", gen)
-	}
 }
 
 // TestEnsureBackendSessionForIngressReusesLiveSession covers the
@@ -177,9 +172,6 @@ func TestEnsureBackendSessionForIngressReusesLiveSession(t *testing.T) {
 	}
 	if metrics := svc.sessionMgr.MetricsSnapshot(); metrics["replacements_total"] != 0 {
 		t.Fatalf("live reuse recorded session replacements: %+v", metrics)
-	}
-	if gen := svc.PeerGeneration(peer.peerKey); gen != 0 {
-		t.Fatalf("ingress admission advanced peerGenerations to %d, want 0", gen)
 	}
 }
 

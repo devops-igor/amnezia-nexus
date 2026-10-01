@@ -336,14 +336,7 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 	if err := svc2.UpdateConfig(ctx, startedCfg); err != nil {
 		t.Fatalf("pin restarted portal identity: %v", err)
 	}
-	svc2.mu.RLock()
-	legacyListener := svc2.endpoint
-	svc2.mu.RUnlock()
-	if legacyListener != nil {
-		_ = legacyListener.Stop()
-	}
 	svc2.mu.Lock()
-	svc2.endpoint = nil
 	if svc2.backendDevices == nil {
 		svc2.backendDevices = make(map[int64]BackendDevice)
 	}

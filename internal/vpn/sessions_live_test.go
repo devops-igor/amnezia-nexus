@@ -30,9 +30,9 @@ func TestSessionsLiveMatchesActiveCount(t *testing.T) {
 	lbTunnel(t, svc, db, 955, "awg955", "pub955", "priv955", "10.9.9.155:51820")
 
 	// Session 1 through the real handshake path.
-	sess1, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess1, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 	// Session 2 straight through the manager (auth/IPAM bypassed), on the
 	// same backend as sess1.
@@ -100,9 +100,9 @@ func TestSessionsLiveDBMissFallback(t *testing.T) {
 	ctx := t.Context()
 
 	tun := lbTunnel(t, svc, db, 956, "awg956", "pub956", "priv956", "10.9.9.156:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Remove the DB identity chain: the tunnel row (cascades the
@@ -172,9 +172,9 @@ func TestSessionsLiveIdentitySurvivesDisplacedDBRow(t *testing.T) {
 	ctx := t.Context()
 
 	tun := lbTunnel(t, svc, db, 960, "awg960", "pub960", "priv960", "10.9.9.160:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Displace the vpn_sessions row exactly like the UNIQUE assigned_ip
@@ -243,9 +243,9 @@ func TestSessionsLiveAccountantDeltas(t *testing.T) {
 	ctx := t.Context()
 
 	lbTunnel(t, svc, db, 957, "awg957", "pub957", "priv957", "10.9.9.157:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Base counters as persisted (the service is never started, so no
@@ -294,9 +294,9 @@ func TestSessionsLiveTrafficAcrossFlush(t *testing.T) {
 	ctx := t.Context()
 
 	lbTunnel(t, svc, db, 959, "awg959", "pub959", "priv959", "10.9.9.159:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// The service is never started, so the accountant's flush loop is not

@@ -714,9 +714,9 @@ func TestStartupIPAMCollision_Scenario7_LosingPeerOldConfig_RefusesHandshake(t *
 	defer func() { _ = svc.Stop() }()
 
 	// Handshake for peer 2 (losing claimant) must be refused
-	_, _, err = svc.HandleIncomingPeer(ctx, peerKey2)
+	_, _, err = svc.HandleIncomingPeerForTest(ctx, peerKey2)
 	if err == nil {
-		t.Fatal("expected HandleIncomingPeer to refuse connection for quarantined peer, got nil error")
+		t.Fatal("expected HandleIncomingPeerForTest to refuse connection for quarantined peer, got nil error")
 	}
 
 	if !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
@@ -794,7 +794,7 @@ func TestStartupIPAMCollision_Scenario8_RegenerateLosingConfig_AllocatesNewIPAnd
 	defer func() { _ = svc.Stop() }()
 
 	// 1. Initial handshake fails per Scenario 7
-	if _, _, err := svc.HandleIncomingPeer(ctx, peerPub2); err == nil {
+	if _, _, err := svc.HandleIncomingPeerForTest(ctx, peerPub2); err == nil {
 		t.Fatal("expected initial handshake to fail before regeneration")
 	}
 
@@ -824,9 +824,9 @@ func TestStartupIPAMCollision_Scenario8_RegenerateLosingConfig_AllocatesNewIPAnd
 	}
 
 	// 4. Connecting with new config succeeds
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerPub2)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerPub2)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed after config regeneration: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed after config regeneration: %v", err)
 	}
 	if sess == nil || sess.AssignedIP != newIP {
 		t.Fatalf("expected session with assigned IP %s, got: %+v", newIP, sess)
@@ -1052,9 +1052,9 @@ func TestStartupIPAMCollision_SamePeerMultipleConnectionsSameIP_RetainsAllUnquar
 	}
 
 	// Incoming handshake must succeed cleanly
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerPub)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerPub)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for same-peer multiple connection: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for same-peer multiple connection: %v", err)
 	}
 	if sess == nil || sess.AssignedIP != sharedIP {
 		t.Fatalf("expected session with %s, got: %+v", sharedIP, sess)
@@ -1267,10 +1267,10 @@ func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesSta
 		t.Fatalf("conn2 config_regeneration_required not true: %v", conn2.ClientParams["config_regeneration_required"])
 	}
 
-	// Step 3: Call svc.HandleIncomingPeer(ctx, samePeer): assert it succeeds deterministically with sess.AssignedIP == "10.100.0.8"
-	sess1, _, err := svc.HandleIncomingPeer(ctx, samePeerPub)
+	// Step 3: Call svc.HandleIncomingPeerForTest(ctx, samePeer): assert it succeeds deterministically with sess.AssignedIP == "10.100.0.8"
+	sess1, _, err := svc.HandleIncomingPeerForTest(ctx, samePeerPub)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for samePeer: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for samePeer: %v", err)
 	}
 	if sess1 == nil || sess1.AssignedIP != "10.100.0.8" {
 		t.Fatalf("expected session with 10.100.0.8, got: %+v", sess1)
@@ -1310,10 +1310,10 @@ func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesSta
 		t.Fatalf("conn2 quarantined_ip_collision not cleared: %v", conn2Regenerated.ClientParams["quarantined_ip_collision"])
 	}
 
-	// Step 5: Assert connecting with newPeer (svc.HandleIncomingPeer(ctx, newPeer)) succeeds with AssignedIP == newIP.
-	sessNew, _, err := svc.HandleIncomingPeer(ctx, newPeer)
+	// Step 5: Assert connecting with newPeer (svc.HandleIncomingPeerForTest(ctx, newPeer)) succeeds with AssignedIP == newIP.
+	sessNew, _, err := svc.HandleIncomingPeerForTest(ctx, newPeer)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for newPeer: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for newPeer: %v", err)
 	}
 	if sessNew == nil || sessNew.AssignedIP != newIP {
 		t.Fatalf("expected session with %s, got: %+v", newIP, sessNew)
@@ -1330,9 +1330,9 @@ func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesSta
 	if conn1After.ClientParams["assigned_ip"] != "10.100.0.8" {
 		t.Fatalf("conn1 assigned_ip changed: got %v, want 10.100.0.8", conn1After.ClientParams["assigned_ip"])
 	}
-	sessSameAgain, _, err := svc.HandleIncomingPeer(ctx, samePeerPub)
+	sessSameAgain, _, err := svc.HandleIncomingPeerForTest(ctx, samePeerPub)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for samePeer after conn2 regeneration: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for samePeer after conn2 regeneration: %v", err)
 	}
 	if sessSameAgain == nil || sessSameAgain.AssignedIP != "10.100.0.8" {
 		t.Fatalf("expected session with 10.100.0.8, got: %+v", sessSameAgain)
@@ -1378,17 +1378,17 @@ func TestStartupIPAMCollision_SamePeerConflictingIPs_RetiresKeypairAndEnablesSta
 		t.Fatalf("conn2 unexpectedly quarantined after restart: %v", conn2Restart.ClientParams["config_regeneration_required"])
 	}
 
-	sess1Restart, _, err := svc2.HandleIncomingPeer(ctx, samePeerPub)
+	sess1Restart, _, err := svc2.HandleIncomingPeerForTest(ctx, samePeerPub)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for samePeer after restart: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for samePeer after restart: %v", err)
 	}
 	if sess1Restart == nil || sess1Restart.AssignedIP != "10.100.0.8" {
 		t.Fatalf("expected session with 10.100.0.8 after restart, got: %+v", sess1Restart)
 	}
 
-	sess2Restart, _, err := svc2.HandleIncomingPeer(ctx, newPeer)
+	sess2Restart, _, err := svc2.HandleIncomingPeerForTest(ctx, newPeer)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed for newPeer after restart: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed for newPeer after restart: %v", err)
 	}
 	if sess2Restart == nil || sess2Restart.AssignedIP != newIP {
 		t.Fatalf("expected session with %s after restart, got: %+v", newIP, sess2Restart)
@@ -1526,7 +1526,7 @@ func TestStartupIPAMCollision_LosingPeerWithMultipleRows_RetiresSharedKeypairAnd
 	}
 
 	// The original losing peer identity must no longer authenticate at all.
-	if _, _, err := svc.HandleIncomingPeer(ctx, loserPub); !errors.Is(err, endpoint.ErrPeerNotFound) {
+	if _, _, err := svc.auth.AuthenticatePeer(ctx, loserPub); !errors.Is(err, endpoint.ErrPeerNotFound) {
 		t.Fatalf("expected retired losing peer to be unknown, got: %v", err)
 	}
 
@@ -1563,12 +1563,12 @@ func TestStartupIPAMCollision_LosingPeerWithMultipleRows_RetiresSharedKeypairAnd
 		t.Fatalf("second duplicate row regained client_id unexpectedly: %q", loser2.ClientID)
 	}
 
-	if sess, _, err := svc.HandleIncomingPeer(ctx, newPeer); err != nil {
+	if sess, _, err := svc.HandleIncomingPeerForTest(ctx, newPeer); err != nil {
 		t.Fatalf("new peer handshake failed: %v", err)
 	} else if sess == nil || sess.AssignedIP != newIP {
 		t.Fatalf("new peer session mismatch: %+v want IP %s", sess, newIP)
 	}
-	if sess, _, err := svc.HandleIncomingPeer(ctx, winnerPub); err != nil {
+	if sess, _, err := svc.HandleIncomingPeerForTest(ctx, winnerPub); err != nil {
 		t.Fatalf("winner peer handshake failed after regeneration: %v", err)
 	} else if sess == nil || sess.AssignedIP != sharedIP {
 		t.Fatalf("winner session mismatch: %+v want IP %s", sess, sharedIP)
@@ -1598,12 +1598,12 @@ func TestStartupIPAMCollision_LosingPeerWithMultipleRows_RetiresSharedKeypairAnd
 		t.Fatalf("retired duplicate row unexpectedly regained client_id after restart: %q", loser2AfterRestart.ClientID)
 	}
 
-	if sess, _, err := svc2.HandleIncomingPeer(ctx, newPeer); err != nil {
+	if sess, _, err := svc2.HandleIncomingPeerForTest(ctx, newPeer); err != nil {
 		t.Fatalf("regenerated peer handshake failed after restart: %v", err)
 	} else if sess == nil || sess.AssignedIP != newIP {
 		t.Fatalf("regenerated peer session mismatch after restart: %+v want IP %s", sess, newIP)
 	}
-	if sess, _, err := svc2.HandleIncomingPeer(ctx, winnerPub); err != nil {
+	if sess, _, err := svc2.HandleIncomingPeerForTest(ctx, winnerPub); err != nil {
 		t.Fatalf("winner handshake failed after restart: %v", err)
 	} else if sess == nil || sess.AssignedIP != sharedIP {
 		t.Fatalf("winner session mismatch after restart: %+v want IP %s", sess, sharedIP)

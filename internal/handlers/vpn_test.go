@@ -90,9 +90,9 @@ func TestVPNSessionsHandler(t *testing.T) {
 			t.Fatalf("vpnSvc.Start failed: %v", err)
 		}
 
-		sess, _, err := vpnSvc.HandleIncomingPeer(ctx, "peer-handler")
+		sess, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, "peer-handler")
 		if err != nil {
-			t.Fatalf("HandleIncomingPeer failed: %v", err)
+			t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 		}
 		sess.RxBytes = 10
 		sess.TxBytes = 20

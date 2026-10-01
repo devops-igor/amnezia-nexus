@@ -113,7 +113,7 @@ func TestHandleIncomingPeerCapacityStress(t *testing.T) {
 		wg.Add(1)
 		go func(pk string) {
 			defer wg.Done()
-			_, _, err := svc.HandleIncomingPeer(ctx, pk)
+			_, _, err := svc.HandleIncomingPeerForTest(ctx, pk)
 			if err != nil {
 				// Capacity rejects are EXPECTED once the cap is reached —
 				// ErrNoActiveBackends from FilterHealthy is exactly the

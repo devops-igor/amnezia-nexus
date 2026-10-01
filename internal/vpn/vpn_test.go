@@ -1,12 +1,8 @@
 package vpn
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -24,10 +20,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
 )
 
 func setupTestDB(t *testing.T) *database.DB {
@@ -216,9 +211,9 @@ func TestVPNServicePeerConnections(t *testing.T) {
 	defer func() { _ = vpnSvc.Stop() }()
 
 	// Handle Incoming Peer Connection
-	sess, backend, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, backend, err := vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 	if sess.UserID != uID || sess.PeerPublicKey != peerKeyAlice || sess.AssignedIP == "" {
 		t.Errorf("invalid session returned: %+v", sess)
@@ -250,7 +245,7 @@ func TestVPNServicePeerConnections(t *testing.T) {
 	}
 
 	// Reconnect and DisconnectUser
-	_, _, _ = vpnSvc.HandleIncomingPeer(ctx, peerKeyAlice)
+	_, _, _ = vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err := vpnSvc.DisconnectUser(ctx, uID); err != nil {
 		t.Fatalf("DisconnectUser failed: %v", err)
 	}
@@ -342,7 +337,7 @@ func TestVPNServiceConfigAndBackends(t *testing.T) {
 		t.Fatalf("expected registered connection for alice: %+v", conns)
 	}
 	newClientPub := conns[0].ClientID
-	if sess, _, err := vpnSvc.HandleIncomingPeer(ctx, newClientPub); err != nil || sess == nil {
+	if sess, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, newClientPub); err != nil || sess == nil {
 		t.Fatalf("peer authentication with generated client key failed: %v", err)
 	}
 
@@ -434,12 +429,12 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 		t.Errorf("expected nil error on DisconnectSession nil sessionMgr")
 	}
 
-	// 12. HandleIncomingPeer uninitialized
-	if _, _, err := emptySvc.HandleIncomingPeer(ctx, "peer"); err == nil {
-		t.Errorf("expected error HandleIncomingPeer uninitialized")
+	// 12. EnsureBackendSessionForIngress uninitialized
+	if _, _, _, err := emptySvc.EnsureBackendSessionForIngress(ctx, ingress.PeerOwnership{PeerPublicKey: "peer"}); err == nil {
+		t.Errorf("expected error EnsureBackendSessionForIngress uninitialized")
 	}
 
-	// 13. HandleIncomingPeer no active backends
+	// 13. EnsureBackendSessionForIngress no active backends
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "bob", Enabled: true})
 	_, _ = db.CreateServer(ctx, &models.Server{Name: "Server", Host: "10.0.0.1"})
 	_, _ = db.CreateConnection(ctx, &models.UserConnection{
@@ -448,8 +443,8 @@ func TestVPNServiceEdgeCases2(t *testing.T) {
 		Protocol: "awg",
 		ClientID: "bob-peer-key",
 	})
-	if _, _, err := svcWithDB.HandleIncomingPeer(ctx, "bob-peer-key"); err == nil {
-		t.Errorf("expected error HandleIncomingPeer when no active backends")
+	if _, _, _, err := svcWithDB.EnsureBackendSessionForIngress(ctx, ingress.PeerOwnership{PeerPublicKey: "bob-peer-key", UserID: uID}); err == nil {
+		t.Errorf("expected error EnsureBackendSessionForIngress when no active backends")
 	}
 
 	// 14. GenerateClientConfig without DB and user not found
@@ -1148,277 +1143,6 @@ func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
 	}
 }
 
-func TestAWG3_HandshakeAndTransportRoundTrip(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenPacket failed: %v", err)
-	}
-	port := pc.LocalAddr().(*net.UDPAddr).Port
-	_ = pc.Close()
-
-	vpnCfg := &models.VPNConfig{
-		Algorithm:           models.LBLeastConnections,
-		ListenPort:          port,
-		SubnetCIDR:          "10.100.0.0/24",
-		H1:                  models.NewHeaderRange(12345678, 12347000),
-		H2:                  models.NewHeaderRange(600000000, 600010000),
-		H3:                  models.NewHeaderRange(1200000000, 1200010000),
-		H4:                  models.NewHeaderRange(1800000000, 1800010000),
-		S1:                  45,
-		S2:                  60,
-		S3:                  25,
-		S4:                  15,
-		HeaderProtectionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-	}
-	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
-		t.Fatalf("SaveVPNConfig failed: %v", err)
-	}
-
-	// Backend tunnel setup
-	sID, err := db.CreateServer(ctx, &models.Server{Name: "US Backend", Host: "127.0.0.1"})
-	if err != nil {
-		t.Fatalf("CreateServer failed: %v", err)
-	}
-	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: "awg-be-1",
-		PublicKey:     "us-backend-pubkey",
-		PrivateKey:    "us-backend-privkey",
-		Endpoint:      "127.0.0.1:51821",
-		Status:        "active",
-	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
-
-	uID, err := db.CreateUser(ctx, &models.User{Username: "carol", Enabled: true})
-	if err != nil {
-		t.Fatalf("CreateUser failed: %v", err)
-	}
-
-	vpnSvc, err := NewVPNService(db, vpnCfg)
-	if err != nil {
-		t.Fatalf("NewVPNService failed: %v", err)
-	}
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		return 20 * time.Millisecond, nil
-	})
-	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("vpnSvc.StartCustomEndpointForTest failed: %v", err)
-	}
-	defer func() { _ = vpnSvc.Stop() }()
-
-	// 1. Generate client config & verify persistence/rendering of stored H/S
-	cfgStr, _, err := vpnSvc.GenerateClientConfig(ctx, uID)
-	if err != nil {
-		t.Fatalf("GenerateClientConfig failed: %v", err)
-	}
-	if !strings.Contains(cfgStr, "H1 = 12345678-12347000") ||
-		!strings.Contains(cfgStr, "H2 = 600000000-600010000") ||
-		!strings.Contains(cfgStr, "H4 = 1800000000-1800010000") ||
-		!strings.Contains(cfgStr, "S1 = 45") ||
-		!strings.Contains(cfgStr, "S2 = 60") {
-		t.Fatalf("GenerateClientConfig did not render stored VPNConfig values: %s", cfgStr)
-	}
-	for _, line := range strings.Split(cfgStr, "\n") {
-		trimmed := strings.TrimSpace(line)
-		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
-			if strings.HasPrefix(trimmed, k+" =") || strings.HasPrefix(trimmed, k+"=") {
-				t.Fatalf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
-			}
-		}
-	}
-
-	// 2. Parse config parameters
-	var clientPrivB64, serverPubB64 string
-	for _, line := range strings.Split(cfgStr, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "PrivateKey =") {
-			clientPrivB64 = strings.TrimSpace(strings.TrimPrefix(trimmed, "PrivateKey ="))
-		} else if strings.HasPrefix(trimmed, "PublicKey =") {
-			serverPubB64 = strings.TrimSpace(strings.TrimPrefix(trimmed, "PublicKey ="))
-		}
-	}
-	clientPrivBytes, err := base64.StdEncoding.DecodeString(clientPrivB64)
-	if err != nil || len(clientPrivBytes) != 32 {
-		t.Fatalf("invalid client priv key: %v", err)
-	}
-	serverPubBytes, err := base64.StdEncoding.DecodeString(serverPubB64)
-	if err != nil || len(serverPubBytes) != 32 {
-		t.Fatalf("invalid server pub key: %v", err)
-	}
-	clientPubBytes, err := curve25519.X25519(clientPrivBytes, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("X25519 failed: %v", err)
-	}
-	clientPubB64 := base64.StdEncoding.EncodeToString(clientPubBytes)
-
-	serverUDPAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
-	clientConn, err := net.DialUDP("udp", nil, serverUDPAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	// 3. Handshake round-trip
-	initPacket, state, err := health.BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, nil, vpnCfg.H1, vpnCfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacket failed: %v", err)
-	}
-	if _, err := clientConn.Write(initPacket); err != nil {
-		t.Fatalf("Write initiation failed: %v", err)
-	}
-
-	respBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("Read handshake response failed: %v", err)
-	}
-	if !health.VerifyAWGResponsePacket(respBuf[:n], state, vpnCfg.H2, vpnCfg.S2) {
-		t.Fatal("VerifyAWGResponsePacket rejected server response")
-	}
-
-	// 4. AWG Transport Framing & Decryption Round-Trip
-	routedCh := make(chan []byte, 1)
-	vpnSvc.endpoint.SetClientPacketRouter(func(peerKey string, pkt []byte) error {
-		if peerKey == clientPubB64 {
-			routedCh <- pkt
-		}
-		return nil
-	})
-
-	respPayload := respBuf[vpnCfg.S2:n]
-	serverReceiverIdx := respPayload[4:8]
-	serverEPub := respPayload[12:44]
-
-	ss3, err := curve25519.X25519(state.ClientEPriv, serverEPub)
-	if err != nil {
-		t.Fatalf("ss3 DH failed: %v", err)
-	}
-	ck := health.KDF1(health.KDF1(state.CK, serverEPub), ss3)
-	ss4, err := curve25519.X25519(state.ClientPriv, serverEPub)
-	if err != nil {
-		t.Fatalf("ss4 DH failed: %v", err)
-	}
-	ck = health.KDF1(ck, ss4)
-	ck, _, _ = health.KDF3(ck, make([]byte, 32))
-	clientSendKey, clientRecvKey := health.KDF2(ck, nil)
-
-	// 4a. Client -> Endpoint: AWG Transport Frame (S4 padding + H4 header + counter 0)
-	aeadSend, err := chacha20poly1305.New(clientSendKey)
-	if err != nil {
-		t.Fatalf("aeadSend failed: %v", err)
-	}
-	testPayload := []byte("client-awg3-data-frame-content")
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], 0)
-
-	s4 := vpnCfg.S4
-	frameLen := s4 + 16
-	transportDatagram := make([]byte, frameLen)
-	if _, err := rand.Read(transportDatagram[:s4]); err != nil {
-		t.Fatalf("rand failed: %v", err)
-	}
-	binary.LittleEndian.PutUint32(transportDatagram[s4:s4+4], vpnCfg.H4.PickOne())
-	copy(transportDatagram[s4+4:s4+8], serverReceiverIdx)
-	binary.LittleEndian.PutUint64(transportDatagram[s4+8:s4+16], 0)
-	transportDatagram = aeadSend.Seal(transportDatagram, nonce[:], testPayload, nil)
-
-	if _, err := clientConn.Write(transportDatagram); err != nil {
-		t.Fatalf("Write transport data failed: %v", err)
-	}
-
-	select {
-	case received := <-routedCh:
-		if !bytes.Equal(received, testPayload) {
-			t.Fatalf("routed packet mismatch: got %q, want %q", received, testPayload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for endpoint to decrypt and route transport packet")
-	}
-
-	// 4b. Endpoint -> Client: SendToPeer AWG Transport Frame
-	replyPayload := []byte("reply-from-endpoint-awg3")
-	if err := vpnSvc.endpoint.SendToPeer(clientPubB64, replyPayload); err != nil {
-		t.Fatalf("SendToPeer failed: %v", err)
-	}
-
-	clientRecvBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	nRecv, err := clientConn.Read(clientRecvBuf)
-	if err != nil {
-		t.Fatalf("Read SendToPeer packet failed: %v", err)
-	}
-	if nRecv < s4+16+len(replyPayload) {
-		t.Fatalf("received frame too short: %d", nRecv)
-	}
-	replyDatagram := clientRecvBuf[:nRecv]
-	replyPayloadPart := replyDatagram[s4:]
-	var counter uint64
-	var msgType uint32
-	if hpKey, _ := health.DecodeKey(vpnCfg.HeaderProtectionKey); len(hpKey) == 32 && s4 >= health.HeaderCipherNonceSize {
-		cip := health.NewHeaderProtectionCipher(hpKey, replyDatagram[:health.HeaderCipherNonceSize])
-		if cip != nil {
-			var unmaskedHdr [16]byte
-			cip.XORKeyStream(unmaskedHdr[:], replyPayloadPart[:16])
-			msgType = binary.LittleEndian.Uint32(unmaskedHdr[0:4])
-			counter = binary.LittleEndian.Uint64(unmaskedHdr[8:16])
-		}
-	}
-	if msgType == 0 {
-		msgType = binary.LittleEndian.Uint32(replyPayloadPart[0:4])
-		counter = binary.LittleEndian.Uint64(replyPayloadPart[8:16])
-	}
-	if !vpnCfg.H4.Contains(msgType) {
-		t.Fatalf("SendToPeer msgType mismatch: got %d, want in %s", msgType, vpnCfg.H4)
-	}
-	aeadRecv, err := chacha20poly1305.New(clientRecvKey)
-	if err != nil {
-		t.Fatalf("aeadRecv failed: %v", err)
-	}
-	var recvNonce [12]byte
-	binary.LittleEndian.PutUint64(recvNonce[4:12], counter)
-	decryptedReply, err := aeadRecv.Open(nil, recvNonce[:], replyPayloadPart[16:], nil)
-	if err != nil {
-		t.Fatalf("failed to decrypt SendToPeer packet: %v", err)
-	}
-	if !bytes.Equal(decryptedReply, replyPayload) {
-		t.Fatalf("decrypted reply mismatch: got %q, want %q", decryptedReply, replyPayload)
-	}
-
-	// 4c. Negative Test: corrupted H4 transport frame is silently dropped, does not route
-	corruptDatagram := make([]byte, len(transportDatagram))
-	copy(corruptDatagram, transportDatagram)
-	binary.LittleEndian.PutUint32(corruptDatagram[s4:s4+4], 0xCAFEBABE)
-	if _, err := clientConn.Write(corruptDatagram); err != nil {
-		t.Fatalf("Write corrupt datagram failed: %v", err)
-	}
-	select {
-	case <-routedCh:
-		t.Fatal("corrupt H4 datagram was routed when it should have been dropped")
-	case <-time.After(150 * time.Millisecond):
-		// Expected silent drop
-	}
-
-	// 4d. Negative Test: handshake with mismatched H1 must fail cleanly (silent drop)
-	wrongH1Packet, _, err := health.BuildAWGInitiationPacket(serverPubBytes, clientPrivBytes, nil, 0x99999999, vpnCfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacket wrong H1 failed: %v", err)
-	}
-	if _, err := clientConn.Write(wrongH1Packet); err != nil {
-		t.Fatalf("Write wrong H1 packet failed: %v", err)
-	}
-	_ = clientConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	wrongRespBuf := make([]byte, 2048)
-	if nWrong, err := clientConn.Read(wrongRespBuf); err == nil {
-		t.Fatalf("expected silent drop for wrong H1 handshake, got %d bytes response", nWrong)
-	}
-}
-
 func TestEnableBackend_TypedSentinelErrors(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)
@@ -1665,11 +1389,6 @@ func TestUpdateConfig_PreservesObfuscationParams(t *testing.T) {
 		t.Errorf("stored portal identity clobbered by partial update: priv=%q pub=%q", stored.ServerPrivateKey, stored.ServerPublicKey)
 	}
 
-	// The listener must agree with the persisted config.
-	lc := svc.endpoint.ListenerConfigSnapshot()
-	if lc.H1 != models.NewHeaderRange(111111, 115000) || lc.S1 != 40 || lc.H4 != models.NewHeaderRange(1800000000, 1800005000) || lc.S4 != 20 {
-		t.Errorf("listener config diverges from stored config: %+v", lc)
-	}
 }
 
 func TestUpdateConfig_RejectsObfuscationChangeWhileRunning(t *testing.T) {
@@ -1702,7 +1421,7 @@ func TestUpdateConfig_RejectsObfuscationChangeWhileRunning(t *testing.T) {
 	}
 }
 
-func TestUpdateConfig_PropagatesObfuscationChangeToIdleListener(t *testing.T) {
+func TestUpdateConfig_PropagatesObfuscationChangeWhenIdle(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -1726,12 +1445,22 @@ func TestUpdateConfig_PropagatesObfuscationChangeToIdleListener(t *testing.T) {
 		t.Fatalf("UpdateConfig with changed H/S on idle service failed: %v", err)
 	}
 
-	lc := svc.endpoint.ListenerConfigSnapshot()
-	if lc.H1 != models.DegenerateHeaderRange(123456789) || lc.H2 != models.DegenerateHeaderRange(234567891) || lc.H3 != models.DegenerateHeaderRange(345678912) || lc.H4 != models.DegenerateHeaderRange(456789123) {
-		t.Errorf("listener config not updated on idle service: %+v", lc)
+	after, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
 	}
-	if lc.S1 != 33 || lc.S2 != 44 || lc.S3 != 55 || lc.S4 != 66 {
-		t.Errorf("listener S params not updated on idle service: %+v", lc)
+	if after.H1 != models.DegenerateHeaderRange(123456789) || after.H2 != models.DegenerateHeaderRange(234567891) || after.H3 != models.DegenerateHeaderRange(345678912) || after.H4 != models.DegenerateHeaderRange(456789123) {
+		t.Errorf("service config not updated on idle service: %+v", after)
+	}
+	if after.S1 != 33 || after.S2 != 44 || after.S3 != 55 || after.S4 != 66 {
+		t.Errorf("service S params not updated on idle service: %+v", after)
+	}
+	stored, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig failed: %v", err)
+	}
+	if stored.H1 != after.H1 || stored.S1 != after.S1 {
+		t.Errorf("persisted config not updated: %+v", stored)
 	}
 }
 
@@ -2014,7 +1743,6 @@ func TestUpdateConfig_RejectsListenPortChangeWhileRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
-	boundSnapshot := svc.endpoint.ListenerConfigSnapshot()
 
 	changed := *before
 	changed.ListenPort = before.ListenPort + 7
@@ -2027,13 +1755,10 @@ func TestUpdateConfig_RejectsListenPortChangeWhileRunning(t *testing.T) {
 		t.Fatalf("expected running-listener rejection error, got: %v", err)
 	}
 
-	// The running config and the bound listener must be untouched.
+	// The running config must be untouched.
 	after, _ := svc.GetConfig(ctx)
 	if after.ListenPort != before.ListenPort {
 		t.Errorf("running config was mutated by rejected update: listen_port %d -> %d", before.ListenPort, after.ListenPort)
-	}
-	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != boundSnapshot.ListenPort {
-		t.Errorf("bound listener port was mutated by rejected update: %d -> %d", boundSnapshot.ListenPort, snap.ListenPort)
 	}
 	_ = svc.Stop()
 
@@ -2041,8 +1766,12 @@ func TestUpdateConfig_RejectsListenPortChangeWhileRunning(t *testing.T) {
 	if err := svc.UpdateConfig(ctx, &changed); err != nil {
 		t.Fatalf("UpdateConfig after Stop failed: %v", err)
 	}
-	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != changed.ListenPort {
-		t.Errorf("idle listener port not updated: want %d, got %d", changed.ListenPort, snap.ListenPort)
+	cfgAfter, err := svc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfgAfter.ListenPort != changed.ListenPort {
+		t.Errorf("idle config port not updated: want %d, got %d", changed.ListenPort, cfgAfter.ListenPort)
 	}
 	// ...and persisted, so the next boot binds the new port.
 	stored, err := db.GetVPNConfig(ctx)
@@ -2074,10 +1803,6 @@ func TestUpdateConfig_AllowsListenPortChangeWhenIdle(t *testing.T) {
 		t.Fatalf("UpdateConfig with changed listen_port on idle service failed: %v", err)
 	}
 
-	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != 31458 {
-		t.Errorf("listener config not updated on idle service: want 31458, got %d", snap.ListenPort)
-	}
-
 	cfgAfter, err := svc.GetConfig(ctx)
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
@@ -2100,8 +1825,8 @@ func TestUpdateConfig_AllowsListenPortChangeWhenIdle(t *testing.T) {
 // TestVPNPortWiring_EnvPortWinsOnFirstBootThenPersists constructs the C1
 // wiring sequence that cmd/panel/main.go and cmd/server/main.go run before
 // vpnSvc.Start: GetConfig -> set port from env -> UpdateConfig. It asserts
-// the port is persisted to the DB config, propagated to the (idle)
-// listener, rendered into the client config endpoint, and read back
+// the port is persisted to the DB config,
+// rendered into the client config endpoint, and read back
 // unchanged by a fresh service (the "subsequent boots read the persisted
 // value" leg of the precedence contract).
 func TestVPNPortWiring_EnvPortWinsOnFirstBootThenPersists(t *testing.T) {
@@ -2136,11 +1861,6 @@ func TestVPNPortWiring_EnvPortWinsOnFirstBootThenPersists(t *testing.T) {
 	}
 	if stored.ListenPort != envPort {
 		t.Errorf("persisted listen_port: want %d, got %d", envPort, stored.ListenPort)
-	}
-
-	// The (idle) listener will bind the wired port at Start.
-	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != envPort {
-		t.Errorf("listener config listen_port: want %d, got %d", envPort, snap.ListenPort)
 	}
 
 	// GenerateClientConfig renders the matching endpoint port.
@@ -2189,15 +1909,12 @@ func TestVPNPortWiring_SamePortIsNoop(t *testing.T) {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 
-	// The service boots with config and listener in agreement; main.go
-	// only calls UpdateConfig when the ports DIFFER, so equality must
-	// stay a no-op with the listener snapshot still matching.
 	cfgVPN, err := svc.GetConfig(ctx)
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
-	if snap := svc.endpoint.ListenerConfigSnapshot(); snap.ListenPort != cfgVPN.ListenPort {
-		t.Errorf("listener diverges from config without any wiring: cfg=%d listener=%d", cfgVPN.ListenPort, snap.ListenPort)
+	if cfgVPN.ListenPort == 0 {
+		t.Fatalf("expected non-zero ListenPort, got %d", cfgVPN.ListenPort)
 	}
 }
 
@@ -4435,140 +4152,6 @@ func TestGenerateClientConfig_PortalOwnHPKey_DoesNotBleedBackend(t *testing.T) {
 	}
 }
 
-func TestGenerateClientConfig_ListenerKeyAgreement_ObfuscatedHandshake(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	sID, err := db.CreateServer(ctx, &models.Server{
-		Name: "Test Backend",
-		Host: "127.0.0.1",
-		Protocols: map[string]any{
-			"awg": map[string]any{
-				"public_key": "backend-pubkey-123456789012345678",
-				"port":       51821,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateServer failed: %v", err)
-	}
-	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: "awg-be-1",
-		PublicKey:     "backend-pubkey-123456789012345678",
-		PrivateKey:    "backend-privkey-12345678901234567",
-		Endpoint:      "127.0.0.1:51821",
-		Status:        "active",
-	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
-
-	tempConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	testPort := 51820
-	if err == nil {
-		testPort = tempConn.LocalAddr().(*net.UDPAddr).Port
-		_ = tempConn.Close()
-	}
-	vCfg, err := db.GetVPNConfig(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vCfg.ListenPort = testPort
-	if err := db.SaveVPNConfig(ctx, vCfg); err != nil {
-		t.Fatal(err)
-	}
-	svc, err := NewVPNService(db, vCfg)
-	if err != nil {
-		t.Fatalf("NewVPNService failed: %v", err)
-	}
-	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		return 10 * time.Millisecond, nil
-	})
-	if err := svc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("svc.StartCustomEndpointForTest failed: %v", err)
-	}
-	defer func() { _ = svc.Stop() }()
-
-	uID, err := db.CreateUser(ctx, &models.User{
-		Username: "client_bob",
-		Enabled:  true,
-	})
-	if err != nil {
-		t.Fatalf("CreateUser failed: %v", err)
-	}
-
-	cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
-	if err != nil {
-		t.Fatalf("GenerateClientConfig failed: %v", err)
-	}
-
-	clientHPKeyStr := parseDirectiveString(t, cfgStr, "HeaderProtectionKey")
-	listenerSnapshot := svc.endpoint.ListenerConfigSnapshot()
-	if clientHPKeyStr == "" {
-		t.Fatalf("client config missing HeaderProtectionKey")
-	}
-	if clientHPKeyStr != listenerSnapshot.HeaderProtectionKey {
-		t.Fatalf("key disagreement: client rendered %q, listener snapshot has %q", clientHPKeyStr, listenerSnapshot.HeaderProtectionKey)
-	}
-
-	hpKeyBytes, err := health.DecodeKey(clientHPKeyStr)
-	if err != nil {
-		t.Fatalf("failed to decode client HP key: %v", err)
-	}
-
-	// Parse server public key from [Peer] section
-	peerPubKeyStr := parseDirectiveString(t, cfgStr, "PublicKey")
-	peerPubBytes, err := base64.StdEncoding.DecodeString(peerPubKeyStr)
-	if err != nil {
-		t.Fatalf("failed to decode server public key: %v", err)
-	}
-
-	// Parse client private key from [Interface] section
-	clientPrivKeyStr := parseDirectiveString(t, cfgStr, "PrivateKey")
-	clientPrivBytes, err := base64.StdEncoding.DecodeString(clientPrivKeyStr)
-	if err != nil {
-		t.Fatalf("failed to decode client private key: %v", err)
-	}
-
-	h1 := parseDirectiveString(t, cfgStr, "H1")
-	s1 := parseDirectiveInt(t, cfgStr, "S1")
-	h2 := parseDirectiveString(t, cfgStr, "H2")
-	s2 := parseDirectiveInt(t, cfgStr, "S2")
-
-	// Construct obfuscated initiation with the client config parameters
-	packet, state, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, h1, s1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
-	}
-
-	serverAddr, ok := svc.endpoint.GetListenAddr().(*net.UDPAddr)
-	if !ok {
-		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", svc.endpoint.GetListenAddr())
-	}
-
-	clientConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	if _, err := clientConn.Write(packet); err != nil {
-		t.Fatalf("failed to send initiation: %v", err)
-	}
-
-	respBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("handshake failed: no response from listener: %v", err)
-	}
-
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKeyBytes, h2, s2) {
-		t.Errorf("VerifyAWGResponsePacketObfuscated rejected listener's handshake response")
-	}
-}
-
 func TestUpdateConfig_EnforcesMinSValues(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -4744,7 +4327,7 @@ func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
 	defer func() { _ = vpnSvc2.Stop() }()
 
 	// 3. Connect peer on vpnSvc2: HandleIncomingPeer must retrieve stored assigned_ip and reserve it in fresh IPAM
-	sess, _, err := vpnSvc2.HandleIncomingPeer(ctx, clientPub)
+	sess, _, err := vpnSvc2.HandleIncomingPeerForTest(ctx, clientPub)
 	if err != nil {
 		t.Fatalf("HandleIncomingPeer failed on restarted service: %v", err)
 	}
@@ -4796,7 +4379,7 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 		t.Fatalf("CreateConnection failed: %v", err)
 	}
 
-	sessBob, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyBob)
+	sessBob, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyBob)
 	if err != nil {
 		t.Fatalf("HandleIncomingPeer for bob failed: %v", err)
 	}
@@ -4845,268 +4428,11 @@ func TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision(t *testing.T) {
 
 	// The lease owner cannot be inferred from an IP alone. Refuse the
 	// handshake rather than removing the dummy peer's lease.
-	if _, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyCharlie); !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+	if _, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, peerKeyCharlie); !errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
 		t.Fatalf("expected collision error for charlie, got %v", err)
 	}
 	if ip, ok := vpnSvc.ipam.GetAssignedIP("dummy-stale-peer"); !ok || ip.String() != targetIP {
 		t.Fatalf("collision evicted the existing owner: ip=%v present=%t", ip, ok)
-	}
-}
-
-func TestService_HeaderRangeHandshake_AndPerPacketTypeAcceptance(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenPacket failed: %v", err)
-	}
-	port := pc.LocalAddr().(*net.UDPAddr).Port
-	_ = pc.Close()
-
-	hpKeyB64 := "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-	vpnCfg := &models.VPNConfig{
-		Algorithm:           models.LBLeastConnections,
-		ListenPort:          port,
-		SubnetCIDR:          "10.100.0.0/24",
-		H1:                  models.NewHeaderRange(1000000, 1005000),
-		H2:                  models.NewHeaderRange(2000000, 2005000),
-		H3:                  models.NewHeaderRange(3000000, 3005000),
-		H4:                  models.NewHeaderRange(4000000, 4005000),
-		S1:                  50,
-		S2:                  60,
-		S3:                  30,
-		S4:                  20,
-		HeaderProtectionKey: hpKeyB64,
-	}
-	if err := db.SaveVPNConfig(ctx, vpnCfg); err != nil {
-		t.Fatalf("SaveVPNConfig failed: %v", err)
-	}
-
-	// Backend server setup
-	sID, err := db.CreateServer(ctx, &models.Server{Name: "US Backend", Host: "127.0.0.1"})
-	if err != nil {
-		t.Fatalf("CreateServer failed: %v", err)
-	}
-	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
-		ServerID:      sID,
-		InterfaceName: "awg-be-range",
-		PublicKey:     "dummy-be-pubkey-123456789012345678",
-		PrivateKey:    "dummy-be-privkey-1234567890123456",
-		Endpoint:      "127.0.0.1:51825",
-		Status:        "active",
-	})
-	if err != nil {
-		t.Fatalf("CreateBackendTunnel failed: %v", err)
-	}
-
-	vpnSvc, err := NewVPNService(db, nil)
-	if err != nil {
-		t.Fatalf("NewVPNService failed: %v", err)
-	}
-	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		return 5 * time.Millisecond, nil
-	})
-	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("vpnSvc.StartCustomEndpointForTest failed: %v", err)
-	}
-	defer func() { _ = vpnSvc.Stop() }()
-
-	// Client credentials
-	clientPrivBytes := make([]byte, 32)
-	if _, err := rand.Read(clientPrivBytes); err != nil {
-		t.Fatalf("rand failed: %v", err)
-	}
-	clientPubBytes, err := curve25519.X25519(clientPrivBytes, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("curve25519 failed: %v", err)
-	}
-	clientPubB64 := base64.StdEncoding.EncodeToString(clientPubBytes)
-
-	uID, err := db.CreateUser(ctx, &models.User{Username: "range_client", Enabled: true})
-	if err != nil {
-		t.Fatalf("CreateUser failed: %v", err)
-	}
-	if _, err := db.CreateConnection(ctx, &models.UserConnection{
-		UserID:   uID,
-		ServerID: 0,
-		Protocol: "awg",
-		ClientID: clientPubB64,
-		Name:     "device-range",
-	}); err != nil {
-		t.Fatalf("CreateConnection failed: %v", err)
-	}
-
-	snap := vpnSvc.endpoint.ListenerConfigSnapshot()
-	liveCfg, err := vpnSvc.GetConfig(ctx)
-	if err != nil {
-		t.Fatalf("GetConfig failed: %v", err)
-	}
-	serverPubB64 := liveCfg.ServerPublicKey
-	serverPubBytes, err := base64.StdEncoding.DecodeString(serverPubB64)
-	if err != nil {
-		t.Fatalf("DecodeString serverPub failed: %v", err)
-	}
-
-	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
-	clientConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	hpKeyBytes, _ := health.DecodeKey(hpKeyB64)
-
-	// Test 1: Initiation with msgType outside H1 range must be rejected
-	badH1 := uint32(999999)
-	badInit, _, err := health.BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, nil, hpKeyBytes, badH1, snap.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated badH1 failed: %v", err)
-	}
-	if _, err := clientConn.Write(badInit); err != nil {
-		t.Fatalf("Write badInit failed: %v", err)
-	}
-	respBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-	if _, err := clientConn.Read(respBuf); err == nil {
-		t.Fatal("expected no response for out-of-range H1 initiation, but got response")
-	}
-
-	// Test 2: Initiation with msgType within H1 range [1000000, 1005000] must succeed
-	validH1 := uint32(1002500)
-	validInit, state, err := health.BuildAWGInitiationPacketObfuscated(serverPubBytes, clientPrivBytes, nil, hpKeyBytes, validH1, snap.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated validH1 failed: %v", err)
-	}
-	if _, err := clientConn.Write(validInit); err != nil {
-		t.Fatalf("Write validInit failed: %v", err)
-	}
-
-	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("Read handshake response failed: %v", err)
-	}
-
-	// Verify server response packet matches H2 range
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKeyBytes, snap.H2, snap.S2) {
-		t.Fatal("VerifyAWGResponsePacketObfuscated rejected server response for H2 range")
-	}
-
-	// Test 3: Transport framing per-packet acceptance
-	routedCh := make(chan []byte, 10)
-	vpnSvc.endpoint.SetClientPacketRouter(func(peerKey string, pkt []byte) error {
-		if peerKey == clientPubB64 {
-			routedCh <- pkt
-		}
-		return nil
-	})
-
-	// Derive session keys
-	respPayload := respBuf[snap.S2:n]
-	cipResp := health.NewHeaderProtectionCipher(hpKeyBytes, respBuf[:health.HeaderCipherNonceSize])
-	unmaskedResp := make([]byte, 92)
-	cipResp.XORKeyStream(unmaskedResp, respPayload[:92])
-	serverReceiverIdx := unmaskedResp[4:8]
-	serverEPub := unmaskedResp[12:44]
-
-	ss3, err := curve25519.X25519(state.ClientEPriv, serverEPub)
-	if err != nil {
-		t.Fatalf("ss3 failed: %v", err)
-	}
-	ck := health.KDF1(health.KDF1(state.CK, serverEPub), ss3)
-	ss4, err := curve25519.X25519(state.ClientPriv, serverEPub)
-	if err != nil {
-		t.Fatalf("ss4 failed: %v", err)
-	}
-	ck = health.KDF1(ck, ss4)
-	ck, _, _ = health.KDF3(ck, make([]byte, 32))
-	clientSendKey, _ := health.KDF2(ck, nil)
-
-	aeadSend, err := chacha20poly1305.New(clientSendKey)
-	if err != nil {
-		t.Fatalf("aeadSend failed: %v", err)
-	}
-
-	// 3a. Send datagram with msgType = 4001234 (within H4 range [4000000, 4005000])
-	s4 := snap.S4
-	frameLen := s4 + 16
-	datagram1 := make([]byte, frameLen)
-	_, _ = rand.Read(datagram1[:s4])
-	binary.LittleEndian.PutUint32(datagram1[s4:s4+4], 4001234)
-	copy(datagram1[s4+4:s4+8], serverReceiverIdx)
-	binary.LittleEndian.PutUint64(datagram1[s4+8:s4+16], 0)
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], 0)
-	payload1 := []byte("packet-within-h4-range")
-	datagram1 = aeadSend.Seal(datagram1, nonce[:], payload1, nil)
-	// Apply header protection
-	cipData := health.NewHeaderProtectionCipher(hpKeyBytes, datagram1[:health.HeaderCipherNonceSize])
-	cipData.XORKeyStream(datagram1[s4:s4+16], datagram1[s4:s4+16])
-
-	if _, err := clientConn.Write(datagram1); err != nil {
-		t.Fatalf("Write datagram1 failed: %v", err)
-	}
-
-	select {
-	case received := <-routedCh:
-		if !bytes.Equal(received, payload1) {
-			t.Fatalf("routed mismatch: got %q, want %q", received, payload1)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for valid H4 transport packet to be accepted")
-	}
-
-	// 3b. Send datagram with msgType = 5000000 (OUTSIDE H4 range)
-	datagramBad := make([]byte, frameLen)
-	_, _ = rand.Read(datagramBad[:s4])
-	binary.LittleEndian.PutUint32(datagramBad[s4:s4+4], 5000000)
-	copy(datagramBad[s4+4:s4+8], serverReceiverIdx)
-	binary.LittleEndian.PutUint64(datagramBad[s4+8:s4+16], 1)
-	binary.LittleEndian.PutUint64(nonce[4:12], 1)
-	payloadBad := []byte("packet-outside-h4-range")
-	datagramBad = aeadSend.Seal(datagramBad, nonce[:], payloadBad, nil)
-	cipBad := health.NewHeaderProtectionCipher(hpKeyBytes, datagramBad[:health.HeaderCipherNonceSize])
-	cipBad.XORKeyStream(datagramBad[s4:s4+16], datagramBad[s4:s4+16])
-
-	if _, err := clientConn.Write(datagramBad); err != nil {
-		t.Fatalf("Write datagramBad failed: %v", err)
-	}
-
-	select {
-	case received := <-routedCh:
-		t.Fatalf("out-of-range H4 packet was unexpectedly accepted: %q", received)
-	case <-time.After(300 * time.Millisecond):
-		// Expected: dropped!
-	}
-
-	// Test 4: SendToPeer per-packet type randomization
-	observedH4 := make(map[uint32]bool)
-	for i := 0; i < 15; i++ {
-		msg := []byte(fmt.Sprintf("probe-send-to-peer-%d", i))
-		if err := vpnSvc.endpoint.SendToPeer(clientPubB64, msg); err != nil {
-			t.Fatalf("SendToPeer failed on iteration %d: %v", i, err)
-		}
-		buf := make([]byte, 2048)
-		_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		nRecv, err := clientConn.Read(buf)
-		if err != nil {
-			t.Fatalf("Read SendToPeer %d failed: %v", i, err)
-		}
-		packet := buf[:nRecv]
-		cipOut := health.NewHeaderProtectionCipher(hpKeyBytes, packet[:health.HeaderCipherNonceSize])
-		unmasked := make([]byte, 16)
-		cipOut.XORKeyStream(unmasked, packet[s4:s4+16])
-		msgType := binary.LittleEndian.Uint32(unmasked[0:4])
-
-		if !snap.H4.Contains(msgType) {
-			t.Fatalf("SendToPeer emitted msgType %d outside H4 range %s", msgType, snap.H4)
-		}
-		observedH4[msgType] = true
-	}
-
-	if len(observedH4) < 2 {
-		t.Errorf("expected per-packet H4 randomization across 15 sends, but observed only %d distinct types", len(observedH4))
 	}
 }
 
@@ -5180,13 +4506,6 @@ func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	svc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
-		return 10 * time.Millisecond, nil
-	})
-	if err := svc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("svc.StartCustomEndpointForTest failed: %v", err)
-	}
-	defer func() { _ = svc.Stop() }()
 
 	upgradedCfg, err := svc.GetConfig(ctx)
 	if err != nil {
@@ -5270,65 +4589,6 @@ func TestEnsureObfuscationParams_DegenerateToRangeUpgrade(t *testing.T) {
 	singleH1 := fmt.Sprintf("H1 = %d\n", legacyH1)
 	if strings.Contains(cfgStr, singleH1) {
 		t.Errorf("client config emitted single value %q instead of range", singleH1)
-	}
-
-	// 5. Listener Compatibility: verify listener accepts both legacy single value AND new range values
-	lc := svc.endpoint.ListenerConfigSnapshot()
-	if lc.H1 != upgradedCfg.H1 {
-		t.Fatalf("listener snapshot H1 %s does not match upgraded %s", lc.H1, upgradedCfg.H1)
-	}
-
-	hpKeyBytes, err := health.DecodeKey(existingHPKey)
-	if err != nil {
-		t.Fatalf("DecodeKey failed: %v", err)
-	}
-	peerPubKeyStr := parseDirectiveString(t, cfgStr, "PublicKey")
-	peerPubBytes, _ := base64.StdEncoding.DecodeString(peerPubKeyStr)
-	clientPrivKeyStr := parseDirectiveString(t, cfgStr, "PrivateKey")
-	clientPrivBytes, _ := base64.StdEncoding.DecodeString(clientPrivKeyStr)
-
-	// Send handshake using legacy single value (359398951)
-	legacyPkt, state1, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, legacyH1, upgradedCfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated legacy failed: %v", err)
-	}
-
-	serverAddr := svc.endpoint.GetListenAddr().(*net.UDPAddr)
-	clientConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	if _, err := clientConn.Write(legacyPkt); err != nil {
-		t.Fatalf("failed to send legacy initiation: %v", err)
-	}
-	respBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("legacy client handshake failed: listener did not respond: %v", err)
-	}
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state1, hpKeyBytes, upgradedCfg.H2, upgradedCfg.S2) {
-		t.Errorf("response verification failed for legacy client")
-	}
-
-	// Send handshake using a random value picked within the upgraded range
-	pickedH1 := upgradedCfg.H1.PickOne()
-	newPkt, state2, err := health.BuildAWGInitiationPacketObfuscated(peerPubBytes, clientPrivBytes, nil, hpKeyBytes, pickedH1, upgradedCfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated range failed: %v", err)
-	}
-	if _, err := clientConn.Write(newPkt); err != nil {
-		t.Fatalf("failed to send range initiation: %v", err)
-	}
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n2, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("range client handshake failed: listener did not respond: %v", err)
-	}
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n2], state2, hpKeyBytes, upgradedCfg.H2, upgradedCfg.S2) {
-		t.Errorf("response verification failed for range client")
 	}
 }
 
@@ -5731,8 +4991,8 @@ func TestSessionReaperHook_Teardown(t *testing.T) {
 	// 2. Age session past IdleTimeout (default 3m, age by 10m)
 	createdSess.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
 
-	// 3. Trigger timeout sweep through listener (which invokes the registered SessionReaperHook)
-	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	// 3. Trigger timeout sweep through service (which invokes the registered SessionReaperHook)
+	timedOut, err := vpnSvc.SweepTimedOutSessions(ctx)
 	if err != nil {
 		t.Fatalf("SweepTimedOutSessions failed: %v", err)
 	}
@@ -5840,11 +5100,11 @@ func TestSessionReaperHook_ReconnectRace(t *testing.T) {
 
 	// 3. Intercept reaper hook execution to simulate delayed reaper execution
 	reaperChan := make(chan *models.VPNSession, 1)
-	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+	vpnSvc.SetSessionReaperHookForTest(func(ctx context.Context, s *models.VPNSession) {
 		reaperChan <- s
 	})
 
-	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	timedOut, err := vpnSvc.SweepTimedOutSessions(ctx)
 	if err != nil {
 		t.Fatalf("SweepTimedOutSessions failed: %v", err)
 	}
@@ -5946,12 +5206,12 @@ func TestSessionReaperHook_ReconcileRace(t *testing.T) {
 
 	// Intercept reaper hook
 	reaperChan := make(chan *models.VPNSession, 1)
-	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+	vpnSvc.SetSessionReaperHookForTest(func(ctx context.Context, s *models.VPNSession) {
 		reaperChan <- s
 	})
 
 	// 3. Trigger SweepTimedOutSessions
-	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	timedOut, err := vpnSvc.SweepTimedOutSessions(ctx)
 	if err != nil {
 		t.Fatalf("SweepTimedOutSessions failed: %v", err)
 	}
@@ -6030,9 +5290,9 @@ func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
 		peers := []string{peerKeyAlice, peerKeyBob}
 		for i := 0; i < 50; i++ {
 			p := peers[i%len(peers)]
-			sess, _, err := vpnSvc.HandleIncomingPeer(ctx, p)
+			sess, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, p)
 			if err == nil && sess != nil {
-				vpnSvc.endpoint.SessionManager().SetSessionLastSeen(p, time.Now().UTC().Add(-10*time.Minute))
+				vpnSvc.sessionMgr.SetSessionLastSeen(p, time.Now().UTC().Add(-10*time.Minute))
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
@@ -6043,7 +5303,7 @@ func TestSessionReaperHook_ConcurrentDeadlock(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			_, _ = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+			_, _ = vpnSvc.SweepTimedOutSessions(ctx)
 			time.Sleep(1 * time.Millisecond)
 		}
 	}()
@@ -6261,12 +5521,12 @@ func TestSessionReaperHook_ReconcileFailureDoesNotSuppressReaper(t *testing.T) {
 
 	// Intercept reaper hook so delayed reapSession execution can be controlled
 	reaperChan := make(chan *models.VPNSession, 1)
-	vpnSvc.endpoint.SetSessionReaperHook(func(ctx context.Context, s *models.VPNSession) {
+	vpnSvc.SetSessionReaperHookForTest(func(ctx context.Context, s *models.VPNSession) {
 		reaperChan <- s
 	})
 
 	// 3. Trigger SweepTimedOutSessions
-	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+	timedOut, err := vpnSvc.SweepTimedOutSessions(ctx)
 	if err != nil {
 		t.Fatalf("SweepTimedOutSessions failed: %v", err)
 	}
@@ -6374,7 +5634,7 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutDuringApply(t *t
 	}
 
 	// Age session past IdleTimeout (default 3m, age by 10m)
-	vpnSvc.endpoint.SessionManager().SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
+	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
 
 	versionBefore := vpnSvc.sessionMgr.LifecycleVersion()
 
@@ -6395,7 +5655,7 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutDuringApply(t *t
 			// SweepTimedOutSessions runs CheckTimeouts under SessionManager.mu,
 			// increments lifecycleVersion, and then invokes registered reaperHook
 			// which calls svc.reapSession(ctx, sess) blocking on Service.mu.
-			timedOut, sweepErr = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+			timedOut, sweepErr = vpnSvc.SweepTimedOutSessions(ctx)
 		}()
 
 		// Wait until CheckTimeouts has removed session A and advanced lifecycleVersion
@@ -6491,7 +5751,7 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *
 	}
 
 	// Age session past IdleTimeout (default 3m, age by 10m)
-	vpnSvc.endpoint.SessionManager().SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
+	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyA, time.Now().UTC().Add(-10*time.Minute))
 
 	versionBefore := vpnSvc.sessionMgr.LifecycleVersion()
 
@@ -6513,7 +5773,7 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *
 			// SweepTimedOutSessions runs CheckTimeouts under SessionManager.mu,
 			// increments lifecycleVersion, and then invokes registered reaperHook
 			// which calls svc.reapSession(ctx, sess) blocking on Service.mu.
-			timedOut, sweepErr = vpnSvc.endpoint.SweepTimedOutSessions(ctx)
+			timedOut, sweepErr = vpnSvc.SweepTimedOutSessions(ctx)
 		}()
 
 		// Wait until CheckTimeouts has removed session A and advanced lifecycleVersion
@@ -6757,184 +6017,6 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 	})
 }
 
-func TestService_ActiveTrafficPreventsSessionReaperTeardown(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, s1ID, _, uID, peerKeyAlice := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	tunnels := vpnSvc.pool.GetActiveTunnels()
-	if len(tunnels) == 0 {
-		t.Fatalf("expected active tunnels in pool")
-	}
-	var tunID int64
-	for _, tun := range tunnels {
-		if tun.ServerID == s1ID {
-			tunID = tun.ID
-			break
-		}
-	}
-	if tunID == 0 {
-		tunID = tunnels[0].ID
-	}
-
-	// 1. Establish an active session:
-	// - session registered in sessionMgr
-	// - route registered in forwarder
-	// - sticky affinities in stickyMgr
-	// - incremented pool connection counter
-	sessID := "sess-active-traffic-test-1"
-	assignedIP := "10.100.0.123"
-	sess, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIP, tunID, sessID)
-	if err != nil {
-		t.Fatalf("CreateSession failed: %v", err)
-	}
-	vpnSvc.forwarder.RegisterSession(sess.ID, "conn-1", peerKeyAlice, assignedIP, tunID)
-	vpnSvc.stickyMgr.AssignAffinity(uID, tunID)
-	vpnSvc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tunID)
-	vpnSvc.pool.IncrementConnections(tunID)
-
-	// 2. Set up client address and transport keys in listener
-	clientAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:49876")
-	if err != nil {
-		t.Fatalf("ResolveUDPAddr failed: %v", err)
-	}
-	clientSendKey := make([]byte, chacha20poly1305.KeySize)
-	clientRecvKey := make([]byte, chacha20poly1305.KeySize)
-	for i := range clientSendKey {
-		clientSendKey[i] = byte(i + 10)
-		clientRecvKey[i] = byte(i + 50)
-	}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, &endpoint.TransportKeys{
-		RecvKey: clientSendKey,
-		SendKey: clientRecvKey,
-	})
-	vpnSvc.endpoint.RememberPeerForTest(clientAddr, peerKeyAlice, 20001)
-
-	// 3. Age session so that without transport traffic it WOULD be reaped (default IdleTimeout is 3m)
-	staleTime := time.Now().UTC().Add(-4 * time.Minute)
-	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyAlice, staleTime)
-
-	// Verify pre-condition: session is currently older than IdleTimeout
-	sessBefore, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice)
-	if !ok || !sessBefore.LastSeen.Equal(staleTime) {
-		t.Fatalf("failed to set stale LastSeen on session")
-	}
-
-	// 4. Construct a valid IPv4 transport datagram matching assignedIP and send through listener
-	// Valid IPv4 packet header with srcIP = 10.100.0.123, dstIP = 1.1.1.1
-	ipv4Packet := make([]byte, 28)                  // 20-byte IPv4 header + 8-byte payload
-	ipv4Packet[0] = 0x45                            // IPv4, header len 20
-	binary.BigEndian.PutUint16(ipv4Packet[2:4], 28) // total length
-	copy(ipv4Packet[12:16], net.ParseIP(assignedIP).To4())
-	copy(ipv4Packet[16:20], net.ParseIP("1.1.1.1").To4())
-	copy(ipv4Packet[20:], []byte("pingdata"))
-
-	clientAEAD, err := chacha20poly1305.New(clientSendKey)
-	if err != nil {
-		t.Fatalf("chacha20poly1305.New failed: %v", err)
-	}
-	var counter uint64 = 0
-	var nonce [chacha20poly1305.NonceSize]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], counter)
-	ciphertext := clientAEAD.Seal(nil, nonce[:], ipv4Packet, nil)
-
-	s4 := vpnSvc.cfg.S4
-	if s4 <= 0 {
-		s4 = 16
-	}
-	s4Junk := make([]byte, s4)
-	var hdr [16]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], vpnSvc.cfg.H4.Lo)
-	binary.LittleEndian.PutUint32(hdr[4:8], 20001)
-	binary.LittleEndian.PutUint64(hdr[8:16], counter)
-
-	datagram := append(s4Junk, hdr[:]...)
-	datagram = append(datagram, ciphertext...)
-
-	// Send datagram into listener via HandleDatagramForTest
-	vpnSvc.endpoint.HandleDatagramForTest(ctx, datagram, clientAddr)
-
-	// 5. Verify that session LastSeen was refreshed by incoming transport data
-	sessAfterPkt, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice)
-	if !ok {
-		t.Fatal("session missing after packet processing")
-	}
-	if !sessAfterPkt.LastSeen.After(staleTime) {
-		t.Fatalf("expected LastSeen to be updated after packet, got %v (stale was %v)", sessAfterPkt.LastSeen, staleTime)
-	}
-
-	// 6. Run SweepTimedOutSessions (simulating idle reaper sweep)
-	timedOut, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
-	if err != nil {
-		t.Fatalf("SweepTimedOutSessions failed: %v", err)
-	}
-	if len(timedOut) > 0 {
-		t.Fatalf("expected active session to NOT be reaped, but %d session(s) were reaped", len(timedOut))
-	}
-
-	// 7. Verify all state remains active:
-	// a) Session remains in sessionMgr
-	if _, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice); !ok {
-		t.Errorf("expected session to remain active in sessionMgr")
-	}
-	// b) Forwarder route remains registered
-	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); !ok {
-		t.Errorf("expected forwarder route to remain intact")
-	}
-	// c) Sticky affinity remains active
-	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
-		t.Errorf("expected user sticky affinity to remain %d, got %d (ok=%v)", tunID, tid, ok)
-	}
-	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
-		t.Errorf("expected peer sticky affinity to remain %d, got %d (ok=%v)", tunID, tid, ok)
-	}
-	// d) Pool connection count remains 1
-	tunCheck, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunCheck.ActiveConnections != 1 {
-		t.Errorf("expected pool ActiveConnections to remain 1, got %d (err=%v)", tunCheck.ActiveConnections, err)
-	}
-
-	// 8. Now simulate genuine idle: no more traffic, age session past IdleTimeout (3m)
-	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyAlice, time.Now().UTC().Add(-10*time.Minute))
-
-	// Run sweep again: idle session should now be reaped
-	timedOutIdle, err := vpnSvc.endpoint.SweepTimedOutSessions(ctx)
-	if err != nil {
-		t.Fatalf("SweepTimedOutSessions failed: %v", err)
-	}
-	if len(timedOutIdle) != 1 || timedOutIdle[0].ID != sess.ID {
-		t.Fatalf("expected idle session to be reaped, got %+v", timedOutIdle)
-	}
-
-	// 9. Post-reap invariants:
-	// a) Session removed from sessionMgr
-	if _, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice); ok {
-		t.Errorf("session should be removed from sessionMgr after idle reap")
-	}
-	// b) Forwarder route unregistered
-	if _, ok := vpnSvc.forwarder.GetClientPacketChannel(peerKeyAlice); ok {
-		t.Errorf("forwarder route should be unregistered after idle reap")
-	}
-	// c) Pool connections decremented to 0
-	tunReaped, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunReaped.ActiveConnections != 0 {
-		t.Errorf("expected pool ActiveConnections=0 after idle reap, got %d", tunReaped.ActiveConnections)
-	}
-	// d) Sticky affinity preserved within AffinityTTL (issue #294)
-	if tid, ok := vpnSvc.stickyMgr.GetAffinity(uID); !ok || tid != tunID {
-		t.Errorf("expected user sticky affinity to be preserved within AffinityTTL, got %d (ok=%v)", tid, ok)
-	}
-	if tid, ok := vpnSvc.stickyMgr.GetPeerAffinity(peerKeyAlice); !ok || tid != tunID {
-		t.Errorf("expected peer sticky affinity to be preserved within AffinityTTL, got %d (ok=%v)", tid, ok)
-	}
-}
-
 func TestService_ReapSession_DoesNotPruneExpiredAffinity(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -7099,668 +6181,6 @@ func TestService_PostSweepHook_PrunesExpiredAffinity(t *testing.T) {
 	uCountAfter, pCountAfter := vpnSvc.stickyMgr.AffinityCount()
 	if uCountAfter != 0 || pCountAfter != 0 {
 		t.Fatalf("expected AffinityCount=(0, 0) after pruning, got (%d, %d)", uCountAfter, pCountAfter)
-	}
-}
-func TestService_DisconnectSession_PrunesTransportStateAfterHandshake(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
-	}
-
-	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
-	if err != nil {
-		t.Fatalf("failed to decode header protection key: %v", err)
-	}
-	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
-	if err != nil {
-		t.Fatalf("failed to decode portal public key: %v", err)
-	}
-
-	// Build initiation packet using AWG header protection
-	packet, state, err := health.BuildAWGInitiationPacketObfuscated(sPub, nil, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
-	}
-	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("failed to derive client pub: %v", err)
-	}
-	peerKey := base64.StdEncoding.EncodeToString(clientPub)
-
-	// Register peer as user connection in DB
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		UserID:   uID,
-		ServerID: 0,
-		Protocol: "awg",
-		ClientID: peerKey,
-		Name:     "handshake-peer",
-	})
-	if err != nil {
-		t.Fatalf("CreateConnection failed: %v", err)
-	}
-
-	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
-	if !ok {
-		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
-	}
-	clientConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	if _, err := clientConn.Write(packet); err != nil {
-		t.Fatalf("failed to send handshake initiation: %v", err)
-	}
-
-	respBuf := make([]byte, 2048)
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("no handshake response received: %v", err)
-	}
-
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf[:n], state, hpKey, vpnSvc.cfg.H2, vpnSvc.cfg.S2) {
-		t.Fatalf("VerifyAWGResponsePacketObfuscated rejected server response")
-	}
-
-	// Response verification alone only stages responder next. Confirm it with
-	// the authenticated zero-length keepalive a real initiator sends.
-	confirmSamePeerHandshake(t, vpnSvc, clientConn, peerKey, hpKey, vpnSvc.cfg.H4, vpnSvc.cfg.S4)
-
-	// 1. Confirm session and transport state exist
-	sess, ok := vpnSvc.sessionMgr.GetSession(peerKey)
-	if !ok || sess == nil {
-		t.Fatalf("expected active session for peer %s after handshake", peerKey)
-	}
-
-	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
-	if cur == nil || cur.LocalIndex == 0 {
-		t.Fatalf("expected current transport keys with non-zero LocalIndex, got %+v", cur)
-	}
-	if prev != nil {
-		t.Fatalf("expected nil previous keys on fresh handshake, got %+v", prev)
-	}
-	localIdx := cur.LocalIndex
-
-	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); !ok {
-		t.Fatalf("expected TransportKeysFor to return keys for %s", peerKey)
-	}
-	if keys, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(localIdx); !ok || keys == nil {
-		t.Fatalf("expected indexTable entry for localIdx %d", localIdx)
-	}
-	if !vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
-		t.Fatalf("expected peersByAddr entry for peer %s", peerKey)
-	}
-	if !vpnSvc.HasTransportStateForPeer(peerKey) {
-		t.Fatalf("expected HasTransportStateForPeer to return true for %s", peerKey)
-	}
-
-	// 2. Disconnect session via Service
-	if err := vpnSvc.DisconnectSession(ctx, sess.ID); err != nil {
-		t.Fatalf("DisconnectSession failed: %v", err)
-	}
-
-	// 3. Verify peerKeypairs, noiseKeys, indexTable entry, and address state are absent
-	curAfter, prevAfter := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
-	if curAfter != nil || prevAfter != nil {
-		t.Fatalf("expected nil peerKeypairs after disconnect, got cur=%+v, prev=%+v", curAfter, prevAfter)
-	}
-	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); ok {
-		t.Fatalf("expected TransportKeysFor to return false after disconnect")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(localIdx); ok {
-		t.Fatalf("expected indexTable entry for localIdx %d to be absent after disconnect", localIdx)
-	}
-	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
-		t.Fatalf("expected peersByAddr entry to be absent after disconnect")
-	}
-	if vpnSvc.HasTransportStateForPeer(peerKey) {
-		t.Fatalf("expected HasTransportStateForPeer to return false after disconnect")
-	}
-	if _, ok := vpnSvc.sessionMgr.GetSession(peerKey); ok {
-		t.Fatalf("expected session to be closed in sessionMgr after disconnect")
-	}
-}
-
-func TestService_DisconnectUser_PrunesTransportStateForAllUserSessions(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, _, _ := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	uIDBob, err := db.CreateUser(ctx, &models.User{Username: "bob-multi", Enabled: true})
-	if err != nil {
-		t.Fatalf("CreateUser failed: %v", err)
-	}
-
-	peerKey1 := "bob-device-1-pubkey"
-	peerKey2 := "bob-device-2-pubkey"
-	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey1, Name: "bob-phone",
-	})
-	_, _ = db.CreateConnection(ctx, &models.UserConnection{
-		UserID: uIDBob, ServerID: 0, Protocol: "awg", ClientID: peerKey2, Name: "bob-laptop",
-	})
-
-	sess1, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey1)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer peerKey1 failed: %v", err)
-	}
-	keys1 := &endpoint.TransportKeys{LocalIndex: 11111, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKey1, keys1, sess1.ID)
-	addr1, _ := net.ResolveUDPAddr("udp", "127.0.0.1:41111")
-	vpnSvc.endpoint.RememberPeerForTest(addr1, peerKey1, keys1.LocalIndex)
-
-	sess2, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKey2)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer peerKey2 failed: %v", err)
-	}
-	keys2 := &endpoint.TransportKeys{LocalIndex: 22222, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKey2, keys2, sess2.ID)
-	addr2, _ := net.ResolveUDPAddr("udp", "127.0.0.1:42222")
-	vpnSvc.endpoint.RememberPeerForTest(addr2, peerKey2, keys2.LocalIndex)
-
-	// Verify pre-condition: transport state exists for both peers
-	if !vpnSvc.HasTransportStateForPeer(peerKey1) || !vpnSvc.HasTransportStateForPeer(peerKey2) {
-		t.Fatalf("expected transport state to exist for both peers before DisconnectUser")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(11111); !ok {
-		t.Fatalf("expected indexTable entry for 11111")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(22222); !ok {
-		t.Fatalf("expected indexTable entry for 22222")
-	}
-
-	// Disconnect user
-	if err := vpnSvc.DisconnectUser(ctx, uIDBob); err != nil {
-		t.Fatalf("DisconnectUser failed: %v", err)
-	}
-
-	// Verify all sessions and transport state for user are pruned
-	if vpnSvc.HasTransportStateForPeer(peerKey1) {
-		t.Errorf("expected peerKey1 transport state pruned after DisconnectUser")
-	}
-	if vpnSvc.HasTransportStateForPeer(peerKey2) {
-		t.Errorf("expected peerKey2 transport state pruned after DisconnectUser")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(11111); ok {
-		t.Errorf("expected indexTable entry 11111 to be absent")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(22222); ok {
-		t.Errorf("expected indexTable entry 22222 to be absent")
-	}
-	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey1) || vpnSvc.endpoint.HasPeerAddrForTest(peerKey2) {
-		t.Errorf("expected address state to be pruned for both peers")
-	}
-	if active := vpnSvc.sessionMgr.GetSessionsByUserID(uIDBob); len(active) > 0 {
-		t.Errorf("expected 0 active sessions for user, got %d", len(active))
-	}
-}
-
-func TestService_ReleaseClient_PrunesTransportState(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, _, peerKeyAlice := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	// 1. Test ReleaseClient with an active session
-	sess, _, err := vpnSvc.HandleIncomingPeer(ctx, peerKeyAlice)
-	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
-	}
-	keys := &endpoint.TransportKeys{LocalIndex: 33333, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys, sess.ID)
-	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:43333")
-	vpnSvc.endpoint.RememberPeerForTest(clientAddr, peerKeyAlice, keys.LocalIndex)
-
-	if !vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
-		t.Fatalf("expected transport state for peerKeyAlice before ReleaseClient")
-	}
-
-	if err := vpnSvc.ReleaseClient(ctx, peerKeyAlice); err != nil {
-		t.Fatalf("ReleaseClient failed: %v", err)
-	}
-
-	if vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
-		t.Errorf("expected transport state to be pruned after ReleaseClient")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(33333); ok {
-		t.Errorf("expected indexTable entry 33333 to be absent after ReleaseClient")
-	}
-	if vpnSvc.endpoint.HasPeerAddrForTest(peerKeyAlice) {
-		t.Errorf("expected address state to be absent after ReleaseClient")
-	}
-	if _, ok := vpnSvc.sessionMgr.GetSession(peerKeyAlice); ok {
-		t.Errorf("expected session to be closed after ReleaseClient")
-	}
-
-	// 2. Test ReleaseClient cleans up orphaned/unindexed transport state without active session
-	orphanPeer := "orphaned-peer-pubkey"
-	orphanKeys := &endpoint.TransportKeys{LocalIndex: 44444, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(orphanPeer, orphanKeys)
-	orphanAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:44444")
-	vpnSvc.endpoint.RememberPeerForTest(orphanAddr, orphanPeer, orphanKeys.LocalIndex)
-
-	if !vpnSvc.HasTransportStateForPeer(orphanPeer) {
-		t.Fatalf("expected transport state for orphanPeer before ReleaseClient")
-	}
-
-	if err := vpnSvc.ReleaseClient(ctx, orphanPeer); err != nil {
-		t.Fatalf("ReleaseClient for orphan failed: %v", err)
-	}
-
-	if vpnSvc.HasTransportStateForPeer(orphanPeer) {
-		t.Errorf("expected orphanPeer transport state to be pruned after ReleaseClient")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(44444); ok {
-		t.Errorf("expected indexTable entry 44444 to be absent after ReleaseClient")
-	}
-	if vpnSvc.endpoint.HasPeerAddrForTest(orphanPeer) {
-		t.Errorf("expected orphanPeer address state to be absent after ReleaseClient")
-	}
-}
-
-func TestService_DisconnectSession_StaleSessionDoesNotPruneReplacement(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
-	}
-
-	tunnels := vpnSvc.pool.GetActiveTunnels()
-	if len(tunnels) == 0 {
-		t.Fatalf("expected active tunnels in pool")
-	}
-	tunID := tunnels[0].ID
-
-	// 1. Establish session 1 for peer
-	sess1, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, "10.100.0.50", tunID, "conn-1")
-	if err != nil {
-		t.Fatalf("CreateSession sess1 failed: %v", err)
-	}
-	keys1 := &endpoint.TransportKeys{LocalIndex: 55551, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys1, sess1.ID)
-	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:45551")
-	vpnSvc.endpoint.RememberPeerForTest(addr, peerKeyAlice, keys1.LocalIndex)
-
-	if sessID := vpnSvc.endpoint.PeerSessionIDForTest(peerKeyAlice); sessID != sess1.ID {
-		t.Fatalf("expected session ID %s, got %s", sess1.ID, sessID)
-	}
-
-	// 2. Concurrent rekey establishes replacement session 2
-	sess2, err := vpnSvc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, "10.100.0.50", tunID, "conn-1")
-	if err != nil {
-		t.Fatalf("CreateSession sess2 failed: %v", err)
-	}
-	keys2 := &endpoint.TransportKeys{LocalIndex: 55552, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	vpnSvc.endpoint.StoreTransportKeysForTest(peerKeyAlice, keys2, sess2.ID)
-
-	if sessID := vpnSvc.endpoint.PeerSessionIDForTest(peerKeyAlice); sessID != sess2.ID {
-		t.Fatalf("expected session ID %s after rekey, got %s", sess2.ID, sessID)
-	}
-
-	// 3. Stale DisconnectSession(sess1.ID) must not prune the new replacement session's transport state
-	// In DisconnectSession, sess1 is no longer in sessionMgr, returning ErrSessionNotFound
-	err = vpnSvc.DisconnectSession(ctx, sess1.ID)
-	if !errors.Is(err, endpoint.ErrSessionNotFound) {
-		t.Fatalf("expected ErrSessionNotFound for stale session disconnect, got: %v", err)
-	}
-
-	// In-flight disconnect scenario: if a caller had already resolved sess1 and invoked PrunePeerTransportStateIfSession
-	pruned := vpnSvc.endpoint.PrunePeerTransportStateIfSession(peerKeyAlice, sess1.ID)
-	if pruned {
-		t.Fatal("PrunePeerTransportStateIfSession should have aborted when expectedSessionID does not match active replacement")
-	}
-
-	// 4. Verify keys2, indexTable entry, and address state are completely preserved
-	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKeyAlice)
-	if cur == nil || cur.LocalIndex != keys2.LocalIndex {
-		t.Fatalf("expected current keys to remain keys2 (55552), got %+v", cur)
-	}
-	if prev == nil || prev.LocalIndex != keys1.LocalIndex {
-		t.Fatalf("expected previous keys to remain keys1 (55551), got %+v", prev)
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(keys2.LocalIndex); !ok {
-		t.Fatalf("expected indexTable entry for replacement keys2 to remain registered")
-	}
-	if !vpnSvc.endpoint.HasPeerAddrForTest(peerKeyAlice) {
-		t.Fatalf("expected address state to remain preserved for peer")
-	}
-	if !vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
-		t.Fatalf("expected HasTransportStateForPeer to remain true for active peer")
-	}
-
-	// 5. Calling DisconnectSession with the active replacement session ID prunes cleanly
-	if err := vpnSvc.DisconnectSession(ctx, sess2.ID); err != nil {
-		t.Fatalf("DisconnectSession for sess2 failed: %v", err)
-	}
-
-	if vpnSvc.HasTransportStateForPeer(peerKeyAlice) {
-		t.Fatalf("expected transport state to be pruned after disconnecting replacement session")
-	}
-	if _, ok := vpnSvc.endpoint.LookupKeypairByIndexForTest(keys2.LocalIndex); ok {
-		t.Fatalf("expected indexTable entry for keys2 to be absent after disconnect")
-	}
-}
-
-// TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse verifies that
-// when an active VPN session is disconnected while a handshake is waiting at the pre-transport-commit
-// hook, commitHandshakeTransportState detects the disconnected session, aborts installation,
-// releases the receiver index from indexTable, suppresses endpoint address registration,
-// leaves no transport state in HasTransportStateForPeer or noiseKeys, and transmits no UDP handshake response.
-func TestHandshakeCommit_StaleSessionDisconnectSuppressesTransportAndResponse(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
-	}
-
-	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
-	if err != nil {
-		t.Fatalf("failed to decode header protection key: %v", err)
-	}
-	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
-	if err != nil {
-		t.Fatalf("failed to decode portal public key: %v", err)
-	}
-
-	packet, state, err := health.BuildAWGInitiationPacketObfuscated(sPub, nil, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated failed: %v", err)
-	}
-	clientPub, err := curve25519.X25519(state.ClientPriv, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("failed to derive client pub: %v", err)
-	}
-	peerKey := base64.StdEncoding.EncodeToString(clientPub)
-
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		UserID:   uID,
-		ServerID: 0,
-		Protocol: "awg",
-		ClientID: peerKey,
-		Name:     "stale-commit-peer",
-	})
-	if err != nil {
-		t.Fatalf("CreateConnection failed: %v", err)
-	}
-
-	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
-	if !ok {
-		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
-	}
-	clientConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP failed: %v", err)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	hookFired := make(chan string, 1)
-	resumeHook := make(chan struct{})
-
-	vpnSvc.SetPreTransportCommitHookForTest(func(pKey string, sID string) {
-		if pKey == peerKey {
-			hookFired <- sID
-			<-resumeHook
-		}
-	})
-
-	if _, err := clientConn.Write(packet); err != nil {
-		t.Fatalf("failed to send handshake initiation: %v", err)
-	}
-
-	var sessID string
-	select {
-	case sessID = <-hookFired:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for preTransportCommitHook to fire")
-	}
-
-	// Session S_1 is connected before DisconnectSession
-	sess, ok := vpnSvc.sessionMgr.GetSessionByID(sessID)
-	if !ok || sess == nil || sess.Status != "connected" {
-		t.Fatalf("expected active connected session S_1 before disconnect, got %+v", sess)
-	}
-
-	// Invoke DisconnectSession(S1.ID) on Service
-	if err := vpnSvc.DisconnectSession(ctx, sessID); err != nil {
-		t.Fatalf("DisconnectSession failed: %v", err)
-	}
-
-	// Resume worker -> commitHandshakeTransportState executes
-	close(resumeHook)
-
-	// Worker drops response; UDP read should timeout
-	_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	respBuf := make([]byte, 2048)
-	n, err := clientConn.Read(respBuf)
-	if err == nil {
-		t.Fatalf("expected no handshake response transmitted over UDP, got %d bytes", n)
-	}
-
-	// Assertions:
-	// 1. commitHandshakeTransportState returned false (directly testable with disconnected session ID)
-	dummyKeys := &endpoint.TransportKeys{LocalIndex: 77771, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	if vpnSvc.endpoint.CommitHandshakeTransportStateForTest(peerKey, sessID, dummyKeys, 77771, serverAddr, 0) {
-		t.Fatal("expected commitHandshakeTransportState to return false for disconnected session")
-	}
-
-	// 2. No transport state exists for the peer (HasTransportStateForPeer is false, noiseKeys has no entry)
-	if vpnSvc.HasTransportStateForPeer(peerKey) {
-		t.Fatal("expected HasTransportStateForPeer to return false")
-	}
-	if _, ok := vpnSvc.endpoint.TransportKeysFor(peerKey); ok {
-		t.Fatal("expected noiseKeys to have no entry for peer")
-	}
-	cur, prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
-	if cur != nil || prev != nil {
-		t.Fatalf("expected nil peerKeypairs, got cur=%+v, prev=%+v", cur, prev)
-	}
-
-	// 3. Allocated receiver index was released from indexTable
-	if count := vpnSvc.endpoint.IndexTableCountForTest(); count != 0 {
-		t.Fatalf("expected indexTable to be empty, got %d entries", count)
-	}
-
-	// 4. peersByAddr has no entry for the sender
-	if vpnSvc.endpoint.HasPeerAddrForTest(peerKey) {
-		t.Fatal("expected peersByAddr to have no entry for sender")
-	}
-}
-
-// TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession verifies at the
-// VPN Service level that concurrent handshakes H1 and H2 for the same peer preserve H2's session
-// and transport keys, rejecting H1's stale commit and ensuring K1 does not clobber K2.
-func TestHandshakeCommit_ConcurrentHandshakeReplacementProtectsNewerSession(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	vpnSvc, _, _, uID, _ := setupTestVPNService(t, db)
-	defer func() { _ = vpnSvc.Stop() }()
-
-	if err := vpnSvc.StartCustomEndpointForTest(ctx); err != nil {
-		t.Fatalf("StartCustomEndpointForTest failed: %v", err)
-	}
-
-	hpKey, err := base64.StdEncoding.DecodeString(vpnSvc.cfg.HeaderProtectionKey)
-	if err != nil {
-		t.Fatalf("failed to decode header protection key: %v", err)
-	}
-	sPub, err := base64.StdEncoding.DecodeString(vpnSvc.portalPubKey)
-	if err != nil {
-		t.Fatalf("failed to decode portal public key: %v", err)
-	}
-
-	// Generate client keypair
-	clientPriv := make([]byte, 32)
-	if _, err := rand.Read(clientPriv); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
-	if err != nil {
-		t.Fatalf("curve25519 failed: %v", err)
-	}
-	peerKey := base64.StdEncoding.EncodeToString(clientPub)
-
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		UserID:   uID,
-		ServerID: 0,
-		Protocol: "awg",
-		ClientID: peerKey,
-		Name:     "concurrent-handshake-peer",
-	})
-	if err != nil {
-		t.Fatalf("CreateConnection failed: %v", err)
-	}
-
-	serverAddr, ok := vpnSvc.endpoint.GetListenAddr().(*net.UDPAddr)
-	if !ok {
-		t.Fatalf("GetListenAddr returned %T, want *net.UDPAddr", vpnSvc.endpoint.GetListenAddr())
-	}
-
-	clientConn1, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP conn1: %v", err)
-	}
-	defer func() { _ = clientConn1.Close() }()
-
-	clientConn2, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		t.Fatalf("DialUDP conn2: %v", err)
-	}
-	defer func() { _ = clientConn2.Close() }()
-
-	var h1Fired atomic.Bool
-	h1PauseChan := make(chan struct{})
-	var releaseH1 sync.Once
-	defer releaseH1.Do(func() { close(h1PauseChan) })
-	h1FiredChan := make(chan string, 1)
-
-	vpnSvc.SetPreTransportCommitHookForTest(func(pKey string, sID string) {
-		if pKey != peerKey {
-			return
-		}
-		if h1Fired.CompareAndSwap(false, true) {
-			h1FiredChan <- sID
-			<-h1PauseChan
-		}
-	})
-
-	// Handshake H1 initiates -> creates session S1
-	pkt1, _, err := health.BuildAWGInitiationPacketObfuscated(sPub, clientPriv, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated H1: %v", err)
-	}
-	if _, err := clientConn1.Write(pkt1); err != nil {
-		t.Fatalf("write initiation H1: %v", err)
-	}
-
-	var h1SessionID string
-	select {
-	case h1SessionID = <-h1FiredChan:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for H1 worker to pause at preTransportCommitHook")
-	}
-	h1Generation := vpnSvc.PeerGeneration(peerKey)
-
-	// Handshake H2 initiates for the same peer while H1 is paused
-	pkt2, state2, err := health.BuildAWGInitiationPacketObfuscated(sPub, clientPriv, nil, hpKey, vpnSvc.cfg.H1, vpnSvc.cfg.S1)
-	if err != nil {
-		t.Fatalf("BuildAWGInitiationPacketObfuscated H2: %v", err)
-	}
-	if _, err := clientConn2.Write(pkt2); err != nil {
-		t.Fatalf("write initiation H2: %v", err)
-	}
-
-	// Worker H2 advances the same session's handshake generation, commits K2, and responds.
-	respBuf2 := make([]byte, 2048)
-	_ = clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n2, err := clientConn2.Read(respBuf2)
-	if err != nil {
-		t.Fatalf("failed to read H2 response: %v", err)
-	}
-	if !health.VerifyAWGResponsePacketObfuscated(respBuf2[:n2], state2, hpKey, vpnSvc.cfg.H2, vpnSvc.cfg.S2) {
-		t.Fatal("VerifyAWGResponsePacketObfuscated rejected H2 response")
-	}
-	confirmSamePeerHandshake(t, vpnSvc, clientConn2, peerKey, hpKey, vpnSvc.cfg.H4, vpnSvc.cfg.S4)
-
-	// Verify confirmed K2 / S2 state before resuming H1.
-	k2Current, k2Prev := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
-	if k2Current == nil {
-		t.Fatal("expected current transport keys K2 for peer after H2")
-	}
-	if k2Prev != nil {
-		t.Fatalf("expected nil previous keys for peer after replacement H2, got %+v", k2Prev)
-	}
-	s2ID := vpnSvc.endpoint.PeerSessionIDForTest(peerKey)
-	if s2ID == "" || s2ID != h1SessionID {
-		t.Fatalf("live rekey replaced the session: H1=%s H2=%s", h1SessionID, s2ID)
-	}
-	k2LocalIdx := k2Current.LocalIndex
-
-	// Resume H1 with stale S1 -> worker H1 commits
-	releaseH1.Do(func() { close(h1PauseChan) })
-
-	// Worker H1 should drop response and not send anything
-	_ = clientConn1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	respBuf1 := make([]byte, 2048)
-	n1, err := clientConn1.Read(respBuf1)
-	if err == nil {
-		t.Fatalf("expected H1 response to be dropped, but read %d bytes", n1)
-	}
-
-	// Assert:
-	// 1. H1 commit is dropped/rejected by its reserved handshake generation.
-	dummyKeys := &endpoint.TransportKeys{LocalIndex: 88882, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	if vpnSvc.endpoint.CommitHandshake(peerKey, h1Generation, dummyKeys, serverAddr, 0) {
-		t.Fatal("expected stale H1 generation to be rejected")
-	}
-
-	// 2. K2 / S2 remains active current keypair in peerKeypairs and noiseKeys
-	curFinal, prevFinal := vpnSvc.endpoint.PeerKeypairsForTest(peerKey)
-	if curFinal == nil || curFinal != k2Current {
-		t.Fatalf("expected current keypair to remain K2, got %+v (want %+v)", curFinal, k2Current)
-	}
-	if curFinal.LocalIndex != k2LocalIdx {
-		t.Fatalf("expected current LocalIndex to remain %d, got %d", k2LocalIdx, curFinal.LocalIndex)
-	}
-	if prevFinal != nil {
-		t.Fatalf("expected prev keypair to remain nil, got %+v", prevFinal)
-	}
-
-	tk, ok := vpnSvc.endpoint.TransportKeysFor(peerKey)
-	if !ok || tk != k2Current {
-		t.Fatalf("expected noiseKeys to retain K2, got %+v (found=%v)", tk, ok)
-	}
-	if sid := vpnSvc.endpoint.PeerSessionIDForTest(peerKey); sid != s2ID {
-		t.Fatalf("expected peer session ID to remain S2 (%s), got %s", s2ID, sid)
-	}
-	if !vpnSvc.HasTransportStateForPeer(peerKey) {
-		t.Fatal("expected HasTransportStateForPeer to remain true for peer with active K2")
 	}
 }
 

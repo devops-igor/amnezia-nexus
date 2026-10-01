@@ -161,7 +161,7 @@ func TestRegressionLegacyAdmissionWithListenerCompletes(t *testing.T) {
 		panic("HandleIncomingPeer blocked: notification path reconciled inline under Service.mu")
 	})
 	defer watchdog.Stop()
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err != nil {
 		t.Fatalf("legacy admission with armed listener: %v", err)
 	}
@@ -222,10 +222,6 @@ func TestRegressionLegacyDisableStopsForwarding(t *testing.T) {
 	after, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil || after.ActiveConnections != 0 {
 		t.Fatalf("backend counter after legacy disable = %d, want 0 (err: %v)", after.ActiveConnections, err)
-	}
-	// The legacy listener stays alive: engine dormancy is the point.
-	if svc.endpoint == nil {
-		t.Fatal("legacy service unexpectedly lost its endpoint listener")
 	}
 }
 

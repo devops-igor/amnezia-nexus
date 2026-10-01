@@ -156,7 +156,6 @@ type Service struct {
 	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
 	db            *database.DB
 	cfg           *models.VPNConfig
-	endpoint      *endpoint.Listener
 	sessionMgr    *endpoint.SessionManager
 	ipam          *endpoint.IPAM
 	auth          *endpoint.DBAuthenticator
@@ -188,7 +187,6 @@ type Service struct {
 
 	lastReconcileTime                      time.Time
 	lastReconcileByTunnel                  map[int64]time.Time
-	peerGenerations                        map[string]uint64
 	reconcilePostSnapshotHook              func()
 	reconcilePreApplyHook                  func()
 	reconcilePreCommitHook                 func()
@@ -202,6 +200,7 @@ type Service struct {
 	updateBackendServerHostErr             error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
+	reaperHook                             func(context.Context, *models.VPNSession)
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -549,30 +548,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		db.SubscribePeerRevokes(revokeDispatch)
 	}
 
-	listenerCfg := endpoint.ListenerConfig{
-		ListenPort:  cfg.ListenPort,
-		SubnetCIDR:  cfg.SubnetCIDR,
-		MTU:         1420,
-		IdleTimeout: 3 * time.Minute,
-		// RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard)
-		// when zero, providing a stable transition window intentionally independent of client-configured
-		// timing ranges.
-		HeaderProtectionKey: cfg.HeaderProtectionKey,
-		H1:                  cfg.H1,
-		S1:                  cfg.S1,
-		H2:                  cfg.H2,
-		S2:                  cfg.S2,
-		H3:                  cfg.H3,
-		S3:                  cfg.S3,
-		H4:                  cfg.H4,
-		S4:                  cfg.S4,
-	}
-
-	epListener, err := endpoint.NewListener(listenerCfg, db, auth, ipam, sessionMgr, serverKeys)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init endpoint listener: %w", err)
-	}
-
 	pool := tunnel.NewPool(db)
 
 	healthCfg := tunnel.DefaultHealthConfig()
@@ -638,7 +613,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	svc := &Service{
 		db:                     db,
 		cfg:                    cfg,
-		endpoint:               epListener,
 		sessionMgr:             sessionMgr,
 		ipam:                   ipam,
 		auth:                   auth,
@@ -653,12 +627,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
-		peerGenerations:        make(map[string]uint64),
 	}
 	revokeDispatch.bind(svc)
 
-	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
-	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
 	// Finding 3 (issue #391 round 4a): committed durable access revocations
 	// tear down live sessions immediately, engine-aware, instead of waiting
 	// for the reconciliation worker or the idle reaper. Service implements
@@ -672,9 +643,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// Issue #78: session replacement (client rekey/reconnect) must migrate the
 	// pool connection counter off the old backend - without this every rekey
 	// leaked +1 on the old backend's ActiveConnections gauge (the original
-	// connect incremented it in HandleIncomingPeer; the replacement path never
-	// decremented, and a later DisconnectSession(oldID) found nothing because
-	// the SessionManager had already dropped the old ID and closed the DB row).
+	// connect incremented it; the replacement path never decremented, and a
+	// later DisconnectSession(oldID) found nothing because the SessionManager
+	// had already dropped the old ID and closed the DB row).
 	// The hook uses the same pool primitives as the clean-disconnect
 	// mirror-decrement paths (DisconnectUser/DisconnectSession/ReleaseClient).
 	// SessionManager owns the ordering: CreateSession removes the old session
@@ -684,13 +655,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// forwarder/sticky state - it must never re-enter the session manager.
 	// Capacity serialization note (issue #86): the hook's pool counter
 	// migration therefore participates in the capacity invariant only
-	// transitively - CreateSession's only production call site today is
-	// HandleIncomingPeer, which holds s.mu for the whole select ->
-	// CreateSession -> increment sequence, so the hook in fact runs nested
+	// transitively - EnsureBackendSessionForIngress holds s.mu for the whole
+	// select -> CreateSession -> increment sequence, so the hook runs nested
 	// under BOTH locks (s.mu -> sm.mu; the reverse order is never taken).
-	// If a CreateSession call site outside s.mu is ever added, the hook
-	// escapes the capacity serialization regime and the contract on
-	// tunnel.Pool.IncrementConnections must be re-evaluated.
 	// Old and new backends may differ when the reconnect re-selected a backend.
 	sessionMgr.SetReplacementHook(func(ctx context.Context, old, new *models.VPNSession) {
 		if old == nil {
@@ -704,7 +671,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 				old.PeerPublicKey, old.BackendTunnelID)
 			return
 		}
-		// Mirror HandleIncomingPeer's increment on the same primitives used by
+		// Mirror admission increment on the same primitives used by
 		// DisconnectUser/DisconnectSession/ReleaseClient for the decrement.
 		svc.pool.DecrementConnections(old.BackendTunnelID)
 		if new.BackendTunnelID != old.BackendTunnelID {
@@ -718,16 +685,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		if svc.stickyMgr != nil {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
-	})
-	// Idle-timeout reaper: run teardown directly on the reaped session
-	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
-	// already closed and removed the session from sessionMgr, so we must not
-	// call DisconnectSession (which looks up the session by ID and fails).
-	epListener.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
-		svc.reapSession(ctx, sess)
-	})
-	epListener.SetPostSweepHook(func(ctx context.Context) {
-		svc.PruneExpiredAffinity()
 	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
@@ -1187,66 +1144,6 @@ func (s *Service) startUpstreamClientEngine(ctx context.Context) error {
 		s.cleanupEngineStartupFailure()
 		return fmt.Errorf("failed to start upstream ingress engine: %w", err)
 	}
-	return nil
-}
-
-// StartCustomEndpointForTest starts the legacy endpoint listener directly for tests
-// exercising custom endpoint protocol logic prior to its removal in Phase 394-B.
-func (s *Service) StartCustomEndpointForTest(ctx context.Context) error {
-	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return nil
-	}
-	s.running = true
-	s.mu.Unlock()
-
-	if s.db != nil {
-		s.assignmentMu.Lock()
-		_ = reservePersistedClientIPs(ctx, s.db, s.ipam)
-		_, _ = s.db.InvalidateVPNSessionsForRestart(ctx)
-		s.assignmentMu.Unlock()
-	}
-
-	if s.pool != nil {
-		if err := s.pool.SyncFromDB(ctx); err != nil {
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
-			return fmt.Errorf("failed to sync tunnels from DB: %w", err)
-		}
-		if err := s.pool.ResetEnabledHealthForStartup(ctx); err != nil {
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
-			return fmt.Errorf("failed to reset backend health for startup: %w", err)
-		}
-		s.EnsureBackendProbeKeys(ctx)
-		s.restoreBackendDevices(ctx)
-	}
-
-	s.reconcileConnectionCounts(ctx)
-
-	if s.forwarder != nil {
-		s.forwarder.Start(ctx)
-		s.forwarder.StartPumps(ctx)
-	}
-
-	if s.prober != nil {
-		_ = s.prober.ProbeAll(ctx)
-		s.prober.StartAfterInitialProbe(ctx)
-	}
-	if s.reconnectMgr != nil {
-		s.reconnectMgr.Start(ctx)
-	}
-
-	if s.endpoint != nil {
-		if err := s.endpoint.Start(ctx); err != nil {
-			s.cleanupEngineStartupFailure()
-			return fmt.Errorf("failed to start legacy custom endpoint: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -1743,9 +1640,6 @@ func (s *Service) Stop() error {
 			recordErr(err)
 		}
 	}
-	if s.endpoint != nil {
-		_ = s.endpoint.Stop()
-	}
 	if s.forwarder != nil {
 		if wait := s.forwarder.RetireCustomRoutes(); wait != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1880,10 +1774,6 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
 	populateForwarderStatus(status, s.forwarder)
-	if s.endpoint != nil {
-		status.HandshakeRejections = s.endpoint.HandshakeRejections()
-		status.TransportDecryptionFailures = s.endpoint.TransportDecryptionFailures()
-	}
 
 	var totalDrops uint64
 	for _, dev := range s.backendDevices {
@@ -3307,7 +3197,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		cfg.ServerPublicKey = s.cfg.ServerPublicKey
 	}
 
-	listenerRunning := s.running || (s.endpoint != nil && s.endpoint.IsRunning()) || (s.ingressEngine != nil && s.ingressEngine.Running())
+	listenerRunning := s.running || (s.ingressEngine != nil && s.ingressEngine.Running())
 	obfuscationChanged := s.cfg != nil && obfuscationDiffers(s.cfg, cfg)
 	if obfuscationChanged && listenerRunning {
 		log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
@@ -3333,14 +3223,12 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	}
 	queueSizeChanged := false
 	routeLimitChanged := false
-	oldQueueSize := forwarder.DefaultClientQueueSize
-	oldMaxActiveRoutes := 1000
 	if s.cfg != nil && s.forwarder != nil {
-		oldQueueSize = s.cfg.ClientQueueSize
+		oldQueueSize := s.cfg.ClientQueueSize
 		if oldQueueSize <= 0 {
 			oldQueueSize = forwarder.DefaultClientQueueSize
 		}
-		oldMaxActiveRoutes = s.cfg.MaxTotalPeers
+		oldMaxActiveRoutes := s.cfg.MaxTotalPeers
 		if oldMaxActiveRoutes <= 0 {
 			oldMaxActiveRoutes = 1000
 		}
@@ -3372,49 +3260,6 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 			}
 			return fmt.Errorf("cannot apply client queue size: %w", err)
 		}
-	}
-	rollback := func(cause error) error {
-		var rollbackErrs []error
-		if s.endpoint != nil && previousCfg != nil {
-			if obfuscationChanged {
-				if err := s.endpoint.UpdateObfuscation(previousCfg.H1, previousCfg.H2, previousCfg.H3, previousCfg.H4, previousCfg.S1, previousCfg.S2, previousCfg.S3, previousCfg.S4); err != nil {
-					rollbackErrs = append(rollbackErrs, err)
-				}
-				if err := s.endpoint.UpdateHeaderProtectionKey(previousCfg.HeaderProtectionKey); err != nil {
-					rollbackErrs = append(rollbackErrs, err)
-				}
-			}
-			if listenPortChanged {
-				s.endpoint.UpdateListenPort(previousCfg.ListenPort)
-			}
-		}
-		if queueSizeChanged || routeLimitChanged {
-			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, oldMaxActiveRoutes); err != nil {
-				rollbackErrs = append(rollbackErrs, err)
-			}
-		}
-		if s.db != nil && previousCfg != nil {
-			if err := s.db.SaveVPNConfig(ctx, previousCfg); err != nil {
-				rollbackErrs = append(rollbackErrs, err)
-			}
-		}
-		if len(rollbackErrs) > 0 {
-			return fmt.Errorf("%w; rollback failed: %v", cause, errors.Join(rollbackErrs...))
-		}
-		return cause
-	}
-	if s.endpoint != nil && obfuscationChanged {
-		if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
-			return rollback(err)
-		}
-		if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
-			return rollback(err)
-		}
-		log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
-	}
-	if s.endpoint != nil && listenPortChanged {
-		s.endpoint.UpdateListenPort(cfg.ListenPort)
-		log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
 	}
 	s.cfg = cfg
 
@@ -3460,21 +3305,11 @@ func (s *Service) GetUserConnectionState(ctx context.Context, userID string) (*U
 // DisconnectUser disconnects all active VPN sessions for a user.
 func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	var retirements []forwarder.Retirement
-	type pendingPrune struct {
-		peer, sessionID string
-		generation      uint64
-	}
-	var prunes []pendingPrune
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		for _, retirement := range retirements {
 			retirement.Wait()
-		}
-		if s.endpoint != nil {
-			for _, prune := range prunes {
-				s.endpoint.PrunePeerTransportStateIfSession(prune.peer, prune.sessionID, prune.generation)
-			}
 		}
 	}()
 
@@ -3484,17 +3319,6 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 
 	sessions := s.sessionMgr.GetSessionsByUserID(userID)
 	for _, sess := range sessions {
-		if sess.AdmittedVia != models.SessionAdmissionIngress {
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			s.peerGenerations[sess.PeerPublicKey]++
-			fenceGen := s.peerGenerations[sess.PeerPublicKey]
-			if s.endpoint != nil {
-				s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
-			}
-			prunes = append(prunes, pendingPrune{sess.PeerPublicKey, sess.ID, fenceGen})
-		}
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
 			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID))
@@ -3512,41 +3336,13 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// reapSession tears down an idle-timed-out session, selecting the teardown
-// class by admission provenance (issue #390 part 1):
-//
-//   - Sessions admitted by the upstream engine (AdmittedVia == ingress) are
-//     reaped ROUTING-ONLY via reapIngressSession: forwarder route retirement
-//     and the pool decrement — never a generation fence, never
-//     PrunePeerTransportState, never any endpoint transport-state mutation.
-//     The configured upstream peer is untouched: its crypto/transport state
-//     belongs to the upstream engine's own rekey lifecycle, and its next
-//     plaintext packet lazily creates a fresh backend session — so an idle
-//     reap never forces the client into a re-handshake and never makes a
-//     configured peer unavailable.
-//
-//   - Every other session (AdmittedVia == "", the handshake-era
-//     custom-listener admission) keeps the legacy teardown byte-for-byte:
-//     generation fence + deferred guarded transport prune, forwarder route
-//     retirement, and the guarded pool decrement. The contracts exercised by
-//     the issue-295/309/39 reaper tests depend on it.
-//
-// Sticky affinity is preserved within AffinityTTL on both paths to prevent
-// backend/IP thrashing upon client reconnect (issue #294). Pool connection
-// counter decrement is skipped if periodic reconciliation already
-// re-synchronized the gauge from the database.
-// Note: sticky affinity pruning is intentionally not executed here to prevent O(K*N)
-// lock contention under Service.mu during mass timeouts; it is amortized post-sweep
-// and during periodic maintenance via PruneExpiredAffinity.
+// reapSession tears down an idle-timed-out session routing-only:
+// forwarder route retirement and guarded pool decrement.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
 	}
-	if sess.AdmittedVia == models.SessionAdmissionIngress {
-		s.reapIngressSession(sess)
-		return
-	}
-	s.reapLegacySession(ctx, sess)
+	s.reapIngressSession(sess)
 }
 
 // reapIngressSession performs the routing-only teardown of an idle upstream
@@ -3627,69 +3423,6 @@ func (s *Service) reapIngressSession(sess *models.VPNSession) {
 	}
 }
 
-// reapLegacySession is the pre-#390 reapSession body, byte-for-byte: reserved
-// generation fence, deferred identity-guarded transport prune, forwarder
-// route retirement, guarded pool decrement. Do not "modernize" it — the
-// custom-listener reaper contracts (issues #295, #309, #39) are pinned to
-// exactly this behavior for handshake-era sessions.
-func (s *Service) reapLegacySession(ctx context.Context, sess *models.VPNSession) {
-	if sess == nil {
-		return
-	}
-	var retirement forwarder.Retirement
-	var fenceGen uint64
-	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		retirement.Wait()
-		if fenceGen != 0 {
-			s.mu.Lock()
-			// A reconnect may have installed a new session while the old
-			// route's admitted writes were finishing. Check under Service.mu
-			// so a new session cannot be created between this check and prune.
-			current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey)
-			if !exists || current.ID == sess.ID {
-				s.endpoint.PrunePeerTransportState(sess.PeerPublicKey, fenceGen)
-			}
-			s.mu.Unlock()
-		}
-		log.Printf("[vpn/service] reaped idle session: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
-			sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
-	}()
-
-	if s.endpoint != nil && s.sessionMgr != nil && s.peerGenerations[sess.PeerPublicKey] <= sess.Generation {
-		// CheckTimeouts has already removed this session. Reserve the next
-		// generation before unlocking, so a fresh handshake receives a
-		// generation beyond this fence while an old handshake is rejected.
-		if current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey); !exists || current.ID == sess.ID {
-			fenceGen = sess.Generation + 1
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			s.peerGenerations[sess.PeerPublicKey] = fenceGen
-			s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
-		}
-	}
-
-	if s.forwarder != nil {
-		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
-	}
-
-	if s.pool != nil {
-		shouldDecrement := true
-		var tunReconcileTime time.Time
-		if s.lastReconcileByTunnel != nil {
-			tunReconcileTime = s.lastReconcileByTunnel[sess.BackendTunnelID]
-		}
-		if !sess.TimedOutAt.IsZero() && !tunReconcileTime.IsZero() && tunReconcileTime.After(sess.TimedOutAt) {
-			shouldDecrement = false
-		}
-		if shouldDecrement {
-			s.pool.DecrementConnections(sess.BackendTunnelID)
-		}
-	}
-}
-
 // PruneExpiredAffinity scans and removes expired sticky affinity records
 // from the load balancer. It acquires s.mu with RLock only long enough to
 // retrieve stickyMgr, then executes pruning outside s.mu to eliminate
@@ -3704,18 +3437,13 @@ func (s *Service) PruneExpiredAffinity() int {
 	return sm.PruneExpired()
 }
 
-// DisconnectSession disconnects a specific VPN session by ID.
+// DisconnectSession disconnects a specific VPN session by ID routing-only.
 func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error {
 	var retirement forwarder.Retirement
-	var prunePeer, pruneSession string
-	var fenceGen uint64
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		retirement.Wait()
-		if prunePeer != "" && s.endpoint != nil {
-			s.endpoint.PrunePeerTransportStateIfSession(prunePeer, pruneSession, fenceGen)
-		}
 	}()
 
 	if s.sessionMgr == nil {
@@ -3727,18 +3455,6 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 		return endpoint.ErrSessionNotFound
 	}
 
-	if sess.AdmittedVia != models.SessionAdmissionIngress {
-		if s.peerGenerations == nil {
-			s.peerGenerations = make(map[string]uint64)
-		}
-		s.peerGenerations[sess.PeerPublicKey]++
-		fenceGen = s.peerGenerations[sess.PeerPublicKey]
-		prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
-		if s.endpoint != nil {
-			s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
-		}
-	}
-
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
 	if s.forwarder != nil {
 		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
@@ -3747,9 +3463,9 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 		s.stickyMgr.ClearAffinity(sess.UserID)
 		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
 	}
-	// Mirror IncrementConnections from HandleIncomingPeer; see
-	// DisconnectUser for why the decrement must happen on every path.
-	s.pool.DecrementConnections(sess.BackendTunnelID)
+	if s.pool != nil {
+		s.pool.DecrementConnections(sess.BackendTunnelID)
+	}
 
 	return nil
 }
@@ -3998,33 +3714,14 @@ func (s *Service) MigrateVPNSession(ctx context.Context, sessionID string, targe
 // ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
 func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 	var retirement forwarder.Retirement
-	var pruneSession string
-	var pruneAfterRetirement bool
-	var fenceGen uint64
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		retirement.Wait()
-		if pruneAfterRetirement && s.endpoint != nil {
-			s.endpoint.PrunePeerTransportStateIfSession(clientPub, pruneSession, fenceGen)
-		}
 	}()
 
 	if s.sessionMgr != nil && clientPub != "" {
 		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			// ReleaseClient used to advance the generation once for the
-			// session and once for the client. Reserve both before removing
-			// the route so an in-flight handshake cannot commit during Wait.
-			s.peerGenerations[sess.PeerPublicKey] += 2
-			fenceGen = s.peerGenerations[sess.PeerPublicKey]
-			if s.endpoint != nil {
-				s.endpoint.FencePeerGeneration(clientPub, fenceGen)
-			}
-			pruneSession = sess.ID
-			pruneAfterRetirement = true
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
 			if s.forwarder != nil {
 				retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
@@ -4032,22 +3729,9 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 			if s.stickyMgr != nil {
 				s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
 			}
-			// Mirror IncrementConnections from HandleIncomingPeer; see
-			// DisconnectUser for why the decrement must happen on every path.
-			s.pool.DecrementConnections(sess.BackendTunnelID)
-		}
-	}
-
-	if clientPub != "" && !pruneAfterRetirement {
-		if s.peerGenerations == nil {
-			s.peerGenerations = make(map[string]uint64)
-		}
-		s.peerGenerations[clientPub]++
-		fenceGen = s.peerGenerations[clientPub]
-		if s.endpoint != nil {
-			// No route to retire: keep the existing in-lock cleanup for a
-			// client whose transport state outlived its session.
-			s.endpoint.PrunePeerTransportStateIfSession(clientPub, "", fenceGen)
+			if s.pool != nil {
+				s.pool.DecrementConnections(sess.BackendTunnelID)
+			}
 		}
 	}
 
@@ -4058,142 +3742,35 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 	return nil
 }
 
-// SetPreTransportCommitHookForTest sets the pre-transport-commit hook on the endpoint listener for testing.
-func (s *Service) SetPreTransportCommitHookForTest(fn func(peerKey string, sessID string)) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.endpoint != nil {
-		s.endpoint.SetPreTransportCommitHookForTest(fn)
-	}
-}
-
-// HasTransportStateForPeer reports whether the endpoint holds any transport state for peerKey.
-func (s *Service) HasTransportStateForPeer(peerKey string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.endpoint == nil {
-		return false
-	}
-	return s.endpoint.HasTransportStateForPeer(peerKey)
-}
-
-// HandleIncomingPeer authenticates a peer. A healthy live session keeps its
-// backend and route through cryptographic rekeys; only admission/reconnect or
-// an unusable assignment goes through backend selection and route registration.
-//
-// Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
-// select → CreateSession → IncrementConnections sequence below, making the
-// check-then-allocate capacity decision (GetActiveTunnels snapshot →
-// selectTunnelForPeer/FilterHealthy → IncrementConnections) atomic. This is
-// the invariant that keeps ActiveConnections from exceeding
-// MaxPeersPerBackend: the gauge itself is only pool-mutex-atomic, so any
-// future caller that mutates pool counters outside s.mu (or outside the
-// rekey hook's nested sm.mu regime — the hook's only production call site
-// today is the CreateSession call here, so it runs nested under s.mu too;
-// full contract on tunnel.Pool.IncrementConnections) reopens the race.
-// A replaced route's device writes are joined only after releasing s.mu;
-// admission, session bookkeeping, and pool counters remain serialized above it.
-func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
-	var retirement forwarder.Retirement
+// SetSessionReaperHookForTest sets a test hook invoked by SweepTimedOutSessions for each reaped session.
+func (s *Service) SetSessionReaperHookForTest(fn func(context.Context, *models.VPNSession)) {
 	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		retirement.Wait()
-	}()
+	defer s.mu.Unlock()
+	s.reaperHook = fn
+}
 
-	if s.auth == nil || s.ipam == nil || s.sessionMgr == nil || s.pool == nil {
-		return nil, nil, errors.New("subsystems not initialized")
+// SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes reapSession
+// (or the test reaper hook) for each timed-out session.
+func (s *Service) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
+	if s == nil || s.sessionMgr == nil {
+		return nil, nil
 	}
-
-	user, conn, err := s.auth.AuthenticatePeer(ctx, peerPublicKey)
+	timeout := 3 * time.Minute
+	timedOut, err := s.sessionMgr.CheckTimeouts(ctx, timeout)
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer authentication failed: %w", err)
+		return nil, err
 	}
-
-	if s.peerGenerations == nil {
-		s.peerGenerations = make(map[string]uint64)
-	}
-	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
-		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
-		// Reuse requires both administrative eligibility and runtime health
-		// (issue #90): after the enabled/status split, Enabled=false,
-		// Status=active is a valid state - a stranded live session on an
-		// admin-disabled backend must fall through to normal backend
-		// selection instead of reusing the disabled backend here.
-		if backendErr == nil &&
-			backend.Enabled &&
-			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
-			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
-			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
-			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {
-				s.peerGenerations[peerPublicKey] = gen
-				if s.stickyMgr != nil {
-					s.stickyMgr.AssignPeerAffinity(peerPublicKey, backend.ID)
-				}
-				return sess, backend, nil
-			}
+	s.mu.RLock()
+	hook := s.reaperHook
+	s.mu.RUnlock()
+	for _, sess := range timedOut {
+		if hook != nil {
+			hook(ctx, sess)
+		} else {
+			s.reapSession(ctx, sess)
 		}
 	}
-
-	activeTunnels := s.pool.GetActiveTunnels()
-	if len(activeTunnels) == 0 {
-		return nil, nil, loadbalancer.ErrNoActiveBackends
-	}
-
-	req := &loadbalancer.RoutingRequest{
-		UserID:           user.ID,
-		PeerPublicKey:    peerPublicKey,
-		AvailableTunnels: activeTunnels,
-	}
-
-	backend, err := s.selectTunnelForPeer(ctx, req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	s.assignmentMu.Lock()
-	if s.db != nil {
-		err = reservePersistedClientIPs(ctx, s.db, s.ipam)
-	}
-	var assignedIP net.IP
-	if err == nil {
-		assignedIP, err = s.resolveOrAllocatePeerIP(ctx, conn, peerPublicKey)
-	}
-	s.assignmentMu.Unlock()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	s.peerGenerations[peerPublicKey]++
-	peerGen := s.peerGenerations[peerPublicKey]
-
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name, peerGen)
-	if err != nil {
-		return nil, nil, fmt.Errorf("session creation failed: %w", err)
-	}
-
-	s.pool.IncrementConnections(backend.ID)
-
-	if s.forwarder != nil {
-		retirement = s.forwarder.BeginRegisterSessionWithLimit(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID, 0, 0)
-		s.forwarder.AttachPeerDevice(peerPublicKey, &peerVirtualDevice{
-			peerKey:  peerPublicKey,
-			endpoint: s.endpoint,
-		})
-	}
-	s.freshSessionRegistrations.Add(1)
-
-	return sess, backend, nil
-}
-
-// PeerGeneration returns the latest assigned generation for a peer under s.mu.
-func (s *Service) PeerGeneration(peerKey string) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.peerGenerations == nil {
-		return 0
-	}
-	return s.peerGenerations[peerKey]
+	return timedOut, nil
 }
 
 func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.RoutingRequest) (*models.BackendTunnel, error) {
@@ -4212,59 +3789,6 @@ func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.Rou
 		return b, nil
 	}
 	return nil, loadbalancer.ErrNoActiveBackends
-}
-
-func (s *Service) resolveOrAllocatePeerIP(ctx context.Context, conn *models.UserConnection, peerPublicKey string) (net.IP, error) {
-	if conn != nil && conn.ClientParams != nil {
-		if req, ok := conn.ClientParams["config_regeneration_required"].(bool); ok && req {
-			return nil, fmt.Errorf("peer %s IP was quarantined due to conflict with another client: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
-		}
-		if qIP, ok := conn.ClientParams["quarantined_ip_collision"]; ok && qIP != nil && qIP != "" {
-			return nil, fmt.Errorf("peer %s IP was quarantined due to conflict with another client: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
-		}
-		if rawIP, ok := conn.ClientParams["assigned_ip"]; ok && rawIP != nil {
-			if strIP, ok := rawIP.(string); ok && strIP != "" {
-				targetIP := net.ParseIP(strIP)
-				if targetIP != nil && targetIP.To4() != nil {
-					err := s.ipam.Reserve(targetIP, peerPublicKey)
-					if err == nil {
-						return targetIP, nil
-					}
-					if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
-						return nil, fmt.Errorf("peer %s persisted IP %s conflicts with another client: %w", peerPublicKey, strIP, err)
-					}
-				}
-			}
-		}
-	}
-
-	ip, err := s.ipam.Allocate(peerPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("ip allocation failed: %w", err)
-	}
-	if conn != nil {
-		params := make(map[string]any, len(conn.ClientParams)+1)
-		for key, value := range conn.ClientParams {
-			params[key] = value
-		}
-		delete(params, "config_regeneration_required")
-		delete(params, "quarantined_ip_collision")
-		params["assigned_ip"] = ip.String()
-		if s.db != nil && conn.ID != "" {
-			updated, err := s.db.UpdateConnection(ctx, conn.ID, map[string]any{
-				"client_params": params,
-			})
-			if err != nil || !updated {
-				_ = s.ipam.Release(peerPublicKey)
-				if err == nil {
-					err = errors.New("connection was removed")
-				}
-				return nil, fmt.Errorf("persist assigned IP for peer %s (updated=%t): %w", peerPublicKey, updated, err)
-			}
-		}
-		conn.ClientParams = params
-	}
-	return ip, nil
 }
 
 // SelectTunnel selects a backend tunnel using the configured load balancing algorithm.
@@ -5120,20 +4644,3 @@ func ExtractClientPublicKeyFromConfig(configStr string) string {
 	}
 	return ""
 }
-
-type peerVirtualDevice struct {
-	peerKey  string
-	endpoint *endpoint.Listener
-}
-
-func (p *peerVirtualDevice) Write(pkt []byte) (int, error) {
-	err := p.endpoint.SendToPeer(p.peerKey, pkt)
-	if err != nil {
-		return 0, err
-	}
-	return len(pkt), nil
-}
-func (p *peerVirtualDevice) Read(pkt []byte) (int, error) { return 0, errors.New("not implemented") }
-func (p *peerVirtualDevice) Close() error                 { return nil }
-func (p *peerVirtualDevice) Name() string                 { return "virtual-" + p.peerKey }
-func (p *peerVirtualDevice) MTU() int                     { return 1280 }

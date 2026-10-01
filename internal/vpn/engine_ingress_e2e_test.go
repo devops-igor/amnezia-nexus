@@ -431,9 +431,6 @@ func TestIngressEngineEndToEndThroughService(t *testing.T) {
 	if sess.PeerPublicKey != peer.publicKey {
 		t.Fatalf("admitted session peer %s, want %s", sess.PeerPublicKey, peer.publicKey)
 	}
-	if gen := svc.PeerGeneration(peer.publicKey); gen != 0 {
-		t.Fatalf("ingress admission advanced peerGenerations to %d, want 0", gen)
-	}
 	if got := svc.freshSessionRegistrations.Load(); got != 1 {
 		t.Fatalf("fresh session registrations = %d, want exactly 1", got)
 	}
@@ -536,9 +533,6 @@ func TestIngressEngineRekeyStableThroughServiceHandshake(t *testing.T) {
 	}
 	if stats := engine.Router().StatsSnapshot(); stats.AdmittedSessions != 1 {
 		t.Fatalf("AdmittedSessions = %d after the rekey, want 1", stats.AdmittedSessions)
-	}
-	if gen := svc.PeerGeneration(peer.publicKey); gen != 0 {
-		t.Fatalf("rekey path advanced peerGenerations to %d, want 0", gen)
 	}
 }
 

@@ -33,7 +33,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			if _, err := db.CreateConnection(t.Context(), &models.UserConnection{UserID: otherUser, ServerID: 0, Protocol: "awg", ClientID: "bob-peer", Name: "bob"}); err != nil {
 				t.Fatal(err)
 			}
-			sess, _, err := svc.HandleIncomingPeer(t.Context(), peer)
+			sess, _, err := svc.HandleIncomingPeerForTest(t.Context(), peer)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +82,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 					err = svc.sessionMgr.CloseSession(t.Context(), sess.ID, "idle_timeout")
 					svc.reapSession(t.Context(), sess)
 				case "replace":
-					_, _, err = svc.HandleIncomingPeer(t.Context(), peer)
+					_, _, err = svc.HandleIncomingPeerForTest(t.Context(), peer)
 				}
 				done <- err
 			}()
@@ -115,7 +115,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			}
 			otherDone := make(chan error, 1)
 			go func() {
-				_, _, err := svc.HandleIncomingPeer(t.Context(), "bob-peer")
+				_, _, err := svc.HandleIncomingPeerForTest(t.Context(), "bob-peer")
 				otherDone <- err
 			}()
 			select {

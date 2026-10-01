@@ -455,8 +455,6 @@ func NewDifferentialHarness(t *testing.T, opts ...func(*models.VPNConfig)) *Diff
 		svc.cfg.RandomTrailers = cfg.RandomTrailers
 		svc.cfg.ContentPaddingAddition = cfg.ContentPaddingAddition
 		svc.mu.Unlock()
-		_ = svc.endpoint.UpdateHeaderProtectionKey("")
-		_ = svc.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4)
 		_ = db.SaveVPNConfig(ctx, cfg)
 	} else {
 		if err := svc.UpdateConfig(ctx, cfg); err != nil {

@@ -9,7 +9,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
-func TestHandleIncomingPeerRejectsRemoteServerConnection(t *testing.T) {
+func TestAuthenticatePeerRejectsRemoteServerConnection(t *testing.T) {
 	db := setupTestDB(t)
 	svc, serverID, _, userID, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
@@ -22,8 +22,8 @@ func TestHandleIncomingPeerRejectsRemoteServerConnection(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if session, _, err := svc.HandleIncomingPeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrPeerNotFound) {
-		t.Fatalf("remote connection authenticated to portal: session=%+v err=%v", session, err)
+	if user, conn, err := svc.auth.AuthenticatePeer(ctx, remotePeer); !errors.Is(err, endpoint.ErrPeerNotFound) {
+		t.Fatalf("remote connection authenticated to portal: user=%+v conn=%+v err=%v", user, conn, err)
 	}
 	if _, ok := svc.ipam.GetAssignedIP(remotePeer); ok {
 		t.Fatal("remote peer received a portal address")

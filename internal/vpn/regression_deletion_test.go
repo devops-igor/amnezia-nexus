@@ -7,7 +7,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
 // regression_deletion_test.go pins the two round-4b deletion-path invariants:
@@ -91,8 +90,6 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 			r.Wait()
 		}
 	}
-	keys := &endpoint.TransportKeys{LocalIndex: 61111, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	svc.endpoint.StoreTransportKeysForTest(peerKey, keys, sess.ID)
 	if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerKey); !ok {
 		t.Fatal("setup: live session missing")
 	}
@@ -115,9 +112,6 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 	}
 	if route := svc.forwarder.RouteSessionID(peerKey); route != "" {
 		t.Fatalf("deleted user's session kept its forwarder route: %q", route)
-	}
-	if cur, _ := svc.endpoint.PeerKeypairsForTest(peerKey); cur != nil {
-		t.Fatalf("deleted user's session kept its legacy transport state: %+v", cur)
 	}
 	after, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil || after.ActiveConnections != 1 {

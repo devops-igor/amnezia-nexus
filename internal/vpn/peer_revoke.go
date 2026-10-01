@@ -6,7 +6,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // revokeDispatcher subscribes to committed durable access revocations before
@@ -53,86 +52,26 @@ func (rd *revokeDispatcher) RecordPeerRevoke(ctx context.Context, event database
 
 // Service-side live-session revocation for durable access changes (issue #391
 // round 4a, finding 3). When a durable disable/revoke/delete commits, the
-// database notification path must not leave established traffic forwarding in
-// EITHER engine mode: upstream-engine sessions are torn down routing-only via
-// RevokeUpstreamPeerSession (the reconcile worker performs the same teardown
-// shortly after commit; this direct path enforces immediately), legacy
-// listener sessions are fenced and pruned like DisconnectSession. Durable IP
-// allocations are never released and other peers' upstream crypto state is
-// untouched. A peer with no live session is a no-op.
+// database notification path tears down established traffic forwarding
+// routing-only via RevokeUpstreamPeerSession (the reconcile worker performs the
+// same teardown shortly after commit; this direct path enforces immediately).
+// Durable IP allocations are never released. A peer with no live session is a no-op.
 //
 // Callers run on the DB commit goroutine AFTER the durable change committed
-// but WITHOUT Service.mu held. The dispatch itself takes s.mu only long
-// enough to snapshot and mark the session; in-flight device writes are joined
-// and transport state pruned after s.mu is released, mirroring the
-// DisconnectUser/DisconnectSession unlock-then-wait discipline.
+// but WITHOUT Service.mu held.
 
-// revokeDurableAccess performs the engine-aware live teardown for one peer
-// whose durable access was just revoked. Engine-aware dispatch (issue #391
-// round 4a, finding 3): upstream-admitted sessions get the routing-only
-// revocation, legacy (handshake-admitted) sessions get generation fencing
-// plus transport pruning exactly once, the routing session is closed with
-// reason "revoked", the forwarder route is retired, and the backend pool
-// counter is decremented exactly once (the round-3 ownership guard shows the
-// pattern: CloseSession failure yields teardown ownership). No live session
-// means no live traffic: a no-op.
+// revokeDurableAccess performs live routing-only teardown for one peer
+// whose durable access was just revoked.
 func (s *Service) revokeDurableAccess(ctx context.Context, peerKey string) {
 	if s == nil || s.sessionMgr == nil {
 		return
 	}
-	sess, ok := s.sessionMgr.GetSession(peerKey)
-	if !ok {
+	if _, ok := s.sessionMgr.GetSession(peerKey); !ok {
 		return
 	}
-	if sess.AdmittedVia == models.SessionAdmissionIngress {
-		// The upstream engine owns this session: routing-only teardown.
-		// Failure must not fail the durable operation; the reconcile
-		// worker retries enforcement and PeerSyncStatus reports drift.
-		if err := s.RevokeUpstreamPeerSession(ctx, peerKey); err != nil {
-			log.Printf("[vpn/service] durable access revocation of upstream session for peer %s failed (reconcile will retry): %v", peerKey, err)
-		}
-		return
+	if err := s.RevokeUpstreamPeerSession(ctx, peerKey); err != nil {
+		log.Printf("[vpn/service] durable access revocation of session for peer %s failed (reconcile will retry): %v", peerKey, err)
 	}
-	var retirement forwarder.Retirement
-	var prunePeer, pruneSession string
-	var fenceGen uint64
-	s.mu.Lock()
-	// CloseSession removed the session exactly once, so nobody else tears
-	// this session down concurrently; the reserved fence rejects any
-	// in-flight or pending handshake of the old generation.
-	if s.peerGenerations == nil {
-		s.peerGenerations = make(map[string]uint64)
-	}
-	s.peerGenerations[sess.PeerPublicKey]++
-	fenceGen = s.peerGenerations[sess.PeerPublicKey]
-	prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
-	if s.endpoint != nil {
-		s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
-	}
-	if err := s.sessionMgr.CloseSession(ctx, sess.ID, "revoked"); err != nil {
-		s.mu.Unlock()
-		// Another teardown path owns this session lifecycle (idle
-		// reaper evicted it first); never double-decrement.
-		log.Printf("[vpn/service] durable access revocation skipped for peer %s: %v", peerKey, err)
-		return
-	}
-	if s.forwarder != nil {
-		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
-	}
-	if s.stickyMgr != nil {
-		s.stickyMgr.ClearAffinity(sess.UserID)
-		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
-	}
-	if s.pool != nil {
-		s.pool.DecrementConnections(sess.BackendTunnelID)
-	}
-	s.mu.Unlock()
-	retirement.Wait()
-	if prunePeer != "" && s.endpoint != nil {
-		s.endpoint.PrunePeerTransportStateIfSession(prunePeer, pruneSession, fenceGen)
-	}
-	log.Printf("[vpn/service] revoked legacy session after durable access change: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
-		sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
 }
 
 // RevokeUserSessions performs immediate engine-aware live teardown for every

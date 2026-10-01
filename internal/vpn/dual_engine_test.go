@@ -52,11 +52,6 @@ func TestDualEngine_StartupUpstreamMode(t *testing.T) {
 		t.Fatalf("svc.Start: %v", err)
 	}
 
-	// Critical Invariant: In upstream mode, endpoint.Listener must NOT be running
-	if svc.endpoint != nil && svc.endpoint.IsRunning() {
-		t.Fatal("upstream mode: endpoint.Listener must NOT be running")
-	}
-
 	if svc.ingressEngine == nil || !svc.ingressEngine.Running() {
 		t.Fatal("upstream mode: expected ingressEngine to be running")
 	}
