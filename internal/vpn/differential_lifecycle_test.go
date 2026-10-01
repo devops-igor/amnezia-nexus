@@ -120,6 +120,9 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	// Connect client to dest through b1
 	c1 := newReturnStreamClient(t, peer, saved, dest, 0x11)
 	defer func() { c1.dev.Close() }()
+	if err := c1.dev.IpcSet("rekey_after_time=120\nrekey_timeout=5\n"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Send initial application traffic through Backend 1
 	payload1 := []byte("pre-migration-traffic-be1")
