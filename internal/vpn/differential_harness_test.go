@@ -144,26 +144,28 @@ func VerifyEnvironmentAndDependencies(repoRoot string) (*EnvironmentManifest, er
 // RedactedConfigManifest represents the frozen, redacted evidence manifest schema.
 // Private keys, unredacted secrets, and real server IP addresses are strictly excluded.
 type RedactedConfigManifest struct {
-	RenderedConfigHash  string `json:"rendered_config_sha256"`
-	ClientPublicKey     string `json:"client_public_key"`
-	AssignedIP          string `json:"assigned_ip"`
-	ServerEndpoint      string `json:"server_endpoint"`
-	ServerPort          int    `json:"server_port"`
-	H1                  string `json:"h1"`
-	H2                  string `json:"h2"`
-	H3                  string `json:"h3"`
-	H4                  string `json:"h4"`
-	S1                  int    `json:"s1"`
-	S2                  int    `json:"s2"`
-	S3                  int    `json:"s3"`
-	S4                  int    `json:"s4"`
-	Jc                  int    `json:"jc"`
-	Jmin                int    `json:"jmin"`
-	Jmax                int    `json:"jmax"`
-	HeaderProtection    string `json:"header_protection"`
-	RekeyAfterTime      string `json:"rekey_after_time,omitempty"`
-	RekeyTimeout        string `json:"rekey_timeout,omitempty"`
-	PersistentKeepalive string `json:"persistent_keepalive,omitempty"`
+	RenderedConfigHash     string `json:"rendered_config_sha256"`
+	ClientPublicKey        string `json:"client_public_key"`
+	AssignedIP             string `json:"assigned_ip"`
+	ServerEndpoint         string `json:"server_endpoint"`
+	ServerPort             int    `json:"server_port"`
+	H1                     string `json:"h1"`
+	H2                     string `json:"h2"`
+	H3                     string `json:"h3"`
+	H4                     string `json:"h4"`
+	S1                     int    `json:"s1"`
+	S2                     int    `json:"s2"`
+	S3                     int    `json:"s3"`
+	S4                     int    `json:"s4"`
+	Jc                     int    `json:"jc"`
+	Jmin                   int    `json:"jmin"`
+	Jmax                   int    `json:"jmax"`
+	HeaderProtection       string `json:"header_protection"`
+	RandomTrailers         string `json:"random_trailers,omitempty"`
+	ContentPaddingAddition string `json:"content_padding_addition,omitempty"`
+	RekeyAfterTime         string `json:"rekey_after_time,omitempty"`
+	RekeyTimeout           string `json:"rekey_timeout,omitempty"`
+	PersistentKeepalive    string `json:"persistent_keepalive,omitempty"`
 }
 
 // CompatibilityEvidenceManifest combines the environment manifest and frozen redacted config manifest.
@@ -243,6 +245,10 @@ func FreezeAndRedactConfig(rawConfig string, clientPubKey string, assignedIP str
 			if v != "" {
 				manifest.HeaderProtection = "<present-32B>"
 			}
+		case "RandomTrailers":
+			manifest.RandomTrailers = v
+		case "ContentPaddingAddition":
+			manifest.ContentPaddingAddition = v
 		case "RekeyAfterTime":
 			manifest.RekeyAfterTime = v
 		case "RekeyTimeout":
@@ -378,6 +384,29 @@ type HarnessClient struct {
 	mu          sync.Mutex
 }
 
+// fullAmneziaWGOpts returns a config mutator enforcing full AmneziaWG obfuscation:
+// H1-H4 header ranges, S1-S4 padding >= 12, HeaderProtectionKey, RandomTrailers, and ContentPaddingAddition.
+func fullAmneziaWGOpts() func(cfg *models.VPNConfig) {
+	return func(cfg *models.VPNConfig) {
+		cfg.H1 = models.NewHeaderRange(100000000, 200000000)
+		cfg.H2 = models.NewHeaderRange(300000000, 400000000)
+		cfg.H3 = models.NewHeaderRange(500000000, 600000000)
+		cfg.H4 = models.NewHeaderRange(700000000, 800000000)
+		cfg.S1 = 50
+		cfg.S2 = 100
+		cfg.S3 = 150
+		cfg.S4 = 200
+		cfg.RandomTrailers = false
+		cfg.DisableCookies = false
+
+		hpBytes := make([]byte, 32)
+		for i := range hpBytes {
+			hpBytes[i] = byte(i + 1)
+		}
+		cfg.HeaderProtectionKey = base64.StdEncoding.EncodeToString(hpBytes)
+	}
+}
+
 // NewDifferentialHarness builds the qualification fixture with frozen client configuration.
 func NewDifferentialHarness(t *testing.T, opts ...func(*models.VPNConfig)) *DifferentialHarness {
 	t.Helper()
@@ -396,23 +425,7 @@ func NewDifferentialHarness(t *testing.T, opts ...func(*models.VPNConfig)) *Diff
 	svc, _, _, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
 		cfg.ListenPort = listenPort
 		cfg.PublicEndpoint = fmt.Sprintf("127.0.0.1:%d", listenPort)
-		cfg.H1 = models.NewHeaderRange(100000000, 200000000)
-		cfg.H2 = models.NewHeaderRange(300000000, 400000000)
-		cfg.H3 = models.NewHeaderRange(500000000, 600000000)
-		cfg.H4 = models.NewHeaderRange(700000000, 800000000)
-		cfg.S1 = 50
-		cfg.S2 = 100
-		cfg.S3 = 150
-		cfg.S4 = 200
-		cfg.RandomTrailers = false
-		cfg.DisableCookies = false
-
-		hpBytes := make([]byte, 32)
-		for i := range hpBytes {
-			hpBytes[i] = byte(i + 1)
-		}
-		cfg.HeaderProtectionKey = base64.StdEncoding.EncodeToString(hpBytes)
-
+		fullAmneziaWGOpts()(cfg)
 		for _, opt := range opts {
 			opt(cfg)
 		}
@@ -435,6 +448,12 @@ func NewDifferentialHarness(t *testing.T, opts ...func(*models.VPNConfig)) *Diff
 		svc.cfg.S2 = cfg.S2
 		svc.cfg.S3 = cfg.S3
 		svc.cfg.S4 = cfg.S4
+		svc.cfg.H1 = cfg.H1
+		svc.cfg.H2 = cfg.H2
+		svc.cfg.H3 = cfg.H3
+		svc.cfg.H4 = cfg.H4
+		svc.cfg.RandomTrailers = cfg.RandomTrailers
+		svc.cfg.ContentPaddingAddition = cfg.ContentPaddingAddition
 		svc.mu.Unlock()
 		_ = svc.endpoint.UpdateHeaderProtectionKey("")
 		_ = svc.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4)
@@ -608,6 +627,20 @@ func (s *ReferenceServer) Close() error {
 	return errors.Join(errs...)
 }
 
+// PeerEndpoint returns the client's outer roaming endpoint as recorded by the reference server.
+func (s *ReferenceServer) PeerEndpoint() (string, error) {
+	ipc, err := s.dev.IpcGet()
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(ipc, "\n") {
+		if strings.HasPrefix(line, "endpoint=") {
+			return strings.TrimPrefix(line, "endpoint="), nil
+		}
+	}
+	return "", errors.New("peer endpoint not found in reference UAPI")
+}
+
 // StopReferenceServer cleanly terminates the reference server.
 func (h *DifferentialHarness) StopReferenceServer(ref *ReferenceServer) error {
 	if ref == nil {
@@ -744,6 +777,18 @@ func (s *SubjectServer) Close() error {
 	return errors.Join(errs...)
 }
 
+// PeerEndpoint returns the client's outer roaming endpoint as recorded by the subject Nexus engine.
+func (s *SubjectServer) PeerEndpoint() (string, error) {
+	st, err := s.engine.Portal().Status()
+	if err != nil {
+		return "", err
+	}
+	if len(st.Peers) > 0 {
+		return st.Peers[0].Endpoint, nil
+	}
+	return "", errors.New("peer endpoint not found in subject status")
+}
+
 // StopSubjectServer cleanly terminates the subject server.
 func (h *DifferentialHarness) StopSubjectServer(sub *SubjectServer) error {
 	if sub == nil {
@@ -761,6 +806,44 @@ func (h *DifferentialHarness) RestartSubjectServer(sub *SubjectServer) (*Subject
 	return h.StartSubjectServer()
 }
 
+// SetClientRekeyAfterTime modifies the raw client config's RekeyAfterTime parameter.
+func (h *DifferentialHarness) SetClientRekeyAfterTime(seconds int) {
+	var lines []string
+	found := false
+	for _, line := range strings.Split(h.rawClientConfig, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RekeyAfterTime") && strings.Contains(trimmed, "=") {
+			lines = append(lines, fmt.Sprintf("RekeyAfterTime = %d", seconds))
+			found = true
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	if !found {
+		lines = append(lines, fmt.Sprintf("RekeyAfterTime = %d", seconds))
+	}
+	h.rawClientConfig = strings.Join(lines, "\n")
+}
+
+// SetClientRekeyTimeout modifies the raw client config's RekeyTimeout parameter.
+func (h *DifferentialHarness) SetClientRekeyTimeout(seconds int) {
+	var lines []string
+	found := false
+	for _, line := range strings.Split(h.rawClientConfig, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RekeyTimeout") && strings.Contains(trimmed, "=") {
+			lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", seconds))
+			found = true
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	if !found {
+		lines = append(lines, fmt.Sprintf("RekeyTimeout = %d", seconds))
+	}
+	h.rawClientConfig = strings.Join(lines, "\n")
+}
+
 // NewClient constructs an upstream AWG client device using the exact frozen client config.
 func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 	assignedAddr := netip.MustParseAddr(h.clientPeer.AllowedIP.Addr().String())
@@ -776,7 +859,6 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 		_ = vt.Close()
 		return nil, fmt.Errorf("client uapi: %w", err)
 	}
-	_ = dev.IpcSet("rekey_after_time=120\nrekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		dev.Close()
 		_ = vt.Close()

@@ -39,7 +39,7 @@ The differential and long-duration compatibility suite proves that previously is
 ### Core Design Rules
 1. **Configuration Freezing:** Client configurations are rendered once (`svc.GenerateClientConfig`) and frozen with their SHA-256 digest before testing starts. Neither the reference server nor the Nexus subject server may regenerate client credentials.
 2. **Sequential Port Binding:** The reference standalone server and Nexus `IngressEngine` run sequentially on the same localhost test port to eliminate port binding collisions while guaranteeing identical network conditions.
-3. **Strict Privacy Invariants:** Zero private keys, zero raw server IPs, and zero local filesystem paths are ever written to disk, committed, or emitted into test output logs.
+3. **Strict Privacy Invariants:** Zero private keys, zero raw server IPs, and zero local filesystem paths are ever persisted in artifacts, committed, or emitted into test output logs.
 
 ---
 
@@ -71,7 +71,7 @@ Fast qualification suites run in under one minute and can be executed during loc
 | Option | Description | Default |
 |---|---|---|
 | `-s, --suite <suite>` | Test suite to execute (`baseline`, `matrix`, `soak`, `lifecycle`, `all`) | `all` |
-| `--soak-full` | Run full unaccelerated 10+-rekey soak (~20-25m) instead of bounded soak | `false` |
+| `--soak-full` | Run full unaccelerated 10+-rekey soak (~40-50m total, ~20-25m each) instead of bounded soak | `false` |
 | `--race` | Enable Go race detector (`-race`) | Auto-detected |
 | `--no-race` | Force disable Go race detector | `false` |
 | `-t, --timeout <dur>` | Test timeout duration (e.g. `20m`, `60m`) | `20m` (`60m` for soak-full) |
@@ -95,8 +95,8 @@ The soak qualification suite verifies protocol durability across extended operat
    - Exercises the complete metrics engine, continuous TCP streaming, sequenced UDP stream, VoIP stream, and keepalive idle phase with a bounded rekey verification window.
 2. **Full Unaccelerated 10+-Rekey Soak (`TestDifferential_Soak_Unaccelerated10Rekey`)**:
    - Gated behind `NEXUS_SOAK_FULL=true` or `--soak-full`.
-   - Runs for ~20-25 minutes under natural production timing parameters.
-   - Observes at least 10 unforced natural rekeys on both reference and subject engines.
+   - Runs both Reference standalone AWG and Subject Nexus IngressEngine sequentially (~40-50m total, ~20-25m each) under natural production timing parameters.
+   - Observes at least 10 unforced natural rekeys on both Reference and Subject engines.
 
 ### Running Full Soak Locally
 
@@ -109,7 +109,7 @@ The soak qualification suite verifies protocol durability across extended operat
 
 - **Long-Lived TCP Continuity (`tcp_continuity_passed`)**: Confirms the exact same TCP socket and connection remain open and able to exchange echo payloads across all rekey events and idle phases.
 - **Sequenced UDP Stream (`sequenced_udp_stats`)**: 20 packets/sec with sequence numbers and timestamps, measuring packet delivery, loss rate, and maximum interruption gap.
-- **VoIP Small-Datagram Stream (`voip_udp_stats`)**: 50 packets/sec (160-byte payload simulating G.711 / Opus voice frames) calculating RFC 3550 interarrival jitter:
+- **VoIP Small-Datagram Stream (`voip_udp_stats`)**: 50 packets/sec (160-byte payload simulating G.711 / Opus voice frames) measuring Round-Trip Time (RTT) delay variation (`rtt_jitter_ns`) / RTT jitter based on consecutive response arrival variance:
   $$J = J + \frac{|D(i-1, i)| - J}{16}$$
 - **Idle Keepalive Phase (`idle_phase_passed`)**: Confirms session survival and immediate traffic resumption after silent periods where only persistent keepalives are exchanged.
 
@@ -151,11 +151,11 @@ gh run download --name "differential-qualification-evidence-*" --dir ./downloade
 ```
 
 Downloaded artifacts include:
-- `qualification_summary.json` — overall qualification status, durations, and privacy audit results.
-- `evidence_manifest.json` — environment details and redacted client configuration schema.
-- `soak_report_reference_*.json` — reference standalone AWG soak report.
-- `soak_report_subject_*.json` — Nexus IngressEngine soak report.
-- `non_netstack_qualification.json` — Linux client network namespace qualification report.
+- `qualification_summary.json`: overall qualification status, durations, and privacy audit results.
+- `evidence_manifest.json`: environment details and redacted client configuration schema.
+- `soak_report_reference_*.json`: reference standalone AWG soak report.
+- `soak_report_subject_*.json`: Nexus IngressEngine soak report.
+- `non_netstack_qualification.json`: Linux client network namespace qualification report.
 
 ---
 
@@ -173,8 +173,15 @@ The script `scripts/run_non_netstack_client_qualification.sh` qualifies the clie
 ### Live Network Namespace Mode (Root / Sudo)
 
 ```bash
-# Execute real interface test in dedicated namespace
+# Execute real interface test in dedicated namespace with client configuration
 sudo ./scripts/run_non_netstack_client_qualification.sh \
+  --config ./client.conf \
+  --output-dir ./test-artifacts
+
+# Or specify individual credentials and server parameters
+sudo ./scripts/run_non_netstack_client_qualification.sh \
+  --server-public-key <server-pubkey> \
+  --client-private-key <client-privkey> \
   --interface awg-client0 \
   --netns nexus-client-ns \
   --server-port 51820 \
@@ -188,7 +195,120 @@ sudo ./scripts/run_non_netstack_client_qualification.sh \
 
 ---
 
-## 6. Environment Variables Reference
+## 6. DEV Server E2E Qualification Workflow (`.github/workflows/e2e-dev.yml`)
+
+The DEV Server E2E workflow integrates upstream qualification directly into the continuous DEV deployment pipeline.
+
+### Qualification Modes
+
+The workflow accepts a `qualification` input via `workflow_dispatch`:
+
+| Mode | Duration | Description | Artifacts Generated |
+|---|---|---|---|
+| `standard` | ~15-20m | Skips extended differential qualification; runs standard DEV server build, deployment, and integration tests. | Standard DEV E2E logs |
+| `bounded` (default) | ~20-25m | Runs baseline, matrix, lifecycle, and bounded soak qualification suites plus live non-netstack client qualification and fail-closed evidence verification. | Full differential suite + live client reports |
+| `full` | ~60-75m | Runs all qualification suites including full unaccelerated 10+-rekey soak (~40-50m), live non-netstack client qualification, and fail-closed evidence verification. | Full soak manifests (>=10 rekeys) + live client reports |
+
+### Execution Flow in E2E Pipeline
+
+```
+[DEV Deploy] 
+    |
+    v
+[Directory Prep: test-artifacts/runtime & test-artifacts/public]
+    |
+    v
+[Differential Qualification Suite (bounded or full)]
+    |
+    v
+[Start Upstream Qualification Subject (cmd/qualification-subject)]
+    |  - Initializes isolated DB & portal identity
+    |  - Freezes client config to test-artifacts/runtime/frozen-client.conf (0600)
+    |  - Starts netstack echo responders (TCP/UDP on port 40001)
+    |  - Starts production IngressEngine on UDP 51820
+    |  - Emits subject.ready JSON status file
+    v
+[Live Non-Netstack Client Qualification (scripts/run_non_netstack_client_qualification.sh)]
+    |  - Executes in isolated netns (nexus-client-ns)
+    |  - Verifies handshake, bi-directional TCP echo, UDP echo, reconnect resilience
+    v
+[Stop Upstream Qualification Subject (SIGTERM)]
+    |
+    v
+[Evidence Aggregator Verification (scripts/verify_issue392_qualification.sh)]
+    |  - Fail-closed validation of public reports and metrics
+    v
+[Upload Public Artifacts (test-artifacts/public/)]
+    |
+    v
+[Unconditional Teardown (if: always())]
+    - Terminate qualification subject process
+    - Delete nexus-client-ns netns and veth/awg interfaces
+    - Delete test-artifacts/runtime/ (wiping all ephemeral private keys)
+```
+
+---
+
+## 7. Artifact Separation & Evidence Aggregator
+
+### Strict Separation: Runtime vs. Public Artifacts
+
+To prevent secret leakage in CI runs and uploaded artifacts, the qualification harness enforces strict physical directory separation:
+
+1. **`test-artifacts/runtime/` (SECRET-BEARING, NEVER UPLOADED)**:
+   - Contains frozen client configuration (`frozen-client.conf`) with private keys.
+   - Contains ephemeral key files for `awg set`.
+   - Permissions enforced: `chmod 600` / `umask 077`.
+   - Wiped unconditionally during teardown (`rm -rf test-artifacts/runtime`).
+2. **`test-artifacts/public/` (PUBLIC EVIDENCE, UPLOADED)**:
+   - Contains only sanitized, redacted JSON reports:
+     - `qualification_summary.json`
+     - `evidence_manifest.json`
+     - `soak_report_reference_*.json`
+     - `soak_report_subject_*.json`
+     - `non_netstack_qualification.json`
+     - `issue392_qualification_summary.json`
+   - Zero private keys, zero raw server IPs, zero local paths.
+   - Uploaded as GitHub Actions workflow artifact.
+
+### Evidence Aggregator CLI (`scripts/verify_issue392_qualification.sh`)
+
+The evidence aggregator verifies that all qualification requirements are strictly satisfied before passing CI:
+
+```bash
+# Verify bounded qualification evidence
+./scripts/verify_issue392_qualification.sh \
+  --artifacts-dir test-artifacts/public \
+  --mode bounded \
+  --expected-commit <sha>
+
+# Verify full qualification evidence (enforces >=10 unforced rekeys, closure eligible)
+./scripts/verify_issue392_qualification.sh \
+  --artifacts-dir test-artifacts/public \
+  --mode full \
+  --expected-commit <sha>
+```
+
+### Assertions Enforced by Aggregator:
+1. **Required Files**: Checks presence of all public JSON manifests.
+2. **Pinned Dependency**: Validates upstream engine dependency is pinned to `golang.zx2c4.com/amneziawg v3.1.20260828`.
+3. **Commit Identity**: Confirms git commit matches expected commit SHA (`--expected-commit`).
+4. **Lifecycle & Matrix Results**: Verifies `status == "PASS"` across all fault shims and backend migrations.
+5. **Soak Duration & Closure Eligibility**:
+   - `bounded` mode: at least 1 rekey observed on both Reference and Subject engines; emits `BOUNDED PASS` (`issue392_closure_eligible: false`).
+   - `full` mode: at least 10 unforced rekeys observed on both Reference and Subject engines; emits `FULL PASS` (`issue392_closure_eligible: true`).
+6. **Network Quality Metrics**:
+   - `tcp_continuity_passed == true` (no dropped TCP stream sockets across rekeys).
+   - `idle_phase_passed == true` (keepalive recovery after silent intervals).
+   - Sequenced UDP packet loss <= 0.05%.
+7. **Non-Netstack Client Parity**:
+   - Confirms `status == "PASS"`, handshake established, TCP echo passed, UDP echo passed, and reconnect resilience passed.
+8. **Privacy Compliance Audit**:
+   - Zero private keys, zero raw IP addresses, zero local filesystem paths in any public artifact.
+
+---
+
+## 8. Environment Variables Reference
 
 | Variable | Description | Example / Allowed Values |
 |---|---|---|
@@ -198,13 +318,14 @@ sudo ./scripts/run_non_netstack_client_qualification.sh \
 
 ---
 
-## 7. Privacy & Security Invariants
+## 9. Privacy & Security Invariants
 
 All differential test suites and scripts adhere to non-negotiable privacy rules:
 
-1. **Zero Private Keys**:
-   - Private keys and raw secrets are never logged via `t.Logf`, written to files, or stored in artifacts.
-   - Verification manifests record only `<present-32B>` or public keys.
+1. **Zero Private Keys & Secrets Retention**:
+   - Private keys and raw secrets are never persisted in artifacts or emitted in logs (`t.Logf`, stderr, JSON manifests).
+   - In live interface qualification, ephemeral 0600 temporary files may be created solely for `awg set` (which requires file inputs for keys) and are removed immediately after configuration and by the cleanup trap.
+   - Verification manifests record only `<present-32B>`, `<absent>`, or public keys.
 2. **Zero Real Server IPs**:
    - Real production/development server IPs are strictly prohibited in tests, scripts, and logs.
    - Leak detection patterns in audit scripts are constructed dynamically to prevent scanner false positives.
@@ -214,7 +335,7 @@ All differential test suites and scripts adhere to non-negotiable privacy rules:
 
 ---
 
-## 8. Failure Triage & Troubleshooting
+## 10. Failure Triage & Troubleshooting
 
 ### Port Collision (`bind: address already in use`)
 - **Cause**: Concurrent execution of test suites binding localhost UDP port 51820.

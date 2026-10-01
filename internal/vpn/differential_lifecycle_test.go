@@ -82,7 +82,7 @@ func startConcurrentEchoBackend(t *testing.T, svc *Service, backend *models.Back
 func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
+	svc := newIngressEngineService(t, db, fullAmneziaWGOpts())
 
 	peer, saved := newEnginePeer(t, svc, db, "lifecycle-migrate-peer")
 	ip := netip.MustParseAddr(peer.assignedIP)
@@ -97,10 +97,9 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	sort.Slice(backends, func(i, j int) bool { return backends[i].ID < backends[j].ID })
 	b1, b2 := backends[0], backends[1]
 
-	dest1 := netip.MustParseAddr("198.51.100.71")
-	startConcurrentEchoBackend(t, svc, b1, dest1, 0x11)
-	dest2 := netip.MustParseAddr("198.51.100.72")
-	startConcurrentEchoBackend(t, svc, b2, dest2, 0x22)
+	dest := netip.MustParseAddr("198.51.100.71")
+	startConcurrentEchoBackend(t, svc, b1, dest, 0x11)
+	startConcurrentEchoBackend(t, svc, b2, dest, 0x22)
 
 	svc.forwarder.StartPumps(ctx)
 	t.Cleanup(svc.forwarder.StopPumps)
@@ -118,14 +117,16 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = engine.Stop() })
 
-	// Connect client to dest1 through b1
-	c1 := newReturnStreamClient(t, peer, saved, dest1, 0x11)
+	// Connect client to dest through b1
+	c1 := newReturnStreamClient(t, peer, saved, dest, 0x11)
 	defer func() { c1.dev.Close() }()
 
 	// Send initial application traffic through Backend 1
 	payload1 := []byte("pre-migration-traffic-be1")
 	returnExchange(t, c1.tcp, payload1, false, 0x11)
 	returnExchange(t, c1.udp, payload1, true, 0x11)
+
+	hsBefore := c1.LastHandshakeTime()
 
 	sess, ok := waitForSession(t, svc, peer.publicKey)
 	if !ok {
@@ -153,13 +154,26 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	waitBackendGaugeEqual(t, svc, b1.ID, 0, "b1 gauge after migration")
 	waitBackendGaugeEqual(t, svc, b2.ID, 1, "b2 gauge after migration")
 
-	// Create client stream directed to dest2 on the migrated backend
-	c2 := newReturnStreamClient(t, peer, saved, dest2, 0x22)
-	defer func() { c2.dev.Close() }()
-
+	// Continue traffic on the SAME client c1, verifying seamless transition to b2 marker 0x22
 	payload2 := []byte("post-migration-traffic-be2")
-	returnExchange(t, c2.tcp, payload2, false, 0x22)
-	returnExchange(t, c2.udp, payload2, true, 0x22)
+	returnExchange(t, c1.udp, payload2, true, 0x22)
+
+	tcpPost, err := c1.stack.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(dest, 40001))
+	if err != nil {
+		t.Fatalf("TCP post-migration dial: %v", err)
+	}
+	defer tcpPost.Close()
+	_ = tcpPost.SetReadDeadline(time.Now().Add(3 * time.Second))
+	initMarker := make([]byte, 1)
+	if _, err := io.ReadFull(tcpPost, initMarker); err != nil || initMarker[0] != 0x22 {
+		t.Fatalf("TCP post-migration reached wrong backend: marker=%v err=%v", initMarker, err)
+	}
+	returnExchange(t, tcpPost, payload2, false, 0x22)
+
+	// Verify c1 device remained continuously up with zero re-handshakes caused by migration
+	if hsAfter := c1.LastHandshakeTime(); !hsAfter.Equal(hsBefore) {
+		t.Fatalf("migration caused unexpected client re-handshake: before=%v after=%v", hsBefore, hsAfter)
+	}
 
 	// Verify forwarder drop statistics remain 0
 	qFull, noRoute, _ := svc.forwarder.DropStats()
@@ -180,7 +194,7 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 func TestLifecycle_IdleSessionReapAndRecreation(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
+	svc := newIngressEngineService(t, db, fullAmneziaWGOpts())
 
 	peer, saved := newEnginePeer(t, svc, db, "lifecycle-reap-peer")
 	lc := engineLifecyclePeer{enginePeer: peer, savedConfig: saved}
@@ -272,7 +286,7 @@ func TestLifecycle_IdleSessionReapAndRecreation(t *testing.T) {
 func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
-	svc1 := newIngressEngineService(t, db)
+	svc1 := newIngressEngineService(t, db, fullAmneziaWGOpts())
 
 	peer, saved := newEnginePeer(t, svc1, db, "lifecycle-restart-peer")
 	ip := netip.MustParseAddr(peer.assignedIP)
@@ -312,7 +326,7 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 	svc1.Stop()
 
 	// Build Service 2 from SAME database
-	svc2 := newIngressEngineService(t, db)
+	svc2 := newIngressEngineService(t, db, fullAmneziaWGOpts())
 	startedCfg := svc2.cfg
 	startedCfg.ListenPort = svc1.cfg.ListenPort
 	startedCfg.PublicEndpoint = svc1.cfg.PublicEndpoint
@@ -381,7 +395,7 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 func TestLifecycle_MultiPeerConcurrencyAndLoad(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
+	svc := newIngressEngineService(t, db, fullAmneziaWGOpts())
 
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
@@ -501,7 +515,7 @@ func TestLifecycle_MultiPeerConcurrencyAndLoad(t *testing.T) {
 func TestLifecycle_ConcurrentRevokeTrafficRace(t *testing.T) {
 	ctx := t.Context()
 	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
+	svc := newIngressEngineService(t, db, fullAmneziaWGOpts())
 
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)

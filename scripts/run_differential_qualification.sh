@@ -14,6 +14,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure go binary is available in PATH
+if ! command -v go >/dev/null 2>&1; then
+    if [[ -x "/usr/local/go/bin/go" ]]; then
+        export PATH="/usr/local/go/bin:$PATH"
+    fi
+fi
+
 # Default options
 SUITE="all"
 SOAK_FULL=false
@@ -133,11 +140,14 @@ fi
 RACE_FLAG=""
 if [[ "$ENABLE_RACE" == "true" ]]; then
     RACE_FLAG="-race"
-    # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA)
+    # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA, missing CGO)
     RACE_TEST_ERR="$(go test -race -run "^$" ./cmd/panel 2>&1 || true)"
-    if echo "$RACE_TEST_ERR" | grep -q "unsupported VMA range"; then
-        echo "NOTICE: Host kernel has 39-bit VMA (unsupported by Go ThreadSanitizer on ARM64)."
-        echo "        Disabling -race for local host (full -race runs in CI on x86_64)."
+    if echo "$RACE_TEST_ERR" | grep -E -q "unsupported VMA range|requires cgo"; then
+        echo "NOTICE: Host environment does not support Go race detector: $(echo "$RACE_TEST_ERR" | tr '\n' ' ')"
+        echo "        Disabling -race for host environment (authoritative -race runs in CI on x86_64)."
+        RACE_FLAG=""
+    elif ! (go test -race -run "^$" ./cmd/panel >/dev/null 2>&1); then
+        echo "NOTICE: Go race detector pre-check failed. Disabling -race on host."
         RACE_FLAG=""
     fi
 fi
@@ -159,7 +169,7 @@ IP_PATTERNS=(
 )
 
 echo "===================================================================="
-echo " Amnezia Nexus — Differential Qualification Runner"
+echo " Amnezia Nexus - Differential Qualification Runner"
 echo "===================================================================="
 echo " Suite:         $SUITE"
 echo " Soak Full:     $SOAK_FULL"
@@ -318,7 +328,8 @@ cat > "$SUMMARY_FILE" << EOF
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "suite": "$SUITE",
   "soak_full": $SOAK_FULL,
-  "race_enabled": $ENABLE_RACE,
+  "race_requested": $ENABLE_RACE,
+  "race_enabled": $([[ -n "$RACE_FLAG" ]] && echo "true" || echo "false"),
   "total_duration_sec": $TOTAL_DURATION,
   "passed_suites": [$(printf '"%s",' "${PASSED_SUITES[@]}" | sed 's/,$//')],
   "failed_suites": [$(printf '"%s",' "${FAILED_SUITES[@]}" | sed 's/,$//')],

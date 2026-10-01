@@ -538,8 +538,12 @@ func TestUpstreamRekeyDoesNotCreateBackendSessionWithoutTraffic(t *testing.T) {
 		t.Fatalf("freshSessionRegistrations = %d without application traffic, want 0", got)
 	}
 
-	// Inject a plaintext UDP packet to trigger admission
-	client.inject(t, engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 0x42))
+	// Inject a plaintext UDP packet to trigger admission; pump to handle
+	// handshake-settling drops under load (issue #391 round 4b, finding 3).
+	pkt := engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 0x42)
+	client.inject(t, pkt)
+	stopPump := pumpEnginePacketUntil(t, client, pkt, nil)
+	defer stopPump()
 
 	sess, ok := waitForSession(t, svc, peer.publicKey)
 	if !ok {
