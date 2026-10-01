@@ -189,6 +189,9 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			// If adoption fails (concurrent reap/replace), do not bind return path or
 			// drop retirement handles; fall through cleanly to fresh admission.
 			if adopted, ok := s.sessionMgr.AdoptSessionForIngress(o.PeerPublicKey, live.ID); ok {
+				if path != nil && path.Closed() {
+					return nil, nil, retirement, forwarder.ErrReturnPathClosed
+				}
 				if path != nil && s.forwarder != nil {
 					retirement, err = s.forwarder.BindSessionReturnPath(adopted.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, path)
 					if err != nil {
@@ -264,6 +267,18 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 
 	// Route registration LAST (admission-then-register): only a checked,
 	// successful registration makes the admission visible.
+	if s.preIngressRouteRegistrationHookForTest != nil {
+		s.preIngressRouteRegistrationHookForTest()
+	}
+
+	if path != nil && path.Closed() {
+		s.rollbackIngressSession(ctx, sess)
+		s.pool.DecrementConnections(backend.ID)
+		s.rollbackIngressSticky(o.PeerPublicKey, hadSticky)
+		retirement = forwarder.Retirement{}
+		return nil, nil, retirement, forwarder.ErrReturnPathClosed
+	}
+
 	if s.forwarder != nil {
 		retirement, err = s.forwarder.TryRegisterSessionWithReturnPath(sess.ID, conn.ID, o.PeerPublicKey, assignedIP, backend.ID, 0, 0, path)
 		if err != nil {

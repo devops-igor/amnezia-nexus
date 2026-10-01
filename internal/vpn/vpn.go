@@ -195,21 +195,22 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	lastReconcileTime                  time.Time
-	lastReconcileByTunnel              map[int64]time.Time
-	peerGenerations                    map[string]uint64
-	reconcilePostSnapshotHook          func()
-	reconcilePreApplyHook              func()
-	reconcilePreCommitHook             func()
-	ensureDevicePreLockHook            func()
-	preCommitMigrationHookForTest      func()
-	preAdoptHookForTest                func(peerKey, sessionID string)
-	preRevokeCloseHookForTest          func(peerKey, sessionID string)
-	postCommitRevokeHookForTest        func(kind database.PeerRevokeKind, userID string, clientID string)
-	updateBackendServerHostPreLockHook func()
-	updateBackendServerHostErr         error
-	syncBackendForwarderHook           func() error
-	enableBackendPreAddTunnelHook      func()
+	lastReconcileTime                      time.Time
+	lastReconcileByTunnel                  map[int64]time.Time
+	peerGenerations                        map[string]uint64
+	reconcilePostSnapshotHook              func()
+	reconcilePreApplyHook                  func()
+	reconcilePreCommitHook                 func()
+	ensureDevicePreLockHook                func()
+	preCommitMigrationHookForTest          func()
+	preAdoptHookForTest                    func(peerKey, sessionID string)
+	preIngressRouteRegistrationHookForTest func()
+	preRevokeCloseHookForTest              func(peerKey, sessionID string)
+	postCommitRevokeHookForTest            func(kind database.PeerRevokeKind, userID string, clientID string)
+	updateBackendServerHostPreLockHook     func()
+	updateBackendServerHostErr             error
+	syncBackendForwarderHook               func() error
+	enableBackendPreAddTunnelHook          func()
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -1794,15 +1795,26 @@ func (s *Service) Stop() error {
 	s.ingressEngine = nil
 	s.mu.Unlock()
 
+	var firstErr error
+	recordErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	if ingressEng != nil {
-		_ = ingressEng.Stop()
+		if err := ingressEng.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
+			recordErr(err)
+		}
 	}
 	if s.endpoint != nil {
 		_ = s.endpoint.Stop()
 	}
 	if s.forwarder != nil {
 		if wait := s.forwarder.RetireCustomRoutes(); wait != nil {
-			wait()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			recordErr(wait(ctx))
+			cancel()
 		}
 	}
 	if s.prober != nil {
@@ -1812,7 +1824,7 @@ func (s *Service) Stop() error {
 		s.reconnectMgr.Stop()
 	}
 	if s.forwarder != nil {
-		_ = s.forwarder.Stop()
+		recordErr(s.forwarder.Stop())
 	}
 	if s.tunDev != nil {
 		_ = s.tunDev.Close()
@@ -1838,7 +1850,7 @@ func (s *Service) Stop() error {
 	}
 	s.mu.Unlock()
 
-	return nil
+	return firstErr
 }
 
 // ClientAWGEngine returns the configured client-facing AWG engine ("custom" or "upstream").
@@ -3911,6 +3923,14 @@ func (s *Service) SetPreAdoptHookForTest(fn func(peerKey, sessionID string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.preAdoptHookForTest = fn
+}
+
+// SetPreIngressRouteRegistrationHookForTest sets a test hook called under s.mu
+// in ensureBackendSessionForIngress immediately before forwarder route registration.
+func (s *Service) SetPreIngressRouteRegistrationHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preIngressRouteRegistrationHookForTest = fn
 }
 
 // SetPreCommitMigrationHookForTest sets a test hook called under s.mu in MigrateSession

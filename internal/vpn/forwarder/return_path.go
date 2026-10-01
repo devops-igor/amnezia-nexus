@@ -73,6 +73,9 @@ func validReturnDestination(packet []byte, destination string) bool {
 // token buckets and protocol-independent routing session intact.
 // Wait on the returned retirement after releasing caller serialization locks.
 func (f *Forwarder) BindSessionReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendID int64, path *ReturnPath) (Retirement, error) {
+	if path != nil && path.Closed() {
+		return Retirement{}, ErrReturnPathClosed
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	old := f.routesByPeer[peerKey]

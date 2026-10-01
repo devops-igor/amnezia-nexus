@@ -89,6 +89,7 @@ type IngressEngine struct {
 	reapInterval     time.Duration
 	peerSyncInterval time.Duration
 	retireRoutes     func()
+	stopTimeout      time.Duration
 }
 
 // reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
@@ -382,9 +383,26 @@ func reapLoopIdleTimeout(*Service) time.Duration {
 	return 3 * time.Minute
 }
 
-// Stop terminates the receive loop and closes the upstream device. Idempotent;
-// stopping a never-started engine still closes the portal device (the engine
-// owns it from construction) and reports ErrIngressEngineNotStarted.
+// SetStopTimeoutForTest sets the quiescence join timeout for route retirement during Stop.
+func (e *IngressEngine) SetStopTimeoutForTest(d time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.stopTimeout = d
+}
+
+func (e *IngressEngine) getStopTimeout() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopTimeout > 0 {
+		return e.stopTimeout
+	}
+	return 5 * time.Second
+}
+
+// Stop terminates the receive loop, shuts down workers, fences the return path,
+// and retires and drains forwarder routes. Idempotent; stopping a never-started engine
+// still closes the portal device (the engine owns it from construction) and reports
+// ErrIngressEngineNotStarted.
 func (e *IngressEngine) Stop() error {
 	e.mu.Lock()
 	e.closed = true
@@ -399,28 +417,12 @@ func (e *IngressEngine) Stop() error {
 	retireRoutes := e.retireRoutes
 	e.mu.Unlock()
 
+	// b) Close/fence ReturnPath (returnPath.Close()).
 	if e.returnPath != nil {
 		e.returnPath.Close()
-		if retireRoutes != nil {
-			retireRoutes()
-		} else if e.svc != nil && e.svc.forwarder != nil {
-			if wait := e.svc.forwarder.RetireRoutesByReturnPath(e.returnPath); wait != nil {
-				wait()
-			}
-		}
 	}
-	// Detach the DB listener FIRST, then invalidate the enqueue path, then
-	// drain the worker (issue #391 round 4b, finding 2). Order matters:
-	// the enqueue path is exactly what a database notification uses, so
-	// stopping the worker while the listener is still attached leaves a
-	// window in which a late commit finds the enqueue path disarmed. The
-	// drain then waits for the in-flight reconcile, which holds peerSync.mu
-	// and may be mid-upstream-call, so it must reach quiescence before the
-	// portal closes underneath it.
-	// The drain is deadline-bounded: a reconcile wedged on the portal
-	// device must not hang Stop, so a timeout is reported and teardown
-	// proceeds (issue #391 round 4a; the worker's ctx is Background by
-	// design so a portal stall cannot mask its own failure).
+
+	// c) Unsubscribe peer changes & stop peer sync worker.
 	if e.unsubscribePeerChanges != nil {
 		e.unsubscribePeerChanges()
 	}
@@ -429,6 +431,8 @@ func (e *IngressEngine) Stop() error {
 			log.Printf("[vpn/ingress] peer sync worker drain timed out during stop: %v", err)
 		}
 	}
+
+	// d) Close stopCh, reapStop, peerSyncStop.
 	if stopCh != nil {
 		close(stopCh)
 	}
@@ -438,19 +442,36 @@ func (e *IngressEngine) Stop() error {
 	if peerSyncStop != nil {
 		close(peerSyncStop)
 	}
+
+	// e) Close portal device (portal.Close()) to unblock receiver parked in ReceiveOutbound.
+	_ = e.portal.Close()
+
+	// f) Wait until receive loop (<-stopped), peer sync loop (<-peerSyncDone), and reap loop (<-reapDone) are fully quiescent.
 	if peerSyncDone != nil {
 		<-peerSyncDone
 	}
-	// Close the portal so a receiver parked in ReceiveOutbound wakes up
-	// (virtualtun.ErrClosed); the loop then exits via the receive error
-	// even without observing stopCh. Unconditional: without it the loop
-	// never exits and Stop would block forever on <-stopped.
-	_ = e.portal.Close()
 	if stopped != nil {
 		<-stopped
 	}
 	if reapDone != nil {
 		<-reapDone
+	}
+
+	// g) ONLY THEN execute FINAL forwarder route retirement for e.returnPath (or test callback).
+	// h) Join in-flight writes with a bounded deadline.
+	var retireErr error
+	if retireRoutes != nil {
+		retireRoutes()
+	} else if e.returnPath != nil && e.svc != nil && e.svc.forwarder != nil {
+		if wait := e.svc.forwarder.RetireRoutesByReturnPath(e.returnPath); wait != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), e.getStopTimeout())
+			retireErr = wait(ctx)
+			cancel()
+		}
+	}
+
+	if retireErr != nil {
+		return retireErr
 	}
 	if !wasRunning {
 		return ErrIngressEngineNotStarted

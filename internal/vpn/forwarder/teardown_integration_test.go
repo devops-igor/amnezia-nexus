@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -190,7 +191,7 @@ func TestRetireAllRoutes_DrainsQueuesAndJoinsWrites(t *testing.T) {
 	waitRetired := make(chan struct{})
 	go func() {
 		wait := f.RetireAllRoutes()
-		wait()
+		_ = wait(context.Background())
 		close(waitRetired)
 	}()
 
@@ -273,7 +274,7 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 
 	// Retire only upstream routes
 	wait := f.RetireRoutesByReturnPath(upPath)
-	wait()
+	_ = wait(context.Background())
 
 	// Upstream routes are removed
 	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.21"), "10.100.0.21"); !errors.Is(err, ErrSessionNotRegistered) {
@@ -300,7 +301,7 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 
 	// Retire custom routes
 	waitCustom := f.RetireCustomRoutes()
-	waitCustom()
+	_ = waitCustom(context.Background())
 
 	_, _, active = f.GetStats()
 	if active != 0 {
@@ -373,5 +374,78 @@ func TestForwarder_Stop_FullCleanupAndDrain(t *testing.T) {
 	f.mu.RUnlock()
 	if rByPeer != 0 || rByIP != 0 || cDevs != 0 {
 		t.Fatalf("expected maps empty: routesByPeer=%d routesByIP=%d clientDevices=%d", rByPeer, rByIP, cDevs)
+	}
+}
+
+func TestRetireAllRoutes_PermanentlyBlockedWriteTimesOut(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 10)
+	dev := newBlockingWriteDevice()
+	f.AttachPeerDevice("peer-blocked", dev)
+	f.RegisterSession("sess-b", "conn-b", "peer-blocked", "10.100.0.99", 1)
+
+	pkt := returnPacket("10.100.0.99")
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.99"); err != nil {
+		t.Fatalf("RouteBackendToClient: %v", err)
+	}
+
+	f.StartPumps(t.Context())
+	defer func() {
+		dev.release()
+		f.StopPumps()
+	}()
+
+	select {
+	case <-dev.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("device write did not start")
+	}
+
+	wait := f.RetireAllRoutes()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	startWait := time.Now()
+	err := wait(ctx)
+	elapsed := time.Since(startWait)
+
+	if !errors.Is(err, ErrRetirementTimeout) {
+		t.Fatalf("expected ErrRetirementTimeout, got %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected timeout within ~50ms, took %v", elapsed)
+	}
+}
+
+func TestForwarder_Stop_PermanentlyBlockedWriteTimesOut(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 10)
+	f.SetStopTimeoutForTest(50 * time.Millisecond)
+	dev := newBlockingWriteDevice()
+	defer dev.release()
+
+	f.AttachPeerDevice("peer-blocked-stop", dev)
+	f.RegisterSession("sess-bs", "conn-bs", "peer-blocked-stop", "10.100.0.98", 1)
+
+	pkt := returnPacket("10.100.0.98")
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.98"); err != nil {
+		t.Fatalf("RouteBackendToClient: %v", err)
+	}
+
+	f.StartPumps(t.Context())
+
+	select {
+	case <-dev.startedC:
+	case <-time.After(time.Second):
+		t.Fatal("device write did not start")
+	}
+
+	startStop := time.Now()
+	err := f.Stop()
+	elapsed := time.Since(startStop)
+
+	if !errors.Is(err, ErrRetirementTimeout) {
+		t.Fatalf("expected ErrRetirementTimeout from Forwarder.Stop, got %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected Forwarder.Stop timeout within ~50ms, took %v", elapsed)
 	}
 }
