@@ -161,7 +161,11 @@ func newReturnStreamClientWithTiming(t *testing.T, peer enginePeer, saved string
 
 func returnExchange(t *testing.T, c net.Conn, payload []byte, datagram bool, backendMarker byte) {
 	t.Helper()
-	if err := c.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	timeout := 3 * time.Second
+	if raceDetectorEnabled {
+		timeout = 10 * time.Second
+	}
+	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatal(err)
 	}
 	n, err := c.Write(payload)

@@ -102,9 +102,10 @@ var (
 		"private_key":       true,
 		"probe_private_key": true,
 		"endpoint":          true,
-		// Administrative intent, runtime health, and state-version fencing
-		// have dedicated writers (issue #90). Keep those fields out of this
-		// generic update path so subsystem ownership cannot be bypassed.
+		"state_version":     true,
+		// Administrative intent and runtime health have dedicated writers
+		// (issue #90). Keep those fields out of this generic update path so
+		// subsystem ownership cannot be bypassed.
 		"active_connections": true,
 		"created_at":         true,
 	}

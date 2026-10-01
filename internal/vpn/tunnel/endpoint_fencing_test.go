@@ -252,3 +252,247 @@ func TestHealthProber_InFlightSuccessfulProbe_FencedBeforeActiveHook(t *testing.
 		t.Errorf("expected Endpoint = %q, got %q", newEndpoint, curTun.Endpoint)
 	}
 }
+
+// TestProbeTunnel_AddTunnel_FencesInFlightProbeOnEndpointRefresh verifies that:
+//  1. A health probe starts against an old endpoint and measures degraded latency.
+//  2. An AddTunnel call refreshes the existing tunnel with a new endpoint, bumping StateVersion.
+//  3. The probe attempts to commit status, but is rejected with ErrStaleStateVersion.
+//  4. In-memory pool status and StateVersion remain unpolluted by the stale probe.
+func TestProbeTunnel_AddTunnel_FencesInFlightProbeOnEndpointRefresh(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "AddTunnel Endpoint Fencing Server", Host: "198.51.100.60"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, serverID, "198.51.100.60:51820", "pubkey-addtunnel-fencing")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.LatencyThresholdMS = 200
+	prober := NewHealthProber(pool, db, cfg, func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 300 * time.Millisecond, nil // measured latency > LatencyThresholdMS (would mark degraded)
+	})
+
+	reached := make(chan struct{})
+	resume := make(chan struct{})
+	prober.preStatusCommitHook = func() {
+		close(reached)
+		<-resume
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := prober.ProbeTunnel(ctx, tun)
+		done <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("probe did not reach preStatusCommitHook")
+	}
+
+	// While probe is paused, endpoint is refreshed via AddTunnel, advancing StateVersion to 2
+	newEndpoint := "198.51.100.61:51820"
+	refreshed, err := pool.AddTunnel(ctx, serverID, newEndpoint, "pubkey-addtunnel-fencing")
+	if err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+	if refreshed.StateVersion != 2 {
+		close(resume)
+		t.Fatalf("expected refreshed StateVersion = 2, got %d", refreshed.StateVersion)
+	}
+
+	// Release probe
+	close(resume)
+	probeErr := <-done
+
+	if !errors.Is(probeErr, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion, got: %v", probeErr)
+	}
+
+	// Verify tunnel in pool was NOT marked degraded by the old probe and retains StateVersion = 2
+	curTun, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if curTun.Status != "active" {
+		t.Errorf("expected status 'active', got %q", curTun.Status)
+	}
+	if curTun.StateVersion != 2 {
+		t.Errorf("expected StateVersion = 2, got %d", curTun.StateVersion)
+	}
+	if curTun.Endpoint != newEndpoint {
+		t.Errorf("expected Endpoint = %q, got %q", newEndpoint, curTun.Endpoint)
+	}
+}
+
+// TestProbeTunnel_AddTunnel_FencesInFlightProbeOnKeyRefresh verifies that:
+//  1. A health probe starts against an old key and measures degraded latency.
+//  2. An AddTunnel call refreshes the existing tunnel with a new public key, bumping StateVersion.
+//  3. The probe attempts to commit status, but is rejected with ErrStaleStateVersion.
+//  4. In-memory pool status and StateVersion remain unpolluted by the stale probe.
+func TestProbeTunnel_AddTunnel_FencesInFlightProbeOnKeyRefresh(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "AddTunnel Key Fencing Server", Host: "198.51.100.70"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialPubKey := "pubkey-key-fencing-old"
+	tun, err := pool.AddTunnel(ctx, serverID, "198.51.100.70:51820", initialPubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.LatencyThresholdMS = 200
+	prober := NewHealthProber(pool, db, cfg, func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 300 * time.Millisecond, nil
+	})
+
+	reached := make(chan struct{})
+	resume := make(chan struct{})
+	prober.preStatusCommitHook = func() {
+		close(reached)
+		<-resume
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := prober.ProbeTunnel(ctx, tun)
+		done <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("probe did not reach preStatusCommitHook")
+	}
+
+	// While probe is paused, public key is refreshed via AddTunnel, advancing StateVersion to 2
+	newPubKey := "pubkey-key-fencing-new"
+	refreshed, err := pool.AddTunnel(ctx, serverID, "198.51.100.70:51820", newPubKey)
+	if err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+	if refreshed.StateVersion != 2 {
+		close(resume)
+		t.Fatalf("expected refreshed StateVersion = 2, got %d", refreshed.StateVersion)
+	}
+
+	// Release probe
+	close(resume)
+	probeErr := <-done
+
+	if !errors.Is(probeErr, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion, got: %v", probeErr)
+	}
+
+	curTun, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if curTun.Status != "active" {
+		t.Errorf("expected status 'active', got %q", curTun.Status)
+	}
+	if curTun.StateVersion != 2 {
+		t.Errorf("expected StateVersion = 2, got %d", curTun.StateVersion)
+	}
+	if curTun.PublicKey != newPubKey {
+		t.Errorf("expected PublicKey = %q, got %q", newPubKey, curTun.PublicKey)
+	}
+}
+
+// TestHealthProber_AddTunnel_InFlightFailedProbeDoesNotContaminateFailureCount verifies that:
+//  1. A health probe starts against an old endpoint and fails.
+//  2. An AddTunnel call refreshes the existing tunnel with a new endpoint, bumping StateVersion.
+//  3. The probe completes its failure path, but handleProbeFailure fences it out due to ErrStaleStateVersion.
+//  4. The failure counter for the server remains 0 (not contaminated by the stale probe).
+func TestHealthProber_AddTunnel_InFlightFailedProbeDoesNotContaminateFailureCount(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Fail Count AddTunnel Server", Host: "198.51.100.80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun, err := pool.AddTunnel(ctx, serverID, "198.51.100.80:51820", "pubkey-fail-addtunnel")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+	prober := NewHealthProber(pool, db, cfg, func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 0, errors.New("simulated handshake failure on old endpoint")
+	})
+
+	reached := make(chan struct{})
+	resume := make(chan struct{})
+	prober.preFailureCommitHook = func() {
+		close(reached)
+		<-resume
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := prober.ProbeTunnel(ctx, tun)
+		done <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("probe did not reach preFailureCommitHook")
+	}
+
+	// While probe is paused, endpoint is refreshed via AddTunnel, advancing StateVersion to 2
+	newEndpoint := "198.51.100.81:51820"
+	refreshed, err := pool.AddTunnel(ctx, serverID, newEndpoint, "pubkey-fail-addtunnel")
+	if err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+	if refreshed.StateVersion != 2 {
+		close(resume)
+		t.Fatalf("expected refreshed StateVersion = 2, got %d", refreshed.StateVersion)
+	}
+
+	// Release probe
+	close(resume)
+	probeErr := <-done
+
+	if !errors.Is(probeErr, ErrStaleStateVersion) {
+		t.Errorf("expected ErrStaleStateVersion, got: %v", probeErr)
+	}
+
+	// Verify failCount was NOT incremented by the stale probe failure
+	if fc := prober.GetFailCount(serverID); fc != 0 {
+		t.Errorf("expected failCount = 0 for new endpoint generation, got %d", fc)
+	}
+
+	curTun, err := pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if curTun.Status != "active" {
+		t.Errorf("expected status 'active', got %q", curTun.Status)
+	}
+	if curTun.StateVersion != 2 {
+		t.Errorf("expected StateVersion = 2, got %d", curTun.StateVersion)
+	}
+	if curTun.Endpoint != newEndpoint {
+		t.Errorf("expected Endpoint = %q, got %q", newEndpoint, curTun.Endpoint)
+	}
+}

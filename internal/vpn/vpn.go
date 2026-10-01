@@ -2233,12 +2233,10 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	var (
 		hasInitial     bool
 		initialEnabled bool
-		initialVersion int64
 	)
 	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
 		hasInitial = true
 		initialEnabled = initTun.Enabled
-		initialVersion = initTun.StateVersion
 	}
 
 	server, err := db.GetServerByID(ctx, serverID)
@@ -2294,7 +2292,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, tun.StateVersion)
 }
 
 func (s *Service) finishEnableBackend(

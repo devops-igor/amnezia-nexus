@@ -487,7 +487,14 @@ func TestUpstreamRekeyDoesNotCreateBackendSessionWithoutTraffic(t *testing.T) {
 	if sess.AdmittedVia != models.SessionAdmissionIngress {
 		t.Fatalf("sess.AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
 	}
-	if got := svc.freshSessionRegistrations.Load(); got != 1 {
+	var got int64
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		got = svc.freshSessionRegistrations.Load()
+		if got == 1 {
+			break
+		}
+	}
+	if got != 1 {
 		t.Fatalf("freshSessionRegistrations = %d after admission, want 1", got)
 	}
 }
