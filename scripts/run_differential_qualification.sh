@@ -159,7 +159,7 @@ IP_PATTERNS=(
 )
 
 echo "===================================================================="
-echo " Amnezia Nexus — Differential Qualification Runner"
+echo " Amnezia Nexus - Differential Qualification Runner"
 echo "===================================================================="
 echo " Suite:         $SUITE"
 echo " Soak Full:     $SOAK_FULL"

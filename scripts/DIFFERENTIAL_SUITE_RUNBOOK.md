@@ -195,7 +195,118 @@ sudo ./scripts/run_non_netstack_client_qualification.sh \
 
 ---
 
-## 6. Environment Variables Reference
+## 6. DEV Server E2E Qualification Workflow (`.github/workflows/e2e-dev.yml`)
+
+The DEV Server E2E workflow integrates upstream qualification directly into the continuous DEV deployment pipeline.
+
+### Qualification Modes
+
+The workflow accepts a `qualification` input via `workflow_dispatch`:
+
+| Mode | Duration | Description | Artifacts Generated |
+|---|---|---|---|
+| `standard` | ~15-20m | Skips extended differential qualification; runs standard DEV server build, deployment, and integration tests. | Standard DEV E2E logs |
+| `bounded` (default) | ~20-25m | Runs baseline, matrix, lifecycle, and bounded soak qualification suites plus live non-netstack client qualification and fail-closed evidence verification. | Full differential suite + live client reports |
+| `full` | ~60-75m | Runs all qualification suites including full unaccelerated 10+-rekey soak (~40-50m), live non-netstack client qualification, and fail-closed evidence verification. | Full soak manifests (>=10 rekeys) + live client reports |
+
+### Execution Flow in E2E Pipeline
+
+```
+[DEV Deploy] 
+    |
+    v
+[Directory Prep: test-artifacts/runtime & test-artifacts/public]
+    |
+    v
+[Differential Qualification Suite (bounded or full)]
+    |
+    v
+[Start Upstream Qualification Subject (cmd/qualification-subject)]
+    |  - Initializes isolated DB & portal identity
+    |  - Freezes client config to test-artifacts/runtime/frozen-client.conf (0600)
+    |  - Starts netstack echo responders (TCP/UDP on port 40001)
+    |  - Starts production IngressEngine on UDP 51820
+    |  - Emits subject.ready JSON status file
+    v
+[Live Non-Netstack Client Qualification (scripts/run_non_netstack_client_qualification.sh)]
+    |  - Executes in isolated netns (nexus-client-ns)
+    |  - Verifies handshake, bi-directional TCP echo, UDP echo, reconnect resilience
+    v
+[Stop Upstream Qualification Subject (SIGTERM)]
+    |
+    v
+[Evidence Aggregator Verification (scripts/verify_issue392_qualification.sh)]
+    |  - Fail-closed validation of public reports and metrics
+    v
+[Upload Public Artifacts (test-artifacts/public/)]
+    |
+    v
+[Unconditional Teardown (if: always())]
+    - Terminate qualification subject process
+    - Delete nexus-client-ns netns and veth/awg interfaces
+    - Delete test-artifacts/runtime/ (wiping all ephemeral private keys)
+```
+
+---
+
+## 7. Artifact Separation & Evidence Aggregator
+
+### Strict Separation: Runtime vs. Public Artifacts
+
+To prevent secret leakage in CI runs and uploaded artifacts, the qualification harness enforces strict physical directory separation:
+
+1. **`test-artifacts/runtime/` (SECRET-BEARING, NEVER UPLOADED)**:
+   - Contains frozen client configuration (`frozen-client.conf`) with private keys.
+   - Contains ephemeral key files for `awg set`.
+   - Permissions enforced: `chmod 600` / `umask 077`.
+   - Wiped unconditionally during teardown (`rm -rf test-artifacts/runtime`).
+2. **`test-artifacts/public/` (PUBLIC EVIDENCE, UPLOADED)**:
+   - Contains only sanitized, redacted JSON reports:
+     - `qualification_summary.json`
+     - `evidence_manifest.json`
+     - `soak_report_reference_*.json`
+     - `soak_report_subject_*.json`
+     - `non_netstack_qualification.json`
+     - `issue392_qualification_summary.json`
+   - Zero private keys, zero raw server IPs, zero local paths.
+   - Uploaded as GitHub Actions workflow artifact.
+
+### Evidence Aggregator CLI (`scripts/verify_issue392_qualification.sh`)
+
+The evidence aggregator verifies that all qualification requirements are strictly satisfied before passing CI:
+
+```bash
+# Verify bounded qualification evidence
+./scripts/verify_issue392_qualification.sh \
+  --artifacts-dir test-artifacts/public \
+  --mode bounded
+
+# Verify full qualification evidence (enforces >=10 unforced rekeys)
+./scripts/verify_issue392_qualification.sh \
+  --artifacts-dir test-artifacts/public \
+  --mode full
+```
+
+### Assertions Enforced by Aggregator:
+1. **Required Files**: Checks presence of all public JSON manifests.
+2. **Pinned Dependency**: Validates upstream engine dependency is pinned to `golang.zx2c4.com/amneziawg v3.1.20260828`.
+3. **Commit Identity**: Confirms git commit matches current HEAD.
+4. **Lifecycle & Matrix Results**: Verifies `status == "PASS"` across all fault shims and backend migrations.
+5. **Soak Duration & Rekey Thresholds**:
+   - `bounded` mode: at least 1 rekey observed on both Reference and Subject engines.
+   - `full` mode: at least 10 unforced rekeys observed on both Reference and Subject engines.
+6. **Network Quality Metrics**:
+   - `tcp_continuity_passed == true` (no dropped TCP stream sockets across rekeys).
+   - `idle_phase_passed == true` (keepalive recovery after silent intervals).
+   - Sequenced UDP packet loss <= 0.05%.
+7. **Non-Netstack Client Parity**:
+   - Confirms `status == "PASS"`, handshake established, TCP echo passed, UDP echo passed, and reconnect resilience passed.
+8. **Privacy Compliance Audit**:
+   - Zero private keys, zero raw IP addresses, zero local filesystem paths in any public artifact.
+
+---
+
+## 8. Environment Variables Reference
 
 | Variable | Description | Example / Allowed Values |
 |---|---|---|
@@ -205,7 +316,7 @@ sudo ./scripts/run_non_netstack_client_qualification.sh \
 
 ---
 
-## 7. Privacy & Security Invariants
+## 9. Privacy & Security Invariants
 
 All differential test suites and scripts adhere to non-negotiable privacy rules:
 
@@ -222,7 +333,7 @@ All differential test suites and scripts adhere to non-negotiable privacy rules:
 
 ---
 
-## 8. Failure Triage & Troubleshooting
+## 10. Failure Triage & Troubleshooting
 
 ### Port Collision (`bind: address already in use`)
 - **Cause**: Concurrent execution of test suites binding localhost UDP port 51820.

@@ -16,40 +16,10 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
-	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 )
-
-// returnStackDevice models the plaintext boundary of a decrypted backend
-// tunnel. Both application endpoints use real userspace TCP/UDP stacks;
-// the portal's production backend reader and queue pumps move their packets.
-// This does not model encryption between Nexus and the backend VPN server.
-type returnStackDevice struct {
-	tun  tun.Device
-	once sync.Once
-}
-
-func (d *returnStackDevice) Read(p []byte) (int, error) {
-	sizes := []int{0}
-	n, err := d.tun.Read([][]byte{p}, sizes, 0)
-	if err != nil || n == 0 {
-		return 0, err
-	}
-	return sizes[0], nil
-}
-func (d *returnStackDevice) Write(p []byte) (int, error) {
-	_, err := d.tun.Write([][]byte{p}, 0)
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-func (d *returnStackDevice) Close() (err error) {
-	d.once.Do(func() { err = d.tun.Close() })
-	return err
-}
 
 func returnEchoServers(t *testing.T, stack *netstack.Net, addr netip.Addr, backendMarker byte) {
 	t.Helper()

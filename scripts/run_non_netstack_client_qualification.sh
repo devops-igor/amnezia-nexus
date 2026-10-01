@@ -37,6 +37,7 @@ TEMP_KEY_FILE=""
 TEMP_HP_FILE=""
 CLIENT_IP_FLAG_SET=""
 HP_KEY_FLAG_SET=""
+RUNTIME_DIR=""
 
 # AmneziaWG protocol parameters
 JC=4
@@ -96,6 +97,8 @@ Options:
   --persistent-keepalive <val>      Persistent keepalive interval in seconds
   -o, --output-dir <path>           Directory to save qualification report
                                     (Default: ./test-artifacts)
+  --runtime-dir <path>              Directory for ephemeral keys and runtime state
+                                    (Default: ./test-artifacts/runtime)
   -v, --verbose                     Enable verbose debugging output
   -h, --help                        Show this help message and exit
 
@@ -122,6 +125,11 @@ EOF
 
 parse_config() {
     local cfg="$1"
+    local _xtrace_active=false
+    if [[ "$-" == *x* ]]; then
+        _xtrace_active=true
+        set +x
+    fi
     local current_section=""
     local comment_regex='^[#;]'
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
@@ -211,6 +219,9 @@ parse_config() {
             esac
         fi
     done < "$cfg"
+    if [[ "$_xtrace_active" == "true" ]]; then
+        set -x
+    fi
 }
 
 # Parse command line arguments
@@ -350,6 +361,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --runtime-dir)
+            RUNTIME_DIR="$2"
+            shift 2
+            ;;
         -v|--verbose)
             VERBOSE=true
             shift
@@ -388,6 +403,17 @@ fi
 
 SERVER_ENDPOINT_IP="${SERVER_ENDPOINT%:*}"
 
+mask_endpoint() {
+    local ep="$1"
+    if [[ "$ep" == *:* ]]; then
+        local port="${ep##*:}"
+        echo "<redacted-ip>:${port}"
+    else
+        echo "<redacted-ip>"
+    fi
+}
+MASKED_SERVER_ENDPOINT="$(mask_endpoint "$SERVER_ENDPOINT")"
+
 if [[ -z "$ALLOWED_IPS" ]]; then
     ALLOWED_IPS="${PORTAL_IP}/32"
 fi
@@ -400,6 +426,19 @@ if [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$REPO_ROOT/$OUTPUT_DIR"
 fi
 mkdir -p "$OUTPUT_DIR"
+
+if [[ -z "$RUNTIME_DIR" ]]; then
+    if [[ -d "$REPO_ROOT/test-artifacts/runtime" ]]; then
+        RUNTIME_DIR="$REPO_ROOT/test-artifacts/runtime"
+    else
+        RUNTIME_DIR="$OUTPUT_DIR"
+    fi
+fi
+if [[ "$RUNTIME_DIR" != /* ]]; then
+    RUNTIME_DIR="$REPO_ROOT/$RUNTIME_DIR"
+fi
+mkdir -p "$RUNTIME_DIR"
+
 REPORT_FILE="$OUTPUT_DIR/non_netstack_qualification.json"
 DISPLAY_DIR="test-artifacts"
 DISPLAY_REPORT="$DISPLAY_DIR/non_netstack_qualification.json"
@@ -412,7 +451,7 @@ echo " Interface:       $IFACE"
 echo " Namespace:       $NETNS"
 echo " Underlay Host:   $UNDERLAY_HOST_IP ($VETH_HOST)"
 echo " Underlay Client: $UNDERLAY_CLIENT_IP ($VETH_CLIENT)"
-echo " Server Endpoint: $SERVER_ENDPOINT"
+echo " Server Endpoint: $MASKED_SERVER_ENDPOINT"
 echo " Client IP:       $CLIENT_IP"
 echo " Portal Target:   $PORTAL_IP:40001"
 echo " Output Dir:      $DISPLAY_DIR"
@@ -435,14 +474,19 @@ fi
 # Cleanup handler for live runs
 cleanup() {
     local exit_code=$?
+    if [[ "$-" == *x* ]]; then
+        set +x
+    fi
     echo ""
     echo "==> Executing isolated resource teardown..."
     if [[ "$DRY_RUN" == "false" ]]; then
         if [[ -n "${TEMP_KEY_FILE:-}" && -f "$TEMP_KEY_FILE" ]]; then
             rm -f "$TEMP_KEY_FILE"
+            TEMP_KEY_FILE=""
         fi
         if [[ -n "${TEMP_HP_FILE:-}" && -f "$TEMP_HP_FILE" ]]; then
             rm -f "$TEMP_HP_FILE"
+            TEMP_HP_FILE=""
         fi
         if [[ -n "$NETNS" ]]; then
             if $SUDO_CMD ip netns list 2>/dev/null | grep -qw "$NETNS"; then
@@ -464,7 +508,7 @@ cleanup() {
     echo "==> Teardown complete. Exiting with code $exit_code."
     exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 START_EPOCH=$(date +%s)
 
@@ -494,7 +538,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "    Command: ip -netns $NETNS link set $VETH_CLIENT up"
     echo "    Command: ip -netns $NETNS route add $UNDERLAY_HOST_ADDR/32 dev $VETH_CLIENT"
     if [[ "$SERVER_ENDPOINT_IP" != "$UNDERLAY_HOST_ADDR" ]]; then
-        echo "    Command: ip -netns $NETNS route add $SERVER_ENDPOINT_IP/32 via $UNDERLAY_HOST_ADDR dev $VETH_CLIENT"
+        echo "    Command: ip -netns $NETNS route add <server-endpoint>/32 via $UNDERLAY_HOST_ADDR dev $VETH_CLIENT"
     fi
     echo "    Status: OK (Dry-Run: Underlay network and outer endpoint route planned)"
 
@@ -532,7 +576,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     if [[ -n "$MAX_HANDSHAKE_ATTEMPTS" ]]; then
         sim_awg_cmd+=" max-handshake-attempts $MAX_HANDSHAKE_ATTEMPTS"
     fi
-    sim_awg_cmd+=" peer <server-pubkey> endpoint $SERVER_ENDPOINT allowed-ips $ALLOWED_IPS"
+    sim_awg_cmd+=" peer <server-pubkey> endpoint $MASKED_SERVER_ENDPOINT allowed-ips $ALLOWED_IPS"
     if [[ -n "$PERSISTENT_KEEPALIVE" ]]; then
         sim_awg_cmd+=" persistent-keepalive $PERSISTENT_KEEPALIVE"
     fi
@@ -548,7 +592,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 
     echo ""
     echo "==> [Step 4/6] Simulating handshake trigger and payload-verified traffic exchange..."
-    echo "    AmneziaWG Outer Endpoint:   $SERVER_ENDPOINT"
+    echo "    AmneziaWG Outer Endpoint:   $MASKED_SERVER_ENDPOINT"
     echo "    Target Portal IP:           $PORTAL_IP:40001"
     echo "    Handshake Trigger:          Initial tunnel packet into $IFACE"
     echo "    Handshake Verification:     Poll awg show $IFACE latest-handshakes"
@@ -655,14 +699,22 @@ else
             TEST_STATUS="SKIPPED"
             REPORT_NOTE="SKIPPED: missing client private key"
         else
-            TEMP_KEY_FILE=$(mktemp -p "$OUTPUT_DIR" .awg-key-XXXXXX 2>/dev/null || echo "${OUTPUT_DIR}/.awg-key-$$-${RANDOM}")
-            echo "$CLIENT_PRIVATE_KEY" > "$TEMP_KEY_FILE"
+            local _xtrace_active=false
+            if [[ "$-" == *x* ]]; then
+                _xtrace_active=true
+                set +x
+            fi
+
+            TEMP_KEY_FILE=$(mktemp -p "$RUNTIME_DIR" .awg-key-XXXXXX 2>/dev/null || echo "${RUNTIME_DIR}/.awg-key-$$-${RANDOM}")
+            ( umask 077 && touch "$TEMP_KEY_FILE" )
             chmod 600 "$TEMP_KEY_FILE"
+            printf '%s\n' "$CLIENT_PRIVATE_KEY" > "$TEMP_KEY_FILE"
 
             if [[ -n "$HEADER_PROTECTION_KEY" ]]; then
-                TEMP_HP_FILE=$(mktemp -p "$OUTPUT_DIR" .awg-hp-XXXXXX 2>/dev/null || echo "${OUTPUT_DIR}/.awg-hp-$$-${RANDOM}")
-                echo "$HEADER_PROTECTION_KEY" > "$TEMP_HP_FILE"
+                TEMP_HP_FILE=$(mktemp -p "$RUNTIME_DIR" .awg-hp-XXXXXX 2>/dev/null || echo "${RUNTIME_DIR}/.awg-hp-$$-${RANDOM}")
+                ( umask 077 && touch "$TEMP_HP_FILE" )
                 chmod 600 "$TEMP_HP_FILE"
+                printf '%s\n' "$HEADER_PROTECTION_KEY" > "$TEMP_HP_FILE"
             fi
 
             AWG_DEVICE_ARGS=(
@@ -729,6 +781,10 @@ else
             if [[ -n "$TEMP_HP_FILE" && -f "$TEMP_HP_FILE" ]]; then
                 rm -f "$TEMP_HP_FILE"
                 TEMP_HP_FILE=""
+            fi
+
+            if [[ "$_xtrace_active" == "true" ]]; then
+                set -x
             fi
 
             # Bring interface UP
@@ -896,7 +952,7 @@ cat > "$REPORT_FILE" << EOF
   "server_port": $SERVER_PORT,
   "client_ip": "$CLIENT_IP",
   "portal_ip": "$PORTAL_IP",
-  "server_endpoint": "$SERVER_ENDPOINT",
+  "server_endpoint": "$MASKED_SERVER_ENDPOINT",
   "amneziawg_parameters": {
     "jc": $JC,
     "jmin": $JMIN,
