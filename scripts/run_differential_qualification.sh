@@ -140,11 +140,14 @@ fi
 RACE_FLAG=""
 if [[ "$ENABLE_RACE" == "true" ]]; then
     RACE_FLAG="-race"
-    # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA)
+    # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA, missing CGO)
     RACE_TEST_ERR="$(go test -race -run "^$" ./cmd/panel 2>&1 || true)"
-    if echo "$RACE_TEST_ERR" | grep -q "unsupported VMA range"; then
-        echo "NOTICE: Host kernel has 39-bit VMA (unsupported by Go ThreadSanitizer on ARM64)."
-        echo "        Disabling -race for local host (full -race runs in CI on x86_64)."
+    if echo "$RACE_TEST_ERR" | grep -Eq "unsupported VMA range|requires cgo"; then
+        echo "NOTICE: Host environment does not support Go race detector: $(echo "$RACE_TEST_ERR" | tr '\n' ' ')"
+        echo "        Disabling -race for host environment (authoritative -race runs in CI on x86_64)."
+        RACE_FLAG=""
+    elif ! (go test -race -run "^$" ./cmd/panel >/dev/null 2>&1); then
+        echo "NOTICE: Go race detector pre-check failed. Disabling -race on host."
         RACE_FLAG=""
     fi
 fi

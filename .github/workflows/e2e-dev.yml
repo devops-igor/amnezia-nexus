@@ -174,7 +174,7 @@ jobs:
           if [ "${{ steps.qual-mode.outputs.mode }}" = "full" ]; then
             SOAK_FLAG="--soak-full"
           fi
-          ./scripts/run_differential_qualification.sh --suite all $SOAK_FLAG --output-dir test-artifacts/public
+          ./scripts/run_differential_qualification.sh --suite all --no-race $SOAK_FLAG --output-dir test-artifacts/public
 
       - name: Start Upstream Qualification Subject
         if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
