@@ -279,22 +279,24 @@ The evidence aggregator verifies that all qualification requirements are strictl
 # Verify bounded qualification evidence
 ./scripts/verify_issue392_qualification.sh \
   --artifacts-dir test-artifacts/public \
-  --mode bounded
+  --mode bounded \
+  --expected-commit <sha>
 
-# Verify full qualification evidence (enforces >=10 unforced rekeys)
+# Verify full qualification evidence (enforces >=10 unforced rekeys, closure eligible)
 ./scripts/verify_issue392_qualification.sh \
   --artifacts-dir test-artifacts/public \
-  --mode full
+  --mode full \
+  --expected-commit <sha>
 ```
 
 ### Assertions Enforced by Aggregator:
 1. **Required Files**: Checks presence of all public JSON manifests.
 2. **Pinned Dependency**: Validates upstream engine dependency is pinned to `golang.zx2c4.com/amneziawg v3.1.20260828`.
-3. **Commit Identity**: Confirms git commit matches current HEAD.
+3. **Commit Identity**: Confirms git commit matches expected commit SHA (`--expected-commit`).
 4. **Lifecycle & Matrix Results**: Verifies `status == "PASS"` across all fault shims and backend migrations.
-5. **Soak Duration & Rekey Thresholds**:
-   - `bounded` mode: at least 1 rekey observed on both Reference and Subject engines.
-   - `full` mode: at least 10 unforced rekeys observed on both Reference and Subject engines.
+5. **Soak Duration & Closure Eligibility**:
+   - `bounded` mode: at least 1 rekey observed on both Reference and Subject engines; emits `BOUNDED PASS` (`issue392_closure_eligible: false`).
+   - `full` mode: at least 10 unforced rekeys observed on both Reference and Subject engines; emits `FULL PASS` (`issue392_closure_eligible: true`).
 6. **Network Quality Metrics**:
    - `tcp_continuity_passed == true` (no dropped TCP stream sockets across rekeys).
    - `idle_phase_passed == true` (keepalive recovery after silent intervals).

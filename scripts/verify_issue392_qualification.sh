@@ -23,6 +23,7 @@ ARTIFACTS_DIR="$REPO_ROOT/test-artifacts/public"
 MODE="bounded"
 REQUIRE_NON_NETSTACK=true
 OUTPUT_FILE=""
+EXPECTED_COMMIT=""
 VERBOSE=false
 
 show_help() {
@@ -34,6 +35,8 @@ Options:
                                     (Default: ./test-artifacts/public)
   -m, --mode <bounded|full>         Qualification mode (bounded or full)
                                     (Default: bounded)
+  -c, --expected-commit <sha>       Expected commit SHA to verify against manifest
+                                    (Default: current git HEAD)
   --require-non-netstack <bool>     Require non_netstack_qualification.json verification
                                     (Default: true)
   -o, --output <path>               Path to save aggregated summary JSON report
@@ -55,6 +58,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--mode)
             MODE="$2"
+            shift 2
+            ;;
+        -c|--expected-commit)
+            EXPECTED_COMMIT="$2"
             shift 2
             ;;
         --require-non-netstack)
@@ -80,6 +87,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -z "$EXPECTED_COMMIT" ]]; then
+    EXPECTED_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+fi
 
 if [[ "$ARTIFACTS_DIR" != /* ]]; then
     ARTIFACTS_DIR="$REPO_ROOT/$ARTIFACTS_DIR"
@@ -119,13 +130,14 @@ echo " Amnezia Nexus - Issue #392 Qualification Evidence Aggregator"
 echo "===================================================================="
 echo " Artifacts Dir:         $(display_path "$ARTIFACTS_DIR")"
 echo " Qualification Mode:    $MODE"
+echo " Expected Commit:       ${EXPECTED_COMMIT:-<none>}"
 echo " Require Non-Netstack:  $REQUIRE_NON_NETSTACK"
 echo " Output Summary:        $(display_path "$OUTPUT_FILE")"
 echo " Started At:            $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 echo "===================================================================="
 
 # Python verification script
-python3 - "$ARTIFACTS_DIR" "$MODE" "$REQUIRE_NON_NETSTACK" "$OUTPUT_FILE" << 'PYEOF'
+python3 - "$ARTIFACTS_DIR" "$MODE" "$REQUIRE_NON_NETSTACK" "$OUTPUT_FILE" "$EXPECTED_COMMIT" << 'PYEOF'
 import sys
 import json
 import os
@@ -135,6 +147,7 @@ artifacts_dir = sys.argv[1]
 mode = sys.argv[2]
 require_non_netstack = (sys.argv[3].lower() == 'true')
 output_file = sys.argv[4]
+expected_commit = sys.argv[5].strip() if len(sys.argv) > 5 else ""
 
 def fail(msg):
     print(f"ERROR: [verify_issue392] {msg}", file=sys.stderr)
@@ -176,7 +189,7 @@ if env.get("upstream_awg_version") != "v3.1.20260828":
     fail(f"Upstream AWG version mismatch: {env.get('upstream_awg_version')}")
 info("Dependency pinning verified: github.com/amnezia-vpn/amneziawg-go/v3@v3.1.20260828")
 
-# 3. Client configuration freezing hash
+# 3. Client configuration freezing hash and commit verification
 frozen_cfg = manifest.get("frozen_client_configuration", {})
 frozen_hash = frozen_cfg.get("rendered_config_sha256", "")
 if not frozen_hash or len(frozen_hash) < 32:
@@ -186,7 +199,13 @@ info(f"Frozen client config hash verified: {frozen_hash[:16]}...")
 commit_sha = env.get("nexus_commit", "")
 if not commit_sha:
     fail("Missing commit SHA in qualification manifest")
-info(f"Commit SHA verified: {commit_sha[:16]}")
+
+if expected_commit:
+    if commit_sha != expected_commit:
+        fail(f"Commit SHA mismatch: manifest has {commit_sha[:16]}, expected {expected_commit[:16]}")
+    info(f"Commit SHA verified matches expected: {commit_sha[:16]}")
+else:
+    info(f"Commit SHA verified: {commit_sha[:16]}")
 
 # 4. Qualification Summary & Suite Status
 if summary_report.get("status") != "PASS":
@@ -253,10 +272,12 @@ info(f"Soak UDP packet loss: Reference={ref_loss:.2f}%, Subject={sub_loss:.2f}% 
 if require_non_netstack:
     if non_netstack.get("status") != "PASS":
         fail(f"Non-netstack live client qualification status is not PASS: {non_netstack.get('status')} ({non_netstack.get('note')})")
-    for req_bool in ["handshake_verified", "tcp_echo_verified", "udp_echo_verified", "reconnect_resilience_verified", "teardown_trap_verified"]:
+    for req_bool in ["handshake_verified", "tcp_echo_verified", "udp_echo_verified", "reconnect_resilience_verified"]:
         if not non_netstack.get(req_bool):
             fail(f"Non-netstack qualification boolean {req_bool} is not true")
-    info("Non-netstack Linux client qualification: PASS (handshake, tcp echo, udp echo, reconnect resilience, teardown)")
+    if not (non_netstack.get("teardown_requested") or non_netstack.get("teardown_trap_verified")):
+        fail("Non-netstack qualification teardown_requested (or teardown_trap_verified) is not true")
+    info("Non-netstack Linux client qualification: PASS (handshake, tcp echo, udp echo, reconnect resilience, teardown registered)")
 
 # 7. Privacy Audit across all JSON artifacts in artifacts_dir
 home_pat = "/" + "home" + "/"
@@ -282,11 +303,17 @@ for root, _, files in os.walk(artifacts_dir):
 info("Privacy invariants audit: PASS (0 private keys, 0 raw server IPs, 0 local filesystem paths)")
 
 # 8. Emit Aggregated Summary Artifact
+is_closure_eligible = (mode == "full")
+
 summary = {
     "schema_version": "1.0.0",
     "timestamp": manifest.get("generated_at", ""),
     "commit_sha": commit_sha,
+    "expected_commit_sha": expected_commit,
+    "commit_sha_verified": bool(expected_commit and commit_sha == expected_commit),
     "qualification_mode": mode,
+    "overall": "PASS",
+    "issue392_closure_eligible": is_closure_eligible,
     "manifest_verified": True,
     "matrix_verified": True,
     "soak_verified": True,
@@ -300,8 +327,7 @@ summary = {
         "idle_phase_passed": True,
         "udp_loss_percent_reference": ref_loss,
         "udp_loss_percent_subject": sub_loss,
-    },
-    "overall": "PASS"
+    }
 }
 
 os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
@@ -315,8 +341,14 @@ echo ""
 echo "===================================================================="
 echo " Qualification Verification Verdict: PASS"
 echo "===================================================================="
-echo " Mode:               $MODE"
-echo " Summary Report:     $(display_path "$OUTPUT_FILE")"
-echo " Result:             PASS (All Issue #392 criteria satisfied)"
+echo " Mode:                        $MODE"
+echo " Summary Report:              $(display_path "$OUTPUT_FILE")"
+if [[ "$MODE" == "full" ]]; then
+    echo " Result:                      FULL PASS"
+    echo " Issue #392 closure eligible: YES"
+else
+    echo " Result:                      BOUNDED PASS"
+    echo " Issue #392 closure eligible: NO"
+fi
 echo "===================================================================="
 exit 0

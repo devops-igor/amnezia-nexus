@@ -229,7 +229,8 @@ jobs:
           chmod +x ./scripts/verify_issue392_qualification.sh
           ./scripts/verify_issue392_qualification.sh \
             --artifacts-dir test-artifacts/public \
-            --mode ${{ steps.qual-mode.outputs.mode }}
+            --mode ${{ steps.qual-mode.outputs.mode }} \
+            --expected-commit "${{ github.sha }}"
 
       - name: Upload Qualification Evidence Artifacts
         uses: actions/upload-artifact@v4

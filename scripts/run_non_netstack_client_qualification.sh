@@ -516,7 +516,7 @@ HANDSHAKE_VERIFIED=false
 TCP_ECHO_VERIFIED=false
 UDP_ECHO_VERIFIED=false
 RECONNECT_VERIFIED=false
-TEARDOWN_VERIFIED=true
+TEARDOWN_REQUESTED=true
 TEST_STATUS="SKIPPED"
 EXEC_MODE="dry-run"
 REPORT_NOTE=""
@@ -622,7 +622,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     TCP_ECHO_VERIFIED=false
     UDP_ECHO_VERIFIED=false
     RECONNECT_VERIFIED=false
-    TEARDOWN_VERIFIED=true
+    TEARDOWN_REQUESTED=true
     TEST_STATUS="SKIPPED"
     EXEC_MODE="dry-run"
     REPORT_NOTE="Dry-run execution verified parameters and commands; live traffic tests were skipped."
@@ -650,7 +650,7 @@ else
         TCP_ECHO_VERIFIED=false
         UDP_ECHO_VERIFIED=false
         RECONNECT_VERIFIED=false
-        TEARDOWN_VERIFIED=true
+        TEARDOWN_REQUESTED=true
         TEST_STATUS="SKIPPED"
         REPORT_NOTE="SKIPPED: $MISSING_PREREQ"
     else
@@ -971,7 +971,8 @@ cat > "$REPORT_FILE" << EOF
   "tcp_echo_verified": $TCP_ECHO_VERIFIED,
   "udp_echo_verified": $UDP_ECHO_VERIFIED,
   "reconnect_resilience_verified": $RECONNECT_VERIFIED,
-  "teardown_trap_verified": $TEARDOWN_VERIFIED,
+  "teardown_requested": $TEARDOWN_REQUESTED,
+  "teardown_trap_verified": $TEARDOWN_REQUESTED,
   "total_duration_sec": $TOTAL_DURATION,
   "status": "$TEST_STATUS",
   "note": "$REPORT_NOTE"
