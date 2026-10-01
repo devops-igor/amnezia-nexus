@@ -29,6 +29,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Ensure Toolchain in PATH
+        run: |
+          if ! command -v go >/dev/null 2>&1; then
+            if [ -d "/usr/local/go/bin" ]; then
+              echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
       - name: Determine Qualification Mode
         id: qual-mode
         run: |
@@ -120,6 +134,38 @@ jobs:
         run: |
           mkdir -p test-artifacts/runtime test-artifacts/public
 
+      - name: Ensure Qualification Toolchain
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          mkdir -p bin
+          # Build and install amneziawg-go userspace daemon if not already available
+          if ! command -v amneziawg-go >/dev/null 2>&1; then
+            echo "Building amneziawg-go from pinned module..."
+            go build -o bin/amneziawg-go github.com/amnezia-vpn/amneziawg-go/v3
+            sudo install -m 755 bin/amneziawg-go /usr/local/bin/amneziawg-go
+          fi
+          # Ensure awg CLI tool is available
+          if ! command -v awg >/dev/null 2>&1; then
+            echo "Checking system package or container image for awg CLI..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y amneziawg-tools musl 2>/dev/null || true
+            fi
+            if ! command -v awg >/dev/null 2>&1; then
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
+              sudo chmod 755 /usr/local/bin/awg
+              if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
+                MUSL_LIB=$(find /usr/lib -name "libc.so" 2>/dev/null | grep -i musl | head -n 1)
+                if [ -n "$MUSL_LIB" ]; then
+                  sudo ln -sf "$MUSL_LIB" /lib/ld-musl-aarch64.so.1
+                fi
+              fi
+            fi
+          fi
+          echo "Toolchain status:"
+          command -v go && go version
+          command -v amneziawg-go && amneziawg-go --version 2>&1 | head -n 2 || true
+          command -v awg && awg --version || true
+
       - name: Run Differential Qualification Suite
         if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
         run: |
@@ -167,7 +213,7 @@ jobs:
         if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
         run: |
           chmod +x ./scripts/run_non_netstack_client_qualification.sh
-          sudo ./scripts/run_non_netstack_client_qualification.sh \
+          sudo env "PATH=$PATH" ./scripts/run_non_netstack_client_qualification.sh \
             --config test-artifacts/runtime/frozen-client.conf \
             --runtime-dir test-artifacts/runtime \
             --output-dir test-artifacts/public

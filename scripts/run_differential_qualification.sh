@@ -14,6 +14,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure go binary is available in PATH
+if ! command -v go >/dev/null 2>&1; then
+    if [[ -x "/usr/local/go/bin/go" ]]; then
+        export PATH="/usr/local/go/bin:$PATH"
+    fi
+fi
+
 # Default options
 SUITE="all"
 SOAK_FULL=false
