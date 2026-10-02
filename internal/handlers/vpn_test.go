@@ -68,10 +68,10 @@ func TestVPNSessionsHandler(t *testing.T) {
 		h.vpnSvc = vpnSvc
 
 		// Backend registered the way production persists it: a server row
-		// plus an active backend tunnel that Start() syncs into the pool.
-		// The backend data plane is an in-memory VirtualTUN (no SSH, no
-		// real network); ListenPort 0 makes the endpoint bind a random UDP
-		// port, and Stop() releases it.
+		// plus an active backend tunnel. Backend tunnels are synced into
+		// the memory pool via SyncBackendTunnelsForTest without binding
+		// a live UDP listener on port 51820, eliminating parallel test
+		// port collisions with internal/vpn.
 		sID, err := db.CreateServer(ctx, &models.Server{Name: "Edge Node 9", Host: "198.51.100.19"})
 		if err != nil {
 			t.Fatalf("CreateServer failed: %v", err)
@@ -86,8 +86,8 @@ func TestVPNSessionsHandler(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CreateBackendTunnel failed: %v", err)
 		}
-		if err := vpnSvc.Start(ctx); err != nil {
-			t.Fatalf("vpnSvc.Start failed: %v", err)
+		if err := vpnSvc.SyncBackendTunnelsForTest(ctx); err != nil {
+			t.Fatalf("vpnSvc.SyncBackendTunnelsForTest failed: %v", err)
 		}
 
 		sess, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, "peer-handler")

@@ -102,3 +102,12 @@ func (s *Service) HandleIncomingPeerForTest(ctx context.Context, peerPublicKey s
 	}
 	return sess, backend, nil
 }
+
+// SyncBackendTunnelsForTest synchronizes backend tunnels from the database into the
+// in-memory pool without binding UDP listeners or starting background pump routines.
+func (s *Service) SyncBackendTunnelsForTest(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return errors.New("subsystems not initialized")
+	}
+	return s.pool.SyncFromDB(ctx)
+}
