@@ -217,6 +217,10 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 		}
 	}
 	p95 := route.writeLatencies.p95()
+	// Sample the per-route recency window AFTER the in-flight stall adjustment
+	// above, so a write that is stalled RIGHT NOW shows up as recent pressure
+	// and not only as a lifetime total (issue #424 round 6, finding 3).
+	recent := route.pressure.sample(time.Now(), route.queueFullDrops.Load(), writes.Errors, writes.Stalls)
 	return RouteQueueStats{
 		Occupancy:          len(route.clientQueue),
 		Capacity:           cap(route.clientQueue),
@@ -229,6 +233,10 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 		OldestWriteMS:      writes.OldestInFlight.Milliseconds(),
 		MaxWriteDurationMS: writes.MaxDuration.Milliseconds(),
 		P95WriteMS:         p95.Milliseconds(),
+
+		QueueFullDropsRecent: recent.QueueFullDropsRecent,
+		WriteErrorsRecent:    recent.WriteErrorsRecent,
+		WriteStallsRecent:    recent.WriteStallsRecent,
 	}
 }
 

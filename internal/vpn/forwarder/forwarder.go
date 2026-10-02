@@ -140,6 +140,31 @@ type RouteQueueStats struct {
 	OldestWriteMS      int64  `json:"oldest_write_ms"`
 	MaxWriteDurationMS int64  `json:"max_write_duration_ms"`
 	P95WriteMS         int64  `json:"p95_write_ms"`
+
+	// PeerKeyDisplay is the REDACTED, human-readable rendering of the peer
+	// this stats block belongs to (issue #424 round 6, finding 2).
+	//
+	// It exists because these stats are served as a MAP whose key must be a
+	// unique, collision-resistant identifier, and the redaction convention
+	// (a truncated key prefix) is not unique. The map key is therefore the
+	// opaque ingress.PeerKeyFingerprint, and this field carries the display
+	// form so a reader of the map still sees something recognizable instead
+	// of a digest.
+	//
+	// It is populated at the API boundary by the caller that owns both the
+	// raw key and the redaction convention; the forwarder itself does not
+	// redact and leaves it empty. Additive and omitempty: a caller that does
+	// not set it keeps the previous payload exactly.
+	PeerKeyDisplay string `json:"peer_key_display,omitempty"`
+
+	// The *Recent fields are the RECENT-change counterparts of the three
+	// lifetime failure counters above, measured over the sampling window
+	// described in route_pressure.go (issue #424 round 6, finding 3). They
+	// are additive and drive the current-pressure decision; the lifetime
+	// fields above are untouched and stay visible as history.
+	QueueFullDropsRecent uint64 `json:"queue_full_drops_recent"`
+	WriteErrorsRecent    uint64 `json:"write_errors_recent"`
+	WriteStallsRecent    uint64 `json:"write_stalls_recent"`
 }
 
 type sessionRoute struct {
@@ -153,11 +178,16 @@ type sessionRoute struct {
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
 	queueFullDrops  atomic.Uint64
-	queueOccupancy  int        // guarded by aggregateQueueMu; reconciles compatibility drains
-	writeMu         sync.Mutex // admission and completion; never acquired under f.mu
-	retired         atomic.Bool
-	writeMetrics    DeviceWriteTelemetry  // guarded by Forwarder.writeMetricsMu
-	writeLatencies  routeLatencyReservoir // guarded by Forwarder.writeMetricsMu
+	queueOccupancy  int // guarded by aggregateQueueMu; reconciles compatibility drains
+	// pressure windows the route's monotonic failure counters so HasPressure
+	// can mean "degraded now" instead of "degraded at some point since the
+	// route was created" (issue #424 round 6, finding 3). It has its own mutex
+	// and is never touched on the packet path.
+	pressure       routePressureWindow
+	writeMu        sync.Mutex // admission and completion; never acquired under f.mu
+	retired        atomic.Bool
+	writeMetrics   DeviceWriteTelemetry  // guarded by Forwarder.writeMetricsMu
+	writeLatencies routeLatencyReservoir // guarded by Forwarder.writeMetricsMu
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
 	// deliberately NOT closed because RouteBackendToClient sends to it after

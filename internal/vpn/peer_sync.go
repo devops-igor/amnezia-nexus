@@ -382,7 +382,14 @@ func (s *peerSynchronizer) publishConvergence(covered int64, err error) {
 }
 
 // noteDivergenceState maintains DivergenceSince from the counts that were just
-// assigned on the status (issue #424 round 5, item B). Callers hold s.mu.
+// assigned on the status (issue #424 round 5, item B; round 6, finding 1).
+// Callers hold s.mu.
+//
+// It is called TWICE per reconciliation pass, and both calls are required.
+// The first runs on the counts read from the upstream device BEFORE this pass
+// repaired anything; the second runs after verifyPeers refreshed ActualPeers
+// from the post-repair read. Only the second can observe that a repair
+// actually converged the device.
 //
 // The three branches are the whole lifecycle, and the middle one is what
 // makes the age meaningful: the start is recorded ONCE, when the mismatch is
@@ -870,7 +877,28 @@ func (s *peerSynchronizer) reconcileNow(ctx context.Context) error {
 
 	// Verify the upstream device against the desired set (finding 1,
 	// steps 5-6): only after verification may ownership be published.
-	failures = append(failures, s.verifyPeers(desired)...)
+	verifyFailures, countsRefreshed := s.verifyPeers(desired)
+	failures = append(failures, verifyFailures...)
+
+	// Re-evaluate the divergence from the POST-REPAIR counts (issue #424
+	// round 6, finding 1). The evaluation above ran from the counts read
+	// BEFORE this pass repaired anything, so a reconcile that really did
+	// add the missing peer left ActualPeers one short at that point. The
+	// recorded start was therefore left standing for a divergence that no
+	// longer existed, and a later, unrelated divergence inherited that stale
+	// start and was reported as hours old the moment it appeared.
+	//
+	// This is deliberately NOT "clear on success". A reconcile can complete
+	// every operation and still leave the counts disagreeing, for example
+	// when a peer was added upstream with a different assignment than the
+	// durable state wants; noteDivergenceState handles that case correctly
+	// because it compares the refreshed counts rather than the error list.
+	//
+	// It is also deliberately conditional on the verify read SUCCEEDING. A
+	// failed upstream Status leaves ActualPeers at its pre-repair value, and
+	// re-arming the clock from a count that was never refreshed is exactly
+	// the understatement the early-return comment above guards against.
+	s.reconcileDivergenceAfterVerify(countsRefreshed)
 
 	// Desired-set-driven Nexus routing cleanup (finding 4): independent
 	// of upstream peer presence. A missing upstream peer must never
@@ -1231,22 +1259,40 @@ func (s *peerSynchronizer) addMissingPeers(actual map[string]clientawg.PeerStatu
 	return failures
 }
 
-func (s *peerSynchronizer) verifyPeers(desired map[string]desiredPeer) []error {
+// reconcileDivergenceAfterVerify re-evaluates the divergence clock once the
+// post-repair counts are known. It is a method rather than an inline branch
+// only so reconcileNow's cyclomatic complexity does not grow for what is a
+// single lifecycle call; the behavior and the reasoning are exactly as
+// documented at the call site.
+func (s *peerSynchronizer) reconcileDivergenceAfterVerify(countsRefreshed bool) {
+	if !countsRefreshed {
+		return
+	}
+	s.noteDivergenceState(s.now())
+}
+
+// verifyPeers re-reads the upstream device after the repair and compares it
+// against the durable desired set. The boolean return reports whether the
+// re-read SUCCEEDED, and therefore whether s.status.ActualPeers was actually
+// refreshed from the device (issue #424 round 6, finding 1). A caller that
+// maintains the divergence clock must not re-evaluate it on a false here,
+// because the counts it would read were never refreshed.
+func (s *peerSynchronizer) verifyPeers(desired map[string]desiredPeer) ([]error, bool) {
 	after, err := s.portal.Status()
 	if err != nil {
-		return []error{err}
+		return []error{err}, false
 	}
 	s.status.ActualPeers = len(after.Peers)
 	if len(after.Peers) != len(desired) {
-		return []error{errors.New("upstream peer count differs from durable state")}
+		return []error{errors.New("upstream peer count differs from durable state")}, true
 	}
 	for _, peer := range after.Peers {
 		want, ok := desired[peer.PublicKey]
 		if !ok || want.peer.AllowedIP != peer.AllowedIP {
-			return []error{errors.New("upstream peer assignment differs from durable state")}
+			return []error{errors.New("upstream peer assignment differs from durable state")}, true
 		}
 	}
-	return nil
+	return nil, true
 }
 
 func (s *peerSynchronizer) fail(err error) error {

@@ -1332,15 +1332,27 @@ func TestGetStatus_ExposesBoundedRouteQueueDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus failed: %v", err)
 	}
-	// The map key is the REDACTED peer key: "peer-secret" is 11 characters,
-	// so ingress.RedactKey keeps the first 8 plus an ellipsis (issue #424
-	// round 5, item 1c, option (a)).
-	stats, ok := status.ForwarderRouteQueues["peer-sec…"]
+	// The map key is ingress.PeerKeyFingerprint, the opaque
+	// collision-resistant identifier (issue #424 round 6, finding 2). The
+	// round 5 form, a RedactKey prefix, could not be used here: two peers
+	// sharing 8 leading characters produced the same key and one route was
+	// silently dropped from the payload.
+	stats, ok := status.ForwarderRouteQueues[ingress.PeerKeyFingerprint("peer-secret")]
 	if !ok {
 		t.Fatalf("route queue diagnostics missing: %+v", status.ForwarderRouteQueues)
 	}
 	if stats.Occupancy != 1 || stats.Capacity != 2048 || stats.HighWater != 1 {
 		t.Fatalf("unexpected route queue diagnostics: %+v", stats)
+	}
+	// The redacted DISPLAY form is still available for a human reader, and is
+	// still not a usable identifier.
+	if stats.PeerKeyDisplay != ingress.RedactKey("peer-secret") {
+		t.Fatalf("peer_key_display = %q, want the redacted display form %q",
+			stats.PeerKeyDisplay, ingress.RedactKey("peer-secret"))
+	}
+	if len(status.ForwarderRouteQueues) != 1 {
+		t.Fatalf("expected exactly one route in the map, got %d: %+v",
+			len(status.ForwarderRouteQueues), status.ForwarderRouteQueues)
 	}
 }
 

@@ -1889,7 +1889,45 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 			//   and (c) would both keep a raw full key in the payload and
 			//   only add a second field for a leak that already has a
 			//   redaction convention to follow.
-			status.ForwarderRouteQueues[ingress.RedactKey(peerKey)] = allRouteQueues[peerKey]
+			// The map IDENTIFIER is ingress.PeerKeyFingerprint, an opaque
+			// truncated digest of the full key (issue #424 round 6,
+			// finding 2). RedactKey, the display convention, is the wrong
+			// tool here for two independent reasons:
+			//
+			//   Collision. RedactKey keeps 8 characters, so two peers
+			//   sharing an 8 character prefix produce the SAME key and the
+			//   second write silently overwrote the first. A route simply
+			//   vanished from the payload. This is a functional regression,
+			//   not a cosmetic one, and the round 5 test could not see it
+			//   because it compared the decoded map length against the
+			//   already-collapsed status map.
+			//
+			//   Disclosure. RedactKey ships the first 8 characters of the
+			//   real key. The fingerprint ships none.
+			//
+			// The fingerprint is therefore a pseudonym, NOT an exemption
+			// from redaction: it is the correct thing to redact TO. Raw peer
+			// keys remain absent from this payload, and the recursive
+			// no-raw-peer-key assertion covers this field exactly as it
+			// covered the previous form.
+			//
+			// CLIENT-VISIBLE CONTRACT CHANGE: forwarder_route_queues keys
+			// changed from a redacted key prefix ("r5SHARED…") to a
+			// fingerprint ("pk<24 hex>-<len>"). A consumer cannot recover a
+			// peer key from either form, and neither form was ever usable
+			// as a lookup key against a full key. What a consumer CAN do
+			// now, and could not before, is rely on the key being unique
+			// and stable across polls. The JSON shape (map of the same
+			// stats, same omitempty, same truncation to
+			// MaxSupportedActiveRoutes, same sort-then-limit order) is
+			// unchanged; only the key VALUE is different.
+			// PeerKeyDisplay carries the redacted DISPLAY form alongside the
+			// fingerprint identifier, so the map is still readable by a human
+			// while its keys stay unique. The display form is deliberately
+			// NOT unique and is never used as a key.
+			stats := allRouteQueues[peerKey]
+			stats.PeerKeyDisplay = ingress.RedactKey(peerKey)
+			status.ForwarderRouteQueues[ingress.PeerKeyFingerprint(peerKey)] = stats
 		}
 	}
 	writes := f.DeviceWriteSnapshot()

@@ -33,7 +33,31 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 		stats := f.routeQueueStatsLocked(route)
 		hasReturnPath := route.returnPath != nil
 		returnPathClosed := hasReturnPath && route.returnPath.Closed()
-		hasPressure := stats.QueueFullDrops > 0 || (stats.Capacity > 0 && stats.Occupancy >= stats.Capacity*8/10) || stats.WriteErrors > 0 || stats.WriteStalls > 0 || stats.OldestWriteMS >= 100
+		// HasPressure means DEGRADED NOW, not "degraded at some point since
+		// this route was created" (issue #424 round 6, finding 3).
+		//
+		// Occupancy and OldestWriteMS are already current-state readings: they
+		// describe the queue as it is right now and fall back on their own
+		// when a drain or a completed write clears them. The three failure
+		// counters are NOT: queueFullDrops, WriteErrors and WriteStalls are
+		// monotonic for the lifetime of the route and production never resets
+		// them anywhere, so "> 0" meant "this route has ever had a problem".
+		// One historical drop therefore kept the route in the CURRENT
+		// problem-routes list until the sessionRoute was destroyed, which
+		// contradicted the principle round 2 established at the aggregate
+		// level.
+		//
+		// They are therefore read through their per-route recency window
+		// (route_pressure.go): a nonzero RECENT delta is a live incident, and
+		// a route whose traffic went quiet goes quiet here too, so a route
+		// with no traffic cannot accumulate pressure it never had. The
+		// lifetime values remain on the payload as history; they simply no
+		// longer decide.
+		hasPressure := (stats.Capacity > 0 && stats.Occupancy >= stats.Capacity*8/10) ||
+			stats.OldestWriteMS >= 100 ||
+			stats.QueueFullDropsRecent > 0 ||
+			stats.WriteErrorsRecent > 0 ||
+			stats.WriteStallsRecent > 0
 
 		routes = append(routes, RouteInfo{
 			PeerKey:          peerKey,

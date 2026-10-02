@@ -1,6 +1,8 @@
 package forwarder
 
 import (
+	"errors"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -39,11 +41,30 @@ func TestInspectAndProblemRoutes(t *testing.T) {
 	// Route 3: normal
 	f.RegisterSession("s3", "c3", "peer3", "10.100.0.4", 1)
 
-	// Simulate drops on Route 2
-	f.mu.RLock()
-	r2 := f.routesByPeer["peer2"]
-	r2.queueFullDrops.Add(5)
-	f.mu.RUnlock()
+	// Prime the per-route recency window for every route BEFORE the incident.
+	// The first sample of a window only establishes a baseline and reports
+	// zero, so a counter that has been rising since the route was created is
+	// never reported as a fresh incident (issue #424 round 6, finding 3). The
+	// wait is required: the first accepted sample is the priming one, and a
+	// sample inside the sampling floor after it is not accepted at all.
+	f.InspectRoutes()
+	time.Sleep(routePressureWindowAdvance())
+
+	// Simulate REAL drops on Route 2 through the production enqueue path:
+	// the client queue is filled to capacity and the next packet is refused.
+	// The counter is NOT poked here, because production never pokes it either.
+	queue, ok := f.GetClientPacketChannel("peer2")
+	if !ok {
+		t.Fatal("client queue missing for peer2")
+	}
+	for i := 0; i < cap(queue); i++ {
+		if err := f.RouteBackendToClient(1, returnPacketFor("10.100.0.3"), "10.100.0.3"); err != nil {
+			t.Fatalf("priming enqueue %d: %v", i, err)
+		}
+	}
+	if err := f.RouteBackendToClient(1, returnPacketFor("10.100.0.3"), "10.100.0.3"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("expected the full queue to drop, got %v", err)
+	}
 
 	routes := f.InspectRoutes()
 	if len(routes) != 3 {
@@ -68,16 +89,16 @@ func TestInspectAndProblemRoutes(t *testing.T) {
 	if len(top1) != 1 || top1[0].PeerKey != "peer2" {
 		t.Errorf("expected top 1 problem route to be peer2, got %+v", top1)
 	}
+}
 
-	// Clear drops on peer2 route: now 0 routes have pressure
-	f.mu.RLock()
-	r2.queueFullDrops.Store(0)
-	f.mu.RUnlock()
-
-	clearedProblemRoutes := f.ProblemRoutes(10)
-	if len(clearedProblemRoutes) != 0 {
-		t.Errorf("expected 0 problem routes when queues are clear, got %d", len(clearedProblemRoutes))
-	}
+// returnPacketFor builds a minimal routable return-path packet for one
+// assigned client IP.
+func returnPacketFor(ip string) []byte {
+	pkt := make([]byte, 28)
+	pkt[0] = 0x45
+	parsed := netip.MustParseAddr(ip).As4()
+	pkt[16], pkt[17], pkt[18], pkt[19] = parsed[0], parsed[1], parsed[2], parsed[3]
+	return pkt
 }
 
 func TestLatencyReservoir(t *testing.T) {

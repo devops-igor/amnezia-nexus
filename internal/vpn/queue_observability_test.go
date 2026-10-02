@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 )
 
 type statusBlockedDevice struct {
@@ -264,11 +266,26 @@ func TestStatusExposesLiveAndCompletedDeviceWriteTelemetry(t *testing.T) {
 	if metrics["forwarder_device_write_oldest_in_flight_ms"] < metrics["forwarder_device_write_stall_threshold_ms"] || metrics["forwarder_device_write_max_duration_ms"] != 0 {
 		t.Fatalf("live/completed durations conflated: %v", metrics)
 	}
-	// The per-route map is keyed by the REDACTED peer key (issue #424 round
-	// 5, item 1c, option (a)). "peer" is 4 characters, so RedactKey fully
-	// masks it.
-	if route := status.ForwarderRouteQueues["****"]; route.WritesInFlight != 1 || route.WriteStalls != 1 || route.OldestWriteMS < forwarder.DeviceWriteStallThreshold.Milliseconds() {
+	// The per-route map is keyed by ingress.PeerKeyFingerprint, the opaque
+	// collision-resistant identifier (issue #424 round 6, finding 2). It is
+	// NOT a truncated key prefix: two peers sharing 8 leading characters would
+	// collapse into one entry and a route would silently disappear from the
+	// payload. The REDACTED display form travels in the value's
+	// peer_key_display field, where a human reads it.
+	fingerprint := ingress.PeerKeyFingerprint("peer")
+	route, ok := status.ForwarderRouteQueues[fingerprint]
+	if !ok {
+		t.Fatalf("status omitted per-route stalled write: %+v", status.ForwarderRouteQueues)
+	}
+	if route.WritesInFlight != 1 || route.WriteStalls != 1 || route.OldestWriteMS < forwarder.DeviceWriteStallThreshold.Milliseconds() {
 		t.Fatalf("status omitted per-route stalled write: %+v", route)
+	}
+	if route.PeerKeyDisplay != ingress.RedactKey("peer") {
+		t.Fatalf("route display key = %q, want the redacted display form %q",
+			route.PeerKeyDisplay, ingress.RedactKey("peer"))
+	}
+	if strings.Contains(fingerprint, "peer") {
+		t.Fatalf("fingerprint %q leaked the raw peer key", fingerprint)
 	}
 	close(dev.release)
 	svc.forwarder.UnregisterSession("peer")
