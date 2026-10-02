@@ -807,10 +807,15 @@ func assertSoakReportCriteria(t *testing.T, report *SoakEvidenceReport, label st
 		t.Errorf("[%s] Idle keepalive phase check failed", label)
 	}
 	// Under local netstack / loopback conditions, packet loss should be under 5%
-	if report.SequencedUDPStats.LossRatePercent > 5.0 {
+	// Under race detector instrumentation overhead, allow up to 15%
+	lossThreshold := 5.0
+	if raceDetectorEnabled {
+		lossThreshold = 15.0
+	}
+	if report.SequencedUDPStats.LossRatePercent > lossThreshold {
 		t.Errorf("[%s] Sequenced UDP packet loss rate too high: %.2f%%", label, report.SequencedUDPStats.LossRatePercent)
 	}
-	if report.VoIPUDPStats.LossRatePercent > 5.0 {
+	if report.VoIPUDPStats.LossRatePercent > lossThreshold {
 		t.Errorf("[%s] VoIP UDP packet loss rate too high: %.2f%%", label, report.VoIPUDPStats.LossRatePercent)
 	}
 	t.Logf("[%s] Soak Report Summary: completedRekeys=%d, duration=%.2fs, tcpPassed=%t, seqLoss=%.2f%%, voipLoss=%.2f%%, idlePassed=%t",

@@ -1036,13 +1036,15 @@ func TestTunnelPool_AddTunnel_ExistingTunnel_KeyGenerationFailurePropagation(t *
 	}
 
 	origEndpoint := "198.51.100.22:51820"
-	tun, err := pool.AddTunnel(ctx, sID, origEndpoint, "orig-pub")
+	_, err = pool.AddTunnel(ctx, sID, origEndpoint, "orig-pub")
 	if err != nil {
 		t.Fatalf("initial AddTunnel failed: %v", err)
 	}
 
 	// Case A: Missing PrivateKey and keygen fails
-	tun.PrivateKey = ""
+	pool.mu.Lock()
+	pool.tunnelsByServerID[sID].PrivateKey = ""
+	pool.mu.Unlock()
 	pool.SetGenerateKeyPairForTest(func() (string, string, error) {
 		return "", "", errors.New("entropy source depleted")
 	})
@@ -1068,8 +1070,10 @@ func TestTunnelPool_AddTunnel_ExistingTunnel_KeyGenerationFailurePropagation(t *
 	}
 
 	// Case B: Valid PrivateKey, missing ProbePrivateKey, and keygen fails
-	tun.PrivateKey = "existing-valid-private-key"
-	tun.ProbePrivateKey = ""
+	pool.mu.Lock()
+	pool.tunnelsByServerID[sID].PrivateKey = "existing-valid-private-key"
+	pool.tunnelsByServerID[sID].ProbePrivateKey = ""
+	pool.mu.Unlock()
 
 	_, err = pool.AddTunnel(ctx, sID, "198.51.100.22:51839", "attempted-pub-2")
 	if err == nil {
@@ -1167,5 +1171,166 @@ func TestPoolAddTunnel_ExistingMissingDBRowFailsWithoutMemoryMutation(t *testing
 	}
 	if dbTun != nil {
 		t.Errorf("expected DB row to remain absent, got %+v", dbTun)
+	}
+}
+
+func TestPoolAddTunnel_ExistingTunnel_NoOpRefreshDoesNotBumpStateVersion(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "noop-server", Host: "198.51.100.90"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	endpoint := "198.51.100.90:51820"
+	pubKey := "pubkey-noop"
+
+	tun, err := pool.AddTunnel(ctx, sID, endpoint, pubKey)
+	if err != nil {
+		t.Fatalf("initial AddTunnel failed: %v", err)
+	}
+	if tun.StateVersion != 1 {
+		t.Fatalf("expected initial StateVersion = 1, got %d", tun.StateVersion)
+	}
+
+	// Call AddTunnel with identical endpoint and pubkey (no-op refresh)
+	refreshed, err := pool.AddTunnel(ctx, sID, endpoint, pubKey)
+	if err != nil {
+		t.Fatalf("no-op AddTunnel failed: %v", err)
+	}
+	if refreshed.StateVersion != 1 {
+		t.Errorf("expected in-memory StateVersion = 1 on no-op refresh, got %d", refreshed.StateVersion)
+	}
+
+	// Check DB record
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.StateVersion != 1 {
+		t.Errorf("expected DB StateVersion = 1 on no-op refresh, got %d", dbTun.StateVersion)
+	}
+}
+
+func TestPoolAddTunnel_ExistingTunnel_PersistenceFailureLeavesStateVersionUntouched(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "persist-fail-server", Host: "198.51.100.91"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	initialEndpoint := "198.51.100.91:51820"
+	initialPubKey := "pubkey-persist-fail-orig"
+
+	tun, err := pool.AddTunnel(ctx, sID, initialEndpoint, initialPubKey)
+	if err != nil {
+		t.Fatalf("initial AddTunnel failed: %v", err)
+	}
+	if tun.StateVersion != 1 {
+		t.Fatalf("expected initial StateVersion = 1, got %d", tun.StateVersion)
+	}
+
+	initialPrivKey := tun.PrivateKey
+	initialProbePrivKey := tun.ProbePrivateKey
+
+	// Force UpdateBackendTunnel failure via canceled context
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	attemptedEndpoint := "198.51.100.92:51820"
+	attemptedPubKey := "pubkey-persist-fail-new"
+
+	_, err = pool.AddTunnel(canceledCtx, sID, attemptedEndpoint, attemptedPubKey)
+	if err == nil {
+		t.Fatal("expected AddTunnel to fail with canceled context, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to persist backend tunnel updates") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Verify StateVersion, endpoint, and keys in memory remain untouched
+	memTun, err := pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if memTun.StateVersion != 1 {
+		t.Errorf("in-memory StateVersion mutated on persistence failure: got %d, want 1", memTun.StateVersion)
+	}
+	if memTun.Endpoint != initialEndpoint {
+		t.Errorf("in-memory endpoint mutated on persistence failure: got %q, want %q", memTun.Endpoint, initialEndpoint)
+	}
+	if memTun.PublicKey != initialPubKey {
+		t.Errorf("in-memory public key mutated on persistence failure: got %q, want %q", memTun.PublicKey, initialPubKey)
+	}
+	if memTun.PrivateKey != initialPrivKey {
+		t.Errorf("in-memory private key mutated on persistence failure: got %q, want %q", memTun.PrivateKey, initialPrivKey)
+	}
+	if memTun.ProbePrivateKey != initialProbePrivKey {
+		t.Errorf("in-memory probe private key mutated on persistence failure: got %q, want %q", memTun.ProbePrivateKey, initialProbePrivKey)
+	}
+
+	// Verify DB record also remains untouched
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.StateVersion != 1 {
+		t.Errorf("DB StateVersion mutated on persistence failure: got %d, want 1", dbTun.StateVersion)
+	}
+	if dbTun.Endpoint != initialEndpoint {
+		t.Errorf("DB endpoint mutated on persistence failure: got %q, want %q", dbTun.Endpoint, initialEndpoint)
+	}
+}
+
+func TestPoolAddTunnel_ExistingTunnel_StateVersionPersistsAcrossSyncFromDB(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "sync-server", Host: "198.51.100.93"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	initialEndpoint := "198.51.100.93:51820"
+	pubKey := "pubkey-sync"
+
+	tun, err := pool.AddTunnel(ctx, sID, initialEndpoint, pubKey)
+	if err != nil {
+		t.Fatalf("initial AddTunnel failed: %v", err)
+	}
+	if tun.StateVersion != 1 {
+		t.Fatalf("expected initial StateVersion = 1, got %d", tun.StateVersion)
+	}
+
+	newEndpoint := "198.51.100.94:51820"
+	refreshed, err := pool.AddTunnel(ctx, sID, newEndpoint, pubKey)
+	if err != nil {
+		t.Fatalf("AddTunnel with new endpoint failed: %v", err)
+	}
+	if refreshed.StateVersion != 2 {
+		t.Fatalf("expected StateVersion = 2 after refresh, got %d", refreshed.StateVersion)
+	}
+
+	// Create fresh pool and reload from DB
+	freshPool := NewPool(db)
+	if err := freshPool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("SyncFromDB failed: %v", err)
+	}
+
+	reloaded, err := freshPool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel from fresh pool failed: %v", err)
+	}
+	if reloaded.StateVersion != 2 {
+		t.Errorf("reloaded tunnel StateVersion = %d, want 2", reloaded.StateVersion)
+	}
+	if reloaded.Endpoint != newEndpoint {
+		t.Errorf("reloaded tunnel Endpoint = %q, want %q", reloaded.Endpoint, newEndpoint)
 	}
 }

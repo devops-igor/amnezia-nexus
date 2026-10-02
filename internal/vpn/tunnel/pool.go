@@ -225,12 +225,28 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 			candProbePrivKey = sk
 		}
 
+		changed := existing.Endpoint != candEndpoint ||
+			existing.PublicKey != candPubKey ||
+			existing.PrivateKey != candPrivKey ||
+			existing.ProbePrivateKey != candProbePrivKey
+
+		candStateVersion := existing.StateVersion
+		if changed {
+			candStateVersion = existing.StateVersion + 1
+			if existing.StateVersion <= 0 {
+				candStateVersion = 2
+			}
+		}
+
 		if p.db != nil {
 			updates := map[string]any{
 				"endpoint":          candEndpoint,
 				"public_key":        candPubKey,
 				"private_key":       candPrivKey,
 				"probe_private_key": candProbePrivKey,
+			}
+			if changed {
+				updates["state_version"] = candStateVersion
 			}
 			if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
 				return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
@@ -241,7 +257,11 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		existing.PublicKey = candPubKey
 		existing.PrivateKey = candPrivKey
 		existing.ProbePrivateKey = candProbePrivKey
-		return existing, nil
+		if changed {
+			existing.StateVersion = candStateVersion
+		}
+		copyTunnel := *existing
+		return &copyTunnel, nil
 	}
 
 	pubKey := serverPubKey
@@ -301,7 +321,8 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[ifName] = tunnel
 
-	return tunnel, nil
+	copyTunnel := *tunnel
+	return &copyTunnel, nil
 }
 
 // RemoveTunnel removes a backend tunnel by server ID.

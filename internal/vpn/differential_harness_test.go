@@ -102,6 +102,9 @@ func VerifyEnvironmentAndDependencies(repoRoot string) (*EnvironmentManifest, er
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "require ") {
+				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "require"))
+			}
 			if strings.HasPrefix(trimmed, ExpectedUpstreamAWGModule) {
 				fields := strings.Fields(trimmed)
 				if len(fields) >= 2 {
