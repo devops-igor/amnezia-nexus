@@ -3108,3 +3108,299 @@ func runDOMScenario(t *testing.T, nodePath, vpnStr, scenarioKey string) {
 		t.Fatalf("DOM scenario %s did not output SCENARIO_PASS\nOutput:\n%s", scenarioKey, string(out))
 	}
 }
+
+func TestIssue424ForwarderHealthRedesign(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	t.Run("RequiredDOMElements", func(t *testing.T) {
+		requiredIDs := []string{
+			"vpn-fwd-headline-summary",
+			"vpn-fwd-problem-list",
+			"vpn-kpi-throughput",
+			"vpn-kpi-routes-sessions",
+			"vpn-kpi-queue-pressure",
+			"vpn-kpi-packet-loss",
+			"vpn-kpi-client-engine",
+			"vpn-kpi-peer-sync",
+			"vpn-kpi-backends",
+			"vpn-kpi-slow-writes",
+			"vpn-diag-throughput",
+			"vpn-diag-packets",
+			"vpn-diag-ewma5m",
+			"vpn-diag-ewma1h",
+			"vpn-diag-queue-occ",
+			"vpn-diag-queue-peak",
+			"vpn-diag-queue-dur50",
+			"vpn-diag-queue-dur80",
+			"vpn-diag-queue-drops",
+			"vpn-diag-lat-percentiles",
+			"vpn-diag-lat-max",
+			"vpn-diag-lat-inflight",
+			"vpn-diag-lat-stalls",
+			"vpn-diag-lat-errors",
+			"vpn-diag-drops-client",
+			"vpn-diag-drops-return",
+			"vpn-diag-drops-total",
+			"vpn-diag-vtun-upstream",
+			"vpn-diag-vtun-nexus",
+			"vpn-diag-engine-status",
+			"vpn-diag-peers-status",
+			"vpn-diag-sync-failures",
+			"vpn-diag-hs-freshness",
+			"vpn-diag-routing-badge",
+			"vpn-diag-routing-counts",
+			"vpn-diag-routing-alerts",
+			"vpn-diag-be-counts",
+			"vpn-diag-be-latency",
+			"vpn-diag-be-skew",
+			"vpn-diag-be-drops",
+			"vpn-diag-res-cpu",
+			"vpn-diag-res-mem",
+			"vpn-diag-res-goroutines",
+			"vpn-diag-res-gc",
+			"vpn-diag-res-fd",
+			"vpn-chart-throughput",
+			"vpn-chart-queue",
+			"vpn-chart-drops",
+			"vpn-chart-latency",
+			"vpn-routes-toggle-all-btn",
+		}
+		for _, id := range requiredIDs {
+			if !strings.Contains(vpnStr, fmt.Sprintf(`id="%s"`, id)) {
+				t.Errorf("vpn.html missing required element ID %q", id)
+			}
+		}
+	})
+
+	t.Run("TranslationKeysInAllLanguages", func(t *testing.T) {
+		transFS, err := GetTranslationsSubFS()
+		if err != nil {
+			t.Fatalf("GetTranslationsSubFS failed: %v", err)
+		}
+
+		requiredKeys := []string{
+			"vpn_fwd_panel_traffic",
+			"vpn_fwd_panel_queue",
+			"vpn_fwd_panel_latency",
+			"vpn_fwd_panel_drops",
+			"vpn_fwd_panel_vtun",
+			"vpn_fwd_panel_peer_sync",
+			"vpn_fwd_panel_routing",
+			"vpn_fwd_panel_backends",
+			"vpn_fwd_panel_runtime",
+			"vpn_fwd_panel_history",
+			"vpn_fwd_panel_problems",
+			"vpn_fwd_upstream_to_nexus",
+			"vpn_fwd_nexus_to_upstream",
+			"vpn_fwd_show_all",
+			"vpn_fwd_show_problems",
+			"vpn_fwd_kpi_throughput",
+			"vpn_fwd_kpi_routes",
+			"vpn_fwd_kpi_pressure",
+			"vpn_fwd_kpi_loss",
+			"vpn_fwd_kpi_client_engine",
+			"vpn_fwd_kpi_peer_sync",
+			"vpn_fwd_kpi_backends",
+			"vpn_fwd_kpi_slow_writes",
+		}
+
+		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
+		for _, langFile := range languages {
+			data, err := fs.ReadFile(transFS, langFile)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", langFile, err)
+			}
+			var dict map[string]string
+			if err := json.Unmarshal(data, &dict); err != nil {
+				t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+			}
+			for _, k := range requiredKeys {
+				val, ok := dict[k]
+				if !ok || strings.TrimSpace(val) == "" {
+					t.Errorf("%s missing required translation key %q", langFile, k)
+				}
+				if strings.Contains(val, "\u2014") {
+					t.Errorf("%s key %s contains prohibited em dash (\\u2014): %q", langFile, k, val)
+				}
+			}
+		}
+	})
+
+	t.Run("ExecutableJSDOMHealthAssessment", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Skipf("node binary not found: %v", err)
+		}
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+
+		runnerScript := fmt.Sprintf(`const assert = require('assert');
+
+class MockElement {
+    constructor(tagName, id) {
+        this.tagName = (tagName || 'div').toUpperCase();
+        this.id = id || '';
+        this.children = [];
+        this._textContent = '';
+        this.className = '';
+        this.style = {};
+        this.title = '';
+        this.open = false;
+        this.attributes = {};
+    }
+    get textContent() { return this._textContent; }
+    set textContent(val) {
+        this._textContent = String(val);
+        if (val === '') this.children = [];
+    }
+    appendChild(child) {
+        this.children.push(child);
+        return child;
+    }
+    setAttribute(name, val) { this.attributes[name] = String(val); }
+    getAttribute(name) { return this.attributes[name]; }
+}
+
+class MockDocument {
+    constructor() { this.reset(); }
+    reset() {
+        this.elements = new Map();
+        const ids = [
+            'vpn-forwarder-card', 'vpn-fwd-status-badge', 'vpn-fwd-status-text',
+            'vpn-fwd-headline-summary', 'vpn-fwd-problem-list',
+            'vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure',
+            'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync',
+            'vpn-kpi-backends', 'vpn-kpi-slow-writes',
+            'vpn-fwd-queue', 'vpn-fwd-peak', 'vpn-fwd-drops-queue-full',
+            'vpn-fwd-drops-no-route', 'vpn-fwd-drops-packet-too-large',
+            'vpn-fwd-write-errors', 'vpn-fwd-decrypt-failures',
+            'vpn-fwd-routes-details', 'vpn-fwd-routes-badge',
+            'vpn-fwd-routes-summary-status', 'vpn-fwd-routes-empty',
+            'vpn-fwd-routes-table', 'vpn-fwd-routes-tbody',
+            'vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h',
+            'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50',
+            'vpn-diag-queue-dur80', 'vpn-diag-queue-drops',
+            'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight',
+            'vpn-diag-lat-stalls', 'vpn-diag-lat-errors',
+            'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total',
+            'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus',
+            'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-sync-failures',
+            'vpn-diag-hs-freshness', 'vpn-diag-routing-badge', 'vpn-diag-routing-counts',
+            'vpn-diag-routing-alerts', 'vpn-diag-be-counts', 'vpn-diag-be-latency',
+            'vpn-diag-be-skew', 'vpn-diag-be-drops',
+            'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines',
+            'vpn-diag-res-gc', 'vpn-diag-res-fd',
+            'vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-drops', 'vpn-chart-latency',
+            'vpn-routes-toggle-all-btn'
+        ];
+        for (const id of ids) {
+            this.elements.set(id, new MockElement('div', id));
+        }
+        this.elements.get('vpn-fwd-status-badge').className = 'badge';
+        this.elements.get('vpn-fwd-status-text').textContent = 'Not reported';
+        this.elements.get('vpn-fwd-routes-empty').style.display = 'block';
+        this.elements.get('vpn-fwd-routes-table').style.display = 'none';
+        this.elements.get('vpn-fwd-routes-details').open = false;
+    }
+    getElementById(id) { return this.elements.get(id) || null; }
+    createElement(tag) { return new MockElement(tag); }
+}
+
+const mockDoc = new MockDocument();
+const translations = {
+    'vpn_forwarder_unavailable': 'Not reported',
+    'vpn_forwarder_healthy': 'Healthy',
+    'vpn_forwarder_pressure': 'Pressure Detected',
+    'vpn_forwarder_warning': 'Warning',
+    'vpn_forwarder_no_route_pressure': 'All route queues clear'
+};
+const _ = (key) => translations[key] || key;
+const document = mockDoc;
+
+%s
+%s
+
+// Test 1: HEALTHY state
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 1024,
+    health_assessment: {
+        status: 'HEALTHY',
+        summary: 'All clear and operational'
+    },
+    rates: { rx_bps: 1000000, tx_bps: 2000000 },
+    routing_consistency: { is_consistent: true, active_routes_count: 5, active_sessions_count: 5 },
+    backends: { healthy_count: 2, total_count: 2 }
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-headline-summary').textContent, 'All clear and operational');
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-backends').textContent, '2 / 2 healthy');
+
+// Test 2: DEGRADED state with condition
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 1024,
+    health_assessment: {
+        status: 'DEGRADED',
+        summary: 'Elevated queue pressure',
+        conditions: [{ severity: 'DEGRADED', message: 'Queue occupancy > 50%%' }]
+    }
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-warn');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Warning');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-problem-list').style.display, 'flex');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-problem-list').children.length, 1);
+
+// Test 3: CRITICAL state
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 1024,
+    health_assessment: {
+        status: 'CRITICAL',
+        summary: 'Packet drops detected',
+        conditions: [{ severity: 'CRITICAL', message: 'Queue full drops' }]
+    }
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-danger');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Pressure Detected');
+
+// Test 4: UNAVAILABLE state
+mockDoc.reset();
+vpnRenderForwarderHealth(null);
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Not reported');
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-throughput').textContent, '-');
+
+console.log('ISSUE_424_PASS');
+`, f1, f2)
+
+		cmd := exec.Command(nodePath, "-e", runnerScript)
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Issue 424 JSDOM tests failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "ISSUE_424_PASS") {
+			t.Fatalf("Issue 424 JSDOM tests did not output ISSUE_424_PASS\nOutput:\n%s", string(out))
+		}
+	})
+}

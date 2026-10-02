@@ -76,6 +76,21 @@ type Status struct {
 	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
 	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
 	PeerSync                       *PeerSyncStatus                      `json:"peer_sync,omitempty"`
+
+	// Issue #424: Redesigned forwarder health & operational diagnostics
+	HealthAssessment   ForwarderHealthAssessment     `json:"health_assessment"`
+	Rates              TrafficRates                  `json:"rates"`
+	QueuePressure      QueuePressureDiagnostics      `json:"queue_pressure"`
+	ForwardLatency     ForwardLatencyDiagnostics     `json:"forward_latency"`
+	DropCategories     DropCategoryBreakdown         `json:"drop_categories"`
+	VirtualTUN         VirtualTUNDiagnostics         `json:"virtual_tun"`
+	RoutingConsistency RoutingConsistencyDiagnostics `json:"routing_consistency"`
+	HandshakeFreshness HandshakeFreshnessDiagnostics `json:"handshake_freshness"`
+	Backends           BackendsDiagnostics           `json:"backends"`
+	ProblemRoutes      []ProblemRouteItem            `json:"problem_routes"`
+	AllRoutes          []ProblemRouteItem            `json:"all_routes,omitempty"`
+	RuntimeResources   RuntimeResources              `json:"runtime_resources"`
+	HistoricalSeries   HistoricalSeries              `json:"historical_series"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -203,6 +218,10 @@ type Service struct {
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
 	reaperHook                             func(context.Context, *models.VPNSession)
+
+	rollingHistory *RollingHistory
+	historyStopCh  chan struct{}
+	historyDoneCh  chan struct{}
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -629,6 +648,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
+		rollingHistory:         NewRollingHistory(),
 	}
 	revokeDispatch.bind(svc)
 
@@ -1099,9 +1119,10 @@ func (s *Service) Start(ctx context.Context) error {
 	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", ClientAWGEngineUpstream, listenPort)
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
-	// Safety net for residual counter drift; gauge-only semantics — it never
+	// Safety net for residual counter drift; gauge-only semantics - it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
+	s.startRollingHistory()
 
 	return nil
 }
@@ -1651,6 +1672,7 @@ func (s *Service) Stop() error {
 	if s.forwarder != nil {
 		recordErr(s.forwarder.Stop())
 	}
+	s.stopRollingHistory()
 	if s.pool != nil {
 		_ = s.pool.Close()
 	}
@@ -1788,6 +1810,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
+	s.populateOperationalDiagnostics(status)
 
 	return status, nil
 }

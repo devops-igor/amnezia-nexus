@@ -1,0 +1,1224 @@
+package vpn
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+)
+
+// Health status states for forwarder and dataplane.
+const (
+	HealthHealthy     = "HEALTHY"
+	HealthDegraded    = "DEGRADED"
+	HealthCritical    = "CRITICAL"
+	HealthUnavailable = "UNAVAILABLE"
+)
+
+// HealthCondition describes an individual condition affecting dataplane health.
+type HealthCondition struct {
+	Category string `json:"category"` // e.g. "queue_pressure", "latency", "drops", "routing", "peer_sync", "backend"
+	Severity string `json:"severity"` // "WARNING", "DEGRADED", "CRITICAL"
+	Message  string `json:"message"`
+}
+
+// ForwarderHealthAssessment contains the overall rule-based health diagnosis.
+type ForwarderHealthAssessment struct {
+	Status     string            `json:"status"` // HEALTHY, DEGRADED, CRITICAL, UNAVAILABLE
+	Summary    string            `json:"summary"`
+	Conditions []HealthCondition `json:"conditions"`
+}
+
+// TrafficRates tracks instantaneous throughput and moving averages.
+type TrafficRates struct {
+	RxBps       float64 `json:"rx_bps"`
+	TxBps       float64 `json:"tx_bps"`
+	RxPps       float64 `json:"rx_pps"`
+	TxPps       float64 `json:"tx_pps"`
+	DropRatePps float64 `json:"drop_rate_pps"`
+	RxBpsAvg5m  float64 `json:"rx_bps_avg_5m"`
+	TxBpsAvg5m  float64 `json:"tx_bps_avg_5m"`
+	RxBpsAvg1h  float64 `json:"rx_bps_avg_1h"`
+	TxBpsAvg1h  float64 `json:"tx_bps_avg_1h"`
+}
+
+// QueuePressureDiagnostics contains queue occupancy and saturation duration.
+type QueuePressureDiagnostics struct {
+	Occupancy             int     `json:"occupancy"`
+	Capacity              int     `json:"capacity"`
+	UtilizationPct        float64 `json:"utilization_pct"`
+	HighWaterPct          float64 `json:"high_water_pct"`
+	TotalSecondsAbove50   int64   `json:"total_seconds_above_50"`
+	TotalSecondsAbove80   int64   `json:"total_seconds_above_80"`
+	ConsecutiveAbove50Sec int64   `json:"consecutive_above_50_sec"`
+	ConsecutiveAbove80Sec int64   `json:"consecutive_above_80_sec"`
+	QueueFullDrops        uint64  `json:"queue_full_drops"`
+	QueueDropRatePps      float64 `json:"queue_drop_rate_pps"`
+}
+
+// ForwardLatencyDiagnostics tracks forward write durations and in-flight operations.
+type ForwardLatencyDiagnostics struct {
+	P50MS             float64 `json:"p50_ms"`
+	P95MS             float64 `json:"p95_ms"`
+	P99MS             float64 `json:"p99_ms"`
+	MaxMS             int64   `json:"max_ms"`
+	InFlight          int     `json:"in_flight"`
+	OldestInFlightMS  int64   `json:"oldest_in_flight_ms"`
+	Stalls            uint64  `json:"stalls"`
+	WriteErrors       uint64  `json:"write_errors"`
+	WriteTotal        uint64  `json:"write_total"`
+	WriteErrorRatePps float64 `json:"write_error_rate_pps"`
+}
+
+// DropCategoryBreakdown separates drops by specific root cause without double counting.
+type DropCategoryBreakdown struct {
+	// Client -> Backend (Ingress to forwarder)
+	ClientMalformed        uint64  `json:"client_malformed"`
+	ClientUnmappedSource   uint64  `json:"client_unmapped_source"`
+	ClientMismatch         uint64  `json:"client_mismatch"`
+	ClientRejected         uint64  `json:"client_rejected"`
+	ClientBackendQueueFull uint64  `json:"client_backend_queue_full"`
+	ClientRateLimited      uint64  `json:"client_rate_limited"`
+	ClientNoHealthyBackend uint64  `json:"client_no_healthy_backend"`
+	ClientTotalDrops       uint64  `json:"client_total_drops"`
+	ClientDropRatePps      float64 `json:"client_drop_rate_pps"`
+
+	// Backend -> Client (Return path)
+	ReturnMalformed       uint64  `json:"return_malformed"`
+	ReturnUnmapped        uint64  `json:"return_unmapped"`
+	ReturnMismatch        uint64  `json:"return_mismatch"`
+	ReturnInjectionErrors uint64  `json:"return_injection_errors"`
+	ReturnVirtualTUNDrops uint64  `json:"return_virtualtun_drops"`
+	ReturnTotalDrops      uint64  `json:"return_total_drops"`
+	ReturnDropRatePps     float64 `json:"return_drop_rate_pps"`
+
+	// Total aggregate drops
+	TotalDrops       uint64  `json:"total_drops"`
+	TotalDropRatePps float64 `json:"total_drop_rate_pps"`
+}
+
+// VirtualTUNDirectionalHealth captures directional queue state for VirtualTUN.
+type VirtualTUNDirectionalHealth struct {
+	Occupancy int    `json:"occupancy"`
+	Capacity  int    `json:"capacity"`
+	Peak      int    `json:"peak"`
+	Drops     uint64 `json:"drops"`
+}
+
+// VirtualTUNDiagnostics tracks upstream and downstream VirtualTUN health.
+type VirtualTUNDiagnostics struct {
+	UpstreamToNexus VirtualTUNDirectionalHealth `json:"upstream_to_nexus"`
+	NexusToUpstream VirtualTUNDirectionalHealth `json:"nexus_to_upstream"`
+}
+
+// RoutingConsistencyDiagnostics audits routing invariants across sessions and routes.
+type RoutingConsistencyDiagnostics struct {
+	ActiveSessionsCount    int      `json:"active_sessions_count"`
+	ActiveRoutesCount      int      `json:"active_routes_count"`
+	ReturnOwnersCount      int      `json:"return_owners_count"`
+	SessionsWithoutRoute   []string `json:"sessions_without_route"`
+	RoutesWithoutSession   []string `json:"routes_without_session"`
+	RoutesWithoutReturn    []string `json:"routes_without_return"`
+	DuplicateIPs           []string `json:"duplicate_ips"`
+	OwnershipMismatchDrops uint64   `json:"ownership_mismatch_drops"`
+	IsConsistent           bool     `json:"is_consistent"`
+	InconsistencyDetails   []string `json:"inconsistency_details,omitempty"`
+}
+
+// HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
+type HandshakeFreshnessDiagnostics struct {
+	Under2mCount      int      `json:"under_2m_count"`
+	Between2m5mCount  int      `json:"between_2m_5m_count"`
+	Over5mCount       int      `json:"over_5m_count"`
+	NeverCount        int      `json:"never_count"`
+	TotalPeers        int      `json:"total_peers"`
+	StaleLiveSessions []string `json:"stale_live_sessions,omitempty"`
+}
+
+// BackendTelemetryItem captures per-backend operational metrics.
+type BackendTelemetryItem struct {
+	ID                  int64   `json:"id"`
+	ServerID            int64   `json:"server_id"`
+	ServerName          string  `json:"server_name"`
+	HealthState         string  `json:"health_state"`
+	ProbeLatencyMS      int64   `json:"probe_latency_ms"`
+	ActiveSessions      int     `json:"active_sessions"`
+	RxBytes             int64   `json:"rx_bytes"`
+	TxBytes             int64   `json:"tx_bytes"`
+	DeviceDrops         uint64  `json:"device_drops"`
+	LastHandshakeAgeSec int64   `json:"last_handshake_age_sec"`
+	LoadSharePct        float64 `json:"load_share_pct"`
+}
+
+// BackendsDiagnostics provides an aggregate summary and itemized backend list.
+type BackendsDiagnostics struct {
+	HealthyCount int                    `json:"healthy_count"`
+	TotalCount   int                    `json:"total_count"`
+	LatencyP95MS float64                `json:"latency_p95_ms"`
+	LoadSkewPct  float64                `json:"load_skew_pct"`
+	TotalDrops   uint64                 `json:"total_drops"`
+	Backends     []BackendTelemetryItem `json:"backends"`
+}
+
+// ProblemRouteItem represents per-route diagnostics.
+type ProblemRouteItem struct {
+	PeerKey      string  `json:"peer_key"`
+	AssignedIP   string  `json:"assigned_ip"`
+	BackendID    int64   `json:"backend_id"`
+	Occupancy    int     `json:"occupancy"`
+	Capacity     int     `json:"capacity"`
+	HighWater    int     `json:"high_water"`
+	Drops        uint64  `json:"drops"`
+	P95WriteMS   float64 `json:"p95_write_ms"`
+	HasPressure  bool    `json:"has_pressure"`
+	PressureNote string  `json:"pressure_note,omitempty"`
+}
+
+// RuntimeResources contains process and runtime health counters.
+type RuntimeResources struct {
+	CPUPercent       float64 `json:"cpu_percent"`
+	MemoryAllocBytes uint64  `json:"memory_alloc_bytes"`
+	MemorySysBytes   uint64  `json:"memory_sys_bytes"`
+	MemoryLimitBytes uint64  `json:"memory_limit_bytes"`
+	MemoryUsagePct   float64 `json:"memory_usage_pct"`
+	Goroutines       int     `json:"goroutines"`
+	GCPauseP95MS     float64 `json:"gc_pause_p95_ms"`
+	OpenFileDesc     int     `json:"open_file_desc"`
+	MaxFileDesc      uint64  `json:"max_file_desc"`
+}
+
+// HistoryPoint is a single time-series sample for dashboard graphs.
+type HistoryPoint struct {
+	Timestamp      int64   `json:"t"`
+	RxBps          float64 `json:"rx_bps"`
+	TxBps          float64 `json:"tx_bps"`
+	QueueUtilPct   float64 `json:"q_pct"`
+	TotalDropRate  float64 `json:"drop_rate"`
+	ForwardP95MS   float64 `json:"fwd_p95_ms"`
+	ActiveSessions int     `json:"sessions"`
+	BackendP95MS   float64 `json:"be_p95_ms"`
+}
+
+// HistoricalSeries contains rolling time-series samples across 4 windows.
+type HistoricalSeries struct {
+	Window15m []HistoryPoint `json:"window_15m"`
+	Window1h  []HistoryPoint `json:"window_1h"`
+	Window6h  []HistoryPoint `json:"window_6h"`
+	Window24h []HistoryPoint `json:"window_24h"`
+}
+
+type ringBuffer struct {
+	points []HistoryPoint
+	maxCap int
+}
+
+func newRingBuffer(maxCap int) *ringBuffer {
+	return &ringBuffer{
+		points: make([]HistoryPoint, 0, maxCap),
+		maxCap: maxCap,
+	}
+}
+
+func (rb *ringBuffer) add(p HistoryPoint) {
+	if len(rb.points) >= rb.maxCap {
+		copy(rb.points, rb.points[1:])
+		rb.points[len(rb.points)-1] = p
+	} else {
+		rb.points = append(rb.points, p)
+	}
+}
+
+func (rb *ringBuffer) snapshot() []HistoryPoint {
+	if len(rb.points) == 0 {
+		return []HistoryPoint{}
+	}
+	out := make([]HistoryPoint, len(rb.points))
+	copy(out, rb.points)
+	return out
+}
+
+// RollingHistory maintains in-memory rolling time-series history.
+type RollingHistory struct {
+	mu sync.RWMutex
+
+	buf15m *ringBuffer // 10s intervals -> 90 points
+	buf1h  *ringBuffer // 1m intervals -> 60 points
+	buf6h  *ringBuffer // 5m intervals -> 72 points
+	buf24h *ringBuffer // 15m intervals -> 96 points
+
+	last1hTime  time.Time
+	last6hTime  time.Time
+	last24hTime time.Time
+}
+
+// NewRollingHistory constructs a new rolling history buffer.
+func NewRollingHistory() *RollingHistory {
+	return &RollingHistory{
+		buf15m: newRingBuffer(90),
+		buf1h:  newRingBuffer(60),
+		buf6h:  newRingBuffer(72),
+		buf24h: newRingBuffer(96),
+	}
+}
+
+// Add appends a new point to the rolling history windows according to their resolution.
+func (rh *RollingHistory) Add(p HistoryPoint) {
+	if rh == nil {
+		return
+	}
+	rh.mu.Lock()
+	defer rh.mu.Unlock()
+
+	now := time.Unix(p.Timestamp, 0)
+	rh.buf15m.add(p)
+
+	if rh.last1hTime.IsZero() || now.Sub(rh.last1hTime) >= 1*time.Minute {
+		rh.buf1h.add(p)
+		rh.last1hTime = now
+	}
+	if rh.last6hTime.IsZero() || now.Sub(rh.last6hTime) >= 5*time.Minute {
+		rh.buf6h.add(p)
+		rh.last6hTime = now
+	}
+	if rh.last24hTime.IsZero() || now.Sub(rh.last24hTime) >= 15*time.Minute {
+		rh.buf24h.add(p)
+		rh.last24hTime = now
+	}
+}
+
+// Snapshot returns a copy of all 4 rolling windows.
+func (rh *RollingHistory) Snapshot() HistoricalSeries {
+	if rh == nil {
+		return HistoricalSeries{
+			Window15m: []HistoryPoint{},
+			Window1h:  []HistoryPoint{},
+			Window6h:  []HistoryPoint{},
+			Window24h: []HistoryPoint{},
+		}
+	}
+	rh.mu.RLock()
+	defer rh.mu.RUnlock()
+
+	return HistoricalSeries{
+		Window15m: rh.buf15m.snapshot(),
+		Window1h:  rh.buf1h.snapshot(),
+		Window6h:  rh.buf6h.snapshot(),
+		Window24h: rh.buf24h.snapshot(),
+	}
+}
+
+// cpuTracker measures CPU usage via syscall.Getrusage.
+type cpuTracker struct {
+	mu           sync.Mutex
+	lastWallTime time.Time
+	lastUserTime time.Duration
+	lastSysTime  time.Duration
+	lastPercent  float64
+}
+
+var globalCPUTracker = &cpuTracker{}
+
+func (ct *cpuTracker) Percent() float64 {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	var usage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
+		return ct.lastPercent
+	}
+
+	userTime := time.Duration(usage.Utime.Sec)*time.Second + time.Duration(usage.Utime.Usec)*time.Microsecond
+	sysTime := time.Duration(usage.Stime.Sec)*time.Second + time.Duration(usage.Stime.Usec)*time.Microsecond
+	now := time.Now()
+
+	if ct.lastWallTime.IsZero() {
+		ct.lastWallTime = now
+		ct.lastUserTime = userTime
+		ct.lastSysTime = sysTime
+		return 0.0
+	}
+
+	wallDelta := now.Sub(ct.lastWallTime).Seconds()
+	if wallDelta < 0.2 {
+		return ct.lastPercent
+	}
+
+	userDelta := (userTime - ct.lastUserTime).Seconds()
+	sysDelta := (sysTime - ct.lastSysTime).Seconds()
+	cpuDelta := userDelta + sysDelta
+
+	numCPU := float64(runtime.NumCPU())
+	if numCPU <= 0 {
+		numCPU = 1.0
+	}
+
+	pct := (cpuDelta / wallDelta) * 100.0 / numCPU
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100.0 {
+		pct = 100.0
+	}
+
+	ct.lastWallTime = now
+	ct.lastUserTime = userTime
+	ct.lastSysTime = sysTime
+	ct.lastPercent = pct
+	return pct
+}
+
+func getOpenFileDescriptors() (int, uint64) {
+	var maxFD uint64 = 1024
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
+		maxFD = rLimit.Cur
+	}
+
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0, maxFD
+	}
+	return len(entries), maxFD
+}
+
+func getMemoryLimit(sysBytes uint64) uint64 {
+	// Try cgroup v2
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		str := strings.TrimSpace(string(data))
+		if str != "max" {
+			if limit, err := strconv.ParseUint(str, 10, 64); err == nil && limit > 0 && limit < (1<<60) {
+				return limit
+			}
+		}
+	}
+	// Try cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		str := strings.TrimSpace(string(data))
+		if limit, err := strconv.ParseUint(str, 10, 64); err == nil && limit > 0 && limit < (1<<60) {
+			return limit
+		}
+	}
+	// Fallback to sysBytes * 2
+	if sysBytes > 0 {
+		return sysBytes * 2
+	}
+	return 1024 * 1024 * 1024 // 1 GiB safe fallback
+}
+
+func collectRuntimeResources() RuntimeResources {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	openFD, maxFD := getOpenFileDescriptors()
+	memLimit := getMemoryLimit(m.Sys)
+
+	var memUsagePct float64
+	if memLimit > 0 {
+		memUsagePct = float64(m.Alloc) / float64(memLimit) * 100.0
+		if memUsagePct > 100.0 {
+			memUsagePct = 100.0
+		}
+	}
+
+	// Calculate GC Pause p95
+	var gcPauseP95MS float64
+	if m.NumGC > 0 {
+		n := int(m.NumGC)
+		if n > 256 {
+			n = 256
+		}
+		pauses := make([]uint64, 0, n)
+		for i := 0; i < n; i++ {
+			p := m.PauseNs[(int(m.NumGC)-1-i+256)%256]
+			if p > 0 {
+				pauses = append(pauses, p)
+			}
+		}
+		if len(pauses) > 0 {
+			sort.Slice(pauses, func(i, j int) bool { return pauses[i] < pauses[j] })
+			idx := int(float64(len(pauses)-1) * 0.95)
+			gcPauseP95MS = float64(pauses[idx]) / 1e6
+		}
+	}
+
+	return RuntimeResources{
+		CPUPercent:       globalCPUTracker.Percent(),
+		MemoryAllocBytes: m.Alloc,
+		MemorySysBytes:   m.Sys,
+		MemoryLimitBytes: memLimit,
+		MemoryUsagePct:   memUsagePct,
+		Goroutines:       runtime.NumGoroutine(),
+		GCPauseP95MS:     gcPauseP95MS,
+		OpenFileDesc:     openFD,
+		MaxFileDesc:      maxFD,
+	}
+}
+
+// checkRoutingInvariants verifies integrity across active sessions, forwarder routes, and return paths.
+func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot) RoutingConsistencyDiagnostics {
+	var activeSessions []Session
+	if s.sessionMgr != nil {
+		activeSessions = s.sessionMgr.ListActiveSessionsSnapshot()
+	}
+
+	diag := RoutingConsistencyDiagnostics{
+		ActiveSessionsCount:    len(activeSessions),
+		ActiveRoutesCount:      len(routes),
+		OwnershipMismatchDrops: retStats.OwnershipMismatchDrops,
+		IsConsistent:           true,
+	}
+
+	sessionByPeer := make(map[string]Session, len(activeSessions))
+	ipSessions := make(map[string][]string)
+
+	for _, sess := range activeSessions {
+		sessionByPeer[sess.PeerPublicKey] = sess
+		if sess.AssignedIP != "" {
+			ipSessions[sess.AssignedIP] = append(ipSessions[sess.AssignedIP], sess.PeerPublicKey)
+		}
+	}
+
+	routesByPeer := make(map[string]forwarder.RouteInfo, len(routes))
+	ipRoutes := make(map[string][]string)
+
+	for _, r := range routes {
+		routesByPeer[r.PeerKey] = r
+		if r.AssignedIP != "" {
+			ipRoutes[r.AssignedIP] = append(ipRoutes[r.AssignedIP], r.PeerKey)
+		}
+		if r.BackendTunnelID > 0 && r.HasReturnPath && !r.ReturnPathClosed {
+			diag.ReturnOwnersCount++
+		}
+	}
+
+	// 1. Sessions without route
+	for peerKey := range sessionByPeer {
+		if _, ok := routesByPeer[peerKey]; !ok {
+			diag.SessionsWithoutRoute = append(diag.SessionsWithoutRoute, peerKey)
+		}
+	}
+
+	// 2. Routes without session
+	for peerKey := range routesByPeer {
+		if _, ok := sessionByPeer[peerKey]; !ok {
+			diag.RoutesWithoutSession = append(diag.RoutesWithoutSession, peerKey)
+		}
+	}
+
+	// 3. Routes without return owner
+	for peerKey, r := range routesByPeer {
+		if r.BackendTunnelID <= 0 || !r.HasReturnPath || r.ReturnPathClosed {
+			diag.RoutesWithoutReturn = append(diag.RoutesWithoutReturn, peerKey)
+		}
+	}
+
+	diag.DuplicateIPs = findDuplicateIPs(ipSessions, ipRoutes)
+
+	sort.Strings(diag.SessionsWithoutRoute)
+	sort.Strings(diag.RoutesWithoutSession)
+	sort.Strings(diag.RoutesWithoutReturn)
+
+	auditRoutingConsistencyDetails(&diag)
+
+	return diag
+}
+
+func findDuplicateIPs(ipSessions, ipRoutes map[string][]string) []string {
+	dupIPSet := make(map[string]struct{})
+	for ip, peers := range ipSessions {
+		if len(peers) > 1 {
+			dupIPSet[ip] = struct{}{}
+		}
+	}
+	for ip, peers := range ipRoutes {
+		if len(peers) > 1 {
+			dupIPSet[ip] = struct{}{}
+		}
+	}
+	dups := make([]string, 0, len(dupIPSet))
+	for ip := range dupIPSet {
+		dups = append(dups, ip)
+	}
+	sort.Strings(dups)
+	return dups
+}
+
+func auditRoutingConsistencyDetails(diag *RoutingConsistencyDiagnostics) {
+	if len(diag.SessionsWithoutRoute) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d active session(s) lack a forwarder route", len(diag.SessionsWithoutRoute)))
+	}
+	if len(diag.RoutesWithoutSession) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d forwarder route(s) have no corresponding active session", len(diag.RoutesWithoutSession)))
+	}
+	if len(diag.RoutesWithoutReturn) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d route(s) lack an assigned return owner/backend", len(diag.RoutesWithoutReturn)))
+	}
+	if len(diag.DuplicateIPs) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d duplicate IP address(es) detected across active routes: %s",
+				len(diag.DuplicateIPs), strings.Join(diag.DuplicateIPs, ", ")))
+	}
+	if diag.OwnershipMismatchDrops > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d ownership mismatch drop(s) observed in return routing", diag.OwnershipMismatchDrops))
+	}
+}
+
+// collectBackendDiagnostics gathers operational state across registered backend tunnels.
+func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
+	if s.pool == nil {
+		return BackendsDiagnostics{Backends: []BackendTelemetryItem{}}
+	}
+
+	tunnels := s.pool.ListTunnels()
+	diag := BackendsDiagnostics{
+		TotalCount: len(tunnels),
+		Backends:   make([]BackendTelemetryItem, 0, len(tunnels)),
+	}
+
+	var totalActiveConns int
+	for _, tun := range tunnels {
+		if tun.Status == TunnelStatusActive {
+			diag.HealthyCount++
+		}
+		totalActiveConns += tun.ActiveConnections
+	}
+
+	activeLatencies := make([]float64, 0, len(tunnels))
+	var maxShare float64
+
+	for _, tun := range tunnels {
+		var drops uint64
+		var lastHSAge int64 = -1
+
+		if dev, exists := s.backendDevices[tun.ID]; exists && dev != nil {
+			drops = dev.DroppedPackets()
+			if !dev.LastHandshakeTime().IsZero() {
+				lastHSAge = int64(time.Since(dev.LastHandshakeTime()).Seconds())
+				if lastHSAge < 0 {
+					lastHSAge = 0
+				}
+			}
+		}
+
+		diag.TotalDrops += drops
+
+		var loadShare float64
+		if totalActiveConns > 0 {
+			loadShare = float64(tun.ActiveConnections) / float64(totalActiveConns) * 100.0
+		}
+		if loadShare > maxShare {
+			maxShare = loadShare
+		}
+
+		if tun.Status == TunnelStatusActive && tun.LatencyMS > 0 {
+			activeLatencies = append(activeLatencies, float64(tun.LatencyMS))
+		}
+
+		diag.Backends = append(diag.Backends, BackendTelemetryItem{
+			ID:                  tun.ID,
+			ServerID:            tun.ServerID,
+			ServerName:          fmt.Sprintf("Server %d", tun.ServerID),
+			HealthState:         tun.Status,
+			ProbeLatencyMS:      tun.LatencyMS,
+			ActiveSessions:      tun.ActiveConnections,
+			DeviceDrops:         drops,
+			LastHandshakeAgeSec: lastHSAge,
+			LoadSharePct:        loadShare,
+		})
+	}
+
+	// Calculate P95 latency across healthy backends
+	if len(activeLatencies) > 0 {
+		sort.Float64s(activeLatencies)
+		idx := int(float64(len(activeLatencies)-1) * 0.95)
+		diag.LatencyP95MS = activeLatencies[idx]
+	}
+
+	// Calculate load skew
+	if diag.HealthyCount > 1 && totalActiveConns > 0 {
+		idealShare := 100.0 / float64(diag.HealthyCount)
+		diag.LoadSkewPct = math.Abs(maxShare - idealShare)
+	}
+
+	return diag
+}
+
+// collectHandshakeDiagnostics inspects upstream device status and checks for stale active sessions.
+func collectHandshakeDiagnostics(s *Service) HandshakeFreshnessDiagnostics {
+	diag := HandshakeFreshnessDiagnostics{}
+	if s.ingressEngine == nil || s.ingressEngine.Portal() == nil {
+		return diag
+	}
+
+	portalStatus, err := s.ingressEngine.Portal().Status()
+	if err != nil {
+		return diag
+	}
+
+	now := time.Now()
+	diag.TotalPeers = len(portalStatus.Peers)
+	peerHandshakes := make(map[string]time.Time, len(portalStatus.Peers))
+
+	for _, p := range portalStatus.Peers {
+		peerHandshakes[p.PublicKey] = p.LastHandshake
+		if p.LastHandshake.IsZero() {
+			diag.NeverCount++
+			continue
+		}
+		age := now.Sub(p.LastHandshake)
+		if age < 2*time.Minute {
+			diag.Under2mCount++
+		} else if age <= 5*time.Minute {
+			diag.Between2m5mCount++
+		} else {
+			diag.Over5mCount++
+		}
+	}
+
+	// Check active live sessions for stale handshakes (> 3 minutes)
+	if s.sessionMgr != nil {
+		activeSessions := s.sessionMgr.ListActiveSessionsSnapshot()
+		for _, sess := range activeSessions {
+			hs, ok := peerHandshakes[sess.PeerPublicKey]
+			if !ok || hs.IsZero() || now.Sub(hs) > 3*time.Minute {
+				diag.StaleLiveSessions = append(diag.StaleLiveSessions, sess.PeerPublicKey)
+			}
+		}
+	}
+
+	sort.Strings(diag.StaleLiveSessions)
+	return diag
+}
+
+// EvaluateForwarderHealth applies deterministic rules to derive the overall dataplane health status.
+func EvaluateForwarderHealth(
+	fwdAvailable bool,
+	engineRunning bool,
+	queue QueuePressureDiagnostics,
+	latency ForwardLatencyDiagnostics,
+	drops DropCategoryBreakdown,
+	vtun VirtualTUNDiagnostics,
+	peerSync *PeerSyncStatus,
+	routing RoutingConsistencyDiagnostics,
+	handshake HandshakeFreshnessDiagnostics,
+	backends BackendsDiagnostics,
+) ForwarderHealthAssessment {
+	if !fwdAvailable || !engineRunning {
+		return ForwarderHealthAssessment{
+			Status:  HealthUnavailable,
+			Summary: "Forwarder engine is stopped or unavailable",
+			Conditions: []HealthCondition{
+				{
+					Category: "engine",
+					Severity: "CRITICAL",
+					Message:  "Forwarder dataplane is not active",
+				},
+			},
+		}
+	}
+
+	var conditions []HealthCondition
+	conditions = append(conditions, evaluateRoutingConditions(routing)...)
+	conditions = append(conditions, evaluateQueueConditions(queue)...)
+	conditions = append(conditions, evaluateLatencyConditions(latency)...)
+	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops)...)
+	conditions = append(conditions, evaluatePeerSyncAndBackendConditions(peerSync, backends, handshake)...)
+
+	status, summary := summarizeHealthConditions(conditions)
+
+	return ForwarderHealthAssessment{
+		Status:     status,
+		Summary:    summary,
+		Conditions: conditions,
+	}
+}
+
+func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCondition {
+	if routing.IsConsistent {
+		return nil
+	}
+	sev := "DEGRADED"
+	if len(routing.DuplicateIPs) > 0 || len(routing.SessionsWithoutRoute) > 0 {
+		sev = "CRITICAL"
+	}
+	conds := make([]HealthCondition, 0, len(routing.InconsistencyDetails))
+	for _, detail := range routing.InconsistencyDetails {
+		conds = append(conds, HealthCondition{
+			Category: "routing",
+			Severity: sev,
+			Message:  detail,
+		})
+	}
+	return conds
+}
+
+func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
+	var conds []HealthCondition
+	if queue.UtilizationPct >= 95.0 {
+		conds = append(conds, HealthCondition{
+			Category: "queue_pressure",
+			Severity: "CRITICAL",
+			Message:  fmt.Sprintf("Queue saturation: Return queue utilization is at %.1f%%", queue.UtilizationPct),
+		})
+	} else if queue.ConsecutiveAbove80Sec >= 30 {
+		conds = append(conds, HealthCondition{
+			Category: "queue_pressure",
+			Severity: "DEGRADED",
+			Message:  fmt.Sprintf("Queue pressure: Return queue stayed above 80%% utilization for %ds", queue.ConsecutiveAbove80Sec),
+		})
+	} else if queue.UtilizationPct >= 80.0 || queue.ConsecutiveAbove50Sec >= 60 {
+		conds = append(conds, HealthCondition{
+			Category: "queue_pressure",
+			Severity: "WARNING",
+			Message:  fmt.Sprintf("Elevated queue utilization at %.1f%%", queue.UtilizationPct),
+		})
+	}
+	if queue.QueueFullDrops > 0 {
+		conds = append(conds, HealthCondition{
+			Category: "drops",
+			Severity: "DEGRADED",
+			Message:  fmt.Sprintf("%d packets dropped due to full return queues", queue.QueueFullDrops),
+		})
+	}
+	return conds
+}
+
+func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondition {
+	var conds []HealthCondition
+	if latency.OldestInFlightMS >= 1000 {
+		conds = append(conds, HealthCondition{
+			Category: "latency",
+			Severity: "CRITICAL",
+			Message:  fmt.Sprintf("Device write stall: in-flight write blocked for %dms", latency.OldestInFlightMS),
+		})
+	} else if latency.OldestInFlightMS >= 100 {
+		conds = append(conds, HealthCondition{
+			Category: "latency",
+			Severity: "WARNING",
+			Message:  fmt.Sprintf("Slow in-flight write: in progress for %dms", latency.OldestInFlightMS),
+		})
+	}
+
+	if latency.P95MS >= 100.0 {
+		conds = append(conds, HealthCondition{
+			Category: "latency",
+			Severity: "DEGRADED",
+			Message:  fmt.Sprintf("High forward write latency: p95 is %.1fms", latency.P95MS),
+		})
+	} else if latency.P95MS >= 50.0 {
+		conds = append(conds, HealthCondition{
+			Category: "latency",
+			Severity: "WARNING",
+			Message:  fmt.Sprintf("Elevated forward write latency: p95 is %.1fms", latency.P95MS),
+		})
+	}
+
+	if latency.WriteErrors > 0 {
+		conds = append(conds, HealthCondition{
+			Category: "latency",
+			Severity: "DEGRADED",
+			Message:  fmt.Sprintf("%d device write errors detected", latency.WriteErrors),
+		})
+	}
+	return conds
+}
+
+func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
+	var conds []HealthCondition
+	if vtun.UpstreamToNexus.Drops > 0 || vtun.NexusToUpstream.Drops > 0 {
+		conds = append(conds, HealthCondition{
+			Category: "virtual_tun",
+			Severity: "DEGRADED",
+			Message: fmt.Sprintf("VirtualTUN packet drops detected: %d inbound, %d outbound",
+				vtun.UpstreamToNexus.Drops, vtun.NexusToUpstream.Drops),
+		})
+	}
+	if drops.TotalDropRatePps >= 10.0 {
+		conds = append(conds, HealthCondition{
+			Category: "drops",
+			Severity: "DEGRADED",
+			Message:  fmt.Sprintf("Elevated drop rate: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
+		})
+	}
+	return conds
+}
+
+func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends BackendsDiagnostics, handshake HandshakeFreshnessDiagnostics) []HealthCondition {
+	var conds []HealthCondition
+	if peerSync != nil {
+		if peerSync.PortalConfigRestartRequired {
+			conds = append(conds, HealthCondition{
+				Category: "peer_sync",
+				Severity: "DEGRADED",
+				Message:  "Portal configuration changed; engine restart is required to apply updates",
+			})
+		}
+		if peerSync.SyncFailures > 0 || peerSync.EnqueueFailures > 0 {
+			conds = append(conds, HealthCondition{
+				Category: "peer_sync",
+				Severity: "DEGRADED",
+				Message: fmt.Sprintf("Peer sync failures detected: %d sync, %d enqueue",
+					peerSync.SyncFailures, peerSync.EnqueueFailures),
+			})
+		}
+		if peerSync.DesiredPeers != peerSync.ActualPeers {
+			conds = append(conds, HealthCondition{
+				Category: "peer_sync",
+				Severity: "WARNING",
+				Message: fmt.Sprintf("Peer sync divergence: %d desired vs %d actual peers",
+					peerSync.DesiredPeers, peerSync.ActualPeers),
+			})
+		}
+	}
+
+	if backends.TotalCount > 0 && backends.HealthyCount == 0 {
+		conds = append(conds, HealthCondition{
+			Category: "backend",
+			Severity: "CRITICAL",
+			Message:  "No healthy backends available to route traffic",
+		})
+	} else if backends.TotalCount > 0 && backends.HealthyCount < backends.TotalCount {
+		conds = append(conds, HealthCondition{
+			Category: "backend",
+			Severity: "WARNING",
+			Message: fmt.Sprintf("%d of %d backends are degraded or unavailable",
+				backends.TotalCount-backends.HealthyCount, backends.TotalCount),
+		})
+	}
+
+	if len(handshake.StaleLiveSessions) > 0 {
+		conds = append(conds, HealthCondition{
+			Category: "sessions",
+			Severity: "WARNING",
+			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> 3m)",
+				len(handshake.StaleLiveSessions)),
+		})
+	}
+	return conds
+}
+
+func summarizeHealthConditions(conditions []HealthCondition) (string, string) {
+	var criticalCount, degradedCount, warningCount int
+	for _, c := range conditions {
+		switch c.Severity {
+		case "CRITICAL":
+			criticalCount++
+		case "DEGRADED":
+			degradedCount++
+		case "WARNING":
+			warningCount++
+		}
+	}
+
+	if criticalCount > 0 {
+		return HealthCritical, fmt.Sprintf("%d critical issue(s) affecting forwarder health: %s",
+			criticalCount, conditions[0].Message)
+	}
+	if degradedCount > 0 {
+		return HealthDegraded, fmt.Sprintf("%d degradation condition(s) detected: %s",
+			degradedCount, conditions[0].Message)
+	}
+	if warningCount > 0 {
+		return HealthHealthy, fmt.Sprintf("Operational with %d warning condition(s): %s",
+			warningCount, conditions[0].Message)
+	}
+	return HealthHealthy, "All forwarder and dataplane components are operating normally"
+}
+
+// collectProblemRoutes converts forwarder RouteInfo slices into ProblemRouteItem diagnostics.
+func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
+	items := make([]ProblemRouteItem, len(routes))
+	for i, r := range routes {
+		var note string
+		if r.Stats.QueueFullDrops > 0 {
+			note = fmt.Sprintf("%d queue drops", r.Stats.QueueFullDrops)
+		} else if r.Stats.P95WriteMS >= 50 {
+			note = fmt.Sprintf("High latency: %dms", r.Stats.P95WriteMS)
+		} else if r.Stats.Occupancy > 0 {
+			note = fmt.Sprintf("%d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
+		}
+
+		items[i] = ProblemRouteItem{
+			PeerKey:      r.PeerKey,
+			AssignedIP:   r.AssignedIP,
+			BackendID:    r.BackendTunnelID,
+			Occupancy:    r.Stats.Occupancy,
+			Capacity:     r.Stats.Capacity,
+			HighWater:    r.Stats.HighWater,
+			Drops:        r.Stats.QueueFullDrops,
+			P95WriteMS:   float64(r.Stats.P95WriteMS),
+			HasPressure:  r.HasPressure,
+			PressureNote: note,
+		}
+	}
+	return items
+}
+
+func (s *Service) startRollingHistory() {
+	s.mu.Lock()
+	if s.rollingHistory == nil {
+		s.rollingHistory = NewRollingHistory()
+	}
+	if s.historyStopCh != nil {
+		s.mu.Unlock()
+		return
+	}
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	s.historyStopCh = stopCh
+	s.historyDoneCh = doneCh
+	s.mu.Unlock()
+
+	go func() {
+		defer close(doneCh)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				s.sampleRollingHistory()
+			}
+		}
+	}()
+}
+
+func (s *Service) stopRollingHistory() {
+	s.mu.Lock()
+	stopCh := s.historyStopCh
+	doneCh := s.historyDoneCh
+	s.historyStopCh = nil
+	s.historyDoneCh = nil
+	s.mu.Unlock()
+
+	if stopCh != nil {
+		close(stopCh)
+		select {
+		case <-doneCh:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Service) sampleRollingHistory() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := s.GetStatus(ctx)
+	if err != nil || status == nil {
+		return
+	}
+
+	point := HistoryPoint{
+		Timestamp:      time.Now().Unix(),
+		RxBps:          status.Rates.RxBps,
+		TxBps:          status.Rates.TxBps,
+		QueueUtilPct:   status.QueuePressure.UtilizationPct,
+		TotalDropRate:  status.Rates.DropRatePps,
+		ForwardP95MS:   status.ForwardLatency.P95MS,
+		ActiveSessions: status.ConnectedSessions,
+		BackendP95MS:   status.Backends.LatencyP95MS,
+	}
+
+	s.mu.RLock()
+	rh := s.rollingHistory
+	s.mu.RUnlock()
+
+	if rh != nil {
+		rh.Add(point)
+	}
+}
+
+func (s *Service) populateOperationalDiagnostics(status *Status) {
+	if status == nil {
+		return
+	}
+
+	// 1. Rates, Queue Pressure, Latency
+	if s.forwarder != nil {
+		fRates := s.forwarder.Rates()
+		status.Rates = TrafficRates{
+			RxBps:       fRates.RxBps,
+			TxBps:       fRates.TxBps,
+			RxPps:       fRates.RxPps,
+			TxPps:       fRates.TxPps,
+			DropRatePps: fRates.DropRatePps,
+			RxBpsAvg5m:  fRates.RxBpsAvg5m,
+			TxBpsAvg5m:  fRates.TxBpsAvg5m,
+			RxBpsAvg1h:  fRates.RxBpsAvg1h,
+			TxBpsAvg1h:  fRates.TxBpsAvg1h,
+		}
+
+		qStats := s.forwarder.QueuePressure()
+		status.QueuePressure = QueuePressureDiagnostics{
+			Occupancy:             qStats.Occupancy,
+			Capacity:              qStats.Capacity,
+			UtilizationPct:        qStats.UtilizationPct,
+			HighWaterPct:          qStats.HighWaterPct,
+			TotalSecondsAbove50:   qStats.SecondsAbove50Pct,
+			TotalSecondsAbove80:   qStats.SecondsAbove80Pct,
+			ConsecutiveAbove50Sec: qStats.ConsecutiveAbove50Sec,
+			ConsecutiveAbove80Sec: qStats.ConsecutiveAbove80Sec,
+			QueueFullDrops:        qStats.QueueFullDrops,
+			QueueDropRatePps:      qStats.QueueFullDropRate,
+		}
+
+		writes := s.forwarder.DeviceWriteSnapshot()
+		status.ForwardLatency = ForwardLatencyDiagnostics{
+			P50MS:             float64(writes.P50Duration.Microseconds()) / 1000.0,
+			P95MS:             float64(writes.P95Duration.Microseconds()) / 1000.0,
+			P99MS:             float64(writes.P99Duration.Microseconds()) / 1000.0,
+			MaxMS:             writes.MaxDuration.Milliseconds(),
+			InFlight:          writes.InFlight,
+			OldestInFlightMS:  writes.OldestInFlight.Milliseconds(),
+			Stalls:            writes.Stalls,
+			WriteErrors:       writes.Errors,
+			WriteTotal:        writes.Count,
+			WriteErrorRatePps: status.Rates.DropRatePps,
+		}
+	}
+
+	// 2. Drop Categories & VirtualTUN
+	var routerMalformed, routerUnmapped, routerMismatch, routerRejected uint64
+	if s.ingressEngine != nil && s.ingressEngine.Router() != nil {
+		routerStats := s.ingressEngine.Router().StatsSnapshot()
+		routerMalformed = routerStats.MalformedPacketDrops
+		routerUnmapped = routerStats.UnmappedSourceIPDrops
+		routerMismatch = routerStats.OwnershipMismatchDrops
+		routerRejected = routerStats.AdmissionRejectedDrops
+	}
+	var retStats ReturnStatsSnapshot
+	if s.ingressEngine != nil {
+		retStats = s.ingressEngine.ReturnStats()
+	}
+
+	var qFullDrops, noRouteDrops uint64
+	var pktTooLarge uint64
+	if s.forwarder != nil {
+		qFullDrops, noRouteDrops, _ = s.forwarder.DropStats()
+		pktTooLarge = s.forwarder.DropsPacketTooLarge()
+	}
+
+	clientTotal := routerMalformed +
+		routerUnmapped +
+		routerMismatch +
+		routerRejected +
+		qFullDrops +
+		noRouteDrops +
+		pktTooLarge
+
+	returnTunDrops := retStats.TUN.InboundDrops + retStats.TUN.OutboundDrops
+	returnTotal := retStats.MalformedDrops +
+		retStats.UnmappedDrops +
+		retStats.OwnershipMismatchDrops +
+		retStats.InjectionErrors +
+		returnTunDrops
+
+	status.DropCategories = DropCategoryBreakdown{
+		ClientMalformed:        routerMalformed,
+		ClientUnmappedSource:   routerUnmapped,
+		ClientMismatch:         routerMismatch,
+		ClientRejected:         routerRejected,
+		ClientBackendQueueFull: qFullDrops,
+		ClientRateLimited:      pktTooLarge,
+		ClientNoHealthyBackend: noRouteDrops,
+		ClientTotalDrops:       clientTotal,
+		ClientDropRatePps:      status.Rates.DropRatePps,
+
+		ReturnMalformed:       retStats.MalformedDrops,
+		ReturnUnmapped:        retStats.UnmappedDrops,
+		ReturnMismatch:        retStats.OwnershipMismatchDrops,
+		ReturnInjectionErrors: retStats.InjectionErrors,
+		ReturnVirtualTUNDrops: returnTunDrops,
+		ReturnTotalDrops:      returnTotal,
+		ReturnDropRatePps:     status.Rates.DropRatePps,
+
+		TotalDrops:       clientTotal + returnTotal,
+		TotalDropRatePps: status.Rates.DropRatePps,
+	}
+
+	status.VirtualTUN = VirtualTUNDiagnostics{
+		UpstreamToNexus: VirtualTUNDirectionalHealth{
+			Occupancy: retStats.TUN.InboundDepth,
+			Capacity:  retStats.TUN.InboundCapacity,
+			Peak:      retStats.TUN.InboundPeak,
+			Drops:     retStats.TUN.InboundDrops,
+		},
+		NexusToUpstream: VirtualTUNDirectionalHealth{
+			Occupancy: retStats.TUN.OutboundDepth,
+			Capacity:  retStats.TUN.OutboundCapacity,
+			Peak:      retStats.TUN.OutboundPeak,
+			Drops:     retStats.TUN.OutboundDrops,
+		},
+	}
+
+	// 3. Routing consistency
+	var routes []forwarder.RouteInfo
+	if s.forwarder != nil {
+		routes = s.forwarder.InspectRoutes()
+	}
+	status.RoutingConsistency = checkRoutingInvariants(s, routes, retStats)
+
+	// 4. Handshake freshness
+	status.HandshakeFreshness = collectHandshakeDiagnostics(s)
+
+	// 5. Backends
+	status.Backends = collectBackendDiagnostics(s)
+
+	// 6. Problem Routes
+	if s.forwarder != nil {
+		status.ProblemRoutes = collectProblemRoutes(s.forwarder.ProblemRoutes(50))
+		status.AllRoutes = collectProblemRoutes(routes)
+	} else {
+		status.ProblemRoutes = []ProblemRouteItem{}
+		status.AllRoutes = []ProblemRouteItem{}
+	}
+
+	// 7. Runtime Resources
+	status.RuntimeResources = collectRuntimeResources()
+
+	// 8. Historical Series
+	if s.rollingHistory != nil {
+		status.HistoricalSeries = s.rollingHistory.Snapshot()
+	} else {
+		status.HistoricalSeries = HistoricalSeries{
+			Window15m: []HistoryPoint{},
+			Window1h:  []HistoryPoint{},
+			Window6h:  []HistoryPoint{},
+			Window24h: []HistoryPoint{},
+		}
+	}
+
+	// 9. Centralized Rule-Based Health Assessment
+	status.HealthAssessment = EvaluateForwarderHealth(
+		status.ForwarderAvailable,
+		status.EngineRunning,
+		status.QueuePressure,
+		status.ForwardLatency,
+		status.DropCategories,
+		status.VirtualTUN,
+		status.PeerSync,
+		status.RoutingConsistency,
+		status.HandshakeFreshness,
+		status.Backends,
+	)
+}

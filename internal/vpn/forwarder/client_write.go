@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sort"
 	"time"
 )
 
@@ -34,6 +35,61 @@ func (r Retirement) Wait() {
 // each write once, including writes still blocked when telemetry is queried.
 const DeviceWriteStallThreshold = 100 * time.Millisecond
 
+const latencyReservoirSize = 1024
+
+type latencyReservoir struct {
+	samples [latencyReservoirSize]time.Duration
+	head    int
+	count   int
+}
+
+func (r *latencyReservoir) record(d time.Duration) {
+	r.samples[r.head] = d
+	r.head = (r.head + 1) % latencyReservoirSize
+	if r.count < latencyReservoirSize {
+		r.count++
+	}
+}
+
+func (r *latencyReservoir) percentiles() (p50, p95, p99 time.Duration) {
+	n := r.count
+	if n == 0 {
+		return 0, 0, 0
+	}
+	buf := make([]time.Duration, n)
+	copy(buf, r.samples[:n])
+	sort.Slice(buf, func(i, j int) bool { return buf[i] < buf[j] })
+	p50 = buf[n*50/100]
+	p95 = buf[n*95/100]
+	p99 = buf[n*99/100]
+	return p50, p95, p99
+}
+
+type routeLatencyReservoir struct {
+	samples [128]time.Duration
+	head    int
+	count   int
+}
+
+func (r *routeLatencyReservoir) record(d time.Duration) {
+	r.samples[r.head] = d
+	r.head = (r.head + 1) % 128
+	if r.count < 128 {
+		r.count++
+	}
+}
+
+func (r *routeLatencyReservoir) p95() time.Duration {
+	n := r.count
+	if n == 0 {
+		return 0
+	}
+	buf := make([]time.Duration, n)
+	copy(buf, r.samples[:n])
+	sort.Slice(buf, func(i, j int) bool { return buf[i] < buf[j] })
+	return buf[n*95/100]
+}
+
 // DeviceWriteTelemetry includes admitted writes, completed outcomes, and live
 // stall diagnostics. Count includes in-flight writes; durations cover completed
 // writes. OldestInFlight is the age of the oldest admitted, unfinished write.
@@ -45,6 +101,9 @@ type DeviceWriteTelemetry struct {
 	OldestInFlight time.Duration
 	TotalDuration  time.Duration
 	MaxDuration    time.Duration
+	P50Duration    time.Duration
+	P95Duration    time.Duration
+	P99Duration    time.Duration
 }
 
 // DeviceWriteSnapshot also includes retired routes whose writes have not yet
@@ -53,6 +112,7 @@ func (f *Forwarder) DeviceWriteSnapshot() DeviceWriteTelemetry {
 	f.writeMetricsMu.Lock()
 	defer f.writeMetricsMu.Unlock()
 	stats := f.writeMetrics
+	stats.P50Duration, stats.P95Duration, stats.P99Duration = f.writeLatencies.percentiles()
 	stats.InFlight = len(f.writesInFlight)
 	for _, started := range f.writesInFlight {
 		age := time.Since(started)
@@ -116,6 +176,8 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, pac
 	delete(f.writesInFlight, route)
 	f.writeMetrics.TotalDuration += duration
 	route.writeMetrics.TotalDuration += duration
+	f.writeLatencies.record(duration)
+	route.writeLatencies.record(duration)
 	if duration > route.writeMetrics.MaxDuration {
 		route.writeMetrics.MaxDuration = duration
 	}
@@ -154,6 +216,7 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 			writes.Stalls++
 		}
 	}
+	p95 := route.writeLatencies.p95()
 	return RouteQueueStats{
 		Occupancy:          len(route.clientQueue),
 		Capacity:           cap(route.clientQueue),
@@ -165,6 +228,7 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 		WritesInFlight:     writes.InFlight,
 		OldestWriteMS:      writes.OldestInFlight.Milliseconds(),
 		MaxWriteDurationMS: writes.MaxDuration.Milliseconds(),
+		P95WriteMS:         p95.Milliseconds(),
 	}
 }
 

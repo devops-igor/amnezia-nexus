@@ -134,6 +134,10 @@ type VirtualTUN struct {
 	dropQueueFull atomic.Uint64
 	dropOversized atomic.Uint64
 	dropShutdown  atomic.Uint64
+	inHighWater   atomic.Uint64
+	outHighWater  atomic.Uint64
+	inDrops       atomic.Uint64
+	outDrops      atomic.Uint64
 	once          sync.Once
 }
 
@@ -298,6 +302,7 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			// caller's next Read re-enters the queue.
 			t.dropCount.Add(1)
 			t.dropOversized.Add(1)
+			t.inDrops.Add(1)
 			return n, nil
 		}
 		copy(dst, pkt)
@@ -350,11 +355,19 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 		copy(out, pkt)
 		select {
 		case t.outPackets <- out:
+			depth := uint64(len(t.outPackets))
+			for current := t.outHighWater.Load(); depth > current; {
+				if t.outHighWater.CompareAndSwap(current, depth) {
+					break
+				}
+				current = t.outHighWater.Load()
+			}
 			n++
 		default:
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
 			t.dropQueueFull.Add(1)
+			t.outDrops.Add(1)
 			n++
 		}
 		t.closeMu.RUnlock()
@@ -384,10 +397,18 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 	}
 	select {
 	case t.inPackets <- out:
+		depth := uint64(len(t.inPackets))
+		for current := t.inHighWater.Load(); depth > current; {
+			if t.inHighWater.CompareAndSwap(current, depth) {
+				break
+			}
+			current = t.inHighWater.Load()
+		}
 		return nil
 	default:
 		t.dropCount.Add(1)
 		t.dropQueueFull.Add(1)
+		t.inDrops.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -455,6 +476,13 @@ type StatsSnapshot struct {
 	// linearization point.
 	OutboundDepth int
 
+	InboundCapacity  int
+	OutboundCapacity int
+	InboundPeak      int
+	OutboundPeak     int
+	InboundDrops     uint64
+	OutboundDrops    uint64
+
 	// DropsTotal mirrors DroppedPackets: every drop counted by the
 	// device plus external drops recorded via RecordDrop/RecordDropN.
 	// Includes shutdown drops drained by Close.
@@ -498,12 +526,18 @@ func (s StatsSnapshot) Sum() uint64 {
 // device operations.
 func (t *VirtualTUN) Stats() StatsSnapshot {
 	return StatsSnapshot{
-		InboundDepth:   len(t.inPackets),
-		OutboundDepth:  len(t.outPackets),
-		DropsTotal:     t.dropCount.Load(),
-		DropsQueueFull: t.dropQueueFull.Load(),
-		DropsOversized: t.dropOversized.Load(),
-		DropsShutdown:  t.dropShutdown.Load(),
+		InboundDepth:     len(t.inPackets),
+		OutboundDepth:    len(t.outPackets),
+		InboundCapacity:  cap(t.inPackets),
+		OutboundCapacity: cap(t.outPackets),
+		InboundPeak:      int(t.inHighWater.Load()),  // #nosec G115 -- bounded by inbound queue capacity.
+		OutboundPeak:     int(t.outHighWater.Load()), // #nosec G115 -- bounded by outbound queue capacity.
+		InboundDrops:     t.inDrops.Load(),
+		OutboundDrops:    t.outDrops.Load(),
+		DropsTotal:       t.dropCount.Load(),
+		DropsQueueFull:   t.dropQueueFull.Load(),
+		DropsOversized:   t.dropOversized.Load(),
+		DropsShutdown:    t.dropShutdown.Load(),
 	}
 }
 
@@ -570,12 +604,14 @@ func (t *VirtualTUN) Close() error {
 			case <-t.inPackets:
 				t.dropCount.Add(1)
 				t.dropShutdown.Add(1)
+				t.inDrops.Add(1)
 			default:
 			}
 			select {
 			case <-t.outPackets:
 				t.dropCount.Add(1)
 				t.dropShutdown.Add(1)
+				t.outDrops.Add(1)
 			default:
 			}
 			// Done when both queues are empty; a reader cannot

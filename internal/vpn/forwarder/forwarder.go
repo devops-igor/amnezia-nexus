@@ -139,6 +139,7 @@ type RouteQueueStats struct {
 	WritesInFlight     int    `json:"writes_in_flight"`
 	OldestWriteMS      int64  `json:"oldest_write_ms"`
 	MaxWriteDurationMS int64  `json:"max_write_duration_ms"`
+	P95WriteMS         int64  `json:"p95_write_ms"`
 }
 
 type sessionRoute struct {
@@ -155,7 +156,8 @@ type sessionRoute struct {
 	queueOccupancy  int        // guarded by aggregateQueueMu; reconciles compatibility drains
 	writeMu         sync.Mutex // admission and completion; never acquired under f.mu
 	retired         atomic.Bool
-	writeMetrics    DeviceWriteTelemetry // guarded by Forwarder.writeMetricsMu
+	writeMetrics    DeviceWriteTelemetry  // guarded by Forwarder.writeMetricsMu
+	writeLatencies  routeLatencyReservoir // guarded by Forwarder.writeMetricsMu
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
 	// deliberately NOT closed because RouteBackendToClient sends to it after
@@ -195,6 +197,8 @@ type Forwarder struct {
 	portalSubnet        *net.IPNet
 	totalRxBytes        atomic.Int64
 	totalTxBytes        atomic.Int64
+	totalRxPackets      atomic.Uint64
+	totalTxPackets      atomic.Uint64
 	dropsQueueFull      atomic.Uint64 // return packets dropped: per-route queue full
 	dropsNoRoute        atomic.Uint64 // return packets dropped: unroutable / no session registered (issue #151)
 	dropsPacketTooLarge atomic.Uint64 // return packets dropped because they exceed the queued payload bound
@@ -235,7 +239,9 @@ type Forwarder struct {
 	writeErrLogUntil        atomic.Int64
 	writeMetricsMu          sync.Mutex
 	writeMetrics            DeviceWriteTelemetry
+	writeLatencies          latencyReservoir
 	writesInFlight          map[*sessionRoute]time.Time
+	rateTracker             *RateTracker
 	aggregateQueueOccupancy int // guarded by aggregateQueueMu
 	aggregateQueueHighWater atomic.Uint64
 	// aggregateQueueMu serializes managed queue operations so aggregate
@@ -370,6 +376,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		bufSize:          queueSize,
 		backendBufSize:   DefaultBackendQueueSize,
 		maxActiveRoutes:  maxActiveRoutes,
+		rateTracker:      NewRateTracker(),
 		stopCh:           make(chan struct{}),
 	}, nil
 }
@@ -810,6 +817,7 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	}
 
 	f.totalRxBytes.Add(pktLen)
+	f.totalRxPackets.Add(1)
 	if f.accountant != nil {
 		f.accountant.RecordRx(sID, cID, pktLen)
 	}
@@ -917,6 +925,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
 		f.totalTxBytes.Add(pktLen)
+		f.totalTxPackets.Add(1)
 		if f.accountant != nil {
 			f.accountant.RecordTx(sID, cID, pktLen)
 		}
@@ -1217,6 +1226,48 @@ func (f *Forwarder) InPortalSubnet(ip string) bool {
 // abuse (or severe NAT misconfiguration) and are safe to alert on.
 func (f *Forwarder) SpoofedRebinds() uint64 {
 	return f.spoofedRebinds.Load()
+}
+
+// PacketStats returns monotonic totals of received and transmitted packets.
+func (f *Forwarder) PacketStats() (rxPackets, txPackets uint64) {
+	if f == nil {
+		return 0, 0
+	}
+	return f.totalRxPackets.Load(), f.totalTxPackets.Load()
+}
+
+// Rates updates and returns recent throughput and packet rates.
+func (f *Forwarder) Rates() TrafficRates {
+	if f == nil {
+		return TrafficRates{}
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, _ := f.AggregateQueueStats()
+	if f.rateTracker != nil {
+		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		return f.rateTracker.Snapshot(rxPackets, txPackets)
+	}
+	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
+}
+
+// QueuePressure updates and returns queue pressure duration and utilization.
+func (f *Forwarder) QueuePressure() QueuePressureStats {
+	if f == nil {
+		return QueuePressureStats{}
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, hw := f.AggregateQueueStats()
+	if f.rateTracker != nil {
+		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		return f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
+	}
+	return QueuePressureStats{Occupancy: occ, Capacity: cap, HighWater: hw, QueueFullDrops: queueDrops}
 }
 
 func (f *Forwarder) stopPumpsSignalOnly() {
