@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 )
 
 // Health status states for forwarder and dataplane.
@@ -953,14 +954,97 @@ func describeLastSuccessfulReconcile(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
+// Peer-sync divergence timing thresholds (issue #424 round 4, item F). A
+// desired/actual mismatch that resolves inside the next reconcile is normal
+// convergence, not an incident; only a PERSISTED mismatch is. The age is
+// measured from the last successful reconciliation, which is the newest
+// evidence that desired state and the device actually agreed.
+const (
+	peerSyncDivergenceWarningAge  = 30 * time.Second
+	peerSyncDivergenceDegradedAge = 60 * time.Second
+)
+
+// peerSyncDivergenceCondition returns the health condition for a persisted
+// desired/actual mismatch, or nil when there is nothing to report.
+//
+// known is false when no reconcile has ever succeeded: the zero
+// LastSuccessfulReconcile means the age is genuinely UNKNOWN, and inventing a
+// large age there would report DEGRADED on a system that has never synced at
+// all. An unknown age still means the counts disagree right now, so it is
+// reported, at WARNING, with the unknown age stated rather than hidden.
+func peerSyncDivergenceCondition(peerSync *PeerSyncStatus, now time.Time) *HealthCondition {
+	if peerSync.DesiredPeers == peerSync.ActualPeers {
+		return nil
+	}
+	age, known := time.Duration(0), false
+	if !peerSync.LastSuccessfulReconcile.IsZero() {
+		age, known = now.Sub(peerSync.LastSuccessfulReconcile), true
+	}
+	switch {
+	case !known:
+		return &HealthCondition{
+			Category: "peer_sync",
+			Severity: "WARNING",
+			Message: fmt.Sprintf("Peer sync divergence: %d desired vs %d actual peers "+
+				"(divergence age unknown: no reconciliation has ever succeeded)",
+				peerSync.DesiredPeers, peerSync.ActualPeers),
+		}
+	case age > peerSyncDivergenceDegradedAge:
+		return &HealthCondition{
+			Category: "peer_sync",
+			Severity: "DEGRADED",
+			Message: fmt.Sprintf("Peer sync divergence for %s: %d desired vs %d actual peers",
+				age.Round(time.Second), peerSync.DesiredPeers, peerSync.ActualPeers),
+		}
+	case age > peerSyncDivergenceWarningAge:
+		return &HealthCondition{
+			Category: "peer_sync",
+			Severity: "WARNING",
+			Message: fmt.Sprintf("Peer sync divergence for %s: %d desired vs %d actual peers",
+				age.Round(time.Second), peerSync.DesiredPeers, peerSync.ActualPeers),
+		}
+	default:
+		// Converging, or younger than the warning threshold: not a condition.
+		return nil
+	}
+}
+
 func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends BackendsDiagnostics, handshake HandshakeFreshnessDiagnostics) []HealthCondition {
 	var conds []HealthCondition
+	now := time.Now()
 	if peerSync != nil {
 		if peerSync.PortalConfigRestartRequired {
 			conds = append(conds, HealthCondition{
 				Category: "peer_sync",
 				Severity: "DEGRADED",
 				Message:  "Portal configuration changed; engine restart is required to apply updates",
+			})
+		}
+		// InvalidRows is STICKY (issue #424 round 4, item G), for the same
+		// reason LastError is: it is durable STATE, not a rate. Every
+		// reconcile re-derives it from the durable rows (peer_sync.go:671), so
+		// it goes to 0 the moment the rows are repaired, and a failed durable
+		// read returns BEFORE that assignment, so a transient read glitch
+		// cannot clear it either. That is what keeps it clear of the round-3
+		// trap: the lifetime counters (SyncFailures and friends) only ever
+		// grow, so they are exposed as history and gated on their windowed
+		// deltas. InvalidRows is not such a counter; it is a level recomputed
+		// from durable state on every pass, so gating on it cannot pin health
+		// forever and cannot be missed by a delta that has gone quiet.
+		//
+		// DEGRADED rather than CRITICAL: an invalid row is excluded from the
+		// desired set, so its peer is simply not enforced upstream and its
+		// traffic is unauthorized and dropped. That is a real, unrecoverable-
+		// by-retry service gap for the affected peer, but every other peer
+		// still reconciles normally, so the dataplane as a whole keeps serving
+		// and CRITICAL would overstate the blast radius.
+		if peerSync.InvalidRows > 0 {
+			conds = append(conds, HealthCondition{
+				Category: "peer_sync",
+				Severity: "DEGRADED",
+				Message: fmt.Sprintf("%d invalid durable peer row(s) excluded from the desired set; "+
+					"those peers are not enforced upstream and their traffic is unauthorized until the rows are repaired",
+					peerSync.InvalidRows),
 			})
 		}
 		// An UNRESOLVED reconciliation failure is sticky and is gated on
@@ -998,13 +1082,8 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 					peerSync.SyncFailures, peerSync.EnqueueFailures),
 			})
 		}
-		if peerSync.DesiredPeers != peerSync.ActualPeers {
-			conds = append(conds, HealthCondition{
-				Category: "peer_sync",
-				Severity: "WARNING",
-				Message: fmt.Sprintf("Peer sync divergence: %d desired vs %d actual peers",
-					peerSync.DesiredPeers, peerSync.ActualPeers),
-			})
+		if divergence := peerSyncDivergenceCondition(peerSync, now); divergence != nil {
+			conds = append(conds, *divergence)
 		}
 	}
 
@@ -1088,7 +1167,16 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 		}
 
 		items[i] = ProblemRouteItem{
-			PeerKey:      r.PeerKey,
+			// Redacted at the API boundary, not in the UI (issue #424 round 4,
+			// item E). The JSON payload IS the disclosure surface: a raw peer
+			// public key shipped to a browser, a log shipper or a support
+			// bundle is already disclosed even if every template masks it. The
+			// value uses ingress.RedactKey, the redaction convention the rest of
+			// the system already uses for peer keys, so the diagnostics surface
+			// renders keys identically to ingress errors and counters. The key
+			// name, presence and non-emptiness are unchanged: an admin still
+			// sees a stable per-route identifier.
+			PeerKey:      ingress.RedactKey(r.PeerKey),
 			AssignedIP:   r.AssignedIP,
 			BackendID:    r.BackendTunnelID,
 			Occupancy:    r.Stats.Occupancy,

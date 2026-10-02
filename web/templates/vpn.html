@@ -1682,9 +1682,24 @@
 
         const kpiPeerSync = document.getElementById('vpn-kpi-peer-sync');
         if (kpiPeerSync) {
-            const hsf = status.handshake_freshness || {};
-            const totalPeers = hsf.total_peers !== undefined ? hsf.total_peers : (status.connected_sessions || 0);
-            kpiPeerSync.textContent = totalPeers + ' peers';
+            // The Peer Sync KPI shows SYNCHRONIZATION state (desired vs actual
+            // peers), not the handshake peer count it used to show: a count of
+            // peers that have handshook says nothing about whether the durable
+            // desired set is enforced upstream, which is what the tile next to
+            // the Peer Sync panel claims to report (issue #424 round 4, item H).
+            // peer_sync is omitempty, so an absent payload renders the same
+            // explicit unavailable state the panel uses instead of a '0 / 0'
+            // that reads like a perfectly synchronized empty deployment.
+            const psKpi = status.peer_sync;
+            if (psKpi && typeof psKpi === 'object') {
+                const psDesired = Number(psKpi.desired_peers || 0);
+                const psActual = Number(psKpi.actual_peers || 0);
+                kpiPeerSync.textContent = psActual + ' / ' + psDesired;
+                kpiPeerSync.style.color = psDesired === psActual ? '' : 'var(--warning)';
+            } else {
+                kpiPeerSync.textContent = (_('vpn_diag_peer_sync_unavailable') || 'Unavailable');
+                kpiPeerSync.style.color = 'var(--text-muted)';
+            }
         }
 
         const kpiBackends = document.getElementById('vpn-kpi-backends');

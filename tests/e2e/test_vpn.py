@@ -50,6 +50,19 @@ def test_vpn_kpi_summary_bar(authenticated_page: Page, base_url: str) -> None:
         el = page.locator(loc)
         expect(el).to_be_visible()
 
+    # The Peer Sync tile reports SYNCHRONIZATION (desired vs actual peers from
+    # status.peer_sync), not the handshake peer count it used to render
+    # (issue #424 round 4, item H). peer_sync is omitempty, so an absent payload
+    # must render an explicit unavailable state, never a misleading '0 / 0'.
+    peer_sync_kpi = page.locator("#vpn-kpi-peer-sync")
+    status_data = api_get(page, "/api/vpn/status")
+    peer_sync = status_data.get("peer_sync")
+    if isinstance(peer_sync, dict):
+        expected = f"{peer_sync['actual_peers']} / {peer_sync['desired_peers']}"
+        expect(peer_sync_kpi).to_have_text(expected)
+    else:
+        assert peer_sync_kpi.inner_text().strip() not in ("", "0 / 0")
+
 
 @pytest.mark.e2e
 def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
@@ -206,6 +219,18 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     assert health["status"] in ("HEALTHY", "DEGRADED", "CRITICAL")
     assert "conditions" in health
     assert isinstance(health["conditions"], list)
+
+    # Validate problem_routes: peer_key must be PRESENT, non-empty and REDACTED
+    # (issue #424 round 4, item E). The API response is the disclosure surface,
+    # so a full-length base64 peer key must never appear in it. The redaction
+    # convention (ingress.RedactKey) keeps 8 characters plus an ellipsis, or
+    # masks shorter values entirely, so a redacted key is at most 9 characters.
+    for route in status_data.get("problem_routes") or []:
+        assert "peer_key" in route, "peer_key must stay present for route correlation"
+        assert route["peer_key"], "peer_key must not be empty"
+        assert len(route["peer_key"]) <= 9, (
+            "peer_key must be redacted, not a full-length peer public key: " f"{route['peer_key']}"
+        )
 
     # Validate rates
     rates = status_data["rates"]

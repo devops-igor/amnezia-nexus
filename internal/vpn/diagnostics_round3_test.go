@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // peerSyncHealthWindow bounds the sampling-window advance. The delta tracker
@@ -50,9 +51,33 @@ func TestUnresolvedPeerSyncFailureHoldsDegradedUntilRecovery(t *testing.T) {
 	peer, _ := newEnginePeer(t, svc, db, "sync-health-sticky")
 	ps, _, portal := newTestPeerSynchronizer(t, svc, db)
 
+	// newIngressEngineService seeds a half-populated durable row (a client id
+	// with no assigned IP). That row genuinely cannot be resolved, so since
+	// issue #424 round 4 item G it correctly reports InvalidRows > 0 and holds
+	// peer_sync DEGRADED on its own. This test is about LastError stickiness,
+	// so the fixture is REPAIRED first: the baseline must really be healthy or
+	// the DEGRADED it asserts on later could be coming from the invalid row
+	// instead of the unresolved failure. No assertion is relaxed; the
+	// precondition is made true.
+	ownerUserID := peerOwnerUserID(t, db, peer.publicKey)
+	for _, c := range mustGetConnections(t, db) {
+		if _, err := db.DeleteConnection(ctx, c.ID); err != nil {
+			t.Fatalf("repair seeded fixture rows: %v", err)
+		}
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: ownerUserID, ServerID: 0, Protocol: "awg",
+		ClientID: peer.publicKey, ClientParams: map[string]any{"assigned_ip": peer.assignedIP},
+	}); err != nil {
+		t.Fatalf("restore the engine peer row: %v", err)
+	}
+
 	// A successful baseline reconcile: no unresolved failure, healthy.
 	if err := ps.reconcileNow(ctx); err != nil {
 		t.Fatalf("baseline reconcile: %v", err)
+	}
+	if stats := ps.Status(); stats.InvalidRows != 0 {
+		t.Fatalf("precondition: the repaired fixture must have no invalid rows, got %+v", stats)
 	}
 	if stats := ps.Status(); stats.LastError != "" {
 		t.Fatalf("precondition: a successful reconcile must leave no LastError, got %q", stats.LastError)
@@ -251,6 +276,16 @@ func TestTransientEnqueueFailureDoesNotPinDegradedForever(t *testing.T) {
 			t.Errorf("an uncleared LastEnqueueError must not pin DEGRADED forever: %+v", conds)
 		}
 	}
+}
+
+// mustGetConnections enumerates every durable connection.
+func mustGetConnections(t *testing.T, db *database.DB) []models.UserConnection {
+	t.Helper()
+	conns, err := db.GetAllConnections(t.Context())
+	if err != nil {
+		t.Fatalf("enumerate connections: %v", err)
+	}
+	return conns
 }
 
 // peerOwnerUserID returns the user id that owns a peer key. Used to revoke it

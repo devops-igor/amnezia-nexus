@@ -2688,6 +2688,10 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			{"Scenario5_SaturatedRouteWithDrops", "saturated_route"},
 			{"Scenario6_OldBackendAbsentFields", "absent_fields"},
 			{"Scenario7_FailedUnavailableStatusSample", "failed_sample"},
+			{"Scenario8_PeerSyncKPIInSync", "peer_sync_in_sync"},
+			{"Scenario9_PeerSyncKPIDiverged", "peer_sync_diverged"},
+			{"Scenario10_PeerSyncKPIAbsent", "peer_sync_absent"},
+			{"Scenario11_PeerSyncKPIIgnoresHandshakeCount", "peer_sync_ignores_handshake_count"},
 			{"AllScenariosInSequence", "all"},
 		}
 
@@ -2840,7 +2844,12 @@ class MockDocument {
             'vpn-fwd-routes-summary-status',
             'vpn-fwd-routes-empty',
             'vpn-fwd-routes-table',
-            'vpn-fwd-routes-tbody'
+            'vpn-fwd-routes-tbody',
+            // The eight KPI tiles (issue #424 round 4, item H asserts on the
+            // Peer Sync tile).
+            'vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure',
+            'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync',
+            'vpn-kpi-backends', 'vpn-kpi-slow-writes'
         ];
         for (const id of ids) {
             this.elements.set(id, new MockElement('div', id));
@@ -2873,7 +2882,8 @@ const translations = {
     'vpn_forwarder_healthy': 'Healthy',
     'vpn_forwarder_pressure': 'Pressure Detected',
     'vpn_forwarder_warning': 'Warning',
-    'vpn_forwarder_no_route_pressure': 'All route queues clear'
+    'vpn_forwarder_no_route_pressure': 'All route queues clear',
+    'vpn_diag_peer_sync_unavailable': 'Unavailable'
 };
 const _ = (key) => translations[key] || key;
 const document = mockDoc;
@@ -3062,6 +3072,57 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'block');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
         assert(!mockDoc.getElementById('vpn-fwd-status-badge').className.includes('badge-success'));
+    } else if (key === 'peer_sync_in_sync') {
+        mockDoc.reset();
+        vpnRenderForwarderHealth({
+            forwarder_available: true,
+            forwarder_queue_capacity: 2048,
+            forwarder_queue_occupancy: 10,
+            peer_sync: { desired_peers: 12, actual_peers: 12 }
+        });
+        // The Peer Sync KPI reports SYNCHRONIZATION (issue #424 round 4, item H),
+        // not the handshake peer count it used to render.
+        assert.strictEqual(mockDoc.getElementById('vpn-kpi-peer-sync').textContent, '12 / 12');
+        assert.strictEqual(mockDoc.getElementById('vpn-kpi-peer-sync').style.color, '');
+    } else if (key === 'peer_sync_diverged') {
+        mockDoc.reset();
+        vpnRenderForwarderHealth({
+            forwarder_available: true,
+            forwarder_queue_capacity: 2048,
+            forwarder_queue_occupancy: 10,
+            peer_sync: { desired_peers: 12, actual_peers: 11 }
+        });
+        const kpi = mockDoc.getElementById('vpn-kpi-peer-sync');
+        assert.strictEqual(kpi.textContent, '11 / 12');
+        assert.strictEqual(kpi.style.color, 'var(--warning)');
+    } else if (key === 'peer_sync_absent') {
+        // peer_sync is omitempty: an absent payload must NOT render a misleading
+        // '0 / 0', it must render the same explicit unavailable state the Peer
+        // Sync panel uses.
+        for (const sample of [
+            { forwarder_available: true, forwarder_queue_capacity: 2048 },
+            { forwarder_available: true, forwarder_queue_capacity: 2048, peer_sync: null },
+            { forwarder_available: true, forwarder_queue_capacity: 2048, peer_sync: 7 },
+            { forwarder_available: true, forwarder_queue_capacity: 2048, handshake_freshness: { total_peers: 42 } }
+        ]) {
+            mockDoc.reset();
+            vpnRenderForwarderHealth(sample);
+            assert.strictEqual(mockDoc.getElementById('vpn-kpi-peer-sync').textContent, 'Unavailable');
+            assert.strictEqual(mockDoc.getElementById('vpn-kpi-peer-sync').style.color, 'var(--text-muted)');
+        }
+    } else if (key === 'peer_sync_ignores_handshake_count') {
+        // A large handshake peer count must not be presented as the sync KPI.
+        mockDoc.reset();
+        vpnRenderForwarderHealth({
+            forwarder_available: true,
+            forwarder_queue_capacity: 2048,
+            handshake_freshness: { total_peers: 42 },
+            connected_sessions: 42,
+            peer_sync: { desired_peers: 2, actual_peers: 2 }
+        });
+        const kpi = mockDoc.getElementById('vpn-kpi-peer-sync');
+        assert.notStrictEqual(kpi.textContent, '42 peers');
+        assert.strictEqual(kpi.textContent, '2 / 2');
     } else if (key === 'failed_sample') {
         const samples = [null, undefined, {}, { forwarder_available: false }, { forwarder_available: false, forwarder_queue_capacity: 0 }];
         for (const sample of samples) {
@@ -3089,7 +3150,7 @@ const scenarioArg = process.argv[1];
 if (scenarioArg && scenarioArg !== 'all') {
     runScenario(scenarioArg);
 } else {
-    ['healthy', 'healthy_zero_routes', 'surviving_peak_after_routes_disconnect', 'failures', 'saturated_route', 'absent_fields', 'failed_sample'].forEach(runScenario);
+    ['healthy', 'healthy_zero_routes', 'surviving_peak_after_routes_disconnect', 'failures', 'saturated_route', 'absent_fields', 'failed_sample', 'peer_sync_in_sync', 'peer_sync_diverged', 'peer_sync_absent', 'peer_sync_ignores_handshake_count'].forEach(runScenario);
 }
 console.log('SCENARIO_PASS');
 `
@@ -3336,7 +3397,8 @@ const translations = {
     'vpn_forwarder_healthy': 'Healthy',
     'vpn_forwarder_pressure': 'Pressure Detected',
     'vpn_forwarder_warning': 'Warning',
-    'vpn_forwarder_no_route_pressure': 'All route queues clear'
+    'vpn_forwarder_no_route_pressure': 'All route queues clear',
+    'vpn_diag_peer_sync_unavailable': 'Unavailable'
 };
 const _ = (key) => translations[key] || key;
 const document = mockDoc;
