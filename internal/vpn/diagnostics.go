@@ -923,6 +923,36 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 	return conds
 }
 
+// maxDiagnosticErrorTextLen bounds an upstream error string embedded in a
+// health message. A peer sync failure joins every reconciliation error, so
+// unbounded text would make the condition message (and the API payload that
+// carries it) arbitrarily large.
+const maxDiagnosticErrorTextLen = 200
+
+// clampDiagnosticText bounds s to max runes, appending an ellipsis marker when
+// anything was removed. It is rune-aware so a multi-byte error string cannot be
+// cut mid-rune.
+func clampDiagnosticText(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "..."
+}
+
+// describeLastSuccessfulReconcile renders the reconcile timestamp for a health
+// message. The zero value means no reconcile has ever succeeded, which is
+// materially different from a stale one and must not be printed as a year 1 date.
+func describeLastSuccessfulReconcile(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends BackendsDiagnostics, handshake HandshakeFreshnessDiagnostics) []HealthCondition {
 	var conds []HealthCondition
 	if peerSync != nil {
@@ -933,10 +963,32 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 				Message:  "Portal configuration changed; engine restart is required to apply updates",
 			})
 		}
-		// Only the windowed deltas degrade current health; the cumulative
-		// SyncFailures/EnqueueFailures stay exposed as history (issue #424
-		// round 2, finding 5).
-		if peerSync.SyncFailuresRecent > 0 || peerSync.EnqueueFailuresRecent > 0 {
+		// An UNRESOLVED reconciliation failure is sticky and is gated on
+		// LastError, not on the windowed deltas (issue #424 round 3,
+		// finding 2). The deltas are a rate: the tracker reports 0 on its
+		// first observation (baseline establishment) and falls back to 0
+		// once the cumulative counter stops rising, so a delta-only gate
+		// reports HEALTHY while the last reconcile is still failing.
+		// LastError is set by peerSynchronizer.fail and cleared ONLY by a
+		// successful reconcile (peer_sync.go), which makes it exactly the
+		// "degraded until recovery" signal the health surface needs.
+		//
+		// LastEnqueueError deliberately does NOT gate here: nothing in the
+		// peer synchronizer ever clears it, so treating it as sticky would
+		// pin DEGRADED permanently after a single transient enqueue
+		// failure. Enqueue failures stay gated on their windowed delta.
+		if peerSync.LastError != "" {
+			conds = append(conds, HealthCondition{
+				Category: "peer_sync",
+				Severity: "DEGRADED",
+				Message: fmt.Sprintf("Unresolved peer sync failure: %s (last successful reconcile %s; "+
+					"recent activity: %d sync, %d enqueue failures in the last %.1fs; %d sync, %d enqueue cumulative)",
+					clampDiagnosticText(peerSync.LastError, maxDiagnosticErrorTextLen),
+					describeLastSuccessfulReconcile(peerSync.LastSuccessfulReconcile),
+					peerSync.SyncFailuresRecent, peerSync.EnqueueFailuresRecent, peerSync.FailuresWindowSec,
+					peerSync.SyncFailures, peerSync.EnqueueFailures),
+			})
+		} else if peerSync.SyncFailuresRecent > 0 || peerSync.EnqueueFailuresRecent > 0 {
 			conds = append(conds, HealthCondition{
 				Category: "peer_sync",
 				Severity: "DEGRADED",

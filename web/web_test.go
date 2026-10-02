@@ -2564,6 +2564,7 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			"vpn_forwarder_cumulative",
 			"vpn_diag_peer_sync_peers",
 			"vpn_diag_peer_sync_failures",
+			"vpn_diag_peer_sync_op_failures",
 			"vpn_diag_peer_sync_invalid_rows",
 			"vpn_diag_peer_sync_enqueue",
 			"vpn_diag_peer_sync_last_reconcile",

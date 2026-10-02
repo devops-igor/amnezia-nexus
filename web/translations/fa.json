@@ -425,6 +425,7 @@
   "vpn_diag_peer_sync_last_reconcile": "آخرین هم‌راستاسازی:",
   "vpn_diag_peer_sync_never": "هرگز",
   "vpn_diag_peer_sync_none": "هیچ‌کدام",
+  "vpn_diag_peer_sync_op_failures": "خطاهای افزودن / به‌روزرسانی / حذف:",
   "vpn_diag_peer_sync_peers": "همتایی‌ها (مطلوب / واقعی):",
   "vpn_diag_peer_sync_restart_no": "خیر",
   "vpn_diag_peer_sync_restart_required": "نیاز به راه‌اندازی مجدد:",

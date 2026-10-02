@@ -425,6 +425,7 @@
   "vpn_diag_peer_sync_last_reconcile": "上次协调：",
   "vpn_diag_peer_sync_never": "从未",
   "vpn_diag_peer_sync_none": "无",
+  "vpn_diag_peer_sync_op_failures": "添加 / 更新 / 删除失败：",
   "vpn_diag_peer_sync_peers": "对等端（期望 / 实际）：",
   "vpn_diag_peer_sync_restart_no": "否",
   "vpn_diag_peer_sync_restart_required": "需要重启：",

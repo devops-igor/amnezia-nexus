@@ -119,8 +119,23 @@ type VirtualTUN struct {
 	// Close holds the write lock while flipping the state and draining,
 	// making Close linearizable with submissions.
 	closeMu sync.RWMutex
-	mtu     int
-	name    string
+	// readSuspended is a TEST-ONLY gate on Read. It is false for every
+	// production device: nothing outside this package's tests ever sets it,
+	// so the production Read path is unchanged.
+	//
+	// It exists because the upstream engine starts its TUN reader goroutine
+	// inside device.NewDevice, and device.Down() only stops the peers and the
+	// bind (downLocked), so no upstream API can suspend that reader. A test
+	// that needs deterministic INBOUND queue state therefore had no seam.
+	readSuspended atomic.Bool
+	// resumeRead is closed by ResumeReadsForTest to release every Read
+	// blocked on the suspension gate. It is created by SuspendReadsForTest
+	// and replaced by the next SuspendReadsForTest, under readMu.
+	resumeRead chan struct{}
+	// readMu guards resumeRead only.
+	readMu sync.Mutex
+	mtu    int
+	name   string
 	// closedFlag is written only by Close under the write lock and read
 	// by submissions under the read lock; it exists so submissions can
 	// check-and-enqueue atomically without racing on the channel close.
@@ -207,6 +222,111 @@ func New(cfg Config) (*VirtualTUN, error) {
 	}, nil
 }
 
+// NewSuspendedForTest creates a device whose reads are ALREADY suspended,
+// before any reader goroutine can exist. It is TEST-ONLY and must not be
+// called from production code.
+//
+// This is the only airtight way to freeze the inbound queue for a test whose
+// TUN is driven by a reader started inside device.NewDevice (the upstream AWG
+// engine). Such a reader spends essentially all its life parked inside Read,
+// blocked on <-inPackets, i.e. already past the awaitReadResume check at the
+// top of Read: arming the gate afterwards has no effect, and the very next
+// InjectInbound is dequeued immediately. Suspending before the goroutine is
+// created makes its FIRST Read call block on the gate, so the queue is
+// provably never drained.
+//
+// Production construction is New, which never suspends; the flag is therefore
+// false for every device that a production path can build.
+func NewSuspendedForTest(cfg Config) (*VirtualTUN, error) {
+	vt, err := New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	vt.SuspendReadsForTest()
+	return vt, nil
+}
+
+// ReadsSuspendedForTest reports whether the test-only read gate is armed. It
+// exists so a test can assert that the device it was handed really does have
+// deterministic inbound queue state, rather than assuming it.
+func (t *VirtualTUN) ReadsSuspendedForTest() bool {
+	if t == nil {
+		return false
+	}
+	return t.readSuspended.Load()
+}
+
+// SuspendReadsForTest makes Read stop dequeuing from the inbound queue so a
+// test can build deterministic queue state. It is TEST-ONLY and must not be
+// called from production code.
+//
+// It only takes effect for a Read call that has not yet passed the gate. A
+// reader already parked inside Read stays parked and keeps dequeuing, so a
+// device whose reader is started by device.NewDevice must be built with
+// NewSuspendedForTest instead: there is no way to reach a parked reader.
+//
+// Motivation: the upstream engine starts its TUN reader goroutine inside
+// device.NewDevice and keeps it running for the device's whole life;
+// device.Down() only stops the peers and closes the bind (downLocked), so
+// there is no upstream API that suspends the reader. Any test that injects
+// into the inbound queue and then asserts its occupancy, its peak, or that a
+// later Close drains it is otherwise racing that goroutine, which is why such
+// tests pass on an idle developer machine and fail on a loaded,
+// coverage-instrumented CI runner.
+//
+// While suspended, a Read blocks without consuming anything: the packets stay
+// queued and every drop counter is untouched, exactly as if the reader had not
+// run yet. Close still unblocks a suspended Read, so shutdown cannot hang.
+func (t *VirtualTUN) SuspendReadsForTest() {
+	if t == nil {
+		return
+	}
+	// The gate is armed BEFORE the flag is published, so a Read can never
+	// observe readSuspended with no channel to wait on.
+	t.readMu.Lock()
+	if t.resumeRead == nil {
+		t.resumeRead = make(chan struct{})
+	}
+	t.readMu.Unlock()
+	t.readSuspended.Store(true)
+}
+
+// ResumeReadsForTest releases every Read blocked by SuspendReadsForTest.
+func (t *VirtualTUN) ResumeReadsForTest() {
+	if t == nil {
+		return
+	}
+	t.readSuspended.Store(false)
+	t.readMu.Lock()
+	if t.resumeRead != nil {
+		close(t.resumeRead)
+		t.resumeRead = nil
+	}
+	t.readMu.Unlock()
+}
+
+// awaitReadResume blocks while reads are suspended. It returns false only when
+// the device was closed underneath it, so a suspended Read cannot outlive
+// Close and wedge shutdown.
+func (t *VirtualTUN) awaitReadResume() bool {
+	for t.readSuspended.Load() {
+		t.readMu.Lock()
+		ch := t.resumeRead
+		t.readMu.Unlock()
+		if ch == nil {
+			// Resume ran between the flag check and the lock. Re-check the flag
+			// rather than proceeding on a stale observation.
+			continue
+		}
+		select {
+		case <-ch:
+		case <-t.closed:
+			return false
+		}
+	}
+	return true
+}
+
 // isClosed reports whether the device has been closed. Called by submissions
 // while holding the closeMu read lock so the observation cannot race with the
 // Close transition.
@@ -240,6 +360,11 @@ func (t *VirtualTUN) File() *os.File { return nil }
 // After Close, Read returns an error wrapping ErrClosed; packets still queued
 // are drained and accounted by Close.
 func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	// Test-only suspension gate. readSuspended is false for every production
+	// device, so this is a single atomic load on the production path.
+	if !t.awaitReadResume() {
+		return 0, ErrClosed
+	}
 	select {
 	case <-t.closed:
 		return 0, ErrClosed

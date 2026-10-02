@@ -425,6 +425,7 @@
   "vpn_diag_peer_sync_last_reconcile": "Dernière réconciliation :",
   "vpn_diag_peer_sync_never": "Jamais",
   "vpn_diag_peer_sync_none": "Aucune",
+  "vpn_diag_peer_sync_op_failures": "Échecs ajout / mise à jour / suppression :",
   "vpn_diag_peer_sync_peers": "Pairs (souhaités / réels) :",
   "vpn_diag_peer_sync_restart_no": "Non",
   "vpn_diag_peer_sync_restart_required": "Redémarrage requis :",

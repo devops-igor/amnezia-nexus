@@ -224,6 +224,7 @@
                 <div class="flex justify-between"><span class="text-muted">Engine:</span><span class="font-mono" id="vpn-diag-engine-status">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_peers" }}</span><span class="font-mono" id="vpn-diag-peers-status">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_failures" }}</span><span class="font-mono" id="vpn-diag-sync-failures">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_op_failures" }}</span><span class="font-mono" id="vpn-diag-peer-sync-op-failures">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_invalid_rows" }}</span><span class="font-mono" id="vpn-diag-peer-sync-invalid">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_enqueue" }}</span><span class="font-mono" id="vpn-diag-peer-sync-enqueue">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_last_reconcile" }}</span><span class="font-mono" id="vpn-diag-peer-sync-reconcile">-</span></div>
@@ -1323,7 +1324,7 @@
                 if (el) { el.textContent = '-'; el.style.color = ''; }
             }
 
-            const diagIds = ['vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h', 'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50', 'vpn-diag-queue-dur80', 'vpn-diag-queue-drops', 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight', 'vpn-diag-lat-stalls', 'vpn-diag-lat-errors', 'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus', 'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-sync-failures', 'vpn-diag-peer-sync-invalid', 'vpn-diag-peer-sync-enqueue', 'vpn-diag-peer-sync-reconcile', 'vpn-diag-peer-sync-error', 'vpn-diag-peer-sync-restart', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts', 'vpn-diag-be-counts', 'vpn-diag-be-latency', 'vpn-diag-be-skew', 'vpn-diag-be-drops', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines', 'vpn-diag-res-gc', 'vpn-diag-res-fd'];
+            const diagIds = ['vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h', 'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50', 'vpn-diag-queue-dur80', 'vpn-diag-queue-drops', 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight', 'vpn-diag-lat-stalls', 'vpn-diag-lat-errors', 'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus', 'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-sync-failures', 'vpn-diag-peer-sync-op-failures', 'vpn-diag-peer-sync-invalid', 'vpn-diag-peer-sync-enqueue', 'vpn-diag-peer-sync-reconcile', 'vpn-diag-peer-sync-error', 'vpn-diag-peer-sync-restart', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts', 'vpn-diag-be-counts', 'vpn-diag-be-latency', 'vpn-diag-be-skew', 'vpn-diag-be-drops', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines', 'vpn-diag-res-gc', 'vpn-diag-res-fd'];
             for (let i = 0; i < diagIds.length; i++) {
                 const el = document.getElementById(diagIds[i]);
                 if (el) { el.textContent = '-'; el.style.color = ''; }
@@ -1856,14 +1857,32 @@
         const dSyncFail = document.getElementById('vpn-diag-sync-failures');
         if (dSyncFail) {
             if (psAvailable) {
-                const psFailures = (ps.sync_failures || 0) + (ps.add_failures || 0) +
-                    (ps.update_failures || 0) + (ps.remove_failures || 0);
+                // sync_failures is an AGGREGATE: peerSynchronizer.fail
+                // increments it AND the specific operation increments its own
+                // counter (add_failures, update_failures, remove_failures).
+                // Summing the aggregate with its own breakdown counted one
+                // failed add twice, so the two are displayed separately
+                // (issue #424 round 3, finding 3).
+                const psSyncTotal = ps.sync_failures || 0;
                 const psRecent = (ps.sync_failures_recent || 0) + (ps.enqueue_failures_recent || 0);
-                dSyncFail.textContent = psFailures + ' (' + psRecent + ' recent)';
-                dSyncFail.style.color = psRecent > 0 ? 'var(--danger)' : (psFailures > 0 ? 'var(--warning)' : '');
+                dSyncFail.textContent = psSyncTotal + ' (' + psRecent + ' recent)';
+                dSyncFail.style.color = psRecent > 0 ? 'var(--danger)' : (psSyncTotal > 0 ? 'var(--warning)' : '');
             } else {
                 dSyncFail.textContent = peerSyncUnavailable;
                 dSyncFail.style.color = 'var(--text-muted)';
+            }
+        }
+        const dOpFail = document.getElementById('vpn-diag-peer-sync-op-failures');
+        if (dOpFail) {
+            if (psAvailable) {
+                const psAdd = ps.add_failures || 0;
+                const psUpdate = ps.update_failures || 0;
+                const psRemove = ps.remove_failures || 0;
+                dOpFail.textContent = psAdd + ' / ' + psUpdate + ' / ' + psRemove;
+                dOpFail.style.color = (psAdd + psUpdate + psRemove) > 0 ? 'var(--warning)' : '';
+            } else {
+                dOpFail.textContent = peerSyncUnavailable;
+                dOpFail.style.color = 'var(--text-muted)';
             }
         }
         const dPsInvalid = document.getElementById('vpn-diag-peer-sync-invalid');

@@ -450,7 +450,20 @@ func newSingleOwnerFixture(t *testing.T) (*Service, *forwarder.Forwarder, *Ingre
 		t.Fatalf("curve25519 peer: %v", err)
 	}
 
-	portal, err := clientawg.NewDevice(clientawg.Config{
+	// The device is built with inbound reads ALREADY suspended, not suspended
+	// after construction. The upstream engine starts its TUN reader goroutine
+	// inside device.NewDevice and parks it inside VirtualTUN.Read, already
+	// past the suspension gate at the top of Read. Arming the gate afterwards
+	// never reaches that goroutine: it dequeues the next injected packet, and
+	// every assertion below on inbound occupancy, inbound peak or a Close()
+	// drain then races it. Building the device suspended makes the reader's
+	// FIRST Read call block on the gate, so the inbound queue is provably
+	// never drained.
+	//
+	// This is test-only determinism. Production construction is
+	// clientawg.NewDevice, which never suspends; the queue, the reader
+	// goroutine and the direction mapping under test are unchanged.
+	portal, err := clientawg.NewDeviceWithSuspendedReadsForTest(clientawg.Config{
 		PrivateKey: base64.StdEncoding.EncodeToString(key[:]),
 		PublicKey:  base64.StdEncoding.EncodeToString(pub),
 		TUN: virtualtun.Config{
@@ -467,6 +480,10 @@ func newSingleOwnerFixture(t *testing.T) (*Service, *forwarder.Forwarder, *Ingre
 	})
 	if err != nil {
 		t.Fatalf("NewDevice: %v", err)
+	}
+	if !portal.ReadsSuspendedForTest() {
+		t.Fatal("fixture built a device whose inbound reads are NOT suspended: " +
+			"every inbound occupancy, peak and drain assertion would race the upstream reader")
 	}
 	t.Cleanup(func() { _ = portal.Close() })
 
@@ -693,9 +710,12 @@ func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
 	// counters being incremented by hand (issue #424 round 2, finding 3).
 	t.Run("ReturnVirtualTUNDrops", func(t *testing.T) {
 		svc, _, engine, resolver, _ := newSingleOwnerFixture(t)
-		if err := engine.portal.DownForTest(); err != nil {
-			t.Fatalf("DownForTest: %v", err)
-		}
+		// Must precede the priming packets: the upstream TUN reader is started
+		// in NewDevice and its Down() cannot stop it, so without suspension it
+		// drains the queue below and it never fills, silently skipping this
+		// subtest instead of covering the ownership annotation (issue #424
+		// round 3, finding 1).
+		requireDeterministicInboundQueue(t, engine)
 		resolver.Update(ingress.PeerOwnership{
 			PeerPublicKey: "ps-peer", IP: netip.MustParseAddr("10.100.0.1"), ConnectionID: "c", UserID: "u",
 		})

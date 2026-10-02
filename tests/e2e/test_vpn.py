@@ -264,6 +264,21 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         ):
             assert isinstance(peer_sync[key], int)
         assert isinstance(peer_sync["portal_config_restart_required"], bool)
+        # sync_failures is an AGGREGATE of the per-operation counters:
+        # peerSynchronizer.fail increments it AND the operation increments its
+        # own counter, so a single failed add raises BOTH sync_failures and
+        # add_failures. The panel must therefore render them as separate rows
+        # and must never sum them (issue #424 round 3, finding 3). A sum would
+        # read 2 for one failed add.
+        assert peer_sync["sync_failures"] >= max(
+            peer_sync["add_failures"],
+            peer_sync["update_failures"],
+            peer_sync["remove_failures"],
+        ), (
+            "sync_failures is the aggregate of the per-operation counters and "
+            "cannot be smaller than any of them: "
+            f"{peer_sync}"
+        )
         # Optional omitempty error strings the panel surfaces when set.
         for key in ("last_error", "last_enqueue_error"):
             if key in peer_sync:

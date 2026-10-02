@@ -425,6 +425,7 @@
   "vpn_diag_peer_sync_last_reconcile": "Последняя сверка:",
   "vpn_diag_peer_sync_never": "Никогда",
   "vpn_diag_peer_sync_none": "Нет",
+  "vpn_diag_peer_sync_op_failures": "Ошибки добавления / обновления / удаления:",
   "vpn_diag_peer_sync_peers": "Пиры (желаемые / фактические):",
   "vpn_diag_peer_sync_restart_no": "Нет",
   "vpn_diag_peer_sync_restart_required": "Требуется перезапуск:",

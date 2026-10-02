@@ -11,6 +11,41 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
+// requireDeterministicInboundQueue asserts that the fixture's portal device
+// has its inbound reads suspended, BEFORE the caller creates any inbound queue
+// state. Every test that injects into the inbound queue and then asserts its
+// occupancy, its peak, or that a later Close drains it must call this first.
+//
+// Why the gate must be armed at construction time: the upstream engine starts
+// its TUN reader goroutine inside device.NewDevice (amneziawg-go
+// v3.1.20260828 device/device.go:374) and device.Down() only closes the bind
+// and stops the peers (downLocked, device/device.go:236-248), so no upstream
+// API can stop it. That reader then sits parked inside VirtualTUN.Read,
+// already past the gate at the top of Read. Arming the gate after the fact
+// does not reach it, and it dequeues the next injected packet immediately.
+// newSingleOwnerFixture therefore builds the device with
+// NewDeviceWithSuspendedReadsForTest, so the reader's first Read call blocks
+// on the gate; this helper exists so each test states that dependency at its
+// own call site and fails loudly if the fixture ever regresses.
+//
+// Without it such a test passes when the assertions run first and fails when
+// the reader runs first, which is exactly what a loaded, coverage-instrumented
+// CI runner produces.
+//
+// This is a test-only determinism measure. Production is untouched: the queue,
+// NewDevice, Up and the reader goroutine all behave exactly as before, and the
+// direction mapping these tests assert is the production mapping.
+func requireDeterministicInboundQueue(t *testing.T, engine *IngressEngine) {
+	t.Helper()
+	if engine.portal == nil {
+		t.Fatal("fixture has no portal device")
+	}
+	if !engine.portal.ReadsSuspendedForTest() {
+		t.Fatal("inbound reads are not suspended: the upstream TUN reader will " +
+			"drain the queue this test is about to assert on")
+	}
+}
+
 // Blocker 1: the VirtualTUN direction mapping must match the device's actual
 // queue semantics. VirtualTUN.Write feeds the OUTBOUND queue and carries
 // upstream -> Nexus traffic; VirtualTUN.InjectInbound feeds the INBOUND queue
@@ -19,8 +54,21 @@ import (
 // The fixture builds an intentionally asymmetric state: several outbound
 // packets and one inbound packet, so the two directions cannot be confused and
 // still produce matching totals.
+//
+// The fixture builds the device with inbound reads already suspended, so the
+// upstream TUN reader (started inside device.NewDevice) blocks on its first
+// Read and never drains the inbound queue. Every inbound assertion below is
+// therefore deterministic rather than a race against that goroutine: on a
+// loaded or coverage-instrumented runner the reader would otherwise win and
+// the packet would already be gone, so occupancy and peak would read 0.
+// This does NOT change production queue behavior: NewDevice, Up and the
+// reader are untouched, and the direction mapping asserted here is the
+// production one.
 func TestVirtualTUNDirectionMapping(t *testing.T) {
 	svc, _, engine, _, _ := newSingleOwnerFixture(t)
+	// Must precede any InjectInbound: the assertions below read inbound
+	// occupancy and inbound peak.
+	requireDeterministicInboundQueue(t, engine)
 
 	outbound := [][]byte{[]byte("up"), []byte("stream"), []byte("payload")}
 	if _, err := engine.portal.WriteOutboundForTest(outbound, 0); err != nil {
@@ -62,6 +110,9 @@ func TestVirtualTUNDirectionMapping(t *testing.T) {
 // totals and the sampled rates together.
 func TestOutboundVirtualTUNDropsCountedOnceInClientBucket(t *testing.T) {
 	svc, _, engine, _, _ := newSingleOwnerFixture(t)
+	// Must precede the queue-filling writes: the shared device is live and a
+	// draining reader would change the exact overflow drop count.
+	requireDeterministicInboundQueue(t, engine)
 
 	// Fill the outbound queue to capacity, then push past it. The device
 	// counts a queue-full drop per rejected packet.
@@ -123,6 +174,9 @@ func TestOutboundVirtualTUNDropsCountedOnceInClientBucket(t *testing.T) {
 // exactly once, and the non-TUN injection error must survive.
 func TestInjectionAndInboundTUNDropsAreDisjoint(t *testing.T) {
 	svc, _, engine, resolver, _ := newSingleOwnerFixture(t)
+	// The shutdown drain below only produces an inbound drop while the packet
+	// is still queued, so the upstream reader must be suspended first.
+	requireDeterministicInboundQueue(t, engine)
 	// The fixture configures a 1280-byte MTU (see newSingleOwnerFixture).
 	const mtu = 1280
 
@@ -200,6 +254,10 @@ func TestInjectionAndInboundTUNDropsAreDisjoint(t *testing.T) {
 // bucket and must not also appear as a non-TUN injection error.
 func TestQueueFullInjectionOwnedByInboundBucket(t *testing.T) {
 	svc, _, engine, _, _ := newSingleOwnerFixture(t)
+	// The priming packets below must still be queued when the real injection
+	// runs, otherwise the inbound queue never fills and the test silently
+	// skips instead of covering the ownership annotation.
+	requireDeterministicInboundQueue(t, engine)
 
 	// Fill the inbound queue, then inject through the real site so the
 	// ownership counter is exercised.
