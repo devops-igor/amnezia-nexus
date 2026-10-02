@@ -204,11 +204,11 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
 
     # Validate rates
     rates = status_data["rates"]
-    assert "rx_bps" in rates and "tx_bps" in rates and "total_bps" in rates
+    assert "rx_bps" in rates and "tx_bps" in rates and "drop_rate_pps" in rates
 
     # Validate queue pressure
     queue = status_data["queue_pressure"]
-    assert "capacity" in queue and "occupancy" in queue and "pressure_pct" in queue
+    assert "capacity" in queue and "occupancy" in queue and "utilization_pct" in queue
 
     # Validate forward latency percentiles
     lat = status_data["forward_latency"]
@@ -220,7 +220,7 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
 
     # Validate backends
     backends = status_data["backends"]
-    assert "total" in backends and "healthy" in backends
+    assert "total_count" in backends and "healthy_count" in backends
 
     # Validate runtime resources
     runtime = status_data["runtime_resources"]

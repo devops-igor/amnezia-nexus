@@ -127,10 +127,6 @@ func (h *Handlers) VPNDisableBackendHandler(w http.ResponseWriter, r *http.Reque
 	ctx := r.Context()
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DisableBackend(ctx, serverID); err != nil {
-			if errors.Is(err, vpn.ErrBackendTunnelNotFound) {
-				h.JSONError(w, http.StatusNotFound, "backend_not_found", fmt.Sprintf("Backend %d not found", serverID))
-				return
-			}
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to disable backend: "+err.Error())
 			return
 		}
