@@ -203,6 +203,11 @@ type Forwarder struct {
 	dropsNoRoute        atomic.Uint64 // return packets dropped: unroutable / no session registered (issue #151)
 	dropsPacketTooLarge atomic.Uint64 // return packets dropped because they exceed the queued payload bound
 	dropsTotal          atomic.Uint64 // return-path drops counted so far
+
+	clientDropsQueueFull   atomic.Uint64 // client packets dropped: backend queue full
+	clientDropsRateLimited atomic.Uint64 // client packets dropped: upstream token bucket exhausted
+	clientDropsNoBackend   atomic.Uint64 // client packets dropped: backend queue not registered/found
+	clientDropsTotal       atomic.Uint64 // monotonic total of client->backend drops in forwarder
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -803,6 +808,8 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 
 	beQueue, ok := f.backendQueues[route.backendTunnelID]
 	if !ok {
+		f.clientDropsNoBackend.Add(1)
+		f.clientDropsTotal.Add(1)
 		f.mu.RUnlock()
 		return ErrBackendNotFound
 	}
@@ -813,6 +820,8 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 
 	pktLen := int64(len(packet))
 	if tbUp != nil && !tbUp.Allow(pktLen) {
+		f.clientDropsRateLimited.Add(1)
+		f.clientDropsTotal.Add(1)
 		return ErrRateLimitExceeded
 	}
 
@@ -829,6 +838,8 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	case beQueue <- pktCopy:
 		return nil
 	default:
+		f.clientDropsQueueFull.Add(1)
+		f.clientDropsTotal.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -1206,6 +1217,19 @@ func (f *Forwarder) DropsPacketTooLarge() uint64 {
 	return f.dropsPacketTooLarge.Load()
 }
 
+// ClientDropStats returns the number of client-to-backend packets dropped because
+// the backend queue was full, rate limited, or no backend was found, along with
+// the monotonic total of client-to-backend drops in the forwarder.
+func (f *Forwarder) ClientDropStats() (queueFull, rateLimited, noBackend, total uint64) {
+	if f == nil {
+		return 0, 0, 0, 0
+	}
+	return f.clientDropsQueueFull.Load(),
+		f.clientDropsRateLimited.Load(),
+		f.clientDropsNoBackend.Load(),
+		f.clientDropsTotal.Load()
+}
+
 // InPortalSubnet reports whether ip belongs to the portal client pool.
 // Unparseable IPs and an unknown subnet both answer false (fail-closed).
 func (f *Forwarder) InPortalSubnet(ip string) bool {
@@ -1444,6 +1468,17 @@ func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stopTimeout = d
+}
+
+// SetBackendQueueForTest sets or deletes a backend queue for testing drop behavior.
+func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch == nil {
+		delete(f.backendQueues, backendTunnelID)
+	} else {
+		f.backendQueues[backendTunnelID] = ch
+	}
 }
 
 func (f *Forwarder) getStopTimeout() time.Duration {

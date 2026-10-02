@@ -147,3 +147,10 @@ func (d *ClientAWGDevice) InjectInbound(packet []byte) error {
 
 // Stats reports bounded queue depths and loss accounting, including after Close.
 func (d *ClientAWGDevice) Stats() virtualtun.StatsSnapshot { return d.tun.Stats() }
+
+// DownForTest suspends the upstream device listener and TUN reader routines for testing.
+func (d *ClientAWGDevice) DownForTest() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.dev.Down()
+}

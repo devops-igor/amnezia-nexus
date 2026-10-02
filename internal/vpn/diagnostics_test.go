@@ -2,11 +2,22 @@ package vpn
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 func TestEvaluateForwarderHealth_States(t *testing.T) {
@@ -68,12 +79,12 @@ func TestEvaluateForwarderHealth_States(t *testing.T) {
 		t.Errorf("expected UNAVAILABLE, got %s", u.Status)
 	}
 
-	// 3. Degraded on queue drops
+	// 3. Degraded on active queue drops
 	qDrops := baseQueue
-	qDrops.QueueFullDrops = 10
+	qDrops.QueueDropRatePps = 1.0
 	deg := EvaluateForwarderHealth(true, true, qDrops, baseLatency, baseDrops, baseVTUN, basePeerSync, baseRouting, baseHandshake, baseBackends)
 	if deg.Status != HealthDegraded {
-		t.Errorf("expected DEGRADED for queue drops, got %s", deg.Status)
+		t.Errorf("expected DEGRADED for active queue drops, got %s", deg.Status)
 	}
 
 	// 4. Critical on queue saturation >= 95%
@@ -110,12 +121,92 @@ func TestEvaluateForwarderHealth_States(t *testing.T) {
 		t.Errorf("expected CRITICAL for duplicate IP, got %s", critRoute.Status)
 	}
 
-	// 8. Degraded on VirtualTUN drops
-	vtunDrops := baseVTUN
-	vtunDrops.NexusToUpstream.Drops = 5
-	degVTUN := EvaluateForwarderHealth(true, true, baseQueue, baseLatency, baseDrops, vtunDrops, basePeerSync, baseRouting, baseHandshake, baseBackends)
+	// 8. Degraded on VirtualTUN queue saturation
+	vtunSat := baseVTUN
+	vtunSat.NexusToUpstream.Capacity = 1000
+	vtunSat.NexusToUpstream.Occupancy = 950 // 95% utilization
+	degVTUN := EvaluateForwarderHealth(true, true, baseQueue, baseLatency, baseDrops, vtunSat, basePeerSync, baseRouting, baseHandshake, baseBackends)
 	if degVTUN.Status != HealthDegraded {
-		t.Errorf("expected DEGRADED for VirtualTUN drops, got %s", degVTUN.Status)
+		t.Errorf("expected DEGRADED for VirtualTUN saturation, got %s", degVTUN.Status)
+	}
+
+	// 9. Degraded on write errors
+	latErr := baseLatency
+	latErr.WriteErrorRatePps = 2.0
+	degLat := EvaluateForwarderHealth(true, true, baseQueue, latErr, baseDrops, baseVTUN, basePeerSync, baseRouting, baseHandshake, baseBackends)
+	if degLat.Status != HealthDegraded {
+		t.Errorf("expected DEGRADED for write errors, got %s", degLat.Status)
+	}
+
+	// 10. Degraded on active dataplane drops
+	dropsActive := baseDrops
+	dropsActive.TotalDropRatePps = 12.0
+	degDrops := EvaluateForwarderHealth(true, true, baseQueue, baseLatency, dropsActive, baseVTUN, basePeerSync, baseRouting, baseHandshake, baseBackends)
+	if degDrops.Status != HealthDegraded {
+		t.Errorf("expected DEGRADED for elevated drop rate, got %s", degDrops.Status)
+	}
+}
+
+func TestEvaluateForwarderHealth_Recovery(t *testing.T) {
+	// Lifetime cumulative counters are non-zero (previous incident)
+	histQueue := QueuePressureDiagnostics{
+		Occupancy:             5,
+		Capacity:              1000,
+		UtilizationPct:        0.5,
+		HighWaterPct:          85.0,
+		ConsecutiveAbove50Sec: 0,
+		ConsecutiveAbove80Sec: 0,
+		QueueFullDrops:        100, // Historical drops
+		QueueDropRatePps:      0.0, // Active rate is 0
+	}
+	histLatency := ForwardLatencyDiagnostics{
+		P50MS:             1.5,
+		P95MS:             5.0,
+		P99MS:             8.0,
+		OldestInFlightMS:  0,
+		Stalls:            10, // Historical stalls
+		WriteErrors:       50, // Historical errors
+		WriteTotal:        5000,
+		WriteErrorRatePps: 0.0, // Active rate is 0
+	}
+	histDrops := DropCategoryBreakdown{
+		ClientBackendQueueFull: 100,
+		ClientTotalDrops:       100,
+		ReturnVirtualTUNDrops:  20,
+		ReturnTotalDrops:       20,
+		TotalDrops:             120, // Historical total
+		ClientDropRatePps:      0.0,
+		ReturnDropRatePps:      0.0,
+		TotalDropRatePps:       0.0, // Active rate is 0
+	}
+	histVTUN := VirtualTUNDiagnostics{
+		UpstreamToNexus: VirtualTUNDirectionalHealth{Capacity: 1000, Occupancy: 10, Peak: 800, Drops: 20}, // Historical drops
+		NexusToUpstream: VirtualTUNDirectionalHealth{Capacity: 1000, Occupancy: 10, Peak: 800, Drops: 15}, // Historical drops
+	}
+	basePeerSync := &PeerSyncStatus{
+		DesiredPeers: 10,
+		ActualPeers:  10,
+		SyncFailures: 0,
+	}
+	baseRouting := RoutingConsistencyDiagnostics{
+		ActiveSessionsCount: 5,
+		ActiveRoutesCount:   5,
+		ReturnOwnersCount:   5,
+		IsConsistent:        true,
+	}
+	baseHandshake := HandshakeFreshnessDiagnostics{
+		TotalPeers: 10,
+	}
+	baseBackends := BackendsDiagnostics{
+		HealthyCount: 2,
+		TotalCount:   2,
+		LatencyP95MS: 15.0,
+	}
+
+	// Dynamic recovery: when active rates and stalls are 0, status MUST evaluate to HEALTHY
+	assessment := EvaluateForwarderHealth(true, true, histQueue, histLatency, histDrops, histVTUN, basePeerSync, baseRouting, baseHandshake, baseBackends)
+	if assessment.Status != HealthHealthy {
+		t.Fatalf("expected HEALTHY status upon recovery, got %s (conditions: %+v)", assessment.Status, assessment.Conditions)
 	}
 }
 
@@ -256,6 +347,7 @@ func TestGetStatus_OperationalDiagnostics(t *testing.T) {
 		t.Fatalf("NewVPNService: %v", err)
 	}
 
+	svc.cfg = &models.VPNConfig{PublicEndpoint: "127.0.0.1:51820"}
 	st, err := svc.GetStatus(context.Background())
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
@@ -276,4 +368,322 @@ func TestGetStatus_OperationalDiagnostics(t *testing.T) {
 	if st.ProblemRoutes == nil {
 		t.Errorf("expected non-nil ProblemRoutes")
 	}
+}
+
+type testSingleOwnerAdmission struct {
+	divergentIP string
+	rejectErr   error
+}
+
+func (a *testSingleOwnerAdmission) EnsureSession(owner ingress.PeerOwnership) (ingress.SessionHandle, ingress.BackendHandle, error) {
+	if a.rejectErr != nil {
+		return nil, nil, a.rejectErr
+	}
+	ip := owner.IP.String()
+	if a.divergentIP != "" {
+		ip = a.divergentIP
+	}
+	return &testAdmissionSessionHandle{id: "sess-" + owner.PeerPublicKey, assignedIP: ip}, &testAdmissionBackendHandle{tunnelID: 1}, nil
+}
+
+type testAdmissionSessionHandle struct {
+	id         string
+	assignedIP string
+}
+
+func (s *testAdmissionSessionHandle) SessionID() string  { return s.id }
+func (s *testAdmissionSessionHandle) AssignedIP() string { return s.assignedIP }
+
+type testAdmissionBackendHandle struct {
+	tunnelID int64
+}
+
+func (b *testAdmissionBackendHandle) TunnelID() int64 { return b.tunnelID }
+
+func buildTestIPv4Packet(srcIP, dstIP net.IP, length int) []byte {
+	pkt := make([]byte, length)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(length))
+	pkt[8] = 64
+	pkt[9] = 17
+	copy(pkt[12:16], srcIP.To4())
+	copy(pkt[16:20], dstIP.To4())
+	return pkt
+}
+
+func newSingleOwnerFixture(t *testing.T) (*Service, *forwarder.Forwarder, *IngressEngine, *ingress.Resolver, *testSingleOwnerAdmission) {
+	t.Helper()
+
+	fwd, err := forwarder.NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+	if err != nil {
+		t.Fatalf("NewForwarderWithLimits: %v", err)
+	}
+
+	resolver := ingress.NewResolver()
+	adm := &testSingleOwnerAdmission{}
+	router := ingress.NewRouter(resolver, adm, fwd, nil)
+
+	key := [32]byte{17}
+	pub, err := curve25519.X25519(key[:], curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("curve25519: %v", err)
+	}
+	peerKey := [32]byte{33}
+	peerPub, err := curve25519.X25519(peerKey[:], curve25519.Basepoint)
+	if err != nil {
+		t.Fatalf("curve25519 peer: %v", err)
+	}
+
+	portal, err := clientawg.NewDevice(clientawg.Config{
+		PrivateKey: base64.StdEncoding.EncodeToString(key[:]),
+		PublicKey:  base64.StdEncoding.EncodeToString(pub),
+		TUN: virtualtun.Config{
+			Name:            "test-portal",
+			MTU:             1280,
+			InboundCapacity: 2,
+		},
+		Peers: []clientawg.Peer{
+			{
+				PublicKey: base64.StdEncoding.EncodeToString(peerPub),
+				AllowedIP: netip.MustParsePrefix("10.40.0.2/32"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDevice: %v", err)
+	}
+	t.Cleanup(func() { _ = portal.Close() })
+
+	engine := &IngressEngine{
+		portal:   portal,
+		router:   router,
+		resolver: resolver,
+	}
+	engine.returnPath = forwarder.NewReturnPath(engine.writeReturnPacket)
+	fwd.SetReturnRejectClassifier(engine.classifyForwarderReject)
+
+	svc := &Service{
+		forwarder:     fwd,
+		ingressEngine: engine,
+		cfg:           &models.VPNConfig{PublicEndpoint: "127.0.0.1:51820"},
+	}
+
+	return svc, fwd, engine, resolver, adm
+}
+
+func assertDropBreakdown(t *testing.T, b DropCategoryBreakdown, expected string) {
+	t.Helper()
+	m := map[string]uint64{
+		"ClientMalformed":        b.ClientMalformed,
+		"ClientUnmappedSource":   b.ClientUnmappedSource,
+		"ClientMismatch":         b.ClientMismatch,
+		"ClientRejected":         b.ClientRejected,
+		"ClientBackendQueueFull": b.ClientBackendQueueFull,
+		"ClientRateLimited":      b.ClientRateLimited,
+		"ClientNoHealthyBackend": b.ClientNoHealthyBackend,
+		"ReturnMalformed":        b.ReturnMalformed,
+		"ReturnUnmapped":         b.ReturnUnmapped,
+		"ReturnMismatch":         b.ReturnMismatch,
+		"ReturnInjectionErrors":  b.ReturnInjectionErrors,
+		"ReturnVirtualTUNDrops":  b.ReturnVirtualTUNDrops,
+	}
+
+	clientCategories := map[string]bool{
+		"ClientMalformed":        true,
+		"ClientUnmappedSource":   true,
+		"ClientMismatch":         true,
+		"ClientRejected":         true,
+		"ClientBackendQueueFull": true,
+		"ClientRateLimited":      true,
+		"ClientNoHealthyBackend": true,
+	}
+
+	for k, v := range m {
+		if k == expected {
+			if v != 1 {
+				t.Errorf("[%s] expected 1, got %d", k, v)
+			}
+		} else {
+			if v != 0 {
+				t.Errorf("[%s] expected 0, got %d (while expecting %s)", k, v, expected)
+			}
+		}
+	}
+
+	if b.TotalDrops != 1 {
+		t.Errorf("TotalDrops: expected 1, got %d", b.TotalDrops)
+	}
+
+	if clientCategories[expected] {
+		if b.ClientTotalDrops != 1 {
+			t.Errorf("ClientTotalDrops: expected 1, got %d", b.ClientTotalDrops)
+		}
+		if b.ReturnTotalDrops != 0 {
+			t.Errorf("ReturnTotalDrops: expected 0, got %d", b.ReturnTotalDrops)
+		}
+	} else {
+		if b.ReturnTotalDrops != 1 {
+			t.Errorf("ReturnTotalDrops: expected 1, got %d", b.ReturnTotalDrops)
+		}
+		if b.ClientTotalDrops != 0 {
+			t.Errorf("ClientTotalDrops: expected 0, got %d", b.ClientTotalDrops)
+		}
+	}
+}
+
+func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
+	t.Run("ClientMalformed", func(t *testing.T) {
+		svc, _, engine, _, _ := newSingleOwnerFixture(t)
+		_ = engine.router.HandlePacket([]byte{1, 2, 3})
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientMalformed")
+	})
+
+	t.Run("ClientUnmappedSource", func(t *testing.T) {
+		svc, _, engine, _, _ := newSingleOwnerFixture(t)
+		pkt := buildTestIPv4Packet(net.ParseIP("198.51.100.99"), net.ParseIP("10.100.0.1"), 40)
+		_ = engine.router.HandlePacket(pkt)
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientUnmappedSource")
+	})
+
+	t.Run("ClientMismatch", func(t *testing.T) {
+		svc, _, engine, resolver, adm := newSingleOwnerFixture(t)
+		const peer = "test-peer-mismatch"
+		_ = resolver.Update(ingress.PeerOwnership{PeerPublicKey: peer, IP: netip.MustParseAddr("10.40.0.2"), ConnectionID: "c1", UserID: "u1"})
+		adm.divergentIP = "10.40.0.99"
+		pkt := buildTestIPv4Packet(net.ParseIP("10.40.0.2"), net.ParseIP("10.100.0.1"), 40)
+		_ = engine.router.HandlePacket(pkt)
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientMismatch")
+	})
+
+	t.Run("ClientRejected", func(t *testing.T) {
+		svc, _, engine, resolver, adm := newSingleOwnerFixture(t)
+		const peer = "test-peer-rejected"
+		_ = resolver.Update(ingress.PeerOwnership{PeerPublicKey: peer, IP: netip.MustParseAddr("10.40.0.3"), ConnectionID: "c1", UserID: "u1"})
+		adm.rejectErr = errors.New("admission rejected: disabled user")
+		pkt := buildTestIPv4Packet(net.ParseIP("10.40.0.3"), net.ParseIP("10.100.0.1"), 40)
+		_ = engine.router.HandlePacket(pkt)
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientRejected")
+	})
+
+	t.Run("ClientBackendQueueFull", func(t *testing.T) {
+		svc, fwd, _, _, _ := newSingleOwnerFixture(t)
+		fwd.RegisterSession("s5", "c5", "p5", "10.100.0.5", 5)
+		ch := make(chan []byte, 1)
+		ch <- []byte{0}
+		fwd.SetBackendQueueForTest(5, ch)
+		pkt := buildTestIPv4Packet(net.ParseIP("10.100.0.5"), net.ParseIP("1.1.1.1"), 40)
+		err := fwd.RouteClientToBackend("p5", pkt)
+		if !errors.Is(err, forwarder.ErrQueueFull) {
+			t.Fatalf("expected ErrQueueFull, got %v", err)
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientBackendQueueFull")
+	})
+
+	t.Run("ClientRateLimited", func(t *testing.T) {
+		svc, fwd, _, _, _ := newSingleOwnerFixture(t)
+		fwd.RegisterSession("s6", "c6", "p6", "10.100.0.6", 6)
+		if err := fwd.SetPeerRateLimit("p6", 0, 10); err != nil {
+			t.Fatalf("SetPeerRateLimit: %v", err)
+		}
+		pkt := buildTestIPv4Packet(net.ParseIP("10.100.0.6"), net.ParseIP("1.1.1.1"), 100)
+		err := fwd.RouteClientToBackend("p6", pkt)
+		if !errors.Is(err, forwarder.ErrRateLimitExceeded) {
+			t.Fatalf("expected ErrRateLimitExceeded, got %v", err)
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientRateLimited")
+	})
+
+	t.Run("ClientNoHealthyBackend", func(t *testing.T) {
+		svc, fwd, _, _, _ := newSingleOwnerFixture(t)
+		fwd.RegisterSession("s7", "c7", "p7", "10.100.0.7", 999)
+		fwd.SetBackendQueueForTest(999, nil)
+		pkt := buildTestIPv4Packet(net.ParseIP("10.100.0.7"), net.ParseIP("1.1.1.1"), 40)
+		err := fwd.RouteClientToBackend("p7", pkt)
+		if !errors.Is(err, forwarder.ErrBackendNotFound) {
+			t.Fatalf("expected ErrBackendNotFound, got %v", err)
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ClientNoHealthyBackend")
+	})
+
+	t.Run("ReturnMalformed", func(t *testing.T) {
+		svc, fwd, engine, _, _ := newSingleOwnerFixture(t)
+		fwd.RegisterSessionWithReturnPath("s8", "c8", "p8", "10.100.0.8", 1, engine.returnPath)
+		err := fwd.RouteBackendToClient(1, []byte{0x00, 0x01}, "10.100.0.8")
+		if err == nil {
+			t.Fatalf("expected error on malformed return packet")
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ReturnMalformed")
+	})
+
+	t.Run("ReturnUnmapped", func(t *testing.T) {
+		svc, fwd, _, _, _ := newSingleOwnerFixture(t)
+		pkt := buildTestIPv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.100.0.99"), 40)
+		err := fwd.RouteBackendToClient(1, pkt, "10.100.0.99")
+		if err == nil {
+			t.Fatalf("expected error on unmapped return packet")
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ReturnUnmapped")
+	})
+
+	t.Run("ReturnMismatch", func(t *testing.T) {
+		svc, fwd, engine, _, _ := newSingleOwnerFixture(t)
+		fwd.RegisterSessionWithReturnPath("s10", "c10", "p10", "10.100.0.10", 1, engine.returnPath)
+		pkt := buildTestIPv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.100.0.10"), 40)
+		err := fwd.RouteBackendToClient(2, pkt, "10.100.0.10")
+		if err == nil {
+			t.Fatalf("expected error on backend mismatch return packet")
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ReturnMismatch")
+	})
+
+	t.Run("ReturnInjectionErrors", func(t *testing.T) {
+		svc, _, engine, _, _ := newSingleOwnerFixture(t)
+		engine.returnCounters.injectionErrors.Add(1)
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ReturnInjectionErrors")
+	})
+
+	t.Run("ReturnVirtualTUNDrops", func(t *testing.T) {
+		svc, _, engine, _, _ := newSingleOwnerFixture(t)
+		if err := engine.portal.DownForTest(); err != nil {
+			t.Fatalf("DownForTest: %v", err)
+		}
+		pkt := buildTestIPv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.100.0.1"), 40)
+		var err error
+		for i := 0; i < 10; i++ {
+			err = engine.portal.InjectInbound(pkt)
+			if errors.Is(err, virtualtun.ErrQueueFull) {
+				break
+			}
+		}
+		if !errors.Is(err, virtualtun.ErrQueueFull) {
+			t.Fatalf("expected ErrQueueFull, got %v", err)
+		}
+		engine.returnCounters.injectionErrors.Add(1)
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		assertDropBreakdown(t, status.DropCategories, "ReturnVirtualTUNDrops")
+	})
 }

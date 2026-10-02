@@ -220,6 +220,8 @@ type Service struct {
 	reaperHook                             func(context.Context, *models.VPNSession)
 
 	rollingHistory *RollingHistory
+	diagRatesMu    sync.Mutex
+	diagRates      *diagRatesTracker
 	historyStopCh  chan struct{}
 	historyDoneCh  chan struct{}
 }
@@ -649,6 +651,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		rollingHistory:         NewRollingHistory(),
+		diagRates:              newDiagRatesTracker(),
 	}
 	revokeDispatch.bind(svc)
 

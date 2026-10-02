@@ -790,11 +790,11 @@ func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
 			Message:  fmt.Sprintf("Elevated queue utilization at %.1f%%", queue.UtilizationPct),
 		})
 	}
-	if queue.QueueFullDrops > 0 {
+	if queue.QueueDropRatePps > 0 {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("%d packets dropped due to full return queues", queue.QueueFullDrops),
+			Message:  fmt.Sprintf("Active queue drops: %.1f drops/sec due to full return queues", queue.QueueDropRatePps),
 		})
 	}
 	return conds
@@ -830,11 +830,11 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 		})
 	}
 
-	if latency.WriteErrors > 0 {
+	if latency.WriteErrorRatePps > 0 {
 		conds = append(conds, HealthCondition{
 			Category: "latency",
 			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("%d device write errors detected", latency.WriteErrors),
+			Message:  fmt.Sprintf("Active device write errors: %.1f errors/sec detected", latency.WriteErrorRatePps),
 		})
 	}
 	return conds
@@ -842,19 +842,39 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 
 func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
 	var conds []HealthCondition
-	if vtun.UpstreamToNexus.Drops > 0 || vtun.NexusToUpstream.Drops > 0 {
+	inUtil := float64(0)
+	if vtun.UpstreamToNexus.Capacity > 0 {
+		inUtil = float64(vtun.UpstreamToNexus.Occupancy) / float64(vtun.UpstreamToNexus.Capacity) * 100.0
+	}
+	outUtil := float64(0)
+	if vtun.NexusToUpstream.Capacity > 0 {
+		outUtil = float64(vtun.NexusToUpstream.Occupancy) / float64(vtun.NexusToUpstream.Capacity) * 100.0
+	}
+	if inUtil >= 90.0 || outUtil >= 90.0 {
 		conds = append(conds, HealthCondition{
 			Category: "virtual_tun",
 			Severity: "DEGRADED",
-			Message: fmt.Sprintf("VirtualTUN packet drops detected: %d inbound, %d outbound",
-				vtun.UpstreamToNexus.Drops, vtun.NexusToUpstream.Drops),
+			Message:  fmt.Sprintf("VirtualTUN queue saturation: inbound %.1f%%, outbound %.1f%%", inUtil, outUtil),
+		})
+	} else if inUtil >= 75.0 || outUtil >= 75.0 {
+		conds = append(conds, HealthCondition{
+			Category: "virtual_tun",
+			Severity: "WARNING",
+			Message:  fmt.Sprintf("Elevated VirtualTUN queue utilization: inbound %.1f%%, outbound %.1f%%", inUtil, outUtil),
 		})
 	}
+
 	if drops.TotalDropRatePps >= 10.0 {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "DEGRADED",
 			Message:  fmt.Sprintf("Elevated drop rate: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
+		})
+	} else if drops.TotalDropRatePps >= 1.0 {
+		conds = append(conds, HealthCondition{
+			Category: "drops",
+			Severity: "WARNING",
+			Message:  fmt.Sprintf("Active packet drops: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
 		})
 	}
 	return conds
@@ -1048,11 +1068,82 @@ func (s *Service) sampleRollingHistory() {
 	}
 }
 
+// diagRatesTracker provides thread-safe sampling and independent rate computation
+// for device write errors, client drops, return drops, and overall dataplane drops.
+type diagRatesTracker struct {
+	mu              sync.Mutex
+	lastSampleTime  time.Time
+	lastClientDrops uint64
+	lastReturnDrops uint64
+	lastTotalDrops  uint64
+	lastWriteErrors uint64
+
+	clientDropRate float64
+	returnDropRate float64
+	totalDropRate  float64
+	writeErrorRate float64
+}
+
+func newDiagRatesTracker() *diagRatesTracker {
+	return &diagRatesTracker{
+		lastSampleTime: time.Now(),
+	}
+}
+
+func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+	if t == nil {
+		return 0, 0, 0, 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.lastSampleTime.IsZero() {
+		t.lastSampleTime = now
+		t.lastClientDrops = clientDrops
+		t.lastReturnDrops = returnDrops
+		t.lastTotalDrops = totalDrops
+		t.lastWriteErrors = writeErrors
+		return 0, 0, 0, 0
+	}
+
+	elapsed := now.Sub(t.lastSampleTime).Seconds()
+	if elapsed < 0.2 { // throttle sub-second sampling calls
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+	}
+
+	deltaClient := float64(0)
+	if clientDrops >= t.lastClientDrops {
+		deltaClient = float64(clientDrops - t.lastClientDrops)
+	}
+	deltaReturn := float64(0)
+	if returnDrops >= t.lastReturnDrops {
+		deltaReturn = float64(returnDrops - t.lastReturnDrops)
+	}
+	deltaWriteErrors := float64(0)
+	if writeErrors >= t.lastWriteErrors {
+		deltaWriteErrors = float64(writeErrors - t.lastWriteErrors)
+	}
+
+	t.clientDropRate = deltaClient / elapsed
+	t.returnDropRate = deltaReturn / elapsed
+	t.totalDropRate = t.clientDropRate + t.returnDropRate
+	t.writeErrorRate = deltaWriteErrors / elapsed
+
+	t.lastSampleTime = now
+	t.lastClientDrops = clientDrops
+	t.lastReturnDrops = returnDrops
+	t.lastTotalDrops = totalDrops
+	t.lastWriteErrors = writeErrors
+
+	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+}
+
 func (s *Service) populateOperationalDiagnostics(status *Status) {
 	if status == nil {
 		return
 	}
 
+	var writeErrors uint64
 	// 1. Rates, Queue Pressure, Latency
 	if s.forwarder != nil {
 		fRates := s.forwarder.Rates()
@@ -1083,6 +1174,7 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 		}
 
 		writes := s.forwarder.DeviceWriteSnapshot()
+		writeErrors = writes.Errors
 		status.ForwardLatency = ForwardLatencyDiagnostics{
 			P50MS:             float64(writes.P50Duration.Microseconds()) / 1000.0,
 			P95MS:             float64(writes.P95Duration.Microseconds()) / 1000.0,
@@ -1093,7 +1185,7 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 			Stalls:            writes.Stalls,
 			WriteErrors:       writes.Errors,
 			WriteTotal:        writes.Count,
-			WriteErrorRatePps: status.Rates.DropRatePps,
+			WriteErrorRatePps: 0,
 		}
 	}
 
@@ -1104,56 +1196,75 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 		routerMalformed = routerStats.MalformedPacketDrops
 		routerUnmapped = routerStats.UnmappedSourceIPDrops
 		routerMismatch = routerStats.OwnershipMismatchDrops
-		routerRejected = routerStats.AdmissionRejectedDrops
+		routerRejected = routerStats.AdmissionRejectedDrops + routerStats.RouteRegistrationErrors
 	}
-	var retStats ReturnStatsSnapshot
-	if s.ingressEngine != nil {
-		retStats = s.ingressEngine.ReturnStats()
-	}
-
-	var qFullDrops, noRouteDrops uint64
-	var pktTooLarge uint64
+	var fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend uint64
 	if s.forwarder != nil {
-		qFullDrops, noRouteDrops, _ = s.forwarder.DropStats()
-		pktTooLarge = s.forwarder.DropsPacketTooLarge()
+		fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend, _ = s.forwarder.ClientDropStats()
 	}
 
 	clientTotal := routerMalformed +
 		routerUnmapped +
 		routerMismatch +
 		routerRejected +
-		qFullDrops +
-		noRouteDrops +
-		pktTooLarge
+		fwdClientQueueFull +
+		fwdClientRateLimited +
+		fwdClientNoBackend
 
-	returnTunDrops := retStats.TUN.InboundDrops + retStats.TUN.OutboundDrops
+	var retStats ReturnStatsSnapshot
+	if s.ingressEngine != nil {
+		retStats = s.ingressEngine.ReturnStats()
+	}
+
+	nonTunInjectionErrors := uint64(0)
+	if retStats.InjectionErrors > retStats.TUN.InboundDrops {
+		nonTunInjectionErrors = retStats.InjectionErrors - retStats.TUN.InboundDrops
+	}
+	returnTunDrops := retStats.TUN.InboundDrops
 	returnTotal := retStats.MalformedDrops +
 		retStats.UnmappedDrops +
 		retStats.OwnershipMismatchDrops +
-		retStats.InjectionErrors +
+		nonTunInjectionErrors +
 		returnTunDrops
+
+	totalDrops := clientTotal + returnTotal
+
+	s.diagRatesMu.Lock()
+	if s.diagRates == nil {
+		s.diagRates = newDiagRatesTracker()
+	}
+	tracker := s.diagRates
+	s.diagRatesMu.Unlock()
+
+	clientDropRate, returnDropRate, totalDropRate, writeErrorRate := tracker.Sample(
+		time.Now(), clientTotal, returnTotal, totalDrops, writeErrors,
+	)
+
+	// Update independent rates
+	status.ForwardLatency.WriteErrorRatePps = writeErrorRate
+	status.Rates.DropRatePps = totalDropRate
 
 	status.DropCategories = DropCategoryBreakdown{
 		ClientMalformed:        routerMalformed,
 		ClientUnmappedSource:   routerUnmapped,
 		ClientMismatch:         routerMismatch,
 		ClientRejected:         routerRejected,
-		ClientBackendQueueFull: qFullDrops,
-		ClientRateLimited:      pktTooLarge,
-		ClientNoHealthyBackend: noRouteDrops,
+		ClientBackendQueueFull: fwdClientQueueFull,
+		ClientRateLimited:      fwdClientRateLimited,
+		ClientNoHealthyBackend: fwdClientNoBackend,
 		ClientTotalDrops:       clientTotal,
-		ClientDropRatePps:      status.Rates.DropRatePps,
+		ClientDropRatePps:      clientDropRate,
 
 		ReturnMalformed:       retStats.MalformedDrops,
 		ReturnUnmapped:        retStats.UnmappedDrops,
 		ReturnMismatch:        retStats.OwnershipMismatchDrops,
-		ReturnInjectionErrors: retStats.InjectionErrors,
+		ReturnInjectionErrors: nonTunInjectionErrors,
 		ReturnVirtualTUNDrops: returnTunDrops,
 		ReturnTotalDrops:      returnTotal,
-		ReturnDropRatePps:     status.Rates.DropRatePps,
+		ReturnDropRatePps:     returnDropRate,
 
-		TotalDrops:       clientTotal + returnTotal,
-		TotalDropRatePps: status.Rates.DropRatePps,
+		TotalDrops:       totalDrops,
+		TotalDropRatePps: totalDropRate,
 	}
 
 	status.VirtualTUN = VirtualTUNDiagnostics{

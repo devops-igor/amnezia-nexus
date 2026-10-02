@@ -51,8 +51,19 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 }
 
 // ProblemRoutes returns active routes ranked problem-first (highest drops, highest queue occupancy, write stalls).
+// Only routes with active pressure (HasPressure == true) are returned. If no routes have pressure,
+// an empty slice is returned.
 func (f *Forwarder) ProblemRoutes(limit int) []RouteInfo {
-	routes := f.InspectRoutes()
+	allRoutes := f.InspectRoutes()
+	routes := make([]RouteInfo, 0, len(allRoutes))
+	for _, r := range allRoutes {
+		if r.HasPressure {
+			routes = append(routes, r)
+		}
+	}
+	if len(routes) == 0 {
+		return []RouteInfo{}
+	}
 
 	// Problem-first sort
 	sort.Slice(routes, func(i, j int) bool {
