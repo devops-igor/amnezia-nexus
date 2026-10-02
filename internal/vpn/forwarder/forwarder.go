@@ -180,11 +180,9 @@ type Forwarder struct {
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
 	backendQueues    map[int64]chan []byte    // backendTunnelID -> queue
-	clientDevices    map[string]PacketDevice  // peerKey -> device
 	backendDevices   map[int64]PacketDevice   // backendTunnelID -> device
 	backendPumpStops map[int64]chan struct{}  // backendTunnelID -> pump stop channel
 	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
-	defaultClientDev PacketDevice             // default client packet device
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -364,7 +362,6 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByPeer:     make(map[string]*sessionRoute),
 		routesByIP:       make(map[string]*sessionRoute),
 		backendQueues:    make(map[int64]chan []byte),
-		clientDevices:    make(map[string]PacketDevice),
 		backendDevices:   make(map[int64]PacketDevice),
 		writesInFlight:   make(map[*sessionRoute]time.Time),
 		backendPumpStops: make(map[int64]chan struct{}),
@@ -403,9 +400,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 // Void registration for API compatibility: a route-capacity refusal is
 // silent here and observable only through the usual absent-route behavior.
 // Callers that must distinguish capacity exhaustion (the ingress admission
-// path, issue #388) use TryRegisterSessionWithLimit instead; this thin
-// wrapper keeps every existing custom-listener call site unchanged until
-// #394 removes the path.
+// path, issue #388) use TryRegisterSessionWithLimit instead.
 func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement) {
 	retirement, _ = f.TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps)
 	return retirement
@@ -656,7 +651,6 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 			delete(f.routesByIP, route.assignedIP)
 		}
 		delete(f.routesByPeer, peerKey)
-		delete(f.clientDevices, peerKey)
 		// Terminate the per-session pump exactly once. The queue is NOT
 		// closed: RouteBackendToClient sends to it after releasing the lock,
 		// and closing would race into a send-on-closed panic. Instead the
@@ -682,7 +676,6 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 			delete(f.routesByIP, route.assignedIP)
 		}
 		delete(f.routesByPeer, route.peerKey)
-		delete(f.clientDevices, route.peerKey)
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 	}
@@ -700,7 +693,6 @@ func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
 	retirements := f.retireRoutesMatchingLocked(nil)
 	clear(f.routesByPeer)
 	clear(f.routesByIP)
-	clear(f.clientDevices)
 	f.aggregateQueueMu.Lock()
 	f.aggregateQueueOccupancy = 0
 	f.aggregateQueueMu.Unlock()
@@ -745,10 +737,10 @@ func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func(ctx co
 	}
 }
 
-// RetireCustomRoutes stops pumps, drains queues, and removes routes belonging to
-// the custom/legacy engine (routes where returnPath == nil).
+// RetireUnmanagedRoutes stops pumps, drains queues, and removes unmanaged routes
+// (routes where returnPath == nil).
 // Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
-func (f *Forwarder) RetireCustomRoutes() (wait func(ctx context.Context) error) {
+func (f *Forwarder) RetireUnmanagedRoutes() (wait func(ctx context.Context) error) {
 	return f.RetireRoutesByReturnPath(nil)
 }
 
@@ -796,67 +788,21 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 		return ErrSessionNotRegistered
 	}
 
-	var (
-		beQueue chan []byte
-		sID     string
-		cID     string
-		tbUp    *TokenBucket
-	)
-
 	if srcIP != "" && srcIP != "0.0.0.0" && route.assignedIP != srcIP {
+		f.spoofedRebinds.Add(1)
 		f.mu.RUnlock()
-		f.mu.Lock()
-		route, ok = f.routesByPeer[peerKey]
-		if !ok {
-			f.mu.Unlock()
-			return ErrSessionNotRegistered
-		}
-		if route.assignedIP != srcIP {
-			// Issue #89: the claimed srcIP comes from the INNER packet and
-			// is attacker-controlled. Only accept the rebind when BOTH hold:
-			//   1. srcIP is inside the portal client subnet (an inner source
-			//      outside the pool can only be a spoof), AND
-			//   2. srcIP is currently UNASSIGNED — checking under THIS write
-			//      lock (routesByIP is only mutated under f.mu, so the
-			//      check-and-insert here is atomic with respect to every
-			//      other registration/unregister/rebind).
-			// Anything else — including another peer's live assigned IP — is
-			// a spoofed rebind attempt: drop the packet and count it. Before
-			// this guard, a peer could claim a victim's (guessable,
-			// sequentially allocated) IP and hijack the victim's downstream
-			// traffic by stealing its routesByIP entry.
-			spoofed := !f.inPortalSubnet(srcIP) || f.routesByIP[srcIP] != nil
-			if spoofed {
-				f.spoofedRebinds.Add(1)
-				f.mu.Unlock()
-				return ErrSpoofedSourceIP
-			}
-			if route.assignedIP != "" {
-				delete(f.routesByIP, route.assignedIP)
-			}
-			f.routesByIP[srcIP] = route
-			route.assignedIP = srcIP
-		}
-		beQueue, ok = f.backendQueues[route.backendTunnelID]
-		if !ok {
-			f.mu.Unlock()
-			return ErrBackendNotFound
-		}
-		sID = route.sessionID
-		cID = route.connectionID
-		tbUp = route.tbUp
-		f.mu.Unlock()
-	} else {
-		beQueue, ok = f.backendQueues[route.backendTunnelID]
-		if !ok {
-			f.mu.RUnlock()
-			return ErrBackendNotFound
-		}
-		sID = route.sessionID
-		cID = route.connectionID
-		tbUp = route.tbUp
-		f.mu.RUnlock()
+		return ErrSpoofedSourceIP
 	}
+
+	beQueue, ok := f.backendQueues[route.backendTunnelID]
+	if !ok {
+		f.mu.RUnlock()
+		return ErrBackendNotFound
+	}
+	sID := route.sessionID
+	cID := route.connectionID
+	tbUp := route.tbUp
+	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
 	if tbUp != nil && !tbUp.Allow(pktLen) {
@@ -1010,22 +956,10 @@ func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan []byt
 	return ch, ok
 }
 
-// AttachClientDevice attaches a default client-facing packet device (e.g. TUN interface).
-func (f *Forwarder) AttachClientDevice(dev PacketDevice) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.defaultClientDev = dev
-}
-
-// AttachPeerDevice attaches a peer-specific packet device.
-func (f *Forwarder) AttachPeerDevice(peerKey string, dev PacketDevice) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if dev != nil {
-		f.clientDevices[peerKey] = dev
-	} else {
-		delete(f.clientDevices, peerKey)
-	}
+// RegisterSessionWithReturnPath registers a peer session route with a dedicated ReturnPath.
+func (f *Forwarder) RegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, path *ReturnPath) {
+	retirement, _ := f.TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, 0, 0, path)
+	retirement.Wait()
 }
 
 // AttachBackendDevice attaches a backend tunnel packet device.
@@ -1263,12 +1197,10 @@ func (f *Forwarder) DropsPacketTooLarge() uint64 {
 	return f.dropsPacketTooLarge.Load()
 }
 
-// inPortalSubnet reports whether ip belongs to the portal client pool.
+// InPortalSubnet reports whether ip belongs to the portal client pool.
 // Unparseable IPs and an unknown subnet both answer false (fail-closed).
-// Callers must hold f.mu (write) or accept a racy-but-constant read: the
-// field is set once at construction and never mutated.
-func (f *Forwarder) inPortalSubnet(ip string) bool {
-	if f.portalSubnet == nil {
+func (f *Forwarder) InPortalSubnet(ip string) bool {
+	if f == nil || f.portalSubnet == nil {
 		return false
 	}
 	parsed := net.ParseIP(ip)
@@ -1390,11 +1322,6 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		var dev packetWriter
 		if route.returnPath != nil {
 			dev = routeWriter{path: route.returnPath, peerKey: route.peerKey, assignedIP: route.assignedIP}
-		} else {
-			dev = f.clientDevices[route.peerKey]
-			if dev == nil {
-				dev = f.defaultClientDev
-			}
 		}
 		f.mu.RUnlock()
 		if dev != nil {
@@ -1413,9 +1340,9 @@ func (f *Forwarder) GetStats() (rx int64, tx int64, activeRoutes int) {
 	return
 }
 
-// ReturnRouteOwner returns the return route owner ("upstream", "custom", or "none")
-// based on currently registered active routes in the forwarder. If no routes are registered,
-// "none" is returned.
+// ReturnRouteOwner returns the return route owner ("upstream" or "none")
+// based on currently registered active routes in the forwarder. If at least one active,
+// non-stopped route has an open return path, "upstream" is returned. Otherwise, "none" is returned.
 func (f *Forwarder) ReturnRouteOwner() string {
 	if f == nil {
 		return "none"
@@ -1425,26 +1352,13 @@ func (f *Forwarder) ReturnRouteOwner() string {
 	if len(f.routesByPeer) == 0 {
 		return "none"
 	}
-	hasUpstream := false
-	hasCustom := false
 	for _, route := range f.routesByPeer {
 		if route.stopped {
 			continue
 		}
 		if route.returnPath != nil && !route.returnPath.Closed() {
-			hasUpstream = true
-		} else {
-			hasCustom = true
+			return "upstream"
 		}
-	}
-	if hasUpstream && !hasCustom {
-		return "upstream"
-	}
-	if hasCustom && !hasUpstream {
-		return "custom"
-	}
-	if hasUpstream && hasCustom {
-		return "mixed"
 	}
 	return "none"
 }

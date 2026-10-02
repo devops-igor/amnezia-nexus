@@ -68,10 +68,10 @@ func TestVPNSessionsHandler(t *testing.T) {
 		h.vpnSvc = vpnSvc
 
 		// Backend registered the way production persists it: a server row
-		// plus an active backend tunnel that Start() syncs into the pool.
-		// The backend data plane is an in-memory VirtualTUN (no SSH, no
-		// real network); ListenPort 0 makes the endpoint bind a random UDP
-		// port, and Stop() releases it.
+		// plus an active backend tunnel. Backend tunnels are synced into
+		// the memory pool via SyncBackendTunnelsForTest without binding
+		// a live UDP listener on port 51820, eliminating parallel test
+		// port collisions with internal/vpn.
 		sID, err := db.CreateServer(ctx, &models.Server{Name: "Edge Node 9", Host: "198.51.100.19"})
 		if err != nil {
 			t.Fatalf("CreateServer failed: %v", err)
@@ -86,13 +86,13 @@ func TestVPNSessionsHandler(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CreateBackendTunnel failed: %v", err)
 		}
-		if err := vpnSvc.Start(ctx); err != nil {
-			t.Fatalf("vpnSvc.Start failed: %v", err)
+		if err := vpnSvc.SyncBackendTunnelsForTest(ctx); err != nil {
+			t.Fatalf("vpnSvc.SyncBackendTunnelsForTest failed: %v", err)
 		}
 
-		sess, _, err := vpnSvc.HandleIncomingPeer(ctx, "peer-handler")
+		sess, _, err := vpnSvc.HandleIncomingPeerForTest(ctx, "peer-handler")
 		if err != nil {
-			t.Fatalf("HandleIncomingPeer failed: %v", err)
+			t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 		}
 		sess.RxBytes = 10
 		sess.TxBytes = 20
@@ -206,8 +206,8 @@ func TestVPNHandlers(t *testing.T) {
 		if err := json.NewDecoder(w.Body).Decode(&stat); err != nil {
 			t.Fatalf("failed to decode vpn status response: %v", err)
 		}
-		if stat.ConfiguredEngine != "custom" {
-			t.Errorf("expected configured_engine custom, got %q", stat.ConfiguredEngine)
+		if stat.ConfiguredEngine != "upstream" {
+			t.Errorf("expected configured_engine upstream, got %q", stat.ConfiguredEngine)
 		}
 		if stat.ActiveEngine != "none" {
 			t.Errorf("expected active_engine 'none' when not running, got %q", stat.ActiveEngine)
@@ -223,15 +223,15 @@ func TestVPNHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("VPNStatusHandler_UpstreamEngine", func(t *testing.T) {
-		if h.vpnSvc != nil {
-			_ = h.vpnSvc.SetClientAWGEngine("upstream")
-			defer func() { _ = h.vpnSvc.SetClientAWGEngine("custom") }()
-		}
+	t.Run("VPNStatusHandler_NilVPNService", func(t *testing.T) {
+		hNil := NewHandlers(Dependencies{
+			Config: h.cfg,
+			DB:     nil,
+		})
 
 		req := httptest.NewRequest(http.MethodGet, "/api/vpn/status", nil)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		hNil.VPNStatusHandler(w, req)
 
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
@@ -1197,8 +1197,8 @@ func TestVPNStatusHandler_ExposesRouteQueueDiagnostics(t *testing.T) {
 	if !ok || !avail {
 		t.Fatalf("expected forwarder_available true, got: %v", status["forwarder_available"])
 	}
-	if status["configured_engine"] != "custom" {
-		t.Fatalf("expected configured_engine custom, got: %v", status["configured_engine"])
+	if status["configured_engine"] != "upstream" {
+		t.Fatalf("expected configured_engine upstream, got: %v", status["configured_engine"])
 	}
 	if status["active_engine"] != "none" {
 		t.Fatalf("expected active_engine none when not running, got: %v", status["active_engine"])

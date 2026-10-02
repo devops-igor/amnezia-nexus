@@ -33,9 +33,9 @@ func TestRekeyFastPathRejectsAdminDisabledBackend(t *testing.T) {
 	}
 
 	// 1. Create a live session through the real admission path.
-	sess1, backend1, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess1, backend1, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err != nil {
-		t.Fatalf("initial HandleIncomingPeer failed: %v", err)
+		t.Fatalf("initial HandleIncomingPeerForTest failed: %v", err)
 	}
 	liveTunID := backend1.ID
 	liveSrvID := backend1.ServerID
@@ -75,9 +75,9 @@ func TestRekeyFastPathRejectsAdminDisabledBackend(t *testing.T) {
 	// session. The fast path must NOT reuse the administratively disabled
 	// backend; with no healthy alternative the call must fail with
 	// ErrNoActiveBackends instead of advancing the live session.
-	sess2, backend2, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess2, backend2, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err == nil {
-		t.Fatalf("expected HandleIncomingPeer to refuse reuse of admin-disabled backend %d, got session %s on backend %d", liveTunID, sess2.ID, backend2.ID)
+		t.Fatalf("expected HandleIncomingPeerForTest to refuse reuse of admin-disabled backend %d, got session %s on backend %d", liveTunID, sess2.ID, backend2.ID)
 	}
 	if !errors.Is(err, loadbalancer.ErrNoActiveBackends) {
 		t.Fatalf("expected ErrNoActiveBackends after fast path refusal, got: %v", err)
@@ -100,9 +100,6 @@ func TestRekeyFastPathRejectsAdminDisabledBackend(t *testing.T) {
 	}
 	if live.BackendTunnelID != liveTunID {
 		t.Errorf("live session moved to backend %d, want %d", live.BackendTunnelID, liveTunID)
-	}
-	if gen := svc.PeerGeneration(peerKey); gen != sess1.Generation {
-		t.Errorf("peer generation advanced by refused rekey: got %d, want %d", gen, sess1.Generation)
 	}
 
 	// 5. No new DB session row; the single row still references the disabled

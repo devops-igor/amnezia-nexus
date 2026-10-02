@@ -400,9 +400,6 @@ func TestUpstreamPeerLifecycleReapAndReadmissionE2E(t *testing.T) {
 	if !ok || resolverAfterReap != resolverBefore {
 		t.Fatalf("resolver record changed at reap: %+v -> %+v", resolverBefore, resolverAfterReap)
 	}
-	if gen := svc.PeerGeneration(lc.publicKey); gen != 0 {
-		t.Fatalf("reap advanced peerGenerations to %d, want 0", gen)
-	}
 
 	// Reset reap timeout to default before Phase 3 so the re-admitted session
 	// is not prematurely reaped while assertions and probe exchange run.
@@ -541,15 +538,6 @@ func TestUpstreamPeerSurvivesServiceRestart(t *testing.T) {
 	if err := started.UpdateConfig(ctx, startedCfg); err != nil {
 		t.Fatalf("pin restarted portal identity: %v", err)
 	}
-	started.mu.RLock()
-	legacyListener := started.endpoint
-	started.mu.RUnlock()
-	if legacyListener != nil {
-		_ = legacyListener.Stop()
-	}
-	started.mu.Lock()
-	started.endpoint = nil // never Start the legacy listener over the portal port
-	started.mu.Unlock()
 	// Suppress probing at the SOURCE, not by stopping the instance: Start
 	// runs ProbeAll + StartAfterInitialProbe on whatever s.prober points to
 	// (vpn.go: "if s.prober != nil"), and a Stop() before Start does not
@@ -602,15 +590,9 @@ func TestUpstreamPeerSurvivesServiceRestart(t *testing.T) {
 
 	// (b) The configured peer is reconstructed from durable state, not from
 	// any vpn_sessions row: resolver lease + portal identity, both durable.
-	freshEngine, err := started.NewIngressEngine(ctx, "restart-portal", []clientawg.Peer{
-		{PublicKey: peer.publicKey, AllowedIP: netip.PrefixFrom(ip, 32)},
-	})
-	if err != nil {
-		t.Fatalf("engine reconstruction from restarted service: %v", err)
-	}
-	t.Cleanup(func() { _ = freshEngine.Stop() })
-	if err := freshEngine.Start(); err != nil {
-		t.Fatal(err)
+	freshEngine := started.ingressEngine
+	if freshEngine == nil {
+		t.Fatal("expected ingressEngine to be initialized after Start")
 	}
 	ownership, ok := freshEngine.Resolver().Lookup(ip)
 	if !ok || ownership.PeerPublicKey != peer.publicKey {

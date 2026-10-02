@@ -941,8 +941,8 @@ func (s *peerSynchronizer) failClosedWithoutStatus(ctx context.Context, desired 
 //
 // Portal scope of a live session is resolved without the durable row when the
 // row can no longer answer: an ingress-admitted session is by construction an
-// ingress-engine peer, and a handshake-admitted session is classified against
-// its durable connection (server_id 0, awg) exactly as before. A handshake
+// ingress-engine peer, and a direct-admitted session is classified against
+// its durable connection (server_id 0, awg) exactly as before. A direct
 // session whose durable row is gone is NOT revoked here: it belongs to the
 // post-commit revoke path, which captured the identity before the delete
 // (issue #391 round 4b, finding 1).
@@ -953,7 +953,7 @@ func (s *peerSynchronizer) cleanupOrphanedRouting(ctx context.Context, desired m
 	// The durable portal-key set still contributes: it covers a live session
 	// whose peer is no longer desired while its row is still present (the
 	// toggle-to-disabled case) and keeps the classification authoritative
-	// for handshake-admitted sessions.
+	// for direct-admitted sessions.
 	portalKeys := make(map[string]struct{})
 	if s.db != nil {
 		assignments, err := s.db.GetVPNClientIPAssignments(ctx)
@@ -1009,7 +1009,7 @@ func (s *peerSynchronizer) cleanupOrphanedRouting(ctx context.Context, desired m
 // already appears in known (a portal durable connection is present) or is
 // ingress-admitted (the ingress engine only ever admits its own portal
 // peers, so this needs no durable row). Every other session — a regular
-// server peer, a legacy server tunnel, a handshake session whose row is gone
+// server peer, a legacy server tunnel, a direct session whose row is gone
 // — is left to its own lifecycle.
 func (s *peerSynchronizer) livePortalSessionKeys(ctx context.Context, known map[string]struct{}) (map[string]struct{}, error) {
 	if s.listActiveSessions == nil {
@@ -1028,7 +1028,7 @@ func (s *peerSynchronizer) livePortalSessionKeys(ctx context.Context, known map[
 			keys[sess.PeerPublicKey] = struct{}{}
 			continue
 		}
-		// Handshake-admitted with no known portal row: classify against
+		// Direct-admitted with no known portal row: classify against
 		// durable state, which is still authoritative for rows that exist.
 		if s.db == nil {
 			continue

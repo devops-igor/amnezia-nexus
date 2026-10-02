@@ -28,24 +28,14 @@ var ErrIngressEngineNotStarted = errors.New("ingress engine is not started")
 // service's real admission primitive (EnsureBackendSessionForIngress), and
 // the service's real session liveness.
 //
-// The engine also owns the upstream-mode idle reap driver (issue #390 part
-// 1): reapLoop runs SessionManager.CheckTimeouts on the engine's reap
-// cadence and hands each timed-out session to the service's provenance-
-// selected reapSession (routing-only for ingress-admitted sessions). The
-// custom listener's heartbeat keeps its own sweep — the two never run the
-// same session twice (CheckTimeouts removes a session exactly once), and
-// in the dormant-engine reality the listener remains the only sweeper. The
-// sweep's idle threshold is the reapIdleTimeoutFn field (issue #390 part
-// 2): it defaults to reapLoopIdleTimeout — the same 3-minute constant the
-// listener config is built with — and tests override it per engine.
+// The engine also owns the idle reap driver (issue #390): reapLoop runs
+// SessionManager.CheckTimeouts on the engine's reap cadence and hands each
+// timed-out session to the service's provenance-selected reapSession
+// (routing-only for ingress-admitted sessions). The sweep's idle threshold
+// is the reapIdleTimeoutFn field: it defaults to reapLoopIdleTimeout (3 minutes),
+// and tests can override it per engine.
 //
-// The engine is DORMANT by default: nothing in the production startup path
-// constructs or starts it. Engine ACTIVATION/canary/cutover/rollback is
-// #393; this type exists so activation has a real, callable component to
-// switch on instead of a test-only receive pump. The custom listener and its
-// handshake path are untouched — the engine runs ALONGSIDE them, sharing the
-// service's forwarder/sessions/pool with the same serialization regime.
-//
+// The engine is the active, permanent client-facing AWG data path in Nexus.
 // Shutdown is clean and idempotent: Stop terminates the receive loop first,
 // then closes the upstream device (which unblocks a receiver parked in
 // ReceiveOutbound through the engine-owned VirtualTUN closure), then waits
@@ -72,29 +62,24 @@ type IngressEngine struct {
 	returnPath     *forwarder.ReturnPath
 	returnCounters returnCounters
 
-	// reapIdleTimeoutFn is the upstream sweep's idle threshold (issue #390
-	// part 2 test seam). Production leaves it nil: sweepOnce then uses
-	// reapLoopIdleTimeout — the same 3-minute constant the service's
-	// listener config is built with. Tests assign it directly (same
-	// package) BEFORE Start, so the reap loop's reads are ordered by
-	// goroutine creation; the field is never written after Start.
+	// reapIdleTimeoutFn is the sweep's idle threshold test seam (issue #390).
+	// Production leaves it nil: sweepOnce then uses reapLoopIdleTimeout (3 minutes).
+	// Tests assign it directly (same package) BEFORE Start, so the reap loop's
+	// reads are ordered by goroutine creation; the field is never written after Start.
 	reapIdleTimeoutFn func(*Service) time.Duration
 
-	// reapInterval is the upstream-mode idle reap ticker cadence (issue #390
-	// part 2 test seam). Production leaves it 0: reapLoop then uses
-	// reapLoopInterval — the same 30s cadence as the custom listener's
-	// heartbeat. Like reapIdleTimeoutFn, tests assign it directly (same
-	// package) BEFORE Start; reapLoop reads it once at loop entry, and the
-	// field is never written after Start.
+	// reapInterval is the idle reap ticker cadence test seam (issue #390).
+	// Production leaves it 0: reapLoop then uses reapLoopInterval (30s).
+	// Like reapIdleTimeoutFn, tests assign it directly (same package) BEFORE
+	// Start; reapLoop reads it once at loop entry, and the field is never written after Start.
 	reapInterval     time.Duration
 	peerSyncInterval time.Duration
 	retireRoutes     func()
 	stopTimeout      time.Duration
 }
 
-// reapLoopInterval is the upstream-mode idle reap cadence. It mirrors the
-// custom listener's heartbeat interval (30s) so idle sessions are retired
-// with the same latency the transport path has always had.
+// reapLoopInterval is the idle reap cadence (30s) so idle sessions are retired
+// promptly without excessive CPU overhead.
 const reapLoopInterval = 30 * time.Second
 const peerSyncLoopInterval = 30 * time.Second
 
@@ -121,8 +106,7 @@ func (e *IngressEngine) reapLoopIntervalFor() time.Duration {
 // tunName labels the in-memory portal TUN. Peers is an optional compatibility
 // assertion for callers that supplied a startup list before #391; durable DB
 // connections now determine the actual peer set. The persisted listen port is
-// reused; the custom listener must NOT be running when the engine activates (#393
-// owns that cutover). Construction validates everything and closes owned
+// bound by the upstream device. Construction validates everything and closes owned
 // resources on failure; a constructed engine is Start-able.
 func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []clientawg.Peer) (*IngressEngine, error) {
 	if s == nil {
@@ -230,9 +214,7 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 	// Production classification (issue #389 rework 2): the forwarder's
 	// backend-reader filters reject malformed/unrouted replies before the
 	// write callback runs, so the engine folds those rejections into the
-	// same counters here. Exactly one engine exists per service (dormant
-	// until #393 activation); a second registration would re-target
-	// subsequent classifications to the newer engine.
+	// same counters here.
 	s.forwarder.SetReturnRejectClassifier(e.classifyForwarderReject)
 	e.router = ingress.NewRouterWithReturnPath(resolver, serviceIngressAdmission{svc: s, returnPath: e.returnPath}, s.forwarder, liveness, e.returnPath)
 	return e, nil
@@ -295,15 +277,12 @@ func (e *IngressEngine) Start() error {
 	return nil
 }
 
-// reapLoop is the upstream-mode idle reap driver (issue #390 part 1):
-// upstream-only operation has no listener heartbeat, so the engine sweeps
+// reapLoop is the idle reap driver (issue #390): the engine sweeps
 // SessionManager.CheckTimeouts on its own cadence and hands each timed-out
 // session to the service's provenance-selected reapSession — routing-only
-// teardown for ingress-admitted sessions, legacy teardown for anything the
-// handshake-era admission created (rollback safety). CheckTimeouts removes a
-// session from the live map exactly once, so the engine's sweep and the
-// custom listener's (both live only during a #394-adjacent overlap) never
-// reap the same session twice. The liveness throttle map is Forget-cleaned
+// teardown for ingress-admitted sessions, and standard teardown for
+// direct-admitted sessions. CheckTimeouts removes a session from the live
+// map exactly once. The liveness throttle map is Forget-cleaned
 // for each reaped peer so it does not retain dead peers.
 func (e *IngressEngine) reapLoop(stopCh <-chan struct{}, done chan<- struct{}) {
 	defer close(done)

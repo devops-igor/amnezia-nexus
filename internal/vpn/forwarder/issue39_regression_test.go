@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -8,7 +9,7 @@ import (
 
 // gatedDevice is a PacketDevice whose Write blocks until the device is
 // closed; it records every frame written to it. It models a slow downstream
-// consumer (e.g. SendToPeer blocked on a contended lock or a slow UDP write)
+// consumer (e.g. transport writer blocked on a contended lock or a slow UDP write)
 // that later recovers: closing the device opens the gate and releases any
 // in-flight Write, so StopPumps can always complete.
 type gatedDevice struct {
@@ -41,6 +42,7 @@ func (g *gatedDevice) count() int {
 func ipv4Packet(dst [4]byte) []byte {
 	pkt := make([]byte, 40)
 	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
 	pkt[16], pkt[17], pkt[18], pkt[19] = dst[0], dst[1], dst[2], dst[3]
 	return pkt
 }
@@ -57,9 +59,9 @@ func TestQueueFullRecoversAfterConsumerStall(t *testing.T) {
 
 	dev := newGatedDevice()
 	defer dev.Close() // runs before StopPumps: releases a blocked Write
-	f.AttachPeerDevice("peer-a", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 	f.StartPumps(t.Context())
-	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 
 	pkt := ipv4Packet([4]byte{10, 100, 0, 3})
 
@@ -111,13 +113,13 @@ func TestReregisteredRouteSurvivesLateUnregister(t *testing.T) {
 	dev := newGatedDevice()
 	defer dev.Close()
 	_ = dev.Close() // consumer healthy for the whole test
-	f.AttachPeerDevice("peer-a", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 	f.StartPumps(t.Context())
 
-	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 	// Rekey/reconnect: a new session for the same peer re-registers the route
 	// (RegisterSession stops the old pump and replaces the route objects).
-	f.RegisterSession("sess-2", "conn-2", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-2", "conn-2", "peer-a", "10.100.0.3", 1, path)
 	// The OLD session's teardown arrives late.
 	f.BeginUnregisterSession("peer-a", "sess-1").Wait()
 
@@ -150,8 +152,8 @@ func TestStaleRouteCannotCaptureReturnTraffic(t *testing.T) {
 	_ = newDev.Close()
 	f.StartPumps(t.Context())
 
-	f.AttachPeerDevice("peer-old", oldDev)
-	f.RegisterSession("sess-1", "conn-1", "peer-old", "10.100.0.7", 1)
+	oldPath := NewReturnPath(func(_, _ string, p []byte) (int, error) { return oldDev.Write(p) })
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-old", "10.100.0.7", 1, oldPath)
 
 	// Close the session (its route is unregistered)...
 	f.UnregisterSession("peer-old")
@@ -163,8 +165,8 @@ func TestStaleRouteCannotCaptureReturnTraffic(t *testing.T) {
 	}
 
 	// A NEW session (new peer key) reuses the same IP.
-	f.AttachPeerDevice("peer-new", newDev)
-	f.RegisterSession("sess-2", "conn-2", "peer-new", "10.100.0.7", 1)
+	newPath := NewReturnPath(func(_, _ string, p []byte) (int, error) { return newDev.Write(p) })
+	f.RegisterSessionWithReturnPath("sess-2", "conn-2", "peer-new", "10.100.0.7", 1, newPath)
 
 	// Return traffic must reach the NEW session only.
 	for i := 0; i < 10; i++ {
@@ -196,10 +198,10 @@ func TestRouteRegisteredBeforeStartPumpsGetsPump(t *testing.T) {
 	dev := newGatedDevice()
 	defer dev.Close()
 	_ = dev.Close()
-	f.AttachPeerDevice("peer-a", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 	// Registration happens BEFORE StartPumps (e.g. sessions restored from DB
 	// during startup, or StartPumps skipped by a failed partial start).
-	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 	f.StartPumps(t.Context())
 
 	if err := f.RouteBackendToClient(1, ipv4Packet([4]byte{10, 100, 0, 3}), "10.100.0.3"); err != nil {
@@ -226,9 +228,9 @@ func TestStalledRouteRecoversAfterStopStartPumps(t *testing.T) {
 	dev := newGatedDevice()
 	defer dev.Close()
 	_ = dev.Close()
-	f.AttachPeerDevice("peer-a", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 
-	f.RegisterSession("sess-1", "conn-1", "peer-a", "10.100.0.3", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 	f.StartPumps(t.Context())
 
 	// A service-level Stop/Start cycle (e.g. EnableVPN after UpdateConfig).

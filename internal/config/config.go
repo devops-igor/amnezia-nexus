@@ -23,12 +23,6 @@ const AppVersion = "2.0.0"
 // AppCodename represents the release codename of the current version.
 const AppCodename = "Zenith"
 
-// Client AWG engine options.
-const (
-	ClientAWGEngineCustom   = "custom"
-	ClientAWGEngineUpstream = "upstream"
-)
-
 // Paths represents the standard filesystem paths used by the application.
 type Paths struct {
 	DataDir   string
@@ -38,23 +32,22 @@ type Paths struct {
 
 // Config / AppConfig contains runtime configuration parameters for the application.
 type Config struct {
-	AppVersion      string
-	AppCodename     string
-	Paths           *Paths
-	Host            string
-	Port            int
-	DataDir         string
-	DBPath          string
-	SecretKey       string
-	TrustedProxies  []string
-	TrustedCIDRs    []*net.IPNet
-	TrustedIPs      []net.IP
-	LogLevel        string
-	CookieInsecure  bool
-	VPNEnabled      bool
-	VPNListenPort   int
-	VPNSubnet       string
-	ClientAWGEngine string
+	AppVersion     string
+	AppCodename    string
+	Paths          *Paths
+	Host           string
+	Port           int
+	DataDir        string
+	DBPath         string
+	SecretKey      string
+	TrustedProxies []string
+	TrustedCIDRs   []*net.IPNet
+	TrustedIPs     []net.IP
+	LogLevel       string
+	CookieInsecure bool
+	VPNEnabled     bool
+	VPNListenPort  int
+	VPNSubnet      string
 }
 
 // AppConfig is an alias for Config to match specification naming.
@@ -188,34 +181,28 @@ func LoadConfig() (*AppConfig, error) {
 		vpnSubnet = "10.100.0.0/16"
 	}
 
-	clientAWGEngine, err := resolveClientAWGEngine()
-	if err != nil {
-		return nil, err
-	}
-
 	secretKey, err := ResolveSecretKey(paths.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve secret key: %w", err)
 	}
 
 	return &Config{
-		AppVersion:      AppVersion,
-		AppCodename:     AppCodename,
-		Paths:           paths,
-		Host:            host,
-		Port:            port,
-		DataDir:         paths.DataDir,
-		DBPath:          paths.DBPath,
-		SecretKey:       secretKey,
-		TrustedProxies:  trustedProxies,
-		TrustedCIDRs:    trustedCIDRs,
-		TrustedIPs:      trustedIPs,
-		LogLevel:        logLevel,
-		CookieInsecure:  cookieInsecure,
-		VPNEnabled:      vpnEnabled,
-		VPNListenPort:   vpnListenPort,
-		VPNSubnet:       vpnSubnet,
-		ClientAWGEngine: clientAWGEngine,
+		AppVersion:     AppVersion,
+		AppCodename:    AppCodename,
+		Paths:          paths,
+		Host:           host,
+		Port:           port,
+		DataDir:        paths.DataDir,
+		DBPath:         paths.DBPath,
+		SecretKey:      secretKey,
+		TrustedProxies: trustedProxies,
+		TrustedCIDRs:   trustedCIDRs,
+		TrustedIPs:     trustedIPs,
+		LogLevel:       logLevel,
+		CookieInsecure: cookieInsecure,
+		VPNEnabled:     vpnEnabled,
+		VPNListenPort:  vpnListenPort,
+		VPNSubnet:      vpnSubnet,
 	}, nil
 }
 
@@ -243,20 +230,6 @@ func parseTrustedProxies(rawProxies string) ([]string, []*net.IPNet, []net.IP) {
 		}
 	}
 	return trustedProxies, trustedCIDRs, trustedIPs
-}
-
-func resolveClientAWGEngine() (string, error) {
-	rawEngine := os.Getenv("VPN_CLIENT_AWG_ENGINE")
-	clientAWGEngine := strings.ToLower(strings.TrimSpace(rawEngine))
-	if clientAWGEngine == "" {
-		clientAWGEngine = ClientAWGEngineCustom
-	}
-	switch clientAWGEngine {
-	case ClientAWGEngineCustom, ClientAWGEngineUpstream:
-		return clientAWGEngine, nil
-	default:
-		return "", fmt.Errorf("invalid client AWG engine %q: must be %q or %q", clientAWGEngine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
-	}
 }
 
 // LoadTranslations loads and caches all translation dictionaries from the embedded web FS.

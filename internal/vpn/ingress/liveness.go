@@ -7,19 +7,17 @@ import (
 )
 
 // TouchSessionThrottleSeconds is the minimum interval in seconds between
-// liveness refreshes for one peer. It mirrors the custom listener's
-// touchSessionThrottleSeconds (issue #294) so the ingress path costs the
-// SessionManager no more mutex contention than the transport path: under
-// sustained traffic at most one refresh per peer per window reaches the
-// SessionManager, and the packet hot path pays one atomic load.
+// liveness refreshes for one peer. It protects the SessionManager from mutex
+// contention: under sustained traffic at most one refresh per peer per window
+// reaches the SessionManager, and the packet hot path pays only one atomic load.
 const TouchSessionThrottleSeconds = 2
 
 // SessionLiveness adapts the SessionManager's TouchSession to the ingress
 // Liveness seam (issue #388): accepted plaintext refreshes the backend
 // routing session's in-memory LastSeen so active sessions survive the idle
-// reaper. Refreshes are throttled per peer with the same CAS-on-unix-seconds
-// pattern the listener's touchPeerSession uses (issue #294); 100 rapid
-// packets within one window collapse to at most a few SessionManager calls.
+// reaper. Refreshes are throttled per peer with a CAS-on-unix-nanos
+// pattern; rapid packets within one window collapse to at most a single
+// SessionManager call.
 //
 // A peer's throttle state lives in a small map of *atomic.Int64 guarded by
 // mu (the map is touched only when a peer's throttle entry is created or

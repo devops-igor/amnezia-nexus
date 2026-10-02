@@ -279,22 +279,27 @@ if require_non_netstack:
         fail("Non-netstack qualification teardown_requested (or teardown_trap_verified) is not true")
     info("Non-netstack Linux client qualification: PASS (handshake, tcp echo, udp echo, reconnect resilience, teardown registered)")
 
-# 6b. Dual-Engine Rollback Rehearsal Report
-rollback_rehearsal_file = os.path.join(artifacts_dir, "dual_engine_rollback_rehearsal.json")
+# 6b. Upstream Durability Rehearsal Report
+durability_file = os.path.join(artifacts_dir, "upstream_restart_durability.json")
+
 rollback_rehearsal = None
-if os.path.isfile(rollback_rehearsal_file):
-    rollback_rehearsal = load_json("dual_engine_rollback_rehearsal.json")
+if os.path.isfile(durability_file):
+    rollback_rehearsal = load_json("upstream_restart_durability.json")
+
+if rollback_rehearsal:
     if rollback_rehearsal.get("verdict") != "PASS":
-        fail(f"Dual-engine rollback rehearsal verdict is not PASS: {rollback_rehearsal.get('verdict')}")
+        fail(f"Upstream durability rehearsal verdict is not PASS: {rollback_rehearsal.get('verdict')}")
     if not rollback_rehearsal.get("config_hash_matched"):
-        fail("Dual-engine rollback rehearsal config hash mismatch across transitions")
+        fail("Upstream durability rehearsal config hash mismatch across transitions")
     if not rollback_rehearsal.get("db_integrity_verified"):
-        fail("Dual-engine rollback rehearsal DB integrity check failed")
-    for leg_name in ["leg1_custom", "leg2_upstream", "leg3_custom_rollback"]:
-        leg = rollback_rehearsal.get("legs", {}).get(leg_name, {})
+        fail("Upstream durability rehearsal DB integrity check failed")
+    legs = rollback_rehearsal.get("legs", {})
+    if not legs:
+        fail("Upstream durability rehearsal contains no legs")
+    for leg_name, leg in legs.items():
         if leg.get("status") not in ["PASS", "SKIPPED"]:
-            fail(f"Dual-engine rollback rehearsal leg {leg_name} status is invalid: {leg.get('status')}")
-    info("Dual-engine rollback rehearsal verified: PASS (custom -> upstream -> custom with exact same client config)")
+            fail(f"Upstream durability rehearsal leg {leg_name} status is invalid: {leg.get('status')}")
+    info("Upstream durability qualification verified: PASS (restarts with exact same client config)")
 
 # 7. Privacy Audit across all JSON artifacts in artifacts_dir
 home_pat = "/" + "home" + "/"

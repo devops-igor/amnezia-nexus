@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,7 +23,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/service"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
 func main() {
@@ -98,33 +96,19 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 		return false, false, nil
 	}
 
-	engine := cfg.ClientAWGEngine
-	if engine == "" {
-		engine = config.ClientAWGEngineCustom
-	}
-	if err := vpnSvc.SetClientAWGEngine(engine); err != nil {
-		return false, false, fmt.Errorf("failed to set client AWG engine: %w", err)
+	if err := vpnSvc.Start(ctx); err != nil {
+		return false, false, fmt.Errorf("failed to start VPN service: %w", err)
 	}
 
-	vpnSvc.RequireTunDevice()
-	stErr := vpnSvc.Start(ctx)
-	switch {
-	case stErr == nil:
-		// Log the port the service is actually configured to bind, not
-		// cfg.VPNListenPort (a hardcoded 51820 default when the env is
-		// unset - misleading, Issue #16).
-		boundPort := 0
-		if boundCfg, cfgErr := vpnSvc.GetConfig(ctx); cfgErr == nil && boundCfg != nil {
-			boundPort = boundCfg.ListenPort
-		}
-		slog.Info("VPN endpoint started", "engine", vpnSvc.ClientAWGEngine(), "listen_port", boundPort)
-		return true, true, nil
-	case errors.Is(stErr, endpoint.ErrTunUnavailable):
-		slog.Warn("VPN endpoint unavailable (no TUN device): running management-only", "err", stErr)
-		return false, true, nil
-	default:
-		return false, false, fmt.Errorf("failed to start VPN service: %w", stErr)
+	// Log the port the service is actually configured to bind, not
+	// cfg.VPNListenPort (a hardcoded 51820 default when the env is
+	// unset - misleading, Issue #16).
+	boundPort := 0
+	if boundCfg, cfgErr := vpnSvc.GetConfig(ctx); cfgErr == nil && boundCfg != nil {
+		boundPort = boundCfg.ListenPort
 	}
+	slog.Info("VPN endpoint started", "engine", "upstream", "listen_port", boundPort)
+	return true, true, nil
 }
 
 func run(ctx context.Context) error {

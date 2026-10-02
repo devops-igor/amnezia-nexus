@@ -117,12 +117,10 @@ func TestLifecycle_TransparentBackendMigration(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = engine.Stop() })
 
-	// Connect client to dest through b1
-	c1 := newReturnStreamClient(t, peer, saved, dest, 0x11)
+	// Connect client to dest through b1 with standard timing (rekey after 120s)
+	// so the 2-second test rekey timer does not trigger during migration.
+	c1 := newReturnStreamClientWithTiming(t, peer, saved, dest, 0x11, "rekey_after_time=120\nrekey_timeout=5\n")
 	defer func() { c1.dev.Close() }()
-	if err := c1.dev.IpcSet("rekey_after_time=120\nrekey_timeout=5\n"); err != nil {
-		t.Fatal(err)
-	}
 
 	// Send initial application traffic through Backend 1
 	payload1 := []byte("pre-migration-traffic-be1")
@@ -336,14 +334,7 @@ func TestLifecycle_EngineRestartWithStatePreservation(t *testing.T) {
 	if err := svc2.UpdateConfig(ctx, startedCfg); err != nil {
 		t.Fatalf("pin restarted portal identity: %v", err)
 	}
-	svc2.mu.RLock()
-	legacyListener := svc2.endpoint
-	svc2.mu.RUnlock()
-	if legacyListener != nil {
-		_ = legacyListener.Stop()
-	}
 	svc2.mu.Lock()
-	svc2.endpoint = nil
 	if svc2.backendDevices == nil {
 		svc2.backendDevices = make(map[int64]BackendDevice)
 	}

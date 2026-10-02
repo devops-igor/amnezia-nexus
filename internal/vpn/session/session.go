@@ -1,4 +1,4 @@
-package endpoint
+package session
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 )
 
 var (
@@ -51,6 +52,8 @@ type ReplacementPoolDelta struct {
 // replacements_total counts session replacements, and the paired
 // counter-migration / teardown-error counters show whether each replacement
 // actually moved the pool gauge or left drift behind.
+//
+//nolint:revive // Stutter is permitted to strictly adhere to task specification
 type SessionMetrics struct {
 	ReplacementsTotal                 atomic.Int64
 	ReplacementCounterMigrationsTotal atomic.Int64
@@ -69,10 +72,12 @@ func (m *SessionMetrics) snapshot() map[string]int64 {
 }
 
 // SessionManager tracks active VPN peer sessions in memory and SQLite.
+//
+//nolint:revive // Stutter is permitted to strictly adhere to task specification
 type SessionManager struct {
 	mu               sync.RWMutex
 	db               *database.DB
-	ipam             *IPAM
+	ipam             *ipam.IPAM
 	sessionsByPeer   map[string]*models.VPNSession // peerPublicKey -> session
 	sessionsByID     map[string]*models.VPNSession // sessionID -> session
 	activeCount      atomic.Int64
@@ -82,7 +87,7 @@ type SessionManager struct {
 }
 
 // NewSessionManager initializes a new VPN Session Manager.
-func NewSessionManager(db *database.DB, ipam *IPAM) *SessionManager {
+func NewSessionManager(db *database.DB, ipam *ipam.IPAM) *SessionManager {
 	return &SessionManager{
 		db:             db,
 		ipam:           ipam,
@@ -157,7 +162,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID, peerPublicK
 // serialization between concurrent CreateSession callers is required to
 // attribute the delta to the right call.
 func (sm *SessionManager) CreateSessionWithDelta(ctx context.Context, userID, peerPublicKey, assignedIP string, backendTunnelID int64, connectionName string, generation ...uint64) (*models.VPNSession, ReplacementPoolDelta, error) {
-	return sm.CreateSessionWithDeltaAndSource(ctx, userID, peerPublicKey, assignedIP, backendTunnelID, connectionName, models.SessionAdmissionHandshake, generation...)
+	return sm.CreateSessionWithDeltaAndSource(ctx, userID, peerPublicKey, assignedIP, backendTunnelID, connectionName, models.SessionAdmissionIngress, generation...)
 }
 
 // CreateSessionWithDeltaAndSource is CreateSessionWithDelta with explicit

@@ -114,7 +114,10 @@ func TestQualificationSubject_LifecycleAndConfigFreezing(t *testing.T) {
 	}
 }
 
-func TestQualificationSubject_RollbackTransitions(t *testing.T) {
+// TestQualificationSubject_Transitions verifies that:
+// 1. Specifying the obsolete "custom" engine is rejected fail-closed.
+// 2. Multi-stage restarts in upstream mode with ReuseDB preserve frozen client configs and readiness.
+func TestQualificationSubject_Transitions(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "panel_test.db")
 	configPath := filepath.Join(tempDir, "frozen-client.conf")
@@ -127,8 +130,8 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 	listenPort := socket.LocalAddr().(*net.UDPAddr).Port
 	_ = socket.Close()
 
-	// Step 1: Start Leg 1 in Custom Engine Mode
-	cfg1 := QualificationSubjectConfig{
+	// Step 0: Custom engine must fail closed
+	cfgCustom := QualificationSubjectConfig{
 		DBPath:           dbPath,
 		FrozenConfigPath: configPath,
 		ReadyPath:        readyPath,
@@ -137,15 +140,30 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 		UnderlayHostIP:   "10.254.250.1",
 		DestinationIP:    "10.100.0.1",
 		Engine:           "custom",
+	}
+	if _, err := NewQualificationSubject(cfgCustom); err == nil {
+		t.Fatal("expected error requesting custom engine on QualificationSubject, got nil")
+	}
+
+	// Step 1: Start Leg 1 in Upstream Engine Mode (fresh DB)
+	cfg1 := QualificationSubjectConfig{
+		DBPath:           dbPath,
+		FrozenConfigPath: configPath,
+		ReadyPath:        readyPath,
+		ListenPort:       listenPort,
+		EchoPort:         40001,
+		UnderlayHostIP:   "10.254.250.1",
+		DestinationIP:    "10.100.0.1",
+		Engine:           "upstream",
 		ReuseDB:          false,
 	}
 
 	sub1, err := NewQualificationSubject(cfg1)
 	if err != nil {
-		t.Fatalf("NewQualificationSubject custom failed: %v", err)
+		t.Fatalf("NewQualificationSubject upstream leg 1 failed: %v", err)
 	}
-	if !sub1.Service().IsRunning() {
-		t.Error("expected sub1 service to be running in custom mode")
+	if sub1.Engine() == nil {
+		t.Error("expected sub1 IngressEngine to be initialized")
 	}
 
 	confBytes1, err := os.ReadFile(configPath)
@@ -160,15 +178,15 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 	if err := json.Unmarshal(readyBytes1, &ready1); err != nil {
 		t.Fatalf("unmarshal ready 1: %v", err)
 	}
-	if ready1["engine"] != "custom" {
-		t.Errorf("leg 1 ready engine = %v, want custom", ready1["engine"])
+	if ready1["engine"] != "upstream" {
+		t.Errorf("leg 1 ready engine = %v, want upstream", ready1["engine"])
 	}
 
 	if err := sub1.Stop(); err != nil {
 		t.Fatalf("sub1.Stop failed: %v", err)
 	}
 
-	// Step 2: Start Leg 2 in Upstream Engine Mode with ReuseDB = true
+	// Step 2: Restart Leg 2 in Upstream Engine Mode with ReuseDB = true
 	cfg2 := QualificationSubjectConfig{
 		DBPath:           dbPath,
 		FrozenConfigPath: configPath,
@@ -183,7 +201,7 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 
 	sub2, err := NewQualificationSubject(cfg2)
 	if err != nil {
-		t.Fatalf("NewQualificationSubject upstream with ReuseDB failed: %v", err)
+		t.Fatalf("NewQualificationSubject upstream with ReuseDB leg 2 failed: %v", err)
 	}
 	if sub2.Engine() == nil {
 		t.Error("expected sub2 IngressEngine to be initialized")
@@ -194,7 +212,7 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 		t.Fatalf("read frozen-client.conf leg 2: %v", err)
 	}
 	if string(confBytes1) != string(confBytes2) {
-		t.Fatal("frozen-client.conf mutated during transition to upstream")
+		t.Fatal("frozen-client.conf mutated during restart to upstream leg 2")
 	}
 
 	readyBytes2, err := os.ReadFile(readyPath)
@@ -213,7 +231,7 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 		t.Fatalf("sub2.Stop failed: %v", err)
 	}
 
-	// Step 3: Start Leg 3 in Custom Engine Mode (Rollback) with ReuseDB = true
+	// Step 3: Restart Leg 3 in Upstream Engine Mode with ReuseDB = true
 	cfg3 := QualificationSubjectConfig{
 		DBPath:           dbPath,
 		FrozenConfigPath: configPath,
@@ -222,16 +240,16 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 		EchoPort:         40001,
 		UnderlayHostIP:   "10.254.250.1",
 		DestinationIP:    "10.100.0.1",
-		Engine:           "custom",
+		Engine:           "upstream",
 		ReuseDB:          true,
 	}
 
 	sub3, err := NewQualificationSubject(cfg3)
 	if err != nil {
-		t.Fatalf("NewQualificationSubject custom rollback with ReuseDB failed: %v", err)
+		t.Fatalf("NewQualificationSubject upstream with ReuseDB leg 3 failed: %v", err)
 	}
-	if !sub3.Service().IsRunning() {
-		t.Error("expected sub3 service to be running in custom rollback mode")
+	if sub3.Engine() == nil {
+		t.Error("expected sub3 IngressEngine to be initialized")
 	}
 
 	confBytes3, err := os.ReadFile(configPath)
@@ -239,7 +257,7 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 		t.Fatalf("read frozen-client.conf leg 3: %v", err)
 	}
 	if string(confBytes1) != string(confBytes3) {
-		t.Fatal("frozen-client.conf mutated during rollback to custom")
+		t.Fatal("frozen-client.conf mutated during restart to upstream leg 3")
 	}
 
 	readyBytes3, err := os.ReadFile(readyPath)
@@ -250,8 +268,8 @@ func TestQualificationSubject_RollbackTransitions(t *testing.T) {
 	if err := json.Unmarshal(readyBytes3, &ready3); err != nil {
 		t.Fatalf("unmarshal ready 3: %v", err)
 	}
-	if ready3["engine"] != "custom" {
-		t.Errorf("leg 3 ready engine = %v, want custom", ready3["engine"])
+	if ready3["engine"] != "upstream" {
+		t.Errorf("leg 3 ready engine = %v, want upstream", ready3["engine"])
 	}
 
 	if err := sub3.Stop(); err != nil {

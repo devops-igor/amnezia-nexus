@@ -7,7 +7,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
 // regression_deletion_test.go pins the two round-4b deletion-path invariants:
@@ -66,14 +65,13 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 	}
 	survivorIP, _ := survivorConn.ClientParams["assigned_ip"].(string)
 
-	// Real established legacy portal sessions: handshake admission, live
-	// transport state in the endpoint listener, registered forwarder routes
+	// Real established portal sessions: direct admission, registered forwarder routes
 	// and live backend allocations.
-	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userID, peerKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionHandshake)
+	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userID, peerKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
-	survivorSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, survivorConnID), survivorKey, survivorIP, backend.ID, survivorConn.Name, models.SessionAdmissionHandshake)
+	survivorSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, survivorConnID), survivorKey, survivorIP, backend.ID, survivorConn.Name, models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +89,6 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 			r.Wait()
 		}
 	}
-	keys := &endpoint.TransportKeys{LocalIndex: 61111, SendKey: make([]byte, 32), RecvKey: make([]byte, 32)}
-	svc.endpoint.StoreTransportKeysForTest(peerKey, keys, sess.ID)
 	if _, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerKey); !ok {
 		t.Fatal("setup: live session missing")
 	}
@@ -115,9 +111,6 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 	}
 	if route := svc.forwarder.RouteSessionID(peerKey); route != "" {
 		t.Fatalf("deleted user's session kept its forwarder route: %q", route)
-	}
-	if cur, _ := svc.endpoint.PeerKeypairsForTest(peerKey); cur != nil {
-		t.Fatalf("deleted user's session kept its legacy transport state: %+v", cur)
 	}
 	after, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil || after.ActiveConnections != 1 {
@@ -309,11 +302,11 @@ func TestRegressionDeletionPathsSpareForeignSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-peer", "10.100.9.11", backend.ID, "server peer", models.SessionAdmissionHandshake)
+	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-peer", "10.100.9.11", backend.ID, "server peer", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-tunnel", "10.100.9.12", backend.ID, "server tunnel", models.SessionAdmissionHandshake)
+	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-tunnel", "10.100.9.12", backend.ID, "server tunnel", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}

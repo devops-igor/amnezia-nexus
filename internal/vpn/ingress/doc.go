@@ -4,24 +4,22 @@
 //
 // # Data path
 //
-//	upstream client engine (amneziawg-go device, one per client)
+//	upstream client engine (amneziawg-go device)
 //	  |  UDP datagrams: authenticated, decrypted
 //	clientawg.ClientAWGDevice (portal role, owns one VirtualTUN)
 //	  |  ReceiveOutbound: authenticated plaintext IPv4
 //	ingress.Router.HandlePacket
 //	  |-- Resolver.Lookup(src)        durable assigned-IP -> ownership
 //	  |-- Admission.EnsureSession     lazy admission, once per live route;
-//	  |                               production wiring adapts
-//	  |                               vpn.Service.HandleIncomingPeer (#393),
-//	  |                               reusing its #86 serialization and
+//	  |                               wired to Service.EnsureBackendSessionForIngress,
+//	  |                               with capacity serialization and
 //	  |                               rekey-stable live-session reuse
 //	  '-- forwarder.Forwarder         route registration + RouteClientToBackend
 //
 // Upstream AllowedIPs enforcement is the first ownership fence: the engine
 // only delivers plaintext whose source matches the peer's leased /32. The
 // router's own checks are the second fence and never mutate a route to
-// "self-heal" a divergent packet (issue #89's rebind exists only on the
-// legacy custom-listener path, untouched until #393).
+// self-heal a divergent packet.
 //
 // # Components
 //
@@ -110,15 +108,9 @@
 //
 // # Wiring status
 //
-// The production integration EXISTS as of issue #388 Rework B and lives in
-// package vpn: Service.EnsureBackendSessionForIngress is the dedicated
-// admission primitive (NOT an adaptation of the custom listener's
-// HandleIncomingPeer, which keeps its handshake-era side effects for the
-// legacy path until #394), and Service.NewIngressEngine owns the upstream
-// chain clientawg.ClientAWGDevice -> receive loop -> Router -> this
-// Admission -> strict forwarder path, wired to the service's real forwarder
-// and SessionLiveness. The engine is DORMANT: nothing in the production
-// startup path constructs or starts it. Engine ACTIVATION, canary,
-// cutover, and rollback are #393's scope. The custom listener and its
-// handshake path are unchanged and keep serving the legacy path.
+// The upstream amneziawg-go engine is the permanent, active client-facing AWG
+// runtime engine in Nexus. Service.EnsureBackendSessionForIngress is the dedicated
+// admission primitive, and Service.NewIngressEngine owns the upstream chain:
+// clientawg.ClientAWGDevice -> receive loop -> Router -> Admission -> strict
+// forwarder path, wired to the service's real forwarder and SessionLiveness.
 package ingress

@@ -24,9 +24,12 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -84,9 +87,8 @@ type UserVPNState struct {
 	LatencyMS       int64              `json:"latency_ms,omitempty"`
 }
 
-// Client AWG engines.
+// Client AWG engines. Upstream is the sole, permanent client-facing engine.
 const (
-	ClientAWGEngineCustom   = "custom"
 	ClientAWGEngineUpstream = "upstream"
 )
 
@@ -152,36 +154,26 @@ type BackendDevice interface {
 // check-then-allocate capacity decision is only safe under this
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
-	mu              sync.RWMutex
-	assignmentMu    sync.Mutex // serialize durable lease creation and restart migration
-	db              *database.DB
-	cfg             *models.VPNConfig
-	endpoint        *endpoint.Listener
-	sessionMgr      *endpoint.SessionManager
-	ipam            *endpoint.IPAM
-	auth            *endpoint.DBAuthenticator
-	pool            *tunnel.Pool
-	prober          *tunnel.HealthProber
-	reconnectMgr    *tunnel.ReconnectManager
-	balancer        loadbalancer.LoadBalancer
-	stickyMgr       *loadbalancer.StickySessionManager
-	forwarder       *forwarder.Forwarder
-	accountant      *forwarder.TrafficAccountant
-	running         bool
-	portalPubKey    string
-	portalPrivKey   string
-	awgProvider     AWGStatusProvider
-	clientAWGEngine string
-	ingressEngine   *IngressEngine
-	// requireTun switches Start to the real Linux TUN data plane (production
-	// mode; cmd opts in via RequireTunDevice when VPN_ENABLED). tunOpener is
-	// the injectable device constructor used by tests to prove the
-	// management-mode (TUN-unavailable) contract hermetically. tunDev is the
-	// attached client-facing device; backendDevices holds the per-backend UDP
-	// devices created by EnableBackend.
-	requireTun                 bool
-	tunOpener                  func() (endpoint.PacketDevice, error)
-	tunDev                     endpoint.PacketDevice
+	mu            sync.RWMutex
+	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
+	db            *database.DB
+	cfg           *models.VPNConfig
+	sessionMgr    *session.SessionManager
+	ipam          *ipam.IPAM
+	auth          *auth.DBAuthenticator
+	pool          *tunnel.Pool
+	prober        *tunnel.HealthProber
+	reconnectMgr  *tunnel.ReconnectManager
+	balancer      loadbalancer.LoadBalancer
+	stickyMgr     *loadbalancer.StickySessionManager
+	forwarder     *forwarder.Forwarder
+	accountant    *forwarder.TrafficAccountant
+	running       bool
+	portalPubKey  string
+	portalPrivKey string
+	awgProvider   AWGStatusProvider
+	ingressEngine *IngressEngine
+	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices             map[int64]BackendDevice
 	backendDeviceEndpoints     map[int64]string
 	lastLoggedDrops            atomic.Uint64
@@ -197,7 +189,6 @@ type Service struct {
 
 	lastReconcileTime                      time.Time
 	lastReconcileByTunnel                  map[int64]time.Time
-	peerGenerations                        map[string]uint64
 	reconcilePostSnapshotHook              func()
 	reconcilePreApplyHook                  func()
 	reconcilePreCommitHook                 func()
@@ -211,6 +202,7 @@ type Service struct {
 	updateBackendServerHostErr             error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
+	reaperHook                             func(context.Context, *models.VPNSession)
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -526,26 +518,26 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		return nil, err
 	}
 
-	ipam, err := endpoint.NewIPAM(cfg.SubnetCIDR)
+	ipamMgr, err := ipam.NewIPAM(cfg.SubnetCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init IPAM: %w", err)
 	}
 	// Config generation is also available before Start. Load both persisted
 	// client leases and legacy session-only leases before exposing this service.
 	if db != nil {
-		if err := reservePersistedClientIPs(context.Background(), db, ipam); err != nil {
+		if err := reservePersistedClientIPs(context.Background(), db, ipamMgr); err != nil {
 			return nil, fmt.Errorf("restore client IP assignments: %w", err)
 		}
 	}
 
-	var auth *endpoint.DBAuthenticator
+	var dbAuth *auth.DBAuthenticator
 	if db != nil {
-		auth = endpoint.NewDBAuthenticator(db)
+		dbAuth = auth.NewDBAuthenticator(db)
 	}
 
-	sessionMgr := endpoint.NewSessionManager(db, ipam)
+	sessionMgr := session.NewSessionManager(db, ipamMgr)
 
-	serverKeys := endpoint.NewServerKeysManager(db)
+	serverKeys := identity.NewServerKeysManager(db)
 
 	// Finding 3 (issue #391 round 4a): committed durable access revocations
 	// tear down live sessions immediately, engine-aware, instead of waiting
@@ -556,30 +548,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	revokeDispatch := newRevokeDispatcher()
 	if db != nil {
 		db.SubscribePeerRevokes(revokeDispatch)
-	}
-
-	listenerCfg := endpoint.ListenerConfig{
-		ListenPort:  cfg.ListenPort,
-		SubnetCIDR:  cfg.SubnetCIDR,
-		MTU:         1420,
-		IdleTimeout: 3 * time.Minute,
-		// RejectAfterTime defaults to device.RejectAfterTime (180s WireGuard protocol standard)
-		// when zero, providing a stable transition window intentionally independent of client-configured
-		// timing ranges.
-		HeaderProtectionKey: cfg.HeaderProtectionKey,
-		H1:                  cfg.H1,
-		S1:                  cfg.S1,
-		H2:                  cfg.H2,
-		S2:                  cfg.S2,
-		H3:                  cfg.H3,
-		S3:                  cfg.S3,
-		H4:                  cfg.H4,
-		S4:                  cfg.S4,
-	}
-
-	epListener, err := endpoint.NewListener(listenerCfg, db, auth, ipam, sessionMgr, serverKeys)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init endpoint listener: %w", err)
 	}
 
 	pool := tunnel.NewPool(db)
@@ -644,22 +612,12 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		cfg.ServerPublicKey = pub
 	}
 
-	rawEngine := os.Getenv("VPN_CLIENT_AWG_ENGINE")
-	engine := strings.ToLower(strings.TrimSpace(rawEngine))
-	if engine == "" {
-		engine = ClientAWGEngineCustom
-	}
-	if engine != ClientAWGEngineCustom && engine != ClientAWGEngineUpstream {
-		return nil, fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
-	}
-
 	svc := &Service{
 		db:                     db,
 		cfg:                    cfg,
-		endpoint:               epListener,
 		sessionMgr:             sessionMgr,
-		ipam:                   ipam,
-		auth:                   auth,
+		ipam:                   ipamMgr,
+		auth:                   dbAuth,
 		pool:                   pool,
 		prober:                 prober,
 		reconnectMgr:           reconnectMgr,
@@ -669,15 +627,11 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		accountant:             accountant,
 		portalPubKey:           pub,
 		portalPrivKey:          priv,
-		clientAWGEngine:        engine,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
-		peerGenerations:        make(map[string]uint64),
 	}
 	revokeDispatch.bind(svc)
 
-	epListener.SetIncomingPeerHandler(svc.HandleIncomingPeer)
-	epListener.SetClientPacketRouter(fwd.RouteClientToBackend)
 	// Finding 3 (issue #391 round 4a): committed durable access revocations
 	// tear down live sessions immediately, engine-aware, instead of waiting
 	// for the reconciliation worker or the idle reaper. Service implements
@@ -691,9 +645,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// Issue #78: session replacement (client rekey/reconnect) must migrate the
 	// pool connection counter off the old backend - without this every rekey
 	// leaked +1 on the old backend's ActiveConnections gauge (the original
-	// connect incremented it in HandleIncomingPeer; the replacement path never
-	// decremented, and a later DisconnectSession(oldID) found nothing because
-	// the SessionManager had already dropped the old ID and closed the DB row).
+	// connect incremented it; the replacement path never decremented, and a
+	// later DisconnectSession(oldID) found nothing because the SessionManager
+	// had already dropped the old ID and closed the DB row).
 	// The hook uses the same pool primitives as the clean-disconnect
 	// mirror-decrement paths (DisconnectUser/DisconnectSession/ReleaseClient).
 	// SessionManager owns the ordering: CreateSession removes the old session
@@ -703,13 +657,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	// forwarder/sticky state - it must never re-enter the session manager.
 	// Capacity serialization note (issue #86): the hook's pool counter
 	// migration therefore participates in the capacity invariant only
-	// transitively - CreateSession's only production call site today is
-	// HandleIncomingPeer, which holds s.mu for the whole select ->
-	// CreateSession -> increment sequence, so the hook in fact runs nested
+	// transitively - EnsureBackendSessionForIngress holds s.mu for the whole
+	// select -> CreateSession -> increment sequence, so the hook runs nested
 	// under BOTH locks (s.mu -> sm.mu; the reverse order is never taken).
-	// If a CreateSession call site outside s.mu is ever added, the hook
-	// escapes the capacity serialization regime and the contract on
-	// tunnel.Pool.IncrementConnections must be re-evaluated.
 	// Old and new backends may differ when the reconnect re-selected a backend.
 	sessionMgr.SetReplacementHook(func(ctx context.Context, old, new *models.VPNSession) {
 		if old == nil {
@@ -723,7 +673,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 				old.PeerPublicKey, old.BackendTunnelID)
 			return
 		}
-		// Mirror HandleIncomingPeer's increment on the same primitives used by
+		// Mirror admission increment on the same primitives used by
 		// DisconnectUser/DisconnectSession/ReleaseClient for the decrement.
 		svc.pool.DecrementConnections(old.BackendTunnelID)
 		if new.BackendTunnelID != old.BackendTunnelID {
@@ -737,16 +687,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		if svc.stickyMgr != nil {
 			svc.stickyMgr.AssignPeerAffinity(old.PeerPublicKey, new.BackendTunnelID)
 		}
-	})
-	// Idle-timeout reaper: run teardown directly on the reaped session
-	// (forwarder route, pool counter, sticky affinity). CheckTimeouts has
-	// already closed and removed the session from sessionMgr, so we must not
-	// call DisconnectSession (which looks up the session by ID and fails).
-	epListener.SetSessionReaperHook(func(ctx context.Context, sess *models.VPNSession) {
-		svc.reapSession(ctx, sess)
-	})
-	epListener.SetPostSweepHook(func(ctx context.Context) {
-		svc.PruneExpiredAffinity()
 	})
 
 	svc.prober.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
@@ -801,13 +741,6 @@ func (s *Service) SetBackendDeviceEndpointForTest(tunID int64, endpoint string) 
 		s.backendDeviceEndpoints = make(map[int64]string)
 	}
 	s.backendDeviceEndpoints[tunID] = endpoint
-}
-
-// SetTunOpener overrides the TUN device opener for testing.
-func (s *Service) SetTunOpener(fn func() (endpoint.PacketDevice, error)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tunOpener = fn
 }
 
 // SetReconcilePostSnapshotHook registers a test hook called immediately after
@@ -1039,23 +972,6 @@ func (s *Service) HasAWGStatusProvider() bool {
 	return s.awgProvider != nil
 }
 
-// RequireTunDevice switches Start to the real Linux TUN data plane: when the
-// TUN device cannot be opened, Start fails with an error chain wrapping
-// endpoint.ErrTunUnavailable so callers can degrade to management-only mode
-// instead of silently running without the data plane.
-func (s *Service) RequireTunDevice() {
-	s.mu.Lock()
-	s.requireTun = true
-	s.tunOpener = defaultLinuxTunOpener
-	s.mu.Unlock()
-}
-
-// defaultLinuxTunOpener opens the production client-facing Linux TUN device
-// ("awg0", MTU 1420). Its errors wrap endpoint.ErrTunUnavailable.
-func defaultLinuxTunOpener() (endpoint.PacketDevice, error) {
-	return endpoint.OpenTunDevice("awg0", 1420)
-}
-
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
 	for _, tun := range s.pool.ListTunnels() {
@@ -1096,15 +1012,6 @@ func (s *Service) Start(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
-	engine := s.clientAWGEngine
-	if engine == "" {
-		engine = ClientAWGEngineCustom
-	}
-	if err := s.validateEngineStartupLocked(engine); err != nil {
-		s.mu.Unlock()
-		return err
-	}
-
 	s.running = true
 	s.mu.Unlock()
 
@@ -1164,30 +1071,13 @@ func (s *Service) Start(ctx context.Context) error {
 	// not fail if reconciliation errors.
 	s.reconcileConnectionCounts(ctx)
 
-	// 3. Client-facing TUN device (production data plane). When required
-	// (RequireTunDevice) and the TUN device cannot be opened, abort
-	// data-plane startup and fail with an error chain wrapping
-	// endpoint.ErrTunUnavailable -- the panel continues management-only.
-	//
-	// CRITICAL INVARIANT: In upstream mode, do NOT open or attach the legacy
-	// client-facing Linux TUN device. IngressEngine owns VirtualTUN and ReturnPath;
-	// retaining a legacy default client device would create an unwanted fallback surface.
-	if engine == ClientAWGEngineCustom {
-		if err := s.startLegacyClientTun(); err != nil {
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
-			return err
-		}
-	}
-
-	// 4. Start forwarder & accountant
+	// 3. Start forwarder & accountant
 	if s.forwarder != nil {
 		s.forwarder.Start(ctx)
 		s.forwarder.StartPumps(ctx)
 	}
 
-	// 5. Establish fresh backend health before accepting client traffic.
+	// 4. Establish fresh backend health before accepting client traffic.
 	// ResetEnabledHealthForStartup intentionally made every enabled backend
 	// unroutable ("connecting"). Run one synchronous sweep here so the endpoint
 	// cannot accept a handshake in the window before the prober goroutine's
@@ -1200,56 +1090,19 @@ func (s *Service) Start(ctx context.Context) error {
 		s.reconnectMgr.Start(ctx)
 	}
 
-	// 6. Start active client AWG engine (mutually exclusive)
-	if engine == ClientAWGEngineCustom {
-		if err := s.startCustomClientEngine(ctx); err != nil {
-			return err
-		}
-	} else if engine == ClientAWGEngineUpstream {
-		if err := s.startUpstreamClientEngine(ctx); err != nil {
-			return err
-		}
+	// 5. Start active client AWG engine (upstream-only)
+	if err := s.startUpstreamClientEngine(ctx); err != nil {
+		return err
 	}
 
 	listenPort := s.resolveActiveListenPort(ctx)
-	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", engine, listenPort)
+	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", ClientAWGEngineUpstream, listenPort)
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
 	// Safety net for residual counter drift; gauge-only semantics — it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
 
-	return nil
-}
-
-func (s *Service) validateEngineStartupLocked(engine string) error {
-	if engine != ClientAWGEngineCustom && engine != ClientAWGEngineUpstream {
-		return fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
-	}
-	if engine == ClientAWGEngineUpstream {
-		if s.endpoint != nil && s.endpoint.IsRunning() {
-			return errors.New("cannot start upstream ingress engine: custom endpoint listener is already running")
-		}
-	} else {
-		if s.ingressEngine != nil && s.ingressEngine.Running() {
-			return errors.New("cannot start custom endpoint listener: upstream ingress engine is already running")
-		}
-	}
-	return nil
-}
-
-func (s *Service) startLegacyClientTun() error {
-	if !s.requireTun || s.tunOpener == nil {
-		return nil
-	}
-	dev, tunErr := s.tunOpener()
-	if tunErr != nil {
-		return fmt.Errorf("failed to open tun device: %w", tunErr)
-	}
-	s.tunDev = dev
-	if s.forwarder != nil {
-		s.forwarder.AttachClientDevice(dev)
-	}
 	return nil
 }
 
@@ -1263,27 +1116,9 @@ func (s *Service) cleanupEngineStartupFailure() {
 	if s.forwarder != nil {
 		_ = s.forwarder.Stop()
 	}
-	if s.tunDev != nil {
-		_ = s.tunDev.Close()
-		s.tunDev = nil
-	}
 	s.mu.Lock()
 	s.running = false
 	s.mu.Unlock()
-}
-
-func (s *Service) startCustomClientEngine(ctx context.Context) error {
-	if s.endpoint == nil {
-		return nil
-	}
-	s.endpoint.SetPostSweepHook(func(ctx context.Context) {
-		s.PruneExpiredAffinity()
-	})
-	if err := s.endpoint.Start(ctx); err != nil {
-		s.cleanupEngineStartupFailure()
-		return fmt.Errorf("failed to start endpoint listener: %w", err)
-	}
-	return nil
 }
 
 func (s *Service) startUpstreamClientEngine(ctx context.Context) error {
@@ -1412,13 +1247,13 @@ func resolvePeerClaims(ctx context.Context, db *database.DB, claims []database.V
 	return active, nil
 }
 
-func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
+func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM, peerKey string, claims []database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
 	// If several durable rows share this peer identity and the peer as a whole
 	// must be quarantined, retire the duplicated keypair on every row. Keeping
 	// the shared client_id would make post-regeneration authentication depend on
 	// whichever duplicate row GetConnectionByClientID happens to return.
 	retireKeypair := len(claims) > 1
-	if current, ok := ipam.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
+	if current, ok := ipamMgr.GetAssignedIP(peerKey); ok && !current.Equal(ip) {
 		for _, c := range claims {
 			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 				return err
@@ -1427,11 +1262,11 @@ func reserveSinglePeerForIP(ctx context.Context, db *database.DB, ipam *endpoint
 		}
 		return nil
 	}
-	if err := ipam.Reserve(ip, peerKey); err != nil {
-		if errors.Is(err, endpoint.ErrIPNotInSubnet) || errors.Is(err, endpoint.ErrIPReserved) {
+	if err := ipamMgr.Reserve(ip, peerKey); err != nil {
+		if errors.Is(err, ipam.ErrIPNotInSubnet) || errors.Is(err, ipam.ErrIPReserved) {
 			return nil
 		}
-		if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 			for _, c := range claims {
 				if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireKeypair); err != nil {
 					return err
@@ -1451,7 +1286,7 @@ type candidatePeer struct {
 	allClaims []database.VPNClientIPAssignment
 }
 
-func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *endpoint.IPAM, peersForIP map[string][]database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
+func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM, peersForIP map[string][]database.VPNClientIPAssignment, ip net.IP, ipStr string) error {
 	peerKeys := make([]string, 0, len(peersForIP))
 	for pKey := range peersForIP {
 		peerKeys = append(peerKeys, pKey)
@@ -1491,7 +1326,7 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	retireWinnerKeypair := len(winner.allClaims) > 1
 
 	// Reserve winner in IPAM
-	if current, ok := ipam.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
+	if current, ok := ipamMgr.GetAssignedIP(winner.peerKey); ok && !current.Equal(ip) {
 		for _, c := range winner.allClaims {
 			if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 				return err
@@ -1499,9 +1334,9 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 			log.Printf("[vpn] warning: connection %s (user %s, peer %s) has conflicting persisted address %s (already assigned %s); quarantined conflicting lease (requires config regeneration)", c.ConnectionID, c.UserID, c.PeerKey, ipStr, current)
 		}
 	} else {
-		if err := ipam.Reserve(ip, winner.peerKey); err != nil {
-			if !errors.Is(err, endpoint.ErrIPNotInSubnet) && !errors.Is(err, endpoint.ErrIPReserved) {
-				if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+		if err := ipamMgr.Reserve(ip, winner.peerKey); err != nil {
+			if !errors.Is(err, ipam.ErrIPNotInSubnet) && !errors.Is(err, ipam.ErrIPReserved) {
+				if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 					for _, c := range winner.allClaims {
 						if err := quarantinePersistedAssignment(ctx, db, c, ipStr, retireWinnerKeypair); err != nil {
 							return err
@@ -1531,8 +1366,8 @@ func reconcileCollidingPeersForIP(ctx context.Context, db *database.DB, ipam *en
 	return nil
 }
 
-func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpoint.IPAM) error {
-	if ipam == nil || db == nil {
+func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipamMgr *ipam.IPAM) error {
+	if ipamMgr == nil || db == nil {
 		return nil
 	}
 	assignments, err := db.GetVPNClientIPAssignments(ctx)
@@ -1593,13 +1428,13 @@ func reservePersistedClientIPs(ctx context.Context, db *database.DB, ipam *endpo
 				singlePeerKey = pk
 				singleClaims = cl
 			}
-			if err := reserveSinglePeerForIP(ctx, db, ipam, singlePeerKey, singleClaims, ip, ipStr); err != nil {
+			if err := reserveSinglePeerForIP(ctx, db, ipamMgr, singlePeerKey, singleClaims, ip, ipStr); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := reconcileCollidingPeersForIP(ctx, db, ipam, peersForIP, ip, ipStr); err != nil {
+		if err := reconcileCollidingPeersForIP(ctx, db, ipamMgr, peersForIP, ip, ipStr); err != nil {
 			return err
 		}
 	}
@@ -1807,16 +1642,6 @@ func (s *Service) Stop() error {
 			recordErr(err)
 		}
 	}
-	if s.endpoint != nil {
-		_ = s.endpoint.Stop()
-	}
-	if s.forwarder != nil {
-		if wait := s.forwarder.RetireCustomRoutes(); wait != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			recordErr(wait(ctx))
-			cancel()
-		}
-	}
 	if s.prober != nil {
 		s.prober.Stop()
 	}
@@ -1825,10 +1650,6 @@ func (s *Service) Stop() error {
 	}
 	if s.forwarder != nil {
 		recordErr(s.forwarder.Stop())
-	}
-	if s.tunDev != nil {
-		_ = s.tunDev.Close()
-		s.tunDev = nil
 	}
 	if s.pool != nil {
 		_ = s.pool.Close()
@@ -1851,35 +1672,6 @@ func (s *Service) Stop() error {
 	s.mu.Unlock()
 
 	return firstErr
-}
-
-// ClientAWGEngine returns the configured client-facing AWG engine ("custom" or "upstream").
-func (s *Service) ClientAWGEngine() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.clientAWGEngine == "" {
-		return ClientAWGEngineCustom
-	}
-	return s.clientAWGEngine
-}
-
-// SetClientAWGEngine sets the client-facing AWG engine ("custom" or "upstream").
-// Must be called before Start.
-func (s *Service) SetClientAWGEngine(engine string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running {
-		return errors.New("cannot change client AWG engine while service is running")
-	}
-	normalized := strings.ToLower(strings.TrimSpace(engine))
-	if normalized == "" {
-		normalized = ClientAWGEngineCustom
-	}
-	if normalized != ClientAWGEngineCustom && normalized != ClientAWGEngineUpstream {
-		return fmt.Errorf("invalid client AWG engine %q: must be %q or %q", engine, ClientAWGEngineCustom, ClientAWGEngineUpstream)
-	}
-	s.clientAWGEngine = normalized
-	return nil
 }
 
 // IngressEngine returns the active IngressEngine when running in upstream mode.
@@ -1907,7 +1699,7 @@ func (s *Service) IsRunning() bool {
 	return s.running
 }
 
-// ReturnRouteOwner returns the actual forwarder return route owner ("upstream", "custom", or "none").
+// ReturnRouteOwner returns the actual forwarder return route owner ("upstream" or "none").
 // If the service is not running or has no registered routes, it returns "none".
 func (s *Service) ReturnRouteOwner() string {
 	s.mu.RLock()
@@ -1923,11 +1715,6 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	engine := s.clientAWGEngine
-	if engine == "" {
-		engine = ClientAWGEngineCustom
-	}
-
 	listenPort := 51820
 	if s.cfg != nil && s.cfg.ListenPort > 0 {
 		listenPort = s.cfg.ListenPort
@@ -1942,22 +1729,18 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	var peerSync *PeerSyncStatus
 
 	if s.running {
-		if engine == ClientAWGEngineUpstream {
-			if s.ingressEngine != nil && s.ingressEngine.Running() {
-				engineRunning = true
-				syncStat := s.ingressEngine.PeerSyncStatus()
-				upstreamDesiredPeers = syncStat.DesiredPeers
-				upstreamActualPeers = syncStat.ActualPeers
-				peerSync = &syncStat
-			}
-		} else {
-			engineRunning = s.endpoint != nil && s.endpoint.IsRunning()
+		if s.ingressEngine != nil && s.ingressEngine.Running() {
+			engineRunning = true
+			syncStat := s.ingressEngine.PeerSyncStatus()
+			upstreamDesiredPeers = syncStat.DesiredPeers
+			upstreamActualPeers = syncStat.ActualPeers
+			peerSync = &syncStat
 		}
 	}
 
 	activeEngine := "none"
 	if engineRunning {
-		activeEngine = engine
+		activeEngine = ClientAWGEngineUpstream
 	}
 
 	returnRouteOwner := "none"
@@ -1966,7 +1749,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	status := &Status{
-		ConfiguredEngine:           engine,
+		ConfiguredEngine:           ClientAWGEngineUpstream,
 		ActiveEngine:               activeEngine,
 		EngineRunning:              engineRunning,
 		ListenPort:                 listenPort,
@@ -1986,10 +1769,6 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
 	populateForwarderStatus(status, s.forwarder)
-	if s.endpoint != nil {
-		status.HandshakeRejections = s.endpoint.HandshakeRejections()
-		status.TransportDecryptionFailures = s.endpoint.TransportDecryptionFailures()
-	}
 
 	var totalDrops uint64
 	for _, dev := range s.backendDevices {
@@ -3413,14 +3192,15 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		cfg.ServerPublicKey = s.cfg.ServerPublicKey
 	}
 
+	listenerRunning := s.running || (s.ingressEngine != nil && s.ingressEngine.Running())
 	obfuscationChanged := s.cfg != nil && obfuscationDiffers(s.cfg, cfg)
-	if obfuscationChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+	if obfuscationChanged && listenerRunning {
 		log.Printf("[vpn] rejecting config update: obfuscation parameters are immutable while listener is running")
 		return errors.New("obfuscation parameters are immutable while listener is running")
 	}
 
 	listenPortChanged := s.cfg != nil && cfg.ListenPort > 0 && cfg.ListenPort != s.cfg.ListenPort
-	if listenPortChanged && s.endpoint != nil && s.endpoint.IsRunning() {
+	if listenPortChanged && listenerRunning {
 		log.Printf("[vpn] rejecting config update: listen_port cannot change from %d to %d while listener is running", s.cfg.ListenPort, cfg.ListenPort)
 		return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
 	}
@@ -3438,14 +3218,12 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	}
 	queueSizeChanged := false
 	routeLimitChanged := false
-	oldQueueSize := forwarder.DefaultClientQueueSize
-	oldMaxActiveRoutes := 1000
 	if s.cfg != nil && s.forwarder != nil {
-		oldQueueSize = s.cfg.ClientQueueSize
+		oldQueueSize := s.cfg.ClientQueueSize
 		if oldQueueSize <= 0 {
 			oldQueueSize = forwarder.DefaultClientQueueSize
 		}
-		oldMaxActiveRoutes = s.cfg.MaxTotalPeers
+		oldMaxActiveRoutes := s.cfg.MaxTotalPeers
 		if oldMaxActiveRoutes <= 0 {
 			oldMaxActiveRoutes = 1000
 		}
@@ -3477,49 +3255,6 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 			}
 			return fmt.Errorf("cannot apply client queue size: %w", err)
 		}
-	}
-	rollback := func(cause error) error {
-		var rollbackErrs []error
-		if s.endpoint != nil && previousCfg != nil {
-			if obfuscationChanged {
-				if err := s.endpoint.UpdateObfuscation(previousCfg.H1, previousCfg.H2, previousCfg.H3, previousCfg.H4, previousCfg.S1, previousCfg.S2, previousCfg.S3, previousCfg.S4); err != nil {
-					rollbackErrs = append(rollbackErrs, err)
-				}
-				if err := s.endpoint.UpdateHeaderProtectionKey(previousCfg.HeaderProtectionKey); err != nil {
-					rollbackErrs = append(rollbackErrs, err)
-				}
-			}
-			if listenPortChanged {
-				s.endpoint.UpdateListenPort(previousCfg.ListenPort)
-			}
-		}
-		if queueSizeChanged || routeLimitChanged {
-			if err := s.forwarder.ReconfigureClientQueueConfig(oldQueueSize, oldMaxActiveRoutes); err != nil {
-				rollbackErrs = append(rollbackErrs, err)
-			}
-		}
-		if s.db != nil && previousCfg != nil {
-			if err := s.db.SaveVPNConfig(ctx, previousCfg); err != nil {
-				rollbackErrs = append(rollbackErrs, err)
-			}
-		}
-		if len(rollbackErrs) > 0 {
-			return fmt.Errorf("%w; rollback failed: %v", cause, errors.Join(rollbackErrs...))
-		}
-		return cause
-	}
-	if s.endpoint != nil && obfuscationChanged {
-		if err := s.endpoint.UpdateObfuscation(cfg.H1, cfg.H2, cfg.H3, cfg.H4, cfg.S1, cfg.S2, cfg.S3, cfg.S4); err != nil {
-			return rollback(err)
-		}
-		if err := s.endpoint.UpdateHeaderProtectionKey(cfg.HeaderProtectionKey); err != nil {
-			return rollback(err)
-		}
-		log.Printf("[vpn] propagated obfuscation parameter change to idle listener")
-	}
-	if s.endpoint != nil && listenPortChanged {
-		s.endpoint.UpdateListenPort(cfg.ListenPort)
-		log.Printf("[vpn] propagated listen port change (%d) to idle listener", cfg.ListenPort)
 	}
 	s.cfg = cfg
 
@@ -3565,21 +3300,11 @@ func (s *Service) GetUserConnectionState(ctx context.Context, userID string) (*U
 // DisconnectUser disconnects all active VPN sessions for a user.
 func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	var retirements []forwarder.Retirement
-	type pendingPrune struct {
-		peer, sessionID string
-		generation      uint64
-	}
-	var prunes []pendingPrune
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		for _, retirement := range retirements {
 			retirement.Wait()
-		}
-		if s.endpoint != nil {
-			for _, prune := range prunes {
-				s.endpoint.PrunePeerTransportStateIfSession(prune.peer, prune.sessionID, prune.generation)
-			}
 		}
 	}()
 
@@ -3589,17 +3314,6 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 
 	sessions := s.sessionMgr.GetSessionsByUserID(userID)
 	for _, sess := range sessions {
-		if sess.AdmittedVia != models.SessionAdmissionIngress {
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			s.peerGenerations[sess.PeerPublicKey]++
-			fenceGen := s.peerGenerations[sess.PeerPublicKey]
-			if s.endpoint != nil {
-				s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
-			}
-			prunes = append(prunes, pendingPrune{sess.PeerPublicKey, sess.ID, fenceGen})
-		}
 		_ = s.sessionMgr.CloseSession(ctx, sess.ID, "disconnected")
 		if s.forwarder != nil {
 			retirements = append(retirements, s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID))
@@ -3617,41 +3331,13 @@ func (s *Service) DisconnectUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// reapSession tears down an idle-timed-out session, selecting the teardown
-// class by admission provenance (issue #390 part 1):
-//
-//   - Sessions admitted by the upstream engine (AdmittedVia == ingress) are
-//     reaped ROUTING-ONLY via reapIngressSession: forwarder route retirement
-//     and the pool decrement — never a generation fence, never
-//     PrunePeerTransportState, never any endpoint transport-state mutation.
-//     The configured upstream peer is untouched: its crypto/transport state
-//     belongs to the upstream engine's own rekey lifecycle, and its next
-//     plaintext packet lazily creates a fresh backend session — so an idle
-//     reap never forces the client into a re-handshake and never makes a
-//     configured peer unavailable.
-//
-//   - Every other session (AdmittedVia == "", the handshake-era
-//     custom-listener admission) keeps the legacy teardown byte-for-byte:
-//     generation fence + deferred guarded transport prune, forwarder route
-//     retirement, and the guarded pool decrement. The contracts exercised by
-//     the issue-295/309/39 reaper tests depend on it.
-//
-// Sticky affinity is preserved within AffinityTTL on both paths to prevent
-// backend/IP thrashing upon client reconnect (issue #294). Pool connection
-// counter decrement is skipped if periodic reconciliation already
-// re-synchronized the gauge from the database.
-// Note: sticky affinity pruning is intentionally not executed here to prevent O(K*N)
-// lock contention under Service.mu during mass timeouts; it is amortized post-sweep
-// and during periodic maintenance via PruneExpiredAffinity.
+// reapSession tears down an idle-timed-out session routing-only:
+// forwarder route retirement and guarded pool decrement.
 func (s *Service) reapSession(ctx context.Context, sess *models.VPNSession) {
 	if sess == nil {
 		return
 	}
-	if sess.AdmittedVia == models.SessionAdmissionIngress {
-		s.reapIngressSession(sess)
-		return
-	}
-	s.reapLegacySession(ctx, sess)
+	s.reapIngressSession(sess)
 }
 
 // reapIngressSession performs the routing-only teardown of an idle upstream
@@ -3732,69 +3418,6 @@ func (s *Service) reapIngressSession(sess *models.VPNSession) {
 	}
 }
 
-// reapLegacySession is the pre-#390 reapSession body, byte-for-byte: reserved
-// generation fence, deferred identity-guarded transport prune, forwarder
-// route retirement, guarded pool decrement. Do not "modernize" it — the
-// custom-listener reaper contracts (issues #295, #309, #39) are pinned to
-// exactly this behavior for handshake-era sessions.
-func (s *Service) reapLegacySession(ctx context.Context, sess *models.VPNSession) {
-	if sess == nil {
-		return
-	}
-	var retirement forwarder.Retirement
-	var fenceGen uint64
-	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		retirement.Wait()
-		if fenceGen != 0 {
-			s.mu.Lock()
-			// A reconnect may have installed a new session while the old
-			// route's admitted writes were finishing. Check under Service.mu
-			// so a new session cannot be created between this check and prune.
-			current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey)
-			if !exists || current.ID == sess.ID {
-				s.endpoint.PrunePeerTransportState(sess.PeerPublicKey, fenceGen)
-			}
-			s.mu.Unlock()
-		}
-		log.Printf("[vpn/service] reaped idle session: id=%s peer=%s user=%s ip=%s tunnel_id=%d",
-			sess.ID, sess.PeerPublicKey, sess.UserID, sess.AssignedIP, sess.BackendTunnelID)
-	}()
-
-	if s.endpoint != nil && s.sessionMgr != nil && s.peerGenerations[sess.PeerPublicKey] <= sess.Generation {
-		// CheckTimeouts has already removed this session. Reserve the next
-		// generation before unlocking, so a fresh handshake receives a
-		// generation beyond this fence while an old handshake is rejected.
-		if current, exists := s.sessionMgr.GetSession(sess.PeerPublicKey); !exists || current.ID == sess.ID {
-			fenceGen = sess.Generation + 1
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			s.peerGenerations[sess.PeerPublicKey] = fenceGen
-			s.endpoint.FencePeerGeneration(sess.PeerPublicKey, fenceGen)
-		}
-	}
-
-	if s.forwarder != nil {
-		retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
-	}
-
-	if s.pool != nil {
-		shouldDecrement := true
-		var tunReconcileTime time.Time
-		if s.lastReconcileByTunnel != nil {
-			tunReconcileTime = s.lastReconcileByTunnel[sess.BackendTunnelID]
-		}
-		if !sess.TimedOutAt.IsZero() && !tunReconcileTime.IsZero() && tunReconcileTime.After(sess.TimedOutAt) {
-			shouldDecrement = false
-		}
-		if shouldDecrement {
-			s.pool.DecrementConnections(sess.BackendTunnelID)
-		}
-	}
-}
-
 // PruneExpiredAffinity scans and removes expired sticky affinity records
 // from the load balancer. It acquires s.mu with RLock only long enough to
 // retrieve stickyMgr, then executes pruning outside s.mu to eliminate
@@ -3809,18 +3432,13 @@ func (s *Service) PruneExpiredAffinity() int {
 	return sm.PruneExpired()
 }
 
-// DisconnectSession disconnects a specific VPN session by ID.
+// DisconnectSession disconnects a specific VPN session by ID routing-only.
 func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error {
 	var retirement forwarder.Retirement
-	var prunePeer, pruneSession string
-	var fenceGen uint64
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		retirement.Wait()
-		if prunePeer != "" && s.endpoint != nil {
-			s.endpoint.PrunePeerTransportStateIfSession(prunePeer, pruneSession, fenceGen)
-		}
 	}()
 
 	if s.sessionMgr == nil {
@@ -3829,19 +3447,7 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 
 	sess, ok := s.sessionMgr.GetSessionByID(sessionID)
 	if !ok {
-		return endpoint.ErrSessionNotFound
-	}
-
-	if sess.AdmittedVia != models.SessionAdmissionIngress {
-		if s.peerGenerations == nil {
-			s.peerGenerations = make(map[string]uint64)
-		}
-		s.peerGenerations[sess.PeerPublicKey]++
-		fenceGen = s.peerGenerations[sess.PeerPublicKey]
-		prunePeer, pruneSession = sess.PeerPublicKey, sess.ID
-		if s.endpoint != nil {
-			s.endpoint.FencePeerGeneration(prunePeer, fenceGen)
-		}
+		return session.ErrSessionNotFound
 	}
 
 	_ = s.sessionMgr.CloseSession(ctx, sessionID, "disconnected")
@@ -3852,9 +3458,9 @@ func (s *Service) DisconnectSession(ctx context.Context, sessionID string) error
 		s.stickyMgr.ClearAffinity(sess.UserID)
 		s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
 	}
-	// Mirror IncrementConnections from HandleIncomingPeer; see
-	// DisconnectUser for why the decrement must happen on every path.
-	s.pool.DecrementConnections(sess.BackendTunnelID)
+	if s.pool != nil {
+		s.pool.DecrementConnections(sess.BackendTunnelID)
+	}
 
 	return nil
 }
@@ -3889,7 +3495,7 @@ func (s *Service) RevokeUpstreamPeerSession(ctx context.Context, peerKey string)
 		s.preRevokeCloseHookForTest(sess.PeerPublicKey, sess.ID)
 	}
 	if err := s.sessionMgr.CloseSession(ctx, sess.ID, "revoked"); err != nil {
-		if errors.Is(err, endpoint.ErrSessionNotFound) {
+		if errors.Is(err, session.ErrSessionNotFound) {
 			// The session was already evicted (e.g. by CheckTimeouts); the idle reaper owns teardown.
 			return nil
 		}
@@ -4024,7 +3630,7 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	sess, ok := s.sessionMgr.GetSessionSnapshotByID(sessionID)
 	if !ok {
-		return endpoint.ErrSessionNotFound
+		return session.ErrSessionNotFound
 	}
 
 	peerKey := sess.PeerPublicKey
@@ -4103,33 +3709,14 @@ func (s *Service) MigrateVPNSession(ctx context.Context, sessionID string, targe
 // ReleaseClient releases IPAM allocations and disconnects any active sessions for the client.
 func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 	var retirement forwarder.Retirement
-	var pruneSession string
-	var pruneAfterRetirement bool
-	var fenceGen uint64
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		retirement.Wait()
-		if pruneAfterRetirement && s.endpoint != nil {
-			s.endpoint.PrunePeerTransportStateIfSession(clientPub, pruneSession, fenceGen)
-		}
 	}()
 
 	if s.sessionMgr != nil && clientPub != "" {
 		if sess, ok := s.sessionMgr.GetSession(clientPub); ok {
-			if s.peerGenerations == nil {
-				s.peerGenerations = make(map[string]uint64)
-			}
-			// ReleaseClient used to advance the generation once for the
-			// session and once for the client. Reserve both before removing
-			// the route so an in-flight handshake cannot commit during Wait.
-			s.peerGenerations[sess.PeerPublicKey] += 2
-			fenceGen = s.peerGenerations[sess.PeerPublicKey]
-			if s.endpoint != nil {
-				s.endpoint.FencePeerGeneration(clientPub, fenceGen)
-			}
-			pruneSession = sess.ID
-			pruneAfterRetirement = true
 			_ = s.sessionMgr.CloseSession(ctx, sess.ID, "client_deleted")
 			if s.forwarder != nil {
 				retirement = s.forwarder.BeginUnregisterSession(sess.PeerPublicKey, sess.ID)
@@ -4137,22 +3724,9 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 			if s.stickyMgr != nil {
 				s.stickyMgr.ClearPeerAffinity(sess.PeerPublicKey)
 			}
-			// Mirror IncrementConnections from HandleIncomingPeer; see
-			// DisconnectUser for why the decrement must happen on every path.
-			s.pool.DecrementConnections(sess.BackendTunnelID)
-		}
-	}
-
-	if clientPub != "" && !pruneAfterRetirement {
-		if s.peerGenerations == nil {
-			s.peerGenerations = make(map[string]uint64)
-		}
-		s.peerGenerations[clientPub]++
-		fenceGen = s.peerGenerations[clientPub]
-		if s.endpoint != nil {
-			// No route to retire: keep the existing in-lock cleanup for a
-			// client whose transport state outlived its session.
-			s.endpoint.PrunePeerTransportStateIfSession(clientPub, "", fenceGen)
+			if s.pool != nil {
+				s.pool.DecrementConnections(sess.BackendTunnelID)
+			}
 		}
 	}
 
@@ -4163,142 +3737,35 @@ func (s *Service) ReleaseClient(ctx context.Context, clientPub string) error {
 	return nil
 }
 
-// SetPreTransportCommitHookForTest sets the pre-transport-commit hook on the endpoint listener for testing.
-func (s *Service) SetPreTransportCommitHookForTest(fn func(peerKey string, sessID string)) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.endpoint != nil {
-		s.endpoint.SetPreTransportCommitHookForTest(fn)
-	}
-}
-
-// HasTransportStateForPeer reports whether the endpoint holds any transport state for peerKey.
-func (s *Service) HasTransportStateForPeer(peerKey string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.endpoint == nil {
-		return false
-	}
-	return s.endpoint.HasTransportStateForPeer(peerKey)
-}
-
-// HandleIncomingPeer authenticates a peer. A healthy live session keeps its
-// backend and route through cryptographic rekeys; only admission/reconnect or
-// an unusable assignment goes through backend selection and route registration.
-//
-// Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
-// select → CreateSession → IncrementConnections sequence below, making the
-// check-then-allocate capacity decision (GetActiveTunnels snapshot →
-// selectTunnelForPeer/FilterHealthy → IncrementConnections) atomic. This is
-// the invariant that keeps ActiveConnections from exceeding
-// MaxPeersPerBackend: the gauge itself is only pool-mutex-atomic, so any
-// future caller that mutates pool counters outside s.mu (or outside the
-// rekey hook's nested sm.mu regime — the hook's only production call site
-// today is the CreateSession call here, so it runs nested under s.mu too;
-// full contract on tunnel.Pool.IncrementConnections) reopens the race.
-// A replaced route's device writes are joined only after releasing s.mu;
-// admission, session bookkeeping, and pool counters remain serialized above it.
-func (s *Service) HandleIncomingPeer(ctx context.Context, peerPublicKey string) (*models.VPNSession, *models.BackendTunnel, error) {
-	var retirement forwarder.Retirement
+// SetSessionReaperHookForTest sets a test hook invoked by SweepTimedOutSessions for each reaped session.
+func (s *Service) SetSessionReaperHookForTest(fn func(context.Context, *models.VPNSession)) {
 	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		retirement.Wait()
-	}()
+	defer s.mu.Unlock()
+	s.reaperHook = fn
+}
 
-	if s.auth == nil || s.ipam == nil || s.sessionMgr == nil || s.pool == nil {
-		return nil, nil, errors.New("subsystems not initialized")
+// SweepTimedOutSessions sweeps for idle-timed-out sessions and invokes reapSession
+// (or the test reaper hook) for each timed-out session.
+func (s *Service) SweepTimedOutSessions(ctx context.Context) ([]*models.VPNSession, error) {
+	if s == nil || s.sessionMgr == nil {
+		return nil, nil
 	}
-
-	user, conn, err := s.auth.AuthenticatePeer(ctx, peerPublicKey)
+	timeout := 3 * time.Minute
+	timedOut, err := s.sessionMgr.CheckTimeouts(ctx, timeout)
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer authentication failed: %w", err)
+		return nil, err
 	}
-
-	if s.peerGenerations == nil {
-		s.peerGenerations = make(map[string]uint64)
-	}
-	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(peerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
-		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
-		// Reuse requires both administrative eligibility and runtime health
-		// (issue #90): after the enabled/status split, Enabled=false,
-		// Status=active is a valid state - a stranded live session on an
-		// admin-disabled backend must fall through to normal backend
-		// selection instead of reusing the disabled backend here.
-		if backendErr == nil &&
-			backend.Enabled &&
-			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
-			(s.forwarder == nil || s.forwarder.HasSessionRoute(peerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {
-			gen := max(s.peerGenerations[peerPublicKey], live.Generation) + 1
-			if sess, advanced := s.sessionMgr.AdvanceLiveSessionGeneration(peerPublicKey, live.ID, user.ID, gen); advanced {
-				s.peerGenerations[peerPublicKey] = gen
-				if s.stickyMgr != nil {
-					s.stickyMgr.AssignPeerAffinity(peerPublicKey, backend.ID)
-				}
-				return sess, backend, nil
-			}
+	s.mu.RLock()
+	hook := s.reaperHook
+	s.mu.RUnlock()
+	for _, sess := range timedOut {
+		if hook != nil {
+			hook(ctx, sess)
+		} else {
+			s.reapSession(ctx, sess)
 		}
 	}
-
-	activeTunnels := s.pool.GetActiveTunnels()
-	if len(activeTunnels) == 0 {
-		return nil, nil, loadbalancer.ErrNoActiveBackends
-	}
-
-	req := &loadbalancer.RoutingRequest{
-		UserID:           user.ID,
-		PeerPublicKey:    peerPublicKey,
-		AvailableTunnels: activeTunnels,
-	}
-
-	backend, err := s.selectTunnelForPeer(ctx, req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	s.assignmentMu.Lock()
-	if s.db != nil {
-		err = reservePersistedClientIPs(ctx, s.db, s.ipam)
-	}
-	var assignedIP net.IP
-	if err == nil {
-		assignedIP, err = s.resolveOrAllocatePeerIP(ctx, conn, peerPublicKey)
-	}
-	s.assignmentMu.Unlock()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	s.peerGenerations[peerPublicKey]++
-	peerGen := s.peerGenerations[peerPublicKey]
-
-	sess, err := s.sessionMgr.CreateSession(ctx, user.ID, peerPublicKey, assignedIP.String(), backend.ID, conn.Name, peerGen)
-	if err != nil {
-		return nil, nil, fmt.Errorf("session creation failed: %w", err)
-	}
-
-	s.pool.IncrementConnections(backend.ID)
-
-	if s.forwarder != nil {
-		retirement = s.forwarder.BeginRegisterSessionWithLimit(sess.ID, conn.ID, peerPublicKey, assignedIP.String(), backend.ID, 0, 0)
-		s.forwarder.AttachPeerDevice(peerPublicKey, &peerVirtualDevice{
-			peerKey:  peerPublicKey,
-			endpoint: s.endpoint,
-		})
-	}
-	s.freshSessionRegistrations.Add(1)
-
-	return sess, backend, nil
-}
-
-// PeerGeneration returns the latest assigned generation for a peer under s.mu.
-func (s *Service) PeerGeneration(peerKey string) uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.peerGenerations == nil {
-		return 0
-	}
-	return s.peerGenerations[peerKey]
+	return timedOut, nil
 }
 
 func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.RoutingRequest) (*models.BackendTunnel, error) {
@@ -4317,59 +3784,6 @@ func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.Rou
 		return b, nil
 	}
 	return nil, loadbalancer.ErrNoActiveBackends
-}
-
-func (s *Service) resolveOrAllocatePeerIP(ctx context.Context, conn *models.UserConnection, peerPublicKey string) (net.IP, error) {
-	if conn != nil && conn.ClientParams != nil {
-		if req, ok := conn.ClientParams["config_regeneration_required"].(bool); ok && req {
-			return nil, fmt.Errorf("peer %s IP was quarantined due to conflict with another client: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
-		}
-		if qIP, ok := conn.ClientParams["quarantined_ip_collision"]; ok && qIP != nil && qIP != "" {
-			return nil, fmt.Errorf("peer %s IP was quarantined due to conflict with another client: %w (config regeneration required)", peerPublicKey, endpoint.ErrIPAlreadyAllocated)
-		}
-		if rawIP, ok := conn.ClientParams["assigned_ip"]; ok && rawIP != nil {
-			if strIP, ok := rawIP.(string); ok && strIP != "" {
-				targetIP := net.ParseIP(strIP)
-				if targetIP != nil && targetIP.To4() != nil {
-					err := s.ipam.Reserve(targetIP, peerPublicKey)
-					if err == nil {
-						return targetIP, nil
-					}
-					if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
-						return nil, fmt.Errorf("peer %s persisted IP %s conflicts with another client: %w", peerPublicKey, strIP, err)
-					}
-				}
-			}
-		}
-	}
-
-	ip, err := s.ipam.Allocate(peerPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("ip allocation failed: %w", err)
-	}
-	if conn != nil {
-		params := make(map[string]any, len(conn.ClientParams)+1)
-		for key, value := range conn.ClientParams {
-			params[key] = value
-		}
-		delete(params, "config_regeneration_required")
-		delete(params, "quarantined_ip_collision")
-		params["assigned_ip"] = ip.String()
-		if s.db != nil && conn.ID != "" {
-			updated, err := s.db.UpdateConnection(ctx, conn.ID, map[string]any{
-				"client_params": params,
-			})
-			if err != nil || !updated {
-				_ = s.ipam.Release(peerPublicKey)
-				if err == nil {
-					err = errors.New("connection was removed")
-				}
-				return nil, fmt.Errorf("persist assigned IP for peer %s (updated=%t): %w", peerPublicKey, updated, err)
-			}
-		}
-		conn.ClientParams = params
-	}
-	return ip, nil
 }
 
 // SelectTunnel selects a backend tunnel using the configured load balancing algorithm.
@@ -4783,7 +4197,7 @@ func (s *Service) resolveAssignedIP(clientParams map[string]any, cfg *models.VPN
 							if err == nil {
 								return existingStr, nil
 							}
-							if errors.Is(err, endpoint.ErrIPAlreadyAllocated) {
+							if errors.Is(err, ipam.ErrIPAlreadyAllocated) {
 								return "", fmt.Errorf("client %s persisted IP %s conflicts with another client: %w", clientPub, existingStr, err)
 							}
 						} else {
@@ -5225,20 +4639,3 @@ func ExtractClientPublicKeyFromConfig(configStr string) string {
 	}
 	return ""
 }
-
-type peerVirtualDevice struct {
-	peerKey  string
-	endpoint *endpoint.Listener
-}
-
-func (p *peerVirtualDevice) Write(pkt []byte) (int, error) {
-	err := p.endpoint.SendToPeer(p.peerKey, pkt)
-	if err != nil {
-		return 0, err
-	}
-	return len(pkt), nil
-}
-func (p *peerVirtualDevice) Read(pkt []byte) (int, error) { return 0, errors.New("not implemented") }
-func (p *peerVirtualDevice) Close() error                 { return nil }
-func (p *peerVirtualDevice) Name() string                 { return "virtual-" + p.peerKey }
-func (p *peerVirtualDevice) MTU() int                     { return 1280 }

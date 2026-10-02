@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -194,12 +195,12 @@ func TestForwarderQueueSizeRejectsReconfigurationWithActiveRoutes(t *testing.T) 
 func TestForwarderDeviceWriteStatsRecordErrorsAndDuration(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 4)
 	dev := &errDevice{err: errors.New("device stalled")}
-	f.AttachPeerDevice("peer-1", dev)
-	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("session-1", "connection-1", "peer-1", "10.100.0.10", 1, path)
 	f.StartPumps(t.Context())
 	defer f.StopPumps()
 
-	if err := f.RouteBackendToClient(1, []byte("packet"), "10.100.0.10"); err != nil {
+	if err := f.RouteBackendToClient(1, returnPacket("10.100.0.10"), "10.100.0.10"); err != nil {
 		t.Fatalf("route packet: %v", err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -399,13 +400,13 @@ func TestForwarderRejectsRegistrationsBeyondActiveRouteLimit(t *testing.T) {
 func TestForwarderSustainedDownstreamStallSaturatesAndRecovers(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 4)
 	dev := newBlockingWriteDevice()
-	f.AttachPeerDevice("peer-1", dev)
-	f.RegisterSession("session-1", "connection-1", "peer-1", "10.100.0.10", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("session-1", "connection-1", "peer-1", "10.100.0.10", 1, path)
 	f.StartPumps(t.Context())
 	defer f.StopPumps()
 	defer dev.release()
 
-	pkt := []byte("packet")
+	pkt := returnPacket("10.100.0.10")
 	if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
@@ -484,13 +485,13 @@ func TestRouteRetirementDoesNotBlockOtherRoutesOnDeviceWrite(t *testing.T) {
 		t.Run(fmt.Sprintf("replace=%t", replace), func(t *testing.T) {
 			f := NewForwarder(nil, "10.100.0.0/16", 2)
 			dev := newBlockingWriteDevice()
-			f.AttachPeerDevice("peer", dev)
-			f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+			path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+			f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
 			oldRoute := f.routesByPeer["peer"]
 			f.StartPumps(t.Context())
 			defer f.StopPumps()
 			defer dev.release()
-			if err := f.RouteBackendToClient(1, []byte("packet"), "10.100.0.10"); err != nil {
+			if err := f.RouteBackendToClient(1, returnPacket("10.100.0.10"), "10.100.0.10"); err != nil {
 				t.Fatal(err)
 			}
 			select {
@@ -501,7 +502,7 @@ func TestRouteRetirementDoesNotBlockOtherRoutesOnDeviceWrite(t *testing.T) {
 			retired := make(chan struct{})
 			go func() {
 				if replace {
-					f.RegisterSession("replacement", "connection", "peer", "10.100.0.11", 1)
+					f.RegisterSessionWithReturnPath("replacement", "connection", "peer", "10.100.0.11", 1, path)
 				} else {
 					f.UnregisterSession("peer")
 				}
@@ -514,7 +515,7 @@ func TestRouteRetirementDoesNotBlockOtherRoutesOnDeviceWrite(t *testing.T) {
 			}
 			otherRegistered := make(chan struct{})
 			go func() {
-				f.RegisterSession("other", "connection", "other", "10.100.0.12", 1)
+				f.RegisterSessionWithReturnPath("other", "connection", "other", "10.100.0.12", 1, path)
 				close(otherRegistered)
 			}()
 			select {
@@ -549,8 +550,8 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 			f := NewForwarder(nil, "10.100.0.0/16", 2)
 			dev := newBlockingWriteDevice()
 			dev.release()
-			f.AttachPeerDevice("peer", dev)
-			f.RegisterSession("old", "connection", "peer", "10.100.0.10", 1)
+			path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+			f.RegisterSessionWithReturnPath("old", "connection", "peer", "10.100.0.10", 1, path)
 			oldRoute := f.routesByPeer["peer"]
 			resume := make(chan struct{})
 			done := make(chan struct{})
@@ -562,7 +563,7 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 				close(done)
 			}()
 			if replace {
-				f.RegisterSession("new", "connection", "peer", "10.100.0.10", 1)
+				f.RegisterSessionWithReturnPath("new", "connection", "peer", "10.100.0.10", 1, path)
 			} else {
 				f.UnregisterSession("peer")
 			}
@@ -588,12 +589,13 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 func TestDeviceTelemetryReportsBlockedWriteBeforeCompletion(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 2)
 	dev := newBlockingWriteDevice()
-	f.AttachPeerDevice("peer", dev)
-	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
 	f.StartPumps(t.Context())
 	defer f.StopPumps()
 	defer dev.release()
-	if err := f.RouteBackendToClient(1, []byte("first"), "10.100.0.10"); err != nil {
+	pkt := returnPacket("10.100.0.10")
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -602,11 +604,11 @@ func TestDeviceTelemetryReportsBlockedWriteBeforeCompletion(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	for i := 0; i < 2; i++ {
-		if err := f.RouteBackendToClient(1, []byte("queued"), "10.100.0.10"); err != nil {
+		if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := f.RouteBackendToClient(1, []byte("drop"), "10.100.0.10"); !errors.Is(err, ErrQueueFull) {
+	if err := f.RouteBackendToClient(1, pkt, "10.100.0.10"); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("expected saturation, got %v", err)
 	}
 	time.Sleep(DeviceWriteStallThreshold)
@@ -740,12 +742,17 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		started: make(chan struct{}, capacity+1),
 		written: make(chan struct{}, capacity+1),
 	}
-	f.AttachPeerDevice("peer", dev)
-	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
 	f.StartPumps(t.Context())
 	defer f.StopPumps()
 	defer close(dev.permits)
-	packet := make([]byte, 1420)
+	packet := returnPacket("10.100.0.10")
+	if len(packet) < 1420 {
+		pad := make([]byte, 1420-len(packet))
+		packet = append(packet, pad...)
+		binary.BigEndian.PutUint16(packet[2:4], 1420)
+	}
 	wait := func(ch <-chan struct{}, count int) {
 		t.Helper()
 		timeout := time.NewTimer(3 * time.Second)

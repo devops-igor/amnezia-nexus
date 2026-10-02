@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 )
 
 func TestRunServerGracefulShutdown(t *testing.T) {
@@ -237,7 +237,7 @@ func TestStartVPNDataPlane_VPNEnabledFalse(t *testing.T) {
 	}
 }
 
-func TestStartVPNDataPlane_TunUnavailable_PoolSynced(t *testing.T) {
+func TestStartVPNDataPlane_VPNEnabledTrue_Success(t *testing.T) {
 	tempDir := t.TempDir()
 	db, err := database.New(filepath.Join(tempDir, "test.db"), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	if err != nil {
@@ -250,23 +250,40 @@ func TestStartVPNDataPlane_TunUnavailable_PoolSynced(t *testing.T) {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
 
-	vpnSvc.SetTunOpener(func() (endpoint.PacketDevice, error) {
-		return nil, endpoint.ErrTunUnavailable
-	})
+	ctx := context.Background()
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen ephemeral udp: %v", err)
+	}
+	port := socket.LocalAddr().(*net.UDPAddr).Port
+	_ = socket.Close()
+
+	vpnCfg, err := vpnSvc.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	vpnCfg.ListenPort = port
+	if err := vpnSvc.UpdateConfig(ctx, vpnCfg); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
 
 	cfg := &config.Config{
 		VPNEnabled: true,
 	}
 
-	ctx := context.Background()
 	vpnStarted, poolSynced, err := startVPNDataPlane(ctx, vpnSvc, cfg)
 	if err != nil {
 		t.Fatalf("startVPNDataPlane failed: %v", err)
 	}
-	if vpnStarted {
-		t.Errorf("expected vpnStarted=false, got true")
+	defer func() { _ = vpnSvc.Stop() }()
+
+	if !vpnStarted {
+		t.Errorf("expected vpnStarted=true, got false")
 	}
 	if !poolSynced {
 		t.Errorf("expected poolSynced=true, got false")
+	}
+	if !vpnSvc.IsRunning() {
+		t.Errorf("expected vpnSvc.IsRunning()=true")
 	}
 }

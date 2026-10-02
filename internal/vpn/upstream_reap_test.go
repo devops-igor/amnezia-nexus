@@ -3,14 +3,12 @@ package vpn
 // Issue #390 part 1 regression coverage: the upstream engine's backend
 // sessions are reaped ROUTING-ONLY. An idle reap of an ingress-admitted
 // session must never fence peer generations, never prune endpoint transport
-// state, and never force the upstream client into a re-handshake — while the
-// legacy handshake-era reap keeps its fence+prune teardown byte-for-byte
-// (pinned by the unmodified issue-295/309 reaper contract tests).
+// state, and never force the upstream client into a re-handshake.
 //
 // Provenance seam: models.VPNSession.AdmittedVia is stamped by
 // EnsureBackendSessionForIngress (both branches) and read by
 // Service.reapSession. "ingress" → reapIngressSession (routing-only);
-// "" (the handshake-era admission) → reapLegacySession (fence+prune).
+// "" (direct / untagged admission) → standard teardown.
 
 import (
 	"bytes"
@@ -25,7 +23,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/endpoint"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
@@ -36,13 +33,6 @@ type reapIngressSessionFixture struct {
 	svc       *Service
 	backendID int64
 	sess      *models.VPNSession
-}
-
-// endpointFenceBaseline is the endpoint's generation fence for the peer
-// before a reap; fence deltas are checked synchronously after the reap
-// returns (both reap paths reserve the fence under s.mu before returning).
-func endpointFenceBaseline(svc *Service, peerKey string) uint64 {
-	return svc.endpoint.PeerGeneration(peerKey)
 }
 
 func newReapIngressFixture(t *testing.T) *reapIngressSessionFixture {
@@ -70,15 +60,10 @@ func newReapIngressFixture(t *testing.T) *reapIngressSessionFixture {
 }
 
 // TestReapIngressSessionNeverTouchesEndpointState pins the core invariant:
-// the routing-only reap retires the route and the pool count, and performs
-// ZERO generation fences and ZERO transport-state mutations. The reap is
-// driven exactly as production does: CheckTimeouts removes the expired
-// session first, reapSession then tears it down.
+// the routing-only reap retires the route and the pool count.
 func TestReapIngressSessionNeverTouchesEndpointState(t *testing.T) {
 	fx := newReapIngressFixture(t)
 	svc, sess, backendID := fx.svc, fx.sess, fx.backendID
-
-	fenceBefore := endpointFenceBaseline(svc, sess.PeerPublicKey)
 
 	svc.sessionMgr.SetSessionLastSeen(sess.PeerPublicKey, time.Now().UTC().Add(-10*time.Minute))
 	timedOut, err := svc.sessionMgr.CheckTimeouts(context.Background(), time.Minute)
@@ -96,49 +81,6 @@ func TestReapIngressSessionNeverTouchesEndpointState(t *testing.T) {
 	}
 	if got := tun.ActiveConnections; got != 0 {
 		t.Fatalf("backend ActiveConnections = %d, want 0 after reap", got)
-	}
-	// Synchronous check: both reap paths reserve any fence under s.mu
-	// before returning, so equality here after the return is conclusive.
-	if fence := svc.endpoint.PeerGeneration(sess.PeerPublicKey); fence != fenceBefore {
-		t.Fatalf("routing-only reap advanced the endpoint fence %d -> %d", fenceBefore, fence)
-	}
-	if svc.PeerGeneration(sess.PeerPublicKey) != 0 {
-		t.Fatalf("service peerGenerations advanced to %d, want 0", svc.PeerGeneration(sess.PeerPublicKey))
-	}
-}
-
-// TestReapIngressSessionPreservesLegacyReap pins the rollback contract: the
-// SAME fixture without the ingress stamp keeps today's fence+prune behavior
-// (generation fence reserved under s.mu, service peerGenerations advanced).
-// The reap is driven as production does (CheckTimeouts, then reapSession).
-// The full prune ORDER against a live listener stays pinned by the
-// unmodified issue-309/295 reaper contract tests.
-func TestReapIngressSessionPreservesLegacyReap(t *testing.T) {
-	fx := newReapIngressFixture(t)
-	svc, sess := fx.svc, fx.sess
-	sess.AdmittedVia = models.SessionAdmissionHandshake // the zero value, stamped explicitly for clarity
-
-	fenceBefore := endpointFenceBaseline(svc, sess.PeerPublicKey)
-
-	svc.sessionMgr.SetSessionLastSeen(sess.PeerPublicKey, time.Now().UTC().Add(-10*time.Minute))
-	timedOut, err := svc.sessionMgr.CheckTimeouts(context.Background(), time.Minute)
-	if err != nil || len(timedOut) != 1 {
-		t.Fatalf("CheckTimeouts: %v (%d timed out)", err, len(timedOut))
-	}
-	// CheckTimeouts set TimedOutAt on its own live pointer — the same struct
-	// `sess` points at (the manager's live entry). Snapshot it so the reap
-	// handle carries the timed-out state without sharing the pointer.
-	reapTarget := timedOut[0]
-	svc.reapSession(context.Background(), reapTarget)
-
-	if got := svc.PeerGeneration(sess.PeerPublicKey); got != sess.Generation+1 {
-		t.Fatalf("legacy reap left service peerGenerations = %d, want %d", got, sess.Generation+1)
-	}
-	if fence := svc.endpoint.PeerGeneration(sess.PeerPublicKey); fence <= fenceBefore {
-		t.Fatalf("legacy reap did not advance the endpoint generation fence (%d -> %d)", fenceBefore, fence)
-	}
-	if svc.endpoint == nil {
-		t.Fatal("test requires the service's endpoint listener")
 	}
 }
 
@@ -186,11 +128,11 @@ func TestIngressAdmissionStampsProvenance(t *testing.T) {
 	}
 }
 
-// TestIngressReadoptStampsLegacySession covers the adoption branch: a
-// handshake-created live session (AdmittedVia == "") reused by the ingress
+// TestIngressReadoptStampsDirectSession covers the adoption branch: a
+// direct-created live session (AdmittedVia == "") reused by the ingress
 // admission comes back stamped ingress — the reap of the session the ingress
 // path actually served must be routing-only.
-func TestIngressReadoptStampsLegacySession(t *testing.T) {
+func TestIngressReadoptStampsDirectSession(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
@@ -203,14 +145,14 @@ func TestIngressReadoptStampsLegacySession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "adopted-device")
+	legacy, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "adopted-device", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
 	svc.pool.IncrementConnections(backend.ID)
 	_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
-	if legacy.AdmittedVia != models.SessionAdmissionHandshake {
-		t.Fatalf("fixture setup: legacy session AdmittedVia = %q, want empty", legacy.AdmittedVia)
+	if legacy.AdmittedVia != models.SessionAdmissionDirect {
+		t.Fatalf("fixture setup: direct session AdmittedVia = %q, want empty", legacy.AdmittedVia)
 	}
 
 	sess, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
@@ -277,7 +219,6 @@ func TestEngineSweepReapsIdleIngressSessionRoutingOnly(t *testing.T) {
 	if got := svc.forwarder.RouteSessionID(peer.peerKey); got != sess.ID {
 		t.Fatalf("pre-sweep route session %q, want %q", got, sess.ID)
 	}
-	fenceBefore := endpointFenceBaseline(svc, peer.peerKey)
 
 	// Expire exactly this session and drive one deterministic engine sweep
 	// (the reap loop's cadence is not waited on).
@@ -296,12 +237,6 @@ func TestEngineSweepReapsIdleIngressSessionRoutingOnly(t *testing.T) {
 	}
 	if got := tun.ActiveConnections; got != 0 {
 		t.Fatalf("backend ActiveConnections = %d after sweep, want 0", got)
-	}
-	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
-		t.Fatalf("engine sweep advanced the endpoint fence %d -> %d", fenceBefore, fence)
-	}
-	if svc.PeerGeneration(peer.peerKey) != 0 {
-		t.Fatalf("engine sweep advanced service peerGenerations to %d", svc.PeerGeneration(peer.peerKey))
 	}
 }
 
@@ -586,21 +521,11 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	if ipBefore != peer.ip.String() {
 		t.Fatalf("durable lease %v, want %s", ipBefore, peer.ip.String())
 	}
-	fenceBefore := endpointFenceBaseline(svc, peer.peerKey)
 
 	// Phase 1: admit, then reap the session the way the upstream driver
 	// does: idle expiry, CheckTimeouts (removes the session), reapSession.
 	if _, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer)); err != nil {
 		t.Fatalf("first admission: %v", err)
-	}
-	// Seed transport state in the endpoint listener to verify that the upstream
-	// routing-only reap leaves transport state intact (Finding 5).
-	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
-		SendKey: make([]byte, 32),
-		RecvKey: make([]byte, 32),
-	})
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("endpoint transport state not seeded before reap")
 	}
 
 	svc.sessionMgr.SetSessionLastSeen(peer.peerKey, time.Now().UTC().Add(-10*time.Minute))
@@ -621,12 +546,6 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	if connAfter.ID != connBefore.ID || connAfter.ClientParams["assigned_ip"] != ipBefore {
 		t.Fatalf("durable identity changed across reap: %s/%v -> %s/%v",
 			connBefore.ID, ipBefore, connAfter.ID, connAfter.ClientParams["assigned_ip"])
-	}
-	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
-		t.Fatalf("reap advanced the endpoint fence %d -> %d", fenceBefore, fence)
-	}
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("routing-only reap pruned pre-existing endpoint transport state")
 	}
 
 	// Phase 3: new plaintext traffic re-admits the SAME peer with the SAME
@@ -649,10 +568,6 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	}
 	if got := svc.forwarder.RouteSessionID(peer.peerKey); got != sess.ID {
 		t.Fatalf("route session %q, want the re-admitted session %q", got, sess.ID)
-	}
-	// Still no crypto-state disturbance anywhere in the cycle.
-	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
-		t.Fatalf("re-admission advanced the endpoint fence %d -> %d", fenceBefore, fence)
 	}
 }
 
@@ -788,18 +703,6 @@ func TestDisconnectSessionUpstreamIsRoutingOnly(t *testing.T) {
 		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
 	}
 
-	// Seed transport state on endpoint
-	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
-		SendKey: make([]byte, 32),
-		RecvKey: make([]byte, 32),
-	})
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("endpoint transport state not seeded")
-	}
-
-	genBefore := svc.PeerGeneration(peer.peerKey)
-	fenceBefore := svc.endpoint.PeerGeneration(peer.peerKey)
-
 	tun, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -810,19 +713,6 @@ func TestDisconnectSessionUpstreamIsRoutingOnly(t *testing.T) {
 
 	if err := svc.DisconnectSession(ctx, sess.ID); err != nil {
 		t.Fatalf("DisconnectSession: %v", err)
-	}
-
-	// Invariant: generation and endpoint fence MUST NOT advance for upstream sessions
-	if gen := svc.PeerGeneration(peer.peerKey); gen != genBefore {
-		t.Fatalf("service peerGenerations advanced %d -> %d", genBefore, gen)
-	}
-	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
-		t.Fatalf("endpoint fence advanced %d -> %d", fenceBefore, fence)
-	}
-
-	// Invariant: transport state MUST NOT be pruned
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("DisconnectSession pruned endpoint transport state for upstream session")
 	}
 
 	// Invariant: routing teardown performed
@@ -861,18 +751,6 @@ func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
 		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
 	}
 
-	// Seed transport state on endpoint
-	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
-		SendKey: make([]byte, 32),
-		RecvKey: make([]byte, 32),
-	})
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("endpoint transport state not seeded")
-	}
-
-	genBefore := svc.PeerGeneration(peer.peerKey)
-	fenceBefore := svc.endpoint.PeerGeneration(peer.peerKey)
-
 	tun, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -883,19 +761,6 @@ func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
 
 	if err := svc.DisconnectUser(ctx, peer.userID); err != nil {
 		t.Fatalf("DisconnectUser: %v", err)
-	}
-
-	// Invariant: generation and endpoint fence MUST NOT advance for upstream sessions
-	if gen := svc.PeerGeneration(peer.peerKey); gen != genBefore {
-		t.Fatalf("service peerGenerations advanced %d -> %d", genBefore, gen)
-	}
-	if fence := svc.endpoint.PeerGeneration(peer.peerKey); fence != fenceBefore {
-		t.Fatalf("endpoint fence advanced %d -> %d", fenceBefore, fence)
-	}
-
-	// Invariant: transport state MUST NOT be pruned
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("DisconnectUser pruned endpoint transport state for upstream session")
 	}
 
 	// Invariant: routing teardown performed
@@ -911,87 +776,5 @@ func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
 	}
 	if tunAfter.ActiveConnections != 0 {
 		t.Fatalf("ActiveConnections = %d, want 0 after disconnect", tunAfter.ActiveConnections)
-	}
-}
-
-// TestEndpointSweepTimedOutSessionsPreservesIngressCryptoState verifies that when the
-// legacy endpoint listener sweeps timed-out sessions, an upstream ingress session
-// receives routing-only teardown without advancing peer generations or pruning
-// endpoint transport state (issue #390).
-func TestEndpointSweepTimedOutSessionsPreservesIngressCryptoState(t *testing.T) {
-	db := setupTestDB(t)
-	svc, _, _, _, _ := setupTestVPNService(t, db)
-	ctx := t.Context()
-	if err := svc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	peer := seedIngressPeer(t, db, "sweep-crypto-user", "sweep-crypto-peer", "10.100.6.70")
-	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
-	if err != nil {
-		t.Fatalf("EnsureBackendSessionForIngress: %v", err)
-	}
-	if sess.AdmittedVia != models.SessionAdmissionIngress {
-		t.Fatalf("AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
-	}
-
-	// Seed transport state in the endpoint listener
-	svc.endpoint.StoreTransportKeysForTest(peer.peerKey, &endpoint.TransportKeys{
-		SendKey: make([]byte, 32),
-		RecvKey: make([]byte, 32),
-	})
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("endpoint transport state not seeded")
-	}
-
-	genBefore := svc.endpoint.PeerGeneration(peer.peerKey)
-
-	tun, err := svc.pool.GetTunnelByID(backend.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tun.ActiveConnections != 1 {
-		t.Fatalf("ActiveConnections = %d, want 1 before sweep", tun.ActiveConnections)
-	}
-
-	// Backdate LastSeen past the listener's idle timeout threshold
-	svc.sessionMgr.SetSessionLastSeen(peer.peerKey, time.Now().UTC().Add(-10*time.Minute))
-
-	// Directly exercise the legacy endpoint listener sweep
-	timedOut, err := svc.endpoint.SweepTimedOutSessions(ctx)
-	if err != nil {
-		t.Fatalf("SweepTimedOutSessions failed: %v", err)
-	}
-	if len(timedOut) != 1 || timedOut[0].ID != sess.ID {
-		t.Fatalf("SweepTimedOutSessions returned %d sessions (want [%s])", len(timedOut), sess.ID)
-	}
-
-	// Assert session is removed from SessionManager
-	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey); ok {
-		t.Fatalf("session still in SessionManager after sweep: %+v", snap)
-	}
-
-	// Assert route is retired from forwarder
-	if route := svc.forwarder.RouteSessionID(peer.peerKey); route != "" {
-		t.Fatalf("route survived sweep: %q", route)
-	}
-
-	// Assert backend active connection count was decremented
-	tunAfter, err := svc.pool.GetTunnelByID(backend.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tunAfter.ActiveConnections != 0 {
-		t.Fatalf("ActiveConnections = %d, want 0 after sweep", tunAfter.ActiveConnections)
-	}
-
-	// Assert svc.endpoint.PeerGeneration(peer.peerKey) did NOT advance
-	if genAfter := svc.endpoint.PeerGeneration(peer.peerKey); genAfter != genBefore {
-		t.Fatalf("endpoint PeerGeneration advanced %d -> %d", genBefore, genAfter)
-	}
-
-	// Assert svc.endpoint.HasTransportStateForPeer(peer.peerKey) remains true
-	if !svc.endpoint.HasTransportStateForPeer(peer.peerKey) {
-		t.Fatal("SweepTimedOutSessions pruned endpoint transport state for ingress session")
 	}
 }

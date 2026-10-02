@@ -150,11 +150,11 @@ func TestSessionRouteStopChannelNeverClosedQueue(t *testing.T) {
 func TestRetireAllRoutes_DrainsQueuesAndJoinsWrites(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 10)
 	dev := newBlockingWriteDevice()
-	f.AttachPeerDevice("peer-1", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 
-	f.RegisterSession("sess-1", "conn-1", "peer-1", "10.100.0.11", 1)
-	f.RegisterSession("sess-2", "conn-2", "peer-2", "10.100.0.12", 1)
-	f.RegisterSession("sess-3", "conn-3", "peer-3", "10.100.0.13", 1)
+	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-1", "10.100.0.11", 1, path)
+	f.RegisterSessionWithReturnPath("sess-2", "conn-2", "peer-2", "10.100.0.12", 1, path)
+	f.RegisterSessionWithReturnPath("sess-3", "conn-3", "peer-3", "10.100.0.13", 1, path)
 
 	// Send packets to all three routes
 	pkt := returnPacket("10.100.0.11")
@@ -206,10 +206,9 @@ func TestRetireAllRoutes_DrainsQueuesAndJoinsWrites(t *testing.T) {
 	f.mu.RLock()
 	routesCount := len(f.routesByPeer)
 	ipCount := len(f.routesByIP)
-	devCount := len(f.clientDevices)
 	f.mu.RUnlock()
-	if routesCount != 0 || ipCount != 0 || devCount != 0 {
-		t.Fatalf("expected route maps to be cleared, got routes=%d ips=%d devs=%d", routesCount, ipCount, devCount)
+	if routesCount != 0 || ipCount != 0 {
+		t.Fatalf("expected route maps to be cleared, got routes=%d ips=%d", routesCount, ipCount)
 	}
 
 	// Unblock device write
@@ -252,7 +251,7 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 		return len(p), nil
 	})
 
-	// Register 2 custom routes
+	// Register 2 unmanaged routes
 	f.RegisterSession("sess-c1", "conn-c1", "peer-c1", "10.100.0.11", 1)
 	f.RegisterSession("sess-c2", "conn-c2", "peer-c2", "10.100.0.12", 1)
 
@@ -268,8 +267,8 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 	if active != 4 {
 		t.Fatalf("expected 4 active routes, got %d", active)
 	}
-	if owner := f.ReturnRouteOwner(); owner != "mixed" {
-		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "upstream" {
+		t.Fatalf("expected return route owner 'upstream', got %q", owner)
 	}
 
 	// Retire only upstream routes
@@ -284,28 +283,28 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 		t.Fatalf("expected ErrSessionNotRegistered for upstream route 2, got %v", err)
 	}
 
-	// Custom routes remain intact
+	// Unmanaged routes remain intact in routesByPeer, but ReturnRouteOwner reports "none" since they have no valid return path
 	_, _, active = f.GetStats()
 	if active != 2 {
 		t.Fatalf("expected 2 active routes after retiring upstream, got %d", active)
 	}
-	if owner := f.ReturnRouteOwner(); owner != "custom" {
-		t.Fatalf("expected return route owner 'custom', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return route owner 'none', got %q", owner)
 	}
 
-	// Custom routes still functional
+	// Unmanaged routes still functional
 	customPkt := returnPacket("10.100.0.11")
 	if err := f.RouteBackendToClient(1, customPkt, "10.100.0.11"); err != nil {
 		t.Fatalf("RouteBackendToClient custom route failed: %v", err)
 	}
 
-	// Retire custom routes
-	waitCustom := f.RetireCustomRoutes()
+	// Retire unmanaged routes
+	waitCustom := f.RetireUnmanagedRoutes()
 	_ = waitCustom(context.Background())
 
 	_, _, active = f.GetStats()
 	if active != 0 {
-		t.Fatalf("expected 0 active routes after retiring custom, got %d", active)
+		t.Fatalf("expected 0 active routes after retiring unmanaged, got %d", active)
 	}
 	if owner := f.ReturnRouteOwner(); owner != "none" {
 		t.Fatalf("expected return route owner 'none', got %q", owner)
@@ -335,8 +334,8 @@ func TestForwarder_Stop_FullCleanupAndDrain(t *testing.T) {
 	if occ == 0 {
 		t.Fatal("expected positive aggregate queue occupancy before stop")
 	}
-	if owner := f.ReturnRouteOwner(); owner != "mixed" {
-		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "upstream" {
+		t.Fatalf("expected return route owner 'upstream', got %q", owner)
 	}
 
 	if err := f.Stop(); err != nil {
@@ -370,18 +369,17 @@ func TestForwarder_Stop_FullCleanupAndDrain(t *testing.T) {
 	f.mu.RLock()
 	rByPeer := len(f.routesByPeer)
 	rByIP := len(f.routesByIP)
-	cDevs := len(f.clientDevices)
 	f.mu.RUnlock()
-	if rByPeer != 0 || rByIP != 0 || cDevs != 0 {
-		t.Fatalf("expected maps empty: routesByPeer=%d routesByIP=%d clientDevices=%d", rByPeer, rByIP, cDevs)
+	if rByPeer != 0 || rByIP != 0 {
+		t.Fatalf("expected maps empty: routesByPeer=%d routesByIP=%d", rByPeer, rByIP)
 	}
 }
 
 func TestRetireAllRoutes_PermanentlyBlockedWriteTimesOut(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 10)
 	dev := newBlockingWriteDevice()
-	f.AttachPeerDevice("peer-blocked", dev)
-	f.RegisterSession("sess-b", "conn-b", "peer-blocked", "10.100.0.99", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("sess-b", "conn-b", "peer-blocked", "10.100.0.99", 1, path)
 
 	pkt := returnPacket("10.100.0.99")
 	if err := f.RouteBackendToClient(1, pkt, "10.100.0.99"); err != nil {
@@ -422,8 +420,8 @@ func TestForwarder_Stop_PermanentlyBlockedWriteTimesOut(t *testing.T) {
 	dev := newBlockingWriteDevice()
 	defer dev.release()
 
-	f.AttachPeerDevice("peer-blocked-stop", dev)
-	f.RegisterSession("sess-bs", "conn-bs", "peer-blocked-stop", "10.100.0.98", 1)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("sess-bs", "conn-bs", "peer-blocked-stop", "10.100.0.98", 1, path)
 
 	pkt := returnPacket("10.100.0.98")
 	if err := f.RouteBackendToClient(1, pkt, "10.100.0.98"); err != nil {

@@ -26,18 +26,18 @@ func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	}
 
 	// Initial connect.
-	sess1, _, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess1, _, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err != nil {
-		t.Fatalf("initial HandleIncomingPeer failed: %v", err)
+		t.Fatalf("initial HandleIncomingPeerForTest failed: %v", err)
 	}
 	if tun.ActiveConnections != 2 {
 		t.Fatalf("after connect: gauge = %d, want 2", tun.ActiveConnections)
 	}
 
 	// Rekey: the same peer initiates a new handshake on the live session.
-	sess2, backend2, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess2, backend2, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err != nil {
-		t.Fatalf("rekey HandleIncomingPeer failed: %v", err)
+		t.Fatalf("rekey HandleIncomingPeerForTest failed: %v", err)
 	}
 	if backend2.ID != tun.ID {
 		t.Fatalf("rekey selected backend %d, want %d", backend2.ID, tun.ID)

@@ -15,7 +15,6 @@ func TestConfigDefaults(t *testing.T) {
 	os.Unsetenv("TRUSTED_PROXIES")
 	os.Unsetenv("LOG_LEVEL")
 	os.Unsetenv("VPN_ENABLED")
-	os.Unsetenv("VPN_CLIENT_AWG_ENGINE")
 
 	tmpDir := t.TempDir()
 	os.Setenv("DATA_DIR", tmpDir)
@@ -44,93 +43,8 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.VPNSubnet != "10.100.0.0/16" {
 		t.Errorf("expected VPNSubnet default 10.100.0.0/16, got %s", cfg.VPNSubnet)
 	}
-	if cfg.ClientAWGEngine != ClientAWGEngineCustom {
-		t.Errorf("expected ClientAWGEngine default %q, got %q", ClientAWGEngineCustom, cfg.ClientAWGEngine)
-	}
 	if len(cfg.SecretKey) != 64 {
 		t.Errorf("expected generated secret key length 64, got %d", len(cfg.SecretKey))
-	}
-}
-
-func TestClientAWGEngineConfig(t *testing.T) {
-	cleanup := func() {
-		os.Unsetenv("VPN_CLIENT_AWG_ENGINE")
-	}
-	defer cleanup()
-
-	tests := []struct {
-		name       string
-		setEnvs    map[string]string
-		wantEngine string
-		wantErr    bool
-	}{
-		{
-			name:       "default to custom when unset",
-			setEnvs:    map[string]string{},
-			wantEngine: ClientAWGEngineCustom,
-		},
-		{
-			name:       "default to custom when empty",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": ""},
-			wantEngine: ClientAWGEngineCustom,
-		},
-		{
-			name:       "empty after trim defaults to custom",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "   "},
-			wantEngine: ClientAWGEngineCustom,
-		},
-		{
-			name:       "VPN_CLIENT_AWG_ENGINE=custom",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "custom"},
-			wantEngine: ClientAWGEngineCustom,
-		},
-		{
-			name:       "VPN_CLIENT_AWG_ENGINE=upstream",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "upstream"},
-			wantEngine: ClientAWGEngineUpstream,
-		},
-		{
-			name:       "case-insensitive and trimmed",
-			setEnvs:    map[string]string{"VPN_CLIENT_AWG_ENGINE": "  UPSTREAM  "},
-			wantEngine: ClientAWGEngineUpstream,
-		},
-		{
-			name:    "invalid engine value fails closed",
-			setEnvs: map[string]string{"VPN_CLIENT_AWG_ENGINE": "kernel"},
-			wantErr: true,
-		},
-		{
-			name:    "invalid typo fails closed",
-			setEnvs: map[string]string{"VPN_CLIENT_AWG_ENGINE": "up-stream"},
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cleanup()
-			tmpDir := t.TempDir()
-			os.Setenv("DATA_DIR", tmpDir)
-			defer os.Unsetenv("DATA_DIR")
-
-			for k, v := range tc.setEnvs {
-				os.Setenv(k, v)
-			}
-
-			cfg, err := LoadConfig()
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected error for invalid engine configuration, got nil (cfg=%+v)", cfg)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected LoadConfig error: %v", err)
-			}
-			if cfg.ClientAWGEngine != tc.wantEngine {
-				t.Errorf("ClientAWGEngine mismatch: got %q, want %q", cfg.ClientAWGEngine, tc.wantEngine)
-			}
-		})
 	}
 }
 

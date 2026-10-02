@@ -26,8 +26,8 @@ func TestSystemHandlers(t *testing.T) {
 		if resp.Status != "ok" || resp.Version != cfg.AppVersion {
 			t.Errorf("unexpected health response: %+v", resp)
 		}
-		if resp.ConfiguredEngine != "custom" {
-			t.Errorf("expected configured_engine custom, got %q", resp.ConfiguredEngine)
+		if resp.ConfiguredEngine != "upstream" {
+			t.Errorf("expected configured_engine upstream, got %q", resp.ConfiguredEngine)
 		}
 		if resp.ActiveEngine != "none" {
 			t.Errorf("expected active_engine none when not running, got %q", resp.ActiveEngine)
@@ -40,15 +40,15 @@ func TestSystemHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("HealthHandler_UpstreamEngine", func(t *testing.T) {
-		if h.vpnSvc != nil {
-			_ = h.vpnSvc.SetClientAWGEngine("upstream")
-			defer func() { _ = h.vpnSvc.SetClientAWGEngine("custom") }()
-		}
+	t.Run("HealthHandler_NilVPNService", func(t *testing.T) {
+		hNil := NewHandlers(Dependencies{
+			Config: cfg,
+			DB:     nil,
+		})
 
 		req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
 		w := httptest.NewRecorder()
-		h.HealthHandler(w, req)
+		hNil.HealthHandler(w, req)
 
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)

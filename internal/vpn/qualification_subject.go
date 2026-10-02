@@ -90,8 +90,8 @@ func normalizeSubjectConfig(cfg QualificationSubjectConfig) (QualificationSubjec
 	if cfg.Engine == "" {
 		cfg.Engine = "upstream"
 	}
-	if cfg.Engine != "upstream" && cfg.Engine != "custom" {
-		return cfg, fmt.Errorf("invalid subject engine %q: must be 'upstream' or 'custom'", cfg.Engine)
+	if cfg.Engine != "upstream" {
+		return cfg, fmt.Errorf("invalid subject engine %q: upstream is the only runtime engine", cfg.Engine)
 	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = "test-artifacts/runtime/panel_test.db"
@@ -421,35 +421,18 @@ func NewQualificationSubject(cfg QualificationSubjectConfig) (*QualificationSubj
 	}()
 	sub.svc.forwarder.StartPumps(ctx)
 
-	if normCfg.Engine == "custom" {
-		if err := sub.svc.SetClientAWGEngine(ClientAWGEngineCustom); err != nil {
-			_ = sub.Stop()
-			return nil, fmt.Errorf("set custom client awg engine: %w", err)
-		}
-		if err := sub.svc.Start(ctx); err != nil {
-			_ = sub.Stop()
-			return nil, fmt.Errorf("start custom vpn service: %w", err)
-		}
-		sub.svc.forwarder.AttachBackendDevice(tunnelID, sub.adapter)
-		sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
-	} else {
-		if err := sub.svc.SetClientAWGEngine(ClientAWGEngineUpstream); err != nil {
-			_ = sub.Stop()
-			return nil, fmt.Errorf("set upstream client awg engine: %w", err)
-		}
-		engine, err := sub.svc.NewIngressEngine(ctx, "nexus-subject", []clientawg.Peer{clientPeer})
-		if err != nil {
-			_ = sub.Stop()
-			return nil, fmt.Errorf("construct ingress engine: %w", err)
-		}
-		sub.engine = engine
-
-		if err := sub.engine.Start(); err != nil {
-			_ = sub.Stop()
-			return nil, fmt.Errorf("start ingress engine: %w", err)
-		}
-		sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
+	engine, err := sub.svc.NewIngressEngine(ctx, "nexus-subject", []clientawg.Peer{clientPeer})
+	if err != nil {
+		_ = sub.Stop()
+		return nil, fmt.Errorf("construct ingress engine: %w", err)
 	}
+	sub.engine = engine
+
+	if err := sub.engine.Start(); err != nil {
+		_ = sub.Stop()
+		return nil, fmt.Errorf("start ingress engine: %w", err)
+	}
+	sub.svc.stickyMgr.AssignPeerAffinity(clientPeer.PublicKey, tunnelID)
 
 	if err := writeSubjectReadiness(normCfg); err != nil {
 		_ = sub.Stop()
@@ -496,14 +479,8 @@ func (s *QualificationSubject) Stop() error {
 				errs = append(errs, err)
 			}
 		}
-		if s.svc != nil {
-			if s.cfg.Engine == "custom" {
-				if err := s.svc.Stop(); err != nil {
-					errs = append(errs, err)
-				}
-			} else if s.svc.forwarder != nil {
-				s.svc.forwarder.StopPumps()
-			}
+		if s.svc != nil && s.svc.forwarder != nil {
+			s.svc.forwarder.StopPumps()
 		}
 		if s.adapter != nil {
 			_ = s.adapter.Close()

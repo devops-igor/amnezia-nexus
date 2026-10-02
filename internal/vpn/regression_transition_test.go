@@ -161,7 +161,7 @@ func TestRegressionLegacyAdmissionWithListenerCompletes(t *testing.T) {
 		panic("HandleIncomingPeer blocked: notification path reconciled inline under Service.mu")
 	})
 	defer watchdog.Stop()
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKey)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKey)
 	if err != nil {
 		t.Fatalf("legacy admission with armed listener: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestRegressionLegacyDisableStopsForwarding(t *testing.T) {
 	// A real enabled user with a real issued connection: the durable toggle
 	// below revokes exactly this peer.
 	peerKey, connID := issueDurablePeer(t, svc, db, "regr-legacy-disable")
-	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, connID), peerKey, "10.100.8.7", backend.ID, "ingress-device", models.SessionAdmissionHandshake)
+	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, connID), peerKey, "10.100.8.7", backend.ID, "ingress-device", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,18 +214,14 @@ func TestRegressionLegacyDisableStopsForwarding(t *testing.T) {
 		t.Fatal("committed disable did not trigger live-session revocation")
 	}
 	if snap, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peerKey); ok {
-		t.Fatalf("disabled legacy session survived: %+v", snap)
+		t.Fatalf("disabled session survived: %+v", snap)
 	}
 	if route := svc.forwarder.RouteSessionID(peerKey); route != "" {
-		t.Fatalf("disabled legacy session kept its forwarder route: %q", route)
+		t.Fatalf("disabled session kept its forwarder route: %q", route)
 	}
 	after, err := svc.pool.GetTunnelByID(backend.ID)
 	if err != nil || after.ActiveConnections != 0 {
-		t.Fatalf("backend counter after legacy disable = %d, want 0 (err: %v)", after.ActiveConnections, err)
-	}
-	// The legacy listener stays alive: engine dormancy is the point.
-	if svc.endpoint == nil {
-		t.Fatal("legacy service unexpectedly lost its endpoint listener")
+		t.Fatalf("backend counter after disable = %d, want 0 (err: %v)", after.ActiveConnections, err)
 	}
 }
 

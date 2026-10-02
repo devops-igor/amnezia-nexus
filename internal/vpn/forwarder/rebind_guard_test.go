@@ -103,10 +103,10 @@ func TestRebindHijackBlocked(t *testing.T) {
 	<-clientB
 }
 
-// TestLegitimateRebindStillWorks covers the NAT/misconfig self-heal use
-// case: a peer whose traffic appears from a DIFFERENT unassigned IP inside
-// the portal subnet still gets its return route rebound to the new IP.
-func TestLegitimateRebindStillWorks(t *testing.T) {
+// TestMismatchedSourceIPRejectedWithoutMutation covers the removal of self-heal rebind:
+// a peer whose traffic appears from a DIFFERENT unassigned IP inside the portal subnet
+// is rejected with ErrSpoofedSourceIP and never mutates the route or reverse map.
+func TestMismatchedSourceIPRejectedWithoutMutation(t *testing.T) {
 	f := NewForwarder(NewTrafficAccountant(nil, 0), "10.100.0.0/16", 64)
 
 	const backendID = int64(2)
@@ -119,34 +119,50 @@ func TestLegitimateRebindStillWorks(t *testing.T) {
 		t.Fatalf("no client channel")
 	}
 
-	// Self-heal: peer sends an inner packet with a NEW, unassigned,
-	// in-subnet source IP.
-	if err := f.RouteClientToBackend("peer-l", rebindTestPacket(newIP)); err != nil {
-		t.Fatalf("legitimate rebind rejected: %v", err)
+	// Peer sends an inner packet with a mismatched source IP.
+	err := f.RouteClientToBackend("peer-l", rebindTestPacket(newIP))
+	if !errors.Is(err, ErrSpoofedSourceIP) {
+		t.Fatalf("expected ErrSpoofedSourceIP, got: %v", err)
 	}
 
-	// Return traffic to the NEW IP must reach the peer.
-	if err := f.RouteBackendToClient(backendID, []byte("self-healed"), newIP); err != nil {
-		t.Fatalf("RouteBackendToClient for rebound IP: %v", err)
+	// Return traffic to the new IP must fail because no dynamic rebind occurred.
+	if err := f.RouteBackendToClient(backendID, []byte("unassigned"), newIP); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for newIP, got: %v", err)
+	}
+
+	// Initial IP must still be routed and reach the client queue.
+	if err := f.RouteBackendToClient(backendID, []byte("initial"), initialIP); err != nil {
+		t.Fatalf("RouteBackendToClient for initial IP: %v", err)
 	}
 	select {
 	case pkt := <-clientChan:
-		if string(pkt) != "self-healed" {
+		if string(pkt) != "initial" {
 			t.Fatalf("payload mismatch: %q", pkt)
 		}
 	default:
-		t.Fatal("no packet on client queue after legit rebind")
+		t.Fatal("no packet on client queue for initial IP")
 	}
 
-	// The old IP entry was moved, not copied: the old address is no longer
-	// routed.
-	if err := f.RouteBackendToClient(backendID, []byte("old"), initialIP); !errors.Is(err, ErrSessionNotRegistered) {
-		t.Fatalf("old IP still routed after legit rebind: %v", err)
+	f.mu.RLock()
+	route := f.routesByPeer["peer-l"]
+	assigned := route.assignedIP
+	mappedRoute := f.routesByIP[initialIP]
+	newIPRoute := f.routesByIP[newIP]
+	f.mu.RUnlock()
+
+	if assigned != initialIP {
+		t.Fatalf("assigned IP mutated: got %q, want %q", assigned, initialIP)
+	}
+	if mappedRoute != route {
+		t.Fatalf("routesByIP[initialIP] does not point to route")
+	}
+	if newIPRoute != nil {
+		t.Fatalf("routesByIP[newIP] unexpectedly mapped")
 	}
 
-	// A legitimate rebind must NOT count as spoofed.
-	if got := f.SpoofedRebinds(); got != 0 {
-		t.Fatalf("SpoofedRebinds = %d after legitimate rebind, want 0", got)
+	// Mismatched packet must count as spoofed.
+	if got := f.SpoofedRebinds(); got != 1 {
+		t.Fatalf("SpoofedRebinds = %d, want 1", got)
 	}
 }
 
