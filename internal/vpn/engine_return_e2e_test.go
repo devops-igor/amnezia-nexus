@@ -113,6 +113,10 @@ func (c *returnStreamClient) LastHandshakeTime() time.Time {
 }
 
 func newReturnStreamClient(t *testing.T, peer enginePeer, saved string, destination netip.Addr, backendMarker byte) *returnStreamClient {
+	return newReturnStreamClientWithTiming(t, peer, saved, destination, backendMarker, "rekey_after_time=2\nrekey_timeout=1\n")
+}
+
+func newReturnStreamClientWithTiming(t *testing.T, peer enginePeer, saved string, destination netip.Addr, backendMarker byte, timingUAPI string) *returnStreamClient {
 	t.Helper()
 	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(peer.assignedIP)}, nil, 1280)
 	if err != nil {
@@ -127,8 +131,10 @@ func newReturnStreamClient(t *testing.T, peer enginePeer, saved string, destinat
 	if err := dev.IpcSet(uapi); err != nil {
 		t.Fatal("client configuration rejected")
 	}
-	if err := dev.IpcSet("rekey_after_time=2\nrekey_timeout=1\n"); err != nil {
-		t.Fatal("test timing configuration rejected")
+	if timingUAPI != "" {
+		if err := dev.IpcSet(timingUAPI); err != nil {
+			t.Fatal("test timing configuration rejected")
+		}
 	}
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
