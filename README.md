@@ -1,5 +1,8 @@
 # Amnezia Nexus
 
+> [!CAUTION]
+> **Disclaimer:** Amnezia Nexus is an independent, non-commercial hobby project developed for personal and friends' use. It is **not** affiliated with, endorsed by, or sponsored by the developers of Amnezia VPN or the AmneziaWG protocol.
+
 Amnezia Nexus is a self-hosted web panel and load balancer built specifically for AmneziaWG.
 
 ## Why this exists
