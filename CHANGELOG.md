@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [2.1.0] - Pulsar - 2026-10-02
 
-- Client-facing upstream AWG device wrapper with persisted portal identity validation, IPv4 peer management, plaintext VirtualTUN access, sanitized status, and localhost compatibility/restart tests (#387). Production listener selection remains unchanged.
+Minor release establishing the official upstream amneziawg-go protocol engine as the permanent client-facing data plane in Amnezia Nexus, decommissioning the legacy custom WireGuard/AmneziaWG state machine, and introducing the differential compatibility qualification suite.
+
+### Added
+- Upstream AmneziaWG engine integration: integrated official upstream amneziawg-go device.Device as the exclusive client-facing protocol engine, terminating handshakes and transport encryption in userspace via an in-memory VirtualTUN interface (#384, #387, #394).
+- Plaintext ingress router and return path: implemented zero-copy plaintext packet routing from VirtualTUN into Nexus backend sessions with fail-closed durable IP ownership and route-bound ReturnPath injection (#388, #389).
+- Durable runtime synchronization: synchronized upstream peer state directly with authoritative user connections, automating dynamic peer creation, key rotation, and revocation without client config regeneration (#391).
+- Differential qualification test harness: added automated cross-validation testing real Linux non-netstack clients, sustained bidirectional TCP/UDP, 10+ natural rekeys, and same-DB restart durability against reference AmneziaWG (#392, #407).
+
+### Changed
+- Peer and session lifetime decoupling: separated client AmneziaWG cryptographic lifetime from backend routing sessions so idle session reaping is routing-only and never tears down client transport keys (#390).
+- Forwarder route ownership: unified forwarder status reporting to upstream-only semantics and replaced custom route retirement with RetireUnmanagedRoutes (#420, #422).
+
+### Removed
+- Custom client protocol engine: permanently deleted legacy custom UDP listener, Noise handshake derivation, manual receiver index tables, and transport crypto state machines (#394, #419).
+- Packet-driven source IP rebinding: eliminated unmanaged packet-driven IP self-rebinds, enforcing fail-closed source IP validation against durable database leases (#420).
+- Rollback-era dual-engine machinery: removed temporary dual-engine status and legacy rollback rehearsal scripts (#422, #425).
 
 ## [2.0.0] - Zenith - 2026-09-27
 
