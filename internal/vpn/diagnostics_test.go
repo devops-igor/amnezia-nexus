@@ -497,6 +497,7 @@ func assertDropBreakdown(t *testing.T, b DropCategoryBreakdown, expected string)
 		"ClientBackendQueueFull": b.ClientBackendQueueFull,
 		"ClientRateLimited":      b.ClientRateLimited,
 		"ClientNoHealthyBackend": b.ClientNoHealthyBackend,
+		"ClientVirtualTUNDrops":  b.ClientVirtualTUNDrops,
 		"ReturnMalformed":        b.ReturnMalformed,
 		"ReturnUnmapped":         b.ReturnUnmapped,
 		"ReturnMismatch":         b.ReturnMismatch,
@@ -512,8 +513,13 @@ func assertDropBreakdown(t *testing.T, b DropCategoryBreakdown, expected string)
 		"ClientBackendQueueFull": true,
 		"ClientRateLimited":      true,
 		"ClientNoHealthyBackend": true,
+		"ClientVirtualTUNDrops":  true,
 	}
 
+	// ReturnInjectionTUNDrops is deliberately absent from this map: it is an
+	// ownership annotation on an injection rejection already counted by
+	// ReturnVirtualTUNDrops, not an additional loss. Counting it here would
+	// assert exclusivity between a loss and its own overlap marker.
 	for k, v := range m {
 		if k == expected {
 			if v != 1 {
@@ -680,15 +686,31 @@ func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
 		assertDropBreakdown(t, status.DropCategories, "ReturnInjectionErrors")
 	})
 
+	// A queue-full injection rejection is owned by the VirtualTUN inbound drop
+	// bucket, so it must surface once as ReturnVirtualTUNDrops and never also
+	// as a non-TUN injection error. The rejection is produced through the real
+	// injection site so the ownership counter is exercised, rather than the
+	// counters being incremented by hand (issue #424 round 2, finding 3).
 	t.Run("ReturnVirtualTUNDrops", func(t *testing.T) {
-		svc, _, engine, _, _ := newSingleOwnerFixture(t)
+		svc, _, engine, resolver, _ := newSingleOwnerFixture(t)
 		if err := engine.portal.DownForTest(); err != nil {
 			t.Fatalf("DownForTest: %v", err)
 		}
+		resolver.Update(ingress.PeerOwnership{
+			PeerPublicKey: "ps-peer", IP: netip.MustParseAddr("10.100.0.1"), ConnectionID: "c", UserID: "u",
+		})
 		pkt := buildTestIPv4Packet(net.ParseIP("1.1.1.1"), net.ParseIP("10.100.0.1"), 40)
+
+		// Fill the inbound queue, then push through writeReturnPacket until the
+		// device rejects with ErrQueueFull.
+		for i := 0; i < 2; i++ {
+			if err := engine.portal.InjectInbound(pkt); err != nil {
+				t.Fatalf("priming InjectInbound %d: %v", i, err)
+			}
+		}
 		var err error
 		for i := 0; i < 10; i++ {
-			err = engine.portal.InjectInbound(pkt)
+			_, err = engine.writeReturnPacket("ps-peer", "10.100.0.1", pkt)
 			if errors.Is(err, virtualtun.ErrQueueFull) {
 				break
 			}
@@ -696,7 +718,13 @@ func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
 		if !errors.Is(err, virtualtun.ErrQueueFull) {
 			t.Fatalf("expected ErrQueueFull, got %v", err)
 		}
-		engine.returnCounters.injectionErrors.Add(1)
+
+		stats := engine.ReturnStats()
+		if stats.InjectionErrors != 1 || stats.InjectionTunDrops != 1 {
+			t.Fatalf("expected the injection site to own exactly 1 of 1 rejections, got %d/%d",
+				stats.InjectionErrors, stats.InjectionTunDrops)
+		}
+
 		var status Status
 		svc.populateOperationalDiagnostics(&status)
 		assertDropBreakdown(t, status.DropCategories, "ReturnVirtualTUNDrops")

@@ -222,8 +222,12 @@ type Service struct {
 	rollingHistory *RollingHistory
 	diagRatesMu    sync.Mutex
 	diagRates      *diagRatesTracker
-	historyStopCh  chan struct{}
-	historyDoneCh  chan struct{}
+	// diagDeltas converts cumulative lifetime failure counters into windowed
+	// deltas so a recovered incident stops pinning current health (issue #424
+	// round 2, finding 5). Its zero value is usable.
+	diagDeltas    diagDeltaTrackers
+	historyStopCh chan struct{}
+	historyDoneCh chan struct{}
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration

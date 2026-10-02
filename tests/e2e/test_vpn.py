@@ -87,6 +87,11 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
         "#vpn-diag-engine-status",
         "#vpn-diag-peers-status",
         "#vpn-diag-sync-failures",
+        "#vpn-diag-peer-sync-invalid",
+        "#vpn-diag-peer-sync-enqueue",
+        "#vpn-diag-peer-sync-reconcile",
+        "#vpn-diag-peer-sync-error",
+        "#vpn-diag-peer-sync-restart",
         "#vpn-diag-hs-freshness",
         # Panel 7: Routing Consistency Invariants
         "#vpn-diag-routing-badge",
@@ -225,6 +230,93 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     # Validate runtime resources
     runtime = status_data["runtime_resources"]
     assert "cpu_percent" in runtime and "goroutines" in runtime
+
+    # Validate the Peer Sync panel source. The panel renders status.peer_sync,
+    # so every key it reads must exist there with a compatible type when the
+    # payload is present. peer_sync is omitempty, so absence is legal; the
+    # panel renders an explicit unavailable state in that case.
+    assert "peer_sync" in status_data
+    peer_sync = status_data["peer_sync"]
+    if peer_sync is not None:
+        assert isinstance(peer_sync, dict)
+        for key in (
+            "desired_peers",
+            "actual_peers",
+            "invalid_rows",
+            "sync_failures",
+            "add_failures",
+            "update_failures",
+            "remove_failures",
+            "enqueue_failures",
+            "last_successful_reconcile",
+            "portal_config_restart_required",
+        ):
+            assert key in peer_sync, f"peer_sync missing {key}"
+        assert isinstance(peer_sync["desired_peers"], int)
+        assert isinstance(peer_sync["actual_peers"], int)
+        assert isinstance(peer_sync["invalid_rows"], int)
+        for key in (
+            "sync_failures",
+            "add_failures",
+            "update_failures",
+            "remove_failures",
+            "enqueue_failures",
+        ):
+            assert isinstance(peer_sync[key], int)
+        assert isinstance(peer_sync["portal_config_restart_required"], bool)
+        # Optional omitempty error strings the panel surfaces when set.
+        for key in ("last_error", "last_enqueue_error"):
+            if key in peer_sync:
+                assert isinstance(peer_sync[key], str)
+
+    # Validate the drop categories the panel renders. client_virtualtun_drops
+    # is the Upstream -> Nexus VirtualTUN bucket added in round 2; it must be
+    # part of client_total_drops so headline loss cannot read zero while the
+    # upstream-to-Nexus queue drops.
+    drops = status_data["drop_categories"]
+    assert "client_virtualtun_drops" in drops
+    assert "return_injection_tun_drops" in drops
+    client_categories = (
+        drops["client_malformed"]
+        + drops["client_unmapped_source"]
+        + drops["client_mismatch"]
+        + drops["client_rejected"]
+        + drops["client_backend_queue_full"]
+        + drops["client_rate_limited"]
+        + drops["client_no_healthy_backend"]
+        + drops["client_virtualtun_drops"]
+    )
+    return_categories = (
+        drops["return_malformed"]
+        + drops["return_unmapped"]
+        + drops["return_mismatch"]
+        + drops["return_injection_errors"]
+        + drops["return_virtualtun_drops"]
+    )
+    assert client_categories == drops["client_total_drops"], (
+        f"client categories sum {client_categories} != client_total_drops "
+        f"{drops['client_total_drops']}"
+    )
+    assert return_categories == drops["return_total_drops"], (
+        f"return categories sum {return_categories} != return_total_drops "
+        f"{drops['return_total_drops']}"
+    )
+    assert (
+        drops["client_total_drops"] + drops["return_total_drops"] == drops["total_drops"]
+    ), "total_drops must be client plus return, with no packet counted twice"
+
+    # Validate the VirtualTUN directions are distinct in the payload, so a
+    # swapped mapping cannot pass silently.
+    vtun_dirs = status_data["virtual_tun"]["upstream_to_nexus"]
+    assert set(vtun_dirs) == {"occupancy", "capacity", "peak", "drops"}
+
+    # Validate routing consistency exposes both the lifetime counter (history)
+    # and the windowed delta (current health).
+    routing = status_data["routing_consistency"]
+    assert "ownership_mismatch_drops" in routing
+    assert "ownership_mismatch_drops_recent" in routing
+    if routing["ownership_mismatch_drops_recent"] == 0:
+        assert routing["is_consistent"] or routing.get("inconsistency_details")
 
 
 @pytest.mark.e2e

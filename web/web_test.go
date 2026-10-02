@@ -2518,13 +2518,19 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			"vpn-fwd-drops-no-route",
 			"vpn-fwd-drops-packet-too-large",
 			"vpn-fwd-write-errors",
-			"vpn-fwd-decrypt-failures",
 			"vpn-fwd-routes-details",
 			"vpn-fwd-routes-badge",
 			"vpn-fwd-routes-summary-status",
 			"vpn-fwd-routes-empty",
 			"vpn-fwd-routes-table",
 			"vpn-fwd-routes-tbody",
+			"vpn-diag-peers-status",
+			"vpn-diag-sync-failures",
+			"vpn-diag-peer-sync-invalid",
+			"vpn-diag-peer-sync-enqueue",
+			"vpn-diag-peer-sync-reconcile",
+			"vpn-diag-peer-sync-error",
+			"vpn-diag-peer-sync-restart",
 		}
 		for _, id := range requiredDOMIDs {
 			if !strings.Contains(vpnStr, `id="`+id+`"`) {
@@ -2542,7 +2548,6 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			"vpn_forwarder_drops_no_route",
 			"vpn_forwarder_drops_oversize",
 			"vpn_forwarder_write_errors",
-			"vpn_forwarder_decrypt_failures",
 			"vpn_forwarder_routes",
 			"vpn_forwarder_unavailable",
 			"vpn_forwarder_no_route_pressure",
@@ -2557,6 +2562,18 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			"vpn_forwarder_instantaneous",
 			"vpn_forwarder_peak_watermark",
 			"vpn_forwarder_cumulative",
+			"vpn_diag_peer_sync_peers",
+			"vpn_diag_peer_sync_failures",
+			"vpn_diag_peer_sync_invalid_rows",
+			"vpn_diag_peer_sync_enqueue",
+			"vpn_diag_peer_sync_last_reconcile",
+			"vpn_diag_peer_sync_last_error",
+			"vpn_diag_peer_sync_restart_required",
+			"vpn_diag_peer_sync_unavailable",
+			"vpn_diag_peer_sync_never",
+			"vpn_diag_peer_sync_none",
+			"vpn_diag_peer_sync_restart_yes",
+			"vpn_diag_peer_sync_restart_no",
 		}
 		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
 
@@ -2604,7 +2621,6 @@ func TestIssue305ForwarderHealthTelemetryUI(t *testing.T) {
 			`{{ _ "vpn_forwarder_drops_no_route" }}`,
 			`{{ _ "vpn_forwarder_drops_oversize" }}`,
 			`{{ _ "vpn_forwarder_write_errors" }}`,
-			`{{ _ "vpn_forwarder_decrypt_failures" }}`,
 			`{{ _ "vpn_forwarder_routes" }}`,
 			`{{ _ "vpn_forwarder_no_route_pressure" }}`,
 			`{{ _ "vpn_forwarder_route_peer" }}`,
@@ -2818,7 +2834,6 @@ class MockDocument {
             'vpn-fwd-drops-no-route',
             'vpn-fwd-drops-packet-too-large',
             'vpn-fwd-write-errors',
-            'vpn-fwd-decrypt-failures',
             'vpn-fwd-routes-details',
             'vpn-fwd-routes-badge',
             'vpn-fwd-routes-summary-status',
@@ -2837,7 +2852,6 @@ class MockDocument {
         this.elements.get('vpn-fwd-drops-no-route').textContent = '-';
         this.elements.get('vpn-fwd-drops-packet-too-large').textContent = '-';
         this.elements.get('vpn-fwd-write-errors').textContent = '-';
-        this.elements.get('vpn-fwd-decrypt-failures').textContent = '-';
         this.elements.get('vpn-fwd-routes-badge').textContent = '0';
         this.elements.get('vpn-fwd-routes-summary-status').textContent = 'Not reported';
         this.elements.get('vpn-fwd-routes-empty').style.display = 'block';
@@ -2927,7 +2941,6 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-badge').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
@@ -2959,7 +2972,6 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
@@ -2975,7 +2987,6 @@ function runScenario(key) {
             forwarder_drops_no_route: 2,
             forwarder_drops_packet_too_large: 1,
             forwarder_device_write_errors: 2,
-            transport_decryption_failures: 3,
             forwarder_route_queues: {}
         });
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-danger');
@@ -2988,8 +2999,6 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').style.color, 'var(--warning)');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '1');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').style.color, 'var(--warning)');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '3');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').style.color, 'var(--warning)');
     } else if (key === 'saturated_route') {
         mockDoc.reset();
         vpnRenderForwarderHealth({
@@ -3046,7 +3055,6 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-no-route').textContent, '-');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '-');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '-');
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-decrypt-failures').textContent, '-');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Not reported');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-badge').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
@@ -3288,7 +3296,7 @@ class MockDocument {
             'vpn-kpi-backends', 'vpn-kpi-slow-writes',
             'vpn-fwd-queue', 'vpn-fwd-peak', 'vpn-fwd-drops-queue-full',
             'vpn-fwd-drops-no-route', 'vpn-fwd-drops-packet-too-large',
-            'vpn-fwd-write-errors', 'vpn-fwd-decrypt-failures',
+            'vpn-fwd-write-errors',
             'vpn-fwd-routes-details', 'vpn-fwd-routes-badge',
             'vpn-fwd-routes-summary-status', 'vpn-fwd-routes-empty',
             'vpn-fwd-routes-table', 'vpn-fwd-routes-tbody',

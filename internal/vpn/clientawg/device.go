@@ -154,3 +154,12 @@ func (d *ClientAWGDevice) DownForTest() error {
 	defer d.mu.Unlock()
 	return d.dev.Down()
 }
+
+// WriteOutboundForTest submits packets to the VirtualTUN outbound queue, the
+// path the upstream AWG engine uses to emit authenticated plaintext toward
+// Nexus. Production reaches it only through the engine, so this exists purely
+// so tests can create the Upstream -> Nexus queue state (including the
+// queue-full drops) that the diagnostics surface reports.
+func (d *ClientAWGDevice) WriteOutboundForTest(bufs [][]byte, offset int) (int, error) {
+	return d.tun.Write(bufs, offset)
+}

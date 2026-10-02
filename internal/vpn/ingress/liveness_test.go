@@ -261,5 +261,3 @@ func TestRouterRegistersRoutesWithCheckedAPI(t *testing.T) {
 		t.Fatalf("failed admission left route %q behind", got)
 	}
 }
-
-

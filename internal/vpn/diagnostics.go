@@ -82,24 +82,35 @@ type ForwardLatencyDiagnostics struct {
 // DropCategoryBreakdown separates drops by specific root cause without double counting.
 type DropCategoryBreakdown struct {
 	// Client -> Backend (Ingress to forwarder)
-	ClientMalformed        uint64  `json:"client_malformed"`
-	ClientUnmappedSource   uint64  `json:"client_unmapped_source"`
-	ClientMismatch         uint64  `json:"client_mismatch"`
-	ClientRejected         uint64  `json:"client_rejected"`
-	ClientBackendQueueFull uint64  `json:"client_backend_queue_full"`
-	ClientRateLimited      uint64  `json:"client_rate_limited"`
-	ClientNoHealthyBackend uint64  `json:"client_no_healthy_backend"`
-	ClientTotalDrops       uint64  `json:"client_total_drops"`
-	ClientDropRatePps      float64 `json:"client_drop_rate_pps"`
+	ClientMalformed        uint64 `json:"client_malformed"`
+	ClientUnmappedSource   uint64 `json:"client_unmapped_source"`
+	ClientMismatch         uint64 `json:"client_mismatch"`
+	ClientRejected         uint64 `json:"client_rejected"`
+	ClientBackendQueueFull uint64 `json:"client_backend_queue_full"`
+	ClientRateLimited      uint64 `json:"client_rate_limited"`
+	ClientNoHealthyBackend uint64 `json:"client_no_healthy_backend"`
+	// ClientVirtualTUNDrops counts packets the upstream AWG engine handed to
+	// the VirtualTUN outbound queue (Upstream -> Nexus) that never reached
+	// Nexus. They belong to the client-side bucket: the upstream device is
+	// the egress of the client-originated direction, so a drop there loses
+	// client traffic rather than a return reply.
+	ClientVirtualTUNDrops uint64  `json:"client_virtualtun_drops"`
+	ClientTotalDrops      uint64  `json:"client_total_drops"`
+	ClientDropRatePps     float64 `json:"client_drop_rate_pps"`
 
 	// Backend -> Client (Return path)
-	ReturnMalformed       uint64  `json:"return_malformed"`
-	ReturnUnmapped        uint64  `json:"return_unmapped"`
-	ReturnMismatch        uint64  `json:"return_mismatch"`
-	ReturnInjectionErrors uint64  `json:"return_injection_errors"`
-	ReturnVirtualTUNDrops uint64  `json:"return_virtualtun_drops"`
-	ReturnTotalDrops      uint64  `json:"return_total_drops"`
-	ReturnDropRatePps     float64 `json:"return_drop_rate_pps"`
+	ReturnMalformed       uint64 `json:"return_malformed"`
+	ReturnUnmapped        uint64 `json:"return_unmapped"`
+	ReturnMismatch        uint64 `json:"return_mismatch"`
+	ReturnInjectionErrors uint64 `json:"return_injection_errors"`
+	ReturnVirtualTUNDrops uint64 `json:"return_virtualtun_drops"`
+	// ReturnInjectionTUNDrops is the subset of injection rejections whose
+	// loss the VirtualTUN inbound bucket already counted (issue #424 round 2,
+	// finding 3). Additive key: it makes the ownership overlap explicit
+	// instead of inferred by subtracting aggregate counters.
+	ReturnInjectionTUNDrops uint64  `json:"return_injection_tun_drops"`
+	ReturnTotalDrops        uint64  `json:"return_total_drops"`
+	ReturnDropRatePps       float64 `json:"return_drop_rate_pps"`
 
 	// Total aggregate drops
 	TotalDrops       uint64  `json:"total_drops"`
@@ -130,8 +141,21 @@ type RoutingConsistencyDiagnostics struct {
 	RoutesWithoutReturn    []string `json:"routes_without_return"`
 	DuplicateIPs           []string `json:"duplicate_ips"`
 	OwnershipMismatchDrops uint64   `json:"ownership_mismatch_drops"`
-	IsConsistent           bool     `json:"is_consistent"`
-	InconsistencyDetails   []string `json:"inconsistency_details,omitempty"`
+	// OwnershipMismatchDropsRecent is the increase of OwnershipMismatchDrops
+	// observed in the last diagnostics sampling window (issue #424 round 2,
+	// finding 5). The cumulative value stays exposed as history; only the
+	// recent delta gates current health, so a recovered incident no longer
+	// pins routing as inconsistent forever.
+	OwnershipMismatchDropsRecent uint64 `json:"ownership_mismatch_drops_recent"`
+	// OwnershipMismatchWindowSec is the length of the sampling window behind
+	// OwnershipMismatchDropsRecent.
+	OwnershipMismatchWindowSec float64  `json:"ownership_mismatch_window_sec"`
+	IsConsistent               bool     `json:"is_consistent"`
+	InconsistencyDetails       []string `json:"inconsistency_details,omitempty"`
+	// HistoricalDetails carries lifetime observations that are deliberately
+	// NOT inconsistencies, so a reader can see the incident without the
+	// headline status being pinned by it.
+	HistoricalDetails []string `json:"historical_details,omitempty"`
 }
 
 // HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
@@ -478,7 +502,11 @@ func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats R
 		RoutesWithoutSession:   []string{},
 		RoutesWithoutReturn:    []string{},
 		DuplicateIPs:           []string{},
+		HistoricalDetails:      []string{},
 	}
+	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(time.Now(), retStats.OwnershipMismatchDrops)
+	diag.OwnershipMismatchDropsRecent = mismatchRate.delta
+	diag.OwnershipMismatchWindowSec = mismatchRate.windowSeconds
 
 	sessionByPeer := make(map[string]Session, len(activeSessions))
 	ipSessions := make(map[string][]string)
@@ -577,10 +605,19 @@ func auditRoutingConsistencyDetails(diag *RoutingConsistencyDiagnostics) {
 			fmt.Sprintf("%d duplicate IP address(es) detected across active routes: %s",
 				len(diag.DuplicateIPs), strings.Join(diag.DuplicateIPs, ", ")))
 	}
-	if diag.OwnershipMismatchDrops > 0 {
+	// A lifetime mismatch counter must not pin routing as inconsistent after
+	// recovery: only the recent delta degrades current health, while the
+	// cumulative total stays visible as a historical note (issue #424 round 2,
+	// finding 5).
+	if diag.OwnershipMismatchDropsRecent > 0 {
 		diag.IsConsistent = false
 		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d ownership mismatch drop(s) observed in return routing", diag.OwnershipMismatchDrops))
+			fmt.Sprintf("%d ownership mismatch drop(s) in the last %.1fs of return routing",
+				diag.OwnershipMismatchDropsRecent, diag.OwnershipMismatchWindowSec))
+	} else if diag.OwnershipMismatchDrops > 0 {
+		diag.HistoricalDetails = append(diag.HistoricalDetails,
+			fmt.Sprintf("%d ownership mismatch drop(s) observed historically, none in the last %.1fs",
+				diag.OwnershipMismatchDrops, diag.OwnershipMismatchWindowSec))
 	}
 }
 
@@ -846,25 +883,27 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 
 func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
 	var conds []HealthCondition
-	inUtil := float64(0)
+	upstreamToNexusUtil := float64(0)
 	if vtun.UpstreamToNexus.Capacity > 0 {
-		inUtil = float64(vtun.UpstreamToNexus.Occupancy) / float64(vtun.UpstreamToNexus.Capacity) * 100.0
+		upstreamToNexusUtil = float64(vtun.UpstreamToNexus.Occupancy) / float64(vtun.UpstreamToNexus.Capacity) * 100.0
 	}
-	outUtil := float64(0)
+	nexusToUpstreamUtil := float64(0)
 	if vtun.NexusToUpstream.Capacity > 0 {
-		outUtil = float64(vtun.NexusToUpstream.Occupancy) / float64(vtun.NexusToUpstream.Capacity) * 100.0
+		nexusToUpstreamUtil = float64(vtun.NexusToUpstream.Occupancy) / float64(vtun.NexusToUpstream.Capacity) * 100.0
 	}
-	if inUtil >= 90.0 || outUtil >= 90.0 {
+	if upstreamToNexusUtil >= 90.0 || nexusToUpstreamUtil >= 90.0 {
 		conds = append(conds, HealthCondition{
 			Category: "virtual_tun",
 			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("VirtualTUN queue saturation: inbound %.1f%%, outbound %.1f%%", inUtil, outUtil),
+			Message: fmt.Sprintf("VirtualTUN queue saturation: upstream->nexus %.1f%%, nexus->upstream %.1f%%",
+				upstreamToNexusUtil, nexusToUpstreamUtil),
 		})
-	} else if inUtil >= 75.0 || outUtil >= 75.0 {
+	} else if upstreamToNexusUtil >= 75.0 || nexusToUpstreamUtil >= 75.0 {
 		conds = append(conds, HealthCondition{
 			Category: "virtual_tun",
 			Severity: "WARNING",
-			Message:  fmt.Sprintf("Elevated VirtualTUN queue utilization: inbound %.1f%%, outbound %.1f%%", inUtil, outUtil),
+			Message: fmt.Sprintf("Elevated VirtualTUN queue utilization: upstream->nexus %.1f%%, nexus->upstream %.1f%%",
+				upstreamToNexusUtil, nexusToUpstreamUtil),
 		})
 	}
 
@@ -894,11 +933,16 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 				Message:  "Portal configuration changed; engine restart is required to apply updates",
 			})
 		}
-		if peerSync.SyncFailures > 0 || peerSync.EnqueueFailures > 0 {
+		// Only the windowed deltas degrade current health; the cumulative
+		// SyncFailures/EnqueueFailures stay exposed as history (issue #424
+		// round 2, finding 5).
+		if peerSync.SyncFailuresRecent > 0 || peerSync.EnqueueFailuresRecent > 0 {
 			conds = append(conds, HealthCondition{
 				Category: "peer_sync",
 				Severity: "DEGRADED",
-				Message: fmt.Sprintf("Peer sync failures detected: %d sync, %d enqueue",
+				Message: fmt.Sprintf("Active peer sync failures: %d sync, %d enqueue in the last %.1fs "+
+					"(%d sync, %d enqueue cumulative)",
+					peerSync.SyncFailuresRecent, peerSync.EnqueueFailuresRecent, peerSync.FailuresWindowSec,
 					peerSync.SyncFailures, peerSync.EnqueueFailures),
 			})
 		}
@@ -951,17 +995,29 @@ func summarizeHealthConditions(conditions []HealthCondition) (string, string) {
 		}
 	}
 
+	// firstMessageAtSeverity returns the message of the first condition at the
+	// winning severity, so the headline describes the condition that actually
+	// set the headline (issue #424 round 2, finding 7).
+	firstMessageAtSeverity := func(severity string) string {
+		for _, c := range conditions {
+			if c.Severity == severity {
+				return c.Message
+			}
+		}
+		return ""
+	}
+
 	if criticalCount > 0 {
 		return HealthCritical, fmt.Sprintf("%d critical issue(s) affecting forwarder health: %s",
-			criticalCount, conditions[0].Message)
+			criticalCount, firstMessageAtSeverity("CRITICAL"))
 	}
 	if degradedCount > 0 {
 		return HealthDegraded, fmt.Sprintf("%d degradation condition(s) detected: %s",
-			degradedCount, conditions[0].Message)
+			degradedCount, firstMessageAtSeverity("DEGRADED"))
 	}
 	if warningCount > 0 {
 		return HealthHealthy, fmt.Sprintf("Operational with %d warning condition(s): %s",
-			warningCount, conditions[0].Message)
+			warningCount, firstMessageAtSeverity("WARNING"))
 	}
 	return HealthHealthy, "All forwarder and dataplane components are operating normally"
 }
@@ -1142,6 +1198,84 @@ func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, total
 	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
 }
 
+// diagDeltaTracker measures the increase of a single lifetime counter over
+// the last sampling window, so a cumulative failure counter can stay visible as
+// history without permanently degrading current health (issue #424 round 2,
+// finding 5).
+type diagDeltaTracker struct {
+	mu            sync.Mutex
+	lastValue     uint64
+	primed        bool
+	lastSampleAt  time.Time
+	delta         uint64
+	windowSeconds float64
+}
+
+// deltaSnapshot is an immutable read of the tracker's last computed delta.
+type deltaSnapshot struct {
+	delta         uint64
+	windowSeconds float64
+}
+
+// Sample records cumulative and returns the increase since the previous
+// accepted sample. The first sample only primes the baseline and reports zero,
+// so a counter that has been rising since process start is never reported as a
+// fresh incident. Resampling sooner than 200ms reuses the previous delta rather
+// than dividing by a near-zero window. A counter that decreased (engine
+// restart) is treated as no new loss this window.
+func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapshot {
+	if t == nil {
+		return deltaSnapshot{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.primed {
+		t.primed = true
+		t.lastValue = cumulative
+		t.lastSampleAt = now
+		t.delta = 0
+		t.windowSeconds = 0
+		return deltaSnapshot{}
+	}
+
+	elapsed := now.Sub(t.lastSampleAt).Seconds()
+	if elapsed < 0.2 {
+		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+	}
+
+	if cumulative >= t.lastValue {
+		t.delta = cumulative - t.lastValue
+	} else {
+		t.delta = 0
+	}
+	t.windowSeconds = elapsed
+	t.lastValue = cumulative
+	t.lastSampleAt = now
+
+	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+}
+
+// diagDeltaTrackers groups the per-counter windowed delta trackers. Each has
+// its own mutex, so a caller needs no outer lock.
+type diagDeltaTrackers struct {
+	ownershipMismatch diagDeltaTracker
+	syncFailures      diagDeltaTracker
+	enqueueFailures   diagDeltaTracker
+}
+
+func (t *diagDeltaTrackers) sampleOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
+	return t.ownershipMismatch.Sample(now, cumulative)
+}
+
+func (t *diagDeltaTrackers) sampleSyncFailures(now time.Time, cumulative uint64) deltaSnapshot {
+	return t.syncFailures.Sample(now, cumulative)
+}
+
+func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint64) deltaSnapshot {
+	return t.enqueueFailures.Sample(now, cumulative)
+}
+
 func (s *Service) populateOperationalDiagnostics(status *Status) {
 	if status == nil {
 		return
@@ -1207,24 +1341,39 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 		fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend, _ = s.forwarder.ClientDropStats()
 	}
 
+	var retStats ReturnStatsSnapshot
+	if s.ingressEngine != nil {
+		retStats = s.ingressEngine.ReturnStats()
+	}
+
+	// Upstream -> Nexus: VirtualTUN.Write feeds the OUTBOUND queue. The upstream
+	// AWG engine emits authenticated plaintext it received from the client, so
+	// an outbound drop is lost client traffic and belongs in the client bucket
+	// (issue #424 round 2, finding 2).
+	clientVirtualTUNDrops := retStats.TUN.OutboundDrops
 	clientTotal := routerMalformed +
 		routerUnmapped +
 		routerMismatch +
 		routerRejected +
 		fwdClientQueueFull +
 		fwdClientRateLimited +
-		fwdClientNoBackend
+		fwdClientNoBackend +
+		clientVirtualTUNDrops
 
-	var retStats ReturnStatsSnapshot
-	if s.ingressEngine != nil {
-		retStats = s.ingressEngine.ReturnStats()
-	}
-
-	nonTunInjectionErrors := uint64(0)
-	if retStats.InjectionErrors > retStats.TUN.InboundDrops {
-		nonTunInjectionErrors = retStats.InjectionErrors - retStats.TUN.InboundDrops
-	}
+	// Nexus -> Upstream: VirtualTUN.InjectInbound feeds the INBOUND queue, so
+	// its drop bucket is the return path's own loss accounting.
 	returnTunDrops := retStats.TUN.InboundDrops
+
+	// The overlap between injection errors and inbound VirtualTUN drops is
+	// owned by the injection site (returnCounters.injectionTunDrops), not
+	// inferred here. InboundDrops also rises on oversized reads and on
+	// shutdown drain with no injection error at all, so subtracting the
+	// aggregate masked real non-TUN injection failures (issue #424 round 2,
+	// finding 3).
+	nonTunInjectionErrors := uint64(0)
+	if retStats.InjectionErrors > retStats.InjectionTunDrops {
+		nonTunInjectionErrors = retStats.InjectionErrors - retStats.InjectionTunDrops
+	}
 	returnTotal := retStats.MalformedDrops +
 		retStats.UnmappedDrops +
 		retStats.OwnershipMismatchDrops +
@@ -1256,33 +1405,38 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 		ClientBackendQueueFull: fwdClientQueueFull,
 		ClientRateLimited:      fwdClientRateLimited,
 		ClientNoHealthyBackend: fwdClientNoBackend,
+		ClientVirtualTUNDrops:  clientVirtualTUNDrops,
 		ClientTotalDrops:       clientTotal,
 		ClientDropRatePps:      clientDropRate,
 
-		ReturnMalformed:       retStats.MalformedDrops,
-		ReturnUnmapped:        retStats.UnmappedDrops,
-		ReturnMismatch:        retStats.OwnershipMismatchDrops,
-		ReturnInjectionErrors: nonTunInjectionErrors,
-		ReturnVirtualTUNDrops: returnTunDrops,
-		ReturnTotalDrops:      returnTotal,
-		ReturnDropRatePps:     returnDropRate,
+		ReturnMalformed:         retStats.MalformedDrops,
+		ReturnUnmapped:          retStats.UnmappedDrops,
+		ReturnMismatch:          retStats.OwnershipMismatchDrops,
+		ReturnInjectionErrors:   nonTunInjectionErrors,
+		ReturnVirtualTUNDrops:   returnTunDrops,
+		ReturnInjectionTUNDrops: retStats.InjectionTunDrops,
+		ReturnTotalDrops:        returnTotal,
+		ReturnDropRatePps:       returnDropRate,
 
 		TotalDrops:       totalDrops,
 		TotalDropRatePps: totalDropRate,
 	}
 
+	// Directional mapping (issue #424 round 2, finding 1):
+	//   UpstreamToNexus <- Outbound*  (VirtualTUN.Write, upstream AWG -> Nexus)
+	//   NexusToUpstream <- Inbound*  (VirtualTUN.InjectInbound, Nexus -> AWG)
 	status.VirtualTUN = VirtualTUNDiagnostics{
 		UpstreamToNexus: VirtualTUNDirectionalHealth{
-			Occupancy: retStats.TUN.InboundDepth,
-			Capacity:  retStats.TUN.InboundCapacity,
-			Peak:      retStats.TUN.InboundPeak,
-			Drops:     retStats.TUN.InboundDrops,
-		},
-		NexusToUpstream: VirtualTUNDirectionalHealth{
 			Occupancy: retStats.TUN.OutboundDepth,
 			Capacity:  retStats.TUN.OutboundCapacity,
 			Peak:      retStats.TUN.OutboundPeak,
 			Drops:     retStats.TUN.OutboundDrops,
+		},
+		NexusToUpstream: VirtualTUNDirectionalHealth{
+			Occupancy: retStats.TUN.InboundDepth,
+			Capacity:  retStats.TUN.InboundCapacity,
+			Peak:      retStats.TUN.InboundPeak,
+			Drops:     retStats.TUN.InboundDrops,
 		},
 	}
 
@@ -1323,7 +1477,18 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 		}
 	}
 
-	// 9. Centralized Rule-Based Health Assessment
+	// 9. Peer sync failure window. The cumulative counters stay untouched as
+	// history; only the recent deltas gate health (issue #424 round 2).
+	if status.PeerSync != nil {
+		now := time.Now()
+		syncRate := s.diagDeltas.sampleSyncFailures(now, status.PeerSync.SyncFailures)
+		enqueueRate := s.diagDeltas.sampleEnqueueFailures(now, status.PeerSync.EnqueueFailures)
+		status.PeerSync.SyncFailuresRecent = syncRate.delta
+		status.PeerSync.EnqueueFailuresRecent = enqueueRate.delta
+		status.PeerSync.FailuresWindowSec = math.Max(syncRate.windowSeconds, enqueueRate.windowSeconds)
+	}
+
+	// 10. Centralized Rule-Based Health Assessment
 	status.HealthAssessment = EvaluateForwarderHealth(
 		status.ForwarderAvailable,
 		status.EngineRunning,

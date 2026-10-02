@@ -38,6 +38,15 @@ type PeerSyncStatus struct {
 	// outside the status a reader already consults.
 	EnqueueFailures  uint64 `json:"enqueue_failures"`
 	LastEnqueueError string `json:"last_enqueue_error,omitempty"`
+
+	// SyncFailuresRecent and EnqueueFailuresRecent are the increases of the
+	// cumulative counters above observed in the last diagnostics sampling
+	// window. Issue #424 defines these as active conditions: the cumulative
+	// values remain exposed as history, but only the deltas degrade current
+	// health, so a recovered incident no longer pins the status.
+	SyncFailuresRecent    uint64  `json:"sync_failures_recent"`
+	EnqueueFailuresRecent uint64  `json:"enqueue_failures_recent"`
+	FailuresWindowSec     float64 `json:"failures_window_sec"`
 }
 
 type portalPeerDevice interface {
