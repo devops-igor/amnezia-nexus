@@ -555,13 +555,40 @@ func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats R
 
 	diag.DuplicateIPs = findDuplicateIPs(ipSessions, ipRoutes)
 
+	// Sort FIRST, redact SECOND (issue #424 round 5, item 1a). These three
+	// slices are built by iterating maps keyed by the RAW peer public key, so
+	// the raw value is what reaches the JSON payload. ingress.RedactKey, the
+	// convention the rest of the system already uses for peer keys, is applied
+	// after the sort on purpose: sort.Strings over raw keys is the ordering
+	// this field has always had, and it is a total order on the raw value, so
+	// the output order stays deterministic and does not silently change if the
+	// redaction truncation is ever revisited. Sorting the REDACTED values would
+	// instead be a function of the truncation (redacted keys share an 8
+	// character prefix, so they cluster), which makes the ordering a property
+	// of the masking scheme rather than of the data.
 	sort.Strings(diag.SessionsWithoutRoute)
 	sort.Strings(diag.RoutesWithoutSession)
 	sort.Strings(diag.RoutesWithoutReturn)
+	redactKeySlice(diag.SessionsWithoutRoute)
+	redactKeySlice(diag.RoutesWithoutSession)
+	redactKeySlice(diag.RoutesWithoutReturn)
 
 	auditRoutingConsistencyDetails(&diag)
 
 	return diag
+}
+
+// redactKeySlice replaces every element of keys with its ingress.RedactKey
+// rendering, in place. It exists because several diagnostics fields are built
+// by iterating maps keyed by the raw peer public key: redacting only at one
+// call site is what left the rest of the surface disclosing full keys in
+// issue #424 round 5. ingress.RedactKey is the single redaction convention in
+// this codebase, so this helper deliberately delegates to it rather than
+// introducing a second scheme.
+func redactKeySlice(keys []string) {
+	for i, k := range keys {
+		keys[i] = ingress.RedactKey(k)
+	}
 }
 
 func findDuplicateIPs(ipSessions, ipRoutes map[string][]string) []string {
@@ -740,12 +767,23 @@ func collectHandshakeDiagnostics(s *Service) HandshakeFreshnessDiagnostics {
 		for _, sess := range activeSessions {
 			hs, ok := peerHandshakes[sess.PeerPublicKey]
 			if !ok || hs.IsZero() || now.Sub(hs) > 3*time.Minute {
+				// Collected raw, redacted after the sort below (issue #424
+				// round 5, item 1b). This value reached /api/vpn/status
+				// verbatim as handshake_freshness.stale_live_sessions.
+				// ingress.RedactKey keeps the per-session correlation an
+				// admin needs while keeping the full key out of the payload.
 				diag.StaleLiveSessions = append(diag.StaleLiveSessions, sess.PeerPublicKey)
 			}
 		}
 	}
 
+	// Sort first, redact second, for the same reason as the routing invariant
+	// slices: sort.Strings over the raw keys is a total order on the data,
+	// whereas sorting the redacted values would order by the 8 character
+	// prefix that redaction leaves behind, making the output order a property
+	// of the masking scheme instead of the keys.
 	sort.Strings(diag.StaleLiveSessions)
+	redactKeySlice(diag.StaleLiveSessions)
 	return diag
 }
 
@@ -954,34 +992,53 @@ func describeLastSuccessfulReconcile(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-// Peer-sync divergence timing thresholds (issue #424 round 4, item F). A
-// desired/actual mismatch that resolves inside the next reconcile is normal
-// convergence, not an incident; only a PERSISTED mismatch is. The age is
-// measured from the last successful reconciliation, which is the newest
-// evidence that desired state and the device actually agreed.
+// Peer-sync divergence timing thresholds (issue #424 round 4, item F; round 5,
+// item B). A desired/actual mismatch that resolves inside the next reconcile
+// is normal convergence, not an incident; only a PERSISTED mismatch is. The
+// age is measured from PeerSync.DivergenceSince, the moment the CURRENT
+// mismatch was first observed, which the peerSynchronizer records during
+// reconcile. It is deliberately NOT measured from LastSuccessfulReconcile:
+// that is when reconciliation last succeeded, which on a long-healthy system
+// can be hours before a single new peer fails to be added, and using it made
+// a seconds-old divergence report DEGRADED with a multi-hour claim.
 const (
 	peerSyncDivergenceWarningAge  = 30 * time.Second
 	peerSyncDivergenceDegradedAge = 60 * time.Second
 )
 
 // peerSyncDivergenceCondition returns the health condition for a persisted
-// desired/actual mismatch, or nil when there is nothing to report.
+// desired/actual mismatch, or nil when there is nothing to report. now is
+// injected so the thresholds are exactly observable; the production caller
+// passes the wall clock (issue #424 round 4).
 //
-// known is false when no reconcile has ever succeeded: the zero
-// LastSuccessfulReconcile means the age is genuinely UNKNOWN, and inventing a
-// large age there would report DEGRADED on a system that has never synced at
-// all. An unknown age still means the counts disagree right now, so it is
-// reported, at WARNING, with the unknown age stated rather than hidden.
+// known is false when no divergence is being timed, i.e. DivergenceSince is
+// zero, which means no reconcile has ever reached the point where both counts
+// are known. Two cases produce that, and they are handled differently rather
+// than inherited from the previous behavior:
+//
+//   - The system has never reconciled, so there is genuinely no evidence of
+//     when anything happened. The age is stated as unknown and the severity
+//     stays WARNING; inventing a large age here would report DEGRADED on a
+//     system that has never synchronized at all.
+//   - A fresh divergence on a system that has never had a SUCCESSFUL
+//     reconcile. Here the synchronizer DID stamp a start on first
+//     observation, so DivergenceSince is set and the age is known: the
+//     mismatch began when it was first seen, regardless of whether any
+//     earlier reconcile succeeded. It is therefore held to the same
+//     thresholds as any other divergence, and is NOT reported as "age
+//     unknown". This is the explicit decision required for the case where
+//     LastSuccessfulReconcile is zero but the counts disagree: a brand new
+//     system whose first reconcile installs 3 of 4 peers is a real,
+//     just-begun divergence, not an unmeasurable one.
+//
+// A negative age (DivergenceSince stamped in the future, which a clock step
+// backwards can produce) is clamped to zero and treated as younger than the
+// warning threshold, so a clock adjustment cannot fabricate an escalation.
 func peerSyncDivergenceCondition(peerSync *PeerSyncStatus, now time.Time) *HealthCondition {
 	if peerSync.DesiredPeers == peerSync.ActualPeers {
 		return nil
 	}
-	age, known := time.Duration(0), false
-	if !peerSync.LastSuccessfulReconcile.IsZero() {
-		age, known = now.Sub(peerSync.LastSuccessfulReconcile), true
-	}
-	switch {
-	case !known:
+	if peerSync.DivergenceSince.IsZero() {
 		return &HealthCondition{
 			Category: "peer_sync",
 			Severity: "WARNING",
@@ -989,6 +1046,12 @@ func peerSyncDivergenceCondition(peerSync *PeerSyncStatus, now time.Time) *Healt
 				"(divergence age unknown: no reconciliation has ever succeeded)",
 				peerSync.DesiredPeers, peerSync.ActualPeers),
 		}
+	}
+	age := now.Sub(peerSync.DivergenceSince)
+	if age < 0 {
+		age = 0
+	}
+	switch {
 	case age > peerSyncDivergenceDegradedAge:
 		return &HealthCondition{
 			Category: "peer_sync",

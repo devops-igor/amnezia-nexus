@@ -176,11 +176,11 @@ func TestDeleteBackendRemovesTunnelAndRow(t *testing.T) {
 	if err := svc.forwarder.RouteClientToBackend("peer-del-1", []byte{0xde, 0xad}); err != nil {
 		t.Errorf("RouteClientToBackend after failover failed: %v", err)
 	}
-	if oldTun.ActiveConnections != 0 {
-		t.Errorf("deleted backend ActiveConnections = %d, want 0 after migration", oldTun.ActiveConnections)
+	if curOld, _ := svc.pool.GetTunnelByID(oldTun.ID); curOld != nil && curOld.ActiveConnections != 0 {
+		t.Errorf("deleted backend ActiveConnections = %d, want 0 after migration", curOld.ActiveConnections)
 	}
-	if newTun.ActiveConnections != 1 {
-		t.Errorf("surviving backend ActiveConnections = %d, want 1 after migration", newTun.ActiveConnections)
+	if curNew, err := svc.pool.GetTunnelByID(newTun.ID); err != nil || curNew.ActiveConnections != 1 {
+		t.Errorf("surviving backend ActiveConnections = %v (err=%v), want 1 after migration", curNew, err)
 	}
 
 	// 5. Deleting an already-deleted backend is a not-found error.

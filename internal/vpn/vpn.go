@@ -27,6 +27,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
@@ -217,6 +218,7 @@ type Service struct {
 	updateBackendServerHostErr             error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
+	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
 
 	rollingHistory *RollingHistory
@@ -880,6 +882,13 @@ func (s *Service) SetEnableBackendPreAddTunnelHookForTest(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.enableBackendPreAddTunnelHook = fn
+}
+
+// SetEnableBackendPostAddTunnelHookForTest sets a hook called immediately after calling pool.AddTunnel in EnableBackend.
+func (s *Service) SetEnableBackendPostAddTunnelHookForTest(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enableBackendPostAddTunnelHook = fn
 }
 
 // SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
@@ -1839,6 +1848,11 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 		for peerKey := range allRouteQueues {
 			peers = append(peers, peerKey)
 		}
+		// Sort the RAW keys, then redact, for the same reason as the routing
+		// invariant slices in diagnostics.go: the order and the LIMIT are a
+		// function of the data, not of the masking. Truncating first and
+		// redacting after keeps which routes are reported identical whether
+		// or not the redaction below exists.
 		sort.Strings(peers)
 		limit := len(peers)
 		if limit > forwarder.MaxSupportedActiveRoutes {
@@ -1846,7 +1860,36 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 		}
 		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
 		for _, peerKey := range peers[:limit] {
-			status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+			// Map keys are redacted with ingress.RedactKey, the single
+			// redaction convention in this codebase (issue #424 round 5,
+			// item 1c).
+			//
+			// EXPLICIT DECISION, option (a): redact the keys and accept the
+			// behavior change, rather than leaving this as a known raw
+			// compatibility leak or adding a redacted parallel field. The
+			// trade-off, stated plainly:
+			//
+			//   Cost: a consumer that matched these keys against a full peer
+			//   public key it holds elsewhere stops matching. The JSON shape
+			//   (a map of the same stats, same omitempty, same truncation to
+			//   MaxSupportedActiveRoutes) is unchanged; only the key VALUE is
+			//   masked, and two keys sharing a 8 character prefix would
+			//   collide into one map entry.
+			//
+			//   Why accepted: the round 4 change already redacted
+			//   problem_routes[*].peer_key, which is the UI's PRIMARY path
+			//   (web/templates/vpn.html prefers problem_routes/all_routes and
+			//   falls back to this map). This map is therefore already
+			//   inconsistent with the rest of the payload: an admin saw a
+			//   redacted key on one code path and a full key on the other,
+			//   and the full key is the one that leaks to browsers, log
+			//   shippers and support bundles. Redacting here makes the
+			//   fallback path agree with the primary path and removes the
+			//   last full-key disclosure from /api/vpn/status. Options (b)
+			//   and (c) would both keep a raw full key in the payload and
+			//   only add a second field for a leak that already has a
+			//   redaction convention to follow.
+			status.ForwarderRouteQueues[ingress.RedactKey(peerKey)] = allRouteQueues[peerKey]
 		}
 	}
 	writes := f.DeviceWriteSnapshot()
@@ -2263,12 +2306,10 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	var (
 		hasInitial     bool
 		initialEnabled bool
-		initialVersion int64
 	)
 	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
 		hasInitial = true
 		initialEnabled = initTun.Enabled
-		initialVersion = initTun.StateVersion
 	}
 
 	server, err := db.GetServerByID(ctx, serverID)
@@ -2295,16 +2336,27 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
+	var postRefreshVersion int64
+	if err == nil && tun != nil {
+		postRefreshVersion = tun.StateVersion
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
 	}
 
+	s.mu.RLock()
+	postAddHook := s.enableBackendPostAddTunnelHook
+	s.mu.RUnlock()
+	if postAddHook != nil {
+		postAddHook()
+	}
+
 	// Register the portal peers on the backend server (issue #43):
-	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) — the DATA
+	//   - "Portal Data Device": identity = derive(tunnel.PrivateKey) - the DATA
 	//     device key with AllowedIPs scoped to portal client subnet so the backend accepts data
 	//     traffic from the portal subnet and routes replies to the data device (never 0.0.0.0/0).
-	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) — a
+	//   - "Portal Health Probe": identity = derive(tunnel.ProbePrivateKey) - a
 	//     dedicated probe key so prober handshakes never roam the data peer's
 	//     return endpoint (per-peer endpoint roaming: last sender wins).
 	// AddClient is an idempotent upsert on the caller-supplied key, so repeat
@@ -2324,7 +2376,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2355,11 +2407,11 @@ func (s *Service) finishEnableBackend(
 		if initialEnabled && !currTun.Enabled {
 			return errors.New("backend was administratively disabled; aborting enable")
 		}
-		if currTun.StateVersion != initialVersion {
-			return errors.New("backend state modified concurrently; aborting enable")
-		}
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
+	}
+	if currTun.StateVersion != initialVersion {
+		return errors.New("backend state modified concurrently; aborting enable")
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {

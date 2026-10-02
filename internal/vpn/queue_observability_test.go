@@ -264,7 +264,10 @@ func TestStatusExposesLiveAndCompletedDeviceWriteTelemetry(t *testing.T) {
 	if metrics["forwarder_device_write_oldest_in_flight_ms"] < metrics["forwarder_device_write_stall_threshold_ms"] || metrics["forwarder_device_write_max_duration_ms"] != 0 {
 		t.Fatalf("live/completed durations conflated: %v", metrics)
 	}
-	if route := status.ForwarderRouteQueues["peer"]; route.WritesInFlight != 1 || route.WriteStalls != 1 || route.OldestWriteMS < forwarder.DeviceWriteStallThreshold.Milliseconds() {
+	// The per-route map is keyed by the REDACTED peer key (issue #424 round
+	// 5, item 1c, option (a)). "peer" is 4 characters, so RedactKey fully
+	// masks it.
+	if route := status.ForwarderRouteQueues["****"]; route.WritesInFlight != 1 || route.WriteStalls != 1 || route.OldestWriteMS < forwarder.DeviceWriteStallThreshold.Milliseconds() {
 		t.Fatalf("status omitted per-route stalled write: %+v", route)
 	}
 	close(dev.release)

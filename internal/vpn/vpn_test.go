@@ -1143,6 +1143,141 @@ func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
 	}
 }
 
+func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ExistingTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "concurrent-enable-server",
+			Host: "198.51.100.77",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "server-concurrent-enable-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		adder := &mockAWGManagerWithClientAdder{}
+		svc.SetAWGStatusProvider(adder)
+
+		// 1. Initial EnableBackend establishes tunnel in pool and DB
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("initial EnableBackend failed: %v", err)
+		}
+
+		tun, err := svc.pool.GetTunnel(srvID)
+		if err != nil || tun == nil {
+			t.Fatalf("expected initial tunnel, got: %v (err=%v)", tun, err)
+		}
+		initialVersion := tun.StateVersion
+
+		// 2. Set postAddTunnelHook to simulate a concurrent event occurring during
+		// EnableBackend network operations (after AddTunnel, before finishEnableBackend):
+		// Mutate tunnel state (via SetTunnelStatusWithReason), incrementing StateVersion.
+		hookFired := false
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			hookFired = true
+			if hookErr := svc.pool.SetTunnelStatusWithReason(ctx, srvID, models.TunnelStatusDegraded, models.DisableReasonNone, 45); hookErr != nil {
+				t.Errorf("concurrent SetTunnelStatusWithReason failed: %v", hookErr)
+			}
+		})
+		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+		// 3. Call EnableBackend again: must abort because StateVersion was concurrently bumped
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil {
+			t.Fatal("expected EnableBackend to fail when tunnel is modified concurrently, got nil")
+		}
+		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if !hookFired {
+			t.Fatal("expected postAddTunnelHook to fire")
+		}
+
+		// 4. Assert in-memory pool state reflects the concurrent modification, not overwritten state
+		finalTun, err := svc.pool.GetTunnel(srvID)
+		if err != nil || finalTun == nil {
+			t.Fatalf("expected tunnel in pool, got %v (err=%v)", finalTun, err)
+		}
+		if finalTun.Status != models.TunnelStatusDegraded {
+			t.Errorf("expected tunnel status %q to remain intact, got %q", models.TunnelStatusDegraded, finalTun.Status)
+		}
+		if finalTun.StateVersion <= initialVersion {
+			t.Errorf("expected StateVersion to reflect concurrent mutation (> %d), got %d", initialVersion, finalTun.StateVersion)
+		}
+	})
+
+	t.Run("NewTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "concurrent-enable-new-server",
+			Host: "198.51.100.78",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "server-concurrent-enable-new-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		adder := &mockAWGManagerWithClientAdder{}
+		svc.SetAWGStatusProvider(adder)
+
+		hookFired := false
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			hookFired = true
+			if hookErr := svc.pool.SetTunnelStatusWithReason(ctx, srvID, models.TunnelStatusDegraded, models.DisableReasonNone, 30); hookErr != nil {
+				t.Errorf("concurrent SetTunnelStatusWithReason failed: %v", hookErr)
+			}
+		})
+		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+		// Call EnableBackend on brand new backend: must abort because StateVersion was concurrently bumped after AddTunnel
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil {
+			t.Fatal("expected EnableBackend to fail when new tunnel is modified concurrently, got nil")
+		}
+		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+		if !hookFired {
+			t.Fatal("expected postAddTunnelHook to fire")
+		}
+
+		finalTun, err := svc.pool.GetTunnel(srvID)
+		if err != nil || finalTun == nil {
+			t.Fatalf("expected tunnel in pool, got %v (err=%v)", finalTun, err)
+		}
+		if finalTun.Status != models.TunnelStatusDegraded {
+			t.Errorf("expected tunnel status %q to remain intact, got %q", models.TunnelStatusDegraded, finalTun.Status)
+		}
+		if finalTun.StateVersion != 2 {
+			t.Errorf("expected StateVersion = 2 after concurrent mutation, got %d", finalTun.StateVersion)
+		}
+	})
+}
+
 func TestEnableBackend_TypedSentinelErrors(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)
@@ -1197,7 +1332,10 @@ func TestGetStatus_ExposesBoundedRouteQueueDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus failed: %v", err)
 	}
-	stats, ok := status.ForwarderRouteQueues["peer-secret"]
+	// The map key is the REDACTED peer key: "peer-secret" is 11 characters,
+	// so ingress.RedactKey keeps the first 8 plus an ellipsis (issue #424
+	// round 5, item 1c, option (a)).
+	stats, ok := status.ForwarderRouteQueues["peer-sec…"]
 	if !ok {
 		t.Fatalf("route queue diagnostics missing: %+v", status.ForwarderRouteQueues)
 	}
@@ -5903,11 +6041,13 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 		svc.stickyMgr.AssignPeerAffinity(peerKey, tun1.ID)
 		svc.forwarder.RegisterSession(sess.ID, "charlie-conn", peerKey, "10.100.0.10", tun1.ID)
 
-		if tun1.ActiveConnections != 1 {
-			t.Fatalf("expected tun1 ActiveConnections == 1, got %d", tun1.ActiveConnections)
+		tun1Check, err := svc.pool.GetTunnelByID(tun1.ID)
+		if err != nil || tun1Check.ActiveConnections != 1 {
+			t.Fatalf("expected tun1 ActiveConnections == 1, got %d (err=%v)", tun1Check.ActiveConnections, err)
 		}
-		if tun2.ActiveConnections != 0 {
-			t.Fatalf("expected tun2 ActiveConnections == 0, got %d", tun2.ActiveConnections)
+		tun2Check, err := svc.pool.GetTunnelByID(tun2.ID)
+		if err != nil || tun2Check.ActiveConnections != 0 {
+			t.Fatalf("expected tun2 ActiveConnections == 0, got %d (err=%v)", tun2Check.ActiveConnections, err)
 		}
 		affPre, ok := svc.stickyMgr.GetPeerAffinity(peerKey)
 		if !ok || affPre != tun1.ID {
@@ -5945,11 +6085,13 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 		if !ok || affPost != tun1.ID {
 			t.Errorf("expected peer affinity preserved for tun1 (%d), got ok=%v aff=%d", tun1.ID, ok, affPost)
 		}
-		if tun1.ActiveConnections != 1 {
-			t.Errorf("expected tun1 ActiveConnections to remain 1, got %d", tun1.ActiveConnections)
+		tun1Final, err := svc.pool.GetTunnelByID(tun1.ID)
+		if err != nil || tun1Final.ActiveConnections != 1 {
+			t.Errorf("expected tun1 ActiveConnections to remain 1, got %d (err=%v)", tun1Final.ActiveConnections, err)
 		}
-		if tun2.ActiveConnections != 0 {
-			t.Errorf("expected tun2 ActiveConnections to remain 0, got %d", tun2.ActiveConnections)
+		tun2Final, err := svc.pool.GetTunnelByID(tun2.ID)
+		if err != nil || tun2Final.ActiveConnections != 0 {
+			t.Errorf("expected tun2 ActiveConnections to remain 0, got %d (err=%v)", tun2Final.ActiveConnections, err)
 		}
 		liveSess, ok := svc.sessionMgr.GetSession(peerKey)
 		if !ok || liveSess.BackendTunnelID != tun1.ID {

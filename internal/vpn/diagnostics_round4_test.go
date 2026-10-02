@@ -151,9 +151,16 @@ func TestPeerSyncDivergenceTimingThresholds(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ps := &PeerSyncStatus{
-				DesiredPeers:            12,
-				ActualPeers:             11,
-				LastSuccessfulReconcile: now.Add(-tc.age),
+				DesiredPeers: 12,
+				ActualPeers:  11,
+				// The age is measured from the recorded divergence START
+				// (issue #424 round 5, item B), not from the last
+				// successful reconcile. The test drives the start back by the
+				// age under test; the reviewer's production sequence, where
+				// the last successful reconcile is hours old but the
+				// divergence is seconds old, is covered by
+				// TestPeerSyncDivergenceAgeIsNotLastSuccessfulReconcileAge.
+				DivergenceSince: now.Add(-tc.age),
 			}
 			got := peerSyncDivergenceCondition(ps, now)
 			if tc.severity == "" {
@@ -219,13 +226,13 @@ func TestPeerSyncDivergenceReachesHealthSurface(t *testing.T) {
 	}
 }
 
-// divergenceAt builds a diverged peer sync whose last successful reconcile was
-// age ago, for the end-to-end consumer test.
+// divergenceAt builds a diverged peer sync whose divergence STARTED age ago,
+// for the end-to-end consumer test.
 func divergenceAt(age time.Duration) *PeerSyncStatus {
 	return &PeerSyncStatus{
-		DesiredPeers:            12,
-		ActualPeers:             11,
-		LastSuccessfulReconcile: time.Now().UTC().Add(-age),
+		DesiredPeers:    12,
+		ActualPeers:     11,
+		DivergenceSince: time.Now().UTC().Add(-age),
 	}
 }
 

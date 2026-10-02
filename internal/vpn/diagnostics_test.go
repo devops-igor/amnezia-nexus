@@ -248,11 +248,15 @@ func TestCheckRoutingInvariants(t *testing.T) {
 	if diag2.IsConsistent {
 		t.Errorf("expected inconsistency for route without session and without return")
 	}
-	if len(diag2.RoutesWithoutSession) != 1 || diag2.RoutesWithoutSession[0] != "peer-a" {
-		t.Errorf("expected peer-a in RoutesWithoutSession, got %v", diag2.RoutesWithoutSession)
+	// These two slices carry REDACTED peer keys: they are built by iterating
+	// maps keyed by the raw key, and ingress.RedactKey is applied before they
+	// reach the API (issue #424 round 5, item 1a). "peer-a" is 6 characters,
+	// so RedactKey fully masks it.
+	if len(diag2.RoutesWithoutSession) != 1 || diag2.RoutesWithoutSession[0] != "******" {
+		t.Errorf("expected the redacted key in RoutesWithoutSession, got %v", diag2.RoutesWithoutSession)
 	}
-	if len(diag2.RoutesWithoutReturn) != 1 || diag2.RoutesWithoutReturn[0] != "peer-a" {
-		t.Errorf("expected peer-a in RoutesWithoutReturn, got %v", diag2.RoutesWithoutReturn)
+	if len(diag2.RoutesWithoutReturn) != 1 || diag2.RoutesWithoutReturn[0] != "******" {
+		t.Errorf("expected the redacted key in RoutesWithoutReturn, got %v", diag2.RoutesWithoutReturn)
 	}
 
 	// Case 3: Duplicate IP across routes

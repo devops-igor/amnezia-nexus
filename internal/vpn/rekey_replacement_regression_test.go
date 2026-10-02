@@ -5,7 +5,7 @@ import (
 )
 
 // Regression tests for issue #78: the rekey/reconnect session-replacement
-// path used to leak +1 on the old backend's ActiveConnections gauge — the
+// path used to leak +1 on the old backend's ActiveConnections gauge - the
 // original connect incremented it in HandleIncomingPeer, but CreateSession's
 // replacement path never decremented and never closed the old DB row, so a
 // later DisconnectSession(oldID) hit ErrSessionNotFound and its mirror
@@ -18,9 +18,18 @@ func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	svc, _, _, _, peerKey := setupTestVPNService(t, db)
 	ctx := t.Context()
 
+	gauge := func(tunnelID int64) int {
+		t.Helper()
+		cur, err := svc.pool.GetTunnelByID(tunnelID)
+		if err != nil {
+			t.Fatalf("GetTunnelByID(%d) failed: %v", tunnelID, err)
+		}
+		return cur.ActiveConnections
+	}
+
 	tun := lbTunnel(t, svc, db, 951, "awg951", "pub951", "priv951", "10.9.9.151:51820")
 	svc.pool.IncrementConnections(tun.ID)
-	baseline := tun.ActiveConnections
+	baseline := gauge(tun.ID)
 	if baseline != 1 {
 		t.Fatalf("setup: baseline gauge = %d, want 1", baseline)
 	}
@@ -30,8 +39,8 @@ func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial HandleIncomingPeerForTest failed: %v", err)
 	}
-	if tun.ActiveConnections != 2 {
-		t.Fatalf("after connect: gauge = %d, want 2", tun.ActiveConnections)
+	if got := gauge(tun.ID); got != 2 {
+		t.Fatalf("after connect: gauge = %d, want 2", got)
 	}
 
 	// Rekey: the same peer initiates a new handshake on the live session.
@@ -47,9 +56,9 @@ func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	}
 
 	// The gauge must be back to exactly 2 (baseline 1 + the one live
-	// session) — a cryptographic rekey must not increment the counter.
-	if tun.ActiveConnections != baseline+1 {
-		t.Errorf("after rekey: old backend gauge = %d, want %d (leak: replacement did not decrement the old session)", tun.ActiveConnections, baseline+1)
+	// session) - a cryptographic rekey must not increment the counter.
+	if got := gauge(tun.ID); got != baseline+1 {
+		t.Errorf("after rekey: old backend gauge = %d, want %d (leak: replacement did not decrement the old session)", got, baseline+1)
 	}
 
 	// No extra DB row may be created by the rekey.
@@ -83,8 +92,8 @@ func TestRekeyKeepsGaugeAtBaseline(t *testing.T) {
 	if err := svc.DisconnectSession(ctx, sess2.ID); err != nil {
 		t.Fatalf("DisconnectSession: %v", err)
 	}
-	if tun.ActiveConnections != baseline {
-		t.Errorf("after disconnect: gauge = %d, want baseline %d", tun.ActiveConnections, baseline)
+	if got := gauge(tun.ID); got != baseline {
+		t.Errorf("after disconnect: gauge = %d, want baseline %d", got, baseline)
 	}
 }
 
@@ -94,6 +103,15 @@ func TestRekeyReplacementAcrossBackends(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
+
+	gauge := func(tunnelID int64) int {
+		t.Helper()
+		cur, err := svc.pool.GetTunnelByID(tunnelID)
+		if err != nil {
+			t.Fatalf("GetTunnelByID(%d) failed: %v", tunnelID, err)
+		}
+		return cur.ActiveConnections
+	}
 
 	oldTun := lbTunnel(t, svc, db, 961, "awg961", "pub961", "priv961", "10.9.9.161:51820")
 	newTun := lbTunnel(t, svc, db, 962, "awg962", "pub962", "priv962", "10.9.9.162:51820")
@@ -105,12 +123,12 @@ func TestRekeyReplacementAcrossBackends(t *testing.T) {
 		t.Fatalf("CreateSession (initial): %v", err)
 	}
 	_ = sess1
-	if oldTun.ActiveConnections != 1 {
-		t.Fatalf("setup: oldTun gauge = %d, want 1", oldTun.ActiveConnections)
+	if got := gauge(oldTun.ID); got != 1 {
+		t.Fatalf("setup: oldTun gauge = %d, want 1", got)
 	}
 
 	// Rekey onto newTun: the replacement hook performs BOTH sides of the
-	// migration (decrement old, increment new) — exactly what
+	// migration (decrement old, increment new) - exactly what
 	// HandleIncomingPeer would drive when the balancer selects newTun.
 	if _, err := svc.sessionMgr.CreateSession(ctx, uID, "peer-move-78", "10.202.0.61", newTun.ID, ""); err != nil {
 		t.Fatalf("CreateSession (rekey): %v", err)
@@ -152,6 +170,15 @@ func TestPeriodicGaugeReconcileCorrectsDrift(t *testing.T) {
 	svc, _, _, uID, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
 
+	gauge := func(tunnelID int64) int {
+		t.Helper()
+		cur, err := svc.pool.GetTunnelByID(tunnelID)
+		if err != nil {
+			t.Fatalf("GetTunnelByID(%d) failed: %v", tunnelID, err)
+		}
+		return cur.ActiveConnections
+	}
+
 	tun := lbTunnel(t, svc, db, 971, "awg971", "pub971", "priv971", "10.9.9.171:51820")
 
 	// One real connected session...
@@ -163,8 +190,8 @@ func TestPeriodicGaugeReconcileCorrectsDrift(t *testing.T) {
 	for i := 0; i < 7; i++ {
 		svc.pool.IncrementConnections(tun.ID)
 	}
-	if tun.ActiveConnections != 8 {
-		t.Fatalf("setup: gauge = %d, want 8", tun.ActiveConnections)
+	if got := gauge(tun.ID); got != 8 {
+		t.Fatalf("setup: gauge = %d, want 8", got)
 	}
 
 	// The periodic reconcile (same entry point StartGaugeReconciler calls
