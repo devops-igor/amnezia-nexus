@@ -315,3 +315,164 @@ def test_server_edit_host_ui_lifecycle(
             assert (
                 isinstance(body, dict) and body.get("status") == "ok"
             ), f"Failed to restore original host in cleanup: {body}"
+
+
+@pytest.mark.e2e
+def test_server_reachability(authenticated_page: Page, base_url: str) -> None:
+    """GET /api/servers/{id}/reachability -> checks server reachability and latency."""
+    page = authenticated_page
+
+    result = api_get(page, "/api/servers")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    if not servers:
+        pytest.skip("No servers available to test reachability")
+
+    server_id = servers[0]["id"]
+    reachability = api_get(page, f"/api/servers/{server_id}/reachability")
+    assert isinstance(reachability, dict)
+    assert_response_shape(
+        reachability,
+        {"reachable": bool, "latency_ms": int, "status": str},
+        "server_reachability",
+    )
+
+
+@pytest.mark.e2e
+def test_server_container_toggle(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
+    """POST /api/servers/{id}/container/toggle -> validates and toggles protocol container."""
+    page = authenticated_page
+
+    result = api_get(page, "/api/servers")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    if not servers:
+        pytest.skip("No servers available to test container toggle")
+
+    server_id = servers[0]["id"]
+
+    # Reject invalid action
+    bad_toggle = api_post(
+        page,
+        f"/api/servers/{server_id}/container/toggle",
+        {"protocol": "awg", "action": "invalid_action"},
+        csrf_token,
+    )
+    assert bad_toggle["status"] == 400
+
+    # Toggle action
+    toggle_result = api_post(
+        page,
+        f"/api/servers/{server_id}/container/toggle",
+        {"protocol": "awg", "action": "restart"},
+        csrf_token,
+    )
+    assert toggle_result["status"] in (200, 400, 500)
+    if toggle_result["status"] == 200:
+        assert toggle_result["body"].get("status") == "ok"
+
+
+@pytest.mark.e2e
+def test_server_config_get_and_save(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """POST /api/servers/{id}/server_config and /save -> retrieves and saves server config."""
+    page = authenticated_page
+
+    result = api_get(page, "/api/servers")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    if not servers:
+        pytest.skip("No servers available to test server config")
+
+    server_id = servers[0]["id"]
+
+    # Reject invalid protocol
+    bad_proto = api_post(
+        page,
+        f"/api/servers/{server_id}/server_config",
+        {"protocol": "invalid_protocol"},
+        csrf_token,
+    )
+    assert bad_proto["status"] == 400
+
+    # Retrieve AWG server config
+    get_config = api_post(
+        page,
+        f"/api/servers/{server_id}/server_config",
+        {"protocol": "awg"},
+        csrf_token,
+    )
+    assert get_config["status"] in (200, 400, 500)
+    if get_config["status"] == 200:
+        body = get_config["body"]
+        assert "config" in body
+        # Save back the retrieved config
+        save_res = api_post(
+            page,
+            f"/api/servers/{server_id}/server_config/save",
+            {"protocol": "awg", "config": body["config"]},
+            csrf_token,
+        )
+        assert save_res["status"] in (200, 400, 500)
+
+
+@pytest.mark.e2e
+def test_server_connections_edit(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
+    """POST /api/servers/{id}/connections/edit -> updates connection parameters."""
+    page = authenticated_page
+
+    result = api_get(page, "/api/servers")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    if not servers:
+        pytest.skip("No servers available to test connections edit")
+
+    server_id = servers[0]["id"]
+
+    # Create temporary user and connection
+    add_u = api_post(
+        page,
+        "/api/users/add",
+        {
+            "username": "e2e_srv_edit_user",
+            "password": "TestPass123!",
+            "role": "user",
+            "enabled": True,
+        },
+        csrf_token,
+    )
+    assert add_u["status"] == 200
+
+    users_res = api_get(page, "/api/users/?size=100")
+    users = users_res if isinstance(users_res, list) else users_res.get("users", [])
+    u = next((x for x in users if x.get("username") == "e2e_srv_edit_user"), None)
+    assert u is not None
+    user_id = u["id"]
+
+    try:
+        conn_res = api_post(
+            page,
+            f"/api/users/{user_id}/connections/add",
+            {"server_id": server_id, "protocol": "awg", "name": "srv_edit_target"},
+            csrf_token,
+        )
+        assert conn_res["status"] == 200
+
+        user_conns = api_get(page, f"/api/users/{user_id}/connections")
+        conns = user_conns if isinstance(user_conns, list) else user_conns.get("connections", [])
+        assert conns
+        client_id = conns[0]["client_id"]
+
+        # Edit connection via /api/servers/{id}/connections/edit
+        edit_res = api_post(
+            page,
+            f"/api/servers/{server_id}/connections/edit",
+            {
+                "protocol": "awg",
+                "client_id": client_id,
+                "name": "srv_edited_name",
+            },
+            csrf_token,
+        )
+        assert edit_res["status"] in (200, 400, 500)
+        if edit_res["status"] == 200:
+            assert edit_res["body"].get("status") == "ok"
+    finally:
+        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)

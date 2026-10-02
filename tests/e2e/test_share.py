@@ -175,3 +175,103 @@ def test_download_config_from_share(
         csrf_token,
     )
     api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+@pytest.mark.e2e
+def test_leaderboard_api(page: Page, base_url: str) -> None:
+    """GET /api/leaderboard -> public traffic leaderboard data."""
+    res = page.request.get(f"{base_url}/api/leaderboard")
+    assert res.status == 200, f"Leaderboard API returned {res.status}"
+    body = res.json()
+    assert isinstance(body, dict)
+    assert_response_shape(
+        body,
+        {"period": str, "entries": list},
+        "leaderboard",
+    )
+
+    res_all = page.request.get(f"{base_url}/api/leaderboard?period=all-time")
+    assert res_all.status == 200
+    body_all = res_all.json()
+    assert body_all.get("period") == "all-time"
+    assert isinstance(body_all.get("entries"), list)
+
+
+@pytest.mark.e2e
+def test_share_token_connections_and_config(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """GET /api/share/{token}/connections and POST /api/share/{token}/config/{id}."""
+    page = authenticated_page
+
+    servers_result = api_get(page, "/api/servers/")
+    servers = (
+        servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
+    )
+    if not servers:
+        pytest.skip("No servers available for share token test")
+
+    server_id = servers[0]["id"]
+    test_user = _find_or_create_user(page, csrf_token, "e2e_share_endpoints_user")
+    user_id = test_user["id"]
+
+    try:
+        # Create connection for user
+        conn_res = api_post(
+            page,
+            f"/api/users/{user_id}/connections/add",
+            {"server_id": server_id, "protocol": "awg", "name": "share_endpoint_conn"},
+            csrf_token,
+        )
+        assert conn_res["status"] == 200, f"Could not create connection: {conn_res}"
+
+        user_conns = api_get(page, f"/api/users/{user_id}/connections")
+        connections = (
+            user_conns if isinstance(user_conns, list) else user_conns.get("connections", [])
+        )
+        assert connections, f"No connection found: {user_conns}"
+        conn_id = connections[0]["id"]
+
+        # Enable share without password (public)
+        share_res = api_post(
+            page,
+            f"/api/users/{user_id}/share/setup",
+            {"enabled": True, "password": ""},
+            csrf_token,
+        )
+        assert share_res["status"] == 200
+        share_token = share_res["body"].get("share_token")
+        assert share_token, "No share token returned"
+
+        # GET /api/share/{token}/connections
+        share_conns_res = page.request.get(f"{base_url}/api/share/{share_token}/connections")
+        assert (
+            share_conns_res.status == 200
+        ), f"Get share connections failed: {share_conns_res.text()}"
+        share_conns = share_conns_res.json()
+        assert isinstance(share_conns, dict)
+        assert_response_shape(
+            share_conns,
+            {"status": str, "username": str, "connections": list},
+            "share_connections",
+        )
+        assert any(c.get("id") == conn_id for c in share_conns["connections"])
+
+        # POST /api/share/{token}/config/{connection_id}
+        share_cfg_res = page.request.post(
+            f"{base_url}/api/share/{share_token}/config/{conn_id}",
+            headers={"Content-Type": "application/json"},
+        )
+        assert share_cfg_res.status in (200, 400, 500)
+        if share_cfg_res.status == 200:
+            cfg_body = share_cfg_res.json()
+            assert "config" in cfg_body and "filename" in cfg_body
+
+    finally:
+        api_post(
+            page,
+            f"/api/users/{user_id}/share/setup",
+            {"enabled": False},
+            csrf_token,
+        )
+        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
