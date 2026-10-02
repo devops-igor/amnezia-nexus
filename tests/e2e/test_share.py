@@ -258,13 +258,15 @@ def test_share_token_connections_and_config(
         assert any(c.get("id") == conn_id for c in share_conns["connections"])
 
         # POST /api/share/{token}/config/{connection_id}
-        share_cfg_res = page.request.post(
-            f"{base_url}/api/share/{share_token}/config/{conn_id}",
-            headers={"Content-Type": "application/json"},
+        share_cfg_res = api_post(
+            page,
+            f"/api/share/{share_token}/config/{conn_id}",
+            {},
+            csrf_token,
         )
-        assert share_cfg_res.status in (200, 400, 500)
-        if share_cfg_res.status == 200:
-            cfg_body = share_cfg_res.json()
+        assert share_cfg_res["status"] in (200, 400, 500)
+        if share_cfg_res["status"] == 200:
+            cfg_body = share_cfg_res["body"]
             assert "config" in cfg_body and "filename" in cfg_body
 
     finally:

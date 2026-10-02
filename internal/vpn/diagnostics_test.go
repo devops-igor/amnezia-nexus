@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -71,6 +73,16 @@ func TestEvaluateForwarderHealth_States(t *testing.T) {
 	h := EvaluateForwarderHealth(true, true, baseQueue, baseLatency, baseDrops, baseVTUN, basePeerSync, baseRouting, baseHandshake, baseBackends)
 	if h.Status != HealthHealthy {
 		t.Errorf("expected HEALTHY, got %s (summary: %s)", h.Status, h.Summary)
+	}
+	if h.Conditions == nil {
+		t.Errorf("expected non-nil h.Conditions for healthy forwarder")
+	}
+	hJSON, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("json.Marshal(h): %v", err)
+	}
+	if !strings.Contains(string(hJSON), `"conditions":[]`) {
+		t.Errorf("expected JSON to contain '\"conditions\":[]', got %s", string(hJSON))
 	}
 
 	// 2. Unavailable
@@ -355,6 +367,9 @@ func TestGetStatus_OperationalDiagnostics(t *testing.T) {
 
 	if st.HealthAssessment.Status == "" {
 		t.Errorf("expected non-empty HealthAssessment.Status")
+	}
+	if st.HealthAssessment.Conditions == nil {
+		t.Errorf("expected non-nil HealthAssessment.Conditions")
 	}
 	if st.RuntimeResources.Goroutines <= 0 {
 		t.Errorf("expected positive Goroutines count")

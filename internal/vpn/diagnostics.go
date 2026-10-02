@@ -474,6 +474,10 @@ func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats R
 		ActiveRoutesCount:      len(routes),
 		OwnershipMismatchDrops: retStats.OwnershipMismatchDrops,
 		IsConsistent:           true,
+		SessionsWithoutRoute:   []string{},
+		RoutesWithoutSession:   []string{},
+		RoutesWithoutReturn:    []string{},
+		DuplicateIPs:           []string{},
 	}
 
 	sessionByPeer := make(map[string]Session, len(activeSessions))
@@ -734,7 +738,7 @@ func EvaluateForwarderHealth(
 		}
 	}
 
-	var conditions []HealthCondition
+	conditions := make([]HealthCondition, 0)
 	conditions = append(conditions, evaluateRoutingConditions(routing)...)
 	conditions = append(conditions, evaluateQueueConditions(queue)...)
 	conditions = append(conditions, evaluateLatencyConditions(latency)...)
