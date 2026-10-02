@@ -320,20 +320,18 @@ type VPNSession struct {
 	TxBytes         int64     `json:"tx_bytes" db:"tx_bytes"`
 	Status          string    `json:"status" db:"status"` // connected, disconnected, draining
 	// ConnectionName is the user-facing config name (UserConnection.Name)
-	// resolved at handshake time. Legacy rows pre-dating the column carry ""
+	// resolved at admission time. Legacy rows pre-dating the column carry ""
 	// and are never backfilled.
 	ConnectionName string `json:"connection_name" db:"connection_name"`
-	// Generation tracks monotonic per-peer handshake sequence numbers to prevent
-	// out-of-order handshake commits from clobbering newer keys/endpoints.
+	// Generation tracks monotonic per-peer admission sequence numbers to prevent
+	// out-of-order commits from clobbering newer state.
 	Generation uint64 `json:"generation,omitempty" db:"-"`
 	// AdmittedVia records which admission path created this session so the
-	// idle reaper can select the session's teardown class (issue #390 part
-	// 1): "ingress" sessions are reaped routing-only, "" (the zero value,
-	// the handshake-era custom-listener admission) keeps the legacy
-	// fence+prune teardown. In-memory state like Generation — vpn_sessions
+	// idle reaper can select the session's teardown class: "ingress" sessions
+	// are reaped routing-only, while "" (the zero value, untagged / direct admission)
+	// uses standard teardown. In-memory state like Generation — vpn_sessions
 	// has no column, and rows do not survive a process restart
-	// (InvalidateVPNSessionsForRestart), so in-memory provenance is
-	// complete (issue #390 part 2).
+	// (InvalidateVPNSessionsForRestart), so in-memory provenance is complete.
 	AdmittedVia string `json:"admitted_via,omitempty" db:"-"`
 	// TimedOutAt records when CheckTimeouts detected that the session exceeded
 	// the idle timeout. Used by the session reaper to avoid duplicate counter
@@ -343,16 +341,13 @@ type VPNSession struct {
 
 // Session admission provenance values for VPNSession.AdmittedVia.
 const (
-	// SessionAdmissionHandshake marks sessions created by the handshake-era
-	// custom-listener admission. Never stamped explicitly: the empty string
-	// is the handshake-era value, so sessions created before the provenance
-	// field existed (and by any caller that does not stamp) reap through the
-	// legacy path.
-	SessionAdmissionHandshake = ""
-	// SessionAdmissionIngress marks sessions created by the upstream
-	// engine's admission (EnsureBackendSessionForIngress). Their idle reap
-	// is routing-only: no generation fence, no endpoint transport prune,
-	// no client re-handshake.
+	// SessionAdmissionDirect marks sessions created directly without explicit
+	// ingress admission tagging (or legacy untagged sessions). The empty string
+	// is the untagged zero value.
+	SessionAdmissionDirect = ""
+	// SessionAdmissionIngress marks sessions created by the client
+	// engine's ingress admission (EnsureBackendSessionForIngress). Their idle reap
+	// is routing-only: no endpoint transport prune, no client re-handshake.
 	SessionAdmissionIngress = "ingress"
 )
 
@@ -376,7 +371,7 @@ type EnrichedVPNSession struct {
 	RxBytes  int64     `json:"rx_bytes"`
 	TxBytes  int64     `json:"tx_bytes"`
 	Status   string    `json:"status"`
-	// ConnectionName is the user-facing config name captured at handshake;
+	// ConnectionName is the user-facing config name captured at admission;
 	// "unknown" when the underlying user_connection row is gone.
 	ConnectionName string `json:"connection_name"`
 }

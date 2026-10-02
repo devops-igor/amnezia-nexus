@@ -62,8 +62,7 @@ type Liveness interface {
 
 // LivenessRefresher is implemented by Liveness implementations that throttle
 // refreshes (the production SessionLiveness does): Touch throttled refreshes
-// at most once per interval per peer, mirroring the custom listener's
-// lastTouchSec pattern (issue #294) so the SessionManager mutex stays off the
+// at most once per interval per peer, keeping the SessionManager mutex off the
 // packet hot path.
 type LivenessRefresher interface {
 	// TouchThrottled refreshes liveness only when the peer's throttle
@@ -117,8 +116,7 @@ type admittedRoute struct {
 
 // Router turns one plaintext packet into a routed backend submission or a
 // counted drop. Admission runs lazily: once per peer for as long as the
-// admitted route stays live, exactly like the custom listener admits per
-// handshake rather than per packet. Construct with NewRouter; a Router is
+// admitted route stays live. Construct with NewRouter; a Router is
 // safe for concurrent use.
 type Router struct {
 	resolver  *Resolver
@@ -169,9 +167,8 @@ func NewRouter(resolver *Resolver, admission Admission, fwd *forwarder.Forwarder
 // owning peer lazily (skipped while the admitted route is still live, which
 // is what keeps rekeys session-stable: Nexus never sees the upstream
 // handshake, and a live session keeps its backend through rekeys) -> verify
-// exact ownership -> submit the packet to the backend through the forwarder
-// exactly like the custom listener path does. Every drop is classified and
-// counted.
+// exact ownership -> submit the packet to the backend through the forwarder.
+// Every drop is classified and counted.
 //
 // Liveness: only ACCEPTED traffic refreshes the peer's backend routing
 // session — drops (malformed, unmapped, mismatched, rejected) never do, and
@@ -298,11 +295,10 @@ func (r *Router) registerLocked(o PeerOwnership, route admittedRoute) (forwarder
 	return retirement, nil
 }
 
-// submit hands the packet to the forwarder's client->backend path — the same
-// primitive the custom listener's packet router uses, with the same fast-path
-// semantics (srcIP equals the route's assigned IP, so no rebind can occur).
-// Success refreshes the peer's routing-session liveness through the Liveness
-// seam (throttled when supported); failures never touch liveness.
+// submit hands the packet to the forwarder's client->backend path, with
+// fast-path semantics (srcIP equals the route's assigned IP, so no rebind can
+// occur). Success refreshes the peer's routing-session liveness through the
+// Liveness seam (throttled when supported); failures never touch liveness.
 func (r *Router) submit(o PeerOwnership, packet []byte) error {
 	if err := r.forwarder.RouteClientToBackend(o.PeerPublicKey, packet); err != nil {
 		// Forwarder-level rejections (queue full, rate limit, backend

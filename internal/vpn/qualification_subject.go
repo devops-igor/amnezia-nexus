@@ -479,14 +479,8 @@ func (s *QualificationSubject) Stop() error {
 				errs = append(errs, err)
 			}
 		}
-		if s.svc != nil {
-			if s.cfg.Engine == "custom" {
-				if err := s.svc.Stop(); err != nil {
-					errs = append(errs, err)
-				}
-			} else if s.svc.forwarder != nil {
-				s.svc.forwarder.StopPumps()
-			}
+		if s.svc != nil && s.svc.forwarder != nil {
+			s.svc.forwarder.StopPumps()
 		}
 		if s.adapter != nil {
 			_ = s.adapter.Close()

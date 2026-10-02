@@ -516,11 +516,11 @@ func TestPeerSyncOwnershipTransitionSparesForeignSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUser, serverPeerKey, "10.100.9.41", backend.ID, "server peer", models.SessionAdmissionHandshake)
+	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUser, serverPeerKey, "10.100.9.41", backend.ID, "server peer", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUser, tunnelKey, "10.100.9.42", backend.ID, "server tunnel", models.SessionAdmissionHandshake)
+	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUser, tunnelKey, "10.100.9.42", backend.ID, "server tunnel", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}

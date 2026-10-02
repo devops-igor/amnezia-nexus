@@ -113,7 +113,6 @@ FROZEN_CONFIG="$RUNTIME_DIR/frozen-client.conf"
 READY_PATH="$RUNTIME_DIR/subject.ready"
 PID_FILE="$RUNTIME_DIR/subject.pid"
 REPORT_FILE="$OUTPUT_DIR/upstream_restart_durability.json"
-LEGACY_REPORT_FILE="$OUTPUT_DIR/dual_engine_rollback_rehearsal.json"
 
 display_path() {
     local p="$1"
@@ -349,7 +348,7 @@ echo ""
 echo "==> [Aggregation] Generating upstream durability rehearsal summary report..."
 
 # Aggregate JSON reports
-python3 - "$OUTPUT_DIR" "$FROZEN_CONFIG_HASH" "$REPORT_FILE" "$LEGACY_REPORT_FILE" "$DRY_RUN" << 'PYEOF'
+python3 - "$OUTPUT_DIR" "$FROZEN_CONFIG_HASH" "$REPORT_FILE" "$DRY_RUN" << 'PYEOF'
 import sys
 import json
 import os
@@ -358,8 +357,7 @@ import datetime
 output_dir = sys.argv[1]
 frozen_hash = sys.argv[2]
 report_file = sys.argv[3]
-legacy_report_file = sys.argv[4]
-dry_run = (sys.argv[5].lower() == "true")
+dry_run = (sys.argv[4].lower() == "true")
 
 def load_leg(fname):
     p = os.path.join(output_dir, fname)
@@ -419,10 +417,7 @@ summary = {
 with open(report_file, "w", encoding="utf-8") as out:
     json.dump(summary, out, indent=2)
 
-with open(legacy_report_file, "w", encoding="utf-8") as out:
-    json.dump(summary, out, indent=2)
-
-print(f"Report written to: {os.path.basename(report_file)} and {os.path.basename(legacy_report_file)} (Verdict: {verdict})")
+print(f"Report written to: {os.path.basename(report_file)} (Verdict: {verdict})")
 if verdict != "PASS":
     sys.exit(1)
 PYEOF
@@ -430,6 +425,5 @@ PYEOF
 echo ""
 echo "===================================================================="
 echo " Upstream Durability Rehearsal Completed: PASS"
-echo " Report:        $(display_path "$REPORT_FILE")"
-echo " Legacy Report: $(display_path "$LEGACY_REPORT_FILE")"
+echo " Report: $(display_path "$REPORT_FILE")"
 echo "===================================================================="

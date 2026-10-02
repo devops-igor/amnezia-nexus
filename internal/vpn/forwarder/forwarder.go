@@ -400,9 +400,7 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 // Void registration for API compatibility: a route-capacity refusal is
 // silent here and observable only through the usual absent-route behavior.
 // Callers that must distinguish capacity exhaustion (the ingress admission
-// path, issue #388) use TryRegisterSessionWithLimit instead; this thin
-// wrapper keeps every existing custom-listener call site unchanged until
-// #394 removes the path.
+// path, issue #388) use TryRegisterSessionWithLimit instead.
 func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement) {
 	retirement, _ = f.TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps)
 	return retirement
@@ -744,13 +742,6 @@ func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func(ctx co
 // Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
 func (f *Forwarder) RetireUnmanagedRoutes() (wait func(ctx context.Context) error) {
 	return f.RetireRoutesByReturnPath(nil)
-}
-
-// RetireCustomRoutes is a backward-compatible alias for RetireUnmanagedRoutes.
-//
-// Deprecated: Custom engine is removed; use RetireUnmanagedRoutes.
-func (f *Forwarder) RetireCustomRoutes() (wait func(ctx context.Context) error) {
-	return f.RetireUnmanagedRoutes()
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).

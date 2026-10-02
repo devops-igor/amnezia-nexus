@@ -65,14 +65,13 @@ func TestRegressionUserDeleteTearsDownPortalSession(t *testing.T) {
 	}
 	survivorIP, _ := survivorConn.ClientParams["assigned_ip"].(string)
 
-	// Real established legacy portal sessions: handshake admission, live
-	// transport state in the endpoint listener, registered forwarder routes
+	// Real established portal sessions: direct admission, registered forwarder routes
 	// and live backend allocations.
-	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userID, peerKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionHandshake)
+	sess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userID, peerKey, assignedIP, backend.ID, conn.Name, models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
-	survivorSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, survivorConnID), survivorKey, survivorIP, backend.ID, survivorConn.Name, models.SessionAdmissionHandshake)
+	survivorSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, userIDFor(t, db, survivorConnID), survivorKey, survivorIP, backend.ID, survivorConn.Name, models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,11 +302,11 @@ func TestRegressionDeletionPathsSpareForeignSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-peer", "10.100.9.11", backend.ID, "server peer", models.SessionAdmissionHandshake)
+	serverSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-peer", "10.100.9.11", backend.ID, "server peer", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-tunnel", "10.100.9.12", backend.ID, "server tunnel", models.SessionAdmissionHandshake)
+	tunnelSess, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, foreignUserID, "regr-spare-server-tunnel", "10.100.9.12", backend.ID, "server tunnel", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,7 +16,7 @@ import (
 // serviceIngressAdmission adapts *Service to ingress.Admission for the
 // upstream plaintext ingress path (issue #388). The router has no context on
 // its packet hot path, so admission runs under context.Background() — the
-// same shape as the custom listener's incoming-peer handler.
+// same shape as incoming-peer admission.
 type serviceIngressAdmission struct {
 	svc        *Service
 	returnPath *forwarder.ReturnPath
@@ -47,17 +47,14 @@ type ingressBackendHandle struct{ tun *models.BackendTunnel }
 func (h ingressBackendHandle) TunnelID() int64 { return h.tun.ID }
 
 // errIngressSubsystems reports an admission attempt on a service whose core
-// subsystems are not initialized (the same precondition HandleIncomingPeer
-// enforces).
+// errIngressSubsystems is reported when required Service routing
+// subsystems are not initialized.
 var errIngressSubsystems = errors.New("ingress admission: subsystems not initialized")
 
 // EnsureBackendSessionForIngress is the dedicated routing-session admission
 // primitive for the upstream plaintext ingress path (issue #388). It admits
 // the peer that durably owns o.IP and returns its backend routing session
-// and the selected backend tunnel. Unlike HandleIncomingPeer — the
-// handshake-era admission, deliberately left untouched for the custom
-// listener and rollback compatibility until #394 — this path has NO
-// handshake-era side effects:
+// and the selected backend tunnel. This path has no legacy side effects:
 //
 //   - it never advances AWG/handshake generations (no peerGenerations,
 //     no AdvanceLiveSessionGeneration, no endpoint fencing);
@@ -65,9 +62,8 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //     IP comes from o (the resolver's durable record) EXACTLY, and a
 //     mismatch between the resolver record and the connection's durable
 //     lease fails closed instead of being repaired;
-//   - it never attaches the custom listener's peerVirtualDevice or any
-//     other custom-listener device;
-//   - it never queries or mutates AWG crypto state (the upstream engine
+//   - it operates exclusively with VirtualTUN in userspace memory;
+//   - it never queries or mutates AWG crypto state directly (the upstream engine
 //     owns all of it).
 //
 // Semantics:
@@ -80,7 +76,7 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //     user, backend enabled+active, and (when the forwarder is wired) a
 //     live forwarder route matching the live identity. Liveness for the
 //     ingress path is LastSeen-based — there are no generations here — so
-//     a live session is reused regardless of upstream handshake age.
+//     a live session is reused across upstream rekeys.
 //   - When no live session qualifies, a backend is selected through the
 //     existing sticky/LB/capacity primitives and a routing session is
 //     created lazily with the persisted assigned IP. A pre-existing
@@ -94,12 +90,11 @@ var errIngressSubsystems = errors.New("ingress admission: subsystems not initial
 //
 // Capacity serialization contract (issue #86): s.mu is held for the ENTIRE
 // reuse-check -> select -> CreateSession -> IncrementConnections -> route
-// registration sequence, exactly like HandleIncomingPeer. The
-// check-then-allocate capacity decision (GetActiveTunnels snapshot ->
-// selectTunnelForPeer/FilterHealthy -> IncrementConnections) is only safe
-// under this serialization; the rollback below depends on it too (no
-// concurrent disconnect can interleave a mirror-decrement between the
-// increment and the rollback decrement).
+// registration sequence. The check-then-allocate capacity decision
+// (GetActiveTunnels snapshot -> selectTunnelForPeer/FilterHealthy ->
+// IncrementConnections) is only safe under this serialization; transaction
+// rollback upon failure depends on it too (no concurrent disconnect can
+// interleave a decrement between the increment and the error rollback).
 //
 // Route registration and rollback (issue #388): admission-then-register —
 // session/backend selection happens first, CHECKED route registration LAST.
@@ -179,11 +174,10 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			}
 			// Provenance seam (issue #390 part 1): the returned session is
 			// served by the ingress path, so its idle reap must be
-			// routing-only even when it was CREATED by the legacy
-			// handshake-era admission and adopted for reuse here. The stamp
-			// goes through the manager (identity-guarded, under sm.mu) so a
-			// reaper sweeping the live map concurrently observes it, not
-			// just this returned copy.
+			// routing-only even when it was created by direct admission
+			// and adopted for reuse here. The stamp goes through the manager
+			// (identity-guarded, under sm.mu) so a reaper sweeping the live
+			// map concurrently observes it, not just this returned copy.
 			// AdoptSessionForIngress verifies session identity and connected status,
 			// stamps AdmittedVia = ingress, and refreshes LastSeen under sm.mu.Lock().
 			// If adoption fails (concurrent reap/replace), do not bind return path or

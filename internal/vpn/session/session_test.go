@@ -680,9 +680,12 @@ func TestAdoptSessionForIngress(t *testing.T) {
 	})
 	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-adopt"})
 
-	sess, err := sm.CreateSession(ctx, uID, "peer-adopt", "10.100.0.10", tID, "device-1")
+	sess, _, err := sm.CreateSessionWithDeltaAndSource(ctx, uID, "peer-adopt", "10.100.0.10", tID, "device-1", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionDirect {
+		t.Fatalf("initial AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionDirect)
 	}
 	oldTime := time.Now().UTC().Add(-10 * time.Minute)
 	sm.SetSessionLastSeen("peer-adopt", oldTime)
@@ -721,5 +724,41 @@ func TestAdoptSessionForIngress(t *testing.T) {
 	_ = sm.CloseSession(ctx, sess.ID, "disconnected")
 	if _, ok := sm.AdoptSessionForIngress("peer-adopt", sess.ID); ok {
 		t.Fatal("AdoptSessionForIngress succeeded on disconnected session")
+	}
+}
+
+func TestCreateSessionWithDelta_DefaultAdmission(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	ipamMgr, err := ipam.NewIPAM("10.100.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(db, ipamMgr)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "VPN Host", Host: "10.0.0.1"})
+	tID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-1",
+		PublicKey:     "tunnel-pubkey",
+		PrivateKey:    "tunnel-privkey",
+		Endpoint:      "10.0.0.1:51820",
+	})
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "user-default-admission"})
+
+	sess, _, err := sm.CreateSessionWithDelta(ctx, uID, "peer-default", "10.100.0.20", tID, "device-default")
+	if err != nil {
+		t.Fatalf("CreateSessionWithDelta failed: %v", err)
+	}
+	if sess.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("sess.AdmittedVia = %q, want %q", sess.AdmittedVia, models.SessionAdmissionIngress)
+	}
+
+	snap, ok := sm.GetSessionSnapshotByPeer("peer-default")
+	if !ok {
+		t.Fatal("GetSessionSnapshotByPeer failed")
+	}
+	if snap.AdmittedVia != models.SessionAdmissionIngress {
+		t.Fatalf("snap.AdmittedVia = %q, want %q", snap.AdmittedVia, models.SessionAdmissionIngress)
 	}
 }

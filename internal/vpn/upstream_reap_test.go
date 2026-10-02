@@ -3,14 +3,12 @@ package vpn
 // Issue #390 part 1 regression coverage: the upstream engine's backend
 // sessions are reaped ROUTING-ONLY. An idle reap of an ingress-admitted
 // session must never fence peer generations, never prune endpoint transport
-// state, and never force the upstream client into a re-handshake — while the
-// legacy handshake-era reap keeps its fence+prune teardown byte-for-byte
-// (pinned by the unmodified issue-295/309 reaper contract tests).
+// state, and never force the upstream client into a re-handshake.
 //
 // Provenance seam: models.VPNSession.AdmittedVia is stamped by
 // EnsureBackendSessionForIngress (both branches) and read by
 // Service.reapSession. "ingress" → reapIngressSession (routing-only);
-// "" (the handshake-era admission) → reapLegacySession (fence+prune).
+// "" (direct / untagged admission) → standard teardown.
 
 import (
 	"bytes"
@@ -130,11 +128,11 @@ func TestIngressAdmissionStampsProvenance(t *testing.T) {
 	}
 }
 
-// TestIngressReadoptStampsLegacySession covers the adoption branch: a
-// handshake-created live session (AdmittedVia == "") reused by the ingress
+// TestIngressReadoptStampsDirectSession covers the adoption branch: a
+// direct-created live session (AdmittedVia == "") reused by the ingress
 // admission comes back stamped ingress — the reap of the session the ingress
 // path actually served must be routing-only.
-func TestIngressReadoptStampsLegacySession(t *testing.T) {
+func TestIngressReadoptStampsDirectSession(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db)
 	ctx := t.Context()
@@ -147,14 +145,14 @@ func TestIngressReadoptStampsLegacySession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := svc.sessionMgr.CreateSession(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "adopted-device")
+	legacy, _, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(ctx, peer.userID, peer.peerKey, peer.ip.String(), backend.ID, "adopted-device", models.SessionAdmissionDirect)
 	if err != nil {
 		t.Fatal(err)
 	}
 	svc.pool.IncrementConnections(backend.ID)
 	_ = svc.forwarder.BeginRegisterSessionWithLimit(legacy.ID, peer.connID, peer.peerKey, peer.ip.String(), backend.ID, 0, 0)
-	if legacy.AdmittedVia != models.SessionAdmissionHandshake {
-		t.Fatalf("fixture setup: legacy session AdmittedVia = %q, want empty", legacy.AdmittedVia)
+	if legacy.AdmittedVia != models.SessionAdmissionDirect {
+		t.Fatalf("fixture setup: direct session AdmittedVia = %q, want empty", legacy.AdmittedVia)
 	}
 
 	sess, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
