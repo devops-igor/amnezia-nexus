@@ -119,10 +119,18 @@ func TestVPNBackendTunnelsUpdateAndStatus(t *testing.T) {
 		t.Fatalf("UpdateBackendTunnel failed: %v", err)
 	}
 
-	for _, ownedColumn := range []string{"enabled", "status", "disable_reason", "state_version", "last_health_check", "latency_ms"} {
+	for _, ownedColumn := range []string{"enabled", "status", "disable_reason", "last_health_check", "latency_ms"} {
 		if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{ownedColumn: 1}); err == nil {
 			t.Errorf("generic UpdateBackendTunnel unexpectedly accepted owned state column %q", ownedColumn)
 		}
+	}
+
+	if err := db.UpdateBackendTunnel(ctx, tID, map[string]any{"state_version": 42}); err != nil {
+		t.Fatalf("UpdateBackendTunnel state_version failed: %v", err)
+	}
+	tVer, err := db.GetBackendTunnel(ctx, tID)
+	if err != nil || tVer.StateVersion != 42 {
+		t.Fatalf("UpdateBackendTunnel state_version mismatch: got %d (err: %v), want 42", tVer.StateVersion, err)
 	}
 
 	if err := db.UpdateBackendTunnelStatus(ctx, tID, "degraded", 88); err != nil {
