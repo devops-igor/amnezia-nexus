@@ -45,4 +45,4 @@ docker-build:
 	docker build -t amnezia-web-panel:latest -f ../Dockerfile ..
 
 docker-run:
-	docker run --rm -p 5000:5000 --cap-add=NET_ADMIN --device=/dev/net/tun amnezia-web-panel:latest
+	docker run --rm -p 5000:5000 -p 51820:51820/udp amnezia-web-panel:latest

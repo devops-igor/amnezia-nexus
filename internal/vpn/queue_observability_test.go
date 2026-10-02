@@ -1,8 +1,10 @@
 package vpn
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -13,6 +15,16 @@ import (
 type statusBlockedDevice struct {
 	started chan struct{}
 	release chan struct{}
+}
+
+func returnPacket(destination string) []byte {
+	p := make([]byte, 28)
+	p[0] = 0x45
+	p[9] = 17
+	binary.BigEndian.PutUint16(p[2:4], 28)
+	ip := netip.MustParseAddr(destination).As4()
+	copy(p[16:20], ip[:])
+	return p
 }
 
 func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
@@ -33,13 +45,20 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			if _, err := db.CreateConnection(t.Context(), &models.UserConnection{UserID: otherUser, ServerID: 0, Protocol: "awg", ClientID: "bob-peer", Name: "bob"}); err != nil {
 				t.Fatal(err)
 			}
-			sess, _, err := svc.HandleIncomingPeer(t.Context(), peer)
+			sess, _, err := svc.HandleIncomingPeerForTest(t.Context(), peer)
 			if err != nil {
 				t.Fatal(err)
 			}
 			oldQueue, _ := svc.forwarder.GetClientPacketChannel(peer)
+			_, conn, err := svc.auth.AuthenticatePeer(t.Context(), peer)
+			if err != nil {
+				t.Fatal(err)
+			}
 			dev := &statusBlockedDevice{started: make(chan struct{}, 1), release: make(chan struct{})}
-			svc.forwarder.AttachPeerDevice(peer, dev)
+			path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+			if _, err := svc.forwarder.BindSessionReturnPath(sess.ID, conn.ID, peer, sess.AssignedIP, sess.BackendTunnelID, path); err != nil {
+				t.Fatal(err)
+			}
 			svc.forwarder.StartPumps(t.Context())
 			defer svc.forwarder.StopPumps()
 			defer func() {
@@ -49,7 +68,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 					close(dev.release)
 				}
 			}()
-			if err := svc.forwarder.RouteBackendToClient(sess.BackendTunnelID, []byte("packet"), sess.AssignedIP); err != nil {
+			if err := svc.forwarder.RouteBackendToClient(sess.BackendTunnelID, returnPacket(sess.AssignedIP), sess.AssignedIP); err != nil {
 				t.Fatal(err)
 			}
 			if action == "replace" {
@@ -82,7 +101,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 					err = svc.sessionMgr.CloseSession(t.Context(), sess.ID, "idle_timeout")
 					svc.reapSession(t.Context(), sess)
 				case "replace":
-					_, _, err = svc.HandleIncomingPeer(t.Context(), peer)
+					_, _, err = svc.HandleIncomingPeerForTest(t.Context(), peer)
 				}
 				done <- err
 			}()
@@ -115,7 +134,7 @@ func TestServiceRetirementReleasesGlobalLockDuringBlockedWrite(t *testing.T) {
 			}
 			otherDone := make(chan error, 1)
 			go func() {
-				_, _, err := svc.HandleIncomingPeer(t.Context(), "bob-peer")
+				_, _, err := svc.HandleIncomingPeerForTest(t.Context(), "bob-peer")
 				otherDone <- err
 			}()
 			select {
@@ -194,8 +213,8 @@ func TestStatusExposesLiveAndCompletedDeviceWriteTelemetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev := &statusBlockedDevice{started: make(chan struct{}, 1), release: make(chan struct{})}
-	svc.forwarder.AttachPeerDevice("peer", dev)
-	svc.forwarder.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
+	path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	svc.forwarder.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
 	svc.forwarder.StartPumps(t.Context())
 	defer svc.forwarder.StopPumps()
 	defer func() {
@@ -205,7 +224,7 @@ func TestStatusExposesLiveAndCompletedDeviceWriteTelemetry(t *testing.T) {
 			close(dev.release)
 		}
 	}()
-	if err := svc.forwarder.RouteBackendToClient(1, []byte("packet"), "10.100.0.10"); err != nil {
+	if err := svc.forwarder.RouteBackendToClient(1, returnPacket("10.100.0.10"), "10.100.0.10"); err != nil {
 		t.Fatal(err)
 	}
 	select {

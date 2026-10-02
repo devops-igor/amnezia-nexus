@@ -342,17 +342,7 @@ func TestOrchestratorRebalanceEndToEndWithVPNService(t *testing.T) {
 	// Configure Orchestrator with vpnSvc as SessionMigrator
 	orch := orchestrator.New(db, nil, orchestrator.WithSessionMigrator(svc))
 
-	// Seed 9 sessions on tun1 (including alice's live session) and 1 session on tun2
-	// Total 10 sessions, avg 5.0, threshold 7, excess 2 on tun1.
-	assignedIPAlice := "10.100.0.18"
-	aliceSess, err := svc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPAlice, tun1.ID, "alice-phone")
-	if err != nil {
-		t.Fatalf("CreateSession failed: %v", err)
-	}
-	svc.forwarder.RegisterSession(aliceSess.ID, "conn-alice", peerKeyAlice, assignedIPAlice, tun1.ID)
-	svc.pool.IncrementConnections(tun1.ID)
-
-	// Seed 8 additional sessions on tun1 in DB + SessionManager
+	// Seed 8 bulk sessions on tun1 in DB + SessionManager
 	for i := 2; i <= 9; i++ {
 		peerKey := "peer-tun1-" + string(rune('0'+i))
 		ip := "10.100.0." + string(rune('0'+i+20))
@@ -362,6 +352,22 @@ func TestOrchestratorRebalanceEndToEndWithVPNService(t *testing.T) {
 		}
 		svc.forwarder.RegisterSession(s.ID, "conn-"+peerKey, peerKey, ip, tun1.ID)
 		svc.pool.IncrementConnections(tun1.ID)
+	}
+
+	// Seed alice's live session on tun1 LAST and set connected_at strictly newer so
+	// that GetActiveVPNSessions (ORDER BY connected_at DESC) deterministically places
+	// alice among the excess sessions selected for rebalancing to tun2.
+	assignedIPAlice := "10.100.0.18"
+	aliceSess, err := svc.sessionMgr.CreateSession(ctx, uID, peerKeyAlice, assignedIPAlice, tun1.ID, "alice-phone")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	svc.forwarder.RegisterSession(aliceSess.ID, "conn-alice", peerKeyAlice, assignedIPAlice, tun1.ID)
+	svc.pool.IncrementConnections(tun1.ID)
+
+	futureTime := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE vpn_sessions SET connected_at = ? WHERE id = ?", futureTime, aliceSess.ID); err != nil {
+		t.Fatalf("failed to update alice connected_at: %v", err)
 	}
 
 	// Seed 1 session on tun2

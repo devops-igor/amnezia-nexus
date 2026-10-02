@@ -310,7 +310,7 @@ func buildUserUpdateClauses(updates map[string]any, skipCols map[string]bool) ([
 }
 
 // UpdateUser dynamically updates fields on a user record. Returns true if user existed and was updated.
-func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
+func (d *DB) updateUser(ctx context.Context, id string, updates map[string]any) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -350,7 +350,7 @@ func (d *DB) UpdateUser(ctx context.Context, id string, updates map[string]any) 
 
 // UpdateUserAndBumpSession updates user attributes and increments session_version
 // by 1 in a single database transaction. Returns whether the user existed and the new session_version.
-func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
+func (d *DB) updateUserAndBumpSession(ctx context.Context, id string, updates map[string]any) (bool, int, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -399,38 +399,51 @@ func (d *DB) UpdateUserAndBumpSession(ctx context.Context, id string, updates ma
 	return true, newVersion, nil
 }
 
-// DeleteUser deletes a user and all associated connections in a transaction.
-func (d *DB) DeleteUser(ctx context.Context, id string) (bool, error) {
+// deleteUser deletes a user and all associated connections in a transaction.
+// It returns the PORTAL-scope peer public keys of the deleted connections,
+// captured INSIDE the transaction immediately BEFORE the deleting statement
+// ran (issue #391 round 4b, finding 1). The post-commit revoke event must
+// carry them: once the rows are gone the dispatcher can no longer classify
+// the user's live sessions and the established portal session, its forwarder
+// route and its backend accounting leak. Capturing inside the same
+// transaction keeps the identity and the delete atomic.
+func (d *DB) deleteUser(ctx context.Context, id string) (bool, []string, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	tx, err := d.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("failed to begin delete user tx: %w", err)
+		return false, nil, fmt.Errorf("failed to begin delete user tx: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback()
 	}()
 
-	_, _ = tx.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", id)
+	portalKeys, err := portalPeerKeysForUser(ctx, tx, id)
+	if err != nil {
+		return false, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", id); err != nil {
+		return false, nil, fmt.Errorf("failed to delete user connections for user %s: %w", id, err)
+	}
 	_, _ = tx.ExecContext(ctx, "DELETE FROM connection_creation_log WHERE user_id = ?", id)
 	_, _ = tx.ExecContext(ctx, "DELETE FROM vpn_sessions WHERE user_id = ?", id)
 
 	res, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id)
 	if err != nil {
-		return false, fmt.Errorf("failed to delete user %s: %w", id, err)
+		return false, nil, fmt.Errorf("failed to delete user %s: %w", id, err)
 	}
 
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit delete user: %w", err)
+		return false, nil, fmt.Errorf("failed to commit delete user: %w", err)
 	}
 
-	return rows > 0, nil
+	return rows > 0, portalKeys, nil
 }
 
 // ToggleUser toggles a user's enabled status.
@@ -457,7 +470,7 @@ type UserTrafficTotals struct {
 // AddUserTraffic increments all user traffic counters and returns the updated
 // totals from the same SQL statement. Concurrent accounting updates cannot be
 // lost between reading and writing these counters.
-func (d *DB) AddUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
+func (d *DB) addUserTraffic(ctx context.Context, id string, rxDelta, txDelta int64) (UserTrafficTotals, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -493,7 +506,7 @@ func (d *DB) UpdateUserTraffic(ctx context.Context, id string, rxDelta, txDelta 
 // ResetUserMonthlyTraffic removes only the counters present in the orchestrator's
 // snapshot. Traffic added after that snapshot remains in the current period.
 // The reset marker prevents two orchestrators from subtracting the same baseline.
-func (d *DB) ResetUserMonthlyTraffic(ctx context.Context, id string, expectedResetAt *string, snapshot UserTrafficTotals, resetAt string) (bool, error) {
+func (d *DB) resetUserMonthlyTraffic(ctx context.Context, id string, expectedResetAt *string, snapshot UserTrafficTotals, resetAt string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -520,7 +533,7 @@ func (d *DB) ResetUserMonthlyTraffic(ctx context.Context, id string, expectedRes
 // ResetUserPeriodTraffic removes the snapshotted previous-period usage while
 // retaining traffic committed after the snapshot. A changed marker or strategy
 // means another reset or configuration update won the race.
-func (d *DB) ResetUserPeriodTraffic(ctx context.Context, id string, expectedResetAt *string, expectedStrategy string, snapshotUsed int64, resetAt string) (bool, error) {
+func (d *DB) resetUserPeriodTraffic(ctx context.Context, id string, expectedResetAt *string, expectedStrategy string, snapshotUsed int64, resetAt string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 

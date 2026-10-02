@@ -209,7 +209,7 @@ func (d *DB) GetConnectionsByToken(ctx context.Context, token string) ([]models.
 }
 
 // CreateConnection inserts a new user connection record.
-func (d *DB) CreateConnection(ctx context.Context, c *models.UserConnection) (string, error) {
+func (d *DB) createConnection(ctx context.Context, c *models.UserConnection) (string, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -272,7 +272,7 @@ func (d *DB) CreateConnection(ctx context.Context, c *models.UserConnection) (st
 }
 
 // UpdateConnection dynamically updates fields on a connection record. Returns true if found and updated.
-func (d *DB) UpdateConnection(ctx context.Context, id string, updates map[string]any) (bool, error) {
+func (d *DB) updateConnection(ctx context.Context, id string, updates map[string]any) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -332,7 +332,7 @@ func (d *DB) UpdateConnection(ctx context.Context, id string, updates map[string
 }
 
 // DeleteConnection deletes a connection by ID. Returns true if found.
-func (d *DB) DeleteConnection(ctx context.Context, id string) (bool, error) {
+func (d *DB) deleteConnection(ctx context.Context, id string) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -349,7 +349,7 @@ func (d *DB) DeleteConnection(ctx context.Context, id string) (bool, error) {
 }
 
 // DeleteConnectionByClientID deletes connection(s) matching clientID and serverID.
-func (d *DB) DeleteConnectionByClientID(ctx context.Context, clientID string, serverID int64) (bool, error) {
+func (d *DB) deleteConnectionByClientID(ctx context.Context, clientID string, serverID int64) (bool, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -365,14 +365,38 @@ func (d *DB) DeleteConnectionByClientID(ctx context.Context, clientID string, se
 	return rows > 0, nil
 }
 
-// ToggleConnection toggles or enables/disables a connection.
+// ToggleConnection toggles or enables/disables a connection. Disabling
+// revokes access: the immediate live-session teardown runs after the commit
+// (issue #391 round 4a, finding 3), then reconciliation is requested.
 func (d *DB) ToggleConnection(ctx context.Context, id string, enabled bool) (bool, error) {
-	// Connection toggling can update client state or name
-	conn, err := d.GetConnection(ctx, id)
-	if err != nil || conn == nil {
+	d.writeMu.Lock()
+	var query string
+	if enabled {
+		query = `UPDATE user_connections SET client_params = json_remove(COALESCE(client_params, '{}'), '$.disabled') WHERE id = ?`
+	} else {
+		query = `UPDATE user_connections SET client_params = json_set(COALESCE(client_params, '{}'), '$.disabled', json('true')) WHERE id = ?`
+	}
+	res, err := d.sqlDB.ExecContext(ctx, query, id)
+	if err != nil {
+		d.writeMu.Unlock()
+		return false, fmt.Errorf("failed to toggle connection %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	d.writeMu.Unlock()
+	if err != nil || rows == 0 {
 		return false, err
 	}
-	return true, nil
+	if !enabled {
+		if conn, getErr := d.GetConnection(ctx, id); getErr == nil && conn != nil {
+			d.recordPeerRevoke(ctx, PeerRevokeEvent{
+				Kind:        PeerRevokeConnection,
+				UserID:      conn.UserID,
+				ClientID:    conn.ClientID,
+				PortalScope: portalScopedConnection(conn),
+			})
+		}
+	}
+	return true, d.notifyPeerChange(ctx)
 }
 
 // UpdateConnectionTraffic records rx/tx byte traffic delta and cumulative totals.
@@ -403,20 +427,80 @@ func (d *DB) GetConnectionsForSync(ctx context.Context, serverID int64) ([]model
 	return d.GetConnectionsByServerID(ctx, serverID)
 }
 
-// DeleteConnectionsByUserID deletes all connections belonging to a user. Returns count deleted.
-func (d *DB) DeleteConnectionsByUserID(ctx context.Context, userID string) (int, error) {
+// portalPeerKeysForUser captures the peer public keys of a user's PORTAL-scope
+// connections (server_id 0, awg protocol) as they exist RIGHT NOW.
+//
+// It is the capture step of the bulk-deletion revocation protocol (issue #391
+// round 4b, finding 1): the identity MUST be read before the deleting
+// statement destroys the row, because afterwards the revoke dispatcher can no
+// longer classify the user's live sessions against durable state and the
+// established session, its forwarder route and its backend accounting leak.
+//
+// It runs on the caller's querier, so the caller owns the transaction: inside
+// deleteUser's transaction the capture and the delete are one atomic unit.
+func portalPeerKeysForUser(ctx context.Context, q vpnAssignmentQuerier, userID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT client_id, server_id, protocol FROM user_connections WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read user connections for revocation: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var keys []string
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		// client_id is NULLABLE (schema.sql): imported/partial connection rows
+		// carry no peer identity. Scan it as sql.NullString — the same
+		// convention as scanConnection below — so a NULL is read as the empty
+		// string and the existing guard skips the row. Scanning it into a plain
+		// string aborted the whole capture on the first NULL, which blocked
+		// DeleteConnectionsByUserID and deleteUser outright (issue #391 round
+		// 4c, F4). protocol is declared NOT NULL and stays a plain string.
+		var clientID sql.NullString
+		var protocol string
+		var serverID int64
+		if err := rows.Scan(&clientID, &serverID, &protocol); err != nil {
+			return nil, fmt.Errorf("failed to scan user connection for revocation: %w", err)
+		}
+		if !clientID.Valid || clientID.String == "" || serverID != 0 || models.NormalizeProtocol(protocol) != "awg" {
+			// A NULL or empty client_id is not a peer identity at all, and
+			// regular server peers and non-AWG protocols are outside the
+			// ingress engine's domain; the engine-aware dispatcher must
+			// never tear their sessions down.
+			continue
+		}
+		key := clientID.String
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read user connections for revocation: %w", err)
+	}
+	return keys, nil
+}
+
+// deleteConnectionsByUserID deletes all connections belonging to a user. It
+// returns the count deleted together with the PORTAL-scope peer public keys
+// captured BEFORE the deleting statement ran (issue #391 round 4b, finding 1).
+func (d *DB) deleteConnectionsByUserID(ctx context.Context, userID string) (int, []string, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	keys, err := portalPeerKeysForUser(ctx, d.sqlDB, userID)
+	if err != nil {
+		return 0, nil, err
+	}
 	res, err := d.sqlDB.ExecContext(ctx, "DELETE FROM user_connections WHERE user_id = ?", userID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to delete user connections: %w", err)
+		return 0, nil, fmt.Errorf("failed to delete user connections: %w", err)
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return int(rows), nil
+	return int(rows), keys, nil
 }
 
 // DeleteConnectionsByUser is an alias for DeleteConnectionsByUserID.
@@ -425,7 +509,7 @@ func (d *DB) DeleteConnectionsByUser(ctx context.Context, userID string) (int, e
 }
 
 // DeleteConnectionsByServerID deletes all connections on a specific server. Returns count deleted.
-func (d *DB) DeleteConnectionsByServerID(ctx context.Context, serverID int64) (int, error) {
+func (d *DB) deleteConnectionsByServerID(ctx context.Context, serverID int64) (int, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -446,7 +530,7 @@ func (d *DB) DeleteConnectionsByServer(ctx context.Context, serverID int64) (int
 }
 
 // DeleteConnectionsByServerAndProtocol deletes all connections for a server/protocol. Returns count deleted.
-func (d *DB) DeleteConnectionsByServerAndProtocol(ctx context.Context, serverID int64, proto string) (int, error) {
+func (d *DB) deleteConnectionsByServerAndProtocol(ctx context.Context, serverID int64, proto string) (int, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 

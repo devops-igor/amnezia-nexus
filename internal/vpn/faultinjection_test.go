@@ -154,9 +154,9 @@ func TestDBWriteFailsAfterInMemoryStateChange(t *testing.T) {
 
 	svc2.pool.IncrementConnections(tun2.ID) // baseline probe gauge, matches handleIncomingPeer precondition
 	gaugeBefore := tun2.ActiveConnections
-	_, _, err = svc2.HandleIncomingPeer(ctx, peerKey)
+	_, _, err = svc2.HandleIncomingPeerForTest(ctx, peerKey)
 	if err == nil {
-		t.Fatalf("expected HandleIncomingPeer to fail on injected CreateVPNSession failure")
+		t.Fatalf("expected HandleIncomingPeerForTest to fail on injected CreateVPNSession failure")
 	}
 	// State invariants after the failed create:
 	//   1. no phantom in-memory session for the peer,
@@ -190,7 +190,7 @@ func TestDBWriteFailsAfterInMemoryStateChange(t *testing.T) {
 	if len(rows) != 0 {
 		t.Errorf("INVARIANT VIOLATED: %d phantom session rows after failed persist", len(rows))
 	}
-	if _, _, err := svc2.HandleIncomingPeer(ctx, peerKey); err != nil {
+	if _, _, err := svc2.HandleIncomingPeerForTest(ctx, peerKey); err != nil {
 		t.Errorf("INVARIANT VIOLATED: reconnect after failed create failed: %v", err)
 	}
 	_ = s1ID
@@ -224,7 +224,7 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 					t.Fatalf("db.Close: %v", err)
 				}
 
-				_, _, err := svc.HandleIncomingPeer(t.Context(), peerKey)
+				_, _, err := svc.HandleIncomingPeerForTest(t.Context(), peerKey)
 				if err == nil {
 					t.Fatalf("expected session-persist failure")
 				}
@@ -254,9 +254,9 @@ func TestPartialSessionCreationLeavesNoOrphans(t *testing.T) {
 				svc, _, _, _, peerKey := setupTestVPNService(t, db)
 				tun := lbTunnel(t, svc, db, 984, "awg984", "pub984", "priv984", "10.9.9.184:51820")
 
-				sess, backend, err := svc.HandleIncomingPeer(t.Context(), peerKey)
+				sess, backend, err := svc.HandleIncomingPeerForTest(t.Context(), peerKey)
 				if err != nil {
-					t.Fatalf("HandleIncomingPeer: %v", err)
+					t.Fatalf("HandleIncomingPeerForTest: %v", err)
 				}
 				if backend.ID != tun.ID {
 					t.Fatalf("backend %d != tunnel %d", backend.ID, tun.ID)
@@ -400,7 +400,7 @@ func TestRestartRacingReconcileGaugeOnly(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, _, _ = svc.HandleIncomingPeer(ctx, peerKey) // rekey/replacement for the same peer
+		_, _, _ = svc.HandleIncomingPeerForTest(ctx, peerKey) // rekey/replacement for the same peer
 	}()
 	wg.Wait()
 

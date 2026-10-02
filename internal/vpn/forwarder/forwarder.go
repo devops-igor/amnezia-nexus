@@ -25,6 +25,13 @@ var (
 	// and the spoofedRebinds counter is incremented; callers (the endpoint
 	// router) treat it as a drop, not a protocol error.
 	ErrSpoofedSourceIP = errors.New("spoofed inner source IP: rebind rejected")
+	// ErrRouteCapacityExhausted is returned by TryRegisterSessionWithLimit
+	// when a NEW route cannot be admitted because the configured
+	// active-route budget is full (issue #388: checked registration —
+	// admission callers must observe the refusal and roll back, instead of
+	// inferring it from an absent route). Re-registering an existing peer
+	// never returns it: replacement does not increase the route count.
+	ErrRouteCapacityExhausted = errors.New("forwarder: active route limit reached")
 )
 
 // PacketDevice abstracts physical Linux TUN / network interfaces and in-memory test devices.
@@ -140,6 +147,7 @@ type sessionRoute struct {
 	peerKey         string
 	assignedIP      string
 	backendTunnelID int64
+	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
 	clientQueue     chan []byte
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
@@ -172,11 +180,9 @@ type Forwarder struct {
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
 	backendQueues    map[int64]chan []byte    // backendTunnelID -> queue
-	clientDevices    map[string]PacketDevice  // peerKey -> device
 	backendDevices   map[int64]PacketDevice   // backendTunnelID -> device
 	backendPumpStops map[int64]chan struct{}  // backendTunnelID -> pump stop channel
 	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
-	defaultClientDev PacketDevice             // default client packet device
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -198,6 +204,29 @@ type Forwarder struct {
 	// portal subnet or already assigned to another route. Such packets are
 	// dropped (never forwarded, never rebound). Exposed via SpoofedRebinds.
 	spoofedRebinds atomic.Uint64
+	// returnRejectClassifier, when non-nil, receives one call for every
+	// return packet rejected by RouteBackendToClient BEFORE any per-route
+	// handling, together with the reason the filter fired (unrouted,
+	// malformed, or backend mismatch). The ingress engine registers one
+	// classifier for its lifetime and folds these rejections into the
+	// engine-level MalformedDrops/UnmappedDrops/OwnershipMismatchDrops
+	// counters, which would otherwise stay at zero in production because
+	// the filter rejects the packet before the engine's write callback
+	// ever sees it (issue #389 rework 2).
+	//
+	// Single-owner rule per drop reason (both sites enforced HERE, in the
+	// forwarder — the ONLY production rejection sites):
+	//   - UnmappedDrops: unrouted replies are rejected at the routesByIP
+	//     lookup, where no route exists — so no ReturnPath writer exists
+	//     either. Only the service-level classifier counts them; the
+	//     engine's write callback never observes an unmapped packet.
+	//   - MalformedDrops / OwnershipMismatchDrops: those replies are
+	//     rejected at the route.returnPath shape filter, which returns
+	//     before calling the writer. Exactly one of (filter, writer) counts
+	//     a given packet.
+	// The write callback must never classify the same packet as the
+	// filter: validReturnDestination is checked before path.write.
+	returnRejectClassifier func(reason ReturnRejectReason) // guarded by mu; set via SetReturnRejectClassifier
 	// writeErrLogUntil throttles return-path device Write-error log lines to
 	// at most one per second (issue #43: a failed dev.Write on the client
 	// queue -> client device leg, e.g. "no transport keys for peer", used to
@@ -219,7 +248,8 @@ type Forwarder struct {
 	pumpsWg          sync.WaitGroup
 	// Diagnostic registration count. Teardown ownership is determined by
 	// sessionRoute.sessionID, never inferred from this counter.
-	peerRegs map[string]uint64 // peerKey -> registrations seen
+	peerRegs    map[string]uint64 // peerKey -> registrations seen
+	stopTimeout time.Duration
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -332,7 +362,6 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByPeer:     make(map[string]*sessionRoute),
 		routesByIP:       make(map[string]*sessionRoute),
 		backendQueues:    make(map[int64]chan []byte),
-		clientDevices:    make(map[string]PacketDevice),
 		backendDevices:   make(map[int64]PacketDevice),
 		writesInFlight:   make(map[*sessionRoute]time.Time),
 		backendPumpStops: make(map[int64]chan struct{}),
@@ -367,21 +396,55 @@ func (f *Forwarder) RegisterSessionWithLimit(sessionID, connectionID, peerKey, a
 // BeginRegisterSessionWithLimit installs the new route and stops admission on
 // the old generation without waiting for device I/O. Call Wait on the returned
 // retirement only after releasing caller locks (including Service.mu).
+//
+// Void registration for API compatibility: a route-capacity refusal is
+// silent here and observable only through the usual absent-route behavior.
+// Callers that must distinguish capacity exhaustion (the ingress admission
+// path, issue #388) use TryRegisterSessionWithLimit instead.
 func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement) {
+	retirement, _ = f.TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps)
+	return retirement
+}
+
+// TryRegisterSessionWithLimit is BeginRegisterSessionWithLimit with an
+// inspectable success/failure contract (issue #388): it returns the
+// retirement of any replaced route and reports ErrRouteCapacityExhausted
+// — without installing anything — when a new peer's route does not fit the
+// configured active-route budget. Re-registration of an existing peer is
+// allowed (replacement, not growth) and never reports capacity exhaustion.
+//
+// Call Wait on the retirement only after releasing caller locks; on error
+// the returned retirement is always the zero value.
+func (f *Forwarder) TryRegisterSessionWithLimit(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, limitDownBps, limitUpBps int64) (retirement Retirement, err error) {
+	return f.TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps, nil)
+}
+
+// TryRegisterSessionWithReturnPath installs a route-bound plaintext writer.
+// A nonnil path always takes precedence over legacy devices, including when closed.
+func (f *Forwarder) TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (Retirement, error) {
+	if path != nil && path.Closed() {
+		return Retirement{}, ErrReturnPathClosed
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.registerSessionLocked(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, limitDownBps, limitUpBps, path)
+}
 
-	// Registration is intentionally void for API compatibility. A new peer is
-	// rejected when the configured active-route budget is full; callers observe
-	// the rejection through the usual absent-route behavior. Re-registration of
-	// an existing peer is allowed so reconnect/rekey lifecycle semantics remain
-	// unchanged and does not increase the active route count.
+func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID, limitDownBps, limitUpBps int64, path *ReturnPath) (retirement Retirement, err error) {
+	if path != nil && path.Closed() {
+		return Retirement{}, ErrReturnPathClosed
+	}
+
+	// A new peer is rejected when the configured active-route budget is
+	// full. Re-registration of an existing peer is allowed so
+	// reconnect/rekey lifecycle semantics remain unchanged and does not
+	// increase the active route count.
 	maxActiveRoutes := f.maxActiveRoutes
 	if maxActiveRoutes <= 0 {
 		maxActiveRoutes = MaxSupportedActiveRoutes
 	}
 	if _, exists := f.routesByPeer[peerKey]; !exists && len(f.routesByPeer) >= maxActiveRoutes {
-		return
+		return Retirement{}, ErrRouteCapacityExhausted
 	}
 
 	// Ensure backend queue exists
@@ -398,6 +461,7 @@ func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerK
 	}
 
 	route := &sessionRoute{
+		returnPath:      path,
 		sessionID:       sessionID,
 		connectionID:    connectionID,
 		peerKey:         peerKey,
@@ -439,7 +503,7 @@ func (f *Forwarder) BeginRegisterSessionWithLimit(sessionID, connectionID, peerK
 		f.pumpsWg.Add(1)
 		go f.pumpClientQueue(f.pumpsStopCh, route)
 	}
-	return retirement
+	return retirement, nil
 }
 
 // stopRoutePumpLocked closes the route's per-session stop channel exactly
@@ -587,7 +651,6 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 			delete(f.routesByIP, route.assignedIP)
 		}
 		delete(f.routesByPeer, peerKey)
-		delete(f.clientDevices, peerKey)
 		// Terminate the per-session pump exactly once. The queue is NOT
 		// closed: RouteBackendToClient sends to it after releasing the lock,
 		// and closing would race into a send-on-closed panic. Instead the
@@ -597,6 +660,88 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.drainRouteQueueLocked(route)
 	}
 	return retirement
+}
+
+func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) bool) []Retirement {
+	var matches []*sessionRoute
+	for _, route := range f.routesByPeer {
+		if route != nil && (predicate == nil || predicate(route)) {
+			matches = append(matches, route)
+		}
+	}
+	retirements := make([]Retirement, 0, len(matches))
+	for _, route := range matches {
+		retirements = append(retirements, Retirement{route: route})
+		if cur, ok := f.routesByIP[route.assignedIP]; ok && cur == route {
+			delete(f.routesByIP, route.assignedIP)
+		}
+		delete(f.routesByPeer, route.peerKey)
+		f.stopRoutePumpLocked(route)
+		f.drainRouteQueueLocked(route)
+	}
+	return retirements
+}
+
+// RetireAllRoutes stops pumps, drains queues, removes all routes from forwarder
+// routing tables, and returns a wait function that callers execute outside forwarder
+// locks to join in-flight writes with a bounded context.
+func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
+	if f == nil {
+		return func(ctx context.Context) error { return nil }
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(nil)
+	clear(f.routesByPeer)
+	clear(f.routesByIP)
+	f.aggregateQueueMu.Lock()
+	f.aggregateQueueOccupancy = 0
+	f.aggregateQueueMu.Unlock()
+	f.mu.Unlock()
+
+	return func(ctx context.Context) error {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		for _, ret := range retirements {
+			if err := ret.WaitContext(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// RetireRoutesByReturnPath stops pumps, drains queues, and removes routes associated
+// with the specified ReturnPath. Routes belonging to other engines remain untouched.
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func(ctx context.Context) error) {
+	if f == nil {
+		return func(ctx context.Context) error { return nil }
+	}
+	f.mu.Lock()
+	retirements := f.retireRoutesMatchingLocked(func(route *sessionRoute) bool {
+		return route.returnPath == path
+	})
+	f.mu.Unlock()
+
+	return func(ctx context.Context) error {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		for _, ret := range retirements {
+			if err := ret.WaitContext(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// RetireUnmanagedRoutes stops pumps, drains queues, and removes unmanaged routes
+// (routes where returnPath == nil).
+// Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
+func (f *Forwarder) RetireUnmanagedRoutes() (wait func(ctx context.Context) error) {
+	return f.RetireRoutesByReturnPath(nil)
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
@@ -619,6 +764,18 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 
 // RouteClientToBackend routes a packet from a client peer toward their assigned backend tunnel.
 func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
+	return f.routeClientToBackend(peerKey, packet, nil)
+}
+
+// RouteClientToBackendWithReturnPath fences submissions to one engine owner.
+func (f *Forwarder) RouteClientToBackendWithReturnPath(peerKey string, packet []byte, path *ReturnPath) error {
+	if path == nil || path.Closed() {
+		return ErrReturnPathClosed
+	}
+	return f.routeClientToBackend(peerKey, packet, path)
+}
+
+func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *ReturnPath) error {
 	var srcIP string
 	if len(packet) >= 20 && (packet[0]>>4) == 4 {
 		srcIP = net.IPv4(packet[12], packet[13], packet[14], packet[15]).String()
@@ -626,72 +783,26 @@ func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
 
 	f.mu.RLock()
 	route, ok := f.routesByPeer[peerKey]
-	if !ok {
+	if !ok || (path != nil && route.returnPath != path) {
 		f.mu.RUnlock()
 		return ErrSessionNotRegistered
 	}
 
-	var (
-		beQueue chan []byte
-		sID     string
-		cID     string
-		tbUp    *TokenBucket
-	)
-
 	if srcIP != "" && srcIP != "0.0.0.0" && route.assignedIP != srcIP {
+		f.spoofedRebinds.Add(1)
 		f.mu.RUnlock()
-		f.mu.Lock()
-		route, ok = f.routesByPeer[peerKey]
-		if !ok {
-			f.mu.Unlock()
-			return ErrSessionNotRegistered
-		}
-		if route.assignedIP != srcIP {
-			// Issue #89: the claimed srcIP comes from the INNER packet and
-			// is attacker-controlled. Only accept the rebind when BOTH hold:
-			//   1. srcIP is inside the portal client subnet (an inner source
-			//      outside the pool can only be a spoof), AND
-			//   2. srcIP is currently UNASSIGNED — checking under THIS write
-			//      lock (routesByIP is only mutated under f.mu, so the
-			//      check-and-insert here is atomic with respect to every
-			//      other registration/unregister/rebind).
-			// Anything else — including another peer's live assigned IP — is
-			// a spoofed rebind attempt: drop the packet and count it. Before
-			// this guard, a peer could claim a victim's (guessable,
-			// sequentially allocated) IP and hijack the victim's downstream
-			// traffic by stealing its routesByIP entry.
-			spoofed := !f.inPortalSubnet(srcIP) || f.routesByIP[srcIP] != nil
-			if spoofed {
-				f.spoofedRebinds.Add(1)
-				f.mu.Unlock()
-				return ErrSpoofedSourceIP
-			}
-			if route.assignedIP != "" {
-				delete(f.routesByIP, route.assignedIP)
-			}
-			f.routesByIP[srcIP] = route
-			route.assignedIP = srcIP
-		}
-		beQueue, ok = f.backendQueues[route.backendTunnelID]
-		if !ok {
-			f.mu.Unlock()
-			return ErrBackendNotFound
-		}
-		sID = route.sessionID
-		cID = route.connectionID
-		tbUp = route.tbUp
-		f.mu.Unlock()
-	} else {
-		beQueue, ok = f.backendQueues[route.backendTunnelID]
-		if !ok {
-			f.mu.RUnlock()
-			return ErrBackendNotFound
-		}
-		sID = route.sessionID
-		cID = route.connectionID
-		tbUp = route.tbUp
-		f.mu.RUnlock()
+		return ErrSpoofedSourceIP
 	}
+
+	beQueue, ok := f.backendQueues[route.backendTunnelID]
+	if !ok {
+		f.mu.RUnlock()
+		return ErrBackendNotFound
+	}
+	sID := route.sessionID
+	cID := route.connectionID
+	tbUp := route.tbUp
+	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
 	if tbUp != nil && !tbUp.Allow(pktLen) {
@@ -720,9 +831,39 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	route, ok := f.routesByIP[destIP]
 	if !ok {
 		f.mu.RUnlock()
+		// Production rejection site (issue #389 rework 2): the packet is
+		// dropped here, BEFORE any route or ReturnPath writer exists, so
+		// the engine's write callback can never classify it — count the
+		// UnmappedDrops equivalent here (single owner of this reason).
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
+		f.classifyReturnReject(ReturnRejectedUnrouted)
 		return ErrSessionNotRegistered
+	}
+	if route.returnPath != nil {
+		if backendTunnelID != route.backendTunnelID {
+			f.mu.RUnlock()
+			// Production rejection site (issue #389 rework 2): the reply
+			// arrived on a backend the route does not own. The engine's
+			// write callback never runs for it — count the
+			// OwnershipMismatchDrops equivalent here (single owner).
+			f.dropsNoRoute.Add(1)
+			f.dropsTotal.Add(1)
+			f.classifyReturnReject(ReturnRejectedMismatch)
+			return ErrReturnRouteMismatch
+		}
+		if !validReturnDestination(packet, destIP) {
+			f.mu.RUnlock()
+			// Production rejection site (issue #389 rework 2): a malformed
+			// reply is rejected by the shape filter before the engine's
+			// write callback runs, so the callback cannot classify it —
+			// count the MalformedDrops equivalent here (single owner; no
+			// double-count with the write callback).
+			f.dropsNoRoute.Add(1)
+			f.dropsTotal.Add(1)
+			f.classifyReturnReject(ReturnRejectedMalformed)
+			return ErrReturnRouteMismatch
+		}
 	}
 	sID := route.sessionID
 	cID := route.connectionID
@@ -815,22 +956,10 @@ func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan []byt
 	return ch, ok
 }
 
-// AttachClientDevice attaches a default client-facing packet device (e.g. TUN interface).
-func (f *Forwarder) AttachClientDevice(dev PacketDevice) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.defaultClientDev = dev
-}
-
-// AttachPeerDevice attaches a peer-specific packet device.
-func (f *Forwarder) AttachPeerDevice(peerKey string, dev PacketDevice) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if dev != nil {
-		f.clientDevices[peerKey] = dev
-	} else {
-		delete(f.clientDevices, peerKey)
-	}
+// RegisterSessionWithReturnPath registers a peer session route with a dedicated ReturnPath.
+func (f *Forwarder) RegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP string, backendTunnelID int64, path *ReturnPath) {
+	retirement, _ := f.TryRegisterSessionWithReturnPath(sessionID, connectionID, peerKey, assignedIP, backendTunnelID, 0, 0, path)
+	retirement.Wait()
 }
 
 // AttachBackendDevice attaches a backend tunnel packet device.
@@ -1068,12 +1197,10 @@ func (f *Forwarder) DropsPacketTooLarge() uint64 {
 	return f.dropsPacketTooLarge.Load()
 }
 
-// inPortalSubnet reports whether ip belongs to the portal client pool.
+// InPortalSubnet reports whether ip belongs to the portal client pool.
 // Unparseable IPs and an unknown subnet both answer false (fail-closed).
-// Callers must hold f.mu (write) or accept a racy-but-constant read: the
-// field is set once at construction and never mutated.
-func (f *Forwarder) inPortalSubnet(ip string) bool {
-	if f.portalSubnet == nil {
+func (f *Forwarder) InPortalSubnet(ip string) bool {
+	if f == nil || f.portalSubnet == nil {
 		return false
 	}
 	parsed := net.ParseIP(ip)
@@ -1092,8 +1219,7 @@ func (f *Forwarder) SpoofedRebinds() uint64 {
 	return f.spoofedRebinds.Load()
 }
 
-// StopPumps terminates background packet pump routines.
-func (f *Forwarder) StopPumps() {
+func (f *Forwarder) stopPumpsSignalOnly() {
 	f.mu.Lock()
 	if !f.pumpsRunning {
 		f.mu.Unlock()
@@ -1114,7 +1240,11 @@ func (f *Forwarder) StopPumps() {
 		route.pumpStarted = false
 	}
 	f.mu.Unlock()
+}
 
+// StopPumps terminates background packet pump routines.
+func (f *Forwarder) StopPumps() {
+	f.stopPumpsSignalOnly()
 	f.pumpsWg.Wait()
 }
 
@@ -1189,9 +1319,9 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			f.mu.RUnlock()
 			continue
 		}
-		dev, ok := f.clientDevices[route.peerKey]
-		if !ok || dev == nil {
-			dev = f.defaultClientDev
+		var dev packetWriter
+		if route.returnPath != nil {
+			dev = routeWriter{path: route.returnPath, peerKey: route.peerKey, assignedIP: route.assignedIP}
 		}
 		f.mu.RUnlock()
 		if dev != nil {
@@ -1210,6 +1340,29 @@ func (f *Forwarder) GetStats() (rx int64, tx int64, activeRoutes int) {
 	return
 }
 
+// ReturnRouteOwner returns the return route owner ("upstream" or "none")
+// based on currently registered active routes in the forwarder. If at least one active,
+// non-stopped route has an open return path, "upstream" is returned. Otherwise, "none" is returned.
+func (f *Forwarder) ReturnRouteOwner() string {
+	if f == nil {
+		return "none"
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(f.routesByPeer) == 0 {
+		return "none"
+	}
+	for _, route := range f.routesByPeer {
+		if route.stopped {
+			continue
+		}
+		if route.returnPath != nil && !route.returnPath.Closed() {
+			return "upstream"
+		}
+	}
+	return "none"
+}
+
 // Start marks the forwarder active.
 func (f *Forwarder) Start(ctx context.Context) {
 	f.mu.Lock()
@@ -1220,18 +1373,70 @@ func (f *Forwarder) Start(ctx context.Context) {
 	}
 }
 
-// Stop terminates the forwarder, pumps, and flushes accountant.
+// HasRoutesForReturnPath reports whether any active route in the forwarder references path.
+func (f *Forwarder) HasRoutesForReturnPath(path *ReturnPath) bool {
+	if f == nil || path == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, route := range f.routesByPeer {
+		if route != nil && route.returnPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+// SetStopTimeoutForTest sets the quiescence wait timeout for route retirement during Stop.
+func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopTimeout = d
+}
+
+func (f *Forwarder) getStopTimeout() time.Duration {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.stopTimeout > 0 {
+		return f.stopTimeout
+	}
+	return 5 * time.Second
+}
+
+// Stop terminates the forwarder, retires and drains all routes, joins in-flight
+// writes, stops pumps, and flushes the accountant.
 func (f *Forwarder) Stop() error {
+	if f == nil {
+		return nil
+	}
+	var retireErr error
+	if wait := f.RetireAllRoutes(); wait != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), f.getStopTimeout())
+		retireErr = wait(ctx)
+		cancel()
+	}
+	if retireErr != nil {
+		f.stopPumpsSignalOnly()
+		f.mu.Lock()
+		f.running = false
+		f.mu.Unlock()
+		if f.accountant != nil {
+			_ = f.accountant.Stop()
+		}
+		return retireErr
+	}
 	f.StopPumps()
 
 	f.mu.Lock()
 	f.running = false
 	f.mu.Unlock()
 
+	var accountantErr error
 	if f.accountant != nil {
-		return f.accountant.Stop()
+		accountantErr = f.accountant.Stop()
 	}
-	return nil
+	return accountantErr
 }
 
 // IsRunning returns true if the forwarder is active.

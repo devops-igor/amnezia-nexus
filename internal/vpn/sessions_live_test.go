@@ -30,9 +30,9 @@ func TestSessionsLiveMatchesActiveCount(t *testing.T) {
 	lbTunnel(t, svc, db, 955, "awg955", "pub955", "priv955", "10.9.9.155:51820")
 
 	// Session 1 through the real handshake path.
-	sess1, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess1, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 	// Session 2 straight through the manager (auth/IPAM bypassed), on the
 	// same backend as sess1.
@@ -85,27 +85,38 @@ func TestSessionsLiveMatchesActiveCount(t *testing.T) {
 // in-memory session, keeping the same fallbacks as the DB-enriched path —
 // 'unknown' username, 'Server #<tunnelID>' naming, server ID 0 — while the
 // manager-known connection name survives.
+//
+// The rows are removed with raw SQL on purpose (issue #391 round 4b, finding
+// 1). The production DeleteUser/DeleteBackendTunnel primitives now tear the
+// live portal session down immediately — the session outliving its deleted
+// user IS the leak that finding fixed, so driving this test through the
+// production primitives would assert the bug. What this test owns is the
+// SessionsLive fallback behaviour for a session whose durable identity rows
+// are missing, which an out-of-band deletion (restore from a backup, manual
+// maintenance, a partially applied migration) still produces.
 func TestSessionsLiveDBMissFallback(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, uID, peerKeyAlice := setupTestVPNService(t, db)
 	ctx := t.Context()
 
 	tun := lbTunnel(t, svc, db, 956, "awg956", "pub956", "priv956", "10.9.9.156:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Remove the DB identity chain: the tunnel row (cascades the
 	// vpn_sessions row) and the user row (the production DeleteUser
 	// primitive removes vpn_sessions rows itself). The in-memory session
 	// survives both — exactly the ghost-row scenario SessionsLive exists
-	// to handle.
-	if err := db.DeleteBackendTunnel(ctx, tun.ID); err != nil {
-		t.Fatalf("DeleteBackendTunnel failed: %v", err)
+	// to handle. Raw SQL: the production primitives now revoke the live
+	// session (issue #391 round 4b, finding 1), and this test owns the
+	// SessionsLive fallback, not the revocation.
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM backend_tunnels WHERE id = ?", tun.ID); err != nil {
+		t.Fatalf("delete backend tunnel row failed: %v", err)
 	}
-	if _, err := db.DeleteUser(ctx, uID); err != nil {
-		t.Fatalf("DeleteUser failed: %v", err)
+	if _, err := db.SQLDB().ExecContext(ctx, "DELETE FROM users WHERE id = ?", uID); err != nil {
+		t.Fatalf("delete user row failed: %v", err)
 	}
 
 	// Precondition: the DB row is really gone, so the row below can only
@@ -161,9 +172,9 @@ func TestSessionsLiveIdentitySurvivesDisplacedDBRow(t *testing.T) {
 	ctx := t.Context()
 
 	tun := lbTunnel(t, svc, db, 960, "awg960", "pub960", "priv960", "10.9.9.160:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Displace the vpn_sessions row exactly like the UNIQUE assigned_ip
@@ -232,9 +243,9 @@ func TestSessionsLiveAccountantDeltas(t *testing.T) {
 	ctx := t.Context()
 
 	lbTunnel(t, svc, db, 957, "awg957", "pub957", "priv957", "10.9.9.157:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// Base counters as persisted (the service is never started, so no
@@ -283,9 +294,9 @@ func TestSessionsLiveTrafficAcrossFlush(t *testing.T) {
 	ctx := t.Context()
 
 	lbTunnel(t, svc, db, 959, "awg959", "pub959", "priv959", "10.9.9.159:51820")
-	sess, _, err := svc.HandleIncomingPeer(ctx, peerKeyAlice)
+	sess, _, err := svc.HandleIncomingPeerForTest(ctx, peerKeyAlice)
 	if err != nil {
-		t.Fatalf("HandleIncomingPeer failed: %v", err)
+		t.Fatalf("HandleIncomingPeerForTest failed: %v", err)
 	}
 
 	// The service is never started, so the accountant's flush loop is not

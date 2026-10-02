@@ -1,5 +1,8 @@
 # Amnezia Nexus
 
+> [!CAUTION]
+> **Disclaimer:** Amnezia Nexus is an independent, non-commercial hobby project developed for personal and friends' use. It is **not** affiliated with, endorsed by, or sponsored by the developers of Amnezia VPN or the AmneziaWG protocol.
+
 Amnezia Nexus is a self-hosted web panel and load balancer built specifically for AmneziaWG.
 
 ## Why this exists
@@ -24,23 +27,6 @@ When users connect directly to a foreign VPS, an IP block takes down everyone's 
 - **AmneziaWG 3.x obfuscation**: Supports ChaCha20 header protection, randomized header ranges (`H1`–`H4`), randomized timing ranges (`RekeyAfterTime`, `RekeyTimeout`, etc.), and junk padding to bypass DPI blocks.
 - **Web interface**: Add remote servers over SSH, manage users, and download `.conf` files or scan QR codes.
 - **Built-in DNS**: Uses AdGuard DNS by default (`94.140.14.14`, `94.140.15.15`).
-
-## How it works
-
-```text
-[Users Inside the Country] 
-     │  (Domestic connection - stays unblocked)
-     ▼
-[Nexus Portal (Hosted Locally)] 
-     │  1. Terminates client handshake & decrypts traffic
-     │  2. Picks a healthy foreign exit node
-     │  3. Re-encrypts traffic for that backend
-     ▼
-[Backend Node A (Foreign)]   [Backend Node B (Foreign)]
-     │  (If Node A gets blocked by DPI, Nexus fails over to Node B)
-     ▼
-[Open Internet]
-```
 
 ---
 
@@ -75,20 +61,9 @@ sysctl net.ipv4.ip_forward
 
 > **Why `rp_filter = 2`?** By default, Linux drops packets if their return route does not match the incoming interface. Because VPN traffic enters through a tunnel interface and leaves through your WAN interface, strict filtering will silently drop return traffic. Loose mode (`2`) fixes this.
 
-### 2. Make sure the TUN device is available
+### 2. Configure firewall and forwarding
 
-Nexus needs `/dev/net/tun` to handle tunnel traffic:
-
-```bash
-sudo modprobe tun
-echo "tun" | sudo tee -a /etc/modules-load.d/tun.conf
-ls -l /dev/net/tun
-# Should show: crw-rw-rw- 1 root root ... /dev/net/tun
-```
-
-### 3. Configure firewall and forwarding
-
-Your firewall needs to let forwarded traffic through.
+Your firewall needs to let incoming connections through.
 
 #### If you use UFW:
 
@@ -114,8 +89,6 @@ WAN_IFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
 
 # Allow forwarded traffic
 sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -i amn+ -o "$WAN_IFACE" -j ACCEPT
-sudo iptables -A FORWARD -i "$WAN_IFACE" -o amn+ -j ACCEPT
 
 # Enable NAT masquerade so packets leave with the server's public IP
 sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
@@ -124,7 +97,7 @@ sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
 sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
-### 4. Install Docker
+### 3. Install Docker
 
 If you don't already have Docker installed:
 
@@ -151,14 +124,9 @@ Create `docker-compose.yaml`:
 ```yaml
 services:
   amnezia-panel:
-    image: ghcr.io/devops-igor/amnezia-nexus:v2.0.0
+    image: ghcr.io/devops-igor/amnezia-nexus:v2.1.0
     container_name: amnezia-panel
     restart: unless-stopped
-    user: root
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
     ports:
       - "8080:5000"           # Web panel
       - "51820:51820/udp"     # VPN port
@@ -184,7 +152,7 @@ volumes:
 
 ### 2. Start the container
 
-> **Image tags:** the compose file above pins the **stable release** (`v2.0.0` - Zenith).
+> **Image tags:** the compose file above pins the **stable release** (`v2.1.0` - Pulsar).
 > Alternatively, use `:latest` to always track the newest build from `main` (recommended only for testing, since it may include unreleased changes).
 > Available tags: https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus
 
@@ -249,60 +217,7 @@ cookies are `Secure` automatically (no extra configuration), and
 
 ---
 
-## Diagnosing return-path queue saturation
-
-The authenticated `/api/vpn/status` endpoint exposes aggregate queue occupancy,
-capacity and high-water marks, plus per-route diagnostics in
-`forwarder_route_queues` (up to 1,000 routes). Queue-full drops use a drop-newest
-policy: queued packets are preserved and the incoming packet is counted in
-`forwarder_drops_queue_full`. No-route and oversized-packet drops have separate
-counters.
-
-Use these write metrics to distinguish a draining queue from a blocked consumer:
-
-| Status field | Meaning |
-| --- | --- |
-| `forwarder_device_write_count` | Admitted writes, including unfinished writes |
-| `forwarder_device_writes_in_flight` | Writes that have not returned, including retired routes |
-| `forwarder_device_write_oldest_in_flight_ms` | Age of the oldest unfinished write; zero when none are active |
-| `forwarder_device_write_duration_ms` | Total duration of completed writes |
-| `forwarder_device_write_max_duration_ms` | Longest completed write |
-| `forwarder_device_write_errors` | Completed writes that returned an error |
-| `forwarder_device_write_stalls` | Writes lasting at least 100 ms, including unfinished writes; each write counts once |
-| `forwarder_device_write_stall_threshold_ms` | The stall threshold (100 ms) |
-
-Rising queue-full drops alongside a growing in-flight write age identify a
-blocked downstream consumer even before the write returns. Route retirement
-waits for admitted writes to finish, but releases both the service and routing
-locks first so status queries and unrelated handshakes remain available.
-
-Each entry in `forwarder_route_queues` also includes `write_count`,
-`write_errors`, `write_stalls`, `writes_in_flight`, `oldest_write_ms`, and
-`max_write_duration_ms`. These describe that active route generation, allowing
-queue-full drops to be correlated with the same client's downstream write.
-Aggregate write metrics retain in-flight writes from retired generations too.
-
-`client_queue_size` defaults to 2,048 packets and is capped using an 8 GiB
-aggregate queued-payload budget, `max_total_peers`, and a 1,500-byte packet bound.
-This budget excludes channel/runtime overhead and packets already in flight.
-Changing `max_total_peers` with connected clients is supported when the limit
-accommodates existing routes and their queue capacity still fits the budget.
-Changing the actual queue capacity requires disconnecting active sessions first.
-Populations above 5,726,623 peers cannot reserve even one packet per route and
-are rejected at startup and during configuration updates.
-
-The synthetic healthy-consumer throughput target is **500 Mbps** (62.5 MB/s).
-Measure the complete forwarder pump and `PacketDevice.Write` path with:
-
-```sh
-go test ./internal/vpn/forwarder -run '^$' -bench BenchmarkHealthyClientPacketDevice -benchtime=2s -count=3
-```
-
-The benchmark sends 1,420-byte packets in bounded bursts, waits for every
-device write, and rejects any packet loss. Its `Mbps` result should exceed the
-target on the intended deployment hardware. The sink is in memory: this checks
-forwarder throughput headroom, not UDP, encryption, or end-to-end VPN bandwidth.
-
 ## Documentation & Specifications
 
+- [How It Works](useful_notes/HOW_IT_WORKS.md): Userspace data plane architecture, in-memory VirtualTUN data paths, and structural reliability design.
 - [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.

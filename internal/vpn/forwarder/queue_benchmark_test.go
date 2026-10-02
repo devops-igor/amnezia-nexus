@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"encoding/binary"
 	"fmt"
 	"testing"
 )
@@ -21,11 +22,16 @@ func BenchmarkHealthyClientPacketDevice(b *testing.B) {
 	const batch = 128
 	f := NewForwarder(nil, "10.100.0.0/16", batch)
 	dev := &benchmarkClientDevice{completed: make(chan struct{}, batch)}
-	f.RegisterSession("session", "connection", "peer", "10.100.0.10", 1)
-	f.AttachPeerDevice("peer", dev)
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
+	f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
 	f.StartPumps(b.Context())
 	defer f.StopPumps()
-	packet := make([]byte, 1420)
+	packet := returnPacket("10.100.0.10")
+	if len(packet) < 1420 {
+		pad := make([]byte, 1420-len(packet))
+		packet = append(packet, pad...)
+		binary.BigEndian.PutUint16(packet[2:4], 1420)
+	}
 	b.SetBytes(int64(len(packet)))
 	b.ReportAllocs()
 	b.ResetTimer()

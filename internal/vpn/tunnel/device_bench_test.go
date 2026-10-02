@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 // benchPacket builds a synthetic packet of the given size.
@@ -150,14 +150,16 @@ func BenchmarkAWGDeviceWrite(b *testing.B) {
 // benchVirtualTUN builds a standalone in-memory tun.Device (the exact type
 // backing AWGClientDevice) primed with one packet per iteration.
 func benchVirtualTUN(_ int) *VirtualTUN {
-	return &VirtualTUN{
-		inPackets:  make(chan []byte, 1024),
-		outPackets: make(chan []byte, 1024),
-		events:     make(chan tun.Event, 2),
-		closed:     make(chan struct{}),
-		mtu:        1340,
-		name:       "bench-vtun",
+	vt, err := virtualtun.New(virtualtun.Config{
+		Name:             "bench-vtun",
+		MTU:              1340,
+		InboundCapacity:  1024,
+		OutboundCapacity: 1024,
+	})
+	if err != nil {
+		panic(err) // unreachable: positive constants only
 	}
+	return vt
 }
 
 // BenchmarkVirtualTUNRead measures the AWG device read path's per-packet
@@ -177,10 +179,8 @@ func BenchmarkVirtualTUNRead(b *testing.B) {
 			b.SetBytes(int64(size))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				select {
-				case vt.inPackets <- pkt:
-				default:
-					b.Fatal("inPackets unexpectedly full")
+				if err := vt.InjectInbound(pkt); err != nil {
+					b.Fatalf("InjectInbound: %v", err)
 				}
 				if _, err := vt.Read(bufs, sizesArr, 0); err != nil {
 					b.Fatalf("VirtualTUN.Read: %v", err)
@@ -208,7 +208,7 @@ func BenchmarkVirtualTUNWrite(b *testing.B) {
 					select {
 					case <-done:
 						return
-					case <-vt.outPackets:
+					case <-vt.Outbound():
 					}
 				}
 			}()

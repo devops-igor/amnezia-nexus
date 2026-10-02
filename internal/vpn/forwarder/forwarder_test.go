@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -283,9 +284,11 @@ func TestForwarderPacketPumps(t *testing.T) {
 	peerKey := "peer-pump-1"
 	assignedIP := "10.100.0.50"
 
-	fwd.AttachClientDevice(clientDev)
+	path := NewReturnPath(func(peer, ip string, p []byte) (int, error) {
+		return clientDev.Write(p)
+	})
 	fwd.AttachBackendDevice(backendID, backendDev)
-	fwd.RegisterSession("s-pump", "c-pump", peerKey, assignedIP, backendID)
+	fwd.RegisterSessionWithReturnPath("s-pump", "c-pump", peerKey, assignedIP, backendID, path)
 
 	// Start packet pumps
 	fwd.StartPumps(ctx)
@@ -309,8 +312,8 @@ func TestForwarderPacketPumps(t *testing.T) {
 		t.Fatalf("backend device packet mismatch: %+v", bePackets)
 	}
 
-	// 2. Backend -> Client routing should be pumped to default clientDev.Write
-	pktBackend := []byte("pumped-backend-packet")
+	// 2. Backend -> Client routing should be pumped to client ReturnPath (clientDev.Write)
+	pktBackend := returnPacket(assignedIP)
 	if err := fwd.RouteBackendToClient(backendID, pktBackend, assignedIP); err != nil {
 		t.Fatalf("RouteBackendToClient failed: %v", err)
 	}
@@ -326,9 +329,14 @@ func TestForwarderPacketPumps(t *testing.T) {
 		t.Fatalf("client device packet mismatch: %+v", clPackets)
 	}
 
-	// 3. Attach peer-specific device and test routing to it
-	fwd.AttachPeerDevice(peerKey, peerDev)
-	pktPeer := []byte("peer-specific-packet")
+	// 3. Bind new ReturnPath and test routing to it
+	peerPath := NewReturnPath(func(peer, ip string, p []byte) (int, error) {
+		return peerDev.Write(p)
+	})
+	if _, err := fwd.BindSessionReturnPath("s-pump", "c-pump", peerKey, assignedIP, backendID, peerPath); err != nil {
+		t.Fatalf("BindSessionReturnPath failed: %v", err)
+	}
+	pktPeer := returnPacket(assignedIP)
 	if err := fwd.RouteBackendToClient(backendID, pktPeer, assignedIP); err != nil {
 		t.Fatalf("RouteBackendToClient to peer dev failed: %v", err)
 	}
@@ -450,7 +458,7 @@ func TestForwarder_ReattachStopsOldPumpAndDeliversToNewDevice(t *testing.T) {
 	}
 }
 
-func TestForwarderDynamicSourceIPLearning(t *testing.T) {
+func TestForwarderDynamicSourceIPRebindRejected(t *testing.T) {
 	accountant := NewTrafficAccountant(nil, 0)
 	fwd := NewForwarder(accountant, "10.100.0.0/16", 10)
 
@@ -458,7 +466,7 @@ func TestForwarderDynamicSourceIPLearning(t *testing.T) {
 	connID := "conn-dyn-1"
 	peerKey := "peer-dyn-1"
 	initialIP := "10.100.0.17"
-	learnedIP := "10.100.0.4"
+	unassignedIP := "10.100.0.4"
 	backendID := int64(10)
 
 	fwd.RegisterSession(sessID, connID, peerKey, initialIP, backendID)
@@ -474,9 +482,9 @@ func TestForwarderDynamicSourceIPLearning(t *testing.T) {
 
 	returnPkt := []byte("dns-reply-packet")
 
-	// 1. Return packet to learnedIP (10.100.0.4) initially fails because only 10.100.0.17 is registered
-	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != ErrSessionNotRegistered {
-		t.Fatalf("expected ErrSessionNotRegistered for learnedIP before learning, got: %v", err)
+	// 1. Return packet to unassignedIP (10.100.0.4) initially fails because only 10.100.0.17 is registered
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, unassignedIP); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for unassignedIP before packet, got: %v", err)
 	}
 
 	// 2. Return packet to initialIP (10.100.0.17) succeeds
@@ -489,7 +497,7 @@ func TestForwarderDynamicSourceIPLearning(t *testing.T) {
 		t.Fatalf("expected packet on client queue for initialIP")
 	}
 
-	// 3. Client sends IPv4 packet with src: 10.100.0.4, dst: 1.1.1.1
+	// 3. Client sends IPv4 packet with mismatched src: 10.100.0.4, dst: 1.1.1.1
 	ipv4Header := make([]byte, 28) // 20 bytes IP + 8 bytes UDP
 	ipv4Header[0] = 0x45           // IPv4, IHL=5
 	// Source IP: 10.100.0.4
@@ -503,50 +511,70 @@ func TestForwarderDynamicSourceIPLearning(t *testing.T) {
 	ipv4Header[18] = 1
 	ipv4Header[19] = 1
 
-	if err := fwd.RouteClientToBackend(peerKey, ipv4Header); err != nil {
-		t.Fatalf("RouteClientToBackend failed: %v", err)
+	err := fwd.RouteClientToBackend(peerKey, ipv4Header)
+	if !errors.Is(err, ErrSpoofedSourceIP) {
+		t.Fatalf("expected ErrSpoofedSourceIP for mismatched source IP, got: %v", err)
 	}
 
 	select {
 	case <-beChan:
+		t.Fatalf("unexpected packet on backend queue for spoofed packet")
 	default:
-		t.Fatalf("expected packet on backend queue")
+	}
+	if rebinds := fwd.SpoofedRebinds(); rebinds != 1 {
+		t.Fatalf("expected 1 spoofed rebind, got %d", rebinds)
 	}
 
-	// 4. Now return packet to learnedIP (10.100.0.4) MUST SUCCEED!
-	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != nil {
-		t.Fatalf("RouteBackendToClient for learnedIP failed after dynamic learning: %v", err)
+	// 4. Return packet to unassignedIP (10.100.0.4) MUST STILL FAIL
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, unassignedIP); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for unassignedIP, got: %v", err)
+	}
+
+	// 5. Initial IP (10.100.0.17) is STILL registered
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); err != nil {
+		t.Fatalf("expected initialIP to remain registered, got error: %v", err)
 	}
 	select {
-	case received := <-clientChan:
-		if string(received) != string(returnPkt) {
-			t.Fatalf("received packet mismatch: %s", string(received))
-		}
+	case <-clientChan:
 	default:
-		t.Fatalf("expected return packet on client queue after dynamic learning")
+		t.Fatalf("expected packet on client queue for initialIP")
 	}
 
-	// 5. Old IP (10.100.0.17) is no longer registered
-	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); err != ErrSessionNotRegistered {
-		t.Fatalf("expected ErrSessionNotRegistered for old initialIP, got: %v", err)
-	}
-
-	// 6. Test edge case: 0.0.0.0 src IP does not override learned IP
+	// 6. Test edge case: 0.0.0.0 src IP is accepted and does not override assigned IP
 	zeroIPPkt := make([]byte, 20)
 	zeroIPPkt[0] = 0x45
 	// src: 0.0.0.0
 	if err := fwd.RouteClientToBackend(peerKey, zeroIPPkt); err != nil {
 		t.Fatalf("RouteClientToBackend for zero IP failed: %v", err)
 	}
-	// Verify learnedIP is still active
-	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != nil {
-		t.Fatalf("RouteBackendToClient for learnedIP failed after 0.0.0.0 packet: %v", err)
+	select {
+	case <-beChan:
+	default:
+		t.Fatalf("expected packet on backend queue for 0.0.0.0 source IP")
+	}
+	// Verify initialIP is still active
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); err != nil {
+		t.Fatalf("RouteBackendToClient for initialIP failed after 0.0.0.0 packet: %v", err)
 	}
 	<-clientChan
 
-	// 7. Unregister session cleanly unregisters learnedIP
+	// 7. Matching source IP packet succeeds
+	matchPkt := make([]byte, 28)
+	matchPkt[0] = 0x45
+	matchPkt[12], matchPkt[13], matchPkt[14], matchPkt[15] = 10, 100, 0, 17
+	matchPkt[16], matchPkt[17], matchPkt[18], matchPkt[19] = 1, 1, 1, 1
+	if err := fwd.RouteClientToBackend(peerKey, matchPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for matching IP failed: %v", err)
+	}
+	select {
+	case <-beChan:
+	default:
+		t.Fatalf("expected packet on backend queue for matching source IP")
+	}
+
+	// 8. Unregister session cleanly unregisters initialIP
 	fwd.UnregisterSession(peerKey)
-	if err := fwd.RouteBackendToClient(backendID, returnPkt, learnedIP); err != ErrSessionNotRegistered {
+	if err := fwd.RouteBackendToClient(backendID, returnPkt, initialIP); !errors.Is(err, ErrSessionNotRegistered) {
 		t.Fatalf("expected ErrSessionNotRegistered after unregister, got: %v", err)
 	}
 }

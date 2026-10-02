@@ -112,13 +112,15 @@ var (
 
 // DB wraps an sql.DB handle and serializes write operations to ensure SQLite thread-safety.
 type DB struct {
-	dbPath            string
-	secretKey         string
-	sqlDB             *sql.DB
-	writeMu           sync.Mutex
-	mu                sync.RWMutex
-	reachabilityMu    sync.RWMutex
-	reachabilityCache map[int64]models.ReachabilityStatus
+	dbPath             string
+	secretKey          string
+	sqlDB              *sql.DB
+	writeMu            sync.Mutex
+	mu                 sync.RWMutex
+	reachabilityMu     sync.RWMutex
+	reachabilityCache  map[int64]models.ReachabilityStatus
+	peerListener       peerListenerSlot
+	peerRevokeListener peerRevokeSlot
 }
 
 // Open opens a connection to the SQLite database with WAL mode, busy timeout, and foreign keys enabled.

@@ -5,6 +5,16 @@ on:
     branches: [ main ]
     types: [ opened, synchronize, reopened, ready_for_review ]
   workflow_dispatch:
+    inputs:
+      qualification:
+        description: 'Qualification mode to execute (standard, bounded, full)'
+        required: true
+        default: 'bounded'
+        type: choice
+        options:
+          - 'standard'
+          - 'bounded'
+          - 'full'
 
 concurrency:
   group: dev-server-deployment
@@ -14,10 +24,31 @@ jobs:
   e2e-dev:
     name: DEV Server E2E Verification
     runs-on: [ self-hosted, linux, arm64, dev ]
-    timeout-minutes: 25
+    timeout-minutes: 90
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Ensure Toolchain in PATH
+        run: |
+          if ! command -v go >/dev/null 2>&1; then
+            if [ -d "/usr/local/go/bin" ]; then
+              echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      - name: Determine Qualification Mode
+        id: qual-mode
+        run: |
+          MODE="${{ github.event.inputs.qualification || 'bounded' }}"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "Selected Qualification Mode: ${MODE}"
 
       - name: Build PR Docker Image
         run: |
@@ -91,9 +122,147 @@ jobs:
           E2E_REQUIRE_DATAPLANE="true" \
           ./scripts/run_e2e_lifecycle.sh
 
+      - name: Clean Residual Containers Before Qualification
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          docker rm -f amnezia-awg2 2>/dev/null || true
+          sudo ip link del awg0 2>/dev/null || true
+          cd ~ && docker compose down -v 2>/dev/null || true
+
+      - name: Prepare Qualification Artifact Directories
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          mkdir -p test-artifacts/runtime test-artifacts/public
+
+      - name: Ensure Qualification Toolchain
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          mkdir -p bin
+          # Build and install amneziawg-go userspace daemon if not already available
+          if ! command -v amneziawg-go >/dev/null 2>&1; then
+            echo "Building amneziawg-go from pinned module..."
+            go build -o bin/amneziawg-go github.com/amnezia-vpn/amneziawg-go/v3
+            sudo install -m 755 bin/amneziawg-go /usr/local/bin/amneziawg-go
+          fi
+          # Ensure functional awg CLI tool is available
+          if ! awg --version >/dev/null 2>&1; then
+            echo "Installing functional awg CLI tool and musl runtime..."
+            if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
+              sudo chmod 755 /lib/ld-musl-aarch64.so.1
+            fi
+            sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
+            sudo chmod 755 /usr/local/bin/awg
+          fi
+          echo "Toolchain status:"
+          command -v go && go version
+          command -v amneziawg-go && amneziawg-go --version 2>&1 | head -n 2 || true
+          command -v awg && awg --version || true
+
+      - name: Run Differential Qualification Suite
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          chmod +x ./scripts/run_differential_qualification.sh
+          SOAK_FLAG=""
+          if [ "${{ steps.qual-mode.outputs.mode }}" = "full" ]; then
+            SOAK_FLAG="--soak-full"
+          fi
+          ./scripts/run_differential_qualification.sh --suite all --no-race $SOAK_FLAG --output-dir test-artifacts/public
+
+      - name: Start Upstream Qualification Subject
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          go build -o bin/qualification-subject ./cmd/qualification-subject
+          ./bin/qualification-subject \
+            --db-path test-artifacts/runtime/panel_test.db \
+            --config-path test-artifacts/runtime/frozen-client.conf \
+            --ready-path test-artifacts/runtime/subject.ready \
+            --listen-port 51820 \
+            --echo-port 40001 \
+            --underlay-ip 10.254.250.1 &
+          SUBJECT_PID=$!
+          echo "$SUBJECT_PID" > test-artifacts/runtime/subject.pid
+
+          echo "Waiting for qualification subject readiness..."
+          READY=0
+          for i in $(seq 1 30); do
+            if [ -f test-artifacts/runtime/subject.ready ]; then
+              echo "Qualification subject is ready after ${i}s"
+              READY=1
+              break
+            fi
+            if ! kill -0 $SUBJECT_PID 2>/dev/null; then
+              echo "Error: Qualification subject exited prematurely" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Error: Qualification subject failed to become ready within 30 seconds" >&2
+            exit 1
+          fi
+
+      - name: Run Non-Netstack Client Qualification
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          chmod +x ./scripts/run_non_netstack_client_qualification.sh
+          sudo env "PATH=$PATH" ./scripts/run_non_netstack_client_qualification.sh \
+            --config test-artifacts/runtime/frozen-client.conf \
+            --runtime-dir test-artifacts/runtime \
+            --output-dir test-artifacts/public
+
+      - name: Stop Upstream Qualification Subject
+        if: always() && steps.qual-mode.outputs.mode != 'standard'
+        run: |
+          if [ -f test-artifacts/runtime/subject.pid ]; then
+            SUBJECT_PID=$(cat test-artifacts/runtime/subject.pid 2>/dev/null || true)
+            if [ -n "$SUBJECT_PID" ] && kill -0 $SUBJECT_PID 2>/dev/null; then
+              echo "Stopping qualification subject process ($SUBJECT_PID)..."
+              kill -TERM $SUBJECT_PID 2>/dev/null || true
+              wait $SUBJECT_PID 2>/dev/null || true
+            fi
+          fi
+
+      - name: Run Upstream Restart Durability Rehearsal
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          chmod +x ./scripts/run_upstream_restart_durability.sh
+          sudo env "PATH=$PATH" ./scripts/run_upstream_restart_durability.sh \
+            --runtime-dir test-artifacts/runtime \
+            --output-dir test-artifacts/public
+
+      - name: Verify Issue #392 Qualification Evidence
+        if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
+        run: |
+          chmod +x ./scripts/verify_issue392_qualification.sh
+          ./scripts/verify_issue392_qualification.sh \
+            --artifacts-dir test-artifacts/public \
+            --mode ${{ steps.qual-mode.outputs.mode }} \
+            --expected-commit "${{ github.sha }}"
+
+      - name: Upload Qualification Evidence Artifacts
+        uses: actions/upload-artifact@v4
+        if: always() && steps.qual-mode.outputs.mode != 'standard'
+        with:
+          name: issue392-qualification-evidence-${{ github.run_id }}
+          path: test-artifacts/public/
+          retention-days: 30
+
       - name: Post-Test Teardown, Docker Prune & Restoration Invariant
         if: always()
         run: |
+          echo "==> Cleaning qualification subject process and network namespaces..."
+          if [ -f test-artifacts/runtime/subject.pid ]; then
+            SUBJECT_PID=$(cat test-artifacts/runtime/subject.pid 2>/dev/null || true)
+            if [ -n "$SUBJECT_PID" ] && kill -0 $SUBJECT_PID 2>/dev/null; then
+              kill -9 $SUBJECT_PID 2>/dev/null || true
+            fi
+          fi
+          pkill -9 -f qualification-subject 2>/dev/null || true
+          sudo ip netns del nexus-client-ns 2>/dev/null || true
+          sudo ip link del veth-nx0 2>/dev/null || true
+          sudo ip link del awg-client0 2>/dev/null || true
+          rm -rf test-artifacts/runtime/
           echo "==> Cleaning AmneziaWG containers and interfaces..."
           docker rm -f amnezia-awg2 2>/dev/null || true
           sudo ip link del awg0 2>/dev/null || true

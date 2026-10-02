@@ -21,10 +21,10 @@ import (
 )
 
 // AppVersion represents the current version of the web panel.
-const AppVersion = "2.0.0"
+const AppVersion = "2.1.0"
 
 // AppCodename represents the release codename of the current version.
-const AppCodename = "Zenith"
+const AppCodename = "Pulsar"
 
 // Paths represents the standard filesystem paths used by the application.
 type Paths struct {
@@ -318,29 +318,7 @@ func LoadConfig() (*AppConfig, error) {
 		}
 	}
 
-	rawProxies := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
-	var trustedProxies []string
-	var trustedCIDRs []*net.IPNet
-	var trustedIPs []net.IP
-
-	if rawProxies != "" {
-		for _, proxy := range strings.Split(rawProxies, ",") {
-			trimmed := strings.TrimSpace(proxy)
-			if trimmed == "" {
-				continue
-			}
-			trustedProxies = append(trustedProxies, trimmed)
-			if strings.Contains(trimmed, "/") {
-				if _, ipNet, err := net.ParseCIDR(trimmed); err == nil {
-					trustedCIDRs = append(trustedCIDRs, ipNet)
-				}
-			} else {
-				if ip := net.ParseIP(trimmed); ip != nil {
-					trustedIPs = append(trustedIPs, ip)
-				}
-			}
-		}
-	}
+	trustedProxies, trustedCIDRs, trustedIPs := parseTrustedProxies(strings.TrimSpace(os.Getenv("TRUSTED_PROXIES")))
 
 	logLevel := os.Getenv("LOG_LEVEL")
 	if logLevel == "" {
@@ -394,6 +372,32 @@ func LoadConfig() (*AppConfig, error) {
 		VPNListenPort:  vpnListenPort,
 		VPNSubnet:      vpnSubnet,
 	}, nil
+}
+
+func parseTrustedProxies(rawProxies string) ([]string, []*net.IPNet, []net.IP) {
+	if rawProxies == "" {
+		return nil, nil, nil
+	}
+	var trustedProxies []string
+	var trustedCIDRs []*net.IPNet
+	var trustedIPs []net.IP
+	for _, proxy := range strings.Split(rawProxies, ",") {
+		trimmed := strings.TrimSpace(proxy)
+		if trimmed == "" {
+			continue
+		}
+		trustedProxies = append(trustedProxies, trimmed)
+		if strings.Contains(trimmed, "/") {
+			if _, ipNet, err := net.ParseCIDR(trimmed); err == nil {
+				trustedCIDRs = append(trustedCIDRs, ipNet)
+			}
+		} else {
+			if ip := net.ParseIP(trimmed); ip != nil {
+				trustedIPs = append(trustedIPs, ip)
+			}
+		}
+	}
+	return trustedProxies, trustedCIDRs, trustedIPs
 }
 
 // LoadTranslations loads and caches all translation dictionaries from the embedded web FS.

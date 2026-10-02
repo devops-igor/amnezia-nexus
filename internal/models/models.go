@@ -299,6 +299,15 @@ type BackendTunnel struct {
 }
 
 // VPNSession tracks an active user connection through the portal AWG endpoint.
+//
+// vpn_sessions is a table of ACTIVE NEXUS BACKEND-ROUTING SESSIONS, not a
+// peer registry: a row exists only while this portal process is routing that
+// peer's traffic to a backend. It does NOT track configured upstream peers
+// (durable: user_connections) or AWG transport/crypto sessions (upstream,
+// invisible to Nexus). A configured peer with no row is the healthy idle
+// state — its next plaintext packet lazily creates a fresh session
+// (EnsureBackendSessionForIngress) — and every row dies with the process
+// (InvalidateVPNSessionsForRestart) or with the peer's idle reap.
 type VPNSession struct {
 	ID              string    `json:"id" db:"id"`
 	UserID          string    `json:"user_id" db:"user_id"`
@@ -311,17 +320,36 @@ type VPNSession struct {
 	TxBytes         int64     `json:"tx_bytes" db:"tx_bytes"`
 	Status          string    `json:"status" db:"status"` // connected, disconnected, draining
 	// ConnectionName is the user-facing config name (UserConnection.Name)
-	// resolved at handshake time. Legacy rows pre-dating the column carry ""
+	// resolved at admission time. Legacy rows pre-dating the column carry ""
 	// and are never backfilled.
 	ConnectionName string `json:"connection_name" db:"connection_name"`
-	// Generation tracks monotonic per-peer handshake sequence numbers to prevent
-	// out-of-order handshake commits from clobbering newer keys/endpoints.
+	// Generation tracks monotonic per-peer admission sequence numbers to prevent
+	// out-of-order commits from clobbering newer state.
 	Generation uint64 `json:"generation,omitempty" db:"-"`
+	// AdmittedVia records which admission path created this session so the
+	// idle reaper can select the session's teardown class: "ingress" sessions
+	// are reaped routing-only, while "" (the zero value, untagged / direct admission)
+	// uses standard teardown. In-memory state like Generation — vpn_sessions
+	// has no column, and rows do not survive a process restart
+	// (InvalidateVPNSessionsForRestart), so in-memory provenance is complete.
+	AdmittedVia string `json:"admitted_via,omitempty" db:"-"`
 	// TimedOutAt records when CheckTimeouts detected that the session exceeded
 	// the idle timeout. Used by the session reaper to avoid duplicate counter
 	// decrements if periodic reconciliation ran after this timestamp.
 	TimedOutAt time.Time `json:"-" db:"-"`
 }
+
+// Session admission provenance values for VPNSession.AdmittedVia.
+const (
+	// SessionAdmissionDirect marks sessions created directly without explicit
+	// ingress admission tagging (or legacy untagged sessions). The empty string
+	// is the untagged zero value.
+	SessionAdmissionDirect = ""
+	// SessionAdmissionIngress marks sessions created by the client
+	// engine's ingress admission (EnsureBackendSessionForIngress). Their idle reap
+	// is routing-only: no endpoint transport prune, no client re-handshake.
+	SessionAdmissionIngress = "ingress"
+)
 
 // EnrichedVPNSession is an active VPN session with identity joins resolved:
 // username from users, backend tunnel and server identity from backend
@@ -343,7 +371,7 @@ type EnrichedVPNSession struct {
 	RxBytes  int64     `json:"rx_bytes"`
 	TxBytes  int64     `json:"tx_bytes"`
 	Status   string    `json:"status"`
-	// ConnectionName is the user-facing config name captured at handshake;
+	// ConnectionName is the user-facing config name captured at admission;
 	// "unknown" when the underlying user_connection row is gone.
 	ConnectionName string `json:"connection_name"`
 }
@@ -373,6 +401,8 @@ type VPNConfig struct {
 	S4                     int                    `json:"s4"`
 	HeaderProtectionKey    string                 `json:"header_protection_key,omitempty"`
 	ContentPaddingAddition string                 `json:"content_padding_addition,omitempty"`
+	RandomTrailers         bool                   `json:"random_trailers,omitempty"`
+	DisableCookies         bool                   `json:"disable_cookies,omitempty"`
 }
 
 // AppearanceSettings holds UI display configuration.

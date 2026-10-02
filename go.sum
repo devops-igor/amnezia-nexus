@@ -102,8 +102,8 @@ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8
 gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
-gvisor.dev/gvisor v0.0.0-20250606233247-e3c4c4cad86f h1:zmc4cHEcCudRt2O8VsCW7nYLfAsbVY2i910/DAop1TM=
-gvisor.dev/gvisor v0.0.0-20250606233247-e3c4c4cad86f/go.mod h1:3r5CMtNQMKIvBlrmM9xWUNamjKBYPOWyXOjmg5Kts3g=
+gvisor.dev/gvisor v0.0.0-20250610212827-59e91d9b9902 h1:cblHQUBjBqPjJwu3bRFnArPR4ZNqK1pwHYuvBSsCmJs=
+gvisor.dev/gvisor v0.0.0-20250610212827-59e91d9b9902/go.mod h1:3r5CMtNQMKIvBlrmM9xWUNamjKBYPOWyXOjmg5Kts3g=
 modernc.org/cc/v4 v4.24.2 h1:uektamHbSXU7egelXcyVpMaaAsrRH4/+uMKUQAQUdOw=
 modernc.org/cc/v4 v4.24.2/go.mod h1:T1lKJZhXIi2VSqGBiB4LIbKs9NsKTbUXj4IDrmGqtTI=
 modernc.org/ccgo/v4 v4.23.5 h1:6uAwu8u3pnla3l/+UVUrDDO1HIGxHTYmFH6w+X9nsyw=

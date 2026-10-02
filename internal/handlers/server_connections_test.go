@@ -449,6 +449,75 @@ func TestServerConnectionsHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("ToggleServerConnectionHandler Server 0 Portal Connection", func(t *testing.T) {
+		portalConn := &models.UserConnection{
+			UserID:   u.ID,
+			ServerID: 0,
+			Protocol: "awg",
+			ClientID: "portal-peer-1",
+			ClientParams: map[string]any{
+				"assigned_ip": "10.100.0.10",
+			},
+		}
+		portalConnID, err := db.CreateConnection(ctx, portalConn)
+		if err != nil {
+			t.Fatalf("CreateConnection failed: %v", err)
+		}
+
+		// Disable via UUID ID
+		bodyDisable, _ := json.Marshal(map[string]any{
+			"protocol":  "awg",
+			"client_id": portalConnID,
+			"enabled":   false,
+		})
+		reqDisable := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/toggle", bytes.NewReader(bodyDisable))
+		wDisable := httptest.NewRecorder()
+		r.ServeHTTP(wDisable, reqDisable)
+		if wDisable.Code != http.StatusOK {
+			t.Fatalf("expected 200 disabling server 0 by ID, got %d: %s", wDisable.Code, wDisable.Body.String())
+		}
+		updated, err := db.GetConnection(ctx, portalConnID)
+		if err != nil || updated == nil {
+			t.Fatalf("GetConnection: %v", err)
+		}
+		if disabled, ok := updated.ClientParams["disabled"].(bool); !ok || !disabled {
+			t.Fatalf("expected disabled=true, got %+v", updated.ClientParams)
+		}
+
+		// Enable via ClientID (public key)
+		bodyEnable, _ := json.Marshal(map[string]any{
+			"protocol":  "awg",
+			"client_id": "portal-peer-1",
+			"enabled":   true,
+		})
+		reqEnable := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/toggle", bytes.NewReader(bodyEnable))
+		wEnable := httptest.NewRecorder()
+		r.ServeHTTP(wEnable, reqEnable)
+		if wEnable.Code != http.StatusOK {
+			t.Fatalf("expected 200 enabling server 0 by client_id, got %d: %s", wEnable.Code, wEnable.Body.String())
+		}
+		updated, err = db.GetConnection(ctx, portalConnID)
+		if err != nil || updated == nil {
+			t.Fatalf("GetConnection: %v", err)
+		}
+		if disabled, ok := updated.ClientParams["disabled"].(bool); ok && disabled {
+			t.Fatalf("expected disabled=false, got %+v", updated.ClientParams)
+		}
+
+		// Not found connection on server 0
+		bodyNotFound, _ := json.Marshal(map[string]any{
+			"protocol":  "awg",
+			"client_id": "nonexistent-client",
+			"enabled":   true,
+		})
+		reqNotFound := httptest.NewRequest(http.MethodPost, "/api/servers/0/connections/toggle", bytes.NewReader(bodyNotFound))
+		wNotFound := httptest.NewRecorder()
+		r.ServeHTTP(wNotFound, reqNotFound)
+		if wNotFound.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for missing server 0 connection, got %d", wNotFound.Code)
+		}
+	})
+
 	t.Run("GetServerConnectionsHandler With User Enrichment", func(t *testing.T) {
 		// Verify assigned_user / assigned_user_id enrichment
 		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/servers/%d/connections?protocol=awg", serverID), nil)

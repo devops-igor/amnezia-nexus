@@ -12,18 +12,18 @@ func (d *AWGClientDevice) SetLastHandshakeTimeForTest(fn func() time.Time) {
 	d.handshakeTimeFn = fn
 }
 
-// InPacketsForTest returns the inPackets channel for testing verification.
+// InPacketsForTest returns the inbound packet queue for testing verification.
 func (d *AWGClientDevice) InPacketsForTest() <-chan []byte {
 	if d.vtun == nil {
 		return nil
 	}
-	return d.vtun.inPackets
+	return d.vtun.Inbound()
 }
 
 // SimulateDropsForTest increments the VirtualTUN drop counter for testing telemetry.
 func (d *AWGClientDevice) SimulateDropsForTest(n uint64) {
 	if d.vtun != nil {
-		d.vtun.dropCount.Add(n)
+		d.vtun.RecordDropN(n)
 	}
 }
 

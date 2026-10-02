@@ -36,7 +36,7 @@ func TestIdleReaperRemovesCurrentRouteAfterRepeatedRekeys(t *testing.T) {
 	}
 
 	svc.sessionMgr.SetSessionLastSeen(peer, time.Now().UTC().Add(-10*time.Minute))
-	timedOut, err := svc.endpoint.SweepTimedOutSessions(ctx)
+	timedOut, err := svc.SweepTimedOutSessions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
