@@ -235,6 +235,11 @@ The workflow accepts a `qualification` input via `workflow_dispatch`:
 [Stop Upstream Qualification Subject (SIGTERM)]
     |
     v
+[Upstream Restart Durability Rehearsal (scripts/run_upstream_restart_durability.sh)]
+    |  - Executes 3 restart legs across reused SQLite DB
+    |  - Verifies exact same frozen client config and port across restarts
+    |  - Emits upstream_restart_durability.json (and dual_engine_rollback_rehearsal.json)
+    v
 [Evidence Aggregator Verification (scripts/verify_issue392_qualification.sh)]
     |  - Fail-closed validation of public reports and metrics
     v
@@ -267,6 +272,7 @@ To prevent secret leakage in CI runs and uploaded artifacts, the qualification h
      - `soak_report_reference_*.json`
      - `soak_report_subject_*.json`
      - `non_netstack_qualification.json`
+     - `upstream_restart_durability.json` (legacy alias: `dual_engine_rollback_rehearsal.json`)
      - `issue392_qualification_summary.json`
    - Zero private keys, zero raw server IPs, zero local paths.
    - Uploaded as GitHub Actions workflow artifact.
@@ -430,6 +436,12 @@ Verify that service restarts with the same DB and port preserve all client state
    ```
    *Expected outcome*: Passes all phases cleanly with transition progression:
    `none -> upstream -> none -> none -> upstream -> none -> none -> upstream -> none`.
+
+   Or run the end-to-end Linux network namespace durability rehearsal script:
+   ```bash
+   sudo ./scripts/run_upstream_restart_durability.sh
+   # (legacy wrapper ./scripts/run_dev_rollback_rehearsal.sh forwards here)
+   ```
 
 2. **Manual In-Situ Rehearsal (Maintenance Window)**:
    - **Step A (Record Baseline)**:

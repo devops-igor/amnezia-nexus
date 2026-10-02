@@ -16,9 +16,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
-// TestDualEngine_ConfigAndEnvironment validates engine resolution: upstream is the only
+// TestUpstreamEngine_ConfigAndEnvironment validates engine resolution: upstream is the only
 // configured client-facing runtime engine.
-func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
+func TestUpstreamEngine_ConfigAndEnvironment(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)
 	if err != nil {
@@ -41,9 +41,9 @@ func TestDualEngine_ConfigAndEnvironment(t *testing.T) {
 	}
 }
 
-// TestDualEngine_StartupUpstreamMode verifies that upstream mode boots IngressEngine,
+// TestUpstreamEngine_StartupUpstreamMode verifies that upstream mode boots IngressEngine,
 // does not use legacy client listeners, and populates status.
-func TestDualEngine_StartupUpstreamMode(t *testing.T) {
+func TestUpstreamEngine_StartupUpstreamMode(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 	ctx := t.Context()
@@ -114,9 +114,9 @@ func (s *safeLogBuffer) Reset() {
 	s.buf.Reset()
 }
 
-// TestDualEngine_StartupLogging verifies the startup log format:
+// TestUpstreamEngine_StartupLogging verifies the startup log format:
 // "[vpn] active client AWG engine=upstream listen_port=<port>"
-func TestDualEngine_StartupLogging(t *testing.T) {
+func TestUpstreamEngine_StartupLogging(t *testing.T) {
 	prevLog := log.Writer()
 	defer log.SetOutput(prevLog)
 
@@ -140,9 +140,9 @@ func TestDualEngine_StartupLogging(t *testing.T) {
 	}
 }
 
-// TestDualEngine_ReturnPathFailClosedFencing verifies:
+// TestUpstreamEngine_ReturnPathFailClosedFencing verifies:
 // Upstream-owned ReturnPath must fail closed on Close and never silently fall back to legacy writes.
-func TestDualEngine_ReturnPathFailClosedFencing(t *testing.T) {
+func TestUpstreamEngine_ReturnPathFailClosedFencing(t *testing.T) {
 	var writes atomic.Int64
 	path := forwarder.NewReturnPath(func(peer, ip string, pkt []byte) (int, error) {
 		writes.Add(1)
@@ -187,10 +187,10 @@ func TestDualEngine_ReturnPathFailClosedFencing(t *testing.T) {
 	}
 }
 
-// TestDualEngine_ConcurrentInFlightReturnWritesFencing verifies that concurrent
+// TestUpstreamEngine_ConcurrentInFlightReturnWritesFencing verifies that concurrent
 // in-flight return writes are cleanly fenced when an engine is stopped and its
 // ReturnPath closed.
-func TestDualEngine_ConcurrentInFlightReturnWritesFencing(t *testing.T) {
+func TestUpstreamEngine_ConcurrentInFlightReturnWritesFencing(t *testing.T) {
 	var activeWrites sync.WaitGroup
 	var acceptedWrites atomic.Int64
 	var rejectedWrites atomic.Int64
@@ -236,9 +236,9 @@ func TestDualEngine_ConcurrentInFlightReturnWritesFencing(t *testing.T) {
 	}
 }
 
-// TestDualEngine_Telemetry verifies accurate reporting of configured_engine,
+// TestUpstreamEngine_Telemetry verifies accurate reporting of configured_engine,
 // active_engine, engine_running, and return_route_owner across lifecycle states.
-func TestDualEngine_Telemetry(t *testing.T) {
+func TestUpstreamEngine_Telemetry(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 	ctx := t.Context()
@@ -328,10 +328,10 @@ func TestDualEngine_Telemetry(t *testing.T) {
 	}
 }
 
-// TestDualEngine_ServiceStopRetiresForwarderRoutes tests that Service.Stop cleanly
+// TestUpstreamEngine_ServiceStopRetiresForwarderRoutes tests that Service.Stop cleanly
 // retires and drains forwarder routes in upstream engine mode,
 // leaving zero active routes and 'none' return route owner.
-func TestDualEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
+func TestUpstreamEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 	t.Run("upstream engine mode stop retires forwarder routes and drains queues", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc := newIngressEngineService(t, db)
@@ -403,7 +403,7 @@ func TestDualEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("dual engine mixed routes stop leaves zero routes and none owner", func(t *testing.T) {
+	t.Run("mixed routes stop leaves zero routes and none owner", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc := newIngressEngineService(t, db)
 		ctx := t.Context()
@@ -412,7 +412,7 @@ func TestDualEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Register custom route (nil returnPath)
+		// Register unmanaged route (nil returnPath)
 		retC := svc.forwarder.BeginRegisterSessionWithLimit("sess-cm", "conn-cm", "peer-cm", "10.100.0.30", 1, 0, 0)
 		retC.Wait()
 
@@ -449,9 +449,9 @@ func TestDualEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 	})
 }
 
-// TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes tests that IngressEngine.Stop
+// TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes tests that IngressEngine.Stop
 // explicitly retires forwarder routes bound to its returnPath and executes the retirement callback.
-func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
+func TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 	ctx := t.Context()
@@ -468,7 +468,7 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 	}
 	retU.Wait()
 
-	// Register a custom route on forwarder
+	// Register an unmanaged route on forwarder
 	retC := svc.forwarder.BeginRegisterSessionWithLimit("sess-c", "conn-c", "peer-c", "10.100.0.51", 1, 0, 0)
 	retC.Wait()
 
@@ -495,7 +495,7 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 		t.Error("expected route retirement callback to be called")
 	}
 
-	// Verify upstream route was retired, custom route remains
+	// Verify upstream route was retired, unmanaged route remains
 	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
 		t.Errorf("expected return route owner custom, got %q", owner)
 	}
@@ -519,7 +519,7 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 		t.Fatalf("engine2.Stop: %v", err)
 	}
 
-	// engine2 route retired, custom route still remains
+	// engine2 route retired, unmanaged route still remains
 	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
 		t.Errorf("expected return route owner custom, got %q", owner)
 	}
@@ -528,20 +528,20 @@ func TestDualEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.T) {
 		t.Errorf("expected 1 active route remaining, got %d", activeAfter2)
 	}
 
-	// Clean up remaining custom route
+	// Clean up remaining unmanaged route
 	_ = svc.forwarder.RetireCustomRoutes()(context.Background())
 	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
 		t.Errorf("expected return route owner 'none', got %q", owner)
 	}
 }
 
-// TestDualEngine_ConcurrentAdmissionDuringEngineStop verifies that if session admission
+// TestUpstreamEngine_ConcurrentAdmissionDuringEngineStop verifies that if session admission
 // is already in progress when IngressEngine.Stop starts:
 //  1. ReturnPath is closed early as an admission fence.
 //  2. The in-progress admission fails closed with ErrReturnPathClosed.
 //  3. After Stop() returns: active_routes == 0, return_route_owner == "none",
 //     and no route in the forwarder references the closed path.
-func TestDualEngine_ConcurrentAdmissionDuringEngineStop(t *testing.T) {
+func TestUpstreamEngine_ConcurrentAdmissionDuringEngineStop(t *testing.T) {
 	db := setupTestDB(t)
 	svc := newIngressEngineService(t, db)
 	ctx := t.Context()

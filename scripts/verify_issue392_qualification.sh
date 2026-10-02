@@ -280,10 +280,16 @@ if require_non_netstack:
     info("Non-netstack Linux client qualification: PASS (handshake, tcp echo, udp echo, reconnect resilience, teardown registered)")
 
 # 6b. Upstream Durability / Rollback Rehearsal Report
-rollback_rehearsal_file = os.path.join(artifacts_dir, "dual_engine_rollback_rehearsal.json")
+durability_file = os.path.join(artifacts_dir, "upstream_restart_durability.json")
+legacy_rollback_file = os.path.join(artifacts_dir, "dual_engine_rollback_rehearsal.json")
+
 rollback_rehearsal = None
-if os.path.isfile(rollback_rehearsal_file):
+if os.path.isfile(durability_file):
+    rollback_rehearsal = load_json("upstream_restart_durability.json")
+elif os.path.isfile(legacy_rollback_file):
     rollback_rehearsal = load_json("dual_engine_rollback_rehearsal.json")
+
+if rollback_rehearsal:
     if rollback_rehearsal.get("verdict") != "PASS":
         fail(f"Upstream durability rehearsal verdict is not PASS: {rollback_rehearsal.get('verdict')}")
     if not rollback_rehearsal.get("config_hash_matched"):
