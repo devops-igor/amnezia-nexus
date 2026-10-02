@@ -739,11 +739,18 @@ func (f *Forwarder) RetireRoutesByReturnPath(path *ReturnPath) (wait func(ctx co
 	}
 }
 
-// RetireCustomRoutes stops pumps, drains queues, and removes routes belonging to
-// the custom/legacy engine (routes where returnPath == nil).
+// RetireUnmanagedRoutes stops pumps, drains queues, and removes unmanaged routes
+// (routes where returnPath == nil).
 // Returns a wait function that callers execute outside forwarder locks to join in-flight writes.
-func (f *Forwarder) RetireCustomRoutes() (wait func(ctx context.Context) error) {
+func (f *Forwarder) RetireUnmanagedRoutes() (wait func(ctx context.Context) error) {
 	return f.RetireRoutesByReturnPath(nil)
+}
+
+// RetireCustomRoutes is a backward-compatible alias for RetireUnmanagedRoutes.
+//
+// Deprecated: Custom engine is removed; use RetireUnmanagedRoutes.
+func (f *Forwarder) RetireCustomRoutes() (wait func(ctx context.Context) error) {
+	return f.RetireUnmanagedRoutes()
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
@@ -1342,9 +1349,9 @@ func (f *Forwarder) GetStats() (rx int64, tx int64, activeRoutes int) {
 	return
 }
 
-// ReturnRouteOwner returns the return route owner ("upstream", "custom", or "none")
-// based on currently registered active routes in the forwarder. If no routes are registered,
-// "none" is returned.
+// ReturnRouteOwner returns the return route owner ("upstream" or "none")
+// based on currently registered active routes in the forwarder. If at least one active,
+// non-stopped route has an open return path, "upstream" is returned. Otherwise, "none" is returned.
 func (f *Forwarder) ReturnRouteOwner() string {
 	if f == nil {
 		return "none"
@@ -1354,26 +1361,13 @@ func (f *Forwarder) ReturnRouteOwner() string {
 	if len(f.routesByPeer) == 0 {
 		return "none"
 	}
-	hasUpstream := false
-	hasCustom := false
 	for _, route := range f.routesByPeer {
 		if route.stopped {
 			continue
 		}
 		if route.returnPath != nil && !route.returnPath.Closed() {
-			hasUpstream = true
-		} else {
-			hasCustom = true
+			return "upstream"
 		}
-	}
-	if hasUpstream && !hasCustom {
-		return "upstream"
-	}
-	if hasCustom && !hasUpstream {
-		return "custom"
-	}
-	if hasUpstream && hasCustom {
-		return "mixed"
 	}
 	return "none"
 }

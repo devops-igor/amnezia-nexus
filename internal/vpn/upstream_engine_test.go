@@ -298,15 +298,16 @@ func TestUpstreamEngine_Telemetry(t *testing.T) {
 		t.Errorf("expected return_route_owner upstream with upstream routes, got %q", stat.ReturnRouteOwner)
 	}
 
-	// Verify mixed ownership detection if forwarder contains both route types
+	// Verify ReturnRouteOwner remains upstream even if forwarder contains unmanaged routes;
+	// ReturnRouteOwner only exposes "upstream" or "none" (custom and mixed are removed).
 	retMixed := svc.forwarder.BeginRegisterSessionWithLimit("sess-m", "conn-m", "peer-m", "10.100.0.30", 1, 0, 0)
 	retMixed.Wait()
 	stat, err = svc.GetStatus(ctx)
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
-	if stat.ReturnRouteOwner != "mixed" {
-		t.Errorf("expected return_route_owner 'mixed' with mixed routes, got %q", stat.ReturnRouteOwner)
+	if stat.ReturnRouteOwner != ClientAWGEngineUpstream {
+		t.Errorf("expected return_route_owner %q with unmanaged routes alongside upstream, got %q", ClientAWGEngineUpstream, stat.ReturnRouteOwner)
 	}
 
 	// Stop upstream service cleanly
@@ -403,7 +404,7 @@ func TestUpstreamEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("mixed routes stop leaves zero routes and none owner", func(t *testing.T) {
+	t.Run("unmanaged and upstream routes stop leaves zero routes and none owner", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc := newIngressEngineService(t, db)
 		ctx := t.Context()
@@ -423,8 +424,8 @@ func TestUpstreamEngine_ServiceStopRetiresForwarderRoutes(t *testing.T) {
 		}
 		retU.Wait()
 
-		if owner := svc.forwarder.ReturnRouteOwner(); owner != "mixed" {
-			t.Fatalf("expected return route owner 'mixed', got %q", owner)
+		if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineUpstream {
+			t.Fatalf("expected return route owner %q, got %q", ClientAWGEngineUpstream, owner)
 		}
 		_, _, active := svc.forwarder.GetStats()
 		if active != 2 {
@@ -472,8 +473,8 @@ func TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.
 	retC := svc.forwarder.BeginRegisterSessionWithLimit("sess-c", "conn-c", "peer-c", "10.100.0.51", 1, 0, 0)
 	retC.Wait()
 
-	if owner := svc.forwarder.ReturnRouteOwner(); owner != "mixed" {
-		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != ClientAWGEngineUpstream {
+		t.Fatalf("expected return route owner %q, got %q", ClientAWGEngineUpstream, owner)
 	}
 	_, _, active := svc.forwarder.GetStats()
 	if active != 2 {
@@ -495,9 +496,9 @@ func TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.
 		t.Error("expected route retirement callback to be called")
 	}
 
-	// Verify upstream route was retired, unmanaged route remains
-	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
-		t.Errorf("expected return route owner custom, got %q", owner)
+	// Verify upstream route was retired; unmanaged route remains in table but has no valid return path so ReturnRouteOwner returns "none"
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+		t.Errorf("expected return route owner 'none', got %q", owner)
 	}
 	_, _, activeAfter := svc.forwarder.GetStats()
 	if activeAfter != 1 {
@@ -519,9 +520,9 @@ func TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.
 		t.Fatalf("engine2.Stop: %v", err)
 	}
 
-	// engine2 route retired, unmanaged route still remains
-	if owner := svc.forwarder.ReturnRouteOwner(); owner != "custom" {
-		t.Errorf("expected return route owner custom, got %q", owner)
+	// engine2 route retired; unmanaged route still remains with no valid return path
+	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
+		t.Errorf("expected return route owner 'none', got %q", owner)
 	}
 	_, _, activeAfter2 := svc.forwarder.GetStats()
 	if activeAfter2 != 1 {
@@ -529,7 +530,7 @@ func TestUpstreamEngine_IngressEngineStopRetiresBoundForwarderRoutes(t *testing.
 	}
 
 	// Clean up remaining unmanaged route
-	_ = svc.forwarder.RetireCustomRoutes()(context.Background())
+	_ = svc.forwarder.RetireUnmanagedRoutes()(context.Background())
 	if owner := svc.forwarder.ReturnRouteOwner(); owner != "none" {
 		t.Errorf("expected return route owner 'none', got %q", owner)
 	}

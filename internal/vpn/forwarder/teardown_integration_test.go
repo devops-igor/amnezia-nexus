@@ -251,7 +251,7 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 		return len(p), nil
 	})
 
-	// Register 2 custom routes
+	// Register 2 unmanaged routes
 	f.RegisterSession("sess-c1", "conn-c1", "peer-c1", "10.100.0.11", 1)
 	f.RegisterSession("sess-c2", "conn-c2", "peer-c2", "10.100.0.12", 1)
 
@@ -267,8 +267,8 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 	if active != 4 {
 		t.Fatalf("expected 4 active routes, got %d", active)
 	}
-	if owner := f.ReturnRouteOwner(); owner != "mixed" {
-		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "upstream" {
+		t.Fatalf("expected return route owner 'upstream', got %q", owner)
 	}
 
 	// Retire only upstream routes
@@ -283,28 +283,28 @@ func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 		t.Fatalf("expected ErrSessionNotRegistered for upstream route 2, got %v", err)
 	}
 
-	// Custom routes remain intact
+	// Unmanaged routes remain intact in routesByPeer, but ReturnRouteOwner reports "none" since they have no valid return path
 	_, _, active = f.GetStats()
 	if active != 2 {
 		t.Fatalf("expected 2 active routes after retiring upstream, got %d", active)
 	}
-	if owner := f.ReturnRouteOwner(); owner != "custom" {
-		t.Fatalf("expected return route owner 'custom', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "none" {
+		t.Fatalf("expected return route owner 'none', got %q", owner)
 	}
 
-	// Custom routes still functional
+	// Unmanaged routes still functional
 	customPkt := returnPacket("10.100.0.11")
 	if err := f.RouteBackendToClient(1, customPkt, "10.100.0.11"); err != nil {
 		t.Fatalf("RouteBackendToClient custom route failed: %v", err)
 	}
 
-	// Retire custom routes
-	waitCustom := f.RetireCustomRoutes()
+	// Retire unmanaged routes
+	waitCustom := f.RetireUnmanagedRoutes()
 	_ = waitCustom(context.Background())
 
 	_, _, active = f.GetStats()
 	if active != 0 {
-		t.Fatalf("expected 0 active routes after retiring custom, got %d", active)
+		t.Fatalf("expected 0 active routes after retiring unmanaged, got %d", active)
 	}
 	if owner := f.ReturnRouteOwner(); owner != "none" {
 		t.Fatalf("expected return route owner 'none', got %q", owner)
@@ -334,8 +334,8 @@ func TestForwarder_Stop_FullCleanupAndDrain(t *testing.T) {
 	if occ == 0 {
 		t.Fatal("expected positive aggregate queue occupancy before stop")
 	}
-	if owner := f.ReturnRouteOwner(); owner != "mixed" {
-		t.Fatalf("expected return route owner 'mixed', got %q", owner)
+	if owner := f.ReturnRouteOwner(); owner != "upstream" {
+		t.Fatalf("expected return route owner 'upstream', got %q", owner)
 	}
 
 	if err := f.Stop(); err != nil {
