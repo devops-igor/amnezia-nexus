@@ -220,4 +220,3 @@ cookies are `Secure` automatically (no extra configuration), and
 ## Documentation & Specifications
 
 - [How It Works](useful_notes/HOW_IT_WORKS.md): Userspace data plane architecture, in-memory VirtualTUN data paths, and structural reliability design.
-- [Compatibility Policy](useful_notes/COMPATIBILITY.md): Formal stability guarantees, route lifecycles, Go package architecture conventions, frontend globals policy, and data migration invariants.
