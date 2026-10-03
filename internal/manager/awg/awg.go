@@ -10,6 +10,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1109,9 +1110,69 @@ func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSH
 	return diskWritten, nil
 }
 
+// strippedConfigPath returns the in-container path that holds the stripped
+// configuration. It lives next to the real configuration so it inherits the
+// same directory conventions, and it is unique per call so concurrent
+// operations never share it.
+func (m *AWGManager) strippedConfigPath(cfgPath string) string {
+	randBytes := make([]byte, 8)
+	_, _ = rand.Read(randBytes)
+	return fmt.Sprintf("%s/.awg-strip-%d-%x.conf", path.Dir(cfgPath), time.Now().UnixNano(), randBytes)
+}
+
+// stripInterfaceConfig runs `awg-quick strip` as a separately checked operation
+// and returns the in-container path of the stripped configuration.
+//
+// Stripping must never be fused into the syncconf command through a process
+// substitution (`<(awg-quick strip ...)`). Bash does not propagate the exit
+// status of a process substitution's producer, so a rejected configuration
+// yielded an empty stream that syncconf happily applied — initializing the
+// interface with a zero private key and peer-replacement flags — while the
+// container exited 0 and the caller reported success. Checking strip on its own
+// guarantees syncconf is unreachable whenever stripping fails, and additionally
+// rejects an empty strip result.
+func (m *AWGManager) stripInterfaceConfig(ctx context.Context, client ssh.SSHClient, cName, cfgPath string) (string, error) {
+	stripPath := m.strippedConfigPath(cfgPath)
+	stripCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
+		ssh.EscapeShellArg(cName),
+		ssh.EscapeShellArg(fmt.Sprintf("%s strip %s > %s && test -s %s",
+			ssh.EscapeShellArg(m.wgBinary()+"-quick"), ssh.EscapeShellArg(cfgPath),
+			ssh.EscapeShellArg(stripPath), ssh.EscapeShellArg(stripPath))))
+	out, errOut, code, err := client.RunSudoCommand(ctx, stripCmd)
+	if err != nil || code != 0 {
+		m.removeContainerFile(ctx, client, cName, stripPath)
+		errMsg := strings.TrimSpace(errOut)
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(out)
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to strip AmneziaWG config in container %s (exit code %d): %s: %w", cName, code, errMsg, err)
+		}
+		return "", fmt.Errorf("failed to strip AmneziaWG config in container %s (exit code %d): %s", cName, code, errMsg)
+	}
+	return stripPath, nil
+}
+
+// removeContainerFile deletes a file created inside a container, best effort.
+// It uses a bounded context detached from ctx so the removal still runs when the
+// caller's context has already been canceled or timed out.
+func (m *AWGManager) removeContainerFile(ctx context.Context, client ssh.SSHClient, cName, filePath string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	_, _, _, _ = client.RunSudoCommand(cleanupCtx, fmt.Sprintf("docker exec -i %s rm -f %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(filePath)))
+}
+
 func (m *AWGManager) syncInterfaceConfig(ctx context.Context, client ssh.SSHClient, cName, cfgPath string) error {
+	// Strip first, separately checked. A failing strip returns here, so syncconf
+	// is never invoked and the caller restores the previous configuration.
+	stripPath, err := m.stripInterfaceConfig(ctx, client, cName, cfgPath)
+	if err != nil {
+		return err
+	}
+	defer m.removeContainerFile(ctx, client, cName, stripPath)
+
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
-		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s <(%s-quick strip %s)", m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)))
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s < %s", m.wgBinary(), m.interfaceName(), ssh.EscapeShellArg(stripPath))))
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
 		if restErr := m.restoreInterfaceIfDown(ctx, client, cName, cfgPath); restErr != nil {
