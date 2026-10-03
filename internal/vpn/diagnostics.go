@@ -221,12 +221,31 @@ type RoutingConsistencyDiagnostics struct {
 	RoutesWithoutReturn    []string `json:"routes_without_return"`
 	DuplicateIPs           []string `json:"duplicate_ips"`
 	OwnershipMismatchDrops uint64   `json:"ownership_mismatch_drops"`
+	// ClientOwnershipMismatchDrops is the CLIENT-direction (client -> backend)
+	// ownership-mismatch counter, the same loss the diagnostics surface already
+	// publishes as DropCategoryBreakdown.ClientMismatch and in history. It was
+	// counted but never wired into routing health, so a client-direction
+	// mismatch was invisible to the headline (issue #424 review round 9,
+	// blocker 3). OwnershipMismatchDrops remains the RETURN-direction counter.
+	//
+	// The two are disjoint populations: a client-direction mismatch is refused
+	// at router admission before the forwarder ever sees the packet, and a
+	// return-direction mismatch is refused when a backend reply arrives for a
+	// backend the route does not own. No packet is refused for an ownership
+	// mismatch twice, so summing them counts no loss twice.
+	ClientOwnershipMismatchDrops uint64 `json:"client_ownership_mismatch_drops"`
 	// OwnershipMismatchDropsRecent is the increase of OwnershipMismatchDrops
 	// observed in the last diagnostics sampling window (issue #424 round 2,
 	// finding 5). The cumulative value stays exposed as history; only the
 	// recent delta gates current health, so a recovered incident no longer
 	// pins routing as inconsistent forever.
 	OwnershipMismatchDropsRecent uint64 `json:"ownership_mismatch_drops_recent"`
+	// ClientOwnershipMismatchDropsRecent is the increase of
+	// ClientOwnershipMismatchDrops over the same sampling window. It is a
+	// sibling of OwnershipMismatchDropsRecent, not a replacement: the two
+	// directions are evaluated independently and both must be non-zero for the
+	// routing condition to name both.
+	ClientOwnershipMismatchDropsRecent uint64 `json:"client_ownership_mismatch_drops_recent"`
 	// OwnershipMismatchWindowSec is the length of the sampling window behind
 	// OwnershipMismatchDropsRecent.
 	OwnershipMismatchWindowSec float64  `json:"ownership_mismatch_window_sec"`
@@ -236,6 +255,42 @@ type RoutingConsistencyDiagnostics struct {
 	// NOT inconsistencies, so a reader can see the incident without the
 	// headline status being pinned by it.
 	HistoricalDetails []string `json:"historical_details,omitempty"`
+}
+
+// OwnershipMismatchRecentTotal is the number of ownership mismatches observed
+// in the current sampling window across BOTH directions. It is the sum of two
+// disjoint populations (see ClientOwnershipMismatchDrops), so it counts each
+// refused packet exactly once.
+//
+// It exists so the CRITICAL gate has ONE number to compare against
+// OwnershipMismatchCriticalDrops. Each direction is still reported separately
+// in the routing condition and in the JSON payload; this is only the sum the
+// threshold is compared to, and it is never used to attribute a loss to a
+// direction.
+func (d RoutingConsistencyDiagnostics) OwnershipMismatchRecentTotal() uint64 {
+	return d.OwnershipMismatchDropsRecent + d.ClientOwnershipMismatchDropsRecent
+}
+
+// OwnershipMismatchRatePPS is the current-window ownership-mismatch rate the
+// ROUTING population contributes to the dataplane drop rate, over the whole
+// window rather than per-direction.
+//
+// It is what the aggregate drop-rate condition subtracts, so that a loss
+// reported by the routing condition is never also counted by the routine
+// drop-rate condition. Deriving it from the windowed deltas rather than from
+// ReasonRates keeps the subtraction and the condition reading the SAME
+// measurement: routing and the drop breakdown are sampled from the same
+// cumulative counters in the same status assembly, and a delta that has gone
+// quiet reports zero in both.
+//
+// A zero or unmeasured window contributes zero. OwnershipMismatchWindowSec is
+// zero only on the priming sample, which also reports a zero delta, so the
+// division is unreachable with a non-zero numerator.
+func (d RoutingConsistencyDiagnostics) OwnershipMismatchRatePPS() float64 {
+	if d.OwnershipMismatchWindowSec <= 0 {
+		return 0
+	}
+	return float64(d.OwnershipMismatchRecentTotal()) / d.OwnershipMismatchWindowSec
 }
 
 // HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
@@ -617,26 +672,42 @@ func collectRuntimeResources() RuntimeResources {
 }
 
 // checkRoutingInvariants verifies integrity across active sessions, forwarder routes, and return paths.
-func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot) RoutingConsistencyDiagnostics {
+//
+// clientOwnershipMismatch is the CLIENT-direction (client -> backend) ownership
+// mismatch cumulative counter. It is a parameter rather than being read from
+// the engine here because the caller already resolved it through
+// addIngressLosses, which folds in losses retained across an engine restart;
+// re-reading the engine's own counter here would silently exclude exactly the
+// retained losses the retention machinery exists to preserve (issue #424
+// review round 9, blocker 3).
+func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot, clientOwnershipMismatch uint64) RoutingConsistencyDiagnostics {
 	var activeSessions []Session
 	if s.sessionMgr != nil {
 		activeSessions = s.sessionMgr.ListActiveSessionsSnapshot()
 	}
 
 	diag := RoutingConsistencyDiagnostics{
-		ActiveSessionsCount:    len(activeSessions),
-		ActiveRoutesCount:      len(routes),
-		OwnershipMismatchDrops: retStats.OwnershipMismatchDrops,
-		IsConsistent:           true,
-		SessionsWithoutRoute:   []string{},
-		RoutesWithoutSession:   []string{},
-		RoutesWithoutReturn:    []string{},
-		DuplicateIPs:           []string{},
-		HistoricalDetails:      []string{},
+		ActiveSessionsCount:          len(activeSessions),
+		ActiveRoutesCount:            len(routes),
+		OwnershipMismatchDrops:       retStats.OwnershipMismatchDrops,
+		ClientOwnershipMismatchDrops: clientOwnershipMismatch,
+		IsConsistent:                 true,
+		SessionsWithoutRoute:         []string{},
+		RoutesWithoutSession:         []string{},
+		RoutesWithoutReturn:          []string{},
+		DuplicateIPs:                 []string{},
+		HistoricalDetails:            []string{},
 	}
-	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(time.Now(), retStats.OwnershipMismatchDrops)
+	// Both mismatch directions are sampled at ONE timestamp and ONE window, so
+	// OwnershipMismatchWindowSec describes both deltas and the rate the
+	// aggregate drop condition subtracts is measured over exactly the interval
+	// the CRITICAL gate was decided on (issue #424 review round 9, blocker 3).
+	now := time.Now()
+	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(now, retStats.OwnershipMismatchDrops)
+	clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(now, clientOwnershipMismatch)
 	diag.OwnershipMismatchDropsRecent = mismatchRate.delta
-	diag.OwnershipMismatchWindowSec = mismatchRate.windowSeconds
+	diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
+	diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
 
 	sessionByPeer := make(map[string]Session, len(activeSessions))
 	ipSessions := make(map[string][]string)
@@ -766,16 +837,47 @@ func auditRoutingConsistencyDetails(diag *RoutingConsistencyDiagnostics) {
 	// recovery: only the recent delta degrades current health, while the
 	// cumulative total stays visible as a historical note (issue #424 round 2,
 	// finding 5).
-	if diag.OwnershipMismatchDropsRecent > 0 {
+	//
+	// BOTH directions are consulted (issue #424 review round 9, blocker 3).
+	// Only the return direction was evaluated before, so a client-direction
+	// mismatch — counted, published, and given its own history series — never
+	// reached routing health at all.
+	if diag.OwnershipMismatchRecentTotal() > 0 {
 		diag.IsConsistent = false
 		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d ownership mismatch drop(s) in the last %.1fs of return routing",
-				diag.OwnershipMismatchDropsRecent, diag.OwnershipMismatchWindowSec))
-	} else if diag.OwnershipMismatchDrops > 0 {
+			describeOwnershipMismatchRecent(diag))
+	} else if diag.OwnershipMismatchDrops > 0 || diag.ClientOwnershipMismatchDrops > 0 {
 		diag.HistoricalDetails = append(diag.HistoricalDetails,
-			fmt.Sprintf("%d ownership mismatch drop(s) observed historically, none in the last %.1fs",
-				diag.OwnershipMismatchDrops, diag.OwnershipMismatchWindowSec))
+			describeOwnershipMismatchHistorical(diag))
 	}
+}
+
+// describeOwnershipMismatchRecent renders the current-window ownership-mismatch
+// note. Each direction that is contributing is named with its own count, so a
+// reader can tell a client-only incident from a return-only one from both, and
+// a direction that is quiet is simply absent rather than reported as zero
+// (issue #424 review round 9, blocker 3).
+func describeOwnershipMismatchRecent(diag *RoutingConsistencyDiagnostics) string {
+	parts := make([]string, 0, 2)
+	if n := diag.ClientOwnershipMismatchDropsRecent; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d client-direction", n))
+	}
+	if n := diag.OwnershipMismatchDropsRecent; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d return-direction", n))
+	}
+	return fmt.Sprintf("%s ownership mismatch drop(s) in the last %.1fs",
+		strings.Join(parts, " and "), diag.OwnershipMismatchWindowSec)
+}
+
+// describeOwnershipMismatchHistorical renders the recovered-incident note. It
+// names the cumulative total across both directions, and stays a HISTORICAL
+// detail: a lifetime counter must not degrade current health (issue #424 round
+// 2, finding 5, extended to the client direction in round 9).
+func describeOwnershipMismatchHistorical(diag *RoutingConsistencyDiagnostics) string {
+	return fmt.Sprintf("%d ownership mismatch drop(s) observed historically (%d client, %d return), none in the last %.1fs",
+		diag.ClientOwnershipMismatchDrops+diag.OwnershipMismatchDrops,
+		diag.ClientOwnershipMismatchDrops, diag.OwnershipMismatchDrops,
+		diag.OwnershipMismatchWindowSec)
 }
 
 // collectBackendDiagnostics gathers operational state across registered backend tunnels.
@@ -1038,7 +1140,7 @@ func EvaluateForwarderHealth(
 	conditions = append(conditions, evaluateRoutingConditions(routing)...)
 	conditions = append(conditions, evaluateQueueConditions(queue)...)
 	conditions = append(conditions, evaluateLatencyConditions(latency)...)
-	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops)...)
+	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops, routing)...)
 	conditions = append(conditions, evaluatePeerSyncAndBackendConditions(peerSync, backends, handshake)...)
 
 	status, summary := summarizeHealthConditions(conditions)
@@ -1050,12 +1152,38 @@ func EvaluateForwarderHealth(
 	}
 }
 
+// evaluateRoutingConditions turns routing invariants into health conditions.
+//
+// A current-window ownership mismatch in EITHER direction escalates the whole
+// routing condition set to CRITICAL (issue #424 review round 9, blocker 3). The
+// escalation is applied to the set rather than to a single detail because the
+// routing details are not independent: duplicate IPs, unroutable sessions and
+// refused packets all describe the same routing plane, and a plane that is
+// refusing packets for ownership reasons in this window is failing now
+// regardless of which other invariant is also breached. Reporting one of them
+// as merely DEGRADED would understate the set, which is the defect blocker 3
+// reports.
+//
+// Without an ownership mismatch the classification is unchanged from before:
+// duplicate IPs and sessions with no route are CRITICAL, everything else is
+// DEGRADED. So no condition that was previously CRITICAL can become less
+// severe, and no DEGRADED routing condition is escalated except by the new
+// reason gate.
 func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCondition {
 	if routing.IsConsistent {
 		return nil
 	}
+	th := defaultHealthThresholds()
+	// Default severity for an invariant breach, matching the pre-round-9
+	// classification: only duplicate IPs and unroutable sessions were critical.
 	sev := "DEGRADED"
 	if len(routing.DuplicateIPs) > 0 || len(routing.SessionsWithoutRoute) > 0 {
+		sev = "CRITICAL"
+	}
+	// Ownership mismatch is a correctness failure at any volume, so its
+	// severity is decided by the reason itself, from the CURRENT window in
+	// BOTH directions, and it overrides the default above.
+	if routing.OwnershipMismatchRecentTotal() >= th.OwnershipMismatchCriticalDrops {
 		sev = "CRITICAL"
 	}
 	conds := make([]HealthCondition, 0, len(routing.InconsistencyDetails))
@@ -1157,7 +1285,30 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 	return conds
 }
 
-func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
+// evaluateVirtualTUNAndDropConditions classifies upstream queue occupancy and
+// dataplane loss.
+//
+// Loss is classified in TWO disjoint populations rather than one aggregate
+// (issue #424 review round 9, blocker 3):
+//
+//  1. CRITICAL reasons, identified by name. A packet refused because ownership
+//     could not be verified, or refused at the injection hop after decryption,
+//     is a correctness failure at any volume. Deciding that by REASON rather
+//     than by aggregate rate is the whole point: previously these losses were
+//     summed into TotalDropRatePps and compared against a generic threshold, so
+//     a sparse critical reason read as HEALTHY and a large one read as DEGRADED.
+//
+//  2. The ROUTINE population: everything else. Its rate is the aggregate MINUS
+//     the reason-claimed losses, so a loss can never be reported twice — once by
+//     reason and once by the aggregate. This is what keeps the two populations
+//     disjoint, and it is why lowering the generic thresholds would NOT have
+//     been a fix: it would have turned high-volume queue-full churn critical
+//     while still misreading a single ownership mismatch.
+//
+// routing is taken so the ownership-mismatch subtraction reads the same
+// windowed measurement the routing condition was decided on, rather than a
+// second, independently-sampled view of the same counters.
+func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown, routing RoutingConsistencyDiagnostics) []HealthCondition {
 	th := defaultHealthThresholds()
 	var conds []HealthCondition
 	upstreamToNexusUtil := float64(0)
@@ -1184,17 +1335,65 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 		})
 	}
 
-	if drops.TotalDropRatePps >= th.DropRateDegradedPPS {
+	// Ownership mismatch in either direction is claimed by the ROUTING
+	// condition, not here. Emitting it in both places is precisely the
+	// double-counted loss round 5 of this review was about, so the routing
+	// contribution is subtracted from the routine population below rather than
+	// reported a second time.
+
+	// Injection failures are claimed here. They have no routing invariant, and
+	// before this change they were visible only through the aggregate rate, so
+	// they could never exceed DEGRADED.
+	//
+	// The rate comes from criticalLossReasons, the same declaration that names
+	// every other critical reason and its owner, so a reason cannot be reported
+	// by reason here without also being subtracted from the routine population
+	// below.
+	//
+	// RatesAvailable gates this deliberately: the first sample of the tracker
+	// publishes zeros because the interval is not yet known, so treating an
+	// unmeasured window as a real rate would fabricate an incident. That is the
+	// same rule the write-latency p95 gate uses (P95HealthSamples > 0).
+	if drops.RatesAvailable {
+		if rate := criticalReasonRatePps(drops, claimDrops); rate > th.InjectionFailureCriticalRatePPS {
+			conds = append(conds, HealthCondition{
+				Category: "drops",
+				Severity: "CRITICAL",
+				Message: fmt.Sprintf("Return-path injection failures: %.1f errors/sec; "+
+					"decrypted replies are being refused at the client ingress hop", rate),
+			})
+		}
+	}
+
+	// The ROUTINE population: the aggregate minus every loss already claimed by
+	// a reason-specific condition, whichever evaluator owns it. The routing
+	// claim is measured through the routing windowed deltas (the same
+	// measurement the routing condition was decided on); the drops claim
+	// through the reason rates. Clamped at zero because the two are sampled
+	// over the same window by independent trackers, so a small negative residue
+	// must never be reported as a negative loss rate.
+	routineRate := drops.TotalDropRatePps -
+		routing.OwnershipMismatchRatePPS() -
+		criticalReasonRatePps(drops, claimDrops)
+	if routineRate < 0 {
+		routineRate = 0
+	}
+
+	if routineRate >= th.DropRateDegradedPPS {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("Elevated drop rate: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
+			Message: fmt.Sprintf("Elevated routine drop rate: %.1f drops/sec across dataplane "+
+				"(excluding ownership-mismatch and injection-failure losses, reported by reason)",
+				routineRate),
 		})
-	} else if drops.TotalDropRatePps >= th.DropRateWarningPPS {
+	} else if routineRate >= th.DropRateWarningPPS {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "WARNING",
-			Message:  fmt.Sprintf("Active packet drops: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
+			Message: fmt.Sprintf("Active routine packet drops: %.1f drops/sec across dataplane "+
+				"(excluding ownership-mismatch and injection-failure losses, reported by reason)",
+				routineRate),
 		})
 	}
 	return conds
@@ -1388,6 +1587,16 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 		}
 	}
 
+	// enabled is the population a FAILURE can be counted against. When eligibility
+	// is known, that is the ENABLED count: a backend an operator disabled is an
+	// operator decision, not a failure, so it must never contribute to a
+	// degradation (issue #424 review round 9, blocker 4).
+	//
+	// HealthyCount already counts only ELIGIBLE backends (enabled AND active),
+	// so HealthyCount < enabled is precisely "enabled backends that are not
+	// carrying traffic". The disabled ones are absent from both sides of that
+	// comparison, which is what keeps failed and disabled distinguishable
+	// without any extra bookkeeping here.
 	enabled := backends.TotalCount
 	if backends.EligibilityKnown {
 		enabled = backends.EnabledCount
@@ -1405,11 +1614,25 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 			Message:  message,
 		})
 	} else if enabled > 0 && backends.HealthyCount < enabled {
+		// DEGRADED, not WARNING. #424 specifies DEGRADED for a degraded
+		// backend, and summarizeHealthConditions maps WARNING-only to
+		// HEALTHY, so a WARNING here reported two enabled backends with one
+		// healthy as HEALTHY (issue #424 review round 9, blocker 4).
+		//
+		// CRITICAL is deliberately reserved for the branch above: with no
+		// healthy backend at all there is nowhere to route traffic, which is a
+		// categorically different condition from losing part of a fleet that
+		// still has somewhere to send packets.
+		//
+		// The message names the enabled population so the count cannot be
+		// misread against TotalCount: a disabled backend is neither healthy nor
+		// failed, and an operator seeing "1 of 2" must be able to tell which two.
 		conds = append(conds, HealthCondition{
 			Category: "backend",
-			Severity: "WARNING",
-			Message: fmt.Sprintf("%d of %d backends are degraded or unavailable",
-				enabled-backends.HealthyCount, enabled),
+			Severity: "DEGRADED",
+			Message: fmt.Sprintf("%d of %d enabled backends are degraded or unavailable "+
+				"(%d administratively disabled, not counted as failures)",
+				enabled-backends.HealthyCount, enabled, backends.DisabledCount),
 		})
 	}
 
@@ -1746,14 +1969,24 @@ func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapsho
 // its own mutex, so a caller needs no outer lock.
 type diagDeltaTrackers struct {
 	ownershipMismatch diagDeltaTracker
-	syncFailures      diagDeltaTracker
-	enqueueFailures   diagDeltaTracker
-	writeStalls       diagDeltaTracker
-	reasons           dropReasonRatesTracker
+	// clientOwnershipMismatch tracks the CLIENT-direction counterpart. It is a
+	// separate tracker, not a second field on the return one, because the two
+	// counters rise independently: sharing a tracker would let a burst in one
+	// direction mask a quiet window in the other, which is the invisibility
+	// blocker 3 exists to remove (issue #424 review round 9).
+	clientOwnershipMismatch diagDeltaTracker
+	syncFailures            diagDeltaTracker
+	enqueueFailures         diagDeltaTracker
+	writeStalls             diagDeltaTracker
+	reasons                 dropReasonRatesTracker
 }
 
 func (t *diagDeltaTrackers) sampleOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
 	return t.ownershipMismatch.Sample(now, cumulative)
+}
+
+func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
+	return t.clientOwnershipMismatch.Sample(now, cumulative)
 }
 
 func (t *diagDeltaTrackers) sampleSyncFailures(now time.Time, cumulative uint64) deltaSnapshot {
@@ -1972,7 +2205,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 	}
 
 	// 3. Routing consistency
-	status.RoutingConsistency = checkRoutingInvariants(s, routes, retStats)
+	status.RoutingConsistency = checkRoutingInvariants(s, routes, retStats, routerMismatch)
 
 	// 4. Handshake freshness
 	status.HandshakeFreshness = collectHandshakeDiagnostics(s)

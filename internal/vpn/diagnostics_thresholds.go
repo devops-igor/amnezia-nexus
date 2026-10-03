@@ -133,15 +133,46 @@ type HealthThresholds struct {
 
 	// --- Dataplane drop rate (evaluateVirtualTUNAndDropConditions) ---
 
-	// DropRateDegradedPPS gates DEGRADED on the dataplane-wide drop rate.
-	// Compared with >= against
-	// DropCategoryBreakdown.TotalDropRatePps.
+	// DropRateDegradedPPS gates DEGRADED on the dataplane-wide ROUTINE drop
+	// rate. Compared with >= against the routine-population rate, which is
+	// TotalDropRatePps MINUS the losses already claimed by a reason-specific
+	// condition (issue #424 review round 9, blocker 3). The subtraction is what
+	// makes the populations disjoint: a loss reported by reason is never also
+	// reported by the aggregate.
 	DropRateDegradedPPS float64
 
-	// DropRateWarningPPS gates WARNING on the dataplane-wide drop rate.
-	// Compared with >= against
-	// DropCategoryBreakdown.TotalDropRatePps.
+	// DropRateWarningPPS gates WARNING on the dataplane-wide ROUTINE drop
+	// rate, over the same disjoint population as DropRateDegradedPPS. Compared
+	// with >=.
 	DropRateWarningPPS float64
+
+	// --- Reason-specific critical loss (issue #424 review round 9, blocker 3) ---
+
+	// OwnershipMismatchCriticalDrops gates CRITICAL on ownership mismatch in
+	// EITHER direction. It is a COUNT over the routing sampling window, not a
+	// rate, because the severity does not depend on volume: a packet refused
+	// because its ownership could not be verified is a correctness failure at
+	// any volume. Compared with >= against
+	// RoutingConsistencyDiagnostics.OwnershipMismatchRecentTotal.
+	//
+	// The value is 1, numerically identical to the `> 0` comparison that
+	// already gated routing inconsistency on this same counter in
+	// auditRoutingConsistencyDetails. Round 9 changes only the SEVERITY that
+	// boundary produces, never the boundary itself, so no incident that was
+	// already detected can become invisible.
+	OwnershipMismatchCriticalDrops uint64
+
+	// InjectionFailureCriticalRatePPS gates CRITICAL on return-path injection
+	// failures. Compared with > against the current-window
+	// DropCategoryBreakdown.ReasonRates[reasonReturnInjectionErrors], so any
+	// non-zero measured rate fires and a zero rate never does.
+	//
+	// The value is 0, numerically identical to the `> 0` comparison the
+	// evaluator already applied to device write-error telemetry
+	// (WriteErrorRatePps > 0) and to QueueActiveDropRatePPS above: both encode
+	// "a non-zero CURRENT rate of this failure is an incident", which is the
+	// same rule applied to a third failure population.
+	InjectionFailureCriticalRatePPS float64
 
 	// --- Peer synchronization (peerSyncDivergenceCondition) ---
 
@@ -214,8 +245,17 @@ func defaultHealthThresholds() HealthThresholds {
 		VirtualTUNDegradedPct: 90.0,
 		VirtualTUNWarningPct:  75.0,
 
+		// The ROUTINE population, not the whole dataplane: see
+		// DropRateDegradedPPS above. Numeric identity with the literals these
+		// two fields replaced is unchanged — only the compared population
+		// moved, and it moved by exactly the reason-claimed losses.
 		DropRateDegradedPPS: 10.0,
 		DropRateWarningPPS:  1.0,
+
+		// `> 0` on the already-gated mismatch counter, restated as >= 1.
+		OwnershipMismatchCriticalDrops: 1,
+		// `> 0`, matching the write-error and queue-drop rate idiom.
+		InjectionFailureCriticalRatePPS: 0,
 
 		PeerSyncDivergenceDegradedAge: 60 * time.Second,
 		PeerSyncDivergenceWarningAge:  30 * time.Second,

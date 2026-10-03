@@ -7,6 +7,86 @@ import (
 	"time"
 )
 
+// lossClaim names the evaluator that OWNS a critical reason's losses. Exactly
+// one evaluator may own each reason: an ownership owned twice is a
+// double-counted condition, which is the failure mode round 5 of this review
+// was entirely about and the one blocker 3 has to avoid reintroducing while
+// adding reason-keyed severity.
+type lossClaim int
+
+const (
+	// claimRouting means the routing consistency evaluator reports the loss
+	// (it owns the ownership-mismatch invariants, both directions).
+	claimRouting lossClaim = iota
+	// claimDrops means this evaluator reports the loss as a reason-keyed
+	// condition.
+	claimDrops
+)
+
+// criticalLossReasons declares, in ONE place, every reason the health
+// evaluator classifies by identity rather than by aggregate volume, and which
+// evaluator owns each (issue #424 review round 9, blocker 3).
+//
+// This map is the single source for two things that must never disagree: the
+// reason-specific condition that is emitted, and the subtraction from the
+// routine population that keeps the same loss out of the aggregate. Adding a
+// reason here is therefore the whole change — there is no second list to
+// remember, and therefore no way to claim a reason in one place and let the
+// aggregate report it in another.
+//
+//   - Ownership mismatch in either direction is owned by the ROUTING
+//     evaluator. #424 treats a packet refused because ownership could not be
+//     verified as CRITICAL: it is a correctness failure (a #391 sync gap or a
+//     manual database edit desynchronised the resolver from the session store),
+//     not congestion, so its severity must not scale with how many packets it
+//     refused.
+//   - Return-path injection failures are owned by THIS evaluator. The return
+//     packet was decrypted and accepted, then refused at the last hop before the
+//     client, so the reply is lost outright with no route to retry it.
+//
+// Note the deliberate absence of queue-full, malformed, and the rest: those are
+// CAPACITY or hygiene reasons whose severity legitimately scales with volume,
+// and TestB3HighVolumeRoutineQueueFullIsNotCritical pins that they stay that
+// way.
+//
+// Keys are asserted against dropReasonTotals by
+// TestB3CriticalReasonKeysArePublishedReasons: a key the tracker does not
+// publish could never carry a rate, and its condition could never fire.
+const (
+	reasonClientOwnershipMismatch = "client_mismatch"
+	reasonReturnOwnershipMismatch = "return_mismatch"
+	reasonReturnInjectionErrors   = "return_injection_errors"
+	reasonClientBackendQueueFull  = "client_backend_queue_full"
+	reasonReturnQueueFull         = "return_queue_full"
+)
+
+var criticalLossReasons = map[string]lossClaim{
+	reasonClientOwnershipMismatch: claimRouting,
+	reasonReturnOwnershipMismatch: claimRouting,
+	reasonReturnInjectionErrors:   claimDrops,
+}
+
+// criticalReasonRatePps sums the current-window rate of every critical reason
+// owned by the given evaluator, out of drops.
+//
+// It returns zero when rates are unavailable: the reason tracker publishes
+// zeros for an interval it has not measured yet, so summing them would be
+// summing unknowns. Callers that emit a condition must gate on RatesAvailable
+// themselves, because a zero here is indistinguishable from "measured and
+// quiet".
+func criticalReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64 {
+	if !drops.RatesAvailable {
+		return 0
+	}
+	total := 0.0
+	for key, owner := range criticalLossReasons {
+		if owner == claim {
+			total += drops.ReasonRates[key]
+		}
+	}
+	return total
+}
+
 // The disjoint reasons use exactly the counter keys in drop_categories.
 // return_injection_tun_drops describes overlap, not an additional loss reason.
 func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {

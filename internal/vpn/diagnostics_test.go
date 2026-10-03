@@ -229,7 +229,7 @@ func TestCheckRoutingInvariants(t *testing.T) {
 	}
 
 	// Case 1: Empty routes, empty sessions -> consistent
-	diag := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{})
+	diag := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{}, 0)
 	if !diag.IsConsistent {
 		t.Errorf("expected consistent for empty sessions/routes, got inconsistencies: %v", diag.InconsistencyDetails)
 	}
@@ -244,7 +244,7 @@ func TestCheckRoutingInvariants(t *testing.T) {
 			ReturnPathClosed: true,
 		},
 	}
-	diag2 := checkRoutingInvariants(svc, routes, ReturnStatsSnapshot{})
+	diag2 := checkRoutingInvariants(svc, routes, ReturnStatsSnapshot{}, 0)
 	if diag2.IsConsistent {
 		t.Errorf("expected inconsistency for route without session and without return")
 	}
@@ -274,7 +274,7 @@ func TestCheckRoutingInvariants(t *testing.T) {
 			HasReturnPath:   true,
 		},
 	}
-	diagDup := checkRoutingInvariants(svc, routesDup, ReturnStatsSnapshot{})
+	diagDup := checkRoutingInvariants(svc, routesDup, ReturnStatsSnapshot{}, 0)
 	if diagDup.IsConsistent {
 		t.Errorf("expected inconsistency for duplicate IPs")
 	}

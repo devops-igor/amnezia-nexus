@@ -344,7 +344,7 @@ func TestRoutingInvariantSlicesAreRedactedAndSorted(t *testing.T) {
 		{PeerKey: round5PeerKeyB, AssignedIP: "10.100.0.3", BackendTunnelID: 0},
 	}
 	svc := &Service{forwarder: fwd}
-	diag := checkRoutingInvariants(svc, routes, ReturnStatsSnapshot{})
+	diag := checkRoutingInvariants(svc, routes, ReturnStatsSnapshot{}, 0)
 
 	if len(diag.RoutesWithoutSession) != 2 {
 		t.Fatalf("expected two routes without a session, got %v", diag.RoutesWithoutSession)

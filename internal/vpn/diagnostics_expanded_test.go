@@ -32,13 +32,25 @@ func TestBackendDiagnosticsEligibilityAndFleetPercentile(t *testing.T) {
 		healthy            int
 		percentile         float64
 		critical           bool
-		warning            bool
+		// degraded is the EXPECTED severity of the partial-failure backend
+		// condition, or "" when no backend condition is expected.
+		//
+		// This field was `warning bool` and the "failed enabled" case expected
+		// WARNING. That expectation ENCODED THE REPORTED DEFECT and is changed
+		// here deliberately, not weakened (issue #424 review round 9, blocker
+		// 4): #424 specifies DEGRADED for a degraded backend, and
+		// summarizeHealthConditions maps WARNING-only to HEALTHY, so pinning
+		// WARNING pinned the wrong behaviour. The expectation is tightened, not
+		// relaxed: it now names the exact severity, and the assertion below also
+		// checks that the WARNING severity is ABSENT rather than merely that a
+		// DEGRADED one is present.
+		degraded string
 	}{
-		{"two eligible", true, true, TunnelStatusActive, TunnelStatusActive, 10, 1000, 2, 1000, false, false},
-		{"singleton", true, false, TunnelStatusActive, TunnelStatusActive, 10, 1000, 1, 10, false, false},
-		{"all disabled", false, false, TunnelStatusActive, TunnelStatusActive, 10, 1000, 0, 0, true, false},
-		{"failed enabled", true, true, TunnelStatusActive, TunnelStatusDegraded, 10, 1000, 1, 10, false, true},
-		{"no latency", true, true, TunnelStatusActive, TunnelStatusActive, 0, 0, 2, 0, false, false},
+		{"two eligible", true, true, TunnelStatusActive, TunnelStatusActive, 10, 1000, 2, 1000, false, ""},
+		{"singleton", true, false, TunnelStatusActive, TunnelStatusActive, 10, 1000, 1, 10, false, ""},
+		{"all disabled", false, false, TunnelStatusActive, TunnelStatusActive, 10, 1000, 0, 0, true, ""},
+		{"failed enabled", true, true, TunnelStatusActive, TunnelStatusDegraded, 10, 1000, 1, 10, false, "DEGRADED"},
+		{"no latency", true, true, TunnelStatusActive, TunnelStatusActive, 0, 0, 2, 0, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, state := range []struct {
@@ -66,14 +78,38 @@ func TestBackendDiagnosticsEligibilityAndFleetPercentile(t *testing.T) {
 			if (health.Status == HealthCritical) != tc.critical {
 				t.Errorf("health=%s: %s; critical=%v", health.Status, health.Summary, tc.critical)
 			}
+			backendDegraded := false
 			backendWarning := false
 			for _, c := range health.Conditions {
-				if c.Category == "backend" && c.Severity == "WARNING" {
+				if c.Category != "backend" {
+					continue
+				}
+				if c.Severity == "DEGRADED" {
+					backendDegraded = true
+				}
+				if c.Severity == "WARNING" {
 					backendWarning = true
 				}
 			}
-			if backendWarning != tc.warning {
-				t.Errorf("backend warning=%v; want %v", backendWarning, tc.warning)
+			// The severity is asserted by NAME, and WARNING is asserted absent.
+			// A partial enabled-backend failure used to be WARNING and read
+			// HEALTHY through the summarizer; accepting either severity here
+			// would let that regression return silently.
+			if want := tc.degraded; (want == "DEGRADED") != backendDegraded {
+				t.Errorf("backend DEGRADED=%v; want %v (conditions: %+v, health %s: %s)",
+					backendDegraded, want, health.Conditions, health.Status, health.Summary)
+			}
+			if backendWarning {
+				t.Errorf("a backend failure must never be WARNING, which summarizes to HEALTHY: %+v",
+					health.Conditions)
+			}
+			// The headline itself: a partially failed fleet is DEGRADED, and a
+			// fully healthy or all-disabled fleet is not.
+			switch {
+			case tc.degraded != "" && health.Status != HealthDegraded:
+				t.Errorf("partial enabled-backend failure: health=%s, want DEGRADED (%s)", health.Status, health.Summary)
+			case tc.degraded == "" && !tc.critical && health.Status != HealthHealthy:
+				t.Errorf("healthy fleet: health=%s, want HEALTHY (%s)", health.Status, health.Summary)
 			}
 			if tc.name == "all disabled" && !strings.Contains(strings.ToLower(health.Summary), "disabled") {
 				t.Errorf("all-disabled inventory must be explained: %s", health.Summary)

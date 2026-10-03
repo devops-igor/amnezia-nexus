@@ -98,12 +98,39 @@ func TestDefaultHealthThresholdsPreservePreviousLiterals(t *testing.T) {
 
 	t.Run("dataplane drop rate", func(t *testing.T) {
 		// diagnostics.go  drops.TotalDropRatePps >= 10.0
+		//
+		// The compared POPULATION moved in review round 9 (routine loss only,
+		// with reason-claimed losses subtracted), but the VALUE and the operator
+		// did not. The boundary tests below pin the operator.
 		if th.DropRateDegradedPPS != 10.0 {
 			t.Errorf("DropRateDegradedPPS=%v, want 10.0 (was the literal 10.0)", th.DropRateDegradedPPS)
 		}
 		// diagnostics.go  drops.TotalDropRatePps >= 1.0
 		if th.DropRateWarningPPS != 1.0 {
 			t.Errorf("DropRateWarningPPS=%v, want 1.0 (was the literal 1.0)", th.DropRateWarningPPS)
+		}
+	})
+
+	// Round 9 added two severity thresholds rather than moving any. They have
+	// no literal they replaced, so their numeric identity is stated as the
+	// comparison they restate: each is the boundary of an EXISTING gate applied
+	// to a different loss population, not a newly chosen number.
+	t.Run("reason-specific critical loss (round 9 additions)", func(t *testing.T) {
+		// Pre-round-9, auditRoutingConsistencyDetails gated the routing
+		// inconsistency on `OwnershipMismatchDropsRecent > 0`. Round 9 keeps that
+		// exact boundary and changes only the severity it produces, so 1 with
+		// >= is numerically identical to the old literal 0 with >.
+		if th.OwnershipMismatchCriticalDrops != 1 {
+			t.Errorf("OwnershipMismatchCriticalDrops=%d, want 1 (the `recent > 0` gate it restates, as >= 1)",
+				th.OwnershipMismatchCriticalDrops)
+		}
+		// Pre-round-9, evaluateLatencyConditions gated device write errors on
+		// `latency.WriteErrorRatePps > 0` against the same literal 0, and
+		// QueueActiveDropRatePPS is already 0 compared with >. The injection
+		// gate is that same rule applied to a third failure population.
+		if th.InjectionFailureCriticalRatePPS != 0 {
+			t.Errorf("InjectionFailureCriticalRatePPS=%v, want 0 (was the literal 0 of the `> 0` rate gates it mirrors)",
+				th.InjectionFailureCriticalRatePPS)
 		}
 	})
 
@@ -426,7 +453,7 @@ func TestVirtualTUNConditionSeverityBoundaries(t *testing.T) {
 		for _, tc := range cases {
 			for _, direction := range []string{"upstream_to_nexus", "nexus_to_upstream"} {
 				t.Run(tc.name+"/"+direction, func(t *testing.T) {
-					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{})
+					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true})
 					if got := severityIn(conds, "virtual_tun"); got != tc.want {
 						t.Errorf("%s at %.0f%%: severity %q, want %q", direction, tc.pct, got, tc.want)
 					}
@@ -448,7 +475,7 @@ func TestVirtualTUNConditionSeverityBoundaries(t *testing.T) {
 		for _, tc := range cases {
 			for _, direction := range []string{"upstream_to_nexus", "nexus_to_upstream"} {
 				t.Run(tc.name+"/"+direction, func(t *testing.T) {
-					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{})
+					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true})
 					if got := severityIn(conds, "virtual_tun"); got != tc.want {
 						t.Errorf("%s at %.0f%%: severity %q, want %q", direction, tc.pct, got, tc.want)
 					}
@@ -477,7 +504,7 @@ func TestDropRateConditionSeverityBoundaries(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), DropCategoryBreakdown{TotalDropRatePps: tc.pps})
+			conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), DropCategoryBreakdown{TotalDropRatePps: tc.pps}, RoutingConsistencyDiagnostics{IsConsistent: true})
 			if got := severityIn(conds, "drops"); got != tc.want {
 				t.Errorf("drop rate %.2f/sec: severity %q, want %q", tc.pps, got, tc.want)
 			}
