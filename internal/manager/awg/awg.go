@@ -1194,8 +1194,15 @@ func (m *AWGManager) syncInterfaceConfig(ctx context.Context, client ssh.SSHClie
 	}
 	defer m.removeContainerFile(ctx, client, cName, stripPath)
 
+	// syncconf takes TWO operands: the interface AND the name of a configuration
+	// file. The stripped configuration therefore has to arrive as a FILENAME
+	// argument, not on stdin. A shell redirect (`< path`) feeds the file on the
+	// standard input stream and supplies NO second operand, so syncconf aborts
+	// with "Usage: awg syncconf <interface> <configuration filename>". The strip
+	// file already lives inside the container, so passing its path directly
+	// needs no second copy.
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
-		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s < %s", m.wgBinary(), m.interfaceName(), ssh.EscapeShellArg(stripPath))))
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s %s", m.wgBinary(), m.interfaceName(), ssh.EscapeShellArg(stripPath))))
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
 		if restErr := m.restoreInterfaceIfDown(ctx, client, cName, cfgPath); restErr != nil {
