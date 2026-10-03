@@ -28,8 +28,7 @@ def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create user for share test")
+    assert add_result["status"] == 200, "Share user fixture creation failed"
 
     # Re-fetch to get full user record
     users_result2 = api_get(page, "/api/users/?size=100")
@@ -39,8 +38,7 @@ def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share
         if u.get("username") == username:
             return u
 
-    pytest.skip("Test user not found after creation")
-    return {}  # unreachable
+    raise AssertionError("Share user fixture not found after creation")
 
 
 @pytest.mark.e2e
@@ -175,3 +173,111 @@ def test_download_config_from_share(
         csrf_token,
     )
     api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+@pytest.mark.e2e
+def test_leaderboard_api(page: Page, base_url: str) -> None:
+    """GET /api/leaderboard -> public traffic leaderboard data."""
+    res = page.request.get(f"{base_url}/api/leaderboard")
+    assert res.status == 200, f"Leaderboard API returned {res.status}"
+    body = res.json()
+    assert isinstance(body, dict)
+    assert_response_shape(
+        body,
+        {"period": str, "entries": list},
+        "leaderboard",
+    )
+
+    res_all = page.request.get(f"{base_url}/api/leaderboard?period=all-time")
+    assert res_all.status == 200
+    body_all = res_all.json()
+    assert body_all.get("period") == "all-time"
+    assert isinstance(body_all.get("entries"), list)
+
+
+@pytest.mark.e2e
+def test_share_token_connections_and_config(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """GET /api/share/{token}/connections and POST /api/share/{token}/config/{id}."""
+    page = authenticated_page
+
+    servers_result = api_get(page, "/api/servers/")
+    servers = (
+        servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
+    )
+    assert servers, "Provisioned server fixture is missing"
+
+    server_id = servers[0]["id"]
+    test_user = _find_or_create_user(page, csrf_token, "e2e_share_endpoints_user")
+    user_id = test_user["id"]
+
+    try:
+        # Create connection for user
+        conn_res = api_post(
+            page,
+            f"/api/users/{user_id}/connections/add",
+            {"server_id": server_id, "protocol": "awg", "name": "share_endpoint_conn"},
+            csrf_token,
+        )
+        assert conn_res["status"] == 200, "Share connection fixture creation failed"
+
+        user_conns = api_get(page, f"/api/users/{user_id}/connections")
+        connections = (
+            user_conns if isinstance(user_conns, list) else user_conns.get("connections", [])
+        )
+        assert connections, "Share connection fixture is missing"
+        conn_id = connections[0]["id"]
+
+        # Enable share without password (public)
+        share_res = api_post(
+            page,
+            f"/api/users/{user_id}/share/setup",
+            {"enabled": True, "password": ""},
+            csrf_token,
+        )
+        assert share_res["status"] == 200
+        share_token = share_res["body"].get("share_token")
+        assert share_token, "No share token returned"
+
+        # GET /api/share/{token}/connections
+        share_conns_res = page.request.get(f"{base_url}/api/share/{share_token}/connections")
+        assert share_conns_res.status == 200, "Share connections read failed"
+        share_conns = share_conns_res.json()
+        assert isinstance(share_conns, dict)
+        assert_response_shape(
+            share_conns,
+            {"status": str, "username": str, "connections": list},
+            "share_connections",
+        )
+        assert any(c.get("id") == conn_id for c in share_conns["connections"])
+
+        # POST /api/share/{token}/config/{connection_id}
+        share_cfg_res = api_post(
+            page,
+            f"/api/share/{share_token}/config/{conn_id}",
+            {},
+            csrf_token,
+        )
+        assert share_cfg_res["status"] == 200, "Share config download failed"
+        cfg_body = share_cfg_res["body"]
+        assert_response_shape(
+            cfg_body, {"status": str, "config": str, "filename": str}, "share_config"
+        )
+        assert cfg_body["status"] == "ok"
+        has_interface = "[Interface]" in cfg_body["config"]
+        assert has_interface, "Share config is empty or unavailable"
+        assert cfg_body["filename"].endswith(".conf")
+
+    finally:
+        try:
+            disabled = api_post(
+                page,
+                f"/api/users/{user_id}/share/setup",
+                {"enabled": False},
+                csrf_token,
+            )
+            assert disabled["status"] == 200, "Share fixture disable failed"
+        finally:
+            deleted = api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+            assert deleted["status"] == 200, "Temporary share fixture cleanup failed"

@@ -139,6 +139,33 @@ type RouteQueueStats struct {
 	WritesInFlight     int    `json:"writes_in_flight"`
 	OldestWriteMS      int64  `json:"oldest_write_ms"`
 	MaxWriteDurationMS int64  `json:"max_write_duration_ms"`
+	P95WriteSamples    int    `json:"p95_write_samples"`
+	P95WriteMS         int64  `json:"p95_write_ms"`
+
+	// PeerKeyDisplay is the REDACTED, human-readable rendering of the peer
+	// this stats block belongs to (issue #424 round 6, finding 2).
+	//
+	// It exists because these stats are served as a MAP whose key must be a
+	// unique, collision-resistant identifier, and the redaction convention
+	// (a truncated key prefix) is not unique. The map key is therefore the
+	// opaque ingress.PeerKeyFingerprint, and this field carries the display
+	// form so a reader of the map still sees something recognizable instead
+	// of a digest.
+	//
+	// It is populated at the API boundary by the caller that owns both the
+	// raw key and the redaction convention; the forwarder itself does not
+	// redact and leaves it empty. Additive and omitempty: a caller that does
+	// not set it keeps the previous payload exactly.
+	PeerKeyDisplay string `json:"peer_key_display,omitempty"`
+
+	// The *Recent fields are the RECENT-change counterparts of the three
+	// lifetime failure counters above, measured over the sampling window
+	// described in route_pressure.go (issue #424 round 6, finding 3). They
+	// are additive and drive the current-pressure decision; the lifetime
+	// fields above are untouched and stay visible as history.
+	QueueFullDropsRecent uint64 `json:"queue_full_drops_recent"`
+	WriteErrorsRecent    uint64 `json:"write_errors_recent"`
+	WriteStallsRecent    uint64 `json:"write_stalls_recent"`
 }
 
 type sessionRoute struct {
@@ -152,10 +179,18 @@ type sessionRoute struct {
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
 	queueFullDrops  atomic.Uint64
-	queueOccupancy  int        // guarded by aggregateQueueMu; reconciles compatibility drains
-	writeMu         sync.Mutex // admission and completion; never acquired under f.mu
-	retired         atomic.Bool
-	writeMetrics    DeviceWriteTelemetry // guarded by Forwarder.writeMetricsMu
+	queueOccupancy  int // guarded by aggregateQueueMu; reconciles compatibility drains
+	// pressure windows the route's monotonic failure counters so HasPressure
+	// can mean "degraded now" instead of "degraded at some point since the
+	// route was created" (issue #424 round 6, finding 3). It has its own mutex
+	// and is never touched on the packet path.
+	pressure       routePressureWindow
+	writeMu        sync.Mutex // admission and completion; never acquired under f.mu
+	retired        atomic.Bool
+	createdAt      time.Time
+	traffic        trafficCounters
+	writeMetrics   DeviceWriteTelemetry  // guarded by Forwarder.writeMetricsMu
+	writeLatencies routeLatencyReservoir // guarded by Forwarder.writeMetricsMu
 	// stopCh terminates this route's pumpClientQueue goroutine on session
 	// teardown; stopped guards exactly-once close. The client queue itself is
 	// deliberately NOT closed because RouteBackendToClient sends to it after
@@ -179,10 +214,11 @@ type Forwarder struct {
 	accountant       *TrafficAccountant
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
-	backendQueues    map[int64]chan []byte    // backendTunnelID -> queue
-	backendDevices   map[int64]PacketDevice   // backendTunnelID -> device
-	backendPumpStops map[int64]chan struct{}  // backendTunnelID -> pump stop channel
-	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
+	backendTraffic   map[int64]*trafficCounters
+	backendQueues    map[int64]chan []byte   // backendTunnelID -> queue
+	backendDevices   map[int64]PacketDevice  // backendTunnelID -> device
+	backendPumpStops map[int64]chan struct{} // backendTunnelID -> pump stop channel
+	backendPumpDones map[int64]chan struct{} // backendTunnelID -> pump done channel
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -195,10 +231,17 @@ type Forwarder struct {
 	portalSubnet        *net.IPNet
 	totalRxBytes        atomic.Int64
 	totalTxBytes        atomic.Int64
+	totalRxPackets      atomic.Uint64
+	totalTxPackets      atomic.Uint64
 	dropsQueueFull      atomic.Uint64 // return packets dropped: per-route queue full
 	dropsNoRoute        atomic.Uint64 // return packets dropped: unroutable / no session registered (issue #151)
 	dropsPacketTooLarge atomic.Uint64 // return packets dropped because they exceed the queued payload bound
 	dropsTotal          atomic.Uint64 // return-path drops counted so far
+
+	clientDropsQueueFull   atomic.Uint64 // client packets dropped: backend queue full
+	clientDropsRateLimited atomic.Uint64 // client packets dropped: upstream token bucket exhausted
+	clientDropsNoBackend   atomic.Uint64 // client packets dropped: backend queue not registered/found
+	clientDropsTotal       atomic.Uint64 // monotonic total of client->backend drops in forwarder
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -235,8 +278,13 @@ type Forwarder struct {
 	writeErrLogUntil        atomic.Int64
 	writeMetricsMu          sync.Mutex
 	writeMetrics            DeviceWriteTelemetry
+	writeHistogram          writeDurationHistogram
+	writeLatencies          latencyReservoir
 	writesInFlight          map[*sessionRoute]time.Time
-	aggregateQueueOccupancy int // guarded by aggregateQueueMu
+	rateTracker             *RateTracker
+	aggregateQueueOccupancy int               // guarded by aggregateQueueMu
+	aggregateQueueCapacity  int               // guarded by aggregateQueueMu
+	queueDwell              queueDwellTracker // guarded by aggregateQueueMu
 	aggregateQueueHighWater atomic.Uint64
 	// aggregateQueueMu serializes managed queue operations so aggregate
 	// high-water is sampled at the same linearization point as enqueue/dequeue.
@@ -370,6 +418,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		bufSize:          queueSize,
 		backendBufSize:   DefaultBackendQueueSize,
 		maxActiveRoutes:  maxActiveRoutes,
+		rateTracker:      NewRateTracker(),
 		stopCh:           make(chan struct{}),
 	}, nil
 }
@@ -450,6 +499,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	// Ensure backend queue exists
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
 		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 
 	var tbDown, tbUp *TokenBucket
@@ -461,6 +511,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	}
 
 	route := &sessionRoute{
+		createdAt:       time.Now(),
 		returnPath:      path,
 		sessionID:       sessionID,
 		connectionID:    connectionID,
@@ -482,6 +533,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 		retirement.route = old
 		f.stopRoutePumpLocked(old)
 		f.drainRouteQueueLocked(old)
+		f.changeQueueCapacityLocked(-cap(old.clientQueue))
 		if old.assignedIP != "" {
 			if current, exists := f.routesByIP[old.assignedIP]; exists && current == old {
 				delete(f.routesByIP, old.assignedIP)
@@ -494,6 +546,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	f.peerRegs[peerKey]++
 
 	f.routesByPeer[peerKey] = route
+	f.changeQueueCapacityLocked(cap(route.clientQueue))
 	if assignedIP != "" {
 		f.routesByIP[assignedIP] = route
 	}
@@ -530,11 +583,12 @@ func (f *Forwarder) drainRouteQueueLocked(route *sessionRoute) {
 	}
 	f.aggregateQueueMu.Lock()
 	defer f.aggregateQueueMu.Unlock()
+	f.reconcileBeforeQueueMutationLocked(route)
 	for {
 		select {
 		case <-route.clientQueue:
-		default:
 			f.reconcileQueueOccupancyLocked(route)
+		default:
 			return
 		}
 	}
@@ -658,6 +712,7 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		// late senders just fill the abandoned buffer and hit ErrQueueFull.
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
+		f.changeQueueCapacityLocked(-cap(route.clientQueue))
 	}
 	return retirement
 }
@@ -678,6 +733,7 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		delete(f.routesByPeer, route.peerKey)
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
+		f.changeQueueCapacityLocked(-cap(route.clientQueue))
 	}
 	return retirements
 }
@@ -695,6 +751,8 @@ func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
 	clear(f.routesByIP)
 	f.aggregateQueueMu.Lock()
 	f.aggregateQueueOccupancy = 0
+	f.aggregateQueueCapacity = 0
+	f.queueDwell.observe(time.Now(), 0, 0)
 	f.aggregateQueueMu.Unlock()
 	f.mu.Unlock()
 
@@ -756,6 +814,7 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 
 	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
 		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(newBackendTunnelID)
 	}
 
 	route.backendTunnelID = newBackendTunnelID
@@ -796,31 +855,58 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 
 	beQueue, ok := f.backendQueues[route.backendTunnelID]
 	if !ok {
+		f.clientDropsNoBackend.Add(1)
+		f.clientDropsTotal.Add(1)
 		f.mu.RUnlock()
 		return ErrBackendNotFound
 	}
 	sID := route.sessionID
 	cID := route.connectionID
 	tbUp := route.tbUp
+	backendTraffic := f.backendTraffic[route.backendTunnelID]
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
 	if tbUp != nil && !tbUp.Allow(pktLen) {
+		f.clientDropsRateLimited.Add(1)
+		f.clientDropsTotal.Add(1)
 		return ErrRateLimitExceeded
 	}
 
-	f.totalRxBytes.Add(pktLen)
-	if f.accountant != nil {
-		f.accountant.RecordRx(sID, cID, pktLen)
-	}
-
+	// The packet copy happens before the send attempt, so the drop path costs
+	// the same allocation it always did; only the ACCOUNTING placement is
+	// under review here (issue #424 round 3, finding 2).
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
 
+	// Throughput accounting records ADMITTED traffic: bytes the backend
+	// actually received. It therefore runs only once the packet is on the
+	// backend queue. It used to run before the send, so a packet refused by
+	// a full queue was counted as backend RX AND as a queue-full drop at the
+	// same time — diagnostics could report +1500 bytes of backend throughput
+	// alongside queue-full +1 for one packet the backend never accepted,
+	// which is the opposite of what per-backend traffic is for (#432).
+	//
+	// Rejected traffic is still visible: it is counted by
+	// clientDropsQueueFull/clientDropsTotal below and reported as the
+	// client_backend_queue_full reason, so no packet is lost from the
+	// accounting — it simply stops being reported as carried throughput.
 	select {
 	case beQueue <- pktCopy:
+		f.totalRxBytes.Add(pktLen)
+		f.totalRxPackets.Add(1)
+		// route.traffic also advances the route's last-traffic age (#433),
+		// so a refused packet must not reset "last seen" for a route that
+		// carried nothing.
+		route.traffic.record(pktLen, true)
+		backendTraffic.record(pktLen, true)
+		if f.accountant != nil {
+			f.accountant.RecordRx(sID, cID, pktLen)
+		}
 		return nil
 	default:
+		f.clientDropsQueueFull.Add(1)
+		f.clientDropsTotal.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -868,6 +954,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	sID := route.sessionID
 	cID := route.connectionID
 	tbDown := route.tbDown
+	backendTraffic := f.backendTraffic[backendTunnelID]
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
@@ -893,6 +980,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
+	f.reconcileBeforeQueueMutationLocked(route)
 	select {
 	case clientQueue <- pktCopy:
 		f.reconcileQueueOccupancyLocked(route)
@@ -917,6 +1005,9 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
 		f.totalTxBytes.Add(pktLen)
+		f.totalTxPackets.Add(1)
+		route.traffic.record(pktLen, false)
+		backendTraffic.record(pktLen, false)
 		if f.accountant != nil {
 			f.accountant.RecordTx(sID, cID, pktLen)
 		}
@@ -990,11 +1081,15 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
 		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 	if dev != nil {
 		f.backendDevices[backendTunnelID] = dev
+		f.ensureBackendTrafficLocked(backendTunnelID)
+		f.backendTraffic[backendTunnelID] = &trafficCounters{}
 	} else {
 		delete(f.backendDevices, backendTunnelID)
+		delete(f.backendTraffic, backendTunnelID)
 	}
 
 	if f.pumpsRunning && dev != nil {
@@ -1011,6 +1106,7 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 func (f *Forwarder) DetachBackendDevice(backendTunnelID int64) {
 	f.mu.Lock()
 	delete(f.backendDevices, backendTunnelID)
+	delete(f.backendTraffic, backendTunnelID)
 	var oldStopCh chan struct{}
 	var oldDoneCh chan struct{}
 	if stopCh, exists := f.backendPumpStops[backendTunnelID]; exists {
@@ -1144,21 +1240,38 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 // active peer queues. The per-route snapshot remains available through
 // AllRouteQueueStats for diagnosis of an individual stalled consumer.
 func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
+	occupancy, capacity, highWater, _ = f.aggregateQueueSnapshot()
+	return
+}
+
+// aggregateQueueSnapshot reconciles legacy handles and reads dwell coherently.
+// Managed mutations update dwell at their transition; compatibility drains can
+// only reset the unobserved run at this snapshot, never supply a past drain time.
+func (f *Forwarder) aggregateQueueSnapshot() (occupancy, capacity, highWater int, dwell queueDwellSnapshot) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	f.aggregateQueueMu.Lock()
 	defer f.aggregateQueueMu.Unlock()
-	occupancy = 0
-	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- aggregate queue high-water is bounded by active queue capacities.
+	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- bounded by active queue capacities.
+	reconciled := false
 	for _, route := range f.routesByPeer {
 		if route == nil {
 			continue
 		}
-		occupancy += len(route.clientQueue)
-		f.reconcileQueueOccupancyLocked(route)
+		current := len(route.clientQueue)
+		reconciled = reconciled || current != route.queueOccupancy
+		route.queueOccupancy = current
+		occupancy += current
 		capacity += cap(route.clientQueue)
 	}
-	return
+	f.aggregateQueueOccupancy, f.aggregateQueueCapacity = occupancy, capacity
+	now := time.Now()
+	if reconciled {
+		f.queueDwell.reconcile(now, occupancy, capacity)
+	} else {
+		f.queueDwell.observe(now, occupancy, capacity)
+	}
+	return occupancy, capacity, highWater, f.queueDwell.snapshot(now)
 }
 
 // DeviceWriteStats returns client-device write failures, total write duration,
@@ -1197,6 +1310,19 @@ func (f *Forwarder) DropsPacketTooLarge() uint64 {
 	return f.dropsPacketTooLarge.Load()
 }
 
+// ClientDropStats returns the number of client-to-backend packets dropped because
+// the backend queue was full, rate limited, or no backend was found, along with
+// the monotonic total of client-to-backend drops in the forwarder.
+func (f *Forwarder) ClientDropStats() (queueFull, rateLimited, noBackend, total uint64) {
+	if f == nil {
+		return 0, 0, 0, 0
+	}
+	return f.clientDropsQueueFull.Load(),
+		f.clientDropsRateLimited.Load(),
+		f.clientDropsNoBackend.Load(),
+		f.clientDropsTotal.Load()
+}
+
 // InPortalSubnet reports whether ip belongs to the portal client pool.
 // Unparseable IPs and an unknown subnet both answer false (fail-closed).
 func (f *Forwarder) InPortalSubnet(ip string) bool {
@@ -1217,6 +1343,48 @@ func (f *Forwarder) InPortalSubnet(ip string) bool {
 // abuse (or severe NAT misconfiguration) and are safe to alert on.
 func (f *Forwarder) SpoofedRebinds() uint64 {
 	return f.spoofedRebinds.Load()
+}
+
+// PacketStats returns monotonic totals of received and transmitted packets.
+func (f *Forwarder) PacketStats() (rxPackets, txPackets uint64) {
+	if f == nil {
+		return 0, 0
+	}
+	return f.totalRxPackets.Load(), f.totalTxPackets.Load()
+}
+
+// Rates updates and returns recent throughput and packet rates.
+func (f *Forwarder) Rates() TrafficRates {
+	if f == nil {
+		return TrafficRates{}
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, _ := f.AggregateQueueStats()
+	if f.rateTracker != nil {
+		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		return f.rateTracker.Snapshot(rxPackets, txPackets)
+	}
+	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
+}
+
+// QueuePressure updates and returns queue pressure duration and utilization.
+func (f *Forwarder) QueuePressure() QueuePressureStats {
+	if f == nil {
+		return QueuePressureStats{}
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, hw, dwell := f.aggregateQueueSnapshot()
+	f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+	stats := f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
+	stats.SecondsAbove50Pct, stats.SecondsAbove80Pct = dwell.total50, dwell.total80
+	stats.ConsecutiveAbove50Sec, stats.ConsecutiveAbove80Sec = dwell.consecutive50, dwell.consecutive80
+	return stats
 }
 
 func (f *Forwarder) stopPumpsSignalOnly() {
@@ -1298,6 +1466,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		// Never receive outside the accounting lock: even a receive followed
 		// immediately by a lock can make an enqueue miss its actual peak.
 		f.aggregateQueueMu.Lock()
+		f.reconcileBeforeQueueMutationLocked(route)
 		select {
 		case pkt = <-route.clientQueue:
 			f.reconcileQueueOccupancyLocked(route)
@@ -1393,6 +1562,18 @@ func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stopTimeout = d
+}
+
+// SetBackendQueueForTest sets or deletes a backend queue for testing drop behavior.
+func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch == nil {
+		delete(f.backendQueues, backendTunnelID)
+	} else {
+		f.backendQueues[backendTunnelID] = ch
+		f.ensureBackendTrafficLocked(backendTunnelID)
+	}
 }
 
 func (f *Forwarder) getStopTimeout() time.Duration {

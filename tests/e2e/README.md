@@ -96,22 +96,23 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 |------|-------|---------------|
 | `test_setup.py` | 4 | Initial setup wizard, validation, admin creation, lock |
 | `test_onboard.py` | 4 | Server 1 SSH onboarding, fingerprint confirm, AWG 3.1 deploy, health |
-| `test_auth.py` | 7 | Login page, success, failure, slide captcha, rate limiting, CSRF, logout |
-| `test_servers.py` | 10 | Server list, detail, check, install, stats, add form, reboot, edit host validation & lifecycle |
+| `test_auth.py` | 10 | Login page, success, failure, slide captcha, rate limiting, CSRF, logout, password change, logout-all |
+| `test_servers.py` | 14 | Server list, detail, check, install, stats, add form, reboot, edit host validation & lifecycle, reachability, container toggle, server config get/save, connection edit |
 | `test_connections.py` | 5 | Connection list, add, config/QR, toggle, delete |
 | `test_users.py` | 7 | User list, add, edit, toggle, add connection, delete, XSS |
-| `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
+| `test_my_connections.py` | 6 | User login+list, create, view config, role access denied, rename connection, alias endpoint |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
-| `test_share.py` | 3 | Enable sharing, access share link, download config |
+| `test_share.py` | 5 | Enable sharing, access share link, download config, public leaderboard, share token endpoints |
+| `test_vpn.py` | 13 | Forwarder health dashboard UI, banner, KPIs, 11 diagnostic panels, sparklines window switcher, problem routes toggle, and full /api/vpn/* REST endpoints |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 52 test scenarios across 10 test suites (4 in Stage 1, 4 in Stage 2, 44 in Stage 3)**
+**Total: 76 test scenarios across 11 test suites (4 in Stage 1, 4 in Stage 2, 68 in Stage 3)**
 
 ---
 
 ## E2E Test Suite & Exact API Coverage Matrix
 
-The following table provides the exhaustive mapping of all 46 test scenarios across all 9 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
+The following table provides the exhaustive mapping of all 76 test scenarios across all 11 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
 
 | Test File | Test Name | Target UI / Page Visited | Exact APIs Called | HTTP Method |
 |-----------|-----------|--------------------------|-------------------|-------------|
@@ -126,9 +127,13 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_auth.py` | `test_login_page_loads` | `/login` | None (login page load) | GET (UI) |
 | `test_auth.py` | `test_login_success` | `/login` (redirects to `/`) | `/api/auth/login` | POST |
 | `test_auth.py` | `test_login_failure` | `/login` | `/api/auth/login` | POST |
+| `test_auth.py` | `test_slide_captcha_rejects_replay` | `/login` | `/api/auth/captcha`<br>`/api/auth/captcha/verify`<br>`/api/auth/login` | GET<br>POST<br>POST |
+| `test_auth.py` | `test_slide_captcha_browser_login` | `/login` | `/api/auth/captcha`<br>`/api/auth/login` | GET<br>POST |
 | `test_auth.py` | `test_login_rate_limiting` | `/login` | `/api/auth/login` | POST |
 | `test_auth.py` | `test_csrf_protection` | `/login` | `/api/auth/login` | POST |
 | `test_auth.py` | `test_logout` | `/logout` (redirects to `/login`) | None (session termination) | GET (UI) |
+| `test_auth.py` | `test_change_password_page_and_api` | `/change-password`, `/login` | `/api/auth/change-password`<br>`/api/auth/login` | POST<br>POST |
+| `test_auth.py` | `test_logout_all` | `/my`, `/login` | `/api/auth/logout-all`<br>`/api/my/connections` | POST<br>GET |
 | `test_servers.py` | `test_server_list_loads` | `/` | None (server dashboard view) | GET (UI) |
 | `test_servers.py` | `test_server_detail_page` | `/server/{server_id}` | `/api/servers` | GET |
 | `test_servers.py` | `test_server_check` | Server Detail / Server Actions | `/api/servers`<br>`/api/servers/{server_id}/check` | GET<br>POST |
@@ -136,6 +141,12 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_servers.py` | `test_server_stats` | Server Detail / Real-time Metrics | `/api/servers`<br>`/api/servers/{server_id}/stats` | GET<br>POST |
 | `test_servers.py` | `test_server_add_form` | `/` (Add Server Modal) | None (form modal rendering) | GET (UI) |
 | `test_servers.py` | `test_server_reboot` | Server Detail / Server Actions | `/api/servers`<br>`/api/servers/{server_id}/reboot` | GET<br>POST |
+| `test_servers.py` | `test_server_edit_host_ui_validation` | Server Detail / Edit Host Modal | `/api/servers`<br>`/api/servers/{server_id}/host` | GET<br>POST |
+| `test_servers.py` | `test_server_edit_host_ui_lifecycle` | Server Detail / Edit Host Modal | `/api/servers`<br>`/api/servers/{server_id}/host` | GET<br>POST |
+| `test_servers.py` | `test_server_reachability` | Server Detail | `/api/servers/{server_id}/reachability` | GET |
+| `test_servers.py` | `test_server_container_toggle` | Server Detail / Container Action | `/api/servers/{server_id}/container/toggle` | POST |
+| `test_servers.py` | `test_server_config_get_and_save` | Server Detail / Server Config Modal | `/api/servers/{server_id}/server_config`<br>`/api/servers/{server_id}/server_config/save` | POST<br>POST |
+| `test_servers.py` | `test_server_connections_edit` | Server Detail / Connections Tab | `/api/servers/{server_id}/connections/edit` | POST |
 | `test_users.py` | `test_user_list_loads` | `/users` | `/api/users/` | GET |
 | `test_users.py` | `test_add_user` | `/users` (Add User Modal) | `/api/users/add`<br>`/api/users/{user_id}/delete` | POST<br>POST |
 | `test_users.py` | `test_edit_user` | `/users` (Edit User Modal) | `/api/users/add`<br>`/api/users/?size=100`<br>`/api/users/{user_id}/update`<br>`/api/users/{user_id}/delete` | POST<br>GET<br>POST<br>POST |
@@ -152,6 +163,8 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_my_connections.py` | `test_create_connection` | `/my` (Self-Service Add Connection) | `/api/servers/`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>GET<br>POST<br>POST |
 | `test_my_connections.py` | `test_view_connection_config` | `/my` (View Config Modal) | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/servers/`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/connections`<br>`/api/servers/{server_id}/connections/config`<br>`/api/users/{user_id}/delete` | POST<br>POST<br>GET<br>GET<br>POST<br>GET<br>POST<br>POST |
 | `test_my_connections.py` | `test_role_access_denied` | `/login`, `/logout`, `/settings` (Admin Guard) | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/settings` | POST<br>POST<br>GET<br>GET |
+| `test_my_connections.py` | `test_rename_connection` | `/my` | `/api/my/connections/{id}/rename` | POST |
+| `test_my_connections.py` | `test_connections_alias_endpoint` | None (Direct REST API) | `/api/connections/` | GET |
 | `test_settings.py` | `test_settings_page_loads` | `/settings` | None (settings page load) | GET (UI) |
 | `test_settings.py` | `test_change_title` | `/settings` (Appearance Settings), `/` | `/api/settings`<br>`/api/settings/save` | GET<br>POST |
 | `test_settings.py` | `test_captcha_toggle` | `/settings` (Security / Captcha Settings) | `/api/settings`<br>`/api/settings/save` | GET<br>POST |
@@ -161,6 +174,21 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_share.py` | `test_enable_sharing` | `/users` (Share Setup Modal) | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup` | GET<br>POST<br>POST |
 | `test_share.py` | `test_access_share_link` | `/share/{share_token}` | `/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST |
 | `test_share.py` | `test_download_config_from_share` | `/share/{share_token}` (Config Download) | `/api/servers/`<br>`/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/share/{token}/auth`<br>`/api/users/{user_id}/delete` | GET<br>GET<br>POST<br>POST<br>POST<br>POST |
+| `test_share.py` | `test_leaderboard_api` | None (Direct REST API) | `/api/leaderboard` | GET |
+| `test_share.py` | `test_share_token_connections_and_config` | `/share/{share_token}` | `/api/share/{token}/connections`<br>`/api/share/{token}/config/{id}` | GET<br>POST |
+| `test_vpn.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn` (Forwarder Health Dashboard) | None (dashboard rendering) | GET (UI) |
+| `test_vpn.py` | `test_vpn_kpi_summary_bar` | `/vpn` (Forwarder Health Dashboard) | None (8 KPI cards rendering) | GET (UI) |
+| `test_vpn.py` | `test_vpn_diagnostic_panels` | `/vpn` (Forwarder Health Dashboard) | None (11 diagnostic panels rendering) | GET (UI) |
+| `test_vpn.py` | `test_vpn_sparklines_window_toggle` | `/vpn` (Interactive Trends) | None (15m/1h/6h/24h toggle interaction) | GET (UI) |
+| `test_vpn.py` | `test_vpn_problem_routes_toggle` | `/vpn` (Problem Routes Section) | None (Problem / all routes toggle) | GET (UI) |
+| `test_vpn.py` | `test_vpn_status_api` | None (Direct REST API) | `/api/vpn/status` | GET |
+| `test_vpn.py` | `test_vpn_sessions_api` | None (Direct REST API) | `/api/vpn/sessions` | GET |
+| `test_vpn.py` | `test_vpn_backends_api` | None (Direct REST API) | `/api/vpn/backends` | GET |
+| `test_vpn.py` | `test_vpn_tunnels_api` | None (Direct REST API) | `/api/vpn/tunnels` | GET |
+| `test_vpn.py` | `test_vpn_config_lifecycle` | None (Direct REST API) | `/api/vpn/config` | GET<br>POST |
+| `test_vpn.py` | `test_vpn_backend_enable_disable` | None (Direct REST API) | `/api/vpn/backends/{server_id}/disable`<br>`/api/vpn/backends/{server_id}/enable` | POST<br>POST |
+| `test_vpn.py` | `test_vpn_disconnect_session` | None (Direct REST API) | `/api/vpn/disconnect` | POST |
+| `test_vpn.py` | `test_vpn_user_self_service` | None (Direct REST API) | `/api/vpn/my-connection`<br>`/api/vpn/my-config` | GET<br>GET |
 | `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
 | `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
 
@@ -168,13 +196,15 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 
 ## Categorized Summary of Tested REST API Endpoints
 
-The E2E test suite exercises 26 distinct REST API routes across the platform, including 24 core functional endpoints and 2 automated server onboarding endpoints:
+The E2E test suite exercises 41 distinct REST API routes across the platform, including 2 automated server onboarding endpoints and full coverage of the VPN subsystem:
 
-### 1. Authentication & Initial Setup (2 endpoints)
+### 1. Authentication & Credentials (4 endpoints)
 - `POST /api/auth/setup` - Initial administrator account setup (locked after initialization)
 - `POST /api/auth/login` - User and administrator authentication session initialization
+- `POST /api/auth/change-password` - User password change and credential rotation
+- `POST /api/auth/logout-all` - Invalidates all active sessions for authenticated user
 
-### 2. Server Management & Diagnostics (7 endpoints)
+### 2. Server Management & Diagnostics (11 endpoints)
 - `GET /api/servers` (or `/api/servers/`) - Lists registered servers and protocol statuses
 - `POST /api/servers/add` - Initiates SSH handshake and captures host key fingerprint
 - `POST /api/servers/confirm-fingerprint` - Confirms SSH fingerprint and persists server record
@@ -182,11 +212,16 @@ The E2E test suite exercises 26 distinct REST API routes across the platform, in
 - `POST /api/servers/{server_id}/install` - Deploys protocol container (AmneziaWG 3.1) on target server
 - `POST /api/servers/{server_id}/stats` - Queries real-time host CPU and RAM telemetry
 - `POST /api/servers/{server_id}/reboot` - Dispatches system reboot command to target server host
+- `POST /api/servers/{server_id}/host` (and PATCH) - Updates server hostname / IP address with validation
+- `GET /api/servers/{server_id}/reachability` - Probes live host reachability and latency
+- `POST /api/servers/{server_id}/container/toggle` - Stops or restarts protocol container
+- `POST /api/servers/{server_id}/server_config` and `/save` - Inspects and persists raw server configuration
 
-### 3. Server Connection Peer Management (3 endpoints)
+### 3. Server Connection Peer Management (4 endpoints)
 - `POST /api/servers/{server_id}/connections/config` - Fetches WireGuard / AmneziaWG configuration profile and QR text
 - `POST /api/servers/{server_id}/connections/toggle` - Enables or disables client peer connection state on server
 - `POST /api/servers/{server_id}/connections/remove` - Disconnects client peer and deletes allocated IP routing
+- `POST /api/servers/{server_id}/connections/edit` - Updates peer connection name and configuration parameters
 
 ### 4. User Directory Management (5 endpoints)
 - `GET /api/users/` (with pagination `?size=100`) - Retrieves paginated list of user accounts and roles
@@ -200,17 +235,33 @@ The E2E test suite exercises 26 distinct REST API routes across the platform, in
 - `POST /api/users/{user_id}/connections/add` - Provisions and allocates a new protocol connection for the user
 - `POST /api/users/{user_id}/share/setup` - Enables or disables web share links and configures share password protection
 
-### 6. User Self-Service Portal (1 endpoint)
+### 6. User Self-Service Portal (3 endpoints)
 - `GET /api/my/connections` - Fetches authenticated user's self-service connections and quota limits
+- `POST /api/my/connections/{id}/rename` - Renames client connection profile
+- `GET /api/connections/` - Standard alias returning user connections and quota limits
 
-### 7. System Settings & Maintenance (3 endpoints)
+### 7. VPN Subsystem & Forwarder Diagnostics (9 endpoints)
+- `GET /api/vpn/status` - Complete forwarder health assessment, rates, latency percentiles, VirtualTUN, route queues
+- `GET /api/vpn/sessions` - Active sessions and connected peer telemetry
+- `GET /api/vpn/backends` - Configured backend tunnels, health states, and traffic metrics
+- `GET /api/vpn/tunnels` - Active tunnel interfaces and transport state
+- `GET /api/vpn/config` and `POST /api/vpn/config` - VPN subsystem settings and health threshold management
+- `POST /api/vpn/backends/{server_id}/enable` - Enables backend tunnel in routing pool
+- `POST /api/vpn/backends/{server_id}/disable` - Drains and disables backend tunnel
+- `POST /api/vpn/disconnect` - Disconnects active VPN session
+- `GET /api/vpn/my-connection` and `GET /api/vpn/my-config` - User self-service VPN connection and config
+
+### 8. System Settings & Maintenance (3 endpoints)
 - `GET /api/settings` - Retrieves global panel configuration (appearance, security, limits)
 - `POST /api/settings/save` - Persists updated panel appearance, branding, and security parameters
 - `GET /api/system/upstream-status` - Retrieves upstream component release status and update availability (supports `?refresh=true`)
 
-### Additional Utility & Public Endpoints (2 endpoints)
+### 9. Public, Share & Utility Endpoints (4 endpoints)
 - `GET /api/settings/backup/download` - Downloads complete JSON database backup archive
+- `GET /api/leaderboard` - Public data plane traffic leaderboard
 - `POST /api/share/{token}/auth` - Verifies passphrase and authenticates access to shared client configuration
+- `GET /api/share/{token}/connections` and `POST /api/share/{token}/config/{id}` - Public access to shared connection profiles
+
 
 ---
 

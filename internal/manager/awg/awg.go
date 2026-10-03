@@ -10,6 +10,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -471,6 +472,22 @@ func (m *AWGManager) clientsTablePath() string {
 	return "/opt/amnezia/awg/clientsTable"
 }
 
+// In-container identity artifacts written once during provisioning
+// (initializeServerKeysAndConfig) and refreshed by reconcileServerIdentity.
+const (
+	serverPrivateKeyArtifactPath = "/opt/amnezia/awg/wireguard_server_private_key.key"
+	serverPublicKeyArtifactPath  = "/opt/amnezia/awg/wireguard_server_public_key.key"
+	serverPSKArtifactPath        = "/opt/amnezia/awg/wireguard_psk.key"
+)
+
+// serverIDOf is a nil-safe accessor for logging.
+func serverIDOf(server *models.Server) int64 {
+	if server == nil {
+		return 0
+	}
+	return server.ID
+}
+
 func (m *AWGManager) interfaceName() string {
 	return "awg0"
 }
@@ -699,11 +716,18 @@ func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client s
 
 	keygenScript := fmt.Sprintf(`
 mkdir -p /opt/amnezia/awg
-echo "%s" > /opt/amnezia/awg/wireguard_server_private_key.key
-echo "%s" > /opt/amnezia/awg/wireguard_server_public_key.key
-echo "%s" > /opt/amnezia/awg/wireguard_psk.key
-`, serverPrivKey, serverPubKey, serverPSK)
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(keygenScript)))
+echo "%s" > %s
+echo "%s" > %s
+echo "%s" > %s
+`, serverPrivKey, serverPrivateKeyArtifactPath, serverPubKey, serverPublicKeyArtifactPath, serverPSK, serverPSKArtifactPath)
+	if _, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(keygenScript))); err != nil || code != 0 {
+		// Provisioning keeps its historical best-effort behavior here: the
+		// identity artifacts are recoverable (the config still carries the
+		// private key, and GetServerPublicKey derives from it), so a failed
+		// artifact write must not abort an otherwise valid install.
+		slog.Warn("failed to write AmneziaWG server identity artifacts during provisioning",
+			"container", cName, "exit_code", code, "stderr", strings.TrimSpace(errOut), "error", err)
+	}
 
 	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, nil)
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_awg0.conf", []byte(serverConfig), 0600); err != nil {
@@ -1109,9 +1133,76 @@ func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSH
 	return diskWritten, nil
 }
 
+// strippedConfigPath returns the in-container path that holds the stripped
+// configuration. It lives next to the real configuration so it inherits the
+// same directory conventions, and it is unique per call so concurrent
+// operations never share it.
+func (m *AWGManager) strippedConfigPath(cfgPath string) string {
+	randBytes := make([]byte, 8)
+	_, _ = rand.Read(randBytes)
+	return fmt.Sprintf("%s/.awg-strip-%d-%x.conf", path.Dir(cfgPath), time.Now().UnixNano(), randBytes)
+}
+
+// stripInterfaceConfig runs `awg-quick strip` as a separately checked operation
+// and returns the in-container path of the stripped configuration.
+//
+// Stripping must never be fused into the syncconf command through a process
+// substitution (`<(awg-quick strip ...)`). Bash does not propagate the exit
+// status of a process substitution's producer, so a rejected configuration
+// yielded an empty stream that syncconf happily applied — initializing the
+// interface with a zero private key and peer-replacement flags — while the
+// container exited 0 and the caller reported success. Checking strip on its own
+// guarantees syncconf is unreachable whenever stripping fails, and additionally
+// rejects an empty strip result.
+func (m *AWGManager) stripInterfaceConfig(ctx context.Context, client ssh.SSHClient, cName, cfgPath string) (string, error) {
+	stripPath := m.strippedConfigPath(cfgPath)
+	stripCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
+		ssh.EscapeShellArg(cName),
+		ssh.EscapeShellArg(fmt.Sprintf("%s strip %s > %s && test -s %s",
+			ssh.EscapeShellArg(m.wgBinary()+"-quick"), ssh.EscapeShellArg(cfgPath),
+			ssh.EscapeShellArg(stripPath), ssh.EscapeShellArg(stripPath))))
+	out, errOut, code, err := client.RunSudoCommand(ctx, stripCmd)
+	if err != nil || code != 0 {
+		m.removeContainerFile(ctx, client, cName, stripPath)
+		errMsg := strings.TrimSpace(errOut)
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(out)
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to strip AmneziaWG config in container %s (exit code %d): %s: %w", cName, code, errMsg, err)
+		}
+		return "", fmt.Errorf("failed to strip AmneziaWG config in container %s (exit code %d): %s", cName, code, errMsg)
+	}
+	return stripPath, nil
+}
+
+// removeContainerFile deletes a file created inside a container, best effort.
+// It uses a bounded context detached from ctx so the removal still runs when the
+// caller's context has already been canceled or timed out.
+func (m *AWGManager) removeContainerFile(ctx context.Context, client ssh.SSHClient, cName, filePath string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	_, _, _, _ = client.RunSudoCommand(cleanupCtx, fmt.Sprintf("docker exec -i %s rm -f %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(filePath)))
+}
+
 func (m *AWGManager) syncInterfaceConfig(ctx context.Context, client ssh.SSHClient, cName, cfgPath string) error {
+	// Strip first, separately checked. A failing strip returns here, so syncconf
+	// is never invoked and the caller restores the previous configuration.
+	stripPath, err := m.stripInterfaceConfig(ctx, client, cName, cfgPath)
+	if err != nil {
+		return err
+	}
+	defer m.removeContainerFile(ctx, client, cName, stripPath)
+
+	// syncconf takes TWO operands: the interface AND the name of a configuration
+	// file. The stripped configuration therefore has to arrive as a FILENAME
+	// argument, not on stdin. A shell redirect (`< path`) feeds the file on the
+	// standard input stream and supplies NO second operand, so syncconf aborts
+	// with "Usage: awg syncconf <interface> <configuration filename>". The strip
+	// file already lives inside the container, so passing its path directly
+	// needs no second copy.
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
-		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s <(%s-quick strip %s)", m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)))
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s %s", m.wgBinary(), m.interfaceName(), ssh.EscapeShellArg(stripPath))))
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
 		if restErr := m.restoreInterfaceIfDown(ctx, client, cName, cfgPath); restErr != nil {
@@ -3015,13 +3106,77 @@ func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHCli
 	return 0
 }
 
-// GetServerPublicKey returns the public key for AmneziaWG server.
-func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Server) (string, error) {
-	client, err := m.getSSHClient(ctx, server)
-	if err != nil {
-		return "", err
-	}
+// awgKeyPattern matches a base64-encoded 32-byte key. Keys are interpolated
+// into in-container shell scripts during identity reconciliation, so the value
+// is required to match this pattern before it is used: the character class
+// admits no shell metacharacter, which makes the interpolation inert on top of
+// the surrounding ssh.EscapeShellArg.
+var awgKeyPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
 
+// isWireGuardKey reports whether s is a base64-encoded WireGuard key as
+// `wg show <iface> public-key` prints it. Commands in this file chain several
+// probes with `||`, and a host whose shell answers a probe with an unrelated
+// non-empty string (a wrapper banner, "OK" from a permissive mock) must not be
+// mistaken for a key: a value that does not decode is skipped so the next,
+// more authoritative source is consulted.
+func isWireGuardKey(s string) bool {
+	if s == "" {
+		return false
+	}
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
+}
+
+// derivePublicKeyFromPrivate returns the base64 X25519 public key for a
+// base64-encoded 32-byte private key.
+func derivePublicKeyFromPrivate(privKeyBase64 string) (string, error) {
+	privBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privKeyBase64))
+	if err != nil {
+		return "", fmt.Errorf("private key is not valid base64: %w", err)
+	}
+	if len(privBytes) != 32 {
+		return "", fmt.Errorf("private key is %d bytes, want 32", len(privBytes))
+	}
+	pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint)
+	if err != nil {
+		return "", fmt.Errorf("failed to derive public key from private key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pubBytes), nil
+}
+
+// interfacePrivateKey returns the [Interface] PrivateKey from a server
+// configuration, or "" when the section or the key is absent. Only the
+// [Interface] section is scanned so a peer line can never be mistaken for the
+// server's own identity.
+func interfacePrivateKey(configText string) string {
+	inInterface := false
+	for _, line := range strings.Split(configText, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || trimmed == "" {
+			continue
+		}
+		if strings.EqualFold(trimmed, "[Interface]") {
+			inInterface = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			inInterface = false
+			continue
+		}
+		if !inInterface {
+			continue
+		}
+		name, value, found := strings.Cut(trimmed, "=")
+		if found && strings.EqualFold(strings.TrimSpace(name), "privatekey") {
+			return strings.TrimSpace(stripComment(strings.TrimSpace(value)))
+		}
+	}
+	return ""
+}
+
+// candidateContainerNames returns the container names to probe, most specific
+// first: the resolved name, then the remaining known AWG container names.
+func (m *AWGManager) candidateContainerNames(ctx context.Context, client ssh.SSHClient) []string {
 	resolved := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(resolved) {
 		resolved = m.containerName()
@@ -3032,34 +3187,93 @@ func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Serv
 			names = append(names, name)
 		}
 	}
+	return names
+}
 
+// GetServerPublicKey returns the public key for AmneziaWG server.
+//
+// Sources are consulted in this order:
+//
+//  1. The live interface (`awg`/`wg show awg0 public-key`). While the interface
+//     is up this is what peers actually authenticate against, so it stays
+//     authoritative — a running-but-different value is never overridden by a
+//     value read off disk.
+//  2. The key derived from the [Interface] PrivateKey of the on-disk
+//     configuration. This is the identity the operator last saved, it costs one
+//     X25519 operation, and it is available whenever the configuration is
+//     readable even if the interface is down.
+//  3. The wireguard_server_public_key.key artifact written during provisioning.
+//     This is a snapshot from provisioning time, so it is a last-resort
+//     recovery source for a stopped container whose configuration cannot be
+//     read — never a source that outranks the configuration. Write-side
+//     reconciliation keeps it in step with the configuration, so on the
+//     recovery path it already describes the current identity.
+func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Server) (string, error) {
+	client, err := m.getSSHClient(ctx, server)
+	if err != nil {
+		return "", err
+	}
+	names := m.candidateContainerNames(ctx, client)
+
+	// 1. Live interface. Authoritative whenever it answers.
 	for _, name := range names {
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_server_public_key.key' 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(name))
+		// awg0 is a literal here, as in the original probe: it is not an
+		// interpolated value, and the interface name is a package constant.
+		// Every value that IS interpolated (the container name and the tool
+		// binary) goes through ssh.EscapeShellArg.
+		cmd := fmt.Sprintf("docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null",
+			ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
-		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
-			return strings.TrimSpace(out), nil
+		if err != nil || code != 0 {
+			continue
+		}
+		// The live probe is the one source that must be validated rather than
+		// merely checked for emptiness: it is now consulted FIRST, and a host
+		// whose `awg`/`wg` wrapper answers with an unrelated non-empty banner
+		// would otherwise be taken as the server identity. A value that does not
+		// decode as base64 is not a key, so fall through to the configured
+		// identity instead.
+		if live := strings.TrimSpace(out); isWireGuardKey(live) {
+			return live, nil
+		}
+		slog.Debug("live AmneziaWG public key probe returned a non-key value; falling back to the configured identity",
+			"container", name, "server_id", serverIDOf(server))
+	}
+
+	// 2. Derive from the configured [Interface] PrivateKey.
+	conf, confErr := m.getServerConfig(ctx, client, names...)
+	if confErr == nil && conf != "" {
+		if derived, err := derivePublicKeyFromPrivate(interfacePrivateKey(conf)); err == nil && derived != "" {
+			return derived, nil
 		}
 	}
 
-	// Also check if public key can be derived from PrivateKey in awg0.conf
-	if conf, err := m.getServerConfig(ctx, client, names...); err == nil && conf != "" {
-		for _, line := range strings.Split(conf, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(strings.ToLower(trimmed), "privatekey") {
-				parts := strings.SplitN(trimmed, "=", 2)
-				if len(parts) == 2 {
-					privKeyBase64 := strings.TrimSpace(parts[1])
-					if privBytes, err := base64.StdEncoding.DecodeString(privKeyBase64); err == nil && len(privBytes) == 32 {
-						if pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint); err == nil {
-							return base64.StdEncoding.EncodeToString(pubBytes), nil
-						}
-					}
-				}
-			}
+	// 3. Provisioning artifact: recovery only, for a stopped container whose
+	// configuration could not be read.
+	for _, name := range names {
+		if !IsValidContainerName(name) {
+			continue
 		}
+		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(serverPublicKeyArtifactPath))
+		out, _, code, err := client.RunSudoCommand(ctx, cmd)
+		if err != nil || code != 0 {
+			continue
+		}
+		artifact := strings.TrimSpace(out)
+		if artifact == "" {
+			continue
+		}
+		if confErr == nil && conf != "" {
+			// The configuration was readable but its private key did not
+			// derive. Surface the disagreement instead of silently handing back
+			// an artifact of unknown age.
+			slog.Warn("falling back to the provisioning AmneziaWG public key artifact; the configured private key did not derive and the artifact may predate the current configuration",
+				"container", name, "server_id", serverIDOf(server))
+		}
+		return artifact, nil
 	}
 
 	return "", errors.New("failed to get AmneziaWG server public key")
@@ -3072,22 +3286,13 @@ func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (s
 		return "", err
 	}
 
-	resolved := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(resolved) {
-		resolved = m.containerName()
-	}
-	names := []string{resolved}
-	for _, name := range AWGContainerNames {
-		if name != resolved && IsValidContainerName(name) {
-			names = append(names, name)
-		}
-	}
+	names := m.candidateContainerNames(ctx, client)
 
 	for _, name := range names {
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_psk.key' 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/wireguard_psk.key' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name))
+		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/wireguard_psk.key' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(serverPSKArtifactPath), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil

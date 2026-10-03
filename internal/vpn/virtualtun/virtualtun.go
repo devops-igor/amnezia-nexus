@@ -26,8 +26,11 @@
 // owners add drops observed outside the device (issue #160 telemetry).
 //
 // Every internal drop also lands in a per-reason bucket (queue-full,
-// oversized, shutdown); Stats reports the breakdown alongside the queue
-// depths. RecordDrop and RecordDropN increment the total only.
+// oversized, shutdown) and in a direction x reason bucket; Stats reports both
+// breakdowns alongside the queue depths. RecordDrop and RecordDropN increment
+// the total and the separate external population, so the per-reason and
+// directional sums fall short of DropsTotal by exactly
+// StatsSnapshot.ExternalDrops(), which is recorded rather than inferred.
 //
 // DroppedPackets therefore INCLUDES shutdown drops: closing a device with
 // packets still queued raises the counter. This is a deliberate semantic
@@ -119,22 +122,61 @@ type VirtualTUN struct {
 	// Close holds the write lock while flipping the state and draining,
 	// making Close linearizable with submissions.
 	closeMu sync.RWMutex
-	mtu     int
-	name    string
+	// readSuspended is a TEST-ONLY gate on Read. It is false for every
+	// production device: nothing outside this package's tests ever sets it,
+	// so the production Read path is unchanged.
+	//
+	// It exists because the upstream engine starts its TUN reader goroutine
+	// inside device.NewDevice, and device.Down() only stops the peers and the
+	// bind (downLocked), so no upstream API can suspend that reader. A test
+	// that needs deterministic INBOUND queue state therefore had no seam.
+	readSuspended atomic.Bool
+	// resumeRead is closed by ResumeReadsForTest to release every Read
+	// blocked on the suspension gate. It is created by SuspendReadsForTest
+	// and replaced by the next SuspendReadsForTest, under readMu.
+	resumeRead chan struct{}
+	// readMu guards resumeRead only.
+	readMu sync.Mutex
+	mtu    int
+	name   string
 	// closedFlag is written only by Close under the write lock and read
 	// by submissions under the read lock; it exists so submissions can
 	// check-and-enqueue atomically without racing on the channel close.
 	closedFlag bool
 	batchSize  int
-	dropCount  atomic.Uint64
-	// Per-reason drop buckets. They are separate atomics, incremented
-	// alongside dropCount at each internal drop site: the sum of the
-	// buckets can transiently lag or lead the total under concurrency
-	// (see Stats).
-	dropQueueFull atomic.Uint64
-	dropOversized atomic.Uint64
-	dropShutdown  atomic.Uint64
-	once          sync.Once
+	// dropCount is the device-wide drop total behind DroppedPackets: every
+	// internal drop plus every RecordDrop/RecordDropN. It is deliberately
+	// NOT the source of StatsSnapshot.DropsTotal, which is derived from the
+	// per-bucket reads so the snapshot stays coherent.
+	dropCount atomic.Uint64
+	// externalDrops counts drops recorded through RecordDrop/RecordDropN,
+	// i.e. drops an outside owner observed without the device itself
+	// classifying them. It is incremented on the RECORDING path (never
+	// derived as a remainder), so an internal queue-full or shutdown loss
+	// can never be published as an external drop. See Stats.
+	externalDrops atomic.Uint64
+	inHighWater   atomic.Uint64
+	outHighWater  atomic.Uint64
+	// Direction x reason drop buckets (issue #424 round 3, finding 1).
+	//
+	// dropQueueFull/dropOversized/dropShutdown carry only a REASON axis and
+	// inDrops/outDrops carry only a DIRECTION axis. Neither can answer "which
+	// direction did this queue-full drop happen in", and the two axes together
+	// are rank-deficient: outbound oversized never happens (Read is the only
+	// oversized site and it drains the inbound queue), yet knowing that does
+	// not resolve the four remaining unknowns. These five counters are the
+	// cross product of the five internal drop sites and make the attribution
+	// exact.
+	//
+	// There is deliberately no outOversized counter: Read is the only site
+	// that drops an oversized packet, and it reads from the inbound queue, so
+	// outbound oversized is not a reachable state.
+	inQueueFull  atomic.Uint64
+	inOversized  atomic.Uint64
+	inShutdown   atomic.Uint64
+	outQueueFull atomic.Uint64
+	outShutdown  atomic.Uint64
+	once         sync.Once
 }
 
 // Compile-time interface compliance.
@@ -203,6 +245,111 @@ func New(cfg Config) (*VirtualTUN, error) {
 	}, nil
 }
 
+// NewSuspendedForTest creates a device whose reads are ALREADY suspended,
+// before any reader goroutine can exist. It is TEST-ONLY and must not be
+// called from production code.
+//
+// This is the only airtight way to freeze the inbound queue for a test whose
+// TUN is driven by a reader started inside device.NewDevice (the upstream AWG
+// engine). Such a reader spends essentially all its life parked inside Read,
+// blocked on <-inPackets, i.e. already past the awaitReadResume check at the
+// top of Read: arming the gate afterwards has no effect, and the very next
+// InjectInbound is dequeued immediately. Suspending before the goroutine is
+// created makes its FIRST Read call block on the gate, so the queue is
+// provably never drained.
+//
+// Production construction is New, which never suspends; the flag is therefore
+// false for every device that a production path can build.
+func NewSuspendedForTest(cfg Config) (*VirtualTUN, error) {
+	vt, err := New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	vt.SuspendReadsForTest()
+	return vt, nil
+}
+
+// ReadsSuspendedForTest reports whether the test-only read gate is armed. It
+// exists so a test can assert that the device it was handed really does have
+// deterministic inbound queue state, rather than assuming it.
+func (t *VirtualTUN) ReadsSuspendedForTest() bool {
+	if t == nil {
+		return false
+	}
+	return t.readSuspended.Load()
+}
+
+// SuspendReadsForTest makes Read stop dequeuing from the inbound queue so a
+// test can build deterministic queue state. It is TEST-ONLY and must not be
+// called from production code.
+//
+// It only takes effect for a Read call that has not yet passed the gate. A
+// reader already parked inside Read stays parked and keeps dequeuing, so a
+// device whose reader is started by device.NewDevice must be built with
+// NewSuspendedForTest instead: there is no way to reach a parked reader.
+//
+// Motivation: the upstream engine starts its TUN reader goroutine inside
+// device.NewDevice and keeps it running for the device's whole life;
+// device.Down() only stops the peers and closes the bind (downLocked), so
+// there is no upstream API that suspends the reader. Any test that injects
+// into the inbound queue and then asserts its occupancy, its peak, or that a
+// later Close drains it is otherwise racing that goroutine, which is why such
+// tests pass on an idle developer machine and fail on a loaded,
+// coverage-instrumented CI runner.
+//
+// While suspended, a Read blocks without consuming anything: the packets stay
+// queued and every drop counter is untouched, exactly as if the reader had not
+// run yet. Close still unblocks a suspended Read, so shutdown cannot hang.
+func (t *VirtualTUN) SuspendReadsForTest() {
+	if t == nil {
+		return
+	}
+	// The gate is armed BEFORE the flag is published, so a Read can never
+	// observe readSuspended with no channel to wait on.
+	t.readMu.Lock()
+	if t.resumeRead == nil {
+		t.resumeRead = make(chan struct{})
+	}
+	t.readMu.Unlock()
+	t.readSuspended.Store(true)
+}
+
+// ResumeReadsForTest releases every Read blocked by SuspendReadsForTest.
+func (t *VirtualTUN) ResumeReadsForTest() {
+	if t == nil {
+		return
+	}
+	t.readSuspended.Store(false)
+	t.readMu.Lock()
+	if t.resumeRead != nil {
+		close(t.resumeRead)
+		t.resumeRead = nil
+	}
+	t.readMu.Unlock()
+}
+
+// awaitReadResume blocks while reads are suspended. It returns false only when
+// the device was closed underneath it, so a suspended Read cannot outlive
+// Close and wedge shutdown.
+func (t *VirtualTUN) awaitReadResume() bool {
+	for t.readSuspended.Load() {
+		t.readMu.Lock()
+		ch := t.resumeRead
+		t.readMu.Unlock()
+		if ch == nil {
+			// Resume ran between the flag check and the lock. Re-check the flag
+			// rather than proceeding on a stale observation.
+			continue
+		}
+		select {
+		case <-ch:
+		case <-t.closed:
+			return false
+		}
+	}
+	return true
+}
+
 // isClosed reports whether the device has been closed. Called by submissions
 // while holding the closeMu read lock so the observation cannot race with the
 // Close transition.
@@ -236,6 +383,11 @@ func (t *VirtualTUN) File() *os.File { return nil }
 // After Close, Read returns an error wrapping ErrClosed; packets still queued
 // are drained and accounted by Close.
 func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	// Test-only suspension gate. readSuspended is false for every production
+	// device, so this is a single atomic load on the production path.
+	if !t.awaitReadResume() {
+		return 0, ErrClosed
+	}
 	select {
 	case <-t.closed:
 		return 0, ErrClosed
@@ -297,7 +449,7 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			// far. Read never waits for a fitting packet: the
 			// caller's next Read re-enters the queue.
 			t.dropCount.Add(1)
-			t.dropOversized.Add(1)
+			t.inOversized.Add(1)
 			return n, nil
 		}
 		copy(dst, pkt)
@@ -350,11 +502,18 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 		copy(out, pkt)
 		select {
 		case t.outPackets <- out:
+			depth := uint64(len(t.outPackets))
+			for current := t.outHighWater.Load(); depth > current; {
+				if t.outHighWater.CompareAndSwap(current, depth) {
+					break
+				}
+				current = t.outHighWater.Load()
+			}
 			n++
 		default:
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
-			t.dropQueueFull.Add(1)
+			t.outQueueFull.Add(1)
 			n++
 		}
 		t.closeMu.RUnlock()
@@ -384,10 +543,17 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 	}
 	select {
 	case t.inPackets <- out:
+		depth := uint64(len(t.inPackets))
+		for current := t.inHighWater.Load(); depth > current; {
+			if t.inHighWater.CompareAndSwap(current, depth) {
+				break
+			}
+			current = t.inHighWater.Load()
+		}
 		return nil
 	default:
 		t.dropCount.Add(1)
-		t.dropQueueFull.Add(1)
+		t.inQueueFull.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -455,9 +621,45 @@ type StatsSnapshot struct {
 	// linearization point.
 	OutboundDepth int
 
-	// DropsTotal mirrors DroppedPackets: every drop counted by the
-	// device plus external drops recorded via RecordDrop/RecordDropN.
-	// Includes shutdown drops drained by Close.
+	InboundCapacity  int
+	OutboundCapacity int
+	InboundPeak      int
+	OutboundPeak     int
+	InboundDrops     uint64
+	OutboundDrops    uint64
+
+	// The five directional x reason buckets below are the cross product of
+	// the internal drop sites (issue #424 round 3, finding 1). Every internal
+	// drop increments exactly one of them, alongside dropCount and exactly
+	// one of the direction and reason aggregates, so
+	//
+	//	InboundQueueFullDrops + InboundOversizedDrops + InboundShutdownDrops + OutboundQueueFullDrops + OutboundShutdownDrops
+	//
+	// equals InboundDrops + OutboundDrops and DropsQueueFull+DropsOversized+
+	// DropsShutdown. They are the only way to tell WHICH direction a
+	// queue-full or shutdown loss happened in; the aggregates above cannot,
+	// because each carries only one axis.
+	//
+	// There is no outbound oversized bucket: Read is the only oversized drop
+	// site and it drains the inbound queue, so the state is unreachable.
+	InboundQueueFullDrops  uint64
+	InboundOversizedDrops  uint64
+	InboundShutdownDrops   uint64
+	OutboundQueueFullDrops uint64
+	OutboundShutdownDrops  uint64
+
+	// DropsExternal counts drops recorded through RecordDrop/RecordDropN:
+	// losses an outside owner observed that the device itself never
+	// classified. It is RECORDED on the recording path, never inferred as
+	// a remainder between independently loaded counters, so an internal
+	// queue-full, oversized or shutdown loss can never appear here.
+	//
+	// ExternalDrops() returns this field.
+	DropsExternal uint64
+
+	// DropsTotal is the total loss across every population: it is always
+	// exactly Sum()+DropsExternal. It mirrors DroppedPackets on a
+	// quiescent device and includes shutdown drops drained by Close.
 	DropsTotal uint64
 
 	// DropsQueueFull counts packets dropped because the destination
@@ -473,50 +675,123 @@ type StatsSnapshot struct {
 	DropsShutdown uint64
 }
 
-// Sum returns the sum of the per-reason drop buckets. External drops
-// recorded through RecordDrop/RecordDropN are intentionally excluded: they
-// have no reason bucket, so Sum equals DropsTotal only when no external
-// drops were recorded and no concurrent drop is in flight.
+// Sum returns the internal drop count: the sum of the per-reason buckets,
+// which are themselves derived from the five directional x reason buckets so
+// the snapshot is internally consistent.
+//
+// External drops recorded through RecordDrop/RecordDropN are deliberately
+// excluded: they carry no reason and no direction, so they live only in
+// DropsExternal. DropsTotal is always exactly Sum()+DropsExternal.
 func (s StatsSnapshot) Sum() uint64 {
 	return s.DropsQueueFull + s.DropsOversized + s.DropsShutdown
 }
 
+// ExternalDrops returns the drops recorded through RecordDrop and
+// RecordDropN: the drops an external owner observed OUTSIDE the device.
+//
+// Those drops carry neither a direction nor a reason — the recording API has
+// no parameter for either — so they belong to no directional bucket and no
+// reason bucket, and every directional x reason sum is short by exactly this
+// amount. Callers MUST account for it explicitly rather than summing buckets
+// and treating the sum as the total; use it as its own named population
+// instead.
+//
+// The figure is RECORDED, not inferred: it was previously computed as the
+// remainder DropsTotal-Sum() between independently loaded atomics, which
+// published an ordinary internal queue-full loss as an external drop whenever
+// a sample landed between the total increment and the bucket increments, and
+// made the loss vanish from the breakdown for the interleaving in the other
+// direction. Because the reason trackers take deltas against a baseline, a
+// loss that migrates between populations across two samples reads as fresh
+// activity.
+func (s StatsSnapshot) ExternalDrops() uint64 {
+	return s.DropsExternal
+}
+
 // Stats returns a snapshot of the queue depths and drop accounting.
 //
-// Consistency: each counter is an independent atomic load and each depth a
-// separate channel-length read, so the snapshot is not a globally consistent
-// point in time. Under concurrent traffic the depths may never be observed
-// together, and the per-reason sum (StatsSnapshot.Sum) can transiently lag
-// or lead DropsTotal (a goroutine can be between the two Add calls at one
-// drop site, and loads of separate atomics are not a single operation).
-// DropsTotal is loaded before the buckets, so a single racy snapshot can
-// even show a bucket ahead of the total; the underlying counters never
-// diverge this way — every counter is individually monotonic and all of
-// them converge once traffic stops. After Close returns the snapshot is
-// stable: depths are zero, no counter can increase except through
-// RecordDrop/RecordDropN. The snapshot is safe to call concurrently with all
-// device operations.
+// Consistency: the snapshot is INTERNALLY COHERENT. Every counter is read
+// exactly once into a local, and every aggregate in the returned value —
+// the direction totals, the reason totals, Sum, DropsExternal and DropsTotal
+// — is DERIVED from those same locals rather than read from its own atomic.
+// So the invariants hold for every sample whatever the device was doing
+// concurrently:
+//
+//	Sum() == InboundDrops + OutboundDrops
+//	Sum() == InboundQueueFullDrops + InboundOversizedDrops + InboundShutdownDrops
+//	       + OutboundQueueFullDrops + OutboundShutdownDrops
+//	DropsTotal == Sum() + DropsExternal
+//
+// A sample may represent a slightly earlier or later instant than any other,
+// since the five counters are still five independent atomics, but it can
+// never report a loss in one bucket and not in the total, count one loss
+// twice, or invent an external drop that was never recorded: the external
+// figure comes from the recording path. Every derived value is also
+// monotonic, because every input counter is monotonic.
+//
+// The depths are still separate channel-length reads and are not jointly
+// consistent with each other under concurrent traffic. After Close returns
+// the snapshot is fully stable: depths are zero and no counter can increase
+// except through RecordDrop/RecordDropN. The snapshot is safe to call
+// concurrently with all device operations.
 func (t *VirtualTUN) Stats() StatsSnapshot {
+	inQueueFull := t.inQueueFull.Load()
+	inOversized := t.inOversized.Load()
+	inShutdown := t.inShutdown.Load()
+	outQueueFull := t.outQueueFull.Load()
+	outShutdown := t.outShutdown.Load()
+	external := t.externalDrops.Load()
+
+	// Reason and direction axes are both derived from the same five
+	// directional x reason reads, which is what makes the two axes agree:
+	// each internal drop site carries exactly one reason AND exactly one
+	// direction, so summing either projection of the same five locals gives
+	// the same number.
+	inboundDrops := inQueueFull + inOversized + inShutdown
+	outboundDrops := outQueueFull + outShutdown
+	internalDrops := inboundDrops + outboundDrops
+
 	return StatsSnapshot{
-		InboundDepth:   len(t.inPackets),
-		OutboundDepth:  len(t.outPackets),
-		DropsTotal:     t.dropCount.Load(),
-		DropsQueueFull: t.dropQueueFull.Load(),
-		DropsOversized: t.dropOversized.Load(),
-		DropsShutdown:  t.dropShutdown.Load(),
+		InboundDepth:     len(t.inPackets),
+		OutboundDepth:    len(t.outPackets),
+		InboundCapacity:  cap(t.inPackets),
+		OutboundCapacity: cap(t.outPackets),
+		InboundPeak:      int(t.inHighWater.Load()),  // #nosec G115 -- bounded by inbound queue capacity.
+		OutboundPeak:     int(t.outHighWater.Load()), // #nosec G115 -- bounded by outbound queue capacity.
+		InboundDrops:     inboundDrops,
+		OutboundDrops:    outboundDrops,
+
+		InboundQueueFullDrops:  inQueueFull,
+		InboundOversizedDrops:  inOversized,
+		InboundShutdownDrops:   inShutdown,
+		OutboundQueueFullDrops: outQueueFull,
+		OutboundShutdownDrops:  outShutdown,
+
+		DropsExternal: external,
+		DropsTotal:    internalDrops + external,
+
+		DropsQueueFull: inQueueFull + outQueueFull,
+		DropsOversized: inOversized,
+		DropsShutdown:  inShutdown + outShutdown,
 	}
 }
 
 // RecordDrop increments the dropped packet counter (issue #160 telemetry
-// hook) for drops observed outside the device.
+// hook) for drops observed outside the device. The loss is recorded in the
+// external population as well, so it is published under DropsExternal rather
+// than appearing later as a remainder between the total and the reason
+// buckets.
 func (t *VirtualTUN) RecordDrop() {
-	t.dropCount.Add(1)
+	t.RecordDropN(1)
 }
 
 // RecordDropN adds n to the dropped packet counter, for external owners that
-// observe drops in batches (issue #160 telemetry hook).
+// observe drops in batches (issue #160 telemetry hook). A zero batch is a
+// no-op. The whole batch lands in the external population: batching never
+// splits an external drop into a reason or a direction it was not given.
 func (t *VirtualTUN) RecordDropN(n uint64) {
 	t.dropCount.Add(n)
+	t.externalDrops.Add(n)
 }
 
 // SendEvent delivers ev to the channel returned by Events. The send never
@@ -569,13 +844,13 @@ func (t *VirtualTUN) Close() error {
 			select {
 			case <-t.inPackets:
 				t.dropCount.Add(1)
-				t.dropShutdown.Add(1)
+				t.inShutdown.Add(1)
 			default:
 			}
 			select {
 			case <-t.outPackets:
 				t.dropCount.Add(1)
-				t.dropShutdown.Add(1)
+				t.outShutdown.Add(1)
 			default:
 			}
 			// Done when both queues are empty; a reader cannot

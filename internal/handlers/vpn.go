@@ -106,8 +106,8 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			// #nosec G706 -- Internal server audit log for failed backend enable
-			log.Printf("[vpn/handlers] failed to enable backend %d: %v", serverID, err)
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend")
+			log.Printf("[vpn/handlers] failed to enable backend %d (stage=%s): %v", serverID, vpn.BackendEnableStage(err), err)
+			h.JSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error", "detail": "Failed to enable backend", "backend_enable_stage": vpn.BackendEnableStage(err)})
 			return
 		}
 	}

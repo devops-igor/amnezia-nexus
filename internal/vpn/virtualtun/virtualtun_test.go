@@ -1066,3 +1066,77 @@ func TestStats_AfterClose(t *testing.T) {
 		t.Errorf("post-Close snapshot perturbed by rejected calls: %+v vs %+v", post3, post)
 	}
 }
+
+func TestVirtualTUN_DirectionalStatsAndPeaks(t *testing.T) {
+	vt, err := New(Config{
+		Name:             "test-peaks",
+		MTU:              1420,
+		InboundCapacity:  5,
+		OutboundCapacity: 4,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer vt.Close()
+
+	initial := vt.Stats()
+	if initial.InboundCapacity != 5 || initial.OutboundCapacity != 4 {
+		t.Fatalf("unexpected capacities: in=%d, out=%d", initial.InboundCapacity, initial.OutboundCapacity)
+	}
+	if initial.InboundPeak != 0 || initial.OutboundPeak != 0 {
+		t.Fatalf("unexpected initial peaks: in=%d, out=%d", initial.InboundPeak, initial.OutboundPeak)
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := vt.InjectInbound([]byte{byte(i)}); err != nil {
+			t.Fatalf("InjectInbound #%d: %v", i, err)
+		}
+	}
+	s := vt.Stats()
+	if s.InboundDepth != 3 || s.InboundPeak != 3 {
+		t.Errorf("inbound mismatch: depth=%d, peak=%d", s.InboundDepth, s.InboundPeak)
+	}
+
+	packets := [][]byte{
+		[]byte{10},
+		[]byte{11},
+	}
+	n, err := vt.Write(packets, 0)
+	if err != nil || n != 2 {
+		t.Fatalf("Write failed: n=%d err=%v", n, err)
+	}
+	s = vt.Stats()
+	if s.OutboundDepth != 2 || s.OutboundPeak != 2 {
+		t.Errorf("outbound mismatch: depth=%d, peak=%d", s.OutboundDepth, s.OutboundPeak)
+	}
+
+	// Fill inbound to capacity and overflow
+	for i := 3; i < 5; i++ {
+		if err := vt.InjectInbound([]byte{byte(i)}); err != nil {
+			t.Fatalf("InjectInbound #%d: %v", i, err)
+		}
+	}
+	errOverflow := vt.InjectInbound([]byte{99})
+	if !errors.Is(errOverflow, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull on overflow, got: %v", errOverflow)
+	}
+	s = vt.Stats()
+	if s.InboundDrops != 1 {
+		t.Errorf("expected InboundDrops=1, got %d", s.InboundDrops)
+	}
+
+	// Fill outbound to capacity and overflow
+	overflowPackets := [][]byte{
+		[]byte{12},
+		[]byte{13},
+		[]byte{14}, // This one overflows (capacity is 4, had 2)
+	}
+	_, err = vt.Write(overflowPackets, 0)
+	if err != nil {
+		t.Fatalf("Write overflow returned err: %v", err)
+	}
+	s = vt.Stats()
+	if s.OutboundDrops != 1 {
+		t.Errorf("expected OutboundDrops=1, got %d", s.OutboundDrops)
+	}
+}

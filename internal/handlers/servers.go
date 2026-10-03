@@ -800,6 +800,15 @@ func (h *Handlers) GetServerConfigHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if req.Protocol == "awg" && h.awgMgr != nil {
+		out, readErr := h.awgMgr.ReadConfiguration(ctx, server)
+		if readErr != nil {
+			h.JSONError(w, http.StatusInternalServerError, "read_failed", "Failed to read AWG configuration")
+			return
+		}
+		h.JSON(w, http.StatusOK, map[string]any{"status": "ok", "config": out})
+		return
+	}
 	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(configPath)))
 	if err != nil || code != 0 {
 		out = "# Configuration not found or empty"
@@ -863,6 +872,15 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if req.Protocol == "awg" && h.awgMgr != nil {
+		if saveErr := h.awgMgr.WriteConfiguration(ctx, server, req.Config); saveErr != nil {
+			h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to apply AWG configuration")
+			return
+		}
+		h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
+		h.JSONOK(w)
+		return
+	}
 	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), 0600); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to save config")
 		return

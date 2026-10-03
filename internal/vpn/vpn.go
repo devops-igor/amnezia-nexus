@@ -27,6 +27,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
@@ -76,6 +77,21 @@ type Status struct {
 	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
 	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
 	PeerSync                       *PeerSyncStatus                      `json:"peer_sync,omitempty"`
+
+	// Issue #424: Redesigned forwarder health & operational diagnostics
+	HealthAssessment   ForwarderHealthAssessment     `json:"health_assessment"`
+	Rates              TrafficRates                  `json:"rates"`
+	QueuePressure      QueuePressureDiagnostics      `json:"queue_pressure"`
+	ForwardLatency     ForwardLatencyDiagnostics     `json:"forward_latency"`
+	DropCategories     DropCategoryBreakdown         `json:"drop_categories"`
+	VirtualTUN         VirtualTUNDiagnostics         `json:"virtual_tun"`
+	RoutingConsistency RoutingConsistencyDiagnostics `json:"routing_consistency"`
+	HandshakeFreshness HandshakeFreshnessDiagnostics `json:"handshake_freshness"`
+	Backends           BackendsDiagnostics           `json:"backends"`
+	ProblemRoutes      []ProblemRouteItem            `json:"problem_routes"`
+	AllRoutes          []ProblemRouteItem            `json:"all_routes,omitempty"`
+	RuntimeResources   RuntimeResources              `json:"runtime_resources"`
+	HistoricalSeries   HistoricalSeries              `json:"historical_series"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -154,29 +170,42 @@ type BackendDevice interface {
 // check-then-allocate capacity decision is only safe under this
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
-	mu            sync.RWMutex
-	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
-	db            *database.DB
-	cfg           *models.VPNConfig
-	sessionMgr    *session.SessionManager
-	ipam          *ipam.IPAM
-	auth          *auth.DBAuthenticator
-	pool          *tunnel.Pool
-	prober        *tunnel.HealthProber
-	reconnectMgr  *tunnel.ReconnectManager
-	balancer      loadbalancer.LoadBalancer
-	stickyMgr     *loadbalancer.StickySessionManager
-	forwarder     *forwarder.Forwarder
-	accountant    *forwarder.TrafficAccountant
-	running       bool
-	portalPubKey  string
-	portalPrivKey string
-	awgProvider   AWGStatusProvider
-	ingressEngine *IngressEngine
+	retiredIngressLosses ingressLossTotals // guarded by mu
+	mu                   sync.RWMutex
+	assignmentMu         sync.Mutex // serialize durable lease creation and restart migration
+	db                   *database.DB
+	cfg                  *models.VPNConfig
+	sessionMgr           *session.SessionManager
+	ipam                 *ipam.IPAM
+	auth                 *auth.DBAuthenticator
+	pool                 *tunnel.Pool
+	prober               *tunnel.HealthProber
+	reconnectMgr         *tunnel.ReconnectManager
+	balancer             loadbalancer.LoadBalancer
+	stickyMgr            *loadbalancer.StickySessionManager
+	forwarder            *forwarder.Forwarder
+	accountant           *forwarder.TrafficAccountant
+	running              bool
+	portalPubKey         string
+	portalPrivKey        string
+	awgProvider          AWGStatusProvider
+	ingressEngine        *IngressEngine
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
-	backendDevices             map[int64]BackendDevice
-	backendDeviceEndpoints     map[int64]string
-	lastLoggedDrops            atomic.Uint64
+	backendDevices         map[int64]BackendDevice
+	backendDeviceEndpoints map[int64]string
+	lastLoggedDrops        atomic.Uint64
+	// retiredBackendDeviceDrops is the LIFETIME accumulator for backend
+	// devices that have left backendDevices (issue #424 round 5, finding 1).
+	//
+	// It is direction- and reason-preserving, not a scalar: a retiring
+	// device's real VirtualTUN breakdown is transferred into the matching
+	// buckets, so a return-direction loss stays a return-direction loss after
+	// the device is gone. The accumulator carries the SAME fields as a live
+	// device's contribution, which is what lets a retired loss be published
+	// under the same key a live one uses.
+	//
+	// guarded by mu
+	retiredBackendDeviceDrops  backendDeviceDropStats
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
 	publicIPMu                 sync.RWMutex
@@ -204,6 +233,16 @@ type Service struct {
 	enableBackendPreAddTunnelHook          func()
 	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
+
+	rollingHistory *RollingHistory
+	diagRatesMu    sync.Mutex
+	diagRates      *diagRatesTracker
+	// diagDeltas converts cumulative lifetime failure counters into windowed
+	// deltas so a recovered incident stops pinning current health (issue #424
+	// round 2, finding 5). Its zero value is usable.
+	diagDeltas    diagDeltaTrackers
+	historyStopCh chan struct{}
+	historyDoneCh chan struct{}
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -630,6 +669,8 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
+		rollingHistory:         NewRollingHistory(),
+		diagRates:              newDiagRatesTracker(),
 	}
 	revokeDispatch.bind(svc)
 
@@ -1107,9 +1148,10 @@ func (s *Service) Start(ctx context.Context) error {
 	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", ClientAWGEngineUpstream, listenPort)
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
-	// Safety net for residual counter drift; gauge-only semantics — it never
+	// Safety net for residual counter drift; gauge-only semantics - it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
+	s.startRollingHistory()
 
 	return nil
 }
@@ -1635,6 +1677,8 @@ func (s *Service) Stop() error {
 	}
 	s.running = false
 	ingressEng := s.ingressEngine
+	initialLosses := engineLossTotals(ingressEng)
+	s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, initialLosses)
 	s.ingressEngine = nil
 	s.mu.Unlock()
 
@@ -1649,6 +1693,9 @@ func (s *Service) Stop() error {
 		if err := ingressEng.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
 			recordErr(err)
 		}
+		s.mu.Lock()
+		s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, ingressLossDelta(engineLossTotals(ingressEng), initialLosses))
+		s.mu.Unlock()
 	}
 	if s.prober != nil {
 		s.prober.Stop()
@@ -1659,6 +1706,7 @@ func (s *Service) Stop() error {
 	if s.forwarder != nil {
 		recordErr(s.forwarder.Stop())
 	}
+	s.stopRollingHistory()
 	if s.pool != nil {
 		_ = s.pool.Close()
 	}
@@ -1668,6 +1716,11 @@ func (s *Service) Stop() error {
 		for id, dev := range s.backendDevices {
 			if dev != nil {
 				_ = dev.Close()
+			}
+			if dev != nil {
+				// Snapshot AFTER Close so the shutdown drains it just
+				// accounted are transferred too.
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 			}
 			delete(s.backendDevices, id)
 		}
@@ -1776,7 +1829,17 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	if s.sessionMgr != nil {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
-	populateForwarderStatus(status, s.forwarder)
+
+	// Capture per-route telemetry exactly once for this status response.
+	// Route pressure contains recency windows over monotonic counters, so a
+	// second read later in the same request is not merely another snapshot:
+	// it can advance the window and consume the incident. Both the legacy
+	// route-queue map and the redesigned diagnostics reuse this value.
+	var routeSnapshot []forwarder.RouteInfo
+	if s.forwarder != nil {
+		routeSnapshot = s.forwarder.InspectRoutes()
+	}
+	populateForwarderStatusFromRoutes(status, s.forwarder, routeSnapshot)
 
 	var totalDrops uint64
 	for _, dev := range s.backendDevices {
@@ -1796,11 +1859,16 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
+	s.populateOperationalDiagnosticsWithRoutes(status, routeSnapshot)
 
 	return status, nil
 }
 
-func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
+// populateForwarderStatusFromRoutes preserves the legacy status keys while
+// using the caller's coherent route snapshot. It must not call
+// AllRouteQueueStats: that method samples the same recency counters again and
+// can consume a just-observed pressure event before problem_routes is built.
+func populateForwarderStatusFromRoutes(status *Status, f *forwarder.Forwarder, routes []forwarder.RouteInfo) {
 	if f == nil {
 		return
 	}
@@ -1811,22 +1879,21 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 	status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = f.DropStats()
 	status.ForwarderDropsPacketTooLarge = f.DropsPacketTooLarge()
 	status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = f.AggregateQueueStats()
-	allRouteQueues := f.AllRouteQueueStats()
-	if len(allRouteQueues) > 0 {
-		peers := make([]string, 0, len(allRouteQueues))
-		for peerKey := range allRouteQueues {
-			peers = append(peers, peerKey)
+
+	if len(routes) > 0 {
+		ordered := append([]forwarder.RouteInfo(nil), routes...)
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i].PeerKey < ordered[j].PeerKey })
+		if len(ordered) > forwarder.MaxSupportedActiveRoutes {
+			ordered = ordered[:forwarder.MaxSupportedActiveRoutes]
 		}
-		sort.Strings(peers)
-		limit := len(peers)
-		if limit > forwarder.MaxSupportedActiveRoutes {
-			limit = forwarder.MaxSupportedActiveRoutes
-		}
-		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
-		for _, peerKey := range peers[:limit] {
-			status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, len(ordered))
+		for _, route := range ordered {
+			stats := route.Stats
+			stats.PeerKeyDisplay = ingress.RedactKey(route.PeerKey)
+			status.ForwarderRouteQueues[ingress.PeerKeyFingerprint(route.PeerKey)] = stats
 		}
 	}
+
 	writes := f.DeviceWriteSnapshot()
 	status.ForwarderDeviceWriteErrors = writes.Errors
 	status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
@@ -2224,7 +2291,14 @@ func parsePort(val any) int {
 // AWG credentials, registering (or refreshing) the tunnel, and attaching its
 // data-plane device. It does not declare the backend healthy: runtime health
 // remains owned by the prober/self-healing subsystem.
-func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
+func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error) {
+	stage := "initialize"
+	defer func() {
+		if err != nil && BackendEnableStage(err) == "unknown" {
+			err = backendEnableFailure(stage, err)
+		}
+	}()
+
 	s.mu.RLock()
 	pool := s.pool
 	db := s.db
@@ -2247,6 +2321,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		initialEnabled = initTun.Enabled
 	}
 
+	stage = "load_server"
 	server, err := db.GetServerByID(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("failed to load server %d: %w", serverID, err)
@@ -2255,6 +2330,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
 	}
 
+	stage = "credentials"
 	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
 	if err != nil {
 		return err
@@ -2269,12 +2345,9 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		preAddHook()
 	}
 
+	stage = "register_tunnel"
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	var postRefreshVersion int64
-	if err == nil && tun != nil {
-		postRefreshVersion = tun.StateVersion
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -2298,6 +2371,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	// registrations refresh in place; a legacy shared-key peer registered under
 	// the data identity keeps its client_ip entry and is re-pointed at the
 	// data-device identity.
+	stage = "register_peers"
 	if awgProv != nil {
 		if err := s.registerBackendPortalPeers(ctx, server, tun); err != nil {
 			_ = pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
@@ -2311,7 +2385,8 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
+	stage = "state_changed"
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2322,7 +2397,6 @@ func (s *Service) finishEnableBackend(
 	serverID int64,
 	hasInitial bool,
 	initialEnabled bool,
-	initialVersion int64,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2345,12 +2419,33 @@ func (s *Service) finishEnableBackend(
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if currTun.StateVersion != initialVersion {
-		return errors.New("backend state modified concurrently; aborting enable")
+	// Fence the enable against a genuine identity change, not against every
+	// StateVersion bump. StateVersion is a single monotonic token that the
+	// health subsystem advances on routine observations too: a successful
+	// background probe reaches Pool.setTunnelStatus (pool.go) via
+	// SetTunnelStatusIfCurrentWithVersion and bumps the live entry's version
+	// while recording nothing but a fresh status/latency/last-check. The prober
+	// ticks every 10s by default, so that bump lands inside the multi-second
+	// SSH window of every enable with high probability, and the abort was a
+	// false positive rather than a real conflict.
+	//
+	// What genuinely invalidates this enable is a replacement of the tunnel
+	// identity the peers were just registered against: a different tunnel row,
+	// a different endpoint, or rotated credentials. That is exactly the set
+	// Pool.AddTunnel advances StateVersion for, plus the endpoint rewrite in
+	// SetTunnelEndpoint. Administrative intent is already covered by the
+	// Enabled checks above, which are exact; a retired or deleted tunnel is
+	// covered by GetTunnel returning ErrTunnelNotFound above.
+	if currTun.ID != tun.ID ||
+		currTun.Endpoint != tun.Endpoint ||
+		currTun.PublicKey != tun.PublicKey ||
+		currTun.PrivateKey != tun.PrivateKey ||
+		currTun.ProbePrivateKey != tun.ProbePrivateKey {
+		return backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
-		return err
+		return backendEnableFailure("attach_device", err)
 	}
 
 	// Issue #50: clear the prober's consecutive-failure counter so the
@@ -2365,13 +2460,13 @@ func (s *Service) finishEnableBackend(
 
 	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
 	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
-		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
+		return backendEnableFailure("persist_enable", fmt.Errorf("failed to persist administrative backend enable: %w", err))
 	}
 	if legacyAdminOnlyState {
 		// Legacy rows encoded administrative disable in runtime status. Once
 		// enabled is authoritative, that old status has no trustworthy health
 		// meaning, so make it unknown/connecting and require a fresh probe.
-		return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0)
+		return backendEnableFailure("persist_enable", pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0))
 	}
 	return nil
 }
@@ -2437,7 +2532,7 @@ func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models
 		"allowed_ips":       portalSubnet,
 	}
 	if _, err := adder.AddClient(ctx, server, dataParams); err != nil {
-		return fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err)
+		return backendEnableFailure("register_data_peer", fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err))
 	}
 
 	probeParams := map[string]any{
@@ -2449,14 +2544,14 @@ func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models
 		// probe peer must never be granted 0.0.0.0/0.
 	}
 	if _, err := adder.AddClient(ctx, server, probeParams); err != nil {
-		return fmt.Errorf("failed to register portal health probe peer on backend server %d: %w", server.ID, err)
+		return backendEnableFailure("register_probe_peer", fmt.Errorf("failed to register portal health probe peer on backend server %d: %w", server.ID, err))
 	}
 
 	// Persist the probe key so the identity is stable across restarts
 	// (Fernet-encrypted at rest by the database layer).
 	if db != nil {
 		if err := db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"probe_private_key": tun.ProbePrivateKey}); err != nil {
-			return fmt.Errorf("failed to persist probe private key for backend tunnel %d (server %d): %w", tun.ID, server.ID, err)
+			return backendEnableFailure("persist_probe_key", fmt.Errorf("failed to persist probe private key for backend tunnel %d (server %d): %w", tun.ID, server.ID, err))
 		}
 	}
 	return nil
@@ -2617,6 +2712,9 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			s.forwarder.DetachBackendDevice(tun.ID)
 			if oldDev != nil {
 				_ = oldDev.Close()
+			}
+			if oldDev != nil {
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
 			delete(s.backendDevices, tun.ID)
 			if s.backendDeviceEndpoints != nil {
@@ -2827,6 +2925,13 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	if dev, ok := s.backendDevices[tunnel.ID]; ok {
 		if dev != nil {
 			_ = dev.Close()
+		}
+		if dev != nil {
+			// The retirement TRANSFER: the device's direction x reason
+			// breakdown moves into the lifetime buckets, so nothing is
+			// double counted while it was live and nothing is reclassified
+			// now that it is gone.
+			s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 		}
 		delete(s.backendDevices, tunnel.ID)
 	}
