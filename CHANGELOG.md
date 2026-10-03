@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Compatibility policy document (`useful_notes/COMPATIBILITY.md`) and its README documentation link. The policy governed API stability guarantees for external consumers; this project has none. Route, package and schema conventions remain enforced by their owning code and tests.
+
 ## [2.1.0] - Pulsar - 2026-10-02
 
 Minor release establishing the official upstream amneziawg-go protocol engine as the permanent client-facing data plane in Amnezia Nexus, decommissioning the legacy custom WireGuard/AmneziaWG state machine, and introducing the differential compatibility qualification suite.
