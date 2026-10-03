@@ -2,11 +2,47 @@
 
 import os
 import time
+from typing import Any
 
 import pytest
 from playwright.sync_api import Page, Request, expect
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
+
+CONFIG_ROUND_TRIP_MARKER = "# E2E config round-trip"
+
+
+def normalize_config_text(value: str) -> str:
+    """Normalize configuration text for read-back comparison.
+
+    The SSH execution path applies strings.TrimSpace to stdout
+    (internal/manager/ssh/exec.go), so surrounding blank lines can never survive a
+    transport read. Comparing byte-for-byte would demand an identity the transport
+    cannot deliver, while the substantive configuration content must still match
+    exactly. Only trailing whitespace is discarded; every other character counts.
+    """
+    return "\n".join(line.rstrip() for line in value.strip().splitlines())
+
+
+def assert_config_persisted(readback: Any, expected: str, marker: str, message: str) -> None:
+    """Assert a saved configuration was read back, ignoring transport whitespace.
+
+    The marker line is asserted separately so a save that silently no-ops still
+    fails: the read-back would lack the marker even if its whitespace happened to
+    normalize to the expected text.
+    """
+    assert isinstance(readback, str), f"{message}: read-back carried no configuration text"
+    normalized = normalize_config_text(readback)
+    assert normalized == normalize_config_text(expected), message
+    assert marker in normalized.splitlines(), f"{message}: saved marker line is absent"
+
+
+def assert_config_restored(readback: Any, original: str, marker: str, message: str) -> None:
+    """Assert the provisioned configuration came back and the marker did not."""
+    assert isinstance(readback, str), f"{message}: read-back carried no configuration text"
+    normalized = normalize_config_text(readback)
+    assert normalized == normalize_config_text(original), message
+    assert marker not in normalized.splitlines(), f"{message}: saved marker line survived"
 
 
 @pytest.mark.e2e
@@ -437,7 +473,7 @@ def test_server_config_get_and_save(
     assert isinstance(original, str)
     has_interface = "[Interface]" in original
     assert has_interface, "Provisioned AWG server config is unavailable"
-    updated = original.rstrip("\n") + "\n# E2E config round-trip\n"
+    updated = original.rstrip("\n") + "\n" + CONFIG_ROUND_TRIP_MARKER + "\n"
     try:
         saved = api_post(
             page, endpoint + "/save", {"protocol": "awg", "config": updated}, csrf_token
@@ -446,8 +482,12 @@ def test_server_config_get_and_save(
         assert saved["body"].get("status") == "ok"
         readback = api_post(page, endpoint, {"protocol": "awg"}, csrf_token)
         assert readback["status"] == 200, "Saved server config read-back failed"
-        matches = readback["body"].get("config") == updated
-        assert matches, "Server config save did not persist the requested change"
+        assert_config_persisted(
+            readback["body"].get("config"),
+            updated,
+            CONFIG_ROUND_TRIP_MARKER,
+            "Server config save did not persist the requested change",
+        )
     finally:
         restored = api_post(
             page, endpoint + "/save", {"protocol": "awg", "config": original}, csrf_token
@@ -455,8 +495,12 @@ def test_server_config_get_and_save(
         assert restored["status"] == 200, "Server config restoration failed"
         restored_config = api_post(page, endpoint, {"protocol": "awg"}, csrf_token)
         assert restored_config["status"] == 200, "Restored server config read-back failed"
-        matches = restored_config["body"].get("config") == original
-        assert matches, "Original server config was not restored"
+        assert_config_restored(
+            restored_config["body"].get("config"),
+            original,
+            CONFIG_ROUND_TRIP_MARKER,
+            "Original server config was not restored",
+        )
 
 
 @pytest.mark.e2e
