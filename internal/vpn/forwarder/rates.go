@@ -4,6 +4,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
 )
 
 // TrafficRates captures instantaneous and moving-average throughput and packet rates.
@@ -212,19 +214,24 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	rt.lastUtilizationKnown = capacity > 0
 
 	if capacity > 0 {
-		above50 := creditAbove(prevUtil, util, 0.50, elapsedSec)
-		above80 := creditAbove(prevUtil, util, 0.80, elapsedSec)
+		// The canonical levels, not the literals they replaced: this
+		// tracker is one of the three measurement sites that must agree with
+		// the health evaluator's message (issue #424 round 5, finding 4).
+		warningLevel := thresholds.QueueDwellWarningUtilization()
+		degradedLevel := thresholds.QueueDwellDegradedUtilization()
+		above50 := creditAbove(prevUtil, util, warningLevel, elapsedSec)
+		above80 := creditAbove(prevUtil, util, degradedLevel, elapsedSec)
 		rt.totalSecondsAbove50 += above50
 		rt.totalSecondsAbove80 += above80
 		// Consecutive time is measured to the CURRENT reading only: if the
 		// queue is below the threshold now, the run is over, whatever the model
 		// says about earlier in the interval.
-		if util >= 0.50 {
+		if util >= warningLevel {
 			rt.consecutiveSecondsAbove50 += above50
 		} else {
 			rt.consecutiveSecondsAbove50 = 0
 		}
-		if util >= 0.80 {
+		if util >= degradedLevel {
 			rt.consecutiveSecondsAbove80 += above80
 		} else {
 			rt.consecutiveSecondsAbove80 = 0

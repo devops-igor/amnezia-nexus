@@ -1,6 +1,10 @@
 package vpn
 
-import "time"
+import (
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
+)
 
 // HealthThresholds is the single, documented owner of every numeric
 // threshold the forwarder health evaluator compares against
@@ -11,9 +15,34 @@ import "time"
 // than scattered". This change is the centralization half, and it is a PURE
 // move: every value below is numerically identical to the literal it
 // replaced, and the comparison operators (>= vs >) are preserved exactly, so
-// no severity boundary moves. Calibration and runtime configurability are
-// deliberately NOT built here — they need production telemetry to be worth
-// doing, and a knob nobody has measured is worse than an owned constant.
+// no severity boundary moves. Calibration is deliberately NOT built here — it
+// needs production telemetry to be worth doing, and a knob nobody has measured
+// is worse than an owned constant.
+//
+// # Shared values are not authored here at all
+//
+// The queue-pressure levels that the forwarder MEASURES (its dwell observer,
+// its rate tracker and its per-route pressure classifier) live in the leaf
+// package internal/vpn/forwarder/thresholds, and the three fields below are
+// DERIVED from it by defaultHealthThresholds rather than transcribed. They
+// cannot live in this package: internal/vpn already imports
+// internal/vpn/forwarder, so the shared values would make the forwarder import
+// its own importer. Before this, the levels were authored twice — once here
+// for the message and once as literals in the measurement code — so raising
+// this value to 85 changed only the message while the measurement kept
+// running against 80.
+//
+// # Runtime configurability
+//
+// Not implemented, and that is a documented deferral rather than an
+// oversight: issue #424's "configurable" wording is narrowed to "centralized
+// and documented" by round 5's finding 4, option (b). The VPN config plumbing
+// carries no threshold fields at all, so there is no existing configuration
+// path to reuse and inventing a parallel one is out of scope. The canonical
+// package's setters (thresholds.SetQueueDwellDegradedUtilization and friends)
+// are the seam a future configuration layer must publish through, so the
+// follow-up adds a config path without re-opening this package. Until then
+// production never calls them.
 //
 // # Severity roles
 //
@@ -153,31 +182,44 @@ type HealthThresholds struct {
 // Treat it as immutable. A future runtime-configurable threshold layer must
 // publish a replacement atomically rather than mutating these fields, so that
 // a diagnostics evaluation can never observe a half-applied change.
-var DefaultHealthThresholds = HealthThresholds{
-	QueueCriticalPct:              95.0,
-	QueueDegradedAbovePct:         80.0,
-	QueueDegradedSustainedSeconds: 30,
-	QueueWarningPct:               80.0,
-	QueueWarningSustainedAbovePct: 50.0,
-	QueueWarningSustainedSeconds:  60,
+var DefaultHealthThresholds = defaultHealthThresholds()
 
-	QueueActiveDropRatePPS: 0,
+// defaultHealthThresholds builds the production threshold set, reading the
+// measurement-linked queue-pressure levels from the canonical leaf package.
+//
+// Every other field is a literal because it is compared only against a value
+// produced here; the three below are different in kind, because the forwarder
+// MEASURES the same boundaries independently and the operator-facing message
+// names them. Deriving them is what makes the message and the measurement the
+// same boundary rather than two values that happen to agree today.
+func defaultHealthThresholds() HealthThresholds {
+	return HealthThresholds{
+		QueueCriticalPct:              95.0,
+		QueueDegradedSustainedSeconds: 30,
+		QueueWarningPct:               80.0,
+		QueueWarningSustainedSeconds:  60,
 
-	WriteStallCriticalMS:   1000,
-	WriteStallWarningMS:    100,
-	WriteLatencyDegradedMS: 100.0,
-	WriteLatencyWarningMS:  50.0,
+		// Canonical, in percent because these fields are percent-valued.
+		QueueDegradedAbovePct:         thresholds.QueueDwellDegradedPct(),
+		QueueWarningSustainedAbovePct: thresholds.QueueDwellWarningPct(),
+		ProblemRoutePressureRatio:     thresholds.RoutePressureUtilization(),
 
-	VirtualTUNDegradedPct: 90.0,
-	VirtualTUNWarningPct:  75.0,
+		QueueActiveDropRatePPS: 0,
 
-	DropRateDegradedPPS: 10.0,
-	DropRateWarningPPS:  1.0,
+		WriteStallCriticalMS:   1000,
+		WriteStallWarningMS:    100,
+		WriteLatencyDegradedMS: 100.0,
+		WriteLatencyWarningMS:  50.0,
 
-	PeerSyncDivergenceDegradedAge: 60 * time.Second,
-	PeerSyncDivergenceWarningAge:  30 * time.Second,
+		VirtualTUNDegradedPct: 90.0,
+		VirtualTUNWarningPct:  75.0,
 
-	HandshakeStaleAge: 3 * time.Minute,
+		DropRateDegradedPPS: 10.0,
+		DropRateWarningPPS:  1.0,
 
-	ProblemRoutePressureRatio: 0.8,
+		PeerSyncDivergenceDegradedAge: 60 * time.Second,
+		PeerSyncDivergenceWarningAge:  30 * time.Second,
+
+		HandshakeStaleAge: 3 * time.Minute,
+	}
 }

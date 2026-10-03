@@ -2329,12 +2329,19 @@ func (m *testBackendDevice) DroppedPackets() uint64 {
 // round 3, finding 1) instead of letting it disappear now that the breakdown
 // reads the axes rather than the total. It is deliberately NOT injected as
 // queue-full: that is the mislabelling this rework removes.
+//
+// The external figure goes in DropsExternal, not just DropsTotal: the
+// external count is RECORDED on the recording path, so a snapshot that only
+// raised the total would report the loss in no population at all
+// (issue #424 round 5, finding 2). DropsTotal is raised alongside it to keep
+// the snapshot's own coherence invariant intact.
 func (m *testBackendDevice) DeviceStats() virtualtun.StatsSnapshot {
 	snap := virtualtun.StatsSnapshot{}
 	if m.AWGClientDevice != nil {
 		snap = m.AWGClientDevice.DeviceStats()
 	}
-	snap.DropsTotal += m.dropCount.Load()
+	snap.DropsExternal += m.dropCount.Load()
+	snap.DropsTotal = snap.Sum() + snap.DropsExternal
 	return snap
 }
 

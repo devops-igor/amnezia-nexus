@@ -28,8 +28,9 @@
 // Every internal drop also lands in a per-reason bucket (queue-full,
 // oversized, shutdown) and in a direction x reason bucket; Stats reports both
 // breakdowns alongside the queue depths. RecordDrop and RecordDropN increment
-// the total only, so the per-reason and directional sums fall short of
-// DropsTotal by exactly StatsSnapshot.ExternalDrops().
+// the total and the separate external population, so the per-reason and
+// directional sums fall short of DropsTotal by exactly
+// StatsSnapshot.ExternalDrops(), which is recorded rather than inferred.
 //
 // DroppedPackets therefore INCLUDES shutdown drops: closing a device with
 // packets still queued raises the counter. This is a deliberate semantic
@@ -143,18 +144,19 @@ type VirtualTUN struct {
 	// check-and-enqueue atomically without racing on the channel close.
 	closedFlag bool
 	batchSize  int
-	dropCount  atomic.Uint64
-	// Per-reason drop buckets. They are separate atomics, incremented
-	// alongside dropCount at each internal drop site: the sum of the
-	// buckets can transiently lag or lead the total under concurrency
-	// (see Stats).
-	dropQueueFull atomic.Uint64
-	dropOversized atomic.Uint64
-	dropShutdown  atomic.Uint64
+	// dropCount is the device-wide drop total behind DroppedPackets: every
+	// internal drop plus every RecordDrop/RecordDropN. It is deliberately
+	// NOT the source of StatsSnapshot.DropsTotal, which is derived from the
+	// per-bucket reads so the snapshot stays coherent.
+	dropCount atomic.Uint64
+	// externalDrops counts drops recorded through RecordDrop/RecordDropN,
+	// i.e. drops an outside owner observed without the device itself
+	// classifying them. It is incremented on the RECORDING path (never
+	// derived as a remainder), so an internal queue-full or shutdown loss
+	// can never be published as an external drop. See Stats.
+	externalDrops atomic.Uint64
 	inHighWater   atomic.Uint64
 	outHighWater  atomic.Uint64
-	inDrops       atomic.Uint64
-	outDrops      atomic.Uint64
 	// Direction x reason drop buckets (issue #424 round 3, finding 1).
 	//
 	// dropQueueFull/dropOversized/dropShutdown carry only a REASON axis and
@@ -447,9 +449,7 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			// far. Read never waits for a fitting packet: the
 			// caller's next Read re-enters the queue.
 			t.dropCount.Add(1)
-			t.dropOversized.Add(1)
 			t.inOversized.Add(1)
-			t.inDrops.Add(1)
 			return n, nil
 		}
 		copy(dst, pkt)
@@ -513,9 +513,7 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 		default:
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
-			t.dropQueueFull.Add(1)
 			t.outQueueFull.Add(1)
-			t.outDrops.Add(1)
 			n++
 		}
 		t.closeMu.RUnlock()
@@ -555,9 +553,7 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 		return nil
 	default:
 		t.dropCount.Add(1)
-		t.dropQueueFull.Add(1)
 		t.inQueueFull.Add(1)
-		t.inDrops.Add(1)
 		return ErrQueueFull
 	}
 }
@@ -652,9 +648,18 @@ type StatsSnapshot struct {
 	OutboundQueueFullDrops uint64
 	OutboundShutdownDrops  uint64
 
-	// DropsTotal mirrors DroppedPackets: every drop counted by the
-	// device plus external drops recorded via RecordDrop/RecordDropN.
-	// Includes shutdown drops drained by Close.
+	// DropsExternal counts drops recorded through RecordDrop/RecordDropN:
+	// losses an outside owner observed that the device itself never
+	// classified. It is RECORDED on the recording path, never inferred as
+	// a remainder between independently loaded counters, so an internal
+	// queue-full, oversized or shutdown loss can never appear here.
+	//
+	// ExternalDrops() returns this field.
+	DropsExternal uint64
+
+	// DropsTotal is the total loss across every population: it is always
+	// exactly Sum()+DropsExternal. It mirrors DroppedPackets on a
+	// quiescent device and includes shutdown drops drained by Close.
 	DropsTotal uint64
 
 	// DropsQueueFull counts packets dropped because the destination
@@ -670,14 +675,13 @@ type StatsSnapshot struct {
 	DropsShutdown uint64
 }
 
-// Sum returns the sum of the per-reason drop buckets. External drops
-// recorded through RecordDrop/RecordDropN are intentionally excluded: they
-// have no reason bucket, so Sum equals DropsTotal only when no external
-// drops were recorded and no concurrent drop is in flight.
+// Sum returns the internal drop count: the sum of the per-reason buckets,
+// which are themselves derived from the five directional x reason buckets so
+// the snapshot is internally consistent.
 //
-// Because the internal drop sites each carry exactly one reason AND exactly
-// one direction, Sum is also the sum of the five directional x reason
-// buckets. ExternalDrops is the exact remainder.
+// External drops recorded through RecordDrop/RecordDropN are deliberately
+// excluded: they carry no reason and no direction, so they live only in
+// DropsExternal. DropsTotal is always exactly Sum()+DropsExternal.
 func (s StatsSnapshot) Sum() uint64 {
 	return s.DropsQueueFull + s.DropsOversized + s.DropsShutdown
 }
@@ -692,33 +696,61 @@ func (s StatsSnapshot) Sum() uint64 {
 // and treating the sum as the total; use it as its own named population
 // instead.
 //
-// The remainder is computed with saturating subtraction: under concurrent
-// traffic the separate atomic loads are not one operation, so a racy
-// snapshot can show the internal buckets ahead of DropsTotal, and an
-// unsigned subtraction would wrap to an absurd value.
+// The figure is RECORDED, not inferred: it was previously computed as the
+// remainder DropsTotal-Sum() between independently loaded atomics, which
+// published an ordinary internal queue-full loss as an external drop whenever
+// a sample landed between the total increment and the bucket increments, and
+// made the loss vanish from the breakdown for the interleaving in the other
+// direction. Because the reason trackers take deltas against a baseline, a
+// loss that migrates between populations across two samples reads as fresh
+// activity.
 func (s StatsSnapshot) ExternalDrops() uint64 {
-	if s.DropsTotal <= s.Sum() {
-		return 0
-	}
-	return s.DropsTotal - s.Sum()
+	return s.DropsExternal
 }
 
 // Stats returns a snapshot of the queue depths and drop accounting.
 //
-// Consistency: each counter is an independent atomic load and each depth a
-// separate channel-length read, so the snapshot is not a globally consistent
-// point in time. Under concurrent traffic the depths may never be observed
-// together, and the per-reason sum (StatsSnapshot.Sum) can transiently lag
-// or lead DropsTotal (a goroutine can be between the two Add calls at one
-// drop site, and loads of separate atomics are not a single operation).
-// DropsTotal is loaded before the buckets, so a single racy snapshot can
-// even show a bucket ahead of the total; the underlying counters never
-// diverge this way — every counter is individually monotonic and all of
-// them converge once traffic stops. After Close returns the snapshot is
-// stable: depths are zero, no counter can increase except through
-// RecordDrop/RecordDropN. The snapshot is safe to call concurrently with all
-// device operations.
+// Consistency: the snapshot is INTERNALLY COHERENT. Every counter is read
+// exactly once into a local, and every aggregate in the returned value —
+// the direction totals, the reason totals, Sum, DropsExternal and DropsTotal
+// — is DERIVED from those same locals rather than read from its own atomic.
+// So the invariants hold for every sample whatever the device was doing
+// concurrently:
+//
+//	Sum() == InboundDrops + OutboundDrops
+//	Sum() == InboundQueueFullDrops + InboundOversizedDrops + InboundShutdownDrops
+//	       + OutboundQueueFullDrops + OutboundShutdownDrops
+//	DropsTotal == Sum() + DropsExternal
+//
+// A sample may represent a slightly earlier or later instant than any other,
+// since the five counters are still five independent atomics, but it can
+// never report a loss in one bucket and not in the total, count one loss
+// twice, or invent an external drop that was never recorded: the external
+// figure comes from the recording path. Every derived value is also
+// monotonic, because every input counter is monotonic.
+//
+// The depths are still separate channel-length reads and are not jointly
+// consistent with each other under concurrent traffic. After Close returns
+// the snapshot is fully stable: depths are zero and no counter can increase
+// except through RecordDrop/RecordDropN. The snapshot is safe to call
+// concurrently with all device operations.
 func (t *VirtualTUN) Stats() StatsSnapshot {
+	inQueueFull := t.inQueueFull.Load()
+	inOversized := t.inOversized.Load()
+	inShutdown := t.inShutdown.Load()
+	outQueueFull := t.outQueueFull.Load()
+	outShutdown := t.outShutdown.Load()
+	external := t.externalDrops.Load()
+
+	// Reason and direction axes are both derived from the same five
+	// directional x reason reads, which is what makes the two axes agree:
+	// each internal drop site carries exactly one reason AND exactly one
+	// direction, so summing either projection of the same five locals gives
+	// the same number.
+	inboundDrops := inQueueFull + inOversized + inShutdown
+	outboundDrops := outQueueFull + outShutdown
+	internalDrops := inboundDrops + outboundDrops
+
 	return StatsSnapshot{
 		InboundDepth:     len(t.inPackets),
 		OutboundDepth:    len(t.outPackets),
@@ -726,31 +758,40 @@ func (t *VirtualTUN) Stats() StatsSnapshot {
 		OutboundCapacity: cap(t.outPackets),
 		InboundPeak:      int(t.inHighWater.Load()),  // #nosec G115 -- bounded by inbound queue capacity.
 		OutboundPeak:     int(t.outHighWater.Load()), // #nosec G115 -- bounded by outbound queue capacity.
-		InboundDrops:     t.inDrops.Load(),
-		OutboundDrops:    t.outDrops.Load(),
-		DropsTotal:       t.dropCount.Load(),
-		DropsQueueFull:   t.dropQueueFull.Load(),
-		DropsOversized:   t.dropOversized.Load(),
-		DropsShutdown:    t.dropShutdown.Load(),
+		InboundDrops:     inboundDrops,
+		OutboundDrops:    outboundDrops,
 
-		InboundQueueFullDrops:  t.inQueueFull.Load(),
-		InboundOversizedDrops:  t.inOversized.Load(),
-		InboundShutdownDrops:   t.inShutdown.Load(),
-		OutboundQueueFullDrops: t.outQueueFull.Load(),
-		OutboundShutdownDrops:  t.outShutdown.Load(),
+		InboundQueueFullDrops:  inQueueFull,
+		InboundOversizedDrops:  inOversized,
+		InboundShutdownDrops:   inShutdown,
+		OutboundQueueFullDrops: outQueueFull,
+		OutboundShutdownDrops:  outShutdown,
+
+		DropsExternal: external,
+		DropsTotal:    internalDrops + external,
+
+		DropsQueueFull: inQueueFull + outQueueFull,
+		DropsOversized: inOversized,
+		DropsShutdown:  inShutdown + outShutdown,
 	}
 }
 
 // RecordDrop increments the dropped packet counter (issue #160 telemetry
-// hook) for drops observed outside the device.
+// hook) for drops observed outside the device. The loss is recorded in the
+// external population as well, so it is published under DropsExternal rather
+// than appearing later as a remainder between the total and the reason
+// buckets.
 func (t *VirtualTUN) RecordDrop() {
-	t.dropCount.Add(1)
+	t.RecordDropN(1)
 }
 
 // RecordDropN adds n to the dropped packet counter, for external owners that
-// observe drops in batches (issue #160 telemetry hook).
+// observe drops in batches (issue #160 telemetry hook). A zero batch is a
+// no-op. The whole batch lands in the external population: batching never
+// splits an external drop into a reason or a direction it was not given.
 func (t *VirtualTUN) RecordDropN(n uint64) {
 	t.dropCount.Add(n)
+	t.externalDrops.Add(n)
 }
 
 // SendEvent delivers ev to the channel returned by Events. The send never
@@ -803,17 +844,13 @@ func (t *VirtualTUN) Close() error {
 			select {
 			case <-t.inPackets:
 				t.dropCount.Add(1)
-				t.dropShutdown.Add(1)
 				t.inShutdown.Add(1)
-				t.inDrops.Add(1)
 			default:
 			}
 			select {
 			case <-t.outPackets:
 				t.dropCount.Add(1)
-				t.dropShutdown.Add(1)
 				t.outShutdown.Add(1)
-				t.outDrops.Add(1)
 			default:
 			}
 			// Done when both queues are empty; a reader cannot

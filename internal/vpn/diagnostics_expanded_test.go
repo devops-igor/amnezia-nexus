@@ -292,7 +292,20 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.DropCategories.ClientBackendDeviceRetired != 42 || next.DropCategories.ClientBackendDeviceExternal != 0 || next.DropCategories.TotalDrops != status.DropCategories.TotalDrops || next.DropCategories.TotalDropRatePps != 0 {
+	// Retirement is a TRANSFER of the device's real breakdown, not a move into
+	// a reasonless bucket (issue #424 round 5, finding 1). This loss was
+	// recorded as EXTERNAL — it had no direction and no reason — so it is
+	// published under the same key after the device is gone. Before that
+	// change it migrated to client_backend_device_retired_drops, which made
+	// five historical RETURN losses look like fresh client loss at the
+	// instant of retirement.
+	//
+	// The retired key is now the directionless-retired population only, so it
+	// is correctly 0 for a device that did report its axes.
+	if next.DropCategories.ClientBackendDeviceExternal != 42 || next.DropCategories.ClientBackendDeviceRetired != 0 {
+		t.Fatalf("retirement reclassified or lost the lifetime loss: %+v", next.DropCategories)
+	}
+	if next.DropCategories.TotalDrops != status.DropCategories.TotalDrops || next.DropCategories.TotalDropRatePps != 0 {
 		t.Fatalf("retirement lost lifetime counters or invented loss: %+v", next.DropCategories)
 	}
 	if next.Backends.TotalDrops != 42 {

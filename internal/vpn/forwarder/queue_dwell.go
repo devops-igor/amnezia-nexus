@@ -1,6 +1,10 @@
 package forwarder
 
-import "time"
+import (
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
+)
 
 // queueDwellTracker measures threshold dwell from serialized queue transitions.
 // Forwarder.aggregateQueueMu owns all fields; it adds no locks or goroutines.
@@ -33,7 +37,14 @@ func (d *queueDwellTracker) observe(now time.Time, occupancy, capacity int) {
 	if capacity > 0 {
 		util = float64(occupancy) / float64(capacity)
 	}
-	above50, above80 := capacity > 0 && util >= 0.5, capacity > 0 && util >= 0.8
+	// Canonical levels, not the literals they replaced: the operator-facing
+	// message in internal/vpn names these same numbers, and a literal here
+	// meant raising the configured level changed the message while the
+	// measurement kept running against the old value
+	// (issue #424 round 5, finding 4).
+	levels := thresholds.Canonical()
+	above50, above80 := capacity > 0 && util >= levels.DwellWarningUtilization,
+		capacity > 0 && util >= levels.DwellDegradedUtilization
 	if above50 && !d.above50 {
 		d.since50 = now
 	}

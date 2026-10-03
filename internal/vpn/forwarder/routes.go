@@ -3,6 +3,8 @@ package forwarder
 import (
 	"sort"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
 )
 
 // RouteInfo holds structural and performance state for an active forwarder route.
@@ -56,7 +58,7 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 		// with no traffic cannot accumulate pressure it never had. The
 		// lifetime values remain on the payload as history; they simply no
 		// longer decide.
-		hasPressure := (stats.Capacity > 0 && routeUtilization(stats) >= 0.8) ||
+		hasPressure := (stats.Capacity > 0 && routeUtilization(stats) >= thresholds.RoutePressureUtilization()) ||
 			stats.OldestWriteMS >= 100 ||
 			stats.QueueFullDropsRecent > 0 ||
 			stats.WriteErrorsRecent > 0 ||

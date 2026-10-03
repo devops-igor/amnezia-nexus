@@ -71,31 +71,84 @@ type backendDeviceDropStats struct {
 	// direction the recorder never supplied.
 	ClientExternal uint64
 
-	// ClientUnattributed is live-device loss observed on a device that does
-	// not implement backendDeviceStatsProvider, so neither axis exists for it.
+	// ClientUnattributed is LIVE loss observed on a device that does not
+	// implement backendDeviceStatsProvider, so neither axis exists for it.
 	// It is reported rather than dropped so TotalDrops stays truthful.
 	ClientUnattributed uint64
 
-	// ClientRetired is s.retiredBackendDeviceDrops, the lifetime accumulator
-	// for devices that have left the map.
+	// ClientRetired is RETIRED loss that carries no direction and no reason:
+	// the lifetime accumulator's own ClientUnattributed bucket, published
+	// under its own key.
 	//
-	// Retirement destroys the object that held the breakdown, so a retired
-	// device's direction and reason are unrecoverable by construction — not a
-	// measurement gap that more instrumentation could close. It is attributed
-	// to the client population, which is where it was attributed before this
-	// change, so the lifetime total is preserved across a retirement, and it
-	// is published under its OWN key rather than being folded into
-	// ClientQueueFull: reporting it as queue-full would reinstate exactly the
-	// mislabelling this rework removes, on the one population where no better
-	// answer exists.
+	// Retirement is a transfer of the device's real breakdown (issue #424
+	// round 5, finding 1), so retired loss that HAS a direction and a reason
+	// is published in the reason keys above exactly as a live loss is — a
+	// retired inbound queue-full loss appears in ClientQueueFull, a retired
+	// outbound one in ReturnQueueFull, and neither changes key at retirement.
+	// What remains here is the one retired population with no direction to
+	// carry: loss on a device that never reported its axes. It is attributed
+	// to the client population, the same conservative default the live path
+	// uses, and it is the CLIENT-direction half of the retired total — the
+	// retired TOTAL is Total(), the sum of every direction.
 	ClientRetired uint64
 }
 
-// Total is the sum of every disjoint population above.
+// Total is the sum of every disjoint population above: for the retired
+// accumulator this is the retired lifetime loss across every direction.
 func (d backendDeviceDropStats) Total() uint64 {
 	return d.ClientQueueFull + d.ClientOversized + d.ClientShutdown +
 		d.ReturnQueueFull + d.ReturnShutdown +
 		d.ClientExternal + d.ClientUnattributed + d.ClientRetired
+}
+
+// addInto folds other into d field by field.
+//
+// It is the RETIREMENT transfer primitive (issue #424 round 5, finding 1):
+// the device's own direction x reason fields are added to the matching
+// lifetime buckets, so a retired loss keeps the direction and reason it was
+// measured with. Adding the device's aggregate scalar instead is what
+// reclassified return loss as client loss at the instant of retirement.
+func (d *backendDeviceDropStats) addInto(other backendDeviceDropStats) {
+	d.ClientQueueFull += other.ClientQueueFull
+	d.ClientOversized += other.ClientOversized
+	d.ClientShutdown += other.ClientShutdown
+	d.ReturnQueueFull += other.ReturnQueueFull
+	d.ReturnShutdown += other.ReturnShutdown
+	d.ClientExternal += other.ClientExternal
+	d.ClientUnattributed += other.ClientUnattributed
+}
+
+// snapshotBackendDeviceDrops reads one device's real direction x reason
+// breakdown into a single-device accumulator.
+//
+// It is the one place that answers "what did THIS device lose, in which
+// direction, for which reason", and both the live-collection loop and every
+// retirement site go through it, so a device is attributed identically while
+// it is live and once it has been retired. A device that cannot report the
+// axes contributes its aggregate as ClientUnattributed rather than being
+// spread across buckets we cannot verify.
+//
+// It must be called AFTER the device has been closed, so shutdown drains are
+// included in the snapshot and are not lost between the transfer and the
+// deletion.
+func snapshotBackendDeviceDrops(dev BackendDevice) backendDeviceDropStats {
+	var out backendDeviceDropStats
+	if dev == nil {
+		return out
+	}
+	provider, ok := dev.(backendDeviceStatsProvider)
+	if !ok {
+		out.ClientUnattributed = dev.DroppedPackets()
+		return out
+	}
+	snap := provider.DeviceStats()
+	out.ClientQueueFull = snap.InboundQueueFullDrops
+	out.ClientOversized = snap.InboundOversizedDrops
+	out.ClientShutdown = snap.InboundShutdownDrops
+	out.ReturnQueueFull = snap.OutboundQueueFullDrops
+	out.ReturnShutdown = snap.OutboundShutdownDrops
+	out.ClientExternal = snap.ExternalDrops()
+	return out
 }
 
 // collectBackendDeviceDropStats folds every live backend device's
@@ -106,28 +159,30 @@ func (d backendDeviceDropStats) Total() uint64 {
 // matching every other diagnostics reader of this state: the values are
 // monotonic per-device counters sampled for a report, never used for a
 // decision.
+//
+// A retired device contributes to the SAME key a live one does, so a loss
+// never changes published key across a retirement. That is what keeps the
+// per-reason rate trackers honest: they take deltas against a baseline, so a
+// loss that migrated between keys at retirement would be published as fresh
+// activity on the destination key while TotalDrops never moved.
 func collectBackendDeviceDropStats(s *Service) backendDeviceDropStats {
-	var out backendDeviceDropStats
-	out.ClientRetired = s.retiredBackendDeviceDrops
+	// Retired loss is published under the same keys as live loss; only the
+	// directionless retired bucket keeps its own key.
+	out := s.retiredBackendDeviceDrops
+	out.ClientRetired = out.ClientUnattributed
+	out.ClientUnattributed = 0
 	for _, dev := range s.backendDevices {
 		if dev == nil {
 			continue
 		}
-		provider, ok := dev.(backendDeviceStatsProvider)
-		if !ok {
-			// No directional or reason data exists for this device. Its
-			// aggregate is still real loss, so it is published under its own
-			// key instead of being spread across buckets we cannot verify.
-			out.ClientUnattributed += dev.DroppedPackets()
-			continue
-		}
-		snap := provider.DeviceStats()
-		out.ClientQueueFull += snap.InboundQueueFullDrops
-		out.ClientOversized += snap.InboundOversizedDrops
-		out.ClientShutdown += snap.InboundShutdownDrops
-		out.ReturnQueueFull += snap.OutboundQueueFullDrops
-		out.ReturnShutdown += snap.OutboundShutdownDrops
-		out.ClientExternal += snap.ExternalDrops()
+		snap := snapshotBackendDeviceDrops(dev)
+		out.ClientQueueFull += snap.ClientQueueFull
+		out.ClientOversized += snap.ClientOversized
+		out.ClientShutdown += snap.ClientShutdown
+		out.ReturnQueueFull += snap.ReturnQueueFull
+		out.ReturnShutdown += snap.ReturnShutdown
+		out.ClientExternal += snap.ClientExternal
+		out.ClientUnattributed += snap.ClientUnattributed
 	}
 	return out
 }

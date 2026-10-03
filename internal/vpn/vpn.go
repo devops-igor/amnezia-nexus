@@ -191,10 +191,21 @@ type Service struct {
 	awgProvider          AWGStatusProvider
 	ingressEngine        *IngressEngine
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
-	backendDevices             map[int64]BackendDevice
-	backendDeviceEndpoints     map[int64]string
-	lastLoggedDrops            atomic.Uint64
-	retiredBackendDeviceDrops  uint64 // guarded by mu; preserves lifetime loss on device retirement
+	backendDevices         map[int64]BackendDevice
+	backendDeviceEndpoints map[int64]string
+	lastLoggedDrops        atomic.Uint64
+	// retiredBackendDeviceDrops is the LIFETIME accumulator for backend
+	// devices that have left backendDevices (issue #424 round 5, finding 1).
+	//
+	// It is direction- and reason-preserving, not a scalar: a retiring
+	// device's real VirtualTUN breakdown is transferred into the matching
+	// buckets, so a return-direction loss stays a return-direction loss after
+	// the device is gone. The accumulator carries the SAME fields as a live
+	// device's contribution, which is what lets a retired loss be published
+	// under the same key a live one uses.
+	//
+	// guarded by mu
+	retiredBackendDeviceDrops  backendDeviceDropStats
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
 	publicIPMu                 sync.RWMutex
@@ -1707,7 +1718,9 @@ func (s *Service) Stop() error {
 				_ = dev.Close()
 			}
 			if dev != nil {
-				s.retiredBackendDeviceDrops += dev.DroppedPackets()
+				// Snapshot AFTER Close so the shutdown drains it just
+				// accounted are transferred too.
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 			}
 			delete(s.backendDevices, id)
 		}
@@ -2685,7 +2698,7 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 				_ = oldDev.Close()
 			}
 			if oldDev != nil {
-				s.retiredBackendDeviceDrops += oldDev.DroppedPackets()
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
 			delete(s.backendDevices, tun.ID)
 			if s.backendDeviceEndpoints != nil {
@@ -2898,7 +2911,11 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 			_ = dev.Close()
 		}
 		if dev != nil {
-			s.retiredBackendDeviceDrops += dev.DroppedPackets()
+			// The retirement TRANSFER: the device's direction x reason
+			// breakdown moves into the lifetime buckets, so nothing is
+			// double counted while it was live and nothing is reclassified
+			// now that it is gone.
+			s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 		}
 		delete(s.backendDevices, tunnel.ID)
 	}

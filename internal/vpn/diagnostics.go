@@ -15,6 +15,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 )
 
@@ -141,10 +142,20 @@ type DropCategoryBreakdown struct {
 	// cannot report the breakdown at all. Published so TotalDrops stays
 	// truthful instead of silently shrinking.
 	ClientBackendDeviceUnattributed uint64 `json:"client_backend_device_unattributed"`
-	// ClientBackendDeviceRetired is the lifetime accumulator for devices that
-	// have left the map. Retirement destroys the breakdown, so its direction
-	// and reason are unrecoverable by construction; it keeps its own key so it
-	// is never relabelled as queue-full loss.
+	// ClientBackendDeviceRetired is retired CLIENT-DIRECTION loss: the
+	// inbound (client -> backend) half of the lifetime accumulator for
+	// devices that have left the map, plus the retired half of loss on devices
+	// that never reported a direction.
+	//
+	// Retirement is a TRANSFER of the device's real breakdown, so retired
+	// loss is published under the SAME key a live loss uses and its reason
+	// survives: retired inbound queue-full loss appears in
+	// ClientBackendDeviceQueueFull, not here. This key exists for the one
+	// population with no reason to carry — loss attributed to the client
+	// population with no direction recorded at all — which is why it is the
+	// client-direction figure and not the retired TOTAL. The retired total is
+	// the sum of every direction (clientTotal and returnTotal each include
+	// their share).
 	ClientBackendDeviceRetired uint64  `json:"client_backend_device_retired_drops"`
 	ClientTotalDrops           uint64  `json:"client_total_drops"`
 	ClientDropRatePps          float64 `json:"client_drop_rate_pps"`
@@ -167,10 +178,17 @@ type DropCategoryBreakdown struct {
 	// VirtualTUN loss on a backend device, i.e. backend -> Nexus return
 	// traffic that never reached the client. They are disjoint from
 	// ReturnQueueFull, which is the forwarder's own return-queue refusal.
-	ReturnBackendDeviceQueueFull uint64  `json:"return_backend_device_queue_full"`
-	ReturnBackendDeviceShutdown  uint64  `json:"return_backend_device_shutdown"`
-	ReturnTotalDrops             uint64  `json:"return_total_drops"`
-	ReturnDropRatePps            float64 `json:"return_drop_rate_pps"`
+	// ReturnBackendDeviceQueueFull is outbound VirtualTUN loss to a full
+	// outbound queue on a backend device, i.e. return traffic that never
+	// reached the client. It carries retired and live loss alike: retirement
+	// transfers a loss into this key rather than moving it to another one.
+	ReturnBackendDeviceQueueFull uint64 `json:"return_backend_device_queue_full"`
+	// ReturnBackendDeviceShutdown is the return-direction half of backend
+	// device loss: outbound VirtualTUN loss drained and discarded when the
+	// device was closed.
+	ReturnBackendDeviceShutdown uint64  `json:"return_backend_device_shutdown"`
+	ReturnTotalDrops            uint64  `json:"return_total_drops"`
+	ReturnDropRatePps           float64 `json:"return_drop_rate_pps"`
 
 	// Total aggregate drops
 	TotalDrops       uint64             `json:"total_drops"`
@@ -815,7 +833,7 @@ func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
 // as the original inline loops did, so the fleet-wide drop population — and
 // therefore the no-pool early-return TotalDrops — is unchanged.
 func totalBackendDeviceDrops(s *Service) uint64 {
-	drops := s.retiredBackendDeviceDrops
+	drops := s.retiredBackendDeviceDrops.Total()
 	for _, dev := range s.backendDevices {
 		if dev != nil {
 			drops += dev.DroppedPackets()
@@ -1052,7 +1070,11 @@ func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCo
 }
 
 func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
-	th := &DefaultHealthThresholds
+	// Read the DERIVED set live, not the package snapshot: the queue-pressure
+	// levels are canonical in internal/vpn/forwarder/thresholds and this is
+	// their reporting half, so a change there must move this evaluation
+	// (issue #424 round 5, finding 4).
+	th := defaultHealthThresholds()
 	var conds []HealthCondition
 	if queue.UtilizationPct >= th.QueueCriticalPct {
 		conds = append(conds, HealthCondition{
@@ -1086,7 +1108,7 @@ func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
 }
 
 func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondition {
-	th := &DefaultHealthThresholds
+	th := defaultHealthThresholds()
 	var conds []HealthCondition
 	if latency.OldestInFlightMS >= th.WriteStallCriticalMS {
 		conds = append(conds, HealthCondition{
@@ -1136,7 +1158,7 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 }
 
 func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
-	th := &DefaultHealthThresholds
+	th := defaultHealthThresholds()
 	var conds []HealthCondition
 	upstreamToNexusUtil := float64(0)
 	if vtun.UpstreamToNexus.Capacity > 0 {
@@ -1451,7 +1473,7 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			switch {
 			case r.Stats.QueueFullDropsRecent > 0:
 				note = fmt.Sprintf("Recent queue drops: %d", r.Stats.QueueFullDropsRecent)
-			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= DefaultHealthThresholds.ProblemRoutePressureRatio:
+			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= thresholds.RoutePressureUtilization():
 				note = fmt.Sprintf("Queue pressure: %d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
 			case r.Stats.WriteErrorsRecent > 0:
 				note = fmt.Sprintf("Recent write errors: %d", r.Stats.WriteErrorsRecent)

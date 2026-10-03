@@ -207,7 +207,7 @@ func TestCollectBackendDiagnosticsEligibilityDecomposition(t *testing.T) {
 func TestCollectBackendDiagnosticsNoPoolBranch(t *testing.T) {
 	svc, _, _, _, _ := setupTestVPNService(t, setupTestDB(t))
 	svc.pool = nil
-	svc.retiredBackendDeviceDrops = 7
+	svc.retiredBackendDeviceDrops = backendDeviceDropStats{ClientQueueFull: 7}
 
 	withDrops := &testBackendDevice{}
 	withDrops.dropCount.Add(5)
@@ -257,15 +257,16 @@ func TestTotalBackendDeviceDropsSkipsNilEntries(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
-		retired uint64
+		retired backendDeviceDropStats
 		devices map[int64]BackendDevice
 		want    uint64
 	}{
-		{"no devices keeps the retired total", 42, nil, 42},
-		{"single device adds onto retired", 1, map[int64]BackendDevice{1: first}, 4},
-		{"multiple devices sum onto retired", 0, map[int64]BackendDevice{1: first, 2: second}, 14},
-		{"nil entries are skipped", 5, map[int64]BackendDevice{1: first, 2: nil, 3: nil}, 8},
-		{"only nil entries keep the retired total", 9, map[int64]BackendDevice{1: nil}, 9},
+		{"no devices keeps the retired total", backendDeviceDropStats{ClientQueueFull: 42}, nil, 42},
+		{"single device adds onto retired", backendDeviceDropStats{ClientQueueFull: 1}, map[int64]BackendDevice{1: first}, 4},
+		{"multiple devices sum onto retired", backendDeviceDropStats{}, map[int64]BackendDevice{1: first, 2: second}, 14},
+		{"nil entries are skipped", backendDeviceDropStats{ReturnQueueFull: 5}, map[int64]BackendDevice{1: first, 2: nil, 3: nil}, 8},
+		{"only nil entries keep the retired total", backendDeviceDropStats{ClientShutdown: 9}, map[int64]BackendDevice{1: nil}, 9},
+		{"retired directions sum, not just the client half", backendDeviceDropStats{ClientQueueFull: 1, ReturnQueueFull: 2}, nil, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := &Service{retiredBackendDeviceDrops: tc.retired, backendDevices: tc.devices}

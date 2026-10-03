@@ -301,11 +301,12 @@ func TestBackendDeviceUnattributedLossIsReportedNotDropped(t *testing.T) {
 	assertDisjointDropReasons(t, d)
 }
 
-// TestRetiredDeviceDropsGetTheirOwnKey pins the retired-device treatment:
-// s.retiredBackendDeviceDrops has no breakdown behind it, so it keeps its own
-// key and is never relabelled as queue-full loss. It stays in the client
-// population, which is where it was attributed before this change, so a
-// retirement cannot shrink the lifetime total.
+// TestRetiredDeviceDropsKeepTheirDirectionAndReason pins the retired-device
+// treatment under round 5, finding 1: retirement is a TRANSFER of the device's
+// real direction x reason breakdown, so the loss keeps both the direction and
+// the reason it was measured with. The retired-directionless bucket keeps its
+// own key (there is no direction to publish it under), and a retirement can
+// neither shrink the lifetime total nor relabel a loss.
 func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 	svc, dev := deviceStatsForService(t)
 	if err := dev.vtun.InjectInbound([]byte("in-1")); err != nil {
@@ -315,10 +316,10 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 		t.Fatalf("second inbound packet onto a 1-deep queue: err=%v, want %v: retirement below folds one real queue-full loss into the accumulator, and without it this test would pin nothing",
 			err, virtualtun.ErrQueueFull)
 	}
-	// Retire the device the way retirement does: fold its lifetime drops into
-	// the accumulator and drop it from the map.
+	// Retire the device the way retirement does: transfer its direction x
+	// reason breakdown into the accumulator and drop it from the map.
 	svc.mu.Lock()
-	svc.retiredBackendDeviceDrops += dev.DroppedPackets()
+	svc.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 	svc.backendDevices = map[int64]BackendDevice{}
 	svc.mu.Unlock()
 
@@ -326,11 +327,19 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 	svc.populateOperationalDiagnostics(&status)
 	d := status.DropCategories
 
-	if d.ClientBackendDeviceRetired != 1 {
-		t.Errorf("client_backend_device_retired_drops=%d, want 1", d.ClientBackendDeviceRetired)
+	// The loss was measured as INBOUND queue-full loss, so it stays in the
+	// inbound queue-full key: same direction, same reason, same value.
+	if d.ClientBackendDeviceQueueFull != 1 {
+		t.Errorf("client_backend_device_queue_full=%d, want 1: retirement must preserve the reason the loss was measured with; %+v",
+			d.ClientBackendDeviceQueueFull, d)
 	}
-	if d.ClientBackendDeviceQueueFull != 0 || d.ClientBackendDeviceExternal != 0 {
-		t.Errorf("retired loss was folded into a live reason: %+v", d)
+	if d.ClientBackendDeviceExternal != 0 || d.ClientBackendDeviceOversized != 0 ||
+		d.ClientBackendDeviceShutdown != 0 || d.ClientBackendDeviceUnattributed != 0 ||
+		d.ClientBackendDeviceRetired != 0 {
+		t.Errorf("retired loss was reclassified into a bucket it was never measured in: %+v", d)
+	}
+	if d.ReturnBackendDeviceQueueFull != 0 || d.ReturnBackendDeviceShutdown != 0 {
+		t.Errorf("a client-direction loss moved into the return population: %+v", d)
 	}
 	if d.TotalDrops != 1 {
 		t.Errorf("total_drops=%d, want 1: retirement must preserve the lifetime total", d.TotalDrops)
