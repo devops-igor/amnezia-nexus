@@ -2170,7 +2170,20 @@
         if (dBeDrops) {
             const be = status.backends || {};
             dBeDrops.textContent = (be.total_drops || 0) + ' device drops';
-            dBeDrops.style.color = Number((status.drop_categories && status.drop_categories.reason_rates && status.drop_categories.reason_rates.client_backend_device_queue_full) || 0) > 0 ? 'var(--danger)' : '';
+            // Colour on ANY live backend-device drop reason, not just
+            // queue-full. The breakdown is now per direction and per reason
+            // (issue #424 round 3, finding 1), so keying the alarm on the
+            // queue-full reason alone would leave outbound and shutdown loss
+            // unhighlighted. The keys below are the complete disjoint set of
+            // backend-device reasons published by /api/vpn/status.
+            const rr = (status.drop_categories && status.drop_categories.reason_rates) || {};
+            const deviceDropRate = [
+                'client_backend_device_queue_full', 'client_backend_device_oversized',
+                'client_backend_device_shutdown', 'client_backend_device_external',
+                'client_backend_device_unattributed', 'client_backend_device_retired_drops',
+                'return_backend_device_queue_full', 'return_backend_device_shutdown',
+            ].reduce((sum, key) => sum + Number(rr[key] || 0), 0);
+            dBeDrops.style.color = deviceDropRate > 0 ? 'var(--danger)' : '';
         }
 
         const backendTraffic = document.getElementById('vpn-diag-be-traffic');

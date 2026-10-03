@@ -15,10 +15,17 @@ func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
 		"client_mismatch": d.ClientMismatch, "client_rejected": d.ClientRejected,
 		"client_backend_queue_full": d.ClientBackendQueueFull, "client_rate_limited": d.ClientRateLimited,
 		"client_no_healthy_backend": d.ClientNoHealthyBackend, "client_virtualtun_drops": d.ClientVirtualTUNDrops,
-		"client_backend_device_queue_full": d.ClientBackendDeviceQueueFull,
-		"return_malformed":                 d.ReturnMalformed, "return_unmapped": d.ReturnUnmapped, "return_mismatch": d.ReturnMismatch,
+		"client_backend_device_queue_full":    d.ClientBackendDeviceQueueFull,
+		"client_backend_device_oversized":     d.ClientBackendDeviceOversized,
+		"client_backend_device_shutdown":      d.ClientBackendDeviceShutdown,
+		"client_backend_device_external":      d.ClientBackendDeviceExternal,
+		"client_backend_device_unattributed":  d.ClientBackendDeviceUnattributed,
+		"client_backend_device_retired_drops": d.ClientBackendDeviceRetired,
+		"return_malformed":                    d.ReturnMalformed, "return_unmapped": d.ReturnUnmapped, "return_mismatch": d.ReturnMismatch,
 		"return_injection_errors": d.ReturnInjectionErrors, "return_virtualtun_drops": d.ReturnVirtualTUNDrops,
 		"return_queue_full": d.ReturnQueueFull, "return_packet_too_large": d.ReturnPacketTooLarge,
+		"return_backend_device_queue_full": d.ReturnBackendDeviceQueueFull,
+		"return_backend_device_shutdown":   d.ReturnBackendDeviceShutdown,
 	}
 }
 

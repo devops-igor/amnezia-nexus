@@ -576,8 +576,8 @@ func TestPeerSyncDivergenceLifecycle(t *testing.T) {
 		advance  time.Duration
 		severity string
 	}{
-		{advance: peerSyncDivergenceWarningAge + time.Second, severity: "WARNING"},
-		{advance: peerSyncDivergenceDegradedAge + time.Second, severity: "DEGRADED"},
+		{advance: DefaultHealthThresholds.PeerSyncDivergenceWarningAge + time.Second, severity: "WARNING"},
+		{advance: DefaultHealthThresholds.PeerSyncDivergenceDegradedAge + time.Second, severity: "DEGRADED"},
 	} {
 		probe := now.Add(tc.advance)
 		// A subsequent reconcile observes the SAME mismatch and must leave
@@ -683,7 +683,7 @@ func TestPeerSyncDivergenceUnknownAgeOnlyWhenNeverTimed(t *testing.T) {
 			t.Fatalf("a 0s fresh divergence must emit no condition, got %s: %q", c.Severity, c.Message)
 		}
 		// Past the warning threshold it escalates, exactly like any other.
-		probe := now.Add(peerSyncDivergenceWarningAge + time.Second)
+		probe := now.Add(DefaultHealthThresholds.PeerSyncDivergenceWarningAge + time.Second)
 		c := peerSyncDivergenceCondition(ps, probe)
 		if c == nil || c.Severity != "WARNING" {
 			t.Fatalf("a fresh divergence past the warning threshold must be WARNING, got %+v", c)

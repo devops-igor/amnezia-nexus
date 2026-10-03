@@ -138,10 +138,21 @@ func TestDiagnosticsDisjointMixedLossProductionPaths(t *testing.T) {
 	encoded, _ := json.Marshal(d)
 	var fields map[string]any
 	_ = json.Unmarshal(encoded, &fields)
-	for key, want := range map[string]float64{"client_backend_device_queue_full": 42, "return_queue_full": 3, "return_packet_too_large": 1} {
+	// The fixture's directly-recorded device loss has no direction and no
+	// reason, so it is published under the EXTERNAL key. It must NOT appear
+	// as queue-full: that is the mislabelling this rework removes
+	// (issue #424 round 3, finding 1).
+	for key, want := range map[string]float64{
+		"client_backend_device_external": 42,
+		"return_queue_full":              3,
+		"return_packet_too_large":        1,
+	} {
 		if fields[key] != want {
 			t.Errorf("%s=%v; want %v", key, fields[key], want)
 		}
+	}
+	if fields["client_backend_device_queue_full"] != float64(0) {
+		t.Errorf("reason-less device loss reported as queue-full: %v", fields["client_backend_device_queue_full"])
 	}
 }
 
@@ -254,7 +265,10 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 		t.Fatal(err)
 	}
 	// Use a real device so Close follows production lifecycle; fixture-owned
-	// dropCount is the device's separate queue-loss population.
+	// dropCount is the device's separate queue-loss population, recorded the
+	// way an external owner records it: with neither a direction nor a reason,
+	// so it is published under the external key rather than as queue-full
+	// (issue #424 round 3, finding 1).
 	_, pub, priv := createTestServerAndKey(t, svc.db, "retirement-fixture", "192.0.2.20")
 	real, err := tunnel.NewAWGClientDevice("loss-retirement", "192.0.2.20:51820", priv, pub, 1340, nil)
 	if err != nil {
@@ -267,8 +281,8 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.DropCategories.ClientBackendDeviceQueueFull != 42 {
-		t.Fatal("active backend loss missing")
+	if status.DropCategories.ClientBackendDeviceExternal != 42 || status.DropCategories.ClientBackendDeviceQueueFull != 0 {
+		t.Fatalf("active backend loss missing or misattributed as queue-full: %+v", status.DropCategories)
 	}
 	if err := svc.DisableBackend(t.Context(), a); err != nil {
 		t.Fatal(err)
@@ -278,7 +292,7 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.DropCategories.ClientBackendDeviceQueueFull != 42 || next.DropCategories.TotalDrops != status.DropCategories.TotalDrops || next.DropCategories.TotalDropRatePps != 0 {
+	if next.DropCategories.ClientBackendDeviceRetired != 42 || next.DropCategories.ClientBackendDeviceExternal != 0 || next.DropCategories.TotalDrops != status.DropCategories.TotalDrops || next.DropCategories.TotalDropRatePps != 0 {
 		t.Fatalf("retirement lost lifetime counters or invented loss: %+v", next.DropCategories)
 	}
 	if next.Backends.TotalDrops != 42 {
@@ -426,7 +440,7 @@ func TestServiceBackendTrafficAndAllHistoryFromProductionCounters(t *testing.T) 
 			for _, rate := range point.DropReasonRates {
 				sum += rate
 			}
-			if point.DropReasonRates["client_backend_device_queue_full"] != 3 || sum != point.TotalDropRate {
+			if point.DropReasonRates["client_backend_device_external"] != 3 || sum != point.TotalDropRate {
 				t.Fatalf("history reason ownership does not match total: reasons=%v total=%v", point.DropReasonRates, point.TotalDropRate)
 			}
 			found := false

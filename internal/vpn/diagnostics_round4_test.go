@@ -142,10 +142,10 @@ func TestPeerSyncDivergenceTimingThresholds(t *testing.T) {
 	}{
 		{name: "just_converging", age: 0, severity: ""},
 		{name: "below_warning", age: 29 * time.Second, severity: ""},
-		{name: "at_warning_boundary", age: peerSyncDivergenceWarningAge, severity: ""},
-		{name: "just_above_warning", age: peerSyncDivergenceWarningAge + time.Millisecond, severity: "WARNING"},
-		{name: "at_degraded_boundary", age: peerSyncDivergenceDegradedAge, severity: "WARNING"},
-		{name: "just_above_degraded", age: peerSyncDivergenceDegradedAge + time.Millisecond, severity: "DEGRADED"},
+		{name: "at_warning_boundary", age: DefaultHealthThresholds.PeerSyncDivergenceWarningAge, severity: ""},
+		{name: "just_above_warning", age: DefaultHealthThresholds.PeerSyncDivergenceWarningAge + time.Millisecond, severity: "WARNING"},
+		{name: "at_degraded_boundary", age: DefaultHealthThresholds.PeerSyncDivergenceDegradedAge, severity: "WARNING"},
+		{name: "just_above_degraded", age: DefaultHealthThresholds.PeerSyncDivergenceDegradedAge + time.Millisecond, severity: "DEGRADED"},
 		{name: "long_divergence", age: 45 * time.Minute, severity: "DEGRADED"},
 	}
 	for _, tc := range cases {

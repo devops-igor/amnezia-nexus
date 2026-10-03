@@ -23,6 +23,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 func setupTestDB(t *testing.T) *database.DB {
@@ -2316,6 +2317,25 @@ func (m *testBackendDevice) DroppedPackets() uint64 {
 		base = m.AWGClientDevice.DroppedPackets()
 	}
 	return base + m.dropCount.Load()
+}
+
+// DeviceStats mirrors the fixture's direct dropCount into the EXTERNAL
+// bucket of the underlying VirtualTUN's snapshot.
+//
+// dropCount is loss the fixture records itself, with no direction and no
+// reason — which is exactly what VirtualTUN.RecordDrop models, and exactly
+// what DroppedPackets reports as a total. Reporting it as external keeps the
+// fixture's injected loss visible to the diagnostics breakdown (issue #424
+// round 3, finding 1) instead of letting it disappear now that the breakdown
+// reads the axes rather than the total. It is deliberately NOT injected as
+// queue-full: that is the mislabelling this rework removes.
+func (m *testBackendDevice) DeviceStats() virtualtun.StatsSnapshot {
+	snap := virtualtun.StatsSnapshot{}
+	if m.AWGClientDevice != nil {
+		snap = m.AWGClientDevice.DeviceStats()
+	}
+	snap.DropsTotal += m.dropCount.Load()
+	return snap
 }
 
 func (m *testBackendDevice) Write(p []byte) (int, error) {

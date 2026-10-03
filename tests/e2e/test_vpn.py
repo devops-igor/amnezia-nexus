@@ -205,6 +205,11 @@ _LOSS_REASONS = {
     "client_no_healthy_backend",
     "client_virtualtun_drops",
     "client_backend_device_queue_full",
+    "client_backend_device_oversized",
+    "client_backend_device_shutdown",
+    "client_backend_device_external",
+    "client_backend_device_unattributed",
+    "client_backend_device_retired_drops",
     "return_malformed",
     "return_unmapped",
     "return_mismatch",
@@ -212,6 +217,8 @@ _LOSS_REASONS = {
     "return_virtualtun_drops",
     "return_queue_full",
     "return_packet_too_large",
+    "return_backend_device_queue_full",
+    "return_backend_device_shutdown",
 }
 
 
@@ -525,6 +532,11 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["client_no_healthy_backend"]
         + drops["client_virtualtun_drops"]
         + drops["client_backend_device_queue_full"]
+        + drops["client_backend_device_oversized"]
+        + drops["client_backend_device_shutdown"]
+        + drops["client_backend_device_external"]
+        + drops["client_backend_device_unattributed"]
+        + drops["client_backend_device_retired_drops"]
     )
     return_categories = (
         drops["return_malformed"]
@@ -534,6 +546,8 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["return_virtualtun_drops"]
         + drops["return_queue_full"]
         + drops["return_packet_too_large"]
+        + drops["return_backend_device_queue_full"]
+        + drops["return_backend_device_shutdown"]
     )
     assert client_categories == drops["client_total_drops"], (
         f"client categories sum {client_categories} != client_total_drops "

@@ -26,8 +26,10 @@
 // owners add drops observed outside the device (issue #160 telemetry).
 //
 // Every internal drop also lands in a per-reason bucket (queue-full,
-// oversized, shutdown); Stats reports the breakdown alongside the queue
-// depths. RecordDrop and RecordDropN increment the total only.
+// oversized, shutdown) and in a direction x reason bucket; Stats reports both
+// breakdowns alongside the queue depths. RecordDrop and RecordDropN increment
+// the total only, so the per-reason and directional sums fall short of
+// DropsTotal by exactly StatsSnapshot.ExternalDrops().
 //
 // DroppedPackets therefore INCLUDES shutdown drops: closing a device with
 // packets still queued raises the counter. This is a deliberate semantic
@@ -153,7 +155,26 @@ type VirtualTUN struct {
 	outHighWater  atomic.Uint64
 	inDrops       atomic.Uint64
 	outDrops      atomic.Uint64
-	once          sync.Once
+	// Direction x reason drop buckets (issue #424 round 3, finding 1).
+	//
+	// dropQueueFull/dropOversized/dropShutdown carry only a REASON axis and
+	// inDrops/outDrops carry only a DIRECTION axis. Neither can answer "which
+	// direction did this queue-full drop happen in", and the two axes together
+	// are rank-deficient: outbound oversized never happens (Read is the only
+	// oversized site and it drains the inbound queue), yet knowing that does
+	// not resolve the four remaining unknowns. These five counters are the
+	// cross product of the five internal drop sites and make the attribution
+	// exact.
+	//
+	// There is deliberately no outOversized counter: Read is the only site
+	// that drops an oversized packet, and it reads from the inbound queue, so
+	// outbound oversized is not a reachable state.
+	inQueueFull  atomic.Uint64
+	inOversized  atomic.Uint64
+	inShutdown   atomic.Uint64
+	outQueueFull atomic.Uint64
+	outShutdown  atomic.Uint64
+	once         sync.Once
 }
 
 // Compile-time interface compliance.
@@ -427,6 +448,7 @@ func (t *VirtualTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			// caller's next Read re-enters the queue.
 			t.dropCount.Add(1)
 			t.dropOversized.Add(1)
+			t.inOversized.Add(1)
 			t.inDrops.Add(1)
 			return n, nil
 		}
@@ -492,6 +514,7 @@ func (t *VirtualTUN) Write(bufs [][]byte, offset int) (int, error) {
 			// Drop when full to avoid blocking the tun writer.
 			t.dropCount.Add(1)
 			t.dropQueueFull.Add(1)
+			t.outQueueFull.Add(1)
 			t.outDrops.Add(1)
 			n++
 		}
@@ -533,6 +556,7 @@ func (t *VirtualTUN) InjectInbound(pkt []byte) error {
 	default:
 		t.dropCount.Add(1)
 		t.dropQueueFull.Add(1)
+		t.inQueueFull.Add(1)
 		t.inDrops.Add(1)
 		return ErrQueueFull
 	}
@@ -608,6 +632,26 @@ type StatsSnapshot struct {
 	InboundDrops     uint64
 	OutboundDrops    uint64
 
+	// The five directional x reason buckets below are the cross product of
+	// the internal drop sites (issue #424 round 3, finding 1). Every internal
+	// drop increments exactly one of them, alongside dropCount and exactly
+	// one of the direction and reason aggregates, so
+	//
+	//	InboundQueueFullDrops + InboundOversizedDrops + InboundShutdownDrops + OutboundQueueFullDrops + OutboundShutdownDrops
+	//
+	// equals InboundDrops + OutboundDrops and DropsQueueFull+DropsOversized+
+	// DropsShutdown. They are the only way to tell WHICH direction a
+	// queue-full or shutdown loss happened in; the aggregates above cannot,
+	// because each carries only one axis.
+	//
+	// There is no outbound oversized bucket: Read is the only oversized drop
+	// site and it drains the inbound queue, so the state is unreachable.
+	InboundQueueFullDrops  uint64
+	InboundOversizedDrops  uint64
+	InboundShutdownDrops   uint64
+	OutboundQueueFullDrops uint64
+	OutboundShutdownDrops  uint64
+
 	// DropsTotal mirrors DroppedPackets: every drop counted by the
 	// device plus external drops recorded via RecordDrop/RecordDropN.
 	// Includes shutdown drops drained by Close.
@@ -630,8 +674,33 @@ type StatsSnapshot struct {
 // recorded through RecordDrop/RecordDropN are intentionally excluded: they
 // have no reason bucket, so Sum equals DropsTotal only when no external
 // drops were recorded and no concurrent drop is in flight.
+//
+// Because the internal drop sites each carry exactly one reason AND exactly
+// one direction, Sum is also the sum of the five directional x reason
+// buckets. ExternalDrops is the exact remainder.
 func (s StatsSnapshot) Sum() uint64 {
 	return s.DropsQueueFull + s.DropsOversized + s.DropsShutdown
+}
+
+// ExternalDrops returns the drops recorded through RecordDrop and
+// RecordDropN: the drops an external owner observed OUTSIDE the device.
+//
+// Those drops carry neither a direction nor a reason — the recording API has
+// no parameter for either — so they belong to no directional bucket and no
+// reason bucket, and every directional x reason sum is short by exactly this
+// amount. Callers MUST account for it explicitly rather than summing buckets
+// and treating the sum as the total; use it as its own named population
+// instead.
+//
+// The remainder is computed with saturating subtraction: under concurrent
+// traffic the separate atomic loads are not one operation, so a racy
+// snapshot can show the internal buckets ahead of DropsTotal, and an
+// unsigned subtraction would wrap to an absurd value.
+func (s StatsSnapshot) ExternalDrops() uint64 {
+	if s.DropsTotal <= s.Sum() {
+		return 0
+	}
+	return s.DropsTotal - s.Sum()
 }
 
 // Stats returns a snapshot of the queue depths and drop accounting.
@@ -663,6 +732,12 @@ func (t *VirtualTUN) Stats() StatsSnapshot {
 		DropsQueueFull:   t.dropQueueFull.Load(),
 		DropsOversized:   t.dropOversized.Load(),
 		DropsShutdown:    t.dropShutdown.Load(),
+
+		InboundQueueFullDrops:  t.inQueueFull.Load(),
+		InboundOversizedDrops:  t.inOversized.Load(),
+		InboundShutdownDrops:   t.inShutdown.Load(),
+		OutboundQueueFullDrops: t.outQueueFull.Load(),
+		OutboundShutdownDrops:  t.outShutdown.Load(),
 	}
 }
 
@@ -729,6 +804,7 @@ func (t *VirtualTUN) Close() error {
 			case <-t.inPackets:
 				t.dropCount.Add(1)
 				t.dropShutdown.Add(1)
+				t.inShutdown.Add(1)
 				t.inDrops.Add(1)
 			default:
 			}
@@ -736,6 +812,7 @@ func (t *VirtualTUN) Close() error {
 			case <-t.outPackets:
 				t.dropCount.Add(1)
 				t.dropShutdown.Add(1)
+				t.outShutdown.Add(1)
 				t.outDrops.Add(1)
 			default:
 			}

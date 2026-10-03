@@ -873,19 +873,36 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 		return ErrRateLimitExceeded
 	}
 
-	f.totalRxBytes.Add(pktLen)
-	f.totalRxPackets.Add(1)
-	route.traffic.record(pktLen, true)
-	backendTraffic.record(pktLen, true)
-	if f.accountant != nil {
-		f.accountant.RecordRx(sID, cID, pktLen)
-	}
-
+	// The packet copy happens before the send attempt, so the drop path costs
+	// the same allocation it always did; only the ACCOUNTING placement is
+	// under review here (issue #424 round 3, finding 2).
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
 
+	// Throughput accounting records ADMITTED traffic: bytes the backend
+	// actually received. It therefore runs only once the packet is on the
+	// backend queue. It used to run before the send, so a packet refused by
+	// a full queue was counted as backend RX AND as a queue-full drop at the
+	// same time — diagnostics could report +1500 bytes of backend throughput
+	// alongside queue-full +1 for one packet the backend never accepted,
+	// which is the opposite of what per-backend traffic is for (#432).
+	//
+	// Rejected traffic is still visible: it is counted by
+	// clientDropsQueueFull/clientDropsTotal below and reported as the
+	// client_backend_queue_full reason, so no packet is lost from the
+	// accounting — it simply stops being reported as carried throughput.
 	select {
 	case beQueue <- pktCopy:
+		f.totalRxBytes.Add(pktLen)
+		f.totalRxPackets.Add(1)
+		// route.traffic also advances the route's last-traffic age (#433),
+		// so a refused packet must not reset "last seen" for a route that
+		// carried nothing.
+		route.traffic.record(pktLen, true)
+		backendTraffic.record(pktLen, true)
+		if f.accountant != nil {
+			f.accountant.RecordRx(sID, cID, pktLen)
+		}
 		return nil
 	default:
 		f.clientDropsQueueFull.Add(1)

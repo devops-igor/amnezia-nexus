@@ -116,10 +116,38 @@ type DropCategoryBreakdown struct {
 	// Nexus. They belong to the client-side bucket: the upstream device is
 	// the egress of the client-originated direction, so a drop there loses
 	// client traffic rather than a return reply.
-	ClientVirtualTUNDrops        uint64  `json:"client_virtualtun_drops"`
-	ClientBackendDeviceQueueFull uint64  `json:"client_backend_device_queue_full"`
-	ClientTotalDrops             uint64  `json:"client_total_drops"`
-	ClientDropRatePps            float64 `json:"client_drop_rate_pps"`
+	ClientVirtualTUNDrops        uint64 `json:"client_virtualtun_drops"`
+	ClientBackendDeviceQueueFull uint64 `json:"client_backend_device_queue_full"`
+	// The backend-device reasons below are the direction x reason breakdown of
+	// live backend devices' VirtualTUNs (issue #424 round 3, finding 1).
+	// Inbound loss is client-originating traffic, so it belongs here; outbound
+	// loss is return traffic and is counted in the return population.
+	//
+	// ClientBackendDeviceQueueFull is a QUEUE-FULL reason only, never a
+	// direction- and reason-agnostic total: before this change it carried
+	// VirtualTUN.DroppedPackets(), which spans both directions and all three
+	// reasons, so return traffic was reported as client-to-backend queue-full
+	// loss and shutdown drains were reported as queue-full loss.
+	ClientBackendDeviceOversized uint64 `json:"client_backend_device_oversized"`
+	// ClientBackendDeviceShutdown is inbound loss drained and discarded when
+	// the device's VirtualTUN was closed.
+	ClientBackendDeviceShutdown uint64 `json:"client_backend_device_shutdown"`
+	// ClientBackendDeviceExternal is loss an EXTERNAL owner recorded through
+	// VirtualTUN.RecordDrop/RecordDropN. The recording API carries no
+	// direction and no reason, so these drops are attributed here under their
+	// own key rather than spread across buckets the recorder never filled.
+	ClientBackendDeviceExternal uint64 `json:"client_backend_device_external"`
+	// ClientBackendDeviceUnattributed is live-device loss on a device that
+	// cannot report the breakdown at all. Published so TotalDrops stays
+	// truthful instead of silently shrinking.
+	ClientBackendDeviceUnattributed uint64 `json:"client_backend_device_unattributed"`
+	// ClientBackendDeviceRetired is the lifetime accumulator for devices that
+	// have left the map. Retirement destroys the breakdown, so its direction
+	// and reason are unrecoverable by construction; it keeps its own key so it
+	// is never relabelled as queue-full loss.
+	ClientBackendDeviceRetired uint64  `json:"client_backend_device_retired_drops"`
+	ClientTotalDrops           uint64  `json:"client_total_drops"`
+	ClientDropRatePps          float64 `json:"client_drop_rate_pps"`
 
 	// Backend -> Client (Return path)
 	ReturnMalformed       uint64 `json:"return_malformed"`
@@ -131,11 +159,18 @@ type DropCategoryBreakdown struct {
 	// loss the VirtualTUN inbound bucket already counted (issue #424 round 2,
 	// finding 3). Additive key: it makes the ownership overlap explicit
 	// instead of inferred by subtracting aggregate counters.
-	ReturnInjectionTUNDrops uint64  `json:"return_injection_tun_drops"`
-	ReturnQueueFull         uint64  `json:"return_queue_full"`
-	ReturnPacketTooLarge    uint64  `json:"return_packet_too_large"`
-	ReturnTotalDrops        uint64  `json:"return_total_drops"`
-	ReturnDropRatePps       float64 `json:"return_drop_rate_pps"`
+	ReturnInjectionTUNDrops uint64 `json:"return_injection_tun_drops"`
+	ReturnQueueFull         uint64 `json:"return_queue_full"`
+	ReturnPacketTooLarge    uint64 `json:"return_packet_too_large"`
+	// ReturnBackendDeviceQueueFull and ReturnBackendDeviceShutdown are the
+	// return-direction half of the backend-device breakdown: outbound
+	// VirtualTUN loss on a backend device, i.e. backend -> Nexus return
+	// traffic that never reached the client. They are disjoint from
+	// ReturnQueueFull, which is the forwarder's own return-queue refusal.
+	ReturnBackendDeviceQueueFull uint64  `json:"return_backend_device_queue_full"`
+	ReturnBackendDeviceShutdown  uint64  `json:"return_backend_device_shutdown"`
+	ReturnTotalDrops             uint64  `json:"return_total_drops"`
+	ReturnDropRatePps            float64 `json:"return_drop_rate_pps"`
 
 	// Total aggregate drops
 	TotalDrops       uint64             `json:"total_drops"`
@@ -933,7 +968,7 @@ func collectHandshakeDiagnostics(s *Service) HandshakeFreshnessDiagnostics {
 		activeSessions := s.sessionMgr.ListActiveSessionsSnapshot()
 		for _, sess := range activeSessions {
 			hs, ok := peerHandshakes[sess.PeerPublicKey]
-			if !ok || hs.IsZero() || now.Sub(hs) > 3*time.Minute {
+			if !ok || hs.IsZero() || now.Sub(hs) > DefaultHealthThresholds.HandshakeStaleAge {
 				// Collected raw, redacted after the sort below (issue #424
 				// round 5, item 1b). This value reached /api/vpn/status
 				// verbatim as handshake_freshness.stale_live_sessions.
@@ -1017,28 +1052,30 @@ func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCo
 }
 
 func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
+	th := &DefaultHealthThresholds
 	var conds []HealthCondition
-	if queue.UtilizationPct >= 95.0 {
+	if queue.UtilizationPct >= th.QueueCriticalPct {
 		conds = append(conds, HealthCondition{
 			Category: "queue_pressure",
 			Severity: "CRITICAL",
 			Message:  fmt.Sprintf("Queue saturation: Return queue utilization is at %.1f%%", queue.UtilizationPct),
 		})
-	} else if queue.ConsecutiveAbove80Sec >= 30 {
+	} else if queue.ConsecutiveAbove80Sec >= th.QueueDegradedSustainedSeconds {
 		conds = append(conds, HealthCondition{
 			Category: "queue_pressure",
 			Severity: "DEGRADED",
 			// Consecutive duration is measured from managed queue transitions.
-			Message: fmt.Sprintf("Queue pressure: Return queue utilization has been at or above 80%% for %ds", queue.ConsecutiveAbove80Sec),
+			Message: fmt.Sprintf("Queue pressure: Return queue utilization has been at or above %d%% for %ds",
+				int(th.QueueDegradedAbovePct), queue.ConsecutiveAbove80Sec),
 		})
-	} else if queue.UtilizationPct >= 80.0 || queue.ConsecutiveAbove50Sec >= 60 {
+	} else if queue.UtilizationPct >= th.QueueWarningPct || queue.ConsecutiveAbove50Sec >= th.QueueWarningSustainedSeconds {
 		conds = append(conds, HealthCondition{
 			Category: "queue_pressure",
 			Severity: "WARNING",
 			Message:  fmt.Sprintf("Elevated queue utilization at %.1f%%", queue.UtilizationPct),
 		})
 	}
-	if queue.QueueDropRatePps > 0 {
+	if queue.QueueDropRatePps > th.QueueActiveDropRatePPS {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "DEGRADED",
@@ -1049,14 +1086,15 @@ func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
 }
 
 func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondition {
+	th := &DefaultHealthThresholds
 	var conds []HealthCondition
-	if latency.OldestInFlightMS >= 1000 {
+	if latency.OldestInFlightMS >= th.WriteStallCriticalMS {
 		conds = append(conds, HealthCondition{
 			Category: "latency",
 			Severity: "CRITICAL",
 			Message:  fmt.Sprintf("Device write stall: in-flight write blocked for %dms", latency.OldestInFlightMS),
 		})
-	} else if latency.OldestInFlightMS >= 100 {
+	} else if latency.OldestInFlightMS >= th.WriteStallWarningMS {
 		conds = append(conds, HealthCondition{
 			Category: "latency",
 			Severity: "WARNING",
@@ -1072,13 +1110,13 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 	// live signals above (an in-flight write blocked right now) still apply
 	// (issue #424 round 8, finding 4).
 	if latency.P95HealthSamples > 0 {
-		if latency.P95HealthMS >= 100.0 {
+		if latency.P95HealthMS >= th.WriteLatencyDegradedMS {
 			conds = append(conds, HealthCondition{
 				Category: "latency",
 				Severity: "DEGRADED",
 				Message:  fmt.Sprintf("High forward write latency: p95 is %.1fms over the last %ds", latency.P95HealthMS, latency.P95HealthWindowSec),
 			})
-		} else if latency.P95HealthMS >= 50.0 {
+		} else if latency.P95HealthMS >= th.WriteLatencyWarningMS {
 			conds = append(conds, HealthCondition{
 				Category: "latency",
 				Severity: "WARNING",
@@ -1098,6 +1136,7 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 }
 
 func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown) []HealthCondition {
+	th := &DefaultHealthThresholds
 	var conds []HealthCondition
 	upstreamToNexusUtil := float64(0)
 	if vtun.UpstreamToNexus.Capacity > 0 {
@@ -1107,14 +1146,14 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 	if vtun.NexusToUpstream.Capacity > 0 {
 		nexusToUpstreamUtil = float64(vtun.NexusToUpstream.Occupancy) / float64(vtun.NexusToUpstream.Capacity) * 100.0
 	}
-	if upstreamToNexusUtil >= 90.0 || nexusToUpstreamUtil >= 90.0 {
+	if upstreamToNexusUtil >= th.VirtualTUNDegradedPct || nexusToUpstreamUtil >= th.VirtualTUNDegradedPct {
 		conds = append(conds, HealthCondition{
 			Category: "virtual_tun",
 			Severity: "DEGRADED",
 			Message: fmt.Sprintf("VirtualTUN queue saturation: upstream->nexus %.1f%%, nexus->upstream %.1f%%",
 				upstreamToNexusUtil, nexusToUpstreamUtil),
 		})
-	} else if upstreamToNexusUtil >= 75.0 || nexusToUpstreamUtil >= 75.0 {
+	} else if upstreamToNexusUtil >= th.VirtualTUNWarningPct || nexusToUpstreamUtil >= th.VirtualTUNWarningPct {
 		conds = append(conds, HealthCondition{
 			Category: "virtual_tun",
 			Severity: "WARNING",
@@ -1123,13 +1162,13 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 		})
 	}
 
-	if drops.TotalDropRatePps >= 10.0 {
+	if drops.TotalDropRatePps >= th.DropRateDegradedPPS {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "DEGRADED",
 			Message:  fmt.Sprintf("Elevated drop rate: %.1f drops/sec across dataplane", drops.TotalDropRatePps),
 		})
-	} else if drops.TotalDropRatePps >= 1.0 {
+	} else if drops.TotalDropRatePps >= th.DropRateWarningPPS {
 		conds = append(conds, HealthCondition{
 			Category: "drops",
 			Severity: "WARNING",
@@ -1170,7 +1209,8 @@ func describeLastSuccessfulReconcile(t time.Time) string {
 }
 
 // Peer-sync divergence timing thresholds (issue #424 round 4, item F; round 5,
-// item B). A desired/actual mismatch that resolves inside the next reconcile
+// item B; centralized in HealthThresholds by round 3, finding 4). A
+// desired/actual mismatch that resolves inside the next reconcile
 // is normal convergence, not an incident; only a PERSISTED mismatch is. The
 // age is measured from PeerSync.DivergenceSince, the moment the CURRENT
 // mismatch was first observed, which the peerSynchronizer records during
@@ -1178,10 +1218,9 @@ func describeLastSuccessfulReconcile(t time.Time) string {
 // that is when reconciliation last succeeded, which on a long-healthy system
 // can be hours before a single new peer fails to be added, and using it made
 // a seconds-old divergence report DEGRADED with a multi-hour claim.
-const (
-	peerSyncDivergenceWarningAge  = 30 * time.Second
-	peerSyncDivergenceDegradedAge = 60 * time.Second
-)
+//
+// The durations themselves live on DefaultHealthThresholds
+// (PeerSyncDivergenceWarningAge / PeerSyncDivergenceDegradedAge).
 
 // peerSyncDivergenceCondition returns the health condition for a persisted
 // desired/actual mismatch, or nil when there is nothing to report. now is
@@ -1229,14 +1268,14 @@ func peerSyncDivergenceCondition(peerSync *PeerSyncStatus, now time.Time) *Healt
 		age = 0
 	}
 	switch {
-	case age > peerSyncDivergenceDegradedAge:
+	case age > DefaultHealthThresholds.PeerSyncDivergenceDegradedAge:
 		return &HealthCondition{
 			Category: "peer_sync",
 			Severity: "DEGRADED",
 			Message: fmt.Sprintf("Peer sync divergence for %s: %d desired vs %d actual peers",
 				age.Round(time.Second), peerSync.DesiredPeers, peerSync.ActualPeers),
 		}
-	case age > peerSyncDivergenceWarningAge:
+	case age > DefaultHealthThresholds.PeerSyncDivergenceWarningAge:
 		return &HealthCondition{
 			Category: "peer_sync",
 			Severity: "WARNING",
@@ -1356,8 +1395,8 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 		conds = append(conds, HealthCondition{
 			Category: "sessions",
 			Severity: "WARNING",
-			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> 3m)",
-				len(handshake.StaleLiveSessions)),
+			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> %s)",
+				len(handshake.StaleLiveSessions), DefaultHealthThresholds.HandshakeStaleAge),
 		})
 	}
 	return conds
@@ -1412,7 +1451,7 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			switch {
 			case r.Stats.QueueFullDropsRecent > 0:
 				note = fmt.Sprintf("Recent queue drops: %d", r.Stats.QueueFullDropsRecent)
-			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= 0.8:
+			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= DefaultHealthThresholds.ProblemRoutePressureRatio:
 				note = fmt.Sprintf("Queue pressure: %d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
 			case r.Stats.WriteErrorsRecent > 0:
 				note = fmt.Sprintf("Recent write errors: %d", r.Stats.WriteErrorsRecent)
@@ -1794,14 +1833,13 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		retStats.TUN = current
 	}
 
-	// Backend-device Write queue losses are client traffic, disjoint from
-	// forwarder admission and backend-queue refusals. Never add entire forwarder totals.
-	deviceDrops := s.retiredBackendDeviceDrops
-	for _, dev := range s.backendDevices {
-		if dev != nil {
-			deviceDrops += dev.DroppedPackets()
-		}
-	}
+	// Backend-device VirtualTUN loss is attributed per direction AND per reason
+	// (issue #424 round 3, finding 1). Inbound loss is client-originating
+	// traffic that never reached the backend; outbound loss is backend->Nexus
+	// RETURN traffic that never reached the client. Neither is a whole-tunnel
+	// total, so nothing here can overlap forwarder admission or backend-queue
+	// refusal, which own their own reasons above.
+	deviceDrops := collectBackendDeviceDropStats(s)
 	var returnQueueFull, returnOversized uint64
 	if s.forwarder != nil {
 		returnQueueFull = s.forwarder.DropsQueueFull()
@@ -1821,7 +1859,13 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		fwdClientQueueFull +
 		fwdClientRateLimited +
 		fwdClientNoBackend +
-		clientVirtualTUNDrops + deviceDrops
+		clientVirtualTUNDrops +
+		deviceDrops.ClientQueueFull +
+		deviceDrops.ClientOversized +
+		deviceDrops.ClientShutdown +
+		deviceDrops.ClientExternal +
+		deviceDrops.ClientUnattributed +
+		deviceDrops.ClientRetired
 
 	// Nexus -> Upstream: VirtualTUN.InjectInbound feeds the INBOUND queue, so
 	// its drop bucket is the return path's own loss accounting.
@@ -1841,21 +1885,27 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		retStats.UnmappedDrops +
 		retStats.OwnershipMismatchDrops +
 		nonTunInjectionErrors +
-		returnTunDrops + returnQueueFull + returnOversized
+		returnTunDrops + returnQueueFull + returnOversized +
+		deviceDrops.ReturnQueueFull + deviceDrops.ReturnShutdown
 
 	totalDrops := clientTotal + returnTotal
 
 	status.DropCategories = DropCategoryBreakdown{
-		ClientMalformed:              routerMalformed,
-		ClientUnmappedSource:         routerUnmapped,
-		ClientMismatch:               routerMismatch,
-		ClientRejected:               routerRejected,
-		ClientBackendQueueFull:       fwdClientQueueFull,
-		ClientRateLimited:            fwdClientRateLimited,
-		ClientNoHealthyBackend:       fwdClientNoBackend,
-		ClientVirtualTUNDrops:        clientVirtualTUNDrops,
-		ClientBackendDeviceQueueFull: deviceDrops,
-		ClientTotalDrops:             clientTotal,
+		ClientMalformed:                 routerMalformed,
+		ClientUnmappedSource:            routerUnmapped,
+		ClientMismatch:                  routerMismatch,
+		ClientRejected:                  routerRejected,
+		ClientBackendQueueFull:          fwdClientQueueFull,
+		ClientRateLimited:               fwdClientRateLimited,
+		ClientNoHealthyBackend:          fwdClientNoBackend,
+		ClientVirtualTUNDrops:           clientVirtualTUNDrops,
+		ClientBackendDeviceQueueFull:    deviceDrops.ClientQueueFull,
+		ClientBackendDeviceOversized:    deviceDrops.ClientOversized,
+		ClientBackendDeviceShutdown:     deviceDrops.ClientShutdown,
+		ClientBackendDeviceExternal:     deviceDrops.ClientExternal,
+		ClientBackendDeviceUnattributed: deviceDrops.ClientUnattributed,
+		ClientBackendDeviceRetired:      deviceDrops.ClientRetired,
+		ClientTotalDrops:                clientTotal,
 
 		ReturnMalformed:         retStats.MalformedDrops,
 		ReturnUnmapped:          retStats.UnmappedDrops,
@@ -1866,6 +1916,9 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		ReturnTotalDrops:        returnTotal,
 		ReturnQueueFull:         returnQueueFull,
 		ReturnPacketTooLarge:    returnOversized,
+
+		ReturnBackendDeviceQueueFull: deviceDrops.ReturnQueueFull,
+		ReturnBackendDeviceShutdown:  deviceDrops.ReturnShutdown,
 
 		TotalDrops: totalDrops,
 	}
