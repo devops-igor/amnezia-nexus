@@ -1221,12 +1221,19 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 	items := make([]ProblemRouteItem, len(routes))
 	for i, r := range routes {
 		var note string
-		if r.Stats.QueueFullDrops > 0 {
-			note = fmt.Sprintf("%d queue drops", r.Stats.QueueFullDrops)
-		} else if r.Stats.P95WriteMS >= 50 {
-			note = fmt.Sprintf("High latency: %dms", r.Stats.P95WriteMS)
-		} else if r.Stats.Occupancy > 0 {
-			note = fmt.Sprintf("%d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
+		if r.HasPressure {
+			switch {
+			case r.Stats.QueueFullDropsRecent > 0:
+				note = fmt.Sprintf("Recent queue drops: %d", r.Stats.QueueFullDropsRecent)
+			case r.Stats.Capacity > 0 && r.Stats.Occupancy >= r.Stats.Capacity*8/10:
+				note = fmt.Sprintf("Queue pressure: %d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
+			case r.Stats.WriteErrorsRecent > 0:
+				note = fmt.Sprintf("Recent write errors: %d", r.Stats.WriteErrorsRecent)
+			case r.Stats.WriteStallsRecent > 0:
+				note = fmt.Sprintf("Recent write stalls: %d", r.Stats.WriteStallsRecent)
+			case r.Stats.OldestWriteMS >= forwarder.DeviceWriteStallThreshold.Milliseconds():
+				note = fmt.Sprintf("Write in flight: %dms", r.Stats.OldestWriteMS)
+			}
 		}
 
 		items[i] = ProblemRouteItem{
@@ -1480,6 +1487,20 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint
 }
 
 func (s *Service) populateOperationalDiagnostics(status *Status) {
+	var routes []forwarder.RouteInfo
+	if s.forwarder != nil {
+		routes = s.forwarder.InspectRoutes()
+	}
+	s.populateOperationalDiagnosticsWithRoutes(status, routes)
+}
+
+// populateOperationalDiagnosticsWithRoutes assembles one status response from
+// the caller's route snapshot. The snapshot is intentionally reused instead of
+// sampling route pressure again: endpoint discovery and other status work may
+// take longer than the 200ms recency window, so independent reads can make one
+// JSON response disagree with itself about whether a just-observed incident is
+// still current.
+func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, routes []forwarder.RouteInfo) {
 	if status == nil {
 		return
 	}
@@ -1644,10 +1665,6 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 	}
 
 	// 3. Routing consistency
-	var routes []forwarder.RouteInfo
-	if s.forwarder != nil {
-		routes = s.forwarder.InspectRoutes()
-	}
 	status.RoutingConsistency = checkRoutingInvariants(s, routes, retStats)
 
 	// 4. Handshake freshness
@@ -1656,9 +1673,10 @@ func (s *Service) populateOperationalDiagnostics(status *Status) {
 	// 5. Backends
 	status.Backends = collectBackendDiagnostics(s)
 
-	// 6. Problem Routes
+	// 6. Problem Routes. Filter/rank the SAME snapshot used above so the
+	// response is internally consistent even when status assembly is slow.
 	if s.forwarder != nil {
-		status.ProblemRoutes = collectProblemRoutes(s.forwarder.ProblemRoutes(50))
+		status.ProblemRoutes = collectProblemRoutes(forwarder.ProblemRoutesFromSnapshot(routes, 50))
 		status.AllRoutes = collectProblemRoutes(routes)
 	} else {
 		status.ProblemRoutes = []ProblemRouteItem{}

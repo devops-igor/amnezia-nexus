@@ -1806,7 +1806,17 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	if s.sessionMgr != nil {
 		status.ConnectedSessions = s.sessionMgr.ActiveCount()
 	}
-	populateForwarderStatus(status, s.forwarder)
+
+	// Capture per-route telemetry exactly once for this status response.
+	// Route pressure contains recency windows over monotonic counters, so a
+	// second read later in the same request is not merely another snapshot:
+	// it can advance the window and consume the incident. Both the legacy
+	// route-queue map and the redesigned diagnostics reuse this value.
+	var routeSnapshot []forwarder.RouteInfo
+	if s.forwarder != nil {
+		routeSnapshot = s.forwarder.InspectRoutes()
+	}
+	populateForwarderStatusFromRoutes(status, s.forwarder, routeSnapshot)
 
 	var totalDrops uint64
 	for _, dev := range s.backendDevices {
@@ -1826,12 +1836,24 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
-	s.populateOperationalDiagnostics(status)
+	s.populateOperationalDiagnosticsWithRoutes(status, routeSnapshot)
 
 	return status, nil
 }
 
 func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
+	var routes []forwarder.RouteInfo
+	if f != nil {
+		routes = f.InspectRoutes()
+	}
+	populateForwarderStatusFromRoutes(status, f, routes)
+}
+
+// populateForwarderStatusFromRoutes preserves the legacy status keys while
+// using the caller's coherent route snapshot. It must not call
+// AllRouteQueueStats: that method samples the same recency counters again and
+// can consume a just-observed pressure event before problem_routes is built.
+func populateForwarderStatusFromRoutes(status *Status, f *forwarder.Forwarder, routes []forwarder.RouteInfo) {
 	if f == nil {
 		return
 	}
@@ -1842,94 +1864,21 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 	status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = f.DropStats()
 	status.ForwarderDropsPacketTooLarge = f.DropsPacketTooLarge()
 	status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = f.AggregateQueueStats()
-	allRouteQueues := f.AllRouteQueueStats()
-	if len(allRouteQueues) > 0 {
-		peers := make([]string, 0, len(allRouteQueues))
-		for peerKey := range allRouteQueues {
-			peers = append(peers, peerKey)
+
+	if len(routes) > 0 {
+		ordered := append([]forwarder.RouteInfo(nil), routes...)
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i].PeerKey < ordered[j].PeerKey })
+		if len(ordered) > forwarder.MaxSupportedActiveRoutes {
+			ordered = ordered[:forwarder.MaxSupportedActiveRoutes]
 		}
-		// Sort the RAW keys, then redact, for the same reason as the routing
-		// invariant slices in diagnostics.go: the order and the LIMIT are a
-		// function of the data, not of the masking. Truncating first and
-		// redacting after keeps which routes are reported identical whether
-		// or not the redaction below exists.
-		sort.Strings(peers)
-		limit := len(peers)
-		if limit > forwarder.MaxSupportedActiveRoutes {
-			limit = forwarder.MaxSupportedActiveRoutes
-		}
-		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
-		for _, peerKey := range peers[:limit] {
-			// Map keys are redacted with ingress.RedactKey, the single
-			// redaction convention in this codebase (issue #424 round 5,
-			// item 1c).
-			//
-			// EXPLICIT DECISION, option (a): redact the keys and accept the
-			// behavior change, rather than leaving this as a known raw
-			// compatibility leak or adding a redacted parallel field. The
-			// trade-off, stated plainly:
-			//
-			//   Cost: a consumer that matched these keys against a full peer
-			//   public key it holds elsewhere stops matching. The JSON shape
-			//   (a map of the same stats, same omitempty, same truncation to
-			//   MaxSupportedActiveRoutes) is unchanged; only the key VALUE is
-			//   masked, and two keys sharing a 8 character prefix would
-			//   collide into one map entry.
-			//
-			//   Why accepted: the round 4 change already redacted
-			//   problem_routes[*].peer_key, which is the UI's PRIMARY path
-			//   (web/templates/vpn.html prefers problem_routes/all_routes and
-			//   falls back to this map). This map is therefore already
-			//   inconsistent with the rest of the payload: an admin saw a
-			//   redacted key on one code path and a full key on the other,
-			//   and the full key is the one that leaks to browsers, log
-			//   shippers and support bundles. Redacting here makes the
-			//   fallback path agree with the primary path and removes the
-			//   last full-key disclosure from /api/vpn/status. Options (b)
-			//   and (c) would both keep a raw full key in the payload and
-			//   only add a second field for a leak that already has a
-			//   redaction convention to follow.
-			// The map IDENTIFIER is ingress.PeerKeyFingerprint, an opaque
-			// truncated digest of the full key (issue #424 round 6,
-			// finding 2). RedactKey, the display convention, is the wrong
-			// tool here for two independent reasons:
-			//
-			//   Collision. RedactKey keeps 8 characters, so two peers
-			//   sharing an 8 character prefix produce the SAME key and the
-			//   second write silently overwrote the first. A route simply
-			//   vanished from the payload. This is a functional regression,
-			//   not a cosmetic one, and the round 5 test could not see it
-			//   because it compared the decoded map length against the
-			//   already-collapsed status map.
-			//
-			//   Disclosure. RedactKey ships the first 8 characters of the
-			//   real key. The fingerprint ships none.
-			//
-			// The fingerprint is therefore a pseudonym, NOT an exemption
-			// from redaction: it is the correct thing to redact TO. Raw peer
-			// keys remain absent from this payload, and the recursive
-			// no-raw-peer-key assertion covers this field exactly as it
-			// covered the previous form.
-			//
-			// CLIENT-VISIBLE CONTRACT CHANGE: forwarder_route_queues keys
-			// changed from a redacted key prefix ("r5SHARED…") to a
-			// fingerprint ("pk<24 hex>-<len>"). A consumer cannot recover a
-			// peer key from either form, and neither form was ever usable
-			// as a lookup key against a full key. What a consumer CAN do
-			// now, and could not before, is rely on the key being unique
-			// and stable across polls. The JSON shape (map of the same
-			// stats, same omitempty, same truncation to
-			// MaxSupportedActiveRoutes, same sort-then-limit order) is
-			// unchanged; only the key VALUE is different.
-			// PeerKeyDisplay carries the redacted DISPLAY form alongside the
-			// fingerprint identifier, so the map is still readable by a human
-			// while its keys stay unique. The display form is deliberately
-			// NOT unique and is never used as a key.
-			stats := allRouteQueues[peerKey]
-			stats.PeerKeyDisplay = ingress.RedactKey(peerKey)
-			status.ForwarderRouteQueues[ingress.PeerKeyFingerprint(peerKey)] = stats
+		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, len(ordered))
+		for _, route := range ordered {
+			stats := route.Stats
+			stats.PeerKeyDisplay = ingress.RedactKey(route.PeerKey)
+			status.ForwarderRouteQueues[ingress.PeerKeyFingerprint(route.PeerKey)] = stats
 		}
 	}
+
 	writes := f.DeviceWriteSnapshot()
 	status.ForwarderDeviceWriteErrors = writes.Errors
 	status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.

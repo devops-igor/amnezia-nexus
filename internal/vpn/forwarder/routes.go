@@ -1,9 +1,6 @@
 package forwarder
 
-import (
-	"math"
-	"sort"
-)
+import "sort"
 
 // RouteInfo holds structural and performance state for an active forwarder route.
 type RouteInfo struct {
@@ -74,11 +71,24 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 	return routes
 }
 
-// ProblemRoutes returns active routes ranked problem-first (highest drops, highest queue occupancy, write stalls).
-// Only routes with active pressure (HasPressure == true) are returned. If no routes have pressure,
-// an empty slice is returned.
+// ProblemRoutes returns active routes ranked by current/recent pressure.
 func (f *Forwarder) ProblemRoutes(limit int) []RouteInfo {
-	allRoutes := f.InspectRoutes()
+	return ProblemRoutesFromSnapshot(f.InspectRoutes(), limit)
+}
+
+// ProblemRoutesFromSnapshot filters and ranks a caller-owned route snapshot.
+//
+// The snapshot form exists so one higher-level status collection can inspect
+// route pressure exactly once and reuse that same observation for routing
+// consistency, the legacy route-queue map, all_routes and problem_routes.
+// Sampling the monotonic counters independently in each consumer can otherwise
+// advance the recency window between reads and make one response disagree with
+// itself.
+//
+// Ranking follows issue #424's current-degradation-first rule. Lifetime totals
+// remain visible as history and are only late tie-breakers after all current
+// pressure signals are equal.
+func ProblemRoutesFromSnapshot(allRoutes []RouteInfo, limit int) []RouteInfo {
 	routes := make([]RouteInfo, 0, len(allRoutes))
 	for _, r := range allRoutes {
 		if r.HasPressure {
@@ -89,47 +99,50 @@ func (f *Forwarder) ProblemRoutes(limit int) []RouteInfo {
 		return []RouteInfo{}
 	}
 
-	// Problem-first sort
 	sort.Slice(routes, func(i, j int) bool {
 		rA := routes[i]
 		rB := routes[j]
 
-		// 1. Any drops?
-		if (rA.Stats.QueueFullDrops > 0) != (rB.Stats.QueueFullDrops > 0) {
-			return rA.Stats.QueueFullDrops > 0
-		}
-		if rA.Stats.QueueFullDrops != rB.Stats.QueueFullDrops {
-			return rA.Stats.QueueFullDrops > rB.Stats.QueueFullDrops
+		// 1. Fresh packet loss is the strongest current signal.
+		if rA.Stats.QueueFullDropsRecent != rB.Stats.QueueFullDropsRecent {
+			return rA.Stats.QueueFullDropsRecent > rB.Stats.QueueFullDropsRecent
 		}
 
-		// 2. High occupancy ratio
-		utilA := float64(0)
-		if rA.Stats.Capacity > 0 {
-			utilA = float64(rA.Stats.Occupancy) / float64(rA.Stats.Capacity)
-		}
-		utilB := float64(0)
-		if rB.Stats.Capacity > 0 {
-			utilB = float64(rB.Stats.Occupancy) / float64(rB.Stats.Capacity)
-		}
-		if math.Abs(utilA-utilB) > 0.05 {
+		// 2. Then current queue saturation.
+		utilA := routeUtilization(rA.Stats)
+		utilB := routeUtilization(rB.Stats)
+		if utilA != utilB {
 			return utilA > utilB
 		}
 
-		// 3. Write errors or stalls
-		if (rA.Stats.WriteErrors > 0) != (rB.Stats.WriteErrors > 0) {
-			return rA.Stats.WriteErrors > 0
+		// 3. Then fresh write failures/stalls.
+		if rA.Stats.WriteErrorsRecent != rB.Stats.WriteErrorsRecent {
+			return rA.Stats.WriteErrorsRecent > rB.Stats.WriteErrorsRecent
 		}
-		if (rA.Stats.WriteStalls > 0) != (rB.Stats.WriteStalls > 0) {
-			return rA.Stats.WriteStalls > 0
+		if rA.Stats.WriteStallsRecent != rB.Stats.WriteStallsRecent {
+			return rA.Stats.WriteStallsRecent > rB.Stats.WriteStallsRecent
 		}
+
+		// 4. Live blocked-write age and recent latency context.
 		if rA.Stats.OldestWriteMS != rB.Stats.OldestWriteMS {
 			return rA.Stats.OldestWriteMS > rB.Stats.OldestWriteMS
 		}
-		if rA.Stats.MaxWriteDurationMS != rB.Stats.MaxWriteDurationMS {
-			return rA.Stats.MaxWriteDurationMS > rB.Stats.MaxWriteDurationMS
+		if rA.Stats.P95WriteMS != rB.Stats.P95WriteMS {
+			return rA.Stats.P95WriteMS > rB.Stats.P95WriteMS
 		}
 
-		// 4. Stable tie-breaker
+		// 5. Historical totals may break an otherwise-current-state tie, but
+		// they never outrank an active signal above.
+		if rA.Stats.QueueFullDrops != rB.Stats.QueueFullDrops {
+			return rA.Stats.QueueFullDrops > rB.Stats.QueueFullDrops
+		}
+		if rA.Stats.WriteErrors != rB.Stats.WriteErrors {
+			return rA.Stats.WriteErrors > rB.Stats.WriteErrors
+		}
+		if rA.Stats.WriteStalls != rB.Stats.WriteStalls {
+			return rA.Stats.WriteStalls > rB.Stats.WriteStalls
+		}
+
 		return rA.PeerKey < rB.PeerKey
 	})
 
@@ -137,4 +150,11 @@ func (f *Forwarder) ProblemRoutes(limit int) []RouteInfo {
 		return routes[:limit]
 	}
 	return routes
+}
+
+func routeUtilization(stats RouteQueueStats) float64 {
+	if stats.Capacity <= 0 {
+		return 0
+	}
+	return float64(stats.Occupancy) / float64(stats.Capacity)
 }
