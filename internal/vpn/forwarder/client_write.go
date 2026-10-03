@@ -37,14 +37,31 @@ const DeviceWriteStallThreshold = 100 * time.Millisecond
 
 const latencyReservoirSize = 1024
 
+// latencyHealthWindow bounds how far back a forward-write duration may be and
+// still count toward CURRENT health (issue #424 round 8, finding 4).
+//
+// The reservoir below never forgets: it keeps the last 1024 durations with no
+// expiry, so on a low-volume or idle server a single burst of slow writes kept
+// p95 above the threshold until 1024 new writes displaced them, which is
+// arbitrarily long. Health now reads a time-bounded slice instead. The reservoir
+// itself remains as descriptive telemetry, so operators keep the historical
+// percentiles.
+const latencyHealthWindow = 60 * time.Second
+
 type latencyReservoir struct {
 	samples [latencyReservoirSize]time.Duration
+	stamps  [latencyReservoirSize]time.Time
 	head    int
 	count   int
 }
 
 func (r *latencyReservoir) record(d time.Duration) {
+	r.recordAt(d, time.Now())
+}
+
+func (r *latencyReservoir) recordAt(d time.Duration, at time.Time) {
 	r.samples[r.head] = d
+	r.stamps[r.head] = at
 	r.head = (r.head + 1) % latencyReservoirSize
 	if r.count < latencyReservoirSize {
 		r.count++
@@ -63,6 +80,31 @@ func (r *latencyReservoir) percentiles() (p50, p95, p99 time.Duration) {
 	p95 = buf[n*95/100]
 	p99 = buf[n*99/100]
 	return p50, p95, p99
+}
+
+// healthP95 returns the p95 over the samples recorded within latencyHealthWindow
+// of now, plus how many samples that slice contains. A zero sample count means
+// nothing recent was observed, and the caller must then treat latency as
+// UNKNOWN rather than BAD: an idle server has no recent evidence of slowness and
+// must not be held DEGRADED on history (issue #424 round 8, finding 4).
+func (r *latencyReservoir) healthP95(now time.Time) (time.Duration, int) {
+	n := r.count
+	if n == 0 {
+		return 0, 0
+	}
+	cutoff := now.Add(-latencyHealthWindow)
+	buf := make([]time.Duration, 0, n)
+	for i := 0; i < n; i++ {
+		if r.stamps[i].Before(cutoff) {
+			continue
+		}
+		buf = append(buf, r.samples[i])
+	}
+	if len(buf) == 0 {
+		return 0, 0
+	}
+	sort.Slice(buf, func(i, j int) bool { return buf[i] < buf[j] })
+	return buf[len(buf)*95/100], len(buf)
 }
 
 type routeLatencyReservoir struct {
@@ -93,6 +135,13 @@ func (r *routeLatencyReservoir) p95() time.Duration {
 // DeviceWriteTelemetry includes admitted writes, completed outcomes, and live
 // stall diagnostics. Count includes in-flight writes; durations cover completed
 // writes. OldestInFlight is the age of the oldest admitted, unfinished write.
+//
+// P50Duration/P95Duration/P99Duration are DESCRIPTIVE: they describe the last
+// latencyReservoirSize completed writes and deliberately never expire.
+// P95HealthDuration/P95HealthSamples are the CURRENT-health view: the p95 over
+// writes completed within latencyHealthWindow, and how many writes that window
+// holds. P95HealthSamples == 0 means no recent write was observed, so latency is
+// UNKNOWN and must not gate health (issue #424 round 8, finding 4).
 type DeviceWriteTelemetry struct {
 	Count          uint64
 	Errors         uint64
@@ -104,6 +153,10 @@ type DeviceWriteTelemetry struct {
 	P50Duration    time.Duration
 	P95Duration    time.Duration
 	P99Duration    time.Duration
+
+	P95HealthDuration time.Duration
+	P95HealthSamples  int
+	HealthWindow      time.Duration
 }
 
 // DeviceWriteSnapshot also includes retired routes whose writes have not yet
@@ -112,7 +165,10 @@ func (f *Forwarder) DeviceWriteSnapshot() DeviceWriteTelemetry {
 	f.writeMetricsMu.Lock()
 	defer f.writeMetricsMu.Unlock()
 	stats := f.writeMetrics
+	now := time.Now()
 	stats.P50Duration, stats.P95Duration, stats.P99Duration = f.writeLatencies.percentiles()
+	stats.P95HealthDuration, stats.P95HealthSamples = f.writeLatencies.healthP95(now)
+	stats.HealthWindow = latencyHealthWindow
 	stats.InFlight = len(f.writesInFlight)
 	for _, started := range f.writesInFlight {
 		age := time.Since(started)

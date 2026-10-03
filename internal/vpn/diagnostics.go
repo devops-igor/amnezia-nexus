@@ -53,6 +53,13 @@ type TrafficRates struct {
 }
 
 // QueuePressureDiagnostics contains queue occupancy and saturation duration.
+//
+// The four duration fields are SAMPLED AND INTERPOLATED estimates, not
+// continuous measurements: occupancy is read once per status collection and the
+// seconds above a threshold are derived from a linear interpolation between the
+// previous and the current reading. An excursion that begins and ends between
+// two collections is under-counted, and one can never be over-counted
+// (issue #424 round 8, finding 3).
 type QueuePressureDiagnostics struct {
 	Occupancy             int     `json:"occupancy"`
 	Capacity              int     `json:"capacity"`
@@ -67,6 +74,14 @@ type QueuePressureDiagnostics struct {
 }
 
 // ForwardLatencyDiagnostics tracks forward write durations and in-flight operations.
+//
+// P50MS/P95MS/P99MS are DESCRIPTIVE percentiles over the last 1024 completed
+// writes; they do not expire and an operator can still read the historical
+// distribution there. The HEALTH decision uses P95HealthMS instead, the p95 over
+// writes completed inside P95HealthWindowSec, together with P95HealthSamples,
+// the number of writes that window contains. P95HealthSamples == 0 means no
+// recent write was observed (an idle server), so latency is UNKNOWN and must not
+// degrade health on history alone (issue #424 round 8, finding 4).
 type ForwardLatencyDiagnostics struct {
 	P50MS             float64 `json:"p50_ms"`
 	P95MS             float64 `json:"p95_ms"`
@@ -78,6 +93,10 @@ type ForwardLatencyDiagnostics struct {
 	WriteErrors       uint64  `json:"write_errors"`
 	WriteTotal        uint64  `json:"write_total"`
 	WriteErrorRatePps float64 `json:"write_error_rate_pps"`
+
+	P95HealthMS        float64 `json:"p95_health_ms"`
+	P95HealthSamples   int     `json:"p95_health_samples"`
+	P95HealthWindowSec int64   `json:"p95_health_window_sec"`
 }
 
 // DropCategoryBreakdown separates drops by specific root cause without double counting.
@@ -861,7 +880,10 @@ func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
 		conds = append(conds, HealthCondition{
 			Category: "queue_pressure",
 			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("Queue pressure: Return queue stayed above 80%% utilization for %ds", queue.ConsecutiveAbove80Sec),
+			// "estimated" is load-bearing: the duration is interpolated between
+			// occupancy samples, not measured continuously (issue #424 round 8,
+			// finding 3).
+			Message: fmt.Sprintf("Queue pressure: Return queue utilization has been at or above 80%% for an estimated %ds", queue.ConsecutiveAbove80Sec),
 		})
 	} else if queue.UtilizationPct >= 80.0 || queue.ConsecutiveAbove50Sec >= 60 {
 		conds = append(conds, HealthCondition{
@@ -896,18 +918,27 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 		})
 	}
 
-	if latency.P95MS >= 100.0 {
-		conds = append(conds, HealthCondition{
-			Category: "latency",
-			Severity: "DEGRADED",
-			Message:  fmt.Sprintf("High forward write latency: p95 is %.1fms", latency.P95MS),
-		})
-	} else if latency.P95MS >= 50.0 {
-		conds = append(conds, HealthCondition{
-			Category: "latency",
-			Severity: "WARNING",
-			Message:  fmt.Sprintf("Elevated forward write latency: p95 is %.1fms", latency.P95MS),
-		})
+	// Latency health uses the RECENT window, not the descriptive percentile.
+	// P95MS describes the last 1024 completed writes and never expires, so on a
+	// low-volume or idle server one burst of slow writes held DEGRADED until
+	// 1024 new writes displaced it. P95HealthSamples == 0 means nothing was
+	// written inside the window, which is UNKNOWN latency, not bad latency: the
+	// live signals above (an in-flight write blocked right now) still apply
+	// (issue #424 round 8, finding 4).
+	if latency.P95HealthSamples > 0 {
+		if latency.P95HealthMS >= 100.0 {
+			conds = append(conds, HealthCondition{
+				Category: "latency",
+				Severity: "DEGRADED",
+				Message:  fmt.Sprintf("High forward write latency: p95 is %.1fms over the last %ds", latency.P95HealthMS, latency.P95HealthWindowSec),
+			})
+		} else if latency.P95HealthMS >= 50.0 {
+			conds = append(conds, HealthCondition{
+				Category: "latency",
+				Severity: "WARNING",
+				Message:  fmt.Sprintf("Elevated forward write latency: p95 is %.1fms over the last %ds", latency.P95HealthMS, latency.P95HealthWindowSec),
+			})
+		}
 	}
 
 	if latency.WriteErrorRatePps > 0 {
@@ -1341,7 +1372,14 @@ func (s *Service) sampleRollingHistory() {
 // diagRatesTracker provides thread-safe sampling and independent rate computation
 // for device write errors, client drops, return drops, and overall dataplane drops.
 type diagRatesTracker struct {
-	mu              sync.Mutex
+	mu sync.Mutex
+	// primed records that the first sample has been taken. It is deliberately
+	// NOT derived from lastSampleTime being zero: a constructor that pre-seeds
+	// the timestamp makes the priming branch below unreachable, which silently
+	// leaves every counter baseline at zero and turns lifetime totals into
+	// bogus per-second rates on the first window. Mirrors diagDeltaTracker
+	// (issue #424 round 8, finding 2).
+	primed          bool
 	lastSampleTime  time.Time
 	lastClientDrops uint64
 	lastReturnDrops uint64
@@ -1354,10 +1392,13 @@ type diagRatesTracker struct {
 	writeErrorRate float64
 }
 
+// newDiagRatesTracker returns an UNPRIMED tracker. lastSampleTime and every
+// counter baseline are captured by the first Sample call, so a counter that has
+// been accumulating since process start is never reported as a fresh incident
+// (issue #424 round 8, finding 2). Seeding the timestamp here would make the
+// priming branch in Sample dead code.
 func newDiagRatesTracker() *diagRatesTracker {
-	return &diagRatesTracker{
-		lastSampleTime: time.Now(),
-	}
+	return &diagRatesTracker{}
 }
 
 func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
@@ -1367,7 +1408,8 @@ func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, total
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if t.lastSampleTime.IsZero() {
+	if !t.primed {
+		t.primed = true
 		t.lastSampleTime = now
 		t.lastClientDrops = clientDrops
 		t.lastReturnDrops = returnDrops
@@ -1548,6 +1590,10 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 			WriteErrors:       writes.Errors,
 			WriteTotal:        writes.Count,
 			WriteErrorRatePps: 0,
+
+			P95HealthMS:        float64(writes.P95HealthDuration.Microseconds()) / 1000.0,
+			P95HealthSamples:   writes.P95HealthSamples,
+			P95HealthWindowSec: writes.HealthWindow.Milliseconds(),
 		}
 	}
 

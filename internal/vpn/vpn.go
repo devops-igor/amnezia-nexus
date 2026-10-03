@@ -1841,14 +1841,6 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	return status, nil
 }
 
-func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
-	var routes []forwarder.RouteInfo
-	if f != nil {
-		routes = f.InspectRoutes()
-	}
-	populateForwarderStatusFromRoutes(status, f, routes)
-}
-
 // populateForwarderStatusFromRoutes preserves the legacy status keys while
 // using the caller's coherent route snapshot. It must not call
 // AllRouteQueueStats: that method samples the same recency counters again and

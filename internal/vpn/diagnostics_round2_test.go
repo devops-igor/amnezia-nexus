@@ -114,6 +114,19 @@ func TestOutboundVirtualTUNDropsCountedOnceInClientBucket(t *testing.T) {
 	// draining reader would change the exact overflow drop count.
 	requireDeterministicInboundQueue(t, engine)
 
+	// Prime the windowed rate tracker BEFORE any drop exists. The tracker must
+	// only report NEW loss inside a window; without this first collection the
+	// drops below would sit in the lifetime totals at prime time and correctly
+	// contribute no rate (issue #424 round 8, finding 2). Previously this test
+	// passed only because the tracker compared lifetime totals against a zero
+	// baseline, which reported a burst of historical drops as an active rate.
+	var first Status
+	svc.populateOperationalDiagnostics(&first)
+	if first.DropCategories.TotalDrops != 0 {
+		t.Fatalf("precondition: expected no drops before the burst, got %d",
+			first.DropCategories.TotalDrops)
+	}
+
 	// Fill the outbound queue to capacity, then push past it. The device
 	// counts a queue-full drop per rejected packet.
 	capacity := virtualtun.DefaultOutboundCapacity
@@ -129,29 +142,29 @@ func TestOutboundVirtualTUNDropsCountedOnceInClientBucket(t *testing.T) {
 	}
 
 	// The tracker throttles sub-200ms resampling, so space the two samples.
-	var first, second Status
-	svc.populateOperationalDiagnostics(&first)
-	if first.DropCategories.ClientVirtualTUNDrops != 5 {
-		t.Errorf("ClientVirtualTUNDrops: expected 5, got %d", first.DropCategories.ClientVirtualTUNDrops)
-	}
-	if first.DropCategories.ClientTotalDrops != 5 {
-		t.Errorf("ClientTotalDrops: expected 5, got %d", first.DropCategories.ClientTotalDrops)
-	}
-	if first.DropCategories.ReturnTotalDrops != 0 {
-		t.Errorf("ReturnTotalDrops: expected 0, got %d (outbound drops are not return-side)",
-			first.DropCategories.ReturnTotalDrops)
-	}
-	if first.DropCategories.TotalDrops != 5 {
-		t.Errorf("TotalDrops: expected 5, got %d", first.DropCategories.TotalDrops)
-	}
-
+	var second Status
 	time.Sleep(250 * time.Millisecond)
 	svc.populateOperationalDiagnostics(&second)
+	if second.DropCategories.ClientVirtualTUNDrops != 5 {
+		t.Errorf("ClientVirtualTUNDrops: expected 5, got %d", second.DropCategories.ClientVirtualTUNDrops)
+	}
+	if second.DropCategories.ClientTotalDrops != 5 {
+		t.Errorf("ClientTotalDrops: expected 5, got %d", second.DropCategories.ClientTotalDrops)
+	}
+	if second.DropCategories.ReturnTotalDrops != 0 {
+		t.Errorf("ReturnTotalDrops: expected 0, got %d (outbound drops are not return-side)",
+			second.DropCategories.ReturnTotalDrops)
+	}
+	if second.DropCategories.TotalDrops != 5 {
+		t.Errorf("TotalDrops: expected 5, got %d", second.DropCategories.TotalDrops)
+	}
 	if second.DropCategories.ClientDropRatePps <= 0 {
-		t.Errorf("ClientDropRatePps: expected a non-zero rate, got %f", second.DropCategories.ClientDropRatePps)
+		t.Errorf("ClientDropRatePps: expected a non-zero rate for drops NEW in this window, got %f",
+			second.DropCategories.ClientDropRatePps)
 	}
 	if second.DropCategories.TotalDropRatePps <= 0 {
-		t.Errorf("TotalDropRatePps: expected a non-zero rate, got %f", second.DropCategories.TotalDropRatePps)
+		t.Errorf("TotalDropRatePps: expected a non-zero rate for drops NEW in this window, got %f",
+			second.DropCategories.TotalDropRatePps)
 	}
 
 	// No category may double-count the same packet.
