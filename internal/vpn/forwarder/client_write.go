@@ -304,4 +304,5 @@ func (f *Forwarder) reconcileQueueOccupancyLocked(route *sessionRoute) {
 	occupancy := len(route.clientQueue)
 	f.aggregateQueueOccupancy += occupancy - route.queueOccupancy
 	route.queueOccupancy = occupancy
+	f.queueDwell.observe(time.Now(), f.aggregateQueueOccupancy, f.aggregateQueueCapacity)
 }

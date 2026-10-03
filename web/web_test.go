@@ -3461,6 +3461,44 @@ assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'ba
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Not reported');
 assert.strictEqual(mockDoc.getElementById('vpn-kpi-throughput').textContent, '-');
 
+// Current route alarms recover while lifetime totals remain visible.
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available:true, forwarder_queue_capacity:100, forwarder_queue_occupancy:0,
+    health_assessment:{status:'HEALTHY',summary:'Recovered',conditions:[]},
+    problem_routes:[],
+    all_routes:[{peer_key:'peer',capacity:100,occupancy:0,drops:5,has_pressure:false}]
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
+
+// Fresh loss remains a problem after the queue drains.
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available:true, forwarder_queue_capacity:100,
+    problem_routes:[{peer_key:'peer',capacity:100,occupancy:0,drops:5,has_pressure:true}],
+    all_routes:[{peer_key:'peer',capacity:100,occupancy:0,drops:5,has_pressure:true}]
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+
+// Old payloads have no flag; current occupancy still detects live pressure.
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available:true,forwarder_queue_capacity:100,
+    forwarder_route_queues:{peer:{capacity:100,occupancy:0,queue_full_drops:5}}
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available:true,forwarder_queue_capacity:100,
+    forwarder_route_queues:{peer:{capacity:100,occupancy:80,queue_full_drops:5}}
+});
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+
 console.log('ISSUE_424_PASS');
 `, f1, f2)
 
@@ -3474,4 +3512,54 @@ console.log('ISSUE_424_PASS');
 			t.Fatalf("Issue 424 JSDOM tests did not output ISSUE_424_PASS\nOutput:\n%s", string(out))
 		}
 	})
+}
+
+func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Skipf("node binary not found: %v", err)
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sparkline, err := extractJSFunction(string(templateData), "function vpnGenerateSparklineSVG")
+	if err != nil {
+		t.Fatal(err)
+	}
+	render, err := extractJSFunction(string(templateData), "function vpnRenderHistoryCharts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `const assert = require('assert');
+const chart = {innerHTML:''};
+const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
+` + sparkline + "\n" + render + `
+vpnRenderHistoryCharts({window_15m:[
+    {fwd_p95_ms:200,fwd_p95_samples:1},
+    {fwd_p95_ms:200,fwd_p95_samples:0},
+    {fwd_p95_ms:0,fwd_p95_samples:1}
+]});
+const stroke = chart.innerHTML.match(/<path d="([^"]+)" fill="none"/);
+assert(stroke, 'observed latency must remain visible');
+assert.strictEqual((stroke[1].match(/M /g) || []).length, 2, 'missing latency must break the line');
+assert(!stroke[1].includes(' L '), 'isolated observations must not connect across the gap');
+assert(stroke[1].includes('M 2.0 2.0') && stroke[1].includes('M 198.0 38.0'), 'gaps must preserve observation x positions');
+assert.strictEqual((chart.innerHTML.match(/<circle /g) || []).length, 2, 'zero and slow observations must both be visible');
+vpnRenderHistoryCharts({window_15m:[{fwd_p95_ms:200,fwd_p95_samples:0}]});
+assert(chart.innerHTML.includes('No data'), 'idle history must be unavailable');
+assert(!chart.innerHTML.includes('<path'), 'unavailable history must not invent zero/slow curves');
+vpnRenderHistoryCharts({window_15m:[{fwd_p95_ms:0,fwd_p95_samples:1}]});
+assert(!chart.innerHTML.includes('No data'), 'a measured zero is available');
+vpnRenderHistoryCharts({window_15m:[{fwd_p95_ms:20}]});
+assert(!chart.innerHTML.includes('No data'), 'old payloads remain readable');
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("history renderer: %v\n%s", err, out)
+	}
 }

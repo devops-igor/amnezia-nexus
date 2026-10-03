@@ -50,7 +50,7 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 		// with no traffic cannot accumulate pressure it never had. The
 		// lifetime values remain on the payload as history; they simply no
 		// longer decide.
-		hasPressure := (stats.Capacity > 0 && stats.Occupancy >= stats.Capacity*8/10) ||
+		hasPressure := (stats.Capacity > 0 && routeUtilization(stats) >= 0.8) ||
 			stats.OldestWriteMS >= 100 ||
 			stats.QueueFullDropsRecent > 0 ||
 			stats.WriteErrorsRecent > 0 ||

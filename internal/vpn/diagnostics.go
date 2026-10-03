@@ -54,12 +54,10 @@ type TrafficRates struct {
 
 // QueuePressureDiagnostics contains queue occupancy and saturation duration.
 //
-// The four duration fields are SAMPLED AND INTERPOLATED estimates, not
-// continuous measurements: occupancy is read once per status collection and the
-// seconds above a threshold are derived from a linear interpolation between the
-// previous and the current reading. An excursion that begins and ends between
-// two collections is under-counted, and one can never be over-counted
-// (issue #424 round 8, finding 3).
+// The four duration fields measure dwell from serialized managed queue
+// transitions, rounded down to completed seconds. Status polling and traffic-rate
+// throttling do not extend a run after a drain. Legacy direct channel drains have
+// unknown timing and reset the unobserved run when reconciled.
 type QueuePressureDiagnostics struct {
 	Occupancy             int     `json:"occupancy"`
 	Capacity              int     `json:"capacity"`
@@ -241,15 +239,18 @@ type RuntimeResources struct {
 }
 
 // HistoryPoint is a single time-series sample for dashboard graphs.
+// ForwardP95Samples == 0 marks unavailable current latency; ForwardP95MS alone
+// cannot distinguish an idle window from a measured zero-duration write.
 type HistoryPoint struct {
-	Timestamp      int64   `json:"t"`
-	RxBps          float64 `json:"rx_bps"`
-	TxBps          float64 `json:"tx_bps"`
-	QueueUtilPct   float64 `json:"q_pct"`
-	TotalDropRate  float64 `json:"drop_rate"`
-	ForwardP95MS   float64 `json:"fwd_p95_ms"`
-	ActiveSessions int     `json:"sessions"`
-	BackendP95MS   float64 `json:"be_p95_ms"`
+	Timestamp         int64   `json:"t"`
+	RxBps             float64 `json:"rx_bps"`
+	TxBps             float64 `json:"tx_bps"`
+	QueueUtilPct      float64 `json:"q_pct"`
+	TotalDropRate     float64 `json:"drop_rate"`
+	ForwardP95Samples int     `json:"fwd_p95_samples"`
+	ForwardP95MS      float64 `json:"fwd_p95_ms"`
+	ActiveSessions    int     `json:"sessions"`
+	BackendP95MS      float64 `json:"be_p95_ms"`
 }
 
 // HistoricalSeries contains rolling time-series samples across 4 windows.
@@ -880,10 +881,8 @@ func evaluateQueueConditions(queue QueuePressureDiagnostics) []HealthCondition {
 		conds = append(conds, HealthCondition{
 			Category: "queue_pressure",
 			Severity: "DEGRADED",
-			// "estimated" is load-bearing: the duration is interpolated between
-			// occupancy samples, not measured continuously (issue #424 round 8,
-			// finding 3).
-			Message: fmt.Sprintf("Queue pressure: Return queue utilization has been at or above 80%% for an estimated %ds", queue.ConsecutiveAbove80Sec),
+			// Consecutive duration is measured from managed queue transitions.
+			Message: fmt.Sprintf("Queue pressure: Return queue utilization has been at or above 80%% for %ds", queue.ConsecutiveAbove80Sec),
 		})
 	} else if queue.UtilizationPct >= 80.0 || queue.ConsecutiveAbove50Sec >= 60 {
 		conds = append(conds, HealthCondition{
@@ -1256,7 +1255,7 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			switch {
 			case r.Stats.QueueFullDropsRecent > 0:
 				note = fmt.Sprintf("Recent queue drops: %d", r.Stats.QueueFullDropsRecent)
-			case r.Stats.Capacity > 0 && r.Stats.Occupancy >= r.Stats.Capacity*8/10:
+			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= 0.8:
 				note = fmt.Sprintf("Queue pressure: %d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
 			case r.Stats.WriteErrorsRecent > 0:
 				note = fmt.Sprintf("Recent write errors: %d", r.Stats.WriteErrorsRecent)
@@ -1350,14 +1349,15 @@ func (s *Service) sampleRollingHistory() {
 	}
 
 	point := HistoryPoint{
-		Timestamp:      time.Now().Unix(),
-		RxBps:          status.Rates.RxBps,
-		TxBps:          status.Rates.TxBps,
-		QueueUtilPct:   status.QueuePressure.UtilizationPct,
-		TotalDropRate:  status.Rates.DropRatePps,
-		ForwardP95MS:   status.ForwardLatency.P95MS,
-		ActiveSessions: status.ConnectedSessions,
-		BackendP95MS:   status.Backends.LatencyP95MS,
+		Timestamp:         time.Now().Unix(),
+		RxBps:             status.Rates.RxBps,
+		TxBps:             status.Rates.TxBps,
+		QueueUtilPct:      status.QueuePressure.UtilizationPct,
+		TotalDropRate:     status.Rates.DropRatePps,
+		ForwardP95MS:      status.ForwardLatency.P95HealthMS,
+		ForwardP95Samples: status.ForwardLatency.P95HealthSamples,
+		ActiveSessions:    status.ConnectedSessions,
+		BackendP95MS:      status.Backends.LatencyP95MS,
 	}
 
 	s.mu.RLock()
@@ -1593,7 +1593,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 
 			P95HealthMS:        float64(writes.P95HealthDuration.Microseconds()) / 1000.0,
 			P95HealthSamples:   writes.P95HealthSamples,
-			P95HealthWindowSec: writes.HealthWindow.Milliseconds(),
+			P95HealthWindowSec: int64(writes.HealthWindow / time.Second),
 		}
 	}
 

@@ -23,11 +23,11 @@ type TrafficRates struct {
 
 // QueuePressureStats captures queue occupancy pressure duration and rates.
 //
-// The duration fields are SAMPLED AND INTERPOLATED estimates: occupancy is read
-// once per status collection and the seconds above a threshold are derived from
-// a linear interpolation between the previous and the current reading, so they
-// under-count an excursion contained inside one interval and can never
-// over-count one (issue #424 round 8, finding 3).
+// Forwarder.QueuePressure fills the duration fields from serialized occupancy
+// transitions, in whole completed seconds. Legacy direct channel drains reset
+// an unobserved run during reconciliation rather than inventing a drain time.
+// Standalone RateTracker snapshots retain descriptive interpolated estimates;
+// those estimates must not drive sustained-pressure health.
 type QueuePressureStats struct {
 	Occupancy             int     `json:"occupancy"`
 	Capacity              int     `json:"capacity"`
@@ -190,9 +190,9 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	// SAMPLED AND INTERPOLATED estimate, not continuous measurement: a brief
 	// spike that begins and ends between two samples is invisible to it, and a
 	// genuine excursion that starts and ends between two samples is
-	// under-counted. It can no longer over-count, which is the direction
-	// issue #424 requires (a short burst must not read as sustained
-	// saturation).
+	// under-counted. It can also over-count if the queue drains between accepted
+	// readings. Forwarder.QueuePressure replaces these descriptive estimates
+	// with measured queue-transition dwell before any health evaluation.
 	util := float64(0)
 	if capacity > 0 {
 		util = float64(occupancy) / float64(capacity)
@@ -283,7 +283,9 @@ func (rt *RateTracker) Snapshot(rxPackets, txPackets uint64) TrafficRates {
 	}
 }
 
-// PressureSnapshot returns current queue pressure indicators.
+// PressureSnapshot returns sampled queue-pressure context. Its interpolated
+// durations are descriptive only; Forwarder.QueuePressure supplies measured
+// transition dwell for the runtime diagnostics and sustained-health decision.
 func (rt *RateTracker) PressureSnapshot(occupancy, capacity, highWater int, queueDrops uint64) QueuePressureStats {
 	if rt == nil {
 		var utilPct, hwPct float64

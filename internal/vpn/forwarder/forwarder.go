@@ -277,7 +277,9 @@ type Forwarder struct {
 	writeLatencies          latencyReservoir
 	writesInFlight          map[*sessionRoute]time.Time
 	rateTracker             *RateTracker
-	aggregateQueueOccupancy int // guarded by aggregateQueueMu
+	aggregateQueueOccupancy int               // guarded by aggregateQueueMu
+	aggregateQueueCapacity  int               // guarded by aggregateQueueMu
+	queueDwell              queueDwellTracker // guarded by aggregateQueueMu
 	aggregateQueueHighWater atomic.Uint64
 	// aggregateQueueMu serializes managed queue operations so aggregate
 	// high-water is sampled at the same linearization point as enqueue/dequeue.
@@ -524,6 +526,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 		retirement.route = old
 		f.stopRoutePumpLocked(old)
 		f.drainRouteQueueLocked(old)
+		f.changeQueueCapacityLocked(-cap(old.clientQueue))
 		if old.assignedIP != "" {
 			if current, exists := f.routesByIP[old.assignedIP]; exists && current == old {
 				delete(f.routesByIP, old.assignedIP)
@@ -536,6 +539,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	f.peerRegs[peerKey]++
 
 	f.routesByPeer[peerKey] = route
+	f.changeQueueCapacityLocked(cap(route.clientQueue))
 	if assignedIP != "" {
 		f.routesByIP[assignedIP] = route
 	}
@@ -572,11 +576,12 @@ func (f *Forwarder) drainRouteQueueLocked(route *sessionRoute) {
 	}
 	f.aggregateQueueMu.Lock()
 	defer f.aggregateQueueMu.Unlock()
+	f.reconcileBeforeQueueMutationLocked(route)
 	for {
 		select {
 		case <-route.clientQueue:
-		default:
 			f.reconcileQueueOccupancyLocked(route)
+		default:
 			return
 		}
 	}
@@ -700,6 +705,7 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		// late senders just fill the abandoned buffer and hit ErrQueueFull.
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
+		f.changeQueueCapacityLocked(-cap(route.clientQueue))
 	}
 	return retirement
 }
@@ -720,6 +726,7 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		delete(f.routesByPeer, route.peerKey)
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
+		f.changeQueueCapacityLocked(-cap(route.clientQueue))
 	}
 	return retirements
 }
@@ -737,6 +744,8 @@ func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
 	clear(f.routesByIP)
 	f.aggregateQueueMu.Lock()
 	f.aggregateQueueOccupancy = 0
+	f.aggregateQueueCapacity = 0
+	f.queueDwell.observe(time.Now(), 0, 0)
 	f.aggregateQueueMu.Unlock()
 	f.mu.Unlock()
 
@@ -942,6 +951,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
+	f.reconcileBeforeQueueMutationLocked(route)
 	select {
 	case clientQueue <- pktCopy:
 		f.reconcileQueueOccupancyLocked(route)
@@ -1194,21 +1204,38 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 // active peer queues. The per-route snapshot remains available through
 // AllRouteQueueStats for diagnosis of an individual stalled consumer.
 func (f *Forwarder) AggregateQueueStats() (occupancy, capacity, highWater int) {
+	occupancy, capacity, highWater, _ = f.aggregateQueueSnapshot()
+	return
+}
+
+// aggregateQueueSnapshot reconciles legacy handles and reads dwell coherently.
+// Managed mutations update dwell at their transition; compatibility drains can
+// only reset the unobserved run at this snapshot, never supply a past drain time.
+func (f *Forwarder) aggregateQueueSnapshot() (occupancy, capacity, highWater int, dwell queueDwellSnapshot) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	f.aggregateQueueMu.Lock()
 	defer f.aggregateQueueMu.Unlock()
-	occupancy = 0
-	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- aggregate queue high-water is bounded by active queue capacities.
+	highWater = int(f.aggregateQueueHighWater.Load()) // #nosec G115 -- bounded by active queue capacities.
+	reconciled := false
 	for _, route := range f.routesByPeer {
 		if route == nil {
 			continue
 		}
-		occupancy += len(route.clientQueue)
-		f.reconcileQueueOccupancyLocked(route)
+		current := len(route.clientQueue)
+		reconciled = reconciled || current != route.queueOccupancy
+		route.queueOccupancy = current
+		occupancy += current
 		capacity += cap(route.clientQueue)
 	}
-	return
+	f.aggregateQueueOccupancy, f.aggregateQueueCapacity = occupancy, capacity
+	now := time.Now()
+	if reconciled {
+		f.queueDwell.reconcile(now, occupancy, capacity)
+	} else {
+		f.queueDwell.observe(now, occupancy, capacity)
+	}
+	return occupancy, capacity, highWater, f.queueDwell.snapshot(now)
 }
 
 // DeviceWriteStats returns client-device write failures, total write duration,
@@ -1316,12 +1343,12 @@ func (f *Forwarder) QueuePressure() QueuePressureStats {
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
-	occ, cap, hw := f.AggregateQueueStats()
-	if f.rateTracker != nil {
-		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
-		return f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
-	}
-	return QueuePressureStats{Occupancy: occ, Capacity: cap, HighWater: hw, QueueFullDrops: queueDrops}
+	occ, cap, hw, dwell := f.aggregateQueueSnapshot()
+	f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+	stats := f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
+	stats.SecondsAbove50Pct, stats.SecondsAbove80Pct = dwell.total50, dwell.total80
+	stats.ConsecutiveAbove50Sec, stats.ConsecutiveAbove80Sec = dwell.consecutive50, dwell.consecutive80
+	return stats
 }
 
 func (f *Forwarder) stopPumpsSignalOnly() {
@@ -1403,6 +1430,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		// Never receive outside the accounting lock: even a receive followed
 		// immediately by a lock can make an enqueue miss its actual peak.
 		f.aggregateQueueMu.Lock()
+		f.reconcileBeforeQueueMutationLocked(route)
 		select {
 		case pkt = <-route.clientQueue:
 			f.reconcileQueueOccupancyLocked(route)

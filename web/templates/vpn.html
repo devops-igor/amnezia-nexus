@@ -1147,7 +1147,7 @@
     }
 
     function vpnGenerateSparklineSVG(data, color, fillOpacity) {
-        if (!data || data.length === 0) {
+        if (!data || !data.some(Number.isFinite)) {
             return '<svg viewBox="0 0 200 40" width="100%" height="40" style="display:block;"><text x="100" y="24" text-anchor="middle" fill="var(--text-muted, #888)" font-size="10">No data</text></svg>';
         }
         const width = 200;
@@ -1155,35 +1155,39 @@
         const padding = 2;
         let maxVal = 0;
         for (let i = 0; i < data.length; i++) {
-            if (data[i] > maxVal) maxVal = data[i];
+            if (Number.isFinite(data[i]) && data[i] > maxVal) maxVal = data[i];
         }
         if (maxVal <= 0) maxVal = 1;
-        const minVal = 0;
-        const range = maxVal - minVal;
         const step = (width - padding * 2) / Math.max(data.length - 1, 1);
+        const segments = [];
+        let segment = [];
+        for (let i = 0; i < data.length; i++) {
+            if (!Number.isFinite(data[i])) {
+                if (segment.length) segments.push(segment);
+                segment = [];
+                continue;
+            }
+            const x = (padding + i * step).toFixed(1);
+            const y = (height - padding - data[i] / maxVal * (height - padding * 2)).toFixed(1);
+            segment.push([x, y]);
+        }
+        if (segment.length) segments.push(segment);
 
         let pathD = '';
         let fillD = '';
-        for (let i = 0; i < data.length; i++) {
-            const x = padding + i * step;
-            const y = height - padding - ((data[i] - minVal) / range) * (height - padding * 2);
-            const xStr = x.toFixed(1);
-            const yStr = y.toFixed(1);
-            if (i === 0) {
-                pathD += 'M ' + xStr + ' ' + yStr;
-                fillD += 'M ' + xStr + ' ' + yStr;
-            } else {
-                pathD += ' L ' + xStr + ' ' + yStr;
-                fillD += ' L ' + xStr + ' ' + yStr;
+        let dots = '';
+        for (const points of segments) {
+            const line = points.map(function(p, i) { return (i === 0 ? 'M ' : ' L ') + p[0] + ' ' + p[1]; }).join('');
+            pathD += line + ' ';
+            fillD += line + ' L ' + points[points.length - 1][0] + ' ' + height + ' L ' + points[0][0] + ' ' + height + ' Z ';
+            if (points.length === 1) {
+                dots += '<circle cx="' + points[0][0] + '" cy="' + points[0][1] + '" r="1.5" fill="' + color + '" />';
             }
         }
-        const lastX = padding + (data.length - 1) * step;
-        fillD += ' L ' + lastX.toFixed(1) + ' ' + height + ' L ' + padding + ' ' + height + ' Z';
-
         return '<svg viewBox="0 0 ' + width + ' ' + height + '" width="100%" height="' + height + '" preserveAspectRatio="none" style="display:block;">' +
             '<path d="' + fillD + '" fill="' + color + '" fill-opacity="' + (fillOpacity || 0.15) + '" />' +
             '<path d="' + pathD + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />' +
-            '</svg>';
+            dots + '</svg>';
     }
 
     function vpnRenderHistoryCharts(series) {
@@ -1198,7 +1202,10 @@
         const tData = points.map(function(p) { return (p.rx_bps || 0) + (p.tx_bps || 0); });
         const qData = points.map(function(p) { return (p.q_pct || 0); });
         const dData = points.map(function(p) { return (p.drop_rate || 0); });
-        const lData = points.map(function(p) { return (p.fwd_p95_ms || 0); });
+        const lData = points.map(function(p) {
+            if (p.fwd_p95_samples !== undefined && Number(p.fwd_p95_samples) <= 0) return null;
+            return Number.isFinite(p.fwd_p95_ms) ? p.fwd_p95_ms : null;
+        });
 
         const chartT = document.getElementById('vpn-chart-throughput');
         if (chartT) chartT.innerHTML = vpnGenerateSparklineSVG(tData, 'var(--primary, #3b82f6)');
@@ -1419,7 +1426,11 @@
                     drops: rDrops,
                     write_count: rWrites,
                     write_errors: rErrors,
-                    has_pressure: rDrops > 0 || (rCap > 0 && rOcc >= rCap * 0.8)
+                    has_pressure: (rCap > 0 && rOcc / rCap >= 0.8) ||
+                        Number(rq.oldest_write_ms || 0) >= 100 ||
+                        Number(rq.queue_full_drops_recent || 0) > 0 ||
+                        Number(rq.write_errors_recent || 0) > 0 ||
+                        Number(rq.write_stalls_recent || 0) > 0
                 });
             }
             allRouteList = routeItems;
@@ -1431,7 +1442,13 @@
             const r = allRouteList[i];
             const d = Number(r.drops !== undefined ? r.drops : (r.queue_full_drops || 0));
             totalRouteDrops += d;
-            if (r.has_pressure || d > 0 || (r.capacity > 0 && r.occupancy >= r.capacity * 0.8)) {
+            const currentPressure = typeof r.has_pressure === 'boolean' ? r.has_pressure :
+                ((r.capacity > 0 && r.occupancy / r.capacity >= 0.8) ||
+                 Number(r.oldest_write_ms || 0) >= 100 ||
+                 Number(r.queue_full_drops_recent || 0) > 0 ||
+                 Number(r.write_errors_recent || 0) > 0 ||
+                 Number(r.write_stalls_recent || 0) > 0);
+            if (currentPressure) {
                 routeHasPressure = true;
             }
         }
@@ -1521,7 +1538,7 @@
         }
 
         if (summaryStatus) {
-            if (routeHasPressure || totalRouteDrops > 0) {
+            if (routeHasPressure) {
                 summaryStatus.textContent = _('vpn_forwarder_pressure') || 'Pressure Detected';
                 summaryStatus.style.color = 'var(--danger)';
             } else {
@@ -1537,7 +1554,7 @@
 
         // Overall Forwarder Health Assessment
         const ha = status.health_assessment;
-        const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || totalRouteDrops > 0 || (cap > 0 && occ >= cap * 0.9);
+        const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || (routeHasPressure && totalRouteDrops > 0) || (cap > 0 && occ >= cap * 0.9);
         const hasWarningIssue = dropsNoRoute > 0 || dropsOversize > 0 || (cap > 0 && occ >= cap * 0.5) || routeHasPressure;
 
         if (statusBadge && statusText) {
@@ -1624,8 +1641,8 @@
             }
         }
 
-        // Auto-expand route details if pressure or drops detected
-        if (routeHasPressure || totalRouteDrops > 0) {
+        // Auto-expand route details only for current pressure.
+        if (routeHasPressure) {
             const detailsElem = document.getElementById('vpn-fwd-routes-details');
             if (detailsElem) {
                 detailsElem.open = true;

@@ -10,9 +10,9 @@ import (
 // three momentary 81% readings accumulated ~30s of claimed sustained pressure
 // and diagnostics surfaced "stayed above 80% utilization for 30s" (DEGRADED).
 //
-// The model is now a linear interpolation between the previous and the current
-// reading. It can under-count an excursion contained inside one interval but it
-// must never over-count one.
+// These tests cover the legacy descriptive interpolation model. Sparse
+// endpoints cannot prove sustained dwell; runtime health instead uses the
+// managed transition accounting tested in queue_dwell_test.go.
 func TestRateTracker_SaturationDurationIsNotBackfilledFromEndingSnapshot(t *testing.T) {
 	// Brief spike: three samples each just over 80%, spaced 10s apart. The
 	// pre-change code credited 10s each, claiming 30s of sustained pressure.

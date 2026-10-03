@@ -106,9 +106,8 @@ func TestEvaluateLatencyConditions_LiveStallStillGatesHealthOnIdleServer(t *test
 	}
 }
 
-// The surfaced queue-pressure message must not overclaim: it states the duration
-// is estimated, because occupancy is only sampled per collection.
-func TestEvaluateQueueConditions_SaturationMessageIsMarkedEstimated(t *testing.T) {
+// The sustained-pressure condition reports measured queue dwell.
+func TestEvaluateQueueConditions_SaturationMessageReportsMeasuredDwell(t *testing.T) {
 	queue := QueuePressureDiagnostics{
 		Capacity:              1000,
 		Occupancy:             810,
@@ -117,10 +116,10 @@ func TestEvaluateQueueConditions_SaturationMessageIsMarkedEstimated(t *testing.T
 	}
 	conds := evaluateQueueConditions(queue)
 	if len(conds) == 0 {
-		t.Fatal("45 estimated seconds above 80%% must produce a condition")
+		t.Fatal("45 measured seconds above 80%% must produce a condition")
 	}
-	if !strings.Contains(conds[0].Message, "estimated") {
-		t.Errorf("sampled-and-interpolated duration must be labelled estimated, got %q", conds[0].Message)
+	if strings.Contains(conds[0].Message, "estimated") || !strings.Contains(conds[0].Message, "for 45s") {
+		t.Errorf("measured dwell must be reported accurately, got %q", conds[0].Message)
 	}
 	if conds[0].Severity != "DEGRADED" {
 		t.Errorf("expected DEGRADED, got %s", conds[0].Severity)
