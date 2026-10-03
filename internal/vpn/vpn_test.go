@@ -1144,10 +1144,26 @@ func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
 	}
 }
 
+// TestEnableBackend_ConcurrentStateModificationAbortsEnable pins that a genuine
+// concurrent modification of the tunnel identity still aborts the enable.
+//
+// HISTORY (issue #424 round 3): this test previously drove the abort with
+// Pool.SetTunnelStatusWithReason — a pure runtime-health observation that only
+// records a new status/latency. It asserted that such a bump must abort the
+// enable. That assertion encoded the defect, not the intent: the background
+// health prober performs exactly that write every 10s, so the "concurrent
+// modification" it simulated was indistinguishable from a routine health tick,
+// and the guard aborted legitimate administrative enables with HTTP 500. The
+// real-prober counterpart now lives in TestEnableBackend_RoutineHealthTickDoesNotAbortEnable.
+//
+// The guard's actual intent — a concurrent change to the identity the portal
+// peers were just registered against — is preserved and asserted below via a
+// real endpoint rewrite, which is the same write Pool.AddTunnel and
+// Pool.SetTunnelEndpoint use to advance StateVersion.
 func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("ExistingTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+	t.Run("ExistingTunnel_EndpointRewriteAbortsEnable", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, err := NewVPNService(db, nil)
 		if err != nil {
@@ -1183,44 +1199,45 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		}
 		initialVersion := tun.StateVersion
 
-		// 2. Set postAddTunnelHook to simulate a concurrent event occurring during
-		// EnableBackend network operations (after AddTunnel, before finishEnableBackend):
-		// Mutate tunnel state (via SetTunnelStatusWithReason), incrementing StateVersion.
+		// 2. Rewrite the endpoint after AddTunnel but before finishEnableBackend,
+		// which is exactly the concurrent identity change the guard exists for.
 		hookFired := false
 		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
 			hookFired = true
-			if hookErr := svc.pool.SetTunnelStatusWithReason(ctx, srvID, models.TunnelStatusDegraded, models.DisableReasonNone, 45); hookErr != nil {
-				t.Errorf("concurrent SetTunnelStatusWithReason failed: %v", hookErr)
+			if hookErr := svc.pool.SetTunnelEndpoint(ctx, tun.ID, "198.51.100.77:51821"); hookErr != nil {
+				t.Errorf("concurrent SetTunnelEndpoint failed: %v", hookErr)
 			}
 		})
 		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
 
-		// 3. Call EnableBackend again: must abort because StateVersion was concurrently bumped
+		// 3. Call EnableBackend again: must abort because the tunnel identity
+		// this enable is provisioning against was changed concurrently.
 		err = svc.EnableBackend(ctx, srvID)
 		if err == nil {
-			t.Fatal("expected EnableBackend to fail when tunnel is modified concurrently, got nil")
+			t.Fatal("expected EnableBackend to fail when the tunnel identity is modified concurrently, got nil")
 		}
-		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
+		if !strings.Contains(err.Error(), "identity modified concurrently") {
 			t.Fatalf("unexpected error message: %v", err)
 		}
 		if !hookFired {
 			t.Fatal("expected postAddTunnelHook to fire")
 		}
 
-		// 4. Assert in-memory pool state reflects the concurrent modification, not overwritten state
+		// 4. The concurrent endpoint rewrite must survive the aborted enable
+		// rather than being overwritten with the stale value.
 		finalTun, err := svc.pool.GetTunnel(srvID)
 		if err != nil || finalTun == nil {
 			t.Fatalf("expected tunnel in pool, got %v (err=%v)", finalTun, err)
 		}
-		if finalTun.Status != models.TunnelStatusDegraded {
-			t.Errorf("expected tunnel status %q to remain intact, got %q", models.TunnelStatusDegraded, finalTun.Status)
+		if finalTun.Endpoint != "198.51.100.77:51821" {
+			t.Errorf("expected the concurrently rewritten endpoint to remain intact, got %q", finalTun.Endpoint)
 		}
 		if finalTun.StateVersion <= initialVersion {
-			t.Errorf("expected StateVersion to reflect concurrent mutation (> %d), got %d", initialVersion, finalTun.StateVersion)
+			t.Errorf("expected StateVersion to reflect concurrent modification (> %d), got %d", initialVersion, finalTun.StateVersion)
 		}
 	})
 
-	t.Run("NewTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+	t.Run("NewTunnel_EndpointRewriteAbortsEnable", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, err := NewVPNService(db, nil)
 		if err != nil {
@@ -1245,21 +1262,31 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		adder := &mockAWGManagerWithClientAdder{}
 		svc.SetAWGStatusProvider(adder)
 
+		// Capture the tunnel row AddTunnel is about to create so the hook can
+		// target it, then rewrite the endpoint mid-flight.
+		var tunID int64
 		hookFired := false
 		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
 			hookFired = true
-			if hookErr := svc.pool.SetTunnelStatusWithReason(ctx, srvID, models.TunnelStatusDegraded, models.DisableReasonNone, 30); hookErr != nil {
-				t.Errorf("concurrent SetTunnelStatusWithReason failed: %v", hookErr)
+			cur, gerr := svc.pool.GetTunnel(srvID)
+			if gerr != nil {
+				t.Errorf("concurrent GetTunnel failed: %v", gerr)
+				return
+			}
+			tunID = cur.ID
+			if hookErr := svc.pool.SetTunnelEndpoint(ctx, cur.ID, "198.51.100.78:51821"); hookErr != nil {
+				t.Errorf("concurrent SetTunnelEndpoint failed: %v", hookErr)
 			}
 		})
 		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
 
-		// Call EnableBackend on brand new backend: must abort because StateVersion was concurrently bumped after AddTunnel
+		// EnableBackend on a brand new backend: must abort because the tunnel
+		// identity was changed concurrently after AddTunnel.
 		err = svc.EnableBackend(ctx, srvID)
 		if err == nil {
-			t.Fatal("expected EnableBackend to fail when new tunnel is modified concurrently, got nil")
+			t.Fatal("expected EnableBackend to fail when a new tunnel's identity is modified concurrently, got nil")
 		}
-		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
+		if !strings.Contains(err.Error(), "identity modified concurrently") {
 			t.Fatalf("unexpected error message: %v", err)
 		}
 		if !hookFired {
@@ -1270,11 +1297,11 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		if err != nil || finalTun == nil {
 			t.Fatalf("expected tunnel in pool, got %v (err=%v)", finalTun, err)
 		}
-		if finalTun.Status != models.TunnelStatusDegraded {
-			t.Errorf("expected tunnel status %q to remain intact, got %q", models.TunnelStatusDegraded, finalTun.Status)
+		if finalTun.Endpoint != "198.51.100.78:51821" {
+			t.Errorf("expected the concurrently rewritten endpoint to remain intact, got %q", finalTun.Endpoint)
 		}
-		if finalTun.StateVersion != 2 {
-			t.Errorf("expected StateVersion = 2 after concurrent mutation, got %d", finalTun.StateVersion)
+		if tunID == 0 {
+			t.Error("expected the hook to have resolved a tunnel id")
 		}
 	})
 }

@@ -2348,10 +2348,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error)
 	stage = "register_tunnel"
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	var postRefreshVersion int64
-	if err == nil && tun != nil {
-		postRefreshVersion = tun.StateVersion
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -2390,7 +2386,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error)
 	}
 
 	stage = "state_changed"
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2401,7 +2397,6 @@ func (s *Service) finishEnableBackend(
 	serverID int64,
 	hasInitial bool,
 	initialEnabled bool,
-	initialVersion int64,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2424,8 +2419,29 @@ func (s *Service) finishEnableBackend(
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if currTun.StateVersion != initialVersion {
-		return errors.New("backend state modified concurrently; aborting enable")
+	// Fence the enable against a genuine identity change, not against every
+	// StateVersion bump. StateVersion is a single monotonic token that the
+	// health subsystem advances on routine observations too: a successful
+	// background probe reaches Pool.setTunnelStatus (pool.go) via
+	// SetTunnelStatusIfCurrentWithVersion and bumps the live entry's version
+	// while recording nothing but a fresh status/latency/last-check. The prober
+	// ticks every 10s by default, so that bump lands inside the multi-second
+	// SSH window of every enable with high probability, and the abort was a
+	// false positive rather than a real conflict.
+	//
+	// What genuinely invalidates this enable is a replacement of the tunnel
+	// identity the peers were just registered against: a different tunnel row,
+	// a different endpoint, or rotated credentials. That is exactly the set
+	// Pool.AddTunnel advances StateVersion for, plus the endpoint rewrite in
+	// SetTunnelEndpoint. Administrative intent is already covered by the
+	// Enabled checks above, which are exact; a retired or deleted tunnel is
+	// covered by GetTunnel returning ErrTunnelNotFound above.
+	if currTun.ID != tun.ID ||
+		currTun.Endpoint != tun.Endpoint ||
+		currTun.PublicKey != tun.PublicKey ||
+		currTun.PrivateKey != tun.PrivateKey ||
+		currTun.ProbePrivateKey != tun.ProbePrivateKey {
+		return backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
