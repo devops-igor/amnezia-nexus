@@ -257,6 +257,7 @@
                 <div class="flex justify-between"><span class="text-muted">Latency p95:</span><span class="font-mono" id="vpn-diag-be-latency">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">Load Skew:</span><span class="font-mono" id="vpn-diag-be-skew">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">Device Drops:</span><span class="font-mono" id="vpn-diag-be-drops">-</span></div>
+                <div id="vpn-diag-be-traffic"></div>
             </div>
         </div>
 
@@ -304,7 +305,16 @@
                 <div style="font-size: 0.75rem; color: var(--text-muted);">Forward Write p95 (ms)</div>
                 <div id="vpn-chart-latency" style="height: 60px; width: 100%;"></div>
             </div>
+            <div id="vpn-chart-directions"></div>
+            <div id="vpn-chart-packets"></div>
+            <div id="vpn-chart-sessions-routes"></div>
+            <div id="vpn-chart-backend-latency"></div>
         </div>
+        <details><summary>Loss reasons and backend traffic</summary>
+            <div id="vpn-chart-reasons"></div>
+            <div id="vpn-chart-backends"></div>
+            <div id="vpn-history-fleet-note" class="text-muted text-sm"></div>
+        </details>
     </div>
 
     <!-- Panel 11: Route-level queue pressure expandable details (Problem-First by Default) -->
@@ -1199,9 +1209,9 @@
         else if (w === '24h') points = series.window_24h || [];
         else points = series.window_15m || [];
 
-        const tData = points.map(function(p) { return (p.rx_bps || 0) + (p.tx_bps || 0); });
+        const tData = points.map(function(p) { return p.traffic_available === false ? null : (p.rx_bps || 0) + (p.tx_bps || 0); });
         const qData = points.map(function(p) { return (p.q_pct || 0); });
-        const dData = points.map(function(p) { return (p.drop_rate || 0); });
+        const dData = points.map(function(p) { return p.drop_rates_available === false ? null : (p.drop_rate || 0); });
         const lData = points.map(function(p) {
             if (p.fwd_p95_samples !== undefined && Number(p.fwd_p95_samples) <= 0) return null;
             return Number.isFinite(p.fwd_p95_ms) ? p.fwd_p95_ms : null;
@@ -1215,6 +1225,71 @@
         if (chartD) chartD.innerHTML = vpnGenerateSparklineSVG(dData, 'var(--danger, #ef4444)');
         const chartL = document.getElementById('vpn-chart-latency');
         if (chartL) chartL.innerHTML = vpnGenerateSparklineSVG(lData, 'var(--info, #06b6d4)');
+        function renderSeries(id, entries) {
+            const element = document.getElementById(id);
+            if (!element) return;
+            element.textContent = '';
+            if (entries.length === 0) {
+                element.textContent = 'No data (' + w + ')';
+                return;
+            }
+            for (const entry of entries) {
+                const label = document.createElement('div');
+                label.textContent = entry.label + ' (' + w + ')';
+                label.className = 'text-muted text-sm';
+                const graph = document.createElement('div');
+                graph.innerHTML = vpnGenerateSparklineSVG(entry.values, entry.color || 'var(--primary, #3b82f6)');
+                element.appendChild(label);
+                element.appendChild(graph);
+            }
+        }
+        function known(p, key, availability) {
+            return p[availability] === false || !Number.isFinite(p[key]) ? null : p[key];
+        }
+        renderSeries('vpn-chart-directions', [
+            {label:'RX client to backend (bps)', values:points.map(p => known(p,'rx_bps','traffic_available'))},
+            {label:'TX backend to client (bps)', values:points.map(p => known(p,'tx_bps','traffic_available')), color:'var(--info, #06b6d4)'}
+        ]);
+        renderSeries('vpn-chart-packets', [
+            {label:'RX packets/s',values:points.map(p => known(p,'rx_pps','traffic_available'))},
+            {label:'TX packets/s',values:points.map(p => known(p,'tx_pps','traffic_available')),color:'var(--info, #06b6d4)'}
+        ]);
+        renderSeries('vpn-chart-sessions-routes', [
+            {label:'Active sessions',values:points.map(p => Number.isFinite(p.sessions) ? p.sessions : null)},
+            {label:'Active routes',values:points.map(p => Number.isFinite(p.routes) ? p.routes : null),color:'var(--info, #06b6d4)'}
+        ]);
+        renderSeries('vpn-chart-backend-latency', [
+            {label:'Eligible backend probe p95 (ms)',values:points.map(p => p.be_latency_samples === 0 || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
+        ]);
+        const reasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
+        renderSeries('vpn-chart-reasons', reasons.map(key => ({
+            label:key.replace(/_/g,' ') + ' (drops/s)',
+            values:points.map(p => p.drop_rates_available === false || !p.drop_reason_rates || !Number.isFinite(p.drop_reason_rates[key]) ? null : p.drop_reason_rates[key]),
+            color:'var(--danger, #ef4444)'
+        })));
+        // The stored fleet context is capped; the renderer also caps churn
+        // across one window, keeping a large retired fleet from expanding the page.
+        const ids = Array.from(new Set(points.flatMap(p => (p.backends || []).map(b => b.id)))).sort((a,b) => a-b);
+        const backendEntries = [];
+        for (const id of ids.slice(0,128)) {
+            for (const [key,label,availability] of [
+                ['rx_bps','RX (bps)','traffic_available'],['tx_bps','TX (bps)','traffic_available'],
+                ['rx_pps','RX packets/s','traffic_available'],['tx_pps','TX packets/s','traffic_available'],
+                ['probe_latency_ms','Probe latency (ms)','probe_available']
+            ]) {
+                backendEntries.push({label:'Backend ' + id + ' ' + label, values:points.map(p => {
+                    const b = (p.backends || []).find(b => b.id === id);
+                    return !b || !b[availability] || !Number.isFinite(b[key]) ? null : b[key];
+                })});
+            }
+        }
+        renderSeries('vpn-chart-backends', backendEntries);
+        const fleetNote = document.getElementById('vpn-history-fleet-note');
+        if (fleetNote) {
+            const omitted = points.reduce((max,p) => Math.max(max,Number(p.backends_omitted || 0)),0);
+            fleetNote.textContent = omitted || ids.length > 128 ? 'Fleet context is limited to 128 backends per sample/view; up to ' + Math.max(omitted,ids.length-128) + ' omitted.' : '';
+        }
+
     }
 
     function vpnSetHistoryWindow(w) {
@@ -1336,6 +1411,29 @@
                 const el = document.getElementById(diagIds[i]);
                 if (el) { el.textContent = '-'; el.style.color = ''; }
             }
+            // History containers hold two distinct DOM shapes: the sparkline
+            // charts carry injected SVG markup via innerHTML, while the
+            // renderSeries containers carry appended element children. An
+            // unavailable forwarder must erase both, otherwise the previous
+            // poll keeps showing plausible historical curves next to an
+            // "unavailable" badge. Assigning both textContent and innerHTML
+            // empties either shape, and a blank container deliberately renders
+            // no placeholder curve, so no data is invented here.
+            const historyIds = ['vpn-chart-throughput', 'vpn-chart-packets', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-directions', 'vpn-chart-reasons', 'vpn-chart-sessions-routes', 'vpn-chart-backends', 'vpn-chart-backend-latency', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
+            for (let i = 0; i < historyIds.length; i++) {
+                const el = document.getElementById(historyIds[i]);
+                if (el) { el.textContent = ''; el.innerHTML = ''; }
+            }
+            // The cached status is only refreshed past the early return, so it
+            // still holds the last available poll. The history-window and
+            // show-all-routes toggles re-render from that cache, which would
+            // repaint the curves erased above while the badge still reads
+            // "unavailable". Dropping the cached series keeps the unavailable
+            // state terminal until a real poll arrives.
+            if (typeof vpnLastStatus !== 'undefined' && vpnLastStatus && typeof vpnLastStatus === 'object') {
+                vpnLastStatus.historical_series = null;
+            }
+
             const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
             if (dRoutBadge) { dRoutBadge.className = 'badge'; dRoutBadge.textContent = '-'; }
             const dRoutAlerts = document.getElementById('vpn-diag-routing-alerts');
@@ -1426,6 +1524,9 @@
                     drops: rDrops,
                     write_count: rWrites,
                     write_errors: rErrors,
+                    queue_full_drops_recent: Number(rq.queue_full_drops_recent || 0),
+                    write_errors_recent: Number(rq.write_errors_recent || 0),
+                    write_stalls_recent: Number(rq.write_stalls_recent || 0),
                     has_pressure: (rCap > 0 && rOcc / rCap >= 0.8) ||
                         Number(rq.oldest_write_ms || 0) >= 100 ||
                         Number(rq.queue_full_drops_recent || 0) > 0 ||
@@ -1476,10 +1577,45 @@
 
                 const tr = document.createElement('tr');
 
+                // Complete payload telemetry. Unknown rates and never-observed traffic
+                // are explicit; percentiles/max/errors/drops retain historical labels.
+                function routeTooltip(route) {
+                    const labels = {
+                        peer_key:'Peer', assigned_ip:'Assigned address', backend_id:'Backend',
+                        occupancy:'Queue occupancy', capacity:'Queue capacity', high_water:'Queue high water',
+                        utilization_pct:'Queue utilization (%)', high_water_pct:'High water (%)',
+                        drops:'Queue drops (cumulative)', p95_write_ms:'Write p95 (historical ms)',
+                        has_pressure:'Current pressure', pressure_note:'Pressure reason',
+                        write_count:'Writes admitted', write_errors:'Write errors (cumulative)',
+                        write_stalls:'Write stalls (cumulative)', writes_in_flight:'Writes in flight',
+                        oldest_write_ms:'Oldest write (ms)', max_write_ms:'Max write (historical ms)',
+                        p95_write_samples:'Write percentile samples', queue_full_drops_recent:'Recent queue drops',
+                        write_errors_recent:'Recent write errors', write_stalls_recent:'Recent write stalls',
+                        session_age_sec:'Session age (s)', last_traffic_age_sec:'Last traffic age (s)',
+                        traffic:'Directional traffic'
+                    };
+                    const lines = [];
+                    for (const key of Object.keys(route)) {
+                        const value = route[key];
+                        const label = labels[key] || key.replace(/_/g, ' ');
+                        if (key === 'traffic' && value && typeof value === 'object') {
+                            for (const name of Object.keys(value)) {
+                                const unavailable = !value.available && ['rx_bytes_per_sec','tx_bytes_per_sec','rx_pps','tx_pps'].includes(name);
+                                lines.push(label + ' ' + name.replace(/_/g, ' ') + ': ' + (unavailable ? 'Unavailable' : String(value[name])));
+                            }
+                        } else {
+                            const unknown = key === 'last_traffic_age_sec' && Number(value) < 0 ||
+                                key === 'p95_write_ms' && route.p95_write_samples === 0;
+                            lines.push(label + ': ' + (unknown ? 'Unavailable' : (value === '' ? 'None' : String(value))));
+                        }
+                    }
+                    return lines.join('\n');
+                }
+
                 // Peer column (truncated + tooltip)
                 const tdPeer = document.createElement('td');
                 tdPeer.className = 'font-mono text-sm';
-                tdPeer.title = peerKey;
+                tdPeer.title = routeTooltip(r);
                 tdPeer.textContent = vpnFormatPeerKey(peerKey);
                 tr.appendChild(tdPeer);
 
@@ -1503,7 +1639,7 @@
                 const tdDrops = document.createElement('td');
                 tdDrops.className = 'font-mono text-sm';
                 tdDrops.textContent = String(rDrops);
-                if (rDrops > 0) {
+                if (Number(r.queue_full_drops_recent || 0) > 0) {
                     tdDrops.style.color = 'var(--danger)';
                     tdDrops.style.fontWeight = 'bold';
                 }
@@ -1516,10 +1652,10 @@
                     tdWrites.textContent = rNote;
                     tdWrites.style.color = 'var(--warning)';
                 } else if (rErrors > 0) {
-                    tdWrites.textContent = rWrites + ' (' + rErrors + ' err)';
-                    tdWrites.style.color = 'var(--warning)';
+                    tdWrites.textContent = rWrites + ' (' + rErrors + ' cumulative errors)';
+                    if (Number(r.write_errors_recent || 0) > 0) tdWrites.style.color = 'var(--warning)';
                 } else if (rP95 > 0) {
-                    tdWrites.textContent = rP95.toFixed(1) + 'ms p95';
+                    tdWrites.textContent = rP95.toFixed(1) + 'ms historical p95';
                 } else {
                     tdWrites.textContent = String(rWrites);
                 }
@@ -1655,7 +1791,7 @@
             const rates = status.rates || {};
             const totalBps = (rates.rx_bps || 0) + (rates.tx_bps || 0);
             const totalPps = (rates.rx_pps || 0) + (rates.tx_pps || 0);
-            kpiThroughput.textContent = fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
+            kpiThroughput.textContent = rates.available === false ? 'Traffic unavailable' : fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
         }
 
         const kpiRoutes = document.getElementById('vpn-kpi-routes-sessions');
@@ -1686,8 +1822,8 @@
             const drops = status.drop_categories || {};
             const totDrops = drops.total_drops !== undefined ? drops.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = drops.total_drop_rate_pps !== undefined ? drops.total_drop_rate_pps.toFixed(2) : '0.00';
-            kpiLoss.textContent = totDrops + ' (' + rate + ' pps)';
-            kpiLoss.style.color = totDrops > 0 ? 'var(--danger)' : '';
+            kpiLoss.textContent = (drops.rates_available === false ? 'Loss rate unavailable' : rate + ' pps') + ' (' + totDrops + ' cumulative)';
+            kpiLoss.style.color = drops.rates_available !== false && Number(drops.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         const kpiEngine = document.getElementById('vpn-kpi-client-engine');
@@ -1723,8 +1859,9 @@
         if (kpiBackends) {
             const be = status.backends || {};
             if (be.total_count !== undefined) {
-                kpiBackends.textContent = be.healthy_count + ' / ' + be.total_count + ' healthy';
-                kpiBackends.style.color = (be.healthy_count < be.total_count) ? 'var(--warning)' : '';
+                const enabled = be.eligibility_known ? Number(be.enabled_count || 0) : be.total_count;
+                kpiBackends.textContent = be.healthy_count + ' / ' + enabled + ' healthy' + (be.disabled_count ? ' (' + be.disabled_count + ' disabled)' : '');
+                kpiBackends.style.color = !be.healthy_count ? 'var(--danger)' : (be.healthy_count < enabled ? 'var(--warning)' : '');
             } else {
                 kpiBackends.textContent = (status.active_tunnels || 0) + ' active';
             }
@@ -1733,10 +1870,16 @@
         const kpiSlowWrites = document.getElementById('vpn-kpi-slow-writes');
         if (kpiSlowWrites) {
             const fl = status.forward_latency || {};
-            const stalls = fl.stalls || 0;
-            const p95 = fl.p95_ms !== undefined ? fl.p95_ms.toFixed(1) : '0.0';
-            kpiSlowWrites.textContent = stalls + ' stalls / ' + p95 + 'ms p95';
-            kpiSlowWrites.style.color = stalls > 0 ? 'var(--warning)' : '';
+            const samples = Number(fl.p95_health_samples || 0);
+            const recentStalls = Number(fl.stalls_recent || 0);
+            const currentP95 = Number(fl.p95_health_ms || 0);
+            const oldest = Number(fl.oldest_in_flight_ms || 0);
+            const latencyText = samples > 0 ? currentP95.toFixed(1) + 'ms p95' : 'Latency unavailable';
+            kpiSlowWrites.textContent = recentStalls + ' recent stalls / ' + latencyText;
+            kpiSlowWrites.title = (fl.stalls || 0) + ' cumulative stalls; ' + Number(fl.p95_ms || 0).toFixed(1) + 'ms historical p95';
+            kpiSlowWrites.style.color = oldest >= 1000 || (samples > 0 && currentP95 >= 100) ? 'var(--danger)' :
+                (recentStalls > 0 || oldest >= 100 || (samples > 0 && currentP95 >= 50) ? 'var(--warning)' : '');
+
         }
 
         // Panel 1: Traffic & Capacity
@@ -1790,20 +1933,20 @@
             const qp = status.queue_pressure || {};
             const qDrops = qp.queue_full_drops !== undefined ? qp.queue_full_drops : dropsQueueFull;
             const rate = qp.queue_drop_rate_pps !== undefined ? qp.queue_drop_rate_pps.toFixed(2) : '0.00';
-            dQueueDrops.textContent = qDrops + ' drops (' + rate + ' pps)';
-            dQueueDrops.style.color = qDrops > 0 ? 'var(--danger)' : '';
+            dQueueDrops.textContent = rate + ' pps (' + qDrops + ' cumulative)';
+            dQueueDrops.style.color = Number(qp.queue_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         // Panel 3: Forwarding Latency & Write Stalls
         const dLatPct = document.getElementById('vpn-diag-lat-percentiles');
         if (dLatPct) {
             const fl = status.forward_latency || {};
-            dLatPct.textContent = (fl.p50_ms || 0).toFixed(1) + 'ms / ' + (fl.p95_ms || 0).toFixed(1) + 'ms / ' + (fl.p99_ms || 0).toFixed(1) + 'ms';
+            dLatPct.textContent = 'Historical: ' + (fl.p50_ms || 0).toFixed(1) + 'ms / ' + (fl.p95_ms || 0).toFixed(1) + 'ms / ' + (fl.p99_ms || 0).toFixed(1) + 'ms';
         }
         const dLatMax = document.getElementById('vpn-diag-lat-max');
         if (dLatMax) {
             const fl = status.forward_latency || {};
-            dLatMax.textContent = (fl.max_ms || 0) + 'ms';
+            dLatMax.textContent = (fl.max_ms || 0) + 'ms historical';
         }
         const dLatInf = document.getElementById('vpn-diag-lat-inflight');
         if (dLatInf) {
@@ -1813,16 +1956,16 @@
         const dLatStalls = document.getElementById('vpn-diag-lat-stalls');
         if (dLatStalls) {
             const fl = status.forward_latency || {};
-            dLatStalls.textContent = (fl.stalls || 0) + ' stalls';
-            dLatStalls.style.color = (fl.stalls || 0) > 0 ? 'var(--warning)' : '';
+            dLatStalls.textContent = (fl.stalls_recent || 0) + ' recent (' + (fl.stalls || 0) + ' cumulative)';
+            dLatStalls.style.color = Number(fl.stalls_recent || 0) > 0 || Number(fl.oldest_in_flight_ms || 0) >= 100 ? 'var(--warning)' : '';
         }
         const dLatErr = document.getElementById('vpn-diag-lat-errors');
         if (dLatErr) {
             const fl = status.forward_latency || {};
             const errCount = fl.write_errors !== undefined ? fl.write_errors : writeErrors;
             const totWrites = fl.write_total || 0;
-            dLatErr.textContent = errCount + ' err / ' + totWrites + ' writes';
-            dLatErr.style.color = errCount > 0 ? 'var(--danger)' : '';
+            dLatErr.textContent = Number(fl.write_error_rate_pps || 0).toFixed(2) + ' errors/s (' + errCount + ' cumulative / ' + totWrites + ' writes)';
+            dLatErr.style.color = Number(fl.write_error_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         // Panel 4: Categorized Drop Diagnostics
@@ -1830,23 +1973,23 @@
         if (dDropsClient) {
             const dc = status.drop_categories || {};
             const rate = (dc.client_drop_rate_pps || 0).toFixed(2);
-            dDropsClient.textContent = (dc.client_total_drops || 0) + ' (' + rate + ' pps)';
-            dDropsClient.style.color = (dc.client_total_drops || 0) > 0 ? 'var(--danger)' : '';
+            dDropsClient.textContent = rate + ' pps (' + (dc.client_total_drops || 0) + ' cumulative)';
+            dDropsClient.style.color = Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsRet = document.getElementById('vpn-diag-drops-return');
         if (dDropsRet) {
             const dc = status.drop_categories || {};
             const rate = (dc.return_drop_rate_pps || 0).toFixed(2);
-            dDropsRet.textContent = (dc.return_total_drops || 0) + ' (' + rate + ' pps)';
-            dDropsRet.style.color = (dc.return_total_drops || 0) > 0 ? 'var(--danger)' : '';
+            dDropsRet.textContent = rate + ' pps (' + (dc.return_total_drops || 0) + ' cumulative)';
+            dDropsRet.style.color = Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsTot = document.getElementById('vpn-diag-drops-total');
         if (dDropsTot) {
             const dc = status.drop_categories || {};
             const tot = dc.total_drops !== undefined ? dc.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = (dc.total_drop_rate_pps || 0).toFixed(2);
-            dDropsTot.textContent = tot + ' (' + rate + ' pps)';
-            dDropsTot.style.color = tot > 0 ? 'var(--danger)' : '';
+            dDropsTot.textContent = rate + ' pps (' + tot + ' cumulative)';
+            dDropsTot.style.color = Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         // Panel 5: VirtualTUN Health
@@ -1854,13 +1997,13 @@
         if (dVtunUp) {
             const vt = (status.virtual_tun && status.virtual_tun.upstream_to_nexus) || {};
             dVtunUp.textContent = 'Occ: ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | Peak: ' + (vt.peak || 0) + ' | Drops: ' + (vt.drops || 0);
-            dVtunUp.style.color = (vt.drops || 0) > 0 ? 'var(--danger)' : '';
+            dVtunUp.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
         }
         const dVtunNex = document.getElementById('vpn-diag-vtun-nexus');
         if (dVtunNex) {
             const vt = (status.virtual_tun && status.virtual_tun.nexus_to_upstream) || {};
             dVtunNex.textContent = 'Occ: ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | Peak: ' + (vt.peak || 0) + ' | Drops: ' + (vt.drops || 0);
-            dVtunNex.style.color = (vt.drops || 0) > 0 ? 'var(--danger)' : '';
+            dVtunNex.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
         }
 
         // Panel 6: Upstream AWG & Peer Sync
@@ -2010,12 +2153,13 @@
         const dBeCounts = document.getElementById('vpn-diag-be-counts');
         if (dBeCounts) {
             const be = status.backends || {};
-            dBeCounts.textContent = (be.healthy_count || 0) + ' / ' + (be.total_count || status.active_tunnels || 0) + ' healthy';
+            const enabled = be.eligibility_known ? Number(be.enabled_count || 0) : Number(be.total_count || status.active_tunnels || 0);
+            dBeCounts.textContent = (be.healthy_count || 0) + ' / ' + enabled + ' healthy (' + Number(be.total_count || 0) + ' inventory, ' + Number(be.disabled_count || 0) + ' disabled)';
         }
         const dBeLat = document.getElementById('vpn-diag-be-latency');
         if (dBeLat) {
             const be = status.backends || {};
-            dBeLat.textContent = (be.latency_p95_ms || 0).toFixed(1) + 'ms';
+            dBeLat.textContent = be.latency_samples === 0 ? 'Unavailable' : Number(be.latency_p95_ms || 0).toFixed(1) + 'ms';
         }
         const dBeSkew = document.getElementById('vpn-diag-be-skew');
         if (dBeSkew) {
@@ -2026,7 +2170,20 @@
         if (dBeDrops) {
             const be = status.backends || {};
             dBeDrops.textContent = (be.total_drops || 0) + ' device drops';
-            dBeDrops.style.color = (be.total_drops || 0) > 0 ? 'var(--danger)' : '';
+            dBeDrops.style.color = Number((status.drop_categories && status.drop_categories.reason_rates && status.drop_categories.reason_rates.client_backend_device_queue_full) || 0) > 0 ? 'var(--danger)' : '';
+        }
+
+        const backendTraffic = document.getElementById('vpn-diag-be-traffic');
+        if (backendTraffic) {
+            backendTraffic.textContent = '';
+            for (const backend of (status.backends && status.backends.backends) || []) {
+                const row = document.createElement('div');
+                const traffic = backend.traffic_available ?
+                    'RX ' + fmtBps(Number(backend.rx_bytes_per_sec || 0) * 8) + ' / TX ' + fmtBps(Number(backend.tx_bytes_per_sec || 0) * 8) +
+                    ' | RX ' + fmtPps(Number(backend.rx_pps || 0)) + ' / TX ' + fmtPps(Number(backend.tx_pps || 0)) : 'Traffic unavailable';
+                row.textContent = backend.server_name + ': ' + (backend.enabled === false ? 'Disabled' : backend.health_state) + ' | ' + traffic;
+                backendTraffic.appendChild(row);
+            }
         }
 
         // Panel 9: Runtime Resources

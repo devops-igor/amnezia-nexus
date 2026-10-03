@@ -233,6 +233,7 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, pac
 	f.writeMetrics.TotalDuration += duration
 	route.writeMetrics.TotalDuration += duration
 	f.writeLatencies.record(duration)
+	f.writeHistogram.observe(duration)
 	route.writeLatencies.record(duration)
 	if duration > route.writeMetrics.MaxDuration {
 		route.writeMetrics.MaxDuration = duration
@@ -289,6 +290,7 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 		OldestWriteMS:      writes.OldestInFlight.Milliseconds(),
 		MaxWriteDurationMS: writes.MaxDuration.Milliseconds(),
 		P95WriteMS:         p95.Milliseconds(),
+		P95WriteSamples:    route.writeLatencies.count,
 
 		QueueFullDropsRecent: recent.QueueFullDropsRecent,
 		WriteErrorsRecent:    recent.WriteErrorsRecent,

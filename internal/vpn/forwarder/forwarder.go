@@ -139,6 +139,7 @@ type RouteQueueStats struct {
 	WritesInFlight     int    `json:"writes_in_flight"`
 	OldestWriteMS      int64  `json:"oldest_write_ms"`
 	MaxWriteDurationMS int64  `json:"max_write_duration_ms"`
+	P95WriteSamples    int    `json:"p95_write_samples"`
 	P95WriteMS         int64  `json:"p95_write_ms"`
 
 	// PeerKeyDisplay is the REDACTED, human-readable rendering of the peer
@@ -186,6 +187,8 @@ type sessionRoute struct {
 	pressure       routePressureWindow
 	writeMu        sync.Mutex // admission and completion; never acquired under f.mu
 	retired        atomic.Bool
+	createdAt      time.Time
+	traffic        trafficCounters
 	writeMetrics   DeviceWriteTelemetry  // guarded by Forwarder.writeMetricsMu
 	writeLatencies routeLatencyReservoir // guarded by Forwarder.writeMetricsMu
 	// stopCh terminates this route's pumpClientQueue goroutine on session
@@ -211,10 +214,11 @@ type Forwarder struct {
 	accountant       *TrafficAccountant
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
-	backendQueues    map[int64]chan []byte    // backendTunnelID -> queue
-	backendDevices   map[int64]PacketDevice   // backendTunnelID -> device
-	backendPumpStops map[int64]chan struct{}  // backendTunnelID -> pump stop channel
-	backendPumpDones map[int64]chan struct{}  // backendTunnelID -> pump done channel
+	backendTraffic   map[int64]*trafficCounters
+	backendQueues    map[int64]chan []byte   // backendTunnelID -> queue
+	backendDevices   map[int64]PacketDevice  // backendTunnelID -> device
+	backendPumpStops map[int64]chan struct{} // backendTunnelID -> pump stop channel
+	backendPumpDones map[int64]chan struct{} // backendTunnelID -> pump done channel
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -274,6 +278,7 @@ type Forwarder struct {
 	writeErrLogUntil        atomic.Int64
 	writeMetricsMu          sync.Mutex
 	writeMetrics            DeviceWriteTelemetry
+	writeHistogram          writeDurationHistogram
 	writeLatencies          latencyReservoir
 	writesInFlight          map[*sessionRoute]time.Time
 	rateTracker             *RateTracker
@@ -494,6 +499,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	// Ensure backend queue exists
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
 		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 
 	var tbDown, tbUp *TokenBucket
@@ -505,6 +511,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 	}
 
 	route := &sessionRoute{
+		createdAt:       time.Now(),
 		returnPath:      path,
 		sessionID:       sessionID,
 		connectionID:    connectionID,
@@ -807,6 +814,7 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 
 	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
 		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(newBackendTunnelID)
 	}
 
 	route.backendTunnelID = newBackendTunnelID
@@ -855,6 +863,7 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	sID := route.sessionID
 	cID := route.connectionID
 	tbUp := route.tbUp
+	backendTraffic := f.backendTraffic[route.backendTunnelID]
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
@@ -866,6 +875,8 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 
 	f.totalRxBytes.Add(pktLen)
 	f.totalRxPackets.Add(1)
+	route.traffic.record(pktLen, true)
+	backendTraffic.record(pktLen, true)
 	if f.accountant != nil {
 		f.accountant.RecordRx(sID, cID, pktLen)
 	}
@@ -926,6 +937,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	sID := route.sessionID
 	cID := route.connectionID
 	tbDown := route.tbDown
+	backendTraffic := f.backendTraffic[backendTunnelID]
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
@@ -977,6 +989,8 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.mu.RUnlock()
 		f.totalTxBytes.Add(pktLen)
 		f.totalTxPackets.Add(1)
+		route.traffic.record(pktLen, false)
+		backendTraffic.record(pktLen, false)
 		if f.accountant != nil {
 			f.accountant.RecordTx(sID, cID, pktLen)
 		}
@@ -1050,11 +1064,15 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
 		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 	if dev != nil {
 		f.backendDevices[backendTunnelID] = dev
+		f.ensureBackendTrafficLocked(backendTunnelID)
+		f.backendTraffic[backendTunnelID] = &trafficCounters{}
 	} else {
 		delete(f.backendDevices, backendTunnelID)
+		delete(f.backendTraffic, backendTunnelID)
 	}
 
 	if f.pumpsRunning && dev != nil {
@@ -1071,6 +1089,7 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 func (f *Forwarder) DetachBackendDevice(backendTunnelID int64) {
 	f.mu.Lock()
 	delete(f.backendDevices, backendTunnelID)
+	delete(f.backendTraffic, backendTunnelID)
 	var oldStopCh chan struct{}
 	var oldDoneCh chan struct{}
 	if stopCh, exists := f.backendPumpStops[backendTunnelID]; exists {
@@ -1536,6 +1555,7 @@ func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan []byte
 		delete(f.backendQueues, backendTunnelID)
 	} else {
 		f.backendQueues[backendTunnelID] = ch
+		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 }
 

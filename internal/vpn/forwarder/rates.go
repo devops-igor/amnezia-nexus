@@ -8,6 +8,7 @@ import (
 
 // TrafficRates captures instantaneous and moving-average throughput and packet rates.
 type TrafficRates struct {
+	Available      bool    `json:"available"`
 	RxBps          float64 `json:"rx_bps"`
 	TxBps          float64 `json:"tx_bps"`
 	RxPps          float64 `json:"rx_pps"`
@@ -44,7 +45,8 @@ type QueuePressureStats struct {
 
 // RateTracker computes rates and exponential moving averages over time.
 type RateTracker struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	available bool
 
 	lastSampleTime time.Time
 	lastRxBytes    int64
@@ -157,6 +159,7 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	rt.lastTotalDrops = totalDrops
 	rt.lastQueueDrops = queueDrops
 
+	rt.available = true
 	rt.currentRxBps = float64(deltaRxBytes*8) / elapsed
 	rt.currentTxBps = float64(deltaTxBytes*8) / elapsed
 	rt.currentRxPps = float64(deltaRxPackets) / elapsed
@@ -269,6 +272,7 @@ func (rt *RateTracker) Snapshot(rxPackets, txPackets uint64) TrafficRates {
 	defer rt.mu.Unlock()
 
 	return TrafficRates{
+		Available:      rt.available,
 		RxBps:          rt.currentRxBps,
 		TxBps:          rt.currentTxBps,
 		RxPps:          rt.currentRxPps,

@@ -47,15 +47,15 @@ print_banner() {
     echo "=================================================================="
     echo "  Amnezia Nexus - Deterministic E2E Lifecycle Verification"
     echo "=================================================================="
-    echo "Target Base URL   : ${E2E_BASE_URL}"
-    echo "Admin User        : ${E2E_ADMIN_USER}"
-    echo "Server Host       : ${E2E_SERVER_HOST}"
+    echo "Target Panel      : Panel fixture"
+    echo "Admin User        : Admin fixture"
+    echo "Server Host       : Server 1"
     echo "Server SSH Port   : ${E2E_SERVER_SSH_PORT}"
-    echo "Server SSH User   : ${E2E_SERVER_SSH_USER}"
+    echo "Server SSH User   : SSH fixture"
     echo "E2E Testing       : ${E2E_TESTING}"
     echo "Require Dataplane : ${E2E_REQUIRE_DATAPLANE}"
     if [ -n "${E2E_SERVER_SSH_KEY}" ]; then
-        echo "Server SSH Key    : ${E2E_SERVER_SSH_KEY}"
+        echo "Server SSH Key    : (configured)"
     else
         echo "Server SSH Key    : (default / ssh-agent)"
     fi
@@ -107,7 +107,7 @@ fi
 # ------------------------------------------------------------------------------
 print_banner
 echo ""
-echo "==> Probing server readiness at ${E2E_BASE_URL}/api/health..."
+echo "==> Probing panel readiness..."
 READY=0
 for i in $(seq 1 30); do
     if curl -s -f "${E2E_BASE_URL}/api/health" >/dev/null 2>&1; then
@@ -118,13 +118,13 @@ for i in $(seq 1 30); do
 done
 
 if [ "$READY" -ne 1 ]; then
-    echo "ERROR: Target server at ${E2E_BASE_URL} failed readiness probe within 30s." >&2
+    echo "ERROR: Panel fixture failed readiness probe within 30s." >&2
     echo "Please ensure the panel is running on a clean-slate database before running this script." >&2
     OVERALL_STATUS=1
     print_summary
     exit 1
 fi
-echo "==> Server is healthy at ${E2E_BASE_URL}."
+echo "==> Panel fixture is healthy."
 
 # ------------------------------------------------------------------------------
 # Stage 1: Initial Setup Wizard

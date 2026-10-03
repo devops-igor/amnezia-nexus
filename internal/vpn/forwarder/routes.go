@@ -1,18 +1,24 @@
 package forwarder
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 // RouteInfo holds structural and performance state for an active forwarder route.
 type RouteInfo struct {
-	PeerKey          string          `json:"peer_key"`
-	AssignedIP       string          `json:"assigned_ip"`
-	SessionID        string          `json:"session_id"`
-	ConnectionID     string          `json:"connection_id"`
-	BackendTunnelID  int64           `json:"backend_tunnel_id"`
-	HasReturnPath    bool            `json:"has_return_path"`
-	ReturnPathClosed bool            `json:"return_path_closed"`
-	Stats            RouteQueueStats `json:"stats"`
-	HasPressure      bool            `json:"has_pressure"`
+	PeerKey           string          `json:"peer_key"`
+	AssignedIP        string          `json:"assigned_ip"`
+	SessionID         string          `json:"session_id"`
+	ConnectionID      string          `json:"connection_id"`
+	BackendTunnelID   int64           `json:"backend_tunnel_id"`
+	HasReturnPath     bool            `json:"has_return_path"`
+	ReturnPathClosed  bool            `json:"return_path_closed"`
+	Stats             RouteQueueStats `json:"stats"`
+	SessionAgeSec     int64           `json:"session_age_sec"`
+	LastTrafficAgeSec int64           `json:"last_traffic_age_sec"`
+	Traffic           TrafficSnapshot `json:"traffic"`
+	HasPressure       bool            `json:"has_pressure"`
 }
 
 // InspectRoutes returns a point-in-time inventory of all currently registered routes.
@@ -57,15 +63,18 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 			stats.WriteStallsRecent > 0
 
 		routes = append(routes, RouteInfo{
-			PeerKey:          peerKey,
-			AssignedIP:       route.assignedIP,
-			SessionID:        route.sessionID,
-			ConnectionID:     route.connectionID,
-			BackendTunnelID:  route.backendTunnelID,
-			HasReturnPath:    hasReturnPath,
-			ReturnPathClosed: returnPathClosed,
-			Stats:            stats,
-			HasPressure:      hasPressure,
+			PeerKey:           peerKey,
+			AssignedIP:        route.assignedIP,
+			SessionID:         route.sessionID,
+			ConnectionID:      route.connectionID,
+			BackendTunnelID:   route.backendTunnelID,
+			HasReturnPath:     hasReturnPath,
+			ReturnPathClosed:  returnPathClosed,
+			Stats:             stats,
+			SessionAgeSec:     int64(time.Since(route.createdAt) / time.Second),
+			LastTrafficAgeSec: route.traffic.lastTrafficAge(time.Now()),
+			Traffic:           route.traffic.snapshot(time.Now()),
+			HasPressure:       hasPressure,
 		})
 	}
 	return routes

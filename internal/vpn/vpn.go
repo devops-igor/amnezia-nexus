@@ -170,29 +170,31 @@ type BackendDevice interface {
 // check-then-allocate capacity decision is only safe under this
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
-	mu            sync.RWMutex
-	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
-	db            *database.DB
-	cfg           *models.VPNConfig
-	sessionMgr    *session.SessionManager
-	ipam          *ipam.IPAM
-	auth          *auth.DBAuthenticator
-	pool          *tunnel.Pool
-	prober        *tunnel.HealthProber
-	reconnectMgr  *tunnel.ReconnectManager
-	balancer      loadbalancer.LoadBalancer
-	stickyMgr     *loadbalancer.StickySessionManager
-	forwarder     *forwarder.Forwarder
-	accountant    *forwarder.TrafficAccountant
-	running       bool
-	portalPubKey  string
-	portalPrivKey string
-	awgProvider   AWGStatusProvider
-	ingressEngine *IngressEngine
+	retiredIngressLosses ingressLossTotals // guarded by mu
+	mu                   sync.RWMutex
+	assignmentMu         sync.Mutex // serialize durable lease creation and restart migration
+	db                   *database.DB
+	cfg                  *models.VPNConfig
+	sessionMgr           *session.SessionManager
+	ipam                 *ipam.IPAM
+	auth                 *auth.DBAuthenticator
+	pool                 *tunnel.Pool
+	prober               *tunnel.HealthProber
+	reconnectMgr         *tunnel.ReconnectManager
+	balancer             loadbalancer.LoadBalancer
+	stickyMgr            *loadbalancer.StickySessionManager
+	forwarder            *forwarder.Forwarder
+	accountant           *forwarder.TrafficAccountant
+	running              bool
+	portalPubKey         string
+	portalPrivKey        string
+	awgProvider          AWGStatusProvider
+	ingressEngine        *IngressEngine
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices             map[int64]BackendDevice
 	backendDeviceEndpoints     map[int64]string
 	lastLoggedDrops            atomic.Uint64
+	retiredBackendDeviceDrops  uint64 // guarded by mu; preserves lifetime loss on device retirement
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
 	publicIPMu                 sync.RWMutex
@@ -1664,6 +1666,8 @@ func (s *Service) Stop() error {
 	}
 	s.running = false
 	ingressEng := s.ingressEngine
+	initialLosses := engineLossTotals(ingressEng)
+	s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, initialLosses)
 	s.ingressEngine = nil
 	s.mu.Unlock()
 
@@ -1678,6 +1682,9 @@ func (s *Service) Stop() error {
 		if err := ingressEng.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
 			recordErr(err)
 		}
+		s.mu.Lock()
+		s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, ingressLossDelta(engineLossTotals(ingressEng), initialLosses))
+		s.mu.Unlock()
 	}
 	if s.prober != nil {
 		s.prober.Stop()
@@ -1698,6 +1705,9 @@ func (s *Service) Stop() error {
 		for id, dev := range s.backendDevices {
 			if dev != nil {
 				_ = dev.Close()
+			}
+			if dev != nil {
+				s.retiredBackendDeviceDrops += dev.DroppedPackets()
 			}
 			delete(s.backendDevices, id)
 		}
@@ -2268,7 +2278,14 @@ func parsePort(val any) int {
 // AWG credentials, registering (or refreshing) the tunnel, and attaching its
 // data-plane device. It does not declare the backend healthy: runtime health
 // remains owned by the prober/self-healing subsystem.
-func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
+func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error) {
+	stage := "initialize"
+	defer func() {
+		if err != nil && BackendEnableStage(err) == "unknown" {
+			err = backendEnableFailure(stage, err)
+		}
+	}()
+
 	s.mu.RLock()
 	pool := s.pool
 	db := s.db
@@ -2291,6 +2308,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		initialEnabled = initTun.Enabled
 	}
 
+	stage = "load_server"
 	server, err := db.GetServerByID(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("failed to load server %d: %w", serverID, err)
@@ -2299,6 +2317,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
 	}
 
+	stage = "credentials"
 	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
 	if err != nil {
 		return err
@@ -2313,6 +2332,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		preAddHook()
 	}
 
+	stage = "register_tunnel"
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
 	var postRefreshVersion int64
@@ -2342,6 +2362,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	// registrations refresh in place; a legacy shared-key peer registered under
 	// the data identity keeps its client_ip entry and is re-pointed at the
 	// data-device identity.
+	stage = "register_peers"
 	if awgProv != nil {
 		if err := s.registerBackendPortalPeers(ctx, server, tun); err != nil {
 			_ = pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
@@ -2355,6 +2376,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
+	stage = "state_changed"
 	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
 }
 
@@ -2394,7 +2416,7 @@ func (s *Service) finishEnableBackend(
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
-		return err
+		return backendEnableFailure("attach_device", err)
 	}
 
 	// Issue #50: clear the prober's consecutive-failure counter so the
@@ -2409,13 +2431,13 @@ func (s *Service) finishEnableBackend(
 
 	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
 	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
-		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
+		return backendEnableFailure("persist_enable", fmt.Errorf("failed to persist administrative backend enable: %w", err))
 	}
 	if legacyAdminOnlyState {
 		// Legacy rows encoded administrative disable in runtime status. Once
 		// enabled is authoritative, that old status has no trustworthy health
 		// meaning, so make it unknown/connecting and require a fresh probe.
-		return pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0)
+		return backendEnableFailure("persist_enable", pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0))
 	}
 	return nil
 }
@@ -2481,7 +2503,7 @@ func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models
 		"allowed_ips":       portalSubnet,
 	}
 	if _, err := adder.AddClient(ctx, server, dataParams); err != nil {
-		return fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err)
+		return backendEnableFailure("register_data_peer", fmt.Errorf("failed to register portal data plane peer on backend server %d: %w", server.ID, err))
 	}
 
 	probeParams := map[string]any{
@@ -2493,14 +2515,14 @@ func (s *Service) registerBackendPortalPeers(ctx context.Context, server *models
 		// probe peer must never be granted 0.0.0.0/0.
 	}
 	if _, err := adder.AddClient(ctx, server, probeParams); err != nil {
-		return fmt.Errorf("failed to register portal health probe peer on backend server %d: %w", server.ID, err)
+		return backendEnableFailure("register_probe_peer", fmt.Errorf("failed to register portal health probe peer on backend server %d: %w", server.ID, err))
 	}
 
 	// Persist the probe key so the identity is stable across restarts
 	// (Fernet-encrypted at rest by the database layer).
 	if db != nil {
 		if err := db.UpdateBackendTunnel(ctx, tun.ID, map[string]any{"probe_private_key": tun.ProbePrivateKey}); err != nil {
-			return fmt.Errorf("failed to persist probe private key for backend tunnel %d (server %d): %w", tun.ID, server.ID, err)
+			return backendEnableFailure("persist_probe_key", fmt.Errorf("failed to persist probe private key for backend tunnel %d (server %d): %w", tun.ID, server.ID, err))
 		}
 	}
 	return nil
@@ -2661,6 +2683,9 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			s.forwarder.DetachBackendDevice(tun.ID)
 			if oldDev != nil {
 				_ = oldDev.Close()
+			}
+			if oldDev != nil {
+				s.retiredBackendDeviceDrops += oldDev.DroppedPackets()
 			}
 			delete(s.backendDevices, tun.ID)
 			if s.backendDeviceEndpoints != nil {
@@ -2871,6 +2896,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	if dev, ok := s.backendDevices[tunnel.ID]; ok {
 		if dev != nil {
 			_ = dev.Close()
+		}
+		if dev != nil {
+			s.retiredBackendDeviceDrops += dev.DroppedPackets()
 		}
 		delete(s.backendDevices, tunnel.ID)
 	}

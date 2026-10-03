@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 )
@@ -41,6 +42,7 @@ type ForwarderHealthAssessment struct {
 
 // TrafficRates tracks instantaneous throughput and moving averages.
 type TrafficRates struct {
+	Available   bool    `json:"available"`
 	RxBps       float64 `json:"rx_bps"`
 	TxBps       float64 `json:"tx_bps"`
 	RxPps       float64 `json:"rx_pps"`
@@ -87,6 +89,8 @@ type ForwardLatencyDiagnostics struct {
 	MaxMS             int64   `json:"max_ms"`
 	InFlight          int     `json:"in_flight"`
 	OldestInFlightMS  int64   `json:"oldest_in_flight_ms"`
+	StallsRecent      uint64  `json:"stalls_recent"`
+	StallsWindowSec   float64 `json:"stalls_window_sec"`
 	Stalls            uint64  `json:"stalls"`
 	WriteErrors       uint64  `json:"write_errors"`
 	WriteTotal        uint64  `json:"write_total"`
@@ -112,9 +116,10 @@ type DropCategoryBreakdown struct {
 	// Nexus. They belong to the client-side bucket: the upstream device is
 	// the egress of the client-originated direction, so a drop there loses
 	// client traffic rather than a return reply.
-	ClientVirtualTUNDrops uint64  `json:"client_virtualtun_drops"`
-	ClientTotalDrops      uint64  `json:"client_total_drops"`
-	ClientDropRatePps     float64 `json:"client_drop_rate_pps"`
+	ClientVirtualTUNDrops        uint64  `json:"client_virtualtun_drops"`
+	ClientBackendDeviceQueueFull uint64  `json:"client_backend_device_queue_full"`
+	ClientTotalDrops             uint64  `json:"client_total_drops"`
+	ClientDropRatePps            float64 `json:"client_drop_rate_pps"`
 
 	// Backend -> Client (Return path)
 	ReturnMalformed       uint64 `json:"return_malformed"`
@@ -127,12 +132,16 @@ type DropCategoryBreakdown struct {
 	// finding 3). Additive key: it makes the ownership overlap explicit
 	// instead of inferred by subtracting aggregate counters.
 	ReturnInjectionTUNDrops uint64  `json:"return_injection_tun_drops"`
+	ReturnQueueFull         uint64  `json:"return_queue_full"`
+	ReturnPacketTooLarge    uint64  `json:"return_packet_too_large"`
 	ReturnTotalDrops        uint64  `json:"return_total_drops"`
 	ReturnDropRatePps       float64 `json:"return_drop_rate_pps"`
 
 	// Total aggregate drops
-	TotalDrops       uint64  `json:"total_drops"`
-	TotalDropRatePps float64 `json:"total_drop_rate_pps"`
+	TotalDrops       uint64             `json:"total_drops"`
+	TotalDropRatePps float64            `json:"total_drop_rate_pps"`
+	ReasonRates      map[string]float64 `json:"reason_rates"`
+	RatesAvailable   bool               `json:"rates_available"`
 }
 
 // VirtualTUNDirectionalHealth captures directional queue state for VirtualTUN.
@@ -188,6 +197,16 @@ type HandshakeFreshnessDiagnostics struct {
 
 // BackendTelemetryItem captures per-backend operational metrics.
 type BackendTelemetryItem struct {
+	Enabled             bool    `json:"enabled"`
+	Routable            bool    `json:"routable"`
+	TrafficAvailable    bool    `json:"traffic_available"`
+	TrafficWindowSec    float64 `json:"traffic_window_sec"`
+	RxBytesPerSec       float64 `json:"rx_bytes_per_sec"`
+	TxBytesPerSec       float64 `json:"tx_bytes_per_sec"`
+	RxPps               float64 `json:"rx_pps"`
+	TxPps               float64 `json:"tx_pps"`
+	RxPackets           uint64  `json:"rx_packets"`
+	TxPackets           uint64  `json:"tx_packets"`
 	ID                  int64   `json:"id"`
 	ServerID            int64   `json:"server_id"`
 	ServerName          string  `json:"server_name"`
@@ -203,26 +222,46 @@ type BackendTelemetryItem struct {
 
 // BackendsDiagnostics provides an aggregate summary and itemized backend list.
 type BackendsDiagnostics struct {
-	HealthyCount int                    `json:"healthy_count"`
-	TotalCount   int                    `json:"total_count"`
-	LatencyP95MS float64                `json:"latency_p95_ms"`
-	LoadSkewPct  float64                `json:"load_skew_pct"`
-	TotalDrops   uint64                 `json:"total_drops"`
-	Backends     []BackendTelemetryItem `json:"backends"`
+	// EligibilityKnown distinguishes current enabled/routable inventory from legacy callers.
+	EligibilityKnown bool                   `json:"eligibility_known"`
+	EnabledCount     int                    `json:"enabled_count"`
+	DisabledCount    int                    `json:"disabled_count"`
+	LatencySamples   int                    `json:"latency_samples"`
+	HealthyCount     int                    `json:"healthy_count"`
+	TotalCount       int                    `json:"total_count"`
+	LatencyP95MS     float64                `json:"latency_p95_ms"`
+	LoadSkewPct      float64                `json:"load_skew_pct"`
+	TotalDrops       uint64                 `json:"total_drops"`
+	Backends         []BackendTelemetryItem `json:"backends"`
 }
 
 // ProblemRouteItem represents per-route diagnostics.
 type ProblemRouteItem struct {
-	PeerKey      string  `json:"peer_key"`
-	AssignedIP   string  `json:"assigned_ip"`
-	BackendID    int64   `json:"backend_id"`
-	Occupancy    int     `json:"occupancy"`
-	Capacity     int     `json:"capacity"`
-	HighWater    int     `json:"high_water"`
-	Drops        uint64  `json:"drops"`
-	P95WriteMS   float64 `json:"p95_write_ms"`
-	HasPressure  bool    `json:"has_pressure"`
-	PressureNote string  `json:"pressure_note,omitempty"`
+	UtilizationPct       float64                   `json:"utilization_pct"`
+	HighWaterPct         float64                   `json:"high_water_pct"`
+	WriteCount           uint64                    `json:"write_count"`
+	WriteErrors          uint64                    `json:"write_errors"`
+	WriteStalls          uint64                    `json:"write_stalls"`
+	WritesInFlight       int                       `json:"writes_in_flight"`
+	OldestWriteMS        int64                     `json:"oldest_write_ms"`
+	MaxWriteMS           int64                     `json:"max_write_ms"`
+	P95WriteSamples      int                       `json:"p95_write_samples"`
+	QueueFullDropsRecent uint64                    `json:"queue_full_drops_recent"`
+	WriteErrorsRecent    uint64                    `json:"write_errors_recent"`
+	WriteStallsRecent    uint64                    `json:"write_stalls_recent"`
+	Traffic              forwarder.TrafficSnapshot `json:"traffic"`
+	SessionAgeSec        int64                     `json:"session_age_sec"`
+	LastTrafficAgeSec    int64                     `json:"last_traffic_age_sec"`
+	PeerKey              string                    `json:"peer_key"`
+	AssignedIP           string                    `json:"assigned_ip"`
+	BackendID            int64                     `json:"backend_id"`
+	Occupancy            int                       `json:"occupancy"`
+	Capacity             int                       `json:"capacity"`
+	HighWater            int                       `json:"high_water"`
+	Drops                uint64                    `json:"drops"`
+	P95WriteMS           float64                   `json:"p95_write_ms"`
+	HasPressure          bool                      `json:"has_pressure"`
+	PressureNote         string                    `json:"pressure_note,omitempty"`
 }
 
 // RuntimeResources contains process and runtime health counters.
@@ -242,15 +281,24 @@ type RuntimeResources struct {
 // ForwardP95Samples == 0 marks unavailable current latency; ForwardP95MS alone
 // cannot distinguish an idle window from a measured zero-duration write.
 type HistoryPoint struct {
-	Timestamp         int64   `json:"t"`
-	RxBps             float64 `json:"rx_bps"`
-	TxBps             float64 `json:"tx_bps"`
-	QueueUtilPct      float64 `json:"q_pct"`
-	TotalDropRate     float64 `json:"drop_rate"`
-	ForwardP95Samples int     `json:"fwd_p95_samples"`
-	ForwardP95MS      float64 `json:"fwd_p95_ms"`
-	ActiveSessions    int     `json:"sessions"`
-	BackendP95MS      float64 `json:"be_p95_ms"`
+	RxPps                 float64               `json:"rx_pps"`
+	TxPps                 float64               `json:"tx_pps"`
+	TrafficAvailable      bool                  `json:"traffic_available"`
+	DropRatesAvailable    bool                  `json:"drop_rates_available"`
+	DropReasonRates       map[string]float64    `json:"drop_reason_rates"`
+	ActiveRoutes          int                   `json:"routes"`
+	BackendLatencySamples int                   `json:"be_latency_samples"`
+	Backends              []BackendHistoryPoint `json:"backends"`
+	BackendsOmitted       int                   `json:"backends_omitted"`
+	Timestamp             int64                 `json:"t"`
+	RxBps                 float64               `json:"rx_bps"`
+	TxBps                 float64               `json:"tx_bps"`
+	QueueUtilPct          float64               `json:"q_pct"`
+	TotalDropRate         float64               `json:"drop_rate"`
+	ForwardP95Samples     int                   `json:"fwd_p95_samples"`
+	ForwardP95MS          float64               `json:"fwd_p95_ms"`
+	ActiveSessions        int                   `json:"sessions"`
+	BackendP95MS          float64               `json:"be_p95_ms"`
 }
 
 // HistoricalSeries contains rolling time-series samples across 4 windows.
@@ -287,7 +335,9 @@ func (rb *ringBuffer) snapshot() []HistoryPoint {
 		return []HistoryPoint{}
 	}
 	out := make([]HistoryPoint, len(rb.points))
-	copy(out, rb.points)
+	for i, p := range rb.points {
+		out[i] = cloneHistoryPoint(p)
+	}
 	return out
 }
 
@@ -324,6 +374,12 @@ func (rh *RollingHistory) Add(p HistoryPoint) {
 	defer rh.mu.Unlock()
 
 	now := time.Unix(p.Timestamp, 0)
+	// Clamp before copying: a small slice of a huge backing array is not bounded storage.
+	if len(p.Backends) > MaxHistoryBackends {
+		p.BackendsOmitted += len(p.Backends) - MaxHistoryBackends
+		p.Backends = p.Backends[:MaxHistoryBackends]
+	}
+	p = cloneHistoryPoint(p)
 	rh.buf15m.add(p)
 
 	if rh.last1hTime.IsZero() || now.Sub(rh.last1hTime) >= 1*time.Minute {
@@ -670,73 +726,166 @@ func auditRoutingConsistencyDetails(diag *RoutingConsistencyDiagnostics) {
 }
 
 // collectBackendDiagnostics gathers operational state across registered backend tunnels.
+//
+// The function itself is a thin composition of the three helpers below — device
+// drop population, eligibility counting, and fleet-wide percentile/skew —
+// because each of those encodes a contract worth pinning in isolation. All
+// three read the same s fields as the original inline body and none of them
+// acquires a lock: drop counters and the tunnel list are read exactly as
+// before, and the sampling cadence is unchanged.
 func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
 	if s.pool == nil {
-		return BackendsDiagnostics{Backends: []BackendTelemetryItem{}}
+		return BackendsDiagnostics{
+			EligibilityKnown: true,
+			TotalDrops:       totalBackendDeviceDrops(s),
+			Backends:         []BackendTelemetryItem{},
+		}
 	}
 
 	tunnels := s.pool.ListTunnels()
+	var traffic map[int64]forwarder.TrafficSnapshot
+	if s.forwarder != nil {
+		traffic = s.forwarder.BackendTrafficSnapshot()
+	}
 	diag := BackendsDiagnostics{
-		TotalCount: len(tunnels),
-		Backends:   make([]BackendTelemetryItem, 0, len(tunnels)),
+		TotalCount:       len(tunnels),
+		EligibilityKnown: true,
+		Backends:         make([]BackendTelemetryItem, 0, len(tunnels)),
+		TotalDrops:       totalBackendDeviceDrops(s),
 	}
 
-	var totalActiveConns int
-	for _, tun := range tunnels {
-		if tun.Status == TunnelStatusActive {
-			diag.HealthyCount++
-		}
-		totalActiveConns += tun.ActiveConnections
-	}
+	totalActiveConns := countBackendEligibility(&diag, tunnels)
 
 	activeLatencies := make([]float64, 0, len(tunnels))
 	var maxShare float64
 
 	for _, tun := range tunnels {
-		var drops uint64
-		var lastHSAge int64 = -1
-
-		if dev, exists := s.backendDevices[tun.ID]; exists && dev != nil {
-			drops = dev.DroppedPackets()
-			if !dev.LastHandshakeTime().IsZero() {
-				lastHSAge = int64(time.Since(dev.LastHandshakeTime()).Seconds())
-				if lastHSAge < 0 {
-					lastHSAge = 0
-				}
-			}
-		}
-
-		diag.TotalDrops += drops
-
-		var loadShare float64
-		if totalActiveConns > 0 {
-			loadShare = float64(tun.ActiveConnections) / float64(totalActiveConns) * 100.0
-		}
+		item, loadShare, hasLatencySample := backendTelemetryItem(s, tun, traffic, totalActiveConns)
 		if loadShare > maxShare {
 			maxShare = loadShare
 		}
-
-		if tun.Status == TunnelStatusActive && tun.LatencyMS > 0 {
+		if hasLatencySample {
 			activeLatencies = append(activeLatencies, float64(tun.LatencyMS))
 		}
-
-		diag.Backends = append(diag.Backends, BackendTelemetryItem{
-			ID:                  tun.ID,
-			ServerID:            tun.ServerID,
-			ServerName:          fmt.Sprintf("Server %d", tun.ServerID),
-			HealthState:         tun.Status,
-			ProbeLatencyMS:      tun.LatencyMS,
-			ActiveSessions:      tun.ActiveConnections,
-			DeviceDrops:         drops,
-			LastHandshakeAgeSec: lastHSAge,
-			LoadSharePct:        loadShare,
-		})
+		diag.Backends = append(diag.Backends, item)
 	}
 
-	// Calculate P95 latency across healthy backends
+	applyBackendFleetStats(&diag, activeLatencies, maxShare, totalActiveConns)
+
+	return diag
+}
+
+// totalBackendDeviceDrops sums the drop counters of every live backend device
+// onto the retired-device lifetime total. nil map entries are skipped exactly
+// as the original inline loops did, so the fleet-wide drop population — and
+// therefore the no-pool early-return TotalDrops — is unchanged.
+func totalBackendDeviceDrops(s *Service) uint64 {
+	drops := s.retiredBackendDeviceDrops
+	for _, dev := range s.backendDevices {
+		if dev != nil {
+			drops += dev.DroppedPackets()
+		}
+	}
+	return drops
+}
+
+// countBackendEligibility tallies enabled, disabled, and healthy counts over the
+// tunnel list and returns the total active connections across eligible
+// backends. Eligibility is the shared "enabled AND active" predicate: a
+// disabled tunnel is counted only in the disabled inventory, never in the
+// healthy count, and never contributes load share, latency samples, or skew.
+func countBackendEligibility(diag *BackendsDiagnostics, tunnels []*models.BackendTunnel) int {
+	var totalActiveConns int
+	for _, tun := range tunnels {
+		if tun.Enabled {
+			diag.EnabledCount++
+		} else {
+			diag.DisabledCount++
+		}
+		if backendEligible(tun) {
+			diag.HealthyCount++
+			totalActiveConns += tun.ActiveConnections
+		}
+	}
+	return totalActiveConns
+}
+
+// backendEligible reports whether a tunnel carries data: administratively
+// enabled and runtime-active. It is the single definition of eligibility shared
+// by the healthy count, the per-backend load share, latency sample admission,
+// and the emitted Routable flag.
+func backendEligible(tun *models.BackendTunnel) bool {
+	return tun.Enabled && tun.Status == TunnelStatusActive
+}
+
+// backendTelemetryItem builds one BackendTelemetryItem for a tunnel. It returns
+// the load share and whether the tunnel contributes a latency sample, so the
+// caller can accumulate the fleet p95 population and the max share without
+// re-deriving either.
+//
+// lastHSAge stays at its -1 sentinel when no device exists or the device has
+// never completed a handshake, and is clamped at 0 when the handshake timestamp
+// is in the future, preserving the original tri-state.
+func backendTelemetryItem(
+	s *Service,
+	tun *models.BackendTunnel,
+	traffic map[int64]forwarder.TrafficSnapshot,
+	totalActiveConns int,
+) (BackendTelemetryItem, float64, bool) {
+	var drops uint64
+	lastHSAge := int64(-1)
+
+	if dev, exists := s.backendDevices[tun.ID]; exists && dev != nil {
+		drops = dev.DroppedPackets()
+		if hs := dev.LastHandshakeTime(); !hs.IsZero() {
+			lastHSAge = int64(time.Since(hs).Seconds())
+			if lastHSAge < 0 {
+				lastHSAge = 0
+			}
+		}
+	}
+
+	eligible := backendEligible(tun)
+
+	var loadShare float64
+	if eligible && totalActiveConns > 0 {
+		loadShare = float64(tun.ActiveConnections) / float64(totalActiveConns) * 100.0
+	}
+
+	// Traffic is read straight from the snapshot: an unsampled backend reports a
+	// zero-value entry with TrafficAvailable false, which is distinct from a
+	// measured zero and is preserved by not defaulting any field.
+	item := BackendTelemetryItem{
+		Enabled: tun.Enabled, Routable: eligible,
+		TrafficAvailable: traffic[tun.ID].Available, TrafficWindowSec: traffic[tun.ID].WindowSec,
+		RxBytes: traffic[tun.ID].RxBytes, TxBytes: traffic[tun.ID].TxBytes,
+		RxBytesPerSec: traffic[tun.ID].RxBytesPerSec, TxBytesPerSec: traffic[tun.ID].TxBytesPerSec,
+		RxPps: traffic[tun.ID].RxPps, TxPps: traffic[tun.ID].TxPps,
+		RxPackets: traffic[tun.ID].RxPackets, TxPackets: traffic[tun.ID].TxPackets,
+		ID:                  tun.ID,
+		ServerID:            tun.ServerID,
+		ServerName:          fmt.Sprintf("Server %d", tun.ServerID),
+		HealthState:         tun.Status,
+		ProbeLatencyMS:      tun.LatencyMS,
+		ActiveSessions:      tun.ActiveConnections,
+		DeviceDrops:         drops,
+		LastHandshakeAgeSec: lastHSAge,
+		LoadSharePct:        loadShare,
+	}
+
+	return item, loadShare, eligible && tun.LatencyMS > 0
+}
+
+// applyBackendFleetStats fills the fleet-wide latency percentile and load skew
+// from the accumulated sample population, max share, and eligible connection
+// total.
+func applyBackendFleetStats(diag *BackendsDiagnostics, activeLatencies []float64, maxShare float64, totalActiveConns int) {
+	// Nearest-rank p95: ceil(0.95*n)-1 over eligible measured probes.
+	// Empty has zero samples; singleton and two-value fleets retain their slow tail.
 	if len(activeLatencies) > 0 {
 		sort.Float64s(activeLatencies)
-		idx := int(float64(len(activeLatencies)-1) * 0.95)
+		diag.LatencySamples = len(activeLatencies)
+		idx := int(math.Ceil(float64(len(activeLatencies))*0.95)) - 1
 		diag.LatencyP95MS = activeLatencies[idx]
 	}
 
@@ -745,8 +894,6 @@ func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
 		idealShare := 100.0 / float64(diag.HealthyCount)
 		diag.LoadSkewPct = math.Abs(maxShare - idealShare)
 	}
-
-	return diag
 }
 
 // collectHandshakeDiagnostics inspects upstream device status and checks for stale active sessions.
@@ -1180,18 +1327,28 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 		}
 	}
 
-	if backends.TotalCount > 0 && backends.HealthyCount == 0 {
+	enabled := backends.TotalCount
+	if backends.EligibilityKnown {
+		enabled = backends.EnabledCount
+	}
+	if backends.HealthyCount == 0 && (backends.TotalCount > 0 || backends.EligibilityKnown) {
+		message := "No healthy backends available to route traffic"
+		if backends.TotalCount == 0 {
+			message = "No backends configured to route traffic"
+		} else if enabled == 0 {
+			message = "All backends are administratively disabled; no traffic can be routed"
+		}
 		conds = append(conds, HealthCondition{
 			Category: "backend",
 			Severity: "CRITICAL",
-			Message:  "No healthy backends available to route traffic",
+			Message:  message,
 		})
-	} else if backends.TotalCount > 0 && backends.HealthyCount < backends.TotalCount {
+	} else if enabled > 0 && backends.HealthyCount < enabled {
 		conds = append(conds, HealthCondition{
 			Category: "backend",
 			Severity: "WARNING",
 			Message: fmt.Sprintf("%d of %d backends are degraded or unavailable",
-				backends.TotalCount-backends.HealthyCount, backends.TotalCount),
+				enabled-backends.HealthyCount, enabled),
 		})
 	}
 
@@ -1266,7 +1423,18 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			}
 		}
 
+		var utilization, highWaterPct float64
+		if r.Stats.Capacity > 0 {
+			utilization = float64(r.Stats.Occupancy) / float64(r.Stats.Capacity) * 100
+			highWaterPct = float64(r.Stats.HighWater) / float64(r.Stats.Capacity) * 100
+		}
 		items[i] = ProblemRouteItem{
+			UtilizationPct: utilization, HighWaterPct: highWaterPct,
+			WriteCount: r.Stats.WriteCount, WriteErrors: r.Stats.WriteErrors, WriteStalls: r.Stats.WriteStalls,
+			WritesInFlight: r.Stats.WritesInFlight, OldestWriteMS: r.Stats.OldestWriteMS, MaxWriteMS: r.Stats.MaxWriteDurationMS,
+			P95WriteSamples:      r.Stats.P95WriteSamples,
+			QueueFullDropsRecent: r.Stats.QueueFullDropsRecent, WriteErrorsRecent: r.Stats.WriteErrorsRecent, WriteStallsRecent: r.Stats.WriteStallsRecent,
+			Traffic: r.Traffic, SessionAgeSec: r.SessionAgeSec, LastTrafficAgeSec: r.LastTrafficAgeSec,
 			// Redacted at the API boundary, not in the UI (issue #424 round 4,
 			// item E). The JSON payload IS the disclosure surface: a raw peer
 			// public key shipped to a browser, a log shipper or a support
@@ -1348,7 +1516,12 @@ func (s *Service) sampleRollingHistory() {
 		return
 	}
 
+	backends, omitted := backendHistory(status.Backends.Backends)
 	point := HistoryPoint{
+		RxPps: status.Rates.RxPps, TxPps: status.Rates.TxPps, TrafficAvailable: status.Rates.Available,
+		DropRatesAvailable: status.DropCategories.RatesAvailable, DropReasonRates: status.DropCategories.ReasonRates,
+		ActiveRoutes: status.RoutingConsistency.ActiveRoutesCount, BackendLatencySamples: status.Backends.LatencySamples,
+		Backends: backends, BackendsOmitted: omitted,
 		Timestamp:         time.Now().Unix(),
 		RxBps:             status.Rates.RxBps,
 		TxBps:             status.Rates.TxBps,
@@ -1514,6 +1687,8 @@ type diagDeltaTrackers struct {
 	ownershipMismatch diagDeltaTracker
 	syncFailures      diagDeltaTracker
 	enqueueFailures   diagDeltaTracker
+	writeStalls       diagDeltaTracker
+	reasons           dropReasonRatesTracker
 }
 
 func (t *diagDeltaTrackers) sampleOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
@@ -1552,6 +1727,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 	if s.forwarder != nil {
 		fRates := s.forwarder.Rates()
 		status.Rates = TrafficRates{
+			Available:   fRates.Available,
 			RxBps:       fRates.RxBps,
 			TxBps:       fRates.TxBps,
 			RxPps:       fRates.RxPps,
@@ -1598,23 +1774,40 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 	}
 
 	// 2. Drop Categories & VirtualTUN
-	var routerMalformed, routerUnmapped, routerMismatch, routerRejected uint64
-	if s.ingressEngine != nil && s.ingressEngine.Router() != nil {
-		routerStats := s.ingressEngine.Router().StatsSnapshot()
-		routerMalformed = routerStats.MalformedPacketDrops
-		routerUnmapped = routerStats.UnmappedSourceIPDrops
-		routerMismatch = routerStats.OwnershipMismatchDrops
-		routerRejected = routerStats.AdmissionRejectedDrops + routerStats.RouteRegistrationErrors
-	}
+	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
+	routerMalformed := losses.router.MalformedPacketDrops
+	routerUnmapped := losses.router.UnmappedSourceIPDrops
+	routerMismatch := losses.router.OwnershipMismatchDrops
+	routerNoBackend := losses.router.NoActiveBackendDrops
+	routerRejected := losses.router.AdmissionRejectedDrops - routerNoBackend + losses.router.RouteRegistrationErrors
 	var fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend uint64
 	if s.forwarder != nil {
 		fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend, _ = s.forwarder.ClientDropStats()
 	}
 
-	var retStats ReturnStatsSnapshot
+	retStats := losses.returns
+	// Use live engine queue gauges; retained state contains counters only.
 	if s.ingressEngine != nil {
-		retStats = s.ingressEngine.ReturnStats()
+		current := s.ingressEngine.ReturnStats().TUN
+		current.InboundDrops = retStats.TUN.InboundDrops
+		current.OutboundDrops = retStats.TUN.OutboundDrops
+		retStats.TUN = current
 	}
+
+	// Backend-device Write queue losses are client traffic, disjoint from
+	// forwarder admission and backend-queue refusals. Never add entire forwarder totals.
+	deviceDrops := s.retiredBackendDeviceDrops
+	for _, dev := range s.backendDevices {
+		if dev != nil {
+			deviceDrops += dev.DroppedPackets()
+		}
+	}
+	var returnQueueFull, returnOversized uint64
+	if s.forwarder != nil {
+		returnQueueFull = s.forwarder.DropsQueueFull()
+		returnOversized = s.forwarder.DropsPacketTooLarge()
+	}
+	fwdClientNoBackend += routerNoBackend
 
 	// Upstream -> Nexus: VirtualTUN.Write feeds the OUTBOUND queue. The upstream
 	// AWG engine emits authenticated plaintext it received from the client, so
@@ -1628,7 +1821,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		fwdClientQueueFull +
 		fwdClientRateLimited +
 		fwdClientNoBackend +
-		clientVirtualTUNDrops
+		clientVirtualTUNDrops + deviceDrops
 
 	// Nexus -> Upstream: VirtualTUN.InjectInbound feeds the INBOUND queue, so
 	// its drop bucket is the return path's own loss accounting.
@@ -1648,36 +1841,21 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		retStats.UnmappedDrops +
 		retStats.OwnershipMismatchDrops +
 		nonTunInjectionErrors +
-		returnTunDrops
+		returnTunDrops + returnQueueFull + returnOversized
 
 	totalDrops := clientTotal + returnTotal
 
-	s.diagRatesMu.Lock()
-	if s.diagRates == nil {
-		s.diagRates = newDiagRatesTracker()
-	}
-	tracker := s.diagRates
-	s.diagRatesMu.Unlock()
-
-	clientDropRate, returnDropRate, totalDropRate, writeErrorRate := tracker.Sample(
-		time.Now(), clientTotal, returnTotal, totalDrops, writeErrors,
-	)
-
-	// Update independent rates
-	status.ForwardLatency.WriteErrorRatePps = writeErrorRate
-	status.Rates.DropRatePps = totalDropRate
-
 	status.DropCategories = DropCategoryBreakdown{
-		ClientMalformed:        routerMalformed,
-		ClientUnmappedSource:   routerUnmapped,
-		ClientMismatch:         routerMismatch,
-		ClientRejected:         routerRejected,
-		ClientBackendQueueFull: fwdClientQueueFull,
-		ClientRateLimited:      fwdClientRateLimited,
-		ClientNoHealthyBackend: fwdClientNoBackend,
-		ClientVirtualTUNDrops:  clientVirtualTUNDrops,
-		ClientTotalDrops:       clientTotal,
-		ClientDropRatePps:      clientDropRate,
+		ClientMalformed:              routerMalformed,
+		ClientUnmappedSource:         routerUnmapped,
+		ClientMismatch:               routerMismatch,
+		ClientRejected:               routerRejected,
+		ClientBackendQueueFull:       fwdClientQueueFull,
+		ClientRateLimited:            fwdClientRateLimited,
+		ClientNoHealthyBackend:       fwdClientNoBackend,
+		ClientVirtualTUNDrops:        clientVirtualTUNDrops,
+		ClientBackendDeviceQueueFull: deviceDrops,
+		ClientTotalDrops:             clientTotal,
 
 		ReturnMalformed:         retStats.MalformedDrops,
 		ReturnUnmapped:          retStats.UnmappedDrops,
@@ -1686,11 +1864,19 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 		ReturnVirtualTUNDrops:   returnTunDrops,
 		ReturnInjectionTUNDrops: retStats.InjectionTunDrops,
 		ReturnTotalDrops:        returnTotal,
-		ReturnDropRatePps:       returnDropRate,
+		ReturnQueueFull:         returnQueueFull,
+		ReturnPacketTooLarge:    returnOversized,
 
-		TotalDrops:       totalDrops,
-		TotalDropRatePps: totalDropRate,
+		TotalDrops: totalDrops,
 	}
+
+	// The loss sampling pair owns one timestamp and one serialization scope.
+	sampleAt := time.Now()
+	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(sampleAt, &status.DropCategories, writeErrors)
+	status.Rates.DropRatePps = status.DropCategories.TotalDropRatePps
+	stalls := s.diagDeltas.writeStalls.Sample(sampleAt, status.ForwardLatency.Stalls)
+	status.ForwardLatency.StallsRecent = stalls.delta
+	status.ForwardLatency.StallsWindowSec = stalls.windowSeconds
 
 	// Directional mapping (issue #424 round 2, finding 1):
 	//   UpstreamToNexus <- Outbound*  (VirtualTUN.Write, upstream AWG -> Nexus)
@@ -1718,6 +1904,19 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 
 	// 5. Backends
 	status.Backends = collectBackendDiagnostics(s)
+
+	if s.sessionMgr != nil {
+		sessions := s.sessionMgr.ListActiveSessionsSnapshot()
+		started := make(map[string]time.Time, len(sessions))
+		for _, session := range sessions {
+			started[session.PeerPublicKey] = session.ConnectedAt
+		}
+		for i := range routes {
+			if at, ok := started[routes[i].PeerKey]; ok {
+				routes[i].SessionAgeSec = int64(time.Since(at) / time.Second)
+			}
+		}
+	}
 
 	// 6. Problem Routes. Filter/rank the SAME snapshot used above so the
 	// response is internally consistent even when status assembly is slow.

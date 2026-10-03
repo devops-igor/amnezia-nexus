@@ -3,6 +3,7 @@ package vpn
 import (
 	"errors"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
@@ -13,6 +14,7 @@ import (
 var errReturnDestination = errors.New("ingress engine: invalid return destination")
 
 type returnCounters struct {
+	injectionMu     sync.Mutex // keeps total/subset snapshot coherent
 	accepted        atomic.Uint64
 	malformed       atomic.Uint64
 	unmapped        atomic.Uint64
@@ -47,11 +49,17 @@ type ReturnStatsSnapshot struct {
 }
 
 func (e *IngressEngine) ReturnStats() ReturnStatsSnapshot {
+	e.returnCounters.injectionMu.Lock()
+	defer e.returnCounters.injectionMu.Unlock()
+	var tun virtualtun.StatsSnapshot
+	if e.portal != nil {
+		tun = e.portal.Stats()
+	}
 	return ReturnStatsSnapshot{
 		AcceptedPackets: e.returnCounters.accepted.Load(), MalformedDrops: e.returnCounters.malformed.Load(),
 		UnmappedDrops: e.returnCounters.unmapped.Load(), OwnershipMismatchDrops: e.returnCounters.mismatch.Load(),
 		InjectionErrors:   e.returnCounters.injectionErrors.Load(),
-		InjectionTunDrops: e.returnCounters.injectionTunDrops.Load(), TUN: e.portal.Stats(),
+		InjectionTunDrops: e.returnCounters.injectionTunDrops.Load(), TUN: tun,
 	}
 }
 
@@ -101,15 +109,19 @@ func (e *IngressEngine) writeReturnPacket(peerKey, assignedIP string, packet []b
 		e.returnCounters.mismatch.Add(1)
 		return 0, errReturnDestination
 	}
-	if err := e.portal.InjectInbound(packet); err != nil {
+	e.returnCounters.injectionMu.Lock()
+	err := e.portal.InjectInbound(packet)
+	if err != nil {
 		e.returnCounters.injectionErrors.Add(1)
 		// ErrQueueFull is the only rejection the VirtualTUN already counted
 		// in its inbound drop bucket, so it is the only overlap to own here.
 		if errors.Is(err, virtualtun.ErrQueueFull) {
 			e.returnCounters.injectionTunDrops.Add(1)
 		}
+		e.returnCounters.injectionMu.Unlock()
 		return 0, err
 	}
+	e.returnCounters.injectionMu.Unlock()
 	e.returnCounters.accepted.Add(1)
 	return len(packet), nil
 }

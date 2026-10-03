@@ -12,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 func TestEmbeddedTranslations(t *testing.T) {
@@ -3027,7 +3030,9 @@ function runScenario(key) {
                     capacity: 2048,
                     occupancy: 2048,
                     high_water: 2048,
+                    // Saturation includes fresh drops; lifetime loss alone stays descriptive.
                     queue_full_drops: 1723,
+                    queue_full_drops_recent: 3,
                     write_count: 5000,
                     write_errors: 10
                 }
@@ -3041,7 +3046,7 @@ function runScenario(key) {
         const rows = mockDoc.getElementById('vpn-fwd-routes-tbody').children;
         assert.strictEqual(rows.length, 1);
         const r1 = rows[0];
-        assert.strictEqual(r1.children[0].title, 'abcdefghijklmnopqrstuvwxyz012345');
+        assert(r1.children[0].title.includes('Peer: abcdefghijklmnopqrstuvwxyz012345'));
         assert.strictEqual(r1.children[0].textContent, 'abcdefgh...2345');
         assert.strictEqual(r1.children[1].textContent, '2048 / 2048');
         assert.strictEqual(r1.children[1].style.color, 'var(--danger)');
@@ -3494,10 +3499,70 @@ assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false)
 mockDoc.reset();
 vpnRenderForwarderHealth({
     forwarder_available:true,forwarder_queue_capacity:100,
+    forwarder_route_queues:{peer:{capacity:100,occupancy:0,queue_full_drops:5,write_errors:7,write_count:20}}
+});
+const recoveredLegacyRow = mockDoc.getElementById('vpn-fwd-routes-tbody').children[0];
+assert.notStrictEqual(recoveredLegacyRow.children[3].style.color,'var(--danger)');
+assert.notStrictEqual(recoveredLegacyRow.children[4].style.color,'var(--warning)');
+assert(recoveredLegacyRow.children[4].textContent.includes('cumulative errors'));
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent,'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open,false);
+mockDoc.reset();
+vpnRenderForwarderHealth({
+    forwarder_available:true,forwarder_queue_capacity:100,
     forwarder_route_queues:{peer:{capacity:100,occupancy:80,queue_full_drops:5}}
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+
+// Recovered KPIs keep lifetime evidence descriptive and show current availability.
+mockDoc.reset();
+vpnRenderForwarderHealth({
+ forwarder_available:true,forwarder_queue_capacity:100,health_assessment:{status:'HEALTHY',summary:'Recovered'},
+ drop_categories:{total_drops:99,total_drop_rate_pps:0},
+ forward_latency:{stalls:7,stalls_recent:0,p95_ms:300,p95_health_ms:0,p95_health_samples:0,oldest_in_flight_ms:0},
+ backends:{eligibility_known:true,healthy_count:1,enabled_count:1,disabled_count:2,total_count:3}
+});
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-packet-loss').style.color,'');
+assert(mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('cumulative'));
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-slow-writes').style.color,'');
+assert(mockDoc.getElementById('vpn-kpi-slow-writes').textContent.includes('unavailable'));
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-backends').style.color,'');
+assert(mockDoc.getElementById('vpn-kpi-backends').textContent.includes('1 / 1'));
+mockDoc.reset();
+vpnRenderForwarderHealth({
+ forwarder_available:true,forwarder_queue_capacity:100,
+ drop_categories:{total_drops:100,total_drop_rate_pps:2},
+ forward_latency:{stalls:8,stalls_recent:1,p95_ms:300,p95_health_ms:150,p95_health_samples:1}
+});
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-packet-loss').style.color,'var(--danger)');
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-slow-writes').style.color,'var(--danger)');
+mockDoc.reset();
+vpnRenderForwarderHealth({
+ forwarder_available:true,forwarder_queue_capacity:100,
+ forward_latency:{p95_health_ms:0,p95_health_samples:1,stalls_recent:0},
+ backends:{eligibility_known:true,healthy_count:0,enabled_count:0,disabled_count:3,total_count:3}
+});
+assert(mockDoc.getElementById('vpn-kpi-slow-writes').textContent.includes('0.0ms'));
+assert(!mockDoc.getElementById('vpn-kpi-slow-writes').textContent.includes('unavailable'));
+assert.strictEqual(mockDoc.getElementById('vpn-kpi-backends').style.color,'var(--danger)');
+
+mockDoc.reset();
+vpnRenderForwarderHealth({
+ forwarder_available:true,forwarder_queue_capacity:100,
+ rates:{available:false,rx_bps:0,tx_bps:0},
+ drop_categories:{rates_available:false,total_drops:0,total_drop_rate_pps:0}
+});
+assert(mockDoc.getElementById('vpn-kpi-throughput').textContent.includes('unavailable'));
+assert(mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('unavailable'));
+mockDoc.reset();
+vpnRenderForwarderHealth({
+ forwarder_available:true,forwarder_queue_capacity:100,
+ rates:{available:true,rx_bps:0,tx_bps:0},
+ drop_categories:{rates_available:true,total_drops:0,total_drop_rate_pps:0}
+});
+assert(!mockDoc.getElementById('vpn-kpi-throughput').textContent.includes('unavailable'));
+assert(!mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('unavailable'));
 
 console.log('ISSUE_424_PASS');
 `, f1, f2)
@@ -3561,5 +3626,364 @@ assert(!chart.innerHTML.includes('No data'), 'old payloads remain readable');
 	cmd := exec.Command(nodePath, "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("history renderer: %v\n%s", err, out)
+	}
+}
+
+func TestVPNCompleteRouteTooltipContract(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Skipf("node binary not found: %v", err)
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	render, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Marshal the production schema: a newly populated field cannot silently
+	// disappear between the status payload and the complete tooltip.
+	route := vpn.ProblemRouteItem{
+		PeerKey: "abcd...wxyz", AssignedIP: "192.0.2.8", BackendID: 38,
+		Occupancy: 23, Capacity: 100, HighWater: 47, UtilizationPct: 23, HighWaterPct: 47,
+		Drops: 17, P95WriteMS: 18, HasPressure: true, PressureNote: "Recent write errors: 19",
+		WriteCount: 101, WriteErrors: 19, WriteStalls: 20, WritesInFlight: 21,
+		OldestWriteMS: 22, MaxWriteMS: 24, P95WriteSamples: 25, QueueFullDropsRecent: 26,
+		WriteErrorsRecent: 27, WriteStallsRecent: 28, SessionAgeSec: 29, LastTrafficAgeSec: 30,
+		Traffic: forwarder.TrafficSnapshot{RxBytes: 31, TxBytes: 32, RxPackets: 33, TxPackets: 34,
+			RxBytesPerSec: 35, TxBytesPerSec: 36, RxPps: 37, TxPps: 39, Available: true, WindowSec: 40},
+	}
+	encoded, err := json.Marshal(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "const route = " + string(encoded) + ";\n" + expandedDOMMock + "\n" + peer + "\n" + render + `
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const title = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+const labels = {
+ peer_key:'Peer',assigned_ip:'Assigned address',backend_id:'Backend',
+ occupancy:'Queue occupancy',capacity:'Queue capacity',high_water:'Queue high water',
+ utilization_pct:'Queue utilization (%)',high_water_pct:'High water (%)',
+ drops:'Queue drops (cumulative)',p95_write_ms:'Write p95 (historical ms)',
+ has_pressure:'Current pressure',pressure_note:'Pressure reason',
+ write_count:'Writes admitted',write_errors:'Write errors (cumulative)',write_stalls:'Write stalls (cumulative)',
+ writes_in_flight:'Writes in flight',oldest_write_ms:'Oldest write (ms)',max_write_ms:'Max write (historical ms)',
+ p95_write_samples:'Write percentile samples',queue_full_drops_recent:'Recent queue drops',
+ write_errors_recent:'Recent write errors',write_stalls_recent:'Recent write stalls',
+ session_age_sec:'Session age (s)',last_traffic_age_sec:'Last traffic age (s)',traffic:'Directional traffic'
+};
+assert.deepStrictEqual(Object.keys(route).sort(),Object.keys(labels).sort(),'payload/tooltip field contract drifted');
+for (const key of Object.keys(route)) {
+ if (key === 'traffic') {
+  for (const name of Object.keys(route.traffic)) {
+   assert(title.includes('Directional traffic '+name.replace(/_/g,' ')+': '+route.traffic[name]), name);
+  }
+ } else assert(title.includes(labels[key]+': '+route[key]),key);
+}
+route.traffic.available=false; route.last_traffic_age_sec=-1;route.p95_write_samples=0;
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const unknown = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+assert(unknown.includes('Directional traffic rx bytes per sec: Unavailable'));
+assert(unknown.includes('Write p95 (historical ms): Unavailable'));
+assert(unknown.includes('Last traffic age (s): Unavailable'));
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,backends:{backends:[
+ {server_name:'Server 1',enabled:true,health_state:'active',traffic_available:false},
+ {server_name:'Server 2',enabled:true,health_state:'active',traffic_available:true,rx_bytes_per_sec:0,tx_bytes_per_sec:0,rx_pps:0,tx_pps:0},
+ {server_name:'Server 3',enabled:false,health_state:'active',traffic_available:true,rx_bytes_per_sec:125,tx_bytes_per_sec:250,rx_pps:2,tx_pps:3}
+]}});
+const rows=document.getElementById('vpn-diag-be-traffic').children;
+assert(rows[0].textContent.includes('Traffic unavailable'));
+assert(!rows[1].textContent.includes('unavailable') && rows[1].textContent.includes('RX 0'));
+assert(rows[2].textContent.includes('Disabled') && rows[2].textContent.includes('1.00 Kbps') && rows[2].textContent.includes('2.00 Kbps'));
+
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("complete route tooltip: %v\n%s", err, out)
+	}
+}
+
+const expandedDOMMock = `const assert = require('assert');
+class Element {
+ constructor() { this.children=[];this._text='';this.innerHTML='';this.style={};this.className='';this.title=''; }
+ set textContent(s) { this._text=String(s);this.children=[]; }
+ get textContent() { return this._text; }
+ appendChild(child) { this.children.push(child);return child; }
+ setAttribute() {}
+}
+const elements = new Map();
+const document = {
+ getElementById(id) { if (!elements.has(id)) elements.set(id,new Element());return elements.get(id); },
+ createElement() { return new Element(); }
+};
+const _ = key => key;
+`
+
+func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Skipf("node binary not found: %v", err)
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"directions", "packets", "sessions-routes", "backend-latency", "reasons", "backends"} {
+		if !strings.Contains(string(data), `id="vpn-chart-`+id+`"`) {
+			t.Fatalf("missing history chart %s", id)
+		}
+	}
+	sparkline, err := extractJSFunction(string(data), "function vpnGenerateSparklineSVG")
+	if err != nil {
+		t.Fatal(err)
+	}
+	render, err := extractJSFunction(string(data), "function vpnRenderHistoryCharts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := expandedDOMMock + "\n" + sparkline + "\n" + render + `
+let vpnHistoryWindow='15m';
+const originalSparkline = vpnGenerateSparklineSVG;
+const seen=[];
+vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
+function entry(id,label) {
+ const children=document.getElementById(id).children;
+ const index=children.findIndex(e=>e.textContent===label+' ('+vpnHistoryWindow+')');
+ assert(index>=0,'missing labelled series '+label+' in '+vpnHistoryWindow);
+ return children[index+1].innerHTML;
+}
+const series={};
+for (const [i,w] of ['15m','1h','6h','24h'].entries()) {
+ const value=i+1;
+ series['window_'+w]=[{
+  t:100,rx_bps:999,tx_bps:999,rx_pps:999,tx_pps:999,traffic_available:false,
+  q_pct:0,drop_rate:999,drop_rates_available:false,
+  drop_reason_rates:{return_queue_full:999,client_backend_device_queue_full:999},
+  fwd_p95_ms:999,fwd_p95_samples:0,be_p95_ms:999,be_latency_samples:0,sessions:0,routes:0,backends:[]
+ },{
+  t:110,rx_bps:value,tx_bps:2*value,rx_pps:3*value,tx_pps:4*value,traffic_available:true,
+  q_pct:5*value,drop_rate:6*value,drop_rates_available:true,
+  drop_reason_rates:{return_queue_full:2*value,client_backend_device_queue_full:4*value},
+  fwd_p95_ms:7*value,fwd_p95_samples:1,be_p95_ms:8*value,be_latency_samples:1,sessions:9*value,routes:10*value,
+  backends:[{id:3,rx_bps:11*value,tx_bps:12*value,rx_pps:13*value,tx_pps:14*value,
+   traffic_available:true,probe_latency_ms:15*value,probe_available:true,routable:true}]
+ },{
+  t:120,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,traffic_available:true,q_pct:0,drop_rate:0,
+  drop_rates_available:true,drop_reason_rates:{return_queue_full:0,client_backend_device_queue_full:0},
+  fwd_p95_ms:0,fwd_p95_samples:1,be_p95_ms:0,be_latency_samples:0,sessions:0,routes:0,
+  backends:[{id:3,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,traffic_available:true,probe_available:false}]
+ }];
+}
+for (const [i,w] of ['15m','1h','6h','24h'].entries()) {
+ vpnHistoryWindow=w;seen.length=0;vpnRenderHistoryCharts(series);
+ const v=i+1;
+ assert.deepStrictEqual(seen.slice(0,4),[[null,3*v,0],[0,5*v,0],[null,6*v,0],[null,7*v,0]]);
+ assert.deepStrictEqual(seen.slice(4,11),[[null,v,0],[null,2*v,0],[null,3*v,0],[null,4*v,0],[0,9*v,0],[0,10*v,0],[null,8*v,null]]);
+ assert.deepStrictEqual(seen.slice(11),[[null,4*v,0],[null,2*v,0],[null,11*v,0],[null,12*v,0],[null,13*v,0],[null,14*v,0],[null,15*v,null]]);
+ for (const [id,label] of [
+  ['vpn-chart-directions','RX client to backend (bps)'],['vpn-chart-directions','TX backend to client (bps)'],
+  ['vpn-chart-packets','RX packets/s'],['vpn-chart-packets','TX packets/s'],
+  ['vpn-chart-sessions-routes','Active sessions'],['vpn-chart-sessions-routes','Active routes'],
+  ['vpn-chart-backend-latency','Eligible backend probe p95 (ms)'],
+  ['vpn-chart-reasons','return queue full (drops/s)'],['vpn-chart-reasons','client backend device queue full (drops/s)'],
+  ['vpn-chart-backends','Backend 3 RX (bps)'],['vpn-chart-backends','Backend 3 TX (bps)'],
+  ['vpn-chart-backends','Backend 3 RX packets/s'],['vpn-chart-backends','Backend 3 TX packets/s'],
+  ['vpn-chart-backends','Backend 3 Probe latency (ms)']
+ ]) assert(entry(id,label).includes('<svg'),label);
+}
+vpnHistoryWindow='15m';
+vpnRenderHistoryCharts({window_15m:[]});
+assert(document.getElementById('vpn-chart-reasons').textContent.includes('No data (15m)'), 'empty reason window must remain visible');
+assert(document.getElementById('vpn-chart-backends').textContent.includes('No data (15m)'), 'empty fleet window must remain visible');
+vpnRenderHistoryCharts({window_15m:[series.window_15m[0]]});
+assert(document.getElementById('vpn-chart-backends').textContent.includes('No data (15m)'), 'pre-provision fleet context must remain visible');
+assert(document.getElementById('vpn-chart-throughput').innerHTML.includes('No data'));
+assert(document.getElementById('vpn-chart-drops').innerHTML.includes('No data'));
+assert(entry('vpn-chart-directions','RX client to backend (bps)').includes('No data'));
+assert(entry('vpn-chart-reasons','return queue full (drops/s)').includes('No data'));
+// Retired/re-registered backend IDs form gaps, never zero-filled continuity.
+vpnRenderHistoryCharts({window_15m:[
+ {backends:[{id:3,rx_bps:10,traffic_available:true}]},{backends:[]},
+ {backends:[{id:3,rx_bps:0,traffic_available:true}]}
+]});
+const gap=entry('vpn-chart-backends','Backend 3 RX (bps)');
+assert.strictEqual((gap.match(/<circle /g)||[]).length,2);
+const gapStroke=gap.match(/<path d="([^"]+)" fill="none"/);
+assert(gapStroke && !gapStroke[1].includes(' L '),'isolated backend samples must not bridge lifecycle gap');
+vpnRenderHistoryCharts({window_15m:[{backends:Array.from({length:129},(_,id)=>({id})),backends_omitted:5}]});
+assert.strictEqual(document.getElementById('vpn-chart-backends').children.length,128*5*2,'fleet churn renderer must remain bounded');
+assert(document.getElementById('vpn-history-fleet-note').textContent.includes('5 omitted'));
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("complete history renderers: %v\n%s", err, out)
+	}
+}
+
+// An unavailable forwarder must erase every rendered history surface. The
+// history render path produces two DOM shapes (injected SVG markup in the four
+// sparkline containers, appended element children in the renderSeries
+// containers), so seeding real stale state and then asserting both shapes are
+// empty is what makes this regression meaningful. Starting from empty
+// containers would prove nothing.
+func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Skipf("node binary not found: %v", err)
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{
+		"vpn-chart-throughput", "vpn-chart-packets", "vpn-chart-queue", "vpn-chart-latency",
+		"vpn-chart-drops", "vpn-chart-directions", "vpn-chart-reasons",
+		"vpn-chart-sessions-routes", "vpn-chart-backends", "vpn-chart-backend-latency",
+		"vpn-diag-be-traffic", "vpn-history-fleet-note",
+	} {
+		if !strings.Contains(string(data), `id="`+id+`"`) {
+			t.Fatalf("missing stale-clearing target %s", id)
+		}
+	}
+	sparkline, err := extractJSFunction(string(data), "function vpnGenerateSparklineSVG")
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := extractJSFunction(string(data), "function vpnRenderHistoryCharts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWindow, err := extractJSFunction(string(data), "function vpnSetHistoryWindow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	toggleRoutes, err := extractJSFunction(string(data), "function vpnToggleShowAllRoutes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := expandedDOMMock + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
+let vpnHistoryWindow='15m';
+let vpnLastStatus=null;
+let vpnShowAllRoutes=false;
+// The window-toggle control is a persistent button group with no stale data
+// of its own; the mock only needs it to answer a querySelectorAll probe.
+document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
+const SVG_CHARTS=['vpn-chart-throughput','vpn-chart-queue','vpn-chart-drops','vpn-chart-latency'];
+const SERIES_CHARTS=['vpn-chart-directions','vpn-chart-packets','vpn-chart-sessions-routes',
+ 'vpn-chart-backend-latency','vpn-chart-reasons','vpn-chart-backends'];
+// Seed realistic stale state: measured series render SVG into the sparkline
+// containers and label/child pairs into the renderSeries containers.
+vpnRenderHistoryCharts({window_15m:[
+ {t:100,rx_bps:900,tx_bps:900,rx_pps:90,tx_pps:90,traffic_available:true,q_pct:12,drop_rate:3,
+  drop_rates_available:true,drop_reason_rates:{return_queue_full:3},fwd_p95_ms:41,fwd_p95_samples:1,
+  be_p95_ms:33,be_latency_samples:1,sessions:4,routes:3,backends_omitted:5,
+  backends:[{id:3,rx_bps:900,tx_bps:900,rx_pps:90,tx_pps:90,traffic_available:true,probe_latency_ms:33,probe_available:true}]},
+ {t:160,rx_bps:1200,tx_bps:1200,rx_pps:120,tx_pps:120,traffic_available:true,q_pct:18,drop_rate:4,
+  drop_rates_available:true,drop_reason_rates:{return_queue_full:4},fwd_p95_ms:52,fwd_p95_samples:1,
+  be_p95_ms:44,be_latency_samples:1,sessions:6,routes:5,backends_omitted:5,
+  backends:[{id:3,rx_bps:1200,tx_bps:1200,rx_pps:120,tx_pps:120,traffic_available:true,probe_latency_ms:44,probe_available:true}]}
+]});
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
+ historical_series:{window_15m:[
+  {t:100,rx_bps:900,tx_bps:900,traffic_available:true,q_pct:12,drop_rate:3,drop_rates_available:true,
+   drop_reason_rates:{return_queue_full:3},fwd_p95_ms:41,fwd_p95_samples:1,be_p95_ms:33,be_latency_samples:1,
+   sessions:4,routes:3,backends_omitted:5,
+   backends:[{id:3,rx_bps:900,tx_bps:900,traffic_available:true,probe_latency_ms:33,probe_available:true}]},
+  {t:160,rx_bps:1200,tx_bps:1200,traffic_available:true,q_pct:18,drop_rate:4,drop_rates_available:true,
+   drop_reason_rates:{return_queue_full:4},fwd_p95_ms:52,fwd_p95_samples:1,be_p95_ms:44,be_latency_samples:1,
+   sessions:6,routes:5,backends_omitted:5,
+   backends:[{id:3,rx_bps:1200,tx_bps:1200,traffic_available:true,probe_latency_ms:44,probe_available:true}]}
+ ]},
+ backends:{backends:[
+ {server_name:'Server 1',enabled:true,health_state:'active',traffic_available:true,
+  rx_bytes_per_sec:900,tx_bytes_per_sec:1200,rx_pps:90,tx_pps:120}
+]}});
+// The available poll must cache a real series, otherwise the toggles below
+// have nothing to resurrect and the cache-clearing guard would go untested.
+assert(vpnLastStatus&&vpnLastStatus.historical_series,'available poll must cache its series');
+for (const id of SVG_CHARTS) {
+ assert(document.getElementById(id).innerHTML.includes('<svg'),'seed must render SVG in '+id);
+}
+for (const id of SERIES_CHARTS) {
+ assert(document.getElementById(id).children.length>0,'seed must render series children in '+id);
+}
+assert(document.getElementById('vpn-diag-be-traffic').children.length>0,'seed must render backend traffic rows');
+assert(document.getElementById('vpn-history-fleet-note').textContent.length>0,'seed must render the fleet note');
+
+// The transition under test.
+vpnRenderForwarderHealth({forwarder_available:false});
+for (const id of SVG_CHARTS) {
+ const el=document.getElementById(id);
+ assert(!el.innerHTML.includes('<svg'),'stale SVG remains in '+id);
+ assert(!el.innerHTML.includes('<path'),'stale curve remains in '+id);
+ assert.strictEqual(el.innerHTML,'','sparkline container must be emptied in '+id);
+ assert.strictEqual(el.textContent,'','sparkline container text must be emptied in '+id);
+}
+for (const id of SERIES_CHARTS) {
+ const el=document.getElementById(id);
+ assert.strictEqual(el.children.length,0,'stale series children remain in '+id);
+ assert.strictEqual(el.textContent,'','series container text must be emptied in '+id);
+ assert(!el.innerHTML.includes('<svg'),'no placeholder SVG may be injected into '+id);
+}
+const beTraffic=document.getElementById('vpn-diag-be-traffic');
+assert.strictEqual(beTraffic.children.length,0,'backend traffic rows must be cleared');
+assert.strictEqual(beTraffic.textContent,'','backend traffic text must be cleared');
+const fleetNote=document.getElementById('vpn-history-fleet-note');
+assert.strictEqual(fleetNote.textContent,'','fleet omission note must be cleared');
+assert.strictEqual(fleetNote.innerHTML,'','fleet omission note markup must be cleared');
+// No invented data anywhere in the unavailable state.
+for (const id of SVG_CHARTS.concat(SERIES_CHARTS).concat(['vpn-diag-be-traffic','vpn-history-fleet-note'])) {
+ const el=document.getElementById(id);
+ assert(!el.innerHTML.includes('<path'),'unavailable state must not invent curves in '+id);
+ assert(!el.innerHTML.includes('<circle'),'unavailable state must not invent points in '+id);
+}
+// The pre-existing clears in the same branch must survive the addition.
+assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent,'-');
+assert.strictEqual(document.getElementById('vpn-diag-res-cpu').textContent,'-');
+assert.strictEqual(document.getElementById('vpn-diag-routing-badge').textContent,'-');
+// The cleared state must be terminal: the history-window and routes toggles
+// re-render from the cached status, so a cache still holding the last
+// available series would repaint the stale curves right after they are cleared.
+// No new poll arrives between the unavailable transition and these toggles,
+// which is exactly the real-world window between two polls.
+vpnSetHistoryWindow('1h');
+for (const id of SVG_CHARTS) {
+ assert.strictEqual(document.getElementById(id).innerHTML,'','window toggle must not restore stale SVG in '+id);
+}
+for (const id of SERIES_CHARTS) {
+ assert.strictEqual(document.getElementById(id).children.length,0,'window toggle must not restore stale series in '+id);
+}
+vpnToggleShowAllRoutes();
+for (const id of SVG_CHARTS) {
+ assert(!document.getElementById(id).innerHTML.includes('<svg'),'routes toggle must not restore stale SVG in '+id);
+}
+for (const id of SERIES_CHARTS) {
+ assert.strictEqual(document.getElementById(id).children.length,0,'routes toggle must not restore stale series in '+id);
+}
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("unavailable-forwarder history clearing: %v\n%s", err, out)
 	}
 }

@@ -1,5 +1,8 @@
 """E2E tests for VPN subsystem and forwarder health dashboard."""
 
+import math
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -140,9 +143,19 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
         "#vpn-chart-queue",
         "#vpn-chart-drops",
         "#vpn-chart-latency",
+        "#vpn-chart-directions",
+        "#vpn-chart-packets",
+        "#vpn-chart-sessions-routes",
+        "#vpn-chart-backend-latency",
     ]
     for chart in charts:
         expect(page.locator(chart)).to_be_visible()
+
+    breakdown = page.locator("details").filter(has=page.locator("#vpn-chart-reasons"))
+    breakdown.locator("summary").click()
+    for chart in ("#vpn-chart-reasons", "#vpn-chart-backends"):
+        expect(page.locator(chart)).to_be_visible()
+    expect(page.locator("#vpn-history-fleet-note")).to_be_attached()
 
     toggles_container = page.locator("#vpn-history-window-toggles")
     expect(toggles_container).to_be_visible()
@@ -153,6 +166,8 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
         expect(btn).to_be_visible()
         btn.click()
         expect(btn).to_have_class("btn btn-sm btn-primary active")
+        for chart in charts + ["#vpn-chart-reasons", "#vpn-chart-backends"]:
+            expect(page.locator(chart)).to_be_visible()
 
 
 @pytest.mark.e2e
@@ -178,6 +193,188 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     # Click again to revert
     toggle_btn.click()
     assert toggle_btn.text_content() == initial_text
+
+
+_LOSS_REASONS = {
+    "client_malformed",
+    "client_unmapped_source",
+    "client_mismatch",
+    "client_rejected",
+    "client_backend_queue_full",
+    "client_rate_limited",
+    "client_no_healthy_backend",
+    "client_virtualtun_drops",
+    "client_backend_device_queue_full",
+    "return_malformed",
+    "return_unmapped",
+    "return_mismatch",
+    "return_injection_errors",
+    "return_virtualtun_drops",
+    "return_queue_full",
+    "return_packet_too_large",
+}
+
+
+def _assert_nonnegative_rates(values: dict) -> None:
+    """Require numeric, finite current measurements without disclosing payload values."""
+    for value in values.values():
+        assert isinstance(value, (int, float)) and not isinstance(value, bool)
+        assert math.isfinite(value) and value >= 0, "Telemetry rate must be finite and nonnegative"
+
+
+def _assert_extended_diagnostics(status: dict) -> None:
+    """Verify additive backend, route and bounded-history API contracts from #431-#434."""
+    drops = status["drop_categories"]
+    assert isinstance(drops["rates_available"], bool)
+    assert set(drops["reason_rates"]) == _LOSS_REASONS
+    _assert_nonnegative_rates(drops["reason_rates"])
+    latency = status["forward_latency"]
+    assert isinstance(latency["stalls_recent"], int)
+    assert isinstance(latency["stalls_window_sec"], (int, float))
+    backends = status["backends"]
+    assert_response_shape(
+        backends,
+        {
+            "enabled_count": int,
+            "disabled_count": int,
+            "eligibility_known": bool,
+            "latency_samples": int,
+            "backends": list,
+        },
+        "backends_diagnostics",
+    )
+    assert backends["eligibility_known"] is True
+    assert backends["enabled_count"] + backends["disabled_count"] == backends["total_count"]
+    assert len(backends["backends"]) == backends["total_count"]
+    for backend in backends["backends"]:
+        assert_response_shape(
+            backend,
+            {
+                "enabled": bool,
+                "routable": bool,
+                "traffic_available": bool,
+                "traffic_window_sec": (int, float),
+                "rx_bytes": int,
+                "tx_bytes": int,
+                "rx_packets": int,
+                "tx_packets": int,
+            },
+            "backend_telemetry",
+        )
+        assert not backend["routable"] or backend["enabled"]
+        rates = {
+            key: backend[key]
+            for key in ("rx_bytes_per_sec", "tx_bytes_per_sec", "rx_pps", "tx_pps")
+        }
+        _assert_nonnegative_rates(rates)
+        if backend["traffic_available"]:
+            assert backend["traffic_window_sec"] > 0
+        else:
+            assert backend["traffic_window_sec"] == 0
+            assert all(value == 0 for value in rates.values())
+    assert backends["healthy_count"] == sum(item["routable"] for item in backends["backends"])
+    for route in status.get("problem_routes") or []:
+        assert_response_shape(
+            route,
+            {
+                "assigned_ip": str,
+                "backend_id": int,
+                "occupancy": int,
+                "capacity": int,
+                "high_water": int,
+                "drops": int,
+                "utilization_pct": (int, float),
+                "high_water_pct": (int, float),
+                "write_count": int,
+                "write_errors": int,
+                "write_stalls": int,
+                "writes_in_flight": int,
+                "oldest_write_ms": int,
+                "max_write_ms": int,
+                "p95_write_ms": (int, float),
+                "p95_write_samples": int,
+                "queue_full_drops_recent": int,
+                "write_errors_recent": int,
+                "write_stalls_recent": int,
+                "traffic": dict,
+                "session_age_sec": int,
+                "last_traffic_age_sec": int,
+            },
+            "route_telemetry",
+        )
+        assert route["session_age_sec"] >= -1 and route["last_traffic_age_sec"] >= -1
+        traffic = route["traffic"]
+        assert_response_shape(
+            traffic,
+            {
+                "available": bool,
+                "window_sec": (int, float),
+                "rx_bytes": int,
+                "tx_bytes": int,
+                "rx_packets": int,
+                "tx_packets": int,
+            },
+            "route_traffic",
+        )
+        _assert_nonnegative_rates(
+            {
+                key: traffic[key]
+                for key in ("rx_bytes_per_sec", "tx_bytes_per_sec", "rx_pps", "tx_pps")
+            }
+        )
+    history = status["historical_series"]
+    for key, bound in (
+        ("window_15m", 90),
+        ("window_1h", 60),
+        ("window_6h", 72),
+        ("window_24h", 96),
+    ):
+        assert isinstance(history[key], list)
+        assert len(history[key]) <= bound
+        for point in history[key]:
+            assert_response_shape(
+                point,
+                {
+                    "t": int,
+                    "rx_bps": (int, float),
+                    "tx_bps": (int, float),
+                    "rx_pps": (int, float),
+                    "tx_pps": (int, float),
+                    "traffic_available": bool,
+                    "q_pct": (int, float),
+                    "drop_rate": (int, float),
+                    "drop_rates_available": bool,
+                    "drop_reason_rates": dict,
+                    "fwd_p95_ms": (int, float),
+                    "fwd_p95_samples": int,
+                    "sessions": int,
+                    "routes": int,
+                    "be_p95_ms": (int, float),
+                    "be_latency_samples": int,
+                    "backends": list,
+                    "backends_omitted": int,
+                },
+                "history_point",
+            )
+            assert set(point["drop_reason_rates"]) == _LOSS_REASONS
+            _assert_nonnegative_rates(point["drop_reason_rates"])
+            assert len(point["backends"]) <= 128 and point["backends_omitted"] >= 0
+            for backend in point["backends"]:
+                assert_response_shape(
+                    backend,
+                    {
+                        "id": int,
+                        "rx_bps": (int, float),
+                        "tx_bps": (int, float),
+                        "rx_pps": (int, float),
+                        "tx_pps": (int, float),
+                        "traffic_available": bool,
+                        "probe_latency_ms": int,
+                        "probe_available": bool,
+                        "routable": bool,
+                    },
+                    "backend_history",
+                )
 
 
 @pytest.mark.e2e
@@ -212,6 +409,8 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         },
         "vpn_status",
     )
+
+    _assert_extended_diagnostics(status_data)
 
     # Validate health assessment
     health = status_data["health_assessment"]
@@ -325,6 +524,7 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["client_rate_limited"]
         + drops["client_no_healthy_backend"]
         + drops["client_virtualtun_drops"]
+        + drops["client_backend_device_queue_full"]
     )
     return_categories = (
         drops["return_malformed"]
@@ -332,6 +532,8 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["return_mismatch"]
         + drops["return_injection_errors"]
         + drops["return_virtualtun_drops"]
+        + drops["return_queue_full"]
+        + drops["return_packet_too_large"]
     )
     assert client_categories == drops["client_total_drops"], (
         f"client categories sum {client_categories} != client_total_drops "
@@ -357,6 +559,58 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     assert "ownership_mismatch_drops_recent" in routing
     if routing["ownership_mismatch_drops_recent"] == 0:
         assert routing["is_consistent"] or routing.get("inconsistency_details")
+
+
+@pytest.mark.e2e
+def test_vpn_metrics_api(authenticated_page: Page, base_url: str) -> None:
+    """Require an authenticated Prometheus histogram with coherent cumulative counts."""
+    response = authenticated_page.request.get(f"{base_url}/api/vpn/metrics")
+    assert response.status == 200, "VPN metrics scrape failed"
+    assert response.headers.get("content-type", "").startswith("text/plain; version=0.0.4")
+    text = response.text()
+    name = "nexus_forwarder_write_duration_seconds"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    assert f"# TYPE {name} histogram" in lines
+    count_values: list[int] = []
+    sum_values: list[float] = []
+    buckets: list[tuple[float, int]] = []
+    number = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    for line in lines:
+        if line.startswith("#"):
+            continue
+        bucket = re.fullmatch(rf'{name}_bucket\{{le="({number}|\+Inf)"\}} (\d+)', line)
+        count = re.fullmatch(rf"{name}_count (\d+)", line)
+        total = re.fullmatch(rf"{name}_sum ({number})", line)
+        assert bucket or count or total, "Unexpected histogram sample or unbounded labels"
+        if bucket:
+            boundary = float(bucket.group(1))
+            assert boundary > 0, "Histogram bucket boundary must be positive"
+            buckets.append((boundary, int(bucket.group(2))))
+        elif count:
+            count_values.append(int(count.group(1)))
+        elif total:
+            sum_values.append(float(total.group(1)))
+    assert len(count_values) == 1 and len(sum_values) == 1
+    assert math.isfinite(sum_values[0]) and sum_values[0] >= 0
+    assert len(buckets) >= 2, "Histogram buckets are missing"
+    boundaries = [boundary for boundary, _ in buckets]
+    assert boundaries[-1] == math.inf
+    assert all(math.isfinite(boundary) for boundary in boundaries[:-1])
+    assert boundaries == sorted(set(boundaries)), "Histogram boundaries must be unique and ordered"
+    assert boundaries[0] < 0.001, "Histogram must resolve sub-millisecond writes"
+    observations = [count for _, count in buckets]
+    assert observations == sorted(observations), "Histogram bucket counts must be cumulative"
+    assert observations[-1] == count_values[0], "Infinite bucket and observation count must agree"
+    if count_values[0] == 0:
+        assert sum_values[0] == 0, "Empty histogram cannot have a duration sum"
+
+
+@pytest.mark.e2e
+def test_vpn_metrics_requires_authentication(page: Page, base_url: str) -> None:
+    """An anonymous scrape must be rejected before any histogram is disclosed."""
+    response = page.request.get(f"{base_url}/api/vpn/metrics")
+    assert response.status == 401
+    assert response.json().get("error") == "unauthorized"
 
 
 @pytest.mark.e2e
@@ -421,7 +675,7 @@ def test_vpn_config_lifecycle(authenticated_page: Page, base_url: str, csrf_toke
             {"health_threshold_ms": new_threshold},
             csrf_token,
         )
-        assert update_result["status"] == 200, f"Config update failed: {update_result}"
+        assert update_result["status"] == 200, "VPN config update failed"
         assert update_result["body"].get("status") == "ok"
 
         # Verify update reflected in GET
@@ -429,62 +683,79 @@ def test_vpn_config_lifecycle(authenticated_page: Page, base_url: str, csrf_toke
         assert updated_config.get("health_threshold_ms") == new_threshold
 
     finally:
-        # Restore original threshold
-        api_post(
+        # Restore the original threshold and verify the shared fixture state.
+        restored = api_post(
             page,
             "/api/vpn/config",
             {"health_threshold_ms": orig_threshold},
             csrf_token,
         )
+        assert restored["status"] == 200, "VPN config restoration failed"
+        assert restored["body"].get("status") == "ok"
+        restored_config = api_get(page, "/api/vpn/config")
+        assert restored_config.get("health_threshold_ms") == orig_threshold
+
+
+def _backend_for_server(page: Page, server_id: int) -> dict | None:
+    """Read backend inventory without accepting a failed or malformed listing."""
+    result = api_get(page, "/api/vpn/backends")
+    assert isinstance(result, dict)
+    assert isinstance(result.get("backends"), list)
+    backend = next(
+        (item for item in result["backends"] if item.get("server_id") == server_id), None
+    )
+    if backend is not None:
+        assert isinstance(backend.get("enabled"), bool)
+    return backend
+
+
+def _backend_enabled(page: Page, server_id: int) -> bool:
+    """Require a registered fixture and read its administrative state."""
+    backend = _backend_for_server(page, server_id)
+    assert backend is not None, "Provisioned backend is missing"
+    return backend["enabled"]
 
 
 @pytest.mark.e2e
 def test_vpn_backend_enable_disable(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """POST /api/vpn/backends/{server_id}/disable and enable -> toggles backend state."""
+    """Enable a provisioned backend, verify both state transitions, and restore its state."""
     page = authenticated_page
-
-    servers_result = api_get(page, "/api/servers/")
-    servers = (
-        servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
-    )
-
-    if not servers:
-        pytest.skip("No servers available to test backend toggle")
-
+    result = api_get(page, "/api/servers/")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    assert servers, "Provisioned server fixture is missing"
     server_id = servers[0]["id"]
-
-    # First enable backend tunnel so it is registered in the pool
-    enable_result = api_post(
-        page,
-        f"/api/vpn/backends/{server_id}/enable",
-        {},
-        csrf_token,
-    )
-    assert enable_result["status"] in (200, 400), f"Initial backend enable failed: {enable_result}"
-
-    # Disable backend tunnel
-    disable_result = api_post(
-        page,
-        f"/api/vpn/backends/{server_id}/disable",
-        {},
-        csrf_token,
-    )
-    if enable_result["status"] == 200:
-        assert disable_result["status"] == 200, f"Backend disable failed: {disable_result}"
-        assert disable_result["body"].get("status") == "ok"
-
-        # Re-enable backend tunnel to leave server operational
-        re_enable = api_post(
-            page,
-            f"/api/vpn/backends/{server_id}/enable",
-            {},
-            csrf_token,
-        )
-        assert re_enable["status"] in (200, 400), f"Backend re-enable failed: {re_enable}"
-    else:
-        assert disable_result["status"] in (200, 404, 500)
+    original = _backend_for_server(page, server_id)
+    # A newly provisioned backend remains enabled for the subsequent traffic stage.
+    original_enabled = original["enabled"] if original is not None else True
+    try:
+        enabled = api_post(page, f"/api/vpn/backends/{server_id}/enable", {}, csrf_token)
+        assert enabled["status"] == 200, "Initial backend enable failed"
+        assert enabled["body"].get("status") == "ok"
+        assert _backend_enabled(page, server_id), "Backend enable did not persist"
+        disabled = api_post(page, f"/api/vpn/backends/{server_id}/disable", {}, csrf_token)
+        assert disabled["status"] == 200, "Backend disable failed"
+        assert disabled["body"].get("status") == "ok"
+        assert not _backend_enabled(page, server_id), "Backend disable did not persist"
+        re_enabled = api_post(page, f"/api/vpn/backends/{server_id}/enable", {}, csrf_token)
+        assert re_enabled["status"] == 200, "Backend re-enable failed"
+        assert re_enabled["body"].get("status") == "ok"
+        assert _backend_enabled(page, server_id), "Backend re-enable did not persist"
+    finally:
+        current = _backend_for_server(page, server_id)
+        if current is not None:
+            # A failed positive call can have partially changed state. Restore
+            # actual differences while preserving the first failure without a
+            # redundant retry when the original state is already intact.
+            if current["enabled"] != original_enabled:
+                action = "enable" if original_enabled else "disable"
+                restored = api_post(page, f"/api/vpn/backends/{server_id}/{action}", {}, csrf_token)
+                assert restored["status"] == 200, "Backend fixture restoration failed"
+            matches = _backend_enabled(page, server_id) == original_enabled
+            assert matches, "Original backend enabled state was not restored"
+        else:
+            assert original is None, "Original backend fixture disappeared during the lifecycle"
 
 
 @pytest.mark.e2e

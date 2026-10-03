@@ -1,6 +1,7 @@
 """E2E tests for server management pages and API."""
 
 import os
+import time
 
 import pytest
 from playwright.sync_api import Page, Request, expect
@@ -337,81 +338,125 @@ def test_server_reachability(authenticated_page: Page, base_url: str) -> None:
     )
 
 
-@pytest.mark.e2e
-def test_server_container_toggle(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
-    """POST /api/servers/{id}/container/toggle -> validates and toggles protocol container."""
-    page = authenticated_page
-
+def _provisioned_server_id(page: Page) -> int:
+    """Require the server provisioned by the preceding lifecycle stage."""
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test container toggle")
+    assert servers, "Provisioned server fixture is missing"
+    return servers[0]["id"]
 
-    server_id = servers[0]["id"]
 
-    # Reject invalid action
-    bad_toggle = api_post(
+def _assert_awg_running(page: Page, server_id: int, csrf_token: str) -> None:
+    """Require the remote AWG container to become operational after a control call."""
+    for attempt in range(15):
+        result = api_post(page, f"/api/servers/{server_id}/check", {}, csrf_token)
+        assert result["status"] == 200, "Server check failed"
+        body = result["body"]
+        awg = body.get("protocols", {}).get("awg", {})
+        if body.get("connection") == "ok" and awg.get("container_running") is True:
+            return
+        if attempt < 14:
+            time.sleep(2)
+    raise AssertionError("Provisioned AWG container is not running")
+
+
+@pytest.mark.e2e
+def test_server_container_toggle_invalid_action(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Reject an unsupported container action without invoking a positive control."""
+    page = authenticated_page
+    server_id = _provisioned_server_id(page)
+    result = api_post(
         page,
         f"/api/servers/{server_id}/container/toggle",
         {"protocol": "awg", "action": "invalid_action"},
         csrf_token,
     )
-    assert bad_toggle["status"] == 400
+    assert result["status"] == 400
+    assert result["body"].get("error") == "validation_failed"
 
-    # Toggle action
-    toggle_result = api_post(
+
+@pytest.mark.e2e
+def test_server_container_toggle(authenticated_page: Page, base_url: str, csrf_token: str) -> None:
+    """Restart the provisioned AWG container and verify it remains operational."""
+    page = authenticated_page
+    server_id = _provisioned_server_id(page)
+    _assert_awg_running(page, server_id, csrf_token)
+    try:
+        result = api_post(
+            page,
+            f"/api/servers/{server_id}/container/toggle",
+            {"protocol": "awg", "action": "restart"},
+            csrf_token,
+        )
+        assert result["status"] == 200, "Container restart failed"
+        assert result["body"].get("status") == "ok"
+        assert result["body"].get("state") == "restart"
+        _assert_awg_running(page, server_id, csrf_token)
+    finally:
+        restore = api_post(
+            page,
+            f"/api/servers/{server_id}/container/toggle",
+            {"protocol": "awg", "action": "start"},
+            csrf_token,
+        )
+        assert restore["status"] == 200, "Container running-state restoration failed"
+        _assert_awg_running(page, server_id, csrf_token)
+
+
+@pytest.mark.e2e
+def test_server_config_invalid_protocol(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Reject an unsupported protocol independently of the successful config lifecycle."""
+    page = authenticated_page
+    server_id = _provisioned_server_id(page)
+    result = api_post(
         page,
-        f"/api/servers/{server_id}/container/toggle",
-        {"protocol": "awg", "action": "restart"},
+        f"/api/servers/{server_id}/server_config",
+        {"protocol": "invalid_protocol"},
         csrf_token,
     )
-    assert toggle_result["status"] in (200, 400, 500)
-    if toggle_result["status"] == 200:
-        assert toggle_result["body"].get("status") == "ok"
+    assert result["status"] == 400
+    assert result["body"].get("error") == "invalid_protocol"
 
 
 @pytest.mark.e2e
 def test_server_config_get_and_save(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """POST /api/servers/{id}/server_config and /save -> retrieves and saves server config."""
+    """Save a harmless comment, read it back, then restore the provisioned server config."""
     page = authenticated_page
-
-    result = api_get(page, "/api/servers")
-    servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test server config")
-
-    server_id = servers[0]["id"]
-
-    # Reject invalid protocol
-    bad_proto = api_post(
-        page,
-        f"/api/servers/{server_id}/server_config",
-        {"protocol": "invalid_protocol"},
-        csrf_token,
-    )
-    assert bad_proto["status"] == 400
-
-    # Retrieve AWG server config
-    get_config = api_post(
-        page,
-        f"/api/servers/{server_id}/server_config",
-        {"protocol": "awg"},
-        csrf_token,
-    )
-    assert get_config["status"] in (200, 400, 500)
-    if get_config["status"] == 200:
-        body = get_config["body"]
-        assert "config" in body
-        # Save back the retrieved config
-        save_res = api_post(
-            page,
-            f"/api/servers/{server_id}/server_config/save",
-            {"protocol": "awg", "config": body["config"]},
-            csrf_token,
+    server_id = _provisioned_server_id(page)
+    endpoint = f"/api/servers/{server_id}/server_config"
+    result = api_post(page, endpoint, {"protocol": "awg"}, csrf_token)
+    assert result["status"] == 200, "Server config read failed"
+    assert result["body"].get("status") == "ok"
+    original = result["body"].get("config")
+    assert isinstance(original, str)
+    has_interface = "[Interface]" in original
+    assert has_interface, "Provisioned AWG server config is unavailable"
+    updated = original.rstrip("\n") + "\n# E2E config round-trip\n"
+    try:
+        saved = api_post(
+            page, endpoint + "/save", {"protocol": "awg", "config": updated}, csrf_token
         )
-        assert save_res["status"] in (200, 400, 500)
+        assert saved["status"] == 200, "Server config save failed"
+        assert saved["body"].get("status") == "ok"
+        readback = api_post(page, endpoint, {"protocol": "awg"}, csrf_token)
+        assert readback["status"] == 200, "Saved server config read-back failed"
+        matches = readback["body"].get("config") == updated
+        assert matches, "Server config save did not persist the requested change"
+    finally:
+        restored = api_post(
+            page, endpoint + "/save", {"protocol": "awg", "config": original}, csrf_token
+        )
+        assert restored["status"] == 200, "Server config restoration failed"
+        restored_config = api_post(page, endpoint, {"protocol": "awg"}, csrf_token)
+        assert restored_config["status"] == 200, "Restored server config read-back failed"
+        matches = restored_config["body"].get("config") == original
+        assert matches, "Original server config was not restored"
 
 
 @pytest.mark.e2e
@@ -419,12 +464,7 @@ def test_server_connections_edit(authenticated_page: Page, base_url: str, csrf_t
     """POST /api/servers/{id}/connections/edit -> updates connection parameters."""
     page = authenticated_page
 
-    result = api_get(page, "/api/servers")
-    servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test connections edit")
-
-    server_id = servers[0]["id"]
+    server_id = _provisioned_server_id(page)
 
     # Create temporary user and connection
     add_u = api_post(
@@ -471,8 +511,13 @@ def test_server_connections_edit(authenticated_page: Page, base_url: str, csrf_t
             },
             csrf_token,
         )
-        assert edit_res["status"] in (200, 400, 500)
-        if edit_res["status"] == 200:
-            assert edit_res["body"].get("status") == "ok"
+        assert edit_res["status"] == 200, "Server connection edit failed"
+        assert edit_res["body"].get("status") == "ok"
+        updated = api_get(page, f"/api/users/{user_id}/connections")
+        connections = updated if isinstance(updated, list) else updated.get("connections", [])
+        edited = next((item for item in connections if item.get("client_id") == client_id), None)
+        assert edited is not None, "Edited connection disappeared"
+        assert edited.get("name") == "srv_edited_name", "Connection name change was not persisted"
     finally:
-        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+        deleted = api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+        assert deleted["status"] == 200, "Temporary connection fixture cleanup failed"
