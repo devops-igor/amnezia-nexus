@@ -1,5 +1,6 @@
 """E2E tests for server management pages and API."""
 
+import hashlib
 import os
 import time
 from typing import Any
@@ -24,25 +25,66 @@ def normalize_config_text(value: str) -> str:
     return "\n".join(line.rstrip() for line in value.strip().splitlines())
 
 
+def config_fingerprint(text: str) -> str:
+    """Summarize configuration text without disclosing it.
+
+    Failure output for a persisted-state assertion must stay useful without ever
+    carrying configuration content, which includes private keys. A line count and
+    a truncated SHA-256 digest identify which side diverged and are not reversible
+    into the text they describe.
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"{len(text.splitlines())} lines, sha256:{digest}"
+
+
+def _assert_readback_is_text(readback: Any, message: str) -> None:
+    """Reject a non-text read-back without introspecting the value itself."""
+    is_text = isinstance(readback, str)
+    assert is_text, f"{message}: read-back carried no configuration text"
+
+
 def assert_config_persisted(readback: Any, expected: str, marker: str, message: str) -> None:
     """Assert a saved configuration was read back, ignoring transport whitespace.
 
     The marker line is asserted separately so a save that silently no-ops still
     fails: the read-back would lack the marker even if its whitespace happened to
     normalize to the expected text.
+
+    Every check below asserts on a pre-computed boolean. Asserting the comparison
+    directly would let pytest's assertion introspection render the normalized
+    configuration — private keys included — into the failure message, because the
+    operands of a failed comparison are the values themselves.
     """
-    assert isinstance(readback, str), f"{message}: read-back carried no configuration text"
+    _assert_readback_is_text(readback, message)
     normalized = normalize_config_text(readback)
-    assert normalized == normalize_config_text(expected), message
-    assert marker in normalized.splitlines(), f"{message}: saved marker line is absent"
+    expected_normalized = normalize_config_text(expected)
+    content_matches = normalized == expected_normalized
+    assert content_matches, (
+        f"{message}: saved configuration content differs from the requested change "
+        f"(read-back {config_fingerprint(normalized)}, "
+        f"expected {config_fingerprint(expected_normalized)})"
+    )
+    marker_present = marker in normalized.splitlines()
+    assert marker_present, f"{message}: saved marker line is absent"
 
 
 def assert_config_restored(readback: Any, original: str, marker: str, message: str) -> None:
-    """Assert the provisioned configuration came back and the marker did not."""
-    assert isinstance(readback, str), f"{message}: read-back carried no configuration text"
+    """Assert the provisioned configuration came back and the marker did not.
+
+    Like assert_config_persisted, every check asserts a pre-computed boolean so no
+    configuration operand reaches the rendered failure message.
+    """
+    _assert_readback_is_text(readback, message)
     normalized = normalize_config_text(readback)
-    assert normalized == normalize_config_text(original), message
-    assert marker not in normalized.splitlines(), f"{message}: saved marker line survived"
+    original_normalized = normalize_config_text(original)
+    content_matches = normalized == original_normalized
+    assert content_matches, (
+        f"{message}: restored configuration content differs from the provisioned one "
+        f"(read-back {config_fingerprint(normalized)}, "
+        f"expected {config_fingerprint(original_normalized)})"
+    )
+    marker_absent = marker not in normalized.splitlines()
+    assert marker_absent, f"{message}: saved marker line survived"
 
 
 @pytest.mark.e2e

@@ -6,9 +6,15 @@ never carries surrounding blank lines. These checks drive the actual E2E test
 function against a transport-faithful fixture and prove the oracle tolerates that
 trimming without becoming vacuous: a save that does not persist the requested
 change still fails the test.
+
+The second half of this file is the disclosure control. The oracle helpers assert
+on pre-computed booleans, so a failing assertion cannot render the configuration
+operands; each of the helpers' four failure paths is exercised here and the
+rendered message is required to be free of both the synthetic secret and every
+line of the configuration body.
 """
 
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import pytest
 
@@ -17,6 +23,12 @@ from playwright.sync_api import Page
 from tests.e2e import test_servers as servers
 
 PROVISIONED_CONFIG = "[Interface]\nAddress = <server-network>\nPrivateKey = synthetic-fixture\n"
+
+DISCLOSURE_SECRET = "synthetic-config-secret"
+DISCLOSURE_CONFIG = (
+    "[Interface]\n" "Address = <server-network>\n" f"PrivateKey = {DISCLOSURE_SECRET}\n"
+)
+DISCLOSURE_MARKER = servers.CONFIG_ROUND_TRIP_MARKER
 
 
 class TransportFaithfulConfigAPI:
@@ -145,3 +157,116 @@ def test_normalization_ignores_only_surrounding_whitespace(monkeypatch: pytest.M
     assert servers.normalize_config_text(base) != servers.normalize_config_text(
         base.replace("Address", " Address")
     )
+
+
+def assert_no_disclosure(failure: BaseException) -> str:
+    """Require a rendered oracle failure to carry no configuration content.
+
+    Both the secret and every individual configuration line are checked, because
+    pytest's assertion introspection truncates long operands: a message can quote
+    a partial body and still disclose the key. Line-level checking closes that
+    gap, and pytest's own explanation text is part of the message under test.
+    """
+    rendered = str(failure)
+    assert DISCLOSURE_SECRET not in rendered, f"Failure disclosed the private key: {rendered}"
+    for line in DISCLOSURE_CONFIG.splitlines():
+        assert line not in rendered, f"Failure disclosed the config line {line!r}: {rendered}"
+    for line in (DISCLOSURE_CONFIG + DISCLOSURE_MARKER).splitlines():
+        assert line not in rendered, f"Failure disclosed the config line {line!r}: {rendered}"
+    return rendered
+
+
+def invoke_oracle(check: Callable[[], None]) -> str:
+    """Run an oracle call that must fail, and return its rendered message."""
+    with pytest.raises(AssertionError) as failure:
+        check()
+    return assert_no_disclosure(failure.value)
+
+
+def test_config_oracle_failure_paths_do_not_disclose_config() -> None:
+    """Every oracle failure path raises without rendering configuration content."""
+    expected = DISCLOSURE_CONFIG + DISCLOSURE_MARKER + "\n"
+
+    # Path 1: the save persisted the wrong content.
+    content_mismatch = invoke_oracle(
+        lambda: servers.assert_config_persisted(
+            DISCLOSURE_CONFIG, expected, DISCLOSURE_MARKER, "Server config save did not persist"
+        )
+    )
+    assert "did not persist" in content_mismatch
+    assert "sha256:" in content_mismatch, "The mismatch must stay diagnosable"
+
+    # Path 2: the content matched but the marker line is absent after the save.
+    marker_absent = invoke_oracle(
+        lambda: servers.assert_config_persisted(
+            DISCLOSURE_CONFIG,
+            DISCLOSURE_CONFIG,
+            DISCLOSURE_MARKER,
+            "Server config save did not persist",
+        )
+    )
+    assert "marker line is absent" in marker_absent
+
+    # Path 3: restoration left the marker line behind.
+    marker_survived = invoke_oracle(
+        lambda: servers.assert_config_restored(
+            expected,
+            expected,
+            DISCLOSURE_MARKER,
+            "Original server config was not restored",
+        )
+    )
+    assert "marker line survived" in marker_survived
+
+    # Path 4: the read-back was not configuration text at all.
+    for absent in (None, 7, {"config": DISCLOSURE_CONFIG}, [DISCLOSURE_CONFIG]):
+        not_text = invoke_oracle(
+            lambda absent=absent: servers.assert_config_persisted(  # type: ignore[misc]
+                absent, expected, DISCLOSURE_MARKER, "Server config save did not persist"
+            )
+        )
+        assert "carried no configuration text" in not_text
+        restored_not_text = invoke_oracle(
+            lambda absent=absent: servers.assert_config_restored(
+                absent, expected, DISCLOSURE_MARKER, "Original server config was not restored"
+            )
+        )
+        assert "carried no configuration text" in restored_not_text
+
+
+def test_restore_oracle_content_mismatch_does_not_disclose_config() -> None:
+    """The restoration helper's content check is disclosure-free too."""
+    rendered = invoke_oracle(
+        lambda: servers.assert_config_restored(
+            DISCLOSURE_CONFIG + "# leftover comment\n",
+            DISCLOSURE_CONFIG,
+            DISCLOSURE_MARKER,
+            "Original server config was not restored",
+        )
+    )
+    assert "differs from the provisioned one" in rendered
+    assert "sha256:" in rendered
+
+
+def test_e2e_noop_save_failure_message_does_not_disclose_config() -> None:
+    """The real E2E test's failure output on a no-op save carries no configuration.
+
+    This drives the actual E2E function through the FixtureAPI fault that DEV CI
+    reported, and inspects the fully rendered pytest message, introspection
+    included, rather than only the helper in isolation.
+    """
+    from tests.test_e2e_assertions import FixtureAPI, install_fixture
+
+    fixture = FixtureAPI("config_noop")
+    fixture.config = DISCLOSURE_CONFIG
+    fixture.original_config = fixture.config
+
+    with pytest.MonkeyPatch.context() as patcher:
+        install_fixture(patcher, servers, fixture)
+        with pytest.raises(AssertionError) as failure:
+            servers.test_server_config_get_and_save(
+                cast(Page, fixture), "https://panel.example.test", "fixture-csrf"
+            )
+    rendered = assert_no_disclosure(failure.value)
+    assert "did not persist the requested change" in rendered
+    assert fixture.config == fixture.original_config, "Restoration must still run"
