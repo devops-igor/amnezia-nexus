@@ -152,10 +152,10 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-activity"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Throughput:</span><span class="font-mono" id="vpn-diag-throughput">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Packet Rate:</span><span class="font-mono" id="vpn-diag-packets">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">5m Avg:</span><span class="font-mono" id="vpn-diag-ewma5m">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">1h Avg:</span><span class="font-mono" id="vpn-diag-ewma1h">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_fwd_kpi_throughput" }}:</span><span class="font-mono" id="vpn-diag-throughput">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_packet_rate" }}:</span><span class="font-mono" id="vpn-diag-packets">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_avg_5m" }}:</span><span class="font-mono" id="vpn-diag-ewma5m">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_avg_1h" }}:</span><span class="font-mono" id="vpn-diag-ewma1h">-</span></div>
             </div>
         </div>
 
@@ -166,11 +166,11 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-database"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Occupancy:</span><span class="font-mono" id="vpn-diag-queue-occ">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Peak Watermark:</span><span class="font-mono" id="vpn-diag-queue-peak">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Duration &gt; 50%:</span><span class="font-mono" id="vpn-diag-queue-dur50">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Duration &gt; 80%:</span><span class="font-mono" id="vpn-diag-queue-dur80">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Queue Drops:</span><span class="font-mono" id="vpn-diag-queue-drops">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_occupancy" }}:</span><span class="font-mono" id="vpn-diag-queue-occ">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_forwarder_peak" }}:</span><span class="font-mono" id="vpn-diag-queue-peak">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_duration" }} &gt; 50%:</span><span class="font-mono" id="vpn-diag-queue-dur50">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_duration" }} &gt; 80%:</span><span class="font-mono" id="vpn-diag-queue-dur80">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_queue_drops" }}:</span><span class="font-mono" id="vpn-diag-queue-drops">-</span></div>
             </div>
         </div>
 
@@ -182,10 +182,10 @@
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
                 <div class="flex justify-between"><span class="text-muted">p50 / p95 / p99:</span><span class="font-mono" id="vpn-diag-lat-percentiles">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Max Duration:</span><span class="font-mono" id="vpn-diag-lat-max">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">In-Flight / Oldest:</span><span class="font-mono" id="vpn-diag-lat-inflight">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Stalls (&ge; 100ms):</span><span class="font-mono" id="vpn-diag-lat-stalls">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Write Errors:</span><span class="font-mono" id="vpn-diag-lat-errors">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_max_duration" }}:</span><span class="font-mono" id="vpn-diag-lat-max">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_in_flight_oldest" }}:</span><span class="font-mono" id="vpn-diag-lat-inflight">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_stalls" }} (&ge; 100ms):</span><span class="font-mono" id="vpn-diag-lat-stalls">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_write_errors" }}:</span><span class="font-mono" id="vpn-diag-lat-errors">-</span></div>
             </div>
         </div>
 
@@ -196,9 +196,9 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Client &rarr; Backend:</span><span class="font-mono" id="vpn-diag-drops-client">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Backend &rarr; Client:</span><span class="font-mono" id="vpn-diag-drops-return">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Total / Drop Rate:</span><span class="font-mono" id="vpn-diag-drops-total">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_client_backend" }}:</span><span class="font-mono" id="vpn-diag-drops-client">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_backend_client" }}:</span><span class="font-mono" id="vpn-diag-drops-return">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_total_drop_rate" }}:</span><span class="font-mono" id="vpn-diag-drops-total">-</span></div>
             </div>
         </div>
 
@@ -221,7 +221,7 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-refresh"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Engine:</span><span class="font-mono" id="vpn-diag-engine-status">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_engine" }}:</span><span class="font-mono" id="vpn-diag-engine-status">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_peers" }}</span><span class="font-mono" id="vpn-diag-peers-status">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_failures" }}</span><span class="font-mono" id="vpn-diag-sync-failures">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_op_failures" }}</span><span class="font-mono" id="vpn-diag-peer-sync-op-failures">-</span></div>
@@ -230,7 +230,7 @@
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_last_reconcile" }}</span><span class="font-mono" id="vpn-diag-peer-sync-reconcile">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_last_error" }}</span><span class="font-mono" id="vpn-diag-peer-sync-error">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_peer_sync_restart_required" }}</span><span class="font-mono" id="vpn-diag-peer-sync-restart">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Handshake Freshness:</span><span class="font-mono" id="vpn-diag-hs-freshness">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_handshake_freshness" }}:</span><span class="font-mono" id="vpn-diag-hs-freshness">-</span></div>
             </div>
         </div>
 
@@ -238,10 +238,10 @@
         <div class="card" style="background: var(--bg-surface); border: 1px solid var(--border-color); padding: var(--space-sm) var(--space-md);">
             <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: var(--space-xs); display: flex; align-items: center; justify-content: space-between;">
                 <span>{{ _ "vpn_fwd_panel_routing" }}</span>
-                <span class="badge badge-success" id="vpn-diag-routing-badge" style="font-size: 0.7rem;">Consistent</span>
+                <span class="badge badge-success" id="vpn-diag-routing-badge" style="font-size: 0.7rem;">{{ _ "vpn_fwd_consistent" }}</span>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Sessions vs Routes vs Returns:</span><span class="font-mono" id="vpn-diag-routing-counts">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_routing_counts" }}:</span><span class="font-mono" id="vpn-diag-routing-counts">-</span></div>
                 <div id="vpn-diag-routing-alerts" style="margin-top: 4px; display: none;"></div>
             </div>
         </div>
@@ -253,10 +253,10 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-server"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">Healthy / Total:</span><span class="font-mono" id="vpn-diag-be-counts">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Latency p95:</span><span class="font-mono" id="vpn-diag-be-latency">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Load Skew:</span><span class="font-mono" id="vpn-diag-be-skew">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Device Drops:</span><span class="font-mono" id="vpn-diag-be-drops">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_healthy_total" }}:</span><span class="font-mono" id="vpn-diag-be-counts">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_latency_p95" }}:</span><span class="font-mono" id="vpn-diag-be-latency">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_load_skew" }}:</span><span class="font-mono" id="vpn-diag-be-skew">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_device_drops" }}:</span><span class="font-mono" id="vpn-diag-be-drops">-</span></div>
                 <div id="vpn-diag-be-traffic"></div>
             </div>
         </div>
@@ -268,11 +268,11 @@
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-settings"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
-                <div class="flex justify-between"><span class="text-muted">CPU Usage:</span><span class="font-mono" id="vpn-diag-res-cpu">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Memory (Alloc / Limit):</span><span class="font-mono" id="vpn-diag-res-mem">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">Goroutines:</span><span class="font-mono" id="vpn-diag-res-goroutines">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">GC Pause p95:</span><span class="font-mono" id="vpn-diag-res-gc">-</span></div>
-                <div class="flex justify-between"><span class="text-muted">File Descriptors:</span><span class="font-mono" id="vpn-diag-res-fd">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_cpu_usage" }}:</span><span class="font-mono" id="vpn-diag-res-cpu">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_memory" }}:</span><span class="font-mono" id="vpn-diag-res-mem">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_goroutines" }}:</span><span class="font-mono" id="vpn-diag-res-goroutines">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_gc_pause" }}:</span><span class="font-mono" id="vpn-diag-res-gc">-</span></div>
+                <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_file_descriptors" }}:</span><span class="font-mono" id="vpn-diag-res-fd">-</span></div>
             </div>
         </div>
     </div>
@@ -290,19 +290,19 @@
         </div>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-sm);">
             <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">Throughput (bps)</div>
+                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_fwd_kpi_throughput" }} (bps)</div>
                 <div id="vpn-chart-throughput" style="height: 60px; width: 100%;"></div>
             </div>
             <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">Queue Utilization (%)</div>
+                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_queue_utilization" }}</div>
                 <div id="vpn-chart-queue" style="height: 60px; width: 100%;"></div>
             </div>
             <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">Drop Rate (drops/s)</div>
+                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_drop_rate" }}</div>
                 <div id="vpn-chart-drops" style="height: 60px; width: 100%;"></div>
             </div>
             <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">Forward Write p95 (ms)</div>
+                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_forward_p95" }}</div>
                 <div id="vpn-chart-latency" style="height: 60px; width: 100%;"></div>
             </div>
             <div id="vpn-chart-directions"></div>
@@ -310,7 +310,7 @@
             <div id="vpn-chart-sessions-routes"></div>
             <div id="vpn-chart-backend-latency"></div>
         </div>
-        <details><summary>Loss reasons and backend traffic</summary>
+        <details><summary>{{ _ "vpn_diag_loss_backend_history" }}</summary>
             <div id="vpn-chart-reasons"></div>
             <div id="vpn-chart-backends"></div>
             <div id="vpn-history-fleet-note" class="text-muted text-sm"></div>
@@ -1156,9 +1156,16 @@
         });
     }
 
+    function vpnDiagText(key, values) {
+        const parameters = values || {};
+        return _(key).replace(/\{([a-z0-9_]+)\}/g, function(match, name) {
+            return Object.prototype.hasOwnProperty.call(parameters, name) ? String(parameters[name]) : match;
+        });
+    }
+
     function vpnGenerateSparklineSVG(data, color, fillOpacity) {
         if (!data || !data.some(Number.isFinite)) {
-            return '<svg viewBox="0 0 200 40" width="100%" height="40" style="display:block;"><text x="100" y="24" text-anchor="middle" fill="var(--text-muted, #888)" font-size="10">No data</text></svg>';
+            return '<svg viewBox="0 0 200 40" width="100%" height="40" style="display:block;"><text x="100" y="24" text-anchor="middle" fill="var(--text-muted, #888)" font-size="10">' + escapeHtml(_('no_data')) + '</text></svg>';
         }
         const width = 200;
         const height = 40;
@@ -1230,7 +1237,7 @@
             if (!element) return;
             element.textContent = '';
             if (entries.length === 0) {
-                element.textContent = 'No data (' + w + ')';
+                element.textContent = _('no_data') + ' (' + w + ')';
                 return;
             }
             for (const entry of entries) {
@@ -1247,23 +1254,48 @@
             return p[availability] === false || !Number.isFinite(p[key]) ? null : p[key];
         }
         renderSeries('vpn-chart-directions', [
-            {label:'RX client to backend (bps)', values:points.map(p => known(p,'rx_bps','traffic_available'))},
-            {label:'TX backend to client (bps)', values:points.map(p => known(p,'tx_bps','traffic_available')), color:'var(--info, #06b6d4)'}
+            {label:_('vpn_diag_rx_direction'), values:points.map(p => known(p,'rx_bps','traffic_available'))},
+            {label:_('vpn_diag_tx_direction'), values:points.map(p => known(p,'tx_bps','traffic_available')), color:'var(--info, #06b6d4)'}
         ]);
         renderSeries('vpn-chart-packets', [
-            {label:'RX packets/s',values:points.map(p => known(p,'rx_pps','traffic_available'))},
-            {label:'TX packets/s',values:points.map(p => known(p,'tx_pps','traffic_available')),color:'var(--info, #06b6d4)'}
+            {label:_('vpn_diag_rx_packets_rate'),values:points.map(p => known(p,'rx_pps','traffic_available'))},
+            {label:_('vpn_diag_tx_packets_rate'),values:points.map(p => known(p,'tx_pps','traffic_available')),color:'var(--info, #06b6d4)'}
         ]);
         renderSeries('vpn-chart-sessions-routes', [
-            {label:'Active sessions',values:points.map(p => Number.isFinite(p.sessions) ? p.sessions : null)},
-            {label:'Active routes',values:points.map(p => Number.isFinite(p.routes) ? p.routes : null),color:'var(--info, #06b6d4)'}
+            {label:_('vpn_diag_active_sessions'),values:points.map(p => Number.isFinite(p.sessions) ? p.sessions : null)},
+            {label:_('vpn_diag_active_routes'),values:points.map(p => Number.isFinite(p.routes) ? p.routes : null),color:'var(--info, #06b6d4)'}
         ]);
         renderSeries('vpn-chart-backend-latency', [
-            {label:'Eligible backend probe p95 (ms)',values:points.map(p => p.be_latency_samples === 0 || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
+            {label:_('vpn_diag_backend_probe_p95'),values:points.map(p => p.be_latency_samples === 0 || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
         ]);
+        const lossLabels = {
+            client_backend_device_external: 'vpn_diag_loss_client_backend_device_external',
+            client_backend_device_oversized: 'vpn_diag_loss_client_backend_device_oversized',
+            client_backend_device_queue_full: 'vpn_diag_loss_client_backend_device_queue_full',
+            client_backend_device_retired_drops: 'vpn_diag_loss_client_backend_device_retired_drops',
+            client_backend_device_shutdown: 'vpn_diag_loss_client_backend_device_shutdown',
+            client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',
+            client_backend_queue_full: 'vpn_diag_loss_client_backend_queue_full',
+            client_malformed: 'vpn_diag_loss_client_malformed',
+            client_mismatch: 'vpn_diag_loss_client_mismatch',
+            client_no_healthy_backend: 'vpn_diag_loss_client_no_healthy_backend',
+            client_rate_limited: 'vpn_diag_loss_client_rate_limited',
+            client_rejected: 'vpn_diag_loss_client_rejected',
+            client_unmapped_source: 'vpn_diag_loss_client_unmapped_source',
+            client_virtualtun_drops: 'vpn_diag_loss_client_virtualtun_drops',
+            return_backend_device_queue_full: 'vpn_diag_loss_return_backend_device_queue_full',
+            return_backend_device_shutdown: 'vpn_diag_loss_return_backend_device_shutdown',
+            return_injection_errors: 'vpn_diag_loss_return_injection_errors',
+            return_malformed: 'vpn_diag_loss_return_malformed',
+            return_mismatch: 'vpn_diag_loss_return_mismatch',
+            return_packet_too_large: 'vpn_diag_loss_return_packet_too_large',
+            return_queue_full: 'vpn_diag_loss_return_queue_full',
+            return_unmapped: 'vpn_diag_loss_return_unmapped',
+            return_virtualtun_drops: 'vpn_diag_loss_return_virtualtun_drops'
+        };
         const reasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
         renderSeries('vpn-chart-reasons', reasons.map(key => ({
-            label:key.replace(/_/g,' ') + ' (drops/s)',
+            label:(lossLabels[key] ? _(lossLabels[key]) : key.replace(/_/g,' ')) + ' (drops/s)',
             values:points.map(p => p.drop_rates_available === false || !p.drop_reason_rates || !Number.isFinite(p.drop_reason_rates[key]) ? null : p.drop_reason_rates[key]),
             color:'var(--danger, #ef4444)'
         })));
@@ -1274,10 +1306,10 @@
         for (const id of ids.slice(0,128)) {
             for (const [key,label,availability] of [
                 ['rx_bps','RX (bps)','traffic_available'],['tx_bps','TX (bps)','traffic_available'],
-                ['rx_pps','RX packets/s','traffic_available'],['tx_pps','TX packets/s','traffic_available'],
-                ['probe_latency_ms','Probe latency (ms)','probe_available']
+                ['rx_pps',_('vpn_diag_rx_packets_rate'),'traffic_available'],['tx_pps',_('vpn_diag_tx_packets_rate'),'traffic_available'],
+                ['probe_latency_ms',_('vpn_diag_probe_latency'),'probe_available']
             ]) {
-                backendEntries.push({label:'Backend ' + id + ' ' + label, values:points.map(p => {
+                backendEntries.push({label:vpnDiagText('vpn_diag_backend_series', {id:id, label:label}), values:points.map(p => {
                     const b = (p.backends || []).find(b => b.id === id);
                     return !b || !b[availability] || !Number.isFinite(b[key]) ? null : b[key];
                 })});
@@ -1287,7 +1319,7 @@
         const fleetNote = document.getElementById('vpn-history-fleet-note');
         if (fleetNote) {
             const omitted = points.reduce((max,p) => Math.max(max,Number(p.backends_omitted || 0)),0);
-            fleetNote.textContent = omitted || ids.length > 128 ? 'Fleet context is limited to 128 backends per sample/view; up to ' + Math.max(omitted,ids.length-128) + ' omitted.' : '';
+            fleetNote.textContent = omitted || ids.length > 128 ? vpnDiagText('vpn_diag_fleet_limit', {count:Math.max(omitted,ids.length-128)}) : '';
         }
 
     }
@@ -1578,18 +1610,43 @@
                 // are explicit; percentiles/max/errors/drops retain historical labels.
                 function routeTooltip(route) {
                     const labels = {
-                        peer_key:'Peer', assigned_ip:'Assigned address', backend_id:'Backend',
-                        occupancy:'Queue occupancy', capacity:'Queue capacity', high_water:'Queue high water',
-                        utilization_pct:'Queue utilization (%)', high_water_pct:'High water (%)',
-                        drops:'Queue drops (cumulative)', p95_write_ms:'Write p95 (historical ms)',
-                        has_pressure:'Current pressure', pressure_note:'Pressure reason',
-                        write_count:'Writes admitted', write_errors:'Write errors (cumulative)',
-                        write_stalls:'Write stalls (cumulative)', writes_in_flight:'Writes in flight',
-                        oldest_write_ms:'Oldest write (ms)', max_write_ms:'Max write (historical ms)',
-                        p95_write_samples:'Write percentile samples', queue_full_drops_recent:'Recent queue drops',
-                        write_errors_recent:'Recent write errors', write_stalls_recent:'Recent write stalls',
-                        session_age_sec:'Session age (s)', last_traffic_age_sec:'Last traffic age (s)',
-                        traffic:'Directional traffic'
+                        peer_key:_('vpn_forwarder_route_peer'),
+                        assigned_ip:_('vpn_diag_assigned_address'),
+                        backend_id:_('vpn_diag_backend'),
+                        occupancy:_('vpn_forwarder_queue'),
+                        capacity:_('vpn_diag_queue_capacity'),
+                        high_water:_('vpn_diag_queue_high_water'),
+                        utilization_pct:_('vpn_diag_queue_utilization'),
+                        high_water_pct:_('vpn_diag_high_water_pct'),
+                        drops:_('vpn_diag_queue_drops_cumulative'),
+                        p95_write_ms:_('vpn_diag_write_p95_historical'),
+                        has_pressure:_('vpn_diag_current_pressure'),
+                        pressure_note:_('vpn_diag_pressure_reason'),
+                        write_count:_('vpn_diag_writes_admitted'),
+                        write_errors:_('vpn_diag_write_errors_cumulative'),
+                        write_stalls:_('vpn_diag_write_stalls_cumulative'),
+                        writes_in_flight:_('vpn_diag_writes_in_flight'),
+                        oldest_write_ms:_('vpn_diag_oldest_write'),
+                        max_write_ms:_('vpn_diag_max_write_historical'),
+                        p95_write_samples:_('vpn_diag_write_samples'),
+                        queue_full_drops_recent:_('vpn_diag_recent_queue_drops'),
+                        write_errors_recent:_('vpn_diag_recent_write_errors'),
+                        write_stalls_recent:_('vpn_diag_recent_write_stalls'),
+                        session_age_sec:_('vpn_diag_session_age'),
+                        last_traffic_age_sec:_('vpn_diag_last_traffic_age'),
+                        traffic:_('vpn_diag_directional_traffic')
+                    };
+                    const trafficLabels = {
+                        rx_bytes:_('vpn_diag_rx_bytes'),
+                        tx_bytes:_('vpn_diag_tx_bytes'),
+                        rx_packets:_('vpn_diag_rx_packets'),
+                        tx_packets:_('vpn_diag_tx_packets'),
+                        rx_bytes_per_sec:_('vpn_diag_rx_bytes_rate'),
+                        tx_bytes_per_sec:_('vpn_diag_tx_bytes_rate'),
+                        rx_pps:_('vpn_diag_rx_packets_rate'),
+                        tx_pps:_('vpn_diag_tx_packets_rate'),
+                        available:_('vpn_diag_available'),
+                        window_sec:_('vpn_diag_window')
                     };
                     const lines = [];
                     for (const key of Object.keys(route)) {
@@ -1598,12 +1655,12 @@
                         if (key === 'traffic' && value && typeof value === 'object') {
                             for (const name of Object.keys(value)) {
                                 const unavailable = !value.available && ['rx_bytes_per_sec','tx_bytes_per_sec','rx_pps','tx_pps'].includes(name);
-                                lines.push(label + ' ' + name.replace(/_/g, ' ') + ': ' + (unavailable ? 'Unavailable' : String(value[name])));
+                                lines.push(label + ' ' + (trafficLabels[name] || name.replace(/_/g, ' ')) + ': ' + (unavailable ? _('vpn_diag_peer_sync_unavailable') : String(value[name])));
                             }
                         } else {
                             const unknown = key === 'last_traffic_age_sec' && Number(value) < 0 ||
                                 key === 'p95_write_ms' && route.p95_write_samples === 0;
-                            lines.push(label + ': ' + (unknown ? 'Unavailable' : (value === '' ? 'None' : String(value))));
+                            lines.push(label + ': ' + (unknown ? _('vpn_diag_peer_sync_unavailable') : (value === '' ? _('vpn_diag_peer_sync_none') : String(value))));
                         }
                     }
                     return lines.join('\n');
@@ -1649,10 +1706,10 @@
                     tdWrites.textContent = rNote;
                     tdWrites.style.color = 'var(--warning)';
                 } else if (rErrors > 0) {
-                    tdWrites.textContent = rWrites + ' (' + rErrors + ' cumulative errors)';
+                    tdWrites.textContent = vpnDiagText('vpn_diag_route_errors', {writes:rWrites, errors:rErrors});
                     if (Number(r.write_errors_recent || 0) > 0) tdWrites.style.color = 'var(--warning)';
                 } else if (rP95 > 0) {
-                    tdWrites.textContent = rP95.toFixed(1) + 'ms historical p95';
+                    tdWrites.textContent = vpnDiagText('vpn_diag_route_p95', {value:rP95.toFixed(1)});
                 } else {
                     tdWrites.textContent = String(rWrites);
                 }
@@ -1695,10 +1752,10 @@
                 const s = String(ha.status).toUpperCase();
                 if (s === 'CRITICAL') {
                     statusBadge.className = 'badge badge-danger';
-                    statusText.textContent = _('vpn_forwarder_pressure') || 'Pressure Detected';
+                    statusText.textContent = _('vpn_forwarder_critical');
                 } else if (s === 'DEGRADED') {
                     statusBadge.className = 'badge badge-warn';
-                    statusText.textContent = _('vpn_forwarder_warning') || 'Warning';
+                    statusText.textContent = _('vpn_forwarder_degraded');
                 } else if (s === 'HEALTHY') {
                     statusBadge.className = 'badge badge-success';
                     statusText.textContent = _('vpn_forwarder_healthy') || 'Healthy';
@@ -1723,11 +1780,11 @@
             if (ha && ha.summary) {
                 headlineElem.textContent = ha.summary;
             } else if (statusBadge && statusBadge.className.includes('badge-danger')) {
-                headlineElem.textContent = 'Dataplane under critical pressure or severe degradation';
+                headlineElem.textContent = _('vpn_diag_summary_critical');
             } else if (statusBadge && statusBadge.className.includes('badge-warn')) {
-                headlineElem.textContent = 'Dataplane operating in degraded state with active warnings';
+                headlineElem.textContent = _('vpn_diag_summary_degraded');
             } else {
-                headlineElem.textContent = 'Dataplane forwarding operating within expected performance thresholds';
+                headlineElem.textContent = _('vpn_diag_summary_healthy');
             }
         }
 
@@ -1759,7 +1816,10 @@
                     } else {
                         sevBadge.className = 'badge badge-info';
                     }
-                    sevBadge.textContent = sev || 'WARN';
+                    sevBadge.textContent = sev === 'CRITICAL' ? _('vpn_forwarder_critical') :
+                        sev === 'DEGRADED' ? _('vpn_forwarder_degraded') :
+                        sev === 'HEALTHY' ? _('vpn_forwarder_healthy') :
+                        (!sev || sev === 'WARN' || sev === 'WARNING') ? _('vpn_forwarder_warning') : sev;
                     row.appendChild(sevBadge);
 
                     const msgSpan = document.createElement('span');
@@ -1788,7 +1848,7 @@
             const rates = status.rates || {};
             const totalBps = (rates.rx_bps || 0) + (rates.tx_bps || 0);
             const totalPps = (rates.rx_pps || 0) + (rates.tx_pps || 0);
-            kpiThroughput.textContent = rates.available === false ? 'Traffic unavailable' : fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
+            kpiThroughput.textContent = rates.available === false ? _('vpn_diag_traffic_unavailable') : fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
         }
 
         const kpiRoutes = document.getElementById('vpn-kpi-routes-sessions');
@@ -1819,14 +1879,14 @@
             const drops = status.drop_categories || {};
             const totDrops = drops.total_drops !== undefined ? drops.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = drops.total_drop_rate_pps !== undefined ? drops.total_drop_rate_pps.toFixed(2) : '0.00';
-            kpiLoss.textContent = (drops.rates_available === false ? 'Loss rate unavailable' : rate + ' pps') + ' (' + totDrops + ' cumulative)';
+            kpiLoss.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:drops.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps', count:totDrops});
             kpiLoss.style.color = drops.rates_available !== false && Number(drops.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         const kpiEngine = document.getElementById('vpn-kpi-client-engine');
         if (kpiEngine) {
             const isRunning = !!status.listener_running;
-            kpiEngine.textContent = 'Upstream (' + (isRunning ? 'Running' : 'Stopped') + ')';
+            kpiEngine.textContent = vpnDiagText('vpn_diag_engine_state', {state:isRunning ? _('vpn_running') : _('vpn_stopped')});
             kpiEngine.style.color = isRunning ? 'var(--success)' : 'var(--danger)';
         }
 
@@ -1847,7 +1907,7 @@
                 kpiPeerSync.textContent = psActual + ' / ' + psDesired;
                 kpiPeerSync.style.color = psDesired === psActual ? '' : 'var(--warning)';
             } else {
-                kpiPeerSync.textContent = (_('vpn_diag_peer_sync_unavailable') || 'Unavailable');
+                kpiPeerSync.textContent = (_('vpn_diag_peer_sync_unavailable'));
                 kpiPeerSync.style.color = 'var(--text-muted)';
             }
         }
@@ -1857,10 +1917,10 @@
             const be = status.backends || {};
             if (be.total_count !== undefined) {
                 const enabled = be.eligibility_known ? Number(be.enabled_count || 0) : be.total_count;
-                kpiBackends.textContent = be.healthy_count + ' / ' + enabled + ' healthy' + (be.disabled_count ? ' (' + be.disabled_count + ' disabled)' : '');
+                kpiBackends.textContent = vpnDiagText('vpn_diag_healthy_count', {healthy:be.healthy_count, enabled:enabled}) + (be.disabled_count ? vpnDiagText('vpn_diag_disabled_count', {count:be.disabled_count}) : '');
                 kpiBackends.style.color = !be.healthy_count ? 'var(--danger)' : (be.healthy_count < enabled ? 'var(--warning)' : '');
             } else {
-                kpiBackends.textContent = (status.active_tunnels || 0) + ' active';
+                kpiBackends.textContent = vpnDiagText('vpn_diag_active_count', {count:status.active_tunnels || 0});
             }
         }
 
@@ -1871,9 +1931,9 @@
             const recentStalls = Number(fl.stalls_recent || 0);
             const currentP95 = Number(fl.p95_health_ms || 0);
             const oldest = Number(fl.oldest_in_flight_ms || 0);
-            const latencyText = samples > 0 ? currentP95.toFixed(1) + 'ms p95' : 'Latency unavailable';
-            kpiSlowWrites.textContent = recentStalls + ' recent stalls / ' + latencyText;
-            kpiSlowWrites.title = (fl.stalls || 0) + ' cumulative stalls; ' + Number(fl.p95_ms || 0).toFixed(1) + 'ms historical p95';
+            const latencyText = samples > 0 ? currentP95.toFixed(1) + 'ms p95' : _('vpn_diag_latency_unavailable');
+            kpiSlowWrites.textContent = vpnDiagText('vpn_diag_slow_writes', {count:recentStalls, latency:latencyText});
+            kpiSlowWrites.title = vpnDiagText('vpn_diag_slow_writes_title', {count:fl.stalls || 0, latency:Number(fl.p95_ms || 0).toFixed(1)});
             kpiSlowWrites.style.color = oldest >= 1000 || (samples > 0 && currentP95 >= 100) ? 'var(--danger)' :
                 (recentStalls > 0 || oldest >= 100 || (samples > 0 && currentP95 >= 50) ? 'var(--warning)' : '');
 
@@ -1883,25 +1943,25 @@
         const dThroughput = document.getElementById('vpn-diag-throughput');
         if (dThroughput) {
             const r = status.rates || {};
-            dThroughput.textContent = r.available === false ? 'Traffic unavailable' :
+            dThroughput.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps || 0) + ' | Tx: ' + fmtBps(r.tx_bps || 0);
         }
         const dPackets = document.getElementById('vpn-diag-packets');
         if (dPackets) {
             const r = status.rates || {};
-            dPackets.textContent = r.available === false ? 'Traffic unavailable' :
+            dPackets.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtPps(r.rx_pps || 0) + ' | Tx: ' + fmtPps(r.tx_pps || 0);
         }
         const dEwma5m = document.getElementById('vpn-diag-ewma5m');
         if (dEwma5m) {
             const r = status.rates || {};
-            dEwma5m.textContent = r.available === false ? 'Traffic unavailable' :
+            dEwma5m.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps_avg_5m || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_5m || 0);
         }
         const dEwma1h = document.getElementById('vpn-diag-ewma1h');
         if (dEwma1h) {
             const r = status.rates || {};
-            dEwma1h.textContent = r.available === false ? 'Traffic unavailable' :
+            dEwma1h.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps_avg_1h || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_1h || 0);
         }
 
@@ -1922,19 +1982,19 @@
         const dQueueDur50 = document.getElementById('vpn-diag-queue-dur50');
         if (dQueueDur50) {
             const qp = status.queue_pressure || {};
-            dQueueDur50.textContent = fmtDurationSec(qp.total_seconds_above_50 || 0) + ' total (' + fmtDurationSec(qp.consecutive_above_50_sec || 0) + ' streak)';
+            dQueueDur50.textContent = vpnDiagText('vpn_diag_duration_streak', {total:fmtDurationSec(qp.total_seconds_above_50 || 0), streak:fmtDurationSec(qp.consecutive_above_50_sec || 0)});
         }
         const dQueueDur80 = document.getElementById('vpn-diag-queue-dur80');
         if (dQueueDur80) {
             const qp = status.queue_pressure || {};
-            dQueueDur80.textContent = fmtDurationSec(qp.total_seconds_above_80 || 0) + ' total (' + fmtDurationSec(qp.consecutive_above_80_sec || 0) + ' streak)';
+            dQueueDur80.textContent = vpnDiagText('vpn_diag_duration_streak', {total:fmtDurationSec(qp.total_seconds_above_80 || 0), streak:fmtDurationSec(qp.consecutive_above_80_sec || 0)});
         }
         const dQueueDrops = document.getElementById('vpn-diag-queue-drops');
         if (dQueueDrops) {
             const qp = status.queue_pressure || {};
             const qDrops = qp.queue_full_drops !== undefined ? qp.queue_full_drops : dropsQueueFull;
             const rate = qp.queue_drop_rate_pps !== undefined ? qp.queue_drop_rate_pps.toFixed(2) : '0.00';
-            dQueueDrops.textContent = rate + ' pps (' + qDrops + ' cumulative)';
+            dQueueDrops.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rate + ' pps', count:qDrops});
             dQueueDrops.style.color = Number(qp.queue_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
@@ -1942,22 +2002,22 @@
         const dLatPct = document.getElementById('vpn-diag-lat-percentiles');
         if (dLatPct) {
             const fl = status.forward_latency || {};
-            dLatPct.textContent = 'Historical: ' + (fl.p50_ms || 0).toFixed(1) + 'ms / ' + (fl.p95_ms || 0).toFixed(1) + 'ms / ' + (fl.p99_ms || 0).toFixed(1) + 'ms';
+            dLatPct.textContent = vpnDiagText('vpn_diag_historical_percentiles', {p50:(fl.p50_ms || 0).toFixed(1), p95:(fl.p95_ms || 0).toFixed(1), p99:(fl.p99_ms || 0).toFixed(1)});
         }
         const dLatMax = document.getElementById('vpn-diag-lat-max');
         if (dLatMax) {
             const fl = status.forward_latency || {};
-            dLatMax.textContent = (fl.max_ms || 0) + 'ms historical';
+            dLatMax.textContent = vpnDiagText('vpn_diag_historical_ms', {value:fl.max_ms || 0});
         }
         const dLatInf = document.getElementById('vpn-diag-lat-inflight');
         if (dLatInf) {
             const fl = status.forward_latency || {};
-            dLatInf.textContent = (fl.in_flight || 0) + ' (oldest: ' + (fl.oldest_in_flight_ms || 0) + 'ms)';
+            dLatInf.textContent = vpnDiagText('vpn_diag_in_flight', {count:fl.in_flight || 0, oldest:fl.oldest_in_flight_ms || 0});
         }
         const dLatStalls = document.getElementById('vpn-diag-lat-stalls');
         if (dLatStalls) {
             const fl = status.forward_latency || {};
-            dLatStalls.textContent = (fl.stalls_recent || 0) + ' recent (' + (fl.stalls || 0) + ' cumulative)';
+            dLatStalls.textContent = vpnDiagText('vpn_diag_recent_cumulative', {recent:fl.stalls_recent || 0, count:fl.stalls || 0});
             dLatStalls.style.color = Number(fl.stalls_recent || 0) > 0 || Number(fl.oldest_in_flight_ms || 0) >= 100 ? 'var(--warning)' : '';
         }
         const dLatErr = document.getElementById('vpn-diag-lat-errors');
@@ -1965,7 +2025,7 @@
             const fl = status.forward_latency || {};
             const errCount = fl.write_errors !== undefined ? fl.write_errors : writeErrors;
             const totWrites = fl.write_total || 0;
-            dLatErr.textContent = Number(fl.write_error_rate_pps || 0).toFixed(2) + ' errors/s (' + errCount + ' cumulative / ' + totWrites + ' writes)';
+            dLatErr.textContent = vpnDiagText('vpn_diag_write_error_counts', {rate:Number(fl.write_error_rate_pps || 0).toFixed(2), errors:errCount, writes:totWrites});
             dLatErr.style.color = Number(fl.write_error_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
@@ -1974,16 +2034,16 @@
         if (dDropsClient) {
             const dc = status.drop_categories || {};
             const rate = (dc.client_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
-            dDropsClient.textContent = rateText + ' (' + (dc.client_total_drops || 0) + ' cumulative)';
+            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            dDropsClient.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.client_total_drops || 0});
             dDropsClient.style.color = dc.rates_available !== false && Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsRet = document.getElementById('vpn-diag-drops-return');
         if (dDropsRet) {
             const dc = status.drop_categories || {};
             const rate = (dc.return_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
-            dDropsRet.textContent = rateText + ' (' + (dc.return_total_drops || 0) + ' cumulative)';
+            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            dDropsRet.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.return_total_drops || 0});
             dDropsRet.style.color = dc.rates_available !== false && Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsTot = document.getElementById('vpn-diag-drops-total');
@@ -1991,8 +2051,8 @@
             const dc = status.drop_categories || {};
             const tot = dc.total_drops !== undefined ? dc.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = (dc.total_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
-            dDropsTot.textContent = rateText + ' (' + tot + ' cumulative)';
+            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            dDropsTot.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:tot});
             dDropsTot.style.color = dc.rates_available !== false && Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
@@ -2000,27 +2060,27 @@
         const dVtunUp = document.getElementById('vpn-diag-vtun-upstream');
         if (dVtunUp) {
             const vt = (status.virtual_tun && status.virtual_tun.upstream_to_nexus) || {};
-            dVtunUp.textContent = 'Occ: ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | Peak: ' + (vt.peak || 0) + ' | Drops: ' + (vt.drops || 0);
+            dVtunUp.textContent = _('vpn_diag_occupancy') + ': ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | ' + _('vpn_forwarder_route_peak') + ': ' + (vt.peak || 0) + ' | ' + _('vpn_forwarder_route_drops') + ': ' + (vt.drops || 0);
             dVtunUp.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
         }
         const dVtunNex = document.getElementById('vpn-diag-vtun-nexus');
         if (dVtunNex) {
             const vt = (status.virtual_tun && status.virtual_tun.nexus_to_upstream) || {};
-            dVtunNex.textContent = 'Occ: ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | Peak: ' + (vt.peak || 0) + ' | Drops: ' + (vt.drops || 0);
+            dVtunNex.textContent = _('vpn_diag_occupancy') + ': ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | ' + _('vpn_forwarder_route_peak') + ': ' + (vt.peak || 0) + ' | ' + _('vpn_forwarder_route_drops') + ': ' + (vt.drops || 0);
             dVtunNex.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
         }
 
         // Panel 6: Upstream AWG & Peer Sync
         const dEngine = document.getElementById('vpn-diag-engine-status');
         if (dEngine) {
-            dEngine.textContent = 'Upstream AWG (' + (status.listener_running ? 'Running' : 'Stopped') + ')';
+            dEngine.textContent = vpnDiagText('vpn_diag_awg_state', {state:status.listener_running ? _('vpn_running') : _('vpn_stopped')});
             dEngine.style.color = status.listener_running ? 'var(--success)' : 'var(--danger)';
         }
         // Peer Sync panel reads the real status.peer_sync payload (issue #424
         // round 2, finding 4). The key is omitempty, so an absent payload
         // renders an explicit unavailable state rather than a row of zeros
         // that reads like a healthy reconcile.
-        const peerSyncUnavailable = _('vpn_diag_peer_sync_unavailable') || 'Unavailable';
+        const peerSyncUnavailable = _('vpn_diag_peer_sync_unavailable');
         const ps = status.peer_sync;
         const psAvailable = !!ps && typeof ps === 'object';
         const dPeers = document.getElementById('vpn-diag-peers-status');
@@ -2044,7 +2104,7 @@
                 // (issue #424 round 3, finding 3).
                 const psSyncTotal = ps.sync_failures || 0;
                 const psRecent = (ps.sync_failures_recent || 0) + (ps.enqueue_failures_recent || 0);
-                dSyncFail.textContent = psSyncTotal + ' (' + psRecent + ' recent)';
+                dSyncFail.textContent = psSyncTotal + ' (' + vpnDiagText('vpn_diag_recent_count', {count:psRecent}) + ')';
                 dSyncFail.style.color = psRecent > 0 ? 'var(--danger)' : (psSyncTotal > 0 ? 'var(--warning)' : '');
             } else {
                 dSyncFail.textContent = peerSyncUnavailable;
@@ -2101,7 +2161,7 @@
         const dPsError = document.getElementById('vpn-diag-peer-sync-error');
         if (dPsError) {
             if (psAvailable) {
-                dPsError.textContent = ps.last_error || (_('vpn_diag_peer_sync_none') || 'None');
+                dPsError.textContent = ps.last_error || (_('vpn_diag_peer_sync_none'));
                 dPsError.style.color = ps.last_error ? 'var(--warning)' : '';
             } else {
                 dPsError.textContent = peerSyncUnavailable;
@@ -2124,7 +2184,7 @@
         const dHsFresh = document.getElementById('vpn-diag-hs-freshness');
         if (dHsFresh) {
             const hsf = status.handshake_freshness || {};
-            dHsFresh.textContent = '<2m: ' + (hsf.under_2m_count || 0) + ' | 2-5m: ' + (hsf.between_2m_5m_count || 0) + ' | >5m: ' + (hsf.over_5m_count || 0) + ' | never: ' + (hsf.never_count || 0);
+            dHsFresh.textContent = '<2m: ' + (hsf.under_2m_count || 0) + ' | 2-5m: ' + (hsf.between_2m_5m_count || 0) + ' | >5m: ' + (hsf.over_5m_count || 0) + ' | ' + _('vpn_diag_peer_sync_never') + ': ' + (hsf.never_count || 0);
         }
 
         // Panel 7: Routing Consistency Invariants
@@ -2136,10 +2196,10 @@
             const isConsistent = rc.is_consistent !== undefined ? rc.is_consistent : true;
             if (dRoutBadge) {
                 dRoutBadge.className = 'badge ' + (isConsistent ? 'badge-success' : 'badge-danger');
-                dRoutBadge.textContent = isConsistent ? 'Consistent' : 'Inconsistent';
+                dRoutBadge.textContent = isConsistent ? _('vpn_fwd_consistent') : _('vpn_fwd_inconsistent');
             }
             if (dRoutCounts) {
-                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' / ' + (rc.active_routes_count || 0) + ' / ' + (rc.return_owners_count || 0) + ' (' + (rc.ownership_mismatch_drops || 0) + ' mismatch drops)';
+                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' / ' + (rc.active_routes_count || 0) + ' / ' + (rc.return_owners_count || 0) + ' (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
             }
             if (dRoutAlerts) {
                 if (Array.isArray(rc.inconsistency_details) && rc.inconsistency_details.length > 0) {
@@ -2158,12 +2218,12 @@
         if (dBeCounts) {
             const be = status.backends || {};
             const enabled = be.eligibility_known ? Number(be.enabled_count || 0) : Number(be.total_count || status.active_tunnels || 0);
-            dBeCounts.textContent = (be.healthy_count || 0) + ' / ' + enabled + ' healthy (' + Number(be.total_count || 0) + ' inventory, ' + Number(be.disabled_count || 0) + ' disabled)';
+            dBeCounts.textContent = vpnDiagText('vpn_diag_backend_counts', {healthy:be.healthy_count || 0, enabled:enabled, total:Number(be.total_count || 0), disabled:Number(be.disabled_count || 0)});
         }
         const dBeLat = document.getElementById('vpn-diag-be-latency');
         if (dBeLat) {
             const be = status.backends || {};
-            dBeLat.textContent = be.latency_samples === 0 ? 'Unavailable' : Number(be.latency_p95_ms || 0).toFixed(1) + 'ms';
+            dBeLat.textContent = be.latency_samples === 0 ? _('vpn_diag_peer_sync_unavailable') : Number(be.latency_p95_ms || 0).toFixed(1) + 'ms';
         }
         const dBeSkew = document.getElementById('vpn-diag-be-skew');
         if (dBeSkew) {
@@ -2173,7 +2233,7 @@
         const dBeDrops = document.getElementById('vpn-diag-be-drops');
         if (dBeDrops) {
             const be = status.backends || {};
-            dBeDrops.textContent = (be.total_drops || 0) + ' device drops';
+            dBeDrops.textContent = vpnDiagText('vpn_diag_device_drop_count', {count:be.total_drops || 0});
             // Colour on ANY live backend-device drop reason, not just
             // queue-full. The breakdown is now per direction and per reason
             // (issue #424 round 3, finding 1), so keying the alarm on the
@@ -2197,8 +2257,8 @@
                 const row = document.createElement('div');
                 const traffic = backend.traffic_available ?
                     'RX ' + fmtBps(Number(backend.rx_bytes_per_sec || 0) * 8) + ' / TX ' + fmtBps(Number(backend.tx_bytes_per_sec || 0) * 8) +
-                    ' | RX ' + fmtPps(Number(backend.rx_pps || 0)) + ' / TX ' + fmtPps(Number(backend.tx_pps || 0)) : 'Traffic unavailable';
-                row.textContent = backend.server_name + ': ' + (backend.enabled === false ? 'Disabled' : backend.health_state) + ' | ' + traffic;
+                    ' | RX ' + fmtPps(Number(backend.rx_pps || 0)) + ' / TX ' + fmtPps(Number(backend.tx_pps || 0)) : _('vpn_diag_traffic_unavailable');
+                row.textContent = backend.server_name + ': ' + (backend.enabled === false ? _('disabled') : vpnStatusLabel(backend.health_state)) + ' | ' + traffic;
                 backendTraffic.appendChild(row);
             }
         }

@@ -1,14 +1,18 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"html/template"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -2880,15 +2884,6 @@ class MockDocument {
 }
 
 const mockDoc = new MockDocument();
-const translations = {
-    'vpn_forwarder_unavailable': 'Not reported',
-    'vpn_forwarder_healthy': 'Healthy',
-    'vpn_forwarder_pressure': 'Pressure Detected',
-    'vpn_forwarder_warning': 'Warning',
-    'vpn_forwarder_no_route_pressure': 'All route queues clear',
-    'vpn_diag_peer_sync_unavailable': 'Unavailable'
-};
-const _ = (key) => translations[key] || key;
 const document = mockDoc;
 
 ` + f1 + `
@@ -2926,7 +2921,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-queue-full').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_no_route_pressure'));
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, '');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'none');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-tbody').children.length, 1);
@@ -2957,7 +2952,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-badge').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_no_route_pressure'));
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'block');
     } else if (key === 'surviving_peak_after_routes_disconnect') {
@@ -2987,7 +2982,7 @@ function runScenario(key) {
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-drops-packet-too-large').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-write-errors').textContent, '0');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
-        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+        assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_no_route_pressure'));
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-table').style.display, 'none');
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-empty').style.display, 'block');
     } else if (key === 'failures') {
@@ -3172,7 +3167,7 @@ func runDOMScenario(t *testing.T, nodePath, vpnStr, scenarioKey string) {
 		t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
 	}
 
-	script := buildJSTestRunner(f1, f2)
+	script := vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + buildJSTestRunner(f1, f2)
 	cmd := exec.Command(nodePath, "-e", script, scenarioKey)
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
@@ -3397,15 +3392,6 @@ class MockDocument {
 }
 
 const mockDoc = new MockDocument();
-const translations = {
-    'vpn_forwarder_unavailable': 'Not reported',
-    'vpn_forwarder_healthy': 'Healthy',
-    'vpn_forwarder_pressure': 'Pressure Detected',
-    'vpn_forwarder_warning': 'Warning',
-    'vpn_forwarder_no_route_pressure': 'All route queues clear',
-    'vpn_diag_peer_sync_unavailable': 'Unavailable'
-};
-const _ = (key) => translations[key] || key;
 const document = mockDoc;
 
 %s
@@ -3441,7 +3427,7 @@ vpnRenderForwarderHealth({
     }
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-warn');
-assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Warning');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Degraded');
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-problem-list').style.display, 'flex');
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-problem-list').children.length, 1);
 
@@ -3457,7 +3443,7 @@ vpnRenderForwarderHealth({
     }
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-danger');
-assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Pressure Detected');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Critical');
 
 // Test 4: UNAVAILABLE state
 mockDoc.reset();
@@ -3474,7 +3460,7 @@ vpnRenderForwarderHealth({
     problem_routes:[],
     all_routes:[{peer_key:'peer',capacity:100,occupancy:0,drops:5,has_pressure:false}]
 });
-assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_no_route_pressure'));
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-text').textContent, 'Healthy');
 
@@ -3494,7 +3480,7 @@ vpnRenderForwarderHealth({
     forwarder_available:true,forwarder_queue_capacity:100,
     forwarder_route_queues:{peer:{capacity:100,occupancy:0,queue_full_drops:5}}
 });
-assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_no_route_pressure'));
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, false);
 mockDoc.reset();
 vpnRenderForwarderHealth({
@@ -3505,7 +3491,7 @@ const recoveredLegacyRow = mockDoc.getElementById('vpn-fwd-routes-tbody').childr
 assert.notStrictEqual(recoveredLegacyRow.children[3].style.color,'var(--danger)');
 assert.notStrictEqual(recoveredLegacyRow.children[4].style.color,'var(--warning)');
 assert(recoveredLegacyRow.children[4].textContent.includes('cumulative errors'));
-assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent,'All route queues clear');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent,_('vpn_forwarder_no_route_pressure'));
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open,false);
 mockDoc.reset();
 vpnRenderForwarderHealth({
@@ -3567,6 +3553,7 @@ assert(!mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('unav
 console.log('ISSUE_424_PASS');
 `, f1, f2)
 
+		runnerScript = vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + runnerScript
 		cmd := exec.Command(nodePath, "-e", runnerScript)
 		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
@@ -3600,7 +3587,7 @@ func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := `const assert = require('assert');
+	script := vpnDiagnosticsTranslationsJS(t, string(templateData), "en") + `const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
 ` + sparkline + "\n" + render + `
@@ -3666,33 +3653,60 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "const route = " + string(encoded) + ";\n" + expandedDOMMock + "\n" + peer + "\n" + render + `
+	script := "const route = " + string(encoded) + ";\n" + expandedDOMMock + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
 const title = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
 const labels = {
- peer_key:'Peer',assigned_ip:'Assigned address',backend_id:'Backend',
- occupancy:'Queue occupancy',capacity:'Queue capacity',high_water:'Queue high water',
- utilization_pct:'Queue utilization (%)',high_water_pct:'High water (%)',
- drops:'Queue drops (cumulative)',p95_write_ms:'Write p95 (historical ms)',
- has_pressure:'Current pressure',pressure_note:'Pressure reason',
- write_count:'Writes admitted',write_errors:'Write errors (cumulative)',write_stalls:'Write stalls (cumulative)',
- writes_in_flight:'Writes in flight',oldest_write_ms:'Oldest write (ms)',max_write_ms:'Max write (historical ms)',
- p95_write_samples:'Write percentile samples',queue_full_drops_recent:'Recent queue drops',
- write_errors_recent:'Recent write errors',write_stalls_recent:'Recent write stalls',
- session_age_sec:'Session age (s)',last_traffic_age_sec:'Last traffic age (s)',traffic:'Directional traffic'
+ peer_key:_('vpn_forwarder_route_peer'),
+ assigned_ip:_('vpn_diag_assigned_address'),
+ backend_id:_('vpn_diag_backend'),
+ occupancy:_('vpn_forwarder_queue'),
+ capacity:_('vpn_diag_queue_capacity'),
+ high_water:_('vpn_diag_queue_high_water'),
+ utilization_pct:_('vpn_diag_queue_utilization'),
+ high_water_pct:_('vpn_diag_high_water_pct'),
+ drops:_('vpn_diag_queue_drops_cumulative'),
+ p95_write_ms:_('vpn_diag_write_p95_historical'),
+ has_pressure:_('vpn_diag_current_pressure'),
+ pressure_note:_('vpn_diag_pressure_reason'),
+ write_count:_('vpn_diag_writes_admitted'),
+ write_errors:_('vpn_diag_write_errors_cumulative'),
+ write_stalls:_('vpn_diag_write_stalls_cumulative'),
+ writes_in_flight:_('vpn_diag_writes_in_flight'),
+ oldest_write_ms:_('vpn_diag_oldest_write'),
+ max_write_ms:_('vpn_diag_max_write_historical'),
+ p95_write_samples:_('vpn_diag_write_samples'),
+ queue_full_drops_recent:_('vpn_diag_recent_queue_drops'),
+ write_errors_recent:_('vpn_diag_recent_write_errors'),
+ write_stalls_recent:_('vpn_diag_recent_write_stalls'),
+ session_age_sec:_('vpn_diag_session_age'),
+ last_traffic_age_sec:_('vpn_diag_last_traffic_age'),
+ traffic:_('vpn_diag_directional_traffic')
+};
+const trafficLabels = {
+ rx_bytes:_('vpn_diag_rx_bytes'),
+ tx_bytes:_('vpn_diag_tx_bytes'),
+ rx_packets:_('vpn_diag_rx_packets'),
+ tx_packets:_('vpn_diag_tx_packets'),
+ rx_bytes_per_sec:_('vpn_diag_rx_bytes_rate'),
+ tx_bytes_per_sec:_('vpn_diag_tx_bytes_rate'),
+ rx_pps:_('vpn_diag_rx_packets_rate'),
+ tx_pps:_('vpn_diag_tx_packets_rate'),
+ available:_('vpn_diag_available'),
+ window_sec:_('vpn_diag_window')
 };
 assert.deepStrictEqual(Object.keys(route).sort(),Object.keys(labels).sort(),'payload/tooltip field contract drifted');
 for (const key of Object.keys(route)) {
  if (key === 'traffic') {
   for (const name of Object.keys(route.traffic)) {
-   assert(title.includes('Directional traffic '+name.replace(/_/g,' ')+': '+route.traffic[name]), name);
+   assert(title.includes(_('vpn_diag_directional_traffic')+' '+trafficLabels[name]+': '+route.traffic[name]), name);
   }
  } else assert(title.includes(labels[key]+': '+route[key]),key);
 }
 route.traffic.available=false; route.last_traffic_age_sec=-1;route.p95_write_samples=0;
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
 const unknown = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
-assert(unknown.includes('Directional traffic rx bytes per sec: Unavailable'));
+assert(unknown.includes('Directional traffic RX bytes/s: Unavailable'));
 assert(unknown.includes('Write p95 (historical ms): Unavailable'));
 assert(unknown.includes('Last traffic age (s): Unavailable'));
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,backends:{backends:[
@@ -3725,7 +3739,6 @@ const document = {
  getElementById(id) { if (!elements.has(id)) elements.set(id,new Element());return elements.get(id); },
  createElement() { return new Element(); }
 };
-const _ = key => key;
 `
 
 func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
@@ -3754,7 +3767,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := expandedDOMMock + "\n" + sparkline + "\n" + render + `
+	script := expandedDOMMock + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + sparkline + "\n" + render + `
 let vpnHistoryWindow='15m';
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
@@ -3886,7 +3899,7 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := expandedDOMMock + "\n" + formatPeerKey + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
+	script := expandedDOMMock + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + formatPeerKey + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
 let vpnHistoryWindow='15m';
 let vpnLastStatus=null;
 let vpnShowAllRoutes=false;
@@ -3930,7 +3943,7 @@ vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
 // The available poll must cache a real series, otherwise the toggles below
 // have nothing to resurrect and the cache-clearing guard would go untested.
 assert(vpnLastStatus&&vpnLastStatus.historical_series,'available poll must cache its series');
-assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent,'vpn_forwarder_healthy','available poll must render Healthy');
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent,_('vpn_forwarder_healthy'),'available poll must render Healthy');
 assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent,'1.00 Mbps / 50.0 pps','available poll must render throughput');
 for (const id of SVG_CHARTS) {
  assert(document.getElementById(id).innerHTML.includes('<svg'),'seed must render SVG in '+id);
@@ -3991,8 +4004,8 @@ const DETAIL_PANEL_IDS = [
 
 function assertAllSurfacesCleared(context) {
  assert.strictEqual(document.getElementById('vpn-fwd-status-badge').className, 'badge', context + ': status badge className');
- assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_unavailable', context + ': status text');
- assert.strictEqual(document.getElementById('vpn-fwd-headline-summary').textContent, 'vpn_forwarder_unavailable', context + ': headline');
+ assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_unavailable'), context + ': status text');
+ assert.strictEqual(document.getElementById('vpn-fwd-headline-summary').textContent, _('vpn_forwarder_unavailable'), context + ': headline');
  const problemList = document.getElementById('vpn-fwd-problem-list');
  assert.strictEqual(problemList.textContent, '', context + ': problem list text');
  assert.strictEqual(problemList.style.display, 'none', context + ': problem list display');
@@ -4012,7 +4025,7 @@ function assertAllSurfacesCleared(context) {
  assert.strictEqual(routAlerts.style.display, 'none', context + ': routing alerts display');
 
  assert.strictEqual(document.getElementById('vpn-fwd-routes-badge').textContent, '0', context + ': routes badge');
- assert.strictEqual(document.getElementById('vpn-fwd-routes-summary-status').textContent, 'vpn_forwarder_unavailable', context + ': routes summary');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-summary-status').textContent, _('vpn_forwarder_unavailable'), context + ': routes summary');
  assert.strictEqual(document.getElementById('vpn-fwd-routes-tbody').children.length, 0, context + ': route rows');
  assert.strictEqual(document.getElementById('vpn-fwd-routes-table').style.display, 'none', context + ': routes table');
  assert.strictEqual(document.getElementById('vpn-fwd-routes-empty').style.display, 'block', context + ': routes empty div');
@@ -4075,7 +4088,7 @@ const freshAvailableStatus = {
 };
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert(vpnLastStatus && vpnLastStatus.historical_series, 'fresh poll must cache status');
-assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_healthy', 'fresh poll restores Healthy');
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'fresh poll restores Healthy');
 assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'fresh poll restores throughput');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'fresh poll restores backend rows');
 for (const id of SVG_CHARTS) assert(document.getElementById(id).innerHTML.includes('<svg'), 'fresh poll restores SVG in ' + id);
@@ -4097,7 +4110,7 @@ assertAllSurfacesCleared('after null window 15m');
 
 // Recovery from null status when live poll succeeds
 vpnRenderForwarderHealth(freshAvailableStatus);
-assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_healthy', 'recovery after null poll');
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'recovery after null poll');
 assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'recovery throughput after null poll');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
 
@@ -4125,7 +4138,7 @@ func TestVPNPanelRateAvailability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := expandedDOMMock + "\n" + health + `
+	script := expandedDOMMock + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + health + `
 let vpnLastStatus = null;
 let vpnShowAllRoutes = false;
 
@@ -4228,5 +4241,403 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 
 	cmd := exec.Command(nodePath, "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("panel rate availability: %v\n%s", err, out)
+	}
+}
+
+func vpnDiagnosticsLocale(t *testing.T, lang string) map[string]string {
+	t.Helper()
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(transFS, lang+".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		t.Fatalf("invalid locale object: %s", lang)
+	}
+	dict := make(map[string]string)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			t.Fatalf("invalid locale key in %s", lang)
+		}
+		if _, exists := dict[key]; exists {
+			t.Fatalf("duplicate locale key %s/%s", lang, key)
+		}
+		var value string
+		if err := decoder.Decode(&value); err != nil {
+			t.Fatal(err)
+		}
+		dict[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		t.Fatal(err)
+	}
+	return dict
+}
+
+func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
+	t.Helper()
+	encoded, err := json.Marshal(vpnDiagnosticsLocale(t, lang))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui, err := fs.ReadFile(staticFS, "js/ui.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	escape, err := extractJSFunction(string(ui), "function escapeHtml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
+	for _, name := range []string{"vpnDiagText", "vpnStatusLabel"} {
+		// The original template has no interpolation helper; baseline repro still
+		// executes its real renderer instead of failing only on missing source.
+		if !strings.Contains(source, "function "+name+"(") {
+			continue
+		}
+		function, err := extractJSFunction(source, "function "+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result += function + "\n"
+	}
+	return result
+}
+
+func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]string) string {
+	t.Helper()
+	parsed, err := template.New("vpn.html").Funcs(template.FuncMap{
+		"_": func(key string) string {
+			if value, ok := dict[key]; ok {
+				return value
+			}
+			return key
+		},
+	}).Parse(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered bytes.Buffer
+	if err := parsed.ExecuteTemplate(&rendered, "content", nil); err != nil {
+		t.Fatal(err)
+	}
+	return rendered.String()
+}
+
+func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
+	fields := map[string]string{
+		"vpn-diag-throughput": "vpn_fwd_kpi_throughput", "vpn-diag-packets": "vpn_diag_packet_rate",
+		"vpn-diag-ewma5m": "vpn_diag_avg_5m", "vpn-diag-ewma1h": "vpn_diag_avg_1h",
+		"vpn-diag-queue-occ": "vpn_diag_occupancy", "vpn-diag-queue-peak": "vpn_forwarder_peak",
+		"vpn-diag-queue-drops": "vpn_diag_queue_drops", "vpn-diag-lat-max": "vpn_diag_max_duration",
+		"vpn-diag-lat-inflight": "vpn_diag_in_flight_oldest", "vpn-diag-lat-errors": "vpn_diag_write_errors",
+		"vpn-diag-drops-client": "vpn_diag_client_backend", "vpn-diag-drops-return": "vpn_diag_backend_client",
+		"vpn-diag-drops-total": "vpn_diag_total_drop_rate", "vpn-diag-engine-status": "vpn_diag_engine",
+		"vpn-diag-hs-freshness": "vpn_diag_handshake_freshness", "vpn-diag-routing-counts": "vpn_diag_routing_counts",
+		"vpn-diag-be-counts": "vpn_diag_healthy_total", "vpn-diag-be-latency": "vpn_diag_latency_p95",
+		"vpn-diag-be-skew": "vpn_diag_load_skew", "vpn-diag-be-drops": "vpn_diag_device_drops",
+		"vpn-diag-res-cpu": "vpn_diag_cpu_usage", "vpn-diag-res-mem": "vpn_diag_memory",
+		"vpn-diag-res-goroutines": "vpn_diag_goroutines", "vpn-diag-res-gc": "vpn_diag_gc_pause",
+		"vpn-diag-res-fd": "vpn_diag_file_descriptors",
+	}
+	labels := make(map[string]string)
+	fieldPattern := regexp.MustCompile(`<div class="flex justify-between"><span class="text-muted">([^<]+)</span><span class="font-mono" id="([^"]+)"`)
+	for _, match := range fieldPattern.FindAllStringSubmatch(rendered, -1) {
+		labels[match[2]] = html.UnescapeString(match[1])
+	}
+	for id, key := range fields {
+		if labels[id] != dict[key]+":" {
+			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key]+":")
+		}
+	}
+	for _, threshold := range []string{"50", "80"} {
+		if labels["vpn-diag-queue-dur"+threshold] != dict["vpn_diag_duration"]+" > "+threshold+"%:" {
+			return fmt.Errorf("duration label %s is not localized", threshold)
+		}
+	}
+	if labels["vpn-diag-lat-stalls"] != dict["vpn_diag_stalls"]+" (≥ 100ms):" {
+		return errors.New("stall label is not localized")
+	}
+	for id, key := range map[string]string{
+		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
+		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_forward_p95",
+	} {
+		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `"`)
+		match := pattern.FindStringSubmatch(rendered)
+		expected := dict[key]
+		if id == "throughput" {
+			expected += " (bps)"
+		}
+		if len(match) != 2 || html.UnescapeString(match[1]) != expected {
+			return fmt.Errorf("static chart %s is not localized", id)
+		}
+	}
+	if !strings.Contains(rendered, "<details><summary>"+html.EscapeString(dict["vpn_diag_loss_backend_history"])+"</summary>") {
+		return errors.New("history details heading is not localized")
+	}
+	return nil
+}
+
+func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string {
+	t.Helper()
+	script := strings.Replace(expandedDOMMock, "const _ = key => key;\n", "", 1) + "\n" + vpnDiagnosticsTranslationsJS(t, source, lang)
+	for _, name := range []string{"vpnFormatPeerKey", "vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnRenderForwarderHealth", "vpnSetHistoryWindow", "vpnToggleShowAllRoutes"} {
+		function, err := extractJSFunction(source, "function "+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		script += "\n" + function
+	}
+	return script + `
+let vpnHistoryWindow='15m', vpnLastStatus=null, vpnShowAllRoutes=false;
+document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
+const text=id=>document.getElementById(id).textContent;
+const E=(key,values={})=>{assert(Object.prototype.hasOwnProperty.call(translations,key),'missing oracle key '+key);return Object.entries(values).reduce((result,[name,value])=>result.split('{'+name+'}').join(String(value)),translations[key]);};
+const route={peer_key:'abcd…',assigned_ip:'<client-address>',backend_id:3,occupancy:0,capacity:100,
+ high_water:0,drops:0,p95_write_ms:0,p95_write_samples:0,last_traffic_age_sec:-1,pressure_note:'',
+ write_count:7,write_errors:2,traffic:{available:false,rx_bytes_per_sec:999,rx_pps:999},future_field:17};
+const point={traffic_available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,sessions:0,routes:0,
+ drop_rates_available:true,drop_reason_rates:{return_queue_full:0,future_reason:0},fwd_p95_ms:0,fwd_p95_samples:1,
+ be_p95_ms:0,be_latency_samples:1,backends:[{id:3,rx_bps:0,traffic_available:true,probe_latency_ms:0,probe_available:true}],backends_omitted:5};
+const fixture={forwarder_available:true,forwarder_queue_capacity:100,listener_running:true,
+ health_assessment:{status:'HEALTHY',conditions:[]},rates:{available:false,rx_bps:999,tx_bps:999},
+ drop_categories:{rates_available:false,total_drops:12},routing_consistency:{is_consistent:false,ownership_mismatch_drops:4,inconsistency_details:['Server detail']},
+ problem_routes:[route],all_routes:[route],
+ queue_pressure:{total_seconds_above_50:65,consecutive_above_50_sec:2,total_seconds_above_80:3600,consecutive_above_80_sec:0},
+ forward_latency:{p95_health_samples:0,stalls_recent:2,stalls:8,p50_ms:1.5,p95_ms:2.5,p99_ms:3.5,max_ms:7,in_flight:2,oldest_in_flight_ms:9,write_total:10,write_errors:3,write_error_rate_pps:1.25},
+ backends:{eligibility_known:true,healthy_count:1,enabled_count:2,total_count:3,disabled_count:1,latency_samples:0,backends:[
+ {server_name:'Server < & "quote">',enabled:false,traffic_available:false},
+ {server_name:'Server 2',enabled:true,health_state:'active',traffic_available:true},
+ {server_name:'Server 3',enabled:true,health_state:'future_state',traffic_available:true}]},
+ historical_series:{window_15m:[point]},peer_sync:{desired_peers:1,actual_peers:1,sync_failures:3,sync_failures_recent:2}};
+const original=JSON.stringify(fixture);
+vpnRenderForwarderHealth(fixture);
+assert.strictEqual(text('vpn-kpi-throughput'),E('vpn_diag_traffic_unavailable'),'traffic state');
+assert.strictEqual(text('vpn-diag-throughput'),E('vpn_diag_traffic_unavailable'));
+assert.strictEqual(text('vpn-kpi-packet-loss'),E('vpn_diag_with_cumulative',{value:E('vpn_diag_loss_unavailable'),count:12}),'unknown loss');
+assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_running')}),'engine running');
+assert.strictEqual(text('vpn-diag-engine-status'),E('vpn_diag_awg_state',{state:E('vpn_running')}));
+assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_inconsistent'),'routing state');
+assert.strictEqual(text('vpn-diag-routing-alerts'),'Server detail','server detail unchanged');
+assert(text('vpn-diag-routing-counts').includes(E('vpn_diag_mismatch_drops',{count:4})));
+assert.strictEqual(text('vpn-diag-be-latency'),E('vpn_diag_peer_sync_unavailable'));
+assert.strictEqual(text('vpn-kpi-backends'),E('vpn_diag_healthy_count',{healthy:1,enabled:2})+E('vpn_diag_disabled_count',{count:1}));
+assert.strictEqual(text('vpn-diag-be-counts'),E('vpn_diag_backend_counts',{healthy:1,enabled:2,total:3,disabled:1}));
+const backendRows=document.getElementById('vpn-diag-be-traffic').children;
+assert(backendRows[0].textContent.includes(E('disabled')) && backendRows[0].textContent.includes(E('vpn_diag_traffic_unavailable')));
+assert(backendRows[0].textContent.includes('Server < & "quote">') && backendRows[0].innerHTML==='','backend name uses text');
+assert(backendRows[1].textContent.includes(E('active')));
+assert(backendRows[2].textContent.includes('future_state'),'unknown health state unchanged');
+assert.strictEqual(text('vpn-kpi-slow-writes'),E('vpn_diag_slow_writes',{count:2,latency:E('vpn_diag_latency_unavailable')}));
+assert.strictEqual(document.getElementById('vpn-kpi-slow-writes').title,E('vpn_diag_slow_writes_title',{count:8,latency:'2.5'}));
+assert.strictEqual(text('vpn-diag-lat-percentiles'),E('vpn_diag_historical_percentiles',{p50:'1.5',p95:'2.5',p99:'3.5'}),'percentile interpolation');
+assert.strictEqual(text('vpn-diag-lat-max'),E('vpn_diag_historical_ms',{value:7}));
+assert.strictEqual(text('vpn-diag-lat-inflight'),E('vpn_diag_in_flight',{count:2,oldest:9}));
+assert.strictEqual(text('vpn-diag-lat-stalls'),E('vpn_diag_recent_cumulative',{recent:2,count:8}));
+assert.strictEqual(text('vpn-diag-lat-errors'),E('vpn_diag_write_error_counts',{rate:'1.25',errors:3,writes:10}));
+assert.strictEqual(text('vpn-diag-queue-dur50'),E('vpn_diag_duration_streak',{total:'1m 5s',streak:'2s'}));
+assert.strictEqual(text('vpn-diag-queue-dur80'),E('vpn_diag_duration_streak',{total:'1h 0m',streak:'0s'}));
+assert.strictEqual(text('vpn-diag-sync-failures'),'3 ('+E('vpn_diag_recent_count',{count:2})+')');
+let title=document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+assert(title.includes(E('vpn_diag_assigned_address')+': <client-address>'),'route label');
+assert(title.includes(E('vpn_diag_write_p95_historical')+': '+E('vpn_diag_peer_sync_unavailable')));
+assert(title.includes(E('vpn_diag_directional_traffic')+' '+E('vpn_diag_rx_bytes_rate')+': '+E('vpn_diag_peer_sync_unavailable')));
+assert(title.includes('future field: 17'),'unknown route field unchanged');
+assert(title.includes(E('vpn_diag_pressure_reason')+': '+E('vpn_diag_peer_sync_none')));
+assert.strictEqual(document.getElementById('vpn-fwd-routes-tbody').children[0].children[4].textContent,E('vpn_diag_route_errors',{writes:7,errors:2}));
+function seriesLabel(id,label) {
+ return document.getElementById(id).children.some(child=>child.textContent===label+' ('+vpnHistoryWindow+')');
+}
+assert(seriesLabel('vpn-chart-directions',E('vpn_diag_rx_direction')),'history direction label');
+assert(seriesLabel('vpn-chart-reasons',E('vpn_diag_loss_return_queue_full')+' (drops/s)'),'known loss label');
+assert(seriesLabel('vpn-chart-reasons','future reason (drops/s)'),'unknown reason unchanged');
+assert(seriesLabel('vpn-chart-backends',E('vpn_diag_backend_series',{id:3,label:'RX (bps)'})),'backend history label');
+assert.strictEqual(text('vpn-history-fleet-note'),E('vpn_diag_fleet_limit',{count:5}));
+assert.strictEqual(JSON.stringify(fixture),original,'renderer must not alter API values');
+
+for (const [status,key,css] of [['HEALTHY','vpn_forwarder_healthy','badge-success'],['DEGRADED','vpn_forwarder_degraded','badge-warn'],['CRITICAL','vpn_forwarder_critical','badge-danger']]) {
+ fixture.health_assessment={status,conditions:[{severity:status,message:'Server condition < & >'}]};
+ vpnRenderForwarderHealth(fixture);
+ assert.strictEqual(text('vpn-fwd-status-text'),E(key),'authoritative severity '+status);
+ assert(document.getElementById('vpn-fwd-status-badge').className.includes(css));
+ const condition=document.getElementById('vpn-fwd-problem-list').children[0];
+ assert.strictEqual(condition.children[0].textContent,E(key),'condition severity '+status);
+ assert.strictEqual(condition.children[1].textContent,'Server condition < & >','server condition unchanged');
+ assert.strictEqual(fixture.health_assessment.status,status,'wire severity unchanged');
+}
+fixture.listener_running=false;fixture.routing_consistency.is_consistent=true;
+fixture.health_assessment={status:'HEALTHY',conditions:[]};
+vpnRenderForwarderHealth(fixture);
+assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_stopped')}));
+assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_consistent'));
+assert.strictEqual(text('vpn-fwd-headline-summary'),E('vpn_diag_summary_healthy'),'fallback summary');
+fixture.health_assessment.summary='Server summary';vpnRenderForwarderHealth(fixture);
+assert.strictEqual(text('vpn-fwd-headline-summary'),'Server summary');
+
+vpnRenderHistoryCharts({window_15m:[]});
+assert(document.getElementById('vpn-chart-throughput').innerHTML.includes(escapeHtml(E('no_data'))),'empty sparkline');
+assert.strictEqual(text('vpn-chart-reasons'),E('no_data')+' (15m)','empty reason history');
+assert.strictEqual(text('vpn-chart-backends'),E('no_data')+' (15m)','empty backend history');
+vpnRenderHistoryCharts({window_15m:[{traffic_available:false,drop_rates_available:false,fwd_p95_samples:0}]});
+assert(document.getElementById('vpn-chart-throughput').innerHTML.includes(escapeHtml(E('no_data'))));
+vpnRenderHistoryCharts(fixture.historical_series);
+assert(document.getElementById('vpn-chart-throughput').innerHTML.includes('<path'),'measured zero remains available');
+
+vpnRenderForwarderHealth({forwarder_available:false});
+assert.strictEqual(vpnLastStatus,null);
+vpnToggleShowAllRoutes();vpnSetHistoryWindow('1h');
+assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_unavailable'),'unavailable remains localized');
+assert.strictEqual(text('vpn-kpi-throughput'),'-','no stale throughput');
+assert.strictEqual(document.getElementById('vpn-chart-directions').children.length,0);
+fixture.rates={available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0};
+fixture.drop_categories={rates_available:true,total_drops:12,total_drop_rate_pps:0};
+fixture.problem_routes[0].traffic={available:true,rx_bytes_per_sec:0,rx_pps:0};
+fixture.problem_routes[0].p95_write_samples=1;fixture.problem_routes[0].last_traffic_age_sec=0;
+fixture.health_assessment={status:'HEALTHY',conditions:[]};
+vpnRenderForwarderHealth(fixture);
+assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_healthy'),'recovered localized healthy');
+assert.strictEqual(text('vpn-kpi-throughput'),'0 bps / 0.0 pps','measured zero differs from unknown');
+assert.strictEqual(text('vpn-kpi-packet-loss'),E('vpn_diag_with_cumulative',{value:'0.00 pps',count:12}));
+title=document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+assert(title.includes(E('vpn_diag_directional_traffic')+' '+E('vpn_diag_rx_bytes_rate')+': 0'));
+assert(title.includes(E('vpn_diag_write_p95_historical')+': 0'));
+
+translations.no_data='<img src=x onerror=alert(1)> & "translated"';
+const emptySVG=vpnGenerateSparklineSVG([]);
+assert(emptySVG.includes('&lt;img') && emptySVG.includes('&amp;') && !emptySVG.includes('<img'),'SVG translation must be escaped');
+console.log('LOCALIZATION_PASS');
+`
+}
+
+func TestVPNDiagnosticsLocalizationDictionaries(t *testing.T) {
+	base := vpnDiagnosticsLocale(t, "en")
+	placeholders := regexp.MustCompile(`\{[a-z0-9_]+\}`)
+	for _, lang := range []string{"en", "fa", "fr", "ru", "zh"} {
+		t.Run(lang, func(t *testing.T) {
+			dict := vpnDiagnosticsLocale(t, lang)
+			if len(dict) != len(base) {
+				t.Fatal("locale key count differs")
+			}
+			for key, expected := range base {
+				value, ok := dict[key]
+				if !ok || strings.TrimSpace(value) == "" {
+					t.Fatalf("missing/empty key %s", key)
+				}
+				a, b := placeholders.FindAllString(expected, -1), placeholders.FindAllString(value, -1)
+				sort.Strings(a)
+				sort.Strings(b)
+				if strings.Join(a, ",") != strings.Join(b, ",") {
+					t.Fatalf("placeholder mismatch for %s", key)
+				}
+			}
+		})
+	}
+}
+
+func TestVPNDiagnosticsLocalization(t *testing.T) {
+	data, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics localization acceptance")
+	}
+	for _, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
+		t.Run(lang, func(t *testing.T) {
+			dict := vpnDiagnosticsLocale(t, lang)
+			rendered := vpnDiagnosticsRenderedHTML(t, source, dict)
+			if err := vpnDiagnosticsStaticOracle(rendered, dict); err != nil {
+				t.Fatal(err)
+			}
+			script := vpnDiagnosticsLocalizationScript(t, source, lang)
+			if out, err := exec.Command(nodePath, "-e", script).CombinedOutput(); err != nil {
+				t.Fatalf("locale renderer: %v\n%s", err, out)
+			}
+		})
+	}
+	t.Run("StaticEscapingAndRTL", func(t *testing.T) {
+		dict := vpnDiagnosticsLocale(t, "fa")
+		dict["vpn_diag_cpu_usage"] = "<translated & \"quoted\">"
+		rendered := vpnDiagnosticsRenderedHTML(t, source, dict)
+		if !strings.Contains(rendered, html.EscapeString(dict["vpn_diag_cpu_usage"])) || strings.Contains(rendered, "<translated") {
+			t.Fatal("static translation escaped incorrectly")
+		}
+		base, err := fs.ReadFile(TemplatesFS, "templates/base.html")
+		if err != nil {
+			t.Fatal(err)
+		}
+		opening := string(base[:bytes.Index(base, []byte("<head>"))])
+		parsed, err := template.New("opening").Parse(opening)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, lang := range []string{"en", "fa"} {
+			var rendered bytes.Buffer
+			if err := parsed.Execute(&rendered, map[string]string{"lang": lang}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(rendered.String(), `dir="rtl"`) != (lang == "fa") {
+				t.Fatal("RTL locale convention changed")
+			}
+		}
+	})
+}
+
+func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
+	data, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	lang := "ru"
+	dict := vpnDiagnosticsLocale(t, lang)
+	t.Run("HardcodedStaticLabel", func(t *testing.T) {
+		before := `{{ _ "vpn_diag_packet_rate" }}`
+		if !strings.Contains(source, before) {
+			t.Fatal("static mutation target missing")
+		}
+		mutated := strings.Replace(source, before, "Packet Rate", 1)
+		err := vpnDiagnosticsStaticOracle(vpnDiagnosticsRenderedHTML(t, mutated, dict), dict)
+		if err == nil || !strings.Contains(err.Error(), "vpn-diag-packets") {
+			t.Fatalf("hardcoded static label escaped the rendered oracle: %v", err)
+		}
+	})
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics localization acceptance")
+	}
+	for _, mutation := range []struct{ name, before, after, failure string }{
+		{"HardcodedTrafficState", "_('vpn_diag_traffic_unavailable')", "'Traffic unavailable'", "traffic state"},
+		{"WrongAuthoritativeSeverity", "_('vpn_forwarder_degraded')", "_('vpn_forwarder_warning')", "authoritative severity DEGRADED"},
+		{"HardcodedRouteLabel", "_('vpn_diag_assigned_address')", "'Assigned address'", "route label"},
+		{"HardcodedHistoryLabel", "_('vpn_diag_rx_direction')", "'RX client to backend (bps)'", "history direction label"},
+		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			if !strings.Contains(source, mutation.before) {
+				t.Fatal("renderer mutation target missing")
+			}
+			mutated := strings.Replace(source, mutation.before, mutation.after, 1)
+			out, err := exec.Command(nodePath, "-e", vpnDiagnosticsLocalizationScript(t, mutated, lang)).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), mutation.failure) {
+				t.Fatalf("mutation escaped its behavioral oracle: %v\n%s", err, out)
+			}
+		})
 	}
 }
