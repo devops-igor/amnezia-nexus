@@ -282,6 +282,7 @@ type Forwarder struct {
 	writeLatencies          latencyReservoir
 	writesInFlight          map[*sessionRoute]time.Time
 	rateTracker             *RateTracker
+	historyRateTracker      *RateTracker
 	aggregateQueueOccupancy int               // guarded by aggregateQueueMu
 	aggregateQueueCapacity  int               // guarded by aggregateQueueMu
 	queueDwell              queueDwellTracker // guarded by aggregateQueueMu
@@ -405,21 +406,22 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		}
 	}
 	return &Forwarder{
-		accountant:       accountant,
-		portalSubnet:     portalSubnet,
-		routesByPeer:     make(map[string]*sessionRoute),
-		routesByIP:       make(map[string]*sessionRoute),
-		backendQueues:    make(map[int64]chan []byte),
-		backendDevices:   make(map[int64]PacketDevice),
-		writesInFlight:   make(map[*sessionRoute]time.Time),
-		backendPumpStops: make(map[int64]chan struct{}),
-		backendPumpDones: make(map[int64]chan struct{}),
-		peerRegs:         make(map[string]uint64),
-		bufSize:          queueSize,
-		backendBufSize:   DefaultBackendQueueSize,
-		maxActiveRoutes:  maxActiveRoutes,
-		rateTracker:      NewRateTracker(),
-		stopCh:           make(chan struct{}),
+		accountant:         accountant,
+		portalSubnet:       portalSubnet,
+		routesByPeer:       make(map[string]*sessionRoute),
+		routesByIP:         make(map[string]*sessionRoute),
+		backendQueues:      make(map[int64]chan []byte),
+		backendDevices:     make(map[int64]PacketDevice),
+		writesInFlight:     make(map[*sessionRoute]time.Time),
+		backendPumpStops:   make(map[int64]chan struct{}),
+		backendPumpDones:   make(map[int64]chan struct{}),
+		peerRegs:           make(map[string]uint64),
+		bufSize:            queueSize,
+		backendBufSize:     DefaultBackendQueueSize,
+		maxActiveRoutes:    maxActiveRoutes,
+		rateTracker:        NewRateTracker(),
+		historyRateTracker: NewRateTracker(),
+		stopCh:             make(chan struct{}),
 	}, nil
 }
 
@@ -1386,6 +1388,47 @@ func (f *Forwarder) QueuePressure() QueuePressureStats {
 	stats.SecondsAbove50Pct, stats.SecondsAbove80Pct = dwell.total50, dwell.total80
 	stats.ConsecutiveAbove50Sec, stats.ConsecutiveAbove80Sec = dwell.consecutive50, dwell.consecutive80
 	return stats
+}
+
+// HistoryRates updates and returns history throughput and packet rates
+// against an independent history baseline.
+func (f *Forwarder) HistoryRates(now time.Time) TrafficRates {
+	if f == nil {
+		return TrafficRates{}
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, _ := f.AggregateQueueStats()
+	if f.historyRateTracker != nil {
+		f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		return f.historyRateTracker.Snapshot(rxPackets, txPackets)
+	}
+	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
+}
+
+// PrimeHistoryRates primes the independent history rate tracker baseline.
+func (f *Forwarder) PrimeHistoryRates(now time.Time) {
+	if f == nil || f.historyRateTracker == nil {
+		return
+	}
+	rxBytes, txBytes, _ := f.GetStats()
+	rxPackets := f.totalRxPackets.Load()
+	txPackets := f.totalTxPackets.Load()
+	queueDrops, _, totalDrops := f.DropStats()
+	occ, cap, _ := f.AggregateQueueStats()
+	f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+}
+
+// ActiveRoutesCount returns the number of currently registered routes.
+func (f *Forwarder) ActiveRoutesCount() int {
+	if f == nil {
+		return 0
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.routesByPeer)
 }
 
 func (f *Forwarder) stopPumpsSignalOnly() {

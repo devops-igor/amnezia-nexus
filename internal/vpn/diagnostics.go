@@ -1,7 +1,6 @@
 package vpn
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"os"
@@ -889,6 +888,14 @@ func describeOwnershipMismatchHistorical(diag *RoutingConsistencyDiagnostics) st
 // acquires a lock: drop counters and the tunnel list are read exactly as
 // before, and the sampling cadence is unchanged.
 func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
+	var traffic map[int64]forwarder.TrafficSnapshot
+	if s.forwarder != nil {
+		traffic = s.forwarder.BackendTrafficSnapshot()
+	}
+	return collectBackendDiagnosticsWithTraffic(s, traffic)
+}
+
+func collectBackendDiagnosticsWithTraffic(s *Service, traffic map[int64]forwarder.TrafficSnapshot) BackendsDiagnostics {
 	if s.pool == nil {
 		return BackendsDiagnostics{
 			EligibilityKnown: true,
@@ -898,10 +905,6 @@ func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
 	}
 
 	tunnels := s.pool.ListTunnels()
-	var traffic map[int64]forwarder.TrafficSnapshot
-	if s.forwarder != nil {
-		traffic = s.forwarder.BackendTrafficSnapshot()
-	}
 	diag := BackendsDiagnostics{
 		TotalCount:       len(tunnels),
 		EligibilityKnown: true,
@@ -1764,7 +1767,9 @@ func (s *Service) startRollingHistory() {
 	doneCh := make(chan struct{})
 	s.historyStopCh = stopCh
 	s.historyDoneCh = doneCh
+	fwd := s.forwarder
 	s.mu.Unlock()
+	s.primeHistory(time.Now(), fwd)
 
 	go func() {
 		defer close(doneCh)
@@ -1799,39 +1804,114 @@ func (s *Service) stopRollingHistory() {
 	}
 }
 
-func (s *Service) sampleRollingHistory() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	status, err := s.GetStatus(ctx)
-	if err != nil || status == nil {
+func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
+	s.diagRatesMu.Lock()
+	if s.historyPrimed {
+		s.diagRatesMu.Unlock()
 		return
 	}
+	s.historyPrimed = true
+	drops := s.collectDropCategories()
+	s.primeHistoryRatesLocked(now, &drops)
+	s.diagRatesMu.Unlock()
 
-	backends, omitted := backendHistory(status.Backends.Backends)
-	point := HistoryPoint{
-		RxPps: status.Rates.RxPps, TxPps: status.Rates.TxPps, TrafficAvailable: status.Rates.Available,
-		DropRatesAvailable: status.DropCategories.RatesAvailable, DropReasonRates: status.DropCategories.ReasonRates,
-		ActiveRoutes: status.RoutingConsistency.ActiveRoutesCount, BackendLatencySamples: status.Backends.LatencySamples,
-		Backends: backends, BackendsOmitted: omitted,
-		Timestamp:         time.Now().Unix(),
-		RxBps:             status.Rates.RxBps,
-		TxBps:             status.Rates.TxBps,
-		QueueUtilPct:      status.QueuePressure.UtilizationPct,
-		TotalDropRate:     status.Rates.DropRatePps,
-		ForwardP95MS:      status.ForwardLatency.P95HealthMS,
-		ForwardP95Samples: status.ForwardLatency.P95HealthSamples,
-		ActiveSessions:    status.ConnectedSessions,
-		BackendP95MS:      status.Backends.LatencyP95MS,
+	if fwd != nil {
+		fwd.PrimeHistoryRates(now)
+		fwd.PrimeBackendTrafficHistory(now)
 	}
+}
+
+func (s *Service) sampleRollingHistory() {
+	now := time.Now()
 
 	s.mu.RLock()
 	rh := s.rollingHistory
+	fwd := s.forwarder
+	sessMgr := s.sessionMgr
 	s.mu.RUnlock()
 
-	if rh != nil {
-		rh.Add(point)
+	if rh == nil {
+		return
 	}
+
+	s.diagRatesMu.Lock()
+	isPrimed := s.historyPrimed
+	s.diagRatesMu.Unlock()
+
+	if !isPrimed {
+		s.primeHistory(now, fwd)
+	}
+
+	// 1. Forwarder traffic rates (independent history baseline)
+	var fRates forwarder.TrafficRates
+	if fwd != nil {
+		fRates = fwd.HistoryRates(now)
+	}
+
+	// 2. Drop categories and drop rates (independent history baseline)
+	drops := s.collectDropCategories()
+	s.sampleHistoryDropRates(now, &drops)
+
+	// 3. Queue utilization
+	var queueUtilPct float64
+	if fwd != nil {
+		occ, cap, _ := fwd.AggregateQueueStats()
+		if cap > 0 {
+			queueUtilPct = float64(occ) / float64(cap) * 100.0
+		}
+	}
+
+	// 4. Latency
+	var fwdP95MS float64
+	var fwdP95Samples int
+	if fwd != nil {
+		writes := fwd.DeviceWriteSnapshot()
+		fwdP95MS = float64(writes.P95HealthDuration.Microseconds()) / 1000.0
+		fwdP95Samples = writes.P95HealthSamples
+	}
+
+	// 5. Active routes
+	activeRoutes := 0
+	if fwd != nil {
+		activeRoutes = fwd.ActiveRoutesCount()
+	}
+
+	// 6. Connected sessions
+	activeSessions := 0
+	if sessMgr != nil {
+		activeSessions = sessMgr.ActiveCount()
+	}
+
+	// 7. Backends diagnostics with history traffic snapshot
+	var traffic map[int64]forwarder.TrafficSnapshot
+	if fwd != nil {
+		traffic = fwd.BackendTrafficHistorySnapshot(now)
+	}
+	beDiag := collectBackendDiagnosticsWithTraffic(s, traffic)
+	backends, omitted := backendHistory(beDiag.Backends)
+
+	point := HistoryPoint{
+		RxPps:                 fRates.RxPps,
+		TxPps:                 fRates.TxPps,
+		TrafficAvailable:      fRates.Available,
+		DropRatesAvailable:    drops.RatesAvailable,
+		DropReasonRates:       drops.ReasonRates,
+		ActiveRoutes:          activeRoutes,
+		BackendLatencySamples: beDiag.LatencySamples,
+		Backends:              backends,
+		BackendsOmitted:       omitted,
+		Timestamp:             now.Unix(),
+		RxBps:                 fRates.RxBps,
+		TxBps:                 fRates.TxBps,
+		QueueUtilPct:          queueUtilPct,
+		TotalDropRate:         drops.TotalDropRatePps,
+		ForwardP95MS:          fwdP95MS,
+		ForwardP95Samples:     fwdP95Samples,
+		ActiveSessions:        activeSessions,
+		BackendP95MS:          beDiag.LatencyP95MS,
+	}
+
+	rh.Add(point)
 }
 
 // diagRatesTracker provides thread-safe sampling and independent rate computation
@@ -2005,77 +2085,7 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint
 	return t.enqueueFailures.Sample(now, cumulative)
 }
 
-func (s *Service) populateOperationalDiagnostics(status *Status) {
-	var routes []forwarder.RouteInfo
-	if s.forwarder != nil {
-		routes = s.forwarder.InspectRoutes()
-	}
-	s.populateOperationalDiagnosticsWithRoutes(status, routes)
-}
-
-// populateOperationalDiagnosticsWithRoutes assembles one status response from
-// the caller's route snapshot. The snapshot is intentionally reused instead of
-// sampling route pressure again: endpoint discovery and other status work may
-// take longer than the 200ms recency window, so independent reads can make one
-// JSON response disagree with itself about whether a just-observed incident is
-// still current.
-func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, routes []forwarder.RouteInfo) {
-	if status == nil {
-		return
-	}
-
-	var writeErrors uint64
-	// 1. Rates, Queue Pressure, Latency
-	if s.forwarder != nil {
-		fRates := s.forwarder.Rates()
-		status.Rates = TrafficRates{
-			Available:   fRates.Available,
-			RxBps:       fRates.RxBps,
-			TxBps:       fRates.TxBps,
-			RxPps:       fRates.RxPps,
-			TxPps:       fRates.TxPps,
-			DropRatePps: fRates.DropRatePps,
-			RxBpsAvg5m:  fRates.RxBpsAvg5m,
-			TxBpsAvg5m:  fRates.TxBpsAvg5m,
-			RxBpsAvg1h:  fRates.RxBpsAvg1h,
-			TxBpsAvg1h:  fRates.TxBpsAvg1h,
-		}
-
-		qStats := s.forwarder.QueuePressure()
-		status.QueuePressure = QueuePressureDiagnostics{
-			Occupancy:             qStats.Occupancy,
-			Capacity:              qStats.Capacity,
-			UtilizationPct:        qStats.UtilizationPct,
-			HighWaterPct:          qStats.HighWaterPct,
-			TotalSecondsAbove50:   qStats.SecondsAbove50Pct,
-			TotalSecondsAbove80:   qStats.SecondsAbove80Pct,
-			ConsecutiveAbove50Sec: qStats.ConsecutiveAbove50Sec,
-			ConsecutiveAbove80Sec: qStats.ConsecutiveAbove80Sec,
-			QueueFullDrops:        qStats.QueueFullDrops,
-			QueueDropRatePps:      qStats.QueueFullDropRate,
-		}
-
-		writes := s.forwarder.DeviceWriteSnapshot()
-		writeErrors = writes.Errors
-		status.ForwardLatency = ForwardLatencyDiagnostics{
-			P50MS:             float64(writes.P50Duration.Microseconds()) / 1000.0,
-			P95MS:             float64(writes.P95Duration.Microseconds()) / 1000.0,
-			P99MS:             float64(writes.P99Duration.Microseconds()) / 1000.0,
-			MaxMS:             writes.MaxDuration.Milliseconds(),
-			InFlight:          writes.InFlight,
-			OldestInFlightMS:  writes.OldestInFlight.Milliseconds(),
-			Stalls:            writes.Stalls,
-			WriteErrors:       writes.Errors,
-			WriteTotal:        writes.Count,
-			WriteErrorRatePps: 0,
-
-			P95HealthMS:        float64(writes.P95HealthDuration.Microseconds()) / 1000.0,
-			P95HealthSamples:   writes.P95HealthSamples,
-			P95HealthWindowSec: int64(writes.HealthWindow / time.Second),
-		}
-	}
-
-	// 2. Drop Categories & VirtualTUN
+func (s *Service) collectDropCategories() DropCategoryBreakdown {
 	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
 	routerMalformed := losses.router.MalformedPacketDrops
 	routerUnmapped := losses.router.UnmappedSourceIPDrops
@@ -2153,7 +2163,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 
 	totalDrops := clientTotal + returnTotal
 
-	status.DropCategories = DropCategoryBreakdown{
+	return DropCategoryBreakdown{
 		ClientMalformed:                 routerMalformed,
 		ClientUnmappedSource:            routerUnmapped,
 		ClientMismatch:                  routerMismatch,
@@ -2185,19 +2195,18 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 
 		TotalDrops: totalDrops,
 	}
+}
 
-	// The loss sampling pair owns one timestamp and one serialization scope.
-	sampleAt := time.Now()
-	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(sampleAt, &status.DropCategories, writeErrors)
-	status.Rates.DropRatePps = status.DropCategories.TotalDropRatePps
-	stalls := s.diagDeltas.writeStalls.Sample(sampleAt, status.ForwardLatency.Stalls)
-	status.ForwardLatency.StallsRecent = stalls.delta
-	status.ForwardLatency.StallsWindowSec = stalls.windowSeconds
-
-	// Directional mapping (issue #424 round 2, finding 1):
-	//   UpstreamToNexus <- Outbound*  (VirtualTUN.Write, upstream AWG -> Nexus)
-	//   NexusToUpstream <- Inbound*  (VirtualTUN.InjectInbound, Nexus -> AWG)
-	status.VirtualTUN = VirtualTUNDiagnostics{
+func (s *Service) collectVirtualTUNDiagnostics() VirtualTUNDiagnostics {
+	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
+	retStats := losses.returns
+	if s.ingressEngine != nil {
+		current := s.ingressEngine.ReturnStats().TUN
+		current.InboundDrops = retStats.TUN.InboundDrops
+		current.OutboundDrops = retStats.TUN.OutboundDrops
+		retStats.TUN = current
+	}
+	return VirtualTUNDiagnostics{
 		UpstreamToNexus: VirtualTUNDirectionalHealth{
 			Occupancy: retStats.TUN.OutboundDepth,
 			Capacity:  retStats.TUN.OutboundCapacity,
@@ -2211,9 +2220,94 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 			Drops:     retStats.TUN.InboundDrops,
 		},
 	}
+}
+
+func (s *Service) populateOperationalDiagnostics(status *Status) {
+	var routes []forwarder.RouteInfo
+	if s.forwarder != nil {
+		routes = s.forwarder.InspectRoutes()
+	}
+	s.populateOperationalDiagnosticsWithRoutes(status, routes)
+}
+
+// populateOperationalDiagnosticsWithRoutes assembles one status response from
+// the caller's route snapshot. The snapshot is intentionally reused instead of
+// sampling route pressure again: endpoint discovery and other status work may
+// take longer than the 200ms recency window, so independent reads can make one
+// JSON response disagree with itself about whether a just-observed incident is
+// still current.
+func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, routes []forwarder.RouteInfo) {
+	if status == nil {
+		return
+	}
+
+	var writeErrors uint64
+	// 1. Rates, Queue Pressure, Latency
+	if s.forwarder != nil {
+		fRates := s.forwarder.Rates()
+		status.Rates = TrafficRates{
+			Available:   fRates.Available,
+			RxBps:       fRates.RxBps,
+			TxBps:       fRates.TxBps,
+			RxPps:       fRates.RxPps,
+			TxPps:       fRates.TxPps,
+			DropRatePps: fRates.DropRatePps,
+			RxBpsAvg5m:  fRates.RxBpsAvg5m,
+			TxBpsAvg5m:  fRates.TxBpsAvg5m,
+			RxBpsAvg1h:  fRates.RxBpsAvg1h,
+			TxBpsAvg1h:  fRates.TxBpsAvg1h,
+		}
+
+		qStats := s.forwarder.QueuePressure()
+		status.QueuePressure = QueuePressureDiagnostics{
+			Occupancy:             qStats.Occupancy,
+			Capacity:              qStats.Capacity,
+			UtilizationPct:        qStats.UtilizationPct,
+			HighWaterPct:          qStats.HighWaterPct,
+			TotalSecondsAbove50:   qStats.SecondsAbove50Pct,
+			TotalSecondsAbove80:   qStats.SecondsAbove80Pct,
+			ConsecutiveAbove50Sec: qStats.ConsecutiveAbove50Sec,
+			ConsecutiveAbove80Sec: qStats.ConsecutiveAbove80Sec,
+			QueueFullDrops:        qStats.QueueFullDrops,
+			QueueDropRatePps:      qStats.QueueFullDropRate,
+		}
+
+		writes := s.forwarder.DeviceWriteSnapshot()
+		writeErrors = writes.Errors
+		status.ForwardLatency = ForwardLatencyDiagnostics{
+			P50MS:             float64(writes.P50Duration.Microseconds()) / 1000.0,
+			P95MS:             float64(writes.P95Duration.Microseconds()) / 1000.0,
+			P99MS:             float64(writes.P99Duration.Microseconds()) / 1000.0,
+			MaxMS:             writes.MaxDuration.Milliseconds(),
+			InFlight:          writes.InFlight,
+			OldestInFlightMS:  writes.OldestInFlight.Milliseconds(),
+			Stalls:            writes.Stalls,
+			WriteErrors:       writes.Errors,
+			WriteTotal:        writes.Count,
+			WriteErrorRatePps: 0,
+
+			P95HealthMS:        float64(writes.P95HealthDuration.Microseconds()) / 1000.0,
+			P95HealthSamples:   writes.P95HealthSamples,
+			P95HealthWindowSec: int64(writes.HealthWindow / time.Second),
+		}
+	}
+
+	// 2. Drop Categories & VirtualTUN
+	status.DropCategories = s.collectDropCategories()
+	status.VirtualTUN = s.collectVirtualTUNDiagnostics()
+
+	// The loss sampling pair owns one timestamp and one serialization scope.
+	sampleAt := time.Now()
+	s.primeHistory(sampleAt, s.forwarder)
+	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(sampleAt, &status.DropCategories, writeErrors)
+	status.Rates.DropRatePps = status.DropCategories.TotalDropRatePps
+	stalls := s.diagDeltas.writeStalls.Sample(sampleAt, status.ForwardLatency.Stalls)
+	status.ForwardLatency.StallsRecent = stalls.delta
+	status.ForwardLatency.StallsWindowSec = stalls.windowSeconds
 
 	// 3. Routing consistency
-	status.RoutingConsistency = checkRoutingInvariants(s, routes, retStats, routerMismatch)
+	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
+	status.RoutingConsistency = checkRoutingInvariants(s, routes, losses.returns, losses.router.OwnershipMismatchDrops)
 
 	// 4. Handshake freshness
 	status.HandshakeFreshness = collectHandshakeDiagnostics(s)

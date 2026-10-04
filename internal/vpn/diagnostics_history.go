@@ -251,3 +251,25 @@ func (s *Service) sampleDropRates(at time.Time, drops *DropCategoryBreakdown, wr
 	drops.ReasonRates, drops.RatesAvailable = s.diagDeltas.reasons.sample(at, dropReasonTotals(*drops))
 	return writeErrorRate
 }
+
+// sampleHistoryDropRates calculates drop rates for history against independent
+// history baselines, ensuring foreground status reads cannot consume deltas.
+func (s *Service) sampleHistoryDropRates(at time.Time, drops *DropCategoryBreakdown) {
+	s.diagRatesMu.Lock()
+	defer s.diagRatesMu.Unlock()
+	if s.historyDiagRates == nil {
+		s.historyDiagRates = newDiagRatesTracker()
+	}
+	drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps, _ = s.historyDiagRates.Sample(
+		at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0,
+	)
+	drops.ReasonRates, drops.RatesAvailable = s.historyDropReasons.sample(at, dropReasonTotals(*drops))
+}
+
+func (s *Service) primeHistoryRatesLocked(at time.Time, drops *DropCategoryBreakdown) {
+	if s.historyDiagRates == nil {
+		s.historyDiagRates = newDiagRatesTracker()
+	}
+	s.historyDiagRates.Sample(at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0)
+	s.historyDropReasons.sample(at, dropReasonTotals(*drops))
+}

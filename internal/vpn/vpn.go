@@ -236,9 +236,12 @@ type Service struct {
 	enableBackendPostAddTunnelHook          func()
 	reaperHook                              func(context.Context, *models.VPNSession)
 
-	rollingHistory *RollingHistory
-	diagRatesMu    sync.Mutex
-	diagRates      *diagRatesTracker
+	rollingHistory     *RollingHistory
+	diagRatesMu        sync.Mutex
+	diagRates          *diagRatesTracker
+	historyDiagRates   *diagRatesTracker
+	historyDropReasons dropReasonRatesTracker
+	historyPrimed      bool
 	// diagDeltas converts cumulative lifetime failure counters into windowed
 	// deltas so a recovered incident stops pinning current health (issue #424
 	// round 2, finding 5). Its zero value is usable.

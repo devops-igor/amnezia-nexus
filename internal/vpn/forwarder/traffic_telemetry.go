@@ -33,6 +33,10 @@ type trafficCounters struct {
 	lastAt      time.Time
 	baseline    TrafficSnapshot
 	current     TrafficSnapshot
+
+	histLastAt   time.Time
+	histBaseline TrafficSnapshot
+	histCurrent  TrafficSnapshot
 }
 
 func (c *trafficCounters) record(n int64, rx bool) {
@@ -83,6 +87,69 @@ func (c *trafficCounters) snapshot(now time.Time) TrafficSnapshot {
 	return totals
 }
 
+func (c *trafficCounters) historySnapshot(now time.Time) TrafficSnapshot {
+	if c == nil {
+		return TrafficSnapshot{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	totals := TrafficSnapshot{RxBytes: c.rxBytes.Load(), TxBytes: c.txBytes.Load(), RxPackets: c.rxPackets.Load(), TxPackets: c.txPackets.Load()}
+	if c.histLastAt.IsZero() {
+		c.histLastAt = now
+		c.histBaseline = totals
+	}
+	elapsed := now.Sub(c.histLastAt).Seconds()
+	if elapsed >= 0.2 {
+		deltaRxBytes := totals.RxBytes - c.histBaseline.RxBytes
+		if deltaRxBytes < 0 {
+			deltaRxBytes = 0
+		}
+		deltaTxBytes := totals.TxBytes - c.histBaseline.TxBytes
+		if deltaTxBytes < 0 {
+			deltaTxBytes = 0
+		}
+		deltaRxPackets := uint64(0)
+		if totals.RxPackets >= c.histBaseline.RxPackets {
+			deltaRxPackets = totals.RxPackets - c.histBaseline.RxPackets
+		}
+		deltaTxPackets := uint64(0)
+		if totals.TxPackets >= c.histBaseline.TxPackets {
+			deltaTxPackets = totals.TxPackets - c.histBaseline.TxPackets
+		}
+		c.histCurrent = TrafficSnapshot{
+			RxBytesPerSec: float64(deltaRxBytes) / elapsed,
+			TxBytesPerSec: float64(deltaTxBytes) / elapsed,
+			RxPps:         float64(deltaRxPackets) / elapsed,
+			TxPps:         float64(deltaTxPackets) / elapsed,
+			Available:     true,
+			WindowSec:     elapsed,
+		}
+		c.histLastAt = now
+		c.histBaseline = totals
+	}
+	totals.RxBytesPerSec, totals.TxBytesPerSec = c.histCurrent.RxBytesPerSec, c.histCurrent.TxBytesPerSec
+	totals.RxPps, totals.TxPps = c.histCurrent.RxPps, c.histCurrent.TxPps
+	totals.Available, totals.WindowSec = c.histCurrent.Available, c.histCurrent.WindowSec
+	return totals
+}
+
+func (c *trafficCounters) primeHistory(now time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.histLastAt.IsZero() {
+		c.histLastAt = now
+		c.histBaseline = TrafficSnapshot{
+			RxBytes:   c.rxBytes.Load(),
+			TxBytes:   c.txBytes.Load(),
+			RxPackets: c.rxPackets.Load(),
+			TxPackets: c.txPackets.Load(),
+		}
+	}
+}
+
 func (c *trafficCounters) lastTrafficAge(now time.Time) int64 {
 	at := c.lastTraffic.Load()
 	if at == 0 {
@@ -107,6 +174,27 @@ func (f *Forwarder) BackendTrafficSnapshot() map[int64]TrafficSnapshot {
 		out[id] = counters.snapshot(now)
 	}
 	return out
+}
+
+// BackendTrafficHistorySnapshot samples backend traffic against independent
+// history baselines so foreground status polling cannot consume deltas.
+func (f *Forwarder) BackendTrafficHistorySnapshot(now time.Time) map[int64]TrafficSnapshot {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[int64]TrafficSnapshot, len(f.backendTraffic))
+	for id, counters := range f.backendTraffic {
+		out[id] = counters.historySnapshot(now)
+	}
+	return out
+}
+
+// PrimeBackendTrafficHistory primes independent history baselines for all current backends.
+func (f *Forwarder) PrimeBackendTrafficHistory(now time.Time) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, counters := range f.backendTraffic {
+		counters.primeHistory(now)
+	}
 }
 
 func (f *Forwarder) ensureBackendTrafficLocked(id int64) {
