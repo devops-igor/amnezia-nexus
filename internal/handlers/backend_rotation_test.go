@@ -448,7 +448,6 @@ func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantine
 	}
 }
 
-
 func TestBackendIdentityRotation_DBCompensationFailureKeepsNewIdentityQuarantined(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 50)
 	newPriv, newPub := deriveTestKey(t, 51)
@@ -485,8 +484,13 @@ func TestBackendIdentityRotation_DBCompensationFailureKeepsNewIdentityQuarantine
 
 	// The first VPN move to NEW persists, then forwarder reconciliation fails
 	// and the service successfully compensates the pool to OLD.
+	syncAttempts := 0
 	svc.SetSyncBackendForwarderHookForTest(func() error {
-		return errors.New("injected forwarder reconciliation failure")
+		syncAttempts++
+		if syncAttempts == 1 {
+			return errors.New("injected forwarder reconciliation failure")
+		}
+		return nil
 	})
 
 	// Persist NEW normally, but make every attempt to compensate the server
