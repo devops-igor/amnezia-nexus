@@ -1,6 +1,11 @@
 """Deterministic checks that real E2E fixture operations reject failed responses."""
 
+import ast
+import importlib
+import inspect
+import sys
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -582,3 +587,195 @@ def test_vpn_config_success_restores_original_threshold(monkeypatch: pytest.Monk
     install_fixture(monkeypatch, vpn, fixture)
     vpn.test_vpn_config_lifecycle(cast(Page, fixture), "https://panel.example.test", "fixture-csrf")
     assert fixture.threshold == 500
+
+
+PEER_DISCLOSURE_MARKER = "SyntheticPeerDisclosure"
+FULL_PEER_IDENTIFIER = PEER_DISCLOSURE_MARKER + "x" * (43 - len(PEER_DISCLOSURE_MARKER)) + "="
+
+
+def status_api_fixture() -> dict[str, Any]:
+    """Complete the sampled diagnostics fixture for the actual status API oracle."""
+    status = extended_status_fixture()
+    status.update(
+        {
+            "configured_engine": "awg",
+            "active_engine": "awg",
+            "engine_running": True,
+            "listen_port": 51820,
+            "listener_running": True,
+            "active_tunnels": 1,
+            "connected_sessions": 1,
+            "health_assessment": {"status": "HEALTHY", "conditions": []},
+            "rates": {"rx_bps": 0, "tx_bps": 0, "drop_rate_pps": 0},
+            "queue_pressure": {"capacity": 1, "occupancy": 0, "utilization_pct": 0},
+            "virtual_tun": {
+                "upstream_to_nexus": dict.fromkeys(["occupancy", "capacity", "peak", "drops"], 0),
+                "nexus_to_upstream": {},
+            },
+            "runtime_resources": {"cpu_percent": 0, "goroutines": 1},
+            "peer_sync": None,
+            "routing_consistency": {
+                "ownership_mismatch_drops": 0,
+                "ownership_mismatch_drops_recent": 0,
+                "is_consistent": True,
+            },
+        }
+    )
+    status["forward_latency"].update(dict.fromkeys(["p50_ms", "p95_ms", "p99_ms"], 0))
+    status["drop_categories"].update(dict.fromkeys(vpn._LOSS_REASONS, 0))
+    status["drop_categories"].update(
+        dict.fromkeys(
+            [
+                "client_total_drops",
+                "return_total_drops",
+                "total_drops",
+                "return_injection_tun_drops",
+            ],
+            0,
+        )
+    )
+    status["problem_routes"][0]["peer_key"] = "abcdefgh…"
+    return status
+
+
+def run_peer_redaction_status(
+    monkeypatch: pytest.MonkeyPatch, status: dict[str, Any], module: Any = vpn
+) -> None:
+    """Stub only transport and run the complete real status API test."""
+    monkeypatch.setattr(module, "api_get", lambda page, url: status)
+    module.test_vpn_status_api(cast(Page, object()), "https://panel.example.test")
+
+
+def assert_peer_redaction_failure_safe(failure: pytest.ExceptionInfo[AssertionError]) -> None:
+    """Inspect exception text and pytest's traceback/explanation without dumping payloads."""
+    for rendered in (str(failure.value), str(failure.getrepr(style="short", showlocals=False))):
+        disclosure_free = (
+            FULL_PEER_IDENTIFIER not in rendered and PEER_DISCLOSURE_MARKER not in rendered
+        )
+        assert disclosure_free, "Peer redaction failure disclosed a synthetic identifier"
+
+
+@pytest.mark.parametrize("peer_key", ["a", "***", "abcdefgh…", "123456789"])
+def test_peer_redaction_accepts_valid_identifiers(
+    monkeypatch: pytest.MonkeyPatch, peer_key: str
+) -> None:
+    """The full oracle accepts nonempty redacted text up to the existing length limit."""
+    status = status_api_fixture()
+    status["problem_routes"][0]["peer_key"] = peer_key
+    run_peer_redaction_status(monkeypatch, status)
+
+
+@pytest.mark.parametrize("routes", [None, []], ids=["null", "empty"])
+def test_peer_redaction_accepts_no_problem_routes(
+    monkeypatch: pytest.MonkeyPatch, routes: Any
+) -> None:
+    """The existing optional/null route inventory remains valid."""
+    status = status_api_fixture()
+    status["problem_routes"] = routes
+    run_peer_redaction_status(monkeypatch, status)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing", "empty", "null", "integer", "boolean", "list", "object", "full-length"],
+)
+def test_peer_redaction_rejects_invalid_identifiers_safely(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """Missing, wrongly typed and unredacted identifiers fail without exposing route content."""
+    status = status_api_fixture()
+    route = status["problem_routes"][0]
+    route["diagnostic"] = PEER_DISCLOSURE_MARKER
+    values = {
+        "empty": "",
+        "null": None,
+        "integer": 7,
+        "boolean": True,
+        "list": [PEER_DISCLOSURE_MARKER],
+        "object": {"value": PEER_DISCLOSURE_MARKER},
+        "full-length": FULL_PEER_IDENTIFIER,
+    }
+    if fault == "missing":
+        del route["peer_key"]
+    else:
+        route["peer_key"] = values[fault]
+    with pytest.raises(AssertionError) as failure:
+        run_peer_redaction_status(monkeypatch, status)
+    assert_peer_redaction_failure_safe(failure)
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [
+        {"diagnostic": PEER_DISCLOSURE_MARKER},
+        7,
+        True,
+        PEER_DISCLOSURE_MARKER,
+        "",
+        {},
+        [PEER_DISCLOSURE_MARKER],
+        [None],
+        [7],
+        [[PEER_DISCLOSURE_MARKER]],
+    ],
+    ids=[
+        "container-object",
+        "container-number",
+        "container-boolean",
+        "container-text",
+        "container-empty-text",
+        "container-empty-object",
+        "route-text",
+        "route-null",
+        "route-number",
+        "route-list",
+    ],
+)
+def test_peer_redaction_rejects_invalid_route_shapes_safely(
+    monkeypatch: pytest.MonkeyPatch, routes: Any
+) -> None:
+    """Malformed inventories and entries fail before other assertions can render the body."""
+    status = status_api_fixture()
+    status["problem_routes"] = routes
+    with pytest.raises(AssertionError) as failure:
+        run_peer_redaction_status(monkeypatch, status)
+    assert_peer_redaction_failure_safe(failure)
+
+
+@pytest.mark.parametrize("mutation", ["raw-message", "raw-operands"])
+def test_peer_redaction_privacy_regression_detects_independent_mutations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
+) -> None:
+    """Restoring either unsafe message text or introspection independently fails privacy."""
+    tree = ast.parse(inspect.getsource(vpn.test_vpn_status_api))
+    assertion = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assert)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "peer_key_valid"
+    )
+    if mutation == "raw-message":
+        assertion.msg = ast.parse('f"peer_key must be redacted: {peer_key}"', mode="eval").body
+    else:
+        assertion.test = ast.parse(
+            "isinstance(peer_key, str) and 0 < len(peer_key) <= 9", mode="eval"
+        ).body
+    module_name = "peer_redaction_mutation_" + mutation.replace("-", "_")
+    module_path = tmp_path / (module_name + ".py")
+    module_path.write_text(
+        "from tests.e2e.test_vpn import (Page, pytest, api_get, assert_response_shape, "
+        "_assert_extended_diagnostics)\n" + ast.unparse(tree) + "\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    pytest.register_assert_rewrite(module_name)
+    mutated = importlib.import_module(module_name)
+    try:
+        status = status_api_fixture()
+        status["problem_routes"][0]["peer_key"] = FULL_PEER_IDENTIFIER
+        with pytest.raises(AssertionError) as failure:
+            run_peer_redaction_status(monkeypatch, status, mutated)
+        with pytest.raises(AssertionError, match="disclosed a synthetic identifier"):
+            assert_peer_redaction_failure_safe(failure)
+    finally:
+        sys.modules.pop(module_name, None)

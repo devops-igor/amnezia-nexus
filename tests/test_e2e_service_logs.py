@@ -1,6 +1,10 @@
 """Privacy regressions for failure-time service evidence using synthetic secrets."""
 
 import io
+import os
+import re
+import subprocess
+import textwrap
 import runpy
 from pathlib import Path
 
@@ -182,3 +186,142 @@ def test_cli_input_failure_emits_only_safe_error(monkeypatch: pytest.MonkeyPatch
     assert output.getvalue() == ""
     assert "raw evidence suppressed" in errors.getvalue()
     assert "synthetic-raw-stream-secret" not in errors.getvalue()
+
+
+def clean_slate_deployment_shell() -> str:
+    """Extract the actual deployment step and substitute only the GitHub expression."""
+    workflow = Path(".github/workflows/e2e-dev.yml").read_text()
+    step = workflow.split("      - name: Clean-Slate Deployment\n", 1)[1]
+    step = step.split("\n      - name:", 1)[0]
+    shell = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    return re.sub(r"\$\{\{.*?\}\}", "fixture-pr", shell)
+
+
+def run_readiness_failure(
+    tmp_path: Path, shell: str, broken_filter: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Execute the real shell step in a synthetic home with every operational tool stubbed."""
+    checkout = tmp_path / "synthetic checkout with spaces"
+    home = tmp_path / "synthetic home"
+    checkout.mkdir()
+    home.mkdir()
+    scripts = checkout / "scripts"
+    scripts.mkdir()
+    sanitizer = scripts / "sanitize_e2e_service_logs.py"
+    if broken_filter:
+        sanitizer.write_text(
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "sys.stderr.write('Service evidence sanitization failed; raw evidence suppressed.' + chr(10))\n"
+            "raise SystemExit(2)\n"
+        )
+    else:
+        sanitizer.write_text(Path("scripts/sanitize_e2e_service_logs.py").read_text())
+    trace = tmp_path / "compose-trace"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GITHUB_WORKSPACE": str(checkout),
+        "BATCH7_STUB_TRACE": str(trace),
+        "E2E_ADMIN_PASS": "synthetic-startup-secret",
+        "SYNTHETIC_LOG_STDOUT": (
+            "startup failed: password=synthetic-startup-secret "
+            "peer_key=" + "a" * 43 + "= address=198.51.100.17"
+        ),
+        "SYNTHETIC_LOG_STDERR": (
+            'probe failed: connection refused token=synthetic-startup-token config="'
+            + str(checkout / "private.conf")
+            + '"'
+        ),
+    }
+    stubs = """
+        docker() {
+          case "$1" in
+            rm) return 0 ;;
+            compose)
+              [ "$PWD" = "$HOME" ] || return 99
+              printf '%s\n' 'compose-home' >> "$BATCH7_STUB_TRACE"
+              ;;
+            logs)
+              printf '%s\n' "$SYNTHETIC_LOG_STDOUT"
+              printf '%s\n' "$SYNTHETIC_LOG_STDERR" >&2
+              ;;
+            *) return 99 ;;
+          esac
+        }
+        sudo() { return 0; }
+        curl() { return 1; }
+        sleep() { return 0; }
+        sed() { return 0; }
+    """
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", stubs + shell],
+        cwd=home,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert trace.read_text().splitlines() == ["compose-home", "compose-home"]
+    return result
+
+
+def assert_readiness_failure_safe(result: subprocess.CompletedProcess[str]) -> None:
+    """Require safe useful evidence from both producer streams while retaining failure."""
+    output = result.stdout + result.stderr
+    failure_preserved = result.returncode != 0
+    assert failure_preserved, "Readiness timeout must remain unsuccessful"
+    causes_present = "startup failed:" in output and "probe failed: connection refused" in output
+    assert causes_present, "Sanitized startup cause missing from producer stdout or stderr"
+    secrets_absent = all(
+        value not in output
+        for value in (
+            "synthetic-startup-secret",
+            "synthetic-startup-token",
+            "a" * 43 + "=",
+            "198.51.100.17",
+            "private.conf",
+            "synthetic checkout with spaces",
+            "synthetic home",
+        )
+    )
+    assert secrets_absent, "Readiness failure disclosed synthetic producer content"
+    redaction_present = "<redacted-" in output
+    assert redaction_present, "Readiness failure must retain sanitized diagnostic evidence"
+
+
+def test_readiness_failure_sanitizes_both_streams_from_home(tmp_path: Path) -> None:
+    """The actual failed step resolves its checkout filter despite a home cwd and spaces."""
+    assert_readiness_failure_safe(run_readiness_failure(tmp_path, clean_slate_deployment_shell()))
+
+
+def test_readiness_failure_suppresses_raw_output_when_filter_fails(tmp_path: Path) -> None:
+    """An unsuccessful filter cannot cause a raw-log fallback or successful deployment."""
+    result = run_readiness_failure(tmp_path, clean_slate_deployment_shell(), broken_filter=True)
+    output = result.stdout + result.stderr
+    failure_preserved = result.returncode != 0
+    assert failure_preserved, "Failed sanitization must keep deployment unsuccessful"
+    raw_suppressed = (
+        "raw evidence suppressed" in output
+        and "startup failed:" not in output
+        and "probe failed:" not in output
+        and "synthetic-startup-secret" not in output
+        and "synthetic-startup-token" not in output
+        and "a" * 43 + "=" not in output
+    )
+    assert raw_suppressed, "Failed sanitization must emit only its safe diagnostic"
+
+
+def test_readiness_failure_regression_rejects_old_relative_filter(tmp_path: Path) -> None:
+    """Restoring the reviewed relative operand loses evidence in the executable cwd test."""
+    shell = clean_slate_deployment_shell()
+    old_shell = shell.replace(
+        'python3 "$GITHUB_WORKSPACE/scripts/sanitize_e2e_service_logs.py"',
+        "python3 scripts/sanitize_e2e_service_logs.py",
+        1,
+    )
+    mutation_applied = old_shell != shell
+    assert mutation_applied, "The old relative-filter mutation must change the actual step"
+    result = run_readiness_failure(tmp_path, old_shell)
+    with pytest.raises(AssertionError, match="Sanitized startup cause missing"):
+        assert_readiness_failure_safe(result)

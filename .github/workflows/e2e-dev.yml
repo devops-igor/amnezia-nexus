@@ -81,7 +81,7 @@ jobs:
           done
           if [ "$READY" -ne 1 ]; then
             echo "Error: Panel failed to become healthy within 45 seconds" >&2
-            docker logs --timestamps --tail 1000 amnezia-panel 2>&1 | python3 scripts/sanitize_e2e_service_logs.py
+            docker logs --timestamps --tail 1000 amnezia-panel 2>&1 | python3 "$GITHUB_WORKSPACE/scripts/sanitize_e2e_service_logs.py"
             exit 1
           fi
           echo "Verifying running image is PR image ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}..."

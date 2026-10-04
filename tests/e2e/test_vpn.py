@@ -417,8 +417,6 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         "vpn_status",
     )
 
-    _assert_extended_diagnostics(status_data)
-
     # Validate health assessment
     health = status_data["health_assessment"]
     assert "status" in health
@@ -431,12 +429,19 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     # so a full-length base64 peer key must never appear in it. The redaction
     # convention (ingress.RedactKey) keeps 8 characters plus an ellipsis, or
     # masks shorter values entirely, so a redacted key is at most 9 characters.
-    for route in status_data.get("problem_routes") or []:
-        assert "peer_key" in route, "peer_key must stay present for route correlation"
-        assert route["peer_key"], "peer_key must not be empty"
-        assert len(route["peer_key"]) <= 9, (
-            "peer_key must be redacted, not a full-length peer public key: " f"{route['peer_key']}"
-        )
+    problem_routes = status_data.get("problem_routes")
+    routes_valid = problem_routes is None or isinstance(problem_routes, list)
+    assert routes_valid, "problem_routes must be a list or null"
+    for route in problem_routes or []:
+        route_valid = isinstance(route, dict)
+        assert route_valid, "problem route must be an object"
+        peer_key = route.get("peer_key")
+        peer_key_valid = isinstance(peer_key, str) and 0 < len(peer_key) <= 9
+        assert (
+            peer_key_valid
+        ), "peer_key must be present, nonempty redacted text (at most 9 characters)"
+
+    _assert_extended_diagnostics(status_data)
 
     # Validate rates
     rates = status_data["rates"]
