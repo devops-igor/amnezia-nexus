@@ -149,12 +149,9 @@ func TestStripFailureNeverReachesSyncconf(t *testing.T) {
 		t.Errorf("syncconf must never run after a failed strip, got %d invocations; commands: %v", syncconfs, rec.recordedCommands())
 	}
 
-	// Identity preservation: the previously persisted configuration is restored.
-	// WriteConfiguration restores through saveServerConfigTracked, which
-	// normalises the interface table flag, so the restored bytes are the
-	// pre-existing config with that (idempotent) normalisation applied - and
-	// crucially never the rejected config that was written before the failure.
-	want := EnsureInterfaceTableOff(original)
+	// Identity preservation: compensation restores the exact previously-read
+	// configuration rather than applying new-write normalization or policy.
+	want := original
 	got := string(rec.mock.files["/opt/amnezia/awg/awg0.conf"])
 	if got != want {
 		t.Errorf("expected the previous configuration to be restored after a rejected strip\n got: %q\nwant: %q", got, want)
@@ -248,5 +245,40 @@ func TestSyncconfFailureStillRetriesAfterRestore(t *testing.T) {
 	}
 	if !restoreCalled {
 		t.Error("expected restoreInterfaceIfDown to run after the first syncconf failure")
+	}
+}
+
+
+func TestPostApplyRollbackRestoresPreviouslyWorkingConfigWithoutRevalidation(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+
+	// Jc=0 is accepted by the real AWG container (and is used by this
+	// repository's real-container tests), but current Nexus front-door
+	// validation requires Jc >= 1. A rollback must never reject the exact
+	// configuration that was running immediately before the mutation.
+	original := strings.Replace(validServerConfig, "Jc = 4", "Jc = 0", 1)
+	params, _, err := ParseServerConfig(original)
+	if err != nil {
+		t.Fatalf("parse original config: %v", err)
+	}
+	if err := ValidateAWGParams(params); err == nil {
+		t.Fatal("test precondition failed: legacy Jc=0 config must be rejected by current Nexus validation")
+	}
+	client.files["/opt/amnezia/awg/awg0.conf"] = []byte(original)
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	server := &models.Server{ID: 77, Host: "192.0.2.77"}
+	postApplyErr := errors.New("injected post-apply reconciliation failure")
+	err = mgr.WriteConfigurationWithPostApply(ctx, server, validServerConfig, func(context.Context) error {
+		return postApplyErr
+	})
+	if err == nil || !errors.Is(err, postApplyErr) {
+		t.Fatalf("expected post-apply failure to be returned, got %v", err)
+	}
+
+	got := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	if got != original {
+		t.Fatalf("rollback did not restore exact previously-read config\nwant:\n%s\ngot:\n%s", original, got)
 	}
 }
