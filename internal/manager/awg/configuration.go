@@ -55,8 +55,10 @@ func (m *AWGManager) WriteConfiguration(ctx context.Context, server *models.Serv
 
 // WriteConfigurationWithPostApply keeps the AWG server lock and remote lock held
 // while postApply reconciles state outside the manager (for example the server
-// database and active VPN backend). If postApply fails, the previous remote
-// configuration is restored before the transaction releases either lock.
+// database and active VPN backend). Ordinary post-apply failures restore the
+// previous remote configuration before either lock is released. A caller that
+// returns ErrConfigurationPostApplyKeepApplied explicitly selects the already-
+// applied configuration as the safer convergence target instead.
 func (m *AWGManager) WriteConfigurationWithPostApply(
 	ctx context.Context,
 	server *models.Server,
