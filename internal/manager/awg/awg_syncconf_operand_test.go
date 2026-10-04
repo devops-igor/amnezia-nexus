@@ -337,8 +337,8 @@ func TestFailingStripNeverReachesSyncconf(t *testing.T) {
 	if syncconfs != 0 {
 		t.Errorf("syncconf ran %d times after a failed strip; commands: %v", syncconfs, rec.recordedCommands())
 	}
-	if got := string(rec.mock.files["/opt/amnezia/awg/awg0.conf"]); got != EnsureInterfaceTableOff(original) {
-		t.Errorf("previous configuration was not restored\n got: %q\nwant: %q", got, EnsureInterfaceTableOff(original))
+	if got := string(rec.mock.files["/opt/amnezia/awg/awg0.conf"]); got != original {
+		t.Errorf("previous configuration was not restored byte-for-byte\n got: %q\nwant: %q", got, original)
 	}
 	if strings.Contains(string(rec.mock.files["/opt/amnezia/awg/awg0.conf"]), "SaveConfig") {
 		t.Error("the rejected config leaked onto disk after a failed strip")
