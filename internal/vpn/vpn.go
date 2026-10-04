@@ -950,6 +950,15 @@ func (s *Service) SetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tun
 	s.pool.SetSetTunnelPublicKeyHookForTest(fn)
 }
 
+
+// SetTunnelEnabledHookForTest sets a test hook for SetTunnelEnabled on the pool.
+func (s *Service) SetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	s.pool.SetSetTunnelEnabledHookForTest(fn)
+}
+
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
@@ -2957,8 +2966,18 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
-	if err := s.pool.SetTunnelEnabled(ctx, serverID, false, models.DisableReasonAdmin); err != nil {
-		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
+	persistErr := s.pool.SetTunnelEnabled(ctx, serverID, false, models.DisableReasonAdmin)
+	if persistErr != nil {
+		// Administrative persistence must not be allowed to keep a backend
+		// serving after a catastrophic reconciliation failure. Force the live
+		// pool state disabled, then continue with device detachment and
+		// failover. The persistence error is returned after runtime quarantine.
+		if forceErr := s.pool.ForceDisableTunnelInMemory(serverID, models.DisableReasonAdmin); forceErr != nil {
+			return errors.Join(
+				fmt.Errorf("failed to persist administrative backend disable: %w", persistErr),
+				fmt.Errorf("failed to force backend disabled in memory: %w", forceErr),
+			)
+		}
 	}
 
 	if s.prober != nil {
@@ -3028,6 +3047,9 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		}
 	}
 
+	if persistErr != nil {
+		return fmt.Errorf("backend quarantined in memory but administrative disable persistence failed: %w", persistErr)
+	}
 	return nil
 }
 
