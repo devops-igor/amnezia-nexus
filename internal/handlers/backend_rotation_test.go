@@ -348,3 +348,95 @@ func TestBackendIdentityRotation_ReconciliationFailureRollback(t *testing.T) {
 		t.Errorf("expected VPN pool identity to remain %q after rollback, got %q", oldPub, tun.PublicKey)
 	}
 }
+
+
+func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantines(t *testing.T) {
+	oldPriv, oldPub := deriveTestKey(t, 40)
+	newPriv, newPub := deriveTestKey(t, 41)
+	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
+	rotated := strings.ReplaceAll(original, oldPriv, newPriv)
+	mock, currentConfig := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
+
+	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
+	ctx := context.Background()
+	id, err := db.CreateServer(ctx, &models.Server{
+		Name:    "rollback-failure-fixture",
+		Host:    "192.0.2.95",
+		SSHUser: "fixture",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": oldPub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.vpnSvc = svc
+	if err = svc.EnableBackend(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// NEW is persisted successfully. Forwarder reconciliation then fails, and
+	// the compensation attempt to OLD fails too, producing ErrVPNRollbackFailed.
+	svc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("injected forwarder reconciliation failure")
+	})
+	svc.SetTunnelPublicKeyHookForTest(func(_ context.Context, _ int64, publicKey string) error {
+		if publicKey == oldPub {
+			return errors.New("injected public-key rollback failure")
+		}
+		return nil
+	})
+
+	r := setupFullServerRouter(h)
+	body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": rotated})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", id), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 on failed VPN compensation, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "reconcile_failed") {
+		t.Fatalf("expected reconcile_failed response, got %s", w.Body.String())
+	}
+
+	// Once VPN rollback has failed, OLD is no longer a safe convergence target.
+	// The transaction must keep the already-applied NEW remote config/DB identity
+	// and quarantine the backend instead of rolling remote+DB back to OLD.
+	if got := currentConfig(); !strings.Contains(got, newPriv) {
+		t.Fatalf("remote AWG config was rolled away from the convergence identity: %s", got)
+	}
+	server, err := db.GetServer(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, _ := server.Protocols["awg"].(map[string]any)["public_key"].(string)
+	if cached != newPub {
+		t.Fatalf("server DB identity=%q, want kept NEW identity %q", cached, newPub)
+	}
+	live, err := h.awgMgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("read live identity: %v", err)
+	}
+	if live != newPub {
+		t.Fatalf("remote live identity=%q, want kept NEW identity %q", live, newPub)
+	}
+	tun, err := svc.GetTunnel(id)
+	if err != nil {
+		t.Fatalf("GetTunnel after failed compensation: %v", err)
+	}
+	if tun.PublicKey != newPub {
+		t.Fatalf("VPN pool identity=%q, want NEW identity %q after failed rollback", tun.PublicKey, newPub)
+	}
+	if tun.Enabled {
+		t.Fatal("backend remained enabled after VPN identity rollback failure; expected quarantine")
+	}
+}
