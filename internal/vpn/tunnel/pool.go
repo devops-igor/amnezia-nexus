@@ -597,6 +597,83 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 	return nil
 }
 
+// CommitBackendEnable commits an administrative backend enable as ONE bounded
+// durable backend-row update, and only then updates live pool state
+// (issue #424 / PR #429, R1-3).
+//
+// It replaces the SetTunnelEnabled + (legacy-only) SetTunnelStatusWithReason
+// pair that the enable commit boundary used to issue as two separate fallible
+// writes. Because there is now exactly ONE fallible durable write, the caller
+// can run it BEFORE any destructive publication step: a failure leaves the
+// previously serving device completely untouched.
+//
+// Semantics deliberately preserved from the two replaced calls:
+//   - the setTunnelEnabledHook still runs before persistence, so the
+//     quarantine-retry fix (explicit intent must reach durable storage even when
+//     live state already matches) is not regressed;
+//   - a health-disabled provenance survives an administrative toggle;
+//   - administrative intent always advances AdminGeneration, while
+//     StateVersion advances only when observable state actually changed;
+//   - legacy rows whose administrative disable lived in runtime status get that
+//     status normalized to connecting with latency cleared and a fresh health
+//     check, in the SAME statement.
+//
+// A returned error therefore means the durable row was not advanced, except
+// where the database boundary itself reported an ambiguous completion; that
+// case is resolved by a bounded durable readback inside the DB call before it
+// returns (see database.CommitBackendTunnelEnable).
+func (p *Pool) CommitBackendEnable(ctx context.Context, serverID int64, normalizeHealth bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	if p.setTunnelEnabledHook != nil {
+		if err := p.setTunnelEnabledHook(ctx, serverID, true, models.DisableReasonNone); err != nil {
+			return err
+		}
+	}
+
+	// Runtime health provenance belongs to the health subsystem. An
+	// administrative toggle must not erase a health-disabled state.
+	effectiveReason := models.DisableReasonNone
+	if tunnel.DisableReason == models.DisableReasonHealth {
+		effectiveReason = models.DisableReasonHealth
+	}
+
+	// Legacy rows encoded administrative disable in runtime status. Once
+	// enabled is authoritative, that old status has no trustworthy health
+	// meaning, so make it unknown/connecting and require a fresh probe.
+	status := ""
+	if normalizeHealth {
+		status = models.TunnelStatusConnecting
+	}
+
+	if p.db != nil {
+		if err := p.db.CommitBackendTunnelEnable(ctx, tunnel.ID, true, effectiveReason, status, normalizeHealth); err != nil {
+			return fmt.Errorf("failed to persist backend administrative state: %w", err)
+		}
+	}
+
+	stateChanged := tunnel.Enabled != true || tunnel.DisableReason != effectiveReason
+	tunnel.Enabled = true
+	tunnel.DisableReason = effectiveReason
+	if normalizeHealth {
+		tunnel.Status = status
+		tunnel.LatencyMS = 0
+		now := time.Now().UTC()
+		tunnel.LastHealthCheck = &now
+		stateChanged = true
+	}
+	if stateChanged {
+		tunnel.StateVersion++
+	}
+	p.bumpAdminGenerationLocked(serverID)
+	return nil
+}
+
 // ForceDisableTunnelInMemory is an emergency fail-closed operation for
 // compensation paths where durable administrative-state persistence has
 // already failed. It prevents the live process from continuing to route traffic

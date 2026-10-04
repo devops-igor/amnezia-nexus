@@ -238,7 +238,14 @@ type Service struct {
 	syncBackendForwarderHook                func() error
 	enableBackendPreAddTunnelHook           func()
 	enableBackendPostAddTunnelHook          func()
-	reaperHook                              func(context.Context, *models.VPNSession)
+	// preparedCandidateCount counts devices built by
+	// prepareBackendForwarderCandidate. It exists so tests can prove that
+	// preparation really ran and was then discarded, rather than being
+	// skipped: at HEAD preparation and publication were one atomic call, so
+	// a pre-publication failure had no window to occur in and no observable
+	// trace. See SetPreparedCandidateCountForTest.
+	preparedCandidateCount atomic.Int64
+	reaperHook             func(context.Context, *models.VPNSession)
 
 	rollingHistory     *RollingHistory
 	diagRatesMu        sync.Mutex
@@ -925,6 +932,17 @@ func (s *Service) SetEnableBackendPostAddTunnelHookForTest(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.enableBackendPostAddTunnelHook = fn
+}
+
+// PreparedCandidateCountForTest returns how many candidate devices
+// prepareBackendForwarderCandidate has constructed and started.
+func (s *Service) PreparedCandidateCountForTest() int64 {
+	return s.preparedCandidateCount.Load()
+}
+
+// ResetPreparedCandidateCountForTest resets the prepared-candidate counter.
+func (s *Service) ResetPreparedCandidateCountForTest() {
+	s.preparedCandidateCount.Store(0)
 }
 
 // SetSyncBackendForwarderHookForTest sets a test hook called inside syncBackendForwarderOnHostUpdateLocked.
@@ -2440,6 +2458,63 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error)
 	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialAdminGen)
 }
 
+// finishEnableBackend is the local commit boundary for an administrative
+// backend enable. It is the third and final step of EnableBackend; the
+// per-server AWG lock -> manager lock -> remote lock order has already been
+// released by the time it runs.
+//
+// Backend mutation ownership contract (issue #424 / PR #429, TX-1).
+//
+//  1. Prepare, OUTSIDE Service.mu, owning everything privately: a *copied*
+//     desired tunnel row — a new key/endpoint must not be published into the
+//     live pool merely to feed the constructor — plus a fully constructed,
+//     configured and started candidate device, and enable registration
+//     prepared without prematurely rewriting an existing tunnel identity.
+//  2. Under Service.mu: revalidate current identity, AdminGeneration, pool
+//     reference and the attached-device witness; then perform ALL fallible
+//     durable local writes (enabled intent plus any legacy disabled/admin
+//     health normalization) in ONE backend-row update; then publish the
+//     prepared device, transfer ownership and retire OLD exactly once.
+//
+// Invariant (R1-3, now enforced): there must be NO fallible status write
+// after OLD retirement. The enabled-intent commit and the legacy health
+// normalization are ONE bounded durable backend-row update, issued under
+// Service.mu after the fence and BEFORE publication, so once OLD is closed
+// there is no going back and nothing fallible is left to do.
+//
+// The candidate belongs to the preparing operation until publication. Any
+// pre-publication failure closes ONLY the candidate, leaves OLD untouched and
+// attached, retains the original error, and contributes NO served-device
+// retirement prefix. An unpublished candidate must never be counted as a
+// retired serving device.
+//
+// On durable write failure: close the candidate, leave OLD as-is, retain the
+// cause. A returned database error is not proof that nothing was written — if
+// the boundary can report ambiguous completion, use a bounded durable readback
+// before claiming OLD is unchanged.
+//
+// Historical default that must not change: CreateBackendTunnel coerces
+// enabled=false with DisableReasonNone to true. A pending disabled row must
+// satisfy the existing effective-disabled contract explicitly; do not change
+// the global default and do not add a migration.
+//
+// Lock order: Service.mu -> Pool.mu -> existing database write
+// synchronization. Manager, SSH and peer reconciliation are NEVER called while
+// Service.mu is held. Candidate construction and socket startup happen outside
+// it.
+//
+// What must keep working (each has a permanent test):
+//   - Explicit same-state persistence still reaches durable storage, so the
+//     quarantine-retry fix (the early return in Pool.SetTunnelEnabled sits
+//     AFTER the persistence hook, internal/vpn/tunnel/pool.go) is not
+//     regressed.
+//   - AdminGeneration fencing still defeats a newer disable.
+//   - Health-only observations do not spuriously invalidate an administrative
+//     commit (they advance StateVersion, not AdminGeneration).
+//   - StateVersion vs AdminGeneration semantics are preserved.
+//   - Prober failure bookkeeping is reset only for the successful commit.
+//   - Allowlisted SQL fields/encryption in internal/database/vpn.go are reused;
+//     extend the row-update API only if genuinely required, and narrowly.
 func (s *Service) finishEnableBackend(
 	ctx context.Context,
 	pool *tunnel.Pool,
@@ -2450,15 +2525,114 @@ func (s *Service) finishEnableBackend(
 	initialEnabled bool,
 	initialAdminGen int64,
 ) error {
+	// ---- PREPARATION (outside Service.mu) --------------------------------
+	//
+	// R1-2 split. The candidate is built, configured and started here, PRIVATE
+	// to this operation: it is not attached to the forwarder, not published into
+	// backendDevices/backendDeviceEndpoints, and OLD is not touched. tun is the
+	// caller's copy of the desired row, so no key or endpoint is published into
+	// the live pool merely to feed the constructor.
+	//
+	// Construction is deliberately outside Service.mu: socket startup is I/O and
+	// the documented lock order forbids holding Service.mu across it.
+	cand, prepErr := s.prepareBackendForwarderCandidate(tun, awgParams, s.hasForwarderOutsideLock())
+	if prepErr != nil {
+		return backendEnableFailure("attach_device", prepErr)
+	}
+
+	// Until the candidate is published below, it belongs to this operation alone.
+	// Every pre-publication failure closes ONLY the candidate and leaves OLD
+	// untouched, attached and registered. An unpublished candidate contributes no
+	// served-device retirement prefix.
+	published := false
+	defer func() {
+		if !published {
+			s.discardBackendForwarderCandidate(cand)
+		}
+	}()
+
+	// ---- COMMIT BOUNDARY (under Service.mu) -------------------------------
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	currTun, err := pool.GetTunnel(serverID)
+	// Revalidate current identity, AdminGeneration and the effective-disabled
+	// contract BEFORE anything destructive happens. See
+	// revalidateBackendEnableCommit.
+	currTun, err := s.revalidateBackendEnableCommit(ctx, pool, tun, serverID, hasInitial, initialEnabled, initialAdminGen)
 	if err != nil {
 		return err
 	}
+
+	// ---- DURABLE ADMINISTRATIVE COMMIT (still before publication) ---------
+	//
+	// R1-3: the enabled-intent commit and the legacy admin-health
+	// normalization are folded into ONE bounded durable backend-row update and
+	// run HERE, under Service.mu, after the fence and before publication. It is
+	// the last fallible step of the enable. See
+	// commitBackendEnableDurableState.
+	if err := s.commitBackendEnableDurableState(ctx, pool, tun, currTun); err != nil {
+		return err
+	}
+
+	// ---- PUBLICATION -----------------------------------------------------
+	//
+	// First destructive step of the replacement, and now the ONLY remaining
+	// step: the candidate becomes the serving device and OLD is retired exactly
+	// once. Publication is non-fallible by construction
+	// (AttachBackendDevice has no error result), and NO fallible durable write
+	// remains after it.
+	s.publishBackendForwarderCandidate(cand)
+	published = true
+
+	// Issue #50: clear the prober's consecutive-failure counter so the
+	// re-enabled backend gets the full FailureThreshold grace period. Reset
+	// only for the successful commit — the persistence-failure path above
+	// returns before reaching this point.
+	if s.prober != nil {
+		s.prober.ResetFailCount(serverID)
+	}
+
+	return nil
+}
+
+// hasForwarderOutsideLock reports whether the Service has a forwarder, for
+// callers that are NOT holding Service.mu. It takes a brief read lock purely to
+// sample the pointer and releases it before returning, so no Service lock is
+// held across device construction.
+//
+// It exists because prepareBackendForwarderCandidate must not take any Service
+// lock itself: its other callers invoke it while already holding Service.mu for
+// writing, and sync.RWMutex is not reentrant, so an internal RLock would
+// deadlock. See prepareBackendForwarderCandidate's lock discipline note.
+func (s *Service) hasForwarderOutsideLock() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.forwarder != nil
+}
+
+// revalidateBackendEnableCommit re-reads the live row and enforces every fence
+// that must hold before the enable publishes anything. It returns the live row
+// so the caller can evaluate the legacy-status condition afterwards.
+//
+// Service.mu MUST be held by the caller. Every fence here is a pure read of
+// live state, so it must run AFTER preparation (so a genuine pre-publication
+// window exists in which a concurrent administrative change can be caught) and
+// BEFORE publication (so nothing has been destroyed yet).
+func (s *Service) revalidateBackendEnableCommit(
+	ctx context.Context,
+	pool *tunnel.Pool,
+	tun *models.BackendTunnel,
+	serverID int64,
+	hasInitial bool,
+	initialEnabled bool,
+	initialAdminGen int64,
+) (*models.BackendTunnel, error) {
+	currTun, err := pool.GetTunnel(serverID)
+	if err != nil {
+		return nil, err
+	}
 	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
-		return errors.New("backend was administratively disabled; aborting enable")
+		return nil, errors.New("backend was administratively disabled; aborting enable")
 	}
 
 	// Fence the enable against a genuine identity change: a different tunnel row,
@@ -2469,7 +2643,7 @@ func (s *Service) finishEnableBackend(
 		currTun.PublicKey != tun.PublicKey ||
 		currTun.PrivateKey != tun.PrivateKey ||
 		currTun.ProbePrivateKey != tun.ProbePrivateKey {
-		return backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
+		return nil, backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
 	}
 
 	// Fence the enable against concurrent administrative modifications.
@@ -2481,9 +2655,9 @@ func (s *Service) finishEnableBackend(
 	// - If the backend is currently enabled, a concurrent enable already completed.
 	if pool.AdminGeneration(serverID) != initialAdminGen {
 		if !currTun.Enabled {
-			return errors.New("backend was administratively disabled; aborting enable")
+			return nil, errors.New("backend was administratively disabled; aborting enable")
 		}
-		return backendEnableFailure("state_changed", errors.New("backend administrative state modified concurrently; aborting enable"))
+		return nil, backendEnableFailure("state_changed", errors.New("backend administrative state modified concurrently; aborting enable"))
 	}
 
 	if hasInitial {
@@ -2492,47 +2666,59 @@ func (s *Service) finishEnableBackend(
 		// administratively disabled when EnableBackend started is the normal
 		// manual-enable case, regardless of preserved runtime-health provenance.
 		if initialEnabled && !currTun.Enabled {
-			return errors.New("backend was administratively disabled; aborting enable")
+			return nil, errors.New("backend was administratively disabled; aborting enable")
 		}
 	} else if !currTun.Enabled {
-		return errors.New("backend was administratively disabled; aborting enable")
+		return nil, errors.New("backend was administratively disabled; aborting enable")
 	}
 
-	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
-		return backendEnableFailure("attach_device", err)
-	}
+	return currTun, nil
+}
 
-	// Issue #50: clear the prober's consecutive-failure counter so the
-	// re-enabled backend gets the full FailureThreshold grace period.
-	if s.prober != nil {
-		s.prober.ResetFailCount(serverID)
-	}
-
+// commitBackendEnableDurableState performs the ONE bounded durable backend-row
+// update that commits an administrative backend enable, and it runs BEFORE
+// publication (issue #424 / PR #429, R1-3).
+//
+// Service.mu MUST be held by the caller.
+//
+// R1-3: the enabled-intent write and the legacy administrative-disable health
+// normalization used to be two separate fallible writes issued here AFTER
+// publication, i.e. after OLD had been closed. They are now folded into a
+// single durable row update (database.CommitBackendTunnelEnable, via
+// Pool.CommitBackendEnable) and issued before publication, so:
+//
+//   - there is exactly ONE fallible durable write left in the whole enable, and
+//     it precedes every destructive step, so the contract invariant "NO second
+//     fallible status write after OLD retirement" now holds;
+//   - a persistence failure closes ONLY the unpublished candidate (see the
+//     deferred discard in finishEnableBackend) and leaves OLD open, attached,
+//     registered and forwarding. No compensation is required or performed here,
+//     because nothing has been destroyed yet.
+//
+// currTun is the row the pre-publication fence just validated; it decides
+// whether the legacy normalization is part of this commit.
+func (s *Service) commitBackendEnableDurableState(
+	ctx context.Context,
+	pool *tunnel.Pool,
+	tun *models.BackendTunnel,
+	currTun *models.BackendTunnel,
+) error {
+	// A self-healing enable never changes administrative intent (the fence in
+	// revalidateBackendEnableCommit already rejected a disabled row), so it
+	// performs no durable administrative write. Preserved from the pre-R1-3
+	// ordering, where this call was simply skipped for such contexts.
 	if tunnel.IsSelfHealingContext(ctx) {
 		return nil
 	}
 
+	// Legacy rows encoded administrative disable in runtime status. Once
+	// enabled is authoritative, that old status has no trustworthy health
+	// meaning, so the same statement also makes it unknown/connecting and
+	// requires a fresh probe.
 	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
-	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
-		if s.forwarder != nil {
-			s.forwarder.DetachBackendDevice(tun.ID)
-		}
-		if dev, ok := s.backendDevices[tun.ID]; ok {
-			if dev != nil {
-				_ = dev.Close()
-			}
-			delete(s.backendDevices, tun.ID)
-		}
-		if s.backendDeviceEndpoints != nil {
-			delete(s.backendDeviceEndpoints, tun.ID)
-		}
+
+	if err := pool.CommitBackendEnable(ctx, tun.ServerID, legacyAdminOnlyState); err != nil {
 		return backendEnableFailure("persist_enable", fmt.Errorf("failed to persist administrative backend enable: %w", err))
-	}
-	if legacyAdminOnlyState {
-		// Legacy rows encoded administrative disable in runtime status. Once
-		// enabled is authoritative, that old status has no trustworthy health
-		// meaning, so make it unknown/connecting and require a fresh probe.
-		return backendEnableFailure("persist_enable", pool.SetTunnelStatusWithReason(ctx, serverID, TunnelStatusConnecting, models.DisableReasonNone, 0))
 	}
 	return nil
 }
@@ -2764,12 +2950,61 @@ func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *m
 	return livePub, livePort, true
 }
 
-func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any) error {
+// backendForwarderCandidate is a fully constructed, configured and STARTED
+// candidate AWG device that has NOT yet been published into the live data
+// plane (issue #424 / PR #429, R1-2).
+//
+// A candidate is owned PRIVATELY by the operation that prepared it. Until
+// publishBackendForwarderCandidate transfers it, the candidate is invisible to
+// the forwarder, to backendDevices/backendDeviceEndpoints and to every reader
+// of live Service state, so a pre-publication failure can close the candidate
+// and nothing else.
+type backendForwarderCandidate struct {
+	tunnelID int64
+	serverID int64
+	endpoint string
+	device   BackendDevice
+}
+
+// prepareBackendForwarderCandidate builds, configures and starts the candidate
+// AWG device for tun. It is the PREPARATION half of the replacement split and
+// it deliberately performs NO publication:
+//
+//   - it does not call forwarder.AttachBackendDevice,
+//   - it does not touch backendDevices / backendDeviceEndpoints,
+//   - it does not close OLD,
+//   - it does not transfer OLD's retirement drops,
+//   - it does not spawn the backend return pump.
+//
+// It therefore cannot affect the currently serving device, and a failure here
+// (bad key, unparsable endpoint, socket bind failure) leaves OLD open, attached,
+// registered, admitting plaintext and still owning its loss ownership.
+//
+// It takes the tunnel ROW by value in the sense that matters here: it reads only
+// from the copy the caller passes, and it publishes nothing back. A new key or
+// endpoint must reach this constructor as a private desired value, never by
+// being published into the live pool first.
+//
+// It MUST be called WITHOUT Service.mu held. Socket startup is I/O; holding
+// Service.mu across it would serialize every Service operation behind it and
+// violates the documented lock order (see finishEnableBackend).
+//
+// LOCK DISCIPLINE: this function acquires NO Service lock of its own. It cannot,
+// because attachBackendForwarder calls it while the caller already holds
+// Service.mu for writing and sync.RWMutex is not reentrant: taking RLock under a
+// held write lock deadlocks forever. Sampling s.forwarder therefore happens in
+// the CALLER, which knows its own lock state, and is passed in as
+// hasForwarder. Callers that hold Service.mu pass s.forwarder != nil directly;
+// callers outside the lock take their own brief RLock and release it.
+//
+// A nil candidate with a nil error means "there is nothing to prepare": the
+// Service has no forwarder, so there is no data plane to publish into.
+func (s *Service) prepareBackendForwarderCandidate(tun *models.BackendTunnel, awgParams map[string]any, hasForwarder bool) (*backendForwarderCandidate, error) {
 	if tun == nil {
-		return errors.New("backend tunnel is nil")
+		return nil, errors.New("backend tunnel is nil")
 	}
-	if s.forwarder == nil {
-		return nil
+	if !hasForwarder {
+		return nil, nil
 	}
 
 	beMTU := 1280
@@ -2785,33 +3020,100 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 
 	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, awgParams)
 	if devErr != nil {
-		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
+		return nil, fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}
-	// Construct and bring up the complete candidate while the current device
-	// remains attached. Configuration or socket startup failure leaves OLD
-	// usable. AttachBackendDevice cannot fail and joins the previous write pump.
-	oldDev := s.backendDevices[tun.ID]
-	s.forwarder.AttachBackendDevice(tun.ID, dev)
+
+	s.preparedCandidateCount.Add(1)
+
+	return &backendForwarderCandidate{
+		tunnelID: tun.ID,
+		serverID: tun.ServerID,
+		endpoint: tun.Endpoint,
+		device:   dev,
+	}, nil
+}
+
+// publishBackendForwarderCandidate transfers an already prepared candidate into
+// the live data plane and retires OLD exactly once. It is the PUBLICATION half
+// of the replacement split, and it is the first DESTRUCTIVE step of a
+// replacement: once it returns, OLD is closed and cannot be reopened.
+//
+// Service.mu MUST be held by the caller. No manager, SSH or peer
+// reconciliation is performed here; routing remediation is still spawned
+// asynchronously so data-plane startup is never blocked by SSH latency.
+//
+// AttachBackendDevice has no error result and waits up to 500ms for the
+// previous write pump; that is a bounded wait, not a guaranteed join.
+func (s *Service) publishBackendForwarderCandidate(cand *backendForwarderCandidate) {
+	if cand == nil || cand.device == nil {
+		return
+	}
+
+	oldDev := s.backendDevices[cand.tunnelID]
+	s.forwarder.AttachBackendDevice(cand.tunnelID, cand.device)
 	if s.backendDevices == nil {
 		s.backendDevices = make(map[int64]BackendDevice)
 	}
-	s.backendDevices[tun.ID] = dev
+	s.backendDevices[cand.tunnelID] = cand.device
 	if s.backendDeviceEndpoints == nil {
 		s.backendDeviceEndpoints = make(map[int64]string)
 	}
-	s.backendDeviceEndpoints[tun.ID] = tun.Endpoint
-	if oldDev != nil {
+	s.backendDeviceEndpoints[cand.tunnelID] = cand.endpoint
+	if oldDev != nil && oldDev != cand.device {
 		_ = oldDev.Close()
 		s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 	}
 
 	// Spawn backend read loop to route packets back to clients
-	go s.pumpBackendReturns(tun.ID, tun.ServerID, dev)
+	go s.pumpBackendReturns(cand.tunnelID, cand.serverID, cand.device)
 
 	// Trigger backend routing and NAT remediation asynchronously in the background
 	// so tunnel attachment and data-plane startup are never blocked by SSH latency.
-	go s.triggerBackendRoutingRemediation(tun.ServerID)
+	go s.triggerBackendRoutingRemediation(cand.serverID)
+}
 
+// discardBackendForwarderCandidate closes ONLY an unpublished candidate.
+//
+// Because the candidate was never published, discarding it has no observable
+// effect beyond the candidate's own socket: the previously serving device stays
+// open, attached and registered, keeps its endpoint ownership, keeps admitting
+// plaintext and keeps its loss ownership. Nothing is transferred into
+// retiredBackendDeviceDrops, because an unpublished candidate was never a
+// retired SERVING device and so must never contribute a retirement prefix.
+//
+// This is the ONLY cleanup a pre-publication failure may perform.
+func (s *Service) discardBackendForwarderCandidate(cand *backendForwarderCandidate) {
+	if cand == nil || cand.device == nil {
+		return
+	}
+	_ = cand.device.Close()
+}
+
+// attachBackendForwarder prepares AND publishes a replacement device in one
+// step, so it also performs the destructive retirement of OLD. It exists for
+// call sites that have no fallible durable work of their own between preparation
+// and publication.
+//
+// The enable commit boundary (finishEnableBackend) does NOT use it: it calls
+// prepareBackendForwarderCandidate outside Service.mu and
+// publishBackendForwarderCandidate under it, so a pre-publication failure closes
+// only the candidate. See the backend mutation ownership contract on
+// finishEnableBackend (issue #424 / PR #429, TX-1/R1-2).
+//
+// NOTE: callers of this helper hold Service.mu across preparation, so device
+// construction happens under Service.mu there. That is pre-existing behavior on
+// those paths (startup restore, probe-driven attach, host-update resync) and is
+// neither widened nor narrowed by R1-2; R2-2 owns moving key/host mutation into
+// the validated Service commit for those callers.
+func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any) error {
+	// Callers hold Service.mu for writing, so s.forwarder is read directly:
+	// this helper must not take any Service lock itself (see
+	// prepareBackendForwarderCandidate's lock discipline note).
+	cand, err := s.prepareBackendForwarderCandidate(tun, awgParams, s.forwarder != nil)
+	if err != nil {
+		return err
+	}
+	s.publishBackendForwarderCandidate(cand)
 	return nil
 }
 
