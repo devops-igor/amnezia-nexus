@@ -458,7 +458,7 @@ func TestVirtualTUNConditionSeverityBoundaries(t *testing.T) {
 		for _, tc := range cases {
 			for _, direction := range []string{"upstream_to_nexus", "nexus_to_upstream"} {
 				t.Run(tc.name+"/"+direction, func(t *testing.T) {
-					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true})
+					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
 					if got := severityIn(conds, "virtual_tun"); got != tc.want {
 						t.Errorf("%s at %.0f%%: severity %q, want %q", direction, tc.pct, got, tc.want)
 					}
@@ -480,7 +480,7 @@ func TestVirtualTUNConditionSeverityBoundaries(t *testing.T) {
 		for _, tc := range cases {
 			for _, direction := range []string{"upstream_to_nexus", "nexus_to_upstream"} {
 				t.Run(tc.name+"/"+direction, func(t *testing.T) {
-					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true})
+					conds := evaluateVirtualTUNAndDropConditions(occupied(tc.pct, direction), DropCategoryBreakdown{}, RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
 					if got := severityIn(conds, "virtual_tun"); got != tc.want {
 						t.Errorf("%s at %.0f%%: severity %q, want %q", direction, tc.pct, got, tc.want)
 					}
@@ -509,7 +509,7 @@ func TestDropRateConditionSeverityBoundaries(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), DropCategoryBreakdown{TotalDropRatePps: tc.pps}, RoutingConsistencyDiagnostics{IsConsistent: true})
+			conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), DropCategoryBreakdown{TotalDropRatePps: tc.pps}, RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
 			if got := severityIn(conds, "drops"); got != tc.want {
 				t.Errorf("drop rate %.2f/sec: severity %q, want %q", tc.pps, got, tc.want)
 			}

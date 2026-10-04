@@ -10,11 +10,11 @@ func TestRateTracker_RatesAndEWMA(t *testing.T) {
 	t0 := time.Now()
 
 	// Initial sample at t0
-	rt.Sample(t0, 0, 0, 0, 0, 0, 0, 0, 1000)
+	rt.Sample(t0, 0, 0, 0, 0, 0, 0)
 
 	// Sample after 1 second: 1000 bytes RX, 2000 bytes TX, 10 pkts RX, 20 pkts TX, 1 drop
 	t1 := t0.Add(1 * time.Second)
-	rt.Sample(t1, 1000, 2000, 10, 20, 1, 1, 600, 1000)
+	rt.Sample(t1, 1000, 2000, 10, 20, 1, 1)
 
 	rates := rt.Snapshot(10, 20)
 	if rates.RxBps != 8000.0 { // 1000 * 8 / 1s
@@ -44,49 +44,10 @@ func TestRateTracker_RatesAndEWMA(t *testing.T) {
 	if pressure.HighWaterPct != 70.0 {
 		t.Errorf("expected HighWaterPct=70%%, got %f", pressure.HighWaterPct)
 	}
-	// Saturation durations are interpolated between the two endpoint readings
-	// (issue #424 round 8, finding 3). The priming reading was 0% and this one is
-	// 60%, so only the fraction of the 1s interval spent above 50% counts, which
-	// is well under a whole second.
-	if pressure.ConsecutiveAbove50Sec != 0 {
-		t.Errorf("a rise from 0%% to 60%% across 1s must not claim a whole second above 50%%, got %d",
-			pressure.ConsecutiveAbove50Sec)
-	}
-	if pressure.ConsecutiveAbove80Sec != 0 {
-		t.Errorf("expected ConsecutiveAbove80Sec == 0, got %d", pressure.ConsecutiveAbove80Sec)
+	if pressure.QueueFullDropRate != 1 {
+		t.Errorf("queue refusal rate=%v, want 1", pressure.QueueFullDropRate)
 	}
 
-	// Sample after another second above 80%
-	t2 := t1.Add(1 * time.Second)
-	rt.Sample(t2, 2000, 4000, 20, 40, 2, 2, 850, 1000)
-	pressure = rt.PressureSnapshot(850, 1000, 850, 2)
-	// 60% -> 85% across 1s: only the fraction above 80% counts, so this stays
-	// under a whole second rather than claiming 1s of saturation.
-	if pressure.ConsecutiveAbove80Sec > 1 {
-		t.Errorf("a rise from 60%% to 85%% across 1s must credit only the post-threshold fraction, got %d",
-			pressure.ConsecutiveAbove80Sec)
-	}
-
-	// A sample that again sees 85% proves the queue really was above the
-	// threshold for a full second, and that must be credited in full.
-	t2b := t2.Add(1 * time.Second)
-	rt.Sample(t2b, 2500, 5000, 25, 50, 2, 2, 850, 1000)
-	pressure = rt.PressureSnapshot(850, 1000, 850, 2)
-	if pressure.ConsecutiveAbove80Sec < 1 {
-		t.Errorf("85%% at both ends of a 1s interval must be credited in full, got %d",
-			pressure.ConsecutiveAbove80Sec)
-	}
-
-	// Sample after another second falling below 50%
-	t3 := t2b.Add(1 * time.Second)
-	rt.Sample(t3, 3000, 6000, 30, 60, 2, 2, 400, 1000)
-	pressure = rt.PressureSnapshot(400, 1000, 850, 2)
-	if pressure.ConsecutiveAbove50Sec != 0 {
-		t.Errorf("expected ConsecutiveAbove50Sec == 0 after dropping below 50%%, got %d", pressure.ConsecutiveAbove50Sec)
-	}
-	if pressure.ConsecutiveAbove80Sec != 0 {
-		t.Errorf("expected ConsecutiveAbove80Sec == 0 after dropping below 80%%, got %d", pressure.ConsecutiveAbove80Sec)
-	}
 }
 
 func TestForwarder_RatesAndPressureAPI(t *testing.T) {

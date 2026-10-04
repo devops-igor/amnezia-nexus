@@ -123,26 +123,6 @@
         </div>
     </div>
 
-    <!-- Hidden compatibility elements to guarantee DOM ID and translation matches for existing assertions -->
-    <div style="display: none;">
-        <span>{{ _ "vpn_forwarder_queue" }}</span>
-        <span>{{ _ "vpn_forwarder_instantaneous" }}</span>
-        <span id="vpn-fwd-queue">-</span>
-        <span>{{ _ "vpn_forwarder_peak" }}</span>
-        <span>{{ _ "vpn_forwarder_peak_watermark" }}</span>
-        <span id="vpn-fwd-peak">-</span>
-        <span>{{ _ "vpn_forwarder_drops_queue_full" }}</span>
-        <span>{{ _ "vpn_forwarder_cumulative" }}</span>
-        <span id="vpn-fwd-drops-queue-full">-</span>
-        <span>{{ _ "vpn_forwarder_drops_no_route" }}</span>
-        <span id="vpn-fwd-drops-no-route">-</span>
-        <span>{{ _ "vpn_forwarder_drops_oversize" }}</span>
-        <span id="vpn-fwd-drops-packet-too-large">-</span>
-        <span>{{ _ "vpn_forwarder_write_errors" }}</span>
-        <span id="vpn-fwd-write-errors">-</span>
-        <span>{{ _ "vpn_forwarder_routes" }}</span>
-    </div>
-
     <!-- 11 Diagnostic Panels Grid -->
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-md);">
         <!-- Panel 1: Traffic & Capacity -->
@@ -200,6 +180,10 @@
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_backend_client" }}:</span><span class="font-mono" id="vpn-diag-drops-return">-</span></div>
                 <div class="flex justify-between"><span class="text-muted">{{ _ "vpn_diag_total_drop_rate" }}:</span><span class="font-mono" id="vpn-diag-drops-total">-</span></div>
             </div>
+            <details style="margin-top: var(--space-xs); font-size: 0.8rem;">
+                <summary>{{ _ "vpn_diag_loss_reasons" }}</summary>
+                <div id="vpn-diag-drop-reasons"></div>
+            </details>
         </div>
 
         <!-- Panel 5: VirtualTUN Health -->
@@ -1163,6 +1147,33 @@
         });
     }
 
+    function vpnLossReasonLabels() {
+        return {
+            client_backend_device_external: 'vpn_diag_loss_client_backend_device_external',
+            client_backend_device_oversized: 'vpn_diag_loss_client_backend_device_oversized',
+            client_backend_device_queue_full: 'vpn_diag_loss_client_backend_device_queue_full',
+            client_backend_device_shutdown: 'vpn_diag_loss_client_backend_device_shutdown',
+            client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',
+            client_backend_queue_full: 'vpn_diag_loss_client_backend_queue_full',
+            client_malformed: 'vpn_diag_loss_client_malformed',
+            client_mismatch: 'vpn_diag_loss_client_mismatch',
+            client_no_healthy_backend: 'vpn_diag_loss_client_no_healthy_backend',
+            client_rate_limited: 'vpn_diag_loss_client_rate_limited',
+            client_rejected: 'vpn_diag_loss_client_rejected',
+            client_unmapped_source: 'vpn_diag_loss_client_unmapped_source',
+            client_virtualtun_drops: 'vpn_diag_loss_client_virtualtun_drops',
+            return_backend_device_queue_full: 'vpn_diag_loss_return_backend_device_queue_full',
+            return_backend_device_shutdown: 'vpn_diag_loss_return_backend_device_shutdown',
+            return_injection_errors: 'vpn_diag_loss_return_injection_errors',
+            return_malformed: 'vpn_diag_loss_return_malformed',
+            return_mismatch: 'vpn_diag_loss_return_mismatch',
+            return_packet_too_large: 'vpn_diag_loss_return_packet_too_large',
+            return_queue_full: 'vpn_diag_loss_return_queue_full',
+            return_unmapped: 'vpn_diag_loss_return_unmapped',
+            return_virtualtun_drops: 'vpn_diag_loss_return_virtualtun_drops'
+        };
+    }
+
     function vpnGenerateSparklineSVG(data, color, fillOpacity) {
         if (!data || !data.some(Number.isFinite)) {
             return '<svg viewBox="0 0 200 40" width="100%" height="40" style="display:block;"><text x="100" y="24" text-anchor="middle" fill="var(--text-muted, #888)" font-size="10">' + escapeHtml(_('no_data')) + '</text></svg>';
@@ -1216,11 +1227,15 @@
         else if (w === '24h') points = series.window_24h || [];
         else points = series.window_15m || [];
 
-        const tData = points.map(function(p) { return p.traffic_available === false ? null : (p.rx_bps || 0) + (p.tx_bps || 0); });
+        const tData = points.map(function(p) { return p.traffic_available !== true ? null : (p.rx_bps || 0) + (p.tx_bps || 0); });
         const qData = points.map(function(p) { return (p.q_pct || 0); });
-        const dData = points.map(function(p) { return p.drop_rates_available === false ? null : (p.drop_rate || 0); });
+        const dData = points.map(function(p) { return p.drop_rates_available !== true ? null : (p.drop_rate || 0); });
+        // An absent observation count is UNKNOWN, not an available zero: only a
+        // positive explicit sample count makes the percentile plottable. Same
+        // availability-honesty rule as traffic_available / drop_rates_available
+        // and be_latency_samples above.
         const lData = points.map(function(p) {
-            if (p.fwd_p95_samples !== undefined && Number(p.fwd_p95_samples) <= 0) return null;
+            if (!(Number(p.fwd_p95_samples) > 0)) return null;
             return Number.isFinite(p.fwd_p95_ms) ? p.fwd_p95_ms : null;
         });
 
@@ -1251,7 +1266,7 @@
             }
         }
         function known(p, key, availability) {
-            return p[availability] === false || !Number.isFinite(p[key]) ? null : p[key];
+            return p[availability] !== true || !Number.isFinite(p[key]) ? null : p[key];
         }
         renderSeries('vpn-chart-directions', [
             {label:_('vpn_diag_rx_direction'), values:points.map(p => known(p,'rx_bps','traffic_available'))},
@@ -1266,37 +1281,13 @@
             {label:_('vpn_diag_active_routes'),values:points.map(p => Number.isFinite(p.routes) ? p.routes : null),color:'var(--info, #06b6d4)'}
         ]);
         renderSeries('vpn-chart-backend-latency', [
-            {label:_('vpn_diag_backend_probe_p95'),values:points.map(p => p.be_latency_samples === 0 || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
+            {label:_('vpn_diag_backend_probe_p95'),values:points.map(p => !(p.be_latency_samples > 0) || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
         ]);
-        const lossLabels = {
-            client_backend_device_external: 'vpn_diag_loss_client_backend_device_external',
-            client_backend_device_oversized: 'vpn_diag_loss_client_backend_device_oversized',
-            client_backend_device_queue_full: 'vpn_diag_loss_client_backend_device_queue_full',
-            client_backend_device_retired_drops: 'vpn_diag_loss_client_backend_device_retired_drops',
-            client_backend_device_shutdown: 'vpn_diag_loss_client_backend_device_shutdown',
-            client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',
-            client_backend_queue_full: 'vpn_diag_loss_client_backend_queue_full',
-            client_malformed: 'vpn_diag_loss_client_malformed',
-            client_mismatch: 'vpn_diag_loss_client_mismatch',
-            client_no_healthy_backend: 'vpn_diag_loss_client_no_healthy_backend',
-            client_rate_limited: 'vpn_diag_loss_client_rate_limited',
-            client_rejected: 'vpn_diag_loss_client_rejected',
-            client_unmapped_source: 'vpn_diag_loss_client_unmapped_source',
-            client_virtualtun_drops: 'vpn_diag_loss_client_virtualtun_drops',
-            return_backend_device_queue_full: 'vpn_diag_loss_return_backend_device_queue_full',
-            return_backend_device_shutdown: 'vpn_diag_loss_return_backend_device_shutdown',
-            return_injection_errors: 'vpn_diag_loss_return_injection_errors',
-            return_malformed: 'vpn_diag_loss_return_malformed',
-            return_mismatch: 'vpn_diag_loss_return_mismatch',
-            return_packet_too_large: 'vpn_diag_loss_return_packet_too_large',
-            return_queue_full: 'vpn_diag_loss_return_queue_full',
-            return_unmapped: 'vpn_diag_loss_return_unmapped',
-            return_virtualtun_drops: 'vpn_diag_loss_return_virtualtun_drops'
-        };
+        const lossLabels = vpnLossReasonLabels();
         const reasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
         renderSeries('vpn-chart-reasons', reasons.map(key => ({
             label:(lossLabels[key] ? _(lossLabels[key]) : key.replace(/_/g,' ')) + ' (drops/s)',
-            values:points.map(p => p.drop_rates_available === false || !p.drop_reason_rates || !Number.isFinite(p.drop_reason_rates[key]) ? null : p.drop_reason_rates[key]),
+            values:points.map(p => p.drop_rates_available !== true || !p.drop_reason_rates || !Number.isFinite(p.drop_reason_rates[key]) ? null : p.drop_reason_rates[key]),
             color:'var(--danger, #ef4444)'
         })));
         // The stored fleet context is capped; the renderer also caps churn
@@ -1337,7 +1328,7 @@
                 }
             }
         }
-        if (vpnLastStatus && vpnLastStatus.forwarder_available !== false && vpnLastStatus.historical_series) {
+        if (vpnLastStatus && vpnLastStatus.forwarder_available === true && vpnLastStatus.historical_series) {
             vpnRenderHistoryCharts(vpnLastStatus.historical_series);
         }
     }
@@ -1348,7 +1339,7 @@
         if (btn) {
             btn.textContent = vpnShowAllRoutes ? (_('vpn_fwd_show_problems') || 'Show Problems Only') : (_('vpn_fwd_show_all') || 'Show All Routes');
         }
-        if (vpnLastStatus && vpnLastStatus.forwarder_available !== false) {
+        if (vpnLastStatus && vpnLastStatus.forwarder_available === true) {
             vpnRenderForwarderHealth(vpnLastStatus);
         }
     }
@@ -1381,25 +1372,10 @@
             return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
         }
 
-        let isAvailable = false;
-        if (status && typeof status === 'object') {
-            if (typeof status.forwarder_available === 'boolean') {
-                isAvailable = status.forwarder_available;
-            } else if (typeof status.forwarder_queue_capacity === 'number') {
-                // Backward-compatibility fallback for older status responses lacking the boolean
-                isAvailable = status.forwarder_queue_capacity > 0 ||
-                    (status.forwarder_drops_total !== undefined && status.forwarder_drops_total !== null);
-            }
-        }
+        const isAvailable = !!status && status.forwarder_available === true;
 
         const statusBadge = document.getElementById('vpn-fwd-status-badge');
         const statusText = document.getElementById('vpn-fwd-status-text');
-        const queueElem = document.getElementById('vpn-fwd-queue');
-        const peakElem = document.getElementById('vpn-fwd-peak');
-        const dropsFullElem = document.getElementById('vpn-fwd-drops-queue-full');
-        const dropsNoRouteElem = document.getElementById('vpn-fwd-drops-no-route');
-        const dropsOversizeElem = document.getElementById('vpn-fwd-drops-packet-too-large');
-        const writeErrorsElem = document.getElementById('vpn-fwd-write-errors');
         const badgeElem = document.getElementById('vpn-fwd-routes-badge');
         const summaryStatus = document.getElementById('vpn-fwd-routes-summary-status');
         const tbody = document.getElementById('vpn-fwd-routes-tbody');
@@ -1414,12 +1390,6 @@
             const problemListElem = document.getElementById('vpn-fwd-problem-list');
             if (problemListElem) { problemListElem.textContent = ''; problemListElem.style.display = 'none'; }
 
-            if (queueElem) { queueElem.textContent = '-'; queueElem.style.color = ''; }
-            if (peakElem) { peakElem.textContent = '-'; peakElem.style.color = ''; }
-            if (dropsFullElem) { dropsFullElem.textContent = '-'; dropsFullElem.style.color = ''; }
-            if (dropsNoRouteElem) { dropsNoRouteElem.textContent = '-'; dropsNoRouteElem.style.color = ''; }
-            if (dropsOversizeElem) { dropsOversizeElem.textContent = '-'; dropsOversizeElem.style.color = ''; }
-            if (writeErrorsElem) { writeErrorsElem.textContent = '-'; writeErrorsElem.style.color = ''; }
 
             if (badgeElem) badgeElem.textContent = '0';
             if (summaryStatus) {
@@ -1438,7 +1408,7 @@
                 if (el) { el.textContent = '-'; el.style.color = ''; }
             }
 
-            const diagIds = ['vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h', 'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50', 'vpn-diag-queue-dur80', 'vpn-diag-queue-drops', 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight', 'vpn-diag-lat-stalls', 'vpn-diag-lat-errors', 'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus', 'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-sync-failures', 'vpn-diag-peer-sync-op-failures', 'vpn-diag-peer-sync-invalid', 'vpn-diag-peer-sync-enqueue', 'vpn-diag-peer-sync-reconcile', 'vpn-diag-peer-sync-error', 'vpn-diag-peer-sync-restart', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts', 'vpn-diag-be-counts', 'vpn-diag-be-latency', 'vpn-diag-be-skew', 'vpn-diag-be-drops', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines', 'vpn-diag-res-gc', 'vpn-diag-res-fd'];
+            const diagIds = ['vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h', 'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50', 'vpn-diag-queue-dur80', 'vpn-diag-queue-drops', 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight', 'vpn-diag-lat-stalls', 'vpn-diag-lat-errors', 'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-drop-reasons', 'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus', 'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-sync-failures', 'vpn-diag-peer-sync-op-failures', 'vpn-diag-peer-sync-invalid', 'vpn-diag-peer-sync-enqueue', 'vpn-diag-peer-sync-reconcile', 'vpn-diag-peer-sync-error', 'vpn-diag-peer-sync-restart', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts', 'vpn-diag-be-counts', 'vpn-diag-be-latency', 'vpn-diag-be-skew', 'vpn-diag-be-drops', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines', 'vpn-diag-res-gc', 'vpn-diag-res-fd'];
             for (let i = 0; i < diagIds.length; i++) {
                 const el = document.getElementById(diagIds[i]);
                 if (el) { el.textContent = '-'; el.style.color = ''; }
@@ -1483,48 +1453,7 @@
         const dropsOversize = Number(status.forwarder_drops_packet_too_large || 0);
         const writeErrors = Number(status.forwarder_device_write_errors || 0);
 
-        // Queue occupancy (instantaneous)
-        if (queueElem) {
-            queueElem.textContent = occ + ' / ' + cap;
-            if (cap > 0 && occ >= cap * 0.8) {
-                queueElem.style.color = 'var(--danger)';
-            } else if (cap > 0 && occ >= cap * 0.5) {
-                queueElem.style.color = 'var(--warning)';
-            } else {
-                queueElem.style.color = '';
-            }
-        }
-
-        // Peak high-water (monotonic watermark)
-        if (peakElem) {
-            peakElem.textContent = String(peak);
-            peakElem.style.color = '';
-        }
-
-        // Drops & error counters (cumulative)
-        if (dropsFullElem) {
-            dropsFullElem.textContent = String(dropsQueueFull);
-            dropsFullElem.style.color = dropsQueueFull > 0 ? 'var(--danger)' : '';
-        }
-
-        if (dropsNoRouteElem) {
-            dropsNoRouteElem.textContent = String(dropsNoRoute);
-            dropsNoRouteElem.style.color = dropsNoRoute > 0 ? 'var(--warning)' : '';
-        }
-
-        if (dropsOversizeElem) {
-            dropsOversizeElem.textContent = String(dropsOversize);
-            dropsOversizeElem.style.color = dropsOversize > 0 ? 'var(--warning)' : '';
-        }
-
-        if (writeErrorsElem) {
-            writeErrorsElem.textContent = String(writeErrors);
-            writeErrorsElem.style.color = writeErrors > 0 ? 'var(--danger)' : '';
-        }
-
-
         // Route Queues & Pressure (Problem-first by default)
-        const routeQueues = status.forwarder_route_queues || {};
         let routeItems = [];
         let allRouteList = [];
         if (Array.isArray(status.all_routes)) {
@@ -1534,44 +1463,11 @@
         }
 
         const showAll = (typeof vpnShowAllRoutes !== 'undefined' && vpnShowAllRoutes);
-        if (Array.isArray(status.problem_routes) || Array.isArray(status.all_routes)) {
-            routeItems = showAll ? (status.all_routes || status.problem_routes || []) : (status.problem_routes || []);
-        } else if (typeof routeQueues === 'object') {
-            for (const peerKey of Object.keys(routeQueues)) {
-                const rq = routeQueues[peerKey] || {};
-                const rOcc = Number(rq.occupancy || 0);
-                const rCap = Number(rq.capacity || 0);
-                const rPeak = Number(rq.high_water || 0);
-                const rDrops = Number(rq.queue_full_drops || 0);
-                const rWrites = Number(rq.write_count || 0);
-                const rErrors = Number(rq.write_errors || 0);
-                routeItems.push({
-                    peer_key: peerKey,
-                    capacity: rCap,
-                    occupancy: rOcc,
-                    high_water: rPeak,
-                    drops: rDrops,
-                    write_count: rWrites,
-                    write_errors: rErrors,
-                    queue_full_drops_recent: Number(rq.queue_full_drops_recent || 0),
-                    write_errors_recent: Number(rq.write_errors_recent || 0),
-                    write_stalls_recent: Number(rq.write_stalls_recent || 0),
-                    has_pressure: (rCap > 0 && rOcc / rCap >= 0.8) ||
-                        Number(rq.oldest_write_ms || 0) >= 100 ||
-                        Number(rq.queue_full_drops_recent || 0) > 0 ||
-                        Number(rq.write_errors_recent || 0) > 0 ||
-                        Number(rq.write_stalls_recent || 0) > 0
-                });
-            }
-            allRouteList = routeItems;
-        }
+        routeItems = showAll ? allRouteList : (status.problem_routes || []);
 
-        let totalRouteDrops = 0;
         let routeHasPressure = false;
         for (let i = 0; i < allRouteList.length; i++) {
             const r = allRouteList[i];
-            const d = Number(r.drops !== undefined ? r.drops : (r.queue_full_drops || 0));
-            totalRouteDrops += d;
             const currentPressure = typeof r.has_pressure === 'boolean' ? r.has_pressure :
                 ((r.capacity > 0 && r.occupancy / r.capacity >= 0.8) ||
                  Number(r.oldest_write_ms || 0) >= 100 ||
@@ -1744,8 +1640,6 @@
 
         // Overall Forwarder Health Assessment
         const ha = status.health_assessment;
-        const hasSevereIssue = dropsQueueFull > 0 || writeErrors > 0 || (routeHasPressure && totalRouteDrops > 0) || (cap > 0 && occ >= cap * 0.9);
-        const hasWarningIssue = dropsNoRoute > 0 || dropsOversize > 0 || (cap > 0 && occ >= cap * 0.5) || routeHasPressure;
 
         if (statusBadge && statusText) {
             if (ha && ha.status) {
@@ -1763,15 +1657,9 @@
                     statusBadge.className = 'badge';
                     statusText.textContent = _('vpn_forwarder_unavailable') || 'Not reported';
                 }
-            } else if (hasSevereIssue) {
-                statusBadge.className = 'badge badge-danger';
-                statusText.textContent = _('vpn_forwarder_pressure') || 'Pressure Detected';
-            } else if (hasWarningIssue) {
-                statusBadge.className = 'badge badge-warn';
-                statusText.textContent = _('vpn_forwarder_warning') || 'Warning';
             } else {
-                statusBadge.className = 'badge badge-success';
-                statusText.textContent = _('vpn_forwarder_healthy') || 'Healthy';
+                statusBadge.className = 'badge';
+                statusText.textContent = _('vpn_forwarder_unavailable');
             }
         }
 
@@ -1784,7 +1672,7 @@
             } else if (statusBadge && statusBadge.className.includes('badge-warn')) {
                 headlineElem.textContent = _('vpn_diag_summary_degraded');
             } else {
-                headlineElem.textContent = _('vpn_diag_summary_healthy');
+                headlineElem.textContent = ha && ha.status === 'HEALTHY' ? _('vpn_diag_summary_healthy') : _('vpn_forwarder_unavailable');
             }
         }
 
@@ -1848,7 +1736,7 @@
             const rates = status.rates || {};
             const totalBps = (rates.rx_bps || 0) + (rates.tx_bps || 0);
             const totalPps = (rates.rx_pps || 0) + (rates.tx_pps || 0);
-            kpiThroughput.textContent = rates.available === false ? _('vpn_diag_traffic_unavailable') : fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
+            kpiThroughput.textContent = rates.available !== true ? _('vpn_diag_traffic_unavailable') : fmtBps(totalBps) + ' / ' + fmtPps(totalPps);
         }
 
         const kpiRoutes = document.getElementById('vpn-kpi-routes-sessions');
@@ -1879,8 +1767,8 @@
             const drops = status.drop_categories || {};
             const totDrops = drops.total_drops !== undefined ? drops.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = drops.total_drop_rate_pps !== undefined ? drops.total_drop_rate_pps.toFixed(2) : '0.00';
-            kpiLoss.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:drops.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps', count:totDrops});
-            kpiLoss.style.color = drops.rates_available !== false && Number(drops.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            kpiLoss.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:drops.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps', count:totDrops});
+            kpiLoss.style.color = drops.rates_available === true && Number(drops.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         const kpiEngine = document.getElementById('vpn-kpi-client-engine');
@@ -1943,25 +1831,25 @@
         const dThroughput = document.getElementById('vpn-diag-throughput');
         if (dThroughput) {
             const r = status.rates || {};
-            dThroughput.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
+            dThroughput.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps || 0) + ' | Tx: ' + fmtBps(r.tx_bps || 0);
         }
         const dPackets = document.getElementById('vpn-diag-packets');
         if (dPackets) {
             const r = status.rates || {};
-            dPackets.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
+            dPackets.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtPps(r.rx_pps || 0) + ' | Tx: ' + fmtPps(r.tx_pps || 0);
         }
         const dEwma5m = document.getElementById('vpn-diag-ewma5m');
         if (dEwma5m) {
             const r = status.rates || {};
-            dEwma5m.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
+            dEwma5m.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps_avg_5m || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_5m || 0);
         }
         const dEwma1h = document.getElementById('vpn-diag-ewma1h');
         if (dEwma1h) {
             const r = status.rates || {};
-            dEwma1h.textContent = r.available === false ? _('vpn_diag_traffic_unavailable') :
+            dEwma1h.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :
                 'Rx: ' + fmtBps(r.rx_bps_avg_1h || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_1h || 0);
         }
 
@@ -2034,40 +1922,63 @@
         if (dDropsClient) {
             const dc = status.drop_categories || {};
             const rate = (dc.client_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsClient.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.client_total_drops || 0});
-            dDropsClient.style.color = dc.rates_available !== false && Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            dDropsClient.style.color = dc.rates_available === true && Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsRet = document.getElementById('vpn-diag-drops-return');
         if (dDropsRet) {
             const dc = status.drop_categories || {};
             const rate = (dc.return_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsRet.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.return_total_drops || 0});
-            dDropsRet.style.color = dc.rates_available !== false && Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            dDropsRet.style.color = dc.rates_available === true && Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsTot = document.getElementById('vpn-diag-drops-total');
         if (dDropsTot) {
             const dc = status.drop_categories || {};
             const tot = dc.total_drops !== undefined ? dc.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = (dc.total_drop_rate_pps || 0).toFixed(2);
-            const rateText = dc.rates_available === false ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsTot.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:tot});
-            dDropsTot.style.color = dc.rates_available !== false && Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            dDropsTot.style.color = dc.rates_available === true && Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
-        // Panel 5: VirtualTUN Health
-        const dVtunUp = document.getElementById('vpn-diag-vtun-upstream');
-        if (dVtunUp) {
-            const vt = (status.virtual_tun && status.virtual_tun.upstream_to_nexus) || {};
-            dVtunUp.textContent = _('vpn_diag_occupancy') + ': ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | ' + _('vpn_forwarder_route_peak') + ': ' + (vt.peak || 0) + ' | ' + _('vpn_forwarder_route_drops') + ': ' + (vt.drops || 0);
-            dVtunUp.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
+        const reasonTable = document.getElementById('vpn-diag-drop-reasons');
+        if (reasonTable) {
+            reasonTable.textContent = '';
+            const dc = status.drop_categories || {};
+            const labels = vpnLossReasonLabels();
+            const rates = dc.reason_rates || {};
+            const reasons = Object.keys(labels).sort((a, b) =>
+                (dc.rates_available === true ? Number(rates[b] || 0) - Number(rates[a] || 0) : 0) ||
+                Number(dc[b] || 0) - Number(dc[a] || 0) || a.localeCompare(b));
+            for (const reason of reasons) {
+                const row = document.createElement('div');
+                const rate = dc.rates_available === true && Number.isFinite(rates[reason]) ?
+                    Number(rates[reason]).toFixed(2) + ' pps' : _('vpn_diag_loss_unavailable');
+                row.textContent = _(labels[reason]) + ': ' +
+                    vpnDiagText('vpn_diag_with_cumulative', {value:rate, count:dc[reason] || 0});
+                row.style.color = dc.rates_available === true && Number(rates[reason]) > 0 ? 'var(--danger)' : '';
+                reasonTable.appendChild(row);
+            }
         }
-        const dVtunNex = document.getElementById('vpn-diag-vtun-nexus');
-        if (dVtunNex) {
-            const vt = (status.virtual_tun && status.virtual_tun.nexus_to_upstream) || {};
-            dVtunNex.textContent = _('vpn_diag_occupancy') + ': ' + (vt.occupancy || 0) + '/' + (vt.capacity || 1024) + ' | ' + _('vpn_forwarder_route_peak') + ': ' + (vt.peak || 0) + ' | ' + _('vpn_forwarder_route_drops') + ': ' + (vt.drops || 0);
-            dVtunNex.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
+
+        // Panel 5: VirtualTUN Health. Zero capacity means no live queue;
+        // retained lifetime drops still belong to their original direction.
+        for (const [id, direction] of [
+            ['vpn-diag-vtun-upstream', 'upstream_to_nexus'],
+            ['vpn-diag-vtun-nexus', 'nexus_to_upstream']
+        ]) {
+            const element = document.getElementById(id);
+            if (!element) continue;
+            const vt = (status.virtual_tun && status.virtual_tun[direction]) || {};
+            const queue = Number.isFinite(vt.capacity) && vt.capacity > 0 ?
+                _('vpn_diag_occupancy') + ': ' + (vt.occupancy || 0) + '/' + vt.capacity +
+                ' | ' + _('vpn_forwarder_route_peak') + ': ' + (vt.peak || 0) :
+                _('vpn_diag_queue_unavailable');
+            element.textContent = queue + ' | ' + _('vpn_forwarder_route_drops') + ': ' + (vt.drops || 0);
+            element.style.color = vt.capacity > 0 && vt.occupancy / vt.capacity >= 0.8 ? 'var(--danger)' : '';
         }
 
         // Panel 6: Upstream AWG & Peer Sync
@@ -2244,7 +2155,6 @@
             const deviceDropRate = [
                 'client_backend_device_queue_full', 'client_backend_device_oversized',
                 'client_backend_device_shutdown', 'client_backend_device_external',
-                'client_backend_device_unattributed', 'client_backend_device_retired_drops',
                 'return_backend_device_queue_full', 'return_backend_device_shutdown',
             ].reduce((sum, key) => sum + Number(rr[key] || 0), 0);
             dBeDrops.style.color = deviceDropRate > 0 ? 'var(--danger)' : '';
@@ -2275,7 +2185,8 @@
             const allocMB = ((rr.memory_alloc_bytes || 0) / 1048576).toFixed(1);
             const limitMB = ((rr.memory_limit_bytes || 0) / 1048576).toFixed(1);
             const pct = (rr.memory_usage_pct || 0).toFixed(1);
-            dResMem.textContent = allocMB + ' MB / ' + limitMB + ' MB (' + pct + '%)';
+            dResMem.textContent = vpnDiagText('vpn_diag_heap_memory', {value:allocMB}) + ' / ' +
+                (rr.memory_limit_available === true ? limitMB + ' MiB (' + pct + '%)' : _('vpn_diag_memory_limit_unavailable'));
         }
         const dResGo = document.getElementById('vpn-diag-res-goroutines');
         if (dResGo) {

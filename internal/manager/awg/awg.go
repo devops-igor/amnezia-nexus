@@ -1124,7 +1124,9 @@ func (m *AWGManager) writeServerConfigTracked(ctx context.Context, client ssh.SS
 		return false, err
 	}
 	defer func() {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", ssh.EscapeShellArg(tmpPath)))
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_, _, _, _ = client.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -f %s", ssh.EscapeShellArg(tmpPath)))
 	}()
 
 	cfgPath := m.resolveContainerConfigPath(ctx, client, cName)

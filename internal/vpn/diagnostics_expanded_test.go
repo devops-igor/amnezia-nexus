@@ -338,7 +338,7 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 	//
 	// The retired key is now the directionless-retired population only, so it
 	// is correctly 0 for a device that did report its axes.
-	if next.DropCategories.ClientBackendDeviceExternal != 42 || next.DropCategories.ClientBackendDeviceRetired != 0 {
+	if next.DropCategories.ClientBackendDeviceExternal != 42 {
 		t.Fatalf("retirement reclassified or lost the lifetime loss: %+v", next.DropCategories)
 	}
 	if next.DropCategories.TotalDrops != status.DropCategories.TotalDrops || next.DropCategories.TotalDropRatePps != 0 {

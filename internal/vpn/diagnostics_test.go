@@ -348,8 +348,24 @@ func TestCollectRuntimeResources(t *testing.T) {
 	if res.MemoryAllocBytes == 0 {
 		t.Errorf("expected non-zero MemoryAllocBytes")
 	}
-	if res.MemoryLimitBytes == 0 {
-		t.Errorf("expected non-zero MemoryLimitBytes")
+	// The runtime memory capacity oracle reports what the kernel actually
+	// discloses and nothing else: readMemoryLimit returns 0 when no finite
+	// cgroup limit is discoverable (the common case on hosts and CI runners
+	// without a cgroup memory file). So assert the availability contract, not
+	// a hardcoded non-zero capacity: a reported limit must be finite (> 0) and
+	// the two fields must agree in both directions. Never assert a specific
+	// numeric limit — that is host-dependent and was the invented-capacity
+	// behavior this oracle deliberately rejects.
+	if res.MemoryLimitAvailable != (res.MemoryLimitBytes > 0) {
+		t.Errorf("MemoryLimitAvailable=%v inconsistent with MemoryLimitBytes=%d",
+			res.MemoryLimitAvailable, res.MemoryLimitBytes)
+	}
+	if res.MemoryLimitAvailable && res.MemoryLimitBytes == 0 {
+		t.Errorf("MemoryLimitAvailable is true but MemoryLimitBytes is 0")
+	}
+	if !res.MemoryLimitAvailable && res.MemoryLimitBytes != 0 {
+		t.Errorf("MemoryLimitAvailable is false but MemoryLimitBytes=%d is non-zero",
+			res.MemoryLimitBytes)
 	}
 	if res.MaxFileDesc == 0 {
 		t.Errorf("expected MaxFileDesc > 0")

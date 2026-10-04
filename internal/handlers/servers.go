@@ -881,6 +881,15 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 			return err
 		})
 		if saveErr != nil {
+			if errors.Is(saveErr, awg.ErrConfigurationRollbackFailed) && h.vpnSvc != nil {
+				quarantineCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				quarantineErr := h.vpnSvc.DisableBackend(quarantineCtx, server.ID)
+				cancel()
+				if quarantineErr != nil {
+					saveErr = errors.Join(saveErr, fmt.Errorf("persist backend quarantine after remote rollback failure: %w", quarantineErr))
+				}
+				slog.Error("AWG rollback failed; backend quarantined before response", "server_id", server.ID, "error", saveErr)
+			}
 			if errors.Is(saveErr, awg.ErrConfigurationPostApply) {
 				h.JSONError(w, http.StatusInternalServerError, "reconcile_failed", "Failed to reconcile AWG server identity")
 			} else {
@@ -903,6 +912,17 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *models.Server, config string) error {
+	// The manager holds the per-server transaction lock during this callback.
+	// Refresh request metadata here: a queued save may have read it before an
+	// earlier save committed, and its rollback must restore that newer generation.
+	fresh, err := h.db.GetServer(ctx, server.ID)
+	if err != nil {
+		return fmt.Errorf("load AWG identity transaction snapshot: %w", err)
+	}
+	if fresh == nil {
+		return errors.New("AWG identity transaction server no longer exists")
+	}
+	*server = *fresh
 	var (
 		oldPub string
 		oldAWG map[string]any
@@ -919,7 +939,7 @@ func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *model
 
 	newPub, err := awg.ExtractServerPublicKey(config)
 	if err != nil {
-		newPub, _ = h.awgMgr.GetServerPublicKey(ctx, server)
+		return fmt.Errorf("derive AWG configuration identity: %w", err)
 	}
 	if newPub == "" || newPub == oldPub {
 		return nil

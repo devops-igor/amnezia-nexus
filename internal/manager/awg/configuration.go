@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -32,6 +30,10 @@ var (
 	// step after the remote AWG configuration was successfully applied.
 	ErrConfigurationPostApply = errors.New("AWG configuration post-apply reconciliation failed")
 
+	// ErrConfigurationRollbackFailed means OLD remote disk/runtime or identity
+	// artifacts could not be restored. The caller must quarantine the backend.
+	ErrConfigurationRollbackFailed = errors.New("AWG configuration rollback failed")
+
 	// ErrConfigurationPostApplyKeepApplied tells the transaction that caller-owned
 	// reconciliation could not safely roll back to the previous identity. In this
 	// state the already-applied remote configuration is the convergence target and
@@ -47,8 +49,9 @@ var (
 // identity. Because the user-facing contract is to reconcile rather than reject
 // such an edit, every derived artifact that carries the identity is refreshed
 // from the newly written configuration before the write is reported successful,
-// so a subsequent read - including one against a stopped container, where only
-// the artifacts are available - describes the new identity.
+// so a subsequent read from the running container describes the new identity.
+// Interface-down reads can use the configuration or artifacts; a stopped
+// container cannot answer docker exec.
 func (m *AWGManager) WriteConfiguration(ctx context.Context, server *models.Server, content string) error {
 	return m.writeConfigurationTransaction(ctx, server, content, nil)
 }
@@ -146,13 +149,13 @@ func (m *AWGManager) restoreConfigurationAfterFailure(
 
 	written, restoreErr := m.restoreKnownServerConfigTracked(restoreCtx, client, original)
 	if restoreErr != nil {
-		return errors.Join(cause, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
+		return errors.Join(cause, ErrConfigurationRollbackFailed, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
 	}
 	if !written {
-		return errors.Join(cause, errors.New("failed to restore previous AWG configuration: write was not persisted"))
+		return errors.Join(cause, ErrConfigurationRollbackFailed, errors.New("failed to restore previous AWG configuration: write was not persisted"))
 	}
 	if identityErr := m.reconcileServerIdentity(restoreCtx, client, server, attempted, original); identityErr != nil {
-		return errors.Join(cause, fmt.Errorf("failed to restore previous AWG identity artifacts: %w", identityErr))
+		return errors.Join(cause, ErrConfigurationRollbackFailed, fmt.Errorf("failed to restore previous AWG identity artifacts: %w", identityErr))
 	}
 	return cause
 }
@@ -166,12 +169,8 @@ func (m *AWGManager) restoreConfigurationAfterFailure(
 // key from the written configuration's [Interface] PrivateKey and rewrites both
 // the private- and public-key artifacts.
 //
-// It is a no-op when the write did not change the PrivateKey, so re-saving the
-// same configuration cannot corrupt identity state. A failure to refresh the
-// artifacts does not fail the write — the configuration and the live interface
-// already carry the new identity, and the read path derives from the
-// configuration — but it is logged, because a stopped-container read would then
-// fall back to a stale artifact.
+// It is a no-op when the write did not change the PrivateKey. Refresh errors
+// fail the transaction so the preceding disk, runtime and artifacts are restored.
 func (m *AWGManager) reconcileServerIdentity(ctx context.Context, client ssh.SSHClient, server *models.Server, original, written string) error {
 	previousKey := interfacePrivateKey(original)
 	newKey := interfacePrivateKey(written)
@@ -180,13 +179,7 @@ func (m *AWGManager) reconcileServerIdentity(ctx context.Context, client ssh.SSH
 	}
 	newPub, err := derivePublicKeyFromPrivate(newKey)
 	if err != nil {
-		// The written configuration carries a private key that is not a valid
-		// 32-byte base64 value. Leave the artifacts alone rather than writing a
-		// public key that does not correspond to anything; the read path will
-		// report the same problem.
-		slog.Warn("AWG configuration changed the server private key but the new key is not a usable Curve25519 private key; identity artifacts were not refreshed",
-			"server_id", serverIDOf(server), "error", err)
-		return nil
+		return fmt.Errorf("derive changed AWG server identity: %w", err)
 	}
 	// Defense in depth for the two values interpolated below: neither may
 	// contain a shell metacharacter even if a future caller builds them
@@ -203,16 +196,18 @@ func (m *AWGManager) reconcileServerIdentity(ctx context.Context, client ssh.SSH
 		return errors.New("invalid container name")
 	}
 
-	script := fmt.Sprintf("mkdir -p /opt/amnezia/awg\nprintf '%%s' '%s' > %s\nprintf '%%s' '%s' > %s\n",
+	// Restrict both new and existing private artifacts before writing secrets.
+	// Checked shell steps prevent a successful public write masking a failed
+	// private write. Command output can contain key material and is not returned.
+	script := fmt.Sprintf("set -e\numask 077\nmkdir -p /opt/amnezia/awg\ntouch %s\nchmod 600 %s\nprintf '%%s' '%s' > %s\nprintf '%%s' '%s' > %s\n",
+		serverPrivateKeyArtifactPath, serverPrivateKeyArtifactPath,
 		newKey, serverPrivateKeyArtifactPath, newPub, serverPublicKeyArtifactPath)
-	if _, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s",
-		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(script))); err != nil || code != 0 {
-		slog.Warn("AWG server identity changed but the derived identity artifacts could not be refreshed; a read against a stopped container will fall back to the previous identity",
-			"server_id", serverIDOf(server), "container", cName, "exit_code", code, "stderr", strings.TrimSpace(errOut), "error", err)
-		return nil
+	if _, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s",
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(script))); err != nil {
+		return fmt.Errorf("refresh AWG identity artifacts: %w", err)
+	} else if code != 0 {
+		return fmt.Errorf("refresh AWG identity artifacts: exit code %d", code)
 	}
-	slog.Info("refreshed AWG server identity artifacts after a configuration write",
-		"server_id", serverIDOf(server), "container", cName)
 	return nil
 }
 

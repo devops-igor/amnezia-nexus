@@ -15,7 +15,8 @@ import (
 )
 
 func TestAWGConfigAdapterUsesContainerAndRestoresFailedSave(t *testing.T) {
-	original := "[Interface]\nPrivateKey = fixture-key\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
+	key, _ := deriveTestKey(t, 120)
+	original := "[Interface]\nPrivateKey = " + key + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
 	current := original
 	uploads := map[string][]byte{}
 	syncFailures := 0

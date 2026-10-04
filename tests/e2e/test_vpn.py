@@ -209,7 +209,6 @@ _LOSS_REASONS = {
     "client_backend_device_shutdown",
     "client_backend_device_external",
     "client_backend_device_unattributed",
-    "client_backend_device_retired_drops",
     "return_malformed",
     "return_unmapped",
     "return_mismatch",
@@ -424,22 +423,38 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     assert "conditions" in health
     assert isinstance(health["conditions"], list)
 
-    # Validate problem_routes: peer_key must be PRESENT, non-empty and REDACTED
-    # (issue #424 round 4, item E). The API response is the disclosure surface,
-    # so a full-length base64 peer key must never appear in it. The redaction
-    # convention (ingress.RedactKey) keeps 8 characters plus an ellipsis, or
-    # masks shorter values entirely, so a redacted key is at most 9 characters.
-    problem_routes = status_data.get("problem_routes")
-    routes_valid = problem_routes is None or isinstance(problem_routes, list)
-    assert routes_valid, "problem_routes must be a list or null"
-    for route in problem_routes or []:
-        route_valid = isinstance(route, dict)
-        assert route_valid, "problem route must be an object"
-        peer_key = route.get("peer_key")
-        peer_key_valid = isinstance(peer_key, str) and 0 < len(peer_key) <= 9
-        assert (
-            peer_key_valid
-        ), "peer_key must be present, nonempty redacted text (at most 9 characters)"
+    schema_valid = (
+        type(status_data.get("status_schema_version")) is int
+        and status_data.get("status_schema_version") == 2
+    )
+    assert schema_valid, "VPN status must use schema version 2"
+
+    # Check privacy before shape helpers can include any response values in failures.
+    for inventory in ("problem_routes", "all_routes"):
+        problem_routes = status_data.get(inventory)
+        routes_valid = problem_routes is None or isinstance(problem_routes, list)
+        assert routes_valid, "route inventory must be a list or null"
+        for route in problem_routes or []:
+            route_valid = isinstance(route, dict)
+            assert route_valid, "problem route must be an object"
+            peer_key = route.get("peer_key")
+            peer_key_valid = isinstance(peer_key, str) and 0 < len(peer_key) <= 9
+            assert (
+                peer_key_valid
+            ), "peer_key must be present, nonempty redacted text (at most 9 characters)"
+    queues = status_data.get("forwarder_route_queues")
+    queues_valid = queues is None or isinstance(queues, dict)
+    assert queues_valid, "route queue inventory must be an object or null"
+    for fingerprint, queue in (queues or {}).items():
+        fingerprint_valid = isinstance(fingerprint, str) and bool(
+            re.fullmatch(r"pk[0-9a-f]{24}-[0-9]+", fingerprint)
+        )
+        assert fingerprint_valid, "route queue map must use opaque fingerprints"
+        queue_valid = isinstance(queue, dict)
+        assert queue_valid, "route queue must be an object"
+        display = queue.get("peer_key_display")
+        display_valid = isinstance(display, str) and 0 < len(display) <= 9
+        assert display_valid, "route queue display must be nonempty redacted text"
 
     _assert_extended_diagnostics(status_data)
 
@@ -466,6 +481,7 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     # Validate runtime resources
     runtime = status_data["runtime_resources"]
     assert "cpu_percent" in runtime and "goroutines" in runtime
+    assert type(runtime.get("memory_limit_available")) is bool
 
     # Validate the Peer Sync panel source. The panel renders status.peer_sync,
     # so every key it reads must exist there with a compatible type when the
@@ -541,7 +557,6 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["client_backend_device_shutdown"]
         + drops["client_backend_device_external"]
         + drops["client_backend_device_unattributed"]
-        + drops["client_backend_device_retired_drops"]
     )
     return_categories = (
         drops["return_malformed"]
@@ -564,12 +579,21 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     )
     assert (
         drops["client_total_drops"] + drops["return_total_drops"] == drops["total_drops"]
-    ), "total_drops must be client plus return, with no packet counted twice"
+    ), "total_drops must equal the sum of the directional totals"
 
-    # Validate the VirtualTUN directions are distinct in the payload, so a
-    # swapped mapping cannot pass silently.
-    vtun_dirs = status_data["virtual_tun"]["upstream_to_nexus"]
-    assert set(vtun_dirs) == {"occupancy", "capacity", "peak", "drops"}
+    # Both queues have independent observations; renderer tests prove their
+    # source-to-panel direction. API shape alone cannot prove physical ownership.
+    for direction in ("upstream_to_nexus", "nexus_to_upstream"):
+        observation = status_data["virtual_tun"][direction]
+        observation_valid = isinstance(observation, dict) and set(observation) == {
+            "occupancy",
+            "capacity",
+            "peak",
+            "drops",
+        }
+        assert observation_valid, "VirtualTUN queue observation is incomplete"
+        values_valid = all(type(value) is int and value >= 0 for value in observation.values())
+        assert values_valid, "VirtualTUN queue observations must be nonnegative integers"
 
     # Validate routing consistency exposes both the lifetime counter (history)
     # and the windowed delta (current health).

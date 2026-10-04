@@ -334,8 +334,7 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 			d.ClientBackendDeviceQueueFull, d)
 	}
 	if d.ClientBackendDeviceExternal != 0 || d.ClientBackendDeviceOversized != 0 ||
-		d.ClientBackendDeviceShutdown != 0 || d.ClientBackendDeviceUnattributed != 0 ||
-		d.ClientBackendDeviceRetired != 0 {
+		d.ClientBackendDeviceShutdown != 0 || d.ClientBackendDeviceUnattributed != 0 {
 		t.Errorf("retired loss was reclassified into a bucket it was never measured in: %+v", d)
 	}
 	if d.ReturnBackendDeviceQueueFull != 0 || d.ReturnBackendDeviceShutdown != 0 {
@@ -355,20 +354,19 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 func assertDisjointDropReasons(t *testing.T, d DropCategoryBreakdown) {
 	t.Helper()
 	client := map[string]uint64{
-		"client_malformed":                    d.ClientMalformed,
-		"client_unmapped_source":              d.ClientUnmappedSource,
-		"client_mismatch":                     d.ClientMismatch,
-		"client_rejected":                     d.ClientRejected,
-		"client_backend_queue_full":           d.ClientBackendQueueFull,
-		"client_rate_limited":                 d.ClientRateLimited,
-		"client_no_healthy_backend":           d.ClientNoHealthyBackend,
-		"client_virtualtun_drops":             d.ClientVirtualTUNDrops,
-		"client_backend_device_queue_full":    d.ClientBackendDeviceQueueFull,
-		"client_backend_device_oversized":     d.ClientBackendDeviceOversized,
-		"client_backend_device_shutdown":      d.ClientBackendDeviceShutdown,
-		"client_backend_device_external":      d.ClientBackendDeviceExternal,
-		"client_backend_device_unattributed":  d.ClientBackendDeviceUnattributed,
-		"client_backend_device_retired_drops": d.ClientBackendDeviceRetired,
+		"client_malformed":                   d.ClientMalformed,
+		"client_unmapped_source":             d.ClientUnmappedSource,
+		"client_mismatch":                    d.ClientMismatch,
+		"client_rejected":                    d.ClientRejected,
+		"client_backend_queue_full":          d.ClientBackendQueueFull,
+		"client_rate_limited":                d.ClientRateLimited,
+		"client_no_healthy_backend":          d.ClientNoHealthyBackend,
+		"client_virtualtun_drops":            d.ClientVirtualTUNDrops,
+		"client_backend_device_queue_full":   d.ClientBackendDeviceQueueFull,
+		"client_backend_device_oversized":    d.ClientBackendDeviceOversized,
+		"client_backend_device_shutdown":     d.ClientBackendDeviceShutdown,
+		"client_backend_device_external":     d.ClientBackendDeviceExternal,
+		"client_backend_device_unattributed": d.ClientBackendDeviceUnattributed,
 	}
 	ret := map[string]uint64{
 		"return_malformed":                 d.ReturnMalformed,

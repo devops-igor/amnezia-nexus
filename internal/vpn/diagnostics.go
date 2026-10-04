@@ -16,7 +16,56 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
+
+// diagnosticsInputs owns Service lifecycle storage for one observation.
+// Shared collaborators synchronize their own methods and remain valid after
+// retirement. Call them only after releasing Service.mu.
+type diagnosticsInputs struct {
+	sessions                  []Session
+	tunnels                   []*models.BackendTunnel
+	forwarder                 *forwarder.Forwarder
+	ingressEngine             *IngressEngine
+	sessionMgr                *session.SessionManager
+	pool                      *tunnel.Pool
+	rollingHistory            *RollingHistory
+	backendDevices            map[int64]BackendDevice
+	retiredBackendDeviceDrops backendDeviceDropStats
+	retiredIngressLosses      ingressLossTotals
+}
+
+func (s *Service) captureDiagnosticsInputs() diagnosticsInputs {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.diagnosticsInputsLocked()
+}
+
+// diagnosticsInputsLocked requires Service.mu. Map storage and retired prefixes
+// are captured together so a retiring device belongs to exactly one population.
+func (s *Service) diagnosticsInputsLocked() diagnosticsInputs {
+	devices := make(map[int64]BackendDevice, len(s.backendDevices))
+	for id, dev := range s.backendDevices {
+		devices[id] = dev
+	}
+	var sessions []Session
+	if s.sessionMgr != nil {
+		sessions = s.sessionMgr.ListActiveSessionsSnapshot()
+	}
+	var tunnels []*models.BackendTunnel
+	if s.pool != nil {
+		tunnels = s.pool.ListTunnels()
+	}
+	return diagnosticsInputs{
+		sessions: sessions, tunnels: tunnels,
+		forwarder: s.forwarder, ingressEngine: s.ingressEngine,
+		sessionMgr: s.sessionMgr, pool: s.pool, rollingHistory: s.rollingHistory,
+		backendDevices:            devices,
+		retiredBackendDeviceDrops: s.retiredBackendDeviceDrops,
+		retiredIngressLosses:      s.retiredIngressLosses,
+	}
+}
 
 // Health status states for forwarder and dataplane.
 const (
@@ -137,27 +186,13 @@ type DropCategoryBreakdown struct {
 	// direction and no reason, so these drops are attributed here under their
 	// own key rather than spread across buckets the recorder never filled.
 	ClientBackendDeviceExternal uint64 `json:"client_backend_device_external"`
-	// ClientBackendDeviceUnattributed is live-device loss on a device that
+	// ClientBackendDeviceUnattributed is lifetime loss on a device that
 	// cannot report the breakdown at all. Published so TotalDrops stays
 	// truthful instead of silently shrinking.
 	ClientBackendDeviceUnattributed uint64 `json:"client_backend_device_unattributed"`
-	// ClientBackendDeviceRetired is retired CLIENT-DIRECTION loss: the
-	// inbound (client -> backend) half of the lifetime accumulator for
-	// devices that have left the map, plus the retired half of loss on devices
-	// that never reported a direction.
-	//
-	// Retirement is a TRANSFER of the device's real breakdown, so retired
-	// loss is published under the SAME key a live loss uses and its reason
-	// survives: retired inbound queue-full loss appears in
-	// ClientBackendDeviceQueueFull, not here. This key exists for the one
-	// population with no reason to carry — loss attributed to the client
-	// population with no direction recorded at all — which is why it is the
-	// client-direction figure and not the retired TOTAL. The retired total is
-	// the sum of every direction (clientTotal and returnTotal each include
-	// their share).
-	ClientBackendDeviceRetired uint64  `json:"client_backend_device_retired_drops"`
-	ClientTotalDrops           uint64  `json:"client_total_drops"`
-	ClientDropRatePps          float64 `json:"client_drop_rate_pps"`
+
+	ClientTotalDrops  uint64  `json:"client_total_drops"`
+	ClientDropRatePps float64 `json:"client_drop_rate_pps"`
 
 	// Backend -> Client (Return path)
 	ReturnMalformed       uint64 `json:"return_malformed"`
@@ -373,15 +408,16 @@ type ProblemRouteItem struct {
 
 // RuntimeResources contains process and runtime health counters.
 type RuntimeResources struct {
-	CPUPercent       float64 `json:"cpu_percent"`
-	MemoryAllocBytes uint64  `json:"memory_alloc_bytes"`
-	MemorySysBytes   uint64  `json:"memory_sys_bytes"`
-	MemoryLimitBytes uint64  `json:"memory_limit_bytes"`
-	MemoryUsagePct   float64 `json:"memory_usage_pct"`
-	Goroutines       int     `json:"goroutines"`
-	GCPauseP95MS     float64 `json:"gc_pause_p95_ms"`
-	OpenFileDesc     int     `json:"open_file_desc"`
-	MaxFileDesc      uint64  `json:"max_file_desc"`
+	CPUPercent           float64 `json:"cpu_percent"`
+	MemoryAllocBytes     uint64  `json:"memory_alloc_bytes"`
+	MemorySysBytes       uint64  `json:"memory_sys_bytes"`
+	MemoryLimitBytes     uint64  `json:"memory_limit_bytes"`
+	MemoryLimitAvailable bool    `json:"memory_limit_available"`
+	MemoryUsagePct       float64 `json:"memory_usage_pct"`
+	Goroutines           int     `json:"goroutines"`
+	GCPauseP95MS         float64 `json:"gc_pause_p95_ms"`
+	OpenFileDesc         int     `json:"open_file_desc"`
+	MaxFileDesc          uint64  `json:"max_file_desc"`
 }
 
 // HistoryPoint is a single time-series sample for dashboard graphs.
@@ -597,28 +633,27 @@ func getOpenFileDescriptors() (int, uint64) {
 	return len(entries), maxFD
 }
 
-func getMemoryLimit(sysBytes uint64) uint64 {
-	// Try cgroup v2
-	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
-		str := strings.TrimSpace(string(data))
-		if str != "max" {
-			if limit, err := strconv.ParseUint(str, 10, 64); err == nil && limit > 0 && limit < (1<<60) {
-				return limit
-			}
+// getMemoryLimit reports a discovered finite cgroup capacity. An absent or
+// unlimited cgroup is unknown; Go runtime Sys is not a memory capacity.
+func getMemoryLimit() uint64 {
+	return readMemoryLimit(os.ReadFile)
+}
+
+func readMemoryLimit(readFile func(string) ([]byte, error)) uint64 {
+	for _, path := range []string{
+		"/sys/fs/cgroup/memory.max",
+		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+	} {
+		data, err := readFile(path)
+		if err != nil {
+			continue
 		}
-	}
-	// Try cgroup v1
-	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
-		str := strings.TrimSpace(string(data))
-		if limit, err := strconv.ParseUint(str, 10, 64); err == nil && limit > 0 && limit < (1<<60) {
+		limit, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		if err == nil && limit > 0 && limit < 1<<60 {
 			return limit
 		}
 	}
-	// Fallback to sysBytes * 2
-	if sysBytes > 0 {
-		return sysBytes * 2
-	}
-	return 1024 * 1024 * 1024 // 1 GiB safe fallback
+	return 0
 }
 
 func collectRuntimeResources() RuntimeResources {
@@ -626,7 +661,7 @@ func collectRuntimeResources() RuntimeResources {
 	runtime.ReadMemStats(&m)
 
 	openFD, maxFD := getOpenFileDescriptors()
-	memLimit := getMemoryLimit(m.Sys)
+	memLimit := getMemoryLimit()
 
 	var memUsagePct float64
 	if memLimit > 0 {
@@ -658,15 +693,16 @@ func collectRuntimeResources() RuntimeResources {
 	}
 
 	return RuntimeResources{
-		CPUPercent:       globalCPUTracker.Percent(),
-		MemoryAllocBytes: m.Alloc,
-		MemorySysBytes:   m.Sys,
-		MemoryLimitBytes: memLimit,
-		MemoryUsagePct:   memUsagePct,
-		Goroutines:       runtime.NumGoroutine(),
-		GCPauseP95MS:     gcPauseP95MS,
-		OpenFileDesc:     openFD,
-		MaxFileDesc:      maxFD,
+		CPUPercent:           globalCPUTracker.Percent(),
+		MemoryAllocBytes:     m.Alloc,
+		MemorySysBytes:       m.Sys,
+		MemoryLimitBytes:     memLimit,
+		MemoryLimitAvailable: memLimit > 0,
+		MemoryUsagePct:       memUsagePct,
+		Goroutines:           runtime.NumGoroutine(),
+		GCPauseP95MS:         gcPauseP95MS,
+		OpenFileDesc:         openFD,
+		MaxFileDesc:          maxFD,
 	}
 }
 
@@ -680,10 +716,11 @@ func collectRuntimeResources() RuntimeResources {
 // retained losses the retention machinery exists to preserve (issue #424
 // review round 9, blocker 3).
 func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot, clientOwnershipMismatch uint64) RoutingConsistencyDiagnostics {
-	var activeSessions []Session
-	if s.sessionMgr != nil {
-		activeSessions = s.sessionMgr.ListActiveSessionsSnapshot()
-	}
+	return checkRoutingInvariantsWithInputs(s, s.captureDiagnosticsInputs(), routes, retStats, clientOwnershipMismatch)
+}
+
+func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot, clientOwnershipMismatch uint64) RoutingConsistencyDiagnostics {
+	activeSessions := inputs.sessions
 
 	diag := RoutingConsistencyDiagnostics{
 		ActiveSessionsCount:          len(activeSessions),
@@ -879,37 +916,34 @@ func describeOwnershipMismatchHistorical(diag *RoutingConsistencyDiagnostics) st
 		diag.OwnershipMismatchWindowSec)
 }
 
-// collectBackendDiagnostics gathers operational state across registered backend tunnels.
-//
-// The function itself is a thin composition of the three helpers below — device
-// drop population, eligibility counting, and fleet-wide percentile/skew —
-// because each of those encodes a contract worth pinning in isolation. All
-// three read the same s fields as the original inline body and none of them
-// acquires a lock: drop counters and the tunnel list are read exactly as
-// before, and the sampling cadence is unchanged.
+// collectBackendDiagnostics captures one owned lifecycle observation.
 func collectBackendDiagnostics(s *Service) BackendsDiagnostics {
-	var traffic map[int64]forwarder.TrafficSnapshot
-	if s.forwarder != nil {
-		traffic = s.forwarder.BackendTrafficSnapshot()
-	}
-	return collectBackendDiagnosticsWithTraffic(s, traffic)
+	return s.captureDiagnosticsInputs().collectBackendDiagnostics()
 }
 
-func collectBackendDiagnosticsWithTraffic(s *Service, traffic map[int64]forwarder.TrafficSnapshot) BackendsDiagnostics {
-	if s.pool == nil {
+func (inputs diagnosticsInputs) collectBackendDiagnostics() BackendsDiagnostics {
+	var traffic map[int64]forwarder.TrafficSnapshot
+	if inputs.forwarder != nil {
+		traffic = inputs.forwarder.BackendTrafficSnapshot()
+	}
+	return inputs.collectBackendDiagnosticsWithTraffic(traffic)
+}
+
+func (inputs diagnosticsInputs) collectBackendDiagnosticsWithTraffic(traffic map[int64]forwarder.TrafficSnapshot) BackendsDiagnostics {
+	if inputs.pool == nil {
 		return BackendsDiagnostics{
 			EligibilityKnown: true,
-			TotalDrops:       totalBackendDeviceDrops(s),
+			TotalDrops:       inputs.totalBackendDeviceDrops(),
 			Backends:         []BackendTelemetryItem{},
 		}
 	}
 
-	tunnels := s.pool.ListTunnels()
+	tunnels := inputs.tunnels
 	diag := BackendsDiagnostics{
 		TotalCount:       len(tunnels),
 		EligibilityKnown: true,
 		Backends:         make([]BackendTelemetryItem, 0, len(tunnels)),
-		TotalDrops:       totalBackendDeviceDrops(s),
+		TotalDrops:       inputs.totalBackendDeviceDrops(),
 	}
 
 	totalActiveConns := countBackendEligibility(&diag, tunnels)
@@ -918,7 +952,7 @@ func collectBackendDiagnosticsWithTraffic(s *Service, traffic map[int64]forwarde
 	var maxShare float64
 
 	for _, tun := range tunnels {
-		item, loadShare, hasLatencySample := backendTelemetryItem(s, tun, traffic, totalActiveConns)
+		item, loadShare, hasLatencySample := backendTelemetryItem(inputs, tun, traffic, totalActiveConns)
 		if loadShare > maxShare {
 			maxShare = loadShare
 		}
@@ -938,8 +972,12 @@ func collectBackendDiagnosticsWithTraffic(s *Service, traffic map[int64]forwarde
 // as the original inline loops did, so the fleet-wide drop population — and
 // therefore the no-pool early-return TotalDrops — is unchanged.
 func totalBackendDeviceDrops(s *Service) uint64 {
-	drops := s.retiredBackendDeviceDrops.Total()
-	for _, dev := range s.backendDevices {
+	return s.captureDiagnosticsInputs().totalBackendDeviceDrops()
+}
+
+func (inputs diagnosticsInputs) totalBackendDeviceDrops() uint64 {
+	drops := inputs.retiredBackendDeviceDrops.Total()
+	for _, dev := range inputs.backendDevices {
 		if dev != nil {
 			drops += dev.DroppedPackets()
 		}
@@ -985,7 +1023,7 @@ func backendEligible(tun *models.BackendTunnel) bool {
 // never completed a handshake, and is clamped at 0 when the handshake timestamp
 // is in the future, preserving the original tri-state.
 func backendTelemetryItem(
-	s *Service,
+	inputs diagnosticsInputs,
 	tun *models.BackendTunnel,
 	traffic map[int64]forwarder.TrafficSnapshot,
 	totalActiveConns int,
@@ -993,7 +1031,7 @@ func backendTelemetryItem(
 	var drops uint64
 	lastHSAge := int64(-1)
 
-	if dev, exists := s.backendDevices[tun.ID]; exists && dev != nil {
+	if dev, exists := inputs.backendDevices[tun.ID]; exists && dev != nil {
 		drops = dev.DroppedPackets()
 		if hs := dev.LastHandshakeTime(); !hs.IsZero() {
 			lastHSAge = int64(time.Since(hs).Seconds())
@@ -1056,12 +1094,16 @@ func applyBackendFleetStats(diag *BackendsDiagnostics, activeLatencies []float64
 
 // collectHandshakeDiagnostics inspects upstream device status and checks for stale active sessions.
 func collectHandshakeDiagnostics(s *Service) HandshakeFreshnessDiagnostics {
+	return s.captureDiagnosticsInputs().collectHandshakeDiagnostics()
+}
+
+func (inputs diagnosticsInputs) collectHandshakeDiagnostics() HandshakeFreshnessDiagnostics {
 	diag := HandshakeFreshnessDiagnostics{}
-	if s.ingressEngine == nil || s.ingressEngine.Portal() == nil {
+	if inputs.ingressEngine == nil || inputs.ingressEngine.Portal() == nil {
 		return diag
 	}
 
-	portalStatus, err := s.ingressEngine.Portal().Status()
+	portalStatus, err := inputs.ingressEngine.Portal().Status()
 	if err != nil {
 		return diag
 	}
@@ -1087,8 +1129,8 @@ func collectHandshakeDiagnostics(s *Service) HandshakeFreshnessDiagnostics {
 	}
 
 	// Check active live sessions for stale handshakes (> 3 minutes)
-	if s.sessionMgr != nil {
-		activeSessions := s.sessionMgr.ListActiveSessionsSnapshot()
+	if inputs.sessionMgr != nil {
+		activeSessions := inputs.sessions
 		for _, sess := range activeSessions {
 			hs, ok := peerHandshakes[sess.PeerPublicKey]
 			if !ok || hs.IsZero() || now.Sub(hs) > DefaultHealthThresholds.HandshakeStaleAge {
@@ -1143,7 +1185,7 @@ func EvaluateForwarderHealth(
 	conditions = append(conditions, evaluateRoutingConditions(routing)...)
 	conditions = append(conditions, evaluateQueueConditions(queue)...)
 	conditions = append(conditions, evaluateLatencyConditions(latency)...)
-	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops, routing)...)
+	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops, routing, queue.QueueDropRatePps)...)
 	conditions = append(conditions, evaluatePeerSyncAndBackendConditions(peerSync, backends, handshake)...)
 
 	status, summary := summarizeHealthConditions(conditions)
@@ -1311,7 +1353,7 @@ func evaluateLatencyConditions(latency ForwardLatencyDiagnostics) []HealthCondit
 // routing is taken so the ownership-mismatch subtraction reads the same
 // windowed measurement the routing condition was decided on, rather than a
 // second, independently-sampled view of the same counters.
-func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown, routing RoutingConsistencyDiagnostics) []HealthCondition {
+func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropCategoryBreakdown, routing RoutingConsistencyDiagnostics, returnQueueRate float64) []HealthCondition {
 	th := defaultHealthThresholds()
 	var conds []HealthCondition
 	upstreamToNexusUtil := float64(0)
@@ -1386,6 +1428,11 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 		routing.OwnershipMismatchRatePPS() -
 		criticalReasonRatePps(drops, claimDrops) -
 		degradedReasonRatePps(drops, claimDrops)
+	// evaluateQueueConditions owns return-queue refusals. Its rate uses the
+	// same reason window as this aggregate in operational status.
+	if returnQueueRate > th.QueueActiveDropRatePPS {
+		routineRate -= returnQueueRate
+	}
 	if routineRate < 0 {
 		routineRate = 0
 	}
@@ -1395,7 +1442,7 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 			Category: "drops",
 			Severity: "DEGRADED",
 			Message: fmt.Sprintf("Elevated routine drop rate: %.1f drops/sec across dataplane "+
-				"(excluding ownership-mismatch, injection-failure, and client-queue losses, reported by reason)",
+				"(excluding ownership-mismatch, injection-failure, and queue losses, reported by reason)",
 				routineRate),
 		})
 	} else if routineRate >= th.DropRateWarningPPS {
@@ -1403,7 +1450,7 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 			Category: "drops",
 			Severity: "WARNING",
 			Message: fmt.Sprintf("Active routine packet drops: %.1f drops/sec across dataplane "+
-				"(excluding ownership-mismatch, injection-failure, and client-queue losses, reported by reason)",
+				"(excluding ownership-mismatch, injection-failure, and queue losses, reported by reason)",
 				routineRate),
 		})
 	}
@@ -1805,13 +1852,17 @@ func (s *Service) stopRollingHistory() {
 }
 
 func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
+	inputs := s.captureDiagnosticsInputs()
+	s.primeHistoryFromDrops(now, fwd, inputs.collectDropCategories())
+}
+
+func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, drops DropCategoryBreakdown) {
 	s.diagRatesMu.Lock()
 	if s.historyPrimed {
 		s.diagRatesMu.Unlock()
 		return
 	}
 	s.historyPrimed = true
-	drops := s.collectDropCategories()
 	s.primeHistoryRatesLocked(now, &drops)
 	s.diagRatesMu.Unlock()
 
@@ -1824,11 +1875,9 @@ func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
 func (s *Service) sampleRollingHistory() {
 	now := time.Now()
 
-	s.mu.RLock()
-	rh := s.rollingHistory
-	fwd := s.forwarder
-	sessMgr := s.sessionMgr
-	s.mu.RUnlock()
+	inputs := s.captureDiagnosticsInputs()
+	rh, fwd, sessMgr := inputs.rollingHistory, inputs.forwarder, inputs.sessionMgr
+	drops := inputs.collectDropCategories()
 
 	if rh == nil {
 		return
@@ -1839,7 +1888,7 @@ func (s *Service) sampleRollingHistory() {
 	s.diagRatesMu.Unlock()
 
 	if !isPrimed {
-		s.primeHistory(now, fwd)
+		s.primeHistoryFromDrops(now, fwd, drops)
 	}
 
 	// 1. Forwarder traffic rates (independent history baseline)
@@ -1849,7 +1898,6 @@ func (s *Service) sampleRollingHistory() {
 	}
 
 	// 2. Drop categories and drop rates (independent history baseline)
-	drops := s.collectDropCategories()
 	s.sampleHistoryDropRates(now, &drops)
 
 	// 3. Queue utilization
@@ -1887,7 +1935,7 @@ func (s *Service) sampleRollingHistory() {
 	if fwd != nil {
 		traffic = fwd.BackendTrafficHistorySnapshot(now)
 	}
-	beDiag := collectBackendDiagnosticsWithTraffic(s, traffic)
+	beDiag := inputs.collectBackendDiagnosticsWithTraffic(traffic)
 	backends, omitted := backendHistory(beDiag.Backends)
 
 	point := HistoryPoint{
@@ -2086,21 +2134,25 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint
 }
 
 func (s *Service) collectDropCategories() DropCategoryBreakdown {
-	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
+	return s.captureDiagnosticsInputs().collectDropCategories()
+}
+
+func (inputs diagnosticsInputs) collectDropCategories() DropCategoryBreakdown {
+	losses := addIngressLosses(inputs.retiredIngressLosses, engineLossTotals(inputs.ingressEngine))
 	routerMalformed := losses.router.MalformedPacketDrops
 	routerUnmapped := losses.router.UnmappedSourceIPDrops
 	routerMismatch := losses.router.OwnershipMismatchDrops
 	routerNoBackend := losses.router.NoActiveBackendDrops
 	routerRejected := losses.router.AdmissionRejectedDrops - routerNoBackend + losses.router.RouteRegistrationErrors
 	var fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend uint64
-	if s.forwarder != nil {
-		fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend, _ = s.forwarder.ClientDropStats()
+	if inputs.forwarder != nil {
+		fwdClientQueueFull, fwdClientRateLimited, fwdClientNoBackend, _ = inputs.forwarder.ClientDropStats()
 	}
 
 	retStats := losses.returns
 	// Use live engine queue gauges; retained state contains counters only.
-	if s.ingressEngine != nil {
-		current := s.ingressEngine.ReturnStats().TUN
+	if inputs.ingressEngine != nil {
+		current := inputs.ingressEngine.ReturnStats().TUN
 		current.InboundDrops = retStats.TUN.InboundDrops
 		current.OutboundDrops = retStats.TUN.OutboundDrops
 		retStats.TUN = current
@@ -2112,11 +2164,11 @@ func (s *Service) collectDropCategories() DropCategoryBreakdown {
 	// RETURN traffic that never reached the client. Neither is a whole-tunnel
 	// total, so nothing here can overlap forwarder admission or backend-queue
 	// refusal, which own their own reasons above.
-	deviceDrops := collectBackendDeviceDropStats(s)
+	deviceDrops := inputs.collectBackendDeviceDropStats()
 	var returnQueueFull, returnOversized uint64
-	if s.forwarder != nil {
-		returnQueueFull = s.forwarder.DropsQueueFull()
-		returnOversized = s.forwarder.DropsPacketTooLarge()
+	if inputs.forwarder != nil {
+		returnQueueFull = inputs.forwarder.DropsQueueFull()
+		returnOversized = inputs.forwarder.DropsPacketTooLarge()
 	}
 	fwdClientNoBackend += routerNoBackend
 
@@ -2137,8 +2189,7 @@ func (s *Service) collectDropCategories() DropCategoryBreakdown {
 		deviceDrops.ClientOversized +
 		deviceDrops.ClientShutdown +
 		deviceDrops.ClientExternal +
-		deviceDrops.ClientUnattributed +
-		deviceDrops.ClientRetired
+		deviceDrops.ClientUnattributed
 
 	// Nexus -> Upstream: VirtualTUN.InjectInbound feeds the INBOUND queue, so
 	// its drop bucket is the return path's own loss accounting.
@@ -2177,7 +2228,6 @@ func (s *Service) collectDropCategories() DropCategoryBreakdown {
 		ClientBackendDeviceShutdown:     deviceDrops.ClientShutdown,
 		ClientBackendDeviceExternal:     deviceDrops.ClientExternal,
 		ClientBackendDeviceUnattributed: deviceDrops.ClientUnattributed,
-		ClientBackendDeviceRetired:      deviceDrops.ClientRetired,
 		ClientTotalDrops:                clientTotal,
 
 		ReturnMalformed:         retStats.MalformedDrops,
@@ -2197,11 +2247,11 @@ func (s *Service) collectDropCategories() DropCategoryBreakdown {
 	}
 }
 
-func (s *Service) collectVirtualTUNDiagnostics() VirtualTUNDiagnostics {
-	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
+func (inputs diagnosticsInputs) collectVirtualTUNDiagnostics() VirtualTUNDiagnostics {
+	losses := addIngressLosses(inputs.retiredIngressLosses, engineLossTotals(inputs.ingressEngine))
 	retStats := losses.returns
-	if s.ingressEngine != nil {
-		current := s.ingressEngine.ReturnStats().TUN
+	if inputs.ingressEngine != nil {
+		current := inputs.ingressEngine.ReturnStats().TUN
 		current.InboundDrops = retStats.TUN.InboundDrops
 		current.OutboundDrops = retStats.TUN.OutboundDrops
 		retStats.TUN = current
@@ -2223,28 +2273,31 @@ func (s *Service) collectVirtualTUNDiagnostics() VirtualTUNDiagnostics {
 }
 
 func (s *Service) populateOperationalDiagnostics(status *Status) {
+	s.mu.RLock()
+	inputs := s.diagnosticsInputsLocked()
 	var routes []forwarder.RouteInfo
-	if s.forwarder != nil {
-		routes = s.forwarder.InspectRoutes()
+	if inputs.forwarder != nil {
+		routes = inputs.forwarder.InspectRoutes()
 	}
-	s.populateOperationalDiagnosticsWithRoutes(status, routes)
+	s.mu.RUnlock()
+	s.populateOperationalDiagnosticsFromInputs(status, routes, inputs)
 }
 
-// populateOperationalDiagnosticsWithRoutes assembles one status response from
-// the caller's route snapshot. The snapshot is intentionally reused instead of
-// sampling route pressure again: endpoint discovery and other status work may
-// take longer than the 200ms recency window, so independent reads can make one
-// JSON response disagree with itself about whether a just-observed incident is
-// still current.
-func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, routes []forwarder.RouteInfo) {
+// populateOperationalDiagnosticsFromInputs assembles one status response from
+// an immutable input snapshot. Both the route snapshot and the sampler inputs
+// are captured once by the caller and reused for the whole response: endpoint
+// discovery and other status work may take longer than the 200ms recency
+// window, so independent reads can make one JSON response disagree with itself
+// about whether a just-observed incident is still current.
+func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, routes []forwarder.RouteInfo, inputs diagnosticsInputs) {
 	if status == nil {
 		return
 	}
 
 	var writeErrors uint64
 	// 1. Rates, Queue Pressure, Latency
-	if s.forwarder != nil {
-		fRates := s.forwarder.Rates()
+	if inputs.forwarder != nil {
+		fRates := inputs.forwarder.Rates()
 		status.Rates = TrafficRates{
 			Available:   fRates.Available,
 			RxBps:       fRates.RxBps,
@@ -2258,7 +2311,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 			TxBpsAvg1h:  fRates.TxBpsAvg1h,
 		}
 
-		qStats := s.forwarder.QueuePressure()
+		qStats := inputs.forwarder.QueuePressure()
 		status.QueuePressure = QueuePressureDiagnostics{
 			Occupancy:             qStats.Occupancy,
 			Capacity:              qStats.Capacity,
@@ -2272,7 +2325,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 			QueueDropRatePps:      qStats.QueueFullDropRate,
 		}
 
-		writes := s.forwarder.DeviceWriteSnapshot()
+		writes := inputs.forwarder.DeviceWriteSnapshot()
 		writeErrors = writes.Errors
 		status.ForwardLatency = ForwardLatencyDiagnostics{
 			P50MS:             float64(writes.P50Duration.Microseconds()) / 1000.0,
@@ -2293,30 +2346,31 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 	}
 
 	// 2. Drop Categories & VirtualTUN
-	status.DropCategories = s.collectDropCategories()
-	status.VirtualTUN = s.collectVirtualTUNDiagnostics()
+	status.DropCategories = inputs.collectDropCategories()
+	status.VirtualTUN = inputs.collectVirtualTUNDiagnostics()
 
 	// The loss sampling pair owns one timestamp and one serialization scope.
 	sampleAt := time.Now()
-	s.primeHistory(sampleAt, s.forwarder)
+	s.primeHistoryFromDrops(sampleAt, inputs.forwarder, status.DropCategories)
 	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(sampleAt, &status.DropCategories, writeErrors)
 	status.Rates.DropRatePps = status.DropCategories.TotalDropRatePps
+	status.QueuePressure.QueueDropRatePps = status.DropCategories.ReasonRates[reasonReturnQueueFull]
 	stalls := s.diagDeltas.writeStalls.Sample(sampleAt, status.ForwardLatency.Stalls)
 	status.ForwardLatency.StallsRecent = stalls.delta
 	status.ForwardLatency.StallsWindowSec = stalls.windowSeconds
 
 	// 3. Routing consistency
-	losses := addIngressLosses(s.retiredIngressLosses, engineLossTotals(s.ingressEngine))
-	status.RoutingConsistency = checkRoutingInvariants(s, routes, losses.returns, losses.router.OwnershipMismatchDrops)
+	losses := addIngressLosses(inputs.retiredIngressLosses, engineLossTotals(inputs.ingressEngine))
+	status.RoutingConsistency = checkRoutingInvariantsWithInputs(s, inputs, routes, losses.returns, losses.router.OwnershipMismatchDrops)
 
 	// 4. Handshake freshness
-	status.HandshakeFreshness = collectHandshakeDiagnostics(s)
+	status.HandshakeFreshness = inputs.collectHandshakeDiagnostics()
 
 	// 5. Backends
-	status.Backends = collectBackendDiagnostics(s)
+	status.Backends = inputs.collectBackendDiagnostics()
 
-	if s.sessionMgr != nil {
-		sessions := s.sessionMgr.ListActiveSessionsSnapshot()
+	if inputs.sessionMgr != nil {
+		sessions := inputs.sessions
 		started := make(map[string]time.Time, len(sessions))
 		for _, session := range sessions {
 			started[session.PeerPublicKey] = session.ConnectedAt
@@ -2330,7 +2384,7 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 
 	// 6. Problem Routes. Filter/rank the SAME snapshot used above so the
 	// response is internally consistent even when status assembly is slow.
-	if s.forwarder != nil {
+	if inputs.forwarder != nil {
 		status.ProblemRoutes = collectProblemRoutes(forwarder.ProblemRoutesFromSnapshot(routes, 50))
 		status.AllRoutes = collectProblemRoutes(routes)
 	} else {
@@ -2342,8 +2396,8 @@ func (s *Service) populateOperationalDiagnosticsWithRoutes(status *Status, route
 	status.RuntimeResources = collectRuntimeResources()
 
 	// 8. Historical Series
-	if s.rollingHistory != nil {
-		status.HistoricalSeries = s.rollingHistory.Snapshot()
+	if inputs.rollingHistory != nil {
+		status.HistoricalSeries = inputs.rollingHistory.Snapshot()
 	} else {
 		status.HistoricalSeries = HistoricalSeries{
 			Window15m: []HistoryPoint{},

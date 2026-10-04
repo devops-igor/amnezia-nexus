@@ -1365,9 +1365,8 @@ func (f *Forwarder) Rates() TrafficRates {
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
-	occ, cap, _ := f.AggregateQueueStats()
 	if f.rateTracker != nil {
-		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 		return f.rateTracker.Snapshot(rxPackets, txPackets)
 	}
 	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
@@ -1383,7 +1382,7 @@ func (f *Forwarder) QueuePressure() QueuePressureStats {
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
 	occ, cap, hw, dwell := f.aggregateQueueSnapshot()
-	f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+	f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 	stats := f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
 	stats.SecondsAbove50Pct, stats.SecondsAbove80Pct = dwell.total50, dwell.total80
 	stats.ConsecutiveAbove50Sec, stats.ConsecutiveAbove80Sec = dwell.consecutive50, dwell.consecutive80
@@ -1400,9 +1399,8 @@ func (f *Forwarder) HistoryRates(now time.Time) TrafficRates {
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
-	occ, cap, _ := f.AggregateQueueStats()
 	if f.historyRateTracker != nil {
-		f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+		f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 		return f.historyRateTracker.Snapshot(rxPackets, txPackets)
 	}
 	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
@@ -1417,8 +1415,7 @@ func (f *Forwarder) PrimeHistoryRates(now time.Time) {
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
-	occ, cap, _ := f.AggregateQueueStats()
-	f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops, occ, cap)
+	f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 }
 
 // ActiveRoutesCount returns the number of currently registered routes.

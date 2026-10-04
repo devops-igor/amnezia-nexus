@@ -137,7 +137,7 @@ func TestB3InjectionFailuresClassifyCritical(t *testing.T) {
 	}
 	quiet := RoutingConsistencyDiagnostics{IsConsistent: true}
 
-	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops, quiet)
+	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops, quiet, 0)
 	cond := assertSingleCondition(t, conds, "drops")
 	if cond.Severity != "CRITICAL" {
 		t.Fatalf("injection failure severity=%q, want CRITICAL: %q", cond.Severity, cond.Message)
@@ -169,7 +169,7 @@ func TestB3InjectionFailuresClassifyCritical(t *testing.T) {
 				RatesAvailable:   true,
 				ReasonRates:      map[string]float64{reasonReturnInjectionErrors: tc.rate},
 			}
-			got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), d, quiet), "drops")
+			got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), d, quiet, 0), "drops")
 			if tc.want == "" {
 				if len(got) != 0 {
 					t.Fatalf("expected no drops condition, got %+v", got)
@@ -189,7 +189,7 @@ func TestB3InjectionFailuresClassifyCritical(t *testing.T) {
 		RatesAvailable:   false,
 		ReasonRates:      map[string]float64{reasonReturnInjectionErrors: 99.0},
 	}
-	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), unmeasured, quiet), "drops"); len(got) != 0 {
+	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), unmeasured, quiet, 0), "drops"); len(got) != 0 {
 		t.Fatalf("unmeasured reason rates must not produce a condition: %+v", got)
 	}
 }
@@ -206,7 +206,7 @@ func TestB3HighVolumeRoutineQueueFullIsNotCritical(t *testing.T) {
 		},
 	}
 	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops,
-		RoutingConsistencyDiagnostics{IsConsistent: true})
+		RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
 	cond := assertSingleCondition(t, conds, "drops")
 	if cond.Severity != "DEGRADED" {
 		t.Fatalf("high-volume routine queue-full loss severity=%q, want DEGRADED (never CRITICAL): %q",
@@ -246,7 +246,7 @@ func TestB3OneLossNeverYieldsTwoConditions(t *testing.T) {
 	// The FULL condition set, so the disjointness claim is made about what an
 	// operator actually sees rather than about one evaluator in isolation.
 	conds := append(evaluateRoutingConditions(diag),
-		evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops, diag)...)
+		evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops, diag, 0)...)
 
 	routingConds := conditionsIn(conds, "routing")
 	if len(routingConds) != 1 {
@@ -287,7 +287,7 @@ func TestB3OneLossNeverYieldsTwoConditions(t *testing.T) {
 	withRoutine.TotalDropRatePps += 1000
 	withRoutine.ReasonRates[reasonReturnQueueFull] = 1000
 	mixed := append(evaluateRoutingConditions(diag),
-		evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), withRoutine, diag)...)
+		evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), withRoutine, diag, 0)...)
 
 	mixedDrops := conditionsIn(mixed, "drops")
 	if len(mixedDrops) != 2 {
@@ -652,7 +652,7 @@ func TestB3ClientBackendQueueLossSeverityBoundaries(t *testing.T) {
 				RatesAvailable:   true,
 				ReasonRates:      map[string]float64{reasonClientBackendQueueFull: tc.rate},
 			}
-			got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), d, quiet), "drops")
+			got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), d, quiet, 0), "drops")
 			if tc.wantSev == "" {
 				if len(got) != 0 {
 					t.Fatalf("expected no drops condition, got %+v", got)
@@ -675,7 +675,7 @@ func TestB3ClientBackendQueueLossSeverityBoundaries(t *testing.T) {
 		RatesAvailable:   false,
 		ReasonRates:      map[string]float64{reasonClientBackendQueueFull: 99.0},
 	}
-	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), unmeasured, quiet), "drops"); len(got) != 0 {
+	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), unmeasured, quiet, 0), "drops"); len(got) != 0 {
 		t.Fatalf("unmeasured reason rates must not produce a condition: %+v", got)
 	}
 }
@@ -692,7 +692,7 @@ func TestB3ClientQueueAndRoutineQueueMixture(t *testing.T) {
 		},
 	}
 	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops,
-		RoutingConsistencyDiagnostics{IsConsistent: true})
+		RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
 
 	dropsConds := conditionsIn(conds, "drops")
 	if len(dropsConds) != 2 {

@@ -73,6 +73,15 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 
 ---
 
+## Scope and proof limits
+
+The auth, sharing and self-service smoke tests are retained from the already integrated #430 proof infrastructure. Removing them would discard useful regression checks and disrupt existing fixture cleanup and lifecycle ordering. They add no production authorization behavior. Stronger owner-versus-other-user access, anonymous endpoint coverage, and two independent sessions for logout-all remain #430 followups.
+
+The diagnostics API oracle checks schema2, privacy on both route inventories and fingerprint-keyed queue maps, finite nonnegative telemetry, both VirtualTUN shapes, bounded history, and aggregate arithmetic. Renderer tests independently verify distinct direction values, units, unknown versus measured zero, current loss reasons, localization, and stale-state clearing. Aggregate arithmetic alone does not prove packets are owned by exactly one counter; deterministic Go dataplane tests provide that proof.
+
+Local doubles do not qualify real networking or restart durability. DEV qualification must supply live client TCP/UDP, differential and full natural-rekey evidence, plus three successful SQLite integrity checks after actual restarts. A dry run reports SKIPPED and cannot claim verified integrity.
+
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -97,22 +106,22 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `test_setup.py` | 4 | Initial setup wizard, validation, admin creation, lock |
 | `test_onboard.py` | 4 | Server 1 SSH onboarding, fingerprint confirm, AWG 3.1 deploy, health |
 | `test_auth.py` | 10 | Login page, success, failure, slide captcha, rate limiting, CSRF, logout, password change, logout-all |
-| `test_servers.py` | 14 | Server list, detail, check, install, stats, add form, reboot, edit host validation & lifecycle, reachability, container toggle, server config get/save, connection edit |
+| `test_servers.py` | 15 | Server list, detail, check, install, stats, add form, reboot, edit host validation & lifecycle, reachability, container toggle, server config get/save, connection edit |
 | `test_connections.py` | 5 | Connection list, add, config/QR, toggle, delete |
 | `test_users.py` | 7 | User list, add, edit, toggle, add connection, delete, XSS |
 | `test_my_connections.py` | 6 | User login+list, create, view config, role access denied, rename connection, alias endpoint |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 5 | Enable sharing, access share link, download config, public leaderboard, share token endpoints |
-| `test_vpn.py` | 13 | Forwarder health dashboard UI, banner, KPIs, 11 diagnostic panels, sparklines window switcher, problem routes toggle, and full /api/vpn/* REST endpoints |
+| `test_vpn.py` | 15 | Forwarder health dashboard UI, banner, KPIs, 11 diagnostic panels, sparklines window switcher, problem routes toggle, and schema2 status, redacted inventories, metrics histogram and anonymous metrics denial, and VPN REST smoke coverage |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 76 test scenarios across 11 test suites (4 in Stage 1, 4 in Stage 2, 68 in Stage 3)**
+**Total: 79 test functions across 11 lifecycle suites (4 in Stage 1, 4 in Stage 2, 71 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
 
 ---
 
 ## E2E Test Suite & Exact API Coverage Matrix
 
-The following table provides the exhaustive mapping of all 76 test scenarios across all 11 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
+The following table maps the 79 lifecycle test functions to their exercised pages and endpoints. Endpoint invocation and shape checks are smoke coverage; they do not establish every authorization or lifecycle invariant.
 
 | Test File | Test Name | Target UI / Page Visited | Exact APIs Called | HTTP Method |
 |-----------|-----------|--------------------------|-------------------|-------------|
@@ -191,6 +200,9 @@ The following table provides the exhaustive mapping of all 76 test scenarios acr
 | `test_vpn.py` | `test_vpn_user_self_service` | None (Direct REST API) | `/api/vpn/my-connection`<br>`/api/vpn/my-config` | GET<br>GET |
 | `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
 | `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
+| `test_servers.py` | `test_server_container_toggle_invalid_action` | Server API | `/api/servers/{id}/container/toggle` | POST |
+| `test_vpn.py` | `test_vpn_metrics_api` | VPN API | `/api/vpn/metrics` | GET |
+| `test_vpn.py` | `test_vpn_metrics_requires_authentication` | Anonymous API | `/api/vpn/metrics` | GET |
 
 ---
 
@@ -240,12 +252,13 @@ The E2E test suite exercises 41 distinct REST API routes across the platform, in
 - `POST /api/my/connections/{id}/rename` - Renames client connection profile
 - `GET /api/connections/` - Standard alias returning user connections and quota limits
 
-### 7. VPN Subsystem & Forwarder Diagnostics (9 endpoints)
+### 7. VPN Subsystem & Forwarder Diagnostics
+- `GET /api/vpn/metrics` - Authenticated Prometheus write-duration histogram; anonymous access rejected
 - `GET /api/vpn/status` - Complete forwarder health assessment, rates, latency percentiles, VirtualTUN, route queues
 - `GET /api/vpn/sessions` - Active sessions and connected peer telemetry
 - `GET /api/vpn/backends` - Configured backend tunnels, health states, and traffic metrics
 - `GET /api/vpn/tunnels` - Active tunnel interfaces and transport state
-- `GET /api/vpn/config` and `POST /api/vpn/config` - VPN subsystem settings and health threshold management
+- `GET /api/vpn/config` and `POST /api/vpn/config` - VPN subsystem settings and backend health-probe latency threshold
 - `POST /api/vpn/backends/{server_id}/enable` - Enables backend tunnel in routing pool
 - `POST /api/vpn/backends/{server_id}/disable` - Drains and disables backend tunnel
 - `POST /api/vpn/disconnect` - Disconnects active VPN session

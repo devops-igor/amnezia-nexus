@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"golang.org/x/crypto/curve25519"
@@ -39,6 +40,7 @@ func deriveTestKey(t *testing.T, seed byte) (string, string) {
 
 func setupRotationMockSSH(initialConfig string, oldPriv, oldPub, newPriv, newPub string) (*testMockSSHClient, func() string) {
 	current := initialConfig
+	live := oldPub
 	uploads := map[string][]byte{}
 	mock := &testMockSSHClient{}
 	mock.cmdFunc = func(_ context.Context, cmd string) (string, string, int, error) {
@@ -50,10 +52,14 @@ func setupRotationMockSSH(initialConfig string, oldPriv, oldPub, newPriv, newPub
 		case strings.Contains(cmd, "docker exec") && strings.Contains(cmd, " cat ") && strings.Contains(cmd, "awg0.conf"):
 			return current, "", 0, nil
 		case strings.Contains(cmd, "show awg0 public-key"):
-			if strings.Contains(current, newPriv) {
-				return newPub, "", 0, nil
+			return live, "", 0, nil
+		case strings.Contains(cmd, "syncconf"):
+			key, err := awg.ExtractServerPublicKey(current)
+			if err != nil {
+				return "", "", 1, err
 			}
-			return oldPub, "", 0, nil
+			live = key
+			return "", "", 0, nil
 		case strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config"):
 			for p, data := range uploads {
 				if strings.Contains(cmd, p) {

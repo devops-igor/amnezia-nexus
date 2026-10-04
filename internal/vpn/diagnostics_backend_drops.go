@@ -75,22 +75,6 @@ type backendDeviceDropStats struct {
 	// implement backendDeviceStatsProvider, so neither axis exists for it.
 	// It is reported rather than dropped so TotalDrops stays truthful.
 	ClientUnattributed uint64
-
-	// ClientRetired is RETIRED loss that carries no direction and no reason:
-	// the lifetime accumulator's own ClientUnattributed bucket, published
-	// under its own key.
-	//
-	// Retirement is a transfer of the device's real breakdown (issue #424
-	// round 5, finding 1), so retired loss that HAS a direction and a reason
-	// is published in the reason keys above exactly as a live loss is — a
-	// retired inbound queue-full loss appears in ClientQueueFull, a retired
-	// outbound one in ReturnQueueFull, and neither changes key at retirement.
-	// What remains here is the one retired population with no direction to
-	// carry: loss on a device that never reported its axes. It is attributed
-	// to the client population, the same conservative default the live path
-	// uses, and it is the CLIENT-direction half of the retired total — the
-	// retired TOTAL is Total(), the sum of every direction.
-	ClientRetired uint64
 }
 
 // Total is the sum of every disjoint population above: for the retired
@@ -98,7 +82,7 @@ type backendDeviceDropStats struct {
 func (d backendDeviceDropStats) Total() uint64 {
 	return d.ClientQueueFull + d.ClientOversized + d.ClientShutdown +
 		d.ReturnQueueFull + d.ReturnShutdown +
-		d.ClientExternal + d.ClientUnattributed + d.ClientRetired
+		d.ClientExternal + d.ClientUnattributed
 }
 
 // addInto folds other into d field by field.
@@ -128,9 +112,8 @@ func (d *backendDeviceDropStats) addInto(other backendDeviceDropStats) {
 // axes contributes its aggregate as ClientUnattributed rather than being
 // spread across buckets we cannot verify.
 //
-// It must be called AFTER the device has been closed, so shutdown drains are
-// included in the snapshot and are not lost between the transfer and the
-// deletion.
+// Retirement callers close the device first so shutdown drains are included
+// before transferring the final counters. Live observers may read it at any time.
 func snapshotBackendDeviceDrops(dev BackendDevice) backendDeviceDropStats {
 	var out backendDeviceDropStats
 	if dev == nil {
@@ -151,38 +134,12 @@ func snapshotBackendDeviceDrops(dev BackendDevice) backendDeviceDropStats {
 	return out
 }
 
-// collectBackendDeviceDropStats folds every live backend device's
-// direction x reason breakdown onto the retired lifetime accumulator.
-//
-// nil map entries are skipped exactly as the original inline loops did. The
-// device map and the retired accumulator are read without the Service mutex,
-// matching every other diagnostics reader of this state: the values are
-// monotonic per-device counters sampled for a report, never used for a
-// decision.
-//
-// A retired device contributes to the SAME key a live one does, so a loss
-// never changes published key across a retirement. That is what keeps the
-// per-reason rate trackers honest: they take deltas against a baseline, so a
-// loss that migrated between keys at retirement would be published as fresh
-// activity on the destination key while TotalDrops never moved.
-func collectBackendDeviceDropStats(s *Service) backendDeviceDropStats {
-	// Retired loss is published under the same keys as live loss; only the
-	// directionless retired bucket keeps its own key.
-	out := s.retiredBackendDeviceDrops
-	out.ClientRetired = out.ClientUnattributed
-	out.ClientUnattributed = 0
-	for _, dev := range s.backendDevices {
-		if dev == nil {
-			continue
-		}
-		snap := snapshotBackendDeviceDrops(dev)
-		out.ClientQueueFull += snap.ClientQueueFull
-		out.ClientOversized += snap.ClientOversized
-		out.ClientShutdown += snap.ClientShutdown
-		out.ReturnQueueFull += snap.ReturnQueueFull
-		out.ReturnShutdown += snap.ReturnShutdown
-		out.ClientExternal += snap.ClientExternal
-		out.ClientUnattributed += snap.ClientUnattributed
+// collectBackendDeviceDropStats folds retired device counters with a snapshot
+// of the live ones. Retired losses retain the same reason as live losses.
+func (inputs diagnosticsInputs) collectBackendDeviceDropStats() backendDeviceDropStats {
+	out := inputs.retiredBackendDeviceDrops
+	for _, dev := range inputs.backendDevices {
+		out.addInto(snapshotBackendDeviceDrops(dev))
 	}
 	return out
 }

@@ -99,6 +99,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Fail before building or starting a subject: skipped DB checks cannot qualify.
+if [[ "$DRY_RUN" != "true" ]] && ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "ERROR: sqlite3 CLI is required for restart database integrity verification." >&2
+    exit 1
+fi
+
 if [[ "$RUNTIME_DIR" != /* ]]; then
     RUNTIME_DIR="$REPO_ROOT/$RUNTIME_DIR"
 fi
@@ -223,22 +229,32 @@ stop_subject() {
     rm -f "$PID_FILE" "$READY_PATH"
 }
 
+DB_INTEGRITY_CHECKS=0
+
 verify_db_integrity() {
     local stage="$1"
-    if ! command -v sqlite3 >/dev/null 2>&1; then
-        echo "    Notice: sqlite3 CLI not found; skipping PRAGMA integrity_check query."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "    [$stage] Database integrity not qualified in dry-run mode."
         return 0
+    fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "ERROR: [$stage] sqlite3 CLI is required for integrity verification." >&2
+        return 1
     fi
     if [[ ! -f "$DB_PATH" ]]; then
         echo "ERROR: [$stage] Database file missing at $(display_path "$DB_PATH")" >&2
         return 1
     fi
     local res
-    res="$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;")"
-    if [[ "$res" != "ok" ]]; then
-        echo "ERROR: [$stage] Database integrity check failed: $res" >&2
+    if ! res="$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null)"; then
+        echo "ERROR: [$stage] Database integrity query failed." >&2
         return 1
     fi
+    if [[ "$res" != "ok" ]]; then
+        echo "ERROR: [$stage] Database integrity check failed." >&2
+        return 1
+    fi
+    DB_INTEGRITY_CHECKS=$((DB_INTEGRITY_CHECKS + 1))
     echo "    [$stage] Database PRAGMA integrity_check: ok"
 }
 
@@ -348,7 +364,7 @@ echo ""
 echo "==> [Aggregation] Generating upstream durability rehearsal summary report..."
 
 # Aggregate JSON reports
-python3 - "$OUTPUT_DIR" "$FROZEN_CONFIG_HASH" "$REPORT_FILE" "$DRY_RUN" << 'PYEOF'
+python3 - "$OUTPUT_DIR" "$FROZEN_CONFIG_HASH" "$REPORT_FILE" "$DRY_RUN" "$DB_INTEGRITY_CHECKS" << 'PYEOF'
 import sys
 import json
 import os
@@ -358,6 +374,8 @@ output_dir = sys.argv[1]
 frozen_hash = sys.argv[2]
 report_file = sys.argv[3]
 dry_run = (sys.argv[4].lower() == "true")
+integrity_checks = int(sys.argv[5])
+integrity_verified = not dry_run and integrity_checks == 3
 
 def load_leg(fname):
     p = os.path.join(output_dir, fname)
@@ -376,7 +394,7 @@ for leg in [leg1, leg2, leg3]:
     if leg.get("status") != expected_status:
         all_passed = False
 
-verdict = "PASS" if all_passed else "FAIL"
+verdict = ("SKIPPED" if dry_run else "PASS") if all_passed and (dry_run or integrity_verified) else "FAIL"
 
 summary = {
     "schema_version": "1.0.0",
@@ -385,7 +403,8 @@ summary = {
     "dry_run": dry_run,
     "frozen_config_sha256": frozen_hash,
     "config_hash_matched": True,
-    "db_integrity_verified": True,
+    "db_integrity_verified": integrity_verified,
+    "db_integrity_checks": integrity_checks,
     "legs": {
         "leg1_upstream": {
             "engine": "upstream",
@@ -418,12 +437,16 @@ with open(report_file, "w", encoding="utf-8") as out:
     json.dump(summary, out, indent=2)
 
 print(f"Report written to: {os.path.basename(report_file)} (Verdict: {verdict})")
-if verdict != "PASS":
+if verdict == "FAIL":
     sys.exit(1)
 PYEOF
 
 echo ""
 echo "===================================================================="
-echo " Upstream Durability Rehearsal Completed: PASS"
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo " Upstream Durability Rehearsal Completed: SKIPPED (dry-run)"
+else
+    echo " Upstream Durability Rehearsal Completed: PASS"
+fi
 echo " Report: $(display_path "$REPORT_FILE")"
 echo "===================================================================="

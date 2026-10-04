@@ -55,8 +55,7 @@ func NewDevice(cfg Config) (*ClientAWGDevice, error) {
 // inbound peak and Close-drain assertions non-deterministic.
 //
 // A test that needs deterministic inbound queue state must use this
-// constructor. SuspendReadsForTest is then redundant (but harmless, and kept
-// as the explicit statement of intent).
+// constructor. The read gate is armed before upstream workers start.
 func NewDeviceWithSuspendedReadsForTest(cfg Config) (*ClientAWGDevice, error) {
 	return newDevice(cfg, true)
 }
@@ -178,42 +177,10 @@ func (d *ClientAWGDevice) InjectInbound(packet []byte) error {
 // Stats reports bounded queue depths and loss accounting, including after Close.
 func (d *ClientAWGDevice) Stats() virtualtun.StatsSnapshot { return d.tun.Stats() }
 
-// DownForTest suspends the upstream device listener for testing.
-//
-// IMPORTANT: it does NOT stop the upstream TUN reader goroutine. That
-// goroutine is started inside the upstream device.NewDevice and runs for the
-// device's whole life; the upstream Down() only closes the bind and stops the
-// peers (downLocked), and it exposes no way to stop the reader. Tests that
-// need deterministic INBOUND queue state must use SuspendReadsForTest.
-func (d *ClientAWGDevice) DownForTest() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.dev.Down()
-}
-
-// SuspendReadsForTest makes the upstream TUN reader stop draining the inbound
-// queue, so a test can build deterministic inbound occupancy, inbound peak and
-// shutdown-drain state. It is TEST-ONLY and changes no production behavior.
-//
-// PREFER NewDeviceWithSuspendedReadsForTest. This method only reaches Read
-// calls that have not yet passed the gate; the upstream reader is started
-// inside device.NewDevice and is normally already parked inside Read (see
-// DownForTest for why no upstream API can stop it), so suspending afterwards
-// usually has no effect. This remains useful for a device whose reader has not
-// started yet, and it makes the intent explicit at the call site.
-func (d *ClientAWGDevice) SuspendReadsForTest() {
-	d.tun.SuspendReadsForTest()
-}
-
 // ReadsSuspendedForTest reports whether the test-only inbound read gate is
 // armed on this device's VirtualTUN.
 func (d *ClientAWGDevice) ReadsSuspendedForTest() bool {
 	return d.tun.ReadsSuspendedForTest()
-}
-
-// ResumeReadsForTest releases a reader suspended by SuspendReadsForTest.
-func (d *ClientAWGDevice) ResumeReadsForTest() {
-	d.tun.ResumeReadsForTest()
 }
 
 // WriteOutboundForTest submits packets to the VirtualTUN outbound queue, the

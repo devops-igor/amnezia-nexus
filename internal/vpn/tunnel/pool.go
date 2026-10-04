@@ -564,14 +564,6 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 	if !ok {
 		return ErrTunnelNotFound
 	}
-	if tunnel.Enabled == enabled && tunnel.DisableReason == disableReason {
-		// Even if the stored boolean and reason already match, an explicit
-		// administrative call asserts current intent and advances the
-		// administrative generation to invalidate any older in-flight enables.
-		p.bumpAdminGenerationLocked(serverID)
-		return nil
-	}
-
 	if p.setTunnelEnabledHook != nil {
 		if err := p.setTunnelEnabledHook(ctx, serverID, enabled, disableReason); err != nil {
 			return err
@@ -591,13 +583,19 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 		}
 	}
 
+	// Explicit intent must reach durable storage even when live state already
+	// matches: emergency quarantine can have changed memory after a failed write.
+	if tunnel.Enabled == enabled && tunnel.DisableReason == effectiveReason {
+		p.bumpAdminGenerationLocked(serverID)
+		return nil
+	}
+
 	tunnel.Enabled = enabled
 	tunnel.DisableReason = effectiveReason
 	tunnel.StateVersion++
 	p.bumpAdminGenerationLocked(serverID)
 	return nil
 }
-
 
 // ForceDisableTunnelInMemory is an emergency fail-closed operation for
 // compensation paths where durable administrative-state persistence has

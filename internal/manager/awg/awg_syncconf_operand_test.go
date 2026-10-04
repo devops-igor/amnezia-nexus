@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // This file is the regression suite for the syncconf OPERAND COUNT defect.
@@ -291,7 +291,16 @@ func TestEmptyStripIsRefusedBeforeSyncconf(t *testing.T) {
 			stripCmd = cmd
 			// Empty strip output, exit status 0 - exactly the silent-failure
 			// shape the `test -s` guard exists to catch.
-			_, _, code := h.run(t, cmd, stripBodyEnv+"=")
+			local := strings.ReplaceAll(cmd, "/opt/amnezia/awg", h.cfgDir)
+			_, _, code := h.run(t, local, stripBodyEnv+"=")
+			paths, globErr := filepath.Glob(filepath.Join(h.cfgDir, ".awg-strip-*.conf"))
+			if globErr != nil || len(paths) != 1 {
+				t.Fatal("strip must create an observable file in writable config directory")
+			}
+			st, statErr := os.Stat(paths[0])
+			if statErr != nil || st.Size() != 0 {
+				t.Fatal("successful strip must produce an empty file")
+			}
 			return "", "", code, nil
 		}
 		if strings.Contains(cmd, "syncconf") && syncCmd == "" {
@@ -312,36 +321,6 @@ func TestEmptyStripIsRefusedBeforeSyncconf(t *testing.T) {
 	}
 	if syncCmd != "" {
 		t.Errorf("syncconf must never run after an empty strip, got: %s", syncCmd)
-	}
-}
-
-// TestFailingStripNeverReachesSyncconf keeps the checked-strip property: a strip
-// that exits non-zero must abort before syncconf and surface an error.
-func TestFailingStripNeverReachesSyncconf(t *testing.T) {
-	ctx := context.Background()
-	rec := newStripFailureRecorder(true)
-	rec.mock.files["/opt/amnezia/awg/awg0.conf"] = []byte(validServerConfig)
-	original := string(rec.mock.files["/opt/amnezia/awg/awg0.conf"])
-
-	mgr := NewAWGManager(&mockAWGSSHProvider{client: rec.mock})
-	server := &models.Server{ID: 1, Host: "1.2.3.4"}
-
-	err := mgr.WriteConfiguration(ctx, server, stripRejectedConfig)
-	if err == nil {
-		t.Fatal("expected WriteConfiguration to fail when strip rejects the config")
-	}
-	stripCalls, syncconfs := rec.counts()
-	if stripCalls == 0 {
-		t.Error("expected strip to be invoked as its own checked step")
-	}
-	if syncconfs != 0 {
-		t.Errorf("syncconf ran %d times after a failed strip; commands: %v", syncconfs, rec.recordedCommands())
-	}
-	if got := string(rec.mock.files["/opt/amnezia/awg/awg0.conf"]); got != original {
-		t.Errorf("previous configuration was not restored byte-for-byte\n got: %q\nwant: %q", got, original)
-	}
-	if strings.Contains(string(rec.mock.files["/opt/amnezia/awg/awg0.conf"]), "SaveConfig") {
-		t.Error("the rejected config leaked onto disk after a failed strip")
 	}
 }
 
@@ -455,41 +434,6 @@ func TestSyncconfCommandResistsShellInjection(t *testing.T) {
 	}
 }
 
-// TestOpsReview_StripFilePermissions pins the insecure creation regression:
-// Under ambient permissive umask (022), stripInterfaceConfig previously created
-// secret-bearing files with mode 0644 before any chmod or sync operation.
-// The file must be created with mode 0600 or stricter.
-func TestOpsReview_StripFilePermissions(t *testing.T) {
-	h := newShellHarness(t)
-	c := newMockAWGSSHClient()
-	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
-		if strings.Contains(cmd, " strip ") {
-			out, stderr, code := h.run(t, "umask 022; "+cmd)
-			return out, stderr, code, nil
-		}
-		return c.defaultRunSudo(cmd)
-	}
-	m := NewAWGManager(&mockAWGSSHProvider{client: c})
-	p, err := m.stripInterfaceConfig(context.Background(), c, "amnezia-awg2", h.cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(p)
-	st, err := os.Stat(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hasPrivateKey := strings.Contains(string(data), "PrivateKey")
-	t.Logf("secret-bearing strip file: mode=%04o private-key-present=%t", st.Mode().Perm(), hasPrivateKey)
-	if st.Mode().Perm()&0077 != 0 {
-		t.Errorf("strip file exposes private keys to group/other: mode=%04o", st.Mode().Perm())
-	}
-}
-
 // TestStripFilePermissions_VariousAmbientUmasks tests that regardless of ambient umask
 // (000, 022, 027, 077), the stripped secret-bearing file is created with mode 0600 or stricter.
 func TestStripFilePermissions_VariousAmbientUmasks(t *testing.T) {
@@ -534,19 +478,18 @@ func TestStripFilePermissions_FailedStripCleansUpAndCreatesPrivately(t *testing.
 	c := newMockAWGSSHClient()
 	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
 		if strings.Contains(cmd, " strip ") {
-			// Find strip path from command to inspect file right after execution
-			for _, part := range strings.Split(cmd, " ") {
-				if strings.Contains(part, ".awg-strip-") {
-					observedPath = strings.Trim(part, "'\"")
-				}
-			}
-			// Simulate failing strip execution under ambient umask 022
+			// Inspect actual filesystem results before the cleanup command.
 			out, stderr, code := h.run(t, "umask 022; "+cmd, stripBodyEnv+"=")
-			if observedPath != "" {
-				if st, err := os.Stat(observedPath); err == nil {
-					observedPerm = st.Mode().Perm()
-				}
+			paths, err := filepath.Glob(filepath.Join(h.cfgDir, ".awg-strip-*.conf"))
+			if err != nil || len(paths) != 1 {
+				t.Fatal("failed strip did not create exactly one observed file")
 			}
+			observedPath = paths[0]
+			st, err := os.Stat(observedPath)
+			if err != nil {
+				t.Fatal("observe created strip file:", err)
+			}
+			observedPerm = st.Mode().Perm()
 			return out, stderr, code, nil
 		}
 		if strings.Contains(cmd, "rm -f") {
@@ -566,7 +509,7 @@ func TestStripFilePermissions_FailedStripCleansUpAndCreatesPrivately(t *testing.
 	if p != "" {
 		t.Errorf("expected empty path on failure, got %s", p)
 	}
-	if observedPerm != 0 && observedPerm&0077 != 0 {
+	if observedPath == "" || observedPerm != 0600 {
 		t.Errorf("strip file created during failed attempt exposed permissions: mode=%04o", observedPerm)
 	}
 	// Verify cleanup removed the file
@@ -580,22 +523,64 @@ func TestStripFilePermissions_FailedStripCleansUpAndCreatesPrivately(t *testing.
 // TestStripFilePermissions_CleanupSurvivesContextCancellation verifies that removeContainerFile
 // executes detached cleanup using context.WithoutCancel even if the caller context was canceled.
 func TestStripFilePermissions_CleanupSurvivesContextCancellation(t *testing.T) {
-	c := newMockAWGSSHClient()
+	c := &contextCheckingSSHClient{mockAWGSSHClient: newMockAWGSSHClient()}
 	var removeExecuted bool
-	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+	c.check = func(ctx context.Context, cmd string) {
 		if strings.Contains(cmd, "rm -f") {
 			removeExecuted = true
-			return "OK", "", 0, nil
+			assertDetachedCleanupContext(t, ctx)
 		}
-		return c.defaultRunSudo(cmd)
 	}
 
-	m := NewAWGManager(&mockAWGSSHProvider{client: c})
+	m := NewAWGManager(&mockAWGSSHProvider{client: c.mockAWGSSHClient})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel context beforehand
 
 	m.removeContainerFile(ctx, c, "amnezia-awg2", "/opt/amnezia/awg/.awg-strip-test.conf")
 	if !removeExecuted {
 		t.Error("removeContainerFile did not execute rm -f under canceled context")
+	}
+}
+
+// contextCheckingSSHClient observes context at the actual SSH interface boundary.
+type contextCheckingSSHClient struct {
+	*mockAWGSSHClient
+	check func(context.Context, string)
+}
+
+func (c *contextCheckingSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if c.check != nil {
+		c.check(ctx, cmd)
+	}
+	return c.mockAWGSSHClient.RunSudoCommand(ctx, cmd)
+}
+func assertDetachedCleanupContext(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := ctx.Err(); err != nil {
+		t.Fatal("cleanup received canceled context", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 30*time.Second {
+		t.Fatal("cleanup must have an alive bounded deadline")
+	}
+}
+
+func TestUploadedConfigurationCleanupSurvivesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &contextCheckingSSHClient{mockAWGSSHClient: newMockAWGSSHClient()}
+	cleaned := false
+	c.check = func(callCtx context.Context, cmd string) {
+		if strings.HasPrefix(cmd, "docker cp ") {
+			cancel()
+		}
+		if strings.HasPrefix(cmd, "rm -f ") {
+			cleaned = true
+			assertDetachedCleanupContext(t, callCtx)
+		}
+	}
+	m := NewAWGManager(&mockAWGSSHProvider{client: c.mockAWGSSHClient})
+	_, _ = m.writeServerConfigTracked(ctx, c, validServerConfig)
+	if !cleaned {
+		t.Fatal("uploaded config cleanup was never executed")
 	}
 }

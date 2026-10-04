@@ -27,6 +27,7 @@ func (h *Handlers) VPNStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil || status == nil {
 		status = &vpn.Status{
+			SchemaVersion:      vpn.VPNStatusSchemaVersion,
 			ConfiguredEngine:   vpn.ClientAWGEngineUpstream,
 			ActiveEngine:       "none",
 			ReturnRouteOwner:   "none",

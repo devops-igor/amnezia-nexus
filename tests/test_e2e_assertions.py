@@ -598,6 +598,7 @@ def status_api_fixture() -> dict[str, Any]:
     status = extended_status_fixture()
     status.update(
         {
+            "status_schema_version": 2,
             "configured_engine": "awg",
             "active_engine": "awg",
             "engine_running": True,
@@ -610,9 +611,13 @@ def status_api_fixture() -> dict[str, Any]:
             "queue_pressure": {"capacity": 1, "occupancy": 0, "utilization_pct": 0},
             "virtual_tun": {
                 "upstream_to_nexus": dict.fromkeys(["occupancy", "capacity", "peak", "drops"], 0),
-                "nexus_to_upstream": {},
+                "nexus_to_upstream": dict.fromkeys(["occupancy", "capacity", "peak", "drops"], 0),
             },
-            "runtime_resources": {"cpu_percent": 0, "goroutines": 1},
+            "runtime_resources": {
+                "cpu_percent": 0,
+                "goroutines": 1,
+                "memory_limit_available": False,
+            },
             "peer_sync": None,
             "routing_consistency": {
                 "ownership_mismatch_drops": 0,
@@ -635,6 +640,8 @@ def status_api_fixture() -> dict[str, Any]:
         )
     )
     status["problem_routes"][0]["peer_key"] = "abcdefgh…"
+    status["all_routes"] = deepcopy(status["problem_routes"])
+    status["forwarder_route_queues"] = {"pk" + "a" * 24 + "-44": {"peer_key_display": "abcdefgh…"}}
     return status
 
 
@@ -765,7 +772,7 @@ def test_peer_redaction_privacy_regression_detects_independent_mutations(
     module_path = tmp_path / (module_name + ".py")
     module_path.write_text(
         "from tests.e2e.test_vpn import (Page, pytest, api_get, assert_response_shape, "
-        "_assert_extended_diagnostics)\n" + ast.unparse(tree) + "\n"
+        "_assert_extended_diagnostics, re)\n" + ast.unparse(tree) + "\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     pytest.register_assert_rewrite(module_name)
@@ -779,3 +786,50 @@ def test_peer_redaction_privacy_regression_detects_independent_mutations(
             assert_peer_redaction_failure_safe(failure)
     finally:
         sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-version",
+        "wrong-version",
+        "raw-map-key",
+        "raw-map-display",
+        "raw-all-route",
+        "missing-return",
+        "missing-return-field",
+        "negative-return",
+        "nonfinite-return",
+        "boolean-return",
+    ],
+)
+def test_status_schema_privacy_and_direction_contract(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """The actual API oracle rejects schema, disclosure and both-direction shape regressions."""
+    status = status_api_fixture()
+    if fault == "missing-version":
+        del status["status_schema_version"]
+    elif fault == "wrong-version":
+        status["status_schema_version"] = 1
+    elif fault == "raw-map-key":
+        status["forwarder_route_queues"] = {FULL_PEER_IDENTIFIER: {"peer_key_display": "abcdefgh…"}}
+    elif fault == "raw-map-display":
+        next(iter(status["forwarder_route_queues"].values()))[
+            "peer_key_display"
+        ] = FULL_PEER_IDENTIFIER
+    elif fault == "raw-all-route":
+        status["all_routes"][0]["peer_key"] = FULL_PEER_IDENTIFIER
+    elif fault == "missing-return":
+        status["virtual_tun"]["nexus_to_upstream"] = {}
+    elif fault == "missing-return-field":
+        del status["virtual_tun"]["nexus_to_upstream"]["drops"]
+    else:
+        status["virtual_tun"]["nexus_to_upstream"]["drops"] = {
+            "negative-return": -1,
+            "nonfinite-return": float("nan"),
+            "boolean-return": True,
+        }[fault]
+    with pytest.raises(AssertionError) as failure:
+        run_peer_redaction_status(monkeypatch, status)
+    assert_peer_redaction_failure_safe(failure)

@@ -58,29 +58,29 @@ type Status struct {
 	// Legacy-compatible forwarder counters that still describe Nexus-owned
 	// dataplane behavior are retained in schema v2. Custom client-engine
 	// decrypt/handshake telemetry was removed with the upstream-only architecture.
-	ForwarderAvailable             bool                                 `json:"forwarder_available"`
-	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
-	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
-	ForwarderDropsPacketTooLarge   uint64                               `json:"forwarder_drops_packet_too_large"`
-	ForwarderDropsTotal            uint64                               `json:"forwarder_drops_total"`
-	ForwarderQueueOccupancy        int                                  `json:"forwarder_queue_occupancy"`
-	ForwarderQueueCapacity         int                                  `json:"forwarder_queue_capacity"`
-	ForwarderQueueHighWater        int                                  `json:"forwarder_queue_high_water"`
-	ForwarderDeviceWriteErrors     uint64                               `json:"forwarder_device_write_errors"`
-	ForwarderDeviceWriteDurationMS uint64                               `json:"forwarder_device_write_duration_ms"`
-	ForwarderDeviceWriteCount      uint64                               `json:"forwarder_device_write_count"`
-	ForwarderDeviceWritesInFlight  int                                  `json:"forwarder_device_writes_in_flight"`
-	ForwarderDeviceWriteOldestMS   int64                                `json:"forwarder_device_write_oldest_in_flight_ms"`
-	ForwarderDeviceWriteMaxMS      int64                                `json:"forwarder_device_write_max_duration_ms"`
-	ForwarderDeviceWriteStalls     uint64                               `json:"forwarder_device_write_stalls"`
-	ForwarderDeviceWriteStallMS    int64                                `json:"forwarder_device_write_stall_threshold_ms"`
-	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
+	ForwarderAvailable             bool   `json:"forwarder_available"`
+	ForwarderDropsQueueFull        uint64 `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute          uint64 `json:"forwarder_drops_no_route"`
+	ForwarderDropsPacketTooLarge   uint64 `json:"forwarder_drops_packet_too_large"`
+	ForwarderDropsTotal            uint64 `json:"forwarder_drops_total"`
+	ForwarderQueueOccupancy        int    `json:"forwarder_queue_occupancy"`
+	ForwarderQueueCapacity         int    `json:"forwarder_queue_capacity"`
+	ForwarderQueueHighWater        int    `json:"forwarder_queue_high_water"`
+	ForwarderDeviceWriteErrors     uint64 `json:"forwarder_device_write_errors"`
+	ForwarderDeviceWriteDurationMS uint64 `json:"forwarder_device_write_duration_ms"`
+	ForwarderDeviceWriteCount      uint64 `json:"forwarder_device_write_count"`
+	ForwarderDeviceWritesInFlight  int    `json:"forwarder_device_writes_in_flight"`
+	ForwarderDeviceWriteOldestMS   int64  `json:"forwarder_device_write_oldest_in_flight_ms"`
+	ForwarderDeviceWriteMaxMS      int64  `json:"forwarder_device_write_max_duration_ms"`
+	ForwarderDeviceWriteStalls     uint64 `json:"forwarder_device_write_stalls"`
+	ForwarderDeviceWriteStallMS    int64  `json:"forwarder_device_write_stall_threshold_ms"`
+	PublicEndpoint                 string `json:"public_endpoint,omitempty"`
 	// Schema v2 map keys are ingress.PeerKeyFingerprint values; peer_key_display
 	// carries the redacted operator-facing identifier.
-	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
-	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
-	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
-	PeerSync                       *PeerSyncStatus                      `json:"peer_sync,omitempty"`
+	ForwarderRouteQueues map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
+	UpstreamDesiredPeers int                                  `json:"upstream_desired_peers,omitempty"`
+	UpstreamActualPeers  int                                  `json:"upstream_actual_peers,omitempty"`
+	PeerSync             *PeerSyncStatus                      `json:"peer_sync,omitempty"`
 
 	// Issue #424: Redesigned forwarder health & operational diagnostics
 	HealthAssessment   ForwarderHealthAssessment     `json:"health_assessment"`
@@ -950,7 +950,6 @@ func (s *Service) SetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tun
 	s.pool.SetSetTunnelPublicKeyHookForTest(fn)
 }
 
-
 // SetTunnelEnabledHookForTest sets a test hook for SetTunnelEnabled on the pool.
 func (s *Service) SetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
 	if s == nil || s.pool == nil {
@@ -1814,13 +1813,25 @@ func (s *Service) ReturnRouteOwner() string {
 // GetStatus returns the operational status and telemetry of the VPN subsystem.
 func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	inputs := s.diagnosticsInputsLocked()
+	// Structural membership shares the Service administrative boundary.
+	// These snapshot methods do no peer synchronization or external I/O.
+	var routeSnapshot []forwarder.RouteInfo
+	if inputs.forwarder != nil {
+		routeSnapshot = inputs.forwarder.InspectRoutes()
+	}
+	running, db := s.running, s.db
+	var cfg *models.VPNConfig
+	if s.cfg != nil {
+		cfg = &models.VPNConfig{ListenPort: s.cfg.ListenPort, PublicEndpoint: s.cfg.PublicEndpoint}
+	}
+	s.mu.RUnlock()
 
 	listenPort := 51820
-	if s.cfg != nil && s.cfg.ListenPort > 0 {
-		listenPort = s.cfg.ListenPort
-	} else if s.db != nil {
-		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
+	if cfg != nil && cfg.ListenPort > 0 {
+		listenPort = cfg.ListenPort
+	} else if db != nil {
+		if dbCfg, err := db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
 			listenPort = dbCfg.ListenPort
 		}
 	}
@@ -1829,10 +1840,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	var upstreamDesiredPeers, upstreamActualPeers int
 	var peerSync *PeerSyncStatus
 
-	if s.running {
-		if s.ingressEngine != nil && s.ingressEngine.Running() {
+	if running {
+		if inputs.ingressEngine != nil && inputs.ingressEngine.Running() {
 			engineRunning = true
-			syncStat := s.ingressEngine.PeerSyncStatus()
+			syncStat := inputs.ingressEngine.PeerSyncStatus()
 			upstreamDesiredPeers = syncStat.DesiredPeers
 			upstreamActualPeers = syncStat.ActualPeers
 			peerSync = &syncStat
@@ -1845,8 +1856,8 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	returnRouteOwner := "none"
-	if engineRunning && s.forwarder != nil {
-		returnRouteOwner = s.forwarder.ReturnRouteOwner()
+	if engineRunning && inputs.forwarder != nil {
+		returnRouteOwner = inputs.forwarder.ReturnRouteOwner()
 	}
 
 	status := &Status{
@@ -1864,11 +1875,13 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		PeerSync:                   peerSync,
 	}
 
-	if s.pool != nil {
-		status.ActiveTunnels = len(s.pool.GetActiveTunnels())
+	for _, tun := range inputs.tunnels {
+		if backendEligible(tun) {
+			status.ActiveTunnels++
+		}
 	}
-	if s.sessionMgr != nil {
-		status.ConnectedSessions = s.sessionMgr.ActiveCount()
+	if inputs.sessionMgr != nil {
+		status.ConnectedSessions = len(inputs.sessions)
 	}
 
 	// Capture per-route telemetry exactly once for this status response.
@@ -1876,14 +1889,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	// second read later in the same request is not merely another snapshot:
 	// it can advance the window and consume the incident. Both the legacy
 	// route-queue map and the redesigned diagnostics reuse this value.
-	var routeSnapshot []forwarder.RouteInfo
-	if s.forwarder != nil {
-		routeSnapshot = s.forwarder.InspectRoutes()
-	}
-	populateForwarderStatusFromRoutes(status, s.forwarder, routeSnapshot)
+	populateForwarderStatusFromRoutes(status, inputs.forwarder, routeSnapshot)
 
 	var totalDrops uint64
-	for _, dev := range s.backendDevices {
+	for _, dev := range inputs.backendDevices {
 		if dev != nil {
 			totalDrops += dev.DroppedPackets()
 		}
@@ -1899,8 +1908,8 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		}
 	}
 
-	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
-	s.populateOperationalDiagnosticsWithRoutes(status, routeSnapshot)
+	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, cfg, listenPort)
+	s.populateOperationalDiagnosticsFromInputs(status, routeSnapshot, inputs)
 
 	return status, nil
 }
@@ -2763,23 +2772,6 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		return nil
 	}
 
-	// Detach and close previous device for this tunnel to prevent leaks
-	if s.backendDevices != nil {
-		if oldDev, ok := s.backendDevices[tun.ID]; ok {
-			s.forwarder.DetachBackendDevice(tun.ID)
-			if oldDev != nil {
-				_ = oldDev.Close()
-			}
-			if oldDev != nil {
-				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
-			}
-			delete(s.backendDevices, tun.ID)
-			if s.backendDeviceEndpoints != nil {
-				delete(s.backendDeviceEndpoints, tun.ID)
-			}
-		}
-	}
-
 	beMTU := 1280
 	if awgParams != nil {
 		if mVal, ok := awgParams["mtu"].(string); ok && mVal != "" {
@@ -2795,6 +2787,10 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	if devErr != nil {
 		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}
+	// Construct and bring up the complete candidate while the current device
+	// remains attached. Configuration or socket startup failure leaves OLD
+	// usable. AttachBackendDevice cannot fail and joins the previous write pump.
+	oldDev := s.backendDevices[tun.ID]
 	s.forwarder.AttachBackendDevice(tun.ID, dev)
 	if s.backendDevices == nil {
 		s.backendDevices = make(map[int64]BackendDevice)
@@ -2804,6 +2800,10 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		s.backendDeviceEndpoints = make(map[int64]string)
 	}
 	s.backendDeviceEndpoints[tun.ID] = tun.Endpoint
+	if oldDev != nil {
+		_ = oldDev.Close()
+		s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
+	}
 
 	// Spawn backend read loop to route packets back to clients
 	go s.pumpBackendReturns(tun.ID, tun.ServerID, dev)
@@ -3185,7 +3185,7 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		defer cancel()
 		if rbErr := s.pool.SetTunnelEndpoint(rbCtx, tun.ID, oldEndpoint); rbErr != nil {
 			log.Printf("[vpn] warning: failed to rollback backend tunnel endpoint for server %d: %v", serverID, rbErr)
-			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore endpoint to %s: %v", ErrVPNRollbackFailed, oldEndpoint, rbErr))
+			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore backend endpoint: %w", ErrVPNRollbackFailed, rbErr))
 		}
 		return originalErr
 	}
@@ -3281,7 +3281,7 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 		defer cancel()
 		if rbErr := s.pool.SetTunnelPublicKey(rbCtx, tun.ID, oldPublicKey); rbErr != nil {
 			log.Printf("[vpn] warning: failed to rollback backend tunnel public key for server %d: %v", serverID, rbErr)
-			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore public key to %s: %v", ErrVPNRollbackFailed, oldPublicKey, rbErr))
+			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore backend public key: %w", ErrVPNRollbackFailed, rbErr))
 		}
 		return originalErr
 	}

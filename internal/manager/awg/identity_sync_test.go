@@ -41,13 +41,13 @@ func identityTestKeypair(t *testing.T, seed byte) (string, string) {
 // artifactPub while the configuration holds privB64.
 //
 // interfaceUp models the tunnel: when true, `awg show awg0 public-key`
-// succeeds and answers with the key derived from the configuration on disk,
-// which is what syncconf leaves behind after applying a rotation. When false
-// the container is stopped: the live probe fails and only the artifacts and the
-// configuration remain readable.
+// succeeds and answers with independent live identity, updated only by a
+// successful syncconf. When false the interface is down inside a running
+// container: artifacts and configuration remain readable through docker exec.
 type identityFixture struct {
 	*mockAWGSSHClient
-	interfaceUp bool
+	interfaceUp   bool
+	livePublicKey string
 }
 
 func newIdentityFixture(privB64, artifactPub string, interfaceUp bool) *identityFixture {
@@ -55,7 +55,8 @@ func newIdentityFixture(privB64, artifactPub string, interfaceUp bool) *identity
 	c.files[serverPublicKeyArtifactPath] = []byte(artifactPub)
 	c.files[serverPrivateKeyArtifactPath] = []byte(privB64)
 	c.files["/opt/amnezia/awg/awg0.conf"] = []byte(identityServerConfig(privB64))
-	f := &identityFixture{mockAWGSSHClient: c, interfaceUp: interfaceUp}
+	live, _ := derivePublicKeyFromPrivate(privB64)
+	f := &identityFixture{mockAWGSSHClient: c, interfaceUp: interfaceUp, livePublicKey: live}
 	c.sudoCmdHandler = f.handle
 	return f
 }
@@ -93,10 +94,14 @@ func (f *identityFixture) handle(cmd string) (string, string, int, error) {
 		if !f.interfaceUp {
 			return "", "Cannot find device \"awg0\"", 1, errors.New("exit status 1")
 		}
-		if pub, err := derivePublicKeyFromPrivate(interfacePrivateKey(string(f.files["/opt/amnezia/awg/awg0.conf"]))); err == nil {
-			return pub, "", 0, nil
+		return f.livePublicKey, "", 0, nil
+	case strings.Contains(cmd, "syncconf"):
+		pub, err := derivePublicKeyFromPrivate(interfacePrivateKey(string(f.files["/opt/amnezia/awg/awg0.conf"])))
+		if err != nil {
+			return "", "", 1, err
 		}
-		return "", "", 1, errors.New("exit status 1")
+		f.livePublicKey = pub
+		return "", "", 0, nil
 	case strings.Contains(cmd, serverPrivateKeyArtifactPath) && strings.Contains(cmd, "cat "):
 		return string(f.files[serverPrivateKeyArtifactPath]), "", 0, nil
 	case strings.Contains(cmd, serverPSKArtifactPath):
@@ -188,7 +193,7 @@ func TestRotatedServerKeyPropagatesToDownloadedClientConfig(t *testing.T) {
 
 // TestIdentityArtifactsReconciledAfterRotation pins the write side: the
 // provisioning artifacts are refreshed from the newly written configuration, so
-// a stopped-container read is correct even though the interface cannot answer.
+// a interface-down read is correct even though the interface cannot answer.
 func TestIdentityArtifactsReconciledAfterRotation(t *testing.T) {
 	ctx := context.Background()
 	oldPriv, oldPub := identityTestKeypair(t, 1)
@@ -210,10 +215,10 @@ func TestIdentityArtifactsReconciledAfterRotation(t *testing.T) {
 	}
 }
 
-// TestGetServerPublicKeyRecoversFromArtifactsWhenContainerStopped is regression
-// 3: the artifact path must still succeed for a stopped container, and after a
+// TestGetServerPublicKeyRecoversWhenInterfaceDown is regression
+// 3: the artifact path must still succeed for an interface-down container, and after a
 // rotation it must return the NEW identity.
-func TestGetServerPublicKeyRecoversFromArtifactsWhenContainerStopped(t *testing.T) {
+func TestGetServerPublicKeyRecoversWhenInterfaceDown(t *testing.T) {
 	ctx := context.Background()
 	oldPriv, oldPub := identityTestKeypair(t, 1)
 	newPriv, newPub := identityTestKeypair(t, 2)
@@ -225,7 +230,7 @@ func TestGetServerPublicKeyRecoversFromArtifactsWhenContainerStopped(t *testing.
 		t.Fatalf("WriteConfiguration(rotate) failed: %v", err)
 	}
 
-	// Now the same container is stopped: the live probe fails and recovery has
+	// Now the same container's interface is down: the live probe fails and recovery has
 	// to come from disk.
 	stopped := &identityFixture{mockAWGSSHClient: running.mockAWGSSHClient, interfaceUp: false}
 	stopped.sudoCmdHandler = stopped.handle
@@ -233,10 +238,10 @@ func TestGetServerPublicKeyRecoversFromArtifactsWhenContainerStopped(t *testing.
 
 	got, err := stoppedMgr.GetServerPublicKey(ctx, identityServer())
 	if err != nil {
-		t.Fatalf("GetServerPublicKey on a stopped container failed: %v", err)
+		t.Fatalf("GetServerPublicKey on an interface-down container failed: %v", err)
 	}
 	if got != newPub {
-		t.Errorf("stopped-container recovery returned %q, want the post-reconciliation identity %q", got, newPub)
+		t.Errorf("interface-down recovery returned %q, want the post-reconciliation identity %q", got, newPub)
 	}
 }
 
@@ -386,7 +391,7 @@ func TestProvisioningStillWritesIdentityArtifacts(t *testing.T) {
 	}
 
 	// The configuration provisioning installed carries the private key whose
-	// public key the artifact records, so a stopped-container read is correct
+	// public key the artifact records, so a interface-down read is correct
 	// straight after provisioning.
 	conf := string(c.files["/opt/amnezia/awg/awg0.conf"])
 	derived, err := derivePublicKeyFromPrivate(interfacePrivateKey(conf))
@@ -466,8 +471,8 @@ func TestReconcileServerIdentityEscapesShellArguments(t *testing.T) {
 	// interpolated into a shell script.
 	wrote = ""
 	hostile := "[Interface]\nPrivateKey = $(touch /tmp/pwned); rm -rf /\nAddress = 10.8.1.1/24\n"
-	if err := mgr.reconcileServerIdentity(ctx, c, identityServer(), original, hostile); err != nil {
-		t.Fatalf("reconcileServerIdentity(hostile) returned an unexpected error: %v", err)
+	if err := mgr.reconcileServerIdentity(ctx, c, identityServer(), original, hostile); err == nil {
+		t.Fatal("invalid changed key must fail reconciliation")
 	}
 	if wrote != "" {
 		t.Errorf("a non-key private key was interpolated into a shell command: %s", wrote)

@@ -88,53 +88,6 @@ func TestPerturbingCanonicalLevelMovesTheDwellMeasurement(t *testing.T) {
 	}
 }
 
-// TestRateTrackerPressureUsesCanonicalThresholds covers the SECOND place the
-// same two levels were hardcoded: the sampled/interpolated rate tracker credits
-// seconds above 0.50 and 0.80 while estimating pressure between readings.
-func TestRateTrackerPressureUsesCanonicalThresholds(t *testing.T) {
-	rt := NewRateTracker()
-	rt.Sample(time.Unix(0, 0), 0, 0, 0, 0, 0, 0, 0, 1000)
-
-	// Sample one second later with the queue at 70% — above the canonical 0.5
-	// but below the canonical 0.8.
-	rt.Sample(time.Unix(1, 0), 0, 0, 0, 0, 0, 0, 700, 1000)
-	// And again one second after that, still at 70%.
-	//
-	// The tracker interpolates utilization LINEARLY between accepted
-	// readings, so a single jump from 0% to 70% credits only the fraction of
-	// the interval spent above the level (0.286 s of the 1 s interval), which
-	// the published whole-second field rounds to 0. Holding the queue AT 70%
-	// for a second makes the reading unambiguous: the steady interval is
-	// wholly above the canonical warning level, so the requirement below is
-	// pinned without depending on sub-second truncation.
-	rt.Sample(time.Unix(2, 0), 0, 0, 0, 0, 0, 0, 700, 1000)
-	stats := rt.PressureSnapshot(700, 1000, 700, 0)
-
-	if stats.SecondsAbove50Pct <= 0 {
-		t.Errorf("a queue at 70%% credited 0 seconds above the canonical warning level %v: %+v",
-			thresholds.QueueDwellWarningUtilization(), stats)
-	}
-	if stats.SecondsAbove80Pct != 0 {
-		t.Errorf("a queue at 70%% credited %d seconds above the canonical degraded level %v: %+v",
-			stats.SecondsAbove80Pct, thresholds.QueueDwellDegradedUtilization(), stats)
-	}
-
-	// Now lower the canonical degraded level to 0.6 and repeat: the same 70%
-	// reading must credit seconds above it.
-	original := thresholds.QueueDwellDegradedUtilization()
-	t.Cleanup(func() { thresholds.SetQueueDwellDegradedUtilization(original) })
-	thresholds.SetQueueDwellDegradedUtilization(0.6)
-
-	rt2 := NewRateTracker()
-	rt2.Sample(time.Unix(0, 0), 0, 0, 0, 0, 0, 0, 0, 1000)
-	rt2.Sample(time.Unix(1, 0), 0, 0, 0, 0, 0, 0, 700, 1000)
-	rt2.Sample(time.Unix(2, 0), 0, 0, 0, 0, 0, 0, 700, 1000)
-	stats2 := rt2.PressureSnapshot(700, 1000, 700, 0)
-	if stats2.SecondsAbove80Pct <= 0 {
-		t.Errorf("after lowering the canonical degraded level to 0.6 a 70%% reading credited 0 seconds above it: %+v", stats2)
-	}
-}
-
 // TestRoutePressureUsesCanonicalThreshold covers the third measurement site:
 // the per-route HasPressure classification, which had its own literal 0.8.
 func TestRoutePressureUsesCanonicalThreshold(t *testing.T) {
