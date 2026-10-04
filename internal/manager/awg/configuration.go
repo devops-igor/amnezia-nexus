@@ -27,9 +27,17 @@ func (m *AWGManager) ReadConfiguration(ctx context.Context, server *models.Serve
 	return m.getServerConfig(ctx, client)
 }
 
-// ErrConfigurationPostApply marks a failure in the caller-supplied reconciliation
-// step after the remote AWG configuration was successfully applied.
-var ErrConfigurationPostApply = errors.New("AWG configuration post-apply reconciliation failed")
+var (
+	// ErrConfigurationPostApply marks a failure in the caller-supplied reconciliation
+	// step after the remote AWG configuration was successfully applied.
+	ErrConfigurationPostApply = errors.New("AWG configuration post-apply reconciliation failed")
+
+	// ErrConfigurationPostApplyKeepApplied tells the transaction that caller-owned
+	// reconciliation could not safely roll back to the previous identity. In this
+	// state the already-applied remote configuration is the convergence target and
+	// must NOT be compensated back to the old identity.
+	ErrConfigurationPostApplyKeepApplied = errors.New("keep applied AWG configuration after post-apply rollback failure")
+)
 
 // WriteConfiguration serializes with peer operations and applies both disk and
 // runtime changes. If runtime application fails after the disk write, restore
@@ -107,13 +115,17 @@ func (m *AWGManager) writeConfigurationTransaction(
 		return nil
 	}
 	if err := postApply(ctx); err != nil {
+		cause := errors.Join(ErrConfigurationPostApply, err)
+		if errors.Is(err, ErrConfigurationPostApplyKeepApplied) {
+			return cause
+		}
 		return m.restoreConfigurationAfterFailure(
 			ctx,
 			client,
 			server,
 			content,
 			original,
-			errors.Join(ErrConfigurationPostApply, err),
+			cause,
 		)
 	}
 	return nil
@@ -130,7 +142,7 @@ func (m *AWGManager) restoreConfigurationAfterFailure(
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
-	written, restoreErr := m.saveServerConfigTracked(restoreCtx, client, original)
+	written, restoreErr := m.restoreKnownServerConfigTracked(restoreCtx, client, original)
 	if restoreErr != nil {
 		return errors.Join(cause, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
 	}
