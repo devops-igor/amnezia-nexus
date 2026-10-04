@@ -874,7 +874,11 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 
 	if req.Protocol == "awg" && h.awgMgr != nil {
 		saveErr := h.awgMgr.WriteConfigurationWithPostApply(ctx, server, req.Config, func(txCtx context.Context) error {
-			return h.reconcileAWGServerIdentity(txCtx, server, req.Config)
+			err := h.reconcileAWGServerIdentity(txCtx, server, req.Config)
+			if errors.Is(err, vpn.ErrVPNRollbackFailed) {
+				return errors.Join(awg.ErrConfigurationPostApplyKeepApplied, err)
+			}
+			return err
 		})
 		if saveErr != nil {
 			if errors.Is(saveErr, awg.ErrConfigurationPostApply) {
@@ -936,6 +940,23 @@ func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *model
 
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.UpdateBackendServerPublicKey(ctx, server.ID, newPub); err != nil {
+			if errors.Is(err, vpn.ErrVPNRollbackFailed) {
+				// The pool accepted the NEW identity but could not compensate back
+				// to OLD. Rolling the DB and remote AWG back now would knowingly
+				// create a split-brain identity. Keep NEW as the convergence target
+				// and quarantine the backend so a stale forwarder device cannot
+				// continue carrying traffic while the operator repairs the failure.
+				quarantineCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if quarantineErr := h.vpnSvc.DisableBackend(quarantineCtx, server.ID); quarantineErr != nil {
+					return errors.Join(
+						fmt.Errorf("failed to reconcile VPN backend public key; keeping newly applied identity because VPN rollback failed: %w", err),
+						fmt.Errorf("failed to quarantine backend after VPN rollback failure: %w", quarantineErr),
+					)
+				}
+				return fmt.Errorf("failed to reconcile VPN backend public key; backend quarantined with newly applied identity: %w", err)
+			}
+
 			if hadAWG {
 				server.Protocols["awg"] = oldAWG
 			} else {
