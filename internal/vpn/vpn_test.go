@@ -6045,7 +6045,7 @@ func TestReconcileConnectionCounts_StaleSnapshotRejected_TimeoutBeforeCommit(t *
 	}
 }
 
-func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) {
+func TestDisableBackend_PersistenceFailureFailsClosed(t *testing.T) {
 	t.Run("ContextCanceled", func(t *testing.T) {
 		db := setupTestDB(t)
 		ctx := context.Background()
@@ -6136,32 +6136,38 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 			t.Fatalf("GetTunnel failed: %v", err)
 		}
 		if tunAfter.Status != TunnelStatusActive {
-			t.Errorf("expected pool status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+			t.Errorf("expected runtime health status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+		}
+		if tunAfter.Enabled {
+			t.Fatal("persistence failure left backend enabled in memory; expected fail-closed disable")
 		}
 
 		devAfter := svc.GetBackendDeviceForTest(tun1.ID)
-		if devAfter == nil {
-			t.Fatal("expected backend device to remain attached in service map, got nil")
+		if devAfter != nil {
+			t.Fatal("persistence failure left backend device attached; expected fail-closed detachment")
 		}
-		if devAfter.IsClosed() {
-			t.Error("expected backend device to remain open, but IsClosed() is true")
+		if !devBefore.IsClosed() {
+			t.Error("detached backend device remained open after fail-closed disable")
 		}
 
+		// The canceled DB context prevents durable session migration, but the
+		// live routing state still fails over to the healthy backend so traffic
+		// cannot continue through the quarantined device.
 		affPost, ok := svc.stickyMgr.GetPeerAffinity(peerKey)
-		if !ok || affPost != tun1.ID {
-			t.Errorf("expected peer affinity preserved for tun1 (%d), got ok=%v aff=%d", tun1.ID, ok, affPost)
+		if !ok || affPost != tun2.ID {
+			t.Errorf("expected peer affinity to fail over to tun2 (%d), got ok=%v aff=%d", tun2.ID, ok, affPost)
 		}
 		tun1Final, err := svc.pool.GetTunnelByID(tun1.ID)
-		if err != nil || tun1Final.ActiveConnections != 1 {
-			t.Errorf("expected tun1 ActiveConnections to remain 1, got %d (err=%v)", tun1Final.ActiveConnections, err)
+		if err != nil || tun1Final.ActiveConnections != 0 {
+			t.Errorf("expected tun1 ActiveConnections to fall to 0, got %d (err=%v)", tun1Final.ActiveConnections, err)
 		}
 		tun2Final, err := svc.pool.GetTunnelByID(tun2.ID)
-		if err != nil || tun2Final.ActiveConnections != 0 {
-			t.Errorf("expected tun2 ActiveConnections to remain 0, got %d (err=%v)", tun2Final.ActiveConnections, err)
+		if err != nil || tun2Final.ActiveConnections != 1 {
+			t.Errorf("expected tun2 ActiveConnections to become 1, got %d (err=%v)", tun2Final.ActiveConnections, err)
 		}
 		liveSess, ok := svc.sessionMgr.GetSession(peerKey)
 		if !ok || liveSess.BackendTunnelID != tun1.ID {
-			t.Errorf("expected session backend to remain tun1 (%d), got ok=%v id=%d", tun1.ID, ok, liveSess.BackendTunnelID)
+			t.Errorf("expected unpersisted session record to remain reconcilable on tun1 (%d), got ok=%v id=%d", tun1.ID, ok, liveSess.BackendTunnelID)
 		}
 	})
 
@@ -6212,15 +6218,18 @@ func TestDisableBackend_PersistenceFailurePreservesStateAndDevice(t *testing.T) 
 			t.Fatalf("GetTunnel failed: %v", err)
 		}
 		if tunAfter.Status != TunnelStatusActive {
-			t.Errorf("expected pool status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+			t.Errorf("expected runtime health status to remain %q, got %q", TunnelStatusActive, tunAfter.Status)
+		}
+		if tunAfter.Enabled {
+			t.Fatal("closed DB left backend enabled in memory; expected fail-closed disable")
 		}
 
 		devAfter := svc.GetBackendDeviceForTest(tun1.ID)
-		if devAfter == nil {
-			t.Fatal("expected backend device to remain attached in service map, got nil")
+		if devAfter != nil {
+			t.Fatal("closed DB left backend device attached; expected fail-closed detachment")
 		}
-		if devAfter.IsClosed() {
-			t.Error("expected backend device to remain open, but IsClosed() is true")
+		if !devBefore.IsClosed() {
+			t.Error("detached backend device remained open after closed-DB fail-closed disable")
 		}
 	})
 }
