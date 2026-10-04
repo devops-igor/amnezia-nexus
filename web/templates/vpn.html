@@ -1305,7 +1305,7 @@
                 }
             }
         }
-        if (vpnLastStatus && vpnLastStatus.historical_series) {
+        if (vpnLastStatus && vpnLastStatus.forwarder_available !== false && vpnLastStatus.historical_series) {
             vpnRenderHistoryCharts(vpnLastStatus.historical_series);
         }
     }
@@ -1316,7 +1316,7 @@
         if (btn) {
             btn.textContent = vpnShowAllRoutes ? (_('vpn_fwd_show_problems') || 'Show Problems Only') : (_('vpn_fwd_show_all') || 'Show All Routes');
         }
-        if (vpnLastStatus) {
+        if (vpnLastStatus && vpnLastStatus.forwarder_available !== false) {
             vpnRenderForwarderHealth(vpnLastStatus);
         }
     }
@@ -1424,14 +1424,11 @@
                 const el = document.getElementById(historyIds[i]);
                 if (el) { el.textContent = ''; el.innerHTML = ''; }
             }
-            // The cached status is only refreshed past the early return, so it
-            // still holds the last available poll. The history-window and
-            // show-all-routes toggles re-render from that cache, which would
-            // repaint the curves erased above while the badge still reads
-            // "unavailable". Dropping the cached series keeps the unavailable
-            // state terminal until a real poll arrives.
-            if (typeof vpnLastStatus !== 'undefined' && vpnLastStatus && typeof vpnLastStatus === 'object') {
-                vpnLastStatus.historical_series = null;
+            // Invalidate the cached available status so local toggles (such as
+            // history-window or show-all-routes) cannot resurrect stale health,
+            // throughput, routes, or backends while the forwarder is unavailable (#424).
+            if (typeof vpnLastStatus !== 'undefined') {
+                vpnLastStatus = null;
             }
 
             const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
@@ -1886,22 +1883,26 @@
         const dThroughput = document.getElementById('vpn-diag-throughput');
         if (dThroughput) {
             const r = status.rates || {};
-            dThroughput.textContent = 'Rx: ' + fmtBps(r.rx_bps || 0) + ' | Tx: ' + fmtBps(r.tx_bps || 0);
+            dThroughput.textContent = r.available === false ? 'Traffic unavailable' :
+                'Rx: ' + fmtBps(r.rx_bps || 0) + ' | Tx: ' + fmtBps(r.tx_bps || 0);
         }
         const dPackets = document.getElementById('vpn-diag-packets');
         if (dPackets) {
             const r = status.rates || {};
-            dPackets.textContent = 'Rx: ' + fmtPps(r.rx_pps || 0) + ' | Tx: ' + fmtPps(r.tx_pps || 0);
+            dPackets.textContent = r.available === false ? 'Traffic unavailable' :
+                'Rx: ' + fmtPps(r.rx_pps || 0) + ' | Tx: ' + fmtPps(r.tx_pps || 0);
         }
         const dEwma5m = document.getElementById('vpn-diag-ewma5m');
         if (dEwma5m) {
             const r = status.rates || {};
-            dEwma5m.textContent = 'Rx: ' + fmtBps(r.rx_bps_avg_5m || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_5m || 0);
+            dEwma5m.textContent = r.available === false ? 'Traffic unavailable' :
+                'Rx: ' + fmtBps(r.rx_bps_avg_5m || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_5m || 0);
         }
         const dEwma1h = document.getElementById('vpn-diag-ewma1h');
         if (dEwma1h) {
             const r = status.rates || {};
-            dEwma1h.textContent = 'Rx: ' + fmtBps(r.rx_bps_avg_1h || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_1h || 0);
+            dEwma1h.textContent = r.available === false ? 'Traffic unavailable' :
+                'Rx: ' + fmtBps(r.rx_bps_avg_1h || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_1h || 0);
         }
 
         // Panel 2: Queue Pressure & High-Water
@@ -1973,23 +1974,26 @@
         if (dDropsClient) {
             const dc = status.drop_categories || {};
             const rate = (dc.client_drop_rate_pps || 0).toFixed(2);
-            dDropsClient.textContent = rate + ' pps (' + (dc.client_total_drops || 0) + ' cumulative)';
-            dDropsClient.style.color = Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
+            dDropsClient.textContent = rateText + ' (' + (dc.client_total_drops || 0) + ' cumulative)';
+            dDropsClient.style.color = dc.rates_available !== false && Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsRet = document.getElementById('vpn-diag-drops-return');
         if (dDropsRet) {
             const dc = status.drop_categories || {};
             const rate = (dc.return_drop_rate_pps || 0).toFixed(2);
-            dDropsRet.textContent = rate + ' pps (' + (dc.return_total_drops || 0) + ' cumulative)';
-            dDropsRet.style.color = Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
+            dDropsRet.textContent = rateText + ' (' + (dc.return_total_drops || 0) + ' cumulative)';
+            dDropsRet.style.color = dc.rates_available !== false && Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsTot = document.getElementById('vpn-diag-drops-total');
         if (dDropsTot) {
             const dc = status.drop_categories || {};
             const tot = dc.total_drops !== undefined ? dc.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = (dc.total_drop_rate_pps || 0).toFixed(2);
-            dDropsTot.textContent = rate + ' pps (' + tot + ' cumulative)';
-            dDropsTot.style.color = Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            const rateText = dc.rates_available === false ? 'Loss rate unavailable' : rate + ' pps';
+            dDropsTot.textContent = rateText + ' (' + tot + ' cumulative)';
+            dDropsTot.style.color = dc.rates_available !== false && Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 
         // Panel 5: VirtualTUN Health

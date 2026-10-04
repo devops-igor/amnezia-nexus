@@ -3862,6 +3862,10 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
+	formatPeerKey, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sparkline, err := extractJSFunction(string(data), "function vpnGenerateSparklineSVG")
 	if err != nil {
 		t.Fatal(err)
@@ -3882,7 +3886,7 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := expandedDOMMock + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
+	script := expandedDOMMock + "\n" + formatPeerKey + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
 let vpnHistoryWindow='15m';
 let vpnLastStatus=null;
 let vpnShowAllRoutes=false;
@@ -3905,7 +3909,11 @@ vpnRenderHistoryCharts({window_15m:[
   backends:[{id:3,rx_bps:1200,tx_bps:1200,rx_pps:120,tx_pps:120,traffic_available:true,probe_latency_ms:44,probe_available:true}]}
 ]});
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
- historical_series:{window_15m:[
+	healthAssessment: {status: 'HEALTHY', summary: 'Operational forwarding', conditions: []},
+	rates: {available: true, rx_bps: 1000000, tx_bps: 0, rx_pps: 50, tx_pps: 0},
+	all_routes: [{peer_key: 'peer12345678', capacity: 100, occupancy: 0, drops: 0, has_pressure: false}],
+	problem_routes: [],
+	historical_series:{window_15m:[
   {t:100,rx_bps:900,tx_bps:900,traffic_available:true,q_pct:12,drop_rate:3,drop_rates_available:true,
    drop_reason_rates:{return_queue_full:3},fwd_p95_ms:41,fwd_p95_samples:1,be_p95_ms:33,be_latency_samples:1,
    sessions:4,routes:3,backends_omitted:5,
@@ -3918,10 +3926,12 @@ vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
  backends:{backends:[
  {server_name:'Server 1',enabled:true,health_state:'active',traffic_available:true,
   rx_bytes_per_sec:900,tx_bytes_per_sec:1200,rx_pps:90,tx_pps:120}
-]}});
+ ]}});
 // The available poll must cache a real series, otherwise the toggles below
 // have nothing to resurrect and the cache-clearing guard would go untested.
 assert(vpnLastStatus&&vpnLastStatus.historical_series,'available poll must cache its series');
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent,'vpn_forwarder_healthy','available poll must render Healthy');
+assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent,'1.00 Mbps / 50.0 pps','available poll must render throughput');
 for (const id of SVG_CHARTS) {
  assert(document.getElementById(id).innerHTML.includes('<svg'),'seed must render SVG in '+id);
 }
@@ -3958,32 +3968,265 @@ for (const id of SVG_CHARTS.concat(SERIES_CHARTS).concat(['vpn-diag-be-traffic',
  assert(!el.innerHTML.includes('<path'),'unavailable state must not invent curves in '+id);
  assert(!el.innerHTML.includes('<circle'),'unavailable state must not invent points in '+id);
 }
-// The pre-existing clears in the same branch must survive the addition.
-assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent,'-');
-assert.strictEqual(document.getElementById('vpn-diag-res-cpu').textContent,'-');
-assert.strictEqual(document.getElementById('vpn-diag-routing-badge').textContent,'-');
-// The cleared state must be terminal: the history-window and routes toggles
-// re-render from the cached status, so a cache still holding the last
-// available series would repaint the stale curves right after they are cleared.
-// No new poll arrives between the unavailable transition and these toggles,
-// which is exactly the real-world window between two polls.
-vpnSetHistoryWindow('1h');
-for (const id of SVG_CHARTS) {
- assert.strictEqual(document.getElementById(id).innerHTML,'','window toggle must not restore stale SVG in '+id);
+const ALL_KPIS = [
+ 'vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure',
+ 'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync',
+ 'vpn-kpi-backends', 'vpn-kpi-slow-writes'
+];
+const DETAIL_PANEL_IDS = [
+ 'vpn-fwd-queue', 'vpn-fwd-peak', 'vpn-fwd-drops-queue-full', 'vpn-fwd-drops-no-route',
+ 'vpn-fwd-drops-packet-too-large', 'vpn-fwd-write-errors',
+ 'vpn-diag-throughput', 'vpn-diag-packets', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h',
+ 'vpn-diag-queue-occ', 'vpn-diag-queue-peak', 'vpn-diag-queue-dur50', 'vpn-diag-queue-dur80',
+ 'vpn-diag-queue-drops', 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max', 'vpn-diag-lat-inflight',
+ 'vpn-diag-lat-stalls', 'vpn-diag-lat-errors', 'vpn-diag-drops-client', 'vpn-diag-drops-return',
+ 'vpn-diag-drops-total', 'vpn-diag-vtun-upstream', 'vpn-diag-vtun-nexus', 'vpn-diag-engine-status',
+ 'vpn-diag-peers-status', 'vpn-diag-sync-failures', 'vpn-diag-peer-sync-op-failures',
+ 'vpn-diag-peer-sync-invalid', 'vpn-diag-peer-sync-enqueue', 'vpn-diag-peer-sync-reconcile',
+ 'vpn-diag-peer-sync-error', 'vpn-diag-peer-sync-restart', 'vpn-diag-hs-freshness',
+ 'vpn-diag-routing-counts', 'vpn-diag-be-counts', 'vpn-diag-be-latency', 'vpn-diag-be-skew',
+ 'vpn-diag-be-drops', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-goroutines',
+ 'vpn-diag-res-gc', 'vpn-diag-res-fd'
+];
+
+function assertAllSurfacesCleared(context) {
+ assert.strictEqual(document.getElementById('vpn-fwd-status-badge').className, 'badge', context + ': status badge className');
+ assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_unavailable', context + ': status text');
+ assert.strictEqual(document.getElementById('vpn-fwd-headline-summary').textContent, 'vpn_forwarder_unavailable', context + ': headline');
+ const problemList = document.getElementById('vpn-fwd-problem-list');
+ assert.strictEqual(problemList.textContent, '', context + ': problem list text');
+ assert.strictEqual(problemList.style.display, 'none', context + ': problem list display');
+
+ for (const id of ALL_KPIS) {
+  assert.strictEqual(document.getElementById(id).textContent, '-', context + ': KPI ' + id);
+ }
+ for (const id of DETAIL_PANEL_IDS) {
+  assert.strictEqual(document.getElementById(id).textContent, '-', context + ': detail elem ' + id);
+ }
+
+ const routBadge = document.getElementById('vpn-diag-routing-badge');
+ assert.strictEqual(routBadge.className, 'badge', context + ': routing badge className');
+ assert.strictEqual(routBadge.textContent, '-', context + ': routing badge text');
+ const routAlerts = document.getElementById('vpn-diag-routing-alerts');
+ assert.strictEqual(routAlerts.textContent, '', context + ': routing alerts text');
+ assert.strictEqual(routAlerts.style.display, 'none', context + ': routing alerts display');
+
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-badge').textContent, '0', context + ': routes badge');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-summary-status').textContent, 'vpn_forwarder_unavailable', context + ': routes summary');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-tbody').children.length, 0, context + ': route rows');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-table').style.display, 'none', context + ': routes table');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-empty').style.display, 'block', context + ': routes empty div');
+ assert.strictEqual(document.getElementById('vpn-fwd-routes-details').open, false, context + ': routes details');
+
+ assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 0, context + ': backend traffic rows');
+ assert.strictEqual(document.getElementById('vpn-history-fleet-note').textContent, '', context + ': fleet note text');
+ assert.strictEqual(document.getElementById('vpn-history-fleet-note').innerHTML, '', context + ': fleet note markup');
+
+ for (const id of SVG_CHARTS) {
+  const el = document.getElementById(id);
+  assert.strictEqual(el.innerHTML, '', context + ': sparkline markup in ' + id);
+  assert.strictEqual(el.textContent, '', context + ': sparkline text in ' + id);
+ }
+ for (const id of SERIES_CHARTS) {
+  const el = document.getElementById(id);
+  assert.strictEqual(el.children.length, 0, context + ': series children in ' + id);
+  assert.strictEqual(el.textContent, '', context + ': series text in ' + id);
+ }
 }
-for (const id of SERIES_CHARTS) {
- assert.strictEqual(document.getElementById(id).children.length,0,'window toggle must not restore stale series in '+id);
+
+assertAllSurfacesCleared('immediately after forwarder_available: false');
+
+// The cleared state must be terminal: toggling the route filter or switching
+// history windows without a new poll must NOT resurrect stale available diagnostics.
+vpnToggleShowAllRoutes(); // Toggle 1: show all routes
+assertAllSurfacesCleared('after route toggle 1');
+
+vpnToggleShowAllRoutes(); // Toggle 2: show problem routes only
+assertAllSurfacesCleared('after route toggle 2');
+
+for (const w of ['1h', '6h', '24h', '15m']) {
+ vpnSetHistoryWindow(w);
+ assertAllSurfacesCleared('after switching history window to ' + w);
 }
+
+// Deliver a fresh available response and verify live data returns cleanly.
+const freshAvailableStatus = {
+ forwarder_available: true,
+ forwarder_queue_capacity: 200,
+ listener_running: true,
+ health_assessment: { status: 'HEALTHY', summary: 'Operational forwarding restored', conditions: [] },
+ rates: { available: true, rx_bps: 2000000, tx_bps: 0, rx_pps: 100, tx_pps: 0 },
+ all_routes: [{ peer_key: 'peer87654321', capacity: 200, occupancy: 5, drops: 0, has_pressure: false }],
+ problem_routes: [],
+ historical_series: {
+  window_15m: [
+   { t: 200, rx_bps: 2000, tx_bps: 2000, traffic_available: true, q_pct: 10, drop_rate: 0, drop_rates_available: true,
+     drop_reason_rates: { return_queue_full: 0 }, fwd_p95_ms: 30, fwd_p95_samples: 1, be_p95_ms: 25, be_latency_samples: 1,
+     sessions: 2, routes: 1, backends_omitted: 0,
+     backends: [{ id: 4, rx_bps: 2000, tx_bps: 2000, traffic_available: true, probe_latency_ms: 25, probe_available: true }] }
+  ]
+ },
+ backends: {
+  backends: [
+   { server_name: 'Server 2', enabled: true, health_state: 'active', traffic_available: true,
+     rx_bytes_per_sec: 2000, tx_bytes_per_sec: 2000, rx_pps: 100, tx_pps: 100 }
+  ]
+ }
+};
+vpnRenderForwarderHealth(freshAvailableStatus);
+assert(vpnLastStatus && vpnLastStatus.historical_series, 'fresh poll must cache status');
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_healthy', 'fresh poll restores Healthy');
+assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'fresh poll restores throughput');
+assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'fresh poll restores backend rows');
+for (const id of SVG_CHARTS) assert(document.getElementById(id).innerHTML.includes('<svg'), 'fresh poll restores SVG in ' + id);
+for (const id of SERIES_CHARTS) assert(document.getElementById(id).children.length > 0, 'fresh poll restores series in ' + id);
+
+// Sequence 2: Polling error response (null status) must also invalidate cache
+// and not resurrect on local toggles.
+vpnRenderForwarderHealth(null);
+assertAllSurfacesCleared('after null polling failure');
+
 vpnToggleShowAllRoutes();
-for (const id of SVG_CHARTS) {
- assert(!document.getElementById(id).innerHTML.includes('<svg'),'routes toggle must not restore stale SVG in '+id);
-}
-for (const id of SERIES_CHARTS) {
- assert.strictEqual(document.getElementById(id).children.length,0,'routes toggle must not restore stale series in '+id);
-}
+assertAllSurfacesCleared('after null route toggle 1');
+vpnToggleShowAllRoutes();
+assertAllSurfacesCleared('after null route toggle 2');
+vpnSetHistoryWindow('1h');
+assertAllSurfacesCleared('after null window 1h');
+vpnSetHistoryWindow('15m');
+assertAllSurfacesCleared('after null window 15m');
+
+// Recovery from null status when live poll succeeds
+vpnRenderForwarderHealth(freshAvailableStatus);
+assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, 'vpn_forwarder_healthy', 'recovery after null poll');
+assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'recovery throughput after null poll');
+assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
+
 `
 	cmd := exec.Command(nodePath, "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("unavailable-forwarder history clearing: %v\n%s", err, out)
+	}
+}
+
+func TestVPNPanelRateAvailability(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Skipf("node binary not found: %v", err)
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := expandedDOMMock + "\n" + health + `
+let vpnLastStatus = null;
+let vpnShowAllRoutes = false;
+
+// 1. Both rate flags false: detail panels must show explicit unavailable text, NOT measured zero.
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { available: false, rx_bps: 0, tx_bps: 0, rx_pps: 0, tx_pps: 0, rx_bps_avg_5m: 0, tx_bps_avg_5m: 0, rx_bps_avg_1h: 0, tx_bps_avg_1h: 0 },
+	drop_categories: { rates_available: false, client_drop_rate_pps: 0, client_total_drops: 12, return_drop_rate_pps: 0, return_total_drops: 34, total_drop_rate_pps: 0, total_drops: 46 }
+});
+
+assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, 'Traffic unavailable', 'KPI throughput must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Traffic unavailable', 'detail throughput must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Traffic unavailable', 'detail packets must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Traffic unavailable', 'detail ewma5m must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Traffic unavailable', 'detail ewma1h must be unavailable');
+
+assert.strictEqual(document.getElementById('vpn-kpi-packet-loss').textContent, 'Loss rate unavailable (46 cumulative)', 'KPI loss must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, 'Loss rate unavailable (12 cumulative)', 'detail client drops must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, 'Loss rate unavailable (34 cumulative)', 'detail return drops must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 'Loss rate unavailable (46 cumulative)', 'detail total drops must be unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color, '', 'unavailable client drop rate must not be colored danger');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').style.color, '', 'unavailable return drop rate must not be colored danger');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').style.color, '', 'unavailable total drop rate must not be colored danger');
+
+// 2. Independent flags: Traffic unavailable, Loss available (legitimate idle zero loss).
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { available: false, rx_bps: 0, tx_bps: 0, rx_pps: 0, tx_pps: 0 },
+	drop_categories: { rates_available: true, client_drop_rate_pps: 0, client_total_drops: 5, return_drop_rate_pps: 0, return_total_drops: 2, total_drop_rate_pps: 0, total_drops: 7 }
+});
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, '0.00 pps (5 cumulative)', 'available zero client loss must show measured rate');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, '0.00 pps (2 cumulative)', 'available zero return loss must show measured rate');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, '0.00 pps (7 cumulative)', 'available zero total loss must show measured rate');
+assert.strictEqual(document.getElementById('vpn-kpi-packet-loss').textContent, '0.00 pps (7 cumulative)');
+
+// 3. Independent flags: Traffic available (legitimate idle zero), Loss unavailable.
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { available: true, rx_bps: 0, tx_bps: 0, rx_pps: 0, tx_pps: 0, rx_bps_avg_5m: 0, tx_bps_avg_5m: 0, rx_bps_avg_1h: 0, tx_bps_avg_1h: 0 },
+	drop_categories: { rates_available: false, client_drop_rate_pps: 0, client_total_drops: 0, return_drop_rate_pps: 0, return_total_drops: 0, total_drop_rate_pps: 0, total_drops: 0 }
+});
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Rx: 0 bps | Tx: 0 bps', 'available zero traffic must show measured rate');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Rx: 0.0 pps | Tx: 0.0 pps', 'available zero packet rate must show measured rate');
+assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Rx: 0 bps | Tx: 0 bps');
+assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Rx: 0 bps | Tx: 0 bps');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, 'Loss rate unavailable (0 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, 'Loss rate unavailable (0 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 'Loss rate unavailable (0 cumulative)');
+
+// 4. Positive measured rates retain formatting and danger highlight.
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { available: true, rx_bps: 1000000, tx_bps: 500000, rx_pps: 100, tx_pps: 50, rx_bps_avg_5m: 800000, tx_bps_avg_5m: 400000, rx_bps_avg_1h: 600000, tx_bps_avg_1h: 300000 },
+	drop_categories: { rates_available: true, client_drop_rate_pps: 2.5, client_total_drops: 10, return_drop_rate_pps: 1.0, return_total_drops: 4, total_drop_rate_pps: 3.5, total_drops: 14 }
+});
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Rx: 1.00 Mbps | Tx: 500.00 Kbps');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Rx: 100.0 pps | Tx: 50.0 pps');
+assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Rx: 800.00 Kbps | Tx: 400.00 Kbps');
+assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Rx: 600.00 Kbps | Tx: 300.00 Kbps');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, '2.50 pps (10 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color, 'var(--danger)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, '1.00 pps (4 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').style.color, 'var(--danger)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, '3.50 pps (14 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').style.color, 'var(--danger)');
+
+// 5. False availability dominates placeholder numeric values in payload.
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { available: false, rx_bps: 999999, tx_bps: 999999, rx_pps: 999, tx_pps: 999, rx_bps_avg_5m: 999999, tx_bps_avg_5m: 999999, rx_bps_avg_1h: 999999, tx_bps_avg_1h: 999999 },
+	drop_categories: { rates_available: false, client_drop_rate_pps: 99.9, client_total_drops: 5, return_drop_rate_pps: 99.9, return_total_drops: 5, total_drop_rate_pps: 199.8, total_drops: 10 }
+});
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Traffic unavailable');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, 'Loss rate unavailable (5 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, 'Loss rate unavailable (5 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 'Loss rate unavailable (10 cumulative)');
+assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color, '');
+
+// 6. Legacy payload without flags preserves numeric rendering.
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	forwarder_queue_capacity: 100,
+	rates: { rx_bps: 0, tx_bps: 0, rx_pps: 0, tx_pps: 0, rx_bps_avg_5m: 0, tx_bps_avg_5m: 0, rx_bps_avg_1h: 0, tx_bps_avg_1h: 0 },
+	drop_categories: { client_drop_rate_pps: 0, client_total_drops: 0, return_drop_rate_pps: 0, return_total_drops: 0, total_drop_rate_pps: 0, total_drops: 0 }
+});
+assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Rx: 0 bps | Tx: 0 bps');
+assert.strictEqual(document.getElementById('vpn-diag-packets').textContent, 'Rx: 0.0 pps | Tx: 0.0 pps');
+assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, '0.00 pps (0 cumulative)');
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("panel rate availability: %v\n%s", err, out)
 	}
 }
