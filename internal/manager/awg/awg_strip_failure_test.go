@@ -248,7 +248,6 @@ func TestSyncconfFailureStillRetriesAfterRestore(t *testing.T) {
 	}
 }
 
-
 func TestPostApplyRollbackRestoresPreviouslyWorkingConfigWithoutRevalidation(t *testing.T) {
 	ctx := context.Background()
 	client := newMockAWGSSHClient()
