@@ -1096,7 +1096,20 @@ func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSH
 		}
 	}
 
-	content = EnsureInterfaceTableOff(content)
+	return m.writeServerConfigTracked(ctx, client, EnsureInterfaceTableOff(content))
+}
+
+// restoreKnownServerConfigTracked restores bytes that were read from this same
+// server immediately before a mutation. It deliberately bypasses Nexus's
+// front-door ParseServerConfig/ValidateAWGParams policy and preserves the exact
+// previous bytes: a running legacy config can be accepted by the installed AWG
+// tools even when newer Nexus validation would reject it. The restore still
+// uses the normal safe copy path, checked awg-quick strip, and checked syncconf.
+func (m *AWGManager) restoreKnownServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+	return m.writeServerConfigTracked(ctx, client, content)
+}
+
+func (m *AWGManager) writeServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
 		cName = m.containerName()
@@ -1120,7 +1133,7 @@ func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSH
 		return false, fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
 	}
 
-	// Disk write succeeded
+	// Disk write succeeded.
 	diskWritten := true
 
 	if err := m.syncInterfaceConfig(ctx, client, cName, cfgPath); err != nil {
