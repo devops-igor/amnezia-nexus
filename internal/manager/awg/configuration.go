@@ -27,6 +27,10 @@ func (m *AWGManager) ReadConfiguration(ctx context.Context, server *models.Serve
 	return m.getServerConfig(ctx, client)
 }
 
+// ErrConfigurationPostApply marks a failure in the caller-supplied reconciliation
+// step after the remote AWG configuration was successfully applied.
+var ErrConfigurationPostApply = errors.New("AWG configuration post-apply reconciliation failed")
+
 // WriteConfiguration serializes with peer operations and applies both disk and
 // runtime changes. If runtime application fails after the disk write, restore
 // the preceding configuration under the same lock with a bounded cleanup context.
@@ -35,9 +39,34 @@ func (m *AWGManager) ReadConfiguration(ctx context.Context, server *models.Serve
 // identity. Because the user-facing contract is to reconcile rather than reject
 // such an edit, every derived artifact that carries the identity is refreshed
 // from the newly written configuration before the write is reported successful,
-// so a subsequent read — including one against a stopped container, where only
-// the artifacts are available — describes the new identity.
+// so a subsequent read - including one against a stopped container, where only
+// the artifacts are available - describes the new identity.
 func (m *AWGManager) WriteConfiguration(ctx context.Context, server *models.Server, content string) error {
+	return m.writeConfigurationTransaction(ctx, server, content, nil)
+}
+
+// WriteConfigurationWithPostApply keeps the AWG server lock and remote lock held
+// while postApply reconciles state outside the manager (for example the server
+// database and active VPN backend). If postApply fails, the previous remote
+// configuration is restored before the transaction releases either lock.
+func (m *AWGManager) WriteConfigurationWithPostApply(
+	ctx context.Context,
+	server *models.Server,
+	content string,
+	postApply func(context.Context) error,
+) error {
+	if postApply == nil {
+		return m.WriteConfiguration(ctx, server, content)
+	}
+	return m.writeConfigurationTransaction(ctx, server, content, postApply)
+}
+
+func (m *AWGManager) writeConfigurationTransaction(
+	ctx context.Context,
+	server *models.Server,
+	content string,
+	postApply func(context.Context) error,
+) error {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
 		return err
@@ -52,26 +81,66 @@ func (m *AWGManager) WriteConfiguration(ctx context.Context, server *models.Serv
 		return err
 	}
 	defer unlock()
+
 	original, err := m.getServerConfig(ctx, client)
 	if err != nil {
 		return err
 	}
 	written, err := m.saveServerConfigTracked(ctx, client, content)
-	if err == nil && written {
-		// The disk and runtime write succeeded. Reconcile the derived identity
-		// artifacts so a later read cannot observe the pre-rotation identity.
-		return m.reconcileServerIdentity(ctx, client, server, original, content)
-	}
-	if err != nil && written {
-		// Disk written but runtime application failed: restore the preceding
-		// configuration under the same lock with a bounded cleanup context.
-		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if _, restoreErr := m.saveServerConfigTracked(restoreCtx, client, original); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
+	if err != nil {
+		if written {
+			return m.restoreConfigurationAfterFailure(ctx, client, server, content, original, err)
 		}
+		return err
 	}
-	return err
+	if !written {
+		return errors.New("AWG configuration write completed without persisting content")
+	}
+
+	// The disk and runtime write succeeded. Reconcile the derived identity
+	// artifacts before any caller-owned state is committed.
+	if err := m.reconcileServerIdentity(ctx, client, server, original, content); err != nil {
+		return m.restoreConfigurationAfterFailure(ctx, client, server, content, original, err)
+	}
+
+	if postApply == nil {
+		return nil
+	}
+	if err := postApply(ctx); err != nil {
+		return m.restoreConfigurationAfterFailure(
+			ctx,
+			client,
+			server,
+			content,
+			original,
+			errors.Join(ErrConfigurationPostApply, err),
+		)
+	}
+	return nil
+}
+
+func (m *AWGManager) restoreConfigurationAfterFailure(
+	ctx context.Context,
+	client ssh.SSHClient,
+	server *models.Server,
+	attempted string,
+	original string,
+	cause error,
+) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	written, restoreErr := m.saveServerConfigTracked(restoreCtx, client, original)
+	if restoreErr != nil {
+		return errors.Join(cause, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
+	}
+	if !written {
+		return errors.Join(cause, errors.New("failed to restore previous AWG configuration: write was not persisted"))
+	}
+	if identityErr := m.reconcileServerIdentity(restoreCtx, client, server, attempted, original); identityErr != nil {
+		return errors.Join(cause, fmt.Errorf("failed to restore previous AWG identity artifacts: %w", identityErr))
+	}
+	return cause
 }
 
 // reconcileServerIdentity refreshes the derived identity artifacts so they match
