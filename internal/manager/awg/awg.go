@@ -1041,19 +1041,10 @@ func (m *AWGManager) ensureBackendNATRule(ctx context.Context, client ssh.SSHCli
 	return m.ensureBackendRoutingAndNAT(ctx, client, "")
 }
 
-func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
+func (m *AWGManager) getServerConfigWithContainer(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, string, error) {
 	names := containerNames
 	if len(names) == 0 || (len(names) == 1 && names[0] == "") {
-		resolved := m.resolveContainerName(ctx, client)
-		if !IsValidContainerName(resolved) {
-			resolved = m.containerName()
-		}
-		names = []string{resolved}
-		for _, name := range AWGContainerNames {
-			if name != resolved && IsValidContainerName(name) {
-				names = append(names, name)
-			}
-		}
+		names = m.candidateContainerNames(ctx, client)
 	}
 	for _, name := range names {
 		if !IsValidContainerName(name) {
@@ -1062,10 +1053,15 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/awg0.conf' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.configPath()), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
-			return out, nil
+			return out, name, nil
 		}
 	}
-	return "", fmt.Errorf("failed to get server config from containers: %v", names)
+	return "", "", fmt.Errorf("failed to get server config from containers: %v", names)
+}
+
+func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
+	cfg, _, err := m.getServerConfigWithContainer(ctx, client, containerNames...)
+	return cfg, err
 }
 
 func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.SSHClient, containerName string) string {
@@ -1158,7 +1154,7 @@ func (m *AWGManager) stripInterfaceConfig(ctx context.Context, client ssh.SSHCli
 	stripPath := m.strippedConfigPath(cfgPath)
 	stripCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
 		ssh.EscapeShellArg(cName),
-		ssh.EscapeShellArg(fmt.Sprintf("%s strip %s > %s && test -s %s",
+		ssh.EscapeShellArg(fmt.Sprintf("(umask 077 && %s strip %s > %s) && test -s %s",
 			ssh.EscapeShellArg(m.wgBinary()+"-quick"), ssh.EscapeShellArg(cfgPath),
 			ssh.EscapeShellArg(stripPath), ssh.EscapeShellArg(stripPath))))
 	out, errOut, code, err := client.RunSudoCommand(ctx, stripCmd)
@@ -2838,13 +2834,13 @@ func (m *AWGManager) GetClientConfig(ctx context.Context, server *models.Server,
 		return "", errors.New("client private key not stored; config cannot be reconstructed")
 	}
 
-	confText, err := m.getServerConfig(ctx, client)
+	confText, containerName, err := m.getServerConfigWithContainer(ctx, client)
 	if err != nil {
 		return "", err
 	}
 
 	serverParams, _, _ := ParseServerConfig(confText)
-	serverPubKey, err := m.GetServerPublicKey(ctx, server)
+	serverPubKey, err := m.getServerPublicKeyInContainer(ctx, client, server, containerName, confText)
 	if err != nil || serverPubKey == "" {
 		if err != nil {
 			return "", fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
@@ -3181,6 +3177,9 @@ func (m *AWGManager) candidateContainerNames(ctx context.Context, client ssh.SSH
 	if !IsValidContainerName(resolved) {
 		resolved = m.containerName()
 	}
+	if !IsValidContainerName(resolved) {
+		resolved = "amnezia-awg2"
+	}
 	names := []string{resolved}
 	for _, name := range AWGContainerNames {
 		if name != resolved && IsValidContainerName(name) {
@@ -3190,24 +3189,83 @@ func (m *AWGManager) candidateContainerNames(ctx context.Context, client ssh.SSH
 	return names
 }
 
-// GetServerPublicKey returns the public key for AmneziaWG server.
-//
-// Sources are consulted in this order:
-//
+// getServerPublicKeyInContainer resolves the public key within a specific container,
+// applying the within-container precedence:
 //  1. The live interface (`awg`/`wg show awg0 public-key`). While the interface
 //     is up this is what peers actually authenticate against, so it stays
-//     authoritative — a running-but-different value is never overridden by a
-//     value read off disk.
+//     authoritative within the selected container — a running-but-different value is
+//     never overridden by a value read off disk.
+//  2. The key derived from the [Interface] PrivateKey of the on-disk
+//     configuration. If confText is not provided, it is read from the container.
+//  3. The wireguard_server_public_key.key artifact written during provisioning:
+//     last-resort recovery source for a stopped container whose configuration
+//     cannot be read or did not derive a key.
+func (m *AWGManager) getServerPublicKeyInContainer(ctx context.Context, client ssh.SSHClient, server *models.Server, containerName string, confText string) (string, error) {
+	if !IsValidContainerName(containerName) {
+		return "", fmt.Errorf("invalid container name %q", containerName)
+	}
+
+	// 1. Live interface within this container. Authoritative whenever it answers with a valid key.
+	cmd := fmt.Sprintf("docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null",
+		ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(containerName))
+	out, _, code, err := client.RunSudoCommand(ctx, cmd)
+	if err == nil && code == 0 {
+		if live := strings.TrimSpace(out); isWireGuardKey(live) {
+			return live, nil
+		}
+		slog.Debug("live AmneziaWG public key probe returned a non-key value; falling back to the configured identity",
+			"container", containerName, "server_id", serverIDOf(server))
+	}
+
+	// 2. Derive from the configured [Interface] PrivateKey within this container.
+	conf := confText
+	var confErr error
+	if conf == "" {
+		conf, confErr = m.getServerConfig(ctx, client, containerName)
+	}
+	if confErr == nil && conf != "" {
+		if derived, err := derivePublicKeyFromPrivate(interfacePrivateKey(conf)); err == nil && derived != "" {
+			return derived, nil
+		}
+	}
+
+	// 3. Provisioning artifact within this container: recovery only, for a stopped
+	// container whose configuration could not be read or derived.
+	artifactCmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", ssh.EscapeShellArg(containerName), ssh.EscapeShellArg(serverPublicKeyArtifactPath))
+	artifactOut, _, artifactCode, artifactErr := client.RunSudoCommand(ctx, artifactCmd)
+	if artifactErr == nil && artifactCode == 0 {
+		artifact := strings.TrimSpace(artifactOut)
+		if artifact != "" {
+			if confErr == nil && conf != "" {
+				slog.Warn("falling back to the provisioning AmneziaWG public key artifact; the configured private key did not derive and the artifact may predate the current configuration",
+					"container", containerName, "server_id", serverIDOf(server))
+			}
+			return artifact, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to get AmneziaWG server public key from container %q", containerName)
+}
+
+// GetServerPublicKey returns the public key for AmneziaWG server.
+//
+// Candidate containers are inspected in priority order (starting with the
+// selected/resolved container). Within each candidate container, sources
+// are consulted in within-container precedence:
+//  1. The live interface (`awg`/`wg show awg0 public-key`). While the interface
+//     is up this is what peers actually authenticate against, so it stays
+//     authoritative within the selected container — a running-but-different value is
+//     never overridden by a value read off disk.
 //  2. The key derived from the [Interface] PrivateKey of the on-disk
 //     configuration. This is the identity the operator last saved, it costs one
 //     X25519 operation, and it is available whenever the configuration is
 //     readable even if the interface is down.
-//  3. The wireguard_server_public_key.key artifact written during provisioning.
-//     This is a snapshot from provisioning time, so it is a last-resort
-//     recovery source for a stopped container whose configuration cannot be
-//     read — never a source that outranks the configuration. Write-side
-//     reconciliation keeps it in step with the configuration, so on the
-//     recovery path it already describes the current identity.
+//  3. The wireguard_server_public_key.key artifact written during provisioning:
+//     recovery only, for a stopped container whose configuration could not be read.
+//
+// An unrelated legacy container's live interface cannot outrank a readable
+// configuration in the selected container. If fallback changes containers,
+// configuration, port, parameters, and identity move as one coherent unit.
 func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Server) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -3215,65 +3273,13 @@ func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Serv
 	}
 	names := m.candidateContainerNames(ctx, client)
 
-	// 1. Live interface. Authoritative whenever it answers.
 	for _, name := range names {
 		if !IsValidContainerName(name) {
 			continue
 		}
-		// awg0 is a literal here, as in the original probe: it is not an
-		// interpolated value, and the interface name is a package constant.
-		// Every value that IS interpolated (the container name and the tool
-		// binary) goes through ssh.EscapeShellArg.
-		cmd := fmt.Sprintf("docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null",
-			ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(name))
-		out, _, code, err := client.RunSudoCommand(ctx, cmd)
-		if err != nil || code != 0 {
-			continue
+		if key, err := m.getServerPublicKeyInContainer(ctx, client, server, name, ""); err == nil && key != "" {
+			return key, nil
 		}
-		// The live probe is the one source that must be validated rather than
-		// merely checked for emptiness: it is now consulted FIRST, and a host
-		// whose `awg`/`wg` wrapper answers with an unrelated non-empty banner
-		// would otherwise be taken as the server identity. A value that does not
-		// decode as base64 is not a key, so fall through to the configured
-		// identity instead.
-		if live := strings.TrimSpace(out); isWireGuardKey(live) {
-			return live, nil
-		}
-		slog.Debug("live AmneziaWG public key probe returned a non-key value; falling back to the configured identity",
-			"container", name, "server_id", serverIDOf(server))
-	}
-
-	// 2. Derive from the configured [Interface] PrivateKey.
-	conf, confErr := m.getServerConfig(ctx, client, names...)
-	if confErr == nil && conf != "" {
-		if derived, err := derivePublicKeyFromPrivate(interfacePrivateKey(conf)); err == nil && derived != "" {
-			return derived, nil
-		}
-	}
-
-	// 3. Provisioning artifact: recovery only, for a stopped container whose
-	// configuration could not be read.
-	for _, name := range names {
-		if !IsValidContainerName(name) {
-			continue
-		}
-		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(serverPublicKeyArtifactPath))
-		out, _, code, err := client.RunSudoCommand(ctx, cmd)
-		if err != nil || code != 0 {
-			continue
-		}
-		artifact := strings.TrimSpace(out)
-		if artifact == "" {
-			continue
-		}
-		if confErr == nil && conf != "" {
-			// The configuration was readable but its private key did not
-			// derive. Surface the disagreement instead of silently handing back
-			// an artifact of unknown age.
-			slog.Warn("falling back to the provisioning AmneziaWG public key artifact; the configured private key did not derive and the artifact may predate the current configuration",
-				"container", name, "server_id", serverIDOf(server))
-		}
-		return artifact, nil
 	}
 
 	return "", errors.New("failed to get AmneziaWG server public key")

@@ -494,3 +494,283 @@ func TestDerivePublicKeyFromPrivate(t *testing.T) {
 		t.Error("expected an error for a short private key")
 	}
 }
+
+// TestOpsReview_ResolvedContainerIdentity pins the mixed-container regression:
+// Selected current container has readable configuration A but no available live interface.
+// Retained legacy container has a different valid live identity B.
+// Old global-live-first behavior probed live identity across all containers and returned B,
+// while GetClientConfig used config/port A, creating an unusable A/B identity mixture.
+// The resolved identity and reconstructed client config must both use selected container A.
+func TestOpsReview_ResolvedContainerIdentity(t *testing.T) {
+	ctx := context.Background()
+	priv, want := identityTestKeypair(t, 1)
+	_, other := identityTestKeypair(t, 2)
+	f := newIdentityFixture(priv, want, false)
+	f.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "show awg0 public-key") {
+			if strings.Contains(cmd, "'amnezia-awg2'") {
+				return "", "interface down", 1, errors.New("interface down")
+			}
+			if strings.Contains(cmd, "'amnezia-awg'") {
+				return other, "", 0, nil
+			}
+		}
+		return f.handle(cmd)
+	}
+	m := NewAWGManager(&mockAWGSSHProvider{client: f.mockAWGSSHClient})
+	got, err := m.GetServerPublicKey(ctx, identityServer())
+	if err != nil {
+		t.Fatalf("GetServerPublicKey failed: %v", err)
+	}
+	t.Logf("returned legacy-container identity=%t; selected-container configured identity=%t", got == other, got == want)
+	if got != want {
+		t.Errorf("GetServerPublicKey = %q, want selected container identity %q (legacy live key was %q)", got, want, other)
+	}
+
+	clientCfg, err := m.GetClientConfig(ctx, identityServer(), "pubkey1")
+	if err != nil {
+		t.Fatalf("GetClientConfig failed: %v", err)
+	}
+	if !strings.Contains(clientCfg, "PublicKey = "+want) {
+		t.Errorf("GetClientConfig does not carry selected container identity %s\nconfig:\n%s", want, clientCfg)
+	}
+	if strings.Contains(clientCfg, "PublicKey = "+other) {
+		t.Errorf("GetClientConfig carries legacy container identity %s\nconfig:\n%s", other, clientCfg)
+	}
+	if !strings.Contains(clientCfg, "Endpoint = 1.2.3.4:55424") {
+		t.Errorf("GetClientConfig does not carry expected endpoint 1.2.3.4:55424\nconfig:\n%s", clientCfg)
+	}
+}
+
+// TestResolvedContainerIdentity_FallbackToLegacyCoherent tests that when the selected
+// container is missing/absent, fallback changes containers coherently: configuration,
+// port, parameters, and public key all come from the legacy container as one unit.
+func TestResolvedContainerIdentity_FallbackToLegacyCoherent(t *testing.T) {
+	ctx := context.Background()
+	_, currentPub := identityTestKeypair(t, 1)
+	legacyPriv, legacyPub := identityTestKeypair(t, 2)
+
+	legacyConf := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = 10.8.2.1/24
+ListenPort = 51820
+MTU = 1360
+Jc = 3
+Jmin = 40
+Jmax = 70
+S1 = 15
+S2 = 25
+H1 = 11111
+H2 = 22222
+
+[Peer]
+PublicKey = pubkey1
+AllowedIPs = 10.8.2.2/32
+`, legacyPriv)
+
+	c := newMockAWGSSHClient()
+	c.files["/opt/amnezia/awg/clientsTable"] = []byte(`[
+  {
+    "clientId": "pubkey1",
+    "userData": {
+      "clientName": "TestClient1",
+      "clientPrivateKey": "privkey1",
+      "clientIp": "10.8.2.2",
+      "enabled": true
+    }
+  }
+]`)
+
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		// Strict rejection for amnezia-awg2: it does not exist
+		if strings.Contains(cmd, "'amnezia-awg2'") {
+			return "", "Error: No such container: amnezia-awg2", 1, errors.New("container not found")
+		}
+		if strings.Contains(cmd, "'amnezia-awg'") {
+			switch {
+			case strings.Contains(cmd, "show awg0 public-key"):
+				// Legacy container live interface is up
+				return legacyPub, "", 0, nil
+			case strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf"):
+				return legacyConf, "", 0, nil
+			case strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable"):
+				return string(c.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+			}
+		}
+		return c.defaultRunSudo(cmd)
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: c})
+	server := identityServer()
+
+	gotKey, err := mgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("GetServerPublicKey failed: %v", err)
+	}
+	if gotKey != legacyPub {
+		t.Errorf("GetServerPublicKey = %q, want legacy container identity %q", gotKey, legacyPub)
+	}
+
+	clientCfg, err := mgr.GetClientConfig(ctx, server, "pubkey1")
+	if err != nil {
+		t.Fatalf("GetClientConfig failed: %v", err)
+	}
+	if !strings.Contains(clientCfg, "PublicKey = "+legacyPub) {
+		t.Errorf("GetClientConfig does not contain legacy public key %s\nconfig:\n%s", legacyPub, clientCfg)
+	}
+	if strings.Contains(clientCfg, "PublicKey = "+currentPub) {
+		t.Errorf("GetClientConfig unexpectedly contains current container public key %s\nconfig:\n%s", currentPub, clientCfg)
+	}
+	// Verify port and MTU match the legacy container configuration coherently
+	if !strings.Contains(clientCfg, "Endpoint = 1.2.3.4:51820") {
+		t.Errorf("GetClientConfig does not match legacy container port 51820\nconfig:\n%s", clientCfg)
+	}
+	if !strings.Contains(clientCfg, "MTU = 1360") {
+		t.Errorf("GetClientConfig does not match legacy container MTU 1360\nconfig:\n%s", clientCfg)
+	}
+}
+
+// TestResolvedContainerIdentity_DiscoveredCustomContainer verifies that discovered custom
+// container names are supported without hardcoding, and candidateContainerNames prioritizes them.
+func TestResolvedContainerIdentity_DiscoveredCustomContainer(t *testing.T) {
+	ctx := context.Background()
+	customPriv, customPub := identityTestKeypair(t, 3)
+	customConf := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = 10.8.3.1/24
+ListenPort = 55555
+MTU = 1280
+
+[Peer]
+PublicKey = pubkey1
+AllowedIPs = 10.8.3.2/32
+`, customPriv)
+
+	c := newMockAWGSSHClient()
+	c.files["/opt/amnezia/awg/clientsTable"] = []byte(`[
+  {
+    "clientId": "pubkey1",
+    "userData": {
+      "clientName": "TestClient1",
+      "clientPrivateKey": "privkey1",
+      "clientIp": "10.8.3.2",
+      "enabled": true
+    }
+  }
+]`)
+
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-awg") {
+			return "amnezia-awg-custom", "", 0, nil
+		}
+		if strings.Contains(cmd, "'amnezia-awg-custom'") {
+			switch {
+			case strings.Contains(cmd, "show awg0 public-key"):
+				return customPub, "", 0, nil
+			case strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf"):
+				return customConf, "", 0, nil
+			case strings.Contains(cmd, "cat ") && strings.Contains(cmd, "clientsTable"):
+				return string(c.files["/opt/amnezia/awg/clientsTable"]), "", 0, nil
+			}
+		}
+		return c.defaultRunSudo(cmd)
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: c})
+	server := identityServer()
+
+	candidates := mgr.candidateContainerNames(ctx, c)
+	if len(candidates) == 0 || candidates[0] != "amnezia-awg-custom" {
+		t.Fatalf("candidateContainerNames = %v, want amnezia-awg-custom at index 0", candidates)
+	}
+
+	gotKey, err := mgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("GetServerPublicKey failed: %v", err)
+	}
+	if gotKey != customPub {
+		t.Errorf("GetServerPublicKey = %q, want custom container identity %q", gotKey, customPub)
+	}
+
+	clientCfg, err := mgr.GetClientConfig(ctx, server, "pubkey1")
+	if err != nil {
+		t.Fatalf("GetClientConfig failed: %v", err)
+	}
+	if !strings.Contains(clientCfg, "PublicKey = "+customPub) {
+		t.Errorf("GetClientConfig does not contain custom public key %s\nconfig:\n%s", customPub, clientCfg)
+	}
+	if !strings.Contains(clientCfg, "Endpoint = 1.2.3.4:55555") {
+		t.Errorf("GetClientConfig does not match custom container endpoint 1.2.3.4:55555\nconfig:\n%s", clientCfg)
+	}
+}
+
+// TestResolvedContainerIdentity_MalformedConfigRecoversFromArtifact verifies that when the
+// selected container's live interface is down and its configuration file is malformed (no PrivateKey),
+// it safely recovers from the provisioning artifact within the container.
+func TestResolvedContainerIdentity_MalformedConfigRecoversFromArtifact(t *testing.T) {
+	ctx := context.Background()
+	_, artifactPub := identityTestKeypair(t, 4)
+
+	malformedConf := `[Interface]
+Address = 10.8.1.1/24
+ListenPort = 55424
+MTU = 1280
+`
+
+	c := newMockAWGSSHClient()
+	c.files[serverPublicKeyArtifactPath] = []byte(artifactPub)
+	c.files["/opt/amnezia/awg/awg0.conf"] = []byte(malformedConf)
+
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		switch {
+		case strings.Contains(cmd, "show awg0 public-key"):
+			return "", "interface down", 1, errors.New("interface down")
+		case strings.Contains(cmd, "cat ") && strings.Contains(cmd, "awg0.conf"):
+			return malformedConf, "", 0, nil
+		case strings.Contains(cmd, "cat ") && strings.Contains(cmd, serverPublicKeyArtifactPath):
+			return artifactPub, "", 0, nil
+		}
+		return c.defaultRunSudo(cmd)
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: c})
+	gotKey, err := mgr.GetServerPublicKey(ctx, identityServer())
+	if err != nil {
+		t.Fatalf("GetServerPublicKey failed: %v", err)
+	}
+	if gotKey != artifactPub {
+		t.Errorf("GetServerPublicKey = %q, want artifact recovery identity %q", gotKey, artifactPub)
+	}
+}
+
+// TestResolvedContainerIdentity_AllContainersAbsentReturnsExplicitError verifies that when
+// no containers exist on the remote host, an explicit error is returned.
+func TestResolvedContainerIdentity_AllContainersAbsentReturnsExplicitError(t *testing.T) {
+	ctx := context.Background()
+	c := newMockAWGSSHClient()
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "clientsTable") {
+			return `[{"clientId": "pubkey1", "userData": {"clientPrivateKey": "privkey1"}}]`, "", 0, nil
+		}
+		return "", "Error: No such container", 1, errors.New("exit status 1")
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: c})
+	server := identityServer()
+
+	_, err := mgr.GetServerPublicKey(ctx, server)
+	if err == nil {
+		t.Fatal("expected GetServerPublicKey to return error when all containers are absent")
+	}
+	if !strings.Contains(err.Error(), "failed to get AmneziaWG server public key") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	_, err = mgr.GetClientConfig(ctx, server, "pubkey1")
+	if err == nil {
+		t.Fatal("expected GetClientConfig to return error when all containers are absent")
+	}
+	if !strings.Contains(err.Error(), "failed to get server config from containers") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}

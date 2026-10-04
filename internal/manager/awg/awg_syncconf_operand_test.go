@@ -2,6 +2,7 @@ package awg
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -451,5 +452,150 @@ func TestSyncconfCommandResistsShellInjection(t *testing.T) {
 				t.Errorf("hostile fragment %q was split out into its own operand: %q", frag, args)
 			}
 		}
+	}
+}
+
+// TestOpsReview_StripFilePermissions pins the insecure creation regression:
+// Under ambient permissive umask (022), stripInterfaceConfig previously created
+// secret-bearing files with mode 0644 before any chmod or sync operation.
+// The file must be created with mode 0600 or stricter.
+func TestOpsReview_StripFilePermissions(t *testing.T) {
+	h := newShellHarness(t)
+	c := newMockAWGSSHClient()
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, " strip ") {
+			out, stderr, code := h.run(t, "umask 022; "+cmd)
+			return out, stderr, code, nil
+		}
+		return c.defaultRunSudo(cmd)
+	}
+	m := NewAWGManager(&mockAWGSSHProvider{client: c})
+	p, err := m.stripInterfaceConfig(context.Background(), c, "amnezia-awg2", h.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(p)
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasPrivateKey := strings.Contains(string(data), "PrivateKey")
+	t.Logf("secret-bearing strip file: mode=%04o private-key-present=%t", st.Mode().Perm(), hasPrivateKey)
+	if st.Mode().Perm()&0077 != 0 {
+		t.Errorf("strip file exposes private keys to group/other: mode=%04o", st.Mode().Perm())
+	}
+}
+
+// TestStripFilePermissions_VariousAmbientUmasks tests that regardless of ambient umask
+// (000, 022, 027, 077), the stripped secret-bearing file is created with mode 0600 or stricter.
+func TestStripFilePermissions_VariousAmbientUmasks(t *testing.T) {
+	umasks := []string{"000", "022", "027", "077"}
+	for _, u := range umasks {
+		t.Run("umask_"+u, func(t *testing.T) {
+			h := newShellHarness(t)
+			c := newMockAWGSSHClient()
+			c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+				if strings.Contains(cmd, " strip ") {
+					out, stderr, code := h.run(t, fmt.Sprintf("umask %s; %s", u, cmd))
+					return out, stderr, code, nil
+				}
+				return c.defaultRunSudo(cmd)
+			}
+			m := NewAWGManager(&mockAWGSSHProvider{client: c})
+			p, err := m.stripInterfaceConfig(context.Background(), c, "amnezia-awg2", h.cfgPath)
+			if err != nil {
+				t.Fatalf("stripInterfaceConfig failed under umask %s: %v", u, err)
+			}
+			defer os.Remove(p)
+			st, err := os.Stat(p)
+			if err != nil {
+				t.Fatalf("stat failed: %v", err)
+			}
+			if st.Mode().Perm()&0077 != 0 {
+				t.Errorf("strip file exposes permissions to group/other under ambient umask %s: mode=%04o", u, st.Mode().Perm())
+			}
+			if st.Mode().Perm() != 0600 {
+				t.Errorf("expected exact mode 0600 under ambient umask %s, got mode=%04o", u, st.Mode().Perm())
+			}
+		})
+	}
+}
+
+// TestStripFilePermissions_FailedStripCleansUpAndCreatesPrivately verifies that when stripping
+// fails, any file created on disk was mode 0600 and is cleaned up on error.
+func TestStripFilePermissions_FailedStripCleansUpAndCreatesPrivately(t *testing.T) {
+	h := newShellHarness(t)
+	var observedPath string
+	var observedPerm os.FileMode
+	c := newMockAWGSSHClient()
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, " strip ") {
+			// Find strip path from command to inspect file right after execution
+			for _, part := range strings.Split(cmd, " ") {
+				if strings.Contains(part, ".awg-strip-") {
+					observedPath = strings.Trim(part, "'\"")
+				}
+			}
+			// Simulate failing strip execution under ambient umask 022
+			out, stderr, code := h.run(t, "umask 022; "+cmd, stripBodyEnv+"=")
+			if observedPath != "" {
+				if st, err := os.Stat(observedPath); err == nil {
+					observedPerm = st.Mode().Perm()
+				}
+			}
+			return out, stderr, code, nil
+		}
+		if strings.Contains(cmd, "rm -f") {
+			if observedPath != "" {
+				_ = os.Remove(observedPath)
+			}
+			return "OK", "", 0, nil
+		}
+		return c.defaultRunSudo(cmd)
+	}
+
+	m := NewAWGManager(&mockAWGSSHProvider{client: c})
+	p, err := m.stripInterfaceConfig(context.Background(), c, "amnezia-awg2", h.cfgPath)
+	if err == nil {
+		t.Fatal("expected stripInterfaceConfig to fail when strip body is empty")
+	}
+	if p != "" {
+		t.Errorf("expected empty path on failure, got %s", p)
+	}
+	if observedPerm != 0 && observedPerm&0077 != 0 {
+		t.Errorf("strip file created during failed attempt exposed permissions: mode=%04o", observedPerm)
+	}
+	// Verify cleanup removed the file
+	if observedPath != "" {
+		if _, err := os.Stat(observedPath); err == nil {
+			t.Errorf("strip file %s was not cleaned up after failure", observedPath)
+		}
+	}
+}
+
+// TestStripFilePermissions_CleanupSurvivesContextCancellation verifies that removeContainerFile
+// executes detached cleanup using context.WithoutCancel even if the caller context was canceled.
+func TestStripFilePermissions_CleanupSurvivesContextCancellation(t *testing.T) {
+	c := newMockAWGSSHClient()
+	var removeExecuted bool
+	c.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "rm -f") {
+			removeExecuted = true
+			return "OK", "", 0, nil
+		}
+		return c.defaultRunSudo(cmd)
+	}
+
+	m := NewAWGManager(&mockAWGSSHProvider{client: c})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel context beforehand
+
+	m.removeContainerFile(ctx, c, "amnezia-awg2", "/opt/amnezia/awg/.awg-strip-test.conf")
+	if !removeExecuted {
+		t.Error("removeContainerFile did not execute rm -f under canceled context")
 	}
 }
