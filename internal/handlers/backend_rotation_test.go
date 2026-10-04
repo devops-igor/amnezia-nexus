@@ -349,7 +349,6 @@ func TestBackendIdentityRotation_ReconciliationFailureRollback(t *testing.T) {
 	}
 }
 
-
 func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantines(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 40)
 	newPriv, newPub := deriveTestKey(t, 41)
