@@ -934,7 +934,7 @@ func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *model
 	}
 	awgProto["public_key"] = newPub
 	server.Protocols["awg"] = awgProto
-	if err := h.db.UpdateServerProtocols(ctx, server.ID, server.Protocols); err != nil {
+	if err := h.updateServerProtocols(ctx, server.ID, server.Protocols); err != nil {
 		return fmt.Errorf("failed to update server protocols: %w", err)
 	}
 
@@ -965,11 +965,34 @@ func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *model
 
 			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			if rbErr := h.db.UpdateServerProtocols(rollbackCtx, server.ID, server.Protocols); rbErr != nil {
-				return errors.Join(
+			if rbErr := h.updateServerProtocols(rollbackCtx, server.ID, server.Protocols); rbErr != nil {
+				// The DB still carries NEW while VPN reconciliation compensated
+				// to OLD. A blind remote rollback would leave DB NEW / remote+VPN
+				// OLD. Keep NEW as the convergence target instead: restore the
+				// in-memory protocol view, quarantine the backend fail-closed, and
+				// move the disabled VPN tunnel forward to NEW. Even if one of
+				// those emergency operations also fails, the backend must not
+				// continue serving in a partially reconciled state.
+				awgProto["public_key"] = newPub
+				server.Protocols["awg"] = awgProto
+
+				quarantineCtx, cancelQuarantine := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancelQuarantine()
+
+				var emergencyErrs []error
+				if quarantineErr := h.vpnSvc.DisableBackend(quarantineCtx, server.ID); quarantineErr != nil {
+					emergencyErrs = append(emergencyErrs, fmt.Errorf("failed to persist complete backend quarantine: %w", quarantineErr))
+				}
+				if convergeErr := h.vpnSvc.UpdateBackendServerPublicKey(quarantineCtx, server.ID, newPub); convergeErr != nil {
+					emergencyErrs = append(emergencyErrs, fmt.Errorf("failed to converge quarantined VPN backend to new public key: %w", convergeErr))
+				}
+
+				baseErr := errors.Join(
+					awg.ErrConfigurationPostApplyKeepApplied,
 					fmt.Errorf("failed to reconcile VPN backend public key: %w", err),
 					fmt.Errorf("failed to rollback server protocols: %w", rbErr),
 				)
+				return errors.Join(append([]error{baseErr}, emergencyErrs...)...)
 			}
 			return fmt.Errorf("failed to reconcile VPN backend public key: %w", err)
 		}
