@@ -216,23 +216,25 @@ type Service struct {
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
 
-	lastReconcileTime                      time.Time
-	lastReconcileByTunnel                  map[int64]time.Time
-	reconcilePostSnapshotHook              func()
-	reconcilePreApplyHook                  func()
-	reconcilePreCommitHook                 func()
-	ensureDevicePreLockHook                func()
-	preCommitMigrationHookForTest          func()
-	preAdoptHookForTest                    func(peerKey, sessionID string)
-	preIngressRouteRegistrationHookForTest func()
-	preRevokeCloseHookForTest              func(peerKey, sessionID string)
-	postCommitRevokeHookForTest            func(kind database.PeerRevokeKind, userID string, clientID string)
-	updateBackendServerHostPreLockHook     func()
-	updateBackendServerHostErr             error
-	syncBackendForwarderHook               func() error
-	enableBackendPreAddTunnelHook          func()
-	enableBackendPostAddTunnelHook         func()
-	reaperHook                             func(context.Context, *models.VPNSession)
+	lastReconcileTime                       time.Time
+	lastReconcileByTunnel                   map[int64]time.Time
+	reconcilePostSnapshotHook               func()
+	reconcilePreApplyHook                   func()
+	reconcilePreCommitHook                  func()
+	ensureDevicePreLockHook                 func()
+	preCommitMigrationHookForTest           func()
+	preAdoptHookForTest                     func(peerKey, sessionID string)
+	preIngressRouteRegistrationHookForTest  func()
+	preRevokeCloseHookForTest               func(peerKey, sessionID string)
+	postCommitRevokeHookForTest             func(kind database.PeerRevokeKind, userID string, clientID string)
+	updateBackendServerHostPreLockHook      func()
+	updateBackendServerHostErr              error
+	updateBackendServerPublicKeyPreLockHook func()
+	updateBackendServerPublicKeyErr         error
+	syncBackendForwarderHook                func() error
+	enableBackendPreAddTunnelHook           func()
+	enableBackendPostAddTunnelHook          func()
+	reaperHook                              func(context.Context, *models.VPNSession)
 
 	rollingHistory *RollingHistory
 	diagRatesMu    sync.Mutex
@@ -888,6 +890,20 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateBackendServerHostErr = err
+}
+
+// SetUpdateBackendServerPublicKeyPreLockHook sets a hook called immediately before acquiring s.mu in UpdateBackendServerPublicKey.
+func (s *Service) SetUpdateBackendServerPublicKeyPreLockHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateBackendServerPublicKeyPreLockHook = fn
+}
+
+// SetUpdateBackendServerPublicKeyErrorForTest sets an error to be returned by UpdateBackendServerPublicKey for testing.
+func (s *Service) SetUpdateBackendServerPublicKeyErrorForTest(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateBackendServerPublicKeyErr = err
 }
 
 // SetEnableBackendPreAddTunnelHookForTest sets a hook called immediately before calling pool.AddTunnel in EnableBackend.
@@ -2348,6 +2364,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error)
 	stage = "register_tunnel"
 	s.mu.Lock()
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
+	initialAdminGen := pool.AdminGeneration(serverID)
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -2386,7 +2403,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) (err error)
 	}
 
 	stage = "state_changed"
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, initialAdminGen)
 }
 
 func (s *Service) finishEnableBackend(
@@ -2397,6 +2414,7 @@ func (s *Service) finishEnableBackend(
 	serverID int64,
 	hasInitial bool,
 	initialEnabled bool,
+	initialAdminGen int64,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2408,6 +2426,32 @@ func (s *Service) finishEnableBackend(
 	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
+
+	// Fence the enable against a genuine identity change: a different tunnel row,
+	// a different endpoint, or rotated credentials. That is exactly the set
+	// Pool.AddTunnel and SetTunnelEndpoint advance identity for.
+	if currTun.ID != tun.ID ||
+		currTun.Endpoint != tun.Endpoint ||
+		currTun.PublicKey != tun.PublicKey ||
+		currTun.PrivateKey != tun.PrivateKey ||
+		currTun.ProbePrivateKey != tun.ProbePrivateKey {
+		return backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
+	}
+
+	// Fence the enable against concurrent administrative modifications.
+	// Routine health observations (probes, status, latency) advance StateVersion
+	// but do NOT advance AdminGeneration. If AdminGeneration advanced while this
+	// enable was in flight, a newer administrative operation completed:
+	// - If the backend is currently disabled, a completed newer administrative
+	//   disable wins over this older in-flight enable.
+	// - If the backend is currently enabled, a concurrent enable already completed.
+	if pool.AdminGeneration(serverID) != initialAdminGen {
+		if !currTun.Enabled {
+			return errors.New("backend was administratively disabled; aborting enable")
+		}
+		return backendEnableFailure("state_changed", errors.New("backend administrative state modified concurrently; aborting enable"))
+	}
+
 	if hasInitial {
 		// Reject only a transition from administratively enabled to disabled
 		// while this operation was in flight. A backend that was already
@@ -2418,30 +2462,6 @@ func (s *Service) finishEnableBackend(
 		}
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
-	}
-	// Fence the enable against a genuine identity change, not against every
-	// StateVersion bump. StateVersion is a single monotonic token that the
-	// health subsystem advances on routine observations too: a successful
-	// background probe reaches Pool.setTunnelStatus (pool.go) via
-	// SetTunnelStatusIfCurrentWithVersion and bumps the live entry's version
-	// while recording nothing but a fresh status/latency/last-check. The prober
-	// ticks every 10s by default, so that bump lands inside the multi-second
-	// SSH window of every enable with high probability, and the abort was a
-	// false positive rather than a real conflict.
-	//
-	// What genuinely invalidates this enable is a replacement of the tunnel
-	// identity the peers were just registered against: a different tunnel row,
-	// a different endpoint, or rotated credentials. That is exactly the set
-	// Pool.AddTunnel advances StateVersion for, plus the endpoint rewrite in
-	// SetTunnelEndpoint. Administrative intent is already covered by the
-	// Enabled checks above, which are exact; a retired or deleted tunnel is
-	// covered by GetTunnel returning ErrTunnelNotFound above.
-	if currTun.ID != tun.ID ||
-		currTun.Endpoint != tun.Endpoint ||
-		currTun.PublicKey != tun.PublicKey ||
-		currTun.PrivateKey != tun.PrivateKey ||
-		currTun.ProbePrivateKey != tun.ProbePrivateKey {
-		return backendEnableFailure("state_changed", errors.New("backend identity modified concurrently; aborting enable"))
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
@@ -2460,6 +2480,18 @@ func (s *Service) finishEnableBackend(
 
 	legacyAdminOnlyState := currTun.Status == TunnelStatusDisabled && currTun.DisableReason == models.DisableReasonAdmin
 	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
+		if s.forwarder != nil {
+			s.forwarder.DetachBackendDevice(tun.ID)
+		}
+		if dev, ok := s.backendDevices[tun.ID]; ok {
+			if dev != nil {
+				_ = dev.Close()
+			}
+			delete(s.backendDevices, tun.ID)
+		}
+		if s.backendDeviceEndpoints != nil {
+			delete(s.backendDeviceEndpoints, tun.ID)
+		}
 		return backendEnableFailure("persist_enable", fmt.Errorf("failed to persist administrative backend enable: %w", err))
 	}
 	if legacyAdminOnlyState {
@@ -3139,6 +3171,102 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 
 	if syncErr != nil {
 		return rollbackEndpoint(syncErr)
+	}
+
+	return nil
+}
+
+// UpdateBackendServerPublicKey updates the public key of a server in the VPN backend pool.
+func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int64, newPublicKey string) error {
+	if s == nil || s.pool == nil {
+		return nil
+	}
+
+	s.mu.RLock()
+	injectedErr := s.updateBackendServerPublicKeyErr
+	s.mu.RUnlock()
+	if injectedErr != nil {
+		return injectedErr
+	}
+
+	tun, err := s.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			return nil
+		}
+		return err
+	}
+	if tun == nil {
+		return nil
+	}
+
+	if tun.PublicKey == newPublicKey {
+		s.mu.RLock()
+		dev := s.backendDevices[tun.ID]
+		s.mu.RUnlock()
+
+		// Genuinely synchronized idempotent no-op: device exists and is open.
+		if dev != nil && !dev.IsClosed() {
+			return nil
+		}
+
+		if !tun.Enabled {
+			return nil
+		}
+
+		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+		s.mu.RLock()
+		hook := s.updateBackendServerPublicKeyPreLockHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	}
+
+	oldPublicKey := tun.PublicKey
+	if err := s.pool.SetTunnelPublicKey(ctx, tun.ID, newPublicKey); err != nil {
+		return fmt.Errorf("failed to update backend tunnel public key in pool: %w", err)
+	}
+	tun.PublicKey = newPublicKey
+
+	rollbackPublicKey := func(originalErr error) error {
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if rbErr := s.pool.SetTunnelPublicKey(rbCtx, tun.ID, oldPublicKey); rbErr != nil {
+			log.Printf("[vpn] warning: failed to rollback backend tunnel public key for server %d: %v", serverID, rbErr)
+			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore public key to %s: %v", ErrVPNRollbackFailed, oldPublicKey, rbErr))
+		}
+		return originalErr
+	}
+
+	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+	s.mu.RLock()
+	hook := s.updateBackendServerPublicKeyPreLockHook
+	s.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return rollbackPublicKey(err)
+	}
+
+	s.mu.Lock()
+	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	s.mu.Unlock()
+
+	if syncErr != nil {
+		return rollbackPublicKey(syncErr)
 	}
 
 	return nil

@@ -87,6 +87,44 @@ func criticalReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64
 	return total
 }
 
+// degradedLossReasons declares, in ONE place, every reason the health
+// evaluator classifies at DEGRADED severity by identity rather than by
+// aggregate volume, and which evaluator owns each (finding B3, issue #424).
+//
+// Just like criticalLossReasons, this map is the single source for both the
+// reason-specific condition emitted and the subtraction from the routine
+// population that keeps the same loss out of the generic aggregate.
+//
+// Queue-loss populations audit (#424):
+//   - client_backend_queue_full: owned by THIS evaluator (claimDrops). A full
+//     backend queue refusing client packets is client-traffic starvation;
+//     its current rate degrades health directly.
+//   - return_queue_full: owned by the return queue pressure evaluator
+//     (QueuePressureDiagnostics.QueueDropRatePps > th.QueueActiveDropRatePPS),
+//     not claimed as a reason-keyed drop here.
+//   - client_backend_device_queue_full / return_backend_device_queue_full:
+//     device-level capacity drops attributed to the general routine population.
+var degradedLossReasons = map[string]lossClaim{
+	reasonClientBackendQueueFull: claimDrops,
+}
+
+// degradedReasonRatePps sums the current-window rate of every degraded reason
+// owned by the given evaluator, out of drops.
+//
+// It returns zero when rates are unavailable, matching criticalReasonRatePps.
+func degradedReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64 {
+	if !drops.RatesAvailable {
+		return 0
+	}
+	total := 0.0
+	for key, owner := range degradedLossReasons {
+		if owner == claim {
+			total += drops.ReasonRates[key]
+		}
+	}
+	return total
+}
+
 // The disjoint reasons use exactly the counter keys in drop_categories.
 // return_injection_tun_drops describes overlap, not an additional loss reason.
 func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {

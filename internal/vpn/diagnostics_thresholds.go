@@ -174,6 +174,19 @@ type HealthThresholds struct {
 	// same rule applied to a third failure population.
 	InjectionFailureCriticalRatePPS float64
 
+	// --- Reason-specific degraded loss (finding B3, issue #424) ---
+
+	// ClientQueueActiveDropRatePPS gates DEGRADED on client-to-backend queue-full
+	// drops happening RIGHT NOW. Compared with > against the current-window
+	// DropCategoryBreakdown.ReasonRates[reasonClientBackendQueueFull], so any
+	// non-zero measured rate fires and a zero rate never does.
+	//
+	// The value is 0, matching the `> 0` comparison applied to
+	// QueueActiveDropRatePPS, WriteErrorRatePps, and
+	// InjectionFailureCriticalRatePPS: all encode "a non-zero CURRENT rate of
+	// this failure is an incident".
+	ClientQueueActiveDropRatePPS float64
+
 	// --- Peer synchronization (peerSyncDivergenceCondition) ---
 
 	// PeerSyncDivergenceDegradedAge gates DEGRADED on a persisted
@@ -256,6 +269,8 @@ func defaultHealthThresholds() HealthThresholds {
 		OwnershipMismatchCriticalDrops: 1,
 		// `> 0`, matching the write-error and queue-drop rate idiom.
 		InjectionFailureCriticalRatePPS: 0,
+		// `> 0`, matching the queue-drop rate idiom for client backend queues.
+		ClientQueueActiveDropRatePPS: 0,
 
 		PeerSyncDivergenceDegradedAge: 60 * time.Second,
 		PeerSyncDivergenceWarningAge:  30 * time.Second,

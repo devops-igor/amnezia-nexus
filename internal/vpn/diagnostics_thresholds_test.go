@@ -132,6 +132,11 @@ func TestDefaultHealthThresholdsPreservePreviousLiterals(t *testing.T) {
 			t.Errorf("InjectionFailureCriticalRatePPS=%v, want 0 (was the literal 0 of the `> 0` rate gates it mirrors)",
 				th.InjectionFailureCriticalRatePPS)
 		}
+		// ClientQueueActiveDropRatePPS is 0 compared with > against client backend queue drops.
+		if th.ClientQueueActiveDropRatePPS != 0 {
+			t.Errorf("ClientQueueActiveDropRatePPS=%v, want 0 (was the literal 0 of the `> 0` rate gates it mirrors)",
+				th.ClientQueueActiveDropRatePPS)
+		}
 	})
 
 	t.Run("peer synchronisation durations", func(t *testing.T) {

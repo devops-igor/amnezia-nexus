@@ -1363,6 +1363,13 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 					"decrypted replies are being refused at the client ingress hop", rate),
 			})
 		}
+		if rate := degradedReasonRatePps(drops, claimDrops); rate > th.ClientQueueActiveDropRatePPS {
+			conds = append(conds, HealthCondition{
+				Category: "drops",
+				Severity: "DEGRADED",
+				Message:  fmt.Sprintf("Active client queue drops: %.1f drops/sec due to full backend queues", rate),
+			})
+		}
 	}
 
 	// The ROUTINE population: the aggregate minus every loss already claimed by
@@ -1374,7 +1381,8 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 	// must never be reported as a negative loss rate.
 	routineRate := drops.TotalDropRatePps -
 		routing.OwnershipMismatchRatePPS() -
-		criticalReasonRatePps(drops, claimDrops)
+		criticalReasonRatePps(drops, claimDrops) -
+		degradedReasonRatePps(drops, claimDrops)
 	if routineRate < 0 {
 		routineRate = 0
 	}
@@ -1384,7 +1392,7 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 			Category: "drops",
 			Severity: "DEGRADED",
 			Message: fmt.Sprintf("Elevated routine drop rate: %.1f drops/sec across dataplane "+
-				"(excluding ownership-mismatch and injection-failure losses, reported by reason)",
+				"(excluding ownership-mismatch, injection-failure, and client-queue losses, reported by reason)",
 				routineRate),
 		})
 	} else if routineRate >= th.DropRateWarningPPS {
@@ -1392,7 +1400,7 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 			Category: "drops",
 			Severity: "WARNING",
 			Message: fmt.Sprintf("Active routine packet drops: %.1f drops/sec across dataplane "+
-				"(excluding ownership-mismatch and injection-failure losses, reported by reason)",
+				"(excluding ownership-mismatch, injection-failure, and client-queue losses, reported by reason)",
 				routineRate),
 		})
 	}

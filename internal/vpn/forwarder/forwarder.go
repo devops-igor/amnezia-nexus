@@ -976,6 +976,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.mu.RUnlock()
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
+		f.classifyReturnReject(ReturnRejectedUnrouted)
 		return ErrSessionNotRegistered
 	}
 	clientQueue := route.clientQueue

@@ -193,3 +193,187 @@ func TestEnableBackend_IdentityChangeStillAbortsEnable(t *testing.T) {
 		}
 	})
 }
+
+// TestEnableBackend_LaterAdministrativeDisableWins verifies that an older in-flight
+// enable operation cannot re-enable a backend after an intervening administrative
+// enable/disable cycle completes. The completed newer administrative disable must win.
+func TestEnableBackend_LaterAdministrativeDisableWins(t *testing.T) {
+	t.Run("PeerRegistrationWindow", func(t *testing.T) {
+		ctx := context.Background()
+		svc, adder, srvID := newStateVersionRaceService(t, "admin-cycle-peer", "192.0.2.90", "peer-window-pubkey")
+
+		// Start disabled.
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("initial EnableBackend failed: %v", err)
+		}
+		if err := svc.DisableBackend(ctx, srvID); err != nil {
+			t.Fatalf("initial DisableBackend failed: %v", err)
+		}
+
+		tunBefore, err := svc.pool.GetTunnel(srvID)
+		if err != nil {
+			t.Fatalf("GetTunnel failed: %v", err)
+		}
+		if tunBefore.Enabled {
+			t.Fatal("expected backend to start disabled")
+		}
+
+		// Older enable A starts while disabled and parks in the SSH peer registration window.
+		adder.armed.Store(true)
+		enableAErr := make(chan error, 1)
+		go func() {
+			enableAErr <- svc.EnableBackend(ctx, srvID)
+		}()
+		awaitEnableWindow(t, adder)
+		adder.armed.Store(false)
+
+		// Later enable B completes, then later disable C completes.
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("intervening EnableBackend B failed: %v", err)
+		}
+		if err := svc.DisableBackend(ctx, srvID); err != nil {
+			t.Fatalf("intervening DisableBackend C failed: %v", err)
+		}
+
+		// Resume older enable A.
+		close(adder.release)
+		errA := <-enableAErr
+		if errA == nil {
+			t.Fatal("expected older enable A to fail after intervening administrative disable C, got nil")
+		}
+		if stage := BackendEnableStage(errA); stage != "state_changed" {
+			t.Fatalf("expected stage=state_changed for older enable A, got %q (err: %v)", stage, errA)
+		}
+
+		// Assert that in-memory pool retains disabled state with DisableReasonAdmin.
+		tunFinal, err := svc.pool.GetTunnel(srvID)
+		if err != nil {
+			t.Fatalf("GetTunnel final failed: %v", err)
+		}
+		if tunFinal.Enabled {
+			t.Error("older in-flight enable A overrode newer completed disable C in memory")
+		}
+		if tunFinal.DisableReason != models.DisableReasonAdmin {
+			t.Errorf("expected disable_reason=%q, got %q", models.DisableReasonAdmin, tunFinal.DisableReason)
+		}
+
+		// Assert persisted database row remains disabled.
+		if svc.db != nil {
+			dbTun, err := svc.db.GetBackendTunnel(ctx, tunFinal.ID)
+			if err != nil {
+				t.Fatalf("GetBackendTunnel from DB failed: %v", err)
+			}
+			if dbTun == nil || dbTun.Enabled {
+				t.Error("older in-flight enable A overrode newer completed disable C in database")
+			}
+		}
+
+		// Assert no forwarder device is attached.
+		if dev := svc.GetBackendDeviceForTest(tunFinal.ID); dev != nil {
+			t.Error("older in-flight enable A reattached data-plane device after newer disable C")
+		}
+	})
+
+	t.Run("PostAddTunnelHook", func(t *testing.T) {
+		ctx := context.Background()
+		svc, _, srvID := newStateVersionRaceService(t, "admin-cycle-hook", "192.0.2.91", "hook-pubkey")
+
+		// Start disabled.
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("initial EnableBackend failed: %v", err)
+		}
+		if err := svc.DisableBackend(ctx, srvID); err != nil {
+			t.Fatalf("initial DisableBackend failed: %v", err)
+		}
+
+		var laterErr error
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+			if laterErr = svc.EnableBackend(ctx, srvID); laterErr != nil {
+				return
+			}
+			laterErr = svc.DisableBackend(ctx, srvID)
+		})
+
+		olderErr := svc.EnableBackend(ctx, srvID)
+		if laterErr != nil {
+			t.Fatalf("later administrative operation failed: %v", laterErr)
+		}
+		if olderErr == nil {
+			t.Fatal("expected older enable to fail after intervening disable, got nil")
+		}
+		if stage := BackendEnableStage(olderErr); stage != "state_changed" {
+			t.Fatalf("expected stage=state_changed, got %q (err: %v)", stage, olderErr)
+		}
+
+		tunFinal, err := svc.pool.GetTunnel(srvID)
+		if err != nil {
+			t.Fatalf("GetTunnel final failed: %v", err)
+		}
+		if tunFinal.Enabled {
+			t.Error("older in-flight enable overrode newer completed disable")
+		}
+		if tunFinal.DisableReason != models.DisableReasonAdmin {
+			t.Errorf("expected disable_reason=%q, got %q", models.DisableReasonAdmin, tunFinal.DisableReason)
+		}
+
+		if dev := svc.GetBackendDeviceForTest(tunFinal.ID); dev != nil {
+			t.Error("older in-flight enable reattached device after newer disable")
+		}
+	})
+}
+
+// TestEnableBackend_PersistenceFailureCleansUpAttachedDevice verifies that if database
+// persistence fails during SetTunnelEnabled in finishEnableBackend, the operation fails
+// with stage=persist_enable and any forwarder device attached during the operation is cleaned up.
+func TestEnableBackend_PersistenceFailureCleansUpAttachedDevice(t *testing.T) {
+	ctx := context.Background()
+	svc, _, srvID := newStateVersionRaceService(t, "persist-fail", "192.0.2.92", "persist-pubkey")
+
+	// Start disabled.
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend failed: %v", err)
+	}
+	if err := svc.DisableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial DisableBackend failed: %v", err)
+	}
+
+	tunBefore, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+
+	// Install a trigger that causes UPDATE of enabled on backend_tunnels to fail.
+	_, err = svc.db.SQLDB().ExecContext(ctx, `
+		CREATE TRIGGER fail_backend_enable
+		BEFORE UPDATE OF enabled ON backend_tunnels
+		BEGIN
+			SELECT RAISE(FAIL, 'simulated database persistence failure');
+		END;
+	`)
+	if err != nil {
+		t.Fatalf("failed to create fail trigger: %v", err)
+	}
+
+	err = svc.EnableBackend(ctx, srvID)
+	if err == nil {
+		t.Fatal("expected EnableBackend to fail when DB update fails, got nil")
+	}
+	if stage := BackendEnableStage(err); stage != "persist_enable" {
+		t.Fatalf("expected stage=persist_enable, got %q (err: %v)", stage, err)
+	}
+
+	// Assert in-memory pool state: must remain disabled.
+	tunFinal, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	if tunFinal.Enabled {
+		t.Error("backend tunnel in memory was marked enabled despite persistence failure")
+	}
+
+	// Assert forwarder device was detached and cleaned up.
+	if dev := svc.GetBackendDeviceForTest(tunBefore.ID); dev != nil {
+		t.Error("backend device remained registered in service after persistence failure")
+	}
+}

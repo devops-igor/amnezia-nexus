@@ -1,11 +1,15 @@
 package vpn
 
 import (
+	"errors"
 	"math"
 	"sort"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // Issue #424 review round 9, BLOCKER 3 and BLOCKER 4.
@@ -198,8 +202,7 @@ func TestB3HighVolumeRoutineQueueFullIsNotCritical(t *testing.T) {
 		TotalDropRatePps: 100000,
 		RatesAvailable:   true,
 		ReasonRates: map[string]float64{
-			reasonReturnQueueFull:        60000,
-			reasonClientBackendQueueFull: 40000,
+			reasonReturnQueueFull: 100000,
 		},
 	}
 	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops,
@@ -578,5 +581,256 @@ func TestB3B4HeadlineComposition(t *testing.T) {
 	}
 	if r := conditionsIn(after.Conditions, "routing"); len(r) != 0 {
 		t.Fatalf("a recovered routing invariant must emit no routing condition, got %+v", r)
+	}
+}
+
+// B3 regression (Finding B3): low-rate (1 packet/sec) real client-side backend queue loss
+// must report DEGRADED with a condition identifying client backend queue full.
+// Prior to the fix, 1 pkt/sec produced generic WARNING which summarized to HEALTHY.
+func TestB3ClientBackendQueueLossRefusalDegradesHealth(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := forwarder.NewForwarder(nil, "192.0.2.0/24", 1)
+		path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		f.RegisterSessionWithReturnPath("s", "c", "peer", "192.0.2.1", 1, path)
+		packet := returnPacket("192.0.2.1")
+		packet[12], packet[13], packet[14], packet[15] = 192, 0, 2, 1
+		for range forwarder.DefaultBackendQueueSize {
+			if err := f.RouteClientToBackend("peer", packet); err != nil {
+				t.Fatal(err)
+			}
+		}
+		svc := &Service{forwarder: f}
+		var baseline Status
+		svc.populateOperationalDiagnostics(&baseline)
+		time.Sleep(time.Second)
+		if err := f.RouteClientToBackend("peer", packet); !errors.Is(err, forwarder.ErrQueueFull) {
+			t.Fatalf("expected actual refusal, got %v", err)
+		}
+		var status Status
+		svc.populateOperationalDiagnostics(&status)
+		if status.DropCategories.ReasonRates["client_backend_queue_full"] != 1 {
+			t.Fatalf("probe did not establish the loss rate: %+v", status.DropCategories.ReasonRates)
+		}
+		health := EvaluateForwarderHealth(true, true, status.QueuePressure, status.ForwardLatency, status.DropCategories, status.VirtualTUN, nil,
+			RoutingConsistencyDiagnostics{IsConsistent: true}, HandshakeFreshnessDiagnostics{},
+			BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 1, HealthyCount: 1, TotalCount: 1})
+		t.Logf("actual client queue refusal: reason_rate=%v return_queue_rate=%v total_rate=%v health=%s conditions=%+v",
+			status.DropCategories.ReasonRates["client_backend_queue_full"], status.QueuePressure.QueueDropRatePps,
+			status.DropCategories.TotalDropRatePps, health.Status, health.Conditions)
+		if health.Status != HealthDegraded {
+			t.Fatalf("actual backend queue loss must degrade health; got %s (conditions: %+v)", health.Status, health.Conditions)
+		}
+		cond := assertSingleCondition(t, health.Conditions, "drops")
+		if cond.Severity != "DEGRADED" {
+			t.Fatalf("condition severity=%q, want DEGRADED", cond.Severity)
+		}
+		if !strings.Contains(cond.Message, "client") || !strings.Contains(cond.Message, "backend") {
+			t.Fatalf("condition message must identify client backend queue: %q", cond.Message)
+		}
+	})
+}
+
+// B3 regression: boundary rates, zero idle, and rate availability for client_backend_queue_full.
+func TestB3ClientBackendQueueLossSeverityBoundaries(t *testing.T) {
+	quiet := RoutingConsistencyDiagnostics{IsConsistent: true}
+
+	for _, tc := range []struct {
+		name    string
+		rate    float64
+		wantSev string
+	}{
+		{"a zero measured rate does not fire", 0, ""},
+		{"an arbitrarily small positive rate does fire", math.SmallestNonzeroFloat64, "DEGRADED"},
+		{"a low positive rate (0.5 pps) fires DEGRADED", 0.5, "DEGRADED"},
+		{"1 pkt/sec rate fires DEGRADED", 1.0, "DEGRADED"},
+		{"a 10 pkt/sec rate fires DEGRADED", 10.0, "DEGRADED"},
+		{"high-volume client queue loss stays DEGRADED (never CRITICAL)", 100000.0, "DEGRADED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := DropCategoryBreakdown{
+				TotalDropRatePps: tc.rate,
+				RatesAvailable:   true,
+				ReasonRates:      map[string]float64{reasonClientBackendQueueFull: tc.rate},
+			}
+			got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), d, quiet), "drops")
+			if tc.wantSev == "" {
+				if len(got) != 0 {
+					t.Fatalf("expected no drops condition, got %+v", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Severity != tc.wantSev {
+				t.Fatalf("rate=%v: got %+v, want one %s", tc.rate, got, tc.wantSev)
+			}
+			if !strings.Contains(got[0].Message, "client") || !strings.Contains(got[0].Message, "backend") {
+				t.Errorf("condition message must identify client backend queue: %q", got[0].Message)
+			}
+		})
+	}
+
+	// An UNMEASURED window is unknown, not bad: no client queue condition
+	// may be fabricated before a rate has been sampled.
+	unmeasured := DropCategoryBreakdown{
+		TotalDropRatePps: 0,
+		RatesAvailable:   false,
+		ReasonRates:      map[string]float64{reasonClientBackendQueueFull: 99.0},
+	}
+	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), unmeasured, quiet), "drops"); len(got) != 0 {
+		t.Fatalf("unmeasured reason rates must not produce a condition: %+v", got)
+	}
+}
+
+// B3 regression: mixtures of reason-owned client queue loss and generic routine loss
+// must remain disjoint, reporting both populations at DEGRADED without double-counting.
+func TestB3ClientQueueAndRoutineQueueMixture(t *testing.T) {
+	drops := DropCategoryBreakdown{
+		TotalDropRatePps: 100000,
+		RatesAvailable:   true,
+		ReasonRates: map[string]float64{
+			reasonClientBackendQueueFull: 40000,
+			reasonReturnQueueFull:        60000,
+		},
+	}
+	conds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops,
+		RoutingConsistencyDiagnostics{IsConsistent: true})
+
+	dropsConds := conditionsIn(conds, "drops")
+	if len(dropsConds) != 2 {
+		t.Fatalf("expected exactly 2 drops conditions (1 client queue, 1 routine), got %d: %+v",
+			len(dropsConds), dropsConds)
+	}
+
+	var foundClient, foundRoutine bool
+	for _, c := range dropsConds {
+		if c.Severity != "DEGRADED" {
+			t.Errorf("condition severity=%q, want DEGRADED: %s", c.Severity, c.Message)
+		}
+		if strings.Contains(c.Message, "client") && strings.Contains(c.Message, "backend") {
+			foundClient = true
+			if !strings.Contains(c.Message, "40000.0") {
+				t.Errorf("client queue condition must report its own 40000.0 rate: %s", c.Message)
+			}
+		}
+		if strings.Contains(c.Message, "routine") {
+			foundRoutine = true
+			if !strings.Contains(c.Message, "60000.0") {
+				t.Errorf("routine condition must subtract client queue loss and report 60000.0: %s", c.Message)
+			}
+		}
+	}
+	if !foundClient {
+		t.Errorf("client queue condition missing: %+v", dropsConds)
+	}
+	if !foundRoutine {
+		t.Errorf("routine drop condition missing: %+v", dropsConds)
+	}
+
+	// Overall headline summary must be DEGRADED (never CRITICAL).
+	status, summary := summarizeHealthConditions(conds)
+	if status != HealthDegraded {
+		t.Fatalf("headline=%s (%s), want DEGRADED", status, summary)
+	}
+}
+
+// B3 regression: when current loss stops, health recovers cleanly;
+// monotonic lifetime counters must not latch degradation.
+func TestB3ClientQueueLossRecoveryDoesNotLatch(t *testing.T) {
+	// Active incident: 10 pps current loss, 500 lifetime drops.
+	active := DropCategoryBreakdown{
+		ClientBackendQueueFull: 500,
+		TotalDropRatePps:       10.0,
+		RatesAvailable:         true,
+		ReasonRates:            map[string]float64{reasonClientBackendQueueFull: 10.0},
+	}
+	activeHealth := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		active, quietVirtualTUN(), nil, RoutingConsistencyDiagnostics{IsConsistent: true}, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 1, HealthyCount: 1, TotalCount: 1})
+	if activeHealth.Status != HealthDegraded {
+		t.Fatalf("active loss must degrade health, got %s", activeHealth.Status)
+	}
+
+	// Recovery: current rate is zero, but cumulative monotonic counter remains 500.
+	recovered := DropCategoryBreakdown{
+		ClientBackendQueueFull: 500,
+		TotalDropRatePps:       0.0,
+		RatesAvailable:         true,
+		ReasonRates:            map[string]float64{reasonClientBackendQueueFull: 0.0},
+	}
+	recoveredHealth := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		recovered, quietVirtualTUN(), nil, RoutingConsistencyDiagnostics{IsConsistent: true}, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 1, HealthyCount: 1, TotalCount: 1})
+	if recoveredHealth.Status != HealthHealthy {
+		t.Fatalf("recovered health must be HEALTHY, got %s (summary: %s, conditions: %+v)",
+			recoveredHealth.Status, recoveredHealth.Summary, recoveredHealth.Conditions)
+	}
+	if len(recoveredHealth.Conditions) != 0 {
+		t.Fatalf("expected no conditions after recovery, got %+v", recoveredHealth.Conditions)
+	}
+}
+
+// B3 regression: truly critical reasons (ownership mismatch, injection failures)
+// take precedence over client backend queue DEGRADED, keeping headline CRITICAL.
+func TestB3CriticalPrecedenceOverClientQueueDegradation(t *testing.T) {
+	// Injection CRITICAL + Client Queue DEGRADED
+	drops := DropCategoryBreakdown{
+		TotalDropRatePps: 15.0,
+		RatesAvailable:   true,
+		ReasonRates: map[string]float64{
+			reasonReturnInjectionErrors:  5.0,
+			reasonClientBackendQueueFull: 10.0,
+		},
+	}
+	health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		drops, quietVirtualTUN(), nil, RoutingConsistencyDiagnostics{IsConsistent: true}, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 1, HealthyCount: 1, TotalCount: 1})
+
+	if health.Status != HealthCritical {
+		t.Fatalf("status=%s, want CRITICAL: summary=%s", health.Status, health.Summary)
+	}
+	if !strings.Contains(health.Summary, "injection") {
+		t.Errorf("summary must identify critical injection failure: %s", health.Summary)
+	}
+
+	// Both conditions must still be observable
+	if !hasCondition(health.Conditions, "drops", "CRITICAL") {
+		t.Errorf("missing CRITICAL drops condition: %+v", health.Conditions)
+	}
+	if !hasCondition(health.Conditions, "drops", "DEGRADED") {
+		t.Errorf("missing DEGRADED client queue drops condition: %+v", health.Conditions)
+	}
+}
+
+// B3: every degraded reason key gated on must be published by dropReasonTotals,
+// and exactly one evaluator must own each degraded reason.
+func TestB3DegradedReasonKeysArePublishedReasons(t *testing.T) {
+	published := dropReasonTotals(DropCategoryBreakdown{})
+	owners := map[string][]string{}
+	for key, claim := range degradedLossReasons {
+		if _, ok := published[key]; !ok {
+			t.Errorf("degraded reason key %q is not published by dropReasonTotals", key)
+		}
+		switch claim {
+		case claimDrops:
+			owners["drops"] = append(owners["drops"], key)
+		default:
+			t.Errorf("degraded reason %q has unexpected owner %d", key, claim)
+		}
+	}
+	wantOwners := map[string][]string{
+		"drops": {reasonClientBackendQueueFull},
+	}
+	for evaluator, want := range wantOwners {
+		got := append([]string(nil), owners[evaluator]...)
+		sort.Strings(got)
+		if len(got) != len(want) {
+			t.Errorf("%s evaluator owns %v, want %v", evaluator, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%s evaluator owns %v, want %v", evaluator, got, want)
+				break
+			}
+		}
 	}
 }

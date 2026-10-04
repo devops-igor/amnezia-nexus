@@ -877,6 +877,12 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 			h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to apply AWG configuration")
 			return
 		}
+
+		if err := h.reconcileAWGServerIdentity(ctx, server, req.Config); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "reconcile_failed", err.Error())
+			return
+		}
+
 		h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 		h.JSONOK(w)
 		return
@@ -888,6 +894,45 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 
 	h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 	h.JSONOK(w)
+}
+
+func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *models.Server, config string) error {
+	var oldPub string
+	if awgProto, ok := server.Protocols["awg"].(map[string]any); ok && awgProto != nil {
+		oldPub, _ = awgProto["public_key"].(string)
+	}
+	newPub, err := awg.ExtractServerPublicKey(config)
+	if err != nil {
+		newPub, _ = h.awgMgr.GetServerPublicKey(ctx, server)
+	}
+	if newPub == "" || newPub == oldPub {
+		return nil
+	}
+
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	awgProto, ok := server.Protocols["awg"].(map[string]any)
+	if !ok || awgProto == nil {
+		awgProto = make(map[string]any)
+	}
+	awgProto["public_key"] = newPub
+	server.Protocols["awg"] = awgProto
+	if err := h.db.UpdateServerProtocols(ctx, server.ID, server.Protocols); err != nil {
+		return fmt.Errorf("failed to update server protocols: %w", err)
+	}
+
+	if h.vpnSvc != nil {
+		if err := h.vpnSvc.UpdateBackendServerPublicKey(ctx, server.ID, newPub); err != nil {
+			if oldPub != "" {
+				awgProto["public_key"] = oldPub
+				server.Protocols["awg"] = awgProto
+				_ = h.db.UpdateServerProtocols(context.WithoutCancel(ctx), server.ID, server.Protocols)
+			}
+			return fmt.Errorf("failed to reconcile VPN backend public key: %w", err)
+		}
+	}
+	return nil
 }
 
 // GetServerReachabilityHandler returns server connectivity and latency status.

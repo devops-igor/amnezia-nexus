@@ -132,3 +132,13 @@ func (m *AWGManager) reconcileServerIdentity(ctx context.Context, client ssh.SSH
 		"server_id", serverIDOf(server), "container", cName)
 	return nil
 }
+
+// ExtractServerPublicKey returns the Base64-encoded public key derived from
+// the [Interface] PrivateKey in an AWG configuration string.
+func ExtractServerPublicKey(content string) (string, error) {
+	key := interfacePrivateKey(content)
+	if key == "" {
+		return "", errors.New("no [Interface] PrivateKey found in configuration")
+	}
+	return derivePublicKeyFromPrivate(key)
+}
