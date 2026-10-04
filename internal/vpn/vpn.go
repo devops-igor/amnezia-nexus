@@ -942,6 +942,15 @@ func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	s.pool.SetSetTunnelEndpointHookForTest(fn)
 }
 
+
+// SetTunnelPublicKeyHookForTest sets a test hook for SetTunnelPublicKey on the pool.
+func (s *Service) SetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tunnelID int64, publicKey string) error) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	s.pool.SetSetTunnelPublicKeyHookForTest(fn)
+}
+
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
 	if s.db == nil {
 		return nil, errors.New("database not available")
