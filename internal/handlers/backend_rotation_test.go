@@ -394,6 +394,14 @@ func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantine
 		}
 		return nil
 	})
+	// Persistence of the administrative disable also fails. Runtime quarantine
+	// must still force the tunnel disabled and detach its device.
+	svc.SetTunnelEnabledHookForTest(func(_ context.Context, _ int64, enabled bool, _ string) error {
+		if !enabled {
+			return errors.New("injected administrative-disable persistence failure")
+		}
+		return nil
+	})
 
 	r := setupFullServerRouter(h)
 	body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": rotated})
@@ -437,5 +445,101 @@ func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantine
 	}
 	if tun.Enabled {
 		t.Fatal("backend remained enabled after VPN identity rollback failure; expected quarantine")
+	}
+}
+
+
+func TestBackendIdentityRotation_DBCompensationFailureKeepsNewIdentityQuarantined(t *testing.T) {
+	oldPriv, oldPub := deriveTestKey(t, 50)
+	newPriv, newPub := deriveTestKey(t, 51)
+	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
+	rotated := strings.ReplaceAll(original, oldPriv, newPriv)
+	mock, currentConfig := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
+
+	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
+	ctx := context.Background()
+	id, err := db.CreateServer(ctx, &models.Server{
+		Name:    "db-rollback-failure-fixture",
+		Host:    "192.0.2.96",
+		SSHUser: "fixture",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": oldPub,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.vpnSvc = svc
+	if err = svc.EnableBackend(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first VPN move to NEW persists, then forwarder reconciliation fails
+	// and the service successfully compensates the pool to OLD.
+	svc.SetSyncBackendForwarderHookForTest(func() error {
+		return errors.New("injected forwarder reconciliation failure")
+	})
+
+	// Persist NEW normally, but make every attempt to compensate the server
+	// protocol row back to OLD fail. The handler must then choose NEW as the
+	// convergence target, quarantine the backend, and move the disabled pool
+	// forward to NEW rather than allowing the manager to restore remote OLD.
+	h.updateServerProtocolsHook = func(callCtx context.Context, serverID int64, protocols map[string]any) error {
+		awgMap, _ := protocols["awg"].(map[string]any)
+		pub, _ := awgMap["public_key"].(string)
+		if pub == oldPub {
+			return errors.New("injected server-protocol rollback failure")
+		}
+		return db.UpdateServerProtocols(callCtx, serverID, protocols)
+	}
+
+	r := setupFullServerRouter(h)
+	body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": rotated})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", id), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 on failed DB compensation, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "reconcile_failed") {
+		t.Fatalf("expected reconcile_failed response, got %s", w.Body.String())
+	}
+
+	if got := currentConfig(); !strings.Contains(got, newPriv) {
+		t.Fatalf("remote AWG config was rolled back despite failed DB compensation: %s", got)
+	}
+	server, err := db.GetServer(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, _ := server.Protocols["awg"].(map[string]any)["public_key"].(string)
+	if cached != newPub {
+		t.Fatalf("server DB identity=%q, want NEW convergence identity %q", cached, newPub)
+	}
+	live, err := h.awgMgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("read live identity: %v", err)
+	}
+	if live != newPub {
+		t.Fatalf("remote live identity=%q, want NEW convergence identity %q", live, newPub)
+	}
+	tun, err := svc.GetTunnel(id)
+	if err != nil {
+		t.Fatalf("GetTunnel after failed DB compensation: %v", err)
+	}
+	if tun.PublicKey != newPub {
+		t.Fatalf("VPN pool identity=%q, want NEW convergence identity %q", tun.PublicKey, newPub)
+	}
+	if tun.Enabled {
+		t.Fatal("backend remained enabled after failed DB compensation; expected fail-closed quarantine")
 	}
 }
