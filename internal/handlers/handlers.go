@@ -69,8 +69,9 @@ type Handlers struct {
 	captchaSt       *captcha.Store
 	userConnMu      sync.Mutex
 	userConnLocks   map[string]*sync.Mutex
-	serverHostMu    sync.Mutex
-	serverHostLocks map[int64]*sync.Mutex
+	serverHostMu              sync.Mutex
+	serverHostLocks           map[int64]*sync.Mutex
+	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
 }
 
 func (h *Handlers) lockUser(userID string) func() {
@@ -89,6 +90,13 @@ func (h *Handlers) lockUser(userID string) func() {
 	return func() {
 		mu.Unlock()
 	}
+}
+
+func (h *Handlers) updateServerProtocols(ctx context.Context, serverID int64, protocols map[string]any) error {
+	if h.updateServerProtocolsHook != nil {
+		return h.updateServerProtocolsHook(ctx, serverID, protocols)
+	}
+	return h.db.UpdateServerProtocols(ctx, serverID, protocols)
 }
 
 func (h *Handlers) lockServerHost(serverID int64) func() {
