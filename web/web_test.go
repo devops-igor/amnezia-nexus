@@ -2901,7 +2901,6 @@ function runScenario(key) {
             forwarder_drops_no_route: 0,
             forwarder_drops_packet_too_large: 0,
             forwarder_device_write_errors: 0,
-            transport_decryption_failures: 0,
             forwarder_route_queues: {
                 'abcdefghijklmnop': {
                     capacity: 2048,
@@ -2937,7 +2936,6 @@ function runScenario(key) {
             forwarder_drops_no_route: 0,
             forwarder_drops_packet_too_large: 0,
             forwarder_device_write_errors: 0,
-            transport_decryption_failures: 0,
             forwarder_route_queues: {}
         });
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
@@ -2967,7 +2965,6 @@ function runScenario(key) {
             forwarder_drops_packet_too_large: 0,
             forwarder_drops_total: 0,
             forwarder_device_write_errors: 0,
-            transport_decryption_failures: 0
         });
         assert.strictEqual(isAvailable, true);
         assert.strictEqual(mockDoc.getElementById('vpn-fwd-status-badge').className, 'badge badge-success');
@@ -3019,7 +3016,6 @@ function runScenario(key) {
             forwarder_drops_no_route: 0,
             forwarder_drops_packet_too_large: 0,
             forwarder_device_write_errors: 0,
-            transport_decryption_failures: 0,
             forwarder_route_queues: {
                 'abcdefghijklmnopqrstuvwxyz012345': {
                     capacity: 2048,
