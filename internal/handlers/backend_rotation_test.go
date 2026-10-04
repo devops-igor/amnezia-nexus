@@ -37,7 +37,7 @@ func deriveTestKey(t *testing.T, seed byte) (string, string) {
 	return base64.StdEncoding.EncodeToString(raw), base64.StdEncoding.EncodeToString(pub)
 }
 
-func setupRotationMockSSH(initialConfig string, oldPriv, oldPub, newPriv, newPub string) *testMockSSHClient {
+func setupRotationMockSSH(initialConfig string, oldPriv, oldPub, newPriv, newPub string) (*testMockSSHClient, func() string) {
 	current := initialConfig
 	uploads := map[string][]byte{}
 	mock := &testMockSSHClient{}
@@ -68,14 +68,14 @@ func setupRotationMockSSH(initialConfig string, oldPriv, oldPub, newPriv, newPub
 		uploads[p] = append([]byte(nil), data...)
 		return nil
 	}
-	return mock
+	return mock, func() string { return current }
 }
 
 func TestBackendIdentityRotationReconcilesPersistedAndActiveIdentity(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 1)
 	newPriv, newPub := deriveTestKey(t, 2)
 	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
-	mock := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
+	mock, _ := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
 
 	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
 	ctx := context.Background()
@@ -156,7 +156,7 @@ func TestBackendIdentityRotationReconcilesPersistedAndActiveIdentity(t *testing.
 func TestBackendIdentityRotation_UnchangedKeyNoOp(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 10)
 	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
-	mock := setupRotationMockSSH(original, oldPriv, oldPub, "", "")
+	mock, _ := setupRotationMockSSH(original, oldPriv, oldPub, "", "")
 
 	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
 	ctx := context.Background()
@@ -209,7 +209,7 @@ func TestBackendIdentityRotation_DisabledBackend(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 20)
 	newPriv, newPub := deriveTestKey(t, 21)
 	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
-	mock := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
+	mock, _ := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
 
 	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
 	ctx := context.Background()
@@ -277,7 +277,7 @@ func TestBackendIdentityRotation_ReconciliationFailureRollback(t *testing.T) {
 	oldPriv, oldPub := deriveTestKey(t, 30)
 	newPriv, newPub := deriveTestKey(t, 31)
 	original := "[Interface]\nPrivateKey = " + oldPriv + "\nAddress = 192.0.2.1/24\nListenPort = 51820\nTable = off\n"
-	mock := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
+	mock, currentConfig := setupRotationMockSSH(original, oldPriv, oldPub, newPriv, newPub)
 
 	h, db, _ := setupTestHandlersWithMockSSH(t, mock)
 	ctx := context.Background()
@@ -329,5 +329,22 @@ func TestBackendIdentityRotation_ReconciliationFailureRollback(t *testing.T) {
 	cached, _ := server.Protocols["awg"].(map[string]any)["public_key"].(string)
 	if cached != oldPub {
 		t.Errorf("expected cached identity in DB to be rolled back to %q, got %q", oldPub, cached)
+	}
+	if got := currentConfig(); got != original {
+		t.Errorf("expected remote AWG configuration to be rolled back after reconciliation failure\nwant:\n%s\ngot:\n%s", original, got)
+	}
+	live, err := h.awgMgr.GetServerPublicKey(ctx, server)
+	if err != nil {
+		t.Fatalf("read rolled-back remote identity: %v", err)
+	}
+	if live != oldPub {
+		t.Errorf("expected live remote identity to be rolled back to %q, got %q", oldPub, live)
+	}
+	tun, err := svc.GetTunnel(id)
+	if err != nil {
+		t.Fatalf("GetTunnel after rollback: %v", err)
+	}
+	if tun.PublicKey != oldPub {
+		t.Errorf("expected VPN pool identity to remain %q after rollback, got %q", oldPub, tun.PublicKey)
 	}
 }
