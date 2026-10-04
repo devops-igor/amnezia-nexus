@@ -34,8 +34,14 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+// VPNStatusSchemaVersion identifies the intentionally versioned /api/vpn/status
+// representation. Version 2 removes legacy custom-engine crypto telemetry and
+// keys forwarder_route_queues by opaque peer fingerprints instead of raw keys.
+const VPNStatusSchemaVersion = 2
+
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
+	SchemaVersion              int    `json:"status_schema_version"`
 	ConfiguredEngine           string `json:"configured_engine"`
 	ActiveEngine               string `json:"active_engine"`
 	EngineRunning              bool   `json:"engine_running"`
@@ -49,11 +55,9 @@ type Status struct {
 	RxBytes                    int64  `json:"rx_bytes"`
 	TxBytes                    int64  `json:"tx_bytes"`
 	DroppedPackets             uint64 `json:"dropped_packets"`
-	// Issue #39, #151 & #288 telemetry: return-path drops inside the forwarder (queue
-	// full / no route / total) and rejected handshake initiations at the listener.
-	// A rising forwarder_drops_total with stable traffic means a stalled
-	// downstream path or unroutable backend returns; a rising handshake_rejections means
-	// client initiations are failing cryptographic verification (issues #39, #288).
+	// Legacy-compatible forwarder counters that still describe Nexus-owned
+	// dataplane behavior are retained in schema v2. Custom client-engine
+	// decrypt/handshake telemetry was removed with the upstream-only architecture.
 	ForwarderAvailable             bool                                 `json:"forwarder_available"`
 	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
 	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
@@ -70,9 +74,9 @@ type Status struct {
 	ForwarderDeviceWriteMaxMS      int64                                `json:"forwarder_device_write_max_duration_ms"`
 	ForwarderDeviceWriteStalls     uint64                               `json:"forwarder_device_write_stalls"`
 	ForwarderDeviceWriteStallMS    int64                                `json:"forwarder_device_write_stall_threshold_ms"`
-	TransportDecryptionFailures    uint64                               `json:"transport_decryption_failures"`
-	HandshakeRejections            uint64                               `json:"handshake_rejections"`
 	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
+	// Schema v2 map keys are ingress.PeerKeyFingerprint values; peer_key_display
+	// carries the redacted operator-facing identifier.
 	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
 	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
 	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
@@ -1829,6 +1833,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	status := &Status{
+		SchemaVersion:              VPNStatusSchemaVersion,
 		ConfiguredEngine:           ClientAWGEngineUpstream,
 		ActiveEngine:               activeEngine,
 		EngineRunning:              engineRunning,
