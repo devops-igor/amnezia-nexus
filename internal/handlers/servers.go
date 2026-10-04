@@ -873,13 +873,15 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	if req.Protocol == "awg" && h.awgMgr != nil {
-		if saveErr := h.awgMgr.WriteConfiguration(ctx, server, req.Config); saveErr != nil {
-			h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to apply AWG configuration")
-			return
-		}
-
-		if err := h.reconcileAWGServerIdentity(ctx, server, req.Config); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "reconcile_failed", err.Error())
+		saveErr := h.awgMgr.WriteConfigurationWithPostApply(ctx, server, req.Config, func(txCtx context.Context) error {
+			return h.reconcileAWGServerIdentity(txCtx, server, req.Config)
+		})
+		if saveErr != nil {
+			if errors.Is(saveErr, awg.ErrConfigurationPostApply) {
+				h.JSONError(w, http.StatusInternalServerError, "reconcile_failed", "Failed to reconcile AWG server identity")
+			} else {
+				h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to apply AWG configuration")
+			}
 			return
 		}
 
@@ -897,10 +899,20 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *models.Server, config string) error {
-	var oldPub string
+	var (
+		oldPub string
+		oldAWG map[string]any
+		hadAWG bool
+	)
 	if awgProto, ok := server.Protocols["awg"].(map[string]any); ok && awgProto != nil {
+		hadAWG = true
+		oldAWG = make(map[string]any, len(awgProto))
+		for key, value := range awgProto {
+			oldAWG[key] = value
+		}
 		oldPub, _ = awgProto["public_key"].(string)
 	}
+
 	newPub, err := awg.ExtractServerPublicKey(config)
 	if err != nil {
 		newPub, _ = h.awgMgr.GetServerPublicKey(ctx, server)
@@ -924,10 +936,19 @@ func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *model
 
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.UpdateBackendServerPublicKey(ctx, server.ID, newPub); err != nil {
-			if oldPub != "" {
-				awgProto["public_key"] = oldPub
-				server.Protocols["awg"] = awgProto
-				_ = h.db.UpdateServerProtocols(context.WithoutCancel(ctx), server.ID, server.Protocols)
+			if hadAWG {
+				server.Protocols["awg"] = oldAWG
+			} else {
+				delete(server.Protocols, "awg")
+			}
+
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if rbErr := h.db.UpdateServerProtocols(rollbackCtx, server.ID, server.Protocols); rbErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to reconcile VPN backend public key: %w", err),
+					fmt.Errorf("failed to rollback server protocols: %w", rbErr),
+				)
 			}
 			return fmt.Errorf("failed to reconcile VPN backend public key: %w", err)
 		}
