@@ -475,6 +475,13 @@ func TestRebalanceDivergenceWithoutSessionMigrator(t *testing.T) {
 	svc.forwarder.RegisterSession(sBob.ID, "conn-bob", "peer-div-bob", "10.100.0.60", tun2.ID)
 	svc.pool.IncrementConnections(tun2.ID)
 
+	// Pin Alice first in connected_at DESC order, independent of second-precision
+	// timestamp ties or a clock boundary while the other sessions are seeded.
+	futureTime := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE vpn_sessions SET connected_at = ? WHERE id = ?", futureTime, aliceSess.ID); err != nil {
+		t.Fatalf("failed to update alice connected_at: %v", err)
+	}
+
 	// Trigger DB-only rebalance
 	if err := orch.RebalanceVPNSessions(ctx); err != nil {
 		t.Fatalf("RebalanceVPNSessions failed: %v", err)
