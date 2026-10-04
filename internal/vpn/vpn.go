@@ -3048,7 +3048,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	}
 
 	if persistErr != nil {
-		return fmt.Errorf("backend quarantined in memory but administrative disable persistence failed: %w", persistErr)
+		return fmt.Errorf("failed to persist administrative backend disable; backend quarantined in memory: %w", persistErr)
 	}
 	return nil
 }
