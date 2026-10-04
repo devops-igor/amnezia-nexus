@@ -34,6 +34,7 @@ type Pool struct {
 	closed                 bool
 	setTunnelEndpointHook  func(ctx context.Context, tunnelID int64, endpoint string) error
 	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
+	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
 	generateKeypairFn      func() (string, string, error)
 }
 
@@ -571,6 +572,12 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 		return nil
 	}
 
+	if p.setTunnelEnabledHook != nil {
+		if err := p.setTunnelEnabledHook(ctx, serverID, enabled, disableReason); err != nil {
+			return err
+		}
+	}
+
 	effectiveReason := disableReason
 	if tunnel.DisableReason == models.DisableReasonHealth {
 		// Runtime health provenance belongs to the health subsystem. An
@@ -589,6 +596,39 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 	tunnel.StateVersion++
 	p.bumpAdminGenerationLocked(serverID)
 	return nil
+}
+
+
+// ForceDisableTunnelInMemory is an emergency fail-closed operation for
+// compensation paths where durable administrative-state persistence has
+// already failed. It prevents the live process from continuing to route traffic
+// through the backend while preserving the persistence error for the caller to
+// report. Normal administrative changes must use SetTunnelEnabled.
+func (p *Pool) ForceDisableTunnelInMemory(serverID int64, disableReason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	tunnel, ok := p.tunnelsByServerID[serverID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	effectiveReason := disableReason
+	if tunnel.DisableReason == models.DisableReasonHealth {
+		effectiveReason = models.DisableReasonHealth
+	}
+	tunnel.Enabled = false
+	tunnel.DisableReason = effectiveReason
+	tunnel.StateVersion++
+	p.bumpAdminGenerationLocked(serverID)
+	return nil
+}
+
+// SetSetTunnelEnabledHookForTest sets a hook invoked before SetTunnelEnabled
+// persists a real state transition.
+func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setTunnelEnabledHook = fn
 }
 
 // CompareAndSwapTunnelStatus conditionally updates tunnel status if the current status,
