@@ -1431,7 +1431,15 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 
 func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string {
 	t.Helper()
-	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, "en")
+	return vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
+}
+
+// vpnDiagnosticsHealthScriptLocale is vpnDiagnosticsHealthScript for an
+// explicit locale, so alarm behaviour can be pinned as locale-independent
+// rather than only asserted in English.
+func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions string) string {
+	t.Helper()
+	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, lang)
 	for _, name := range []string{"vpnFormatPeerKey", "vpnRenderForwarderHealth"} {
 		function, err := extractJSFunction(source, "function "+name)
 		if err != nil {
@@ -1440,6 +1448,186 @@ func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string 
 		script += "\n" + function
 	}
 	return script + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions
+}
+
+// vpnBackendDeviceReasonInventory builds the backend-device reason inventory
+// independently of the template, from the serialized Go API schema. Deriving it
+// from vpn.DropCategoryBreakdown means a reason the API publishes but the label
+// map omits (or the reverse) fails the test instead of silently losing the
+// backend KPI alarm for that reason.
+func vpnBackendDeviceReasonInventory(t *testing.T) []string {
+	t.Helper()
+	encoded, err := json.Marshal(vpn.DropCategoryBreakdown{})
+	if err != nil {
+		t.Fatalf("serializing DropCategoryBreakdown: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("parsing serialized DropCategoryBreakdown: %v", err)
+	}
+	var reasons []string
+	for name := range payload {
+		if strings.HasPrefix(name, "client_backend_device_") || strings.HasPrefix(name, "return_backend_device_") {
+			reasons = append(reasons, name)
+		}
+	}
+	sort.Strings(reasons)
+	return reasons
+}
+
+// vpnBackendDeviceReasonsBody is the shared renderer oracle. It supplies each
+// supported backend-device reason on its own, requires the alarm for it, and
+// pins the availability, zero, recovery, unknown and locale contracts around the
+// same KPI. It prints RESULT <json> so the caller can compare locales byte for
+// byte instead of trusting that one locale happened to be exercised.
+func vpnBackendDeviceReasonsBody(t *testing.T) string {
+	t.Helper()
+	inventory, err := json.Marshal(vpnBackendDeviceReasonInventory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `
+const apiReasons = ` + string(inventory) + `;
+const deviceReasons = Object.keys(vpnLossReasonLabels()).filter(key =>
+	key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);
+assert.deepStrictEqual(deviceReasons.slice().sort(), apiReasons,
+	'API-to-label backend-device reason inventory drifted');
+assert.strictEqual(deviceReasons.length, 7, 'backend-device reason count changed');
+assert(deviceReasons.includes('client_backend_device_unattributed'),
+	'client_backend_device_unattributed must drive the backend KPI alarm');
+for (const retired of ['client_backend_device_retired_drops']) {
+	assert(!deviceReasons.includes(retired), 'retired-only reason must stay out of the KPI: ' + retired);
+}
+const kpi = () => document.getElementById('vpn-diag-be-drops');
+const alarm = () => kpi().style.color;
+const observed = [];
+function render(drop_categories, backends) {
+	vpnRenderForwarderHealth(Object.assign({
+		forwarder_available: true,
+		forwarder_queue_capacity: 100,
+		health_assessment: {status: 'HEALTHY', conditions: []}
+	}, backends ? {backends} : {}, {drop_categories}));
+}
+// Every supported backend-device reason alarms on its own positive current rate.
+for (const reason of apiReasons) {
+	render({rates_available: true, reason_rates: {[reason]: 3}}, {total_drops: 17});
+	assert.strictEqual(alarm(), 'var(--danger)', reason + ' current backend loss must alarm');
+	observed.push(reason + '=' + alarm());
+}
+// Nonzero lifetime alone is history, not a current alarm.
+render({rates_available: true, total_drops: 4242}, {total_drops: 4242});
+assert.strictEqual(alarm(), '', 'lifetime backend drops alone must not alarm');
+observed.push('lifetime=' + alarm());
+// A measured zero rate clears a prior alarm while the loss stays visible.
+render({rates_available: true, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 3}}, {total_drops: 4242});
+assert.strictEqual(alarm(), 'var(--danger)', 'fresh current loss must alarm');
+observed.push('fresh=' + alarm());
+render({rates_available: true, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 0}}, {total_drops: 4242});
+assert.strictEqual(alarm(), '', 'measured zero must clear the alarm');
+observed.push('zero=' + alarm());
+// Unavailable rates and an unavailable forwarder both suppress the alarm.
+render({rates_available: false, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 9}}, {total_drops: 4242});
+assert.strictEqual(alarm(), '', 'unavailable rates must not alarm');
+observed.push('unavailable=' + alarm());
+render({}, {total_drops: 4242});
+assert.strictEqual(alarm(), '', 'missing rates_available must not alarm');
+observed.push('missing-flag=' + alarm());
+vpnRenderForwarderHealth({forwarder_available: false});
+assert.strictEqual(alarm(), '', 'unavailable forwarder must clear the alarm');
+observed.push('unavailable-forwarder=' + alarm());
+// Unknown, retired-only and overlapping non-device reasons stay out of the sum.
+render({rates_available: true, total_drops: 7, reason_rates: {
+	client_backend_device_retired_drops: 5, future_reason: 5, return_injection_errors: 5,
+	client_backend_queue_full: 5}}, {total_drops: 7});
+assert.strictEqual(alarm(), '', 'retired, unknown and injection reasons must not alarm');
+observed.push('excluded=' + alarm());
+// Fresh recovery after an unavailable poll alarms again on a live reason.
+render({rates_available: true, reason_rates: {return_backend_device_shutdown: 1}}, {total_drops: 8});
+assert.strictEqual(alarm(), 'var(--danger)', 'recovered poll must alarm on live loss');
+observed.push('recovery=' + alarm());
+console.log('RESULT ' + JSON.stringify(observed));
+`
+}
+
+// TestVPNBackendDeviceKPIAlarmCoverage pins the backend-device KPI against the
+// canonical reason map for every active locale. The defect under test: a second,
+// manually curated KPI subset omitted client_backend_device_unattributed, so the
+// detailed reason table showed the loss while the KPI never alarmed.
+func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := vpnBackendDeviceReasonsBody(t)
+	var baseline string
+	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
+		t.Run(lang, func(t *testing.T) {
+			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			if err != nil {
+				t.Fatalf("backend KPI alarm coverage: %v\n%s", err, out)
+			}
+			idx := strings.Index(string(out), "RESULT ")
+			if idx < 0 {
+				t.Fatalf("renderer produced no alarm report:\n%s", out)
+			}
+			reported := strings.TrimSpace(string(out)[idx+len("RESULT "):])
+			if i == 0 {
+				baseline = reported
+				return
+			}
+			if reported != baseline {
+				t.Fatalf("alarm behaviour differs in %s:\n got %s\nwant %s", lang, reported, baseline)
+			}
+		})
+	}
+}
+
+// TestVPNBackendDeviceKPIAlarmMutations proves the acceptance oracle above is
+// load-bearing in both directions: the alarm coverage must break when
+// unattributed is dropped from the KPI subset, and the API-to-label inventory
+// must break when it is dropped from the canonical map.
+func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := vpnBackendDeviceReasonsBody(t)
+	for _, mutation := range []struct{ name, before, after, failure string }{
+		{
+			name:    "UnattributedDroppedFromKPISubset",
+			before:  "return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0;",
+			after:   "return key !== 'client_backend_device_unattributed' && (key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);",
+			failure: "client_backend_device_unattributed current backend loss must alarm",
+		},
+		{
+			name:    "UnattributedDroppedFromCanonicalMap",
+			before:  "client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',\n            ",
+			after:   "",
+			failure: "API-to-label backend-device reason inventory drifted",
+		},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			original := string(source)
+			if !strings.Contains(original, mutation.before) {
+				t.Fatal("mutation target missing from template")
+			}
+			mutated := strings.Replace(original, mutation.before, mutation.after, 1)
+			script := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), mutation.failure) {
+				t.Fatalf("mutation escaped its acceptance oracle: %v\n%s", err, out)
+			}
+		})
+	}
 }
 
 func TestVPNDiagnosticsCurrentObservations(t *testing.T) {
