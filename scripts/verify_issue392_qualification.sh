@@ -159,7 +159,8 @@ def info(msg):
 # 1. Check required artifact files exist
 required_files = [
     "evidence_manifest.json",
-    "qualification_summary.json"
+    "qualification_summary.json",
+    "upstream_restart_durability.json"
 ]
 if require_non_netstack:
     required_files.append("non_netstack_qualification.json")
@@ -280,26 +281,29 @@ if require_non_netstack:
     info("Non-netstack Linux client qualification: PASS (handshake, tcp echo, udp echo, reconnect resilience, teardown registered)")
 
 # 6b. Upstream Durability Rehearsal Report
-durability_file = os.path.join(artifacts_dir, "upstream_restart_durability.json")
-
-rollback_rehearsal = None
-if os.path.isfile(durability_file):
-    rollback_rehearsal = load_json("upstream_restart_durability.json")
-
-if rollback_rehearsal:
-    if rollback_rehearsal.get("verdict") != "PASS":
-        fail(f"Upstream durability rehearsal verdict is not PASS: {rollback_rehearsal.get('verdict')}")
-    if not rollback_rehearsal.get("config_hash_matched"):
-        fail("Upstream durability rehearsal config hash mismatch across transitions")
-    if not rollback_rehearsal.get("db_integrity_verified"):
-        fail("Upstream durability rehearsal DB integrity check failed")
-    legs = rollback_rehearsal.get("legs", {})
-    if not legs:
-        fail("Upstream durability rehearsal contains no legs")
-    for leg_name, leg in legs.items():
-        if leg.get("status") not in ["PASS", "SKIPPED"]:
-            fail(f"Upstream durability rehearsal leg {leg_name} status is invalid: {leg.get('status')}")
-    info("Upstream durability qualification verified: PASS (restarts with exact same client config)")
+rollback_rehearsal = load_json("upstream_restart_durability.json")
+if not isinstance(rollback_rehearsal, dict) or rollback_rehearsal.get("verdict") != "PASS":
+    fail("Upstream durability rehearsal verdict must be PASS")
+if rollback_rehearsal.get("dry_run") is not False:
+    fail("Upstream durability rehearsal must be live, not dry-run")
+if rollback_rehearsal.get("config_hash_matched") is not True:
+    fail("Upstream durability rehearsal config hash mismatch across transitions")
+if rollback_rehearsal.get("db_integrity_verified") is not True:
+    fail("Upstream durability rehearsal DB integrity check failed")
+checks = rollback_rehearsal.get("db_integrity_checks")
+if type(checks) is not int or checks != 3:
+    fail("Upstream durability rehearsal requires three actual DB integrity checks")
+legs = rollback_rehearsal.get("legs")
+expected_legs = {"leg1_upstream", "leg2_upstream", "leg3_upstream"}
+if not isinstance(legs, dict) or set(legs) != expected_legs:
+    fail("Upstream durability rehearsal requires exactly three upstream legs")
+for leg in legs.values():
+    if not isinstance(leg, dict) or leg.get("engine") != "upstream" or leg.get("status") != "PASS":
+        fail("Upstream durability rehearsal requires live PASS for every upstream leg")
+    for field in ("handshake_verified", "tcp_echo_verified", "udp_echo_verified", "reconnect_resilience_verified"):
+        if leg.get(field) is not True:
+            fail("Upstream durability rehearsal live client evidence is incomplete")
+info("Upstream durability qualification verified: PASS (three live legs and DB integrity checks)")
 
 # 7. Privacy Audit across all JSON artifacts in artifacts_dir
 home_pat = "/" + "home" + "/"

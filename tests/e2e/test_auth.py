@@ -74,7 +74,9 @@ def test_slide_captcha_rejects_replay(
     try:
         assert api_post(admin, "/api/settings/save", settings, csrf_token)["status"] == 200
         guest = guest_context.new_page()
-        with guest.expect_response(lambda response: response.url.endswith("/api/auth/captcha")) as issued:
+        with guest.expect_response(
+            lambda response: response.url.endswith("/api/auth/captcha")
+        ) as issued:
             guest.goto(f"{base_url}/login")
         guest.locator("#captchaHandle:not([disabled])").wait_for()
         challenge = issued.value.json()
@@ -82,6 +84,7 @@ def test_slide_captcha_rejects_replay(
         assert guest.locator("#captchaPiece").get_attribute("src") == challenge["thumb"]
         assert challenge["captcha_id"] and challenge["thumb_y"] >= 0
         token = guest.locator('meta[name="csrf-token"]').get_attribute("content")
+        assert isinstance(token, str) and token, "Guest CSRF token unavailable"
         attempt = {
             "captcha_id": challenge["captcha_id"],
             "point": {"x": challenge["thumb_x"], "y": challenge["thumb_y"]},
@@ -106,8 +109,12 @@ def test_slide_captcha_rejects_replay(
     reason="The puzzle's test-only target is available only with E2E_TESTING enabled",
 )
 def test_slide_captcha_browser_login(
-    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str,
-    admin_user: str, admin_pass: str,
+    authenticated_page: Page,
+    browser: Browser,
+    base_url: str,
+    csrf_token: str,
+    admin_user: str,
+    admin_pass: str,
 ) -> None:
     """Drag the rendered slider, receive a ticket, and log in through the page."""
     admin = authenticated_page
@@ -119,7 +126,9 @@ def test_slide_captcha_browser_login(
     try:
         assert api_post(admin, "/api/settings/save", settings, csrf_token)["status"] == 200
         guest = guest_context.new_page()
-        with guest.expect_response(lambda response: response.url.endswith("/api/auth/captcha")) as issued:
+        with guest.expect_response(
+            lambda response: response.url.endswith("/api/auth/captcha")
+        ) as issued:
             guest.goto(f"{base_url}/login")
         challenge = issued.value.json()
         target_x = int(issued.value.headers["x-e2e-captcha-target-x"])
@@ -146,7 +155,8 @@ def test_slide_captcha_browser_login(
         guest.locator("#username").fill(admin_user)
         guest.locator("#password").fill(admin_pass)
         with guest.expect_response(
-            lambda response: response.url.endswith("/api/auth/login") and response.request.method == "POST"
+            lambda response: response.url.endswith("/api/auth/login")
+            and response.request.method == "POST"
         ) as login:
             guest.locator("#loginBtn").click()
         assert login.value.status == 200, login.value.text()[:200]
@@ -226,3 +236,129 @@ def test_logout(authenticated_page: Page, base_url: str, csrf_token: str) -> Non
     # Verify we're on the login page
     assert "/login" in page.url
     assert page.locator("input#username").is_visible()
+
+
+@pytest.mark.e2e
+def test_change_password_page_and_api(
+    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str
+) -> None:
+    """GET /change-password and POST /api/auth/change-password password update lifecycle."""
+    admin = authenticated_page
+
+    user_name = "e2e_pwd_change_user"
+    old_pass = "OldPassword123!"
+    new_pass = "NewPassword456!"
+
+    add_res = api_post(
+        admin,
+        "/api/users/add",
+        {"username": user_name, "password": old_pass, "role": "user", "enabled": True},
+        csrf_token,
+    )
+    assert add_res["status"] == 200, f"Could not create user: {add_res}"
+
+    users_res = api_get(admin, "/api/users/?size=100")
+    users = users_res if isinstance(users_res, list) else users_res.get("users", [])
+    user_obj = next((u for u in users if u.get("username") == user_name), None)
+    assert user_obj is not None
+    user_id = user_obj["id"]
+
+    user_context = browser.new_context()
+    try:
+        user_page = user_context.new_page()
+        _do_login(user_page, base_url, user_name, old_pass)
+        user_csrf = _get_csrf_cookie(user_page)
+
+        # UI Navigation to /change-password
+        user_page.goto(f"{base_url}/change-password")
+        user_page.wait_for_load_state("networkidle")
+        assert "/change-password" in user_page.url
+        assert user_page.locator("#currentPassword").is_visible()
+        assert user_page.locator("#newPassword").is_visible()
+        assert user_page.locator("#confirmPassword").is_visible()
+        assert user_page.locator("#changePasswordBtn").is_visible()
+
+        # POST /api/auth/change-password
+        change_res = api_post(
+            user_page,
+            "/api/auth/change-password",
+            {
+                "current_password": old_pass,
+                "new_password": new_pass,
+                "confirm_password": new_pass,
+            },
+            user_csrf,
+        )
+        assert change_res["status"] == 200, f"Change password failed: {change_res}"
+        assert change_res["body"].get("status") == "ok"
+
+        # Verify old password cannot log in
+        login_fail_page = user_context.new_page()
+        login_fail_page.goto(f"{base_url}/login")
+        login_csrf = _get_csrf_cookie(login_fail_page)
+        fail_res = login_fail_page.request.post(
+            f"{base_url}/api/auth/login",
+            data={"username": user_name, "password": old_pass, "captcha": None},
+            headers={"X-CSRF-Token": login_csrf, "Content-Type": "application/json"},
+        )
+        assert fail_res.status in (400, 401, 403)
+
+        # Verify new password logs in successfully
+        login_success_page = user_context.new_page()
+        _do_login(login_success_page, base_url, user_name, new_pass)
+        assert "/login" not in login_success_page.url
+
+    finally:
+        user_context.close()
+        api_post(admin, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+@pytest.mark.e2e
+def test_logout_all(
+    authenticated_page: Page, browser: Browser, base_url: str, csrf_token: str
+) -> None:
+    """POST /api/auth/logout-all -> invalidates all active sessions for user."""
+    admin = authenticated_page
+    user_name = "e2e_logout_all_user"
+    user_pass = "TestPassword123!"
+
+    add_res = api_post(
+        admin,
+        "/api/users/add",
+        {"username": user_name, "password": user_pass, "role": "user", "enabled": True},
+        csrf_token,
+    )
+    assert add_res["status"] == 200, f"Could not create user: {add_res}"
+
+    users_res = api_get(admin, "/api/users/?size=100")
+    users = users_res if isinstance(users_res, list) else users_res.get("users", [])
+    user_obj = next((u for u in users if u.get("username") == user_name), None)
+    assert user_obj is not None
+    user_id = user_obj["id"]
+
+    user_context = browser.new_context()
+    try:
+        user_page = user_context.new_page()
+        _do_login(user_page, base_url, user_name, user_pass)
+        user_csrf = _get_csrf_cookie(user_page)
+
+        # Invalidate all sessions via logout-all
+        logout_all_res = api_post(
+            user_page,
+            "/api/auth/logout-all",
+            {},
+            user_csrf,
+        )
+        assert logout_all_res["status"] == 200, f"Logout-all failed: {logout_all_res}"
+        assert logout_all_res["body"].get("status") == "ok"
+
+        # Subsequent authenticated request should be rejected (session invalidated)
+        subsequent = user_page.request.get(
+            f"{base_url}/api/my/connections",
+            headers={"X-CSRF-Token": user_csrf},
+        )
+        assert subsequent.status in (401, 403)
+
+    finally:
+        user_context.close()
+        api_post(admin, f"/api/users/{user_id}/delete", {}, csrf_token)
