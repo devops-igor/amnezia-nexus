@@ -1,7 +1,6 @@
 package vpn
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -366,21 +365,6 @@ func TestBackendLossRetirementAndClosedReturnPathPreserveLifetime(t *testing.T) 
 	svc2.populateOperationalDiagnostics(&after)
 	if before.DropCategories.ReturnQueueFull != 1 || after.DropCategories.ReturnQueueFull != 1 || after.DropCategories.TotalDropRatePps != 0 {
 		t.Fatalf("closed owner discarded counted losses: before=%+v after=%+v", before.DropCategories, after.DropCategories)
-	}
-}
-
-func TestBackendEnableFailureStagePreservesTypedCauses(t *testing.T) {
-	svc, err := NewVPNService(setupTestDB(t), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = svc.EnableBackend(t.Context(), 999)
-	if !errors.Is(err, ErrServerNotFound) || BackendEnableStage(err) != "load_server" {
-		t.Fatalf("stage discarded sentinel cause: %v / %s", err, BackendEnableStage(err))
-	}
-	cancelled := backendEnableFailure("register_data_peer", fmt.Errorf("provider: %w", context.DeadlineExceeded))
-	if !errors.Is(cancelled, context.DeadlineExceeded) || BackendEnableStage(cancelled) != "register_data_peer" {
-		t.Fatal("provider cause/stage lost")
 	}
 }
 

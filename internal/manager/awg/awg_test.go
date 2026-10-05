@@ -1194,7 +1194,6 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 	mockClient := newMockAWGSSHClient()
 
 	var copiedTarget string
-	var stripCmdExecuted string
 	var syncCmdExecuted string
 
 	mockClient.sudoCmdHandler = func(cmd string) (string, string, int, error) {
@@ -1207,10 +1206,6 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 		if strings.Contains(cmd, "docker cp") && strings.Contains(cmd, "_amnz_edit_config") {
 			copiedTarget = cmd
 			return "", "", 0, nil
-		}
-		if strings.Contains(cmd, "awg-quick") && strings.Contains(cmd, "strip") {
-			stripCmdExecuted = cmd
-			return "OK", "", 0, nil
 		}
 		if strings.Contains(cmd, "syncconf") {
 			syncCmdExecuted = cmd
@@ -1245,11 +1240,8 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 	if !strings.Contains(copiedTarget, "/etc/amnezia/amneziawg/awg0.conf") {
 		t.Errorf("expected config to be copied to /etc/amnezia/amneziawg/awg0.conf, got: %s", copiedTarget)
 	}
-	if !strings.Contains(stripCmdExecuted, "/etc/amnezia/amneziawg/awg0.conf") {
-		t.Errorf("expected strip to target /etc/amnezia/amneziawg/awg0.conf, got: %s", stripCmdExecuted)
-	}
-	if !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/.awg-strip-") {
-		t.Errorf("expected syncconf to consume the stripped config beside it, got: %s", syncCmdExecuted)
+	if !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/awg0.conf") {
+		t.Errorf("expected syncconf to target /etc/amnezia/amneziawg/awg0.conf, got: %s", syncCmdExecuted)
 	}
 }
 

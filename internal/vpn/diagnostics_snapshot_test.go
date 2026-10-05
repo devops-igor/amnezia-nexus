@@ -10,11 +10,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 )
 
+func newDiagnosticsLifecycleService(t *testing.T, name, host, publicKey string) (*Service, int64) {
+	t.Helper()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, err := db.CreateServer(t.Context(), &models.Server{
+		Name: name, Host: host,
+		Protocols: map[string]any{"awg": map[string]any{
+			"installed": true, "port": 51820, "public_key": publicKey,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	return svc, serverID
+}
+
 func TestDiagnosticsConcurrentBackendLifecycle(t *testing.T) {
-	svc, _, serverID := newStateVersionRaceService(t, "diagnostics-lifecycle", "192.0.2.20", "diagnostics-key")
+	svc, serverID := newDiagnosticsLifecycleService(t, "diagnostics-lifecycle", "192.0.2.20", "diagnostics-key")
 	if err := svc.EnableBackend(t.Context(), serverID); err != nil {
 		t.Fatal(err)
 	}

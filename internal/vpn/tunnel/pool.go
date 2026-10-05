@@ -25,17 +25,14 @@ var (
 
 // Pool manages the in-process AWG tunnels connected to backend VPN servers.
 type Pool struct {
-	mu                     sync.RWMutex
-	db                     *database.DB
-	tunnelsByServerID      map[int64]*models.BackendTunnel
-	tunnelsByID            map[int64]*models.BackendTunnel
-	tunnelsByIfName        map[string]*models.BackendTunnel
-	adminGenerations       map[int64]int64
-	closed                 bool
-	setTunnelEndpointHook  func(ctx context.Context, tunnelID int64, endpoint string) error
-	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
-	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
-	generateKeypairFn      func() (string, string, error)
+	mu                    sync.RWMutex
+	db                    *database.DB
+	tunnelsByServerID     map[int64]*models.BackendTunnel
+	tunnelsByID           map[int64]*models.BackendTunnel
+	tunnelsByIfName       map[string]*models.BackendTunnel
+	closed                bool
+	setTunnelEndpointHook func(ctx context.Context, tunnelID int64, endpoint string) error
+	generateKeypairFn     func() (string, string, error)
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -77,7 +74,6 @@ func NewPool(db *database.DB) *Pool {
 		tunnelsByServerID: make(map[int64]*models.BackendTunnel),
 		tunnelsByID:       make(map[int64]*models.BackendTunnel),
 		tunnelsByIfName:   make(map[string]*models.BackendTunnel),
-		adminGenerations:  make(map[int64]int64),
 	}
 }
 
@@ -117,13 +113,6 @@ func (p *Pool) SetGenerateKeyPairForTest(fn func() (string, string, error)) {
 	p.generateKeypairFn = fn
 }
 
-func (p *Pool) bumpAdminGenerationLocked(serverID int64) {
-	if p.adminGenerations == nil {
-		p.adminGenerations = make(map[int64]int64)
-	}
-	p.adminGenerations[serverID]++
-}
-
 // SyncFromDB loads all backend tunnels from the database into the memory pool.
 func (p *Pool) SyncFromDB(ctx context.Context) error {
 	if p.db == nil {
@@ -137,10 +126,6 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if p.adminGenerations == nil {
-		p.adminGenerations = make(map[int64]int64)
-	}
 
 	for i := range tunnels {
 		t := tunnels[i]
@@ -163,7 +148,6 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		p.tunnelsByServerID[t.ServerID] = &t
 		p.tunnelsByID[t.ID] = &t
 		p.tunnelsByIfName[t.InterfaceName] = &t
-		p.adminGenerations[t.ServerID] = t.StateVersion
 	}
 
 	return nil
@@ -275,7 +259,6 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 		existing.ProbePrivateKey = candProbePrivKey
 		if changed {
 			existing.StateVersion = candStateVersion
-			p.bumpAdminGenerationLocked(serverID)
 		}
 		copyTunnel := *existing
 		return &copyTunnel, nil
@@ -337,7 +320,6 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 	p.tunnelsByServerID[serverID] = tunnel
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[ifName] = tunnel
-	p.bumpAdminGenerationLocked(serverID)
 
 	copyTunnel := *tunnel
 	return &copyTunnel, nil
@@ -362,7 +344,6 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	delete(p.tunnelsByServerID, serverID)
 	delete(p.tunnelsByID, tunnel.ID)
 	delete(p.tunnelsByIfName, tunnel.InterfaceName)
-	p.bumpAdminGenerationLocked(serverID)
 
 	return nil
 }
@@ -564,10 +545,8 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 	if !ok {
 		return ErrTunnelNotFound
 	}
-	if p.setTunnelEnabledHook != nil {
-		if err := p.setTunnelEnabledHook(ctx, serverID, enabled, disableReason); err != nil {
-			return err
-		}
+	if tunnel.Enabled == enabled && tunnel.DisableReason == disableReason {
+		return nil
 	}
 
 	effectiveReason := disableReason
@@ -583,127 +562,10 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 		}
 	}
 
-	// Explicit intent must reach durable storage even when live state already
-	// matches: emergency quarantine can have changed memory after a failed write.
-	if tunnel.Enabled == enabled && tunnel.DisableReason == effectiveReason {
-		p.bumpAdminGenerationLocked(serverID)
-		return nil
-	}
-
 	tunnel.Enabled = enabled
 	tunnel.DisableReason = effectiveReason
 	tunnel.StateVersion++
-	p.bumpAdminGenerationLocked(serverID)
 	return nil
-}
-
-// CommitBackendEnable commits an administrative backend enable as ONE bounded
-// durable backend-row update, and only then updates live pool state
-// (issue #424 / PR #429, R1-3).
-//
-// It replaces the SetTunnelEnabled + (legacy-only) SetTunnelStatusWithReason
-// pair that the enable commit boundary used to issue as two separate fallible
-// writes. Because there is now exactly ONE fallible durable write, the caller
-// can run it BEFORE any destructive publication step: a failure leaves the
-// previously serving device completely untouched.
-//
-// Semantics deliberately preserved from the two replaced calls:
-//   - the setTunnelEnabledHook still runs before persistence, so the
-//     quarantine-retry fix (explicit intent must reach durable storage even when
-//     live state already matches) is not regressed;
-//   - a health-disabled provenance survives an administrative toggle;
-//   - administrative intent always advances AdminGeneration, while
-//     StateVersion advances only when observable state actually changed;
-//   - legacy rows whose administrative disable lived in runtime status get that
-//     status normalized to connecting with latency cleared and a fresh health
-//     check, in the SAME statement.
-//
-// A returned error therefore means the durable row was not advanced, except
-// where the database boundary itself reported an ambiguous completion; that
-// case is resolved by a bounded durable readback inside the DB call before it
-// returns (see database.CommitBackendTunnelEnable).
-func (p *Pool) CommitBackendEnable(ctx context.Context, serverID int64, normalizeHealth bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	tunnel, ok := p.tunnelsByServerID[serverID]
-	if !ok {
-		return ErrTunnelNotFound
-	}
-	if p.setTunnelEnabledHook != nil {
-		if err := p.setTunnelEnabledHook(ctx, serverID, true, models.DisableReasonNone); err != nil {
-			return err
-		}
-	}
-
-	// Runtime health provenance belongs to the health subsystem. An
-	// administrative toggle must not erase a health-disabled state.
-	effectiveReason := models.DisableReasonNone
-	if tunnel.DisableReason == models.DisableReasonHealth {
-		effectiveReason = models.DisableReasonHealth
-	}
-
-	// Legacy rows encoded administrative disable in runtime status. Once
-	// enabled is authoritative, that old status has no trustworthy health
-	// meaning, so make it unknown/connecting and require a fresh probe.
-	status := ""
-	if normalizeHealth {
-		status = models.TunnelStatusConnecting
-	}
-
-	if p.db != nil {
-		if err := p.db.CommitBackendTunnelEnable(ctx, tunnel.ID, true, effectiveReason, status, normalizeHealth); err != nil {
-			return fmt.Errorf("failed to persist backend administrative state: %w", err)
-		}
-	}
-
-	stateChanged := tunnel.Enabled != true || tunnel.DisableReason != effectiveReason
-	tunnel.Enabled = true
-	tunnel.DisableReason = effectiveReason
-	if normalizeHealth {
-		tunnel.Status = status
-		tunnel.LatencyMS = 0
-		now := time.Now().UTC()
-		tunnel.LastHealthCheck = &now
-		stateChanged = true
-	}
-	if stateChanged {
-		tunnel.StateVersion++
-	}
-	p.bumpAdminGenerationLocked(serverID)
-	return nil
-}
-
-// ForceDisableTunnelInMemory is an emergency fail-closed operation for
-// compensation paths where durable administrative-state persistence has
-// already failed. It prevents the live process from continuing to route traffic
-// through the backend while preserving the persistence error for the caller to
-// report. Normal administrative changes must use SetTunnelEnabled.
-func (p *Pool) ForceDisableTunnelInMemory(serverID int64, disableReason string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	tunnel, ok := p.tunnelsByServerID[serverID]
-	if !ok {
-		return ErrTunnelNotFound
-	}
-	effectiveReason := disableReason
-	if tunnel.DisableReason == models.DisableReasonHealth {
-		effectiveReason = models.DisableReasonHealth
-	}
-	tunnel.Enabled = false
-	tunnel.DisableReason = effectiveReason
-	tunnel.StateVersion++
-	p.bumpAdminGenerationLocked(serverID)
-	return nil
-}
-
-// SetSetTunnelEnabledHookForTest sets a hook invoked before SetTunnelEnabled
-// persists a real state transition.
-func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.setTunnelEnabledHook = fn
 }
 
 // CompareAndSwapTunnelStatus conditionally updates tunnel status if the current status,
@@ -1010,21 +872,7 @@ func (p *Pool) SetTunnelEndpoint(ctx context.Context, tunnelID int64, endpoint s
 
 	tunnel.StateVersion++
 	tunnel.Endpoint = endpoint
-	p.bumpAdminGenerationLocked(tunnel.ServerID)
 	return nil
-}
-
-// AdminGeneration returns the current administrative generation token for the server.
-// Health-only updates (probes, status, latency) do not advance this token; only
-// administrative intent changes (SetTunnelEnabled), endpoint updates, and tunnel
-// identity replacements advance it.
-func (p *Pool) AdminGeneration(serverID int64) int64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.adminGenerations == nil {
-		return 0
-	}
-	return p.adminGenerations[serverID]
 }
 
 // SetSetTunnelEndpointHookForTest sets a hook invoked at the start of SetTunnelEndpoint for testing.
@@ -1032,60 +880,6 @@ func (p *Pool) SetSetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.setTunnelEndpointHook = fn
-}
-
-// SetTunnelPublicKey updates the public key of a backend tunnel in memory and in the database,
-// advancing StateVersion and AdminGeneration so in-flight health probes and older administrative
-// operations targeting the previous identity are fenced.
-func (p *Pool) SetTunnelPublicKey(ctx context.Context, tunnelID int64, publicKey string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.setTunnelPublicKeyHook != nil {
-		if err := p.setTunnelPublicKeyHook(ctx, tunnelID, publicKey); err != nil {
-			return err
-		}
-	}
-
-	if p.closed {
-		return ErrPoolClosed
-	}
-
-	tunnel, ok := p.tunnelsByID[tunnelID]
-	if !ok {
-		return ErrTunnelNotFound
-	}
-
-	if tunnel.PublicKey == publicKey {
-		return nil
-	}
-
-	nextVersion := tunnel.StateVersion + 1
-	if tunnel.StateVersion <= 0 {
-		nextVersion = 2
-	}
-
-	if p.db != nil {
-		updates := map[string]any{
-			"public_key":    publicKey,
-			"state_version": nextVersion,
-		}
-		if err := p.db.UpdateBackendTunnel(ctx, tunnel.ID, updates); err != nil {
-			return fmt.Errorf("failed to persist backend tunnel public key: %w", err)
-		}
-	}
-
-	tunnel.StateVersion = nextVersion
-	tunnel.PublicKey = publicKey
-	p.bumpAdminGenerationLocked(tunnel.ServerID)
-	return nil
-}
-
-// SetSetTunnelPublicKeyHookForTest sets a hook invoked at the start of SetTunnelPublicKey for testing.
-func (p *Pool) SetSetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tunnelID int64, publicKey string) error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.setTunnelPublicKeyHook = fn
 }
 
 // Close tears down all tunnels and cleans up resources.

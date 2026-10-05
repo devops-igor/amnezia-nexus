@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -269,120 +268,6 @@ func (d *DB) UpdateBackendTunnelEnabled(ctx context.Context, id int64, enabled b
 	// cleanup path, which may intentionally operate on an in-memory tunnel
 	// whose DB row has already disappeared.
 	return nil
-}
-
-// CommitBackendTunnelEnable performs the ONE bounded durable backend-row update
-// that commits an administrative backend enable (issue #424 / PR #429, R1-3).
-//
-// It folds what used to be two separate statements — UpdateBackendTunnelEnabled
-// (administrative intent) and, for legacy rows that encoded an administrative
-// disable in runtime status, UpdateBackendTunnelStatusWithReason (health
-// normalization) — into a single UPDATE, so the enable commit has exactly ONE
-// fallible durable write point. It must therefore run BEFORE any destructive
-// publication step.
-//
-// Fields are the same allowlisted backend_tunnels columns the two replaced
-// statements wrote; no new column and no migration is involved.
-//
-//   - enabled/disable_reason carry administrative intent. A health-disabled
-//     provenance (DisableReasonHealth) is the caller's responsibility to
-//     preserve and is rejected here only when it is the administrative reason.
-//   - status, disable_reason, latency_ms and last_health_check are rewritten
-//     ONLY when normalizeHealth is set, which the caller does exclusively for a
-//     legacy row whose administrative disable was stored in runtime status.
-//     Administrative disable is refused here as well, so runtime status can
-//     never be used to express it.
-//   - state_version advances by exactly one, matching the single logical commit.
-//
-// A missing row is a successful no-op, matching UpdateBackendTunnelEnabled's
-// documented contract.
-//
-// AMBIGUOUS COMPLETION. A returned driver error is not by itself proof that
-// nothing was written (a lost connection or a canceled context can surface
-// after the statement committed). Rather than let a caller conclude that the
-// previous serving state is untouched on the strength of an error alone, the
-// pre-write state_version is captured inside the same writeMu critical section
-// and, on error, the row is read back ONCE. The write is only reported as
-// having landed when state_version advanced by exactly one AND every field the
-// commit owns matches its target; any other outcome is reported as a failure.
-// The readback is bounded (one indexed SELECT) and never retried.
-func (d *DB) CommitBackendTunnelEnable(ctx context.Context, id int64, enabled bool, disableReason, status string, normalizeHealth bool) error {
-	if disableReason == models.DisableReasonAdmin {
-		return errors.New("administrative backend state must be changed with UpdateBackendTunnelEnabled")
-	}
-	if normalizeHealth && status == "" {
-		return errors.New("backend tunnel health normalization requires a status")
-	}
-	if normalizeHealth && status == models.TunnelStatusDisabled {
-		return errors.New("administrative backend state must not be expressed as runtime status")
-	}
-
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
-	preVersion, found, err := d.backendTunnelStateVersion(ctx, id)
-	if err != nil {
-		return err
-	}
-	if !found {
-		// Match UpdateBackendTunnelEnabled: an already-missing row is a
-		// successful no-op, not a failure.
-		return nil
-	}
-
-	query := `UPDATE backend_tunnels
-		SET enabled = ?, disable_reason = ?, state_version = state_version + 1
-		WHERE id = ?`
-	args := []any{enabled, disableReason, id}
-	if normalizeHealth {
-		query = `UPDATE backend_tunnels
-			SET enabled = ?, disable_reason = ?, status = ?, latency_ms = 0, last_health_check = ?,
-			    state_version = state_version + 1
-			WHERE id = ?`
-		args = []any{enabled, disableReason, status, time.Now().Format(time.RFC3339), id}
-	}
-
-	if _, execErr := d.sqlDB.ExecContext(ctx, query, args...); execErr != nil {
-		if d.backendTunnelEnableLanded(ctx, id, preVersion, enabled, disableReason, status, normalizeHealth) {
-			slog.Warn("backend tunnel enable commit reported an error but the durable row carries the intended state",
-				"tunnel_id", id, "error", execErr)
-			return nil
-		}
-		return fmt.Errorf("failed to commit backend tunnel administrative enable: %w", execErr)
-	}
-	return nil
-}
-
-// backendTunnelStateVersion reads the current state_version of a backend tunnel
-// row. It reports found=false for a missing row.
-func (d *DB) backendTunnelStateVersion(ctx context.Context, id int64) (int64, bool, error) {
-	var version int64
-	err := d.sqlDB.QueryRowContext(ctx, `SELECT state_version FROM backend_tunnels WHERE id = ?`, id).Scan(&version)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("failed to read backend tunnel %d state version: %w", id, err)
-	}
-	return version, true, nil
-}
-
-// backendTunnelEnableLanded performs the single bounded durable readback that
-// decides whether a commit whose statement reported an error actually landed.
-// Every field the commit owns must match its target and state_version must have
-// advanced by exactly one from preVersion.
-func (d *DB) backendTunnelEnableLanded(ctx context.Context, id, preVersion int64, enabled bool, disableReason, status string, normalizeHealth bool) bool {
-	row, err := d.GetBackendTunnel(ctx, id)
-	if err != nil || row == nil {
-		return false
-	}
-	if row.StateVersion != preVersion+1 || row.Enabled != enabled || row.DisableReason != disableReason {
-		return false
-	}
-	if normalizeHealth && (row.Status != status || row.LatencyMS != 0) {
-		return false
-	}
-	return true
 }
 
 // ResetEnabledBackendTunnelHealthForStartup clears persisted runtime-health
