@@ -41,18 +41,25 @@ type QueuePressureStats struct {
 	QueueFullDropRate     float64 `json:"queue_full_drop_rate"`
 }
 
-// RateTracker computes rates and exponential moving averages over time.
-type RateTracker struct {
-	mu        sync.Mutex
-	available bool
+// rateTrackerSampleInterval is the minimum spacing between two accepted Rate
+// samples. It matches the 200ms floor the diagnostics trackers use.
+const rateTrackerSampleInterval = GenerationSampleMinInterval
 
-	lastSampleTime time.Time
-	lastRxBytes    int64
-	lastTxBytes    int64
-	lastRxPackets  uint64
-	lastTxPackets  uint64
-	lastTotalDrops uint64
-	lastQueueDrops uint64
+// RateTracker computes rates and exponential moving averages over time.
+//
+// Its baselines are generation-aware and monotonic (GenerationSampler): a
+// stale lower observation reports zero and never rewinds a baseline, and
+// Reset(generation) on a forwarder restart re-primes instead of inferring the
+// restart from counters that moved backwards.
+type RateTracker struct {
+	mu      sync.Mutex
+	sampler *GenerationSampler
+	// gen is the generation subsequent samples are tagged with. It is
+	// adopted from Reset so a forwarder restart's samples land in the new
+	// generation instead of being rejected as stale forever (issue #429
+	// review blocker 1).
+	gen       Generation
+	available bool
 
 	currentRxBps   float64
 	currentTxBps   float64
@@ -69,10 +76,35 @@ type RateTracker struct {
 
 // NewRateTracker constructs a new RateTracker with unprimed counter baselines.
 func NewRateTracker() *RateTracker {
-	return &RateTracker{}
+	return &RateTracker{sampler: NewGenerationSampler(6)}
+}
+
+// Reset starts a new generation: baselines are cleared so the next sample
+// re-primes, and measured rates/availability return to unknown. A generation
+// lower than the accepted one is ignored.
+func (rt *RateTracker) Reset(gen Generation) {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if gen > rt.gen {
+		rt.gen = gen
+	}
+	rt.sampler.Reset(rt.gen)
+	rt.available = false
+	rt.currentRxBps, rt.currentTxBps = 0, 0
+	rt.currentRxPps, rt.currentTxPps = 0, 0
+	rt.currentDropPps, rt.queueDropRate = 0, 0
+	rt.ewmaRxBps5m, rt.ewmaTxBps5m = 0, 0
+	rt.ewmaRxBps1h, rt.ewmaTxBps1h = 0, 0
 }
 
 // Sample updates rate tracking using the latest cumulative counters.
+//
+// rxBytes/txBytes are signed lifetimes. A byte counter that moved backwards
+// (generation restart) reports zero for that direction and keeps its accepted
+// baseline, so the pre-window value cannot be replayed later.
 func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, txPackets, totalDrops, queueDrops uint64) {
 	if rt == nil {
 		return
@@ -80,57 +112,24 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	if rt.lastSampleTime.IsZero() {
-		rt.lastSampleTime = now
-		rt.lastRxBytes = rxBytes
-		rt.lastTxBytes = txBytes
-		rt.lastRxPackets = rxPackets
-		rt.lastTxPackets = txPackets
-		rt.lastTotalDrops = totalDrops
-		rt.lastQueueDrops = queueDrops
-
+	// Sign-extended into the unsigned domain a byte counter cannot wrap into:
+	// a restarting counter only ever travels DOWN from 2^64-k, which compares
+	// lower than any real cumulative total, so the monotonic guard reports it
+	// as zero delta instead of a two-complement overflow burst.
+	rxU := uint64(rxBytes)
+	txU := uint64(txBytes)
+	deltas, elapsed, accepted := rt.sampler.Sample(rt.gen, now, rateTrackerSampleInterval,
+		[]uint64{rxU, txU, rxPackets, txPackets, totalDrops, queueDrops})
+	if !accepted {
 		return
 	}
 
-	elapsed := now.Sub(rt.lastSampleTime).Seconds()
-	if elapsed < 0.2 { // throttle sub-second sampling calls
-		return
-	}
-	rt.lastSampleTime = now
-
-	// Calculate deltas safely
-	deltaRxBytes := rxBytes - rt.lastRxBytes
-	if deltaRxBytes < 0 {
-		deltaRxBytes = 0
-	}
-	deltaTxBytes := txBytes - rt.lastTxBytes
-	if deltaTxBytes < 0 {
-		deltaTxBytes = 0
-	}
-
-	deltaRxPackets := uint64(0)
-	if rxPackets >= rt.lastRxPackets {
-		deltaRxPackets = rxPackets - rt.lastRxPackets
-	}
-	deltaTxPackets := uint64(0)
-	if txPackets >= rt.lastTxPackets {
-		deltaTxPackets = txPackets - rt.lastTxPackets
-	}
-	deltaDrops := uint64(0)
-	if totalDrops >= rt.lastTotalDrops {
-		deltaDrops = totalDrops - rt.lastTotalDrops
-	}
-	deltaQueueDrops := uint64(0)
-	if queueDrops >= rt.lastQueueDrops {
-		deltaQueueDrops = queueDrops - rt.lastQueueDrops
-	}
-
-	rt.lastRxBytes = rxBytes
-	rt.lastTxBytes = txBytes
-	rt.lastRxPackets = rxPackets
-	rt.lastTxPackets = txPackets
-	rt.lastTotalDrops = totalDrops
-	rt.lastQueueDrops = queueDrops
+	deltaRxBytes := deltas[0]
+	deltaTxBytes := deltas[1]
+	deltaRxPackets := deltas[2]
+	deltaTxPackets := deltas[3]
+	deltaDrops := deltas[4]
+	deltaQueueDrops := deltas[5]
 
 	rt.available = true
 	rt.currentRxBps = float64(deltaRxBytes*8) / elapsed
@@ -154,7 +153,6 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	}
 	rt.ewmaRxBps1h = alpha1h*rt.currentRxBps + (1.0-alpha1h)*rt.ewmaRxBps1h
 	rt.ewmaTxBps1h = alpha1h*rt.currentTxBps + (1.0-alpha1h)*rt.ewmaTxBps1h
-
 }
 
 // Snapshot returns point-in-time traffic rates.

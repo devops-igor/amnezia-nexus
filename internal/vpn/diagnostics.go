@@ -80,6 +80,14 @@ type HealthCondition struct {
 	Category string `json:"category"` // e.g. "queue_pressure", "latency", "drops", "routing", "peer_sync", "backend"
 	Severity string `json:"severity"` // "WARNING", "DEGRADED", "CRITICAL"
 	Message  string `json:"message"`
+	// MessageKey optionally names the canonical translation key for the
+	// condition, so the web renderer can show a localized sentence instead of
+	// the English server message. It is additive and omitempty: every
+	// condition ever serialized before it existed still decodes byte-for-byte,
+	// and a client that does not know the key falls back to Message. The
+	// existing conditions predate it and deliberately do not set it —
+	// retrofitting keys onto them is a separate, string-by-string decision.
+	MessageKey string `json:"message_key,omitempty"`
 }
 
 // ForwarderHealthAssessment contains the overall rule-based health diagnosis.
@@ -1408,11 +1416,35 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 					"decrypted replies are being refused at the client ingress hop", rate),
 			})
 		}
-		if rate := degradedReasonRatePps(drops, claimDrops); rate > th.ClientQueueActiveDropRatePPS {
+		// The queue-full gate reads its OWN reason's rate, not the degraded
+		// reason sum: client_backend_device_unattributed now shares the
+		// degradedLossReasons map (and the routine-population subtraction) but
+		// has its own condition below, so summing here would report one loss
+		// twice under two different messages.
+		if rate := drops.ReasonRates[reasonClientBackendQueueFull]; rate > th.ClientQueueActiveDropRatePPS {
 			conds = append(conds, HealthCondition{
 				Category: "drops",
 				Severity: "DEGRADED",
 				Message:  fmt.Sprintf("Active client queue drops: %.1f drops/sec due to full backend queues", rate),
+			})
+		}
+		// Unattributed backend-device loss is active: drops ARE happening on a
+		// device, but that device cannot report the direction x reason
+		// breakdown, so nothing can say which traffic or why. Reported by
+		// reason (DEGRADED, review item 2) instead of folding into the generic
+		// routine aggregate, which the review called not actionable. The same
+		// RatesAvailable gate as above applies: an unmeasured window is not an
+		// incident. A device WITH detailed attribution publishes a measured
+		// zero for this reason and a non-zero rate under a device-specific
+		// key, so this condition stays off in both of its firing-exclusion
+		// cases (attribution available; drops quiet).
+		if rate := drops.ReasonRates[reasonClientBackendDeviceUnattributed]; rate > th.BackendDeviceUnattributedActiveDropRatePPS {
+			conds = append(conds, HealthCondition{
+				Category:   "drops",
+				Severity:   "DEGRADED",
+				MessageKey: vpnDiagConditionBackendDeviceUnattributed,
+				Message: fmt.Sprintf("Backend device drops are active but detailed per-direction attribution is unavailable: "+
+					"%.1f drops/sec", rate),
 			})
 		}
 	}
@@ -1856,14 +1888,38 @@ func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
 	s.primeHistoryFromDrops(now, fwd, inputs.collectDropCategories())
 }
 
+// historyPrimedForCurrentGenerationLocked reports whether the history
+// baselines are already primed FOR THE CURRENT generation. It requires
+// s.diagRatesMu. The priming state is keyed to s.diagGeneration (issue #429
+// review blocker 1): after a lifecycle reset in Service.Start the generation
+// no longer matches, so priming is re-done instead of the sticky flag
+// suppressing history for the process lifetime.
+func (s *Service) historyPrimedForCurrentGenerationLocked() bool {
+	return s.historyPrimed && s.historyPrimedGen == s.diagGeneration
+}
+
+// markHistoryPrimedForCurrentGenerationLocked primes the history baselines and
+// records the generation the priming was performed for. It requires
+// s.diagRatesMu. The forwarder's own history baselines are primed by the
+// caller AFTER the diagRatesMu release, since they carry independent locks.
+func (s *Service) markHistoryPrimedForCurrentGenerationLocked(now time.Time, drops *DropCategoryBreakdown) {
+	s.primeHistoryRatesLocked(now, drops)
+	s.historyPrimedGen = s.diagGeneration
+	s.historyPrimed = true
+}
+
 func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, drops DropCategoryBreakdown) {
 	s.diagRatesMu.Lock()
-	if s.historyPrimed {
+	// historyPrimed is NOT a sticky flag: it is the per-generation priming
+	// state (accepted gen == current gen && baselines exist), so a new
+	// generation from Service.Start re-primes here automatically instead of
+	// the call returning early forever (issue #429 review blocker 1, Stop/
+	// Start epoch reuse).
+	if s.historyPrimedForCurrentGenerationLocked() {
 		s.diagRatesMu.Unlock()
 		return
 	}
-	s.historyPrimed = true
-	s.primeHistoryRatesLocked(now, &drops)
+	s.markHistoryPrimedForCurrentGenerationLocked(now, &drops)
 	s.diagRatesMu.Unlock()
 
 	if fwd != nil {
@@ -1884,7 +1940,7 @@ func (s *Service) sampleRollingHistory() {
 	}
 
 	s.diagRatesMu.Lock()
-	isPrimed := s.historyPrimed
+	isPrimed := s.historyPrimedForCurrentGenerationLocked()
 	s.diagRatesMu.Unlock()
 
 	if !isPrimed {
@@ -1964,20 +2020,23 @@ func (s *Service) sampleRollingHistory() {
 
 // diagRatesTracker provides thread-safe sampling and independent rate computation
 // for device write errors, client drops, return drops, and overall dataplane drops.
+//
+// Its baseline bookkeeping delegates to the ONE reusable generation-aware
+// window primitive (generationWindow, issue #429 review blocker 1): within a
+// generation an accepted baseline is monotonic — a stale LOWER observation
+// reports zero deltas and never replaces the baseline — and a lifecycle reset
+// re-primes instead of inferring a restart from counters that moved backwards.
 type diagRatesTracker struct {
 	mu sync.Mutex
-	// primed records that the first sample has been taken. It is deliberately
-	// NOT derived from lastSampleTime being zero: a constructor that pre-seeds
-	// the timestamp makes the priming branch below unreachable, which silently
-	// leaves every counter baseline at zero and turns lifetime totals into
-	// bogus per-second rates on the first window. Mirrors diagDeltaTracker
-	// (issue #424 round 8, finding 2).
-	primed          bool
-	lastSampleTime  time.Time
-	lastClientDrops uint64
-	lastReturnDrops uint64
-	lastTotalDrops  uint64
-	lastWriteErrors uint64
+	// window is generation-aware; priming semantics are unchanged (issue
+	// #424 round 8, finding 2): the first sample captures lastSampleTime AND
+	// every counter baseline and reports zero rates. primed stays a tracker
+	// field on purpose — the round-8 audit pins an unprimed constructor via
+	// tk.primed, and it must never be derived from lastSampleTime being zero.
+	primed         bool
+	window         generationWindow[float64]
+	gen            diagGeneration
+	lastSampleTime time.Time
 
 	clientDropRate float64
 	returnDropRate float64
@@ -1994,6 +2053,10 @@ func newDiagRatesTracker() *diagRatesTracker {
 	return &diagRatesTracker{}
 }
 
+// Sample records the cumulative drop counters and reports the per-second rates
+// of the newly accepted window. Only observations >= the accepted baseline
+// advance it; an older/lower observation reports zero and leaves the baseline
+// unchanged (issue #429 review blocker 1).
 func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
 	if t == nil {
 		return 0, 0, 0, 0
@@ -2002,56 +2065,62 @@ func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, total
 	defer t.mu.Unlock()
 
 	if !t.primed {
+		// First sample: prime time AND every counter baseline, report zero.
 		t.primed = true
+		t.window.sample(t.gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
 		t.lastSampleTime = now
-		t.lastClientDrops = clientDrops
-		t.lastReturnDrops = returnDrops
-		t.lastTotalDrops = totalDrops
-		t.lastWriteErrors = writeErrors
 		return 0, 0, 0, 0
 	}
-
-	elapsed := now.Sub(t.lastSampleTime).Seconds()
-	if elapsed < 0.2 { // throttle sub-second sampling calls
+	if accepted := t.window.sample(t.gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors}); !accepted {
 		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
 	}
+	deltas, elapsed, _ := t.window.last()
 
-	deltaClient := float64(0)
-	if clientDrops >= t.lastClientDrops {
-		deltaClient = float64(clientDrops - t.lastClientDrops)
-	}
-	deltaReturn := float64(0)
-	if returnDrops >= t.lastReturnDrops {
-		deltaReturn = float64(returnDrops - t.lastReturnDrops)
-	}
-	deltaWriteErrors := float64(0)
-	if writeErrors >= t.lastWriteErrors {
-		deltaWriteErrors = float64(writeErrors - t.lastWriteErrors)
-	}
-
-	t.clientDropRate = deltaClient / elapsed
-	t.returnDropRate = deltaReturn / elapsed
+	t.clientDropRate = deltas[0] / elapsed
+	t.returnDropRate = deltas[1] / elapsed
 	t.totalDropRate = t.clientDropRate + t.returnDropRate
-	t.writeErrorRate = deltaWriteErrors / elapsed
-
+	// deltas[3] is the writeErrors counter; deltas[2] is totalDrops, which
+	// the aggregate rate derives from client+return instead (pre-conversion
+	// semantics, caught by TestDiagGeneration_LifecycleResetsReprime).
+	t.writeErrorRate = deltas[3] / elapsed
 	t.lastSampleTime = now
-	t.lastClientDrops = clientDrops
-	t.lastReturnDrops = returnDrops
-	t.lastTotalDrops = totalDrops
-	t.lastWriteErrors = writeErrors
 
 	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+}
+
+// reset re-primes the tracker for a new diagnostics generation: subsequent
+// samples are tagged with gen, and the window re-primes on its next call
+// (issue #429 review blocker 1). A generation lower than the accepted one is
+// ignored.
+func (t *diagRatesTracker) reset(gen diagGeneration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if gen > t.gen {
+		t.gen = gen
+	}
+	t.primed = false
+	t.window.reset(t.gen)
+	t.lastSampleTime = time.Time{}
+	t.clientDropRate, t.returnDropRate = 0, 0
+	t.totalDropRate, t.writeErrorRate = 0, 0
 }
 
 // diagDeltaTracker measures the increase of a single lifetime counter over
 // the last sampling window, so a cumulative failure counter can stay visible as
 // history without permanently degrading current health (issue #424 round 2,
 // finding 5).
+//
+// Its baseline bookkeeping delegates to the ONE reusable generation-aware
+// window primitive (generationWindow, issue #429 review blocker 1): within a
+// generation the accepted baseline is monotonic — a stale LOWER observation
+// reports zero and never rewinds the baseline — and Reset re-primes on an
+// explicit new generation instead of inferring a restart from current<previous.
 type diagDeltaTracker struct {
-	mu            sync.Mutex
-	lastValue     uint64
-	primed        bool
-	lastSampleAt  time.Time
+	window        generationWindow[uint64]
+	gen           diagGeneration
 	delta         uint64
 	windowSeconds float64
 }
@@ -2066,39 +2135,34 @@ type deltaSnapshot struct {
 // accepted sample. The first sample only primes the baseline and reports zero,
 // so a counter that has been rising since process start is never reported as a
 // fresh incident. Resampling sooner than 200ms reuses the previous delta rather
-// than dividing by a near-zero window. A counter that decreased (engine
-// restart) is treated as no new loss this window.
+// than dividing by a near-zero window. A stale LOWER observation reports no
+// new loss AND leaves the accepted baseline unchanged, so later activity up to
+// the previously accepted value can never be replayed as a fresh delta
+// (issue #429 review blocker 1).
 func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapshot {
 	if t == nil {
 		return deltaSnapshot{}
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if !t.primed {
-		t.primed = true
-		t.lastValue = cumulative
-		t.lastSampleAt = now
-		t.delta = 0
-		t.windowSeconds = 0
-		return deltaSnapshot{}
-	}
-
-	elapsed := now.Sub(t.lastSampleAt).Seconds()
-	if elapsed < 0.2 {
+	if accepted := t.window.sample(t.gen, now, []uint64{cumulative}); !accepted {
 		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
 	}
-
-	if cumulative >= t.lastValue {
-		t.delta = cumulative - t.lastValue
-	} else {
-		t.delta = 0
-	}
+	deltas, elapsed, _ := t.window.last()
+	t.delta = deltas[0]
 	t.windowSeconds = elapsed
-	t.lastValue = cumulative
-	t.lastSampleAt = now
-
 	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+}
+
+// reset re-primes the tracker for a new diagnostics generation: subsequent
+// samples are tagged with gen, and the window re-primes on its next call
+// (issue #429 review blocker 1). A generation lower than the accepted one is
+// ignored.
+func (t *diagDeltaTracker) reset(gen diagGeneration) {
+	if gen > t.gen {
+		t.gen = gen
+	}
+	t.window.reset(t.gen)
+	t.delta = 0
+	t.windowSeconds = 0
 }
 
 // diagDeltaTrackers groups the per-counter windowed delta trackers. Each has
@@ -2131,6 +2195,18 @@ func (t *diagDeltaTrackers) sampleSyncFailures(now time.Time, cumulative uint64)
 
 func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint64) deltaSnapshot {
 	return t.enqueueFailures.Sample(now, cumulative)
+}
+
+// reset re-primes every sub-tracker — ownership mismatch (both directions),
+// peer-sync failures, enqueue failures, write stalls and the per-reason drop
+// rates — for a new diagnostics generation (issue #429 review blocker 1).
+func (t *diagDeltaTrackers) reset(gen diagGeneration) {
+	t.ownershipMismatch.reset(gen)
+	t.clientOwnershipMismatch.reset(gen)
+	t.syncFailures.reset(gen)
+	t.enqueueFailures.reset(gen)
+	t.writeStalls.reset(gen)
+	t.reasons.reset(gen)
 }
 
 func (s *Service) collectDropCategories() DropCategoryBreakdown {

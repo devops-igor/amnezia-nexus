@@ -1,7 +1,6 @@
 package vpn
 
 import (
-	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -58,7 +57,23 @@ const (
 	reasonReturnInjectionErrors   = "return_injection_errors"
 	reasonClientBackendQueueFull  = "client_backend_queue_full"
 	reasonReturnQueueFull         = "return_queue_full"
+	// reasonClientBackendDeviceUnattributed is the directionless loss key for
+	// a backend device that does not implement backendDeviceStatsProvider: the
+	// loader can measure the loss but attribute neither direction nor reason.
+	// Its DEGRADED condition is the operator-facing "drops are active but
+	// detailed attribution is unavailable" signal (issue #424 review round 10,
+	// item 2).
+	reasonClientBackendDeviceUnattributed = "client_backend_device_unattributed"
 )
+
+// vpnDiagConditionBackendDeviceUnattributed is the translation key of the
+// unattributed-attribution condition's message in web/translations/*.json.
+// It lives here, next to the reason keys, so the Go emitter and the five
+// locale files cannot drift apart silently: the key the evaluator publishes
+// in HealthCondition.MessageKey is exactly the key every locale must define
+// (pinned by TestVPNDiagnosticsLocalizationDictionaries on the web side and
+// TestBackendDeviceUnattributedHealthCondition* here).
+const vpnDiagConditionBackendDeviceUnattributed = "vpn_diag_condition_backend_device_unattributed"
 
 var criticalLossReasons = map[string]lossClaim{
 	reasonClientOwnershipMismatch: claimRouting,
@@ -104,8 +119,15 @@ func criticalReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64
 //     not claimed as a reason-keyed drop here.
 //   - client_backend_device_queue_full / return_backend_device_queue_full:
 //     device-level capacity drops attributed to the general routine population.
+//   - client_backend_device_unattributed: owned by THIS evaluator
+//     (claimDrops), as of the R5-refinement. Living in this map is what
+//     subtracts the directionless device loss from the routine population —
+//     one-loss-one-condition is preserved — and what lets the evaluator
+//     report "attribution unavailable" by reason instead of folding the loss
+//     back into the generic aggregate the review called not actionable.
 var degradedLossReasons = map[string]lossClaim{
-	reasonClientBackendQueueFull: claimDrops,
+	reasonClientBackendQueueFull:          claimDrops,
+	reasonClientBackendDeviceUnattributed: claimDrops,
 }
 
 // degradedReasonRatePps sums the current-window rate of every degraded reason
@@ -146,39 +168,53 @@ func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
 	}
 }
 
+// dropReasonRatesTracker samples per-reason drop totals against independent
+// per-reason generation-aware windows (issue #429 review blocker 1): within a
+// generation an accepted per-reason baseline is monotonic — a stale LOWER
+// total reports a zero rate and never replaces the baseline — and a lifecycle
+// reset re-primes instead of inferring a restart from totals that moved
+// backwards.
 type dropReasonRatesTracker struct {
 	mu        sync.Mutex
-	lastAt    time.Time
-	baseline  map[string]uint64
-	rates     map[string]float64
+	windows   *diagCounterWindows
+	gen       diagGeneration
 	available bool
 }
 
 func (t *dropReasonRatesTracker) sample(now time.Time, totals map[string]uint64) (map[string]float64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.lastAt.IsZero() {
-		t.lastAt = now
-		t.baseline = totals
-		t.rates = make(map[string]float64, len(totals))
-		for key := range totals {
-			t.rates[key] = 0
-		}
+	if t.windows == nil {
+		t.windows = newDiagCounterWindows()
 	}
-	elapsed := now.Sub(t.lastAt).Seconds()
-	if elapsed >= 0.2 {
-		for key, total := range totals {
-			var delta uint64
-			if total >= t.baseline[key] {
-				delta = total - t.baseline[key]
-			}
-			t.rates[key] = float64(delta) / elapsed
-		}
-		t.lastAt = now
-		t.baseline = totals
+	if accepted := t.windows.sample(t.gen, now, totals); accepted {
 		t.available = true
 	}
-	return maps.Clone(t.rates), t.available
+	rates := make(map[string]float64, len(totals))
+	for key := range totals {
+		if rate, ok := t.windows.rate(key); ok {
+			rates[key] = rate
+		} else {
+			rates[key] = 0
+		}
+	}
+	return rates, t.available
+}
+
+// reset re-primes the per-reason windows for a new diagnostics generation:
+// subsequent samples are tagged with gen, and the windows re-prime on their
+// next call (issue #429 review blocker 1). A generation lower than the
+// accepted one is ignored.
+func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if gen > t.gen {
+		t.gen = gen
+	}
+	if t.windows != nil {
+		t.windows.reset(t.gen)
+	}
+	t.available = false
 }
 
 // MaxHistoryBackends caps the fleet context within each existing fixed ring.

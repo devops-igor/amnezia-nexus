@@ -187,6 +187,21 @@ type HealthThresholds struct {
 	// this failure is an incident".
 	ClientQueueActiveDropRatePPS float64
 
+	// BackendDeviceUnattributedActiveDropRatePPS gates DEGRADED on
+	// backend-device loss that is active RIGHT NOW on a device that cannot
+	// report the direction x reason breakdown (no backendDeviceStatsProvider,
+	// so the loader publishes it under the directionless
+	// client_backend_device_unattributed key). Compared with > against the
+	// current-window DropCategoryBreakdown.ReasonRates[reasonClientBackendDeviceUnattributed],
+	// so any non-zero measured rate fires and a zero rate never does —
+	// including the measured zero a device WITH detailed attribution
+	// publishes, which is what keeps this condition off when attribution is
+	// available.
+	//
+	// The value is 0, matching the `> 0` rate idiom of
+	// ClientQueueActiveDropRatePPS above.
+	BackendDeviceUnattributedActiveDropRatePPS float64
+
 	// --- Peer synchronization (peerSyncDivergenceCondition) ---
 
 	// PeerSyncDivergenceDegradedAge gates DEGRADED on a persisted
@@ -271,6 +286,9 @@ func defaultHealthThresholds() HealthThresholds {
 		InjectionFailureCriticalRatePPS: 0,
 		// `> 0`, matching the queue-drop rate idiom for client backend queues.
 		ClientQueueActiveDropRatePPS: 0,
+		// `> 0`, matching the client backend queue rate idiom for unattributed
+		// backend-device loss.
+		BackendDeviceUnattributedActiveDropRatePPS: 0,
 
 		PeerSyncDivergenceDegradedAge: 60 * time.Second,
 		PeerSyncDivergenceWarningAge:  30 * time.Second,

@@ -1711,7 +1711,11 @@
                     row.appendChild(sevBadge);
 
                     const msgSpan = document.createElement('span');
-                    msgSpan.textContent = cond.message || '';
+                    // A condition that carries a canonical translation key is
+                    // rendered localized; the serialized English message is the
+                    // fallback when the key does not resolve in this locale.
+                    msgSpan.textContent = cond.message_key && _(cond.message_key) !== cond.message_key
+                        ? _(cond.message_key) : (cond.message || '');
                     row.appendChild(msgSpan);
 
                     problemListElem.appendChild(row);

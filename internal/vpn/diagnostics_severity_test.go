@@ -816,8 +816,12 @@ func TestB3DegradedReasonKeysArePublishedReasons(t *testing.T) {
 			t.Errorf("degraded reason %q has unexpected owner %d", key, claim)
 		}
 	}
+	// client_backend_device_unattributed joined this evaluator with the
+	// R5-refinement: it has its own DEGRADED condition (reported by reason),
+	// and living in this pin is what keeps one-loss-one-condition enforced —
+	// the same loss may never also surface in the routine aggregate.
 	wantOwners := map[string][]string{
-		"drops": {reasonClientBackendQueueFull},
+		"drops": {reasonClientBackendDeviceUnattributed, reasonClientBackendQueueFull},
 	}
 	for evaluator, want := range wantOwners {
 		got := append([]string(nil), owners[evaluator]...)

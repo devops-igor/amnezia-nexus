@@ -638,5 +638,6 @@
   "vpn_diag_loss_return_queue_full": "返回队列已满",
   "vpn_diag_loss_return_packet_too_large": "返回数据包过大",
   "vpn_diag_loss_return_backend_device_queue_full": "返回后端设备队列已满",
-  "vpn_diag_loss_return_backend_device_shutdown": "返回后端设备关闭"
+  "vpn_diag_loss_return_backend_device_shutdown": "返回后端设备关闭",
+  "vpn_diag_condition_backend_device_unattributed": "后端设备丢包处于活动状态，但无法获得按方向的详细归因"
 }

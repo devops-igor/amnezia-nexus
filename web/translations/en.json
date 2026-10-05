@@ -638,5 +638,6 @@
   "vpn_diag_loss_return_queue_full": "return queue full",
   "vpn_diag_loss_return_packet_too_large": "return packet too large",
   "vpn_diag_loss_return_backend_device_queue_full": "return backend device queue full",
-  "vpn_diag_loss_return_backend_device_shutdown": "return backend device shutdown"
+  "vpn_diag_loss_return_backend_device_shutdown": "return backend device shutdown",
+  "vpn_diag_condition_backend_device_unattributed": "Backend device drops are active but detailed per-direction attribution is unavailable"
 }

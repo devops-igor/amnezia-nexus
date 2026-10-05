@@ -1630,6 +1630,97 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 	}
 }
 
+// vpnBackendDeviceConditionBody is the shared renderer oracle for the
+// unattributed-attribution health condition. It renders the no-stats-device
+// fixture (aggregate-only loss with the canonical message_key), requires the
+// backend KPI alarm AND the condition row translated from the active locale
+// dictionary, and pins both fallbacks: an unresolvable message_key renders the
+// serialized message, a condition without one keeps the legacy behaviour. It
+// prints RESULT <json> of locale-independent booleans so the caller can prove
+// across locales that no locale silently falls back to the wire message.
+func vpnBackendDeviceConditionBody(t *testing.T) string {
+	t.Helper()
+	return `
+const CONDITION_KEY = 'vpn_diag_condition_backend_device_unattributed';
+assert(Object.prototype.hasOwnProperty.call(translations, CONDITION_KEY) && translations[CONDITION_KEY],
+	'locale dictionary must ship ' + CONDITION_KEY);
+const observed = [];
+function render(conditions) {
+	vpnRenderForwarderHealth({
+		forwarder_available: true,
+		forwarder_queue_capacity: 100,
+		health_assessment: {status: 'DEGRADED', conditions},
+		drop_categories: {
+			rates_available: true,
+			total_drops: 9,
+			reason_rates: {client_backend_device_unattributed: 3}
+		}
+	});
+}
+const condition = {
+	category: 'drops',
+	severity: 'DEGRADED',
+	message_key: CONDITION_KEY,
+	message: 'Backend device drops are active but detailed per-direction attribution is unavailable: 3.0 drops/sec'
+};
+render([condition]);
+observed.push('alarm=' + (document.getElementById('vpn-diag-be-drops').style.color === 'var(--danger)'),
+	'no aggregate-only loss must still alarm the backend KPI');
+const row = document.getElementById('vpn-fwd-problem-list').children[0];
+assert.strictEqual(row.children[0].textContent, _('vpn_forwarder_degraded'), 'condition severity badge');
+assert.strictEqual(row.children[1].textContent, _(CONDITION_KEY),
+	'condition text must come from the locale dictionary, not the serialized message');
+observed.push('severity_from_dict=' + (row.children[0].textContent === _('vpn_forwarder_degraded')),
+	'message_from_dict=' + (row.children[1].textContent === _(CONDITION_KEY)));
+// An unresolvable message_key falls back to the serialized message.
+render([{category: 'drops', severity: 'DEGRADED', message_key: 'vpn_diag_condition_future_key', message: 'Server fallback < & >'}]);
+observed.push('fallback=' + (document.getElementById('vpn-fwd-problem-list').children[0].children[1].textContent === 'Server fallback < & >'));
+// A condition without message_key keeps the legacy rendering.
+render([{category: 'drops', severity: 'DEGRADED', message: 'Legacy server text'}]);
+observed.push('legacy=' + (document.getElementById('vpn-fwd-problem-list').children[0].children[1].textContent === 'Legacy server text'));
+console.log('RESULT ' + JSON.stringify(observed));
+`
+}
+
+// TestVPNBackendDeviceUnattributedConditionRendering is the renderer half of
+// the R5-refinement acceptance: for every active locale, a no-stats device
+// with active loss shows the backend KPI alarm AND the condition row rendered
+// from that locale's own dictionary entry via message_key — never the
+// serialized English message.
+func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := vpnBackendDeviceConditionBody(t)
+	var baseline string
+	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
+		t.Run(lang, func(t *testing.T) {
+			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			if err != nil {
+				t.Fatalf("unattributed condition rendering: %v\n%s", err, out)
+			}
+			idx := strings.Index(string(out), "RESULT ")
+			if idx < 0 {
+				t.Fatalf("renderer produced no condition report:\n%s", out)
+			}
+			reported := strings.TrimSpace(string(out)[idx+len("RESULT "):])
+			if i == 0 {
+				baseline = reported
+				return
+			}
+			if reported != baseline {
+				t.Fatalf("condition rendering differs in %s:\n got %s\nwant %s", lang, reported, baseline)
+			}
+		})
+	}
+}
+
 func TestVPNDiagnosticsCurrentObservations(t *testing.T) {
 	node, err := findNodeBinary()
 	if err != nil {

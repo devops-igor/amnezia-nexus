@@ -275,18 +275,27 @@ type Forwarder struct {
 	// queue -> client device leg, e.g. "no transport keys for peer", used to
 	// vanish silently). CAS-based on a monotonic deadline, same pattern as
 	// the endpoint listener's rejectLogUntil; safe under concurrent pumps.
-	writeErrLogUntil        atomic.Int64
-	writeMetricsMu          sync.Mutex
-	writeMetrics            DeviceWriteTelemetry
-	writeHistogram          writeDurationHistogram
-	writeLatencies          latencyReservoir
-	writesInFlight          map[*sessionRoute]time.Time
-	rateTracker             *RateTracker
-	historyRateTracker      *RateTracker
-	aggregateQueueOccupancy int               // guarded by aggregateQueueMu
-	aggregateQueueCapacity  int               // guarded by aggregateQueueMu
-	queueDwell              queueDwellTracker // guarded by aggregateQueueMu
-	aggregateQueueHighWater atomic.Uint64
+	writeErrLogUntil   atomic.Int64
+	writeMetricsMu     sync.Mutex
+	writeMetrics       DeviceWriteTelemetry
+	writeHistogram     writeDurationHistogram
+	writeLatencies     latencyReservoir
+	writesInFlight     map[*sessionRoute]time.Time
+	rateTracker        *RateTracker
+	historyRateTracker *RateTracker
+	// genEpoch is the forwarder's generation counter (issue #429 review
+	// blocker 1). It advances only in Start, so every Start after Stop is an
+	// explicit new generation: the rate trackers and the per-backend traffic
+	// history baselines are reset/re-primed instead of a restart being
+	// inferred from counters that moved backwards.
+	genEpoch atomic.Uint64
+	// backendTrafficGeneration is the generation the per-backend traffic
+	// HISTORY baselines are tagged with. It mirrors genEpoch.
+	backendTrafficGeneration atomic.Uint64
+	aggregateQueueOccupancy  int               // guarded by aggregateQueueMu
+	aggregateQueueCapacity   int               // guarded by aggregateQueueMu
+	queueDwell               queueDwellTracker // guarded by aggregateQueueMu
+	aggregateQueueHighWater  atomic.Uint64
 	// aggregateQueueMu serializes managed queue operations so aggregate
 	// high-water is sampled at the same linearization point as enqueue/dequeue.
 	aggregateQueueMu sync.Mutex
@@ -405,7 +414,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 			log.Printf("[vpn/forwarder] invalid portal subnet CIDR %q: srcIP rebind self-heal disabled", portalSubnetCIDR)
 		}
 	}
-	return &Forwarder{
+	fwd := &Forwarder{
 		accountant:         accountant,
 		portalSubnet:       portalSubnet,
 		routesByPeer:       make(map[string]*sessionRoute),
@@ -422,7 +431,13 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		rateTracker:        NewRateTracker(),
 		historyRateTracker: NewRateTracker(),
 		stopCh:             make(chan struct{}),
-	}, nil
+	}
+	// The constructor-time incarnation is generation 0 and is already live:
+	// adopt its baselines explicitly so a reused Forwarder value always has
+	// exactly one accepted generation (issue #429 review blocker 1).
+	fwd.backendTrafficGeneration.Store(0)
+	fwd.resetRateTrackersForGeneration(0)
+	return fwd, nil
 }
 
 // RegisterSession registers a peer session route with unlimited bandwidth.
@@ -1573,11 +1588,53 @@ func (f *Forwarder) ReturnRouteOwner() string {
 	return "none"
 }
 
-// Start marks the forwarder active.
+// currentGeneration returns the forwarder's accepted generation.
+func (f *Forwarder) currentGeneration() Generation {
+	return Generation(f.genEpoch.Load())
+}
+
+// resetRateTrackersForGeneration adopts gen as the accepted generation for
+// the aggregate and history rate trackers. Called from the constructor with
+// the initial generation and from Start with the bumped one.
+func (f *Forwarder) resetRateTrackersForGeneration(gen Generation) {
+	f.rateTracker.Reset(gen)
+	f.historyRateTracker.Reset(gen)
+}
+
+// resetBackendTrafficHistoryForGeneration re-primes every current per-backend
+// traffic history baseline so a restarted forwarder measures only post-restart
+// traffic into its history windows. The caller must hold at least f.mu.RLock
+// (Start calls it with f.mu exclusively released; history writes re-take
+// c.mu per counter).
+func (f *Forwarder) resetBackendTrafficHistoryForGeneration(gen Generation, now time.Time) {
+	for _, counters := range f.backendTraffic {
+		counters.resetHistoryForGeneration(gen, now)
+	}
+}
+
+// Start marks the forwarder active and establishes a new diagnostics
+// generation: every cumulative telemetry baseline owned here is reset and
+// re-primes on its next sample (issue #429 review blocker 1).
 func (f *Forwarder) Start(ctx context.Context) {
+	// Every Start after Stop is an explicit new generation. Bumping before
+	// any sample can be tagged with it guarantees stale in-flight samples
+	// from the previous generation are ignored rather than mixed in. The
+	// per-backend history baselines re-prime for backends that exist now;
+	// backends registered later prime lazily in their first history read.
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.running = true
+	f.genEpoch.Add(1)
+	f.backendTrafficGeneration.Store(f.genEpoch.Load())
+	gen := Generation(f.genEpoch.Load())
+	f.resetRateTrackersForGeneration(gen)
+	f.mu.Unlock()
+
+	// The baseline re-prime reads live counters (c.mu per counter), so it
+	// must not run under f.mu: RouteBackendToClient holds f.mu while
+	// sampling backend traffic, and blocking it here risks lock-order
+	// inversion.
+	f.resetBackendTrafficHistoryForGeneration(gen, time.Now())
+
 	if f.accountant != nil {
 		f.accountant.Start(ctx)
 	}

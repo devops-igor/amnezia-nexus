@@ -638,5 +638,6 @@
   "vpn_diag_loss_return_queue_full": "صف بازگشت پر است",
   "vpn_diag_loss_return_packet_too_large": "بسته بازگشت بیش از حد بزرگ",
   "vpn_diag_loss_return_backend_device_queue_full": "صف دستگاه سرور پشتیبان بازگشت پر است",
-  "vpn_diag_loss_return_backend_device_shutdown": "خاموشی دستگاه سرور پشتیبان بازگشت"
+  "vpn_diag_loss_return_backend_device_shutdown": "خاموشی دستگاه سرور پشتیبان بازگشت",
+  "vpn_diag_condition_backend_device_unattributed": "حذف دستگاه سرور پشتیبان فعال است، اما انتساب دقیق جهت‌به‌جهت در دسترس نیست"
 }

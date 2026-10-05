@@ -243,7 +243,24 @@ type Service struct {
 	diagRates          *diagRatesTracker
 	historyDiagRates   *diagRatesTracker
 	historyDropReasons dropReasonRatesTracker
-	historyPrimed      bool
+	// diagGeneration is the diagnostics generation (issue #429 review
+	// blocker 1). It advances ONLY in Start, so every Start after Stop is an
+	// explicit new generation: every cumulative diagnostics baseline below is
+	// reset/re-primed instead of a restart being inferred from counters that
+	// moved backwards.
+	diagGeneration diagGeneration
+	// historyPrimedGen is the generation the history priming state was
+	// recorded for. historyPrimed is true only while historyPrimedGen equals
+	// the current generation, so a generation bump in Start automatically
+	// un-primes history and the next history read re-primes into the new
+	// generation (issue #429 review blocker 1). Both are guarded by
+	// diagRatesMu.
+	historyPrimedGen diagGeneration
+	// historyPrimed records that the history baselines captured a first
+	// sample for historyPrimedGen. It is deliberately NOT derived from any
+	// timestamp being zero (issue #424 round 8, finding 2) and deliberately
+	// NOT a sticky flag (issue #429 review blocker 1).
+	historyPrimed bool
 	// diagDeltas converts cumulative lifetime failure counters into windowed
 	// deltas so a recovered incident stops pinning current health (issue #424
 	// round 2, finding 5). Its zero value is usable.
@@ -1158,9 +1175,47 @@ func (s *Service) Start(ctx context.Context) error {
 	// Safety net for residual counter drift; gauge-only semantics - it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
+
+	// Issue #429 review blocker 1: every Start after Stop is an explicit new
+	// diagnostics generation. Bump the generation and re-prime every
+	// cumulative diagnostics tracker under diagRatesMu BEFORE
+	// startRollingHistory() primes the history baselines, so all sampling
+	// after this point is tagged with the new generation and computed only
+	// from post-start observations — a restart can never be inferred from
+	// counters that moved backwards. (The forwarder's trackers are already
+	// reset inside Forwarder.Start above.)
+	s.resetDiagnosticsGeneration()
+
 	s.startRollingHistory()
 
 	return nil
+}
+
+// resetDiagnosticsGeneration starts a new diagnostics generation and re-primes
+// every cumulative diagnostics tracker for it (issue #429 review blocker 1).
+// Called from Service.Start after the forwarder has started; startRollingHistory
+// then primes the history baselines into the new generation.
+func (s *Service) resetDiagnosticsGeneration() {
+	s.diagRatesMu.Lock()
+	defer s.diagRatesMu.Unlock()
+	s.diagGeneration++
+	gen := s.diagGeneration
+	if s.diagRates != nil {
+		s.diagRates.reset(gen)
+	}
+	if s.historyDiagRates != nil {
+		s.historyDiagRates.reset(gen)
+	}
+	s.historyDropReasons.reset(gen)
+	s.diagDeltas.reset(gen)
+	// historyPrimed is keyed to the generation (historyPrimedGen): bumping
+	// diagGeneration invalidates it by itself, so the next history read
+	// re-primes into the new generation. The prime call here captures the
+	// FIRST post-start observation as the new baseline.
+	s.primeHistoryRatesLocked(time.Now(), func() *DropCategoryBreakdown {
+		drops := s.captureDiagnosticsInputs().collectDropCategories()
+		return &drops
+	}())
 }
 
 func (s *Service) cleanupEngineStartupFailure() {

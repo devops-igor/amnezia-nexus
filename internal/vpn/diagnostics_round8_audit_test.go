@@ -13,11 +13,17 @@ import (
 func TestWindowedTrackersAudit_NoneHasADeadPrimingBranch(t *testing.T) {
 	t.Run("diagDeltaTracker", func(t *testing.T) {
 		var d diagDeltaTracker
-		if d.primed {
+		// Priming state lives in the generation-aware window (issue #429
+		// review blocker 1); the audit property is unchanged: a zero-value
+		// tracker is unprimed, the first sample primes and reports zero.
+		if d.window.primed {
 			t.Fatal("zero-value diagDeltaTracker must be unprimed")
 		}
 		if snap := d.Sample(time.Now(), 5_000); snap.delta != 0 {
 			t.Fatalf("first sample must prime and report zero delta, got %d", snap.delta)
+		}
+		if !d.window.primed {
+			t.Fatal("first sample must prime the window")
 		}
 		if snap := d.Sample(time.Now().Add(5*time.Second), 5_000); snap.delta != 0 {
 			t.Fatalf("unchanged counter must report zero delta, got %d", snap.delta)

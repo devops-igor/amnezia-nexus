@@ -36,11 +36,13 @@ func TestDiagRatesTracker_FirstSamplePrimesBaselinesNotLifetimeTotals(t *testing
 	}
 
 	// The baselines must have been captured, otherwise step 3 cannot hold.
+	// They live in the generation-aware window since issue #429 review
+	// blocker 1 (layout: client, return, total, writeErrors).
 	tk.mu.Lock()
-	captured := tk.lastClientDrops == historyClientDrops &&
-		tk.lastReturnDrops == historyReturnDrops &&
-		tk.lastTotalDrops == historyTotalDrops &&
-		tk.lastWriteErrors == historyWriteErrors &&
+	captured := tk.window.baseline[0] == historyClientDrops &&
+		tk.window.baseline[1] == historyReturnDrops &&
+		tk.window.baseline[2] == historyTotalDrops &&
+		tk.window.baseline[3] == historyWriteErrors &&
 		tk.lastSampleTime.Equal(base)
 	tk.mu.Unlock()
 	if !captured {
