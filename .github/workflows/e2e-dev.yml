@@ -102,7 +102,7 @@ jobs:
           python3 -m venv ~/e2e-venv
           source ~/e2e-venv/bin/activate
           pip install --quiet -r tests/e2e/requirements.txt
-          python -m pytest tests/test_vpn_diagnostics_oracle.py tests/test_e2e_assertions.py tests/test_e2e_service_logs.py tests/test_e2e_config_oracle.py tests/test_restart_durability.py -p no:cacheprovider
+          python -m pytest tests/test_vpn_diagnostics_oracle.py tests/test_e2e_assertions.py tests/test_e2e_service_logs.py tests/test_e2e_config_oracle.py tests/test_restart_durability.py tests/test_verify_issue392_verifier.py -p no:cacheprovider
           playwright install --with-deps chromium
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh

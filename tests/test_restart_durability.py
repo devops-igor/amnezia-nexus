@@ -173,6 +173,7 @@ def test_restart_dry_run_cannot_claim_integrity(tmp_path: Path) -> None:
 
 def qualification_fixture(tmp_path: Path) -> dict[str, Any]:
     """Write the smallest valid full-qualification reports consumed by the real verifier."""
+    run_mode = "unaccelerated_10_rekey"
     live = {
         "status": "PASS",
         "handshake_verified": True,
@@ -205,14 +206,23 @@ def qualification_fixture(tmp_path: Path) -> dict[str, Any]:
         "non_netstack_qualification.json": {**live, "teardown_requested": True},
         "upstream_restart_durability.json": restart,
     }
-    soak = {
+    base_soak = {
         "tcp_continuity_passed": True,
         "idle_phase_passed": True,
         "completed_rekeys": 10,
-        "sequenced_udp_stats": {"loss_rate_percent": 0.0},
     }
     for side in ("reference", "subject"):
-        reports[f"soak_report_{side}_fixture.json"] = soak
+        reports[f"soak_report_{side}_{run_mode}.json"] = {
+            **base_soak,
+            "server_type": side,
+            "run_mode": run_mode,
+            "sequenced_udp_stats": {
+                "packets_sent": 20000,
+                "packets_received": 19990,
+                "packets_lost": 10,
+                "loss_rate_percent": 0.05,
+            },
+        }
     for name, report in reports.items():
         (tmp_path / name).write_text(json.dumps(report))
     return restart

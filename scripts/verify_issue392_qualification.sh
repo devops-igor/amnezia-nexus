@@ -125,6 +125,33 @@ if [[ ! -d "$ARTIFACTS_DIR" ]]; then
     exit 1
 fi
 
+# Output must not collide with a consumed input report. Only the reports the verifier
+# actually consumes are candidates; a previously published summary is not an input.
+OUTPUT_ABS="$(cd "$(dirname "$OUTPUT_FILE")" 2>/dev/null && pwd)/$(basename "$OUTPUT_FILE")" || {
+    echo "ERROR: Output summary directory does not exist." >&2
+    exit 1
+}
+consumed_names="evidence_manifest.json qualification_summary.json \
+upstream_restart_durability.json non_netstack_qualification.json"
+shopt -s nullglob
+consumed_paths=("$ARTIFACTS_DIR"/soak_report_reference_*.json "$ARTIFACTS_DIR"/soak_report_subject_*.json)
+shopt -u nullglob
+for input_name in $consumed_names; do
+    consumed_paths+=("$ARTIFACTS_DIR/$input_name")
+done
+for input_path in "${consumed_paths[@]}"; do
+    [[ -f "$input_path" ]] || continue
+    input_abs="$(cd "$(dirname "$input_path")" && pwd)/$(basename "$input_path")"
+    if [[ "$input_abs" == "$OUTPUT_ABS" ]]; then
+        echo "ERROR: Output summary would overwrite a consumed input report: $(basename "$input_path")" >&2
+        exit 1
+    fi
+done
+
+# Invalidate the requested output before any report is consumed, so a failed rerun
+# can never leave a stale PASS summary behind.
+rm -f -- "$OUTPUT_FILE"
+
 echo "===================================================================="
 echo " Amnezia Nexus - Issue #392 Qualification Evidence Aggregator"
 echo "===================================================================="
@@ -140,8 +167,10 @@ echo "===================================================================="
 python3 - "$ARTIFACTS_DIR" "$MODE" "$REQUIRE_NON_NETSTACK" "$OUTPUT_FILE" "$EXPECTED_COMMIT" << 'PYEOF'
 import sys
 import json
+import math
 import os
 import re
+import tempfile
 
 artifacts_dir = sys.argv[1]
 mode = sys.argv[2]
@@ -220,21 +249,108 @@ if summary_report.get("privacy_violations_count", -1) != 0:
 info(f"Differential test suites verified: {passed_str}")
 
 # 5. Soak Reports Verification
-ref_soak_file = None
-sub_soak_file = None
-for f in os.listdir(artifacts_dir):
-    if f.startswith("soak_report_reference_") and f.endswith(".json"):
-        ref_soak_file = f
-    elif f.startswith("soak_report_subject_") and f.endswith(".json"):
-        sub_soak_file = f
+# Fail-closed: exactly one reference and one subject soak report must exist, each
+# must be a JSON object that declares the requested side and run mode. Stale or
+# duplicate reports are never resolved by arbitrary last-match selection.
+EXPECTED_RUN_MODE = {"bounded": "bounded_verification", "full": "unaccelerated_10_rekey"}
+expected_run_mode = EXPECTED_RUN_MODE[mode]
+UDP_LOSS_BUDGET_PERCENT = 0.05
 
-if not ref_soak_file:
-    fail("Missing reference soak report (soak_report_reference_*.json)")
-if not sub_soak_file:
-    fail("Missing subject soak report (soak_report_subject_*.json)")
+def load_soak_report(name):
+    """Load one soak report as a JSON object; diagnostics never echo report content."""
+    path = os.path.join(artifacts_dir, name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+    except (OSError, ValueError):
+        fail(f"Failed to parse soak report {name} as JSON")
+    if not isinstance(report, dict):
+        fail(f"Soak report {name} must be a JSON object")
+    return report
 
-ref_soak = load_json(ref_soak_file)
-sub_soak = load_json(sub_soak_file)
+def find_side_reports(side):
+    """Return the sorted soak report file names declared for one side."""
+    prefix = f"soak_report_{side}_"
+    try:
+        entries = os.listdir(artifacts_dir)
+    except OSError:
+        fail(f"Failed to list artifacts directory for {side} soak reports")
+    return sorted(e for e in entries if e.startswith(prefix) and e.endswith(".json"))
+
+def require_single_report(side):
+    """Require exactly one soak report for a side; duplicates are ambiguous evidence."""
+    reports = find_side_reports(side)
+    if not reports:
+        fail(f"Missing {side} soak report (soak_report_{side}_*.json)")
+    if len(reports) > 1:
+        fail(f"Ambiguous {side} soak evidence: exactly one report is required, found {len(reports)}")
+    return reports[0]
+
+def require_side_metadata(report, name, side):
+    """A report must declare the side it claims and the run mode that was requested."""
+    if report.get("server_type") != side:
+        fail(f"Soak report {name} must declare server_type '{side}'")
+    if report.get("run_mode") != expected_run_mode:
+        fail(f"Soak report {name} must declare run_mode '{expected_run_mode}'")
+
+def require_finite_rate(stats, side):
+    """loss_rate_percent must be present, numeric (not bool), finite and within 0..100."""
+    if "loss_rate_percent" not in stats:
+        fail(f"{side} sequenced_udp_stats is missing loss_rate_percent")
+    rate = stats["loss_rate_percent"]
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        fail(f"{side} sequenced_udp_stats loss_rate_percent must be a number")
+    value = float(rate)
+    if not math.isfinite(value):
+        fail(f"{side} sequenced_udp_stats loss_rate_percent must be finite")
+    if value < 0.0 or value > 100.0:
+        fail(f"{side} sequenced_udp_stats loss_rate_percent must be within 0..100")
+    return value
+
+def require_counter(stats, field, side, minimum):
+    """Packet counters must be present integers (not bool) at or above `minimum`."""
+    if field not in stats:
+        fail(f"{side} sequenced_udp_stats is missing {field}")
+    value = stats[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{side} sequenced_udp_stats {field} must be an integer")
+    if value < minimum:
+        fail(f"{side} sequenced_udp_stats {field} must be >= {minimum}")
+    return value
+
+def verify_udp_evidence(report, name, side):
+    """Require measured, internally consistent sequenced UDP evidence. No defaults."""
+    stats = report.get("sequenced_udp_stats")
+    if not isinstance(stats, dict):
+        fail(f"Soak report {name} is missing a sequenced_udp_stats object")
+
+    rate = require_finite_rate(stats, side)
+    sent = require_counter(stats, "packets_sent", side, 1)
+    received = require_counter(stats, "packets_received", side, 1)
+    lost = require_counter(stats, "packets_lost", side, 0)
+
+    if received > sent:
+        fail(f"{side} sequenced_udp_stats packets_received must not exceed packets_sent")
+    if lost > sent:
+        fail(f"{side} sequenced_udp_stats packets_lost must not exceed packets_sent")
+
+    # received + lost == sent is deliberately NOT required: the producer's late and
+    # duplicate echo accounting does not guarantee that equality.
+    expected_rate = 100.0 * lost / sent
+    if not math.isclose(rate, expected_rate, rel_tol=1e-9, abs_tol=1e-9):
+        fail(f"{side} sequenced_udp_stats loss_rate_percent is inconsistent with packet counters")
+    if rate > UDP_LOSS_BUDGET_PERCENT:
+        fail(f"{side} sequenced UDP packet loss exceeded the qualification budget")
+    return rate
+
+ref_soak_file = require_single_report("reference")
+sub_soak_file = require_single_report("subject")
+
+ref_soak = load_soak_report(ref_soak_file)
+sub_soak = load_soak_report(sub_soak_file)
+
+require_side_metadata(ref_soak, ref_soak_file, "reference")
+require_side_metadata(sub_soak, sub_soak_file, "subject")
 
 if not ref_soak.get("tcp_continuity_passed"):
     fail(f"Reference soak failed TCP stream continuity verification ({ref_soak_file})")
@@ -247,8 +363,8 @@ if not sub_soak.get("idle_phase_passed"):
 
 ref_rekeys = ref_soak.get("completed_rekeys", 0)
 sub_rekeys = sub_soak.get("completed_rekeys", 0)
-ref_loss = ref_soak.get("sequenced_udp_stats", {}).get("loss_rate_percent", 0.0)
-sub_loss = sub_soak.get("sequenced_udp_stats", {}).get("loss_rate_percent", 0.0)
+ref_loss = verify_udp_evidence(ref_soak, ref_soak_file, "reference")
+sub_loss = verify_udp_evidence(sub_soak, sub_soak_file, "subject")
 
 if mode == "full":
     if ref_rekeys < 10:
@@ -263,11 +379,7 @@ else:
         fail(f"Bounded qualification requires >=1 subject rekey, observed {sub_rekeys}")
     info(f"Bounded soak verified: Reference Rekeys={ref_rekeys}, Subject Rekeys={sub_rekeys}")
 
-if ref_loss > 0.05:
-    fail(f"Reference UDP packet loss exceeded threshold: {ref_loss}% > 0.05%")
-if sub_loss > 0.05:
-    fail(f"Subject UDP packet loss exceeded threshold: {sub_loss}% > 0.05%")
-info(f"Soak UDP packet loss: Reference={ref_loss:.2f}%, Subject={sub_loss:.2f}% (<= 0.05%)")
+info(f"Soak UDP packet loss: Reference={ref_loss:.2f}%, Subject={sub_loss:.2f}% (<= {UDP_LOSS_BUDGET_PERCENT}%)")
 
 # 6. Non-Netstack Live Client Report
 if require_non_netstack:
@@ -329,6 +441,8 @@ for root, _, files in os.walk(artifacts_dir):
 info("Privacy invariants audit: PASS (0 private keys, 0 raw server IPs, 0 local filesystem paths)")
 
 # 8. Emit Aggregated Summary Artifact
+# Publish only after every gate has passed, via a temporary sibling and an atomic
+# replace. A write failure or cancellation exits nonzero and publishes no evidence.
 is_closure_eligible = (mode == "full")
 
 summary = {
@@ -357,9 +471,27 @@ summary = {
     }
 }
 
-os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-with open(output_file, "w", encoding="utf-8") as out:
-    json.dump(summary, out, indent=2)
+def publish_summary(output_path, payload):
+    """Write the summary to a temporary sibling and atomically replace the target."""
+    directory = os.path.dirname(os.path.abspath(output_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".issue392_summary_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
+            json.dump(payload, out, indent=2)
+        os.replace(tmp_path, output_path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        fail("Failed to publish aggregated qualification summary")
+
+try:
+    publish_summary(output_file, summary)
+except Exception:
+    # Never suppress a publication failure as a successful verdict.
+    fail("Failed to publish aggregated qualification summary")
 
 print(f"Aggregated summary written to: {os.path.basename(output_file)}")
 PYEOF
