@@ -1080,19 +1080,69 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 	return m.configPath()
 }
 
+// configMutationClassification describes what is known about the remote
+// container's configuration state after a tracked write attempt. The ordering
+// is significant: values are linearly ordered from "nothing touched" to "fully
+// applied", and the transaction's compensation gate compares against
+// mutationDiskWritten (see writeConfigurationTransaction).
+//
+// R3-1 semantics (re-review resolution plan, section 4 item 1): a copy
+// invocation can COMPLETE inside the container and only then have its SSH
+// result lost to cancellation, timeout or transport failure. Therefore no SSH
+// error observed after the copy command was issued is proof of "no mutation":
+// every such outcome classifies as at least configMutationAttempted. Only
+// failures strictly before the copy invocation (validation, path resolution,
+// upload preparation) are known no-config-mutation cases.
+type configMutationClassification int
+
+const (
+	// configMutationNotAttempted: the write failed before the copy command was
+	// invoked. The container configuration was provably not touched.
+	configMutationNotAttempted configMutationClassification = iota
+	// configMutationAttempted: the copy command was invoked and returned an
+	// SSH-level error (cancellation, timeout, transport failure). The copy may
+	// have completed server-side; disk state is UNKNOWN, never "old".
+	configMutationAttempted
+	// configMutationDiskWritten: the copy returned a nonzero exit status, or a
+	// later step (strip/syncconf) failed after a successful copy. The disk
+	// bytes are NEW; runtime/artifacts may be OLD.
+	configMutationDiskWritten
+	// configMutationSucceeded: disk write, runtime sync (and any tracked
+	// follow-up) all completed successfully.
+	configMutationSucceeded
+)
+
+// configMutationAttemptedOrBeyond reports whether the container configuration
+// was mutated, or may have been mutated, by the tracked write. It is the R3-1
+// replacement for the old boolean "did the write succeed" reading: every
+// post-invocation SSH error class must report true, because no SSH error is
+// proof of no side effect.
+func (c configMutationClassification) configMutationAttemptedOrBeyond() bool {
+	return c >= configMutationAttempted
+}
+
+// asLegacyWriteSucceeded maps the classification onto the historical boolean
+// contract (true == "disk write is known to have persisted"). Used ONLY at
+// call sites whose compensation behavior is owned by other tasks: the R3-1
+// transaction gate and AddClient's rollback bookkeeping. The routing change
+// for ambiguous outcomes is R3-2 (see writeConfigurationTransaction).
+func (c configMutationClassification) asLegacyWriteSucceeded() bool {
+	return c >= configMutationDiskWritten
+}
+
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
 	_, err := m.saveServerConfigTracked(ctx, client, content)
 	return err
 }
 
-func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (configMutationClassification, error) {
 	params, _, err := ParseServerConfig(content)
 	if err != nil {
-		return false, fmt.Errorf("invalid server config: %w", err)
+		return configMutationNotAttempted, fmt.Errorf("invalid server config: %w", err)
 	}
 	if len(params) > 0 {
 		if err := ValidateAWGParams(params); err != nil {
-			return false, fmt.Errorf("invalid AWG parameters: %w", err)
+			return configMutationNotAttempted, fmt.Errorf("invalid AWG parameters: %w", err)
 		}
 	}
 
@@ -1105,23 +1155,30 @@ func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSH
 // previous bytes: a running legacy config can be accepted by the installed AWG
 // tools even when newer Nexus validation would reject it. The restore still
 // uses the normal safe copy path, checked awg-quick strip, and checked syncconf.
-func (m *AWGManager) restoreKnownServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+func (m *AWGManager) restoreKnownServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (configMutationClassification, error) {
 	return m.writeServerConfigTracked(ctx, client, content)
 }
 
-func (m *AWGManager) writeServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+// writeServerConfigTracked performs the remote configuration write and returns
+// what is known about the container's configuration state (see
+// configMutationClassification). The classification is advanced to
+// configMutationAttempted immediately BEFORE the copy command is invoked: once
+// the copy has been issued, its result can be lost (cancellation, timeout,
+// transport failure) while the mutation still completed server-side, so no
+// post-invocation SSH error may classify as "not attempted".
+func (m *AWGManager) writeServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (configMutationClassification, error) {
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
 		cName = m.containerName()
 	}
 	if !IsValidContainerName(cName) {
-		return false, errors.New("invalid container name")
+		return configMutationNotAttempted, errors.New("invalid container name")
 	}
 	randBytes := make([]byte, 8)
 	_, _ = rand.Read(randBytes)
 	tmpPath := fmt.Sprintf("/tmp/_amnz_edit_config_%d_%x.conf", time.Now().UnixNano(), randBytes)
 	if err := client.UploadSudoFile(ctx, tmpPath, []byte(content), 0600); err != nil {
-		return false, err
+		return configMutationNotAttempted, err
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -1131,17 +1188,21 @@ func (m *AWGManager) writeServerConfigTracked(ctx context.Context, client ssh.SS
 
 	cfgPath := m.resolveContainerConfigPath(ctx, client, cName)
 	cpCmd := fmt.Sprintf("docker cp %s %s:%s", ssh.EscapeShellArg(tmpPath), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cfgPath))
+	// R3-1: from this point on, every outcome is at least "attempted". A
+	// canceled, timed-out or transport-failed result says nothing about whether
+	// the copy completed inside the container.
+	mutation := configMutationAttempted
 	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
-		return false, fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
+		return mutation, fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
 	}
 
-	// Disk write succeeded.
-	diskWritten := true
+	// Copy confirmed: the disk bytes are NEW.
+	mutation = configMutationDiskWritten
 
 	if err := m.syncInterfaceConfig(ctx, client, cName, cfgPath); err != nil {
-		return diskWritten, err
+		return mutation, err
 	}
-	return diskWritten, nil
+	return configMutationSucceeded, nil
 }
 
 // strippedConfigPath returns the in-container path that holds the stripped
@@ -1786,6 +1847,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	diskWritten := false
 	remoteCommitted := false
+	var classification configMutationClassification
 	defer func() {
 		if err != nil {
 			m.rollbackAddClient(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, previousOwner, rekeyedIP, initialConfText, initialClients, rekeyed, newlyAllocated, diskWritten, remoteCommitted)
@@ -1803,9 +1865,18 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	allowedIPs := resolveAllowedIPs(clientParams)
 	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP, allowedIPs)
 
-	if diskWritten, err = m.commitPeerConfigWithCAS(ctx, client, confText, peerSection, clientPubKey, clientName, existingPubKey); err != nil {
+	if classification, err = m.commitPeerConfigWithCAS(ctx, client, confText, peerSection, clientPubKey, clientName, existingPubKey); err != nil {
+		// The historical multi-assign populated diskWritten even when the
+		// commit returned an error (disk-written failure classes), and the
+		// deferred rollback below depends on that bookkeeping. Mirror it on
+		// the error path too.
+		diskWritten = classification.asLegacyWriteSucceeded()
 		return nil, err
 	}
+	// AddClient's rollback bookkeeping keeps its historical meaning (rollback
+	// only when the disk write is KNOWN to have persisted); the ambiguous-class
+	// routing decision is R3-2's scope.
+	diskWritten = classification.asLegacyWriteSucceeded()
 	remoteCommitted = true
 
 	mimicry := resolveMimicry(clientParams)
@@ -1885,20 +1956,20 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 	ctx context.Context,
 	client ssh.SSHClient,
 	initialConf, peerSection, clientPubKey, clientName, existingPubKey string,
-) (bool, error) {
+) (configMutationClassification, error) {
 	confText := initialConf
 	currExistingPubKey := existingPubKey
 
 	for attempt := 0; attempt < 5; attempt++ {
 		freshConf, err := m.getServerConfig(ctx, client)
 		if err != nil {
-			return false, fmt.Errorf("failed to fetch remote config for CAS check: %w", err)
+			return configMutationNotAttempted, fmt.Errorf("failed to fetch remote config for CAS check: %w", err)
 		}
 		if freshConf != confText {
 			confText = freshConf
 			clients, err := m.getClientsTable(ctx, client)
 			if err != nil {
-				return false, fmt.Errorf("failed to fetch clientsTable for CAS retry: %w", err)
+				return configMutationNotAttempted, fmt.Errorf("failed to fetch clientsTable for CAS retry: %w", err)
 			}
 			_, currExistingPubKey = findExistingClient(clients, clientPubKey, clientName)
 			continue
@@ -1907,12 +1978,12 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 		removePubKeys := peerRemovalKeys(currExistingPubKey, clientPubKey)
 		newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
 		if err != nil {
-			return false, fmt.Errorf("failed to upsert peer in config: %w", err)
+			return configMutationNotAttempted, fmt.Errorf("failed to upsert peer in config: %w", err)
 		}
 		return m.saveServerConfigTracked(ctx, client, newConfig)
 	}
 
-	return false, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
+	return configMutationNotAttempted, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
 }
 
 func extractPeerSection(confText, pubKey, ip string) string {

@@ -99,14 +99,25 @@ func (m *AWGManager) writeConfigurationTransaction(
 	if err != nil {
 		return err
 	}
-	written, err := m.saveServerConfigTracked(ctx, client, content)
+	mutation, err := m.saveServerConfigTracked(ctx, client, content)
 	if err != nil {
-		if written {
+		// R3-1 classification: mutation >= configMutationAttempted means the
+		// copy was invoked and its outcome is ambiguous or known-mutated; only
+		// configMutationNotAttempted proves the container was not touched.
+		//
+		// R3-2 routing: every ambiguous attempted write compensates. No SSH
+		// result observed after the copy invocation proves the server-side
+		// state, so configMutationAttempted is compensated exactly like a
+		// known write — restoreConfigurationAfterFailure re-proves the
+		// resulting disk, runtime and artifact state and reports
+		// ErrConfigurationRollbackFailed when the original identity could not
+		// be re-established.
+		if mutation.configMutationAttemptedOrBeyond() {
 			return m.restoreConfigurationAfterFailure(ctx, client, server, content, original, err)
 		}
 		return err
 	}
-	if !written {
+	if mutation != configMutationSucceeded {
 		return errors.New("AWG configuration write completed without persisting content")
 	}
 
@@ -151,7 +162,10 @@ func (m *AWGManager) restoreConfigurationAfterFailure(
 	if restoreErr != nil {
 		return errors.Join(cause, ErrConfigurationRollbackFailed, fmt.Errorf("failed to restore previous AWG configuration: %w", restoreErr))
 	}
-	if !written {
+	// R3-1: treat the restore as persisted only when its full success is
+	// classified; the attempted/ambiguous classes mean the rollback itself is
+	// not proven complete (rollback is R3-2's routing concern).
+	if written != configMutationSucceeded {
 		return errors.Join(cause, ErrConfigurationRollbackFailed, errors.New("failed to restore previous AWG configuration: write was not persisted"))
 	}
 	if identityErr := m.reconcileServerIdentity(restoreCtx, client, server, attempted, original); identityErr != nil {
