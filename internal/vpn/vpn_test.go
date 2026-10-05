@@ -2968,49 +2968,142 @@ func TestUpdateBackendServerHost_CanceledContextRollback(t *testing.T) {
 	}
 }
 
-// TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed verifies that
-// if endpoint rollback fails during compensation, UpdateBackendServerHost returns an error
-// joining the original error and ErrVPNRollbackFailed.
-func TestUpdateBackendServerHost_RollbackFailure_ReturnsErrVPNRollbackFailed(t *testing.T) {
-	db := setupTestDB(t)
+// TestUpdateBackendServerHost_PersistFailureLeavesOldStateUntouched pins the
+// preparation-first commit contract at the same injected boundary the deleted
+// rollback test used (R2-3, resolution-plan section 3 item 3): the forwarder
+// sync failure that used to trigger a metadata rollback cannot happen on this
+// path, and the one fallible step left — the durable endpoint commit — happens
+// BEFORE publication. When it fails, nothing has been published or mutated, so
+// OLD state is untouched end to end:
+//
+//   - the update reports the original persistence error, and the result is
+//     NOT a rollback-failure classification (ErrVPNRollbackFailed is not in
+//     the chain: no compensation ran, because none was needed);
+//   - the actual OLD device stays open, attached, serving and admitting
+//     plaintext, with its endpoint ownership intact (no device was rebuilt);
+//   - the live pool row, SQLite, and a freshly reloaded pool all still carry
+//     the OLD endpoint;
+//   - exactly one private candidate was prepared and discarded; OLD's loss
+//     ownership was never retired.
+//
+// The old pinned contract (TestUpdateBackendServerHost_RollbackFailure_
+// ReturnsErrVPNRollbackFailed) belonged to the deleted dual-write
+// implementation, which published the desired endpoint first and compensated
+// failures by writing OLD back behind whatever device a concurrent operation
+// had attached — a failure of that rollback write surfaced the joined
+// ErrVPNRollbackFailed. There is no local work after the durable commit on
+// this path, so there is no rollback to fail; the strict truthful contract is
+// "failure leaves OLD untouched", asserted here with real-device, pool, and
+// SQLite oracles.
+func TestUpdateBackendServerHost_PersistFailureLeavesOldStateUntouched(t *testing.T) {
 	ctx := context.Background()
+	vpnSvc, s1ID, tunBefore := lifecycleTestService(t)
 
-	vpnSvc, s1ID, _, _, _ := setupTestVPNService(t, db)
-	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
-		t.Fatalf("SyncFromDB failed: %v", err)
+	if tunBefore == nil || !tunBefore.Enabled {
+		t.Fatalf("fixture precondition: expected an enabled tunnel, got %+v", tunBefore)
 	}
-
-	tunBefore := tunMust(t, vpnSvc, s1ID)
+	if tunBefore.Status != models.TunnelStatusActive {
+		t.Fatalf("fixture precondition: tunnel must be actively serving, got %q", tunBefore.Status)
+	}
 	origEndpoint := tunBefore.Endpoint
+	origKey := tunBefore.PublicKey
 
-	// 1. Hook forwarder sync to fail
+	// The forwarder-sync hook fires inside syncBackendForwarderOnHostUpdateLocked,
+	// which this different-endpoint update does NOT reach: a changed endpoint
+	// takes the prepare→commit→publish path, where the only fallible step is
+	// the durable SetTunnelEndpoint write. The hook is armed anyway so the
+	// test proves it is never invoked — i.e. the failure the old contract
+	// compensated is structurally unreachable here.
 	vpnSvc.SetSyncBackendForwarderHookForTest(func() error {
 		return errors.New("forwarder sync failure")
 	})
+	t.Cleanup(func() { vpnSvc.SetSyncBackendForwarderHookForTest(nil) })
 
-	// 2. Hook SetTunnelEndpoint so rollback to origEndpoint fails
+	// Fail ONLY the durable endpoint write, at the real boundary
+	// (Pool.SetTunnelEndpoint persists through UpdateBackendTunnelEndpoint
+	// before mutating memory, so memory cannot drift either).
 	vpnSvc.SetTunnelEndpointHookForTest(func(ctx context.Context, tunnelID int64, endpoint string) error {
-		if endpoint == origEndpoint {
-			return errors.New("simulated disk error during rollback")
+		if endpoint == newHostEndpoint(t, origEndpoint, "198.51.100.89") {
+			return errors.New("simulated disk error during endpoint persist")
 		}
 		return nil
 	})
+	t.Cleanup(func() { vpnSvc.SetTunnelEndpointHookForTest(nil) })
 
-	newHost := "198.51.100.89"
-	err := vpnSvc.UpdateBackendServerHost(ctx, s1ID, newHost)
+	vpnSvc.ResetPreparedCandidateCountForTest()
+	oldDev := vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if oldDev == nil || oldDev.IsClosed() {
+		t.Fatalf("fixture must start with an open real OLD device, got %T", oldDev)
+	}
+
+	err := vpnSvc.UpdateBackendServerHost(ctx, s1ID, "198.51.100.89")
 	if err == nil {
-		t.Fatal("expected error, got nil")
+		t.Fatal("expected the endpoint persistence failure to fail the update")
+	}
+	if errors.Is(err, ErrVPNRollbackFailed) {
+		t.Errorf("a preparation-first persistence failure is not a rollback failure; got ErrVPNRollbackFailed in %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated disk error during endpoint persist") {
+		t.Errorf("expected the original durable cause to be preserved, got %v", err)
 	}
 
-	if !errors.Is(err, ErrVPNRollbackFailed) {
-		t.Errorf("expected error to wrap ErrVPNRollbackFailed, got %v", err)
+	// OLD device untouched: open, registered, same endpoint ownership. No
+	// publication ran, so no device was rebuilt or retired.
+	oldDev = vpnSvc.GetBackendDeviceForTest(tunBefore.ID)
+	if oldDev == nil || oldDev.IsClosed() {
+		t.Fatalf("OLD device must stay open and registered after the failed persist, got %T (closed=%v)", oldDev, oldDev != nil && oldDev.IsClosed())
 	}
-	if !strings.Contains(err.Error(), "forwarder sync failure") {
-		t.Errorf("expected error to include original error 'forwarder sync failure', got %v", err)
+	if got := vpnSvc.GetBackendDeviceEndpointForTest(tunBefore.ID); got != origEndpoint {
+		t.Errorf("OLD device endpoint ownership must be intact, got %q want %q", got, origEndpoint)
 	}
-	if !strings.Contains(err.Error(), "simulated disk error during rollback") {
-		t.Errorf("expected error to include rollback error, got %v", err)
+
+	// Exactly one private candidate was prepared for the update, and the
+	// failed commit published nothing: the discard compensation closes it.
+	if n := vpnSvc.PreparedCandidateCountForTest(); n != 1 {
+		t.Errorf("the update must have prepared exactly one private candidate, got %d", n)
 	}
+
+	// OLD identity survives in the live pool row.
+	tunAfter := tunMust(t, vpnSvc, s1ID)
+	if tunAfter.Endpoint != origEndpoint {
+		t.Errorf("live pool endpoint must stay OLD, got %q want %q", tunAfter.Endpoint, origEndpoint)
+	}
+	if tunAfter.PublicKey != tunBefore.PublicKey {
+		t.Errorf("live pool key must stay OLD, got %q want %q", tunAfter.PublicKey, tunBefore.PublicKey)
+	}
+
+	// OLD identity survives in SQLite and in a freshly reloaded pool.
+	dbTun, err := vpnSvc.db.GetBackendTunnelByServerID(ctx, s1ID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if dbTun.Endpoint != origEndpoint || dbTun.PublicKey != origKey {
+		t.Errorf("SQLite row must still describe OLD, got (%q, %q) want (%q, %q)",
+			dbTun.Endpoint, dbTun.PublicKey, origEndpoint, origKey)
+	}
+	reloadedPool := tunnel.NewPool(vpnSvc.db)
+	if err := reloadedPool.SyncFromDB(ctx); err != nil {
+		t.Fatalf("fresh pool reload failed: %v", err)
+	}
+	reloaded, err := reloadedPool.GetTunnel(s1ID)
+	if err != nil {
+		t.Fatalf("reloaded pool GetTunnel failed: %v", err)
+	}
+	if reloaded.Endpoint != origEndpoint || reloaded.PublicKey != tunBefore.PublicKey {
+		t.Errorf("reloaded pool row must still describe OLD, got (%q, %q) want (%q, %q)",
+			reloaded.Endpoint, reloaded.PublicKey, origEndpoint, tunBefore.PublicKey)
+	}
+}
+
+// newHostEndpoint mirrors resolveNewBackendEndpoint for a plain IPv4 host:port
+// fixture endpoint: same port, host swapped for the one the test passes.
+func newHostEndpoint(t *testing.T, origEndpoint, newHost string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(origEndpoint)
+	if err != nil {
+		t.Fatalf("fixture endpoint %q must be host:port", origEndpoint)
+	}
+	return net.JoinHostPort(newHost, port)
 }
 
 func TestUpdateBackendServerHost_SameEndpointReconcilesBackendForwarder(t *testing.T) {

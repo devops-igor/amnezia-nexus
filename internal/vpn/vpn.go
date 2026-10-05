@@ -3072,6 +3072,34 @@ func (s *Service) publishBackendForwarderCandidate(cand *backendForwarderCandida
 	go s.triggerBackendRoutingRemediation(cand.serverID)
 }
 
+// publishPreparedCandidateIfServingLocked is the PUBLICATION decision shared by
+// the key/host commit boundaries (R2-2): it publishes the caller's already
+// prepared candidate exactly when the CURRENT committed row is actively
+// serving (administratively enabled and runtime active/degraded), and reports
+// whether it did.
+//
+// Service.mu MUST be held by the caller.
+//
+// A disabled row keeps its disable intent and its current device state — no
+// device is replaced, mirroring syncBackendForwarderOnHostUpdateLocked's
+// disposition of disabled rows. The same applies to an enabled row whose
+// runtime status is not actively serving: the health subsystem owns device
+// attachment there. On false the caller's deferred discard closes the
+// candidate, so every non-published path shrinks to the R1-2
+// candidate-discard compensation.
+func (s *Service) publishPreparedCandidateIfServingLocked(currTun *models.BackendTunnel, cand *backendForwarderCandidate) bool {
+	if currTun == nil || !currTun.Enabled || cand == nil {
+		return false
+	}
+	serving := currTun.Status == TunnelStatusActive || currTun.Status == TunnelStatusDegraded ||
+		currTun.Status == models.TunnelStatusActive || currTun.Status == models.TunnelStatusDegraded
+	if !serving {
+		return false
+	}
+	s.publishBackendForwarderCandidate(cand)
+	return true
+}
+
 // discardBackendForwarderCandidate closes ONLY an unpublished candidate.
 //
 // Because the candidate was never published, discarding it has no observable
@@ -3413,6 +3441,209 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 	return nil
 }
 
+// backendIdentityCommitStale is the stale-commit outcome of the key/host
+// commit fences (R2-2): a newer administrative operation committed while this
+// operation was between its pre-boundary snapshot and the Service.mu commit
+// boundary. The caller aborts its own commit without compensating anything,
+// so the newer generation's committed state stays exactly as it was.
+var backendIdentityCommitStale = errors.New("backend identity was modified concurrently")
+
+// fenceBackendIdentityCommit re-reads the live row inside the commit boundary
+// and enforces the fences that let a key/host update commit its identity
+// change behind the R1-3 ordering: nothing has been published and no live
+// metadata touched before this point, so every fence rejection here shrinks
+// the whole operation to discarding its private candidate.
+//
+// Service.mu MUST be held by the caller (the fences read live pool state).
+//
+//   - Tunnel identity: a different tunnel row (delete/recreate) refuses the
+//     commit outright. Same-row host updates are the normal case for BOTH
+//     operations: the key commit must not reject a newer endpoint, and the
+//     host commit must not reject a newer key — a stale whole-row copy would
+//     overwrite a newer field with old data, which is exactly the R2 split.
+//     The endpoint/key the commit owns are therefore re-derived from the
+//     returned live row by the caller, never taken from the stale snapshot.
+//
+//   - AdminGeneration: reports whether it advanced past baseAdminGen, i.e.
+//     whether a newer administrative operation completed inside the window.
+//     The CALLER decides what an advance means for its own commit:
+//
+//     The key commit rejects any advance: its candidate device was built for
+//     the pre-advance construction identity, so publishing it could no longer
+//     be proven coherent with whatever the newer operation committed — and
+//     rebuilding under Service.mu is forbidden (I/O). It returns
+//     backendIdentityCommitStale and merges nothing.
+//
+//     The host commit MERGES an advance whose row is now administratively
+//     disabled (the newer operation was a disable; the endpoint field-commit
+//     is still valid, and the publication gate below simply keeps the
+//     disable's device state untouched — the pinned concurrent-disable
+//     schedule requires this update to succeed). An advance whose row is
+//     still enabled means a newer identity-touching administrative
+//     operation (e.g. a key rotation) committed its own device: publishing
+//     this operation's candidate — built for the pre-advance identity —
+//     would split device and metadata, so the host commit returns
+//     backendIdentityCommitStale and leaves that newer generation intact.
+//
+// Device witness: there is deliberately NO attached-device fence here.
+// Publication (not the commit) is where device state is decided:
+// publishPreparedCandidateIfServingLocked attaches the replacement device
+// only when the committed row is actively serving, and never retires or
+// re-attaches anything behind a disabled row.
+func (s *Service) fenceBackendIdentityCommit(
+	pool *tunnel.Pool,
+	serverID int64,
+	expectedTunnelID int64,
+	baseAdminGen int64,
+) (*models.BackendTunnel, bool, error) {
+	currTun, err := pool.GetTunnel(serverID)
+	if err != nil {
+		return nil, false, err
+	}
+	if currTun == nil || currTun.ID != expectedTunnelID {
+		return nil, false, fmt.Errorf("backend tunnel identity changed concurrently for server %d: %w", serverID, backendIdentityCommitStale)
+	}
+	return currTun, pool.AdminGeneration(serverID) != baseAdminGen, nil
+}
+
+// backendIdentityCommitStaleErr is the typed rejection a stale commit returns:
+// the request's own cancellation (if any) is preserved as the cause so callers
+// can errors.Is the result for either signal.
+func backendIdentityCommitStaleErr(ctx context.Context, serverID int64) error {
+	err := fmt.Errorf("backend administrative state changed concurrently for server %d: %w", serverID, backendIdentityCommitStale)
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", err, ctx.Err())
+	}
+	return err
+}
+
+// keyHostCommitError normalizes a key/host commit outcome: a nil fence error
+// with a canceled request still reports the cancellation (nothing was
+// applied), and a persistence failure keeps its ordinary error — the durable
+// row was NOT advanced (Pool.SetTunnel* updates memory only on success), so a
+// canceled request that raced a real persistence failure reports the
+// persistence failure, not a clean cancellation.
+func keyHostCommitError(ctx context.Context, commitErr error) error {
+	if commitErr == nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return commitErr
+}
+
+// commitBackendEndpointUpdate is the validated Service commit of the R2-2
+// host (endpoint) update, run under Service.mu: it fences identity and
+// administrative generation (fenceBackendIdentityCommit), applies the
+// HOST-path merge rule, commits the endpoint FIELD only, and — when the
+// caller prepared a candidate and the committed row is actively serving —
+// publishes it. It reports whether the candidate was published, so the
+// caller's deferred discard closes exactly the unpublished outcomes.
+//
+// Host-path merge rule (per the fence contract): an admin-generation advance
+// whose row is NOW administratively disabled was a disable operation — the
+// endpoint field-commit stays valid and the publication gate keeps the
+// disable's device state untouched. An advance whose row is still enabled
+// means a newer identity-touching operation (e.g. a key rotation) committed
+// its own device, so publishing this operation's candidate — built for the
+// pre-advance identity — would split device and metadata: the commit is
+// rejected with backendIdentityCommitStale and the newer generation stays
+// intact.
+//
+// Service.mu MUST NOT be held (the helper acquires it). cand may be nil (no
+// forwarder): publication then reports false and only the durable
+// field-commit happens.
+func (s *Service) commitBackendEndpointUpdate(ctx context.Context, serverID int64, tunnelID int64, newEndpoint string, baseAdminGen int64, cand *backendForwarderCandidate) (bool, error) {
+	s.mu.Lock()
+	currTun, advanced, fenceErr := s.fenceBackendIdentityCommit(s.pool, serverID, tunnelID, baseAdminGen)
+	if fenceErr == nil && advanced && currTun.Enabled {
+		fenceErr = backendIdentityCommitStaleErr(ctx, serverID)
+	}
+	if fenceErr == nil {
+		if commitErr := s.pool.SetTunnelEndpoint(ctx, tunnelID, newEndpoint); commitErr != nil {
+			fenceErr = fmt.Errorf("failed to update backend tunnel endpoint in pool: %w", commitErr)
+		}
+	}
+	if fenceErr != nil {
+		s.mu.Unlock()
+		return false, keyHostCommitError(ctx, fenceErr)
+	}
+	published := s.publishPreparedCandidateIfServingLocked(currTun, cand)
+	s.mu.Unlock()
+	return published, nil
+}
+
+// commitBackendPublicKeyUpdate is the validated Service commit of the R2-2
+// key update, run under Service.mu: it fences identity and administrative
+// generation (fenceBackendIdentityCommit), applies the KEY-path fence rule,
+// commits the key FIELD only, and publishes a prepared candidate exactly on
+// the same serving gate as the host commit. It reports whether the candidate
+// was published.
+//
+// Key-path fence rule (per the fence contract): the key commit rejects ANY
+// admin-generation advance — its candidate device was built for the
+// pre-advance construction identity, so publishing it could no longer be
+// proven coherent with whatever the newer operation committed, and
+// rebuilding under Service.mu is forbidden (I/O).
+//
+// A canceled request is judged by the same fence, not by an early return:
+// with a newer operation committed the result is the typed
+// backendIdentityCommitStale carrying the cancellation as its cause
+// (keyHostCommitError); with no advance the commit is skipped and the bare
+// cancellation reported. Memory moves only through Pool.SetTunnelPublicKey,
+// which persists before mutating memory, so a canceled request can never
+// leave the pool and SQLite disagreeing.
+//
+// Service.mu MUST NOT be held (the helper acquires it). cand may be nil (no
+// forwarder): publication then reports false and only the durable
+// field-commit happens.
+func (s *Service) commitBackendPublicKeyUpdate(ctx context.Context, serverID int64, tunnelID int64, newPublicKey string, baseAdminGen int64, cand *backendForwarderCandidate) (bool, error) {
+	s.mu.Lock()
+	currTun, advanced, fenceErr := s.fenceBackendIdentityCommit(s.pool, serverID, tunnelID, baseAdminGen)
+	if fenceErr == nil && advanced {
+		fenceErr = backendIdentityCommitStaleErr(ctx, serverID)
+	}
+	if fenceErr == nil && ctx.Err() != nil {
+		fenceErr = ctx.Err()
+	}
+	if fenceErr == nil {
+		if commitErr := s.pool.SetTunnelPublicKey(ctx, tunnelID, newPublicKey); commitErr != nil {
+			fenceErr = fmt.Errorf("failed to update backend tunnel public key in pool: %w", commitErr)
+		}
+	}
+	if fenceErr != nil {
+		s.mu.Unlock()
+		return false, keyHostCommitError(ctx, fenceErr)
+	}
+	published := s.publishPreparedCandidateIfServingLocked(currTun, cand)
+	s.mu.Unlock()
+	return published, nil
+}
+
+// prepareHostUpdateCandidate builds a PRIVATE candidate device for the desired
+// identity (endpoint, publicKey), or reports that there is nothing to prepare.
+//
+// Service.mu MUST NOT be held: socket startup is I/O (same lock discipline as
+// prepareBackendForwarderCandidate). The desired values are passed straight
+// into the device constructor and are NOT published into the live pool; the
+// caller commits the durable identity only after its validated commit boundary
+// and only then publishes this candidate. A nil candidate with a nil error
+// means the Service has no forwarder, so there is no data plane to prepare
+// into.
+//
+// R2-2 ordering note: the private candidate is built BEFORE the commit so a
+// genuine construction failure (bad key, unparsable endpoint, socket bind
+// failure) aborts the operation with the durable identity untouched — the
+// construction-failure ordering of the previous dual-write implementation is
+// preserved even though the rollback that used to compensate it is gone.
+func (s *Service) prepareHostUpdateCandidate(tun *models.BackendTunnel, endpoint, publicKey string, awgParams map[string]any, hasForwarder bool) (*backendForwarderCandidate, error) {
+	if !hasForwarder {
+		return nil, nil
+	}
+	desired := *tun
+	desired.Endpoint = endpoint
+	desired.PublicKey = publicKey
+	return s.prepareBackendForwarderCandidate(&desired, awgParams, true)
+}
+
 // UpdateBackendServerHost updates the endpoint of a server in the VPN backend pool.
 func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, newHost string) error {
 	if s == nil || s.pool == nil {
@@ -3476,44 +3707,57 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
 	}
 
-	oldEndpoint := tun.Endpoint
-	if err := s.pool.SetTunnelEndpoint(ctx, tun.ID, newEndpoint); err != nil {
-		return fmt.Errorf("failed to update backend tunnel endpoint in pool: %w", err)
-	}
-	tun.Endpoint = newEndpoint
+	baseAdminGen := s.pool.AdminGeneration(serverID)
 
-	rollbackEndpoint := func(originalErr error) error {
-		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rbErr := s.pool.SetTunnelEndpoint(rbCtx, tun.ID, oldEndpoint); rbErr != nil {
-			log.Printf("[vpn] warning: failed to rollback backend tunnel endpoint for server %d: %v", serverID, rbErr)
-			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore backend endpoint: %w", ErrVPNRollbackFailed, rbErr))
-		}
-		return originalErr
-	}
-
+	// ---- PREPARATION (outside Service.mu) --------------------------------
+	// R2-2, following the R1-2/R1-3 split: the desired endpoint is built as a
+	// PRIVATE constructor input — nothing is written into the live pool or
+	// SQLite before the validated Service commit, so there is no window in
+	// which another operation can build a device from this operation's
+	// half-applied identity, and no dual-write compensation can split durable
+	// metadata from an attached device.
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
 	s.mu.RLock()
+	hasForwarder := s.forwarder != nil
 	hook := s.updateBackendServerHostPreLockHook
 	s.mu.RUnlock()
 	if hook != nil {
 		hook()
 	}
 
+	// The context.Err() branch former callers compensated with a metadata
+	// rollback no longer exists: nothing durable was touched before the
+	// commit, so a canceled request here has nothing to undo.
 	if err := ctx.Err(); err != nil {
-		return rollbackEndpoint(err)
+		return err
 	}
 
-	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
-	s.mu.Unlock()
+	if cand, prepErr := s.prepareHostUpdateCandidate(tun, newEndpoint, tun.PublicKey, awgParams, hasForwarder); prepErr != nil {
+		return fmt.Errorf("failed to prepare backend endpoint update for server %d: %w", serverID, prepErr)
+	} else if cand != nil {
+		// Until publication the candidate belongs to this operation alone:
+		// every non-published outcome below closes ONLY it.
+		published := false
+		defer func() {
+			if !published {
+				s.discardBackendForwarderCandidate(cand)
+			}
+		}()
 
-	if syncErr != nil {
-		return rollbackEndpoint(syncErr)
+		// ---- VALIDATED SERVICE COMMIT (under Service.mu) ---------------
+		// Revalidate identity and administrative generation against the
+		// CURRENT committed snapshot. The commit owns the endpoint field
+		// only; a newer field (e.g. a newer key) survives untouched.
+		var commitErr error
+		published, commitErr = s.commitBackendEndpointUpdate(ctx, serverID, tun.ID, newEndpoint, baseAdminGen, cand)
+		return commitErr
 	}
 
-	return nil
+	// No data plane to prepare into (no forwarder): the endpoint commit is
+	// still the validated Service commit, just without a candidate.
+	_, err = s.commitBackendEndpointUpdate(ctx, serverID, tun.ID, newEndpoint, baseAdminGen, nil)
+	return err
 }
 
 // UpdateBackendServerPublicKey updates the public key of a server in the VPN backend pool.
@@ -3572,44 +3816,64 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
 	}
 
-	oldPublicKey := tun.PublicKey
-	if err := s.pool.SetTunnelPublicKey(ctx, tun.ID, newPublicKey); err != nil {
-		return fmt.Errorf("failed to update backend tunnel public key in pool: %w", err)
-	}
-	tun.PublicKey = newPublicKey
+	baseAdminGen := s.pool.AdminGeneration(serverID)
 
-	rollbackPublicKey := func(originalErr error) error {
-		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rbErr := s.pool.SetTunnelPublicKey(rbCtx, tun.ID, oldPublicKey); rbErr != nil {
-			log.Printf("[vpn] warning: failed to rollback backend tunnel public key for server %d: %v", serverID, rbErr)
-			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore backend public key: %w", ErrVPNRollbackFailed, rbErr))
-		}
-		return originalErr
-	}
-
+	// ---- PREPARATION (outside Service.mu) --------------------------------
+	// R2-2, following the R1-2/R1-3 split: the desired key stays a PRIVATE
+	// constructor input. The old implementation dual-wrote it into the live
+	// pool and SQLite HERE (vpn.go:3576 pattern) and compensated failures by
+	// rolling the old key back behind whatever device a concurrent update had
+	// attached in the meantime — the stale-compensation split the R2-1
+	// regression pins. Nothing is published anymore before the validated
+	// commit, so no compensation beyond candidate discard exists or is needed.
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
 	s.mu.RLock()
+	hasForwarder := s.forwarder != nil
 	hook := s.updateBackendServerPublicKeyPreLockHook
 	s.mu.RUnlock()
 	if hook != nil {
 		hook()
 	}
 
-	if err := ctx.Err(); err != nil {
-		return rollbackPublicKey(err)
+	// R2-2: there is deliberately NO ctx.Err() early return between the
+	// pre-lock hook and the commit fence (unlike the host path). The R2-1
+	// schedule cancels the key request while it is parked in its private
+	// preparation window and then releases it: the pinned contract is that
+	// the release reaches the commit fence, which observes the newer
+	// administrative generation and reports the typed
+	// backendIdentityCommitStale result carrying the cancellation as its
+	// cause (keyHostCommitError) — not a bare context.Canceled. A canceled
+	// request can never reach the mutation below with memory applied: the
+	// commit is gated on ctx.Err()==nil and Pool.SetTunnelPublicKey
+	// persists before mutating memory (fail-closed), so the durable and
+	// in-memory rows only ever move together.
+
+	if cand, prepErr := s.prepareHostUpdateCandidate(tun, tun.Endpoint, newPublicKey, awgParams, hasForwarder); prepErr != nil {
+		return fmt.Errorf("failed to prepare backend key update for server %d: %w", serverID, prepErr)
+	} else if cand != nil {
+		// Until publication the candidate belongs to this operation alone:
+		// every non-published outcome below closes ONLY it.
+		published := false
+		defer func() {
+			if !published {
+				s.discardBackendForwarderCandidate(cand)
+			}
+		}()
+
+		// ---- VALIDATED SERVICE COMMIT (under Service.mu) ---------------
+		// The fence inside judges both the newer-generation advance and the
+		// request's own cancellation (see the R2-2 note above): no early
+		// return path can publish or touch live state.
+		var commitErr error
+		published, commitErr = s.commitBackendPublicKeyUpdate(ctx, serverID, tun.ID, newPublicKey, baseAdminGen, cand)
+		return commitErr
 	}
 
-	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
-	s.mu.Unlock()
-
-	if syncErr != nil {
-		return rollbackPublicKey(syncErr)
-	}
-
-	return nil
+	// No data plane to prepare into (no forwarder): the key commit is still
+	// the validated Service commit, just without a candidate.
+	_, err = s.commitBackendPublicKeyUpdate(ctx, serverID, tun.ID, newPublicKey, baseAdminGen, nil)
+	return err
 }
 
 // DeleteBackend permanently removes a backend tunnel from the load-balancing
