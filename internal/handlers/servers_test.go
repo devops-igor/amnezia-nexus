@@ -445,7 +445,12 @@ func TestServerHandlers(t *testing.T) {
 				t.Fatalf("expected 200 get config %s, got %d", p, wGet.Code)
 			}
 
-			bodySave, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: p, Config: "dummy-config"})
+			config := "dummy-config"
+			if p == "awg" {
+				key, _ := deriveTestKey(t, 121)
+				config = "[Interface]\nPrivateKey = " + key + "\nListenPort = 51820\n"
+			}
+			bodySave, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: p, Config: config})
 			reqSave := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", sCfgID), bytes.NewReader(bodySave))
 			wSave := httptest.NewRecorder()
 			r.ServeHTTP(wSave, reqSave)

@@ -54,23 +54,24 @@ type Dependencies struct {
 
 // Handlers encapsulates all HTTP route handlers and business logic.
 type Handlers struct {
-	cfg             *config.Config
-	db              *database.DB
-	registry        *manager.Registry
-	sshPool         SSHPoolProvider
-	awgMgr          *awg.AWGManager
-	mtproxylMgr     *mtproxyl.MTProxyLManager
-	dnsMgr          *dns.DNSManager
-	vpnSvc          *vpn.Service
-	upstreamSvc     UpstreamChecker
-	dialTimeout     func(network, address string, timeout time.Duration) (net.Conn, error)
-	setupMu         sync.Mutex
-	captchaOnce     sync.Once
-	captchaSt       *captcha.Store
-	userConnMu      sync.Mutex
-	userConnLocks   map[string]*sync.Mutex
-	serverHostMu    sync.Mutex
-	serverHostLocks map[int64]*sync.Mutex
+	cfg                       *config.Config
+	db                        *database.DB
+	registry                  *manager.Registry
+	sshPool                   SSHPoolProvider
+	awgMgr                    *awg.AWGManager
+	mtproxylMgr               *mtproxyl.MTProxyLManager
+	dnsMgr                    *dns.DNSManager
+	vpnSvc                    *vpn.Service
+	upstreamSvc               UpstreamChecker
+	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
+	setupMu                   sync.Mutex
+	captchaOnce               sync.Once
+	captchaSt                 *captcha.Store
+	userConnMu                sync.Mutex
+	userConnLocks             map[string]*sync.Mutex
+	serverHostMu              sync.Mutex
+	serverHostLocks           map[int64]*sync.Mutex
+	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
 }
 
 func (h *Handlers) lockUser(userID string) func() {
@@ -89,6 +90,13 @@ func (h *Handlers) lockUser(userID string) func() {
 	return func() {
 		mu.Unlock()
 	}
+}
+
+func (h *Handlers) updateServerProtocols(ctx context.Context, serverID int64, protocols map[string]any) error {
+	if h.updateServerProtocolsHook != nil {
+		return h.updateServerProtocolsHook(ctx, serverID, protocols)
+	}
+	return h.db.UpdateServerProtocols(ctx, serverID, protocols)
 }
 
 func (h *Handlers) lockServerHost(serverID int64) func() {
