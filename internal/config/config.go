@@ -92,9 +92,8 @@ var (
 		}
 		return os.Link(oldname, newname)
 	}
-	renameNoReplaceFunc    = renameNoReplace
-	syncDirFunc            = syncDir
-	acquireProcessLockFunc = acquireProcessLock
+	renameNoReplaceFunc = renameNoReplace
+	syncDirFunc         = syncDir
 )
 
 // syncDir opens the directory and calls Sync (fsync) to ensure directory entries
@@ -168,27 +167,9 @@ func ResolveSecretKey(dataDir string) (string, error) {
 
 	// Ensure directory exists
 	// #nosec G703
-	if err := os.MkdirAll(cleanDataDir, 0750); err != nil {
+	if err := os.MkdirAll(cleanDataDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
 	}
-
-	// Flush parent directory entry to media to guarantee durability of DATA_DIR
-	// across power loss or crashes before acquiring the process lock.
-	parentDir := filepath.Dir(cleanDataDir)
-	if err := syncDirFunc(parentDir); err != nil {
-		return "", fmt.Errorf("failed to sync parent directory %s: %w", parentDir, err)
-	}
-
-	// Acquire cross-process lock to prevent races between publishing the key file
-	// and completing directory fsync durability barrier.
-	lockPath := filepath.Join(cleanDataDir, ".secret_key.lock")
-	lock, err := acquireProcessLockFunc(lockPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to acquire secret key process lock: %w", err)
-	}
-	defer func() {
-		_ = lock.Release()
-	}()
 
 	// #nosec G304 G703 -- Reading secret key from configured data directory is intended
 	data, err := os.ReadFile(cleanKeyPath)
@@ -280,10 +261,8 @@ func ResolveSecretKey(dataDir string) (string, error) {
 	}
 
 	if placed {
-		// Durability barrier: durably flush the parent directory entry to media.
+		// Durability barrier: durably flush the data directory entry to media.
 		if err := syncDirFunc(cleanDataDir); err != nil {
-			// #nosec G703
-			_ = os.Remove(cleanKeyPath)
 			return "", fmt.Errorf("failed to sync data directory %s: %w", cleanDataDir, err)
 		}
 		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
