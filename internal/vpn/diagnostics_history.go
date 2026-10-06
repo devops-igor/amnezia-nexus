@@ -57,13 +57,16 @@ const (
 	reasonReturnInjectionErrors   = "return_injection_errors"
 	reasonClientBackendQueueFull  = "client_backend_queue_full"
 	reasonReturnQueueFull         = "return_queue_full"
-	// reasonClientBackendDeviceUnattributed is the directionless loss key for
-	// a backend device that does not implement backendDeviceStatsProvider: the
+	// reasonBackendDeviceUnattributed is the directionless loss key for a
+	// backend device that does not implement backendDeviceStatsProvider: the
 	// loader can measure the loss but attribute neither direction nor reason.
-	// Its DEGRADED condition is the operator-facing "drops are active but
-	// detailed attribution is unavailable" signal (issue #424 review round 10,
+	// It is deliberately NOT prefixed client_: the device reports no
+	// direction, so the loss counts toward TotalDrops but toward NEITHER
+	// directional total (issue #429 review round 3, blocker 3). Its DEGRADED
+	// condition is the operator-facing "drops are active but detailed
+	// attribution is unavailable" signal (issue #424 review round 10,
 	// item 2).
-	reasonClientBackendDeviceUnattributed = "client_backend_device_unattributed"
+	reasonBackendDeviceUnattributed = "backend_device_unattributed"
 )
 
 // vpnDiagConditionBackendDeviceUnattributed is the translation key of the
@@ -119,15 +122,16 @@ func criticalReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64
 //     not claimed as a reason-keyed drop here.
 //   - client_backend_device_queue_full / return_backend_device_queue_full:
 //     device-level capacity drops attributed to the general routine population.
-//   - client_backend_device_unattributed: owned by THIS evaluator
-//     (claimDrops), as of the R5-refinement. Living in this map is what
-//     subtracts the directionless device loss from the routine population —
-//     one-loss-one-condition is preserved — and what lets the evaluator
-//     report "attribution unavailable" by reason instead of folding the loss
-//     back into the generic aggregate the review called not actionable.
+//   - backend_device_unattributed: owned by THIS evaluator (claimDrops), as
+//     of the R5-refinement (direction-neutral key as of review round 3,
+//     blocker 3). Living in this map is what subtracts the directionless
+//     device loss from the routine population — one-loss-one-condition is
+//     preserved — and what lets the evaluator report "attribution
+//     unavailable" by reason instead of folding the loss back into the
+//     generic aggregate the review called not actionable.
 var degradedLossReasons = map[string]lossClaim{
-	reasonClientBackendQueueFull:          claimDrops,
-	reasonClientBackendDeviceUnattributed: claimDrops,
+	reasonClientBackendQueueFull:    claimDrops,
+	reasonBackendDeviceUnattributed: claimDrops,
 }
 
 // degradedReasonRatePps sums the current-window rate of every degraded reason
@@ -155,12 +159,12 @@ func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
 		"client_mismatch": d.ClientMismatch, "client_rejected": d.ClientRejected,
 		"client_backend_queue_full": d.ClientBackendQueueFull, "client_rate_limited": d.ClientRateLimited,
 		"client_no_healthy_backend": d.ClientNoHealthyBackend, "client_virtualtun_drops": d.ClientVirtualTUNDrops,
-		"client_backend_device_queue_full":   d.ClientBackendDeviceQueueFull,
-		"client_backend_device_oversized":    d.ClientBackendDeviceOversized,
-		"client_backend_device_shutdown":     d.ClientBackendDeviceShutdown,
-		"client_backend_device_external":     d.ClientBackendDeviceExternal,
-		"client_backend_device_unattributed": d.ClientBackendDeviceUnattributed,
-		"return_malformed":                   d.ReturnMalformed, "return_unmapped": d.ReturnUnmapped, "return_mismatch": d.ReturnMismatch,
+		"client_backend_device_queue_full": d.ClientBackendDeviceQueueFull,
+		"client_backend_device_oversized":  d.ClientBackendDeviceOversized,
+		"client_backend_device_shutdown":   d.ClientBackendDeviceShutdown,
+		"client_backend_device_external":   d.ClientBackendDeviceExternal,
+		"backend_device_unattributed":      d.BackendDeviceUnattributed,
+		"return_malformed":                 d.ReturnMalformed, "return_unmapped": d.ReturnUnmapped, "return_mismatch": d.ReturnMismatch,
 		"return_injection_errors": d.ReturnInjectionErrors, "return_virtualtun_drops": d.ReturnVirtualTUNDrops,
 		"return_queue_full": d.ReturnQueueFull, "return_packet_too_large": d.ReturnPacketTooLarge,
 		"return_backend_device_queue_full": d.ReturnBackendDeviceQueueFull,

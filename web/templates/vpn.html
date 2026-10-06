@@ -1149,11 +1149,11 @@
 
     function vpnLossReasonLabels() {
         return {
+            backend_device_unattributed: 'vpn_diag_loss_backend_device_unattributed',
             client_backend_device_external: 'vpn_diag_loss_client_backend_device_external',
             client_backend_device_oversized: 'vpn_diag_loss_client_backend_device_oversized',
             client_backend_device_queue_full: 'vpn_diag_loss_client_backend_device_queue_full',
             client_backend_device_shutdown: 'vpn_diag_loss_client_backend_device_shutdown',
-            client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',
             client_backend_queue_full: 'vpn_diag_loss_client_backend_queue_full',
             client_malformed: 'vpn_diag_loss_client_malformed',
             client_mismatch: 'vpn_diag_loss_client_mismatch',
@@ -2154,16 +2154,18 @@
             // #424 round 3, finding 1), so keying the alarm on queue-full alone
             // leaves outbound, shutdown and unattributed loss unhighlighted.
             // The subset is DERIVED from the canonical vpnLossReasonLabels()
-            // map by prefix instead of being curated again here: a second hand
-            // maintained list silently omitted client_backend_device_unattributed,
-            // so the detailed reason table showed the loss while this KPI never
-            // alarmed on it (rereview R5). Overlapping injection diagnostics
-            // (return_injection_errors) carry neither prefix and stay outside
-            // the sum, so backend-device loss is never double counted.
+            // map by prefix (plus the direction-neutral
+            // backend_device_unattributed key) instead of being curated again
+            // here: a second hand-maintained list silently omitted the
+            // unattributed reason, so the detailed reason table showed the
+            // loss while this KPI never alarmed on it (rereview R5).
+            // Overlapping injection diagnostics (return_injection_errors)
+            // carry neither prefix and stay outside the sum, so backend-device
+            // loss is never double counted.
             const rr = (status.drop_categories && status.drop_categories.reason_rates) || {};
             const ratesAvailable = !!(status.drop_categories && status.drop_categories.rates_available === true);
             const deviceDropReasons = Object.keys(vpnLossReasonLabels()).filter(function(key) {
-                return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0;
+                return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0 || key === 'backend_device_unattributed';
             });
             const deviceDropRate = ratesAvailable
                 ? deviceDropReasons.reduce((sum, key) => sum + Number(rr[key] || 0), 0)

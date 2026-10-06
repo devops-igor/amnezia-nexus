@@ -629,7 +629,7 @@
   "vpn_diag_loss_client_backend_device_oversized": "слишком большой пакет устройства бэкенда клиента",
   "vpn_diag_loss_client_backend_device_shutdown": "остановка устройства бэкенда клиента",
   "vpn_diag_loss_client_backend_device_external": "внешние потери устройства бэкенда клиента",
-  "vpn_diag_loss_client_backend_device_unattributed": "потери устройства бэкенда клиента без атрибуции",
+  "vpn_diag_loss_backend_device_unattributed": "потери устройства бэкенда без атрибуции",
   "vpn_diag_loss_return_malformed": "некорректный обратный пакет",
   "vpn_diag_loss_return_unmapped": "обратный пакет без маршрута",
   "vpn_diag_loss_return_mismatch": "несоответствие обратного пакета",

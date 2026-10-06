@@ -194,10 +194,14 @@ type DropCategoryBreakdown struct {
 	// direction and no reason, so these drops are attributed here under their
 	// own key rather than spread across buckets the recorder never filled.
 	ClientBackendDeviceExternal uint64 `json:"client_backend_device_external"`
-	// ClientBackendDeviceUnattributed is lifetime loss on a device that
-	// cannot report the breakdown at all. Published so TotalDrops stays
-	// truthful instead of silently shrinking.
-	ClientBackendDeviceUnattributed uint64 `json:"client_backend_device_unattributed"`
+	// BackendDeviceUnattributed is lifetime loss on a device that cannot
+	// report the breakdown at all. It is DIRECTION-NEUTRAL (issue #429
+	// review round 3, blocker 3): it counts toward TotalDrops so the total
+	// stays truthful instead of silently shrinking, but toward NEITHER
+	// directional total — the device reports no direction, so publishing it
+	// under the client key asserted a direction the implementation says is
+	// unavailable.
+	BackendDeviceUnattributed uint64 `json:"backend_device_unattributed"`
 
 	ClientTotalDrops  uint64  `json:"client_total_drops"`
 	ClientDropRatePps float64 `json:"client_drop_rate_pps"`
@@ -1417,7 +1421,7 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 			})
 		}
 		// The queue-full gate reads its OWN reason's rate, not the degraded
-		// reason sum: client_backend_device_unattributed now shares the
+		// reason sum: backend_device_unattributed now shares the
 		// degradedLossReasons map (and the routine-population subtraction) but
 		// has its own condition below, so summing here would report one loss
 		// twice under two different messages.
@@ -1434,11 +1438,13 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 		// reason (DEGRADED, review item 2) instead of folding into the generic
 		// routine aggregate, which the review called not actionable. The same
 		// RatesAvailable gate as above applies: an unmeasured window is not an
-		// incident. A device WITH detailed attribution publishes a measured
-		// zero for this reason and a non-zero rate under a device-specific
-		// key, so this condition stays off in both of its firing-exclusion
-		// cases (attribution available; drops quiet).
-		if rate := drops.ReasonRates[reasonClientBackendDeviceUnattributed]; rate > th.BackendDeviceUnattributedActiveDropRatePPS {
+		// incident. The reason is the direction-NEUTRAL backend_device_unattributed
+		// key (issue #429 review round 3, blocker 3): the loss counts toward the
+		// total but toward neither directional total. A device WITH detailed
+		// attribution publishes a measured zero for this reason and a non-zero
+		// rate under a device-specific key, so this condition stays off in both
+		// of its firing-exclusion cases (attribution available; drops quiet).
+		if rate := drops.ReasonRates[reasonBackendDeviceUnattributed]; rate > th.BackendDeviceUnattributedActiveDropRatePPS {
 			conds = append(conds, HealthCondition{
 				Category:   "drops",
 				Severity:   "DEGRADED",
@@ -2119,6 +2125,12 @@ func (t *diagRatesTracker) reset(gen diagGeneration) {
 // reports zero and never rewinds the baseline — and Reset re-primes on an
 // explicit new generation instead of inferring a restart from current<previous.
 type diagDeltaTracker struct {
+	mu sync.Mutex
+	// window owns its own locking; mu guards only the WRAPPER state below
+	// (gen and the published snapshot), which Sample reads and reset clears
+	// without any other synchronization (issue #429 review round 3,
+	// blocker 1 — the "each has its own mutex" claim was false for the
+	// wrapper fields).
 	window        generationWindow[uint64]
 	gen           diagGeneration
 	delta         uint64
@@ -2143,6 +2155,8 @@ func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapsho
 	if t == nil {
 		return deltaSnapshot{}
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if accepted := t.window.sample(t.gen, now, []uint64{cumulative}); !accepted {
 		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
 	}
@@ -2157,6 +2171,11 @@ func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapsho
 // (issue #429 review blocker 1). A generation lower than the accepted one is
 // ignored.
 func (t *diagDeltaTracker) reset(gen diagGeneration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if gen > t.gen {
 		t.gen = gen
 	}
@@ -2166,7 +2185,8 @@ func (t *diagDeltaTracker) reset(gen diagGeneration) {
 }
 
 // diagDeltaTrackers groups the per-counter windowed delta trackers. Each has
-// its own mutex, so a caller needs no outer lock.
+// its own mutex (both the wrapper state and the embedded window are
+// synchronized), so a caller needs no outer lock.
 type diagDeltaTrackers struct {
 	ownershipMismatch diagDeltaTracker
 	// clientOwnershipMismatch tracks the CLIENT-direction counterpart. It is a
@@ -2264,8 +2284,7 @@ func (inputs diagnosticsInputs) collectDropCategories() DropCategoryBreakdown {
 		deviceDrops.ClientQueueFull +
 		deviceDrops.ClientOversized +
 		deviceDrops.ClientShutdown +
-		deviceDrops.ClientExternal +
-		deviceDrops.ClientUnattributed
+		deviceDrops.ClientExternal
 
 	// Nexus -> Upstream: VirtualTUN.InjectInbound feeds the INBOUND queue, so
 	// its drop bucket is the return path's own loss accounting.
@@ -2288,23 +2307,27 @@ func (inputs diagnosticsInputs) collectDropCategories() DropCategoryBreakdown {
 		returnTunDrops + returnQueueFull + returnOversized +
 		deviceDrops.ReturnQueueFull + deviceDrops.ReturnShutdown
 
-	totalDrops := clientTotal + returnTotal
+	// The direction-neutral backend-device population is real measured loss,
+	// so loss conservation keeps it in the total; it belongs to NEITHER
+	// directional total because its device reports no direction (issue #429
+	// review round 3, blocker 3).
+	totalDrops := clientTotal + returnTotal + deviceDrops.Unattributed
 
 	return DropCategoryBreakdown{
-		ClientMalformed:                 routerMalformed,
-		ClientUnmappedSource:            routerUnmapped,
-		ClientMismatch:                  routerMismatch,
-		ClientRejected:                  routerRejected,
-		ClientBackendQueueFull:          fwdClientQueueFull,
-		ClientRateLimited:               fwdClientRateLimited,
-		ClientNoHealthyBackend:          fwdClientNoBackend,
-		ClientVirtualTUNDrops:           clientVirtualTUNDrops,
-		ClientBackendDeviceQueueFull:    deviceDrops.ClientQueueFull,
-		ClientBackendDeviceOversized:    deviceDrops.ClientOversized,
-		ClientBackendDeviceShutdown:     deviceDrops.ClientShutdown,
-		ClientBackendDeviceExternal:     deviceDrops.ClientExternal,
-		ClientBackendDeviceUnattributed: deviceDrops.ClientUnattributed,
-		ClientTotalDrops:                clientTotal,
+		ClientMalformed:              routerMalformed,
+		ClientUnmappedSource:         routerUnmapped,
+		ClientMismatch:               routerMismatch,
+		ClientRejected:               routerRejected,
+		ClientBackendQueueFull:       fwdClientQueueFull,
+		ClientRateLimited:            fwdClientRateLimited,
+		ClientNoHealthyBackend:       fwdClientNoBackend,
+		ClientVirtualTUNDrops:        clientVirtualTUNDrops,
+		ClientBackendDeviceQueueFull: deviceDrops.ClientQueueFull,
+		ClientBackendDeviceOversized: deviceDrops.ClientOversized,
+		ClientBackendDeviceShutdown:  deviceDrops.ClientShutdown,
+		ClientBackendDeviceExternal:  deviceDrops.ClientExternal,
+		BackendDeviceUnattributed:    deviceDrops.Unattributed,
+		ClientTotalDrops:             clientTotal,
 
 		ReturnMalformed:         retStats.MalformedDrops,
 		ReturnUnmapped:          retStats.UnmappedDrops,

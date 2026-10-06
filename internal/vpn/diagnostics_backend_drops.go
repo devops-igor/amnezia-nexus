@@ -71,10 +71,13 @@ type backendDeviceDropStats struct {
 	// direction the recorder never supplied.
 	ClientExternal uint64
 
-	// ClientUnattributed is LIVE loss observed on a device that does not
-	// implement backendDeviceStatsProvider, so neither axis exists for it.
-	// It is reported rather than dropped so TotalDrops stays truthful.
-	ClientUnattributed uint64
+	// Unattributed is LIVE loss observed on a device that does not implement
+	// backendDeviceStatsProvider, so neither axis exists for it. It is
+	// deliberately DIRECTION-NEUTRAL (issue #429 review round 3, blocker 3):
+	// attributing it to the client population asserted a direction the
+	// implementation says is unavailable, so it counts toward TotalDrops —
+	// loss conservation — but toward NEITHER directional total.
+	Unattributed uint64
 }
 
 // Total is the sum of every disjoint population above: for the retired
@@ -82,7 +85,7 @@ type backendDeviceDropStats struct {
 func (d backendDeviceDropStats) Total() uint64 {
 	return d.ClientQueueFull + d.ClientOversized + d.ClientShutdown +
 		d.ReturnQueueFull + d.ReturnShutdown +
-		d.ClientExternal + d.ClientUnattributed
+		d.ClientExternal + d.Unattributed
 }
 
 // addInto folds other into d field by field.
@@ -99,7 +102,7 @@ func (d *backendDeviceDropStats) addInto(other backendDeviceDropStats) {
 	d.ReturnQueueFull += other.ReturnQueueFull
 	d.ReturnShutdown += other.ReturnShutdown
 	d.ClientExternal += other.ClientExternal
-	d.ClientUnattributed += other.ClientUnattributed
+	d.Unattributed += other.Unattributed
 }
 
 // snapshotBackendDeviceDrops reads one device's real direction x reason
@@ -109,8 +112,8 @@ func (d *backendDeviceDropStats) addInto(other backendDeviceDropStats) {
 // direction, for which reason", and both the live-collection loop and every
 // retirement site go through it, so a device is attributed identically while
 // it is live and once it has been retired. A device that cannot report the
-// axes contributes its aggregate as ClientUnattributed rather than being
-// spread across buckets we cannot verify.
+// axes contributes its aggregate as the direction-neutral Unattributed
+// population rather than being spread across buckets we cannot verify.
 //
 // Retirement callers close the device first so shutdown drains are included
 // before transferring the final counters. Live observers may read it at any time.
@@ -121,7 +124,7 @@ func snapshotBackendDeviceDrops(dev BackendDevice) backendDeviceDropStats {
 	}
 	provider, ok := dev.(backendDeviceStatsProvider)
 	if !ok {
-		out.ClientUnattributed = dev.DroppedPackets()
+		out.Unattributed = dev.DroppedPackets()
 		return out
 	}
 	snap := provider.DeviceStats()

@@ -1467,7 +1467,7 @@ func vpnBackendDeviceReasonInventory(t *testing.T) []string {
 	}
 	var reasons []string
 	for name := range payload {
-		if strings.HasPrefix(name, "client_backend_device_") || strings.HasPrefix(name, "return_backend_device_") {
+		if strings.HasPrefix(name, "client_backend_device_") || strings.HasPrefix(name, "return_backend_device_") || name == "backend_device_unattributed" {
 			reasons = append(reasons, name)
 		}
 	}
@@ -1489,12 +1489,12 @@ func vpnBackendDeviceReasonsBody(t *testing.T) string {
 	return `
 const apiReasons = ` + string(inventory) + `;
 const deviceReasons = Object.keys(vpnLossReasonLabels()).filter(key =>
-	key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);
+	key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0 || key === 'backend_device_unattributed');
 assert.deepStrictEqual(deviceReasons.slice().sort(), apiReasons,
 	'API-to-label backend-device reason inventory drifted');
 assert.strictEqual(deviceReasons.length, 7, 'backend-device reason count changed');
-assert(deviceReasons.includes('client_backend_device_unattributed'),
-	'client_backend_device_unattributed must drive the backend KPI alarm');
+assert(deviceReasons.includes('backend_device_unattributed'),
+	'backend_device_unattributed must drive the backend KPI alarm');
 for (const retired of ['client_backend_device_retired_drops']) {
 	assert(!deviceReasons.includes(retired), 'retired-only reason must stay out of the KPI: ' + retired);
 }
@@ -1519,14 +1519,14 @@ render({rates_available: true, total_drops: 4242}, {total_drops: 4242});
 assert.strictEqual(alarm(), '', 'lifetime backend drops alone must not alarm');
 observed.push('lifetime=' + alarm());
 // A measured zero rate clears a prior alarm while the loss stays visible.
-render({rates_available: true, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 3}}, {total_drops: 4242});
+render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 3}}, {total_drops: 4242});
 assert.strictEqual(alarm(), 'var(--danger)', 'fresh current loss must alarm');
 observed.push('fresh=' + alarm());
-render({rates_available: true, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 0}}, {total_drops: 4242});
+render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 0}}, {total_drops: 4242});
 assert.strictEqual(alarm(), '', 'measured zero must clear the alarm');
 observed.push('zero=' + alarm());
 // Unavailable rates and an unavailable forwarder both suppress the alarm.
-render({rates_available: false, total_drops: 4242, reason_rates: {client_backend_device_unattributed: 9}}, {total_drops: 4242});
+render({rates_available: false, total_drops: 4242, reason_rates: {backend_device_unattributed: 9}}, {total_drops: 4242});
 assert.strictEqual(alarm(), '', 'unavailable rates must not alarm');
 observed.push('unavailable=' + alarm());
 render({}, {total_drops: 4242});
@@ -1551,8 +1551,9 @@ console.log('RESULT ' + JSON.stringify(observed));
 
 // TestVPNBackendDeviceKPIAlarmCoverage pins the backend-device KPI against the
 // canonical reason map for every active locale. The defect under test: a second,
-// manually curated KPI subset omitted client_backend_device_unattributed, so the
-// detailed reason table showed the loss while the KPI never alarmed.
+// manually curated KPI subset omitted the unattributed backend-device reason
+// (backend_device_unattributed), so the detailed reason table showed the loss
+// while the KPI never alarmed.
 func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 	node, err := findNodeBinary()
 	if err != nil {
@@ -1589,8 +1590,8 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 
 // TestVPNBackendDeviceKPIAlarmMutations proves the acceptance oracle above is
 // load-bearing in both directions: the alarm coverage must break when
-// unattributed is dropped from the KPI subset, and the API-to-label inventory
-// must break when it is dropped from the canonical map.
+// backend_device_unattributed is dropped from the KPI subset, and the
+// API-to-label inventory must break when it is dropped from the canonical map.
 func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 	node, err := findNodeBinary()
 	if err != nil {
@@ -1604,13 +1605,13 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		{
 			name:    "UnattributedDroppedFromKPISubset",
-			before:  "return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0;",
-			after:   "return key !== 'client_backend_device_unattributed' && (key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);",
-			failure: "client_backend_device_unattributed current backend loss must alarm",
+			before:  "return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0 || key === 'backend_device_unattributed';",
+			after:   "return key !== 'backend_device_unattributed' && (key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);",
+			failure: "backend_device_unattributed current backend loss must alarm",
 		},
 		{
 			name:    "UnattributedDroppedFromCanonicalMap",
-			before:  "client_backend_device_unattributed: 'vpn_diag_loss_client_backend_device_unattributed',\n            ",
+			before:  "backend_device_unattributed: 'vpn_diag_loss_backend_device_unattributed',\n            ",
 			after:   "",
 			failure: "API-to-label backend-device reason inventory drifted",
 		},
@@ -1653,7 +1654,7 @@ function render(conditions) {
 		drop_categories: {
 			rates_available: true,
 			total_drops: 9,
-			reason_rates: {client_backend_device_unattributed: 3}
+			reason_rates: {backend_device_unattributed: 3}
 		}
 	});
 }

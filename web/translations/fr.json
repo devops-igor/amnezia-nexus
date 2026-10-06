@@ -629,7 +629,7 @@
   "vpn_diag_loss_client_backend_device_oversized": "paquet surdimensionné du périphérique serveur côté client",
   "vpn_diag_loss_client_backend_device_shutdown": "arrêt du périphérique serveur côté client",
   "vpn_diag_loss_client_backend_device_external": "perte externe du périphérique serveur côté client",
-  "vpn_diag_loss_client_backend_device_unattributed": "perte non attribuée du périphérique serveur côté client",
+  "vpn_diag_loss_backend_device_unattributed": "perte non attribuée du périphérique serveur",
   "vpn_diag_loss_return_malformed": "paquet retour mal formé",
   "vpn_diag_loss_return_unmapped": "retour non associé",
   "vpn_diag_loss_return_mismatch": "incohérence du retour",

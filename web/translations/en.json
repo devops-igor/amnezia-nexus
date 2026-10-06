@@ -629,7 +629,7 @@
   "vpn_diag_loss_client_backend_device_oversized": "client backend device oversized",
   "vpn_diag_loss_client_backend_device_shutdown": "client backend device shutdown",
   "vpn_diag_loss_client_backend_device_external": "client backend device external",
-  "vpn_diag_loss_client_backend_device_unattributed": "client backend device unattributed",
+  "vpn_diag_loss_backend_device_unattributed": "backend device unattributed",
   "vpn_diag_loss_return_malformed": "return malformed",
   "vpn_diag_loss_return_unmapped": "return unmapped",
   "vpn_diag_loss_return_mismatch": "return mismatch",

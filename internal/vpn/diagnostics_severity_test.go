@@ -817,11 +817,13 @@ func TestB3DegradedReasonKeysArePublishedReasons(t *testing.T) {
 		}
 	}
 	// client_backend_device_unattributed joined this evaluator with the
-	// R5-refinement: it has its own DEGRADED condition (reported by reason),
-	// and living in this pin is what keeps one-loss-one-condition enforced —
-	// the same loss may never also surface in the routine aggregate.
+	// R5-refinement and is published under the direction-neutral
+	// backend_device_unattributed key as of review round 3, blocker 3: it has
+	// its own DEGRADED condition (reported by reason), and living in this pin
+	// is what keeps one-loss-one-condition enforced — the same loss may never
+	// also surface in the routine aggregate.
 	wantOwners := map[string][]string{
-		"drops": {reasonClientBackendDeviceUnattributed, reasonClientBackendQueueFull},
+		"drops": {reasonBackendDeviceUnattributed, reasonClientBackendQueueFull},
 	}
 	for evaluator, want := range wantOwners {
 		got := append([]string(nil), owners[evaluator]...)

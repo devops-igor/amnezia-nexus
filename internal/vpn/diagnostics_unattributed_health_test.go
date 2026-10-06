@@ -12,9 +12,9 @@ import (
 
 // The R5-refinement acceptance tests: backend-device loss that is ACTIVE but
 // ATTRIBUTIONLESS (a device with no backendDeviceStatsProvider, published
-// under client_backend_device_unattributed) must surface as its own DEGRADED
-// health condition instead of being folded into the generic routine-loss
-// aggregate, which the review called not actionable.
+// under the direction-neutral backend_device_unattributed key) must surface as
+// its own DEGRADED health condition instead of being folded into the generic
+// routine-loss aggregate, which the review called not actionable.
 //
 // Firing exclusions are pinned by reason, not by accident: a device WITH
 // detailed attribution publishes a measured zero for the directionless key
@@ -29,7 +29,7 @@ func unattributedDrops(rate float64) DropCategoryBreakdown {
 	return DropCategoryBreakdown{
 		TotalDropRatePps: rate,
 		RatesAvailable:   true,
-		ReasonRates:      map[string]float64{reasonClientBackendDeviceUnattributed: rate},
+		ReasonRates:      map[string]float64{reasonBackendDeviceUnattributed: rate},
 	}
 }
 
@@ -112,7 +112,7 @@ func TestBackendDeviceUnattributedHealthConditionAbsentWithDetailedProvider(t *t
 	if got := drops.ClientBackendDeviceQueueFull; got != 1 {
 		t.Fatalf("fixture lost attribution: client_backend_device_queue_full=%d, want 1", got)
 	}
-	if got := drops.ClientBackendDeviceUnattributed; got != 0 {
+	if got := drops.BackendDeviceUnattributed; got != 0 {
 		t.Fatalf("a detailed provider must never publish the directionless key: %d", got)
 	}
 	svc.sampleDropRates(at, &drops, 0)
@@ -133,7 +133,7 @@ func TestBackendDeviceUnattributedHealthConditionAbsentAtZeroDrops(t *testing.T)
 	drops := DropCategoryBreakdown{
 		TotalDropRatePps: 0,
 		RatesAvailable:   true,
-		ReasonRates:      map[string]float64{reasonClientBackendDeviceUnattributed: 0},
+		ReasonRates:      map[string]float64{reasonBackendDeviceUnattributed: 0},
 	}
 	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(
 		quietVirtualTUN(), drops, RoutingConsistencyDiagnostics{IsConsistent: true}, 0), "drops"); len(got) != 0 {
@@ -148,7 +148,7 @@ func TestBackendDeviceUnattributedHealthConditionAbsentWhenRatesUnmeasured(t *te
 	drops := DropCategoryBreakdown{
 		TotalDropRatePps: 0,
 		RatesAvailable:   false,
-		ReasonRates:      map[string]float64{reasonClientBackendDeviceUnattributed: 99.0},
+		ReasonRates:      map[string]float64{reasonBackendDeviceUnattributed: 99.0},
 	}
 	if got := conditionsIn(evaluateVirtualTUNAndDropConditions(
 		quietVirtualTUN(), drops, RoutingConsistencyDiagnostics{IsConsistent: true}, 0), "drops"); len(got) != 0 {
@@ -157,10 +157,10 @@ func TestBackendDeviceUnattributedHealthConditionAbsentWhenRatesUnmeasured(t *te
 }
 
 // TestBackendDeviceUnattributedHealthConditionEndToEnd walks the full
-// production path: attribution-less device -> loader publishes
-// client_backend_device_unattributed -> sampled rates -> health evaluation ->
-// serialized status payload. The MessageKey must survive serialization so the
-// web renderer can translate it.
+// production path: attribution-less device -> loader publishes the
+// direction-neutral backend_device_unattributed key -> sampled rates ->
+// health evaluation -> serialized status payload. The MessageKey must survive
+// serialization so the web renderer can translate it.
 //
 // The forwarder startup copies TestDiagnosticsDisjointMixedLossProductionPaths
 // (diagnostics_expanded_test.go): a live forwarder attached to the
@@ -210,7 +210,7 @@ func TestBackendDeviceUnattributedHealthConditionEndToEnd(t *testing.T) {
 	if !status.DropCategories.RatesAvailable {
 		t.Fatal("fixture must produce a measured rate window")
 	}
-	if got := status.DropCategories.ReasonRates[reasonClientBackendDeviceUnattributed]; got <= 0 {
+	if got := status.DropCategories.ReasonRates[reasonBackendDeviceUnattributed]; got <= 0 {
 		t.Fatalf("fixture must produce a positive unattributed rate, got %v", got)
 	}
 

@@ -292,11 +292,20 @@ func TestBackendDeviceUnattributedLossIsReportedNotDropped(t *testing.T) {
 	svc.populateOperationalDiagnostics(&status)
 	d := status.DropCategories
 
-	if d.ClientBackendDeviceUnattributed != 9 {
-		t.Errorf("client_backend_device_unattributed=%d, want 9", d.ClientBackendDeviceUnattributed)
+	if d.BackendDeviceUnattributed != 9 {
+		t.Errorf("backend_device_unattributed=%d, want 9", d.BackendDeviceUnattributed)
 	}
 	if d.ClientBackendDeviceQueueFull != 0 || d.ClientBackendDeviceExternal != 0 {
 		t.Errorf("unattributable loss was spread into a reason bucket: %+v", d)
+	}
+	// Direction-neutral (issue #429 review round 3, blocker 3): the loss is
+	// real, so it must appear in the total, but in NEITHER directional total.
+	if d.ClientTotalDrops != 0 || d.ReturnTotalDrops != 0 {
+		t.Errorf("directionless loss was attributed to a direction: client=%d return=%d",
+			d.ClientTotalDrops, d.ReturnTotalDrops)
+	}
+	if d.TotalDrops != 9 {
+		t.Errorf("total_drops=%d, want 9: loss conservation requires the unattributed loss in the total", d.TotalDrops)
 	}
 	assertDisjointDropReasons(t, d)
 }
@@ -334,7 +343,7 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 			d.ClientBackendDeviceQueueFull, d)
 	}
 	if d.ClientBackendDeviceExternal != 0 || d.ClientBackendDeviceOversized != 0 ||
-		d.ClientBackendDeviceShutdown != 0 || d.ClientBackendDeviceUnattributed != 0 {
+		d.ClientBackendDeviceShutdown != 0 || d.BackendDeviceUnattributed != 0 {
 		t.Errorf("retired loss was reclassified into a bucket it was never measured in: %+v", d)
 	}
 	if d.ReturnBackendDeviceQueueFull != 0 || d.ReturnBackendDeviceShutdown != 0 {
@@ -354,19 +363,18 @@ func TestRetiredDeviceDropsGetTheirOwnKey(t *testing.T) {
 func assertDisjointDropReasons(t *testing.T, d DropCategoryBreakdown) {
 	t.Helper()
 	client := map[string]uint64{
-		"client_malformed":                   d.ClientMalformed,
-		"client_unmapped_source":             d.ClientUnmappedSource,
-		"client_mismatch":                    d.ClientMismatch,
-		"client_rejected":                    d.ClientRejected,
-		"client_backend_queue_full":          d.ClientBackendQueueFull,
-		"client_rate_limited":                d.ClientRateLimited,
-		"client_no_healthy_backend":          d.ClientNoHealthyBackend,
-		"client_virtualtun_drops":            d.ClientVirtualTUNDrops,
-		"client_backend_device_queue_full":   d.ClientBackendDeviceQueueFull,
-		"client_backend_device_oversized":    d.ClientBackendDeviceOversized,
-		"client_backend_device_shutdown":     d.ClientBackendDeviceShutdown,
-		"client_backend_device_external":     d.ClientBackendDeviceExternal,
-		"client_backend_device_unattributed": d.ClientBackendDeviceUnattributed,
+		"client_malformed":                 d.ClientMalformed,
+		"client_unmapped_source":           d.ClientUnmappedSource,
+		"client_mismatch":                  d.ClientMismatch,
+		"client_rejected":                  d.ClientRejected,
+		"client_backend_queue_full":        d.ClientBackendQueueFull,
+		"client_rate_limited":              d.ClientRateLimited,
+		"client_no_healthy_backend":        d.ClientNoHealthyBackend,
+		"client_virtualtun_drops":          d.ClientVirtualTUNDrops,
+		"client_backend_device_queue_full": d.ClientBackendDeviceQueueFull,
+		"client_backend_device_oversized":  d.ClientBackendDeviceOversized,
+		"client_backend_device_shutdown":   d.ClientBackendDeviceShutdown,
+		"client_backend_device_external":   d.ClientBackendDeviceExternal,
 	}
 	ret := map[string]uint64{
 		"return_malformed":                 d.ReturnMalformed,
@@ -395,9 +403,13 @@ func assertDisjointDropReasons(t *testing.T, d DropCategoryBreakdown) {
 	if returnSum != d.ReturnTotalDrops {
 		t.Errorf("return reasons sum to %d but return_total_drops=%d", returnSum, d.ReturnTotalDrops)
 	}
-	if d.ClientTotalDrops+d.ReturnTotalDrops != d.TotalDrops {
-		t.Errorf("total_drops=%d but client(%d)+return(%d)=%d",
-			d.TotalDrops, d.ClientTotalDrops, d.ReturnTotalDrops, d.ClientTotalDrops+d.ReturnTotalDrops)
+	// backend_device_unattributed is the direction-neutral population: real
+	// loss, so it is conserved in the total, but owned by neither direction
+	// (issue #429 review round 3, blocker 3).
+	if d.ClientTotalDrops+d.ReturnTotalDrops+d.BackendDeviceUnattributed != d.TotalDrops {
+		t.Errorf("total_drops=%d but client(%d)+return(%d)+neutral(%d)=%d",
+			d.TotalDrops, d.ClientTotalDrops, d.ReturnTotalDrops, d.BackendDeviceUnattributed,
+			d.ClientTotalDrops+d.ReturnTotalDrops+d.BackendDeviceUnattributed)
 	}
 	// return_injection_tun_drops documents an OWNERSHIP OVERLAP with the
 	// return VirtualTUN bucket, not an additional loss reason, so it is

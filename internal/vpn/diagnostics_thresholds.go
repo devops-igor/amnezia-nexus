@@ -190,9 +190,9 @@ type HealthThresholds struct {
 	// BackendDeviceUnattributedActiveDropRatePPS gates DEGRADED on
 	// backend-device loss that is active RIGHT NOW on a device that cannot
 	// report the direction x reason breakdown (no backendDeviceStatsProvider,
-	// so the loader publishes it under the directionless
-	// client_backend_device_unattributed key). Compared with > against the
-	// current-window DropCategoryBreakdown.ReasonRates[reasonClientBackendDeviceUnattributed],
+	// so the loader publishes it under the direction-neutral
+	// backend_device_unattributed key). Compared with > against the
+	// current-window DropCategoryBreakdown.ReasonRates[reasonBackendDeviceUnattributed],
 	// so any non-zero measured rate fires and a zero rate never does —
 	// including the measured zero a device WITH detailed attribution
 	// publishes, which is what keeps this condition off when attribution is

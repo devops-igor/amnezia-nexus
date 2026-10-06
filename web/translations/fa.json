@@ -629,7 +629,7 @@
   "vpn_diag_loss_client_backend_device_oversized": "بسته بزرگ دستگاه سرور پشتیبان کاربر",
   "vpn_diag_loss_client_backend_device_shutdown": "خاموشی دستگاه سرور پشتیبان کاربر",
   "vpn_diag_loss_client_backend_device_external": "حذف خارجی دستگاه سرور پشتیبان کاربر",
-  "vpn_diag_loss_client_backend_device_unattributed": "حذف بدون انتساب دستگاه سرور پشتیبان کاربر",
+  "vpn_diag_loss_backend_device_unattributed": "حذف بدون انتساب دستگاه سرور پشتیبان",
   "vpn_diag_loss_return_malformed": "بسته بازگشت نامعتبر",
   "vpn_diag_loss_return_unmapped": "بازگشت بدون نگاشت",
   "vpn_diag_loss_return_mismatch": "عدم تطابق بازگشت",

@@ -629,7 +629,7 @@
   "vpn_diag_loss_client_backend_device_oversized": "客户端后端设备数据包过大",
   "vpn_diag_loss_client_backend_device_shutdown": "客户端后端设备关闭",
   "vpn_diag_loss_client_backend_device_external": "客户端后端设备外部丢包",
-  "vpn_diag_loss_client_backend_device_unattributed": "客户端后端设备未归类丢包",
+  "vpn_diag_loss_backend_device_unattributed": "后端设备未归类丢包",
   "vpn_diag_loss_return_malformed": "返回数据格式错误",
   "vpn_diag_loss_return_unmapped": "返回数据未映射",
   "vpn_diag_loss_return_mismatch": "返回数据不匹配",

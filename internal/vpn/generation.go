@@ -55,6 +55,22 @@ type numericDelta interface {
 // sample applies the generation gate, the throttle floor and the
 // monotonic-baseline rule to one cumulative observation. accepted reports
 // whether this observation opened a new measurement window.
+//
+// Staleness contract (issue #429 review round 3, blocker 2):
+//   - a counter below its accepted baseline is a stale observation: in an
+//     accepted window it contributes no delta (its published delta is zeroed
+//     for that window) and leaves its baseline untouched;
+//   - an observation in which EVERY counter is below its baseline is rejected
+//     wholesale: accepted=false and NOTHING is mutated — not the accepted
+//     baselines, not the published deltas, not the accepted sampling
+//     timestamp (at) and not the published window. A stale read therefore
+//     cannot corrupt the denominator of the next valid window, and callers
+//     keep the previous accepted snapshot unchanged;
+//   - a PARTIALLY stale observation (some counters >= baseline, some below)
+//     is accepted: the advancing counters move their baselines and deltas,
+//     the stale counters report a zero delta for this window, and the shared
+//     timestamp/window advance because at least one counter genuinely
+//     advanced.
 func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values []uint64) (accepted bool) {
 	if len(values) == 0 {
 		return false
@@ -86,10 +102,27 @@ func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values [
 	if elapsed < diagEpochSampleFloor.Seconds() {
 		return false
 	}
+	// First pass: classify WITHOUT mutating. An observation in which every
+	// counter is below its baseline is fully stale and must change nothing
+	// (issue #429 review round 3, blocker 2) — zeroing deltas or advancing
+	// the anchor here would erase the last accepted window and corrupt the
+	// next valid denominator.
+	anyAdvanced := false
+	for i, value := range values {
+		if value >= w.baseline[i] {
+			anyAdvanced = true
+			break
+		}
+	}
+	if !anyAdvanced {
+		return false
+	}
+	// Second pass: apply the accepted window. Stale counters report a zero
+	// delta for this window and keep their baselines; advancing counters
+	// move both.
 	for i, value := range values {
 		var zero N
 		if value < w.baseline[i] {
-			// Stale lower observation: zero delta, baseline untouched.
 			w.delta[i] = zero
 			continue
 		}
