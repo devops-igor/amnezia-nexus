@@ -347,22 +347,26 @@ func TestGenerationWindow_CrossGenerationSnapshotLeavesNoTrace(t *testing.T) {
 	})
 }
 
-// TestDiagGeneration_HistoryPrimingIsGenerationKeyed pins the helper pair the
-// primeHistoryFromDrops gate is built on: priming is recorded per generation,
-// a generation bump invalidates it by itself, and re-priming records the new
-// generation — including a fresh service priming at generation 0.
+// TestDiagGeneration_HistoryPrimingIsGenerationKeyed pins the generation
+// keying of the priming gate: priming is recorded per generation via the
+// production entry point, a generation bump invalidates it by itself, and
+// re-priming records the new generation — including a fresh service priming
+// at generation 0. (The mark primitive was removed in review round 5: it
+// substituted the tracker-current generation for the observation's, letting
+// a stale snapshot mark the new generation.)
 func TestDiagGeneration_HistoryPrimingIsGenerationKeyed(t *testing.T) {
 	svc := &Service{}
+	now := time.Now()
 
+	svc.primeHistoryFromDrops(now, nil, 0, DropCategoryBreakdown{})
 	svc.diagRatesMu.Lock()
-	if svc.historyPrimedForCurrentGenerationLocked() {
-		svc.diagRatesMu.Unlock()
-		t.Fatal("fresh service must not report primed history")
-	}
-	svc.markHistoryPrimedForCurrentGenerationLocked(time.Now(), &DropCategoryBreakdown{})
 	if !svc.historyPrimedForCurrentGenerationLocked() {
 		svc.diagRatesMu.Unlock()
-		t.Fatal("history must be primed for generation 0 after marking")
+		t.Fatal("fresh service must report primed history for generation 0 after priming")
+	}
+	if svc.historyPrimedGen != 0 {
+		svc.diagRatesMu.Unlock()
+		t.Fatalf("historyPrimedGen=%d, want 0", svc.historyPrimedGen)
 	}
 	svc.diagRatesMu.Unlock()
 
@@ -375,12 +379,17 @@ func TestDiagGeneration_HistoryPrimingIsGenerationKeyed(t *testing.T) {
 		svc.diagRatesMu.Unlock()
 		t.Fatal("history must be un-primed after the generation bump")
 	}
-	svc.markHistoryPrimedForCurrentGenerationLocked(time.Now(), &DropCategoryBreakdown{})
+	svc.diagRatesMu.Unlock()
+
+	svc.primeHistoryFromDrops(now, nil, svc.currentDiagGeneration(), DropCategoryBreakdown{})
+	svc.diagRatesMu.Lock()
+	defer svc.diagRatesMu.Unlock()
 	if !svc.historyPrimedForCurrentGenerationLocked() {
-		svc.diagRatesMu.Unlock()
 		t.Fatal("history must re-prime into the new generation")
 	}
-	svc.diagRatesMu.Unlock()
+	if want := svc.currentDiagGeneration(); svc.historyPrimedGen != want {
+		t.Fatalf("historyPrimedGen=%d, want %d", svc.historyPrimedGen, want)
+	}
 }
 
 // TestDiagGeneration_HistoryRatesComputedOnlyFromPostStartGeneration drives the

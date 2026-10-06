@@ -1928,44 +1928,53 @@ func (s *Service) historyPrimedForCurrentGenerationLocked() bool {
 	return s.historyPrimed && s.historyPrimedGen == diagGeneration(s.diagGeneration.Load())
 }
 
-// markHistoryPrimedForCurrentGenerationLocked primes the history baselines and
-// records the generation the priming was performed for. It requires
-// s.diagRatesMu. The forwarder's own history baselines are primed by the
-// caller AFTER the diagRatesMu release, since they carry independent locks.
-func (s *Service) markHistoryPrimedForCurrentGenerationLocked(now time.Time, drops *DropCategoryBreakdown) {
-	// Ordering invariant: the primed-mark MUST be recorded even when the
-	// caller's generation is stale (primeHistoryFromDrops checks its
-	// stale-generation guard only AFTER this call). The per-generation
-	// historyPrimed keying below makes that safe — a stale mark still records
-	// the CURRENT generation, which is exactly the state whose genuine
-	// re-prime must not be suppressed.
-	s.primeHistoryRatesLocked(s.currentDiagGeneration(), now, drops)
-	s.historyPrimedGen = diagGeneration(s.diagGeneration.Load())
-	s.historyPrimed = true
-}
-
 func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, gen diagGeneration, drops DropCategoryBreakdown) {
+	// Generation rejection happens FIRST, under diagRatesMu, before ANY
+	// mutation (issue #429 review round 5, blocker 1). The previous order
+	// primed and marked with the tracker-current generation substituted for
+	// the observation's and only then ran the stale guard, so a stale
+	// pre-restart snapshot resuming between the lifecycle reset and the new
+	// generation's first genuine collection re-baselined the new generation
+	// from old high totals and its primed-mark suppressed the genuine
+	// re-prime.
+	//
+	// gen != current, not gen < current: priming must record the live
+	// generation the baselines actually belong to, so only an observation
+	// captured under it may prime or mark. A generation lower than current
+	// is a pre-restart snapshot; a higher one cannot legitimately occur (the
+	// generation travels inside the snapshot and only resetDiagnostics-
+	// Generation bumps it under diagRatesMu), but priming or marking on one
+	// would equally suppress the CURRENT generation's genuine re-prime.
 	s.diagRatesMu.Lock()
+	current := s.currentDiagGeneration()
+	if gen != current {
+		s.diagRatesMu.Unlock()
+		return
+	}
 	// historyPrimed is NOT a sticky flag: it is the per-generation priming
 	// state (accepted gen == current gen && baselines exist), so a new
 	// generation from Service.Start re-primes here automatically instead of
 	// the call returning early forever (issue #429 review blocker 1, Stop/
-	// Start epoch reuse).
+	// Start epoch reuse). The per-generation keying matters: after a bump
+	// the mark is still true but recorded for the OLD generation, so the
+	// first genuine observation of the new one re-primes and re-marks.
 	if s.historyPrimedForCurrentGenerationLocked() {
 		s.diagRatesMu.Unlock()
 		return
 	}
-	s.markHistoryPrimedForCurrentGenerationLocked(now, &drops)
+	// Prime with the OBSERVATION'S generation. Both checks above ran under
+	// this lock hold, so gen == current here: the recorded historyPrimedGen
+	// is the live generation and the mark can never stand in for a newer
+	// one.
+	s.primeHistoryRatesLocked(gen, now, &drops)
+	s.historyPrimedGen = gen
+	s.historyPrimed = true
 	s.diagRatesMu.Unlock()
-	// A snapshot whose generation was captured BEFORE a lifecycle reset must
-	// not re-prime the new generation on completion (issue #429 review round
-	// 4, blocker 1): its priming samples are tagged with the stale generation
-	// and would be ignored, but the primed-mark would suppress the genuine
-	// re-prime. The new generation's own first read re-primes instead.
-	if gen < s.currentDiagGeneration() {
-		return
-	}
 
+	// The forwarder's own history baselines carry independent locks, so they
+	// prime after the diagRatesMu release — but under the SAME generation
+	// decision made above, before any mutation: a rejected snapshot primes
+	// nothing, forwarder history included.
 	if fwd != nil {
 		fwd.PrimeHistoryRates(now)
 		fwd.PrimeBackendTrafficHistory(now)
