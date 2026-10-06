@@ -170,3 +170,16 @@ func (w *GenerationSampler) Baseline(i int) (value uint64, at time.Time, primed 
 	}
 	return w.values[i], w.at, w.primed, w.gen
 }
+
+// counterUint64 converts a signed cumulative byte counter into the unsigned
+// domain of the generation-aware samplers, clamping a negative observation to
+// 0 (gosec G115, CWE-190): a negative lifetime must never convert to a
+// two-complement uint64 burst. Clamped values still compare lower than any
+// accepted baseline, so the monotonic-baseline rule keeps reporting a zero
+// delta for a counter that moved backwards.
+func counterUint64(v int64) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
+}

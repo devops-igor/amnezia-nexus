@@ -47,8 +47,8 @@ type generationTrafficWindow struct {
 // cumulative observation. accepted reports whether this observation opened a
 // new measurement window; current is the previously published window.
 func (w *generationTrafficWindow) observe(gen Generation, now time.Time, totals TrafficSnapshot) (current TrafficSnapshot, elapsed float64, accepted bool) {
-	rxU := uint64(totals.RxBytes)
-	txU := uint64(totals.TxBytes)
+	rxU := counterUint64(totals.RxBytes)
+	txU := counterUint64(totals.TxBytes)
 	if gen < w.gen {
 		return w.current, 0, false
 	}

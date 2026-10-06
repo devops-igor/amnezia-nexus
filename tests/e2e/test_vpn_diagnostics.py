@@ -208,7 +208,7 @@ _LOSS_REASONS = {
     "client_backend_device_oversized",
     "client_backend_device_shutdown",
     "client_backend_device_external",
-    "client_backend_device_unattributed",
+    "backend_device_unattributed",
     "return_malformed",
     "return_unmapped",
     "return_mismatch",
@@ -556,7 +556,7 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["client_backend_device_oversized"]
         + drops["client_backend_device_shutdown"]
         + drops["client_backend_device_external"]
-        + drops["client_backend_device_unattributed"]
+        + drops["backend_device_unattributed"]
     )
     return_categories = (
         drops["return_malformed"]

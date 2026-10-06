@@ -112,12 +112,13 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	// Sign-extended into the unsigned domain a byte counter cannot wrap into:
-	// a restarting counter only ever travels DOWN from 2^64-k, which compares
-	// lower than any real cumulative total, so the monotonic guard reports it
-	// as zero delta instead of a two-complement overflow burst.
-	rxU := uint64(rxBytes)
-	txU := uint64(txBytes)
+	// Byte counters arrive as signed lifetimes; counterUint64 clamps a
+	// negative observation to 0 instead of wrapping it into the
+	// two-complement range. A restarting counter only ever travels DOWN,
+	// which compares lower than any real cumulative total, so the monotonic
+	// guard reports it as zero delta instead of an overflow burst.
+	rxU := counterUint64(rxBytes)
+	txU := counterUint64(txBytes)
 	deltas, elapsed, accepted := rt.sampler.Sample(rt.gen, now, rateTrackerSampleInterval,
 		[]uint64{rxU, txU, rxPackets, txPackets, totalDrops, queueDrops})
 	if !accepted {
