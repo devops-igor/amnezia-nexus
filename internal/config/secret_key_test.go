@@ -729,7 +729,7 @@ func TestResolveSecretKey_Invariant8_PublishVsDirectorySyncRaceBarrier_MultiProc
 			t.Fatalf("Process A failed to reach syncDir pause within timeout; stderr: %s", stderrA.String())
 		}
 
-		// Process A is now holding the process lock inside syncDir.
+		// Process A has placed the candidate file and is paused in syncDir.
 		// Spawn Process B concurrently.
 		cmdB := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
 		var stdoutB, stderrB bytes.Buffer
@@ -765,7 +765,7 @@ func TestResolveSecretKey_Invariant8_PublishVsDirectorySyncRaceBarrier_MultiProc
 			t.Fatalf("Process B failed to start within timeout; stderr: %s", stderrB.String())
 		}
 
-		// Allow Process B a brief moment to be blocked waiting on .secret_key.lock
+		// Allow Process B a brief moment to reach key publication / read.
 		time.Sleep(50 * time.Millisecond)
 
 		// Release Process A, causing it to return the simulated syncDir error
@@ -1012,6 +1012,138 @@ func TestResolveSecretKey_Invariant8_ReaderDurabilityBarrier(t *testing.T) {
 		}
 		if key != "" {
 			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+	})
+}
+
+// TestResolveSecretKey_Invariant9_ParentDirectoryDurabilityOnDataDirCreation tests Invariant 9:
+// When dataDir is newly created by MkdirAll, its parent directory is durably synchronized (dir.Sync())
+// before returning success; if parent directory sync fails, ResolveSecretKey fails fast without generating
+// or persisting the key; when dataDir already exists, parent directory is not synced.
+func TestResolveSecretKey_Invariant9_ParentDirectoryDurabilityOnDataDirCreation(t *testing.T) {
+	os.Unsetenv("SECRET_KEY")
+
+	t.Run("ParentDirectorySyncedWhenDataDirCreated", func(t *testing.T) {
+		parentDir := t.TempDir()
+		newDataDir := filepath.Join(parentDir, "brand_new_datadir")
+
+		var syncedDirs []string
+		var mu sync.Mutex
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			mu.Lock()
+			syncedDirs = append(syncedDirs, filepath.Clean(dirPath))
+			mu.Unlock()
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(newDataDir)
+		if err != nil {
+			t.Fatalf("ResolveSecretKey failed: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("expected 64-char key, got %d: %q", len(key), key)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		hasParent := false
+		hasData := false
+		for _, d := range syncedDirs {
+			if d == filepath.Clean(parentDir) {
+				hasParent = true
+			}
+			if d == filepath.Clean(newDataDir) {
+				hasData = true
+			}
+		}
+
+		if !hasParent {
+			t.Errorf("parent directory %s was not synced on creation; synced dirs: %v", parentDir, syncedDirs)
+		}
+		if !hasData {
+			t.Errorf("new data directory %s was not synced; synced dirs: %v", newDataDir, syncedDirs)
+		}
+	})
+
+	t.Run("ParentDirectorySyncFailureFailsFast", func(t *testing.T) {
+		parentDir := t.TempDir()
+		newDataDir := filepath.Join(parentDir, "fail_parent_datadir")
+
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			if filepath.Clean(dirPath) == filepath.Clean(parentDir) {
+				return errors.New("simulated parent directory sync failure")
+			}
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(newDataDir)
+		if err == nil {
+			t.Fatalf("expected error when parent directory sync fails, got key: %q", key)
+		}
+		if !strings.Contains(err.Error(), "failed to sync parent directory") {
+			t.Errorf("expected error message to mention 'failed to sync parent directory', got: %v", err)
+		}
+		if key != "" {
+			t.Errorf("expected empty key on failure, got: %q", key)
+		}
+
+		// Verify key was not created / persisted (failed fast before key generation / DB init)
+		keyPath := filepath.Join(newDataDir, ".secret_key")
+		if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+			t.Errorf("secret key file should not exist, statErr: %v", statErr)
+		}
+
+		// Also verify LoadConfig fails fast
+		newDataDir2 := filepath.Join(parentDir, "fail_parent_datadir_loadcfg")
+		os.Setenv("DATA_DIR", newDataDir2)
+		defer os.Unsetenv("DATA_DIR")
+		cfg, loadErr := LoadConfig()
+		if loadErr == nil {
+			t.Fatalf("expected LoadConfig to fail fast on parent dir sync failure, got cfg: %+v", cfg)
+		}
+		if !strings.Contains(loadErr.Error(), "failed to sync parent directory") {
+			t.Errorf("expected LoadConfig error to mention 'failed to sync parent directory', got: %v", loadErr)
+		}
+	})
+
+	t.Run("ParentDirectoryNotSyncedWhenDataDirAlreadyExists", func(t *testing.T) {
+		dataDir := t.TempDir() // already exists
+
+		var syncedDirs []string
+		var mu sync.Mutex
+		origSync := syncDirFunc
+		defer func() { syncDirFunc = origSync }()
+
+		syncDirFunc = func(dirPath string) error {
+			mu.Lock()
+			syncedDirs = append(syncedDirs, filepath.Clean(dirPath))
+			mu.Unlock()
+			return origSync(dirPath)
+		}
+
+		key, err := ResolveSecretKey(dataDir)
+		if err != nil {
+			t.Fatalf("ResolveSecretKey failed: %v", err)
+		}
+		if len(key) != 64 {
+			t.Errorf("expected 64-char key, got: %q", key)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		parentOfDataDir := filepath.Clean(filepath.Dir(dataDir))
+		for _, d := range syncedDirs {
+			if d == parentOfDataDir {
+				t.Errorf("parent directory %s should NOT have been synced when dataDir already existed", d)
+			}
 		}
 	})
 }
