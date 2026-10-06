@@ -191,28 +191,47 @@ func TestGenerationWindow_FullyStaleObservationNeverAdvancesWindow(t *testing.T)
 	})
 
 	t.Run("primitive_partial_stale_advances", func(t *testing.T) {
-		// Documented contract: SOME counters below baseline with at least one
-		// advancing is still an accepted window (the advancing counters moved
-		// genuinely); the stale counters report zero for that window.
+		// Whole-vector monotonicity (issue #429 review round 7): any counter
+		// below baseline must cause wholesale rejection of the observation,
+		// leaving baselines, timestamp, and published deltas untouched.
 		var w generationWindow[float64]
 		base := time.Now()
 		w.sample(0, base, []uint64{100, 200})
 		if !w.sample(0, base.Add(1*time.Second), []uint64{110, 210}) {
 			t.Fatal("window 1 must be accepted")
 		}
-		// counter[1] replays stale while counter[0] genuinely advanced.
-		if !w.sample(0, base.Add(2*time.Second), []uint64{130, 200}) {
-			t.Fatal("partially stale observation must be accepted when one counter advanced")
+		// counter[1] replays stale (200 < 210) while counter[0] genuinely advanced (130 >= 110).
+		// Whole-vector monotonicity requires wholesale rejection.
+		if w.sample(0, base.Add(2*time.Second), []uint64{130, 200}) {
+			t.Fatal("partially stale observation must be rejected wholesale")
 		}
 		deltas, windowSec, primed := w.last()
 		if !primed {
 			t.Fatal("window must be primed")
 		}
-		if deltas[0] != 20 || deltas[1] != 0 {
-			t.Fatalf("deltas=%v, want [20 0]: the stale counter reports zero and must not rewind", deltas)
+		if deltas[0] != 10 || deltas[1] != 10 {
+			t.Fatalf("deltas=%v, want [10 10]: rejected sample must not mutate published deltas", deltas)
 		}
 		if math.Abs(windowSec-1.0) > 1e-9 {
-			t.Fatalf("window=%v, want 1.0: the shared window advances with the genuine counter", windowSec)
+			t.Fatalf("window=%v, want 1.0: rejected sample must not mutate window length", windowSec)
+		}
+		if !w.at.Equal(base.Add(1 * time.Second)) {
+			t.Fatalf("anchor moved: got %v, want %v", w.at, base.Add(1*time.Second))
+		}
+		if w.baseline[0] != 110 || w.baseline[1] != 210 {
+			t.Fatalf("baseline mutated: got %v, want [110 210]", w.baseline)
+		}
+
+		// Subsequent genuine sample retains original denominator: 3s - 1s = 2s.
+		if !w.sample(0, base.Add(3*time.Second), []uint64{130, 220}) {
+			t.Fatal("subsequent genuine observation must be accepted")
+		}
+		deltas, windowSec, _ = w.last()
+		if deltas[0] != 20 || deltas[1] != 10 {
+			t.Fatalf("deltas=%v, want [20 10] (130-110, 220-210)", deltas)
+		}
+		if math.Abs(windowSec-2.0) > 1e-9 {
+			t.Fatalf("window=%v, want 2.0: denominator must be preserved across rejected sample", windowSec)
 		}
 	})
 
@@ -422,4 +441,216 @@ func TestDiagGeneration_HistoryRatesComputedOnlyFromPostStartGeneration(t *testi
 				drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps)
 		}
 	})
+}
+
+// TestGenerationWindow_WholeVectorMonotonicity pins issue #424 round 7
+// remediation: whole-vector monotonicity across generationWindow.
+func TestGenerationWindow_WholeVectorMonotonicity(t *testing.T) {
+	t.Run("lower_plus_equal", func(t *testing.T) {
+		// 1. Lower + Equal:
+		// Baseline: [110, 200, 10]
+		// Stale observation: [100, 200, 10]
+		// Verification: Rejected (accepted == false), timestamp and baselines unchanged.
+		var w generationWindow[uint64]
+		base := time.Now()
+		w.sample(0, base, []uint64{100, 190, 5}) // prime
+		if !w.sample(0, base.Add(1*time.Second), []uint64{110, 200, 10}) {
+			t.Fatal("window 1 must be accepted")
+		}
+		anchor1 := base.Add(1 * time.Second)
+
+		// Stale observation: counter 0 lower (100 < 110), counters 1 and 2 equal (200, 10)
+		accepted := w.sample(0, base.Add(2*time.Second), []uint64{100, 200, 10})
+		if accepted {
+			t.Fatal("lower+equal observation must be rejected")
+		}
+		if !w.at.Equal(anchor1) {
+			t.Fatalf("at=%v, want %v: timestamp must not mutate", w.at, anchor1)
+		}
+		wantBaselines := []uint64{110, 200, 10}
+		for i, want := range wantBaselines {
+			if w.baseline[i] != want {
+				t.Fatalf("baseline[%d]=%d, want %d", i, w.baseline[i], want)
+			}
+		}
+		deltas, windowSec, primed := w.last()
+		if !primed || deltas[0] != 10 || deltas[1] != 10 || deltas[2] != 5 || math.Abs(windowSec-1.0) > 1e-9 {
+			t.Fatalf("last window mutated by rejected sample: deltas=%v window=%v", deltas, windowSec)
+		}
+	})
+
+	t.Run("lower_plus_greater", func(t *testing.T) {
+		// 2. Lower + Greater:
+		// Baseline: [110, 200]
+		// Stale observation: [100, 220]
+		// Verification: Rejected wholesale (accepted == false), baseline and timestamp unchanged.
+		var w generationWindow[uint64]
+		base := time.Now()
+		w.sample(0, base, []uint64{100, 190}) // prime
+		if !w.sample(0, base.Add(1*time.Second), []uint64{110, 200}) {
+			t.Fatal("window 1 must be accepted")
+		}
+		anchor1 := base.Add(1 * time.Second)
+
+		// Stale observation: counter 0 lower (100 < 110), counter 1 greater (220 >= 200)
+		accepted := w.sample(0, base.Add(2*time.Second), []uint64{100, 220})
+		if accepted {
+			t.Fatal("lower+greater observation must be rejected wholesale")
+		}
+		if !w.at.Equal(anchor1) {
+			t.Fatalf("at=%v, want %v: timestamp must not mutate", w.at, anchor1)
+		}
+		if w.baseline[0] != 110 || w.baseline[1] != 200 {
+			t.Fatalf("baseline=%v, want [110 200]", w.baseline)
+		}
+		deltas, windowSec, primed := w.last()
+		if !primed || deltas[0] != 10 || deltas[1] != 10 || math.Abs(windowSec-1.0) > 1e-9 {
+			t.Fatalf("last window mutated by rejected sample: deltas=%v window=%v", deltas, windowSec)
+		}
+	})
+
+	t.Run("all_equal", func(t *testing.T) {
+		// 3. All Equal:
+		// Baseline: [110, 200]
+		// Observation: [110, 200] after sample floor
+		// Verification: Accepted (accepted == true), deltas [0, 0], rates compute to 0.
+		var w generationWindow[float64]
+		base := time.Now()
+		w.sample(0, base, []uint64{100, 190}) // prime
+		if !w.sample(0, base.Add(1*time.Second), []uint64{110, 200}) {
+			t.Fatal("window 1 must be accepted")
+		}
+
+		// Observation with all counters equal after sample floor (1s elapsed >= 200ms)
+		accepted := w.sample(0, base.Add(2*time.Second), []uint64{110, 200})
+		if !accepted {
+			t.Fatal("all-equal observation after floor must be accepted")
+		}
+		deltas, windowSec, primed := w.last()
+		if !primed {
+			t.Fatal("window must be primed")
+		}
+		if deltas[0] != 0 || deltas[1] != 0 {
+			t.Fatalf("deltas=%v, want [0 0]", deltas)
+		}
+		if math.Abs(windowSec-1.0) > 1e-9 {
+			t.Fatalf("windowSec=%v, want 1.0", windowSec)
+		}
+		if !w.at.Equal(base.Add(2 * time.Second)) {
+			t.Fatalf("at=%v, want %v", w.at, base.Add(2*time.Second))
+		}
+		rate0 := deltas[0] / windowSec
+		rate1 := deltas[1] / windowSec
+		if rate0 != 0 || rate1 != 0 {
+			t.Fatalf("rates must compute to 0, got %v %v", rate0, rate1)
+		}
+	})
+
+	t.Run("greater_plus_equal", func(t *testing.T) {
+		// 4. Greater + Equal:
+		// Baseline: [110, 200]
+		// Observation: [120, 200] after sample floor
+		// Verification: Accepted, deltas [10, 0], baselines [120, 200].
+		var w generationWindow[uint64]
+		base := time.Now()
+		w.sample(0, base, []uint64{100, 190}) // prime
+		if !w.sample(0, base.Add(1*time.Second), []uint64{110, 200}) {
+			t.Fatal("window 1 must be accepted")
+		}
+
+		accepted := w.sample(0, base.Add(2*time.Second), []uint64{120, 200})
+		if !accepted {
+			t.Fatal("greater+equal observation must be accepted")
+		}
+		deltas, windowSec, primed := w.last()
+		if !primed {
+			t.Fatal("window must be primed")
+		}
+		if deltas[0] != 10 || deltas[1] != 0 {
+			t.Fatalf("deltas=%v, want [10 0]", deltas)
+		}
+		if math.Abs(windowSec-1.0) > 1e-9 {
+			t.Fatalf("windowSec=%v, want 1.0", windowSec)
+		}
+		if w.baseline[0] != 120 || w.baseline[1] != 200 {
+			t.Fatalf("baseline=%v, want [120 200]", w.baseline)
+		}
+		if !w.at.Equal(base.Add(2 * time.Second)) {
+			t.Fatalf("at=%v, want %v", w.at, base.Add(2*time.Second))
+		}
+	})
+}
+
+// TestDiagRatesTracker_WholeVectorMonotonicity_NoRateInflation pins issue #424
+// round 7 regression 6: production-level diagRatesTracker must reject an older
+// same-generation lower+equal snapshot, leaving headline drop/write-error rates,
+// baselines, and timestamp unaffected, so the next genuine sample preserves its
+// full denominator without rate inflation.
+func TestDiagRatesTracker_WholeVectorMonotonicity_NoRateInflation(t *testing.T) {
+	tk := newDiagRatesTracker()
+	base := time.Now()
+
+	// 1. Prime generation 0
+	tk.Sample(0, base, 100, 100, 200, 10)
+
+	// 2. Establish baseline at t1 = base + 1s
+	t1 := base.Add(1 * time.Second)
+	// clientDrops: 100 -> 110 (+10)
+	// returnDrops: 100 -> 110 (+10)
+	// totalDrops: 200 -> 220 (+20)
+	// writeErrors: 10 -> 12 (+2)
+	c1, r1, tot1, w1 := tk.Sample(0, t1, 110, 110, 220, 12)
+	if c1 != 10 || r1 != 10 || tot1 != 20 || w1 != 2 {
+		t.Fatalf("window 1: want 10/10/20/2 pps, got %v %v %v %v", c1, r1, tot1, w1)
+	}
+
+	// 3. Stale same-generation lower+equal observation at tStale = base + 10s
+	// e.g. clientDrops lower (105 < 110), others equal (returnDrops=110, totalDrops=220, writeErrors=12)
+	tStale := base.Add(10 * time.Second)
+	cStale, rStale, totStale, wStale := tk.Sample(0, tStale, 105, 110, 220, 12)
+	if cStale != 10 || rStale != 10 || totStale != 20 || wStale != 2 {
+		t.Fatalf("stale sample must keep previous rates, got %v %v %v %v", cStale, rStale, totStale, wStale)
+	}
+	if !tk.lastSampleTime.Equal(t1) {
+		t.Fatalf("lastSampleTime mutated: got %v, want %v", tk.lastSampleTime, t1)
+	}
+	if !tk.window.at.Equal(t1) {
+		t.Fatalf("window.at mutated: got %v, want %v", tk.window.at, t1)
+	}
+	wantBaselines := []uint64{110, 110, 220, 12}
+	for i, want := range wantBaselines {
+		if tk.window.baseline[i] != want {
+			t.Fatalf("baseline[%d] mutated: got %d, want %d", i, tk.window.baseline[i], want)
+		}
+	}
+
+	// 4. Next genuine sample at t2 = base + 11s (10s elapsed since t1)
+	// clientDrops: 110 -> 120 (+10)
+	// returnDrops: 110 -> 120 (+10)
+	// totalDrops: 220 -> 240 (+20)
+	// writeErrors: 12 -> 14 (+2)
+	t2 := base.Add(11 * time.Second)
+	c2, r2, tot2, w2 := tk.Sample(0, t2, 120, 120, 240, 14)
+
+	// Denominator must be preserved: 11s - 1s = 10s!
+	// If the stale read at tStale had corrupted the denominator, elapsed would be 1s,
+	// and rates would be inflated 10x (10/10/20/2 pps instead of 1/1/2/0.2 pps).
+	const wantElapsed = 10.0
+	const wantClient = 10.0 / wantElapsed
+	const wantReturn = 10.0 / wantElapsed
+	const wantTotal = 20.0 / wantElapsed
+	const wantWrite = 2.0 / wantElapsed
+
+	if math.Abs(c2-wantClient) > 1e-9 {
+		t.Fatalf("clientDropRate inflated: got %v, want %v", c2, wantClient)
+	}
+	if math.Abs(r2-wantReturn) > 1e-9 {
+		t.Fatalf("returnDropRate inflated: got %v, want %v", r2, wantReturn)
+	}
+	if math.Abs(tot2-wantTotal) > 1e-9 {
+		t.Fatalf("totalDropRate inflated: got %v, want %v", tot2, wantTotal)
+	}
+	if math.Abs(w2-wantWrite) > 1e-9 {
+		t.Fatalf("writeErrorRate inflated: got %v, want %v", w2, wantWrite)
+	}
 }

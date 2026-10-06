@@ -34,12 +34,11 @@ const GenerationSampleMinInterval = 200 * time.Millisecond
 //     primes the baseline and reports no accepted window;
 //   - a sample inside GenerationSampleMinInterval of the accepted one leaves
 //     the window untouched, so repeated reads within one collection agree;
-//   - a counter observation lower than its accepted baseline contributes no
-//     delta and leaves its baseline unchanged; an observation in which EVERY
-//     counter is below its baseline is rejected wholesale (accepted=false and
-//     NOTHING is mutated — baseline, anchor or window), and a PARTIALLY stale
-//     observation advances the window only when at least one counter is
-//     current (same documented rule as internal/vpn/generationWindow);
+//   - within one generation, the sampler enforces whole-vector monotonicity
+//     (issue #429 review round 7): if ANY counter observation is lower than
+//     its accepted baseline, the entire observation is rejected wholesale
+//     (accepted=false and NOTHING is mutated — baseline, anchor or window);
+//     only observations where ALL counters are >= baseline advance the window;
 //   - Reset(generation) explicitly starts a new generation, clearing the
 //     baselines so the next sample re-primes into it.
 //
@@ -63,22 +62,23 @@ func NewGenerationSampler(counters int) *GenerationSampler {
 }
 
 // Sample applies the generation gate, the throttle floor and the
-// monotonic-baseline rule to one cumulative observation of len(values)
-// counters.
+// whole-vector monotonic-baseline rule to one cumulative observation of
+// len(values) counters.
 //
 // accepted reports whether this observation opened a new measurement window;
 // only then are deltas and elapsed meaningful and the baselines advanced.
 // The returned slice is freshly allocated.
 //
-// Staleness contract (issue #429 review round 4, finding 3 — same documented
-// rule as internal/vpn/generationWindow): classification happens BEFORE any
-// mutation. An observation in which every counter is below its accepted
-// baseline is fully stale: accepted=false and NOTHING is mutated — not the
-// baselines, not the accepted sampling anchor (at), so the next valid window
-// keeps its true denominator. A PARTIALLY stale observation (at least one
-// counter >= baseline) is accepted: advancing counters move their baselines
-// and deltas, stale counters report a zero delta for that window, and the
-// shared anchor advances because at least one counter genuinely advanced.
+// Staleness contract (issue #429 review round 4 finding 3, round 7 — same
+// documented rule as internal/vpn/generationWindow): classification happens
+// BEFORE any mutation. Whole-vector monotonicity is enforced: if ANY counter
+// in values is lower than its accepted baseline (value < w.values[i]), the
+// observation is rejected wholesale: accepted=false, returning nil, 0, false,
+// and NOTHING is mutated — not the baselines, not the accepted sampling
+// anchor (at), so the next valid window keeps its true denominator.
+// An observation where all counters are equal (idle period) is accepted after
+// minInterval yielding zero deltas, and advancing observations (some greater,
+// remainder equal) advance baselines and the shared anchor.
 func (w *GenerationSampler) Sample(gen Generation, now time.Time, minInterval time.Duration, values []uint64) (deltas []uint64, elapsed float64, accepted bool) {
 	if len(values) == 0 {
 		return nil, 0, false
@@ -112,31 +112,18 @@ func (w *GenerationSampler) Sample(gen Generation, now time.Time, minInterval ti
 		return nil, 0, false
 	}
 
-	// First pass: classify WITHOUT mutating. An observation in which every
-	// counter is below its baseline is fully stale and must change nothing
-	// (issue #429 review round 4, finding 3) — pre-fix, the zero-delta
-	// branches fell through to w.at = now + accepted=true, so a stale
-	// observation moved the sampling clock and corrupted the next valid
-	// window's denominator.
-	anyAdvanced := false
+	// Whole-vector monotonicity (issue #429 review round 7): classify
+	// WITHOUT mutating. If ANY counter in values is lower than its accepted
+	// baseline, the observation is stale or incoherent and must be rejected
+	// wholesale without mutating baselines, anchor, or window.
 	for i, value := range values {
-		if value >= w.values[i] {
-			anyAdvanced = true
-			break
+		if value < w.values[i] {
+			return nil, 0, false
 		}
-	}
-	if !anyAdvanced {
-		return nil, 0, false
 	}
 
 	deltas = make([]uint64, len(values))
 	for i, value := range values {
-		if value < w.values[i] {
-			// Stale lower observation: zero delta, baseline untouched.
-			// Rewinding here would replay later activity up to the old
-			// higher value as a fresh delta (issue #429 review blocker 1).
-			continue
-		}
 		deltas[i] = value - w.values[i]
 		w.values[i] = value
 	}

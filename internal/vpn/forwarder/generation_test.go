@@ -112,22 +112,35 @@ func TestGenerationSampler_FullyStaleNeverAdvancesClock(t *testing.T) {
 	})
 
 	t.Run("partial_stale_advances", func(t *testing.T) {
-		// Documented contract: SOME counters below baseline with at least one
-		// advancing is still an accepted window (the advancing counters moved
-		// genuinely); the stale counters report zero for that window.
+		// Whole-vector monotonicity (issue #429 review round 7): any counter
+		// below baseline must cause wholesale rejection of the observation,
+		// leaving baselines, timestamp, and published deltas untouched.
 		w := NewGenerationSampler(2)
 		base := time.Now()
 		w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 200}) // prime
 		if d, _, accepted := w.Sample(0, base.Add(1*time.Second), GenerationSampleMinInterval, []uint64{110, 210}); !accepted || d[0] != 10 || d[1] != 10 {
 			t.Fatalf("window 1: want accepted deltas [10 10], got accepted=%v deltas=%v", accepted, d)
 		}
-		// counter[1] replays stale while counter[0] genuinely advanced.
+		// counter[1] replays stale (200 < 210) while counter[0] genuinely advanced (130 >= 110).
+		// Whole-vector monotonicity requires wholesale rejection.
 		d, elapsed, accepted := w.Sample(0, base.Add(2*time.Second), GenerationSampleMinInterval, []uint64{130, 200})
-		if !accepted || d[0] != 20 || d[1] != 0 {
-			t.Fatalf("partially stale observation must be accepted when one counter advanced, got accepted=%v deltas=%v", accepted, d)
+		if accepted || d != nil || elapsed != 0 {
+			t.Fatalf("partially stale observation with lower counter must be rejected wholesale, got accepted=%v deltas=%v elapsed=%v", accepted, d, elapsed)
 		}
-		if math.Abs(elapsed-1.0) > 1e-9 {
-			t.Fatalf("elapsed=%v, want 1.0: the shared window advances with the genuine counter", elapsed)
+		if v, at, primed, gen := w.Baseline(0); !primed || gen != 0 || v != 110 || !at.Equal(base.Add(1*time.Second)) {
+			t.Fatalf("counter 0 baseline must remain 110 at t1, got value=%d at=%v primed=%v gen=%d", v, at, primed, gen)
+		}
+		if v, at, primed, gen := w.Baseline(1); !primed || gen != 0 || v != 210 || !at.Equal(base.Add(1*time.Second)) {
+			t.Fatalf("counter 1 baseline must remain 210 at t1, got value=%d at=%v primed=%v gen=%d", v, at, primed, gen)
+		}
+
+		// Subsequent genuine sample retains original denominator: 3s - 1s = 2s.
+		d, elapsed, accepted = w.Sample(0, base.Add(3*time.Second), GenerationSampleMinInterval, []uint64{130, 220})
+		if !accepted || d[0] != 20 || d[1] != 10 {
+			t.Fatalf("subsequent genuine observation must be accepted, got accepted=%v deltas=%v", accepted, d)
+		}
+		if math.Abs(elapsed-2.0) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 2.0: denominator must be preserved across rejected sample", elapsed)
 		}
 	})
 
@@ -321,4 +334,178 @@ func TestForwarder_StartResetsGenerationAndReprimesRates(t *testing.T) {
 	if v, _, primed, gen := fwd.historyRateTracker.sampler.Baseline(2); !primed || gen != 1 || v != 50 {
 		t.Fatalf("history rx-packets baseline must be primed at the post-start value in generation 1, got value=%d primed=%v gen=%d", v, primed, gen)
 	}
+}
+
+// TestGenerationSampler_WholeVectorMonotonicity pins issue #424 round 7
+// remediation: whole-vector monotonicity across GenerationSampler.
+func TestGenerationSampler_WholeVectorMonotonicity(t *testing.T) {
+	t.Run("lower_plus_equal", func(t *testing.T) {
+		// 1. Lower + Equal:
+		// Baseline: [110, 200, 10]
+		// Stale observation: [100, 200, 10]
+		// Verification: Rejected (accepted == false, deltas nil, elapsed 0), timestamp and baselines unchanged.
+		w := NewGenerationSampler(3)
+		base := time.Now()
+		deltas, elapsed, accepted := w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 190, 5}) // prime
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("prime: want accepted=false deltas=nil elapsed=0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		t1 := base.Add(1 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t1, GenerationSampleMinInterval, []uint64{110, 200, 10})
+		if !accepted || len(deltas) != 3 || deltas[0] != 10 || deltas[1] != 10 || deltas[2] != 5 || math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("window 1: want accepted=true deltas=[10 10 5] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// Stale observation: counter 0 lower (100 < 110), counters 1 and 2 equal (200, 10)
+		tStale := base.Add(2 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, tStale, GenerationSampleMinInterval, []uint64{100, 200, 10})
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("lower+equal observation must be rejected: got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		wantBaselines := []uint64{110, 200, 10}
+		for i, want := range wantBaselines {
+			val, at, primed, gen := w.Baseline(i)
+			if !primed || gen != 0 {
+				t.Fatalf("counter %d: want primed=true gen=0, got primed=%v gen=%d", i, primed, gen)
+			}
+			if val != want {
+				t.Fatalf("counter %d baseline mutated: got %d, want %d", i, val, want)
+			}
+			if !at.Equal(t1) {
+				t.Fatalf("counter %d timestamp mutated: got %v, want %v", i, at, t1)
+			}
+		}
+	})
+
+	t.Run("lower_plus_greater", func(t *testing.T) {
+		// 2. Lower + Greater:
+		// Baseline: [110, 200]
+		// Stale observation: [100, 220]
+		// Verification: Rejected wholesale (accepted == false, deltas nil, elapsed 0), baselines and timestamp unchanged.
+		w := NewGenerationSampler(2)
+		base := time.Now()
+		deltas, elapsed, accepted := w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 190}) // prime
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("prime: want accepted=false deltas=nil elapsed=0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		t1 := base.Add(1 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t1, GenerationSampleMinInterval, []uint64{110, 200})
+		if !accepted || len(deltas) != 2 || deltas[0] != 10 || deltas[1] != 10 || math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("window 1: want accepted=true deltas=[10 10] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// Stale observation: counter 0 lower (100 < 110), counter 1 greater (220 >= 200)
+		tStale := base.Add(2 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, tStale, GenerationSampleMinInterval, []uint64{100, 220})
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("lower+greater observation must be rejected wholesale: got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		wantBaselines := []uint64{110, 200}
+		for i, want := range wantBaselines {
+			val, at, primed, gen := w.Baseline(i)
+			if !primed || gen != 0 {
+				t.Fatalf("counter %d: want primed=true gen=0, got primed=%v gen=%d", i, primed, gen)
+			}
+			if val != want {
+				t.Fatalf("counter %d baseline mutated: got %d, want %d", i, val, want)
+			}
+			if !at.Equal(t1) {
+				t.Fatalf("counter %d timestamp mutated: got %v, want %v", i, at, t1)
+			}
+		}
+	})
+
+	t.Run("all_equal", func(t *testing.T) {
+		// 3. All Equal:
+		// Baseline: [110, 200]
+		// Observation: [110, 200] after sample floor
+		// Verification: Accepted (accepted == true), deltas [0, 0].
+		w := NewGenerationSampler(2)
+		base := time.Now()
+		deltas, elapsed, accepted := w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 190}) // prime
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("prime: want accepted=false deltas=nil elapsed=0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		t1 := base.Add(1 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t1, GenerationSampleMinInterval, []uint64{110, 200})
+		if !accepted || len(deltas) != 2 || deltas[0] != 10 || deltas[1] != 10 || math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("window 1: want accepted=true deltas=[10 10] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// Observation with all counters equal after sample floor (1s elapsed >= 200ms)
+		t2 := base.Add(2 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t2, GenerationSampleMinInterval, []uint64{110, 200})
+		if !accepted {
+			t.Fatal("all-equal observation after floor must be accepted")
+		}
+		if len(deltas) != 2 || deltas[0] != 0 || deltas[1] != 0 {
+			t.Fatalf("deltas=%v, want [0 0]", deltas)
+		}
+		if math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 1.0", elapsed)
+		}
+		wantBaselines := []uint64{110, 200}
+		for i, want := range wantBaselines {
+			val, at, primed, gen := w.Baseline(i)
+			if !primed || gen != 0 {
+				t.Fatalf("counter %d: want primed=true gen=0, got primed=%v gen=%d", i, primed, gen)
+			}
+			if val != want {
+				t.Fatalf("counter %d baseline mutated: got %d, want %d", i, val, want)
+			}
+			if !at.Equal(t2) {
+				t.Fatalf("counter %d timestamp: got %v, want %v", i, at, t2)
+			}
+		}
+	})
+
+	t.Run("greater_plus_equal", func(t *testing.T) {
+		// 4. Greater + Equal:
+		// Baseline: [110, 200]
+		// Observation: [120, 200] after sample floor
+		// Verification: Accepted, deltas [10, 0], baselines [120, 200].
+		w := NewGenerationSampler(2)
+		base := time.Now()
+		deltas, elapsed, accepted := w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 190}) // prime
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("prime: want accepted=false deltas=nil elapsed=0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		t1 := base.Add(1 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t1, GenerationSampleMinInterval, []uint64{110, 200})
+		if !accepted || len(deltas) != 2 || deltas[0] != 10 || deltas[1] != 10 || math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("window 1: want accepted=true deltas=[10 10] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// Observation: counter 0 is greater (120 >= 110), counter 1 is equal (200 >= 200)
+		t2 := base.Add(2 * time.Second)
+		deltas, elapsed, accepted = w.Sample(0, t2, GenerationSampleMinInterval, []uint64{120, 200})
+		if !accepted {
+			t.Fatal("greater+equal observation after floor must be accepted")
+		}
+		if len(deltas) != 2 || deltas[0] != 10 || deltas[1] != 0 {
+			t.Fatalf("deltas=%v, want [10 0]", deltas)
+		}
+		if math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 1.0", elapsed)
+		}
+		wantBaselines := []uint64{120, 200}
+		for i, want := range wantBaselines {
+			val, at, primed, gen := w.Baseline(i)
+			if !primed || gen != 0 {
+				t.Fatalf("counter %d: want primed=true gen=0, got primed=%v gen=%d", i, primed, gen)
+			}
+			if val != want {
+				t.Fatalf("counter %d baseline mutated: got %d, want %d", i, val, want)
+			}
+			if !at.Equal(t2) {
+				t.Fatalf("counter %d timestamp: got %v, want %v", i, at, t2)
+			}
+		}
+	})
 }

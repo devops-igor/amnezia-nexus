@@ -30,9 +30,12 @@ const diagEpochSampleFloor = forwarder.GenerationSampleMinInterval
 //     no accepted window;
 //   - a sample inside diagEpochSampleFloor of the accepted one leaves the
 //     window untouched, so repeated reads within one collection agree;
-//   - a counter observation lower than its accepted baseline reports a zero
-//     delta AND leaves that baseline unchanged; only observations >= the
-//     baseline advance it;
+//   - within one generation, the sampler enforces whole-vector monotonicity
+//     (issue #429 review round 7): if ANY counter observation is lower than
+//     its accepted baseline, the entire observation is rejected wholesale
+//     (accepted=false and NOTHING is mutated — baselines, timestamp, or
+//     deltas); only observations where ALL counters are >= baseline advance
+//     the window;
 //   - Reset(gen) explicitly starts a new generation, clearing the baseline so
 //     the next sample re-primes into it.
 type generationWindow[N numericDelta] struct {
@@ -53,24 +56,24 @@ type numericDelta interface {
 }
 
 // sample applies the generation gate, the throttle floor and the
-// monotonic-baseline rule to one cumulative observation. accepted reports
-// whether this observation opened a new measurement window.
+// whole-vector monotonic-baseline rule to one cumulative observation.
+// accepted reports whether this observation opened a new measurement window.
 //
-// Staleness contract (issue #429 review round 3, blocker 2):
-//   - a counter below its accepted baseline is a stale observation: in an
-//     accepted window it contributes no delta (its published delta is zeroed
-//     for that window) and leaves its baseline untouched;
-//   - an observation in which EVERY counter is below its baseline is rejected
-//     wholesale: accepted=false and NOTHING is mutated — not the accepted
-//     baselines, not the published deltas, not the accepted sampling
-//     timestamp (at) and not the published window. A stale read therefore
-//     cannot corrupt the denominator of the next valid window, and callers
-//     keep the previous accepted snapshot unchanged;
-//   - a PARTIALLY stale observation (some counters >= baseline, some below)
-//     is accepted: the advancing counters move their baselines and deltas,
-//     the stale counters report a zero delta for this window, and the shared
-//     timestamp/window advance because at least one counter genuinely
-//     advanced.
+// Staleness contract (issue #429 review round 3 blocker 2, round 7):
+//   - whole-vector monotonicity: classification happens BEFORE any mutation.
+//     If ANY counter in values is lower than its accepted baseline
+//     (value < w.baseline[i]), the observation is rejected wholesale:
+//     accepted=false and NOTHING is mutated — not the accepted baselines,
+//     not the published deltas, not the accepted sampling timestamp (at),
+//     and not the published window. A stale read therefore cannot corrupt
+//     the denominator of the next valid window, and callers keep the previous
+//     accepted snapshot unchanged;
+//   - an observation where all counters equal their baselines (idle period)
+//     is accepted after the sample floor (elapsed >= diagEpochSampleFloor),
+//     producing zero deltas so idle rates legitimately drop to 0;
+//   - an observation where some counters advance and the remainder are equal
+//     is accepted normally: advancing counters move their baselines and deltas,
+//     equal counters report zero deltas, and the shared timestamp advances.
 func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values []uint64) (accepted bool) {
 	if len(values) == 0 {
 		return false
@@ -102,30 +105,17 @@ func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values [
 	if elapsed < diagEpochSampleFloor.Seconds() {
 		return false
 	}
-	// First pass: classify WITHOUT mutating. An observation in which every
-	// counter is below its baseline is fully stale and must change nothing
-	// (issue #429 review round 3, blocker 2) — zeroing deltas or advancing
-	// the anchor here would erase the last accepted window and corrupt the
-	// next valid denominator.
-	anyAdvanced := false
+	// Whole-vector monotonicity (issue #429 review round 7): classify
+	// WITHOUT mutating. If ANY counter in values is lower than its accepted
+	// baseline, the observation is stale or incoherent and must be rejected
+	// wholesale without mutating baselines, timestamp, window, or deltas.
 	for i, value := range values {
-		if value >= w.baseline[i] {
-			anyAdvanced = true
-			break
-		}
-	}
-	if !anyAdvanced {
-		return false
-	}
-	// Second pass: apply the accepted window. Stale counters report a zero
-	// delta for this window and keep their baselines; advancing counters
-	// move both.
-	for i, value := range values {
-		var zero N
 		if value < w.baseline[i] {
-			w.delta[i] = zero
-			continue
+			return false
 		}
+	}
+	// All counters are >= baseline. Compute deltas, advance baselines and clock.
+	for i, value := range values {
 		w.delta[i] = N(value - w.baseline[i])
 		w.baseline[i] = value
 	}
