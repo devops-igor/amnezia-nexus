@@ -19,13 +19,13 @@ func TestWindowedTrackersAudit_NoneHasADeadPrimingBranch(t *testing.T) {
 		if d.window.primed {
 			t.Fatal("zero-value diagDeltaTracker must be unprimed")
 		}
-		if snap := d.Sample(time.Now(), 5_000); snap.delta != 0 {
+		if snap := d.Sample(0, time.Now(), 5_000); snap.delta != 0 {
 			t.Fatalf("first sample must prime and report zero delta, got %d", snap.delta)
 		}
 		if !d.window.primed {
 			t.Fatal("first sample must prime the window")
 		}
-		if snap := d.Sample(time.Now().Add(5*time.Second), 5_000); snap.delta != 0 {
+		if snap := d.Sample(0, time.Now().Add(5*time.Second), 5_000); snap.delta != 0 {
 			t.Fatalf("unchanged counter must report zero delta, got %d", snap.delta)
 		}
 	})

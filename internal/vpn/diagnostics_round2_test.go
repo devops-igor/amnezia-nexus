@@ -386,19 +386,19 @@ func TestPeerSyncDeltaWindowRecovers(t *testing.T) {
 	svc := &Service{}
 	ps := &PeerSyncStatus{DesiredPeers: 1, ActualPeers: 1}
 
-	svc.diagDeltas.sampleSyncFailures(time.Now(), 0)
+	svc.diagDeltas.sampleSyncFailures(0, time.Now(), 0)
 	time.Sleep(250 * time.Millisecond)
 
-	svc.diagDeltas.sampleSyncFailures(time.Now(), 3)
-	svc.diagDeltas.sampleEnqueueFailures(time.Now(), 2)
+	svc.diagDeltas.sampleSyncFailures(0, time.Now(), 3)
+	svc.diagDeltas.sampleEnqueueFailures(0, time.Now(), 2)
 	if ps.SyncFailures != 0 {
 		t.Fatalf("precondition failed")
 	}
 
 	// After the increase, a fresh window with no further increase recovers.
 	time.Sleep(250 * time.Millisecond)
-	syncRate := svc.diagDeltas.sampleSyncFailures(time.Now(), 3)
-	enqueueRate := svc.diagDeltas.sampleEnqueueFailures(time.Now(), 2)
+	syncRate := svc.diagDeltas.sampleSyncFailures(0, time.Now(), 3)
+	enqueueRate := svc.diagDeltas.sampleEnqueueFailures(0, time.Now(), 2)
 	if syncRate.delta != 0 || enqueueRate.delta != 0 {
 		t.Errorf("expected zero deltas after recovery, got sync=%d enqueue=%d",
 			syncRate.delta, enqueueRate.delta)

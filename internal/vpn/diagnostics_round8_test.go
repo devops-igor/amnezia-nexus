@@ -29,7 +29,7 @@ func TestDiagRatesTracker_FirstSamplePrimesBaselinesNotLifetimeTotals(t *testing
 
 	// Step 1+2: the first sample primes time AND every counter baseline. All
 	// four rates must be zero even though the counters carry real history.
-	client, ret, total, writeErr := tk.Sample(base, historyClientDrops, historyReturnDrops, historyTotalDrops, historyWriteErrors)
+	client, ret, total, writeErr := tk.Sample(0, base, historyClientDrops, historyReturnDrops, historyTotalDrops, historyWriteErrors)
 	if client != 0 || ret != 0 || total != 0 || writeErr != 0 {
 		t.Fatalf("STEP1 first sample must report zero rates, got client=%v return=%v total=%v writeErr=%v",
 			client, ret, total, writeErr)
@@ -53,7 +53,7 @@ func TestDiagRatesTracker_FirstSamplePrimesBaselinesNotLifetimeTotals(t *testing
 	// Counters are UNCHANGED, so no new loss occurred, yet the sample is well
 	// past the 200ms throttle. Pre-fix behaviour divides the full lifetime
 	// totals by the elapsed seconds and reports a large non-zero rate.
-	client, ret, total, writeErr = tk.Sample(
+	client, ret, total, writeErr = tk.Sample(0,
 		base.Add(10*time.Second),
 		historyClientDrops, historyReturnDrops, historyTotalDrops, historyWriteErrors,
 	)
@@ -64,7 +64,7 @@ func TestDiagRatesTracker_FirstSamplePrimesBaselinesNotLifetimeTotals(t *testing
 
 	// Step 4: a real increment is reported as a rate over the new window, and
 	// only over that increment.
-	_, _, total, _ = tk.Sample(
+	_, _, total, _ = tk.Sample(0,
 		base.Add(20*time.Second),
 		historyClientDrops+50, historyReturnDrops, historyTotalDrops+50, historyWriteErrors,
 	)
@@ -86,10 +86,10 @@ func TestDiagRatesTracker_PrimingIsReachableAfterConstruction(t *testing.T) {
 	}
 
 	base := time.Now().Add(time.Second)
-	if _, _, total, _ := tk.Sample(base, 0, 0, 0, 0); total != 0 {
+	if _, _, total, _ := tk.Sample(0, base, 0, 0, 0, 0); total != 0 {
 		t.Fatalf("first status response must report zero rate, got %v", total)
 	}
-	if _, _, total, _ := tk.Sample(base.Add(30*time.Second), 0, 0, 0, 0); total != 0 {
+	if _, _, total, _ := tk.Sample(0, base.Add(30*time.Second), 0, 0, 0, 0); total != 0 {
 		t.Fatalf("idle server must report zero rate on later windows, got %v", total)
 	}
 }

@@ -24,21 +24,21 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		base := time.Now()
 
 		// Window 1: 100 -> 110 over 1s.
-		tk.Sample(base, 100, 100, 200, 10)
-		tk.Sample(base.Add(1*time.Second), 110, 110, 220, 12)
+		tk.Sample(0, base, 100, 100, 200, 10)
+		tk.Sample(0, base.Add(1*time.Second), 110, 110, 220, 12)
 
 		// Out-of-order: the pre-restart observation (100) replays AFTER the
 		// higher one was accepted. It is rejected wholesale (round 3, blocker
 		// 2: a fully stale observation mutates nothing), so the tracker keeps
 		// publishing the LAST ACCEPTED window — 10 pps — and the replay
 		// contributes no fresh loss.
-		c, r, tot, w := tk.Sample(base.Add(2*time.Second), 100, 100, 200, 10)
+		c, r, tot, w := tk.Sample(0, base.Add(2*time.Second), 100, 100, 200, 10)
 		if c != 10 || r != 10 || tot != 20 || w != 2 {
 			t.Fatalf("lower observation must keep the last accepted rates, got client=%v return=%v total=%v writeErr=%v", c, r, tot, w)
 		}
 		// ...and must not rewind the baseline: the counters return to 110 and
 		// the delta must still be zero (no replayed "fresh" loss).
-		c, r, tot, w = tk.Sample(base.Add(3*time.Second), 110, 110, 220, 12)
+		c, r, tot, w = tk.Sample(0, base.Add(3*time.Second), 110, 110, 220, 12)
 		if c != 0 || r != 0 || tot != 0 || w != 0 {
 			t.Fatalf("activity up to the accepted baseline must not replay as fresh loss, got client=%v return=%v total=%v writeErr=%v", c, r, tot, w)
 		}
@@ -49,8 +49,8 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		base := time.Now()
 
 		// Window 1: 100 -> 110 for client_queue_full over 1s.
-		tr.sample(base, map[string]uint64{"client_queue_full": 100})
-		rates, avail := tr.sample(base.Add(1*time.Second), map[string]uint64{"client_queue_full": 110})
+		tr.sample(0, base, map[string]uint64{"client_queue_full": 100})
+		rates, avail := tr.sample(0, base.Add(1*time.Second), map[string]uint64{"client_queue_full": 110})
 		if !avail || rates["client_queue_full"] != 10 {
 			t.Fatalf("window 1: want rate 10 avail true, got %v avail=%v", rates, avail)
 		}
@@ -59,12 +59,12 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		// accepted. The stale observation is rejected wholesale (round 3,
 		// blocker 2: nothing mutates), so the tracker keeps publishing the
 		// last accepted window's rate and keeps 110 accepted.
-		rates, avail = tr.sample(base.Add(2*time.Second), map[string]uint64{"client_queue_full": 100})
+		rates, avail = tr.sample(0, base.Add(2*time.Second), map[string]uint64{"client_queue_full": 100})
 		if !avail || rates["client_queue_full"] != 10 {
 			t.Fatalf("lower observation must keep the last accepted rate, got %v avail=%v", rates, avail)
 		}
 		// Back to 110: still zero — the baseline was never rewound.
-		rates, avail = tr.sample(base.Add(3*time.Second), map[string]uint64{"client_queue_full": 110})
+		rates, avail = tr.sample(0, base.Add(3*time.Second), map[string]uint64{"client_queue_full": 110})
 		if avail && rates["client_queue_full"] != 0 {
 			t.Fatalf("activity up to the accepted baseline must not replay, got %v avail=%v", rates, avail)
 		}
@@ -75,8 +75,8 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		base := time.Now()
 
 		// Window 1: 100 -> 110 over 1s.
-		dts.sampleOwnershipMismatch(base, 100)
-		first := dts.sampleOwnershipMismatch(base.Add(1*time.Second), 110)
+		dts.sampleOwnershipMismatch(0, base, 100)
+		first := dts.sampleOwnershipMismatch(0, base.Add(1*time.Second), 110)
 		if first.delta != 10 {
 			t.Fatalf("window 1: want delta 10, got %d", first.delta)
 		}
@@ -84,11 +84,11 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		// Out-of-order: pre-restart observation 100 replays, then 110 again.
 		// The stale observation is rejected wholesale (round 3, blocker 2:
 		// nothing mutates), so the PREVIOUS accepted snapshot is returned.
-		replay := dts.sampleOwnershipMismatch(base.Add(2*time.Second), 100)
+		replay := dts.sampleOwnershipMismatch(0, base.Add(2*time.Second), 100)
 		if replay.delta != 10 {
 			t.Fatalf("lower observation must keep the last accepted delta, got %d", replay.delta)
 		}
-		again := dts.sampleOwnershipMismatch(base.Add(3*time.Second), 110)
+		again := dts.sampleOwnershipMismatch(0, base.Add(3*time.Second), 110)
 		if again.delta != 0 {
 			t.Fatalf("activity up to the accepted baseline must not replay as fresh delta, got %d", again.delta)
 		}
@@ -104,47 +104,47 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 func TestDiagGeneration_LifecycleResetsReprime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		svc := &Service{rollingHistory: NewRollingHistory()}
-		if svc.diagGeneration != 0 {
-			t.Fatalf("fresh service must start at generation 0, got %d", svc.diagGeneration)
+		if svc.diagGeneration.Load() != 0 {
+			t.Fatalf("fresh service must start at generation 0, got %d", svc.diagGeneration.Load())
 		}
 		svc.diagRates = newDiagRatesTracker()
 
 		// --- Pre-start era (generation 0): real activity, baselines live. ---
 		base := time.Now()
-		svc.diagRates.Sample(base, 100, 100, 200, 10)
-		svc.diagRates.Sample(base.Add(1*time.Second), 110, 110, 220, 12)
-		svc.diagDeltas.sampleOwnershipMismatch(base, 100)
-		svc.diagDeltas.sampleOwnershipMismatch(base.Add(1*time.Second), 110)
-		svc.sampleHistoryDropRates(base, &DropCategoryBreakdown{})
-		svc.sampleHistoryDropRates(base.Add(1*time.Second), &DropCategoryBreakdown{ClientTotalDrops: 100, TotalDrops: 100})
+		svc.diagRates.Sample(0, base, 100, 100, 200, 10)
+		svc.diagRates.Sample(0, base.Add(1*time.Second), 110, 110, 220, 12)
+		svc.diagDeltas.sampleOwnershipMismatch(0, base, 100)
+		svc.diagDeltas.sampleOwnershipMismatch(0, base.Add(1*time.Second), 110)
+		svc.sampleHistoryDropRates(0, base, &DropCategoryBreakdown{})
+		svc.sampleHistoryDropRates(0, base.Add(1*time.Second), &DropCategoryBreakdown{ClientTotalDrops: 100, TotalDrops: 100})
 
 		// --- Stop->Start: the production lifecycle reset. ---
 		// (Service.Start itself needs the full engine stack;
 		// resetDiagnosticsGeneration is exactly the diagnostics part of it.)
 		svc.resetDiagnosticsGeneration()
-		if svc.diagGeneration != 1 {
-			t.Fatalf("reset must advance the generation to 1, got %d", svc.diagGeneration)
+		if svc.currentDiagGeneration() != 1 {
+			t.Fatalf("reset must advance the generation to 1, got %d", svc.currentDiagGeneration())
 		}
 
 		// --- Post-start era (generation 1): counters restarted from zero. ---
 		// Foreground trackers re-prime lazily from the post-start counters;
 		// history baselines were re-primed eagerly by the reset itself.
 		post := time.Now()
-		svc.diagRates.Sample(post, 0, 0, 0, 0) // prime gen 1 from zero
-		rc, rr, rt, rw := svc.diagRates.Sample(post.Add(1*time.Second), 0, 5, 5, 0)
+		svc.diagRates.Sample(1, post, 0, 0, 0, 0) // prime gen 1 from zero
+		rc, rr, rt, rw := svc.diagRates.Sample(1, post.Add(1*time.Second), 0, 5, 5, 0)
 		if rc != 0 || rr != 5 || rt != 5 || rw != 0 {
 			t.Fatalf("post-start foreground rates must come only from post-start counters, got client=%v return=%v total=%v writeErr=%v", rc, rr, rt, rw)
 		}
 
-		svc.diagDeltas.sampleOwnershipMismatch(post, 0) // prime gen 1
-		d := svc.diagDeltas.sampleOwnershipMismatch(post.Add(1*time.Second), 3)
+		svc.diagDeltas.sampleOwnershipMismatch(1, post, 0) // prime gen 1
+		d := svc.diagDeltas.sampleOwnershipMismatch(1, post.Add(1*time.Second), 3)
 		if d.delta != 3 {
 			t.Fatalf("post-start delta must come only from post-start activity, got %d", d.delta)
 		}
 
-		svc.sampleHistoryDropRates(post, &DropCategoryBreakdown{})
+		svc.sampleHistoryDropRates(1, post, &DropCategoryBreakdown{})
 		drops := DropCategoryBreakdown{ReturnTotalDrops: 4, TotalDrops: 4}
-		svc.sampleHistoryDropRates(post.Add(1*time.Second), &drops)
+		svc.sampleHistoryDropRates(1, post.Add(1*time.Second), &drops)
 		if !drops.RatesAvailable {
 			t.Fatal("post-start history window must be available")
 		}
@@ -219,20 +219,20 @@ func TestGenerationWindow_FullyStaleObservationNeverAdvancesWindow(t *testing.T)
 	t.Run("aggregate_rates_tracker", func(t *testing.T) {
 		tk := newDiagRatesTracker()
 		base := time.Now()
-		tk.Sample(base, 100, 100, 200, 10)
-		c, r, tot, w := tk.Sample(base.Add(1*time.Second), 110, 110, 220, 12)
+		tk.Sample(0, base, 100, 100, 200, 10)
+		c, r, tot, w := tk.Sample(0, base.Add(1*time.Second), 110, 110, 220, 12)
 		if c != 10 || r != 10 || tot != 20 || w != 2 {
 			t.Fatalf("window 1: want 10/10/20/2 pps, got %v %v %v %v", c, r, tot, w)
 		}
 		// Fully stale across every counter: rejected, so the tracker keeps
 		// publishing the previous window's rates unchanged.
-		c, r, tot, w = tk.Sample(base.Add(10*time.Second), 100, 100, 200, 10)
+		c, r, tot, w = tk.Sample(0, base.Add(10*time.Second), 100, 100, 200, 10)
 		if c != 10 || r != 10 || tot != 20 || w != 2 {
 			t.Fatalf("fully stale observation must keep the previous rates, got %v %v %v %v", c, r, tot, w)
 		}
 		// The valid observation 0.2s later keeps its true denominator: the
 		// same 10-count growth over 9.2s, not 50/s over the corrupted 0.2s.
-		c, r, tot, w = tk.Sample(base.Add(10200*time.Millisecond), 120, 120, 240, 14)
+		c, r, tot, w = tk.Sample(0, base.Add(10200*time.Millisecond), 120, 120, 240, 14)
 		if math.Abs(c-10/9.2) > 1e-9 || math.Abs(r-10/9.2) > 1e-9 ||
 			math.Abs(tot-20/9.2) > 1e-9 || math.Abs(w-2/9.2) > 1e-9 {
 			t.Fatalf("rates must use the preserved denominator (9.2s), got client=%v return=%v total=%v writeErr=%v", c, r, tot, w)
@@ -247,19 +247,19 @@ func TestGenerationWindow_FullyStaleObservationNeverAdvancesWindow(t *testing.T)
 		// zero rate while availability is retained.
 		var tr dropReasonRatesTracker
 		base := time.Now()
-		tr.sample(base, map[string]uint64{"client_malformed": 100})
-		rates, avail := tr.sample(base.Add(1*time.Second), map[string]uint64{"client_malformed": 110})
+		tr.sample(0, base, map[string]uint64{"client_malformed": 100})
+		rates, avail := tr.sample(0, base.Add(1*time.Second), map[string]uint64{"client_malformed": 110})
 		if !avail || rates["client_malformed"] != 10 {
 			t.Fatalf("window 1: want rate 10, got %v avail=%v", rates, avail)
 		}
-		rates, avail = tr.sample(base.Add(10*time.Second), map[string]uint64{"client_malformed": 100})
+		rates, avail = tr.sample(0, base.Add(10*time.Second), map[string]uint64{"client_malformed": 100})
 		if !avail {
 			t.Fatal("availability must survive a stale observation")
 		}
 		if rates["client_malformed"] != 10 {
 			t.Fatalf("stale observation must keep the last accepted rate, got %v", rates["client_malformed"])
 		}
-		rates, avail = tr.sample(base.Add(10200*time.Millisecond), map[string]uint64{"client_malformed": 120})
+		rates, avail = tr.sample(0, base.Add(10200*time.Millisecond), map[string]uint64{"client_malformed": 120})
 		if !avail {
 			t.Fatal("valid window must keep availability")
 		}
@@ -272,16 +272,16 @@ func TestGenerationWindow_FullyStaleObservationNeverAdvancesWindow(t *testing.T)
 	t.Run("delta_tracker", func(t *testing.T) {
 		var dts diagDeltaTrackers
 		base := time.Now()
-		dts.sampleOwnershipMismatch(base, 100)
-		first := dts.sampleOwnershipMismatch(base.Add(1*time.Second), 110)
+		dts.sampleOwnershipMismatch(0, base, 100)
+		first := dts.sampleOwnershipMismatch(0, base.Add(1*time.Second), 110)
 		if first.delta != 10 {
 			t.Fatalf("window 1: want delta 10, got %d", first.delta)
 		}
-		stale := dts.sampleOwnershipMismatch(base.Add(10*time.Second), 100)
+		stale := dts.sampleOwnershipMismatch(0, base.Add(10*time.Second), 100)
 		if stale.delta != 10 || stale.windowSeconds != 1 {
 			t.Fatalf("stale observation must return the PREVIOUS snapshot unchanged, got %+v", stale)
 		}
-		valid := dts.sampleOwnershipMismatch(base.Add(10200*time.Millisecond), 120)
+		valid := dts.sampleOwnershipMismatch(0, base.Add(10200*time.Millisecond), 120)
 		if valid.delta != 10 {
 			t.Fatalf("valid delta=%d, want 10", valid.delta)
 		}
@@ -304,22 +304,22 @@ func TestGenerationWindow_CrossGenerationSnapshotLeavesNoTrace(t *testing.T) {
 		base := time.Now()
 
 		// Generation 0: live baselines.
-		tk.Sample(base, 100)
-		first := tk.Sample(base.Add(1*time.Second), 110)
+		tk.Sample(0, base, 100)
+		first := tk.Sample(0, base.Add(1*time.Second), 110)
 		if first.delta != 10 {
 			t.Fatalf("window 1: want delta 10, got %+v", first)
 		}
 		// The in-flight snapshot request captured its generation and its
 		// (pre-reset) observation time before the lifecycle reset happened.
-		capturedGen := tk.gen
+		capturedGen := diagGeneration(0) // the generation travels with the observation (round 4)
 		capturedAt := base.Add(10 * time.Second)
 
 		// Stop->Start: the production lifecycle reset, then the new
 		// generation is primed from post-start counters.
 		tk.reset(1)
 		post := time.Now()
-		tk.Sample(post, 0)                            // prime gen 1
-		snap := tk.Sample(post.Add(1*time.Second), 3) // first gen-1 window
+		tk.Sample(1, post, 0)                            // prime gen 1
+		snap := tk.Sample(1, post.Add(1*time.Second), 3) // first gen-1 window
 		if snap.delta != 3 {
 			t.Fatalf("gen 1 must prime from post-start counters, got %+v", snap)
 		}
@@ -337,7 +337,7 @@ func TestGenerationWindow_CrossGenerationSnapshotLeavesNoTrace(t *testing.T) {
 
 		// The next live sample still sees the gen-1 baseline (3), not one
 		// rewound to the pre-reset 110.
-		next := tk.Sample(post.Add(2*time.Second), 7)
+		next := tk.Sample(1, post.Add(2*time.Second), 7)
 		if next.delta != 4 {
 			t.Fatalf("post-stale delta=%d, want 4 (7-3): the stale request must not have re-baselined the new generation", next.delta)
 		}
@@ -393,8 +393,8 @@ func TestDiagGeneration_HistoryRatesComputedOnlyFromPostStartGeneration(t *testi
 
 		base := time.Now()
 		// Pre-start history sampling: prime at gen 0, then a live window.
-		svc.sampleHistoryDropRates(base, &DropCategoryBreakdown{})
-		svc.sampleHistoryDropRates(base.Add(1*time.Second), &DropCategoryBreakdown{ClientTotalDrops: 100, TotalDrops: 100})
+		svc.sampleHistoryDropRates(0, base, &DropCategoryBreakdown{})
+		svc.sampleHistoryDropRates(0, base.Add(1*time.Second), &DropCategoryBreakdown{ClientTotalDrops: 100, TotalDrops: 100})
 
 		// Lifecycle reset (the diagnostics part of Stop->Start).
 		svc.resetDiagnosticsGeneration()
@@ -402,9 +402,9 @@ func TestDiagGeneration_HistoryRatesComputedOnlyFromPostStartGeneration(t *testi
 		// Post-start sampling with counters restarted from zero: the first
 		// sample re-primes, the second records the window.
 		post := time.Now()
-		svc.sampleHistoryDropRates(post, &DropCategoryBreakdown{})
+		svc.sampleHistoryDropRates(1, post, &DropCategoryBreakdown{})
 		drops := DropCategoryBreakdown{ReturnTotalDrops: 4, TotalDrops: 4}
-		svc.sampleHistoryDropRates(post.Add(1*time.Second), &drops)
+		svc.sampleHistoryDropRates(1, post.Add(1*time.Second), &drops)
 		if !drops.RatesAvailable {
 			t.Fatal("post-start history window must be available")
 		}

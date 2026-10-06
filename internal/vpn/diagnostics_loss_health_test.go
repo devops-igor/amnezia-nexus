@@ -45,13 +45,13 @@ func TestUnattributedRetirementDoesNotInventLossRate(t *testing.T) {
 	svc := &Service{backendDevices: map[int64]BackendDevice{1: dev}}
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	before := svc.collectDropCategories()
-	svc.sampleDropRates(at, &before, 0)
+	svc.sampleDropRates(0, at, &before, 0)
 	svc.mu.Lock()
 	svc.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 	delete(svc.backendDevices, 1)
 	svc.mu.Unlock()
 	after := svc.collectDropCategories()
-	svc.sampleDropRates(at.Add(time.Second), &after, 0)
+	svc.sampleDropRates(0, at.Add(time.Second), &after, 0)
 	if before.TotalDrops != 9 || after.TotalDrops != 9 {
 		t.Fatal("retirement changed total")
 	}

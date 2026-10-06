@@ -115,7 +115,7 @@ func TestBackendDeviceUnattributedHealthConditionAbsentWithDetailedProvider(t *t
 	if got := drops.BackendDeviceUnattributed; got != 0 {
 		t.Fatalf("a detailed provider must never publish the directionless key: %d", got)
 	}
-	svc.sampleDropRates(at, &drops, 0)
+	svc.sampleDropRates(0, at, &drops, 0)
 
 	conds := evaluateVirtualTUNAndDropConditions(
 		quietVirtualTUN(), drops, RoutingConsistencyDiagnostics{IsConsistent: true}, 0)
@@ -193,7 +193,7 @@ func TestBackendDeviceUnattributedHealthConditionEndToEnd(t *testing.T) {
 	// A single instantaneous observation cannot produce a rate window: prime
 	// the per-reason baselines, then resample one floor later so the window
 	// is measured (the same production sampler every diagnostics read uses).
-	if rate := svc.sampleDropRates(at, &status.DropCategories, 0); rate != 0 || status.DropCategories.RatesAvailable {
+	if rate := svc.sampleDropRates(0, at, &status.DropCategories, 0); rate != 0 || status.DropCategories.RatesAvailable {
 		t.Fatalf("priming sample must publish no window: rate=%v available=%v", rate, status.DropCategories.RatesAvailable)
 	}
 	// The device loses MORE packets, and the next real production poll happens

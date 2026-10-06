@@ -23,7 +23,15 @@ import (
 // diagnosticsInputs owns Service lifecycle storage for one observation.
 // Shared collaborators synchronize their own methods and remain valid after
 // retirement. Call them only after releasing Service.mu.
+//
+// generation is the dataplane incarnation this snapshot belongs to (issue
+// #429 review round 4, blocker 1): it is captured atomically together with
+// the rest of the snapshot and must be passed to EVERY sampling entry point
+// fed from it, so a snapshot can never be sampled against the trackers'
+// current generation after a lifecycle reset. The trackers' reset(gen)
+// lifecycle is unchanged.
 type diagnosticsInputs struct {
+	generation                diagGeneration
 	sessions                  []Session
 	tunnels                   []*models.BackendTunnel
 	forwarder                 *forwarder.Forwarder
@@ -42,8 +50,13 @@ func (s *Service) captureDiagnosticsInputs() diagnosticsInputs {
 	return s.diagnosticsInputsLocked()
 }
 
-// diagnosticsInputsLocked requires Service.mu. Map storage and retired prefixes
-// are captured together so a retiring device belongs to exactly one population.
+// diagnosticsInputsLocked requires Service.mu. Map storage, retired prefixes
+// and the diagnostics generation are captured together so an observation
+// belongs to exactly one population AND one dataplane incarnation: the
+// atomic load cannot straddle a lifecycle transition that the rest of the
+// snapshot already crossed, because resetDiagnosticsGeneration bumps the
+// generation under diagRatesMu before Service.Start repopulates the
+// snapshot's collaborators (and their writers hold s.mu).
 func (s *Service) diagnosticsInputsLocked() diagnosticsInputs {
 	devices := make(map[int64]BackendDevice, len(s.backendDevices))
 	for id, dev := range s.backendDevices {
@@ -58,13 +71,22 @@ func (s *Service) diagnosticsInputsLocked() diagnosticsInputs {
 		tunnels = s.pool.ListTunnels()
 	}
 	return diagnosticsInputs{
-		sessions: sessions, tunnels: tunnels,
+		generation: s.currentDiagGeneration(),
+		sessions:   sessions, tunnels: tunnels,
 		forwarder: s.forwarder, ingressEngine: s.ingressEngine,
 		sessionMgr: s.sessionMgr, pool: s.pool, rollingHistory: s.rollingHistory,
 		backendDevices:            devices,
 		retiredBackendDeviceDrops: s.retiredBackendDeviceDrops,
 		retiredIngressLosses:      s.retiredIngressLosses,
 	}
+}
+
+// currentDiagGeneration reports the live diagnostics generation. Lock-free on
+// purpose (atomic): capture paths hold s.mu, while resetDiagnosticsGeneration
+// holds diagRatesMu and takes s.mu for its priming capture — a diagRatesMu
+// read here would invert the established lock order and deadlock.
+func (s *Service) currentDiagGeneration() diagGeneration {
+	return diagGeneration(s.diagGeneration.Load())
 }
 
 // Health status states for forwarder and dataplane.
@@ -750,9 +772,11 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 	// OwnershipMismatchWindowSec describes both deltas and the rate the
 	// aggregate drop condition subtracts is measured over exactly the interval
 	// the CRITICAL gate was decided on (issue #424 review round 9, blocker 3).
+	// The generation travels with the inputs snapshot (issue #429 review
+	// round 4, blocker 1): a stale snapshot can never advance these windows.
 	now := time.Now()
-	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(now, retStats.OwnershipMismatchDrops)
-	clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(now, clientOwnershipMismatch)
+	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
+	clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(inputs.generation, now, clientOwnershipMismatch)
 	diag.OwnershipMismatchDropsRecent = mismatchRate.delta
 	diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
 	diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
@@ -1891,7 +1915,7 @@ func (s *Service) stopRollingHistory() {
 
 func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
 	inputs := s.captureDiagnosticsInputs()
-	s.primeHistoryFromDrops(now, fwd, inputs.collectDropCategories())
+	s.primeHistoryFromDrops(now, fwd, inputs.generation, inputs.collectDropCategories())
 }
 
 // historyPrimedForCurrentGenerationLocked reports whether the history
@@ -1901,7 +1925,7 @@ func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
 // no longer matches, so priming is re-done instead of the sticky flag
 // suppressing history for the process lifetime.
 func (s *Service) historyPrimedForCurrentGenerationLocked() bool {
-	return s.historyPrimed && s.historyPrimedGen == s.diagGeneration
+	return s.historyPrimed && s.historyPrimedGen == diagGeneration(s.diagGeneration.Load())
 }
 
 // markHistoryPrimedForCurrentGenerationLocked primes the history baselines and
@@ -1909,12 +1933,18 @@ func (s *Service) historyPrimedForCurrentGenerationLocked() bool {
 // s.diagRatesMu. The forwarder's own history baselines are primed by the
 // caller AFTER the diagRatesMu release, since they carry independent locks.
 func (s *Service) markHistoryPrimedForCurrentGenerationLocked(now time.Time, drops *DropCategoryBreakdown) {
-	s.primeHistoryRatesLocked(now, drops)
-	s.historyPrimedGen = s.diagGeneration
+	// Ordering invariant: the primed-mark MUST be recorded even when the
+	// caller's generation is stale (primeHistoryFromDrops checks its
+	// stale-generation guard only AFTER this call). The per-generation
+	// historyPrimed keying below makes that safe — a stale mark still records
+	// the CURRENT generation, which is exactly the state whose genuine
+	// re-prime must not be suppressed.
+	s.primeHistoryRatesLocked(s.currentDiagGeneration(), now, drops)
+	s.historyPrimedGen = diagGeneration(s.diagGeneration.Load())
 	s.historyPrimed = true
 }
 
-func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, drops DropCategoryBreakdown) {
+func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, gen diagGeneration, drops DropCategoryBreakdown) {
 	s.diagRatesMu.Lock()
 	// historyPrimed is NOT a sticky flag: it is the per-generation priming
 	// state (accepted gen == current gen && baselines exist), so a new
@@ -1927,6 +1957,14 @@ func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder,
 	}
 	s.markHistoryPrimedForCurrentGenerationLocked(now, &drops)
 	s.diagRatesMu.Unlock()
+	// A snapshot whose generation was captured BEFORE a lifecycle reset must
+	// not re-prime the new generation on completion (issue #429 review round
+	// 4, blocker 1): its priming samples are tagged with the stale generation
+	// and would be ignored, but the primed-mark would suppress the genuine
+	// re-prime. The new generation's own first read re-primes instead.
+	if gen < s.currentDiagGeneration() {
+		return
+	}
 
 	if fwd != nil {
 		fwd.PrimeHistoryRates(now)
@@ -1950,7 +1988,7 @@ func (s *Service) sampleRollingHistory() {
 	s.diagRatesMu.Unlock()
 
 	if !isPrimed {
-		s.primeHistoryFromDrops(now, fwd, drops)
+		s.primeHistoryFromDrops(now, fwd, inputs.generation, drops)
 	}
 
 	// 1. Forwarder traffic rates (independent history baseline)
@@ -1958,9 +1996,10 @@ func (s *Service) sampleRollingHistory() {
 	if fwd != nil {
 		fRates = fwd.HistoryRates(now)
 	}
-
-	// 2. Drop categories and drop rates (independent history baseline)
-	s.sampleHistoryDropRates(now, &drops)
+	// History samples use the generation the snapshot was captured under
+	// (issue #429 review round 4, blocker 1): a snapshot taken before a
+	// lifecycle reset can never advance the new generation's baselines.
+	s.sampleHistoryDropRates(inputs.generation, now, &drops)
 
 	// 3. Queue utilization
 	var queueUtilPct float64
@@ -2039,9 +2078,12 @@ type diagRatesTracker struct {
 	// every counter baseline and reports zero rates. primed stays a tracker
 	// field on purpose — the round-8 audit pins an unprimed constructor via
 	// tk.primed, and it must never be derived from lastSampleTime being zero.
+	// The generation travels with the observation (issue #429 review round
+	// 4, blocker 1): Sample takes it explicitly instead of reading a
+	// tracker-current field, so a snapshot captured before a lifecycle reset
+	// can never be sampled against the new generation.
 	primed         bool
 	window         generationWindow[float64]
-	gen            diagGeneration
 	lastSampleTime time.Time
 
 	clientDropRate float64
@@ -2060,10 +2102,13 @@ func newDiagRatesTracker() *diagRatesTracker {
 }
 
 // Sample records the cumulative drop counters and reports the per-second rates
-// of the newly accepted window. Only observations >= the accepted baseline
-// advance it; an older/lower observation reports zero and leaves the baseline
-// unchanged (issue #429 review blocker 1).
-func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+// of the newly accepted window. The generation travels with the observation
+// (issue #429 review round 4, blocker 1): callers pass the generation the
+// snapshot was captured under, never a tracker-current value. Only
+// observations >= the accepted baseline advance it; an older/lower observation
+// reports the previous window and leaves the baseline unchanged (issue #429
+// review blocker 1).
+func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
 	if t == nil {
 		return 0, 0, 0, 0
 	}
@@ -2073,21 +2118,24 @@ func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, total
 	if !t.primed {
 		// First sample: prime time AND every counter baseline, report zero.
 		t.primed = true
-		t.window.sample(t.gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
+		t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
 		t.lastSampleTime = now
 		return 0, 0, 0, 0
 	}
-	if accepted := t.window.sample(t.gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors}); !accepted {
+	if accepted := t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors}); !accepted {
 		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
 	}
 	deltas, elapsed, _ := t.window.last()
 
 	t.clientDropRate = deltas[0] / elapsed
 	t.returnDropRate = deltas[1] / elapsed
-	t.totalDropRate = t.clientDropRate + t.returnDropRate
-	// deltas[3] is the writeErrors counter; deltas[2] is totalDrops, which
-	// the aggregate rate derives from client+return instead (pre-conversion
-	// semantics, caught by TestDiagGeneration_LifecycleResetsReprime).
+	// deltas[2] is the TotalDrops counter (issue #429 review round 4,
+	// blocker 2): the total rate must come from the total counter, not the
+	// client+return sum — the direction-neutral backend_device_unattributed
+	// bucket is in TotalDrops but in neither directional total, so the sum
+	// under-reported the conserved total.
+	t.totalDropRate = deltas[2] / elapsed
+	// deltas[3] is the writeErrors counter.
 	t.writeErrorRate = deltas[3] / elapsed
 	t.lastSampleTime = now
 
@@ -2095,20 +2143,17 @@ func (t *diagRatesTracker) Sample(now time.Time, clientDrops, returnDrops, total
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
-// samples are tagged with gen, and the window re-primes on its next call
-// (issue #429 review blocker 1). A generation lower than the accepted one is
-// ignored.
+// samples are tagged with the generation their snapshot captured, and the
+// window re-primes on its next call (issue #429 review blocker 1). A
+// generation lower than the accepted one is ignored.
 func (t *diagRatesTracker) reset(gen diagGeneration) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if gen > t.gen {
-		t.gen = gen
-	}
 	t.primed = false
-	t.window.reset(t.gen)
+	t.window.reset(gen)
 	t.lastSampleTime = time.Time{}
 	t.clientDropRate, t.returnDropRate = 0, 0
 	t.totalDropRate, t.writeErrorRate = 0, 0
@@ -2127,12 +2172,13 @@ func (t *diagRatesTracker) reset(gen diagGeneration) {
 type diagDeltaTracker struct {
 	mu sync.Mutex
 	// window owns its own locking; mu guards only the WRAPPER state below
-	// (gen and the published snapshot), which Sample reads and reset clears
+	// (the published snapshot), which Sample reads and reset clears
 	// without any other synchronization (issue #429 review round 3,
 	// blocker 1 — the "each has its own mutex" claim was false for the
-	// wrapper fields).
+	// wrapper fields). The generation travels with the observation (issue
+	// #429 review round 4, blocker 1): Sample takes it explicitly instead
+	// of reading a tracker-current field.
 	window        generationWindow[uint64]
-	gen           diagGeneration
 	delta         uint64
 	windowSeconds float64
 }
@@ -2144,20 +2190,22 @@ type deltaSnapshot struct {
 }
 
 // Sample records cumulative and returns the increase since the previous
-// accepted sample. The first sample only primes the baseline and reports zero,
-// so a counter that has been rising since process start is never reported as a
-// fresh incident. Resampling sooner than 200ms reuses the previous delta rather
-// than dividing by a near-zero window. A stale LOWER observation reports no
-// new loss AND leaves the accepted baseline unchanged, so later activity up to
-// the previously accepted value can never be replayed as a fresh delta
-// (issue #429 review blocker 1).
-func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapshot {
+// accepted sample. The generation travels with the observation (issue #429
+// review round 4, blocker 1): callers pass the generation the snapshot was
+// captured under, never a tracker-current value. The first sample only primes
+// the baseline and reports zero, so a counter that has been rising since
+// process start is never reported as a fresh incident. Resampling sooner than
+// 200ms reuses the previous delta rather than dividing by a near-zero window.
+// A stale LOWER observation reports no new loss AND leaves the accepted
+// baseline unchanged, so later activity up to the previously accepted value
+// can never be replayed as a fresh delta (issue #429 review blocker 1).
+func (t *diagDeltaTracker) Sample(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
 	if t == nil {
 		return deltaSnapshot{}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if accepted := t.window.sample(t.gen, now, []uint64{cumulative}); !accepted {
+	if accepted := t.window.sample(gen, now, []uint64{cumulative}); !accepted {
 		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
 	}
 	deltas, elapsed, _ := t.window.last()
@@ -2167,19 +2215,16 @@ func (t *diagDeltaTracker) Sample(now time.Time, cumulative uint64) deltaSnapsho
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
-// samples are tagged with gen, and the window re-primes on its next call
-// (issue #429 review blocker 1). A generation lower than the accepted one is
-// ignored.
+// samples are tagged with the generation their snapshot captured, and the
+// window re-primes on its next call (issue #429 review blocker 1). A
+// generation lower than the accepted one is ignored.
 func (t *diagDeltaTracker) reset(gen diagGeneration) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if gen > t.gen {
-		t.gen = gen
-	}
-	t.window.reset(t.gen)
+	t.window.reset(gen)
 	t.delta = 0
 	t.windowSeconds = 0
 }
@@ -2201,20 +2246,20 @@ type diagDeltaTrackers struct {
 	reasons                 dropReasonRatesTracker
 }
 
-func (t *diagDeltaTrackers) sampleOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
-	return t.ownershipMismatch.Sample(now, cumulative)
+func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	return t.ownershipMismatch.Sample(gen, now, cumulative)
 }
 
-func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(now time.Time, cumulative uint64) deltaSnapshot {
-	return t.clientOwnershipMismatch.Sample(now, cumulative)
+func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	return t.clientOwnershipMismatch.Sample(gen, now, cumulative)
 }
 
-func (t *diagDeltaTrackers) sampleSyncFailures(now time.Time, cumulative uint64) deltaSnapshot {
-	return t.syncFailures.Sample(now, cumulative)
+func (t *diagDeltaTrackers) sampleSyncFailures(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	return t.syncFailures.Sample(gen, now, cumulative)
 }
 
-func (t *diagDeltaTrackers) sampleEnqueueFailures(now time.Time, cumulative uint64) deltaSnapshot {
-	return t.enqueueFailures.Sample(now, cumulative)
+func (t *diagDeltaTrackers) sampleEnqueueFailures(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	return t.enqueueFailures.Sample(gen, now, cumulative)
 }
 
 // reset re-primes every sub-tracker — ownership mismatch (both directions),
@@ -2449,12 +2494,15 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	status.VirtualTUN = inputs.collectVirtualTUNDiagnostics()
 
 	// The loss sampling pair owns one timestamp and one serialization scope.
+	// Both use the generation the inputs snapshot captured (issue #429 review
+	// round 4, blocker 1): an in-flight request whose snapshot predates a
+	// lifecycle reset cannot advance the new generation's trackers.
 	sampleAt := time.Now()
-	s.primeHistoryFromDrops(sampleAt, inputs.forwarder, status.DropCategories)
-	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(sampleAt, &status.DropCategories, writeErrors)
+	s.primeHistoryFromDrops(sampleAt, inputs.forwarder, inputs.generation, status.DropCategories)
+	status.ForwardLatency.WriteErrorRatePps = s.sampleDropRates(inputs.generation, sampleAt, &status.DropCategories, writeErrors)
 	status.Rates.DropRatePps = status.DropCategories.TotalDropRatePps
 	status.QueuePressure.QueueDropRatePps = status.DropCategories.ReasonRates[reasonReturnQueueFull]
-	stalls := s.diagDeltas.writeStalls.Sample(sampleAt, status.ForwardLatency.Stalls)
+	stalls := s.diagDeltas.writeStalls.Sample(inputs.generation, sampleAt, status.ForwardLatency.Stalls)
 	status.ForwardLatency.StallsRecent = stalls.delta
 	status.ForwardLatency.StallsWindowSec = stalls.windowSeconds
 
@@ -2510,8 +2558,8 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	// history; only the recent deltas gate health (issue #424 round 2).
 	if status.PeerSync != nil {
 		now := time.Now()
-		syncRate := s.diagDeltas.sampleSyncFailures(now, status.PeerSync.SyncFailures)
-		enqueueRate := s.diagDeltas.sampleEnqueueFailures(now, status.PeerSync.EnqueueFailures)
+		syncRate := s.diagDeltas.sampleSyncFailures(inputs.generation, now, status.PeerSync.SyncFailures)
+		enqueueRate := s.diagDeltas.sampleEnqueueFailures(inputs.generation, now, status.PeerSync.EnqueueFailures)
 		status.PeerSync.SyncFailuresRecent = syncRate.delta
 		status.PeerSync.EnqueueFailuresRecent = enqueueRate.delta
 		status.PeerSync.FailuresWindowSec = math.Max(syncRate.windowSeconds, enqueueRate.windowSeconds)

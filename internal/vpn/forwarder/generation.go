@@ -34,9 +34,12 @@ const GenerationSampleMinInterval = 200 * time.Millisecond
 //     primes the baseline and reports no accepted window;
 //   - a sample inside GenerationSampleMinInterval of the accepted one leaves
 //     the window untouched, so repeated reads within one collection agree;
-//   - a counter observation lower than its accepted baseline reports a zero
-//     delta AND leaves that baseline unchanged; only observations >= the
-//     baseline advance it;
+//   - a counter observation lower than its accepted baseline contributes no
+//     delta and leaves its baseline unchanged; an observation in which EVERY
+//     counter is below its baseline is rejected wholesale (accepted=false and
+//     NOTHING is mutated — baseline, anchor or window), and a PARTIALLY stale
+//     observation advances the window only when at least one counter is
+//     current (same documented rule as internal/vpn/generationWindow);
 //   - Reset(generation) explicitly starts a new generation, clearing the
 //     baselines so the next sample re-primes into it.
 //
@@ -66,6 +69,16 @@ func NewGenerationSampler(counters int) *GenerationSampler {
 // accepted reports whether this observation opened a new measurement window;
 // only then are deltas and elapsed meaningful and the baselines advanced.
 // The returned slice is freshly allocated.
+//
+// Staleness contract (issue #429 review round 4, finding 3 — same documented
+// rule as internal/vpn/generationWindow): classification happens BEFORE any
+// mutation. An observation in which every counter is below its accepted
+// baseline is fully stale: accepted=false and NOTHING is mutated — not the
+// baselines, not the accepted sampling anchor (at), so the next valid window
+// keeps its true denominator. A PARTIALLY stale observation (at least one
+// counter >= baseline) is accepted: advancing counters move their baselines
+// and deltas, stale counters report a zero delta for that window, and the
+// shared anchor advances because at least one counter genuinely advanced.
 func (w *GenerationSampler) Sample(gen Generation, now time.Time, minInterval time.Duration, values []uint64) (deltas []uint64, elapsed float64, accepted bool) {
 	if len(values) == 0 {
 		return nil, 0, false
@@ -99,6 +112,23 @@ func (w *GenerationSampler) Sample(gen Generation, now time.Time, minInterval ti
 		return nil, 0, false
 	}
 
+	// First pass: classify WITHOUT mutating. An observation in which every
+	// counter is below its baseline is fully stale and must change nothing
+	// (issue #429 review round 4, finding 3) — pre-fix, the zero-delta
+	// branches fell through to w.at = now + accepted=true, so a stale
+	// observation moved the sampling clock and corrupted the next valid
+	// window's denominator.
+	anyAdvanced := false
+	for i, value := range values {
+		if value >= w.values[i] {
+			anyAdvanced = true
+			break
+		}
+	}
+	if !anyAdvanced {
+		return nil, 0, false
+	}
+
 	deltas = make([]uint64, len(values))
 	for i, value := range values {
 		if value < w.values[i] {
@@ -114,7 +144,12 @@ func (w *GenerationSampler) Sample(gen Generation, now time.Time, minInterval ti
 	return deltas, elapsed, true
 }
 
-// SampleCounter is the allocation-free single-counter form of Sample.
+// SampleCounter is the allocation-free single-counter form of Sample and
+// follows the same classify-before-mutation staleness contract (issue #429
+// review round 4, finding 3): an observation below the accepted baseline is
+// rejected with accepted=false and zero mutation — the baseline, the sampling
+// anchor and the window are untouched, so the next valid window keeps its
+// true denominator.
 func (w *GenerationSampler) SampleCounter(gen Generation, now time.Time, minInterval time.Duration, value uint64) (delta uint64, elapsed float64, accepted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

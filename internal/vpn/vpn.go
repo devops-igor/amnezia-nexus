@@ -248,7 +248,17 @@ type Service struct {
 	// explicit new generation: every cumulative diagnostics baseline below is
 	// reset/re-primed instead of a restart being inferred from counters that
 	// moved backwards.
-	diagGeneration diagGeneration
+	//
+	// Atomic (issue #429 review round 4, blocker 1): diagnosticsInputsLocked
+	// captures it as part of the observation, and that capture runs under
+	// s.mu while resetDiagnosticsGeneration holds diagRatesMu and takes s.mu
+	// for its priming capture — reading the field there under diagRatesMu
+	// would invert the established lock order and deadlock. The atomic load
+	// cannot straddle a lifecycle transition because resetDiagnosticsGeneration
+	// bumps it BEFORE startRollingHistory publishes any new-generation
+	// tracker work, while the writers of everything else in the snapshot
+	// hold s.mu.
+	diagGeneration atomic.Uint64
 	// historyPrimedGen is the generation the history priming state was
 	// recorded for. historyPrimed is true only while historyPrimedGen equals
 	// the current generation, so a generation bump in Start automatically
@@ -1198,8 +1208,7 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) resetDiagnosticsGeneration() {
 	s.diagRatesMu.Lock()
 	defer s.diagRatesMu.Unlock()
-	s.diagGeneration++
-	gen := s.diagGeneration
+	gen := diagGeneration(s.diagGeneration.Add(1))
 	if s.diagRates != nil {
 		s.diagRates.reset(gen)
 	}
@@ -1212,7 +1221,7 @@ func (s *Service) resetDiagnosticsGeneration() {
 	// diagGeneration invalidates it by itself, so the next history read
 	// re-primes into the new generation. The prime call here captures the
 	// FIRST post-start observation as the new baseline.
-	s.primeHistoryRatesLocked(time.Now(), func() *DropCategoryBreakdown {
+	s.primeHistoryRatesLocked(gen, time.Now(), func() *DropCategoryBreakdown {
 		drops := s.captureDiagnosticsInputs().collectDropCategories()
 		return &drops
 	}())

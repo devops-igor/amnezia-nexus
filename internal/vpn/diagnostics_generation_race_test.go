@@ -33,7 +33,7 @@ func TestDiagDeltaTrackerConcurrentSampleReset(t *testing.T) {
 			go func(w int) {
 				defer wg.Done()
 				for i := 1; i <= iters; i++ {
-					tk.Sample(base.Add(time.Duration(i)*time.Second), uint64(w*iters+i))
+					tk.Sample(0, base.Add(time.Duration(i)*time.Second), uint64(w*iters+i))
 				}
 			}(w)
 		}
@@ -52,7 +52,7 @@ func TestDiagDeltaTrackerConcurrentSampleReset(t *testing.T) {
 		// Post-hammer consistency: a fresh sample in the final generation must
 		// behave exactly like a priming sample (the reset cleared the
 		// baseline) and return a coherent snapshot.
-		snap := tk.Sample(base.Add(500*time.Second), 42)
+		snap := tk.Sample(0, base.Add(500*time.Second), 42)
 		if snap.delta != 0 || snap.windowSeconds != 0 {
 			t.Fatalf("sample after reset must report the priming zero snapshot, got %+v", snap)
 		}
@@ -74,11 +74,11 @@ func TestDiagDeltaTrackersConcurrentResetAll(t *testing.T) {
 				defer wg.Done()
 				for j := 1; j <= 100; j++ {
 					at := base.Add(time.Duration(j) * time.Second)
-					dts.ownershipMismatch.Sample(at, uint64(j))
-					dts.syncFailures.Sample(at, uint64(j))
-					dts.writeStalls.Sample(at, uint64(j))
+					dts.ownershipMismatch.Sample(0, at, uint64(j))
+					dts.syncFailures.Sample(0, at, uint64(j))
+					dts.writeStalls.Sample(0, at, uint64(j))
 					if i == 0 {
-						dts.reasons.sample(at, map[string]uint64{"client_malformed": uint64(j)})
+						dts.reasons.sample(0, at, map[string]uint64{"client_malformed": uint64(j)})
 					}
 				}
 			}(i)
@@ -103,15 +103,15 @@ func TestDiagGeneration_ConcurrentStaleSnapshotVersusReset(t *testing.T) {
 		var tk diagDeltaTracker
 		base := time.Now()
 
-		tk.Sample(base, 100)
-		tk.Sample(base.Add(1*time.Second), 110)
+		tk.Sample(0, base, 100)
+		tk.Sample(0, base.Add(1*time.Second), 110)
 
 		// The in-flight generation-0 request captured its tag before the
 		// lifecycle reset.
-		capturedGen := tk.gen
+		capturedGen := diagGeneration(0) // the generation travels with the observation (round 4)
 		tk.reset(1)
-		tk.Sample(base.Add(2*time.Second), 0) // prime gen 1
-		snap := tk.Sample(base.Add(3*time.Second), 3)
+		tk.Sample(1, base.Add(2*time.Second), 0) // prime gen 1
+		snap := tk.Sample(1, base.Add(3*time.Second), 3)
 		if snap.delta != 3 {
 			t.Fatalf("generation 1 must be primed from post-start counters, got %+v", snap)
 		}
@@ -121,11 +121,11 @@ func TestDiagGeneration_ConcurrentStaleSnapshotVersusReset(t *testing.T) {
 		if tk.window.sample(capturedGen, base.Add(10*time.Second), []uint64{110}) {
 			t.Fatal("stale cross-generation completion must be rejected")
 		}
-		if tk.gen != 1 {
-			t.Fatalf("wrapper generation=%d, want 1: a stale completion must never demote it", tk.gen)
+		if tk.window.gen != 1 {
+			t.Fatalf("window generation=%d, want 1: a stale completion must never demote it", tk.window.gen)
 		}
 		// And the accepted generation-1 baseline must still be 3.
-		next := tk.Sample(base.Add(4*time.Second), 5)
+		next := tk.Sample(1, base.Add(4*time.Second), 5)
 		if next.delta != 2 {
 			t.Fatalf("post-stale delta=%d, want 2 (5-3): the stale request must not re-baseline", next.delta)
 		}

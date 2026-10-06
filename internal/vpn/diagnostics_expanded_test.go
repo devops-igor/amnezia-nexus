@@ -519,7 +519,7 @@ func TestLossSamplingAvailabilityAndRatesAtExactBoundary(t *testing.T) {
 	svc := &Service{diagDeltas: diagDeltaTrackers{}}
 	start := time.Unix(100, 0)
 	d := DropCategoryBreakdown{ClientMalformed: 10, ClientTotalDrops: 10, ReturnQueueFull: 20, ReturnTotalDrops: 20, TotalDrops: 30}
-	if rate := svc.sampleDropRates(start, &d, 4); rate != 0 || d.RatesAvailable || d.TotalDropRatePps != 0 {
+	if rate := svc.sampleDropRates(0, start, &d, 4); rate != 0 || d.RatesAvailable || d.TotalDropRatePps != 0 {
 		t.Fatal("first lifetime baseline must be unknown")
 	}
 	d.ClientMalformed += 2
@@ -527,7 +527,7 @@ func TestLossSamplingAvailabilityAndRatesAtExactBoundary(t *testing.T) {
 	d.ReturnQueueFull += 3
 	d.ReturnTotalDrops += 3
 	d.TotalDrops += 5
-	if rate := svc.sampleDropRates(start.Add(200*time.Millisecond-time.Nanosecond), &d, 5); rate != 0 || d.RatesAvailable || d.TotalDropRatePps != 0 {
+	if rate := svc.sampleDropRates(0, start.Add(200*time.Millisecond-time.Nanosecond), &d, 5); rate != 0 || d.RatesAvailable || d.TotalDropRatePps != 0 {
 		t.Fatalf("aggregate/reason availability disagreed before boundary: %+v", d)
 	}
 	for _, rate := range d.ReasonRates {
@@ -535,10 +535,10 @@ func TestLossSamplingAvailabilityAndRatesAtExactBoundary(t *testing.T) {
 			t.Fatal("unknown aggregate interval published fresh reason rate")
 		}
 	}
-	if rate := svc.sampleDropRates(start.Add(200*time.Millisecond), &d, 5); rate != 5 || !d.RatesAvailable || d.ClientDropRatePps != 10 || d.ReturnDropRatePps != 15 || d.TotalDropRatePps != 25 || d.ReasonRates["client_malformed"] != 10 || d.ReasonRates["return_queue_full"] != 15 {
+	if rate := svc.sampleDropRates(0, start.Add(200*time.Millisecond), &d, 5); rate != 5 || !d.RatesAvailable || d.ClientDropRatePps != 10 || d.ReturnDropRatePps != 15 || d.TotalDropRatePps != 25 || d.ReasonRates["client_malformed"] != 10 || d.ReasonRates["return_queue_full"] != 15 {
 		t.Fatalf("aggregate/reasons did not share exact boundary and interval: %+v writeErrors=%v", d, rate)
 	}
-	if rate := svc.sampleDropRates(start.Add(400*time.Millisecond), &d, 5); rate != 0 || !d.RatesAvailable || d.TotalDropRatePps != 0 {
+	if rate := svc.sampleDropRates(0, start.Add(400*time.Millisecond), &d, 5); rate != 0 || !d.RatesAvailable || d.TotalDropRatePps != 0 {
 		t.Fatal("measured idle lost availability")
 	}
 	for _, rate := range d.ReasonRates {
@@ -552,14 +552,14 @@ func TestConcurrentLossSamplingKeepsAggregateAndReasonsInSameWindow(t *testing.T
 	svc := &Service{diagDeltas: diagDeltaTrackers{}, diagRates: newDiagRatesTracker()}
 	start := time.Unix(100, 0)
 	var prime DropCategoryBreakdown
-	svc.sampleDropRates(start, &prime, 0)
+	svc.sampleDropRates(0, start, &prime, 0)
 	failures := make(chan DropCategoryBreakdown, 1)
 	var group sync.WaitGroup
 	for i := uint64(1); i <= 800; i++ {
 		group.Go(func() {
 			count := i * i // Nonlinear totals distinguish every sampled interval.
 			d := DropCategoryBreakdown{ClientMalformed: count, ClientTotalDrops: count, ReturnQueueFull: 2 * count, ReturnTotalDrops: 2 * count, TotalDrops: 3 * count}
-			svc.sampleDropRates(start.Add(time.Duration(i)*time.Second), &d, 0)
+			svc.sampleDropRates(0, start.Add(time.Duration(i)*time.Second), &d, 0)
 			sum := 0.0
 			for _, rate := range d.ReasonRates {
 				sum += rate

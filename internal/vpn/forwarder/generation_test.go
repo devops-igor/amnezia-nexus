@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -16,9 +17,10 @@ import (
 // TestGenerationSampler_OutOfOrderNeverRewindsBaselines drives the shared
 // primitive through the canonical out-of-order scenario: rising counters, one
 // LOWER observation (the pre-restart epoch replaying), then the return to the
-// higher value. The lower observation must report no fresh delta and must
-// leave the accepted baseline untouched; a stale-generation observation must
-// be ignored entirely.
+// higher value. A fully lower observation must be rejected wholesale —
+// accepted=false with zero mutation (round 4 finding 3: it used to open a
+// window and advance the anchor); a stale-generation observation must be
+// ignored entirely.
 func TestGenerationSampler_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	w := NewGenerationSampler(2)
 	base := time.Now()
@@ -36,14 +38,11 @@ func TestGenerationSampler_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	}
 
 	// Out-of-order: the pre-restart observations (100, 900) replay AFTER the
-	// higher ones were accepted. The window still opens (outside the floor)...
+	// higher ones were accepted. The observation is fully stale, so it must
+	// be rejected wholesale: accepted=false and nothing mutates.
 	deltas, _, accepted = w.Sample(0, base.Add(2*time.Second), GenerationSampleMinInterval, []uint64{100, 900})
-	if !accepted {
-		t.Fatal("an observation outside the sample floor must open a window")
-	}
-	// ...but both lower counters must report zero and keep 110/1100 accepted.
-	if deltas[0] != 0 || deltas[1] != 0 {
-		t.Fatalf("lower observations must report zero deltas, got %v", deltas)
+	if accepted || deltas != nil {
+		t.Fatalf("a fully stale observation must be rejected with no deltas, got accepted=%v deltas=%v", accepted, deltas)
 	}
 
 	// The counters return to the previously accepted values: still zero —
@@ -78,6 +77,81 @@ func TestGenerationSampler_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	if v, _, primed, gen := w.Baseline(0); !primed || gen != 1 || v != 0 {
 		t.Fatalf("stale observation must not touch the generation-1 baseline, got value=%d primed=%v gen=%d", v, primed, gen)
 	}
+}
+
+// TestGenerationSampler_FullyStaleNeverAdvancesClock pins review round 4,
+// finding 3 with the review's exact numbers: accepted 110@t1, fully stale
+// 100@t10 rejected with accepted=false and zero mutation, valid 120@t10.2
+// keeps its true denominator (9.2s). Pre-fix the stale observation returned
+// accepted=true and advanced w.at, corrupting the denominator to 0.2s.
+func TestGenerationSampler_FullyStaleNeverAdvancesClock(t *testing.T) {
+	t.Run("multi_counter_sample", func(t *testing.T) {
+		w := NewGenerationSampler(1)
+		base := time.Now()
+		w.Sample(0, base, GenerationSampleMinInterval, []uint64{100}) // prime
+		deltas, elapsed, accepted := w.Sample(0, base.Add(1*time.Second), GenerationSampleMinInterval, []uint64{110})
+		if !accepted || deltas[0] != 10 || elapsed != 1 {
+			t.Fatalf("window 1: want accepted delta 10 over 1s, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// Fully stale: every counter below baseline. Must classify before
+		// mutation: accepted=false, nil deltas, zero elapsed, NOTHING moves.
+		deltas, elapsed, accepted = w.Sample(0, base.Add(10*time.Second), GenerationSampleMinInterval, []uint64{100})
+		if accepted || deltas != nil || elapsed != 0 {
+			t.Fatalf("fully stale observation must be rejected with zero mutation, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+		}
+
+		// The valid observation keeps its true denominator: 10.2s - 1s = 9.2s.
+		deltas, elapsed, accepted = w.Sample(0, base.Add(10200*time.Millisecond), GenerationSampleMinInterval, []uint64{120})
+		if !accepted || deltas[0] != 10 {
+			t.Fatalf("valid observation must be accepted with delta 10, got accepted=%v deltas=%v", accepted, deltas)
+		}
+		if math.Abs(elapsed-9.2) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 9.2: the stale observation must not consume the denominator", elapsed)
+		}
+	})
+
+	t.Run("partial_stale_advances", func(t *testing.T) {
+		// Documented contract: SOME counters below baseline with at least one
+		// advancing is still an accepted window (the advancing counters moved
+		// genuinely); the stale counters report zero for that window.
+		w := NewGenerationSampler(2)
+		base := time.Now()
+		w.Sample(0, base, GenerationSampleMinInterval, []uint64{100, 200}) // prime
+		if d, _, accepted := w.Sample(0, base.Add(1*time.Second), GenerationSampleMinInterval, []uint64{110, 210}); !accepted || d[0] != 10 || d[1] != 10 {
+			t.Fatalf("window 1: want accepted deltas [10 10], got accepted=%v deltas=%v", accepted, d)
+		}
+		// counter[1] replays stale while counter[0] genuinely advanced.
+		d, elapsed, accepted := w.Sample(0, base.Add(2*time.Second), GenerationSampleMinInterval, []uint64{130, 200})
+		if !accepted || d[0] != 20 || d[1] != 0 {
+			t.Fatalf("partially stale observation must be accepted when one counter advanced, got accepted=%v deltas=%v", accepted, d)
+		}
+		if math.Abs(elapsed-1.0) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 1.0: the shared window advances with the genuine counter", elapsed)
+		}
+	})
+
+	t.Run("sample_counter_same_contract", func(t *testing.T) {
+		w := NewGenerationSampler(1)
+		base := time.Now()
+		if _, _, accepted := w.SampleCounter(0, base, GenerationSampleMinInterval, 100); accepted {
+			t.Fatal("first sample must only prime")
+		}
+		if delta, _, accepted := w.SampleCounter(0, base.Add(1*time.Second), GenerationSampleMinInterval, 110); !accepted || delta != 10 {
+			t.Fatalf("window 1: want accepted delta 10, got delta=%d accepted=%v", delta, accepted)
+		}
+		// Fully stale single counter: the same classify-before-mutation
+		// contract (already correct at head; pinned explicitly).
+		if delta, elapsed, accepted := w.SampleCounter(0, base.Add(10*time.Second), GenerationSampleMinInterval, 100); accepted || delta != 0 || elapsed != 0 {
+			t.Fatalf("fully stale SampleCounter must be rejected with zero mutation, got delta=%d elapsed=%v accepted=%v", delta, elapsed, accepted)
+		}
+		// Denominator preserved for the next valid window.
+		if delta, elapsed, accepted := w.SampleCounter(0, base.Add(10200*time.Millisecond), GenerationSampleMinInterval, 120); !accepted || delta != 10 {
+			t.Fatalf("valid observation must be accepted with delta 10, got delta=%d accepted=%v", delta, accepted)
+		} else if math.Abs(elapsed-9.2) > 1e-9 {
+			t.Fatalf("elapsed=%v, want 9.2", elapsed)
+		}
+	})
 }
 
 // TestGenerationSampler_SampleFloorKeepsWindowIntact pins the throttle half of
@@ -159,10 +233,13 @@ func TestRateTracker_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	}
 
 	// Out-of-order: the pre-restart counters replay after the higher window.
+	// Fully stale, so the sample is rejected wholesale and the PREVIOUS
+	// window's rates stay published (pre-fix this returned true with zero
+	// deltas, zeroing the published rates for 200ms of wall time).
 	rt.Sample(base.Add(2*time.Second), 1000, 2000, 100, 200, 50, 5)
 	rates = rt.Snapshot(0, 0)
-	if !rates.Available || rates.RxBps != 0 || rates.RxPps != 0 || rates.TxPps != 0 || rates.DropRatePps != 0 {
-		t.Fatalf("lower replay must report zero rates, got %+v", rates)
+	if !rates.Available || rates.RxBps != 8000 || rates.RxPps != 100 || rates.TxPps != 200 || rates.DropRatePps != 10 {
+		t.Fatalf("lower replay must keep the last accepted rates, got %+v", rates)
 	}
 
 	// Return to the higher counters: still zero — the baselines never moved,

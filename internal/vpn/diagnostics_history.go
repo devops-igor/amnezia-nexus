@@ -177,21 +177,22 @@ func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
 // generation an accepted per-reason baseline is monotonic — a stale LOWER
 // total reports a zero rate and never replaces the baseline — and a lifecycle
 // reset re-primes instead of inferring a restart from totals that moved
-// backwards.
+// backwards. The generation travels with the observation (issue #429 review
+// round 4, blocker 1): sample takes it explicitly, so a snapshot captured
+// before a lifecycle reset can never touch the new generation's windows.
 type dropReasonRatesTracker struct {
 	mu        sync.Mutex
 	windows   *diagCounterWindows
-	gen       diagGeneration
 	available bool
 }
 
-func (t *dropReasonRatesTracker) sample(now time.Time, totals map[string]uint64) (map[string]float64, bool) {
+func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, totals map[string]uint64) (map[string]float64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.windows == nil {
 		t.windows = newDiagCounterWindows()
 	}
-	if accepted := t.windows.sample(t.gen, now, totals); accepted {
+	if accepted := t.windows.sample(gen, now, totals); accepted {
 		t.available = true
 	}
 	rates := make(map[string]float64, len(totals))
@@ -206,17 +207,13 @@ func (t *dropReasonRatesTracker) sample(now time.Time, totals map[string]uint64)
 }
 
 // reset re-primes the per-reason windows for a new diagnostics generation:
-// subsequent samples are tagged with gen, and the windows re-prime on their
-// next call (issue #429 review blocker 1). A generation lower than the
-// accepted one is ignored.
+// subsequent samples are tagged with the generation their snapshot captured,
+// and the windows re-prime on their next call (issue #429 review blocker 1).
 func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if gen > t.gen {
-		t.gen = gen
-	}
 	if t.windows != nil {
-		t.windows.reset(t.gen)
+		t.windows.reset(gen)
 	}
 	t.available = false
 }
@@ -276,8 +273,11 @@ func cloneHistoryPoint(p HistoryPoint) HistoryPoint {
 
 // sampleDropRates publishes aggregate and reason rates as one operation.
 // The existing diagnostics lock prevents concurrent status/history callers
-// from returning rates from different intervals; all trackers use the same clock.
-func (s *Service) sampleDropRates(at time.Time, drops *DropCategoryBreakdown, writeErrors uint64) float64 {
+// from returning rates from different intervals; all trackers use the same
+// clock. The generation travels with the observation (issue #429 review
+// round 4, blocker 1): gen is the generation the drop counters were captured
+// under, never read back from the trackers.
+func (s *Service) sampleDropRates(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown, writeErrors uint64) float64 {
 	s.diagRatesMu.Lock()
 	defer s.diagRatesMu.Unlock()
 	if s.diagRates == nil {
@@ -285,30 +285,30 @@ func (s *Service) sampleDropRates(at time.Time, drops *DropCategoryBreakdown, wr
 	}
 	var writeErrorRate float64
 	drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps, writeErrorRate = s.diagRates.Sample(
-		at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors,
+		gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors,
 	)
-	drops.ReasonRates, drops.RatesAvailable = s.diagDeltas.reasons.sample(at, dropReasonTotals(*drops))
+	drops.ReasonRates, drops.RatesAvailable = s.diagDeltas.reasons.sample(gen, at, dropReasonTotals(*drops))
 	return writeErrorRate
 }
 
 // sampleHistoryDropRates calculates drop rates for history against independent
 // history baselines, ensuring foreground status reads cannot consume deltas.
-func (s *Service) sampleHistoryDropRates(at time.Time, drops *DropCategoryBreakdown) {
+func (s *Service) sampleHistoryDropRates(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown) {
 	s.diagRatesMu.Lock()
 	defer s.diagRatesMu.Unlock()
 	if s.historyDiagRates == nil {
 		s.historyDiagRates = newDiagRatesTracker()
 	}
 	drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps, _ = s.historyDiagRates.Sample(
-		at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0,
+		gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0,
 	)
-	drops.ReasonRates, drops.RatesAvailable = s.historyDropReasons.sample(at, dropReasonTotals(*drops))
+	drops.ReasonRates, drops.RatesAvailable = s.historyDropReasons.sample(gen, at, dropReasonTotals(*drops))
 }
 
-func (s *Service) primeHistoryRatesLocked(at time.Time, drops *DropCategoryBreakdown) {
+func (s *Service) primeHistoryRatesLocked(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown) {
 	if s.historyDiagRates == nil {
 		s.historyDiagRates = newDiagRatesTracker()
 	}
-	s.historyDiagRates.Sample(at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0)
-	s.historyDropReasons.sample(at, dropReasonTotals(*drops))
+	s.historyDiagRates.Sample(gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0)
+	s.historyDropReasons.sample(gen, at, dropReasonTotals(*drops))
 }
