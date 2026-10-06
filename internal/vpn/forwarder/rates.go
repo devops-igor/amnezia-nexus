@@ -54,10 +54,12 @@ const rateTrackerSampleInterval = GenerationSampleMinInterval
 type RateTracker struct {
 	mu      sync.Mutex
 	sampler *GenerationSampler
-	// gen is the generation subsequent samples are tagged with. It is
-	// adopted from Reset so a forwarder restart's samples land in the new
-	// generation instead of being rejected as stale forever (issue #429
-	// review blocker 1).
+	// gen is lifecycle state only: the generation the tracker was last
+	// Reset to (review round 6). It is NOT applied to observations —
+	// Sample tags each observation with the generation its caller
+	// captured BEFORE reading the counters, so an in-flight observation
+	// from a previous forwarder incarnation is rejected as stale instead
+	// of being mislabeled with the current generation.
 	gen       Generation
 	available bool
 
@@ -102,10 +104,17 @@ func (rt *RateTracker) Reset(gen Generation) {
 
 // Sample updates rate tracking using the latest cumulative counters.
 //
+// gen is the forwarder generation the caller captured BEFORE reading the
+// counters (review round 6): an observation from a previous generation —
+// one captured before a Start() reset and completed after the new
+// generation was primed — is rejected wholesale, so it can neither advance
+// the window with no new information (equal-fields partial accept) nor be
+// mislabeled as belonging to the current generation.
+//
 // rxBytes/txBytes are signed lifetimes. A byte counter that moved backwards
 // (generation restart) reports zero for that direction and keeps its accepted
 // baseline, so the pre-window value cannot be replayed later.
-func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, txPackets, totalDrops, queueDrops uint64) {
+func (rt *RateTracker) Sample(gen Generation, now time.Time, rxBytes, txBytes int64, rxPackets, txPackets, totalDrops, queueDrops uint64) {
 	if rt == nil {
 		return
 	}
@@ -119,7 +128,7 @@ func (rt *RateTracker) Sample(now time.Time, rxBytes, txBytes int64, rxPackets, 
 	// guard reports it as zero delta instead of an overflow burst.
 	rxU := counterUint64(rxBytes)
 	txU := counterUint64(txBytes)
-	deltas, elapsed, accepted := rt.sampler.Sample(rt.gen, now, rateTrackerSampleInterval,
+	deltas, elapsed, accepted := rt.sampler.Sample(gen, now, rateTrackerSampleInterval,
 		[]uint64{rxU, txU, rxPackets, txPackets, totalDrops, queueDrops})
 	if !accepted {
 		return

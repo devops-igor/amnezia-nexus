@@ -1376,12 +1376,17 @@ func (f *Forwarder) Rates() TrafficRates {
 	if f == nil {
 		return TrafficRates{}
 	}
+	// The generation is captured BEFORE the counter snapshot (review round
+	// 6): a Start() between capture and read leaves this observation tagged
+	// old, so the tracker conservatively rejects it instead of mislabeling
+	// pre-restart counters with the new generation.
+	gen := f.currentGeneration()
 	rxBytes, txBytes, _ := f.GetStats()
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
 	if f.rateTracker != nil {
-		f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
+		f.rateTracker.Sample(gen, time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 		return f.rateTracker.Snapshot(rxPackets, txPackets)
 	}
 	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
@@ -1392,12 +1397,14 @@ func (f *Forwarder) QueuePressure() QueuePressureStats {
 	if f == nil {
 		return QueuePressureStats{}
 	}
+	// Generation before counters: same ordering contract as Rates.
+	gen := f.currentGeneration()
 	rxBytes, txBytes, _ := f.GetStats()
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
 	occ, cap, hw, dwell := f.aggregateQueueSnapshot()
-	f.rateTracker.Sample(time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
+	f.rateTracker.Sample(gen, time.Now(), rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 	stats := f.rateTracker.PressureSnapshot(occ, cap, hw, queueDrops)
 	stats.SecondsAbove50Pct, stats.SecondsAbove80Pct = dwell.total50, dwell.total80
 	stats.ConsecutiveAbove50Sec, stats.ConsecutiveAbove80Sec = dwell.consecutive50, dwell.consecutive80
@@ -1410,12 +1417,14 @@ func (f *Forwarder) HistoryRates(now time.Time) TrafficRates {
 	if f == nil {
 		return TrafficRates{}
 	}
+	// Generation before counters: same ordering contract as Rates.
+	gen := f.currentGeneration()
 	rxBytes, txBytes, _ := f.GetStats()
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
 	if f.historyRateTracker != nil {
-		f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
+		f.historyRateTracker.Sample(gen, now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 		return f.historyRateTracker.Snapshot(rxPackets, txPackets)
 	}
 	return TrafficRates{TotalRxPackets: rxPackets, TotalTxPackets: txPackets}
@@ -1426,11 +1435,13 @@ func (f *Forwarder) PrimeHistoryRates(now time.Time) {
 	if f == nil || f.historyRateTracker == nil {
 		return
 	}
+	// Generation before counters: same ordering contract as Rates.
+	gen := f.currentGeneration()
 	rxBytes, txBytes, _ := f.GetStats()
 	rxPackets := f.totalRxPackets.Load()
 	txPackets := f.totalTxPackets.Load()
 	queueDrops, _, totalDrops := f.DropStats()
-	f.historyRateTracker.Sample(now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
+	f.historyRateTracker.Sample(gen, now, rxBytes, txBytes, rxPackets, txPackets, totalDrops, queueDrops)
 }
 
 // ActiveRoutesCount returns the number of currently registered routes.

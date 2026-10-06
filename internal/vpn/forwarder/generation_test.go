@@ -224,8 +224,8 @@ func TestRateTracker_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	base := time.Now()
 
 	// Prime, then window 1: +1000 rx bytes, +100 rx pkts, +10 drops over 1s.
-	rt.Sample(base, 1000, 2000, 100, 200, 50, 5)
-	rt.Sample(base.Add(1*time.Second), 2000, 4000, 200, 400, 60, 6)
+	rt.Sample(0, base, 1000, 2000, 100, 200, 50, 5)
+	rt.Sample(0, base.Add(1*time.Second), 2000, 4000, 200, 400, 60, 6)
 
 	rates := rt.Snapshot(0, 0)
 	if !rates.Available || rates.RxBps != 8000 || rates.RxPps != 100 || rates.TxPps != 200 || rates.DropRatePps != 10 {
@@ -236,7 +236,7 @@ func TestRateTracker_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 	// Fully stale, so the sample is rejected wholesale and the PREVIOUS
 	// window's rates stay published (pre-fix this returned true with zero
 	// deltas, zeroing the published rates for 200ms of wall time).
-	rt.Sample(base.Add(2*time.Second), 1000, 2000, 100, 200, 50, 5)
+	rt.Sample(0, base.Add(2*time.Second), 1000, 2000, 100, 200, 50, 5)
 	rates = rt.Snapshot(0, 0)
 	if !rates.Available || rates.RxBps != 8000 || rates.RxPps != 100 || rates.TxPps != 200 || rates.DropRatePps != 10 {
 		t.Fatalf("lower replay must keep the last accepted rates, got %+v", rates)
@@ -244,14 +244,14 @@ func TestRateTracker_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 
 	// Return to the higher counters: still zero — the baselines never moved,
 	// so the pre-restart totals cannot resurface as a fresh loss burst.
-	rt.Sample(base.Add(3*time.Second), 2000, 4000, 200, 400, 60, 6)
+	rt.Sample(0, base.Add(3*time.Second), 2000, 4000, 200, 400, 60, 6)
 	rates = rt.Snapshot(0, 0)
 	if !rates.Available || rates.RxBps != 0 || rates.RxPps != 0 || rates.TxPps != 0 || rates.DropRatePps != 0 {
 		t.Fatalf("activity up to the accepted baseline must not replay as fresh rates, got %+v", rates)
 	}
 
 	// Only genuinely-new activity above the baselines is measured.
-	rt.Sample(base.Add(4*time.Second), 3000, 4000, 250, 400, 63, 6)
+	rt.Sample(0, base.Add(4*time.Second), 3000, 4000, 250, 400, 63, 6)
 	rates = rt.Snapshot(0, 0)
 	if !rates.Available || rates.RxBps != 8000 || rates.RxPps != 50 || rates.DropRatePps != 3 {
 		t.Fatalf("post-replay delta must measure only new activity (rx 8000Bps/50pps, drops 3pps), got %+v", rates)

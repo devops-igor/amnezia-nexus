@@ -10,11 +10,11 @@ func TestRateTracker_RatesAndEWMA(t *testing.T) {
 	t0 := time.Now()
 
 	// Initial sample at t0
-	rt.Sample(t0, 0, 0, 0, 0, 0, 0)
+	rt.Sample(0, t0, 0, 0, 0, 0, 0, 0)
 
 	// Sample after 1 second: 1000 bytes RX, 2000 bytes TX, 10 pkts RX, 20 pkts TX, 1 drop
 	t1 := t0.Add(1 * time.Second)
-	rt.Sample(t1, 1000, 2000, 10, 20, 1, 1)
+	rt.Sample(0, t1, 1000, 2000, 10, 20, 1, 1)
 
 	rates := rt.Snapshot(10, 20)
 	if rates.RxBps != 8000.0 { // 1000 * 8 / 1s
