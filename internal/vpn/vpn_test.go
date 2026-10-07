@@ -23,6 +23,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 func setupTestDB(t *testing.T) *database.DB {
@@ -1332,12 +1333,27 @@ func TestGetStatus_ExposesBoundedRouteQueueDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus failed: %v", err)
 	}
-	stats, ok := status.ForwarderRouteQueues["peer-secret"]
+	// The map key is ingress.PeerKeyFingerprint, the opaque
+	// collision-resistant identifier (issue #424 round 6, finding 2). The
+	// round 5 form, a RedactKey prefix, could not be used here: two peers
+	// sharing 8 leading characters produced the same key and one route was
+	// silently dropped from the payload.
+	stats, ok := status.ForwarderRouteQueues[ingress.PeerKeyFingerprint("peer-secret")]
 	if !ok {
 		t.Fatalf("route queue diagnostics missing: %+v", status.ForwarderRouteQueues)
 	}
 	if stats.Occupancy != 1 || stats.Capacity != 2048 || stats.HighWater != 1 {
 		t.Fatalf("unexpected route queue diagnostics: %+v", stats)
+	}
+	// The redacted DISPLAY form is still available for a human reader, and is
+	// still not a usable identifier.
+	if stats.PeerKeyDisplay != ingress.RedactKey("peer-secret") {
+		t.Fatalf("peer_key_display = %q, want the redacted display form %q",
+			stats.PeerKeyDisplay, ingress.RedactKey("peer-secret"))
+	}
+	if len(status.ForwarderRouteQueues) != 1 {
+		t.Fatalf("expected exactly one route in the map, got %d: %+v",
+			len(status.ForwarderRouteQueues), status.ForwarderRouteQueues)
 	}
 }
 
@@ -2301,6 +2317,32 @@ func (m *testBackendDevice) DroppedPackets() uint64 {
 		base = m.AWGClientDevice.DroppedPackets()
 	}
 	return base + m.dropCount.Load()
+}
+
+// DeviceStats mirrors the fixture's direct dropCount into the EXTERNAL
+// bucket of the underlying VirtualTUN's snapshot.
+//
+// dropCount is loss the fixture records itself, with no direction and no
+// reason — which is exactly what VirtualTUN.RecordDrop models, and exactly
+// what DroppedPackets reports as a total. Reporting it as external keeps the
+// fixture's injected loss visible to the diagnostics breakdown (issue #424
+// round 3, finding 1) instead of letting it disappear now that the breakdown
+// reads the axes rather than the total. It is deliberately NOT injected as
+// queue-full: that is the mislabelling this rework removes.
+//
+// The external figure goes in DropsExternal, not just DropsTotal: the
+// external count is RECORDED on the recording path, so a snapshot that only
+// raised the total would report the loss in no population at all
+// (issue #424 round 5, finding 2). DropsTotal is raised alongside it to keep
+// the snapshot's own coherence invariant intact.
+func (m *testBackendDevice) DeviceStats() virtualtun.StatsSnapshot {
+	snap := virtualtun.StatsSnapshot{}
+	if m.AWGClientDevice != nil {
+		snap = m.AWGClientDevice.DeviceStats()
+	}
+	snap.DropsExternal += m.dropCount.Load()
+	snap.DropsTotal = snap.Sum() + snap.DropsExternal
+	return snap
 }
 
 func (m *testBackendDevice) Write(p []byte) (int, error) {

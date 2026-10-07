@@ -3,6 +3,7 @@ package vpn
 import (
 	"errors"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
@@ -13,11 +14,20 @@ import (
 var errReturnDestination = errors.New("ingress engine: invalid return destination")
 
 type returnCounters struct {
+	injectionMu     sync.Mutex // keeps total/subset snapshot coherent
 	accepted        atomic.Uint64
 	malformed       atomic.Uint64
 	unmapped        atomic.Uint64
 	mismatch        atomic.Uint64
 	injectionErrors atomic.Uint64
+	// injectionTunDrops counts the subset of injectionErrors whose loss was
+	// already accounted by the VirtualTUN inbound drop bucket. Only the
+	// queue-full rejection of InjectInbound does that: ErrClosed drops
+	// nothing, and ErrPacketTooLarge is recorded as an external device drop
+	// outside the per-reason inbound buckets. Owning the overlap here is what
+	// makes the diagnostics-side subtraction exact, instead of an unsound
+	// subtraction of two unrelated aggregates.
+	injectionTunDrops atomic.Uint64
 }
 
 // ReturnStatsSnapshot describes plaintext submission to the client engine.
@@ -30,14 +40,26 @@ type ReturnStatsSnapshot struct {
 	UnmappedDrops          uint64
 	OwnershipMismatchDrops uint64
 	InjectionErrors        uint64
-	TUN                    virtualtun.StatsSnapshot
+	// InjectionTunDrops is the subset of InjectionErrors already counted by
+	// TUN.InboundDrops, owned at the injection site. NonTunInjectionErrors is
+	// therefore InjectionErrors - InjectionTunDrops: exact rather than
+	// approximated from unrelated inbound drop reasons.
+	InjectionTunDrops uint64
+	TUN               virtualtun.StatsSnapshot
 }
 
 func (e *IngressEngine) ReturnStats() ReturnStatsSnapshot {
+	e.returnCounters.injectionMu.Lock()
+	defer e.returnCounters.injectionMu.Unlock()
+	var tun virtualtun.StatsSnapshot
+	if e.portal != nil {
+		tun = e.portal.Stats()
+	}
 	return ReturnStatsSnapshot{
 		AcceptedPackets: e.returnCounters.accepted.Load(), MalformedDrops: e.returnCounters.malformed.Load(),
 		UnmappedDrops: e.returnCounters.unmapped.Load(), OwnershipMismatchDrops: e.returnCounters.mismatch.Load(),
-		InjectionErrors: e.returnCounters.injectionErrors.Load(), TUN: e.portal.Stats(),
+		InjectionErrors:   e.returnCounters.injectionErrors.Load(),
+		InjectionTunDrops: e.returnCounters.injectionTunDrops.Load(), TUN: tun,
 	}
 }
 
@@ -87,8 +109,16 @@ func (e *IngressEngine) writeReturnPacket(peerKey, assignedIP string, packet []b
 		e.returnCounters.mismatch.Add(1)
 		return 0, errReturnDestination
 	}
-	if err := e.portal.InjectInbound(packet); err != nil {
+	err := e.portal.InjectInbound(packet)
+	if err != nil {
+		e.returnCounters.injectionMu.Lock()
 		e.returnCounters.injectionErrors.Add(1)
+		// ErrQueueFull is the only rejection the VirtualTUN already counted
+		// in its inbound drop bucket, so it is the only overlap to own here.
+		if errors.Is(err, virtualtun.ErrQueueFull) {
+			e.returnCounters.injectionTunDrops.Add(1)
+		}
+		e.returnCounters.injectionMu.Unlock()
 		return 0, err
 	}
 	e.returnCounters.accepted.Add(1)

@@ -340,6 +340,24 @@ func (d *AWGClientDevice) DroppedPackets() uint64 {
 	return d.vtun.DroppedPackets()
 }
 
+// DeviceStats exposes the underlying VirtualTUN's directional and per-reason
+// drop accounting (issue #424 round 3, finding 1).
+//
+// DroppedPackets deliberately reports only the direction- and reason-agnostic
+// total: a caller that has to route that loss between the client-originating
+// and the return direction, or between queue-full and shutdown, cannot
+// recover either axis from the aggregate. This accessor is how the diagnostics
+// layer obtains both.
+//
+// The receiver is nil-safe so the method can be promoted through an embedded
+// nil *AWGClientDevice on a test device.
+func (d *AWGClientDevice) DeviceStats() virtualtun.StatsSnapshot {
+	if d == nil || d.vtun == nil {
+		return virtualtun.StatsSnapshot{}
+	}
+	return d.vtun.Stats()
+}
+
 // IsClosed returns true if the device has been closed.
 func (d *AWGClientDevice) IsClosed() bool {
 	return d.closed.Load()

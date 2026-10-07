@@ -793,32 +793,246 @@ SoakDone:
 	return report
 }
 
-// assertSoakReportCriteria validates the acceptance criteria defined for the soak suite.
-func assertSoakReportCriteria(t *testing.T, report *SoakEvidenceReport, label string) {
-	t.Helper()
+// soakCriteriaViolations validates the acceptance criteria defined for the soak
+// suite and returns one violation per failed criterion, each already prefixed
+// with the side label, in a stable order. assertSoakReportCriteria reports each
+// of them via t.Error; keeping the criteria as a pure list makes them
+// unit-testable without fabricating a *testing.T.
+func soakCriteriaViolations(report *SoakEvidenceReport, label string) []string {
+	var violations []string
 
 	if !report.TCPContinuityPassed {
-		t.Errorf("[%s] TCP continuity check failed: socket identity mutated or connection dropped", label)
+		violations = append(violations, fmt.Sprintf("[%s] TCP continuity check failed: socket identity mutated or connection dropped", label))
 	}
 	if report.CompletedRekeys < report.TargetRekeys {
-		t.Errorf("[%s] Completed rekeys (%d) < target (%d)", label, report.CompletedRekeys, report.TargetRekeys)
+		violations = append(violations, fmt.Sprintf("[%s] Completed rekeys (%d) < target (%d)", label, report.CompletedRekeys, report.TargetRekeys))
 	}
 	if !report.IdlePhasePassed {
-		t.Errorf("[%s] Idle keepalive phase check failed", label)
+		violations = append(violations, fmt.Sprintf("[%s] Idle keepalive phase check failed", label))
+	}
+	// R6-3: the sequenced UDP stream must have been ACTUALLY OBSERVED before any
+	// loss figure is trusted. A report whose stream never ran (sent == 0, zero
+	// loss) used to pass these criteria while carrying no evidence at all; the
+	// strict consumer (scripts/verify_issue392_qualification.sh, verify_udp_evidence)
+	// rejects such evidence, and the producer now rejects it locally too. An
+	// explicit zero-loss report remains valid — but only with sent/received > 0.
+	if err := validateObservedUDPStream(report.SequencedUDPStats); err != nil {
+		violations = append(violations, fmt.Sprintf("[%s] %s", label, err))
 	}
 	// Under local netstack / loopback conditions, packet loss should be under 5%
 	// Under race detector instrumentation overhead, allow up to 15%
+	// (thresholds and natural timing unchanged; they now apply to a stream
+	// proven observed above).
 	lossThreshold := 5.0
 	if raceDetectorEnabled {
 		lossThreshold = 15.0
 	}
 	if report.SequencedUDPStats.LossRatePercent > lossThreshold {
-		t.Errorf("[%s] Sequenced UDP packet loss rate too high: %.2f%%", label, report.SequencedUDPStats.LossRatePercent)
+		violations = append(violations, fmt.Sprintf("[%s] Sequenced UDP packet loss rate too high: %.2f%%", label, report.SequencedUDPStats.LossRatePercent))
 	}
 	if report.VoIPUDPStats.LossRatePercent > lossThreshold {
-		t.Errorf("[%s] VoIP UDP packet loss rate too high: %.2f%%", label, report.VoIPUDPStats.LossRatePercent)
+		violations = append(violations, fmt.Sprintf("[%s] VoIP UDP packet loss rate too high: %.2f%%", label, report.VoIPUDPStats.LossRatePercent))
+	}
+	return violations
+}
+
+// validateObservedUDPStream enforces the producer-side observed-stream contract
+// for sequenced UDP evidence, mirroring the strict consumer's validation shape
+// (verify_udp_evidence / require_finite_rate / require_counter in
+// scripts/verify_issue392_qualification.sh):
+//
+//   - packets_sent and packets_received must be positive integers (Go's int64
+//     cannot be bool or float, which is the consumer's excluding-bool check);
+//   - packets_lost must be a nonnegative integer with lost <= sent and
+//     received <= sent (received + lost == sent is deliberately NOT required:
+//     late and duplicate echo accounting does not guarantee that equality);
+//   - loss_rate_percent must be finite, within 0..100, and consistent with
+//     100*lost/sent within the same 1e-9 relative-or-absolute tolerance the
+//     consumer uses (math.isclose rel_tol=1e-9, abs_tol=1e-9).
+//
+// A never-run stream (sent == 0) FAILS here even with zero loss, exactly as it
+// fails the consumer. This function inspects counters only; the loss-budget
+// ceilings stay in soakCriteriaViolations, unchanged.
+func validateObservedUDPStream(stats StreamStats) error {
+	if stats.PacketsSent <= 0 {
+		return fmt.Errorf("sequenced UDP stream was not observed: packets_sent=%d, want a positive integer", stats.PacketsSent)
+	}
+	if stats.PacketsReceived <= 0 {
+		return fmt.Errorf("sequenced UDP stream was not observed: packets_received=%d, want a positive integer", stats.PacketsReceived)
+	}
+	if stats.PacketsLost < 0 {
+		return fmt.Errorf("sequenced UDP packets_lost=%d, want a nonnegative integer", stats.PacketsLost)
+	}
+	if stats.PacketsReceived > stats.PacketsSent {
+		return fmt.Errorf("sequenced UDP packets_received=%d must not exceed packets_sent=%d", stats.PacketsReceived, stats.PacketsSent)
+	}
+	if stats.PacketsLost > stats.PacketsSent {
+		return fmt.Errorf("sequenced UDP packets_lost=%d must not exceed packets_sent=%d", stats.PacketsLost, stats.PacketsSent)
+	}
+	if math.IsNaN(stats.LossRatePercent) || math.IsInf(stats.LossRatePercent, 0) {
+		return fmt.Errorf("sequenced UDP loss_rate_percent=%v, want a finite number", stats.LossRatePercent)
+	}
+	if stats.LossRatePercent < 0.0 || stats.LossRatePercent > 100.0 {
+		return fmt.Errorf("sequenced UDP loss_rate_percent=%v, want within 0..100", stats.LossRatePercent)
+	}
+	expectedRate := 100.0 * float64(stats.PacketsLost) / float64(stats.PacketsSent)
+	diff := math.Abs(stats.LossRatePercent - expectedRate)
+	// math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9) semantics: satisfied iff
+	// diff <= max(rel_tol*|expected|, abs_tol). Fail only when BOTH bounds are
+	// exceeded, so a rate within either tolerance is accepted.
+	if diff > 1e-9 && diff > 1e-9*math.Abs(expectedRate) {
+		return fmt.Errorf("sequenced UDP loss_rate_percent=%v is inconsistent with 100*%d/%d=%v within the 1e-9 tolerance", stats.LossRatePercent, stats.PacketsLost, stats.PacketsSent, expectedRate)
+	}
+	return nil
+}
+
+// assertSoakReportCriteria fails the test for every soak acceptance-criteria
+// violation in the report (see soakCriteriaViolations for the criteria
+// themselves, including the R6-3 requirement that the sequenced UDP stream was
+// actually observed).
+func assertSoakReportCriteria(t *testing.T, report *SoakEvidenceReport, label string) {
+	t.Helper()
+
+	for _, violation := range soakCriteriaViolations(report, label) {
+		t.Error(violation)
 	}
 	t.Logf("[%s] Soak Report Summary: completedRekeys=%d, duration=%.2fs, tcpPassed=%t, seqLoss=%.2f%%, voipLoss=%.2f%%, idlePassed=%t",
 		label, report.CompletedRekeys, report.TotalDurationSec, report.TCPContinuityPassed,
 		report.SequencedUDPStats.LossRatePercent, report.VoIPUDPStats.LossRatePercent, report.IdlePhasePassed)
+}
+
+// validObservedStream returns a minimal, internally consistent, OBSERVED
+// sequenced UDP stream (positive sent/received, zero loss, matching rate) used
+// as the passing baseline for the criteria tables below.
+func validObservedStream() StreamStats {
+	return StreamStats{
+		PacketsSent:     400,
+		PacketsReceived: 400,
+		PacketsLost:     0,
+		LossRatePercent: 0,
+	}
+}
+
+// TestSoakCriteriaRequireObservedUDPStream pins the R6-3 producer criteria:
+// a report whose sequenced UDP stream was never observed (sent/received == 0)
+// FAILS locally even with zero loss, an observed zero-loss stream PASSES, and
+// every counter/rate shape the strict consumer rejects is rejected here with
+// exactly one violation naming the failed criterion.
+func TestSoakCriteriaRequireObservedUDPStream(t *testing.T) {
+	passingReport := func(seq StreamStats) *SoakEvidenceReport {
+		return &SoakEvidenceReport{
+			ServerType:          "reference",
+			RunMode:             "bounded_verification",
+			TargetRekeys:        2,
+			CompletedRekeys:     2,
+			TCPContinuityPassed: true,
+			IdlePhasePassed:     true,
+			SequencedUDPStats:   seq,
+			VoIPUDPStats:        validObservedStream(),
+		}
+	}
+
+	tests := []struct {
+		name          string
+		mutate        func(*StreamStats)
+		wantViolation string // empty means the report must pass with zero violations
+		allowExtra    bool   // true: the marker must be present but the preserved 5%/15% ceiling may also fire (rates above it violate both criteria at once)
+	}{
+		{"observed zero loss is valid", func(*StreamStats) {}, "", false},
+		{"observed with loss and consistent rate", func(s *StreamStats) {
+			s.PacketsReceived = 396
+			s.PacketsLost = 4
+			s.LossRatePercent = 1.0
+		}, "", false},
+		{"rate consistent within 1e-9 relative tolerance", func(s *StreamStats) {
+			s.PacketsReceived = 399
+			s.PacketsLost = 1
+			s.LossRatePercent = 0.25 * (1 + 5e-10) // diff 1.25e-10, inside both bounds
+		}, "", false},
+		{"rate consistent within 1e-9 absolute tolerance", func(s *StreamStats) {
+			s.PacketsReceived = 399
+			s.PacketsLost = 1
+			s.LossRatePercent = 0.25 + 5e-10
+		}, "", false},
+		{"unobserved zero-sent report fails", func(s *StreamStats) {
+			s.PacketsSent = 0
+			s.PacketsReceived = 0
+			s.LossRatePercent = 0
+		}, "was not observed: packets_sent=0", false},
+		{"negative sent fails", func(s *StreamStats) {
+			s.PacketsSent = -5
+			s.PacketsReceived = -5
+			s.LossRatePercent = 0
+		}, "was not observed: packets_sent=-5", false},
+		{"zero received fails", func(s *StreamStats) {
+			s.PacketsReceived = 0
+			s.PacketsLost = 5
+			s.LossRatePercent = 1.25
+		}, "was not observed: packets_received=0", false},
+		{"negative lost fails", func(s *StreamStats) {
+			s.PacketsReceived = 401
+			s.PacketsLost = -1
+			s.LossRatePercent = -0.25
+		}, "want a nonnegative integer", false},
+		{"received exceeding sent fails", func(s *StreamStats) {
+			s.PacketsReceived = 401
+			s.PacketsLost = 0
+			s.LossRatePercent = 0
+		}, "packets_received=401 must not exceed packets_sent=400", false},
+		{"lost exceeding sent fails", func(s *StreamStats) {
+			s.PacketsReceived = 396
+			s.PacketsLost = 401
+			s.LossRatePercent = 100.25
+		}, "packets_lost=401 must not exceed packets_sent=400", true},
+		{"negative rate fails", func(s *StreamStats) {
+			s.PacketsLost = 1
+			s.PacketsReceived = 399
+			s.LossRatePercent = -0.25
+		}, "want within 0..100", false},
+		{"rate above 100 fails", func(s *StreamStats) {
+			// Sane counters, fabricated rate field: the 0..100 guard must fire
+			// on the field itself, independently of counter arithmetic.
+			s.PacketsReceived = 400
+			s.PacketsLost = 400
+			s.LossRatePercent = 100.5
+		}, "want within 0..100", true},
+		{"NaN rate fails", func(s *StreamStats) {
+			s.LossRatePercent = math.NaN()
+		}, "want a finite number", false},
+		{"Inf rate fails", func(s *StreamStats) {
+			s.LossRatePercent = math.Inf(1)
+		}, "want a finite number", true},
+		{"rate off by 2e-9 fails", func(s *StreamStats) {
+			s.PacketsReceived = 399
+			s.PacketsLost = 1
+			s.LossRatePercent = 0.25 + 2e-9 // outside both 1e-9 bounds
+		}, "is inconsistent with 100*1/400", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stats := validObservedStream()
+			tt.mutate(&stats)
+			violations := soakCriteriaViolations(passingReport(stats), "reference")
+
+			if tt.wantViolation == "" {
+				if len(violations) != 0 {
+					t.Fatalf("expected zero violations for a criteria-satisfying report, got %d: %q", len(violations), violations)
+				}
+				return
+			}
+			found := false
+			for _, v := range violations {
+				if strings.Contains(v, tt.wantViolation) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no violation contains expected marker %q; got %q", tt.wantViolation, violations)
+			}
+			if !tt.allowExtra && len(violations) != 1 {
+				t.Fatalf("expected exactly 1 violation, got %d: %q", len(violations), violations)
+			}
+		})
+	}
 }

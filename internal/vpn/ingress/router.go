@@ -1,11 +1,13 @@
 package ingress
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // SessionHandle exposes the identity fields routing needs from the admitted
@@ -91,10 +93,13 @@ var _ routeRegistrar = (*forwarder.Forwarder)(nil)
 type Stats struct {
 	// AdmittedSessions counts lazy admissions (first valid plaintext for a
 	// peer without a live matching route), not per-packet events.
-	AdmittedSessions        uint64 `json:"admitted_sessions"`
-	MalformedPacketDrops    uint64 `json:"malformed_packet_drops"`
-	UnmappedSourceIPDrops   uint64 `json:"unmapped_source_ip_drops"`
-	OwnershipMismatchDrops  uint64 `json:"ownership_mismatch_drops"`
+	AdmittedSessions       uint64 `json:"admitted_sessions"`
+	MalformedPacketDrops   uint64 `json:"malformed_packet_drops"`
+	UnmappedSourceIPDrops  uint64 `json:"unmapped_source_ip_drops"`
+	OwnershipMismatchDrops uint64 `json:"ownership_mismatch_drops"`
+	// NoActiveBackendDrops is a subset of AdmissionRejectedDrops. Diagnostics
+	// subtract it from generic rejections before adding the specific cause.
+	NoActiveBackendDrops    uint64 `json:"no_active_backend_drops"`
 	AdmissionRejectedDrops  uint64 `json:"admission_rejected_drops"`
 	RouteRegistrationErrors uint64 `json:"route_registration_errors"`
 }
@@ -129,6 +134,7 @@ type Router struct {
 	unmappedDrops    atomic.Uint64
 	mismatchDrops    atomic.Uint64
 	rejectedDrops    atomic.Uint64
+	noBackendDrops   atomic.Uint64
 	routeRegErrors   atomic.Uint64
 
 	// stateMu guards sessions and serializes admission. Fast packets (memo
@@ -204,7 +210,11 @@ func (r *Router) HandlePacket(packet []byte) error {
 	session, backend, err := r.admission.EnsureSession(owner)
 	if err != nil {
 		r.stateMu.Unlock()
-		r.rejectedDrops.Add(1)
+		if errors.Is(err, loadbalancer.ErrNoActiveBackends) {
+			r.noBackendDrops.Add(1)
+		} else {
+			r.rejectedDrops.Add(1)
+		}
 		return fmt.Errorf("%w: peer %s: %w", ErrAdmissionRejected, RedactKey(owner.PeerPublicKey), err)
 	}
 	if session == nil || backend == nil {
@@ -327,12 +337,16 @@ func (r *Router) touchLiveness(peerPublicKey string) {
 
 // StatsSnapshot returns the current counter values.
 func (r *Router) StatsSnapshot() Stats {
+	// Producer counters are disjoint; derive the compatibility total from the
+	// same no-backend observation used by its subset, so consumers can subtract safely.
+	noBackend := r.noBackendDrops.Load()
 	return Stats{
 		AdmittedSessions:        r.admittedSessions.Load(),
+		NoActiveBackendDrops:    noBackend,
 		MalformedPacketDrops:    r.malformedDrops.Load(),
 		UnmappedSourceIPDrops:   r.unmappedDrops.Load(),
 		OwnershipMismatchDrops:  r.mismatchDrops.Load(),
-		AdmissionRejectedDrops:  r.rejectedDrops.Load(),
+		AdmissionRejectedDrops:  r.rejectedDrops.Load() + noBackend,
 		RouteRegistrationErrors: r.routeRegErrors.Load(),
 	}
 }

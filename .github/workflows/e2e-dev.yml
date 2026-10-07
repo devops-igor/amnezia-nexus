@@ -81,7 +81,7 @@ jobs:
           done
           if [ "$READY" -ne 1 ]; then
             echo "Error: Panel failed to become healthy within 45 seconds" >&2
-            cd ~ && docker compose logs
+            echo "Readiness service output omitted to protect private fixture data." >&2
             exit 1
           fi
           echo "Verifying running image is PR image ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}..."
@@ -102,6 +102,7 @@ jobs:
           python3 -m venv ~/e2e-venv
           source ~/e2e-venv/bin/activate
           pip install --quiet -r tests/e2e/requirements.txt
+          python -m pytest tests/test_vpn_diagnostics_oracle.py -p no:cacheprovider
           playwright install --with-deps chromium
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh

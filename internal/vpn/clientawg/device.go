@@ -38,10 +38,39 @@ type ClientAWGDevice struct {
 // owned resources. Upstream errors are intentionally sanitized: IPC errors can
 // contain secret configuration values.
 func NewDevice(cfg Config) (*ClientAWGDevice, error) {
+	return newDevice(cfg, false)
+}
+
+// NewDeviceWithSuspendedReadsForTest builds the device with the VirtualTUN's
+// inbound reads ALREADY suspended, before device.NewDevice starts the upstream
+// TUN reader goroutine. It is TEST-ONLY and changes no production behavior:
+// NewDevice is the only constructor any production path uses.
+//
+// The suspension has to be armed at construction time, not afterwards. The
+// upstream reader (started inside device.NewDevice, see device.go:374) spends
+// essentially all its life parked inside VirtualTUN.Read, already past the
+// gate at the top of Read and blocked on the inbound channel. Arming the gate
+// after NewDevice returns therefore does not reach it, and it dequeues the
+// next injected packet immediately, which is what makes inbound occupancy,
+// inbound peak and Close-drain assertions non-deterministic.
+//
+// A test that needs deterministic inbound queue state must use this
+// constructor. The read gate is armed before upstream workers start.
+func NewDeviceWithSuspendedReadsForTest(cfg Config) (*ClientAWGDevice, error) {
+	return newDevice(cfg, true)
+}
+
+func newDevice(cfg Config, suspendReads bool) (*ClientAWGDevice, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	vtun, err := virtualtun.New(cfg.TUN)
+	var vtun *virtualtun.VirtualTUN
+	var err error
+	if suspendReads {
+		vtun, err = virtualtun.NewSuspendedForTest(cfg.TUN)
+	} else {
+		vtun, err = virtualtun.New(cfg.TUN)
+	}
 	if err != nil {
 		return nil, errors.New("clientawg: cannot create virtual TUN")
 	}
@@ -147,3 +176,18 @@ func (d *ClientAWGDevice) InjectInbound(packet []byte) error {
 
 // Stats reports bounded queue depths and loss accounting, including after Close.
 func (d *ClientAWGDevice) Stats() virtualtun.StatsSnapshot { return d.tun.Stats() }
+
+// ReadsSuspendedForTest reports whether the test-only inbound read gate is
+// armed on this device's VirtualTUN.
+func (d *ClientAWGDevice) ReadsSuspendedForTest() bool {
+	return d.tun.ReadsSuspendedForTest()
+}
+
+// WriteOutboundForTest submits packets to the VirtualTUN outbound queue, the
+// path the upstream AWG engine uses to emit authenticated plaintext toward
+// Nexus. Production reaches it only through the engine, so this exists purely
+// so tests can create the Upstream -> Nexus queue state (including the
+// queue-full drops) that the diagnostics surface reports.
+func (d *ClientAWGDevice) WriteOutboundForTest(bufs [][]byte, offset int) (int, error) {
+	return d.tun.Write(bufs, offset)
+}

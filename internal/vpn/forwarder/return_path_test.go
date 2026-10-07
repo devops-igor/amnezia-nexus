@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,5 +194,54 @@ func TestReturnPathCloseJoinsConcurrentWrites(t *testing.T) {
 	<-done
 	if writes.Load() != atClose {
 		t.Fatal("callback entered after Close")
+	}
+}
+
+func TestReturnRetirementClassification(t *testing.T) {
+	f := NewForwarder(nil, "", 10)
+	f.RegisterSession("s", "c", "peer", "192.0.2.1", 1)
+	if err := f.SetPeerRateLimit("peer", 1000, 0); err != nil {
+		t.Fatal(err)
+	}
+	var classified atomic.Uint64
+	var lastReason ReturnRejectReason
+	f.SetReturnRejectClassifier(func(r ReturnRejectReason) {
+		lastReason = r
+		classified.Add(1)
+	})
+	bucket := f.routesByPeer["peer"].tbDown
+	bucket.mu.Lock()
+	result := make(chan error, 1)
+	go func() { result <- f.RouteBackendToClient(1, returnPacket("192.0.2.1"), "192.0.2.1") }()
+	stack := make([]byte, 65536)
+	waiting := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		n := runtime.Stack(stack, true)
+		if strings.Contains(string(stack[:n]), "forwarder.(*TokenBucket).Allow") {
+			waiting = true
+			break
+		}
+		runtime.Gosched()
+	}
+	if !waiting {
+		bucket.mu.Unlock()
+		t.Fatal("writer did not reach the controlled rate-limit boundary")
+	}
+	f.UnregisterSession("peer")
+	bucket.mu.Unlock()
+	if err := <-result; !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("want route-retirement rejection, got %v", err)
+	}
+	q, unrouted, total := f.DropStats()
+	t.Logf("retirement rejection: queue_full=%d no_route=%d internal_total=%d engine_classifications=%d", q, unrouted, total, classified.Load())
+	if total != 1 || unrouted != 1 {
+		t.Fatalf("expected 1 unrouted drop, got total=%d unrouted=%d", total, unrouted)
+	}
+	if classified.Load() != 1 {
+		t.Fatalf("expected 1 classified rejection, got %d", classified.Load())
+	}
+	if lastReason != ReturnRejectedUnrouted {
+		t.Fatalf("expected ReturnRejectedUnrouted (%v), got %v", ReturnRejectedUnrouted, lastReason)
 	}
 }
