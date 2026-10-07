@@ -654,3 +654,51 @@ func TestDiagRatesTracker_WholeVectorMonotonicity_NoRateInflation(t *testing.T) 
 		t.Fatalf("writeErrorRate inflated: got %v, want %v", w2, wantWrite)
 	}
 }
+
+// TestWindowedTrackersAudit_PrimingBehavior verifies that trackers prime on their
+// first sample and report zero deltas/rates rather than treating pre-existing cumulative
+// totals as live rate spikes (issue #424 round 8, finding 2).
+func TestWindowedTrackersAudit_PrimingBehavior(t *testing.T) {
+	t.Run("diagDeltaTracker", func(t *testing.T) {
+		var d diagDeltaTracker
+		now := time.Now()
+		// First sample must prime baseline and report zero delta
+		if snap := d.Sample(0, now, 5_000); snap.delta != 0 {
+			t.Fatalf("first sample must prime and report zero delta, got %d", snap.delta)
+		}
+		// Unchanged counter after sample interval reports zero delta
+		if snap := d.Sample(0, now.Add(5*time.Second), 5_000); snap.delta != 0 {
+			t.Fatalf("unchanged counter must report zero delta, got %d", snap.delta)
+		}
+		// Counter increase reports proper delta
+		if snap := d.Sample(0, now.Add(10*time.Second), 5_010); snap.delta != 10 {
+			t.Fatalf("incremented counter must report delta 10, got %d", snap.delta)
+		}
+	})
+
+	t.Run("diagRatesTracker", func(t *testing.T) {
+		tk := newDiagRatesTracker()
+		now := time.Now()
+		// First sample must prime and report zero rates
+		c, r, tot, w := tk.Sample(0, now, 100, 100, 200, 10)
+		if c != 0 || r != 0 || tot != 0 || w != 0 {
+			t.Fatalf("first sample must prime and report zero rates, got %v %v %v %v", c, r, tot, w)
+		}
+		// Second sample over 1s reports valid rate
+		c, r, tot, w = tk.Sample(0, now.Add(1*time.Second), 110, 110, 220, 12)
+		if c != 10 || r != 10 || tot != 20 || w != 2 {
+			t.Fatalf("second sample must report 10/10/20/2 pps, got %v %v %v %v", c, r, tot, w)
+		}
+	})
+
+	t.Run("RollingHistory", func(t *testing.T) {
+		rh := NewRollingHistory()
+		rh.mu.RLock()
+		preSeeded := rh.last1hTime
+		rh.mu.RUnlock()
+		if !preSeeded.IsZero() {
+			t.Fatalf("NewRollingHistory must not pre-seed last1hTime, got %v", preSeeded)
+		}
+	})
+}
+
