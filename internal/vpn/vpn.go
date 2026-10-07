@@ -233,6 +233,7 @@ type Service struct {
 	postCommitRevokeHookForTest            func(kind database.PeerRevokeKind, userID string, clientID string)
 	updateBackendServerHostPreLockHook     func()
 	updateBackendServerHostErr             error
+	deleteBackendErr                       error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
 	enableBackendPostAddTunnelHook         func()
@@ -922,6 +923,13 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateBackendServerHostErr = err
+}
+
+// SetDeleteBackendErrorForTest sets an error to be returned by DeleteBackend for testing.
+func (s *Service) SetDeleteBackendErrorForTest(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteBackendErr = err
 }
 
 // SetEnableBackendPreAddTunnelHookForTest sets a hook called immediately before calling pool.AddTunnel in EnableBackend.
@@ -3211,6 +3219,10 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.deleteBackendErr != nil {
+		return s.deleteBackendErr
+	}
 
 	if s.pool == nil {
 		return errors.New("tunnel pool not initialized")

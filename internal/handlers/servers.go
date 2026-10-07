@@ -152,6 +152,14 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.vpnSvc != nil {
+		if err := h.vpnSvc.DeleteBackend(ctx, serverID); err != nil && !errors.Is(err, vpn.ErrBackendTunnelNotFound) {
+			slog.Error("failed to teardown VPN backend for server", "server_id", serverID, "error", err)
+			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to teardown VPN backend")
+			return
+		}
+	}
+
 	if h.sshPool != nil {
 		h.sshPool.Remove(serverID)
 	}
