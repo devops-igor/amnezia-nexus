@@ -167,19 +167,8 @@ func ResolveSecretKey(dataDir string) (string, error) {
 
 	// Ensure directory exists
 	// #nosec G703
-	_, statErr := os.Stat(cleanDataDir)
-	newDir := errors.Is(statErr, os.ErrNotExist)
-
-	// #nosec G703
 	if err := os.MkdirAll(cleanDataDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
-	}
-
-	if newDir {
-		parentDir := filepath.Dir(cleanDataDir)
-		if err := syncDirFunc(parentDir); err != nil {
-			return "", fmt.Errorf("failed to sync parent directory %s: %w", parentDir, err)
-		}
 	}
 
 	// #nosec G304 G703 -- Reading secret key from configured data directory is intended
@@ -197,6 +186,15 @@ func ResolveSecretKey(dataDir string) (string, error) {
 		return key, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("failed to read secret key file %s: %w", cleanKeyPath, err)
+	}
+
+	// First-boot key generation path: .secret_key did not pre-exist.
+	// Any process on this path must guarantee durability of parentDir before publishing or returning the key.
+	parentDir := filepath.Dir(cleanDataDir)
+	if parentDir != cleanDataDir {
+		if err := syncDirFunc(parentDir); err != nil {
+			return "", fmt.Errorf("failed to sync parent directory %s: %w", parentDir, err)
+		}
 	}
 
 	// Generate 32 bytes (64 hex characters)
