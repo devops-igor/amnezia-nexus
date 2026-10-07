@@ -499,3 +499,34 @@ def test_status_schema_privacy_and_direction_contract(
     with pytest.raises(AssertionError) as failure:
         run_peer_redaction_status(monkeypatch, status)
     assert_peer_redaction_failure_safe(failure)
+
+
+def test_status_schema_direction_neutral_unattributed_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drop conservation holds when non-zero direction-neutral backend_device_unattributed loss exists."""
+    status = status_api_fixture()
+    drops = status["drop_categories"]
+    drops["client_malformed"] = 7
+    drops["client_total_drops"] = 7
+    drops["return_malformed"] = 11
+    drops["return_total_drops"] = 11
+    drops["backend_device_unattributed"] = 3
+    drops["total_drops"] = 21  # 7 + 11 + 3 = 21
+
+    # Status API assertion must pass cleanly with unattributed drops present
+    run_peer_redaction_status(monkeypatch, status)
+
+    # Inconsistent total_drops (omitting unattributed loss) must be rejected
+    status_broken = status_api_fixture()
+    drops_broken = status_broken["drop_categories"]
+    drops_broken["client_malformed"] = 7
+    drops_broken["client_total_drops"] = 7
+    drops_broken["return_malformed"] = 11
+    drops_broken["return_total_drops"] = 11
+    drops_broken["backend_device_unattributed"] = 3
+    drops_broken["total_drops"] = 18  # 18 != 7 + 11 + 3
+    with pytest.raises(AssertionError) as failure:
+        run_peer_redaction_status(monkeypatch, status_broken)
+    assert_peer_redaction_failure_safe(failure)
+

@@ -556,7 +556,6 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         + drops["client_backend_device_oversized"]
         + drops["client_backend_device_shutdown"]
         + drops["client_backend_device_external"]
-        + drops["backend_device_unattributed"]
     )
     return_categories = (
         drops["return_malformed"]
@@ -578,8 +577,15 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
         f"{drops['return_total_drops']}"
     )
     assert (
-        drops["client_total_drops"] + drops["return_total_drops"] == drops["total_drops"]
-    ), "total_drops must equal the sum of the directional totals"
+        drops["client_total_drops"]
+        + drops["return_total_drops"]
+        + drops["backend_device_unattributed"]
+        == drops["total_drops"]
+    ), (
+        f"total_drops {drops['total_drops']} != sum of client ({drops['client_total_drops']}), "
+        f"return ({drops['return_total_drops']}), and backend_device_unattributed "
+        f"({drops['backend_device_unattributed']})"
+    )
 
     # Both queues have independent observations; renderer tests prove their
     # source-to-panel direction. API shape alone cannot prove physical ownership.
