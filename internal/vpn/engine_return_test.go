@@ -1,11 +1,19 @@
 package vpn
 
 import (
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
@@ -229,4 +237,126 @@ func TestEngineFreshAdmissionCarriesReturnOwner(t *testing.T) {
 	if !svc.forwarder.HasSessionRouteWithReturnPath(peer.peerKey, sess.ID, peer.connID, peer.ip.String(), be.ID, path) {
 		t.Fatal("fresh admission omitted return owner")
 	}
+}
+
+// TestEngineReturnWriteConcurrent_Race verifies lockless writeReturnPacket
+// scaling across multiple concurrent goroutines under -race (issue #424 round-8, Chunk 2).
+func TestEngineReturnWriteConcurrent_Race(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	peerKey, _ := engineKeys(t)
+	peer := seedIngressPeer(t, db, "race-return", peerKey, "10.100.8.98")
+	engine, err := svc.NewIngressEngine(t.Context(), "race-return-portal", []clientawg.Peer{
+		{PublicKey: peer.peerKey, AllowedIP: netip.PrefixFrom(peer.ip, 32)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Stop() })
+
+	packet := make([]byte, 28)
+	packet[0] = 0x45
+	packet[9] = 17
+	binary.BigEndian.PutUint16(packet[2:4], 28)
+	ip := peer.ip.As4()
+	copy(packet[16:20], ip[:])
+
+	const workers = 8
+	const perWorker = 100
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				_, _ = engine.writeReturnPacket(peer.peerKey, peer.ip.String(), packet)
+			}
+		}()
+	}
+	wg.Wait()
+
+	stats := engine.ReturnStats()
+	if stats.AcceptedPackets == 0 && stats.InjectionErrors == 0 {
+		t.Fatalf("expected accounted return packets, got accepted=%d errors=%d", stats.AcceptedPackets, stats.InjectionErrors)
+	}
+}
+
+func setupBenchReturnEngine(b *testing.B) (*IngressEngine, string, netip.Addr) {
+	b.Helper()
+	dir := b.TempDir()
+	dbPath := filepath.Join(dir, "bench_vpn.db")
+	db, err := database.Open(dbPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		b.Fatalf("failed to open bench db: %v", err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	s1ID, _ := db.CreateServer(ctx, &models.Server{Name: "US East", Host: "198.51.100.1", Protocols: map[string]any{
+		"awg": map[string]any{"public_key": "us-east-pubkey", "port": 51820},
+	}})
+	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: s1ID, InterfaceName: "awg-be-1", PublicKey: "us-east-pubkey",
+		PrivateKey: "us-east-privkey", Endpoint: "198.51.100.1:51820", Status: "active",
+	})
+	cfg := &models.VPNConfig{
+		Algorithm: models.LBLeastConnections, SubnetCIDR: "10.100.0.0/16",
+		Weights: map[int64]int{s1ID: 100},
+	}
+	vpnSvc, err := NewVPNService(db, cfg)
+	if err != nil {
+		b.Fatalf("NewVPNService: %v", err)
+	}
+	if err := vpnSvc.pool.SyncFromDB(ctx); err != nil {
+		b.Fatal(err)
+	}
+
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		b.Fatal(err)
+	}
+	peerKey := base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
+	assignedIP := netip.MustParseAddr("10.100.8.99")
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "bench", Role: "user", Enabled: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{
+		ID: "conn-bench", UserID: uID, ServerID: 0, Protocol: "awg", ClientID: peerKey,
+		ClientParams: map[string]any{"assigned_ip": assignedIP.String()},
+	})
+
+	engine, err := vpnSvc.NewIngressEngine(b.Context(), "bench-return-portal", []clientawg.Peer{
+		{PublicKey: peerKey, AllowedIP: netip.PrefixFrom(assignedIP, 32)},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = engine.Stop() })
+	return engine, peerKey, assignedIP
+}
+
+// BenchmarkWriteReturnPacket_Concurrent verifies lockless throughput scaling
+// of writeReturnPacket under concurrent submission from multiple goroutines
+// (issue #424 round-8 remediation, Chunk 2).
+func BenchmarkWriteReturnPacket_Concurrent(b *testing.B) {
+	engine, peerKey, assignedIP := setupBenchReturnEngine(b)
+
+	packet := make([]byte, 28)
+	packet[0] = 0x45
+	packet[9] = 17
+	binary.BigEndian.PutUint16(packet[2:4], 28)
+	ip := assignedIP.As4()
+	copy(packet[16:20], ip[:])
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = engine.writeReturnPacket(peerKey, assignedIP.String(), packet)
+		}
+	})
 }

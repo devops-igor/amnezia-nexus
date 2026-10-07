@@ -109,9 +109,9 @@ func (e *IngressEngine) writeReturnPacket(peerKey, assignedIP string, packet []b
 		e.returnCounters.mismatch.Add(1)
 		return 0, errReturnDestination
 	}
-	e.returnCounters.injectionMu.Lock()
 	err := e.portal.InjectInbound(packet)
 	if err != nil {
+		e.returnCounters.injectionMu.Lock()
 		e.returnCounters.injectionErrors.Add(1)
 		// ErrQueueFull is the only rejection the VirtualTUN already counted
 		// in its inbound drop bucket, so it is the only overlap to own here.
@@ -121,7 +121,6 @@ func (e *IngressEngine) writeReturnPacket(peerKey, assignedIP string, packet []b
 		e.returnCounters.injectionMu.Unlock()
 		return 0, err
 	}
-	e.returnCounters.injectionMu.Unlock()
 	e.returnCounters.accepted.Add(1)
 	return len(packet), nil
 }
