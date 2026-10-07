@@ -1614,11 +1614,22 @@ func (f *Forwarder) resetRateTrackersForGeneration(gen Generation) {
 
 // resetBackendTrafficHistoryForGeneration re-primes every current per-backend
 // traffic history baseline so a restarted forwarder measures only post-restart
-// traffic into its history windows. The caller must hold at least f.mu.RLock
-// (Start calls it with f.mu exclusively released; history writes re-take
-// c.mu per counter).
+// traffic into its history windows.
+//
+// Concurrency contract (issue #424 round 8, blocker 3): f.backendTraffic is
+// snapshotted under f.mu.RLock so iteration cannot race with concurrent
+// AttachBackendDevice or DetachBackendDevice map writes. The per-counter
+// resetHistoryForGeneration calls then run outside f.mu, preventing lock-order
+// inversion with RouteBackendToClient.
 func (f *Forwarder) resetBackendTrafficHistoryForGeneration(gen Generation, now time.Time) {
+	f.mu.RLock()
+	snapshot := make([]*trafficCounters, 0, len(f.backendTraffic))
 	for _, counters := range f.backendTraffic {
+		snapshot = append(snapshot, counters)
+	}
+	f.mu.RUnlock()
+
+	for _, counters := range snapshot {
 		counters.resetHistoryForGeneration(gen, now)
 	}
 }

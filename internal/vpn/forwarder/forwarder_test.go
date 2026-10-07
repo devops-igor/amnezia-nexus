@@ -578,3 +578,43 @@ func TestForwarderDynamicSourceIPRebindRejected(t *testing.T) {
 		t.Fatalf("expected ErrSessionNotRegistered after unregister, got: %v", err)
 	}
 }
+
+// TestForwarder_StartConcurrentWithBackendLifecycle_Race verifies that Forwarder.Start()
+// and generation resets do not race with concurrent AttachBackendDevice and DetachBackendDevice
+// calls on f.backendTraffic (issue #424 round-8 remediation, Chunk 3).
+func TestForwarder_StartConcurrentWithBackendLifecycle_Race(t *testing.T) {
+	fwd := NewForwarder(nil, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const workers = 4
+	const iterations = 50
+	var wg sync.WaitGroup
+
+	// Goroutines repeatedly attaching/detaching mock backend devices
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				beID := int64(workerID*100 + (i % 10))
+				dev := newMockPacketDev()
+				fwd.AttachBackendDevice(beID, dev)
+				fwd.DetachBackendDevice(beID)
+			}
+		}(w)
+	}
+
+	// Goroutines repeatedly calling Start() (generation reset)
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				fwd.Start(ctx)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
