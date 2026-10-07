@@ -77,9 +77,12 @@
                 <svg class="icon text-muted" style="width: 22px; height: 22px;"><use href="#icon-activity"></use></svg>
                 <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_forwarder_health" }}</h3>
             </div>
-            <span class="badge" id="vpn-fwd-status-badge">
-                <span class="badge-dot"></span> <span id="vpn-fwd-status-text">{{ _ "vpn_forwarder_unavailable" }}</span>
-            </span>
+            <div class="flex items-center gap-sm" style="flex-wrap: wrap;">
+                <span class="text-xs text-muted font-mono" id="vpn-fwd-counters-since" style="display: none;"></span>
+                <span class="badge" id="vpn-fwd-status-badge">
+                    <span class="badge-dot"></span> <span id="vpn-fwd-status-text">{{ _ "vpn_forwarder_unavailable" }}</span>
+                </span>
+            </div>
         </div>
         <div id="vpn-fwd-headline-summary" style="font-size: 0.875rem; color: var(--text-muted); margin-top: var(--space-xs);">
             {{ _ "vpn_forwarder_unavailable" }}
@@ -104,6 +107,7 @@
         <div class="info-card" style="padding: var(--space-xs) var(--space-sm);">
             <div class="info-card-label" style="font-size: 0.75rem;">{{ _ "vpn_fwd_kpi_loss" }}</div>
             <div class="info-card-value font-mono" id="vpn-kpi-packet-loss" style="font-size: 0.95rem; margin-top: 2px;">-</div>
+            <div class="info-card-sub text-muted font-mono" id="vpn-kpi-packet-loss-sub" style="font-size: 0.7rem; margin-top: 2px; display: none;"></div>
         </div>
         <div class="info-card" style="padding: var(--space-xs) var(--space-sm);">
             <div class="info-card-label" style="font-size: 0.75rem;">{{ _ "vpn_fwd_kpi_client_engine" }}</div>
@@ -173,6 +177,7 @@
         <div class="card" style="background: var(--bg-surface); border: 1px solid var(--border-color); padding: var(--space-sm) var(--space-md);">
             <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: var(--space-xs); display: flex; align-items: center; justify-content: space-between;">
                 <span>{{ _ "vpn_fwd_panel_drops" }}</span>
+                <span class="text-xs text-muted" style="font-weight: normal;">{{ _ "vpn_fwd_horizon_current" }} / {{ _ "vpn_fwd_horizon_since_reset" }}</span>
                 <svg class="icon text-muted" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
             </div>
             <div style="font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px;">
@@ -1371,6 +1376,23 @@
             if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
             return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
         }
+        function vpnFormatCountersSince(val) {
+            if (!val) return '';
+            try {
+                const d = new Date(val);
+                if (!isNaN(d.getTime())) {
+                    const y = d.getUTCFullYear();
+                    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(d.getUTCDate()).padStart(2, '0');
+                    const h = String(d.getUTCHours()).padStart(2, '0');
+                    const min = String(d.getUTCMinutes()).padStart(2, '0');
+                    return y + '-' + m + '-' + day + ' ' + h + ':' + min + ' UTC';
+                }
+                return String(val);
+            } catch (_) {
+                return String(val);
+            }
+        }
 
         const isAvailable = !!status && status.forwarder_available === true;
 
@@ -1389,7 +1411,10 @@
             if (headlineElem) headlineElem.textContent = _('vpn_forwarder_unavailable') || 'Not reported';
             const problemListElem = document.getElementById('vpn-fwd-problem-list');
             if (problemListElem) { problemListElem.textContent = ''; problemListElem.style.display = 'none'; }
-
+            const countersSinceElem = document.getElementById('vpn-fwd-counters-since');
+            if (countersSinceElem) { countersSinceElem.textContent = ''; countersSinceElem.style.display = 'none'; }
+            const kpiLossSub = document.getElementById('vpn-kpi-packet-loss-sub');
+            if (kpiLossSub) { kpiLossSub.textContent = ''; kpiLossSub.style.display = 'none'; }
 
             if (badgeElem) badgeElem.textContent = '0';
             if (summaryStatus) {
@@ -1443,6 +1468,19 @@
 
         if (typeof vpnLastStatus !== 'undefined') {
             vpnLastStatus = status;
+        }
+
+        const countersSinceElem = document.getElementById('vpn-fwd-counters-since');
+        if (countersSinceElem) {
+            const rawSince = status.counters_since || status.uptime_baseline;
+            if (rawSince) {
+                const formattedSince = vpnFormatCountersSince(rawSince);
+                countersSinceElem.textContent = vpnDiagText('vpn_fwd_counters_since', {time: formattedSince});
+                countersSinceElem.style.display = '';
+            } else {
+                countersSinceElem.textContent = '';
+                countersSinceElem.style.display = 'none';
+            }
         }
 
         const cap = Number(status.forwarder_queue_capacity || 0);
@@ -1644,9 +1682,9 @@
         if (statusBadge && statusText) {
             if (ha && ha.status) {
                 const s = String(ha.status).toUpperCase();
-                if (s === 'CRITICAL') {
+                if (s === 'CRITICAL' || s === 'DOWN') {
                     statusBadge.className = 'badge badge-danger';
-                    statusText.textContent = _('vpn_forwarder_critical');
+                    statusText.textContent = s === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') : _('vpn_forwarder_critical');
                 } else if (s === 'DEGRADED') {
                     statusBadge.className = 'badge badge-warn';
                     statusText.textContent = _('vpn_forwarder_degraded');
@@ -1767,12 +1805,21 @@
         }
 
         const kpiLoss = document.getElementById('vpn-kpi-packet-loss');
+        const kpiLossSub = document.getElementById('vpn-kpi-packet-loss-sub');
         if (kpiLoss) {
             const drops = status.drop_categories || {};
             const totDrops = drops.total_drops !== undefined ? drops.total_drops : (dropsQueueFull + dropsNoRoute + dropsOversize);
             const rate = drops.total_drop_rate_pps !== undefined ? drops.total_drop_rate_pps.toFixed(2) : '0.00';
-            kpiLoss.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:drops.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps', count:totDrops});
+            const rateStr = drops.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
+            kpiLoss.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateStr, count:totDrops});
             kpiLoss.style.color = drops.rates_available === true && Number(drops.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
+            const liveLabel = _('vpn_fwd_horizon_current') || 'Current / Live';
+            const resetLabel = _('vpn_fwd_horizon_since_reset') || 'Since Startup / Reset';
+            kpiLoss.title = liveLabel + ': ' + rateStr + ' | ' + resetLabel + ': ' + totDrops;
+            if (kpiLossSub) {
+                kpiLossSub.textContent = liveLabel + ': ' + rateStr + ' | ' + resetLabel + ': ' + totDrops;
+                kpiLossSub.style.display = 'block';
+            }
         }
 
         const kpiEngine = document.getElementById('vpn-kpi-client-engine');
@@ -1922,12 +1969,15 @@
         }
 
         // Panel 4: Categorized Drop Diagnostics
+        const liveHorizon = _('vpn_fwd_horizon_current') || 'Current / Live';
+        const resetHorizon = _('vpn_fwd_horizon_since_reset') || 'Since Startup / Reset';
         const dDropsClient = document.getElementById('vpn-diag-drops-client');
         if (dDropsClient) {
             const dc = status.drop_categories || {};
             const rate = (dc.client_drop_rate_pps || 0).toFixed(2);
             const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsClient.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.client_total_drops || 0});
+            dDropsClient.title = liveHorizon + ': ' + rateText + ' | ' + resetHorizon + ': ' + (dc.client_total_drops || 0);
             dDropsClient.style.color = dc.rates_available === true && Number(dc.client_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsRet = document.getElementById('vpn-diag-drops-return');
@@ -1936,6 +1986,7 @@
             const rate = (dc.return_drop_rate_pps || 0).toFixed(2);
             const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsRet.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:dc.return_total_drops || 0});
+            dDropsRet.title = liveHorizon + ': ' + rateText + ' | ' + resetHorizon + ': ' + (dc.return_total_drops || 0);
             dDropsRet.style.color = dc.rates_available === true && Number(dc.return_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
         const dDropsTot = document.getElementById('vpn-diag-drops-total');
@@ -1945,6 +1996,7 @@
             const rate = (dc.total_drop_rate_pps || 0).toFixed(2);
             const rateText = dc.rates_available !== true ? _('vpn_diag_loss_unavailable') : rate + ' pps';
             dDropsTot.textContent = vpnDiagText('vpn_diag_with_cumulative', {value:rateText, count:tot});
+            dDropsTot.title = liveHorizon + ': ' + rateText + ' | ' + resetHorizon + ': ' + tot;
             dDropsTot.style.color = dc.rates_available === true && Number(dc.total_drop_rate_pps || 0) > 0 ? 'var(--danger)' : '';
         }
 

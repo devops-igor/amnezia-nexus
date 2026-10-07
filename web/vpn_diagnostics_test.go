@@ -1842,3 +1842,85 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 		}
 	}
 }
+
+func TestVPNForwarderHealthDecouplingAndHorizon(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertions := `
+const text = id => document.getElementById(id).textContent;
+const el = id => document.getElementById(id);
+
+// 1. Nominal loss with historical drops retains HEALTHY green and unhighlighted KPI
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	counters_since: '2026-10-07T06:14:40Z',
+	drop_categories: { rates_available: true, total_drop_rate_pps: 0, total_drops: 109 }
+});
+
+assert(el('vpn-fwd-status-badge').className.includes('badge-success'), 'top banner must remain HEALTHY green when loss rate is nominal');
+assert.strictEqual(text('vpn-fwd-status-text'), 'Healthy');
+assert.strictEqual(el('vpn-kpi-packet-loss').style.color, '', 'nominal loss rate must not color packet loss KPI card');
+assert.strictEqual(text('vpn-fwd-counters-since'), 'Counters since: 2026-10-07 06:14 UTC', 'counters_since must be formatted');
+assert.notStrictEqual(el('vpn-fwd-counters-since').style.display, 'none');
+assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Current / Live: 0.00 pps | Since Startup / Reset: 109');
+assert(el('vpn-kpi-packet-loss').title.includes('Current / Live: 0.00 pps'));
+assert(el('vpn-kpi-packet-loss').title.includes('Since Startup / Reset: 109'));
+
+// 2. Positive active drop rate activates danger highlight
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'DEGRADED', conditions: [{ severity: 'DEGRADED', message: 'Loss active' }] },
+	rates: { available: true },
+	counters_since: '2026-10-07T06:14:40Z',
+	drop_categories: { rates_available: true, total_drop_rate_pps: 3.5, total_drops: 115 }
+});
+assert.strictEqual(el('vpn-kpi-packet-loss').style.color, 'var(--danger)', 'active loss rate must highlight KPI card');
+assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Current / Live: 3.50 pps | Since Startup / Reset: 115');
+
+// 3. Status DOWN displays Down badge
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'DOWN', conditions: [] }
+});
+assert(el('vpn-fwd-status-badge').className.includes('badge-danger'), 'DOWN status must have danger badge');
+assert.strictEqual(text('vpn-fwd-status-text'), 'Down');
+
+// 4. Unavailable forwarder clears counters_since and sublabel
+vpnRenderForwarderHealth(null);
+assert.strictEqual(el('vpn-fwd-counters-since').style.display, 'none');
+assert.strictEqual(el('vpn-kpi-packet-loss-sub').style.display, 'none');
+`
+
+	script := vpnDiagnosticsHealthScript(t, string(source), assertions)
+	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+		t.Fatalf("decoupling test failed: %v\n%s", err, out)
+	}
+
+	// 5. Test Russian locale translation for horizon labels and counters_since
+	ruAssertions := `
+const text = id => document.getElementById(id).textContent;
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	counters_since: '2026-10-07T06:14:40Z',
+	drop_categories: { rates_available: true, total_drop_rate_pps: 0, total_drops: 109 }
+});
+assert.strictEqual(text('vpn-fwd-status-text'), 'В норме');
+assert.strictEqual(text('vpn-fwd-counters-since'), 'Счетчики с: 2026-10-07 06:14 UTC');
+assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Текущий / Онлайн: 0.00 pps | С запуска / Сброса: 109');
+`
+	ruScript := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
+	if out, err := exec.Command(node, "-e", ruScript).CombinedOutput(); err != nil {
+		t.Fatalf("Russian decoupling test failed: %v\n%s", err, out)
+	}
+}

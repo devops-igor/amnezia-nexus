@@ -96,6 +96,7 @@ type Status struct {
 	AllRoutes          []ProblemRouteItem            `json:"all_routes,omitempty"`
 	RuntimeResources   RuntimeResources              `json:"runtime_resources"`
 	HistoricalSeries   HistoricalSeries              `json:"historical_series"`
+	CountersSince      string                        `json:"counters_since,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -190,6 +191,7 @@ type Service struct {
 	forwarder            *forwarder.Forwarder
 	accountant           *forwarder.TrafficAccountant
 	running              bool
+	startedAt            time.Time // baseline timestamp for cumulative metrics; guarded by mu
 	portalPubKey         string
 	portalPrivKey        string
 	awgProvider          AWGStatusProvider
@@ -1096,6 +1098,7 @@ func (s *Service) Start(ctx context.Context) error {
 		return nil
 	}
 	s.running = true
+	s.startedAt = time.Now().UTC()
 	s.mu.Unlock()
 
 	// No client transport keys, endpoints, or forwarder routes survive a process
@@ -1747,6 +1750,7 @@ func (s *Service) Stop() error {
 		return nil
 	}
 	s.running = false
+	s.startedAt = time.Time{}
 	ingressEng := s.ingressEngine
 	initialLosses := engineLossTotals(ingressEng)
 	s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, initialLosses)
@@ -1853,6 +1857,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		routeSnapshot = inputs.forwarder.InspectRoutes()
 	}
 	running, db := s.running, s.db
+	startedAt := s.startedAt
 	var cfg *models.VPNConfig
 	if s.cfg != nil {
 		cfg = &models.VPNConfig{ListenPort: s.cfg.ListenPort, PublicEndpoint: s.cfg.PublicEndpoint}
@@ -1905,6 +1910,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		UpstreamDesiredPeers:       upstreamDesiredPeers,
 		UpstreamActualPeers:        upstreamActualPeers,
 		PeerSync:                   peerSync,
+	}
+
+	if !startedAt.IsZero() {
+		status.CountersSince = startedAt.UTC().Format("2006-01-02 15:04 UTC")
 	}
 
 	for _, tun := range inputs.tunnels {
