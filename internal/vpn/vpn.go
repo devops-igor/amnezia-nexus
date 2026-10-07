@@ -197,6 +197,7 @@ type Service struct {
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string
+	deletedServers         map[int64]struct{} // guarded by mu
 	lastLoggedDrops        atomic.Uint64
 	// retiredBackendDeviceDrops is the LIFETIME accumulator for backend
 	// devices that have left backendDevices (issue #424 round 5, finding 1).
@@ -703,6 +704,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPubKey:           pub,
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
+		deletedServers:         make(map[int64]struct{}),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		rollingHistory:         NewRollingHistory(),
 		diagRates:              newDiagRatesTracker(),
@@ -1034,6 +1036,10 @@ func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.Bac
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isServerDeletedLocked(t.ServerID) {
+		return fmt.Errorf("server %d is deleted", t.ServerID)
+	}
 
 	if err := s.backendTunnelReady(t); err != nil {
 		return err
@@ -2383,6 +2389,10 @@ func parsePort(val any) int {
 // remains owned by the prober/self-healing subsystem.
 func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	s.mu.RLock()
+	if s.isServerDeletedLocked(serverID) {
+		s.mu.RUnlock()
+		return fmt.Errorf("%w: server %d is deleted", ErrServerNotFound, serverID)
+	}
 	pool := s.pool
 	db := s.db
 	awgProv := s.awgProvider
@@ -2427,6 +2437,10 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	s.mu.Lock()
+	if s.isServerDeletedLocked(serverID) {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: server %d is deleted", ErrServerNotFound, serverID)
+	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
 	var postRefreshVersion int64
 	if err == nil && tun != nil {
@@ -3204,6 +3218,57 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	return nil
 }
 
+type deleteServerContextKey struct{}
+
+func withDeleteServer(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deleteServerContextKey{}, true)
+}
+
+func isDeleteServerContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	val, ok := ctx.Value(deleteServerContextKey{}).(bool)
+	return ok && val
+}
+
+func (s *Service) isServerDeletedLocked(serverID int64) bool {
+	if s.deletedServers == nil {
+		return false
+	}
+	_, ok := s.deletedServers[serverID]
+	return ok
+}
+
+// DeleteServer tombstones the server to prevent concurrent resurrection by EnableBackend
+// or automated self-healing, tears down any associated VPN backend tunnel and drains sessions.
+func (s *Service) DeleteServer(ctx context.Context, serverID int64) error {
+	s.mu.Lock()
+	if s.deletedServers == nil {
+		s.deletedServers = make(map[int64]struct{})
+	}
+	s.deletedServers[serverID] = struct{}{}
+	if s.deleteBackendErr != nil {
+		err := s.deleteBackendErr
+		delete(s.deletedServers, serverID)
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
+	err := s.DeleteBackend(withDeleteServer(ctx), serverID)
+	if err != nil {
+		if errors.Is(err, ErrBackendTunnelNotFound) {
+			return nil
+		}
+		s.mu.Lock()
+		delete(s.deletedServers, serverID)
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 // DeleteBackend permanently removes a backend tunnel from the load-balancing
 // pool (issue #29): the server itself and its AWG protocol configuration are
 // untouched — only the backend_tunnels registration and the in-memory pool
@@ -3222,6 +3287,10 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 
 	if s.deleteBackendErr != nil {
 		return s.deleteBackendErr
+	}
+
+	if s.isServerDeletedLocked(serverID) && !isDeleteServerContext(ctx) {
+		return ErrBackendTunnelNotFound
 	}
 
 	if s.pool == nil {

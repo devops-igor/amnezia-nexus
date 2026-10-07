@@ -436,7 +436,226 @@ func TestDeleteServerHandler_WithActiveVPNBackend_DrainsAndMigratesSessions(t *t
 	if err != nil {
 		t.Fatalf("GetVPNSessionByID failed: %v", err)
 	}
-	if sessAfter != nil && sessAfter.BackendTunnelID != tun2.ID {
+	if sessAfter == nil {
+		t.Fatal("expected session to survive and migrate")
+	}
+	if sessAfter.BackendTunnelID != tun2.ID {
 		t.Errorf("expected session BackendTunnelID %d, got %d", tun2.ID, sessAfter.BackendTunnelID)
+	}
+}
+
+func TestDeleteServerHandler_ConcurrentEnableBackend_CannotResurrectZombieTunnel(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	h.vpnSvc = vpnSvc
+
+	srv := &models.Server{
+		Name:    "Zombie-Race-Server",
+		Host:    "192.168.10.60",
+		SSHPort: 22,
+		SSHUser: "root",
+		SSHPass: "pass123",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "backend-pubkey-zombie",
+			},
+		},
+		CreatedAt: time.Now(),
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("expected backend tunnel before delete: %v", err)
+	}
+
+	preAddCalled := make(chan struct{})
+	resumeAdd := make(chan struct{})
+	vpnSvc.SetEnableBackendPreAddTunnelHookForTest(func() {
+		close(preAddCalled)
+		<-resumeAdd
+	})
+	t.Cleanup(func() {
+		vpnSvc.SetEnableBackendPreAddTunnelHookForTest(nil)
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- vpnSvc.EnableBackend(ctx, serverID)
+	}()
+
+	select {
+	case <-preAddCalled:
+	case <-time.After(5 * time.Second):
+		close(resumeAdd)
+		t.Fatal("timed out waiting for goroutine A to reach preAdd hook")
+	}
+
+	serverRouter := setupFullServerRouter(h)
+	reqDel := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/delete", serverID), nil)
+	wDel := httptest.NewRecorder()
+	serverRouter.ServeHTTP(wDel, reqDel)
+	if wDel.Code != http.StatusOK {
+		close(resumeAdd)
+		t.Fatalf("expected 200 OK on DeleteServerHandler, got %d (body: %s)", wDel.Code, wDel.Body.String())
+	}
+
+	close(resumeAdd)
+	var enableErr error
+	select {
+	case enableErr = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for goroutine A to finish EnableBackend")
+	}
+
+	if enableErr == nil {
+		t.Fatal("expected EnableBackend to fail on tombstoned server, got nil")
+	}
+	if !errors.Is(enableErr, vpn.ErrServerNotFound) {
+		t.Errorf("expected ErrServerNotFound, got: %v", enableErr)
+	}
+
+	// 1. Server row absent from DB
+	srvAfter, err := db.GetServer(ctx, serverID)
+	if err == nil && srvAfter != nil {
+		t.Errorf("expected server to be deleted from DB, but still exists: %+v", srvAfter)
+	}
+
+	// 2. backend_tunnels absent from DB
+	dbTunAfter, err := db.GetBackendTunnelByServerID(ctx, serverID)
+	if err != nil {
+		t.Errorf("GetBackendTunnelByServerID after delete returned error: %v", err)
+	}
+	if dbTunAfter != nil {
+		t.Errorf("expected backend_tunnels row to be deleted from DB, got: %+v", dbTunAfter)
+	}
+
+	// 3. pool.GetTunnel(serverID) == ErrTunnelNotFound
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err == nil || tunAfter != nil {
+		t.Fatalf("expected tunnel to be absent from in-memory pool, got: %+v", tunAfter)
+	}
+	if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound, got: %v", err)
+	}
+
+	// 4. /api/vpn/backends has no server 1
+	vpnRouter := setupFullVPNRouter(h)
+	wListAfter := httptest.NewRecorder()
+	vpnRouter.ServeHTTP(wListAfter, httptest.NewRequest(http.MethodGet, "/api/vpn/backends", nil))
+	if wListAfter.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/vpn/backends after delete, got %d", wListAfter.Code)
+	}
+	var listRespAfter struct {
+		Backends []struct {
+			ServerID int64 `json:"server_id"`
+		} `json:"backends"`
+	}
+	if err := json.NewDecoder(wListAfter.Body).Decode(&listRespAfter); err != nil {
+		t.Fatalf("failed to decode backends after delete: %v", err)
+	}
+	for _, b := range listRespAfter.Backends {
+		if b.ServerID == serverID {
+			t.Errorf("server %d still found in /api/vpn/backends after delete (zombie tunnel)", serverID)
+		}
+	}
+
+	// 5. No backend device attached
+	if dev := vpnSvc.GetBackendDeviceForTest(tunBefore.ID); dev != nil {
+		t.Errorf("expected no backend device for tunnel %d, got %+v", tunBefore.ID, dev)
+	}
+}
+
+func TestDeleteServerHandler_SelfHealing_CannotResurrectDeletedServer(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	h.vpnSvc = vpnSvc
+
+	srv := &models.Server{
+		Name:    "Self-Healing-Target-Server",
+		Host:    "192.168.10.70",
+		SSHPort: 22,
+		SSHUser: "root",
+		SSHPass: "pass123",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "backend-pubkey-selfheal",
+			},
+		},
+		CreatedAt: time.Now(),
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	// Delete server
+	serverRouter := setupFullServerRouter(h)
+	reqDel := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/delete", serverID), nil)
+	wDel := httptest.NewRecorder()
+	serverRouter.ServeHTTP(wDel, reqDel)
+	if wDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on DeleteServerHandler, got %d (body: %s)", wDel.Code, wDel.Body.String())
+	}
+
+	// Attempt self-healing resurrection
+	selfHealCtx := tunnel.ContextWithSelfHealing(ctx)
+	enableErr := vpnSvc.EnableBackend(selfHealCtx, serverID)
+	if enableErr == nil {
+		t.Fatal("expected EnableBackend with self-healing to fail on deleted server, got nil")
+	}
+	if !errors.Is(enableErr, vpn.ErrServerNotFound) {
+		t.Errorf("expected ErrServerNotFound, got: %v", enableErr)
+	}
+
+	// Ensure no tunnel was created in pool
+	tunAfter, err := vpnSvc.GetTunnel(serverID)
+	if err == nil || tunAfter != nil {
+		t.Fatalf("expected no tunnel in pool, but found: %+v", tunAfter)
+	}
+	if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound, got: %v", err)
+	}
+
+	// Ensure no tunnel in DB
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, serverID)
+	if err != nil {
+		t.Errorf("GetBackendTunnelByServerID error: %v", err)
+	}
+	if dbTun != nil {
+		t.Errorf("expected no backend_tunnels in DB, got: %+v", dbTun)
 	}
 }
