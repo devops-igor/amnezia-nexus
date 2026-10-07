@@ -27,14 +27,21 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+// VPNStatusSchemaVersion identifies the intentionally versioned /api/vpn/status
+// representation. Version 2 removes legacy custom-engine crypto telemetry and
+// keys forwarder_route_queues by opaque peer fingerprints instead of raw keys.
+const VPNStatusSchemaVersion = 2
+
 // Status represents the overall runtime telemetry of the VPN endpoint and load balancing subsystem.
 type Status struct {
+	SchemaVersion              int    `json:"status_schema_version"`
 	ConfiguredEngine           string `json:"configured_engine"`
 	ActiveEngine               string `json:"active_engine"`
 	EngineRunning              bool   `json:"engine_running"`
@@ -48,34 +55,47 @@ type Status struct {
 	RxBytes                    int64  `json:"rx_bytes"`
 	TxBytes                    int64  `json:"tx_bytes"`
 	DroppedPackets             uint64 `json:"dropped_packets"`
-	// Issue #39, #151 & #288 telemetry: return-path drops inside the forwarder (queue
-	// full / no route / total) and rejected handshake initiations at the listener.
-	// A rising forwarder_drops_total with stable traffic means a stalled
-	// downstream path or unroutable backend returns; a rising handshake_rejections means
-	// client initiations are failing cryptographic verification (issues #39, #288).
-	ForwarderAvailable             bool                                 `json:"forwarder_available"`
-	ForwarderDropsQueueFull        uint64                               `json:"forwarder_drops_queue_full"`
-	ForwarderDropsNoRoute          uint64                               `json:"forwarder_drops_no_route"`
-	ForwarderDropsPacketTooLarge   uint64                               `json:"forwarder_drops_packet_too_large"`
-	ForwarderDropsTotal            uint64                               `json:"forwarder_drops_total"`
-	ForwarderQueueOccupancy        int                                  `json:"forwarder_queue_occupancy"`
-	ForwarderQueueCapacity         int                                  `json:"forwarder_queue_capacity"`
-	ForwarderQueueHighWater        int                                  `json:"forwarder_queue_high_water"`
-	ForwarderDeviceWriteErrors     uint64                               `json:"forwarder_device_write_errors"`
-	ForwarderDeviceWriteDurationMS uint64                               `json:"forwarder_device_write_duration_ms"`
-	ForwarderDeviceWriteCount      uint64                               `json:"forwarder_device_write_count"`
-	ForwarderDeviceWritesInFlight  int                                  `json:"forwarder_device_writes_in_flight"`
-	ForwarderDeviceWriteOldestMS   int64                                `json:"forwarder_device_write_oldest_in_flight_ms"`
-	ForwarderDeviceWriteMaxMS      int64                                `json:"forwarder_device_write_max_duration_ms"`
-	ForwarderDeviceWriteStalls     uint64                               `json:"forwarder_device_write_stalls"`
-	ForwarderDeviceWriteStallMS    int64                                `json:"forwarder_device_write_stall_threshold_ms"`
-	TransportDecryptionFailures    uint64                               `json:"transport_decryption_failures"`
-	HandshakeRejections            uint64                               `json:"handshake_rejections"`
-	PublicEndpoint                 string                               `json:"public_endpoint,omitempty"`
-	ForwarderRouteQueues           map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
-	UpstreamDesiredPeers           int                                  `json:"upstream_desired_peers,omitempty"`
-	UpstreamActualPeers            int                                  `json:"upstream_actual_peers,omitempty"`
-	PeerSync                       *PeerSyncStatus                      `json:"peer_sync,omitempty"`
+	// Legacy-compatible forwarder counters that still describe Nexus-owned
+	// dataplane behavior are retained in schema v2. Custom client-engine
+	// decrypt/handshake telemetry was removed with the upstream-only architecture.
+	ForwarderAvailable             bool   `json:"forwarder_available"`
+	ForwarderDropsQueueFull        uint64 `json:"forwarder_drops_queue_full"`
+	ForwarderDropsNoRoute          uint64 `json:"forwarder_drops_no_route"`
+	ForwarderDropsPacketTooLarge   uint64 `json:"forwarder_drops_packet_too_large"`
+	ForwarderDropsTotal            uint64 `json:"forwarder_drops_total"`
+	ForwarderQueueOccupancy        int    `json:"forwarder_queue_occupancy"`
+	ForwarderQueueCapacity         int    `json:"forwarder_queue_capacity"`
+	ForwarderQueueHighWater        int    `json:"forwarder_queue_high_water"`
+	ForwarderDeviceWriteErrors     uint64 `json:"forwarder_device_write_errors"`
+	ForwarderDeviceWriteDurationMS uint64 `json:"forwarder_device_write_duration_ms"`
+	ForwarderDeviceWriteCount      uint64 `json:"forwarder_device_write_count"`
+	ForwarderDeviceWritesInFlight  int    `json:"forwarder_device_writes_in_flight"`
+	ForwarderDeviceWriteOldestMS   int64  `json:"forwarder_device_write_oldest_in_flight_ms"`
+	ForwarderDeviceWriteMaxMS      int64  `json:"forwarder_device_write_max_duration_ms"`
+	ForwarderDeviceWriteStalls     uint64 `json:"forwarder_device_write_stalls"`
+	ForwarderDeviceWriteStallMS    int64  `json:"forwarder_device_write_stall_threshold_ms"`
+	PublicEndpoint                 string `json:"public_endpoint,omitempty"`
+	// Schema v2 map keys are ingress.PeerKeyFingerprint values; peer_key_display
+	// carries the redacted operator-facing identifier.
+	ForwarderRouteQueues map[string]forwarder.RouteQueueStats `json:"forwarder_route_queues,omitempty"`
+	UpstreamDesiredPeers int                                  `json:"upstream_desired_peers,omitempty"`
+	UpstreamActualPeers  int                                  `json:"upstream_actual_peers,omitempty"`
+	PeerSync             *PeerSyncStatus                      `json:"peer_sync,omitempty"`
+
+	// Issue #424: Redesigned forwarder health & operational diagnostics
+	HealthAssessment   ForwarderHealthAssessment     `json:"health_assessment"`
+	Rates              TrafficRates                  `json:"rates"`
+	QueuePressure      QueuePressureDiagnostics      `json:"queue_pressure"`
+	ForwardLatency     ForwardLatencyDiagnostics     `json:"forward_latency"`
+	DropCategories     DropCategoryBreakdown         `json:"drop_categories"`
+	VirtualTUN         VirtualTUNDiagnostics         `json:"virtual_tun"`
+	RoutingConsistency RoutingConsistencyDiagnostics `json:"routing_consistency"`
+	HandshakeFreshness HandshakeFreshnessDiagnostics `json:"handshake_freshness"`
+	Backends           BackendsDiagnostics           `json:"backends"`
+	ProblemRoutes      []ProblemRouteItem            `json:"problem_routes"`
+	AllRoutes          []ProblemRouteItem            `json:"all_routes,omitempty"`
+	RuntimeResources   RuntimeResources              `json:"runtime_resources"`
+	HistoricalSeries   HistoricalSeries              `json:"historical_series"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -154,29 +174,42 @@ type BackendDevice interface {
 // check-then-allocate capacity decision is only safe under this
 // serialization. Full contract: tunnel.Pool.IncrementConnections.
 type Service struct {
-	mu            sync.RWMutex
-	assignmentMu  sync.Mutex // serialize durable lease creation and restart migration
-	db            *database.DB
-	cfg           *models.VPNConfig
-	sessionMgr    *session.SessionManager
-	ipam          *ipam.IPAM
-	auth          *auth.DBAuthenticator
-	pool          *tunnel.Pool
-	prober        *tunnel.HealthProber
-	reconnectMgr  *tunnel.ReconnectManager
-	balancer      loadbalancer.LoadBalancer
-	stickyMgr     *loadbalancer.StickySessionManager
-	forwarder     *forwarder.Forwarder
-	accountant    *forwarder.TrafficAccountant
-	running       bool
-	portalPubKey  string
-	portalPrivKey string
-	awgProvider   AWGStatusProvider
-	ingressEngine *IngressEngine
+	retiredIngressLosses ingressLossTotals // guarded by mu
+	mu                   sync.RWMutex
+	assignmentMu         sync.Mutex // serialize durable lease creation and restart migration
+	db                   *database.DB
+	cfg                  *models.VPNConfig
+	sessionMgr           *session.SessionManager
+	ipam                 *ipam.IPAM
+	auth                 *auth.DBAuthenticator
+	pool                 *tunnel.Pool
+	prober               *tunnel.HealthProber
+	reconnectMgr         *tunnel.ReconnectManager
+	balancer             loadbalancer.LoadBalancer
+	stickyMgr            *loadbalancer.StickySessionManager
+	forwarder            *forwarder.Forwarder
+	accountant           *forwarder.TrafficAccountant
+	running              bool
+	portalPubKey         string
+	portalPrivKey        string
+	awgProvider          AWGStatusProvider
+	ingressEngine        *IngressEngine
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
-	backendDevices             map[int64]BackendDevice
-	backendDeviceEndpoints     map[int64]string
-	lastLoggedDrops            atomic.Uint64
+	backendDevices         map[int64]BackendDevice
+	backendDeviceEndpoints map[int64]string
+	lastLoggedDrops        atomic.Uint64
+	// retiredBackendDeviceDrops is the LIFETIME accumulator for backend
+	// devices that have left backendDevices (issue #424 round 5, finding 1).
+	//
+	// It is direction- and reason-preserving, not a scalar: a retiring
+	// device's real VirtualTUN breakdown is transferred into the matching
+	// buckets, so a return-direction loss stays a return-direction loss after
+	// the device is gone. The accumulator carries the SAME fields as a live
+	// device's contribution, which is what lets a retired loss be published
+	// under the same key a live one uses.
+	//
+	// guarded by mu
+	retiredBackendDeviceDrops  backendDeviceDropStats
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
 	publicIPMu                 sync.RWMutex
@@ -204,6 +237,46 @@ type Service struct {
 	enableBackendPreAddTunnelHook          func()
 	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
+
+	rollingHistory     *RollingHistory
+	diagRatesMu        sync.Mutex
+	diagRates          *diagRatesTracker
+	historyDiagRates   *diagRatesTracker
+	historyDropReasons dropReasonRatesTracker
+	// diagGeneration is the diagnostics generation (issue #429 review
+	// blocker 1). It advances ONLY in Start, so every Start after Stop is an
+	// explicit new generation: every cumulative diagnostics baseline below is
+	// reset/re-primed instead of a restart being inferred from counters that
+	// moved backwards.
+	//
+	// Atomic (issue #429 review round 4, blocker 1): diagnosticsInputsLocked
+	// captures it as part of the observation, and that capture runs under
+	// s.mu while resetDiagnosticsGeneration holds diagRatesMu and takes s.mu
+	// for its priming capture — reading the field there under diagRatesMu
+	// would invert the established lock order and deadlock. The atomic load
+	// cannot straddle a lifecycle transition because resetDiagnosticsGeneration
+	// bumps it BEFORE startRollingHistory publishes any new-generation
+	// tracker work, while the writers of everything else in the snapshot
+	// hold s.mu.
+	diagGeneration atomic.Uint64
+	// historyPrimedGen is the generation the history priming state was
+	// recorded for. historyPrimed is true only while historyPrimedGen equals
+	// the current generation, so a generation bump in Start automatically
+	// un-primes history and the next history read re-primes into the new
+	// generation (issue #429 review blocker 1). Both are guarded by
+	// diagRatesMu.
+	historyPrimedGen diagGeneration
+	// historyPrimed records that the history baselines captured a first
+	// sample for historyPrimedGen. It is deliberately NOT derived from any
+	// timestamp being zero (issue #424 round 8, finding 2) and deliberately
+	// NOT a sticky flag (issue #429 review blocker 1).
+	historyPrimed bool
+	// diagDeltas converts cumulative lifetime failure counters into windowed
+	// deltas so a recovered incident stops pinning current health (issue #424
+	// round 2, finding 5). Its zero value is usable.
+	diagDeltas    diagDeltaTrackers
+	historyStopCh chan struct{}
+	historyDoneCh chan struct{}
 }
 
 // obfuscationMigrationMu serializes first-read obfuscation migration
@@ -630,6 +703,8 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
+		rollingHistory:         NewRollingHistory(),
+		diagRates:              newDiagRatesTracker(),
 	}
 	revokeDispatch.bind(svc)
 
@@ -1107,11 +1182,49 @@ func (s *Service) Start(ctx context.Context) error {
 	log.Printf("[vpn] active client AWG engine=%s listen_port=%d", ClientAWGEngineUpstream, listenPort)
 
 	// Issue #78: hourly periodic reconcile of the active_connections gauge.
-	// Safety net for residual counter drift; gauge-only semantics — it never
+	// Safety net for residual counter drift; gauge-only semantics - it never
 	// touches sessions, so it cannot fight the idle-timeout reaper.
 	s.StartGaugeReconciler(ctx)
 
+	// Issue #429 review blocker 1: every Start after Stop is an explicit new
+	// diagnostics generation. Bump the generation and re-prime every
+	// cumulative diagnostics tracker under diagRatesMu BEFORE
+	// startRollingHistory() primes the history baselines, so all sampling
+	// after this point is tagged with the new generation and computed only
+	// from post-start observations — a restart can never be inferred from
+	// counters that moved backwards. (The forwarder's trackers are already
+	// reset inside Forwarder.Start above.)
+	s.resetDiagnosticsGeneration()
+
+	s.startRollingHistory()
+
 	return nil
+}
+
+// resetDiagnosticsGeneration starts a new diagnostics generation and re-primes
+// every cumulative diagnostics tracker for it (issue #429 review blocker 1).
+// Called from Service.Start after the forwarder has started; startRollingHistory
+// then primes the history baselines into the new generation.
+func (s *Service) resetDiagnosticsGeneration() {
+	s.diagRatesMu.Lock()
+	defer s.diagRatesMu.Unlock()
+	gen := diagGeneration(s.diagGeneration.Add(1))
+	if s.diagRates != nil {
+		s.diagRates.reset(gen)
+	}
+	if s.historyDiagRates != nil {
+		s.historyDiagRates.reset(gen)
+	}
+	s.historyDropReasons.reset(gen)
+	s.diagDeltas.reset(gen)
+	// historyPrimed is keyed to the generation (historyPrimedGen): bumping
+	// diagGeneration invalidates it by itself, so the next history read
+	// re-primes into the new generation. The prime call here captures the
+	// FIRST post-start observation as the new baseline.
+	s.primeHistoryRatesLocked(gen, time.Now(), func() *DropCategoryBreakdown {
+		drops := s.captureDiagnosticsInputs().collectDropCategories()
+		return &drops
+	}())
 }
 
 func (s *Service) cleanupEngineStartupFailure() {
@@ -1635,6 +1748,8 @@ func (s *Service) Stop() error {
 	}
 	s.running = false
 	ingressEng := s.ingressEngine
+	initialLosses := engineLossTotals(ingressEng)
+	s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, initialLosses)
 	s.ingressEngine = nil
 	s.mu.Unlock()
 
@@ -1649,6 +1764,9 @@ func (s *Service) Stop() error {
 		if err := ingressEng.Stop(); err != nil && !errors.Is(err, ErrIngressEngineNotStarted) {
 			recordErr(err)
 		}
+		s.mu.Lock()
+		s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, ingressLossDelta(engineLossTotals(ingressEng), initialLosses))
+		s.mu.Unlock()
 	}
 	if s.prober != nil {
 		s.prober.Stop()
@@ -1659,6 +1777,7 @@ func (s *Service) Stop() error {
 	if s.forwarder != nil {
 		recordErr(s.forwarder.Stop())
 	}
+	s.stopRollingHistory()
 	if s.pool != nil {
 		_ = s.pool.Close()
 	}
@@ -1668,6 +1787,11 @@ func (s *Service) Stop() error {
 		for id, dev := range s.backendDevices {
 			if dev != nil {
 				_ = dev.Close()
+			}
+			if dev != nil {
+				// Snapshot AFTER Close so the shutdown drains it just
+				// accounted are transferred too.
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 			}
 			delete(s.backendDevices, id)
 		}
@@ -1721,13 +1845,25 @@ func (s *Service) ReturnRouteOwner() string {
 // GetStatus returns the operational status and telemetry of the VPN subsystem.
 func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	inputs := s.diagnosticsInputsLocked()
+	// Structural membership shares the Service administrative boundary.
+	// These snapshot methods do no peer synchronization or external I/O.
+	var routeSnapshot []forwarder.RouteInfo
+	if inputs.forwarder != nil {
+		routeSnapshot = inputs.forwarder.InspectRoutes()
+	}
+	running, db := s.running, s.db
+	var cfg *models.VPNConfig
+	if s.cfg != nil {
+		cfg = &models.VPNConfig{ListenPort: s.cfg.ListenPort, PublicEndpoint: s.cfg.PublicEndpoint}
+	}
+	s.mu.RUnlock()
 
 	listenPort := 51820
-	if s.cfg != nil && s.cfg.ListenPort > 0 {
-		listenPort = s.cfg.ListenPort
-	} else if s.db != nil {
-		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
+	if cfg != nil && cfg.ListenPort > 0 {
+		listenPort = cfg.ListenPort
+	} else if db != nil {
+		if dbCfg, err := db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.ListenPort > 0 {
 			listenPort = dbCfg.ListenPort
 		}
 	}
@@ -1736,10 +1872,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	var upstreamDesiredPeers, upstreamActualPeers int
 	var peerSync *PeerSyncStatus
 
-	if s.running {
-		if s.ingressEngine != nil && s.ingressEngine.Running() {
+	if running {
+		if inputs.ingressEngine != nil && inputs.ingressEngine.Running() {
 			engineRunning = true
-			syncStat := s.ingressEngine.PeerSyncStatus()
+			syncStat := inputs.ingressEngine.PeerSyncStatus()
 			upstreamDesiredPeers = syncStat.DesiredPeers
 			upstreamActualPeers = syncStat.ActualPeers
 			peerSync = &syncStat
@@ -1752,11 +1888,12 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	returnRouteOwner := "none"
-	if engineRunning && s.forwarder != nil {
-		returnRouteOwner = s.forwarder.ReturnRouteOwner()
+	if engineRunning && inputs.forwarder != nil {
+		returnRouteOwner = inputs.forwarder.ReturnRouteOwner()
 	}
 
 	status := &Status{
+		SchemaVersion:              VPNStatusSchemaVersion,
 		ConfiguredEngine:           ClientAWGEngineUpstream,
 		ActiveEngine:               activeEngine,
 		EngineRunning:              engineRunning,
@@ -1770,16 +1907,24 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		PeerSync:                   peerSync,
 	}
 
-	if s.pool != nil {
-		status.ActiveTunnels = len(s.pool.GetActiveTunnels())
+	for _, tun := range inputs.tunnels {
+		if backendEligible(tun) {
+			status.ActiveTunnels++
+		}
 	}
-	if s.sessionMgr != nil {
-		status.ConnectedSessions = s.sessionMgr.ActiveCount()
+	if inputs.sessionMgr != nil {
+		status.ConnectedSessions = len(inputs.sessions)
 	}
-	populateForwarderStatus(status, s.forwarder)
+
+	// Capture per-route telemetry exactly once for this status response.
+	// Route pressure contains recency windows over monotonic counters, so a
+	// second read later in the same request is not merely another snapshot:
+	// it can advance the window and consume the incident. Both the legacy
+	// route-queue map and the redesigned diagnostics reuse this value.
+	populateForwarderStatusFromRoutes(status, inputs.forwarder, routeSnapshot)
 
 	var totalDrops uint64
-	for _, dev := range s.backendDevices {
+	for _, dev := range inputs.backendDevices {
 		if dev != nil {
 			totalDrops += dev.DroppedPackets()
 		}
@@ -1795,12 +1940,17 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		}
 	}
 
-	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, s.cfg, listenPort)
+	status.PublicEndpoint = resolveClientEndpointInternal(ctx, s, cfg, listenPort)
+	s.populateOperationalDiagnosticsFromInputs(status, routeSnapshot, inputs)
 
 	return status, nil
 }
 
-func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
+// populateForwarderStatusFromRoutes preserves the legacy status keys while
+// using the caller's coherent route snapshot. It must not call
+// AllRouteQueueStats: that method samples the same recency counters again and
+// can consume a just-observed pressure event before problem_routes is built.
+func populateForwarderStatusFromRoutes(status *Status, f *forwarder.Forwarder, routes []forwarder.RouteInfo) {
 	if f == nil {
 		return
 	}
@@ -1811,22 +1961,21 @@ func populateForwarderStatus(status *Status, f *forwarder.Forwarder) {
 	status.ForwarderDropsQueueFull, status.ForwarderDropsNoRoute, status.ForwarderDropsTotal = f.DropStats()
 	status.ForwarderDropsPacketTooLarge = f.DropsPacketTooLarge()
 	status.ForwarderQueueOccupancy, status.ForwarderQueueCapacity, status.ForwarderQueueHighWater = f.AggregateQueueStats()
-	allRouteQueues := f.AllRouteQueueStats()
-	if len(allRouteQueues) > 0 {
-		peers := make([]string, 0, len(allRouteQueues))
-		for peerKey := range allRouteQueues {
-			peers = append(peers, peerKey)
+
+	if len(routes) > 0 {
+		ordered := append([]forwarder.RouteInfo(nil), routes...)
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i].PeerKey < ordered[j].PeerKey })
+		if len(ordered) > forwarder.MaxSupportedActiveRoutes {
+			ordered = ordered[:forwarder.MaxSupportedActiveRoutes]
 		}
-		sort.Strings(peers)
-		limit := len(peers)
-		if limit > forwarder.MaxSupportedActiveRoutes {
-			limit = forwarder.MaxSupportedActiveRoutes
-		}
-		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, limit)
-		for _, peerKey := range peers[:limit] {
-			status.ForwarderRouteQueues[peerKey] = allRouteQueues[peerKey]
+		status.ForwarderRouteQueues = make(map[string]forwarder.RouteQueueStats, len(ordered))
+		for _, route := range ordered {
+			stats := route.Stats
+			stats.PeerKeyDisplay = ingress.RedactKey(route.PeerKey)
+			status.ForwarderRouteQueues[ingress.PeerKeyFingerprint(route.PeerKey)] = stats
 		}
 	}
+
 	writes := f.DeviceWriteSnapshot()
 	status.ForwarderDeviceWriteErrors = writes.Errors
 	status.ForwarderDeviceWriteDurationMS = uint64(writes.TotalDuration.Milliseconds()) // #nosec G115 -- completed write durations are non-negative.
@@ -2617,6 +2766,7 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			s.forwarder.DetachBackendDevice(tun.ID)
 			if oldDev != nil {
 				_ = oldDev.Close()
+				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
 			delete(s.backendDevices, tun.ID)
 			if s.backendDeviceEndpoints != nil {
@@ -2827,6 +2977,13 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 	if dev, ok := s.backendDevices[tunnel.ID]; ok {
 		if dev != nil {
 			_ = dev.Close()
+		}
+		if dev != nil {
+			// The retirement TRANSFER: the device's direction x reason
+			// breakdown moves into the lifetime buckets, so nothing is
+			// double counted while it was live and nothing is reclassified
+			// now that it is gone.
+			s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(dev))
 		}
 		delete(s.backendDevices, tunnel.ID)
 	}

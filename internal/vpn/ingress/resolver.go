@@ -2,9 +2,12 @@ package ingress
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -122,11 +125,65 @@ func LoadResolver(ctx context.Context, db *database.DB) (*Resolver, *LoadStats, 
 
 // RedactKey renders a peer public key safe for error text and counters: the
 // first 8 characters plus an ellipsis, or full masking for shorter values.
+//
+// RedactKey is a DISPLAY form. It is deliberately lossy and therefore NOT an
+// identifier: two distinct keys sharing their first 8 characters render
+// identically, and every key leaks its first 8 characters verbatim. Never use
+// it as a map key or any other place where distinct inputs must stay distinct;
+// use PeerKeyFingerprint there.
 func RedactKey(key string) string {
 	if len(key) <= 8 {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:8] + "…"
+}
+
+// PeerKeyFingerprintBytes is how many bytes of the digest PeerKeyFingerprint
+// keeps. 12 bytes (96 bits) keeps the identifier short enough to read in a
+// table while leaving a collision probability far below any plausible
+// deployment's birthday bound, even with a few thousand live peers.
+const PeerKeyFingerprintBytes = 12
+
+// PeerKeyFingerprint returns a STABLE, OPAQUE, COLLISION-RESISTANT identifier
+// for a peer public key, suitable for use where distinct inputs must remain
+// distinct: a JSON map key, a DOM id, a log correlation field.
+//
+// Format: "pk" + hex(SHA-256(key)[:12]) + "-" + decimal byte length, for
+// example "pk3f9c1ab77de4e05b3c291a-44". The length suffix is redundant
+// against a hash collision and exists so that two keys of different lengths
+// can never be presented as the same identifier by a consumer that compares
+// them as opaque strings, and so a reader can tell at a glance that this is
+// a digest and not a truncated key.
+//
+// The function is pure and deterministic: the same key always yields the same
+// fingerprint, within a process and across restarts, so an operator watching
+// the dashboard does not see identifiers flicker between polls.
+//
+// SECURITY TRADE-OFF, stated plainly rather than claimed as irreversible:
+//
+//   - This is an UNSALTED truncated hash, so it is a CONFIRMATION oracle, not
+//     a one-way secrecy boundary. Anyone who already holds a candidate key
+//     (from a leaked config, a support bundle, or the same API under another
+//     name) can hash it and learn whether that specific key is present in this
+//     payload. That is the residual risk, and it is real.
+//   - It is NOT a preimage risk. A peer public key is 32 bytes of curve25519
+//     output, so recovering a key from its digest by brute force is infeasible.
+//   - It discloses strictly LESS than the display form it replaces:
+//     RedactKey ships the first 8 characters of the real key, which is both a
+//     disclosure of key material and a collision hazard. The fingerprint ships
+//     no characters of the key at all.
+//   - A KEYED HMAC was considered and rejected. A stable HMAC needs a stable
+//     secret, and every available source of one is worse than the problem: a
+//     per-boot random key re-identifies every route on each restart and across
+//     replicas, and persisting a secret adds rotation, backup and
+//     "which instance minted this id" failure modes to a diagnostics field.
+//     Confirmation-only risk, bounded as above, against zero key material, is
+//     the right trade for an admin-only diagnostics surface. If this identifier
+//     ever needs to gate access rather than correlate rows, it must move to a
+//     keyed HMAC with a persisted secret, and this comment must change with it.
+func PeerKeyFingerprint(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "pk" + hex.EncodeToString(sum[:PeerKeyFingerprintBytes]) + "-" + strconv.Itoa(len(key))
 }
 
 // insert adds one ownership entry, failing closed on conflicts. Caller holds

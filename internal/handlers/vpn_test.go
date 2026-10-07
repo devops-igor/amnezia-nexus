@@ -1193,6 +1193,15 @@ func TestVPNStatusHandler_ExposesRouteQueueDiagnostics(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
+	if got := status["status_schema_version"]; got != float64(vpn.VPNStatusSchemaVersion) {
+		t.Fatalf("expected status_schema_version %d, got: %v", vpn.VPNStatusSchemaVersion, got)
+	}
+	if _, ok := status["transport_decryption_failures"]; ok {
+		t.Fatal("schema v2 must not expose legacy transport_decryption_failures")
+	}
+	if _, ok := status["handshake_rejections"]; ok {
+		t.Fatal("schema v2 must not expose legacy handshake_rejections")
+	}
 	avail, ok := status["forwarder_available"].(bool)
 	if !ok || !avail {
 		t.Fatalf("expected forwarder_available true, got: %v", status["forwarder_available"])

@@ -73,6 +73,10 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 
 ---
 
+## Diagnostics proof limits
+
+The diagnostics module uses the existing lifecycle fixture for read-only dashboard, status and metrics checks. Its local oracle suite verifies the published schema2, redacted route inventories and queue keys, history bounds, directional arithmetic and histogram contracts. Local doubles do not establish live traffic or restart durability; platform mutations and qualification infrastructure belong to #430.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -103,15 +107,16 @@ E2E_SERVER_SSH_KEY=~/.ssh/id_ed25519 \
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
+| `test_vpn_diagnostics.py` | 8 | Read-only forwarder dashboard, schema2 status/privacy/history and metrics histogram/authentication |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 52 test scenarios across 10 test suites (4 in Stage 1, 4 in Stage 2, 44 in Stage 3)**
+**Total: 60 test functions across 11 lifecycle suites (4 in Stage 1, 4 in Stage 2, 52 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
 
 ---
 
 ## E2E Test Suite & Exact API Coverage Matrix
 
-The following table provides the exhaustive mapping of all 46 test scenarios across all 9 test suites to their target UI pages visited, exact REST API endpoints executed, and corresponding HTTP methods:
+The existing platform coverage matrix is retained below, with eight read-only diagnostics tests added.
 
 | Test File | Test Name | Target UI / Page Visited | Exact APIs Called | HTTP Method |
 |-----------|-----------|--------------------------|-------------------|-------------|
@@ -163,6 +168,15 @@ The following table provides the exhaustive mapping of all 46 test scenarios acr
 | `test_share.py` | `test_download_config_from_share` | `/share/{share_token}` (Config Download) | `/api/servers/`<br>`/api/users/?size=100`<br>`/api/users/add`<br>`/api/users/{user_id}/share/setup`<br>`/api/share/{token}/auth`<br>`/api/users/{user_id}/delete` | GET<br>GET<br>POST<br>POST<br>POST<br>POST |
 | `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
 | `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
+
+| `test_vpn_diagnostics.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn` (Forwarder Health Dashboard) | None (dashboard rendering) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_kpi_summary_bar` | `/vpn` (Forwarder Health Dashboard) | None (8 KPI cards rendering) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_diagnostic_panels` | `/vpn` (Forwarder Health Dashboard) | None (11 diagnostic panels rendering) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_sparklines_window_toggle` | `/vpn` (Interactive Trends) | None (15m/1h/6h/24h toggle interaction) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_problem_routes_toggle` | `/vpn` (Problem Routes Section) | None (Problem / all routes toggle) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_status_api` | None (Direct REST API) | `/api/vpn/status` | GET |
+| `test_vpn_diagnostics.py` | `test_vpn_metrics_api` | VPN API | `/api/vpn/metrics` | GET |
+| `test_vpn_diagnostics.py` | `test_vpn_metrics_requires_authentication` | Anonymous API | `/api/vpn/metrics` | GET |
 
 ---
 

@@ -17,6 +17,7 @@ package forwarder
 import (
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 )
 
@@ -132,3 +133,43 @@ func BenchmarkTokenBucketAllow(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkInspectRoutes_Contention measures InspectRoutes collection under concurrent
+// dataplane load with high route counts (issue #424).
+func BenchmarkInspectRoutes_Contention(b *testing.B) {
+	const nPeers = 256
+	const backendID = int64(1)
+	f := setupBenchForwarder(b, nPeers, backendID)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			pkt := syntheticPacket(64, benchAssignedIP(0))
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					peer := benchPeerKey(workerID % nPeers)
+					_ = f.RouteClientToBackend(peer, pkt)
+					_ = f.UpdateSessionBackend(peer, backendID)
+				}
+			}
+		}(w)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		routes := f.InspectRoutes()
+		_ = routes
+	}
+	b.StopTimer()
+
+	close(stop)
+	wg.Wait()
+}
+
