@@ -58,38 +58,8 @@ func TestDwellMeasurementUsesCanonicalThresholds(t *testing.T) {
 	}
 }
 
-// TestPerturbingCanonicalLevelMovesTheDwellMeasurement is the measurement half
-// of the reviewer's "perturb it and watch both move" test: moving the canonical
-// level must move where the observer classifies the queue.
-//
-// Against the pre-fix tree this fails, because the observer compared against a
-// literal that no configuration could reach.
-func TestPerturbingCanonicalLevelMovesTheDwellMeasurement(t *testing.T) {
-	const capacity = 1000
-
-	original := thresholds.QueueDwellDegradedUtilization()
-	t.Cleanup(func() { thresholds.SetQueueDwellDegradedUtilization(original) })
-
-	// Lower the canonical degraded level to 0.6: a 65%-full queue must now be
-	// classified as "above the degraded level".
-	thresholds.SetQueueDwellDegradedUtilization(0.6)
-	_, degradedAt := dwellBoundaries(t, capacity)
-	if want := int(0.6 * capacity); degradedAt != want {
-		t.Errorf("after lowering the canonical level to 0.6 the dwell boundary is %d/%d, want %d: "+
-			"the observer is not reading the canonical source", degradedAt, capacity, want)
-	}
-
-	// Raise it to 0.9: the same 65%-full queue must no longer qualify.
-	thresholds.SetQueueDwellDegradedUtilization(0.9)
-	_, degradedAt = dwellBoundaries(t, capacity)
-	if want := int(0.9 * capacity); degradedAt != want {
-		t.Errorf("after raising the canonical level to 0.9 the dwell boundary is %d/%d, want %d: "+
-			"the observer is not reading the canonical source", degradedAt, capacity, want)
-	}
-}
-
-// TestRoutePressureUsesCanonicalThreshold covers the third measurement site:
-// the per-route HasPressure classification, which had its own literal 0.8.
+// TestRoutePressureUsesCanonicalThreshold covers the per-route HasPressure
+// classification at the canonical threshold (0.8).
 func TestRoutePressureUsesCanonicalThreshold(t *testing.T) {
 	const capacity = 100
 	routeAt := func(occupancy int) forwarderRoutePressure {
@@ -97,30 +67,14 @@ func TestRoutePressureUsesCanonicalThreshold(t *testing.T) {
 		return f.pressureFor(occupancy, capacity)
 	}
 
-	// 79% is below the canonical 0.8.
+	// 79% is below the canonical 0.8: HasPressure is false
 	if routeAt(79).HasPressure {
 		t.Errorf("79%% occupancy classified as pressure at the canonical ratio %v", thresholds.RoutePressureUtilization())
 	}
-	// 80% is exactly at it, and the comparison is >=.
+	// 80% is exactly at it, and the comparison is >=: HasPressure is true
 	if !routeAt(80).HasPressure {
 		t.Errorf("80%% occupancy NOT classified as pressure at the canonical ratio %v: the boundary is >=",
 			thresholds.RoutePressureUtilization())
-	}
-
-	original := thresholds.RoutePressureUtilization()
-	t.Cleanup(func() { thresholds.SetRoutePressureUtilization(original) })
-
-	// Lower the canonical ratio to 0.75: 79% must now qualify.
-	thresholds.SetRoutePressureUtilization(0.75)
-	if !routeAt(79).HasPressure {
-		t.Errorf("79%% occupancy not classified as pressure after lowering the canonical ratio to 0.75: " +
-			"the route classifier is not reading the canonical source")
-	}
-	// Raise it to 0.85: 80% must no longer qualify.
-	thresholds.SetRoutePressureUtilization(0.85)
-	if routeAt(80).HasPressure {
-		t.Errorf("80%% occupancy still classified as pressure after raising the canonical ratio to 0.85: " +
-			"the route classifier is not reading the canonical source")
 	}
 }
 

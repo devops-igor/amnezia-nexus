@@ -378,6 +378,20 @@ func TestB3CriticalReasonKeysArePublishedReasons(t *testing.T) {
 	}
 }
 
+// TestKnownDropReasonKeysMatchesDropReasonTotals ensures knownDropReasonKeys is kept
+// perfectly in sync with dropReasonTotals without drift.
+func TestKnownDropReasonKeysMatchesDropReasonTotals(t *testing.T) {
+	published := dropReasonTotals(DropCategoryBreakdown{})
+	if len(knownDropReasonKeys) != len(published) {
+		t.Fatalf("knownDropReasonKeys has %d keys, want %d", len(knownDropReasonKeys), len(published))
+	}
+	for _, key := range knownDropReasonKeys {
+		if _, ok := published[key]; !ok {
+			t.Errorf("knownDropReasonKeys contains %q which is not in dropReasonTotals", key)
+		}
+	}
+}
+
 // B4: the reviewer's exact scenario. Two enabled backends, one healthy: the
 // headline must be DEGRADED. Before the fix this was a WARNING condition, and
 // summarizeHealthConditions maps WARNING-only to HEALTHY.

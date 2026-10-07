@@ -153,14 +153,12 @@ func (w *generationWindow[N]) last() (deltas []N, windowSec float64, primed bool
 // diagCounterWindows is the keyed counter window set used by trackers whose
 // counter keys are data-driven (drop reasons).
 type diagCounterWindows struct {
-	mu       sync.Mutex
-	windows  map[string]*generationWindow[float64]
-	alive    map[string]bool
-	at       time.Time
-	window   float64
-	accepted bool
-	primed   bool
-	gen      diagGeneration
+	mu      sync.Mutex
+	windows map[string]*generationWindow[float64]
+	alive   map[string]bool
+	at      time.Time
+	primed  bool
+	gen     diagGeneration
 }
 
 func newDiagCounterWindows() *diagCounterWindows {
@@ -179,8 +177,6 @@ func (d *diagCounterWindows) sample(gen diagGeneration, now time.Time, totals ma
 		d.gen = gen
 		d.primed = true
 		d.at = now
-		d.window = 0
-		d.accepted = false
 		for key, total := range totals {
 			w, ok := d.windows[key]
 			if !ok {
@@ -216,8 +212,6 @@ func (d *diagCounterWindows) sample(gen diagGeneration, now time.Time, totals ma
 	}
 	if acceptedAny {
 		d.at = now
-		d.window = elapsed
-		d.accepted = true
 	}
 	return acceptedAny
 }
@@ -249,8 +243,6 @@ func (d *diagCounterWindows) reset(gen diagGeneration) {
 		d.gen = gen
 	}
 	d.primed = false
-	d.accepted = false
-	d.window = 0
 	d.at = time.Time{}
 	for _, w := range d.windows {
 		w.reset(d.gen)

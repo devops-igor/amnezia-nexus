@@ -25,39 +25,83 @@ type RouteInfo struct {
 
 // InspectRoutes returns a point-in-time inventory of all currently registered routes.
 func (f *Forwarder) InspectRoutes() []RouteInfo {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	f.aggregateQueueMu.Lock()
-	defer f.aggregateQueueMu.Unlock()
+	type rawRoute struct {
+		peerKey          string
+		route            *sessionRoute
+		writes           DeviceWriteTelemetry
+		latencies        routeLatencyReservoir
+		occupancy        int
+		capacity         int
+		highWater        int
+		queueFullDrops   uint64
+		hasReturnPath    bool
+		returnPathClosed bool
+		createdAt        time.Time
+	}
 
-	routes := make([]RouteInfo, 0, len(f.routesByPeer))
+	f.mu.RLock()
+	f.aggregateQueueMu.Lock()
+	f.writeMetricsMu.Lock()
+
+	raw := make([]rawRoute, 0, len(f.routesByPeer))
 	for peerKey, route := range f.routesByPeer {
 		if route == nil {
 			continue
 		}
-		stats := f.routeQueueStatsLocked(route)
+		writes := route.writeMetrics
+		if started, ok := f.writesInFlight[route]; ok {
+			writes.InFlight = 1
+			writes.OldestInFlight = time.Since(started)
+			if writes.OldestInFlight >= DeviceWriteStallThreshold {
+				writes.Stalls++
+			}
+		}
 		hasReturnPath := route.returnPath != nil
 		returnPathClosed := hasReturnPath && route.returnPath.Closed()
+		raw = append(raw, rawRoute{
+			peerKey:          peerKey,
+			route:            route,
+			writes:           writes,
+			latencies:        route.writeLatencies,
+			occupancy:        len(route.clientQueue),
+			capacity:         cap(route.clientQueue),
+			highWater:        int(route.queueHighWater.Load()), // #nosec G115 -- bounded by channel capacity.
+			queueFullDrops:   route.queueFullDrops.Load(),
+			hasReturnPath:    hasReturnPath,
+			returnPathClosed: returnPathClosed,
+			createdAt:        route.createdAt,
+		})
+	}
+
+	f.writeMetricsMu.Unlock()
+	f.aggregateQueueMu.Unlock()
+	f.mu.RUnlock()
+
+	now := time.Now()
+	routes := make([]RouteInfo, 0, len(raw))
+	for _, item := range raw {
+		p95 := item.latencies.p95()
+		recent := item.route.pressure.sample(now, item.queueFullDrops, item.writes.Errors, item.writes.Stalls)
+		stats := RouteQueueStats{
+			Occupancy:            item.occupancy,
+			Capacity:             item.capacity,
+			HighWater:            item.highWater,
+			QueueFullDrops:       item.queueFullDrops,
+			WriteCount:           item.writes.Count,
+			WriteErrors:          item.writes.Errors,
+			WriteStalls:          item.writes.Stalls,
+			WritesInFlight:       item.writes.InFlight,
+			OldestWriteMS:        item.writes.OldestInFlight.Milliseconds(),
+			MaxWriteDurationMS:   item.writes.MaxDuration.Milliseconds(),
+			P95WriteMS:           p95.Milliseconds(),
+			P95WriteSamples:      item.latencies.count,
+			QueueFullDropsRecent: recent.QueueFullDropsRecent,
+			WriteErrorsRecent:    recent.WriteErrorsRecent,
+			WriteStallsRecent:    recent.WriteStallsRecent,
+		}
+
 		// HasPressure means DEGRADED NOW, not "degraded at some point since
 		// this route was created" (issue #424 round 6, finding 3).
-		//
-		// Occupancy and OldestWriteMS are already current-state readings: they
-		// describe the queue as it is right now and fall back on their own
-		// when a drain or a completed write clears them. The three failure
-		// counters are NOT: queueFullDrops, WriteErrors and WriteStalls are
-		// monotonic for the lifetime of the route and production never resets
-		// them anywhere, so "> 0" meant "this route has ever had a problem".
-		// One historical drop therefore kept the route in the CURRENT
-		// problem-routes list until the sessionRoute was destroyed, which
-		// contradicted the principle round 2 established at the aggregate
-		// level.
-		//
-		// They are therefore read through their per-route recency window
-		// (route_pressure.go): a nonzero RECENT delta is a live incident, and
-		// a route whose traffic went quiet goes quiet here too, so a route
-		// with no traffic cannot accumulate pressure it never had. The
-		// lifetime values remain on the payload as history; they simply no
-		// longer decide.
 		hasPressure := (stats.Capacity > 0 && routeUtilization(stats) >= thresholds.RoutePressureUtilization()) ||
 			stats.OldestWriteMS >= 100 ||
 			stats.QueueFullDropsRecent > 0 ||
@@ -65,17 +109,17 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 			stats.WriteStallsRecent > 0
 
 		routes = append(routes, RouteInfo{
-			PeerKey:           peerKey,
-			AssignedIP:        route.assignedIP,
-			SessionID:         route.sessionID,
-			ConnectionID:      route.connectionID,
-			BackendTunnelID:   route.backendTunnelID,
-			HasReturnPath:     hasReturnPath,
-			ReturnPathClosed:  returnPathClosed,
+			PeerKey:           item.peerKey,
+			AssignedIP:        item.route.assignedIP,
+			SessionID:         item.route.sessionID,
+			ConnectionID:      item.route.connectionID,
+			BackendTunnelID:   item.route.backendTunnelID,
+			HasReturnPath:     item.hasReturnPath,
+			ReturnPathClosed:  item.returnPathClosed,
 			Stats:             stats,
-			SessionAgeSec:     int64(time.Since(route.createdAt) / time.Second),
-			LastTrafficAgeSec: route.traffic.lastTrafficAge(time.Now()),
-			Traffic:           route.traffic.snapshot(time.Now()),
+			SessionAgeSec:     int64(now.Sub(item.createdAt) / time.Second),
+			LastTrafficAgeSec: item.route.traffic.lastTrafficAge(now),
+			Traffic:           item.route.traffic.snapshot(now),
 			HasPressure:       hasPressure,
 		})
 	}

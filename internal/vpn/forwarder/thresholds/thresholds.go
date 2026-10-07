@@ -26,30 +26,11 @@
 // accessors exist only for the health evaluator's message text and its
 // percentage-valued struct fields; they are derived, never authored.
 //
-// # Runtime configurability
+// # Immutability
 //
-// Round 5 recorded these as documented named defaults and explicitly DEFERRED
-// runtime configurability (finding 4 option (b)): #424's "configurable"
-// wording is narrowed to "centralized and documented" plus this follow-up.
-// There is no existing config path for VPN diagnostic thresholds — the VPN
-// config plumbing carries no threshold fields at all — so wiring one would mean
-// inventing a parallel configuration system rather than reusing an existing
-// one, which the spec forbids. The setters below exist so a future
-// configuration layer (and the round-5 regressions) can supply a different set
-// through the SAME accessors the production path reads; production never calls
-// them.
-//
-// # Concurrency
-//
-// The values are held in a mutex-guarded struct and every read goes through an
-// accessor. The accessors sit on the queue-transition observer's path, not on
-// the per-packet path, so the cost is a mutex acquisition per observed queue
-// transition, not per packet. Once a configuration layer exists it must publish
-// a replacement set through SetCanonical rather than mutating fields, so a
-// diagnostics evaluation can never observe a half-applied change.
+// Thresholds are immutable canonical constants. Speculative runtime setters
+// are rejected to avoid runtime synchronization overhead and configuration drift.
 package thresholds
-
-import "sync"
 
 // QueuePressure holds the canonical queue-pressure levels as utilization
 // fractions in [0,1].
@@ -70,68 +51,33 @@ type QueuePressure struct {
 	RoutePressureUtilization float64
 }
 
-// Canonical returns a coherent copy of the canonical queue-pressure levels.
-//
-// A copy, not a pointer into the live set: a caller that reads the levels
-// several times must see ONE set, so a concurrent reconfiguration cannot make
-// it compare a new warning level against an old degraded one.
-func Canonical() QueuePressure {
-	mu.Lock()
-	defer mu.Unlock()
-	return canonical
-}
+const (
+	dwellWarningUtilization  = 0.5
+	dwellDegradedUtilization = 0.8
+	routePressureUtilization = 0.8
+)
 
-// SetCanonical publishes a replacement set. A future configuration layer calls
-// this once per accepted reconfiguration; nothing else may.
-func SetCanonical(p QueuePressure) {
-	mu.Lock()
-	defer mu.Unlock()
-	canonical = p
+// Canonical returns a coherent copy of the canonical queue-pressure levels.
+func Canonical() QueuePressure {
+	return QueuePressure{
+		DwellWarningUtilization:  dwellWarningUtilization,
+		DwellDegradedUtilization: dwellDegradedUtilization,
+		RoutePressureUtilization: routePressureUtilization,
+	}
 }
 
 // QueueDwellWarningUtilization is the canonical sustained-WARNING level.
-func QueueDwellWarningUtilization() float64 { return Canonical().DwellWarningUtilization }
+func QueueDwellWarningUtilization() float64 { return dwellWarningUtilization }
 
 // QueueDwellDegradedUtilization is the canonical sustained-DEGRADED level.
-func QueueDwellDegradedUtilization() float64 { return Canonical().DwellDegradedUtilization }
+func QueueDwellDegradedUtilization() float64 { return dwellDegradedUtilization }
 
 // RoutePressureUtilization is the canonical route-pressure level.
-func RoutePressureUtilization() float64 { return Canonical().RoutePressureUtilization }
+func RoutePressureUtilization() float64 { return routePressureUtilization }
 
 // QueueDwellWarningPct is QueueDwellWarningUtilization as a percentage, for
 // the health evaluator's percent-valued fields and message text.
-func QueueDwellWarningPct() float64 { return QueueDwellWarningUtilization() * 100 }
+func QueueDwellWarningPct() float64 { return dwellWarningUtilization * 100 }
 
 // QueueDwellDegradedPct is QueueDwellDegradedUtilization as a percentage.
-func QueueDwellDegradedPct() float64 { return QueueDwellDegradedUtilization() * 100 }
-
-// SetQueueDwellDegradedUtilization moves ONLY the sustained-DEGRADED level.
-// It exists so a regression can perturb one level and observe that the
-// measurement and the message move together; production never calls it.
-func SetQueueDwellDegradedUtilization(v float64) {
-	mu.Lock()
-	defer mu.Unlock()
-	canonical.DwellDegradedUtilization = v
-}
-
-// SetRoutePressureUtilization moves ONLY the route-pressure level, for the same
-// reason as SetQueueDwellDegradedUtilization.
-func SetRoutePressureUtilization(v float64) {
-	mu.Lock()
-	defer mu.Unlock()
-	canonical.RoutePressureUtilization = v
-}
-
-var (
-	mu sync.Mutex
-	// canonical is the ONE production set of queue-pressure levels. Every
-	// value is numerically identical to the literal it replaced in
-	// internal/vpn/forwarder (queue_dwell.go: 0.5 and 0.8; routes.go: 0.8), so
-	// this change is a de-duplication and not a retuning: no severity
-	// boundary moves.
-	canonical = QueuePressure{
-		DwellWarningUtilization:  0.5,
-		DwellDegradedUtilization: 0.8,
-		RoutePressureUtilization: 0.8,
-	}
-)
+func QueueDwellDegradedPct() float64 { return dwellDegradedUtilization * 100 }

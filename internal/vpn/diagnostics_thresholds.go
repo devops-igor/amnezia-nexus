@@ -36,13 +36,8 @@ import (
 //
 // Not implemented, and that is a documented deferral rather than an
 // oversight: issue #424's "configurable" wording is narrowed to "centralized
-// and documented" by round 5's finding 4, option (b). The VPN config plumbing
-// carries no threshold fields at all, so there is no existing configuration
-// path to reuse and inventing a parallel one is out of scope. The canonical
-// package's setters (thresholds.SetQueueDwellDegradedUtilization and friends)
-// are the seam a future configuration layer must publish through, so the
-// follow-up adds a config path without re-opening this package. Until then
-// production never calls them.
+// and documented" by round 5's finding 4, option (b). The canonical thresholds
+// are immutable constants shared across measurement and diagnostics evaluation.
 //
 // # Severity roles
 //

@@ -264,7 +264,6 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, pac
 // route generation. The caller holds f.mu and aggregateQueueMu.
 func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 	f.writeMetricsMu.Lock()
-	defer f.writeMetricsMu.Unlock()
 	writes := route.writeMetrics
 	if started, ok := f.writesInFlight[route]; ok {
 		writes.InFlight = 1
@@ -273,7 +272,10 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 			writes.Stalls++
 		}
 	}
-	p95 := route.writeLatencies.p95()
+	latencies := route.writeLatencies
+	f.writeMetricsMu.Unlock()
+
+	p95 := latencies.p95()
 	// Sample the per-route recency window AFTER the in-flight stall adjustment
 	// above, so a write that is stalled RIGHT NOW shows up as recent pressure
 	// and not only as a lifetime total (issue #424 round 6, finding 3).
@@ -290,7 +292,7 @@ func (f *Forwarder) routeQueueStatsLocked(route *sessionRoute) RouteQueueStats {
 		OldestWriteMS:      writes.OldestInFlight.Milliseconds(),
 		MaxWriteDurationMS: writes.MaxDuration.Milliseconds(),
 		P95WriteMS:         p95.Milliseconds(),
-		P95WriteSamples:    route.writeLatencies.count,
+		P95WriteSamples:    latencies.count,
 
 		QueueFullDropsRecent: recent.QueueFullDropsRecent,
 		WriteErrorsRecent:    recent.WriteErrorsRecent,

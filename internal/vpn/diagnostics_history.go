@@ -151,6 +151,33 @@ func degradedReasonRatePps(drops DropCategoryBreakdown, claim lossClaim) float64
 	return total
 }
 
+// knownDropReasonKeys is the fixed set of drop category keys published by dropReasonTotals.
+// Using a static slice avoids heap allocations during history point cloning.
+var knownDropReasonKeys = []string{
+	"client_malformed",
+	"client_unmapped_source",
+	"client_mismatch",
+	"client_rejected",
+	"client_backend_queue_full",
+	"client_rate_limited",
+	"client_no_healthy_backend",
+	"client_virtualtun_drops",
+	"client_backend_device_queue_full",
+	"client_backend_device_oversized",
+	"client_backend_device_shutdown",
+	"client_backend_device_external",
+	"backend_device_unattributed",
+	"return_malformed",
+	"return_unmapped",
+	"return_mismatch",
+	"return_injection_errors",
+	"return_virtualtun_drops",
+	"return_queue_full",
+	"return_packet_too_large",
+	"return_backend_device_queue_full",
+	"return_backend_device_shutdown",
+}
+
 // The disjoint reasons use exactly the counter keys in drop_categories.
 // return_injection_tun_drops describes overlap, not an additional loss reason.
 func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
@@ -257,8 +284,8 @@ func backendHistory(backends []BackendTelemetryItem) ([]BackendHistoryPoint, int
 
 func cloneHistoryPoint(p HistoryPoint) HistoryPoint {
 	if p.DropReasonRates != nil {
-		finite := make(map[string]float64, len(dropReasonTotals(DropCategoryBreakdown{})))
-		for key := range dropReasonTotals(DropCategoryBreakdown{}) {
+		finite := make(map[string]float64, len(knownDropReasonKeys))
+		for _, key := range knownDropReasonKeys {
 			if rate, ok := p.DropReasonRates[key]; ok {
 				finite[key] = rate
 			}

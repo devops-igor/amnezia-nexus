@@ -1240,16 +1240,72 @@ func (f *Forwarder) RouteQueueStats(peerKey string) (RouteQueueStats, bool) {
 
 // AllRouteQueueStats returns point-in-time snapshots for all active peers.
 func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
+	type rawItem struct {
+		peerKey        string
+		route          *sessionRoute
+		writes         DeviceWriteTelemetry
+		latencies      routeLatencyReservoir
+		occupancy      int
+		capacity       int
+		highWater      int
+		queueFullDrops uint64
+	}
+
 	f.mu.RLock()
-	defer f.mu.RUnlock()
 	f.aggregateQueueMu.Lock()
-	defer f.aggregateQueueMu.Unlock()
-	stats := make(map[string]RouteQueueStats, len(f.routesByPeer))
+	f.writeMetricsMu.Lock()
+
+	raw := make([]rawItem, 0, len(f.routesByPeer))
 	for peerKey, route := range f.routesByPeer {
 		if route == nil {
 			continue
 		}
-		stats[peerKey] = f.routeQueueStatsLocked(route)
+		writes := route.writeMetrics
+		if started, ok := f.writesInFlight[route]; ok {
+			writes.InFlight = 1
+			writes.OldestInFlight = time.Since(started)
+			if writes.OldestInFlight >= DeviceWriteStallThreshold {
+				writes.Stalls++
+			}
+		}
+		raw = append(raw, rawItem{
+			peerKey:        peerKey,
+			route:          route,
+			writes:         writes,
+			latencies:      route.writeLatencies,
+			occupancy:      len(route.clientQueue),
+			capacity:         cap(route.clientQueue),
+			highWater:      int(route.queueHighWater.Load()), // #nosec G115 -- bounded by channel capacity.
+			queueFullDrops: route.queueFullDrops.Load(),
+		})
+	}
+
+	f.writeMetricsMu.Unlock()
+	f.aggregateQueueMu.Unlock()
+	f.mu.RUnlock()
+
+	now := time.Now()
+	stats := make(map[string]RouteQueueStats, len(raw))
+	for _, item := range raw {
+		p95 := item.latencies.p95()
+		recent := item.route.pressure.sample(now, item.queueFullDrops, item.writes.Errors, item.writes.Stalls)
+		stats[item.peerKey] = RouteQueueStats{
+			Occupancy:            item.occupancy,
+			Capacity:             item.capacity,
+			HighWater:            item.highWater,
+			QueueFullDrops:       item.queueFullDrops,
+			WriteCount:           item.writes.Count,
+			WriteErrors:          item.writes.Errors,
+			WriteStalls:          item.writes.Stalls,
+			WritesInFlight:       item.writes.InFlight,
+			OldestWriteMS:        item.writes.OldestInFlight.Milliseconds(),
+			MaxWriteDurationMS:   item.writes.MaxDuration.Milliseconds(),
+			P95WriteMS:           p95.Milliseconds(),
+			P95WriteSamples:      item.latencies.count,
+			QueueFullDropsRecent: recent.QueueFullDropsRecent,
+			WriteErrorsRecent:    recent.WriteErrorsRecent,
+			WriteStallsRecent:    recent.WriteStallsRecent,
+		}
 	}
 	return stats
 }
