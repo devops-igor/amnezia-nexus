@@ -28,9 +28,11 @@ type TrafficSnapshot struct {
 //   - an observation tagged with an older generation is stale and ignored;
 //   - the first observation of a generation (after construction or reset)
 //     only primes the baseline;
-//   - an observation lower than the accepted baseline reports nothing and
-//     leaves the baseline untouched, so activity up to the previously
-//     accepted value can never be replayed as a fresh rate;
+//   - within one generation, whole-vector monotonicity is enforced: if ANY
+//     counter in an observation is lower than its accepted baseline, the entire
+//     observation is rejected wholesale without mutating baselines, timestamp
+//     anchor (w.at), or the published window, preserving the true time denominator
+//     for subsequent observations and preventing rate spikes;
 //   - reset(gen) explicitly starts a new generation, clearing the baseline.
 type generationTrafficWindow struct {
 	gen       Generation
@@ -43,9 +45,19 @@ type generationTrafficWindow struct {
 	current   TrafficSnapshot
 }
 
-// observe applies the generation gate and the monotonic-baseline rule to one
-// cumulative observation. accepted reports whether this observation opened a
-// new measurement window; current is the previously published window.
+// observe applies the generation gate, the minimum elapsed interval floor, and
+// the whole-vector monotonic-baseline rule to one cumulative observation.
+// accepted reports whether this observation opened a new measurement window;
+// current is the previously published window.
+//
+// Staleness contract (issue #429 review blocker 1): classification happens
+// BEFORE any mutation. Whole-vector monotonicity is enforced: if ANY counter
+// in totals is lower than its accepted baseline (rxU < w.rxBytes || txU < w.txBytes ||
+// totals.RxPackets < w.rxPackets || totals.TxPackets < w.txPackets), the observation
+// is rejected wholesale (accepted=false, returning w.current, 0, false), and
+// NOTHING is mutated — not baselines, not the sampling anchor (w.at).
+// Only observations where ALL counters are >= baseline advance the window and
+// update baselines and the timestamp anchor.
 func (w *generationTrafficWindow) observe(gen Generation, now time.Time, totals TrafficSnapshot) (current TrafficSnapshot, elapsed float64, accepted bool) {
 	rxU := counterUint64(totals.RxBytes)
 	txU := counterUint64(totals.TxBytes)
@@ -64,26 +76,18 @@ func (w *generationTrafficWindow) observe(gen Generation, now time.Time, totals 
 	if elapsed < 0.2 {
 		return w.current, 0, false
 	}
-	var (
-		dRx, dTx   uint64
-		dRxP, dTxP uint64
-	)
-	if rxU >= w.rxBytes {
-		dRx = rxU - w.rxBytes
-		w.rxBytes = rxU
+	if rxU < w.rxBytes || txU < w.txBytes || totals.RxPackets < w.rxPackets || totals.TxPackets < w.txPackets {
+		return w.current, 0, false
 	}
-	if txU >= w.txBytes {
-		dTx = txU - w.txBytes
-		w.txBytes = txU
-	}
-	if totals.RxPackets >= w.rxPackets {
-		dRxP = totals.RxPackets - w.rxPackets
-		w.rxPackets = totals.RxPackets
-	}
-	if totals.TxPackets >= w.txPackets {
-		dTxP = totals.TxPackets - w.txPackets
-		w.txPackets = totals.TxPackets
-	}
+	dRx := rxU - w.rxBytes
+	dTx := txU - w.txBytes
+	dRxP := totals.RxPackets - w.rxPackets
+	dTxP := totals.TxPackets - w.txPackets
+
+	w.rxBytes = rxU
+	w.txBytes = txU
+	w.rxPackets = totals.RxPackets
+	w.txPackets = totals.TxPackets
 	w.at = now
 	w.current = TrafficSnapshot{
 		RxBytesPerSec: float64(dRx) / elapsed,
