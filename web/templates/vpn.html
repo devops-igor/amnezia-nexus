@@ -127,6 +127,16 @@
         </div>
     </div>
 
+    <!-- Progressive Disclosure: Technical Diagnostics & Telemetry (Panels 1-11) -->
+    <details id="vpn-fwd-tech-details" class="card" style="margin-bottom: var(--space-md); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md);">
+        <summary style="cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; font-weight: 600; font-size: 0.875rem;">
+            <div class="flex items-center gap-xs">
+                <svg class="icon text-muted" style="width: 16px; height: 16px;"><use href="#icon-activity"></use></svg>
+                <span>{{ _ "vpn_fwd_tech_diagnostics" }}</span>
+            </div>
+        </summary>
+        <div style="margin-top: var(--space-md);">
+
     <!-- 11 Diagnostic Panels Grid -->
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-md);">
         <!-- Panel 1: Traffic & Capacity -->
@@ -340,6 +350,8 @@
                 <tbody id="vpn-fwd-routes-tbody">
                 </tbody>
             </table>
+        </div>
+    </details>
         </div>
     </details>
 </div>
@@ -1426,6 +1438,8 @@
             if (emptyDiv) emptyDiv.style.display = 'block';
             const detailsElem = document.getElementById('vpn-fwd-routes-details');
             if (detailsElem) detailsElem.open = false;
+            const techDetails = document.getElementById('vpn-fwd-tech-details');
+            if (techDetails) techDetails.open = false;
 
             const kpiIds = ['vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure', 'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync', 'vpn-kpi-backends', 'vpn-kpi-slow-writes'];
             for (let i = 0; i < kpiIds.length; i++) {
@@ -1714,20 +1728,39 @@
             }
         }
 
+        const s = (ha && ha.status) ? String(ha.status).toUpperCase() : '';
+        const rawConditions = (ha && Array.isArray(ha.conditions)) ? ha.conditions : [];
+        const hasExplicitConditions = rawConditions.length > 0;
+        const isDegradedOrDown = s === 'DEGRADED' || s === 'DOWN' || s === 'CRITICAL';
+        const hasActiveProblems = hasExplicitConditions || isDegradedOrDown || routeHasPressure;
+        const isHealthy = s === 'HEALTHY' && !hasExplicitConditions && !routeHasPressure;
+
         const problemListElem = document.getElementById('vpn-fwd-problem-list');
         if (problemListElem) {
-            if (ha && Array.isArray(ha.conditions) && ha.conditions.length > 0) {
+            if (hasActiveProblems) {
+                const conditionsToRender = hasExplicitConditions ? rawConditions : [
+                    {
+                        severity: isDegradedOrDown ? s : 'WARNING',
+                        message: (ha && ha.summary) ? ha.summary : (s === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') : (_('vpn_forwarder_degraded') || 'Degraded')),
+                        category: routeHasPressure ? 'routing' : 'forwarder'
+                    }
+                ];
                 problemListElem.textContent = '';
                 problemListElem.style.display = 'flex';
                 problemListElem.style.flexDirection = 'column';
                 problemListElem.style.gap = '6px';
-                for (let i = 0; i < ha.conditions.length; i++) {
-                    const cond = ha.conditions[i];
+                for (let i = 0; i < conditionsToRender.length; i++) {
+                    const cond = conditionsToRender[i];
                     const row = document.createElement('div');
+                    row.className = 'card problem-card';
                     row.style.display = 'flex';
                     row.style.alignItems = 'center';
                     row.style.gap = '8px';
                     row.style.fontSize = '0.825rem';
+                    row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
+                    row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
+                    row.style.border = '1px solid var(--border-color)';
+                    row.style.borderRadius = 'var(--radius-sm, 4px)';
 
                     const sevBadge = document.createElement('span');
                     sevBadge.style.fontSize = '0.7rem';
@@ -1735,20 +1768,25 @@
                     sevBadge.style.borderRadius = 'var(--radius-sm, 4px)';
                     sevBadge.style.fontWeight = '600';
                     const sev = String(cond.severity || '').toUpperCase();
-                    if (sev === 'CRITICAL') {
+                    if (sev === 'CRITICAL' || sev === 'DOWN') {
                         sevBadge.className = 'badge badge-danger';
+                        row.style.borderLeft = '3px solid var(--danger)';
                     } else if (sev === 'DEGRADED') {
                         sevBadge.className = 'badge badge-warn';
+                        row.style.borderLeft = '3px solid var(--warning)';
                     } else {
                         sevBadge.className = 'badge badge-info';
+                        row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
                     }
                     sevBadge.textContent = sev === 'CRITICAL' ? _('vpn_forwarder_critical') :
+                        sev === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') :
                         sev === 'DEGRADED' ? _('vpn_forwarder_degraded') :
                         sev === 'HEALTHY' ? _('vpn_forwarder_healthy') :
                         (!sev || sev === 'WARN' || sev === 'WARNING') ? _('vpn_forwarder_warning') : sev;
                     row.appendChild(sevBadge);
 
                     const msgSpan = document.createElement('span');
+                    msgSpan.style.flex = '1';
                     // A condition that carries a canonical translation key is
                     // rendered localized; the serialized English message is the
                     // fallback when the key does not resolve in this locale.
@@ -1756,12 +1794,112 @@
                         ? _(cond.message_key) : (cond.message || '');
                     row.appendChild(msgSpan);
 
+                    const backendLabel = cond.backend_id !== undefined ? ('Backend ' + cond.backend_id) : '';
+                    const compLabel = cond.component || cond.category || '';
+                    const componentOrCategory = backendLabel && compLabel ? (compLabel + ' • ' + backendLabel) : (backendLabel || compLabel);
+                    if (componentOrCategory) {
+                        const compBadge = document.createElement('span');
+                        compBadge.className = 'badge text-muted font-mono';
+                        compBadge.style.fontSize = '0.7rem';
+                        compBadge.style.padding = '1px 6px';
+                        compBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
+                        compBadge.style.border = '1px solid var(--border-color)';
+                        compBadge.style.borderRadius = 'var(--radius-sm, 4px)';
+                        compBadge.textContent = componentOrCategory;
+                        row.appendChild(compBadge);
+                    }
+
                     problemListElem.appendChild(row);
                 }
+            } else if (isHealthy) {
+                // NOMINAL (0 active problems): render reassuring green badge
+                problemListElem.textContent = '';
+                problemListElem.style.display = 'flex';
+                problemListElem.style.flexDirection = 'column';
+                problemListElem.style.gap = '6px';
+
+                const nominalBadge = document.createElement('div');
+                nominalBadge.className = 'badge badge-success';
+                nominalBadge.style.display = 'inline-flex';
+                nominalBadge.style.alignItems = 'center';
+                nominalBadge.style.gap = '6px';
+                nominalBadge.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
+                nominalBadge.style.fontSize = '0.825rem';
+                nominalBadge.style.fontWeight = '500';
+                nominalBadge.style.borderRadius = 'var(--radius-sm, 4px)';
+                nominalBadge.style.width = 'fit-content';
+
+                const psKpi = status.peer_sync;
+                let actualPeers = 0;
+                let desiredPeers = 0;
+                if (psKpi && typeof psKpi === 'object') {
+                    actualPeers = Number(psKpi.actual_peers !== undefined ? psKpi.actual_peers : (psKpi.synced || 0));
+                    desiredPeers = Number(psKpi.desired_peers !== undefined ? psKpi.desired_peers : (psKpi.total || actualPeers));
+                } else if (status.connected_sessions !== undefined) {
+                    actualPeers = Number(status.connected_sessions || 0);
+                    desiredPeers = actualPeers;
+                } else if (status.routing_consistency && status.routing_consistency.active_sessions_count !== undefined) {
+                    actualPeers = Number(status.routing_consistency.active_sessions_count || 0);
+                    desiredPeers = actualPeers;
+                } else if (allRouteList && allRouteList.length > 0) {
+                    actualPeers = allRouteList.length;
+                    desiredPeers = allRouteList.length;
+                }
+
+                const be = status.backends || {};
+                let healthyBackends = 0;
+                let totalBackends = 0;
+                if (be.total_count !== undefined) {
+                    totalBackends = Number(be.total_count || 0);
+                    healthyBackends = Number(be.healthy_count !== undefined ? be.healthy_count : 0);
+                } else if (be.total !== undefined) {
+                    totalBackends = Number(be.total || 0);
+                    healthyBackends = Number(be.healthy !== undefined ? be.healthy : 0);
+                } else if (status.active_tunnels !== undefined) {
+                    healthyBackends = Number(status.active_tunnels || 0);
+                    totalBackends = healthyBackends;
+                }
+
+                let noProblemsText = _('vpn_fwd_no_active_problems');
+                if (!noProblemsText || noProblemsText === 'vpn_fwd_no_active_problems') {
+                    noProblemsText = 'No active problems detected';
+                }
+
+                let peersText = vpnDiagText('vpn_fwd_nominal_peers', {
+                    actual: actualPeers,
+                    desired: desiredPeers,
+                    synced: actualPeers,
+                    total: desiredPeers
+                });
+                if (!peersText || peersText === 'vpn_fwd_nominal_peers') {
+                    peersText = actualPeers + '/' + desiredPeers + ' peers synced';
+                }
+
+                let routesText = _('vpn_fwd_nominal_routes');
+                if (!routesText || routesText === 'vpn_fwd_nominal_routes') {
+                    routesText = 'All routes consistent';
+                }
+
+                let backendsText = vpnDiagText('vpn_fwd_nominal_backends', {
+                    healthy: healthyBackends,
+                    total: totalBackends
+                });
+                if (!backendsText || backendsText === 'vpn_fwd_nominal_backends') {
+                    backendsText = healthyBackends + '/' + totalBackends + ' backends healthy';
+                }
+
+                nominalBadge.textContent = '✓ ' + noProblemsText + ' • ' + peersText + ' • ' + routesText + ' • ' + backendsText;
+                problemListElem.appendChild(nominalBadge);
             } else {
                 problemListElem.textContent = '';
                 problemListElem.style.display = 'none';
             }
+        }
+
+        // Auto-expand technical details when degraded, down, or has active problems; remain closed when healthy.
+        const techDetails = document.getElementById('vpn-fwd-tech-details');
+        if (techDetails) {
+            techDetails.open = !!hasActiveProblems;
         }
 
         // Auto-expand route details only for current pressure.

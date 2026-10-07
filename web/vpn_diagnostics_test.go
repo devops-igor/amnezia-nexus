@@ -80,6 +80,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		requiredIDs := []string{
 			"vpn-fwd-headline-summary",
 			"vpn-fwd-problem-list",
+			"vpn-fwd-tech-details",
 			"vpn-kpi-throughput",
 			"vpn-kpi-routes-sessions",
 			"vpn-kpi-queue-pressure",
@@ -166,6 +167,11 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_kpi_peer_sync",
 			"vpn_fwd_kpi_backends",
 			"vpn_fwd_kpi_slow_writes",
+			"vpn_fwd_tech_diagnostics",
+			"vpn_fwd_no_active_problems",
+			"vpn_fwd_nominal_peers",
+			"vpn_fwd_nominal_routes",
+			"vpn_fwd_nominal_backends",
 		}
 
 		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
@@ -1922,5 +1928,149 @@ assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Текущий / Онлай
 	ruScript := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
 	if out, err := exec.Command(node, "-e", ruScript).CombinedOutput(); err != nil {
 		t.Fatalf("Russian decoupling test failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNProgressiveDisclosureAndActiveProblems(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	// 1. Invariant: <details id="vpn-fwd-tech-details"> must be present in template.
+	if !strings.Contains(tmplStr, `<details id="vpn-fwd-tech-details"`) {
+		t.Fatal("vpn.html missing progressive disclosure container <details id=\"vpn-fwd-tech-details\">")
+	}
+
+	assertions := `
+const el = id => document.getElementById(id);
+const text = id => document.getElementById(id).textContent;
+
+// 1. Nominal / Healthy forwarder:
+// - techDetails remains closed (open === false)
+// - problem-list renders reassuring green badge with live synced peers, routes, and backends
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	routing_consistency: { is_consistent: true, active_routes_count: 5, active_sessions_count: 5 },
+	peer_sync: { actual_peers: 5, desired_peers: 5 },
+	backends: { healthy_count: 2, total_count: 2 }
+});
+
+assert.strictEqual(el('vpn-fwd-tech-details').open, false, 'tech details must remain closed when healthy');
+assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'flex');
+assert.strictEqual(el('vpn-fwd-problem-list').children.length, 1);
+const greenBadge = el('vpn-fwd-problem-list').children[0];
+assert(greenBadge.className.includes('badge-success'), 'nominal summary must have badge-success class');
+assert.strictEqual(
+	greenBadge.textContent,
+	'✓ No active problems detected • 5/5 peers synced • All routes consistent • 2/2 backends healthy',
+	'nominal green badge text must show live counts'
+);
+
+// 2. Degraded forwarder with active issue:
+// - techDetails auto-expands (open === true)
+// - problem-list renders styled alert card with severity, message, and component/backend
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'DEGRADED',
+		conditions: [{
+			severity: 'DEGRADED',
+			message: 'Backend -> Client packet drops active',
+			component: 'dataplane',
+			backend_id: 3
+		}]
+	}
+});
+
+assert.strictEqual(el('vpn-fwd-tech-details').open, true, 'tech details must auto-expand when degraded');
+assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'flex');
+assert.strictEqual(el('vpn-fwd-problem-list').children.length, 1);
+const problemCard = el('vpn-fwd-problem-list').children[0];
+assert(problemCard.className.includes('problem-card'), 'problem card must have problem-card class');
+assert.strictEqual(problemCard.children[0].textContent, 'Degraded');
+assert(problemCard.children[0].className.includes('badge-warn'));
+assert.strictEqual(problemCard.children[1].textContent, 'Backend -> Client packet drops active');
+assert(problemCard.children[2].textContent.includes('Backend 3'));
+assert(problemCard.children[2].textContent.includes('dataplane'));
+
+// 3. Down forwarder:
+// - techDetails auto-expands (open === true)
+// - problem-list renders styled alert card with Down severity
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'DOWN',
+		summary: 'WireGuard forwarder daemon down'
+	}
+});
+
+assert.strictEqual(el('vpn-fwd-tech-details').open, true, 'tech details must auto-expand when down');
+assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'flex');
+assert.strictEqual(el('vpn-fwd-problem-list').children.length, 1);
+const downCard = el('vpn-fwd-problem-list').children[0];
+assert.strictEqual(downCard.children[0].textContent, 'Down');
+assert(downCard.children[0].className.includes('badge-danger'));
+assert.strictEqual(downCard.children[1].textContent, 'WireGuard forwarder daemon down');
+
+// 4. Critical forwarder with explicit condition:
+// - techDetails auto-expands (open === true)
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'CRITICAL',
+		conditions: [{
+			severity: 'CRITICAL',
+			message: 'Queue full drops critical',
+			category: 'drops'
+		}]
+	}
+});
+
+assert.strictEqual(el('vpn-fwd-tech-details').open, true, 'tech details must auto-expand when critical');
+assert.strictEqual(el('vpn-fwd-problem-list').children[0].children[0].textContent, 'Critical');
+assert(el('vpn-fwd-problem-list').children[0].children[0].className.includes('badge-danger'));
+
+// 5. Unavailable forwarder:
+// - techDetails closed
+// - problem-list hidden and empty
+vpnRenderForwarderHealth(null);
+assert.strictEqual(el('vpn-fwd-tech-details').open, false, 'tech details must close when unavailable');
+assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'none');
+assert.strictEqual(el('vpn-fwd-problem-list').textContent, '');
+`
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+		t.Fatalf("progressive disclosure & active problems test failed: %v\n%s", err, out)
+	}
+
+	// 6. Test Russian locale rendering of nominal badge
+	ruAssertions := `
+const el = id => document.getElementById(id);
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	peer_sync: { actual_peers: 12, desired_peers: 12 },
+	backends: { healthy_count: 3, total_count: 3 }
+});
+
+assert.strictEqual(el('vpn-fwd-tech-details').open, false);
+assert.strictEqual(
+	el('vpn-fwd-problem-list').children[0].textContent,
+	'✓ Активных проблем не обнаружено • 12/12 пиров синхронизировано • Все маршруты согласованы • 3/3 бэкендов в норме'
+);
+`
+	ruScript := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
+	if out, err := exec.Command(node, "-e", ruScript).CombinedOutput(); err != nil {
+		t.Fatalf("Russian progressive disclosure nominal badge test failed: %v\n%s", err, out)
 	}
 }
