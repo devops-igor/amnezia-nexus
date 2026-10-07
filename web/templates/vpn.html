@@ -1,6 +1,17 @@
 {{ define "title_extra" }} - {{ _ "vpn_page_title" }}{{ end }}
 
 {{ define "content" }}
+<style>
+#vpnSessionsTable tr.row-expanded td {
+    border-bottom: none !important;
+}
+#vpnSessionsTable tr.row-expanded .vpn-expand-icon {
+    transform: rotate(90deg);
+}
+#vpnSessionsTable .vpn-session-drilldown-row td {
+    border-top: none !important;
+}
+</style>
 <div class="section-title" style="display: flex; align-items: center; gap: var(--space-sm);">
     <svg class="icon" style="width: 24px; height: 24px;"><use href="#icon-shield"></use></svg>
     <span>{{ _ "vpn_page_title" }}</span>
@@ -393,12 +404,19 @@
     </div>
 </div>
 
-<!-- ACTIVE SESSIONS TABLE -->
+<!-- ACTIVE SESSIONS / CONNECTION TROUBLESHOOTING TABLE -->
 <div class="card" style="margin-top: var(--space-xl);">
     <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
         <div class="flex items-center gap-sm">
             <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-users"></use></svg>
-            <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_active_sessions" }}</h3>
+            <h3 class="card-title" id="vpn-troubleshooting-title" style="margin-bottom: 0;">{{ _ "vpn_troubleshooting_title" }}</h3>
+            <span id="vpn-sessions-count-badge" class="badge badge-secondary" style="font-size: 0.75rem;">0</span>
+        </div>
+        <div class="flex items-center gap-sm">
+            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" onclick="vpnToggleSessionsProblemFilter()" style="font-size: 0.8rem; display: inline-flex; align-items: center; gap: var(--space-xs);">
+                <svg class="icon" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
+                <span id="vpn-sessions-toggle-problems-text">{{ _ "vpn_show_problems_only" }}</span>
+            </button>
         </div>
     </div>
 
@@ -410,11 +428,15 @@
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_packet_loss" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_queue_pressure" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
                 </tr>
             </thead>
             <tbody id="vpn-sessions-tbody">
                 <tr id="vpn-sessions-loading" class="table-loading-row">
-                    <td colspan="4" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
                         <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
                         <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
                     </td>
@@ -543,9 +565,11 @@
     // never a plain "no sessions" empty state.
     let vpnLastSessions = null;
     let vpnSessionsStale = false;
+    let vpnSessionsFilterOnlyProblems = false;
     let vpnHistoryWindow = '15m';
     let vpnShowAllRoutes = false;
     let vpnLastStatus = null;
+    let vpnExpandedSessionIds = new Set();
 
     function vpnFormatApiError(err, res, data) {
         const errMsg = (data && (data.detail || data.message || data.error)) ||
@@ -1050,31 +1074,342 @@
         }
     }
 
-    function vpnRenderSessionRow(s) {
-        const tr = document.createElement('tr');
-        tr.setAttribute('data-status', s.status || '');
+    function fmtBps(bps) {
+        const b = Number(bps || 0);
+        if (b >= 1e9) return (b / 1e9).toFixed(2) + ' Gbps';
+        if (b >= 1e6) return (b / 1e6).toFixed(2) + ' Mbps';
+        if (b >= 1e3) return (b / 1e3).toFixed(2) + ' Kbps';
+        return b.toFixed(0) + ' bps';
+    }
 
+    function fmtPps(pps) {
+        const p = Number(pps || 0);
+        if (p >= 1e6) return (p / 1e6).toFixed(2) + ' Mpps';
+        if (p >= 1e3) return (p / 1e3).toFixed(2) + ' Kpps';
+        return p.toFixed(1) + ' pps';
+    }
+
+    function vpnFormatBytes(bytes) {
+        if (typeof Telemetry !== 'undefined' && typeof Telemetry.formatBytes === 'function') {
+            return Telemetry.formatBytes(bytes);
+        }
+        const b = Number(bytes || 0);
+        if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
+        if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+        if (b >= 1024) return (b / 1024).toFixed(2) + ' KB';
+        return b + ' B';
+    }
+
+    function vpnFindRouteForSession(s) {
+        if (!s || !vpnLastStatus) return null;
+        const routes = [];
+        if (Array.isArray(vpnLastStatus.all_routes)) {
+            routes.push(...vpnLastStatus.all_routes);
+        }
+        if (Array.isArray(vpnLastStatus.problem_routes)) {
+            for (let i = 0; i < vpnLastStatus.problem_routes.length; i++) {
+                const pr = vpnLastStatus.problem_routes[i];
+                if (!routes.includes(pr)) {
+                    routes.push(pr);
+                }
+            }
+        }
+        if (!routes.length) return null;
+
+        if (s.assigned_ip) {
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
+                if (r && r.assigned_ip && s.assigned_ip === r.assigned_ip) {
+                    return r;
+                }
+            }
+        }
+
+        const sConn = s.connection_id;
+        if (sConn !== undefined && sConn !== null && sConn !== '') {
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
+                if (r && r.connection_id !== undefined && r.connection_id !== null && String(sConn) === String(r.connection_id)) {
+                    return r;
+                }
+            }
+        }
+
+        const sSess = s.session_id !== undefined && s.session_id !== null && s.session_id !== '' ? s.session_id : s.id;
+        if (sSess !== undefined && sSess !== null && sSess !== '') {
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
+                const rSess = r && (r.session_id !== undefined && r.session_id !== null && r.session_id !== '' ? r.session_id : r.id);
+                if (r && rSess !== undefined && rSess !== null && String(sSess) === String(rSess)) {
+                    return r;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function vpnRenderSessionRow(s, route) {
+        if (route === undefined) {
+            route = vpnFindRouteForSession(s);
+        }
+        const tr = document.createElement('tr');
+        tr.setAttribute('data-status', (s && s.status) || '');
+
+        const sessId = s ? (s.session_id || s.id) : null;
+        if (sessId && vpnExpandedSessionIds && vpnExpandedSessionIds.has(sessId)) {
+            if (tr.classList) tr.classList.add('row-expanded');
+            else tr.className = ((tr.className || '') + ' row-expanded').trim();
+        }
+
+        // 1. User cell
         const tdUser = document.createElement('td');
         tdUser.className = 'font-weight-600';
-        tdUser.textContent = s.username || '-';
+        tdUser.style.cursor = 'pointer';
+        tdUser.style.display = 'flex';
+        tdUser.style.alignItems = 'center';
+        tdUser.style.gap = 'var(--space-xs)';
+        const safeUsername = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.username) || '-') : ((s && s.username) || '-');
+        tdUser.innerHTML = `<svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg><span>${safeUsername}</span>`;
+        tdUser.onclick = function(e) {
+            if (e && e.stopPropagation) e.stopPropagation();
+            vpnToggleSessionDrilldown(s, tr);
+        };
         tr.appendChild(tdUser);
 
+        // 2. Config cell
         const tdConfig = document.createElement('td');
         tdConfig.className = 'font-mono text-sm';
-        tdConfig.textContent = s.connection_name || '-';
+        tdConfig.textContent = (s && s.connection_name) || '-';
         tr.appendChild(tdConfig);
 
+        // 3. Server cell
         const tdServer = document.createElement('td');
         tdServer.className = 'font-weight-600';
-        tdServer.textContent = s.server_name || '-';
+        tdServer.textContent = (s && s.server_name) || '-';
         tr.appendChild(tdServer);
 
+        // 4. Assigned IP cell
         const tdIp = document.createElement('td');
         tdIp.className = 'font-mono text-sm';
-        tdIp.textContent = s.assigned_ip || '-';
+        tdIp.textContent = (s && s.assigned_ip) || '-';
         tr.appendChild(tdIp);
 
+        // 5. Live Traffic cell
+        const tdTraffic = document.createElement('td');
+        tdTraffic.className = 'font-mono text-sm';
+        if (route && route.traffic) {
+            const rx = route.traffic.rx_bps !== undefined ? route.traffic.rx_bps : ((route.traffic.rx_bytes_per_sec || 0) * 8);
+            const tx = route.traffic.tx_bps !== undefined ? route.traffic.tx_bps : ((route.traffic.tx_bytes_per_sec || 0) * 8);
+            tdTraffic.textContent = `↓ ${fmtBps(rx)} ↑ ${fmtBps(tx)}`;
+        } else {
+            tdTraffic.textContent = '-';
+        }
+        tr.appendChild(tdTraffic);
+
+        // 6. Packet Loss cell
+        const tdLoss = document.createElement('td');
+        tdLoss.className = 'font-mono text-sm';
+        if (route) {
+            const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
+            const recentDrops = Number(route.queue_full_drops_recent || 0);
+            if (recentDrops > 0 || drops > 0) {
+                tdLoss.innerHTML = `<span class="text-danger font-weight-600">${drops}</span>`;
+            } else {
+                tdLoss.textContent = String(drops);
+            }
+        } else {
+            tdLoss.textContent = '-';
+        }
+        tr.appendChild(tdLoss);
+
+        // 7. Queue Pressure cell
+        const tdPressure = document.createElement('td');
+        tdPressure.className = 'font-mono text-sm';
+        if (route) {
+            const occ = route.queue_occupancy !== undefined ? route.queue_occupancy : (route.occupancy || 0);
+            const cap = route.queue_capacity !== undefined ? route.queue_capacity : (route.capacity || 0);
+            const pressureStr = `${occ}/${cap}`;
+            if (route.has_pressure === true) {
+                tdPressure.innerHTML = `<span class="badge badge-warn">${pressureStr}</span>`;
+            } else {
+                tdPressure.textContent = pressureStr;
+            }
+        } else {
+            tdPressure.textContent = '-';
+        }
+        tr.appendChild(tdPressure);
+
+        // 8. Status cell
+        const tdStatus = document.createElement('td');
+        if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0))) {
+            tdStatus.innerHTML = `<span class="badge badge-warn">${_('vpn_forwarder_degraded')}</span>`;
+        } else if (s && s.status === 'active') {
+            let activeLabel = _('vpn_status_active');
+            if (!activeLabel || activeLabel === 'vpn_status_active') {
+                activeLabel = (typeof vpnStatusLabel === 'function' ? vpnStatusLabel('active') : '') || _('active') || 'Active';
+            }
+            tdStatus.innerHTML = `<span class="badge badge-success">${activeLabel}</span>`;
+        } else {
+            const otherStatus = s ? (typeof vpnStatusLabel === 'function' ? vpnStatusLabel(s.status) : (s.status || '-')) : '-';
+            tdStatus.innerHTML = `<span class="badge badge-secondary">${otherStatus}</span>`;
+        }
+        tr.appendChild(tdStatus);
+
         return tr;
+    }
+
+    function vpnCreateSessionDrilldownRow(s, route) {
+        if (route === undefined) {
+            route = vpnFindRouteForSession(s);
+        }
+        const tr = document.createElement('tr');
+        tr.className = 'vpn-session-drilldown-row table-empty-state';
+
+        const td = document.createElement('td');
+        td.colSpan = 8;
+        td.style.background = 'var(--bg-surface-secondary, rgba(0,0,0,0.02))';
+        td.style.padding = 'var(--space-md) var(--space-lg)';
+
+        if (!route) {
+            td.innerHTML = `<div class="text-muted" style="font-size: 0.85rem; font-style: italic;">${_('vpn_drilldown_no_telemetry')}</div>`;
+        } else {
+            // 1) Latency Reservoirs (vpn_drilldown_reservoir)
+            const p95Val = (route.reservoir && route.reservoir.p95_ms !== undefined) ? route.reservoir.p95_ms : route.p95_write_ms;
+            const p95Samples = (route.reservoir && route.reservoir.samples !== undefined) ? route.reservoir.samples : (route.p95_write_samples !== undefined ? route.p95_write_samples : 0);
+            const p95Str = (p95Samples === 0 || p95Val === undefined) ? '-' : (Number(p95Val || 0).toFixed(1) + ' ms');
+            const maxVal = (route.reservoir && route.reservoir.max_ms !== undefined) ? route.reservoir.max_ms : (route.max_write_ms !== undefined ? route.max_write_ms : route.oldest_write_ms);
+            const maxStr = (maxVal !== undefined && maxVal !== null) ? (Number(maxVal || 0).toFixed(1) + ' ms') : '-';
+
+            // 2) Queue Dwell & Buffer (vpn_drilldown_dwell)
+            const occ = route.queue_occupancy !== undefined ? route.queue_occupancy : (route.occupancy || 0);
+            const cap = route.queue_capacity !== undefined ? route.queue_capacity : (route.capacity || 0);
+            const hwm = route.high_water !== undefined ? route.high_water : (route.queue_high_water || 0);
+            const dwell = route.queue_dwell_p95_ms !== undefined ? route.queue_dwell_p95_ms : (route.dwell_p95_ms !== undefined ? route.dwell_p95_ms : route.p95_dwell_ms);
+            const dwellStr = (dwell !== undefined && dwell !== null) ? (Number(dwell).toFixed(1) + ' ms') : '-';
+
+            // 3) Errors & Stalls (vpn_drilldown_write_stalls)
+            const stalls = route.write_stalls !== undefined ? route.write_stalls : (route.stalls || 0);
+            const errors = route.write_errors !== undefined ? route.write_errors : (route.errors || 0);
+            const inflight = route.writes_in_flight !== undefined ? route.writes_in_flight : (route.in_flight !== undefined ? route.in_flight : (route.inflight || 0));
+
+            // 4) Traffic Details (vpn_drilldown_traffic_details)
+            let trafficContent = '-';
+            if (route.traffic) {
+                const trf = route.traffic;
+                const rxB = trf.rx_bytes !== undefined ? vpnFormatBytes(trf.rx_bytes) : '-';
+                const txB = trf.tx_bytes !== undefined ? vpnFormatBytes(trf.tx_bytes) : '-';
+                const rxP = trf.rx_packets !== undefined ? trf.rx_packets : (trf.rx_pps !== undefined ? fmtPps(trf.rx_pps) : '-');
+                const txP = trf.tx_packets !== undefined ? trf.tx_packets : (trf.tx_pps !== undefined ? fmtPps(trf.tx_pps) : '-');
+                const rxR = fmtBps(trf.rx_bps !== undefined ? trf.rx_bps : ((trf.rx_bytes_per_sec || 0) * 8));
+                const txR = fmtBps(trf.tx_bps !== undefined ? trf.tx_bps : ((trf.tx_bytes_per_sec || 0) * 8));
+                trafficContent = `
+                    <div style="font-size: 0.8rem; line-height: 1.4;">
+                        <div>Bytes: ↓ ${rxB} ↑ ${txB}</div>
+                        <div>Packets: ↓ ${rxP} ↑ ${txP}</div>
+                        <div>Rate: ↓ ${rxR} ↑ ${txR}</div>
+                    </div>
+                `;
+            }
+
+            td.innerHTML = `
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-md);">
+                    <div class="card" style="padding: var(--space-sm) var(--space-md); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm);">
+                        <div class="text-muted" style="font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">${_('vpn_drilldown_reservoir')}</div>
+                        <div style="font-size: 0.8rem; line-height: 1.4;">
+                            <div>p95: <span class="font-mono">${p95Str}</span></div>
+                            <div>Samples: <span class="font-mono">${p95Samples}</span></div>
+                            <div>Max: <span class="font-mono">${maxStr}</span></div>
+                        </div>
+                    </div>
+                    <div class="card" style="padding: var(--space-sm) var(--space-md); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm);">
+                        <div class="text-muted" style="font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">${_('vpn_drilldown_dwell')}</div>
+                        <div style="font-size: 0.8rem; line-height: 1.4;">
+                            <div>Queue: <span class="font-mono">${occ} / ${cap}</span></div>
+                            <div>High-Water: <span class="font-mono">${hwm}</span></div>
+                            <div>Dwell p95: <span class="font-mono">${dwellStr}</span></div>
+                        </div>
+                    </div>
+                    <div class="card" style="padding: var(--space-sm) var(--space-md); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm);">
+                        <div class="text-muted" style="font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">${_('vpn_drilldown_write_stalls')}</div>
+                        <div style="font-size: 0.8rem; line-height: 1.4;">
+                            <div>Stalls: <span class="font-mono">${stalls}</span></div>
+                            <div>Errors: <span class="font-mono">${errors}</span></div>
+                            <div>In-Flight: <span class="font-mono">${inflight}</span></div>
+                        </div>
+                    </div>
+                    <div class="card" style="padding: var(--space-sm) var(--space-md); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm);">
+                        <div class="text-muted" style="font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">${_('vpn_drilldown_traffic_details')}</div>
+                        <div>${trafficContent}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        tr.appendChild(td);
+        return tr;
+    }
+
+    function vpnToggleSessionDrilldown(s, tr) {
+        const sessId = s ? (s.session_id || s.id) : null;
+        const isExpanded = sessId ? vpnExpandedSessionIds.has(sessId) : (tr.classList && tr.classList.contains('row-expanded'));
+
+        if (isExpanded) {
+            if (sessId) vpnExpandedSessionIds.delete(sessId);
+            if (tr.classList) tr.classList.remove('row-expanded');
+            else tr.className = (tr.className || '').replace(/\brow-expanded\b/g, '').trim();
+
+            const next = tr.nextElementSibling || tr.nextSibling;
+            if (next && ((next.classList && next.classList.contains('vpn-session-drilldown-row')) || (next.className && next.className.includes('vpn-session-drilldown-row')))) {
+                next.remove();
+            }
+        } else {
+            if (sessId) vpnExpandedSessionIds.add(sessId);
+            if (tr.classList) tr.classList.add('row-expanded');
+            else tr.className = ((tr.className || '') + ' row-expanded').trim();
+
+            const next = tr.nextElementSibling || tr.nextSibling;
+            if (next && ((next.classList && next.classList.contains('vpn-session-drilldown-row')) || (next.className && next.className.includes('vpn-session-drilldown-row')))) {
+                next.remove();
+            }
+
+            const route = vpnFindRouteForSession(s);
+            const drilldownRow = vpnCreateSessionDrilldownRow(s, route);
+            if (tr.parentNode) {
+                tr.parentNode.insertBefore(drilldownRow, tr.nextSibling);
+            }
+        }
+    }
+
+    function vpnToggleSessionsProblemFilter() {
+        vpnSessionsFilterOnlyProblems = !vpnSessionsFilterOnlyProblems;
+        const btn = document.getElementById('vpn-sessions-toggle-problems-btn');
+        const textSpan = document.getElementById('vpn-sessions-toggle-problems-text');
+        if (btn) {
+            if (vpnSessionsFilterOnlyProblems) {
+                if (btn.classList) {
+                    btn.classList.remove('btn-ghost');
+                    btn.classList.add('btn-primary');
+                } else {
+                    btn.className = (btn.className || '').replace(/\bbtn-ghost\b/g, '').trim() + ' btn-primary';
+                }
+            } else {
+                if (btn.classList) {
+                    btn.classList.remove('btn-primary');
+                    btn.classList.add('btn-ghost');
+                } else {
+                    btn.className = (btn.className || '').replace(/\bbtn-primary\b/g, '').trim() + ' btn-ghost';
+                }
+            }
+        }
+        if (textSpan) {
+            textSpan.textContent = vpnSessionsFilterOnlyProblems
+                ? _('vpn_show_all_connections')
+                : _('vpn_show_problems_only');
+        }
+        if (vpnLastSessions && vpnLastSessions.sessions) {
+            renderSessions(vpnLastSessions.sessions);
+        }
     }
 
     function vpnRenderSessionsStaleBanner() {
@@ -1089,12 +1424,13 @@
         banner = document.createElement('tr');
         banner.id = 'vpnSessionsStaleBanner';
         banner.className = 'table-empty-state';
+        const safeStaleText = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_sessions_stale') || 'Session data unavailable - showing last known values') : (_('vpn_sessions_stale') || 'Session data unavailable - showing last known values');
         banner.innerHTML = `
-            <td colspan="4" style="padding: var(--space-md);">
+            <td colspan="8" style="padding: var(--space-md);">
                 <div class="empty-state" style="padding: 0;">
                     <div class="empty-title" style="display: flex; align-items: center; justify-content: center; gap: var(--space-sm); font-size: 0.9rem; font-weight: 600; margin: 0; color: var(--warning, #b45309);">
                         <svg class="icon" style="width: 18px; height: 18px; flex-shrink: 0;"><use href="#icon-x"></use></svg>
-                        <span>${UI.escapeHtml(_('vpn_sessions_stale') || 'Session data unavailable - showing last known values')}</span>
+                        <span>${safeStaleText}</span>
                     </div>
                 </div>
             </td>
@@ -1104,38 +1440,57 @@
 
     function renderSessions(sessions) {
         const tbody = document.getElementById('vpn-sessions-tbody');
+        if (!tbody) return;
         tbody.textContent = '';
-        // Apply/clear the stale banner AFTER the wipe: the banner is a
-        // tbody child, so inserting it before the clear would destroy it.
-        // Rows appended below land after it, and NexusTable refreshes
-        // never reorder it (table-empty-state rows are not indexed).
         vpnRenderSessionsStaleBanner();
+
+        const countBadge = document.getElementById('vpn-sessions-count-badge');
+        if (countBadge) {
+            countBadge.textContent = String(sessions ? sessions.length : 0);
+        }
+
+        let sessionsToRender = sessions || [];
+        if (vpnSessionsFilterOnlyProblems) {
+            sessionsToRender = sessionsToRender.filter(function(s) {
+                const route = vpnFindRouteForSession(s);
+                const hasRouteProblem = route && (
+                    route.has_pressure === true ||
+                    Number(route.queue_full_drops_recent || 0) > 0 ||
+                    Number(route.drops || 0) > 0
+                );
+                return hasRouteProblem || (s.status !== 'active');
+            });
+        }
+
         if (vpnSessionsTableInstance) {
-            // Post-init: NexusTable renders its own emptyMessage on refresh,
-            // so never inject a custom empty row here - just update the rows
-            // (possibly zero) and refresh.
-            for (const s of (sessions || [])) {
-                tbody.appendChild(vpnRenderSessionRow(s));
+            for (const s of sessionsToRender) {
+                const route = vpnFindRouteForSession(s);
+                const tr = vpnRenderSessionRow(s, route);
+                tbody.appendChild(tr);
+                const sessId = s ? (s.session_id || s.id) : null;
+                if (sessId && vpnExpandedSessionIds && vpnExpandedSessionIds.has(sessId)) {
+                    const drilldownTr = vpnCreateSessionDrilldownRow(s, route);
+                    tbody.appendChild(drilldownTr);
+                }
             }
             vpnSessionsTableInstance.refresh();
             return;
         }
-        if (!sessions || !sessions.length) {
-            // Pre-init empty state: no NexusTable exists yet to render its
-            // emptyMessage, so build the custom empty row here (and leave
-            // the table uninitialized until real rows arrive).
+
+        if (!sessionsToRender || !sessionsToRender.length) {
             const tr = document.createElement('tr');
             tr.className = 'table-empty-state';
             const td = document.createElement('td');
-            td.colSpan = 4;
+            td.colSpan = 8;
             td.style.padding = 'var(--space-2xl) var(--space-md)';
             td.style.textAlign = 'center';
+            const safeNoSessions = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_no_sessions')) : (_('vpn_no_sessions') || 'No active sessions');
             td.innerHTML = `
                 <div class="empty-state" style="padding: 0;">
                     <div class="empty-icon" style="margin-bottom: var(--space-sm);">
                         <svg class="icon text-muted" style="width: 48px; height: 48px;"><use href="#icon-users"></use></svg>
                     </div>
-                    <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${UI.escapeHtml(_('vpn_no_sessions'))}</div>
+                    <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${safeNoSessions}</div>
                 </div>
             `;
             tr.appendChild(td);
@@ -1143,18 +1498,27 @@
             return;
         }
 
-        for (const s of sessions) {
-            tbody.appendChild(vpnRenderSessionRow(s));
+        for (const s of sessionsToRender) {
+            const route = vpnFindRouteForSession(s);
+            const tr = vpnRenderSessionRow(s, route);
+            tbody.appendChild(tr);
+            const sessId = s ? (s.session_id || s.id) : null;
+            if (sessId && vpnExpandedSessionIds && vpnExpandedSessionIds.has(sessId)) {
+                const drilldownTr = vpnCreateSessionDrilldownRow(s, route);
+                tbody.appendChild(drilldownTr);
+            }
         }
 
-        vpnSessionsTableInstance = new NexusTable('#vpnSessionsTable', {
-            searchable: true,
-            sortable: true,
-            paginate: true,
-            pageSize: 10,
-            searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
-            emptyMessage: _('vpn_no_sessions') || 'No active sessions'
-        });
+        if (typeof NexusTable === 'function') {
+            vpnSessionsTableInstance = new NexusTable('#vpnSessionsTable', {
+                searchable: true,
+                sortable: true,
+                paginate: true,
+                pageSize: 10,
+                searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
+                emptyMessage: _('vpn_no_sessions') || 'No active sessions'
+            });
+        }
     }
 
     function vpnDiagText(key, values) {
@@ -1470,6 +1834,11 @@
             // throughput, routes, or backends while the forwarder is unavailable (#424).
             if (typeof vpnLastStatus !== 'undefined') {
                 vpnLastStatus = null;
+            }
+            if (typeof vpnLastSessions !== 'undefined' && vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
+                if (typeof renderSessions === 'function') {
+                    renderSessions(vpnLastSessions.sessions);
+                }
             }
 
             const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
@@ -2410,6 +2779,12 @@
         // Panel 10: Historical Trends
         if (typeof vpnRenderHistoryCharts === 'function' && status.historical_series) {
             vpnRenderHistoryCharts(status.historical_series);
+        }
+
+        if (typeof vpnLastSessions !== 'undefined' && vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
+            if (typeof renderSessions === 'function') {
+                renderSessions(vpnLastSessions.sessions);
+            }
         }
 
         return isAvailable;

@@ -648,5 +648,18 @@
   "vpn_diag_loss_return_packet_too_large": "return packet too large",
   "vpn_diag_loss_return_backend_device_queue_full": "return backend device queue full",
   "vpn_diag_loss_return_backend_device_shutdown": "return backend device shutdown",
-  "vpn_diag_condition_backend_device_unattributed": "Backend device drops are active but detailed per-direction attribution is unavailable"
+  "vpn_diag_condition_backend_device_unattributed": "Backend device drops are active but detailed per-direction attribution is unavailable",
+  "vpn_col_live_traffic": "Live Traffic",
+  "vpn_col_traffic": "Live Traffic",
+  "vpn_col_packet_loss": "Packet Loss",
+  "vpn_col_queue_pressure": "Queue Pressure",
+  "vpn_show_all_connections": "All Connections",
+  "vpn_show_problems_only": "Problems Only",
+  "vpn_troubleshooting_title": "Connection Diagnostics",
+  "vpn_drilldown_reservoir": "Latency Reservoirs",
+  "vpn_drilldown_dwell": "Queue Dwell & Buffer",
+  "vpn_drilldown_write_stalls": "Errors & Stalls",
+  "vpn_drilldown_write_errors": "Write Errors",
+  "vpn_drilldown_traffic_details": "Traffic Details",
+  "vpn_drilldown_no_telemetry": "Forwarder route telemetry not available for this session"
 }

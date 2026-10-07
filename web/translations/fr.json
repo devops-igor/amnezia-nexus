@@ -648,5 +648,18 @@
   "vpn_diag_loss_return_packet_too_large": "paquet retour trop grand",
   "vpn_diag_loss_return_backend_device_queue_full": "file du périphérique serveur pleine au retour",
   "vpn_diag_loss_return_backend_device_shutdown": "arrêt du périphérique serveur au retour",
-  "vpn_diag_condition_backend_device_unattributed": "les pertes du périphérique serveur sont actives, mais l'attribution détaillée par direction est indisponible"
+  "vpn_diag_condition_backend_device_unattributed": "les pertes du périphérique serveur sont actives, mais l'attribution détaillée par direction est indisponible",
+  "vpn_col_live_traffic": "Trafic en direct",
+  "vpn_col_traffic": "Trafic en direct",
+  "vpn_col_packet_loss": "Perte de paquets",
+  "vpn_col_queue_pressure": "Pression de file",
+  "vpn_show_all_connections": "Toutes les connexions",
+  "vpn_show_problems_only": "Problèmes uniquement",
+  "vpn_troubleshooting_title": "Dépannage des connexions",
+  "vpn_drilldown_reservoir": "Réservoirs de latence",
+  "vpn_drilldown_dwell": "Séjour en file et tampon",
+  "vpn_drilldown_write_stalls": "Erreurs et blocages",
+  "vpn_drilldown_write_errors": "Erreurs d'écriture",
+  "vpn_drilldown_traffic_details": "Détails du trafic",
+  "vpn_drilldown_no_telemetry": "Télémétrie de route du forwarder non disponible pour cette session"
 }

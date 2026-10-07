@@ -39,6 +39,12 @@ func findNodeBinary() (string, error) {
 	return "", errors.New("node binary not found in PATH or standard locations")
 }
 
+func execNodeScript(nodePath, script string) ([]byte, error) {
+	cmd := exec.Command(nodePath)
+	cmd.Stdin = strings.NewReader(script)
+	return cmd.CombinedOutput()
+}
+
 func extractJSFunction(source, funcName string) (string, error) {
 	startIdx := strings.Index(source, funcName)
 	if startIdx == -1 {
@@ -129,6 +135,13 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn-chart-drops",
 			"vpn-chart-latency",
 			"vpn-routes-toggle-all-btn",
+			"vpn-troubleshooting-title",
+			"vpn-sessions-count-badge",
+			"vpn-sessions-toggle-problems-btn",
+			"vpn-sessions-toggle-problems-text",
+			"vpnSessionsTable",
+			"vpn-sessions-tbody",
+			"vpn-sessions-loading",
 		}
 		for _, id := range requiredIDs {
 			if !strings.Contains(vpnStr, fmt.Sprintf(`id="%s"`, id)) {
@@ -172,6 +185,18 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_nominal_peers",
 			"vpn_fwd_nominal_routes",
 			"vpn_fwd_nominal_backends",
+			"vpn_col_live_traffic",
+			"vpn_col_packet_loss",
+			"vpn_col_queue_pressure",
+			"vpn_show_all_connections",
+			"vpn_show_problems_only",
+			"vpn_troubleshooting_title",
+			"vpn_drilldown_reservoir",
+			"vpn_drilldown_dwell",
+			"vpn_drilldown_write_stalls",
+			"vpn_drilldown_write_errors",
+			"vpn_drilldown_traffic_details",
+			"vpn_drilldown_no_telemetry",
 		}
 
 		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
@@ -526,20 +551,93 @@ func vpnDOMMock(t *testing.T, source string) string {
 	}
 	return "const templateIDs = " + string(encoded) + ";\n" + `const assert = require('assert');
 class Element {
- constructor() { this.children=[];this._text='';this._html='';this.style={};this.className='';this.title='';this.open=false;this.attributes={}; }
+ constructor() { this.children=[];this._text='';this._html='';this.style={};this.className='';this.title='';this.open=false;this.attributes={};this.parentNode=null; }
  set textContent(s) { this._text=String(s);this._html='';this.children=[]; }
- get textContent() { return this._text; }
+ get textContent() {
+   if (this._text) return this._text;
+   if (this.children && this.children.length > 0) return this.children.map(c => c.textContent).join('');
+   if (this._html) return this._html.replace(/<[^>]*>/g, '');
+   return '';
+ }
  set innerHTML(s) { this._html=String(s);this._text='';this.children=[]; }
- get innerHTML() { return this._html; }
- appendChild(child) { this.children.push(child);return child; }
- setAttribute(k,v) { this.attributes[k]=String(v); }
+ get innerHTML() {
+   if (this._html) return this._html;
+   if (this.children && this.children.length > 0) return this.children.map(c => c.innerHTML).join('');
+   return '';
+ }
+ appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+ insertBefore(child, ref) {
+   child.parentNode = this;
+   const idx = ref ? this.children.indexOf(ref) : -1;
+   if (idx >= 0) {
+     this.children.splice(idx, 0, child);
+   } else {
+     this.children.push(child);
+   }
+   return child;
+ }
+ remove() {
+   if (this.parentNode && Array.isArray(this.parentNode.children)) {
+     const idx = this.parentNode.children.indexOf(this);
+     if (idx >= 0) this.parentNode.children.splice(idx, 1);
+   }
+ }
+ get nextElementSibling() {
+   if (!this.parentNode || !Array.isArray(this.parentNode.children)) return null;
+   const idx = this.parentNode.children.indexOf(this);
+   if (idx >= 0 && idx + 1 < this.parentNode.children.length) {
+     return this.parentNode.children[idx + 1];
+   }
+   return null;
+ }
+ get nextSibling() { return this.nextElementSibling; }
+ get firstChild() { return this.children && this.children.length > 0 ? this.children[0] : null; }
+ get lastChild() { return this.children && this.children.length > 0 ? this.children[this.children.length - 1] : null; }
+ get classList() {
+   const self = this;
+   return {
+     add(...classes) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       for (const c of classes) set.add(c);
+       self.className = Array.from(set).join(' ');
+     },
+     remove(...classes) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       for (const c of classes) set.delete(c);
+       self.className = Array.from(set).join(' ');
+     },
+     contains(c) {
+       return (self.className || '').split(/\s+/).filter(Boolean).includes(c);
+     },
+     toggle(c, force) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       const has = set.has(c);
+       const want = force !== undefined ? !!force : !has;
+       if (want) set.add(c); else set.delete(c);
+       self.className = Array.from(set).join(' ');
+       return want;
+     }
+   };
+ }
+ set id(val) { this._id = String(val); elements.set(String(val), this); }
+ get id() { return this._id || this.attributes['id'] || ''; }
+ setAttribute(k,v) { this.attributes[k]=String(v); if (k === 'id') { this._id = String(v); elements.set(String(v), this); } }
  getAttribute(k) { return this.attributes[k]; }
+ querySelector() { return null; }
+ querySelectorAll() { return []; }
 }
 const elements = new Map();
+const dynamicIDs = new Set(['vpnSessionsStaleBanner']);
 const document = {
  reset() { elements.clear(); for (const id of templateIDs) elements.set(id,new Element()); },
- getElementById(id) { assert(elements.has(id), 'DOM id missing from actual template: '+id);return elements.get(id); },
- createElement() { return new Element(); }
+ getElementById(id) {
+   if (elements.has(id)) return elements.get(id);
+   if (dynamicIDs.has(id)) return null;
+   assert(elements.has(id), 'DOM id missing from actual template: '+id);
+   return null;
+ },
+ createElement() { return new Element(); },
+ createTextNode(s) { const el = new Element(); el.textContent = String(s); return el; }
 };
 document.reset();
 `
@@ -1359,7 +1457,7 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			script := vpnDiagnosticsLocalizationScript(t, source, lang)
-			if out, err := exec.Command(nodePath, "-e", script).CombinedOutput(); err != nil {
+			if out, err := execNodeScript(nodePath, script); err != nil {
 				t.Fatalf("locale renderer: %v\n%s", err, out)
 			}
 		})
@@ -1417,7 +1515,7 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 	}
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		{"HardcodedTrafficState", "_('vpn_diag_traffic_unavailable')", "'Traffic unavailable'", "traffic state"},
-		{"WrongAuthoritativeSeverity", "_('vpn_forwarder_degraded')", "_('vpn_forwarder_warning')", "authoritative severity DEGRADED"},
+		{"WrongAuthoritativeSeverity", "statusText.textContent = _('vpn_forwarder_degraded');", "statusText.textContent = _('vpn_forwarder_warning');", "authoritative severity DEGRADED"},
 		{"HardcodedRouteLabel", "_('vpn_diag_assigned_address')", "'Assigned address'", "route label"},
 		{"HardcodedHistoryLabel", "_('vpn_diag_rx_direction')", "'RX client to backend (bps)'", "history direction label"},
 		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
@@ -1427,7 +1525,7 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 				t.Fatal("renderer mutation target missing")
 			}
 			mutated := strings.Replace(source, mutation.before, mutation.after, 1)
-			out, err := exec.Command(nodePath, "-e", vpnDiagnosticsLocalizationScript(t, mutated, lang)).CombinedOutput()
+			out, err := execNodeScript(nodePath, vpnDiagnosticsLocalizationScript(t, mutated, lang))
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
 				t.Fatalf("mutation escaped its behavioral oracle: %v\n%s", err, out)
 			}
@@ -1574,7 +1672,7 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
 			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
-			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("backend KPI alarm coverage: %v\n%s", err, out)
 			}
@@ -1629,7 +1727,7 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 			}
 			mutated := strings.Replace(original, mutation.before, mutation.after, 1)
 			script := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
-			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			out, err := execNodeScript(node, script)
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
 				t.Fatalf("mutation escaped its acceptance oracle: %v\n%s", err, out)
 			}
@@ -1708,7 +1806,7 @@ func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
 			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
-			out, err := exec.Command(node, "-e", script).CombinedOutput()
+			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("unattributed condition rendering: %v\n%s", err, out)
 			}
@@ -1807,7 +1905,7 @@ vpnRenderForwarderHealth(null);
 assert.strictEqual(text('vpn-diag-drop-reasons'),'-');
 assert.strictEqual(document.getElementById('vpn-diag-drop-reasons').children.length,0);
 `)
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("current observations: %v\n%s", err, out)
 	}
 }
@@ -1823,7 +1921,7 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 	}
 	mutated := strings.Replace(string(source), `id="vpn-diag-vtun-upstream"`, `id="vpn-diag-vtun-typo"`, 1)
 	script := vpnDiagnosticsHealthScript(t, mutated, `vpnRenderForwarderHealth({forwarder_available:true});`)
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err == nil ||
+	if out, err := execNodeScript(node, script); err == nil ||
 		!strings.Contains(string(out), "DOM id missing from actual template: vpn-diag-vtun-upstream") {
 		t.Fatalf("template ID mutation escaped DOM oracle: %v", err)
 	}
@@ -1907,7 +2005,7 @@ assert.strictEqual(el('vpn-kpi-packet-loss-sub').style.display, 'none');
 `
 
 	script := vpnDiagnosticsHealthScript(t, string(source), assertions)
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("decoupling test failed: %v\n%s", err, out)
 	}
 
@@ -1926,7 +2024,7 @@ assert.strictEqual(text('vpn-fwd-counters-since'), 'Счетчики с: 2026-10
 assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Текущий / Онлайн: 0.00 pps | С запуска / Сброса: 109');
 `
 	ruScript := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
-	if out, err := exec.Command(node, "-e", ruScript).CombinedOutput(); err != nil {
+	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian decoupling test failed: %v\n%s", err, out)
 	}
 }
@@ -2048,7 +2146,7 @@ assert.strictEqual(el('vpn-fwd-problem-list').textContent, '');
 `
 
 	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("progressive disclosure & active problems test failed: %v\n%s", err, out)
 	}
 
@@ -2070,7 +2168,405 @@ assert.strictEqual(
 );
 `
 	ruScript := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
-	if out, err := exec.Command(node, "-e", ruScript).CombinedOutput(); err != nil {
+	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian progressive disclosure nominal badge test failed: %v\n%s", err, out)
+	}
+}
+
+func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assertions string) string {
+	t.Helper()
+	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, lang)
+	for _, name := range []string{
+		"fmtBps",
+		"fmtPps",
+		"vpnFormatBytes",
+		"vpnFormatPeerKey",
+		"vpnFindRouteForSession",
+		"vpnRenderSessionRow",
+		"vpnCreateSessionDrilldownRow",
+		"vpnToggleSessionDrilldown",
+		"vpnToggleSessionsProblemFilter",
+		"vpnRenderSessionsStaleBanner",
+		"renderSessions",
+		"vpnRenderForwarderHealth",
+	} {
+		function, err := extractJSFunction(source, "function "+name)
+		if err != nil {
+			t.Fatalf("extractJSFunction %s: %v", name, err)
+		}
+		script += "\n" + function
+	}
+	return script + `
+let vpnLastSessions = null;
+let vpnSessionsStale = false;
+let vpnSessionsFilterOnlyProblems = false;
+let vpnLastStatus = null;
+let vpnExpandedSessionIds = new Set();
+let vpnSessionsTableInstance = null;
+const UI = { escapeHtml: escapeHtml };
+` + assertions
+}
+
+func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	// Structural invariants in template
+	for _, requiredID := range []string{
+		"vpnSessionsTable",
+		"vpn-troubleshooting-title",
+		"vpn-sessions-count-badge",
+		"vpn-sessions-toggle-problems-btn",
+		"vpn-sessions-toggle-problems-text",
+		"vpn-sessions-tbody",
+		"vpn-sessions-loading",
+	} {
+		if !strings.Contains(tmplStr, `id="`+requiredID+`"`) {
+			t.Fatalf("vpn.html missing required ID %q", requiredID)
+		}
+	}
+
+	// 1. English DOM assertions: 8 columns, correlation, telemetry, drilldown, and problem filter
+	enAssertions := `
+const tbody = document.getElementById('vpn-sessions-tbody');
+const countBadge = document.getElementById('vpn-sessions-count-badge');
+const filterBtn = document.getElementById('vpn-sessions-toggle-problems-btn');
+const filterText = document.getElementById('vpn-sessions-toggle-problems-text');
+
+// Telemetry status payload with 2 routes
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [
+        {
+            assigned_ip: '10.8.0.2',
+            connection_id: 101,
+            session_id: 'sess-1',
+            occupancy: 12,
+            capacity: 100,
+            drops: 0,
+            queue_full_drops_recent: 0,
+            has_pressure: false,
+            traffic: {
+                available: true,
+                rx_bps: 1000000,
+                tx_bps: 2000000,
+                rx_bytes: 1048576,
+                tx_bytes: 2097152,
+                rx_packets: 1500,
+                tx_packets: 2500
+            },
+            reservoir: {
+                p95_ms: 4.2,
+                samples: 100,
+                max_ms: 12.5
+            },
+            high_water: 45,
+            queue_dwell_p95_ms: 3.1,
+            write_stalls: 0,
+            write_errors: 0,
+            writes_in_flight: 1
+        },
+        {
+            assigned_ip: '10.8.0.3',
+            connection_id: 102,
+            session_id: 'sess-2',
+            occupancy: 90,
+            capacity: 100,
+            drops: 15,
+            queue_full_drops_recent: 5,
+            has_pressure: true,
+            traffic: {
+                available: true,
+                rx_bps: 500000,
+                tx_bps: 100000,
+                rx_bytes: 524288,
+                tx_bytes: 1048576
+            },
+            reservoir: {
+                p95_ms: 22.8,
+                samples: 40,
+                max_ms: 85.0
+            },
+            high_water: 95,
+            queue_dwell_p95_ms: 18.4,
+            write_stalls: 3,
+            write_errors: 1,
+            writes_in_flight: 4
+        }
+    ]
+};
+
+const sessions = [
+    {
+        id: 1,
+        session_id: 'sess-1',
+        connection_id: 101,
+        username: 'alice',
+        connection_name: 'alice-phone',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.2',
+        status: 'active'
+    },
+    {
+        id: 2,
+        session_id: 'sess-2',
+        connection_id: 102,
+        username: 'bob',
+        connection_name: 'bob-laptop',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.3',
+        status: 'active'
+    },
+    {
+        id: 3,
+        session_id: 'sess-3',
+        connection_id: 103,
+        username: 'charlie',
+        connection_name: 'charlie-pc',
+        server_name: 'Frankfurt-2',
+        assigned_ip: '10.8.0.99',
+        status: 'active'
+    }
+];
+
+vpnLastSessions = { sessions: sessions };
+renderSessions(sessions);
+
+// Assertion 1: Count badge and row count
+assert.strictEqual(countBadge.textContent, '3', 'badge count must match session count');
+assert.strictEqual(tbody.children.length, 3, 'table must render 3 session rows');
+
+// Row 0 (alice - nominal correlated route):
+const row0 = tbody.children[0];
+assert.strictEqual(row0.children.length, 8, 'session row must have 8 columns');
+assert(row0.children[0].textContent.includes('alice'), 'col 0 must render username');
+assert.strictEqual(row0.children[0].style.cursor, 'pointer', 'user cell must have pointer style');
+assert(row0.children[0].innerHTML.includes('vpn-expand-icon'), 'user cell must render chevron icon');
+assert.strictEqual(row0.children[1].textContent, 'alice-phone', 'col 1 must render config name');
+assert.strictEqual(row0.children[2].textContent, 'Frankfurt-1', 'col 2 must render server name');
+assert.strictEqual(row0.children[3].textContent, '10.8.0.2', 'col 3 must render assigned IP');
+assert(row0.children[4].textContent.includes('1.00 Mbps') && row0.children[4].textContent.includes('2.00 Mbps'), 'col 4 must render live traffic rates');
+assert.strictEqual(row0.children[5].textContent, '0', 'col 5 must render 0 drops');
+assert.strictEqual(row0.children[6].textContent, '12/100', 'col 6 must render queue occupancy/capacity');
+assert(row0.children[7].textContent.includes('Active'), 'col 7 must render Active status badge');
+
+// Row 1 (bob - degraded correlated route):
+const row1 = tbody.children[1];
+assert.strictEqual(row1.children.length, 8);
+assert(row1.children[0].textContent.includes('bob'));
+assert(row1.children[5].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
+assert(row1.children[5].textContent.includes('15'), 'drops count must be 15');
+assert(row1.children[6].innerHTML.includes('badge-warn'), 'queue pressure must be styled with badge-warn');
+assert.strictEqual(row1.children[6].textContent, '90/100');
+assert(row1.children[7].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
+assert(row1.children[7].textContent.includes('Degraded'), 'status text must show Degraded');
+
+// Row 2 (charlie - active session without route):
+const row2 = tbody.children[2];
+assert.strictEqual(row2.children.length, 8);
+assert(row2.children[0].textContent.includes('charlie'));
+assert.strictEqual(row2.children[4].textContent, '-', 'traffic must be dash when route is absent');
+assert.strictEqual(row2.children[5].textContent, '-', 'loss must be dash when route is absent');
+assert.strictEqual(row2.children[6].textContent, '-', 'pressure must be dash when route is absent');
+assert(row2.children[7].textContent.includes('Active'), 'nominal session without route stays Active');
+
+// Assertion 2: Expandable drilldown with 4 telemetry cards
+vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
+assert(vpnExpandedSessionIds.has('sess-1'), 'session ID must be tracked in expanded set');
+assert(tbody.children[0].classList.contains('row-expanded'), 'row must gain row-expanded class');
+assert.strictEqual(tbody.children.length, 4, 'tbody must have drilldown row inserted');
+const drilldown0 = tbody.children[1];
+assert(drilldown0.className.includes('vpn-session-drilldown-row'), 'drilldown row must have correct class');
+assert.strictEqual(drilldown0.children[0].colSpan, 8, 'drilldown td must span all 8 columns');
+
+// 4 cards in drilldown:
+assert(drilldown0.innerHTML.includes('Latency Reservoirs'), 'drilldown must contain Latency Reservoirs card');
+assert(drilldown0.textContent.includes('4.2 ms'), 'drilldown must show p95 reservoir latency');
+assert(drilldown0.textContent.includes('100'), 'drilldown must show samples count');
+assert(drilldown0.textContent.includes('12.5 ms'), 'drilldown must show max latency');
+
+assert(drilldown0.innerHTML.includes('Queue Dwell & Buffer'), 'drilldown must contain Queue Dwell card');
+assert(drilldown0.textContent.includes('12 / 100'), 'drilldown must show queue occupancy');
+assert(drilldown0.textContent.includes('45'), 'drilldown must show high water mark');
+assert(drilldown0.textContent.includes('3.1 ms'), 'drilldown must show queue dwell p95');
+
+assert(drilldown0.innerHTML.includes('Errors & Stalls'), 'drilldown must contain Errors & Stalls card');
+assert(drilldown0.textContent.includes('Stalls: 0'), 'drilldown must show write stalls');
+assert(drilldown0.textContent.includes('Errors: 0'), 'drilldown must show write errors');
+assert(drilldown0.textContent.includes('In-Flight: 1'), 'drilldown must show writes in-flight');
+
+assert(drilldown0.innerHTML.includes('Traffic Details'), 'drilldown must contain Traffic Details card');
+assert(drilldown0.textContent.includes('1 MB') || drilldown0.textContent.includes('1.00 MB') || drilldown0.textContent.includes('1048576'), 'drilldown must show traffic bytes');
+assert(drilldown0.textContent.includes('1.00 Mbps'), 'drilldown must show traffic rate');
+
+// Collapse alice's drilldown
+vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
+assert(!vpnExpandedSessionIds.has('sess-1'), 'session ID must be removed on collapse');
+assert(!tbody.children[0].classList.contains('row-expanded'), 'row-expanded class must be removed');
+assert.strictEqual(tbody.children.length, 3, 'drilldown row must be removed from tbody');
+
+// Assertion 3: Expandable drilldown for session without route displays vpn_drilldown_no_telemetry
+const charlieRow = tbody.children[2];
+vpnToggleSessionDrilldown(sessions[2], charlieRow);
+assert.strictEqual(tbody.children.length, 4, 'charlie drilldown row must be inserted');
+const charlieDrilldown = tbody.children[3];
+assert(charlieDrilldown.textContent.includes('Forwarder route telemetry not available for this session'), 'must display no-telemetry notice');
+// Collapse charlie
+vpnToggleSessionDrilldown(sessions[2], charlieRow);
+assert.strictEqual(tbody.children.length, 3);
+
+// Assertion 4: Problem filter toggle
+// Filter ON:
+vpnToggleSessionsProblemFilter();
+assert.strictEqual(vpnSessionsFilterOnlyProblems, true, 'filter flag must be true');
+assert(filterBtn.classList.contains('btn-primary'), 'filter button must gain btn-primary');
+assert.strictEqual(filterText.textContent, 'All Connections', 'filter button text must toggle to show all');
+assert.strictEqual(tbody.children.length, 1, 'only degraded sessions must remain');
+assert(tbody.children[0].textContent.includes('bob'), 'bob must be visible in problem filter');
+
+// Filter OFF:
+vpnToggleSessionsProblemFilter();
+assert.strictEqual(vpnSessionsFilterOnlyProblems, false, 'filter flag must be false');
+assert(filterBtn.classList.contains('btn-ghost'), 'filter button must gain btn-ghost');
+assert.strictEqual(filterText.textContent, 'Problems Only', 'filter button text must toggle to problems only');
+assert.strictEqual(tbody.children.length, 3, 'all sessions must return');
+
+// Assertion 5: Forwarder polling sync re-renders session route metrics
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [
+        {
+            assigned_ip: '10.8.0.2',
+            connection_id: 101,
+            session_id: 'sess-1',
+            occupancy: 95,
+            capacity: 100,
+            drops: 42,
+            queue_full_drops_recent: 12,
+            has_pressure: true,
+            traffic: { rx_bps: 4000000, tx_bps: 8000000 }
+        }
+    ]
+};
+vpnRenderForwarderHealth(vpnLastStatus);
+assert.strictEqual(tbody.children.length, 3);
+const updatedAlice = tbody.children[0];
+assert(updatedAlice.children[4].textContent.includes('4.00 Mbps') && updatedAlice.children[4].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
+assert(updatedAlice.children[5].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
+assert(updatedAlice.children[6].innerHTML.includes('badge-warn'), 'queue pressure must update dynamically');
+assert.strictEqual(updatedAlice.children[6].textContent, '95/100');
+assert(updatedAlice.children[7].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
+`
+
+	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", enAssertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("English connection troubleshooting table test failed: %v\n%s", err, out)
+	}
+
+	// 2. Russian locale assertions: table headers, problem button, drilldown titles, and degraded status
+	ruAssertions := `
+const tbody = document.getElementById('vpn-sessions-tbody');
+const filterBtn = document.getElementById('vpn-sessions-toggle-problems-btn');
+const filterText = document.getElementById('vpn-sessions-toggle-problems-text');
+
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [
+        {
+            assigned_ip: '10.8.0.10',
+            connection_id: 201,
+            session_id: 'sess-ru-1',
+            occupancy: 88,
+            capacity: 100,
+            drops: 8,
+            queue_full_drops_recent: 2,
+            has_pressure: true,
+            traffic: { rx_bps: 1000000, tx_bps: 2000000 },
+            reservoir: { p95_ms: 15.0, samples: 50, max_ms: 30.0 },
+            high_water: 90,
+            queue_dwell_p95_ms: 12.0,
+            write_stalls: 1,
+            write_errors: 0,
+            writes_in_flight: 2
+        }
+    ]
+};
+
+const sessions = [
+    {
+        id: 1,
+        session_id: 'sess-ru-1',
+        connection_id: 201,
+        username: 'иван',
+        connection_name: 'иван-офис',
+        server_name: 'Москва-1',
+        assigned_ip: '10.8.0.10',
+        status: 'active'
+    },
+    {
+        id: 2,
+        session_id: 'sess-ru-2',
+        connection_id: 202,
+        username: 'петр',
+        connection_name: 'петр-дом',
+        server_name: 'Москва-1',
+        assigned_ip: '10.8.0.20',
+        status: 'active'
+    }
+];
+
+vpnLastSessions = { sessions: sessions };
+renderSessions(sessions);
+
+// Russian problem filter button text
+vpnToggleSessionsProblemFilter();
+assert.strictEqual(filterText.textContent, 'Все подключения', 'toggled filter text in Russian');
+vpnToggleSessionsProblemFilter();
+assert.strictEqual(filterText.textContent, 'Только с проблемами', 'reverted filter text in Russian');
+
+// Russian degraded status badge
+const row0 = tbody.children[0];
+assert(row0.children[7].textContent.includes('Деградировано'), 'Russian degraded status label');
+
+// Russian drilldown cards titles
+vpnToggleSessionDrilldown(sessions[0], row0);
+const drilldownRow = tbody.children[1];
+assert(drilldownRow.innerHTML.includes('Резервуары задержки'), 'Russian drilldown reservoir card');
+assert(drilldownRow.innerHTML.includes('Буфер и задержка в очереди'), 'Russian drilldown dwell card');
+assert(drilldownRow.innerHTML.includes('Ошибки и задержки записи'), 'Russian drilldown stalls card');
+assert(drilldownRow.innerHTML.includes('Детализация трафика'), 'Russian drilldown traffic card');
+
+// Russian drilldown fallback when no telemetry
+const row1 = tbody.children[2];
+vpnToggleSessionDrilldown(sessions[1], row1);
+const drilldown1 = tbody.children[3];
+assert(drilldown1.textContent.includes('Телеметрия маршрута форвардера недоступна для этой сессии'), 'Russian drilldown no-telemetry fallback');
+`
+
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
+	if out, err := execNodeScript(node, ruScript); err != nil {
+		t.Fatalf("Russian connection troubleshooting table test failed: %v\n%s", err, out)
+	}
+
+	// 3. Rendered template localized headers verification in Russian
+	ruDict := vpnDiagnosticsLocale(t, "ru")
+	renderedHTML := vpnDiagnosticsRenderedHTML(t, tmplStr, ruDict)
+	for _, expectedRussianHeader := range []string{
+		"Текущий трафик",
+		"Потеря пакетов",
+		"Нагрузка на очередь",
+		"Диагностика подключений",
+		"Только с проблемами",
+	} {
+		if !strings.Contains(renderedHTML, expectedRussianHeader) {
+			t.Fatalf("rendered Russian template missing header %q", expectedRussianHeader)
+		}
 	}
 }

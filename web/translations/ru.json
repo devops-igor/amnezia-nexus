@@ -648,5 +648,18 @@
   "vpn_diag_loss_return_packet_too_large": "обратный пакет слишком большой",
   "vpn_diag_loss_return_backend_device_queue_full": "очередь устройства бэкенда на возврате заполнена",
   "vpn_diag_loss_return_backend_device_shutdown": "остановка устройства бэкенда на возврате",
-  "vpn_diag_condition_backend_device_unattributed": "потери устройства бэкенда активны, но подробная атрибуция по направлениям недоступна"
+  "vpn_diag_condition_backend_device_unattributed": "потери устройства бэкенда активны, но подробная атрибуция по направлениям недоступна",
+  "vpn_col_live_traffic": "Текущий трафик",
+  "vpn_col_traffic": "Текущий трафик",
+  "vpn_col_packet_loss": "Потеря пакетов",
+  "vpn_col_queue_pressure": "Нагрузка на очередь",
+  "vpn_show_all_connections": "Все подключения",
+  "vpn_show_problems_only": "Только с проблемами",
+  "vpn_troubleshooting_title": "Диагностика подключений",
+  "vpn_drilldown_reservoir": "Резервуары задержки",
+  "vpn_drilldown_dwell": "Буфер и задержка в очереди",
+  "vpn_drilldown_write_stalls": "Ошибки и задержки записи",
+  "vpn_drilldown_write_errors": "Ошибки записи",
+  "vpn_drilldown_traffic_details": "Детализация трафика",
+  "vpn_drilldown_no_telemetry": "Телеметрия маршрута форвардера недоступна для этой сессии"
 }

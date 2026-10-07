@@ -648,5 +648,18 @@
   "vpn_diag_loss_return_packet_too_large": "بسته بازگشت بیش از حد بزرگ",
   "vpn_diag_loss_return_backend_device_queue_full": "صف دستگاه سرور پشتیبان بازگشت پر است",
   "vpn_diag_loss_return_backend_device_shutdown": "خاموشی دستگاه سرور پشتیبان بازگشت",
-  "vpn_diag_condition_backend_device_unattributed": "حذف دستگاه سرور پشتیبان فعال است، اما انتساب دقیق جهت‌به‌جهت در دسترس نیست"
+  "vpn_diag_condition_backend_device_unattributed": "حذف دستگاه سرور پشتیبان فعال است، اما انتساب دقیق جهت‌به‌جهت در دسترس نیست",
+  "vpn_col_live_traffic": "ترافیک زنده",
+  "vpn_col_traffic": "ترافیک زنده",
+  "vpn_col_packet_loss": "از دست رفتن بسته‌ها",
+  "vpn_col_queue_pressure": "فشار صف",
+  "vpn_show_all_connections": "همه اتصالات",
+  "vpn_show_problems_only": "فقط موارد مشکل‌دار",
+  "vpn_troubleshooting_title": "عیب‌یابی اتصالات",
+  "vpn_drilldown_reservoir": "مخازن تاخیر",
+  "vpn_drilldown_dwell": "بافر و ماندگاری صف",
+  "vpn_drilldown_write_stalls": "خطاها و توقف‌ها",
+  "vpn_drilldown_write_errors": "خطاهای نوشتن",
+  "vpn_drilldown_traffic_details": "جزئیات ترافیک",
+  "vpn_drilldown_no_telemetry": "تله‌متری مسیر فورواردر برای این نشست در دسترس نیست"
 }
