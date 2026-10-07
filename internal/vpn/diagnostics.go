@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -112,11 +113,29 @@ type HealthCondition struct {
 	MessageKey string `json:"message_key,omitempty"`
 }
 
+// ActionableProblem describes an actionable, correlated problem affecting a specific
+// connection, session, user, or route in the dataplane.
+type ActionableProblem struct {
+	Severity       string    `json:"severity"` // CRITICAL, DEGRADED, WARNING
+	Category       string    `json:"category"` // routing, dataplane, etc.
+	Message        string    `json:"message"`
+	MessageKey     string    `json:"message_key,omitempty"`
+	UserID         string    `json:"user_id,omitempty"`
+	Username       string    `json:"username,omitempty"`
+	ConnectionID   string    `json:"connection_id,omitempty"`
+	ConnectionName string    `json:"connection_name,omitempty"`
+	AssignedIP     string    `json:"assigned_ip,omitempty"`
+	BackendID      int64     `json:"backend_id,omitempty"`
+	ObservedRate   string    `json:"observed_rate,omitempty"`
+	FirstObserved  time.Time `json:"first_observed,omitempty"`
+}
+
 // ForwarderHealthAssessment contains the overall rule-based health diagnosis.
 type ForwarderHealthAssessment struct {
-	Status     string            `json:"status"` // HEALTHY, DEGRADED, CRITICAL, UNAVAILABLE
-	Summary    string            `json:"summary"`
-	Conditions []HealthCondition `json:"conditions"`
+	Status             string              `json:"status"` // HEALTHY, DEGRADED, CRITICAL, UNAVAILABLE
+	Summary            string              `json:"summary"`
+	Conditions         []HealthCondition   `json:"conditions"`
+	ActionableProblems []ActionableProblem `json:"actionable_problems,omitempty"`
 }
 
 // TrafficRates tracks instantaneous throughput and moving averages.
@@ -411,8 +430,17 @@ type BackendsDiagnostics struct {
 	Backends         []BackendTelemetryItem `json:"backends"`
 }
 
+// RouteReservoirItem holds write latency reservoir stats for drilldown telemetry.
+type RouteReservoirItem struct {
+	P95MS   float64 `json:"p95_ms"`
+	Samples int     `json:"samples"`
+	MaxMS   float64 `json:"max_ms"`
+}
+
 // ProblemRouteItem represents per-route diagnostics.
 type ProblemRouteItem struct {
+	SessionID            string                    `json:"session_id,omitempty"`
+	ConnectionID         string                    `json:"connection_id,omitempty"`
 	UtilizationPct       float64                   `json:"utilization_pct"`
 	HighWaterPct         float64                   `json:"high_water_pct"`
 	WriteCount           uint64                    `json:"write_count"`
@@ -436,6 +464,8 @@ type ProblemRouteItem struct {
 	HighWater            int                       `json:"high_water"`
 	Drops                uint64                    `json:"drops"`
 	P95WriteMS           float64                   `json:"p95_write_ms"`
+	QueueDwellP95MS      float64                   `json:"queue_dwell_p95_ms,omitempty"`
+	Reservoir            *RouteReservoirItem       `json:"reservoir,omitempty"`
 	HasPressure          bool                      `json:"has_pressure"`
 	PressureNote         string                    `json:"pressure_note,omitempty"`
 }
@@ -1202,6 +1232,7 @@ func EvaluateForwarderHealth(
 	routing RoutingConsistencyDiagnostics,
 	handshake HandshakeFreshnessDiagnostics,
 	backends BackendsDiagnostics,
+	actionable ...ActionableProblem,
 ) ForwarderHealthAssessment {
 	if !fwdAvailable || !engineRunning {
 		return ForwarderHealthAssessment{
@@ -1214,6 +1245,7 @@ func EvaluateForwarderHealth(
 					Message:  "Forwarder dataplane is not active",
 				},
 			},
+			ActionableProblems: actionable,
 		}
 	}
 
@@ -1227,9 +1259,10 @@ func EvaluateForwarderHealth(
 	status, summary := summarizeHealthConditions(conditions)
 
 	return ForwarderHealthAssessment{
-		Status:     status,
-		Summary:    summary,
-		Conditions: conditions,
+		Status:             status,
+		Summary:            summary,
+		Conditions:         conditions,
+		ActionableProblems: actionable,
 	}
 }
 
@@ -1832,13 +1865,33 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			utilization = float64(r.Stats.Occupancy) / float64(r.Stats.Capacity) * 100
 			highWaterPct = float64(r.Stats.HighWater) / float64(r.Stats.Capacity) * 100
 		}
+		var reservoir *RouteReservoirItem
+		if r.Stats.P95WriteSamples > 0 || r.Stats.MaxWriteDurationMS > 0 || r.Stats.P95WriteMS > 0 {
+			reservoir = &RouteReservoirItem{
+				P95MS:   float64(r.Stats.P95WriteMS),
+				Samples: r.Stats.P95WriteSamples,
+				MaxMS:   float64(r.Stats.MaxWriteDurationMS),
+			}
+		}
 		items[i] = ProblemRouteItem{
-			UtilizationPct: utilization, HighWaterPct: highWaterPct,
-			WriteCount: r.Stats.WriteCount, WriteErrors: r.Stats.WriteErrors, WriteStalls: r.Stats.WriteStalls,
-			WritesInFlight: r.Stats.WritesInFlight, OldestWriteMS: r.Stats.OldestWriteMS, MaxWriteMS: r.Stats.MaxWriteDurationMS,
+			SessionID:            r.SessionID,
+			ConnectionID:         r.ConnectionID,
+			Reservoir:            reservoir,
+			UtilizationPct:       utilization,
+			HighWaterPct:         highWaterPct,
+			WriteCount:           r.Stats.WriteCount,
+			WriteErrors:          r.Stats.WriteErrors,
+			WriteStalls:          r.Stats.WriteStalls,
+			WritesInFlight:       r.Stats.WritesInFlight,
+			OldestWriteMS:        r.Stats.OldestWriteMS,
+			MaxWriteMS:           r.Stats.MaxWriteDurationMS,
 			P95WriteSamples:      r.Stats.P95WriteSamples,
-			QueueFullDropsRecent: r.Stats.QueueFullDropsRecent, WriteErrorsRecent: r.Stats.WriteErrorsRecent, WriteStallsRecent: r.Stats.WriteStallsRecent,
-			Traffic: r.Traffic, SessionAgeSec: r.SessionAgeSec, LastTrafficAgeSec: r.LastTrafficAgeSec,
+			QueueFullDropsRecent: r.Stats.QueueFullDropsRecent,
+			WriteErrorsRecent:    r.Stats.WriteErrorsRecent,
+			WriteStallsRecent:    r.Stats.WriteStallsRecent,
+			Traffic:              r.Traffic,
+			SessionAgeSec:        r.SessionAgeSec,
+			LastTrafficAgeSec:    r.LastTrafficAgeSec,
 			// Redacted at the API boundary, not in the UI (issue #424 round 4,
 			// item E). The JSON payload IS the disclosure surface: a raw peer
 			// public key shipped to a browser, a log shipper or a support
@@ -2575,6 +2628,7 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	}
 
 	// 10. Centralized Rule-Based Health Assessment
+	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions)
 	status.HealthAssessment = EvaluateForwarderHealth(
 		status.ForwarderAvailable,
 		status.EngineRunning,
@@ -2586,5 +2640,273 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 		status.RoutingConsistency,
 		status.HandshakeFreshness,
 		status.Backends,
+		actionableProblems...,
 	)
+}
+
+// SynthesizeActionableProblems derives per-session/route actionable problem records
+// by correlating active routes, route pressure, and active VPN sessions.
+func SynthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+	problems := synthesizeUnroutableSessionProblems(routes, sessions)
+	for _, r := range routes {
+		sess, hasSess := findSessionForRoute(r, sessions)
+		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess)...)
+	}
+	sortActionableProblems(problems)
+	return problems
+}
+
+func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bool) {
+	if r.SessionID != "" {
+		for _, s := range sessions {
+			if s.ID == r.SessionID {
+				return s, true
+			}
+		}
+	}
+	if r.PeerKey != "" {
+		for _, s := range sessions {
+			if s.PeerPublicKey == r.PeerKey {
+				return s, true
+			}
+		}
+	}
+	if r.AssignedIP != "" {
+		for _, s := range sessions {
+			if s.AssignedIP == r.AssignedIP {
+				return s, true
+			}
+		}
+	}
+	return Session{}, false
+}
+
+func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+	routesByPeer := make(map[string]struct{}, len(routes))
+	routesByIP := make(map[string]struct{}, len(routes))
+	routesBySessionID := make(map[string]struct{}, len(routes))
+	for _, r := range routes {
+		if r.PeerKey != "" {
+			routesByPeer[r.PeerKey] = struct{}{}
+		}
+		if r.AssignedIP != "" {
+			routesByIP[r.AssignedIP] = struct{}{}
+		}
+		if r.SessionID != "" {
+			routesBySessionID[r.SessionID] = struct{}{}
+		}
+	}
+
+	var problems []ActionableProblem
+	for _, sess := range sessions {
+		if sess.Status != "" && sess.Status != "connected" {
+			continue
+		}
+		_, hasPeer := routesByPeer[sess.PeerPublicKey]
+		_, hasIP := routesByIP[sess.AssignedIP]
+		_, hasSess := routesBySessionID[sess.ID]
+		if !hasPeer && !hasIP && !hasSess {
+			problems = append(problems, ActionableProblem{
+				Severity:       "CRITICAL",
+				Category:       "routing",
+				Message:        fmt.Sprintf("Active session %s has no forwarder route", sess.ID),
+				MessageKey:     "vpn_problem_session_without_route",
+				UserID:         sess.UserID,
+				ConnectionName: sess.ConnectionName,
+				AssignedIP:     sess.AssignedIP,
+				BackendID:      sess.BackendTunnelID,
+				FirstObserved:  sess.ConnectedAt,
+			})
+		}
+	}
+	return problems
+}
+
+func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSess bool) []ActionableProblem {
+	var problems []ActionableProblem
+	var userID, connName string
+	var firstObserved time.Time
+	if hasSess {
+		userID = sess.UserID
+		connName = sess.ConnectionName
+		firstObserved = sess.ConnectedAt
+	}
+	connID := r.ConnectionID
+
+	if r.Stats.QueueFullDropsRecent > 0 {
+		problems = append(problems, ActionableProblem{
+			Severity:       "DEGRADED",
+			Category:       "dataplane",
+			Message:        fmt.Sprintf("Return queue full drops (%d recent) for %s", r.Stats.QueueFullDropsRecent, r.AssignedIP),
+			MessageKey:     "vpn_problem_route_queue_drops",
+			UserID:         userID,
+			ConnectionID:   connID,
+			ConnectionName: connName,
+			AssignedIP:     r.AssignedIP,
+			BackendID:      r.BackendTunnelID,
+			ObservedRate:   fmt.Sprintf("%d drops", r.Stats.QueueFullDropsRecent),
+			FirstObserved:  firstObserved,
+		})
+	}
+
+	if r.Stats.WriteStallsRecent > 0 || r.Stats.OldestWriteMS >= 100 {
+		sev := "WARNING"
+		if r.Stats.OldestWriteMS >= 2000 {
+			sev = "CRITICAL"
+		} else if r.Stats.OldestWriteMS >= 500 || r.Stats.WriteStallsRecent > 0 {
+			sev = "DEGRADED"
+		}
+		msg := fmt.Sprintf("Device write stall (%dms) for %s", r.Stats.OldestWriteMS, r.AssignedIP)
+		rate := fmt.Sprintf("%dms stall", r.Stats.OldestWriteMS)
+		if r.Stats.OldestWriteMS == 0 && r.Stats.WriteStallsRecent > 0 {
+			msg = fmt.Sprintf("Device write stalls (%d recent) for %s", r.Stats.WriteStallsRecent, r.AssignedIP)
+			rate = fmt.Sprintf("%d stalls", r.Stats.WriteStallsRecent)
+		}
+		problems = append(problems, ActionableProblem{
+			Severity:       sev,
+			Category:       "dataplane",
+			Message:        msg,
+			MessageKey:     "vpn_problem_write_stall",
+			UserID:         userID,
+			ConnectionID:   connID,
+			ConnectionName: connName,
+			AssignedIP:     r.AssignedIP,
+			BackendID:      r.BackendTunnelID,
+			ObservedRate:   rate,
+			FirstObserved:  firstObserved,
+		})
+	}
+
+	if r.Stats.WriteErrorsRecent > 0 {
+		problems = append(problems, ActionableProblem{
+			Severity:       "DEGRADED",
+			Category:       "dataplane",
+			Message:        fmt.Sprintf("Device write errors (%d recent) for %s", r.Stats.WriteErrorsRecent, r.AssignedIP),
+			MessageKey:     "vpn_problem_write_errors",
+			UserID:         userID,
+			ConnectionID:   connID,
+			ConnectionName: connName,
+			AssignedIP:     r.AssignedIP,
+			BackendID:      r.BackendTunnelID,
+			ObservedRate:   fmt.Sprintf("%d errors", r.Stats.WriteErrorsRecent),
+			FirstObserved:  firstObserved,
+		})
+	}
+
+	if r.HasPressure && r.Stats.QueueFullDropsRecent == 0 && r.Stats.WriteStallsRecent == 0 && r.Stats.WriteErrorsRecent == 0 && r.Stats.OldestWriteMS < 100 {
+		problems = append(problems, ActionableProblem{
+			Severity:       "WARNING",
+			Category:       "queue_pressure",
+			Message:        fmt.Sprintf("Route queue pressure (%d/%d queued) for %s", r.Stats.Occupancy, r.Stats.Capacity, r.AssignedIP),
+			MessageKey:     "vpn_problem_route_queue_pressure",
+			UserID:         userID,
+			ConnectionID:   connID,
+			ConnectionName: connName,
+			AssignedIP:     r.AssignedIP,
+			BackendID:      r.BackendTunnelID,
+			ObservedRate:   fmt.Sprintf("%.1f%%", float64(r.Stats.Occupancy)/float64(r.Stats.Capacity)*100),
+			FirstObserved:  firstObserved,
+		})
+	}
+
+	return problems
+}
+
+func sortActionableProblems(problems []ActionableProblem) {
+	problemSeverityRank := func(sev string) int {
+		switch strings.ToUpper(sev) {
+		case "CRITICAL":
+			return 1
+		case "DEGRADED":
+			return 2
+		case "WARNING":
+			return 3
+		default:
+			return 4
+		}
+	}
+	sort.SliceStable(problems, func(i, j int) bool {
+		ri, rj := problemSeverityRank(problems[i].Severity), problemSeverityRank(problems[j].Severity)
+		if ri != rj {
+			return ri < rj
+		}
+		if problems[i].AssignedIP != problems[j].AssignedIP {
+			return problems[i].AssignedIP < problems[j].AssignedIP
+		}
+		return problems[i].Category < problems[j].Category
+	})
+}
+
+func (s *Service) fetchPeerIdentityMappings(ctx context.Context, peerKeys []string) (map[string]string, map[string]string) {
+	connByPeer := make(map[string]string)
+	userByPeer := make(map[string]string)
+	if len(peerKeys) == 0 || s == nil || s.db == nil {
+		return connByPeer, userByPeer
+	}
+
+	pkPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(peerKeys)), ",")
+	pkArgs := make([]any, len(peerKeys))
+	for i, pk := range peerKeys {
+		pkArgs[i] = pk
+	}
+	query := `SELECT uc.client_id, uc.id, COALESCE(u.username, '')
+		FROM user_connections uc
+		LEFT JOIN users u ON u.id = uc.user_id
+		WHERE uc.client_id IN (` + pkPlaceholders + `)`
+	rows, err := s.db.QueryContext(ctx, query, pkArgs...)
+	if err != nil {
+		return connByPeer, userByPeer
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pk, connID, username string
+		if err := rows.Scan(&pk, &connID, &username); err == nil {
+			connByPeer[pk] = connID
+			userByPeer[pk] = username
+		}
+	}
+	return connByPeer, userByPeer
+}
+
+func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+	problems := SynthesizeActionableProblems(routes, sessions)
+	if len(problems) == 0 || s == nil || s.db == nil {
+		return problems
+	}
+
+	peerKeys := make([]string, 0, len(sessions))
+	for _, sess := range sessions {
+		if sess.PeerPublicKey != "" {
+			peerKeys = append(peerKeys, sess.PeerPublicKey)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	connByPeer, userByPeer := s.fetchPeerIdentityMappings(ctx, peerKeys)
+
+	for i := range problems {
+		p := &problems[i]
+		if p.Username != "" && p.ConnectionID != "" {
+			continue
+		}
+		for _, sess := range sessions {
+			match := (p.UserID != "" && sess.UserID == p.UserID) || (p.AssignedIP != "" && sess.AssignedIP == p.AssignedIP)
+			if !match {
+				continue
+			}
+			if p.Username == "" {
+				p.Username = userByPeer[sess.PeerPublicKey]
+			}
+			if p.ConnectionID == "" {
+				p.ConnectionID = connByPeer[sess.PeerPublicKey]
+			}
+			if p.ConnectionName == "" {
+				p.ConnectionName = sess.ConnectionName
+			}
+			break
+		}
+	}
+
+	return problems
 }

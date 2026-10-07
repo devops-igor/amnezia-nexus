@@ -770,3 +770,248 @@ func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
 		assertDropBreakdown(t, status.DropCategories, "ReturnVirtualTUNDrops")
 	})
 }
+
+func TestProblemRouteItem_IncludesSessionAndConnectionID(t *testing.T) {
+	routes := []forwarder.RouteInfo{
+		{
+			PeerKey:         "client-peer-key-1",
+			AssignedIP:      "10.8.0.2",
+			SessionID:       "sess-test-1",
+			ConnectionID:    "conn-test-1",
+			BackendTunnelID: 42,
+			HasPressure:     true,
+			Stats: forwarder.RouteQueueStats{
+				Occupancy:            50,
+				Capacity:             100,
+				HighWater:            80,
+				QueueFullDrops:       10,
+				QueueFullDropsRecent: 5,
+				P95WriteMS:           15,
+				P95WriteSamples:      60,
+				MaxWriteDurationMS:   35,
+			},
+		},
+	}
+
+	items := collectProblemRoutes(routes)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 ProblemRouteItem, got %d", len(items))
+	}
+
+	item := items[0]
+	if item.SessionID != "sess-test-1" {
+		t.Errorf("expected SessionID 'sess-test-1', got %q", item.SessionID)
+	}
+	if item.ConnectionID != "conn-test-1" {
+		t.Errorf("expected ConnectionID 'conn-test-1', got %q", item.ConnectionID)
+	}
+	if item.Reservoir == nil {
+		t.Fatal("expected Reservoir to be populated, got nil")
+	}
+	if item.Reservoir.P95MS != 15.0 || item.Reservoir.Samples != 60 || item.Reservoir.MaxMS != 35.0 {
+		t.Errorf("unexpected Reservoir stats: %+v", item.Reservoir)
+	}
+
+	data, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	raw := string(data)
+	if !strings.Contains(raw, `"session_id":"sess-test-1"`) {
+		t.Errorf("JSON missing session_id: %s", raw)
+	}
+	if !strings.Contains(raw, `"connection_id":"conn-test-1"`) {
+		t.Errorf("JSON missing connection_id: %s", raw)
+	}
+	if !strings.Contains(raw, `"reservoir"`) {
+		t.Errorf("JSON missing reservoir: %s", raw)
+	}
+}
+
+func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	sessions := []Session{
+		{
+			ID:              "sess-unroutable",
+			UserID:          "user-1",
+			ConnectionName:  "user1-laptop",
+			PeerPublicKey:   "pk-unroutable",
+			AssignedIP:      "10.8.0.10",
+			BackendTunnelID: 101,
+			ConnectedAt:     now.Add(-10 * time.Minute),
+			Status:          "connected",
+		},
+		{
+			ID:              "sess-drops",
+			UserID:          "user-2",
+			ConnectionName:  "user2-phone",
+			PeerPublicKey:   "pk-drops",
+			AssignedIP:      "10.8.0.20",
+			BackendTunnelID: 102,
+			ConnectedAt:     now.Add(-5 * time.Minute),
+			Status:          "connected",
+		},
+		{
+			ID:              "sess-stalls",
+			UserID:          "user-3",
+			ConnectionName:  "user3-desktop",
+			PeerPublicKey:   "pk-stalls",
+			AssignedIP:      "10.8.0.30",
+			BackendTunnelID: 103,
+			ConnectedAt:     now.Add(-2 * time.Minute),
+			Status:          "connected",
+		},
+		{
+			ID:              "sess-healthy",
+			UserID:          "user-4",
+			ConnectionName:  "user4-home",
+			PeerPublicKey:   "pk-healthy",
+			AssignedIP:      "10.8.0.40",
+			BackendTunnelID: 104,
+			ConnectedAt:     now.Add(-20 * time.Minute),
+			Status:          "connected",
+		},
+	}
+
+	routes := []forwarder.RouteInfo{
+		{
+			PeerKey:         "pk-drops",
+			AssignedIP:      "10.8.0.20",
+			SessionID:       "sess-drops",
+			ConnectionID:    "conn-2",
+			BackendTunnelID: 102,
+			HasPressure:     true,
+			Stats: forwarder.RouteQueueStats{
+				QueueFullDrops:       15,
+				QueueFullDropsRecent: 5,
+			},
+		},
+		{
+			PeerKey:         "pk-stalls",
+			AssignedIP:      "10.8.0.30",
+			SessionID:       "sess-stalls",
+			ConnectionID:    "conn-3",
+			BackendTunnelID: 103,
+			HasPressure:     true,
+			Stats: forwarder.RouteQueueStats{
+				OldestWriteMS:     2500,
+				WriteStallsRecent: 2,
+			},
+		},
+		{
+			PeerKey:         "pk-healthy",
+			AssignedIP:      "10.8.0.40",
+			SessionID:       "sess-healthy",
+			ConnectionID:    "conn-4",
+			BackendTunnelID: 104,
+			HasPressure:     false,
+			Stats: forwarder.RouteQueueStats{
+				QueueFullDrops:       100, // Historical drops ONLY; no recent drops
+				QueueFullDropsRecent: 0,
+			},
+		},
+	}
+
+	problems := SynthesizeActionableProblems(routes, sessions)
+	if len(problems) != 3 {
+		t.Fatalf("expected 3 actionable problems (unroutable, drops, stalls), got %d: %+v", len(problems), problems)
+	}
+
+	var unroutableProb, dropsProb, stallsProb *ActionableProblem
+	for i := range problems {
+		p := &problems[i]
+		switch p.MessageKey {
+		case "vpn_problem_session_without_route":
+			unroutableProb = p
+		case "vpn_problem_route_queue_drops":
+			dropsProb = p
+		case "vpn_problem_write_stall":
+			stallsProb = p
+		}
+	}
+
+	if unroutableProb == nil {
+		t.Fatal("missing vpn_problem_session_without_route problem")
+	}
+	if unroutableProb.Severity != "CRITICAL" {
+		t.Errorf("unroutable severity: got %q, want CRITICAL", unroutableProb.Severity)
+	}
+	if unroutableProb.Category != "routing" {
+		t.Errorf("unroutable category: got %q, want routing", unroutableProb.Category)
+	}
+	if unroutableProb.UserID != "user-1" {
+		t.Errorf("unroutable user_id: got %q, want user-1", unroutableProb.UserID)
+	}
+	if unroutableProb.ConnectionName != "user1-laptop" {
+		t.Errorf("unroutable connection_name: got %q, want user1-laptop", unroutableProb.ConnectionName)
+	}
+	if unroutableProb.AssignedIP != "10.8.0.10" {
+		t.Errorf("unroutable assigned_ip: got %q, want 10.8.0.10", unroutableProb.AssignedIP)
+	}
+	if unroutableProb.BackendID != 101 {
+		t.Errorf("unroutable backend_id: got %d, want 101", unroutableProb.BackendID)
+	}
+	if !unroutableProb.FirstObserved.Equal(sessions[0].ConnectedAt) {
+		t.Errorf("unroutable first_observed: got %v, want %v", unroutableProb.FirstObserved, sessions[0].ConnectedAt)
+	}
+
+	if dropsProb == nil {
+		t.Fatal("missing vpn_problem_route_queue_drops problem")
+	}
+	if dropsProb.Severity != "DEGRADED" {
+		t.Errorf("drops severity: got %q, want DEGRADED", dropsProb.Severity)
+	}
+	if dropsProb.Category != "dataplane" {
+		t.Errorf("drops category: got %q, want dataplane", dropsProb.Category)
+	}
+	if dropsProb.UserID != "user-2" {
+		t.Errorf("drops user_id: got %q, want user-2", dropsProb.UserID)
+	}
+	if dropsProb.ConnectionID != "conn-2" {
+		t.Errorf("drops connection_id: got %q, want conn-2", dropsProb.ConnectionID)
+	}
+	if dropsProb.ConnectionName != "user2-phone" {
+		t.Errorf("drops connection_name: got %q, want user2-phone", dropsProb.ConnectionName)
+	}
+	if dropsProb.AssignedIP != "10.8.0.20" {
+		t.Errorf("drops assigned_ip: got %q, want 10.8.0.20", dropsProb.AssignedIP)
+	}
+	if dropsProb.BackendID != 102 {
+		t.Errorf("drops backend_id: got %d, want 102", dropsProb.BackendID)
+	}
+	if dropsProb.ObservedRate != "5 drops" {
+		t.Errorf("drops observed_rate: got %q, want '5 drops'", dropsProb.ObservedRate)
+	}
+
+	if stallsProb == nil {
+		t.Fatal("missing vpn_problem_write_stall problem")
+	}
+	if stallsProb.Severity != "CRITICAL" {
+		t.Errorf("stalls severity: got %q, want CRITICAL", stallsProb.Severity)
+	}
+	if stallsProb.Category != "dataplane" {
+		t.Errorf("stalls category: got %q, want dataplane", stallsProb.Category)
+	}
+	if stallsProb.UserID != "user-3" {
+		t.Errorf("stalls user_id: got %q, want user-3", stallsProb.UserID)
+	}
+	if stallsProb.ConnectionID != "conn-3" {
+		t.Errorf("stalls connection_id: got %q, want conn-3", stallsProb.ConnectionID)
+	}
+	if stallsProb.ConnectionName != "user3-desktop" {
+		t.Errorf("stalls connection_name: got %q, want user3-desktop", stallsProb.ConnectionName)
+	}
+	if stallsProb.AssignedIP != "10.8.0.30" {
+		t.Errorf("stalls assigned_ip: got %q, want 10.8.0.30", stallsProb.AssignedIP)
+	}
+	if stallsProb.BackendID != 103 {
+		t.Errorf("stalls backend_id: got %d, want 103", stallsProb.BackendID)
+	}
+
+	for _, p := range problems {
+		if p.AssignedIP == "10.8.0.40" {
+			t.Errorf("healthy route with historical drops only must not be flagged as active problem: %+v", p)
+		}
+	}
+}

@@ -359,6 +359,7 @@ type EnrichedVPNSession struct {
 	ID              string    `json:"id"`
 	UserID          string    `json:"user_id"`
 	Username        string    `json:"username"`
+	ConnectionID    string    `json:"connection_id"`
 	BackendTunnelID int64     `json:"backend_tunnel_id"`
 	ServerID        int64     `json:"server_id"`
 	ServerName      string    `json:"server_name"`
