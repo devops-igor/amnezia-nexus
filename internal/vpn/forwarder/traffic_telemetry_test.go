@@ -164,3 +164,32 @@ func TestGenerationTrafficWindow_WholeVectorMonotonicity(t *testing.T) {
 		t.Fatalf("gen 2 first observation should only prime: got acc=%v el=%v", acc4, el4)
 	}
 }
+
+// TestGenerationTrafficWindow_OlderGenerationResetIsNoop ensures that a reset
+// with an older generation does not clear the active generation's baseline.
+func TestGenerationTrafficWindow_OlderGenerationResetIsNoop(t *testing.T) {
+	var w generationTrafficWindow
+	base := time.Now()
+
+	// Prime and advance generation 2
+	w.observe(2, base, TrafficSnapshot{RxBytes: 1000, TxBytes: 2000, RxPackets: 10, TxPackets: 20})
+	snap, _, ok := w.observe(2, base.Add(1*time.Second), TrafficSnapshot{RxBytes: 1500, TxBytes: 3000, RxPackets: 15, TxPackets: 30})
+	if !ok || !snap.Available {
+		t.Fatalf("expected valid window in gen 2")
+	}
+
+	// Stale reset for generation 1 arriving late (e.g. out-of-order Start() finish)
+	w.reset(1)
+
+	// State must be completely intact: gen 2, primed=true, w.at untouched
+	if w.gen != 2 {
+		t.Fatalf("gen mutated by older reset: got %d, want 2", w.gen)
+	}
+	if !w.primed {
+		t.Fatalf("primed cleared by older reset")
+	}
+	if w.rxBytes != 1500 || w.txBytes != 3000 {
+		t.Fatalf("baselines cleared by older reset")
+	}
+}
+

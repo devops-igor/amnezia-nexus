@@ -27,6 +27,10 @@ type RouteInfo struct {
 func (f *Forwarder) InspectRoutes() []RouteInfo {
 	type rawRoute struct {
 		peerKey          string
+		assignedIP       string
+		sessionID        string
+		connectionID     string
+		backendTunnelID  int64
 		route            *sessionRoute
 		writes           DeviceWriteTelemetry
 		latencies        routeLatencyReservoir
@@ -60,6 +64,10 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 		returnPathClosed := hasReturnPath && route.returnPath.Closed()
 		raw = append(raw, rawRoute{
 			peerKey:          peerKey,
+			assignedIP:       route.assignedIP,
+			sessionID:        route.sessionID,
+			connectionID:     route.connectionID,
+			backendTunnelID:  route.backendTunnelID,
 			route:            route,
 			writes:           writes,
 			latencies:        route.writeLatencies,
@@ -110,10 +118,10 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 
 		routes = append(routes, RouteInfo{
 			PeerKey:           item.peerKey,
-			AssignedIP:        item.route.assignedIP,
-			SessionID:         item.route.sessionID,
-			ConnectionID:      item.route.connectionID,
-			BackendTunnelID:   item.route.backendTunnelID,
+			AssignedIP:        item.assignedIP,
+			SessionID:         item.sessionID,
+			ConnectionID:      item.connectionID,
+			BackendTunnelID:   item.backendTunnelID,
 			HasReturnPath:     item.hasReturnPath,
 			ReturnPathClosed:  item.returnPathClosed,
 			Stats:             stats,

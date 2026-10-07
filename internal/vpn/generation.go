@@ -129,6 +129,9 @@ func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values [
 func (w *generationWindow[N]) reset(gen diagGeneration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if gen < w.gen {
+		return
+	}
 	if gen > w.gen {
 		w.gen = gen
 	}
@@ -239,6 +242,9 @@ func (d *diagCounterWindows) rate(key string) (float64, bool) {
 func (d *diagCounterWindows) reset(gen diagGeneration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if gen < d.gen {
+		return
+	}
 	if gen > d.gen {
 		d.gen = gen
 	}

@@ -103,6 +103,9 @@ func (w *generationTrafficWindow) observe(gen Generation, now time.Time, totals 
 // reset starts a new generation: the baseline is cleared so the next
 // observation re-primes into it. Older generations are ignored.
 func (w *generationTrafficWindow) reset(gen Generation) {
+	if gen < w.gen {
+		return
+	}
 	if gen > w.gen {
 		w.gen = gen
 	}

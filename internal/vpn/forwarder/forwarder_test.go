@@ -618,3 +618,60 @@ func TestForwarder_StartConcurrentWithBackendLifecycle_Race(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestForwarder_InspectRoutesConcurrentWithUpdateSessionBackend_Race tests that
+// InspectRoutes and AllRouteQueueStats snapshot route identities safely under locks
+// and do not race with concurrent UpdateSessionBackend migrations (issue #424).
+func TestForwarder_InspectRoutesConcurrentWithUpdateSessionBackend_Race(t *testing.T) {
+	fwd := NewForwarder(nil, "10.100.0.0/16")
+	const numPeers = 8
+	for i := 0; i < numPeers; i++ {
+		peer := fmt.Sprintf("peer-race-%d", i)
+		ip := fmt.Sprintf("10.100.0.%d", 10+i)
+		fwd.RegisterSession(fmt.Sprintf("sess-%d", i), fmt.Sprintf("conn-%d", i), peer, ip, 1)
+	}
+
+	const iterations = 100
+	var wg sync.WaitGroup
+
+	// Reader goroutines calling InspectRoutes
+	for r := 0; r < 3; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				routes := fwd.InspectRoutes()
+				for _, route := range routes {
+					_ = route.BackendTunnelID
+					_ = route.AssignedIP
+				}
+			}
+		}()
+	}
+
+	// Reader goroutines calling AllRouteQueueStats
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			stats := fwd.AllRouteQueueStats()
+			_ = stats
+		}
+	}()
+
+	// Writer goroutines migrating backend tunnels via UpdateSessionBackend
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				peer := fmt.Sprintf("peer-race-%d", i%numPeers)
+				newBackendID := int64((i % 4) + 1)
+				_ = fwd.UpdateSessionBackend(peer, newBackendID)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+}
+

@@ -702,3 +702,53 @@ func TestWindowedTrackersAudit_PrimingBehavior(t *testing.T) {
 	})
 }
 
+// TestGenerationWindow_OlderGenerationResetIsNoop verifies that older-generation
+// resets are ignored and do not clear the active generation's baseline (issue #424).
+func TestGenerationWindow_OlderGenerationResetIsNoop(t *testing.T) {
+	t.Run("generationWindow", func(t *testing.T) {
+		var w generationWindow[uint64]
+		now := time.Now()
+
+		// Prime gen 2
+		w.sample(2, now, []uint64{100})
+		// Valid delta in gen 2
+		accepted := w.sample(2, now.Add(1*time.Second), []uint64{110})
+		if !accepted {
+			t.Fatalf("expected accepted window in gen 2")
+		}
+
+		// Stale reset for gen 1 arriving late
+		w.reset(1)
+
+		// State must remain intact: deltas and baselines untouched
+		deltas, windowSec, primed := w.last()
+		if !primed || len(deltas) != 1 || deltas[0] != 10 || windowSec <= 0 {
+			t.Fatalf("generationWindow state wiped by older reset: primed=%v deltas=%v windowSec=%v", primed, deltas, windowSec)
+		}
+	})
+
+	t.Run("diagCounterWindows", func(t *testing.T) {
+		dw := newDiagCounterWindows()
+		now := time.Now()
+
+		// Prime gen 2
+		dw.sample(2, now, map[string]uint64{"client_malformed": 100})
+		dw.sample(2, now.Add(1*time.Second), map[string]uint64{"client_malformed": 110})
+
+		rate, ok := dw.rate("client_malformed")
+		if !ok || rate != 10 {
+			t.Fatalf("expected rate 10 in gen 2, got rate=%v ok=%v", rate, ok)
+		}
+
+		// Stale reset for gen 1
+		dw.reset(1)
+
+		// Rate must still be available
+		rateAfter, okAfter := dw.rate("client_malformed")
+		if !okAfter || rateAfter != 10 {
+			t.Fatalf("diagCounterWindows rate wiped by older reset: rate=%v ok=%v", rateAfter, okAfter)
+		}
+	})
+}
+
+
