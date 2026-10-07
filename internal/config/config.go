@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/web"
 )
@@ -80,11 +83,80 @@ func ResolvePaths() *Paths {
 	}
 }
 
+var (
+	secretKeyMu sync.Mutex
+
+	linkFile = func(oldname, newname string) error {
+		if os.Getenv("AMNEZIA_TEST_SIMULATE_NO_HARDLINKS") == "1" {
+			return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EXDEV}
+		}
+		return os.Link(oldname, newname)
+	}
+	renameNoReplaceFunc = renameNoReplace
+	syncDirFunc         = syncDir
+)
+
+// syncDir opens the directory and calls Sync (fsync) to ensure directory entries
+// and metadata are durably written to physical media.
+func syncDir(dirPath string) (err error) {
+	// #nosec G304 G703 -- Directory path is derived from clean data directory
+	dir, openErr := os.Open(dirPath)
+	if openErr != nil {
+		return fmt.Errorf("failed to open directory %s for sync: %w", dirPath, openErr)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close directory %s after sync: %w", dirPath, closeErr)
+		}
+	}()
+	if syncErr := dir.Sync(); syncErr != nil {
+		return fmt.Errorf("failed to sync directory %s: %w", dirPath, syncErr)
+	}
+	return nil
+}
+
+// readWinningKey reads the secret key after another process won the creation race.
+// It retries briefly in case of filesystem metadata propagation delay.
+func readWinningKey(cleanKeyPath string) (string, error) {
+	var persistedKey string
+	var readErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		// #nosec G304 G703 -- Reading secret key from configured data directory is intended
+		persistedData, err := os.ReadFile(cleanKeyPath)
+		if err == nil {
+			persistedKey = strings.TrimSpace(string(persistedData))
+			if persistedKey != "" {
+				// Durability barrier: ensure directory entry is durably flushed before returning key
+				cleanDataDir := filepath.Dir(cleanKeyPath)
+				if err := syncDirFunc(cleanDataDir); err != nil {
+					return "", fmt.Errorf("failed to sync data directory %s: %w", cleanDataDir, err)
+				}
+				slog.Info("Loaded SECRET_KEY from persistent storage")
+				return persistedKey, nil
+			}
+			readErr = fmt.Errorf("concurrently created secret key file %s is empty", cleanKeyPath)
+		} else {
+			readErr = err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return "", fmt.Errorf("failed to read concurrently created secret key file %s: %w", cleanKeyPath, readErr)
+}
+
 // ResolveSecretKey resolves or generates the application SECRET_KEY per specification:
 // 1. SECRET_KEY env variable
 // 2. <DATA_DIR>/.secret_key file
-// 3. Generate 32 crypto random bytes -> 64-char hex string, save with 0600 permissions.
+// 3. Generate 32 crypto random bytes -> 64-char hex string, save atomically with 0600 permissions.
 func ResolveSecretKey(dataDir string) (string, error) {
+	if envKey := strings.TrimSpace(os.Getenv("SECRET_KEY")); envKey != "" {
+		slog.Info("Using SECRET_KEY from environment variable")
+		return envKey, nil
+	}
+
+	secretKeyMu.Lock()
+	defer secretKeyMu.Unlock()
+
+	// Re-check environment variable under lock
 	if envKey := strings.TrimSpace(os.Getenv("SECRET_KEY")); envKey != "" {
 		slog.Info("Using SECRET_KEY from environment variable")
 		return envKey, nil
@@ -93,12 +165,35 @@ func ResolveSecretKey(dataDir string) (string, error) {
 	cleanDataDir := filepath.Clean(dataDir)
 	cleanKeyPath := filepath.Clean(filepath.Join(cleanDataDir, ".secret_key"))
 
+	// Ensure directory exists
+	// #nosec G703
+	if err := os.MkdirAll(cleanDataDir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
+	}
+
 	// #nosec G304 G703 -- Reading secret key from configured data directory is intended
-	if data, err := os.ReadFile(cleanKeyPath); err == nil {
+	data, err := os.ReadFile(cleanKeyPath)
+	if err == nil {
 		key := strings.TrimSpace(string(data))
-		if key != "" {
-			slog.Info("Loaded SECRET_KEY from persistent storage")
-			return key, nil
+		if key == "" {
+			return "", fmt.Errorf("secret key file %s is empty", cleanKeyPath)
+		}
+		// Durability barrier: ensure directory entry is durably flushed before returning key
+		if err := syncDirFunc(cleanDataDir); err != nil {
+			return "", fmt.Errorf("failed to sync data directory %s: %w", cleanDataDir, err)
+		}
+		slog.Info("Loaded SECRET_KEY from persistent storage")
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("failed to read secret key file %s: %w", cleanKeyPath, err)
+	}
+
+	// First-boot key generation path: .secret_key did not pre-exist.
+	// Any process on this path must guarantee durability of parentDir before publishing or returning the key.
+	parentDir := filepath.Dir(cleanDataDir)
+	if parentDir != cleanDataDir {
+		if err := syncDirFunc(parentDir); err != nil {
+			return "", fmt.Errorf("failed to sync parent directory %s: %w", parentDir, err)
 		}
 	}
 
@@ -109,20 +204,81 @@ func ResolveSecretKey(dataDir string) (string, error) {
 	}
 	newKey := hex.EncodeToString(randomBytes)
 
-	// Ensure directory exists
-	// #nosec G703
-	if err := os.MkdirAll(cleanDataDir, 0750); err != nil {
-		return "", fmt.Errorf("failed to create data dir %s: %w", cleanDataDir, err)
+	// Persist key atomically to temporary file with strict 0600 permissions, then move into place.
+	// #nosec G304 G703
+	tmpFile, err := os.CreateTemp(cleanDataDir, ".secret_key.tmp.*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary secret key file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to set permissions on secret key file: %w", err)
 	}
 
-	// #nosec G703
-	if err := os.WriteFile(cleanKeyPath, []byte(newKey), 0600); err != nil {
-		slog.Warn("Failed to persist generated SECRET_KEY to file", "err", err)
+	if _, err := tmpFile.WriteString(newKey + "\n"); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to write secret key to temporary file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("failed to sync secret key file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temporary secret key file: %w", err)
+	}
+
+	// Atomically place file into target destination with strict no-clobber semantics.
+	// We try hard link first. Hard links are atomic and fail with ErrExist if cleanKeyPath exists.
+	placed := false
+	linkErr := linkFile(tmpPath, cleanKeyPath)
+	if linkErr == nil {
+		placed = true
+		// Remove temporary link source
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+	} else if isErrExist(linkErr) {
+		// Another process won the race and created the key concurrently.
+		// #nosec G703
+		_ = os.Remove(tmpPath)
+		return readWinningKey(cleanKeyPath)
 	} else {
-		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
+		// Hard links failed (e.g. cross-device link, unsupported on filesystem).
+		// Attempt atomic rename with strict no-replace semantics.
+		renameErr := renameNoReplaceFunc(tmpPath, cleanKeyPath)
+		if renameErr == nil {
+			placed = true
+		} else if isErrExist(renameErr) {
+			// Another process won the race and created the key concurrently.
+			// #nosec G703
+			_ = os.Remove(tmpPath)
+			return readWinningKey(cleanKeyPath)
+		} else {
+			// Neither hard link nor atomic no-replace is available or succeeded.
+			// Fail closed rather than risking clobbering an existing key.
+			// #nosec G703
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("failed to place secret key file %s without clobbering (link err: %v, rename err: %w)", cleanKeyPath, linkErr, renameErr)
+		}
 	}
 
-	return newKey, nil
+	if placed {
+		// Durability barrier: durably flush the data directory entry to media.
+		if err := syncDirFunc(cleanDataDir); err != nil {
+			return "", fmt.Errorf("failed to sync data directory %s: %w", cleanDataDir, err)
+		}
+		slog.Warn("Generated new SECRET_KEY on first boot. Set SECRET_KEY in production to avoid persistence issues.")
+		return newKey, nil
+	}
+
+	return "", fmt.Errorf("unexpected state: failed to place secret key file %s", cleanKeyPath)
 }
 
 // Load initializes configuration from environment variables and local secrets.
