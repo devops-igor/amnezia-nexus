@@ -457,6 +457,7 @@
   "vpn_forwarder_warning": "Warning",
   "vpn_forwarder_critical": "Critical",
   "vpn_forwarder_degraded": "Degraded",
+  "vpn_forwarder_unroutable": "Unroutable",
   "vpn_forwarder_down": "Down",
   "vpn_fwd_counters_since": "Counters since: {time}",
   "vpn_fwd_horizon_current": "Current / Live",

@@ -457,6 +457,7 @@
   "vpn_forwarder_warning": "هشدار",
   "vpn_forwarder_critical": "بحرانی",
   "vpn_forwarder_degraded": "تضعیف شده",
+  "vpn_forwarder_unroutable": "غیرقابل مسیریابی",
   "vpn_forwarder_down": "غیرفعال",
   "vpn_fwd_counters_since": "شمارنده‌ها از: {time}",
   "vpn_fwd_horizon_current": "فعلی / زنده",

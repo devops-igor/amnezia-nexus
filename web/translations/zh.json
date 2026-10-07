@@ -457,6 +457,7 @@
   "vpn_forwarder_warning": "警告",
   "vpn_forwarder_critical": "严重",
   "vpn_forwarder_degraded": "降级",
+  "vpn_forwarder_unroutable": "无法路由",
   "vpn_forwarder_down": "已宕机",
   "vpn_fwd_counters_since": "计数器起始时间：{time}",
   "vpn_fwd_horizon_current": "当前 / 实时",

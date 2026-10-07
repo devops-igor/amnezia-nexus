@@ -197,6 +197,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_drilldown_write_errors",
 			"vpn_drilldown_traffic_details",
 			"vpn_drilldown_no_telemetry",
+			"vpn_forwarder_unroutable",
 		}
 
 		languages := []string{"en.json", "ru.json", "fa.json", "fr.json", "zh.json"}
@@ -2079,11 +2080,16 @@ vpnRenderForwarderHealth({
 	forwarder_available: true,
 	health_assessment: {
 		status: 'DEGRADED',
-		conditions: [{
+		actionable_problems: [{
 			severity: 'DEGRADED',
 			message: 'Backend -> Client packet drops active',
-			component: 'dataplane',
-			backend_id: 3
+			category: 'dataplane',
+			user_id: 'usr-1',
+			username: 'alice',
+			connection_name: 'alice-phone',
+			assigned_ip: '10.8.0.2',
+			backend_id: 3,
+			observed_rate: '15 drops'
 		}]
 	}
 });
@@ -2098,6 +2104,10 @@ assert(problemCard.children[0].className.includes('badge-warn'));
 assert.strictEqual(problemCard.children[1].textContent, 'Backend -> Client packet drops active');
 assert(problemCard.children[2].textContent.includes('Backend 3'));
 assert(problemCard.children[2].textContent.includes('dataplane'));
+assert(problemCard.children[2].textContent.includes('User: alice'));
+assert(problemCard.children[2].textContent.includes('Config: alice-phone'));
+assert(problemCard.children[2].textContent.includes('IP: 10.8.0.2'));
+assert(problemCard.children[2].textContent.includes('15 drops'));
 
 // 3. Down forwarder:
 // - techDetails auto-expands (open === true)
@@ -2246,7 +2256,7 @@ vpnLastStatus = {
     all_routes: [
         {
             assigned_ip: '10.8.0.2',
-            connection_id: 101,
+            connection_id: '101',
             session_id: 'sess-1',
             occupancy: 12,
             capacity: 100,
@@ -2275,7 +2285,7 @@ vpnLastStatus = {
         },
         {
             assigned_ip: '10.8.0.3',
-            connection_id: 102,
+            connection_id: '102',
             session_id: 'sess-2',
             occupancy: 90,
             capacity: 100,
@@ -2299,6 +2309,35 @@ vpnLastStatus = {
             write_stalls: 3,
             write_errors: 1,
             writes_in_flight: 4
+        },
+        {
+            assigned_ip: '10.8.0.4',
+            connection_id: '104',
+            session_id: 'sess-4',
+            occupancy: 5,
+            capacity: 100,
+            drops: 10,
+            queue_full_drops_recent: 0,
+            has_pressure: false,
+            traffic: {
+                available: true,
+                rx_bps: 100000,
+                tx_bps: 200000,
+                rx_bytes: 1048576,
+                tx_bytes: 2097152,
+                rx_packets: 1000,
+                tx_packets: 2000
+            },
+            reservoir: {
+                p95_ms: 2.0,
+                samples: 20,
+                max_ms: 5.0
+            },
+            high_water: 10,
+            queue_dwell_p95_ms: 1.0,
+            write_stalls: 0,
+            write_errors: 0,
+            writes_in_flight: 0
         }
     ]
 };
@@ -2307,7 +2346,7 @@ const sessions = [
     {
         id: 1,
         session_id: 'sess-1',
-        connection_id: 101,
+        connection_id: '101',
         username: 'alice',
         connection_name: 'alice-phone',
         server_name: 'Frankfurt-1',
@@ -2317,7 +2356,7 @@ const sessions = [
     {
         id: 2,
         session_id: 'sess-2',
-        connection_id: 102,
+        connection_id: '102',
         username: 'bob',
         connection_name: 'bob-laptop',
         server_name: 'Frankfurt-1',
@@ -2327,11 +2366,21 @@ const sessions = [
     {
         id: 3,
         session_id: 'sess-3',
-        connection_id: 103,
+        connection_id: '103',
         username: 'charlie',
         connection_name: 'charlie-pc',
         server_name: 'Frankfurt-2',
         assigned_ip: '10.8.0.99',
+        status: 'active'
+    },
+    {
+        id: 4,
+        session_id: 'sess-4',
+        connection_id: '104',
+        username: 'dan',
+        connection_name: 'dan-phone',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.4',
         status: 'active'
     }
 ];
@@ -2340,8 +2389,8 @@ vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
 // Assertion 1: Count badge and row count
-assert.strictEqual(countBadge.textContent, '3', 'badge count must match session count');
-assert.strictEqual(tbody.children.length, 3, 'table must render 3 session rows');
+assert.strictEqual(countBadge.textContent, '4', 'badge count must match session count');
+assert.strictEqual(tbody.children.length, 4, 'table must render 4 session rows');
 
 // Row 0 (alice - nominal correlated route):
 const row0 = tbody.children[0];
@@ -2375,13 +2424,23 @@ assert(row2.children[0].textContent.includes('charlie'));
 assert.strictEqual(row2.children[4].textContent, '-', 'traffic must be dash when route is absent');
 assert.strictEqual(row2.children[5].textContent, '-', 'loss must be dash when route is absent');
 assert.strictEqual(row2.children[6].textContent, '-', 'pressure must be dash when route is absent');
-assert(row2.children[7].textContent.includes('Active'), 'nominal session without route stays Active');
+assert(row2.children[7].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
+assert(row2.children[7].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
+
+// Row 3 (dan - nominal session with historical drops):
+const row3 = tbody.children[3];
+assert.strictEqual(row3.children.length, 8);
+assert(row3.children[0].textContent.includes('dan'));
+assert.strictEqual(row3.children[5].textContent, '10', 'historical drops must render count');
+assert(!row3.children[5].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
+assert(row3.children[7].textContent.includes('Active'), 'session with only historical drops must remain Active status');
+assert(row3.children[7].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
 
 // Assertion 2: Expandable drilldown with 4 telemetry cards
 vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
 assert(vpnExpandedSessionIds.has('sess-1'), 'session ID must be tracked in expanded set');
 assert(tbody.children[0].classList.contains('row-expanded'), 'row must gain row-expanded class');
-assert.strictEqual(tbody.children.length, 4, 'tbody must have drilldown row inserted');
+assert.strictEqual(tbody.children.length, 5, 'tbody must have drilldown row inserted');
 const drilldown0 = tbody.children[1];
 assert(drilldown0.className.includes('vpn-session-drilldown-row'), 'drilldown row must have correct class');
 assert.strictEqual(drilldown0.children[0].colSpan, 8, 'drilldown td must span all 8 columns');
@@ -2410,17 +2469,17 @@ assert(drilldown0.textContent.includes('1.00 Mbps'), 'drilldown must show traffi
 vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
 assert(!vpnExpandedSessionIds.has('sess-1'), 'session ID must be removed on collapse');
 assert(!tbody.children[0].classList.contains('row-expanded'), 'row-expanded class must be removed');
-assert.strictEqual(tbody.children.length, 3, 'drilldown row must be removed from tbody');
+assert.strictEqual(tbody.children.length, 4, 'drilldown row must be removed from tbody');
 
 // Assertion 3: Expandable drilldown for session without route displays vpn_drilldown_no_telemetry
 const charlieRow = tbody.children[2];
 vpnToggleSessionDrilldown(sessions[2], charlieRow);
-assert.strictEqual(tbody.children.length, 4, 'charlie drilldown row must be inserted');
+assert.strictEqual(tbody.children.length, 5, 'charlie drilldown row must be inserted');
 const charlieDrilldown = tbody.children[3];
 assert(charlieDrilldown.textContent.includes('Forwarder route telemetry not available for this session'), 'must display no-telemetry notice');
 // Collapse charlie
 vpnToggleSessionDrilldown(sessions[2], charlieRow);
-assert.strictEqual(tbody.children.length, 3);
+assert.strictEqual(tbody.children.length, 4);
 
 // Assertion 4: Problem filter toggle
 // Filter ON:
@@ -2428,15 +2487,16 @@ vpnToggleSessionsProblemFilter();
 assert.strictEqual(vpnSessionsFilterOnlyProblems, true, 'filter flag must be true');
 assert(filterBtn.classList.contains('btn-primary'), 'filter button must gain btn-primary');
 assert.strictEqual(filterText.textContent, 'All Connections', 'filter button text must toggle to show all');
-assert.strictEqual(tbody.children.length, 1, 'only degraded sessions must remain');
+assert.strictEqual(tbody.children.length, 2, 'degraded bob and unroutable charlie must remain in problem filter');
 assert(tbody.children[0].textContent.includes('bob'), 'bob must be visible in problem filter');
+assert(tbody.children[1].textContent.includes('charlie'), 'unroutable charlie must be visible in problem filter');
 
 // Filter OFF:
 vpnToggleSessionsProblemFilter();
 assert.strictEqual(vpnSessionsFilterOnlyProblems, false, 'filter flag must be false');
 assert(filterBtn.classList.contains('btn-ghost'), 'filter button must gain btn-ghost');
 assert.strictEqual(filterText.textContent, 'Problems Only', 'filter button text must toggle to problems only');
-assert.strictEqual(tbody.children.length, 3, 'all sessions must return');
+assert.strictEqual(tbody.children.length, 4, 'all sessions must return');
 
 // Assertion 5: Forwarder polling sync re-renders session route metrics
 vpnLastStatus = {
@@ -2444,7 +2504,7 @@ vpnLastStatus = {
     all_routes: [
         {
             assigned_ip: '10.8.0.2',
-            connection_id: 101,
+            connection_id: '101',
             session_id: 'sess-1',
             occupancy: 95,
             capacity: 100,
@@ -2456,13 +2516,26 @@ vpnLastStatus = {
     ]
 };
 vpnRenderForwarderHealth(vpnLastStatus);
-assert.strictEqual(tbody.children.length, 3);
+assert.strictEqual(tbody.children.length, 4);
 const updatedAlice = tbody.children[0];
 assert(updatedAlice.children[4].textContent.includes('4.00 Mbps') && updatedAlice.children[4].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
 assert(updatedAlice.children[5].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
 assert(updatedAlice.children[6].innerHTML.includes('badge-warn'), 'queue pressure must update dynamically');
 assert.strictEqual(updatedAlice.children[6].textContent, '95/100');
 assert(updatedAlice.children[7].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
+
+// Assertion 6: Correlation priority ordering (session_id > connection_id > assigned_ip)
+const routeSessionMatch = { session_id: 'sess-prio', connection_id: 'conn-other', assigned_ip: '10.8.0.200' };
+const routeIPMatch = { session_id: 'sess-diff', connection_id: 'conn-diff', assigned_ip: '10.8.0.100' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeIPMatch, routeSessionMatch] };
+
+const sessWithPrio = { session_id: 'sess-prio', connection_id: 'conn-x', assigned_ip: '10.8.0.100' };
+assert.strictEqual(vpnFindRouteForSession(sessWithPrio), routeSessionMatch, 'session ID match must take precedence over IP match');
+
+const routeConnMatch = { session_id: 'sess-none', connection_id: 'conn-prio', assigned_ip: '10.8.0.250' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeSessionMatch, routeConnMatch] };
+const sessWithConnPrio = { session_id: 'sess-unmatched', connection_id: 'conn-prio', assigned_ip: '10.8.0.200' };
+assert.strictEqual(vpnFindRouteForSession(sessWithConnPrio), routeConnMatch, 'connection ID match must take precedence over IP match');
 `
 
 	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", enAssertions)
@@ -2481,7 +2554,7 @@ vpnLastStatus = {
     all_routes: [
         {
             assigned_ip: '10.8.0.10',
-            connection_id: 201,
+            connection_id: '201',
             session_id: 'sess-ru-1',
             occupancy: 88,
             capacity: 100,
@@ -2503,7 +2576,7 @@ const sessions = [
     {
         id: 1,
         session_id: 'sess-ru-1',
-        connection_id: 201,
+        connection_id: '201',
         username: 'иван',
         connection_name: 'иван-офис',
         server_name: 'Москва-1',
@@ -2513,7 +2586,7 @@ const sessions = [
     {
         id: 2,
         session_id: 'sess-ru-2',
-        connection_id: 202,
+        connection_id: '202',
         username: 'петр',
         connection_name: 'петр-дом',
         server_name: 'Москва-1',
@@ -2534,6 +2607,11 @@ assert.strictEqual(filterText.textContent, 'Только с проблемами
 // Russian degraded status badge
 const row0 = tbody.children[0];
 assert(row0.children[7].textContent.includes('Деградировано'), 'Russian degraded status label');
+
+// Russian unroutable status badge for session without route
+const row1Before = tbody.children[1];
+assert(row1Before.children[7].textContent.includes('Немаршрутизируемый'), 'Russian unroutable status label');
+assert(row1Before.children[7].innerHTML.includes('badge-warn'));
 
 // Russian drilldown cards titles
 vpnToggleSessionDrilldown(sessions[0], row0);

@@ -457,6 +457,7 @@
   "vpn_forwarder_warning": "Внимание",
   "vpn_forwarder_critical": "Критическое",
   "vpn_forwarder_degraded": "Деградировано",
+  "vpn_forwarder_unroutable": "Немаршрутизируемый",
   "vpn_forwarder_down": "Не работает",
   "vpn_fwd_counters_since": "Счетчики с: {time}",
   "vpn_fwd_horizon_current": "Текущий / Онлайн",

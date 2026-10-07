@@ -1116,31 +1116,34 @@
         }
         if (!routes.length) return null;
 
-        if (s.assigned_ip) {
-            for (let i = 0; i < routes.length; i++) {
-                const r = routes[i];
-                if (r && r.assigned_ip && s.assigned_ip === r.assigned_ip) {
-                    return r;
-                }
-            }
-        }
-
-        const sConn = s.connection_id;
-        if (sConn !== undefined && sConn !== null && sConn !== '') {
-            for (let i = 0; i < routes.length; i++) {
-                const r = routes[i];
-                if (r && r.connection_id !== undefined && r.connection_id !== null && String(sConn) === String(r.connection_id)) {
-                    return r;
-                }
-            }
-        }
-
+        // 1. Durable session ID match first
         const sSess = s.session_id !== undefined && s.session_id !== null && s.session_id !== '' ? s.session_id : s.id;
         if (sSess !== undefined && sSess !== null && sSess !== '') {
             for (let i = 0; i < routes.length; i++) {
                 const r = routes[i];
                 const rSess = r && (r.session_id !== undefined && r.session_id !== null && r.session_id !== '' ? r.session_id : r.id);
                 if (r && rSess !== undefined && rSess !== null && String(sSess) === String(rSess)) {
+                    return r;
+                }
+            }
+        }
+
+        // 2. Durable connection ID match second
+        const sConn = s.connection_id;
+        if (sConn !== undefined && sConn !== null && sConn !== '') {
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
+                if (r && r.connection_id !== undefined && r.connection_id !== null && r.connection_id !== '' && String(sConn) === String(r.connection_id)) {
+                    return r;
+                }
+            }
+        }
+
+        // 3. Fall back to assigned IP match as display/fallback
+        if (s.assigned_ip) {
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
+                if (r && r.assigned_ip && s.assigned_ip === r.assigned_ip) {
                     return r;
                 }
             }
@@ -1213,7 +1216,7 @@
         if (route) {
             const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
             const recentDrops = Number(route.queue_full_drops_recent || 0);
-            if (recentDrops > 0 || drops > 0) {
+            if (recentDrops > 0 || route.has_pressure === true) {
                 tdLoss.innerHTML = `<span class="text-danger font-weight-600">${drops}</span>`;
             } else {
                 tdLoss.textContent = String(drops);
@@ -1242,14 +1245,22 @@
 
         // 8. Status cell
         const tdStatus = document.createElement('td');
-        if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0))) {
+        if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0) || (Number(route.write_errors_recent || 0) > 0) || (Number(route.write_stalls_recent || 0) > 0))) {
             tdStatus.innerHTML = `<span class="badge badge-warn">${_('vpn_forwarder_degraded')}</span>`;
         } else if (s && s.status === 'active') {
-            let activeLabel = _('vpn_status_active');
-            if (!activeLabel || activeLabel === 'vpn_status_active') {
-                activeLabel = (typeof vpnStatusLabel === 'function' ? vpnStatusLabel('active') : '') || _('active') || 'Active';
+            if (!route) {
+                let unroutableLabel = _('vpn_forwarder_unroutable');
+                if (!unroutableLabel || unroutableLabel === 'vpn_forwarder_unroutable') {
+                    unroutableLabel = 'Unroutable';
+                }
+                tdStatus.innerHTML = `<span class="badge badge-warn">${unroutableLabel}</span>`;
+            } else {
+                let activeLabel = _('vpn_status_active');
+                if (!activeLabel || activeLabel === 'vpn_status_active') {
+                    activeLabel = (typeof vpnStatusLabel === 'function' ? vpnStatusLabel('active') : '') || _('active') || 'Active';
+                }
+                tdStatus.innerHTML = `<span class="badge badge-success">${activeLabel}</span>`;
             }
-            tdStatus.innerHTML = `<span class="badge badge-success">${activeLabel}</span>`;
         } else {
             const otherStatus = s ? (typeof vpnStatusLabel === 'function' ? vpnStatusLabel(s.status) : (s.status || '-')) : '-';
             tdStatus.innerHTML = `<span class="badge badge-secondary">${otherStatus}</span>`;
@@ -1453,10 +1464,14 @@
         if (vpnSessionsFilterOnlyProblems) {
             sessionsToRender = sessionsToRender.filter(function(s) {
                 const route = vpnFindRouteForSession(s);
-                const hasRouteProblem = route && (
+                if (!route) {
+                    return true;
+                }
+                const hasRouteProblem = (
                     route.has_pressure === true ||
                     Number(route.queue_full_drops_recent || 0) > 0 ||
-                    Number(route.drops || 0) > 0
+                    Number(route.write_errors_recent || 0) > 0 ||
+                    Number(route.write_stalls_recent || 0) > 0
                 );
                 return hasRouteProblem || (s.status !== 'active');
             });
@@ -1603,7 +1618,8 @@
         if (!series || typeof series !== 'object') return;
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
-        if (w === '1h') points = series.window_1h || [];
+        if (w === '5m' || w === '1m') points = (series.window_5m || series.window_1m || (series.window_15m ? series.window_15m.slice(-30) : []));
+        else if (w === '1h') points = series.window_1h || [];
         else if (w === '6h') points = series.window_6h || [];
         else if (w === '24h') points = series.window_24h || [];
         else points = series.window_15m || [];
@@ -2098,87 +2114,160 @@
         }
 
         const s = (ha && ha.status) ? String(ha.status).toUpperCase() : '';
+        const actionableProblems = (ha && Array.isArray(ha.actionable_problems)) ? ha.actionable_problems : [];
+        const hasActionableProblems = actionableProblems.length > 0;
         const rawConditions = (ha && Array.isArray(ha.conditions)) ? ha.conditions : [];
         const hasExplicitConditions = rawConditions.length > 0;
         const isDegradedOrDown = s === 'DEGRADED' || s === 'DOWN' || s === 'CRITICAL';
-        const hasActiveProblems = hasExplicitConditions || isDegradedOrDown || routeHasPressure;
-        const isHealthy = s === 'HEALTHY' && !hasExplicitConditions && !routeHasPressure;
+        const hasActiveProblems = hasActionableProblems || hasExplicitConditions || isDegradedOrDown || routeHasPressure;
+        const isHealthy = s === 'HEALTHY' && !hasActiveProblems;
 
         const problemListElem = document.getElementById('vpn-fwd-problem-list');
         if (problemListElem) {
             if (hasActiveProblems) {
-                const conditionsToRender = hasExplicitConditions ? rawConditions : [
-                    {
-                        severity: isDegradedOrDown ? s : 'WARNING',
-                        message: (ha && ha.summary) ? ha.summary : (s === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') : (_('vpn_forwarder_degraded') || 'Degraded')),
-                        category: routeHasPressure ? 'routing' : 'forwarder'
-                    }
-                ];
                 problemListElem.textContent = '';
                 problemListElem.style.display = 'flex';
                 problemListElem.style.flexDirection = 'column';
                 problemListElem.style.gap = '6px';
-                for (let i = 0; i < conditionsToRender.length; i++) {
-                    const cond = conditionsToRender[i];
-                    const row = document.createElement('div');
-                    row.className = 'card problem-card';
-                    row.style.display = 'flex';
-                    row.style.alignItems = 'center';
-                    row.style.gap = '8px';
-                    row.style.fontSize = '0.825rem';
-                    row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
-                    row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
-                    row.style.border = '1px solid var(--border-color)';
-                    row.style.borderRadius = 'var(--radius-sm, 4px)';
 
+                function createSeverityBadge(sev) {
                     const sevBadge = document.createElement('span');
                     sevBadge.style.fontSize = '0.7rem';
                     sevBadge.style.padding = '1px 6px';
                     sevBadge.style.borderRadius = 'var(--radius-sm, 4px)';
                     sevBadge.style.fontWeight = '600';
-                    const sev = String(cond.severity || '').toUpperCase();
-                    if (sev === 'CRITICAL' || sev === 'DOWN') {
+                    const upperSev = String(sev || '').toUpperCase();
+                    if (upperSev === 'CRITICAL' || upperSev === 'DOWN') {
                         sevBadge.className = 'badge badge-danger';
-                        row.style.borderLeft = '3px solid var(--danger)';
-                    } else if (sev === 'DEGRADED') {
+                    } else if (upperSev === 'DEGRADED') {
                         sevBadge.className = 'badge badge-warn';
-                        row.style.borderLeft = '3px solid var(--warning)';
                     } else {
                         sevBadge.className = 'badge badge-info';
-                        row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
                     }
-                    sevBadge.textContent = sev === 'CRITICAL' ? _('vpn_forwarder_critical') :
-                        sev === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') :
-                        sev === 'DEGRADED' ? _('vpn_forwarder_degraded') :
-                        sev === 'HEALTHY' ? _('vpn_forwarder_healthy') :
-                        (!sev || sev === 'WARN' || sev === 'WARNING') ? _('vpn_forwarder_warning') : sev;
-                    row.appendChild(sevBadge);
+                    sevBadge.textContent = upperSev === 'CRITICAL' ? _('vpn_forwarder_critical') :
+                        upperSev === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') :
+                        upperSev === 'DEGRADED' ? _('vpn_forwarder_degraded') :
+                        upperSev === 'HEALTHY' ? _('vpn_forwarder_healthy') :
+                        (!upperSev || upperSev === 'WARN' || upperSev === 'WARNING') ? _('vpn_forwarder_warning') : upperSev;
+                    return { badge: sevBadge, upperSev: upperSev };
+                }
 
-                    const msgSpan = document.createElement('span');
-                    msgSpan.style.flex = '1';
-                    // A condition that carries a canonical translation key is
-                    // rendered localized; the serialized English message is the
-                    // fallback when the key does not resolve in this locale.
-                    msgSpan.textContent = cond.message_key && _(cond.message_key) !== cond.message_key
-                        ? _(cond.message_key) : (cond.message || '');
-                    row.appendChild(msgSpan);
+                if (hasActionableProblems) {
+                    for (let i = 0; i < actionableProblems.length; i++) {
+                        const p = actionableProblems[i];
+                        const row = document.createElement('div');
+                        row.className = 'card problem-card';
+                        row.style.display = 'flex';
+                        row.style.alignItems = 'center';
+                        row.style.gap = '8px';
+                        row.style.fontSize = '0.825rem';
+                        row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
+                        row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
+                        row.style.border = '1px solid var(--border-color)';
+                        row.style.borderRadius = 'var(--radius-sm, 4px)';
 
-                    const backendLabel = cond.backend_id !== undefined ? ('Backend ' + cond.backend_id) : '';
-                    const compLabel = cond.component || cond.category || '';
-                    const componentOrCategory = backendLabel && compLabel ? (compLabel + ' • ' + backendLabel) : (backendLabel || compLabel);
-                    if (componentOrCategory) {
-                        const compBadge = document.createElement('span');
-                        compBadge.className = 'badge text-muted font-mono';
-                        compBadge.style.fontSize = '0.7rem';
-                        compBadge.style.padding = '1px 6px';
-                        compBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
-                        compBadge.style.border = '1px solid var(--border-color)';
-                        compBadge.style.borderRadius = 'var(--radius-sm, 4px)';
-                        compBadge.textContent = componentOrCategory;
-                        row.appendChild(compBadge);
+                        const { badge: sevBadge, upperSev } = createSeverityBadge(p.severity);
+                        if (upperSev === 'CRITICAL' || upperSev === 'DOWN') {
+                            row.style.borderLeft = '3px solid var(--danger)';
+                        } else if (upperSev === 'DEGRADED') {
+                            row.style.borderLeft = '3px solid var(--warning)';
+                        } else {
+                            row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
+                        }
+                        row.appendChild(sevBadge);
+
+                        const msgSpan = document.createElement('span');
+                        msgSpan.style.flex = '1';
+                        msgSpan.textContent = p.message_key && _(p.message_key) !== p.message_key
+                            ? _(p.message_key) : (p.message || '');
+                        row.appendChild(msgSpan);
+
+                        const detailsParts = [];
+                        if (p.category) {
+                            detailsParts.push(p.category);
+                        }
+                        const user = p.username || p.user_id;
+                        if (user) {
+                            detailsParts.push('User: ' + user);
+                        }
+                        if (p.connection_name) {
+                            detailsParts.push('Config: ' + p.connection_name);
+                        }
+                        if (p.assigned_ip) {
+                            detailsParts.push('IP: ' + p.assigned_ip);
+                        }
+                        if (p.backend_id !== undefined && p.backend_id !== null && p.backend_id !== '') {
+                            detailsParts.push('Backend ' + p.backend_id);
+                        }
+                        if (p.observed_rate) {
+                            detailsParts.push(p.observed_rate);
+                        }
+
+                        if (detailsParts.length > 0) {
+                            const detailsBadge = document.createElement('span');
+                            detailsBadge.className = 'badge text-muted font-mono';
+                            detailsBadge.style.fontSize = '0.7rem';
+                            detailsBadge.style.padding = '1px 6px';
+                            detailsBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
+                            detailsBadge.style.border = '1px solid var(--border-color)';
+                            detailsBadge.style.borderRadius = 'var(--radius-sm, 4px)';
+                            detailsBadge.textContent = detailsParts.join(' • ');
+                            row.appendChild(detailsBadge);
+                        }
+
+                        problemListElem.appendChild(row);
                     }
+                } else {
+                    const conditionsToRender = hasExplicitConditions ? rawConditions : [
+                        {
+                            severity: isDegradedOrDown ? s : 'WARNING',
+                            message: (ha && ha.summary) ? ha.summary : (s === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') : (_('vpn_forwarder_degraded') || 'Degraded')),
+                            category: routeHasPressure ? 'routing' : 'forwarder'
+                        }
+                    ];
+                    for (let i = 0; i < conditionsToRender.length; i++) {
+                        const cond = conditionsToRender[i];
+                        const row = document.createElement('div');
+                        row.className = 'card problem-card';
+                        row.style.display = 'flex';
+                        row.style.alignItems = 'center';
+                        row.style.gap = '8px';
+                        row.style.fontSize = '0.825rem';
+                        row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
+                        row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
+                        row.style.border = '1px solid var(--border-color)';
+                        row.style.borderRadius = 'var(--radius-sm, 4px)';
 
-                    problemListElem.appendChild(row);
+                        const { badge: sevBadge, upperSev } = createSeverityBadge(cond.severity);
+                        if (upperSev === 'CRITICAL' || upperSev === 'DOWN') {
+                            row.style.borderLeft = '3px solid var(--danger)';
+                        } else if (upperSev === 'DEGRADED') {
+                            row.style.borderLeft = '3px solid var(--warning)';
+                        } else {
+                            row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
+                        }
+                        row.appendChild(sevBadge);
+
+                        const msgSpan = document.createElement('span');
+                        msgSpan.style.flex = '1';
+                        msgSpan.textContent = cond.message_key && _(cond.message_key) !== cond.message_key
+                            ? _(cond.message_key) : (cond.message || '');
+                        row.appendChild(msgSpan);
+
+                        if (cond.category) {
+                            const compBadge = document.createElement('span');
+                            compBadge.className = 'badge text-muted font-mono';
+                            compBadge.style.fontSize = '0.7rem';
+                            compBadge.style.padding = '1px 6px';
+                            compBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
+                            compBadge.style.border = '1px solid var(--border-color)';
+                            compBadge.style.borderRadius = 'var(--radius-sm, 4px)';
+                            compBadge.textContent = cond.category;
+                            row.appendChild(compBadge);
+                        }
+
+                        problemListElem.appendChild(row);
+                    }
                 }
             } else if (isHealthy) {
                 // NOMINAL (0 active problems): render reassuring green badge
