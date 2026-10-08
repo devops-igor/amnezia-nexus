@@ -3393,6 +3393,14 @@ searchPaths.forEach(p => {
     }
 });
 
+const child_process = require('child_process');
+try {
+    const globalRoot = child_process.execSync('npm root -g').toString().trim();
+    if (globalRoot && fs.existsSync(globalRoot) && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
 let JSDOM;
 try {
     JSDOM = require('jsdom').JSDOM;
@@ -3522,6 +3530,9 @@ w.eval(tablesCode);
 		t.Fatalf("TestVPNNexusTableLifecycleDrilldownAndConfigDedup failed: %v\n%s", err, string(out))
 	}
 	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is required in CI environment but was not available: %s", string(out))
+		}
 		t.Skip("jsdom is not available in Node environment")
 	}
 }
