@@ -2771,7 +2771,7 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 }
 
 func synthesizeStaleHandshakeProblems(sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time) []ActionableProblem {
-	if len(peerHandshakes) == 0 {
+	if peerHandshakes == nil {
 		return nil
 	}
 	if observedAt.IsZero() {
@@ -2791,6 +2791,8 @@ func synthesizeStaleHandshakeProblems(sessions []Session, peerHandshakes map[str
 				MessageKey:     "vpn_problem_stale_handshake",
 				SessionID:      sess.ID,
 				UserID:         sess.UserID,
+				Username:       sess.Username,
+				ConnectionID:   sess.ConnectionID,
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
