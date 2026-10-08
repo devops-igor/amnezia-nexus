@@ -583,6 +583,7 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_CannotResurrectZombieTunnel
 	if dev := vpnSvc.GetBackendDeviceForTest(tunBefore.ID); dev != nil {
 		t.Errorf("expected no backend device for tunnel %d, got %+v", tunBefore.ID, dev)
 	}
+	_ = vpnSvc.Stop()
 }
 
 func TestDeleteServerHandler_SelfHealing_CannotResurrectDeletedServer(t *testing.T) {
@@ -851,7 +852,7 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_ServerGenerationChanged_Rej
 	serverBackup := map[string]any{
 		"id":       serverID,
 		"name":     "GenB-Server",
-		"host":     "192.168.10.91",
+		"host":     "192.168.10.90",
 		"ssh_user": "root",
 		"ssh_port": 22,
 		"ssh_pass": "pass123",
@@ -911,8 +912,8 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_ServerGenerationChanged_Rej
 	if !tunB.Enabled {
 		t.Errorf("expected Gen B tunnel to be enabled")
 	}
-	if tunB.Endpoint != "192.168.10.91:51821" {
-		t.Errorf("expected Gen B endpoint '192.168.10.91:51821', got %q", tunB.Endpoint)
+	if tunB.Endpoint != "192.168.10.90:51821" {
+		t.Errorf("expected Gen B endpoint '192.168.10.90:51821', got %q", tunB.Endpoint)
 	}
 	if tunB.PublicKey != "backend-pubkey-genb" {
 		t.Errorf("expected Gen B public key 'backend-pubkey-genb', got %q", tunB.PublicKey)
