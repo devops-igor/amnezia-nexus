@@ -1229,15 +1229,14 @@
             const dropRate = Number(route.queue_full_drop_rate_pps || 0);
             const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
             const recentDrops = Number(route.queue_full_drops_recent || 0);
-            if (dropRate > 0 || recentDrops > 0 || route.has_pressure === true) {
+            if (dropRate > 0 || recentDrops > 0) {
                 let dropText = '';
                 if (dropRate > 0) {
                     const lossFmt = _('vpn_fwd_loss_rate_format') || '%s drops/s (%d total)';
                     dropText = lossFmt.replace('%s', dropRate.toFixed(1)).replace('%d', drops);
-                } else if (recentDrops > 0) {
-                    dropText = `${recentDrops} recent (${drops})`;
                 } else {
-                    dropText = String(drops);
+                    const recentLabel = _('vpn_fwd_recent') || 'recent';
+                    dropText = `${recentDrops} ${recentLabel} (${drops})`;
                 }
                 tdLoss.innerHTML = `<span class="text-danger font-weight-600">${dropText}</span>`;
             } else if (drops > 0) {
@@ -2173,11 +2172,13 @@
             affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.username || p.user_id; }).filter(Boolean)).size;
             affectedConfigsCount = new Set(actionableProblems.map(function(p) { return p.connection_name || p.connection_id; }).filter(Boolean)).size;
         } else if (ha && Array.isArray(ha.conditions) && ha.conditions.length > 0) {
-            if (s === 'DEGRADED' || s === 'CRITICAL' || s === 'DOWN') {
-                activeProblemsCount = ha.conditions.length;
-                affectedUsersCount = 0;
-                affectedConfigsCount = 0;
-            }
+            const qualifyingConditions = ha.conditions.filter(function(c) {
+                const sev = (c && c.severity) ? String(c.severity).toUpperCase() : '';
+                return sev === 'DEGRADED' || sev === 'CRITICAL' || sev === 'WARNING' || sev === 'WARN';
+            });
+            activeProblemsCount = qualifyingConditions.length;
+            affectedUsersCount = 0;
+            affectedConfigsCount = 0;
         }
 
         const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');

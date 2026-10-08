@@ -667,5 +667,6 @@
   "vpn_drilldown_write_stalls": "Erreurs et blocages",
   "vpn_drilldown_write_errors": "Erreurs d'écriture",
   "vpn_drilldown_traffic_details": "Détails du trafic",
-  "vpn_drilldown_no_telemetry": "Télémétrie de route du forwarder non disponible pour cette session"
+  "vpn_drilldown_no_telemetry": "Télémétrie de route du forwarder non disponible pour cette session",
+  "vpn_fwd_recent": "récent"
 }

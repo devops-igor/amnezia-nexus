@@ -667,5 +667,6 @@
   "vpn_drilldown_write_stalls": "خطاها و توقف‌ها",
   "vpn_drilldown_write_errors": "خطاهای نوشتن",
   "vpn_drilldown_traffic_details": "جزئیات ترافیک",
-  "vpn_drilldown_no_telemetry": "تله‌متری مسیر فورواردر برای این نشست در دسترس نیست"
+  "vpn_drilldown_no_telemetry": "تله‌متری مسیر فورواردر برای این نشست در دسترس نیست",
+  "vpn_fwd_recent": "اخیر"
 }

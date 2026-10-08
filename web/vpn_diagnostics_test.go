@@ -190,6 +190,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_affected_users_count",
 			"vpn_fwd_affected_configs_count",
 			"vpn_fwd_loss_rate_format",
+			"vpn_fwd_recent",
 			"vpn_col_live_traffic",
 			"vpn_col_packet_loss",
 			"vpn_col_queue_pressure",
@@ -429,8 +430,7 @@ assert(!chart.innerHTML.includes('No data'), 'a measured zero is available');
 vpnRenderHistoryCharts({window_15m:[{fwd_p95_ms:20}]});
 assert(chart.innerHTML.includes('No data'), 'missing observation count is unavailable');
 `
-	cmd := exec.Command(nodePath, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("history renderer: %v\n%s", err, out)
 	}
 }
@@ -541,8 +541,7 @@ assert(!rows[1].textContent.includes('unavailable') && rows[1].textContent.inclu
 assert(rows[2].textContent.includes('Disabled') && rows[2].textContent.includes('1.00 Kbps') && rows[2].textContent.includes('2.00 Kbps'));
 
 `
-	cmd := exec.Command(nodePath, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("complete route tooltip: %v\n%s", err, out)
 	}
 }
@@ -750,8 +749,7 @@ vpnRenderHistoryCharts({window_15m:[{backends:Array.from({length:129},(_,id)=>({
 assert.strictEqual(document.getElementById('vpn-chart-backends').children.length,128*5*2,'fleet churn renderer must remain bounded');
 assert(document.getElementById('vpn-history-fleet-note').textContent.includes('5 omitted'));
 `
-	cmd := exec.Command(nodePath, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("complete history renderers: %v\n%s", err, out)
 	}
 }
@@ -1023,8 +1021,7 @@ assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
 
 `
-	cmd := exec.Command(nodePath, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("unavailable-forwarder history clearing: %v\n%s", err, out)
 	}
 }
@@ -1137,8 +1134,7 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color,
 
 
 `
-	cmd := exec.Command(nodePath, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("panel rate availability: %v\n%s", err, out)
 	}
 }
@@ -2918,6 +2914,23 @@ assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be
 assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem from condition');
 assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
 assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
+
+// 6. Warning-only condition with empty actionable_problems: summary header must display active problems count
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'HEALTHY',
+		summary: 'Warning condition present',
+		conditions: [
+			{ severity: 'WARNING', message: 'Cert expiring soon', category: 'cert' }
+		],
+		actionable_problems: []
+	}
+});
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when warning condition exists');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem from warning condition');
+assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
+assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
 `
 
 	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
@@ -2978,6 +2991,7 @@ func TestVPNTranslationKeyParity(t *testing.T) {
 		"vpn_fwd_affected_users_count",
 		"vpn_fwd_affected_configs_count",
 		"vpn_fwd_loss_rate_format",
+		"vpn_fwd_recent",
 	}
 	for _, langFile := range languages {
 		for _, k := range newKeys {
@@ -2989,5 +3003,151 @@ func TestVPNTranslationKeyParity(t *testing.T) {
 				t.Errorf("%s new key %q contains prohibited em dash (\\u2014): %q", langFile, k, val)
 			}
 		}
+	}
+}
+
+func TestVPNPacketLossCellDecoupledFromQueuePressure(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const tbody = document.getElementById('vpn-sessions-tbody');
+
+// Route 1: Dan has historical drops (10) and queue pressure (occupancy 95/100, has_pressure: true),
+// but ZERO recent drops and ZERO drop rate pps.
+// Loss cell MUST NOT be red (no text-danger). Pressure cell MUST have badge-warn.
+// Route 2: Eve has recent drops (5 recent out of 20 total, no pps rate).
+// Loss cell MUST be red (text-danger) and use localized "recent" word.
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [
+        {
+            assigned_ip: '10.8.0.4',
+            connection_id: '104',
+            session_id: 'sess-dan',
+            occupancy: 95,
+            capacity: 100,
+            drops: 10,
+            queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: true
+        },
+        {
+            assigned_ip: '10.8.0.5',
+            connection_id: '105',
+            session_id: 'sess-eve',
+            occupancy: 10,
+            capacity: 100,
+            drops: 20,
+            queue_full_drops_recent: 5,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false
+        }
+    ]
+};
+
+const sessions = [
+    {
+        id: 1,
+        session_id: 'sess-dan',
+        connection_id: '104',
+        username: 'dan',
+        connection_name: 'dan-phone',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.4',
+        status: 'connected'
+    },
+    {
+        id: 2,
+        session_id: 'sess-eve',
+        connection_id: '105',
+        username: 'eve',
+        connection_name: 'eve-laptop',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.5',
+        status: 'connected'
+    }
+];
+
+vpnLastSessions = { sessions: sessions };
+renderSessions(sessions);
+
+assert.strictEqual(tbody.children.length, 2, 'table must render 2 session rows');
+
+// Row 0: Dan (historical drops + queue pressure)
+const rowDan = tbody.children[0];
+const lossDan = rowDan.children[5];
+const pressureDan = rowDan.children[6];
+
+// Loss cell MUST NOT be colored red
+assert.strictEqual(lossDan.textContent, '10', 'Dan loss cell must display historical drops count 10');
+assert(!lossDan.innerHTML.includes('text-danger'), 'Dan loss cell must NOT be red when only historical drops + pressure');
+
+// Pressure cell MUST have warning badge
+assert(pressureDan.innerHTML.includes('badge-warn'), 'Dan pressure cell must have badge-warn');
+assert.strictEqual(pressureDan.textContent, '95/100', 'Dan pressure cell must show 95/100');
+
+// Row 1: Eve (recent drops without pps rate)
+const rowEve = tbody.children[1];
+const lossEve = rowEve.children[5];
+
+// Loss cell MUST be colored red with localized format
+assert(lossEve.innerHTML.includes('text-danger'), 'Eve loss cell must have text-danger styling for recent drops');
+assert(lossEve.textContent.includes('5 recent (20)'), 'Eve loss cell must format as "5 recent (20)"');
+`
+
+	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("packet loss decoupling test (en) failed: %v\n%s", err, out)
+	}
+
+	// Also verify Russian translation of fallback format "5 недавних (20)"
+	ruAssertions := `
+const tbody = document.getElementById('vpn-sessions-tbody');
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [
+        {
+            assigned_ip: '10.8.0.5',
+            connection_id: '105',
+            session_id: 'sess-eve',
+            occupancy: 10,
+            capacity: 100,
+            drops: 20,
+            queue_full_drops_recent: 5,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false
+        }
+    ]
+};
+const sessions = [
+    {
+        id: 1,
+        session_id: 'sess-eve',
+        connection_id: '105',
+        username: 'eve',
+        connection_name: 'eve-laptop',
+        server_name: 'Frankfurt-1',
+        assigned_ip: '10.8.0.5',
+        status: 'connected'
+    }
+];
+vpnLastSessions = { sessions: sessions };
+renderSessions(sessions);
+
+const lossEve = tbody.children[0].children[5];
+assert(lossEve.innerHTML.includes('text-danger'), 'Russian: Eve loss cell must have text-danger');
+assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve loss cell must use localized "недавних"');
+`
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
+	if out, err := execNodeScript(node, ruScript); err != nil {
+		t.Fatalf("packet loss decoupling test (ru) failed: %v\n%s", err, out)
 	}
 }

@@ -667,5 +667,6 @@
   "vpn_drilldown_write_stalls": "Ошибки и задержки записи",
   "vpn_drilldown_write_errors": "Ошибки записи",
   "vpn_drilldown_traffic_details": "Детализация трафика",
-  "vpn_drilldown_no_telemetry": "Телеметрия маршрута форвардера недоступна для этой сессии"
+  "vpn_drilldown_no_telemetry": "Телеметрия маршрута форвардера недоступна для этой сессии",
+  "vpn_fwd_recent": "недавних"
 }

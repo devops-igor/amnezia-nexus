@@ -667,5 +667,6 @@
   "vpn_drilldown_write_stalls": "错误与停顿",
   "vpn_drilldown_write_errors": "写入错误",
   "vpn_drilldown_traffic_details": "流量详情",
-  "vpn_drilldown_no_telemetry": "此会话的转发器路由遥测不可用"
+  "vpn_drilldown_no_telemetry": "此会话的转发器路由遥测不可用",
+  "vpn_fwd_recent": "最近"
 }

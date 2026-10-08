@@ -1769,16 +1769,7 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 				MaxMS:   float64(r.Stats.MaxWriteDurationMS),
 			}
 		}
-		var dropRatePPS float64
-		if r.Stats.QueueFullDropRatePPS > 0 {
-			dropRatePPS = r.Stats.QueueFullDropRatePPS
-		} else if r.Stats.QueueFullDropsRecent > 0 {
-			windowSec := r.Traffic.WindowSec
-			if windowSec <= 0 {
-				windowSec = 1.0
-			}
-			dropRatePPS = float64(r.Stats.QueueFullDropsRecent) / windowSec
-		}
+		dropRatePPS := r.Stats.QueueFullDropRatePPS
 		items[i] = ProblemRouteItem{
 			SessionID:            r.SessionID,
 			ConnectionID:         r.ConnectionID,
@@ -2903,6 +2894,14 @@ func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, ses
 		return problems
 	}
 
+	return s.enrichActionableProblemsWithDatabase(problems, sessions)
+}
+
+func (s *Service) enrichActionableProblemsWithDatabase(problems []ActionableProblem, sessions []Session) []ActionableProblem {
+	if len(problems) == 0 || s == nil || s.db == nil {
+		return problems
+	}
+
 	peerKeys := make([]string, 0, len(sessions))
 	for _, sess := range sessions {
 		if sess.PeerPublicKey != "" {
@@ -2915,15 +2914,31 @@ func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, ses
 	connByPeer, userByPeer := s.fetchPeerIdentityMappings(ctx, peerKeys)
 
 	for i := range problems {
-		p := &problems[i]
-		if p.Username != "" && p.ConnectionID != "" {
-			continue
+		enrichSingleProblem(&problems[i], sessions, connByPeer, userByPeer)
+	}
+
+	return problems
+}
+
+func enrichSingleProblem(p *ActionableProblem, sessions []Session, connByPeer, userByPeer map[string]string) {
+	if p.Username != "" && p.ConnectionID != "" {
+		return
+	}
+
+	if p.SessionID != "" {
+		if enrichBySessionID(p, sessions, connByPeer, userByPeer) {
+			return
 		}
-		for _, sess := range sessions {
-			match := (p.UserID != "" && sess.UserID == p.UserID) || (p.SessionID != "" && sess.ID == p.SessionID)
-			if !match {
-				continue
-			}
+	}
+
+	if p.UserID != "" {
+		enrichByUserID(p, sessions, connByPeer, userByPeer)
+	}
+}
+
+func enrichBySessionID(p *ActionableProblem, sessions []Session, connByPeer, userByPeer map[string]string) bool {
+	for _, sess := range sessions {
+		if sess.ID == p.SessionID {
 			if p.Username == "" {
 				p.Username = userByPeer[sess.PeerPublicKey]
 			}
@@ -2933,9 +2948,38 @@ func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, ses
 			if p.ConnectionName == "" {
 				p.ConnectionName = sess.ConnectionName
 			}
-			break
+			return true
 		}
 	}
+	return false
+}
 
-	return problems
+func enrichByUserID(p *ActionableProblem, sessions []Session, connByPeer, userByPeer map[string]string) {
+	var matching []Session
+	for _, sess := range sessions {
+		if sess.UserID == p.UserID {
+			matching = append(matching, sess)
+		}
+	}
+	if len(matching) == 1 {
+		sess := matching[0]
+		if p.Username == "" {
+			p.Username = userByPeer[sess.PeerPublicKey]
+		}
+		if p.ConnectionID == "" {
+			p.ConnectionID = connByPeer[sess.PeerPublicKey]
+		}
+		if p.ConnectionName == "" {
+			p.ConnectionName = sess.ConnectionName
+		}
+	} else if len(matching) > 1 {
+		if p.Username == "" {
+			for _, sess := range matching {
+				if u := userByPeer[sess.PeerPublicKey]; u != "" {
+					p.Username = u
+					return
+				}
+			}
+		}
+	}
 }

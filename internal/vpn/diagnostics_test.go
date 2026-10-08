@@ -1732,13 +1732,14 @@ func TestProblemRouteItem_IncludesDropRatePPS(t *testing.T) {
 				Stats: forwarder.RouteQueueStats{
 					QueueFullDrops:       20,
 					QueueFullDropsRecent: 5,
+					QueueFullDropRatePPS: 2.5,
 				},
 				Traffic: forwarder.TrafficSnapshot{
 					WindowSec: 2.0,
 				},
 				HasPressure: true,
 			},
-			wantRatePPS:  2.5, // 5 drops / 2.0s = 2.5 pps
+			wantRatePPS:  2.5,
 			wantHasPress: true,
 		},
 		{
@@ -1776,7 +1777,7 @@ func TestProblemRouteItem_IncludesDropRatePPS(t *testing.T) {
 			wantHasPress: false,
 		},
 		{
-			name: "recent drops without explicit traffic window falls back to 1s window",
+			name: "rate comes directly from route stats without borrowing traffic window",
 			route: forwarder.RouteInfo{
 				SessionID:    "sess-4",
 				ConnectionID: "conn-4",
@@ -1784,13 +1785,14 @@ func TestProblemRouteItem_IncludesDropRatePPS(t *testing.T) {
 				Stats: forwarder.RouteQueueStats{
 					QueueFullDrops:       10,
 					QueueFullDropsRecent: 7,
+					QueueFullDropRatePPS: 0.0,
 				},
 				Traffic: forwarder.TrafficSnapshot{
-					WindowSec: 0,
+					WindowSec: 5.0,
 				},
 				HasPressure: true,
 			},
-			wantRatePPS:  7.0, // 7 drops / 1.0s = 7.0 pps
+			wantRatePPS:  0.0,
 			wantHasPress: true,
 		},
 	}
@@ -1827,5 +1829,114 @@ func TestProblemRouteItem_IncludesDropRatePPS(t *testing.T) {
 				t.Errorf("JSON queue_full_drop_rate_pps = %v, want %v", rateVal, tt.wantRatePPS)
 			}
 		})
+	}
+}
+
+func TestEnrichActionableProblemsWithDatabase_MultiConfigDisambiguation(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+
+	ctx := context.Background()
+	_, err = db.ExecContext(ctx, "INSERT INTO users (id, username, password_hash, role) VALUES ('u1', 'alice', 'hash', 'user'), ('u2', 'bob', 'hash', 'user')")
+	if err != nil {
+		t.Fatalf("insert users: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, `INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name) VALUES 
+		('conn-1', 'u1', 1, 'awg', 'pk-alice-phone', 'Alice Phone'),
+		('conn-2', 'u1', 1, 'awg', 'pk-alice-laptop', 'Alice Laptop'),
+		('conn-3', 'u2', 1, 'awg', 'pk-bob-desktop', 'Bob Desktop')`)
+	if err != nil {
+		t.Fatalf("insert user_connections: %v", err)
+	}
+
+	sessions := []Session{
+		{
+			ID:             "sess-1",
+			UserID:         "u1",
+			ConnectionName: "Alice Phone",
+			PeerPublicKey:  "pk-alice-phone",
+		},
+		{
+			ID:             "sess-2",
+			UserID:         "u1",
+			ConnectionName: "Alice Laptop",
+			PeerPublicKey:  "pk-alice-laptop",
+		},
+		{
+			ID:             "sess-3",
+			UserID:         "u2",
+			ConnectionName: "Bob Desktop",
+			PeerPublicKey:  "pk-bob-desktop",
+		},
+	}
+
+	p1 := ActionableProblem{
+		SessionID: "sess-1",
+		UserID:    "u1",
+	}
+	p2 := ActionableProblem{
+		SessionID: "sess-2",
+		UserID:    "u1",
+	}
+	p3 := ActionableProblem{
+		SessionID: "",
+		UserID:    "u1",
+	}
+	p4 := ActionableProblem{
+		SessionID: "",
+		UserID:    "u2",
+	}
+
+	enriched := svc.enrichActionableProblemsWithDatabase([]ActionableProblem{p1, p2, p3, p4}, sessions)
+	if len(enriched) != 4 {
+		t.Fatalf("expected 4 enriched problems, got %d", len(enriched))
+	}
+
+	// Assert Problem 1: correlated to sess-1 / conn-1 (Alice Phone)
+	if enriched[0].Username != "alice" {
+		t.Errorf("p1 username: got %q, want 'alice'", enriched[0].Username)
+	}
+	if enriched[0].ConnectionID != "conn-1" {
+		t.Errorf("p1 connectionID: got %q, want 'conn-1'", enriched[0].ConnectionID)
+	}
+	if enriched[0].ConnectionName != "Alice Phone" {
+		t.Errorf("p1 connectionName: got %q, want 'Alice Phone'", enriched[0].ConnectionName)
+	}
+
+	// Assert Problem 2: correlated to sess-2 / conn-2 (Alice Laptop)
+	if enriched[1].Username != "alice" {
+		t.Errorf("p2 username: got %q, want 'alice'", enriched[1].Username)
+	}
+	if enriched[1].ConnectionID != "conn-2" {
+		t.Errorf("p2 connectionID: got %q, want 'conn-2'", enriched[1].ConnectionID)
+	}
+	if enriched[1].ConnectionName != "Alice Laptop" {
+		t.Errorf("p2 connectionName: got %q, want 'Alice Laptop'", enriched[1].ConnectionName)
+	}
+
+	// Assert Problem 3: multi-config user with missing session_id must NOT clobber ConnectionID or ConnectionName
+	if enriched[2].Username != "alice" {
+		t.Errorf("p3 username: got %q, want 'alice'", enriched[2].Username)
+	}
+	if enriched[2].ConnectionID != "" {
+		t.Errorf("p3 connectionID: expected empty, got %q (must not ambiguously clobber config for multi-session user)", enriched[2].ConnectionID)
+	}
+	if enriched[2].ConnectionName != "" {
+		t.Errorf("p3 connectionName: expected empty, got %q (must not ambiguously clobber config for multi-session user)", enriched[2].ConnectionName)
+	}
+
+	// Assert Problem 4: single-session user safely falls back to single active config
+	if enriched[3].Username != "bob" {
+		t.Errorf("p4 username: got %q, want 'bob'", enriched[3].Username)
+	}
+	if enriched[3].ConnectionID != "conn-3" {
+		t.Errorf("p4 connectionID: got %q, want 'conn-3'", enriched[3].ConnectionID)
+	}
+	if enriched[3].ConnectionName != "Bob Desktop" {
+		t.Errorf("p4 connectionName: got %q, want 'Bob Desktop'", enriched[3].ConnectionName)
 	}
 }
