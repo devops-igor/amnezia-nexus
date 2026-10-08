@@ -673,5 +673,10 @@
   "vpn_fwd_user_prefix": "کاربر: ",
   "vpn_fwd_config_prefix": "پیکربندی: ",
   "vpn_fwd_ip_prefix": "آی‌پی: ",
-  "vpn_fwd_backend_prefix": "بک‌اند "
+  "vpn_fwd_backend_prefix": "بک‌اند ",
+  "vpn_problem_session_without_route": "نشست فعال فاقد مسیر فورواردر است",
+  "vpn_problem_route_queue_drops": "افت بسته کلاینت در صف بازگشت فعال است",
+  "vpn_problem_write_stall": "توقف نوشتن دستگاه شناسایی شد",
+  "vpn_problem_write_errors": "خطاهای نوشتن دستگاه فعال است",
+  "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد"
 }

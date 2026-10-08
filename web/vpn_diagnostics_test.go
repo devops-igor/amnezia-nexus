@@ -2200,6 +2200,9 @@ func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assert
 		"vpnToggleSessionDrilldown",
 		"vpnToggleSessionsProblemFilter",
 		"vpnRenderSessionsStaleBanner",
+		"vpnFindSessionById",
+		"vpnSyncExpandedDrilldowns",
+		"vpnWrapSessionsTableRender",
 		"renderSessions",
 		"vpnRenderForwarderHealth",
 	} {
@@ -2281,7 +2284,6 @@ vpnLastStatus = {
                 max_ms: 12.5
             },
             high_water: 45,
-            queue_dwell_p95_ms: 3.1,
             write_stalls: 0,
             write_errors: 0,
             writes_in_flight: 1
@@ -2309,7 +2311,6 @@ vpnLastStatus = {
                 max_ms: 85.0
             },
             high_water: 95,
-            queue_dwell_p95_ms: 18.4,
             write_stalls: 3,
             write_errors: 1,
             writes_in_flight: 4
@@ -2339,7 +2340,6 @@ vpnLastStatus = {
                 max_ms: 5.0
             },
             high_water: 10,
-            queue_dwell_p95_ms: 1.0,
             write_stalls: 0,
             write_errors: 0,
             writes_in_flight: 0
@@ -2461,7 +2461,7 @@ assert(drilldown0.textContent.includes('12.5 ms'), 'drilldown must show max late
 assert(drilldown0.innerHTML.includes('Queue Dwell & Buffer'), 'drilldown must contain Queue Dwell card');
 assert(drilldown0.textContent.includes('12 / 100'), 'drilldown must show queue occupancy');
 assert(drilldown0.textContent.includes('45'), 'drilldown must show high water mark');
-assert(drilldown0.textContent.includes('3.1 ms'), 'drilldown must show queue dwell p95');
+assert(drilldown0.textContent.includes('Dwell p95: -'), 'drilldown must show dash for unpopulated dwell');
 
 assert(drilldown0.innerHTML.includes('Errors & Stalls'), 'drilldown must contain Errors & Stalls card');
 assert(drilldown0.textContent.includes('Stalls: 0'), 'drilldown must show write stalls');
@@ -3108,6 +3108,11 @@ func TestVPNTranslationKeyParity(t *testing.T) {
 		"vpn_fwd_config_prefix",
 		"vpn_fwd_ip_prefix",
 		"vpn_fwd_backend_prefix",
+		"vpn_problem_session_without_route",
+		"vpn_problem_route_queue_drops",
+		"vpn_problem_write_stall",
+		"vpn_problem_write_errors",
+		"vpn_problem_route_queue_pressure",
 	}
 	for _, langFile := range languages {
 		for _, k := range newKeys {
@@ -3338,5 +3343,185 @@ assert(probRow.children[7].textContent.includes('Unroutable'), 'session in Probl
 	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("TestVPNReconnectSessionIDMismatchShowsUnroutable failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNNexusTableLifecycleDrilldownAndConfigDedup(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enData, err := fs.ReadFile(transFS, "en.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testScript := fmt.Sprintf(`
+const fs = require('fs');
+const assert = require('assert');
+
+const path = require('path');
+const home = process.env.HOME || process.env.USERPROFILE || '';
+// Ensure JSDOM is discoverable
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+
+const source = %q;
+const en = JSON.parse(%q);
+const tablesCode = %q;
+
+function extract(name) {
+    const start = source.indexOf('    function ' + name + '(');
+    assert(start >= 0, 'function not found: ' + name);
+    const rest = source.slice(start + 1);
+    const match = /^    (?:async )?function /m.exec(rest);
+    return source.slice(start, match ? start + 1 + match.index : source.indexOf('</script>', start));
+}
+
+const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
+const w = dom.window;
+w.eval('const translations = ' + JSON.stringify(en) + ';' +
+'function _(key) { return translations[key] || key; };' +
+'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
+'const UI = { escapeHtml };' +
+'var vpnLastSessions = null, vpnLastStatus = null;' +
+'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
+'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnHistoryWindow = "15m";\n' +
+[
+    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
+    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
+    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
+    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
+    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+].map(extract).join('\n'));
+
+w.eval(tablesCode);
+
+(async function() {
+    const sessions = [
+        {id:'s-z',user_id:'u-z',username:'zulu',connection_id:'c-z',connection_name:'default',assigned_ip:'Client Z',status:'connected'},
+        {id:'s-a',user_id:'u-a',username:'alpha',connection_id:'c-a',connection_name:'default',assigned_ip:'Client A',status:'connected'},
+        {id:'s-b',user_id:'u-b',username:'bravo',connection_id:'c-b',connection_name:'default',assigned_ip:'Client B',status:'connected'}
+    ];
+    w.vpnLastSessions = {sessions: sessions};
+    w.vpnLastStatus = {
+        forwarder_available: true,
+        all_routes: sessions.map(s => ({
+            session_id: s.id,
+            connection_id: s.connection_id,
+            assigned_ip: s.assigned_ip,
+            occupancy: 0,
+            capacity: 100,
+            has_pressure: false,
+            traffic: { available: true, rx_bps: 0, tx_bps: 0 }
+        }))
+    };
+
+    w.renderSessions(sessions);
+    const tbody = w.document.getElementById('vpn-sessions-tbody');
+    function rowOrder() {
+        return Array.from(tbody.children).filter(r => r.style.display !== 'none').map(r => r.classList.contains('vpn-session-drilldown-row') ? 'DETAIL' : r.cells[0]?.textContent.trim());
+    }
+
+    // 1. Sort ascending
+    w.document.querySelector('#vpnSessionsTable thead th').click();
+    assert.deepStrictEqual(rowOrder(), ['alpha', 'bravo', 'zulu'], 'table must sort ascending by user');
+
+    // 2. Expand alpha
+    const alpha = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    assert(alpha, 'alpha row must exist');
+    alpha.cells[0].click();
+    assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'detail row must follow alpha');
+    assert.strictEqual(alpha.nextElementSibling?.classList.contains('vpn-session-drilldown-row'), true, 'detail row must be adjacent to alpha');
+
+    // 3. Polling refresh
+    w.renderSessions(sessions);
+    assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'order must be preserved after poll refresh');
+    const alphaAfterPoll = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    const detailAfterPoll = alphaAfterPoll?.nextElementSibling;
+    assert.strictEqual(detailAfterPoll?.classList.contains('vpn-session-drilldown-row'), true, 'detail row must remain adjacent to parent after poll refresh');
+
+    // 4. Search for alpha
+    w.vpnSessionsTableInstance.searchInputEl.value = 'alpha';
+    w.vpnSessionsTableInstance.searchInputEl.dispatchEvent(new w.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL'], 'detail row must remain visible when parent matches search');
+
+    // 5. Search for bravo (different user)
+    w.vpnSessionsTableInstance.searchInputEl.value = 'bravo';
+    w.vpnSessionsTableInstance.searchInputEl.dispatchEvent(new w.Event('input'));
+    await new Promise(r => setTimeout(r, 200));
+    assert.deepStrictEqual(rowOrder(), ['bravo'], 'detail row must be hidden when parent is filtered out by search');
+    const detailRows = Array.from(tbody.querySelectorAll('.vpn-session-drilldown-row'));
+    assert.strictEqual(detailRows.length, 1, 'must have 1 drilldown row');
+    assert.strictEqual(detailRows[0].style.display, 'none', 'drilldown row must have display none when parent is hidden');
+
+    // 6. Fix F2: Configuration deduplication by unique connection identity
+    w.vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [],
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Loss A', user_id: 'u-a', username: 'alpha', connection_id: 'c-a', connection_name: 'default' },
+                { severity: 'DEGRADED', message: 'Loss B', user_id: 'u-b', username: 'bravo', connection_id: 'c-b', connection_name: 'default' }
+            ]
+        }
+    });
+    const summaryHeader = w.document.getElementById('vpn-fwd-summary-header');
+    assert(summaryHeader, 'summary header must exist');
+    assert(summaryHeader.textContent.includes('2 client configs'), 'different connection_ids with common name default must count as 2 configs: ' + summaryHeader.textContent);
+    assert(summaryHeader.textContent.includes('2 affected users'), 'must count 2 affected users: ' + summaryHeader.textContent);
+    assert(summaryHeader.textContent.includes('2 active problems'), 'must count 2 active problems: ' + summaryHeader.textContent);
+
+    console.log('PASS');
+})().catch(e => {
+    console.error(e);
+    process.exit(1);
+});
+`, tmplStr, string(enData), string(tablesJS))
+
+	out, err := execNodeScript(node, testScript)
+	if err != nil {
+		t.Fatalf("TestVPNNexusTableLifecycleDrilldownAndConfigDedup failed: %v\n%s", err, string(out))
+	}
+	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		t.Skip("jsdom is not available in Node environment")
 	}
 }

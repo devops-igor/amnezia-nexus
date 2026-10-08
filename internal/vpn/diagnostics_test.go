@@ -1845,7 +1845,7 @@ func TestEnrichActionableProblemsWithDatabase_MultiConfigDisambiguation(t *testi
 		t.Fatalf("insert users: %v", err)
 	}
 
-	_, err = db.ExecContext(ctx, `INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name) VALUES 
+	_, err = db.ExecContext(ctx, `INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name) VALUES
 		('conn-1', 'u1', 1, 'awg', 'pk-alice-phone', 'Alice Phone'),
 		('conn-2', 'u1', 1, 'awg', 'pk-alice-laptop', 'Alice Laptop'),
 		('conn-3', 'u2', 1, 'awg', 'pk-bob-desktop', 'Bob Desktop')`)

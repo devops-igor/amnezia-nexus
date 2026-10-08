@@ -673,5 +673,10 @@
   "vpn_fwd_user_prefix": "Пользователь: ",
   "vpn_fwd_config_prefix": "Конфиг: ",
   "vpn_fwd_ip_prefix": "IP: ",
-  "vpn_fwd_backend_prefix": "Бэкенд "
+  "vpn_fwd_backend_prefix": "Бэкенд ",
+  "vpn_problem_session_without_route": "Активная сессия не имеет маршрута в форвардере",
+  "vpn_problem_route_queue_drops": "Активен сброс пакетов клиента в очереди возврата",
+  "vpn_problem_write_stall": "Обнаружена задержка записи в устройство",
+  "vpn_problem_write_errors": "Активны ошибки записи в устройство",
+  "vpn_problem_route_queue_pressure": "Обнаружена высокая нагрузка очереди на маршруте форвардера"
 }

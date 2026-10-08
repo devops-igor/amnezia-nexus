@@ -1192,6 +1192,9 @@
         tr.setAttribute('data-status', (s && s.status) || '');
 
         const sessId = s ? (s.session_id || s.id) : null;
+        if (sessId !== null && sessId !== undefined && sessId !== '') {
+            tr.setAttribute('data-session-id', sessId);
+        }
         if (sessId && vpnExpandedSessionIds && vpnExpandedSessionIds.has(sessId)) {
             if (tr.classList) tr.classList.add('row-expanded');
             else tr.className = ((tr.className || '') + ' row-expanded').trim();
@@ -1320,6 +1323,10 @@
         }
         const tr = document.createElement('tr');
         tr.className = 'vpn-session-drilldown-row table-empty-state';
+        const sessId = s ? (s.session_id || s.id) : null;
+        if (sessId !== null && sessId !== undefined && sessId !== '') {
+            tr.setAttribute('data-parent-session-id', sessId);
+        }
 
         const td = document.createElement('td');
         td.colSpan = 8;
@@ -1493,10 +1500,110 @@
         tbody.insertBefore(banner, tbody.firstChild);
     }
 
+    function vpnFindSessionById(sessId) {
+        if (sessId === null || sessId === undefined) return null;
+        let list = [];
+        if (typeof vpnLastSessions !== 'undefined' && vpnLastSessions) {
+            if (Array.isArray(vpnLastSessions.sessions)) {
+                list = vpnLastSessions.sessions;
+            } else if (Array.isArray(vpnLastSessions)) {
+                list = vpnLastSessions;
+            }
+        }
+        for (let i = 0; i < list.length; i++) {
+            const item = list[i];
+            if (item && String(item.session_id || item.id) === String(sessId)) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    function vpnSyncExpandedDrilldowns() {
+        const tbody = document.getElementById('vpn-sessions-tbody');
+        if (!tbody) return;
+
+        const isExpanded = function(id) {
+            if (!vpnExpandedSessionIds || id === null || id === undefined) return false;
+            return vpnExpandedSessionIds.has(id) || vpnExpandedSessionIds.has(String(id)) || (!isNaN(id) && vpnExpandedSessionIds.has(Number(id)));
+        };
+
+        const escapeAttr = function(val) {
+            if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+                return CSS.escape(val);
+            }
+            return String(val).replace(/["\\]/g, '\\$&');
+        };
+
+        const drilldowns = Array.from(tbody.querySelectorAll('.vpn-session-drilldown-row'));
+        drilldowns.forEach(function(d) {
+            const sessId = d.getAttribute('data-parent-session-id');
+            const safeId = sessId ? escapeAttr(sessId) : null;
+            const parent = safeId ? tbody.querySelector('tr[data-session-id="' + safeId + '"]') : null;
+            if (!parent || !sessId || !isExpanded(sessId)) {
+                d.remove();
+                return;
+            }
+            if (parent.style.display === 'none') {
+                d.style.display = 'none';
+            } else {
+                d.style.display = '';
+                if (parent.nextElementSibling !== d) {
+                    if (typeof parent.after === 'function') {
+                        parent.after(d);
+                    } else if (parent.parentNode) {
+                        parent.parentNode.insertBefore(d, parent.nextSibling);
+                    }
+                }
+            }
+        });
+
+        if (vpnExpandedSessionIds && vpnExpandedSessionIds.size > 0) {
+            vpnExpandedSessionIds.forEach(function(sessId) {
+                if (sessId === null || sessId === undefined) return;
+                const safeId = escapeAttr(sessId);
+                const existing = tbody.querySelector('tr.vpn-session-drilldown-row[data-parent-session-id="' + safeId + '"]');
+                if (existing) return;
+                const parent = tbody.querySelector('tr[data-session-id="' + safeId + '"]');
+                if (!parent) return;
+                const s = vpnFindSessionById(sessId) || { session_id: sessId, id: sessId };
+                const route = vpnFindRouteForSession(s);
+                const d = vpnCreateSessionDrilldownRow(s, route);
+                if (parent.style.display === 'none') {
+                    d.style.display = 'none';
+                } else {
+                    d.style.display = '';
+                }
+                if (typeof parent.after === 'function') {
+                    parent.after(d);
+                } else if (parent.parentNode) {
+                    parent.parentNode.insertBefore(d, parent.nextSibling);
+                }
+            });
+        }
+    }
+
+    function vpnWrapSessionsTableRender(tableInstance) {
+        if (!tableInstance || tableInstance._vpnDrilldownWrapped) return;
+        tableInstance._vpnDrilldownWrapped = true;
+        const origRender = typeof tableInstance._render === 'function' ? tableInstance._render : tableInstance.render;
+        const wrapped = function() {
+            if (typeof origRender === 'function') {
+                origRender.apply(tableInstance, arguments);
+            }
+            vpnSyncExpandedDrilldowns();
+        };
+        tableInstance._render = wrapped;
+        tableInstance.render = wrapped;
+    }
+
     function renderSessions(sessions) {
         const tbody = document.getElementById('vpn-sessions-tbody');
         if (!tbody) return;
         tbody.textContent = '';
+        if (sessions && (!vpnLastSessions || !vpnLastSessions.sessions)) {
+            vpnLastSessions = { sessions: sessions };
+        }
         vpnRenderSessionsStaleBanner();
 
         const countBadge = document.getElementById('vpn-sessions-count-badge');
@@ -1523,6 +1630,7 @@
         }
 
         if (vpnSessionsTableInstance) {
+            vpnWrapSessionsTableRender(vpnSessionsTableInstance);
             for (const s of sessionsToRender) {
                 const route = vpnFindRouteForSession(s);
                 const tr = vpnRenderSessionRow(s, route);
@@ -1534,6 +1642,7 @@
                 }
             }
             vpnSessionsTableInstance.refresh();
+            vpnSyncExpandedDrilldowns();
             return;
         }
 
@@ -1578,6 +1687,8 @@
                 searchPlaceholder: _('vpn_search_sessions') || _('search_placeholder') || 'Search sessions...',
                 emptyMessage: _('vpn_no_sessions') || 'No active sessions'
             });
+            vpnWrapSessionsTableRender(vpnSessionsTableInstance);
+            vpnSyncExpandedDrilldowns();
         }
     }
 
@@ -2218,8 +2329,10 @@
         let affectedConfigsCount = 0;
 
         if (hasActionableProblems) {
-            affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.username || p.user_id; }).filter(Boolean)).size;
-            affectedConfigsCount = new Set(actionableProblems.map(function(p) { return p.connection_name || p.connection_id; }).filter(Boolean)).size;
+            affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.user_id || p.username; }).filter(Boolean)).size;
+            affectedConfigsCount = new Set(actionableProblems.map(function(p) {
+                return p.connection_id || (p.user_id ? p.user_id + ':' + (p.connection_name || '') : p.connection_name);
+            }).filter(Boolean)).size;
         }
 
         const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');

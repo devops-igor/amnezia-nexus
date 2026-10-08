@@ -673,5 +673,10 @@
   "vpn_fwd_user_prefix": "用户: ",
   "vpn_fwd_config_prefix": "配置: ",
   "vpn_fwd_ip_prefix": "IP: ",
-  "vpn_fwd_backend_prefix": "后端 "
+  "vpn_fwd_backend_prefix": "后端 ",
+  "vpn_problem_session_without_route": "活动会话没有转发器路由",
+  "vpn_problem_route_queue_drops": "返回队列中客户端数据包丢弃处于活动状态",
+  "vpn_problem_write_stall": "检测到设备写入停顿",
+  "vpn_problem_write_errors": "设备写入错误处于活动状态",
+  "vpn_problem_route_queue_pressure": "在转发器路由上检测到较高的队列压力"
 }

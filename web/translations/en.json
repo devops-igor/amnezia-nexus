@@ -673,5 +673,10 @@
   "vpn_fwd_user_prefix": "User: ",
   "vpn_fwd_config_prefix": "Config: ",
   "vpn_fwd_ip_prefix": "IP: ",
-  "vpn_fwd_backend_prefix": "Backend "
+  "vpn_fwd_backend_prefix": "Backend ",
+  "vpn_problem_session_without_route": "Active session has no forwarder route",
+  "vpn_problem_route_queue_drops": "Client packet drops active on return queue",
+  "vpn_problem_write_stall": "Device write stall detected",
+  "vpn_problem_write_errors": "Device write errors active",
+  "vpn_problem_route_queue_pressure": "High queue pressure detected on forwarder route"
 }
