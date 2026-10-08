@@ -58,11 +58,11 @@ There are limits. A blocked gateway can still leave users disconnected, and a ba
 ## How it works
 
 ```mermaid
-flowchart TB
-    client["VPN clients<br/>Single Nexus endpoint"] -->|"AmneziaWG"| nexus["Amnezia Nexus<br/>Gateway, monitoring & load balancer"]
-    nexus -->|"Encrypted backend tunnel"| backendA["Backend A"]
-    nexus -->|"Encrypted backend tunnel"| backendB["Backend B"]
-    nexus -->|"Encrypted backend tunnel"| backendC["Backend C"]
+flowchart TD
+    clients["VPN clients"] -->|"AmneziaWG"| nexus["Amnezia Nexus"]
+    nexus -->|"Encrypted tunnel"| backendA["Backend A"]
+    nexus -->|"Encrypted tunnel"| backendB["Backend B"]
+    nexus -->|"Encrypted tunnel"| backendC["Backend C"]
     backendA --> internet["Internet"]
     backendB --> internet
     backendC --> internet
