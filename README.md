@@ -1,22 +1,28 @@
-<div align="center">
+<p align="center">
+  <img src="web/static/favicon.svg" alt="Amnezia Nexus icon" width="76" height="76">
+</p>
 
-<img src="web/static/favicon.svg" alt="Amnezia Nexus icon" width="76" height="76">
+<h1 align="center">Amnezia Nexus</h1>
 
-# Amnezia Nexus
+<p align="center"><strong>One VPN entry point. Multiple backend servers. Automatic failover.</strong></p>
 
-**One VPN entry point. Multiple backend servers. Automatic failover.**
+<p align="center">Self-hosted AmneziaWG VPN gateway and management platform for resilient, centrally managed connectivity.</p>
 
-Self-hosted AmneziaWG VPN gateway and management platform for resilient, centrally managed connectivity.
+<p align="center">
+  <a href="https://github.com/devops-igor/amnezia-nexus/actions/workflows/ci.yml"><img src="https://github.com/devops-igor/amnezia-nexus/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="https://github.com/devops-igor/amnezia-nexus/actions/workflows/docker.yml"><img src="https://github.com/devops-igor/amnezia-nexus/actions/workflows/docker.yml/badge.svg?branch=main" alt="Docker build status"></a>
+  <a href="https://github.com/devops-igor/amnezia-nexus/releases/latest"><img src="https://img.shields.io/github/v/release/devops-igor/amnezia-nexus?style=flat-square&amp;label=release" alt="Latest release"></a>
+  <a href="https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus"><img src="https://img.shields.io/badge/GHCR-container_images-blue?style=flat-square&amp;logo=docker" alt="GHCR container images"></a>
+  <a href="https://github.com/devops-igor/amnezia-nexus/blob/main/go.mod"><img src="https://img.shields.io/github/go-mod/go-version/devops-igor/amnezia-nexus?style=flat-square&amp;logo=go" alt="Go version"></a>
+</p>
 
-[![CI](https://github.com/devops-igor/amnezia-nexus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/devops-igor/amnezia-nexus/actions/workflows/ci.yml)
-[![Docker Build](https://github.com/devops-igor/amnezia-nexus/actions/workflows/docker.yml/badge.svg?branch=main)](https://github.com/devops-igor/amnezia-nexus/actions/workflows/docker.yml)
-[![Latest Release](https://img.shields.io/github/v/release/devops-igor/amnezia-nexus?style=flat-square&label=release)](https://github.com/devops-igor/amnezia-nexus/releases/latest)
-[![Container Images](https://img.shields.io/badge/GHCR-container_images-blue?style=flat-square&logo=docker)](https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/devops-igor/amnezia-nexus?style=flat-square&logo=go)](https://github.com/devops-igor/amnezia-nexus/blob/main/go.mod)
-
-[**Quick Start**](#quick-start) · [**Features**](#features) · [**How It Works**](#how-it-works) · [**Documentation**](#documentation--specifications) · [**Releases**](https://github.com/devops-igor/amnezia-nexus/releases)
-
-</div>
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#how-it-works">How It Works</a> ·
+  <a href="#documentation--specifications">Documentation</a> ·
+  <a href="https://github.com/devops-igor/amnezia-nexus/releases">Releases</a>
+</p>
 
 Amnezia Nexus provides a stable, client-facing AmneziaWG endpoint while routing traffic through a pool of separately managed backend servers. It combines load balancing, health monitoring, failover, and a web interface so administrators can change backend infrastructure without routinely reissuing client configurations.
 
@@ -143,16 +149,12 @@ You should see logs confirming the database is ready and the VPN endpoint is run
 
 ---
 
----
-
 ## Setting Up Your VPN
 
 1. **Log in**: Open `http://<YOUR_SERVER_IP>:8080` in your browser and complete the initial admin setup.
 2. **Add your server**: Go to **Servers** -> **Add Server**. Enter the IP address, SSH port, and SSH credentials of your remote node so Nexus can manage it.
 3. **Add it to the VPN pool**: Go to the **VPN** section, click **Add Backend**, choose your server from the dropdown, and click **Enable Backend**. Nexus will connect to the node, verify its AmneziaWG container, set up NAT forwarding rules, and add it to the active load balancing pool.
 4. **Create client configs**: Go to **Clients** -> **Create Client**. You can scan the generated QR code with the Amnezia VPN mobile app or download the `.conf` file for your desktop.
-
----
 
 ---
 
@@ -232,8 +234,6 @@ Install **Docker Engine** and the **Docker Compose plugin** using the [official 
 
 ---
 
----
-
 ## Configuration (Environment Variables)
 
 You can customize Nexus using the following environment variables in your `docker-compose.yaml`:
@@ -269,8 +269,6 @@ socket is plain HTTP. Requests from any other peer carrying
 `X-Forwarded-Proto` are **not** trusted. When the panel terminates TLS itself,
 cookies are `Secure` automatically (no extra configuration), and
 `COOKIE_INSECURE=1` (development only) unconditionally disables `Secure`.
-
----
 
 ---
 
