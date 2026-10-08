@@ -668,5 +668,10 @@
   "vpn_drilldown_write_errors": "Write Errors",
   "vpn_drilldown_traffic_details": "Traffic Details",
   "vpn_drilldown_no_telemetry": "Forwarder route telemetry not available for this session",
-  "vpn_fwd_recent": "recent"
+  "vpn_fwd_recent": "recent",
+  "vpn_diag_summary_actionable_issues": "Active VPN session routing or dataplane issues detected",
+  "vpn_fwd_user_prefix": "User: ",
+  "vpn_fwd_config_prefix": "Config: ",
+  "vpn_fwd_ip_prefix": "IP: ",
+  "vpn_fwd_backend_prefix": "Backend "
 }

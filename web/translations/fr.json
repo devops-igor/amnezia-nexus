@@ -668,5 +668,10 @@
   "vpn_drilldown_write_errors": "Erreurs d'écriture",
   "vpn_drilldown_traffic_details": "Détails du trafic",
   "vpn_drilldown_no_telemetry": "Télémétrie de route du forwarder non disponible pour cette session",
-  "vpn_fwd_recent": "récent"
+  "vpn_fwd_recent": "récent",
+  "vpn_diag_summary_actionable_issues": "Problèmes actifs de routage ou de plan de données de session VPN détectés",
+  "vpn_fwd_user_prefix": "Utilisateur : ",
+  "vpn_fwd_config_prefix": "Configuration : ",
+  "vpn_fwd_ip_prefix": "IP : ",
+  "vpn_fwd_backend_prefix": "Backend "
 }

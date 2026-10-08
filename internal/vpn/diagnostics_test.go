@@ -2129,3 +2129,45 @@ func TestSynthesizeActionableProblems_ObservedRateFormatting(t *testing.T) {
 		})
 	}
 }
+
+func TestBackendCorrelation_ReconnectContradictorySessionIDDisqualified(t *testing.T) {
+	oldRoute := forwarder.RouteInfo{
+		SessionID: "old-123",
+		PeerKey:   "peer-A",
+	}
+	newSess := Session{
+		ID:            "new-456",
+		PeerPublicKey: "peer-A",
+		Status:        "connected",
+	}
+
+	// 1. findSessionForRoute must NOT correlate contradictory session IDs
+	if sess, ok := findSessionForRoute(oldRoute, []Session{newSess}); ok {
+		t.Fatalf("findSessionForRoute unexpectedly correlated route %s with session %s", oldRoute.SessionID, sess.ID)
+	}
+
+	// 2. synthesizeUnroutableSessionProblems must emit an unroutable problem for new-456
+	problems := synthesizeUnroutableSessionProblems([]forwarder.RouteInfo{oldRoute}, []Session{newSess}, time.Now())
+	if len(problems) != 1 {
+		t.Fatalf("expected 1 unroutable problem, got %d: %+v", len(problems), problems)
+	}
+	if problems[0].SessionID != "new-456" {
+		t.Errorf("expected problem for session %q, got %q", "new-456", problems[0].SessionID)
+	}
+	if problems[0].MessageKey != "vpn_problem_session_without_route" {
+		t.Errorf("expected MessageKey %q, got %q", "vpn_problem_session_without_route", problems[0].MessageKey)
+	}
+
+	// 3. auditRoutingConsistencyDetails must report SessionsWithoutRoute for new-456 and RoutesWithoutSession for old-123
+	diag := auditRoutingConsistencyDetails([]forwarder.RouteInfo{oldRoute}, []Session{newSess})
+	if diag.IsConsistent {
+		t.Errorf("expected routing to be inconsistent, got IsConsistent == true")
+	}
+	expectedRedacted := ingress.RedactKey("peer-A")
+	if len(diag.SessionsWithoutRoute) != 1 || diag.SessionsWithoutRoute[0] != expectedRedacted {
+		t.Errorf("SessionsWithoutRoute: got %v, want [%s]", diag.SessionsWithoutRoute, expectedRedacted)
+	}
+	if len(diag.RoutesWithoutSession) != 1 || diag.RoutesWithoutSession[0] != expectedRedacted {
+		t.Errorf("RoutesWithoutSession: got %v, want [%s]", diag.RoutesWithoutSession, expectedRedacted)
+	}
+}

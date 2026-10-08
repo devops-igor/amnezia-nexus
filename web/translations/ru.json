@@ -668,5 +668,10 @@
   "vpn_drilldown_write_errors": "Ошибки записи",
   "vpn_drilldown_traffic_details": "Детализация трафика",
   "vpn_drilldown_no_telemetry": "Телеметрия маршрута форвардера недоступна для этой сессии",
-  "vpn_fwd_recent": "недавних"
+  "vpn_fwd_recent": "недавних",
+  "vpn_diag_summary_actionable_issues": "Обнаружены активные проблемы маршрутизации или плоскости данных VPN-сессий",
+  "vpn_fwd_user_prefix": "Пользователь: ",
+  "vpn_fwd_config_prefix": "Конфиг: ",
+  "vpn_fwd_ip_prefix": "IP: ",
+  "vpn_fwd_backend_prefix": "Бэкенд "
 }

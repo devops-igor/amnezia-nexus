@@ -135,6 +135,7 @@ type ActionableProblem struct {
 type ForwarderHealthAssessment struct {
 	Status             string              `json:"status"` // HEALTHY, DEGRADED, CRITICAL, UNAVAILABLE
 	Summary            string              `json:"summary"`
+	SummaryKey         string              `json:"summary_key,omitempty"`
 	Conditions         []HealthCondition   `json:"conditions"`
 	ActionableProblems []ActionableProblem `json:"actionable_problems,omitempty"`
 }
@@ -681,31 +682,42 @@ func checkRoutingInvariants(s *Service, routes []forwarder.RouteInfo, retStats R
 
 func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, routes []forwarder.RouteInfo, retStats ReturnStatsSnapshot, clientOwnershipMismatch uint64) RoutingConsistencyDiagnostics {
 	activeSessions := inputs.sessions
+	diag := auditRoutingConsistencyDetails(routes, activeSessions)
+	diag.OwnershipMismatchDrops = retStats.OwnershipMismatchDrops
+	diag.ClientOwnershipMismatchDrops = clientOwnershipMismatch
 
-	diag := RoutingConsistencyDiagnostics{
-		ActiveSessionsCount:          len(activeSessions),
-		ActiveRoutesCount:            len(routes),
-		OwnershipMismatchDrops:       retStats.OwnershipMismatchDrops,
-		ClientOwnershipMismatchDrops: clientOwnershipMismatch,
-		IsConsistent:                 true,
-		SessionsWithoutRoute:         []string{},
-		RoutesWithoutSession:         []string{},
-		RoutesWithoutReturn:          []string{},
-		DuplicateIPs:                 []string{},
-		HistoricalDetails:            []string{},
+	if s != nil {
+		now := time.Now()
+		mismatchRate := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
+		clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(inputs.generation, now, clientOwnershipMismatch)
+		diag.OwnershipMismatchDropsRecent = mismatchRate.delta
+		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
+		diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
+
+		if diag.OwnershipMismatchRecentTotal() > 0 {
+			diag.IsConsistent = false
+			diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+				describeOwnershipMismatchRecent(&diag))
+		} else if diag.OwnershipMismatchDrops > 0 || diag.ClientOwnershipMismatchDrops > 0 {
+			diag.HistoricalDetails = append(diag.HistoricalDetails,
+				describeOwnershipMismatchHistorical(&diag))
+		}
 	}
-	// Both mismatch directions are sampled at ONE timestamp and ONE window, so
-	// OwnershipMismatchWindowSec describes both deltas and the rate the
-	// aggregate drop condition subtracts is measured over exactly the interval
-	// the CRITICAL gate was decided on (issue #424 review round 9, blocker 3).
-	// The generation travels with the inputs snapshot (issue #429 review
-	// round 4, blocker 1): a stale snapshot can never advance these windows.
-	now := time.Now()
-	mismatchRate := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
-	clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(inputs.generation, now, clientOwnershipMismatch)
-	diag.OwnershipMismatchDropsRecent = mismatchRate.delta
-	diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
-	diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
+
+	return diag
+}
+
+func auditRoutingConsistencyDetails(routes []forwarder.RouteInfo, activeSessions []Session) RoutingConsistencyDiagnostics {
+	diag := RoutingConsistencyDiagnostics{
+		ActiveSessionsCount:  len(activeSessions),
+		ActiveRoutesCount:    len(routes),
+		IsConsistent:         true,
+		SessionsWithoutRoute: []string{},
+		RoutesWithoutSession: []string{},
+		RoutesWithoutReturn:  []string{},
+		DuplicateIPs:         []string{},
+		HistoricalDetails:    []string{},
+	}
 
 	sessionByPeer := make(map[string]Session, len(activeSessions))
 	ipSessions := make(map[string][]string)
@@ -730,40 +742,11 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 		}
 	}
 
-	// 1. Sessions without route
-	for peerKey := range sessionByPeer {
-		if _, ok := routesByPeer[peerKey]; !ok {
-			diag.SessionsWithoutRoute = append(diag.SessionsWithoutRoute, peerKey)
-		}
-	}
-
-	// 2. Routes without session
-	for peerKey := range routesByPeer {
-		if _, ok := sessionByPeer[peerKey]; !ok {
-			diag.RoutesWithoutSession = append(diag.RoutesWithoutSession, peerKey)
-		}
-	}
-
-	// 3. Routes without return owner
-	for peerKey, r := range routesByPeer {
-		if r.BackendTunnelID <= 0 || !r.HasReturnPath || r.ReturnPathClosed {
-			diag.RoutesWithoutReturn = append(diag.RoutesWithoutReturn, peerKey)
-		}
-	}
-
+	diag.SessionsWithoutRoute, diag.RoutesWithoutSession = auditUnpairedRoutesAndSessions(sessionByPeer, routesByPeer)
+	diag.RoutesWithoutReturn = auditRoutesWithoutReturn(routesByPeer)
 	diag.DuplicateIPs = findDuplicateIPs(ipSessions, ipRoutes)
 
-	// Sort FIRST, redact SECOND (issue #424 round 5, item 1a). These three
-	// slices are built by iterating maps keyed by the RAW peer public key, so
-	// the raw value is what reaches the JSON payload. ingress.RedactKey, the
-	// convention the rest of the system already uses for peer keys, is applied
-	// after the sort on purpose: sort.Strings over raw keys is the ordering
-	// this field has always had, and it is a total order on the raw value, so
-	// the output order stays deterministic and does not silently change if the
-	// redaction truncation is ever revisited. Sorting the REDACTED values would
-	// instead be a function of the truncation (redacted keys share an 8
-	// character prefix, so they cluster), which makes the ordering a property
-	// of the masking scheme rather than of the data.
+	// Sort FIRST, redact SECOND (issue #424 round 5, item 1a).
 	sort.Strings(diag.SessionsWithoutRoute)
 	sort.Strings(diag.RoutesWithoutSession)
 	sort.Strings(diag.RoutesWithoutReturn)
@@ -771,9 +754,63 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 	redactKeySlice(diag.RoutesWithoutSession)
 	redactKeySlice(diag.RoutesWithoutReturn)
 
-	auditRoutingConsistencyDetails(&diag)
+	finalizeRoutingConsistencyIssues(&diag)
 
 	return diag
+}
+
+func auditUnpairedRoutesAndSessions(sessionByPeer map[string]Session, routesByPeer map[string]forwarder.RouteInfo) ([]string, []string) {
+	var sessionsWithoutRoute []string
+	for peerKey, sess := range sessionByPeer {
+		r, ok := routesByPeer[peerKey]
+		if !ok || (r.SessionID != "" && sess.ID != "" && r.SessionID != sess.ID) {
+			sessionsWithoutRoute = append(sessionsWithoutRoute, peerKey)
+		}
+	}
+
+	var routesWithoutSession []string
+	for peerKey, r := range routesByPeer {
+		sess, ok := sessionByPeer[peerKey]
+		if !ok || (r.SessionID != "" && sess.ID != "" && r.SessionID != sess.ID) {
+			routesWithoutSession = append(routesWithoutSession, peerKey)
+		}
+	}
+
+	return sessionsWithoutRoute, routesWithoutSession
+}
+
+func auditRoutesWithoutReturn(routesByPeer map[string]forwarder.RouteInfo) []string {
+	var routesWithoutReturn []string
+	for peerKey, r := range routesByPeer {
+		if r.BackendTunnelID <= 0 || !r.HasReturnPath || r.ReturnPathClosed {
+			routesWithoutReturn = append(routesWithoutReturn, peerKey)
+		}
+	}
+	return routesWithoutReturn
+}
+
+func finalizeRoutingConsistencyIssues(diag *RoutingConsistencyDiagnostics) {
+	if len(diag.SessionsWithoutRoute) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d active session(s) lack a forwarder route", len(diag.SessionsWithoutRoute)))
+	}
+	if len(diag.RoutesWithoutSession) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d forwarder route(s) have no corresponding active session", len(diag.RoutesWithoutSession)))
+	}
+	if len(diag.RoutesWithoutReturn) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d route(s) lack an assigned return owner/backend", len(diag.RoutesWithoutReturn)))
+	}
+	if len(diag.DuplicateIPs) > 0 {
+		diag.IsConsistent = false
+		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
+			fmt.Sprintf("%d duplicate IP address(es) detected across active routes: %s",
+				len(diag.DuplicateIPs), strings.Join(diag.DuplicateIPs, ", ")))
+	}
 }
 
 // redactKeySlice replaces every element of keys with its ingress.RedactKey
@@ -807,47 +844,6 @@ func findDuplicateIPs(ipSessions, ipRoutes map[string][]string) []string {
 	}
 	sort.Strings(dups)
 	return dups
-}
-
-func auditRoutingConsistencyDetails(diag *RoutingConsistencyDiagnostics) {
-	if len(diag.SessionsWithoutRoute) > 0 {
-		diag.IsConsistent = false
-		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d active session(s) lack a forwarder route", len(diag.SessionsWithoutRoute)))
-	}
-	if len(diag.RoutesWithoutSession) > 0 {
-		diag.IsConsistent = false
-		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d forwarder route(s) have no corresponding active session", len(diag.RoutesWithoutSession)))
-	}
-	if len(diag.RoutesWithoutReturn) > 0 {
-		diag.IsConsistent = false
-		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d route(s) lack an assigned return owner/backend", len(diag.RoutesWithoutReturn)))
-	}
-	if len(diag.DuplicateIPs) > 0 {
-		diag.IsConsistent = false
-		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			fmt.Sprintf("%d duplicate IP address(es) detected across active routes: %s",
-				len(diag.DuplicateIPs), strings.Join(diag.DuplicateIPs, ", ")))
-	}
-	// A lifetime mismatch counter must not pin routing as inconsistent after
-	// recovery: only the recent delta degrades current health, while the
-	// cumulative total stays visible as a historical note (issue #424 round 2,
-	// finding 5).
-	//
-	// BOTH directions are consulted (issue #424 review round 9, blocker 3).
-	// Only the return direction was evaluated before, so a client-direction
-	// mismatch — counted, published, and given its own history series — never
-	// reached routing health at all.
-	if diag.OwnershipMismatchRecentTotal() > 0 {
-		diag.IsConsistent = false
-		diag.InconsistencyDetails = append(diag.InconsistencyDetails,
-			describeOwnershipMismatchRecent(diag))
-	} else if diag.OwnershipMismatchDrops > 0 || diag.ClientOwnershipMismatchDrops > 0 {
-		diag.HistoricalDetails = append(diag.HistoricalDetails,
-			describeOwnershipMismatchHistorical(diag))
-	}
 }
 
 // describeOwnershipMismatchRecent renders the current-window ownership-mismatch
@@ -1172,13 +1168,16 @@ func EvaluateForwarderHealth(
 		status = HealthDegraded
 	}
 
+	var summaryKey string
 	if (initialStatus == HealthHealthy || initialStatus == "WARNING") && status != initialStatus {
 		summary = "Active VPN session routing or dataplane issues detected"
+		summaryKey = "vpn_diag_summary_actionable_issues"
 	}
 
 	return ForwarderHealthAssessment{
 		Status:             status,
 		Summary:            summary,
+		SummaryKey:         summaryKey,
 		Conditions:         conditions,
 		ActionableProblems: actionable,
 	}
@@ -2662,6 +2661,7 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 }
 
 func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bool) {
+	// Priority 1: Exact Session ID match
 	if r.SessionID != "" {
 		for _, s := range sessions {
 			if s.ID == r.SessionID {
@@ -2669,20 +2669,38 @@ func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bo
 			}
 		}
 	}
+
+	// Priority 2: Peer key fallback
+	// Permitted ONLY when session ID is absent on one/both sides (r.SessionID == "" || s.ID == "").
+	// If both provide a session ID and they differ, s is strictly disqualified from matching r.
 	if r.PeerKey != "" {
 		for _, s := range sessions {
 			if s.PeerPublicKey == r.PeerKey {
+				if r.SessionID != "" && s.ID != "" && r.SessionID != s.ID {
+					continue
+				}
 				return s, true
 			}
 		}
 	}
-	// Priority 3 (IP Fallback): ONLY permit s.AssignedIP == r.AssignedIP if the route has NO durable
-	// identity (r.SessionID == "" && r.PeerKey == "") AND the session has no contradictory match.
-	// If durable identifiers exist on both sides and do not match, NEVER fall back to IP match.
-	if r.SessionID == "" && r.PeerKey == "" && r.AssignedIP != "" {
+
+	// Priority 3: IP fallback
+	// Permitted ONLY when both session ID and peer key are absent on one/both sides.
+	// If session IDs contradict, or if peer keys contradict, fallback is strictly forbidden.
+	if r.AssignedIP != "" {
 		for _, s := range sessions {
 			if s.AssignedIP == r.AssignedIP {
-				return s, true
+				if r.SessionID != "" && s.ID != "" && r.SessionID != s.ID {
+					continue
+				}
+				if r.PeerKey != "" && s.PeerPublicKey != "" && r.PeerKey != s.PeerPublicKey {
+					continue
+				}
+				rAbsent := r.SessionID == "" && r.PeerKey == ""
+				sAbsent := s.ID == "" && s.PeerPublicKey == ""
+				if rAbsent || sAbsent {
+					return s, true
+				}
 			}
 		}
 	}
@@ -2693,15 +2711,14 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
-	routesByPeer := make(map[string]struct{}, len(routes))
+	routesByPeerWithoutSession := make(map[string]struct{}, len(routes))
 	routesBySessionID := make(map[string]struct{}, len(routes))
 	untaggedRoutesByIP := make(map[string]struct{}, len(routes))
 	for _, r := range routes {
 		if r.SessionID != "" {
 			routesBySessionID[r.SessionID] = struct{}{}
-		}
-		if r.PeerKey != "" {
-			routesByPeer[r.PeerKey] = struct{}{}
+		} else if r.PeerKey != "" {
+			routesByPeerWithoutSession[r.PeerKey] = struct{}{}
 		}
 		if r.SessionID == "" && r.PeerKey == "" && r.AssignedIP != "" {
 			untaggedRoutesByIP[r.AssignedIP] = struct{}{}
@@ -2719,7 +2736,7 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 		}
 		hasPeer := false
 		if sess.PeerPublicKey != "" {
-			_, hasPeer = routesByPeer[sess.PeerPublicKey]
+			_, hasPeer = routesByPeerWithoutSession[sess.PeerPublicKey]
 		}
 		hasUntaggedIP := false
 		if sess.AssignedIP != "" {

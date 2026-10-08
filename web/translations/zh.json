@@ -668,5 +668,10 @@
   "vpn_drilldown_write_errors": "写入错误",
   "vpn_drilldown_traffic_details": "流量详情",
   "vpn_drilldown_no_telemetry": "此会话的转发器路由遥测不可用",
-  "vpn_fwd_recent": "最近"
+  "vpn_fwd_recent": "最近",
+  "vpn_diag_summary_actionable_issues": "检测到活动的 VPN 会话路由或数据平面问题",
+  "vpn_fwd_user_prefix": "用户: ",
+  "vpn_fwd_config_prefix": "配置: ",
+  "vpn_fwd_ip_prefix": "IP: ",
+  "vpn_fwd_backend_prefix": "后端 "
 }

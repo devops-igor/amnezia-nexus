@@ -1119,43 +1119,63 @@
         }
         if (!routes.length) return null;
 
-        // 1. Durable session ID match first
-        const sSess = s.session_id !== undefined && s.session_id !== null && s.session_id !== '' ? s.session_id : s.id;
-        if (sSess !== undefined && sSess !== null && sSess !== '') {
+        // 1. Exact session ID match first
+        const sSess = (s.session_id !== undefined && s.session_id !== null && s.session_id !== '') ? s.session_id : s.id;
+        const hasSSess = sSess !== undefined && sSess !== null && sSess !== '';
+        if (hasSSess) {
             for (let i = 0; i < routes.length; i++) {
                 const r = routes[i];
-                const rSess = r && (r.session_id !== undefined && r.session_id !== null && r.session_id !== '' ? r.session_id : r.id);
-                if (r && rSess !== undefined && rSess !== null && String(sSess) === String(rSess)) {
+                const rSess = r && ((r.session_id !== undefined && r.session_id !== null && r.session_id !== '') ? r.session_id : r.id);
+                if (r && rSess !== undefined && rSess !== null && rSess !== '' && String(sSess) === String(rSess)) {
                     return r;
                 }
             }
         }
 
-        // 2. Durable connection ID match second
+        // 2. Connection ID match second
+        // Permitted ONLY when session ID is absent on s or r.
+        // If both provide a session ID and they differ, r is strictly disqualified for s.
         const sConn = s.connection_id;
-        if (sConn !== undefined && sConn !== null && sConn !== '') {
+        const hasSConn = sConn !== undefined && sConn !== null && sConn !== '';
+        if (hasSConn) {
             for (let i = 0; i < routes.length; i++) {
                 const r = routes[i];
-                if (r && r.connection_id !== undefined && r.connection_id !== null && r.connection_id !== '' && String(sConn) === String(r.connection_id)) {
+                if (!r) continue;
+                const rSess = (r.session_id !== undefined && r.session_id !== null && r.session_id !== '') ? r.session_id : r.id;
+                const hasRSess = rSess !== undefined && rSess !== null && rSess !== '';
+                if (hasSSess && hasRSess && String(sSess) !== String(rSess)) {
+                    continue;
+                }
+                const rConn = r.connection_id;
+                const hasRConn = rConn !== undefined && rConn !== null && rConn !== '';
+                if (hasRConn && String(sConn) === String(rConn)) {
                     return r;
                 }
             }
         }
 
         // 3. Fall back to assigned IP match as display/fallback
-        // Only match s.assigned_ip === r.assigned_ip if durable IDs (session_id, connection_id) are ABSENT on both sides.
-        // If durable IDs are present on both sides and contradictory (different session/connection IDs), do NOT fall back to IP match.
+        // Permitted ONLY when both session ID and connection ID are absent on one/both sides.
+        // If session IDs contradict, or connection IDs contradict, r is strictly disqualified.
         if (s.assigned_ip) {
-            const sHasDurable = (s.session_id !== undefined && s.session_id !== null && s.session_id !== '') ||
-                                (s.connection_id !== undefined && s.connection_id !== null && s.connection_id !== '');
             for (let i = 0; i < routes.length; i++) {
                 const r = routes[i];
-                if (r && r.assigned_ip && s.assigned_ip === r.assigned_ip) {
-                    const rHasDurable = (r.session_id !== undefined && r.session_id !== null && r.session_id !== '') ||
-                                        (r.connection_id !== undefined && r.connection_id !== null && r.connection_id !== '');
-                    if (sHasDurable && rHasDurable) {
-                        continue;
-                    }
+                if (!r || !r.assigned_ip || s.assigned_ip !== r.assigned_ip) {
+                    continue;
+                }
+                const rSess = (r.session_id !== undefined && r.session_id !== null && r.session_id !== '') ? r.session_id : r.id;
+                const hasRSess = rSess !== undefined && rSess !== null && rSess !== '';
+                if (hasSSess && hasRSess && String(sSess) !== String(rSess)) {
+                    continue;
+                }
+                const rConn = r.connection_id;
+                const hasRConn = rConn !== undefined && rConn !== null && rConn !== '';
+                if (hasSConn && hasRConn && String(sConn) === String(rConn)) {
+                    continue;
+                }
+                const sAbsent = !hasSSess && !hasSConn;
+                const rAbsent = !hasRSess && !hasRConn;
+                if (sAbsent || rAbsent) {
                     return r;
                 }
             }
@@ -2149,7 +2169,11 @@
 
         const headlineElem = document.getElementById('vpn-fwd-headline-summary');
         if (headlineElem) {
-            if (ha && ha.summary) {
+            if (ha && ha.summary_key && _(ha.summary_key) && _(ha.summary_key) !== ha.summary_key) {
+                headlineElem.textContent = _(ha.summary_key);
+            } else if (ha && ha.summary === 'Active VPN session routing or dataplane issues detected' && _('vpn_diag_summary_actionable_issues') && _('vpn_diag_summary_actionable_issues') !== 'vpn_diag_summary_actionable_issues') {
+                headlineElem.textContent = _('vpn_diag_summary_actionable_issues');
+            } else if (ha && ha.summary) {
                 headlineElem.textContent = ha.summary;
             } else if (statusBadge && statusBadge.className.includes('badge-danger')) {
                 headlineElem.textContent = _('vpn_diag_summary_critical');
@@ -2284,16 +2308,20 @@
                     }
                     const user = p.username || p.user_id;
                     if (user) {
-                        detailsParts.push('User: ' + user);
+                        const userPrefix = (_('vpn_fwd_user_prefix') && _('vpn_fwd_user_prefix') !== 'vpn_fwd_user_prefix') ? _('vpn_fwd_user_prefix') : (_('vpn_fwd_user_prefix') || 'User: ');
+                        detailsParts.push(userPrefix + user);
                     }
                     if (p.connection_name) {
-                        detailsParts.push('Config: ' + p.connection_name);
+                        const configPrefix = (_('vpn_fwd_config_prefix') && _('vpn_fwd_config_prefix') !== 'vpn_fwd_config_prefix') ? _('vpn_fwd_config_prefix') : (_('vpn_fwd_config_prefix') || 'Config: ');
+                        detailsParts.push(configPrefix + p.connection_name);
                     }
                     if (p.assigned_ip) {
-                        detailsParts.push('IP: ' + p.assigned_ip);
+                        const ipPrefix = (_('vpn_fwd_ip_prefix') && _('vpn_fwd_ip_prefix') !== 'vpn_fwd_ip_prefix') ? _('vpn_fwd_ip_prefix') : (_('vpn_fwd_ip_prefix') || 'IP: ');
+                        detailsParts.push(ipPrefix + p.assigned_ip);
                     }
                     if (p.backend_id !== undefined && p.backend_id !== null && p.backend_id !== '') {
-                        detailsParts.push('Backend ' + p.backend_id);
+                        const backendPrefix = (_('vpn_fwd_backend_prefix') && _('vpn_fwd_backend_prefix') !== 'vpn_fwd_backend_prefix') ? _('vpn_fwd_backend_prefix') : (_('vpn_fwd_backend_prefix') || 'Backend ');
+                        detailsParts.push(backendPrefix + p.backend_id);
                     }
                     if (p.observed_rate) {
                         detailsParts.push(p.observed_rate);

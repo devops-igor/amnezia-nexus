@@ -2541,10 +2541,17 @@ vpnLastStatus = { forwarder_available: true, all_routes: [routeIPMatch, routeSes
 const sessWithPrio = { session_id: 'sess-prio', connection_id: 'conn-x', assigned_ip: '10.8.0.100' };
 assert.strictEqual(vpnFindRouteForSession(sessWithPrio), routeSessionMatch, 'session ID match must take precedence over IP match');
 
-const routeConnMatch = { session_id: 'sess-none', connection_id: 'conn-prio', assigned_ip: '10.8.0.250' };
+// Connection ID fallback permitted when session ID is absent on one side
+const routeConnMatch = { connection_id: 'conn-prio', assigned_ip: '10.8.0.250' };
 vpnLastStatus = { forwarder_available: true, all_routes: [routeSessionMatch, routeConnMatch] };
 const sessWithConnPrio = { session_id: 'sess-unmatched', connection_id: 'conn-prio', assigned_ip: '10.8.0.200' };
-assert.strictEqual(vpnFindRouteForSession(sessWithConnPrio), routeConnMatch, 'connection ID match must take precedence over IP match');
+assert.strictEqual(vpnFindRouteForSession(sessWithConnPrio), routeConnMatch, 'connection ID match must take precedence over IP match when session ID absent on route');
+
+// Contradictory session IDs strictly disqualify connection ID fallback
+const routeContradictoryConn = { session_id: 'sess-route-diff', connection_id: 'conn-same', assigned_ip: '10.8.0.251' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeContradictoryConn] };
+const sessContradictoryConn = { session_id: 'sess-client-diff', connection_id: 'conn-same', assigned_ip: '10.8.0.251' };
+assert.strictEqual(vpnFindRouteForSession(sessContradictoryConn), null, 'contradictory session IDs must strictly disqualify connection ID fallback');
 
 // Hardened correlation: Different connection IDs but identical IP do NOT match
 const routeDiffConnSameIP = { connection_id: 'conn-route-99', assigned_ip: '10.8.0.150' };
@@ -3096,6 +3103,11 @@ func TestVPNTranslationKeyParity(t *testing.T) {
 		"vpn_fwd_affected_configs_count",
 		"vpn_fwd_loss_rate_format",
 		"vpn_fwd_recent",
+		"vpn_diag_summary_actionable_issues",
+		"vpn_fwd_user_prefix",
+		"vpn_fwd_config_prefix",
+		"vpn_fwd_ip_prefix",
+		"vpn_fwd_backend_prefix",
 	}
 	for _, langFile := range languages {
 		for _, k := range newKeys {
@@ -3253,5 +3265,78 @@ assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve lo
 	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("packet loss decoupling test (ru) failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const tbody = document.getElementById('vpn-sessions-tbody');
+
+// Old route from previous connection
+const oldRoute = {
+    session_id: 'old-123',
+    connection_id: 101,
+    drops: 25,
+    queue_full_drops_recent: 10,
+    has_pressure: true,
+    assigned_ip: '10.8.0.101'
+};
+
+// New reconnected session
+const newSession = {
+    id: 1,
+    session_id: 'new-456',
+    connection_id: 101,
+    username: 'alice',
+    connection_name: 'alice-phone',
+    server_name: 'Frankfurt-1',
+    assigned_ip: '10.8.0.101',
+    status: 'connected'
+};
+
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [oldRoute]
+};
+const sessions = [newSession];
+vpnLastSessions = { sessions: sessions };
+
+// 1. vpnFindRouteForSession must return null due to contradictory session IDs
+assert.strictEqual(vpnFindRouteForSession(newSession), null, 'vpnFindRouteForSession must return null when session IDs contradict');
+
+// 2. Render all sessions
+renderSessions(sessions);
+assert.strictEqual(tbody.children.length, 1, 'tbody must have 1 session row');
+const row = tbody.children[0];
+
+// Assert drops column does NOT inherit the old route's drops (drops: 25)
+const dropsCell = row.children[5];
+assert.strictEqual(dropsCell.textContent, '-', 'unroutable session must have dash for drops without inheriting old route telemetry');
+
+// Assert status column renders with Unroutable badge
+const statusCell = row.children[7];
+assert(statusCell.textContent.includes('Unroutable'), 'session without matching route must show Unroutable status badge');
+assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge must have badge-warn');
+
+// 3. Switch to "Problems Only" filter
+vpnToggleSessionsProblemFilter();
+assert.strictEqual(tbody.children.length, 1, 'unroutable session must appear under Problems Only filter');
+const probRow = tbody.children[0];
+assert(probRow.children[7].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
+`
+
+	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("TestVPNReconnectSessionIDMismatchShowsUnroutable failed: %v\n%s", err, out)
 	}
 }

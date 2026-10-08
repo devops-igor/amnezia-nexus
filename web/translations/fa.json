@@ -668,5 +668,10 @@
   "vpn_drilldown_write_errors": "خطاهای نوشتن",
   "vpn_drilldown_traffic_details": "جزئیات ترافیک",
   "vpn_drilldown_no_telemetry": "تله‌متری مسیر فورواردر برای این نشست در دسترس نیست",
-  "vpn_fwd_recent": "اخیر"
+  "vpn_fwd_recent": "اخیر",
+  "vpn_diag_summary_actionable_issues": "مشکلات فعال مسیریابی یا صفحه داده نشست VPN شناسایی شد",
+  "vpn_fwd_user_prefix": "کاربر: ",
+  "vpn_fwd_config_prefix": "پیکربندی: ",
+  "vpn_fwd_ip_prefix": "آی‌پی: ",
+  "vpn_fwd_backend_prefix": "بک‌اند "
 }
