@@ -812,7 +812,7 @@
         if (!confirmed) return;
 
         try {
-            await API.delete('/api/vpn/backends/' + encodeURIComponent(serverId));
+            await API.post('/api/vpn/backends/' + encodeURIComponent(serverId) + '/delete');
             UI.toast((_('vpn_delete') || 'Delete') + ' OK', 'success');
             await vpnLoadData();
         } catch (err) {
