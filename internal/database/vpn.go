@@ -758,11 +758,13 @@ func (d *DB) GetEnrichedActiveVPNSessions(ctx context.Context) ([]models.Enriche
 		s.backend_tunnel_id, COALESCE(t.server_id, 0) AS server_id,
 		COALESCE(srv.name, 'Server #' || t.server_id, 'Server #' || s.backend_tunnel_id) AS server_name,
 		s.peer_public_key, s.assigned_ip, s.connected_at, s.last_seen,
-		s.rx_bytes, s.tx_bytes, s.status, s.connection_name
+		s.rx_bytes, s.tx_bytes, s.status, s.connection_name,
+		COALESCE(c.id, '') AS connection_id
 		FROM vpn_sessions s
 		LEFT JOIN users u ON u.id = s.user_id
 		LEFT JOIN backend_tunnels t ON t.id = s.backend_tunnel_id
 		LEFT JOIN servers srv ON srv.id = t.server_id
+		LEFT JOIN (SELECT client_id, user_id, MIN(id) AS id FROM user_connections GROUP BY client_id, user_id) c ON c.client_id = s.peer_public_key AND c.user_id = s.user_id
 		WHERE s.status = 'connected'
 		ORDER BY s.connected_at DESC`
 
@@ -779,7 +781,7 @@ func (d *DB) GetEnrichedActiveVPNSessions(ctx context.Context) ([]models.Enriche
 		if err := rows.Scan(
 			&s.ID, &s.UserID, &s.Username, &s.BackendTunnelID, &s.ServerID,
 			&s.ServerName, &s.PeerPublicKey, &s.AssignedIP, &connectedAt, &lastSeen,
-			&s.RxBytes, &s.TxBytes, &s.Status, &s.ConnectionName,
+			&s.RxBytes, &s.TxBytes, &s.Status, &s.ConnectionName, &s.ConnectionID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan enriched vpn session: %w", err)
 		}

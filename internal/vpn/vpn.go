@@ -96,6 +96,7 @@ type Status struct {
 	AllRoutes          []ProblemRouteItem            `json:"all_routes,omitempty"`
 	RuntimeResources   RuntimeResources              `json:"runtime_resources"`
 	HistoricalSeries   HistoricalSeries              `json:"historical_series"`
+	CountersSince      string                        `json:"counters_since,omitempty"`
 }
 
 // UserVPNState represents the real-time VPN connection state for a specific user.
@@ -190,6 +191,7 @@ type Service struct {
 	forwarder            *forwarder.Forwarder
 	accountant           *forwarder.TrafficAccountant
 	running              bool
+	startedAt            time.Time // baseline timestamp for cumulative metrics; guarded by mu
 	portalPubKey         string
 	portalPrivKey        string
 	awgProvider          AWGStatusProvider
@@ -245,6 +247,7 @@ type Service struct {
 	diagRates          *diagRatesTracker
 	historyDiagRates   *diagRatesTracker
 	historyDropReasons dropReasonRatesTracker
+	problemOnset       *problemOnsetTracker
 	// diagGeneration is the diagnostics generation (issue #429 review
 	// blocker 1). It advances ONLY in Start, so every Start after Stop is an
 	// explicit new generation: every cumulative diagnostics baseline below is
@@ -708,6 +711,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		rollingHistory:         NewRollingHistory(),
 		diagRates:              newDiagRatesTracker(),
+		problemOnset:           newProblemOnsetTracker(),
 	}
 	revokeDispatch.bind(svc)
 
@@ -1110,6 +1114,9 @@ func (s *Service) Start(ctx context.Context) error {
 		return nil
 	}
 	s.running = true
+	s.startedAt = time.Time{}
+	s.retiredIngressLosses = ingressLossTotals{}
+	s.retiredBackendDeviceDrops = backendDeviceDropStats{}
 	s.mu.Unlock()
 
 	// No client transport keys, endpoints, or forwarder routes survive a process
@@ -1127,6 +1134,7 @@ func (s *Service) Start(ctx context.Context) error {
 		if err != nil {
 			s.mu.Lock()
 			s.running = false
+			s.startedAt = time.Time{}
 			s.mu.Unlock()
 			return fmt.Errorf("failed to invalidate VPN sessions on restart: %w", err)
 		}
@@ -1139,12 +1147,14 @@ func (s *Service) Start(ctx context.Context) error {
 		if err := s.pool.SyncFromDB(ctx); err != nil {
 			s.mu.Lock()
 			s.running = false
+			s.startedAt = time.Time{}
 			s.mu.Unlock()
 			return fmt.Errorf("failed to sync tunnels from DB: %w", err)
 		}
 		if err := s.pool.ResetEnabledHealthForStartup(ctx); err != nil {
 			s.mu.Lock()
 			s.running = false
+			s.startedAt = time.Time{}
 			s.mu.Unlock()
 			return fmt.Errorf("failed to reset backend health for startup: %w", err)
 		}
@@ -1212,6 +1222,10 @@ func (s *Service) Start(ctx context.Context) error {
 
 	s.startRollingHistory()
 
+	s.mu.Lock()
+	s.startedAt = time.Now().UTC()
+	s.mu.Unlock()
+
 	return nil
 }
 
@@ -1253,6 +1267,7 @@ func (s *Service) cleanupEngineStartupFailure() {
 	}
 	s.mu.Lock()
 	s.running = false
+	s.startedAt = time.Time{}
 	s.mu.Unlock()
 }
 
@@ -1761,6 +1776,7 @@ func (s *Service) Stop() error {
 		return nil
 	}
 	s.running = false
+	s.startedAt = time.Time{}
 	ingressEng := s.ingressEngine
 	initialLosses := engineLossTotals(ingressEng)
 	s.retiredIngressLosses = addIngressLosses(s.retiredIngressLosses, initialLosses)
@@ -1867,6 +1883,7 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		routeSnapshot = inputs.forwarder.InspectRoutes()
 	}
 	running, db := s.running, s.db
+	startedAt := s.startedAt
 	var cfg *models.VPNConfig
 	if s.cfg != nil {
 		cfg = &models.VPNConfig{ListenPort: s.cfg.ListenPort, PublicEndpoint: s.cfg.PublicEndpoint}
@@ -1919,6 +1936,10 @@ func (s *Service) GetStatus(ctx context.Context) (*Status, error) {
 		UpstreamDesiredPeers:       upstreamDesiredPeers,
 		UpstreamActualPeers:        upstreamActualPeers,
 		PeerSync:                   peerSync,
+	}
+
+	if !startedAt.IsZero() {
+		status.CountersSince = startedAt.UTC().Format("2006-01-02 15:04 UTC")
 	}
 
 	for _, tun := range inputs.tunnels {
@@ -2194,7 +2215,7 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	// DBAuthenticator.AuthenticatePeer). Duplicates, if data ever
 	// degenerated, would map to an arbitrary-but-stable iteration winner
 	// and must not fabricate traffic.
-	usernames, err := s.resolveUsernamesByPeerKey(ctx, out)
+	peerIdentities, err := s.resolvePeerIdentitiesByPeerKey(ctx, out)
 	if err != nil {
 		return nil, err
 	}
@@ -2230,8 +2251,9 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	// DB row keep the snapshot's zero counters and in-memory last_seen;
 	// the buffered deltas are added below either way.
 	for i := range out {
-		if username, ok := usernames[out[i].PeerPublicKey]; ok {
-			out[i].Username = username
+		if id, ok := peerIdentities[out[i].PeerPublicKey]; ok {
+			out[i].Username = id.username
+			out[i].ConnectionID = id.connectionID
 		}
 		if srv, ok := byTunnel[out[i].BackendTunnelID]; ok {
 			out[i].ServerID = srv.serverID
@@ -2249,15 +2271,15 @@ func (s *Service) SessionsLive(ctx context.Context) ([]models.EnrichedVPNSession
 	return s.applyBufferedAccountantDeltas(out), nil
 }
 
-// resolveUsernamesByPeerKey resolves session identity by PEER PUBLIC KEY
-// (issue #213): user_connections.client_id is the stable connection-config
-// identity, so the username survives vpn_sessions row displacement.
-// client_id is cryptographically unique by construction (Curve25519 public
-// key; enforced in practice by the auth path treating it as the identity
-// key, not by a schema constraint — same precedent as
-// DBAuthenticator.AuthenticatePeer). Duplicates, if data ever degenerated,
-// would map to an arbitrary-but-stable iteration winner.
-func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []models.EnrichedVPNSession) (map[string]string, error) {
+type livePeerIdentity struct {
+	username     string
+	connectionID string
+}
+
+// resolvePeerIdentitiesByPeerKey resolves session identity and connection ID by PEER PUBLIC KEY
+// (issue #213, issue #447): user_connections.client_id is the stable connection-config
+// identity, so the username and connection ID survive vpn_sessions row displacement.
+func (s *Service) resolvePeerIdentitiesByPeerKey(ctx context.Context, sessions []models.EnrichedVPNSession) (map[string]livePeerIdentity, error) {
 	peerKeys := make([]string, 0, len(sessions))
 	peerSeen := make(map[string]struct{}, len(sessions))
 	for i := range sessions {
@@ -2271,9 +2293,9 @@ func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []mode
 		peerSeen[pk] = struct{}{}
 		peerKeys = append(peerKeys, pk)
 	}
-	usernames := make(map[string]string, len(peerKeys))
+	identities := make(map[string]livePeerIdentity, len(peerKeys))
 	if len(peerKeys) == 0 {
-		return usernames, nil
+		return identities, nil
 	}
 
 	pkPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(peerKeys)), ",")
@@ -2281,7 +2303,8 @@ func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []mode
 	for i, pk := range peerKeys {
 		pkArgs[i] = pk
 	}
-	identityQuery := `SELECT uc.client_id AS pk, COALESCE(u.username, 'unknown') AS username
+	identityQuery := `SELECT uc.client_id AS pk, COALESCE(u.username, 'unknown') AS username,
+		COALESCE(uc.id, '') AS connection_id
 		FROM user_connections uc
 		LEFT JOIN users u ON u.id = uc.user_id
 		WHERE uc.client_id IN (` + pkPlaceholders + `)`
@@ -2292,16 +2315,19 @@ func (s *Service) resolveUsernamesByPeerKey(ctx context.Context, sessions []mode
 	}
 	defer idRows.Close()
 	for idRows.Next() {
-		var pk, username string
-		if err := idRows.Scan(&pk, &username); err != nil {
+		var pk, username, connID string
+		if err := idRows.Scan(&pk, &username, &connID); err != nil {
 			return nil, fmt.Errorf("failed to scan live session identity: %w", err)
 		}
-		usernames[pk] = username
+		identities[pk] = livePeerIdentity{
+			username:     username,
+			connectionID: connID,
+		}
 	}
 	if err := idRows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate live session identities: %w", err)
 	}
-	return usernames, nil
+	return identities, nil
 }
 
 // liveServerIdentity is one backend tunnel's resolved server identity.

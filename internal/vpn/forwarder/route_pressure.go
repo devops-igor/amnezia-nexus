@@ -41,6 +41,8 @@ type routePressureWindow struct {
 	dropsDelta   uint64
 	errorsDelta  uint64
 	stallsDelta  uint64
+	dropRatePPS  float64
+	elapsedSec   float64
 }
 
 // pressureSnapshot is one route's recent-change view of its lifetime counters.
@@ -48,6 +50,8 @@ type pressureSnapshot struct {
 	QueueFullDropsRecent uint64
 	WriteErrorsRecent    uint64
 	WriteStallsRecent    uint64
+	DropRatePPS          float64
+	ElapsedSec           float64
 }
 
 // sample records the cumulative counters and returns the increase since the
@@ -71,6 +75,7 @@ func (w *routePressureWindow) sample(now time.Time, drops, writeErrors, writeSta
 		w.lastDrops, w.lastErrors, w.lastStalls = drops, writeErrors, writeStalls
 		w.lastSampleAt = now
 		w.dropsDelta, w.errorsDelta, w.stallsDelta = 0, 0, 0
+		w.dropRatePPS, w.elapsedSec = 0, 0
 		return pressureSnapshot{}
 	}
 
@@ -79,9 +84,12 @@ func (w *routePressureWindow) sample(now time.Time, drops, writeErrors, writeSta
 			QueueFullDropsRecent: w.dropsDelta,
 			WriteErrorsRecent:    w.errorsDelta,
 			WriteStallsRecent:    w.stallsDelta,
+			DropRatePPS:          w.dropRatePPS,
+			ElapsedSec:           w.elapsedSec,
 		}
 	}
 
+	elapsedSec := now.Sub(w.lastSampleAt).Seconds()
 	if drops >= w.lastDrops {
 		w.dropsDelta = drops - w.lastDrops
 	} else {
@@ -100,9 +108,18 @@ func (w *routePressureWindow) sample(now time.Time, drops, writeErrors, writeSta
 	w.lastDrops, w.lastErrors, w.lastStalls = drops, writeErrors, writeStalls
 	w.lastSampleAt = now
 
+	var dropRate float64
+	if w.dropsDelta > 0 && elapsedSec > 0 {
+		dropRate = float64(w.dropsDelta) / elapsedSec
+	}
+	w.dropRatePPS = dropRate
+	w.elapsedSec = elapsedSec
+
 	return pressureSnapshot{
 		QueueFullDropsRecent: w.dropsDelta,
 		WriteErrorsRecent:    w.errorsDelta,
 		WriteStallsRecent:    w.stallsDelta,
+		DropRatePPS:          dropRate,
+		ElapsedSec:           elapsedSec,
 	}
 }
