@@ -90,6 +90,9 @@ func (rt *RateTracker) Reset(gen Generation) {
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	if gen < rt.gen {
+		return
+	}
 	if gen > rt.gen {
 		rt.gen = gen
 	}

@@ -174,6 +174,9 @@ func (w *GenerationSampler) SampleCounter(gen Generation, now time.Time, minInte
 func (w *GenerationSampler) Reset(gen Generation) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if gen < w.gen {
+		return
+	}
 	if gen > w.gen {
 		w.gen = gen
 	}
