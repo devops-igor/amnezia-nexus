@@ -339,3 +339,159 @@ func (s *Service) primeHistoryRatesLocked(gen diagGeneration, at time.Time, drop
 	s.historyDiagRates.Sample(gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0)
 	s.historyDropReasons.sample(gen, at, dropReasonTotals(*drops))
 }
+
+type ringBuffer struct {
+	points []HistoryPoint
+	maxCap int
+}
+
+func newRingBuffer(maxCap int) *ringBuffer {
+	return &ringBuffer{
+		points: make([]HistoryPoint, 0, maxCap),
+		maxCap: maxCap,
+	}
+}
+
+func (rb *ringBuffer) add(p HistoryPoint) {
+	if len(rb.points) >= rb.maxCap {
+		copy(rb.points, rb.points[1:])
+		rb.points[len(rb.points)-1] = p
+	} else {
+		rb.points = append(rb.points, p)
+	}
+}
+
+func (rb *ringBuffer) snapshot() []HistoryPoint {
+	if len(rb.points) == 0 {
+		return []HistoryPoint{}
+	}
+	out := make([]HistoryPoint, len(rb.points))
+	for i, p := range rb.points {
+		out[i] = cloneHistoryPoint(p)
+	}
+	return out
+}
+
+// RollingHistory maintains in-memory rolling time-series history.
+type RollingHistory struct {
+	mu sync.RWMutex
+
+	buf1m  *ringBuffer // 10s intervals -> 6 points (1 minute)
+	buf5m  *ringBuffer // 10s intervals -> 30 points (5 minutes)
+	buf15m *ringBuffer // 10s intervals -> 90 points (15 minutes)
+	buf1h  *ringBuffer // 1m intervals -> 60 points (1 hour)
+	buf6h  *ringBuffer // 5m intervals -> 72 points (6 hours)
+	buf24h *ringBuffer // 15m intervals -> 96 points (24 hours)
+
+	last1hTime  time.Time
+	last6hTime  time.Time
+	last24hTime time.Time
+}
+
+// NewRollingHistory constructs a new rolling history buffer.
+func NewRollingHistory() *RollingHistory {
+	return &RollingHistory{
+		buf1m:  newRingBuffer(6),
+		buf5m:  newRingBuffer(30),
+		buf15m: newRingBuffer(90),
+		buf1h:  newRingBuffer(60),
+		buf6h:  newRingBuffer(72),
+		buf24h: newRingBuffer(96),
+	}
+}
+
+// Add appends a new point to the rolling history windows according to their resolution.
+func (rh *RollingHistory) Add(p HistoryPoint) {
+	if rh == nil {
+		return
+	}
+	rh.mu.Lock()
+	defer rh.mu.Unlock()
+
+	now := time.Unix(p.Timestamp, 0)
+	// Clamp before copying: a small slice of a huge backing array is not bounded storage.
+	if len(p.Backends) > MaxHistoryBackends {
+		p.BackendsOmitted += len(p.Backends) - MaxHistoryBackends
+		p.Backends = p.Backends[:MaxHistoryBackends]
+	}
+	p = cloneHistoryPoint(p)
+	if rh.buf1m != nil {
+		rh.buf1m.add(p)
+	}
+	if rh.buf5m != nil {
+		rh.buf5m.add(p)
+	}
+	if rh.buf15m != nil {
+		rh.buf15m.add(p)
+	}
+
+	if rh.buf1h != nil && (rh.last1hTime.IsZero() || now.Sub(rh.last1hTime) >= 1*time.Minute) {
+		rh.buf1h.add(p)
+		rh.last1hTime = now
+	}
+	if rh.buf6h != nil && (rh.last6hTime.IsZero() || now.Sub(rh.last6hTime) >= 5*time.Minute) {
+		rh.buf6h.add(p)
+		rh.last6hTime = now
+	}
+	if rh.buf24h != nil && (rh.last24hTime.IsZero() || now.Sub(rh.last24hTime) >= 15*time.Minute) {
+		rh.buf24h.add(p)
+		rh.last24hTime = now
+	}
+}
+
+// Snapshot returns a copy of all 6 rolling windows.
+func (rh *RollingHistory) Snapshot() HistoricalSeries {
+	if rh == nil {
+		return HistoricalSeries{
+			Window1m:  []HistoryPoint{},
+			Window5m:  []HistoryPoint{},
+			Window15m: []HistoryPoint{},
+			Window1h:  []HistoryPoint{},
+			Window6h:  []HistoryPoint{},
+			Window24h: []HistoryPoint{},
+		}
+	}
+	rh.mu.RLock()
+	defer rh.mu.RUnlock()
+
+	var w1m, w5m, w15m, w1h, w6h, w24h []HistoryPoint
+	if rh.buf1m != nil {
+		w1m = rh.buf1m.snapshot()
+	} else {
+		w1m = []HistoryPoint{}
+	}
+	if rh.buf5m != nil {
+		w5m = rh.buf5m.snapshot()
+	} else {
+		w5m = []HistoryPoint{}
+	}
+	if rh.buf15m != nil {
+		w15m = rh.buf15m.snapshot()
+	} else {
+		w15m = []HistoryPoint{}
+	}
+	if rh.buf1h != nil {
+		w1h = rh.buf1h.snapshot()
+	} else {
+		w1h = []HistoryPoint{}
+	}
+	if rh.buf6h != nil {
+		w6h = rh.buf6h.snapshot()
+	} else {
+		w6h = []HistoryPoint{}
+	}
+	if rh.buf24h != nil {
+		w24h = rh.buf24h.snapshot()
+	} else {
+		w24h = []HistoryPoint{}
+	}
+
+	return HistoricalSeries{
+		Window1m:  w1m,
+		Window5m:  w5m,
+		Window15m: w15m,
+		Window1h:  w1h,
+		Window6h:  w6h,
+		Window24h: w24h,
+	}
+}

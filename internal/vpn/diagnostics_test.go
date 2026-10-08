@@ -303,6 +303,14 @@ func TestRollingHistory_WindowsAndConcurrency(t *testing.T) {
 	}
 
 	snap := rh.Snapshot()
+	// buf1m has maxCap 6, so len must be exactly 6
+	if len(snap.Window1m) != 6 {
+		t.Errorf("expected Window1m len=6, got %d", len(snap.Window1m))
+	}
+	// buf5m has maxCap 30, so len must be exactly 30
+	if len(snap.Window5m) != 30 {
+		t.Errorf("expected Window5m len=30, got %d", len(snap.Window5m))
+	}
 	// buf15m has maxCap 90, so len must be exactly 90
 	if len(snap.Window15m) != 90 {
 		t.Errorf("expected Window15m len=90, got %d", len(snap.Window15m))
@@ -393,6 +401,12 @@ func TestGetStatus_OperationalDiagnostics(t *testing.T) {
 	}
 	if st.RuntimeResources.Goroutines <= 0 {
 		t.Errorf("expected positive Goroutines count")
+	}
+	if st.HistoricalSeries.Window1m == nil {
+		t.Errorf("expected non-nil HistoricalSeries.Window1m")
+	}
+	if st.HistoricalSeries.Window5m == nil {
+		t.Errorf("expected non-nil HistoricalSeries.Window5m")
 	}
 	if st.HistoricalSeries.Window15m == nil {
 		t.Errorf("expected non-nil HistoricalSeries.Window15m")
@@ -913,7 +927,7 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 		},
 	}
 
-	problems := SynthesizeActionableProblems(routes, sessions)
+	problems := SynthesizeActionableProblemsAt(routes, sessions, now)
 	if len(problems) != 3 {
 		t.Fatalf("expected 3 actionable problems (unroutable, drops, stalls), got %d: %+v", len(problems), problems)
 	}
@@ -952,8 +966,11 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 	if unroutableProb.BackendID != 101 {
 		t.Errorf("unroutable backend_id: got %d, want 101", unroutableProb.BackendID)
 	}
-	if !unroutableProb.FirstObserved.Equal(sessions[0].ConnectedAt) {
-		t.Errorf("unroutable first_observed: got %v, want %v", unroutableProb.FirstObserved, sessions[0].ConnectedAt)
+	if unroutableProb.FirstObserved.Equal(sessions[0].ConnectedAt) {
+		t.Errorf("unroutable first_observed must not equal ConnectedAt: got %v", unroutableProb.FirstObserved)
+	}
+	if !unroutableProb.FirstObserved.Equal(now) {
+		t.Errorf("unroutable first_observed: got %v, want onset %v", unroutableProb.FirstObserved, now)
 	}
 
 	if dropsProb == nil {
@@ -983,6 +1000,12 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 	if dropsProb.ObservedRate != "5 drops" {
 		t.Errorf("drops observed_rate: got %q, want '5 drops'", dropsProb.ObservedRate)
 	}
+	if dropsProb.FirstObserved.Equal(sessions[1].ConnectedAt) {
+		t.Errorf("drops first_observed must not equal ConnectedAt: got %v", dropsProb.FirstObserved)
+	}
+	if !dropsProb.FirstObserved.Equal(now) {
+		t.Errorf("drops first_observed: got %v, want onset %v", dropsProb.FirstObserved, now)
+	}
 
 	if stallsProb == nil {
 		t.Fatal("missing vpn_problem_write_stall problem")
@@ -1008,10 +1031,316 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 	if stallsProb.BackendID != 103 {
 		t.Errorf("stalls backend_id: got %d, want 103", stallsProb.BackendID)
 	}
+	if stallsProb.FirstObserved.Equal(sessions[2].ConnectedAt) {
+		t.Errorf("stalls first_observed must not equal ConnectedAt: got %v", stallsProb.FirstObserved)
+	}
+	expectedStallOnset := now.Add(-time.Duration(routes[1].Stats.OldestWriteMS) * time.Millisecond)
+	if !stallsProb.FirstObserved.Equal(expectedStallOnset) {
+		t.Errorf("stalls first_observed: got %v, want onset %v", stallsProb.FirstObserved, expectedStallOnset)
+	}
 
 	for _, p := range problems {
 		if p.AssignedIP == "10.8.0.40" {
 			t.Errorf("healthy route with historical drops only must not be flagged as active problem: %+v", p)
 		}
+	}
+}
+
+func TestForwarderDrops_RestartDoesNotAttributePreRestartDrops(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if svc.forwarder == nil {
+		t.Fatal("expected non-nil forwarder on service")
+	}
+
+	// 1. Start forwarder in initial generation
+	svc.forwarder.Start(ctx)
+
+	// 2. Seed pre-restart drops into forwarder
+	svc.forwarder.SeedDropsForTest(10, 5, 2, 7, 3, 1)
+
+	qF, noRoute, total := svc.forwarder.DropStats()
+	if qF != 10 || noRoute != 5 || total != 17 {
+		t.Fatalf("expected seeded drops before restart: qF=10 noRoute=5 total=17, got (%d, %d, %d)", qF, noRoute, total)
+	}
+	cqF, crL, cnB, cTot := svc.forwarder.ClientDropStats()
+	if cqF != 7 || crL != 3 || cnB != 1 || cTot != 11 {
+		t.Fatalf("expected seeded client drops before restart: got (%d, %d, %d, %d)", cqF, crL, cnB, cTot)
+	}
+
+	// 3. Stop forwarder and restart (simulating restart lifecycle)
+	_ = svc.forwarder.Stop()
+	svc.forwarder.Start(ctx)
+
+	// 4. Verify that drops since startup are now ZERO
+	qF, noRoute, total = svc.forwarder.DropStats()
+	if qF != 0 || noRoute != 0 || total != 0 {
+		t.Fatalf("expected 0 drops after restart: got qF=%d noRoute=%d total=%d", qF, noRoute, total)
+	}
+	cqF, crL, cnB, cTot = svc.forwarder.ClientDropStats()
+	if cqF != 0 || crL != 0 || cnB != 0 || cTot != 0 {
+		t.Fatalf("expected 0 client drops after restart: got (%d, %d, %d, %d)", cqF, crL, cnB, cTot)
+	}
+	if qfSince := svc.forwarder.DropsQueueFullSinceStartup(); qfSince != 0 {
+		t.Fatalf("expected DropsQueueFullSinceStartup=0, got %d", qfSince)
+	}
+	if ovSince := svc.forwarder.DropsPacketTooLargeSinceStartup(); ovSince != 0 {
+		t.Fatalf("expected DropsPacketTooLargeSinceStartup=0, got %d", ovSince)
+	}
+
+	// 5. Verify diagnosticsInputs and collectDropCategories reflect zero forwarder drops
+	inputs := svc.captureDiagnosticsInputs()
+	drops := inputs.collectDropCategories()
+	if drops.ReturnQueueFull != 0 {
+		t.Errorf("ReturnQueueFull = %d, want 0 after restart", drops.ReturnQueueFull)
+	}
+	if drops.ReturnPacketTooLarge != 0 {
+		t.Errorf("ReturnPacketTooLarge = %d, want 0 after restart", drops.ReturnPacketTooLarge)
+	}
+	if drops.ClientBackendQueueFull != 0 {
+		t.Errorf("ClientBackendQueueFull = %d, want 0 after restart", drops.ClientBackendQueueFull)
+	}
+	if drops.ClientRateLimited != 0 {
+		t.Errorf("ClientRateLimited = %d, want 0 after restart", drops.ClientRateLimited)
+	}
+
+	// 6. Seed fresh drops in the new epoch and verify they ARE reported
+	svc.forwarder.SeedDropsForTest(3, 0, 1, 4, 0, 0)
+	qF, _, total = svc.forwarder.DropStats()
+	if qF != 3 || total != 4 {
+		t.Fatalf("expected fresh drops: qF=3 total=4, got (%d, %d)", qF, total)
+	}
+	dropsAfter := svc.captureDiagnosticsInputs().collectDropCategories()
+	if dropsAfter.ReturnQueueFull != 3 {
+		t.Errorf("ReturnQueueFull = %d, want 3 for fresh drops", dropsAfter.ReturnQueueFull)
+	}
+	if dropsAfter.ReturnPacketTooLarge != 1 {
+		t.Errorf("ReturnPacketTooLarge = %d, want 1 for fresh drops", dropsAfter.ReturnPacketTooLarge)
+	}
+	if dropsAfter.ClientBackendQueueFull != 4 {
+		t.Errorf("ClientBackendQueueFull = %d, want 4 for fresh drops", dropsAfter.ClientBackendQueueFull)
+	}
+}
+
+func TestHistoricalSeries_Populates1mAnd5m(t *testing.T) {
+	rh := NewRollingHistory()
+	baseTime := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+
+	// Before adding any points, windows must be initialized non-nil empty slices
+	initial := rh.Snapshot()
+	if initial.Window1m == nil || initial.Window5m == nil || initial.Window15m == nil {
+		t.Fatal("expected non-nil windows in initial snapshot")
+	}
+	if len(initial.Window1m) != 0 || len(initial.Window5m) != 0 {
+		t.Fatalf("expected empty initial windows, got 1m=%d 5m=%d", len(initial.Window1m), len(initial.Window5m))
+	}
+
+	// Add 3 samples at 10s intervals
+	for i := 0; i < 3; i++ {
+		rh.Add(HistoryPoint{
+			Timestamp: baseTime.Add(time.Duration(i*10) * time.Second).Unix(),
+			RxBps:     float64((i + 1) * 1000),
+		})
+	}
+	snap3 := rh.Snapshot()
+	if len(snap3.Window1m) != 3 {
+		t.Fatalf("expected Window1m len=3, got %d", len(snap3.Window1m))
+	}
+	if len(snap3.Window5m) != 3 {
+		t.Fatalf("expected Window5m len=3, got %d", len(snap3.Window5m))
+	}
+
+	// Add up to 50 samples to saturate 1m (cap 6) and 5m (cap 30)
+	for i := 3; i < 50; i++ {
+		rh.Add(HistoryPoint{
+			Timestamp: baseTime.Add(time.Duration(i*10) * time.Second).Unix(),
+			RxBps:     float64((i + 1) * 1000),
+		})
+	}
+	snapFull := rh.Snapshot()
+	if len(snapFull.Window1m) != 6 {
+		t.Fatalf("expected Window1m capped at 6, got %d", len(snapFull.Window1m))
+	}
+	if len(snapFull.Window5m) != 30 {
+		t.Fatalf("expected Window5m capped at 30, got %d", len(snapFull.Window5m))
+	}
+	if len(snapFull.Window15m) != 50 {
+		t.Fatalf("expected Window15m len=50, got %d", len(snapFull.Window15m))
+	}
+
+	// Verify the latest point in Window1m is the last added sample
+	lastSampleTime := baseTime.Add(49 * 10 * time.Second).Unix()
+	if snapFull.Window1m[5].Timestamp != lastSampleTime {
+		t.Errorf("Window1m last point timestamp=%d, want %d", snapFull.Window1m[5].Timestamp, lastSampleTime)
+	}
+	if snapFull.Window5m[29].Timestamp != lastSampleTime {
+		t.Errorf("Window5m last point timestamp=%d, want %d", snapFull.Window5m[29].Timestamp, lastSampleTime)
+	}
+}
+
+func TestSynthesizeActionableProblems_OnsetSemanticsTable(t *testing.T) {
+	now := time.Date(2026, 10, 8, 15, 30, 0, 0, time.UTC)
+	connectedAt := now.Add(-3 * time.Hour) // User connected 3 hours ago
+
+	tests := []struct {
+		name              string
+		routes            []forwarder.RouteInfo
+		sessions          []Session
+		wantKey           string
+		wantFirstObserved time.Time
+	}{
+		{
+			name:   "unroutable session onset is observation time, not connectedAt",
+			routes: []forwarder.RouteInfo{},
+			sessions: []Session{
+				{
+					ID:          "sess-unrouted",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.50",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_session_without_route",
+			wantFirstObserved: now,
+		},
+		{
+			name: "route queue full drops onset is observation time",
+			routes: []forwarder.RouteInfo{
+				{
+					SessionID:  "sess-drops",
+					AssignedIP: "10.8.0.51",
+					Stats: forwarder.RouteQueueStats{
+						QueueFullDropsRecent: 4,
+					},
+				},
+			},
+			sessions: []Session{
+				{
+					ID:          "sess-drops",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.51",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_route_queue_drops",
+			wantFirstObserved: now,
+		},
+		{
+			name: "write stall with oldest write onset reflects tracking duration",
+			routes: []forwarder.RouteInfo{
+				{
+					SessionID:  "sess-stall",
+					AssignedIP: "10.8.0.52",
+					Stats: forwarder.RouteQueueStats{
+						OldestWriteMS:     3500,
+						WriteStallsRecent: 1,
+					},
+				},
+			},
+			sessions: []Session{
+				{
+					ID:          "sess-stall",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.52",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_write_stall",
+			wantFirstObserved: now.Add(-3500 * time.Millisecond),
+		},
+		{
+			name: "write stall without oldest write onset is observation time",
+			routes: []forwarder.RouteInfo{
+				{
+					SessionID:  "sess-stall-recent",
+					AssignedIP: "10.8.0.53",
+					Stats: forwarder.RouteQueueStats{
+						OldestWriteMS:     0,
+						WriteStallsRecent: 2,
+					},
+				},
+			},
+			sessions: []Session{
+				{
+					ID:          "sess-stall-recent",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.53",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_write_stall",
+			wantFirstObserved: now,
+		},
+		{
+			name: "write errors onset is observation time",
+			routes: []forwarder.RouteInfo{
+				{
+					SessionID:  "sess-err",
+					AssignedIP: "10.8.0.54",
+					Stats: forwarder.RouteQueueStats{
+						WriteErrorsRecent: 3,
+					},
+				},
+			},
+			sessions: []Session{
+				{
+					ID:          "sess-err",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.54",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_write_errors",
+			wantFirstObserved: now,
+		},
+		{
+			name: "queue pressure onset is observation time",
+			routes: []forwarder.RouteInfo{
+				{
+					SessionID:   "sess-press",
+					AssignedIP:  "10.8.0.55",
+					HasPressure: true,
+					Stats: forwarder.RouteQueueStats{
+						Occupancy: 80,
+						Capacity:  100,
+					},
+				},
+			},
+			sessions: []Session{
+				{
+					ID:          "sess-press",
+					Status:      "connected",
+					AssignedIP:  "10.8.0.55",
+					ConnectedAt: connectedAt,
+				},
+			},
+			wantKey:           "vpn_problem_route_queue_pressure",
+			wantFirstObserved: now,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probs := SynthesizeActionableProblemsAt(tt.routes, tt.sessions, now)
+			if len(probs) != 1 {
+				t.Fatalf("expected 1 problem, got %d: %+v", len(probs), probs)
+			}
+			p := probs[0]
+			if p.MessageKey != tt.wantKey {
+				t.Errorf("MessageKey = %q, want %q", p.MessageKey, tt.wantKey)
+			}
+			if p.FirstObserved.Equal(connectedAt) {
+				t.Errorf("FirstObserved must NEVER equal ConnectedAt (%v)", connectedAt)
+			}
+			if !p.FirstObserved.Equal(tt.wantFirstObserved) {
+				t.Errorf("FirstObserved = %v, want %v", p.FirstObserved, tt.wantFirstObserved)
+			}
+		})
 	}
 }

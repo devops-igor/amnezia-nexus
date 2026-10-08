@@ -508,120 +508,14 @@ type HistoryPoint struct {
 	BackendP95MS          float64               `json:"be_p95_ms"`
 }
 
-// HistoricalSeries contains rolling time-series samples across 4 windows.
+// HistoricalSeries contains rolling time-series samples across 6 windows.
 type HistoricalSeries struct {
+	Window1m  []HistoryPoint `json:"window_1m"`
+	Window5m  []HistoryPoint `json:"window_5m"`
 	Window15m []HistoryPoint `json:"window_15m"`
 	Window1h  []HistoryPoint `json:"window_1h"`
 	Window6h  []HistoryPoint `json:"window_6h"`
 	Window24h []HistoryPoint `json:"window_24h"`
-}
-
-type ringBuffer struct {
-	points []HistoryPoint
-	maxCap int
-}
-
-func newRingBuffer(maxCap int) *ringBuffer {
-	return &ringBuffer{
-		points: make([]HistoryPoint, 0, maxCap),
-		maxCap: maxCap,
-	}
-}
-
-func (rb *ringBuffer) add(p HistoryPoint) {
-	if len(rb.points) >= rb.maxCap {
-		copy(rb.points, rb.points[1:])
-		rb.points[len(rb.points)-1] = p
-	} else {
-		rb.points = append(rb.points, p)
-	}
-}
-
-func (rb *ringBuffer) snapshot() []HistoryPoint {
-	if len(rb.points) == 0 {
-		return []HistoryPoint{}
-	}
-	out := make([]HistoryPoint, len(rb.points))
-	for i, p := range rb.points {
-		out[i] = cloneHistoryPoint(p)
-	}
-	return out
-}
-
-// RollingHistory maintains in-memory rolling time-series history.
-type RollingHistory struct {
-	mu sync.RWMutex
-
-	buf15m *ringBuffer // 10s intervals -> 90 points
-	buf1h  *ringBuffer // 1m intervals -> 60 points
-	buf6h  *ringBuffer // 5m intervals -> 72 points
-	buf24h *ringBuffer // 15m intervals -> 96 points
-
-	last1hTime  time.Time
-	last6hTime  time.Time
-	last24hTime time.Time
-}
-
-// NewRollingHistory constructs a new rolling history buffer.
-func NewRollingHistory() *RollingHistory {
-	return &RollingHistory{
-		buf15m: newRingBuffer(90),
-		buf1h:  newRingBuffer(60),
-		buf6h:  newRingBuffer(72),
-		buf24h: newRingBuffer(96),
-	}
-}
-
-// Add appends a new point to the rolling history windows according to their resolution.
-func (rh *RollingHistory) Add(p HistoryPoint) {
-	if rh == nil {
-		return
-	}
-	rh.mu.Lock()
-	defer rh.mu.Unlock()
-
-	now := time.Unix(p.Timestamp, 0)
-	// Clamp before copying: a small slice of a huge backing array is not bounded storage.
-	if len(p.Backends) > MaxHistoryBackends {
-		p.BackendsOmitted += len(p.Backends) - MaxHistoryBackends
-		p.Backends = p.Backends[:MaxHistoryBackends]
-	}
-	p = cloneHistoryPoint(p)
-	rh.buf15m.add(p)
-
-	if rh.last1hTime.IsZero() || now.Sub(rh.last1hTime) >= 1*time.Minute {
-		rh.buf1h.add(p)
-		rh.last1hTime = now
-	}
-	if rh.last6hTime.IsZero() || now.Sub(rh.last6hTime) >= 5*time.Minute {
-		rh.buf6h.add(p)
-		rh.last6hTime = now
-	}
-	if rh.last24hTime.IsZero() || now.Sub(rh.last24hTime) >= 15*time.Minute {
-		rh.buf24h.add(p)
-		rh.last24hTime = now
-	}
-}
-
-// Snapshot returns a copy of all 4 rolling windows.
-func (rh *RollingHistory) Snapshot() HistoricalSeries {
-	if rh == nil {
-		return HistoricalSeries{
-			Window15m: []HistoryPoint{},
-			Window1h:  []HistoryPoint{},
-			Window6h:  []HistoryPoint{},
-			Window24h: []HistoryPoint{},
-		}
-	}
-	rh.mu.RLock()
-	defer rh.mu.RUnlock()
-
-	return HistoricalSeries{
-		Window15m: rh.buf15m.snapshot(),
-		Window1h:  rh.buf1h.snapshot(),
-		Window6h:  rh.buf6h.snapshot(),
-		Window24h: rh.buf24h.snapshot(),
-	}
 }
 
 // cpuTracker measures CPU usage via syscall.Getrusage.
@@ -2609,6 +2503,8 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 		status.HistoricalSeries = inputs.rollingHistory.Snapshot()
 	} else {
 		status.HistoricalSeries = HistoricalSeries{
+			Window1m:  []HistoryPoint{},
+			Window5m:  []HistoryPoint{},
 			Window15m: []HistoryPoint{},
 			Window1h:  []HistoryPoint{},
 			Window6h:  []HistoryPoint{},
@@ -2647,10 +2543,19 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 // SynthesizeActionableProblems derives per-session/route actionable problem records
 // by correlating active routes, route pressure, and active VPN sessions.
 func SynthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
-	problems := synthesizeUnroutableSessionProblems(routes, sessions)
+	return SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC())
+}
+
+// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
+// relative to an explicit observation timestamp.
+func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time) []ActionableProblem {
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	problems := synthesizeUnroutableSessionProblems(routes, sessions, observedAt)
 	for _, r := range routes {
 		sess, hasSess := findSessionForRoute(r, sessions)
-		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess)...)
+		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess, observedAt)...)
 	}
 	sortActionableProblems(problems)
 	return problems
@@ -2681,7 +2586,10 @@ func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bo
 	return Session{}, false
 }
 
-func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time) []ActionableProblem {
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 	routesByPeer := make(map[string]struct{}, len(routes))
 	routesByIP := make(map[string]struct{}, len(routes))
 	routesBySessionID := make(map[string]struct{}, len(routes))
@@ -2715,23 +2623,25 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
-				FirstObserved:  sess.ConnectedAt,
+				FirstObserved:  observedAt,
 			})
 		}
 	}
 	return problems
 }
 
-func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSess bool) []ActionableProblem {
+func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSess bool, observedAt time.Time) []ActionableProblem {
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 	var problems []ActionableProblem
 	var userID, connName string
-	var firstObserved time.Time
 	if hasSess {
 		userID = sess.UserID
 		connName = sess.ConnectionName
-		firstObserved = sess.ConnectedAt
 	}
 	connID := r.ConnectionID
+	firstObserved := observedAt
 
 	if r.Stats.QueueFullDropsRecent > 0 {
 		problems = append(problems, ActionableProblem{
@@ -2762,6 +2672,10 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			msg = fmt.Sprintf("Device write stalls (%d recent) for %s", r.Stats.WriteStallsRecent, r.AssignedIP)
 			rate = fmt.Sprintf("%d stalls", r.Stats.WriteStallsRecent)
 		}
+		stallFirstObserved := firstObserved
+		if r.Stats.OldestWriteMS > 0 {
+			stallFirstObserved = firstObserved.Add(-time.Duration(r.Stats.OldestWriteMS) * time.Millisecond)
+		}
 		problems = append(problems, ActionableProblem{
 			Severity:       sev,
 			Category:       "dataplane",
@@ -2773,7 +2687,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			AssignedIP:     r.AssignedIP,
 			BackendID:      r.BackendTunnelID,
 			ObservedRate:   rate,
-			FirstObserved:  firstObserved,
+			FirstObserved:  stallFirstObserved,
 		})
 	}
 
