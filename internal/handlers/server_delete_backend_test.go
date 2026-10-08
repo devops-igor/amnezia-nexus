@@ -659,3 +659,121 @@ func TestDeleteServerHandler_SelfHealing_CannotResurrectDeletedServer(t *testing
 		t.Errorf("expected no backend_tunnels in DB, got: %+v", dbTun)
 	}
 }
+
+func TestDeleteServerHandler_BackupRestoreSameID_CanEnableBackend(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	h.vpnSvc = vpnSvc
+
+	srv := &models.Server{
+		Name:    "Backup-Restore-Target-Server",
+		Host:    "192.168.10.80",
+		SSHPort: 22,
+		SSHUser: "root",
+		SSHPass: "pass123",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "backend-pubkey-restore",
+			},
+		},
+		CreatedAt: time.Now(),
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	tunBefore, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunBefore == nil {
+		t.Fatalf("expected backend tunnel before delete: %v", err)
+	}
+
+	// Delete server via DeleteServerHandler
+	serverRouter := setupFullServerRouter(h)
+	reqDel := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/delete", serverID), nil)
+	wDel := httptest.NewRecorder()
+	serverRouter.ServeHTTP(wDel, reqDel)
+	if wDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on DeleteServerHandler, got %d (body: %s)", wDel.Code, wDel.Body.String())
+	}
+
+	// Verify server is deleted from DB and pool
+	srvAfterDel, err := db.GetServer(ctx, serverID)
+	if err == nil && srvAfterDel != nil {
+		t.Fatalf("expected server to be deleted from DB, but still exists: %+v", srvAfterDel)
+	}
+
+	tunAfterDel, err := vpnSvc.GetTunnel(serverID)
+	if err == nil || tunAfterDel != nil {
+		t.Fatalf("expected tunnel to be absent from pool, but found: %+v", tunAfterDel)
+	}
+	if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound, got: %v", err)
+	}
+
+	// Verify that while server is absent from DB, EnableBackend cannot resurrect it
+	delErr := vpnSvc.EnableBackend(ctx, serverID)
+	if delErr == nil {
+		t.Fatal("expected EnableBackend on deleted server to fail, got nil")
+	}
+	if !errors.Is(delErr, vpn.ErrServerNotFound) {
+		t.Errorf("expected ErrServerNotFound, got: %v", delErr)
+	}
+
+	// Recreate/restore server in DB with the same ID via restoreBackupServers
+	serverBackup := map[string]any{
+		"id":       serverID,
+		"name":     srv.Name,
+		"host":     srv.Host,
+		"ssh_user": srv.SSHUser,
+		"ssh_port": srv.SSHPort,
+		"ssh_pass": srv.SSHPass,
+		"protocols": map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "backend-pubkey-restore",
+			},
+		},
+	}
+	restoredCount, _ := h.restoreBackupServers(ctx, []map[string]any{serverBackup})
+	if restoredCount != 1 {
+		t.Fatalf("expected 1 restored server, got %d", restoredCount)
+	}
+
+	restoredSrv, err := db.GetServer(ctx, serverID)
+	if err != nil || restoredSrv == nil {
+		t.Fatalf("failed to load restored server %d: %v", serverID, err)
+	}
+	if restoredSrv.ID != serverID {
+		t.Fatalf("expected restored server ID %d, got %d", serverID, restoredSrv.ID)
+	}
+
+	// EnableBackend on that server ID: verify it SUCCEEDS cleanly without requiring process restart!
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("expected EnableBackend to succeed on restored server %d without process restart, got: %v", serverID, err)
+	}
+
+	tunRestored, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunRestored == nil {
+		t.Fatalf("expected backend tunnel for restored server: %v", err)
+	}
+	if !tunRestored.Enabled {
+		t.Errorf("expected restored tunnel to be enabled")
+	}
+}

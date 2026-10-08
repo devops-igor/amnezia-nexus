@@ -158,6 +158,7 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to teardown VPN backend")
 			return
 		}
+		defer h.vpnSvc.ClearServerDeletedTombstone(serverID)
 	}
 
 	if h.sshPool != nil {

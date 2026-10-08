@@ -2441,6 +2441,19 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		s.mu.Unlock()
 		return fmt.Errorf("%w: server %d is deleted", ErrServerNotFound, serverID)
 	}
+	if s.db != nil {
+		checkCtx, checkCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		srv, err := s.db.GetServer(checkCtx, serverID)
+		checkCancel()
+		if err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("failed to verify server %d in database: %w", serverID, err)
+		}
+		if srv == nil {
+			s.mu.Unlock()
+			return fmt.Errorf("%w: server %d not found in database", ErrServerNotFound, serverID)
+		}
+	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
 	var postRefreshVersion int64
 	if err == nil && tun != nil {
@@ -3267,6 +3280,19 @@ func (s *Service) DeleteServer(ctx context.Context, serverID int64) error {
 		return err
 	}
 	return nil
+}
+
+// ClearServerDeletedTombstone removes the deletion tombstone for a server ID,
+// allowing subsequent additions or restores of that server ID to succeed.
+func (s *Service) ClearServerDeletedTombstone(serverID int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deletedServers != nil {
+		delete(s.deletedServers, serverID)
+	}
 }
 
 // DeleteBackend permanently removes a backend tunnel from the load-balancing
