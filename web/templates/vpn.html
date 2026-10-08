@@ -98,6 +98,7 @@
         <div id="vpn-fwd-headline-summary" style="font-size: 0.875rem; color: var(--text-muted); margin-top: var(--space-xs);">
             {{ _ "vpn_forwarder_unavailable" }}
         </div>
+        <div id="vpn-fwd-summary-header" class="vpn-fwd-summary-header" style="font-size: 0.85rem; font-weight: 600; margin-top: var(--space-xs); display: none;"></div>
         <div id="vpn-fwd-problem-list" style="margin-top: var(--space-sm); display: none;"></div>
     </div>
 
@@ -292,6 +293,8 @@
         <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); flex-wrap: wrap; gap: var(--space-xs);">
             <div style="font-weight: 600; font-size: 0.85rem;">{{ _ "vpn_fwd_panel_history" }}</div>
             <div class="btn-group" id="vpn-history-window-toggles">
+                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('1m')">1m</button>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('5m')">5m</button>
                 <button type="button" class="btn btn-sm btn-primary active" onclick="vpnSetHistoryWindow('15m')">15m</button>
                 <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('1h')">1h</button>
                 <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('6h')">6h</button>
@@ -1140,10 +1143,19 @@
         }
 
         // 3. Fall back to assigned IP match as display/fallback
+        // Only match s.assigned_ip === r.assigned_ip if durable IDs (session_id, connection_id) are ABSENT on both sides.
+        // If durable IDs are present on both sides and contradictory (different session/connection IDs), do NOT fall back to IP match.
         if (s.assigned_ip) {
+            const sHasDurable = (s.session_id !== undefined && s.session_id !== null && s.session_id !== '') ||
+                                (s.connection_id !== undefined && s.connection_id !== null && s.connection_id !== '');
             for (let i = 0; i < routes.length; i++) {
                 const r = routes[i];
                 if (r && r.assigned_ip && s.assigned_ip === r.assigned_ip) {
+                    const rHasDurable = (r.session_id !== undefined && r.session_id !== null && r.session_id !== '') ||
+                                        (r.connection_id !== undefined && r.connection_id !== null && r.connection_id !== '');
+                    if (sHasDurable && rHasDurable) {
+                        continue;
+                    }
                     return r;
                 }
             }
@@ -1216,10 +1228,11 @@
         if (route) {
             const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
             const recentDrops = Number(route.queue_full_drops_recent || 0);
+            const dropText = recentDrops > 0 ? `${recentDrops} recent / ${drops} total` : String(drops);
             if (recentDrops > 0 || route.has_pressure === true) {
-                tdLoss.innerHTML = `<span class="text-danger font-weight-600">${drops}</span>`;
+                tdLoss.innerHTML = `<span class="text-danger font-weight-600">${dropText}</span>`;
             } else {
-                tdLoss.textContent = String(drops);
+                tdLoss.textContent = dropText;
             }
         } else {
             tdLoss.textContent = '-';
@@ -1245,9 +1258,10 @@
 
         // 8. Status cell
         const tdStatus = document.createElement('td');
+        const isNominalActive = s && (s.status === 'connected' || s.status === 'active');
         if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0) || (Number(route.write_errors_recent || 0) > 0) || (Number(route.write_stalls_recent || 0) > 0))) {
             tdStatus.innerHTML = `<span class="badge badge-warn">${_('vpn_forwarder_degraded')}</span>`;
-        } else if (s && s.status === 'active') {
+        } else if (isNominalActive) {
             if (!route) {
                 let unroutableLabel = _('vpn_forwarder_unroutable');
                 if (!unroutableLabel || unroutableLabel === 'vpn_forwarder_unroutable') {
@@ -1464,6 +1478,7 @@
         if (vpnSessionsFilterOnlyProblems) {
             sessionsToRender = sessionsToRender.filter(function(s) {
                 const route = vpnFindRouteForSession(s);
+                const isNominalActive = s && (s.status === 'connected' || s.status === 'active');
                 if (!route) {
                     return true;
                 }
@@ -1473,7 +1488,7 @@
                     Number(route.write_errors_recent || 0) > 0 ||
                     Number(route.write_stalls_recent || 0) > 0
                 );
-                return hasRouteProblem || (s.status !== 'active');
+                return hasRouteProblem || !isNominalActive;
             });
         }
 
@@ -1618,7 +1633,8 @@
         if (!series || typeof series !== 'object') return;
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
-        if (w === '5m' || w === '1m') points = (series.window_5m || series.window_1m || (series.window_15m ? series.window_15m.slice(-30) : []));
+        if (w === '1m') points = series.window_1m || [];
+        else if (w === '5m') points = series.window_5m || [];
         else if (w === '1h') points = series.window_1h || [];
         else if (w === '6h') points = series.window_6h || [];
         else if (w === '24h') points = series.window_24h || [];
@@ -1785,6 +1801,24 @@
                 return String(val);
             }
         }
+        function vpnFormatTime(val) {
+            if (!val) return '';
+            try {
+                const d = new Date(val);
+                if (!isNaN(d.getTime())) {
+                    const y = d.getUTCFullYear();
+                    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(d.getUTCDate()).padStart(2, '0');
+                    const h = String(d.getUTCHours()).padStart(2, '0');
+                    const min = String(d.getUTCMinutes()).padStart(2, '0');
+                    const sec = String(d.getUTCSeconds()).padStart(2, '0');
+                    return y + '-' + m + '-' + day + ' ' + h + ':' + min + ':' + sec + ' UTC';
+                }
+                return String(val);
+            } catch (_) {
+                return String(val);
+            }
+        }
 
         const isAvailable = !!status && status.forwarder_available === true;
 
@@ -1801,6 +1835,8 @@
             if (statusText) statusText.textContent = _('vpn_forwarder_unavailable') || 'Not reported';
             const headlineElem = document.getElementById('vpn-fwd-headline-summary');
             if (headlineElem) headlineElem.textContent = _('vpn_forwarder_unavailable') || 'Not reported';
+            const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');
+            if (summaryHeaderElem) { summaryHeaderElem.textContent = ''; summaryHeaderElem.style.display = 'none'; }
             const problemListElem = document.getElementById('vpn-fwd-problem-list');
             if (problemListElem) { problemListElem.textContent = ''; problemListElem.style.display = 'none'; }
             const countersSinceElem = document.getElementById('vpn-fwd-counters-since');
@@ -2116,6 +2152,21 @@
         const s = (ha && ha.status) ? String(ha.status).toUpperCase() : '';
         const actionableProblems = (ha && Array.isArray(ha.actionable_problems)) ? ha.actionable_problems : [];
         const hasActionableProblems = actionableProblems.length > 0;
+        const activeProblemsCount = actionableProblems.length;
+        const affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.username || p.user_id; }).filter(Boolean)).size;
+        const affectedConfigsCount = new Set(actionableProblems.map(function(p) { return p.connection_name || p.connection_id; }).filter(Boolean)).size;
+
+        const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');
+        if (summaryHeaderElem) {
+            if (activeProblemsCount > 0) {
+                summaryHeaderElem.innerHTML = `<span class="badge badge-warn" style="font-size: 0.8rem; padding: 2px 8px;">${activeProblemsCount} active problems • ${affectedUsersCount} affected users • ${affectedConfigsCount} client configs</span>`;
+                summaryHeaderElem.style.display = 'block';
+            } else {
+                summaryHeaderElem.textContent = '';
+                summaryHeaderElem.style.display = 'none';
+            }
+        }
+
         const rawConditions = (ha && Array.isArray(ha.conditions)) ? ha.conditions : [];
         const hasExplicitConditions = rawConditions.length > 0;
         const isDegradedOrDown = s === 'DEGRADED' || s === 'DOWN' || s === 'CRITICAL';
@@ -2213,6 +2264,14 @@
                             detailsBadge.style.borderRadius = 'var(--radius-sm, 4px)';
                             detailsBadge.textContent = detailsParts.join(' • ');
                             row.appendChild(detailsBadge);
+                        }
+
+                        if (p.first_observed) {
+                            const onsetSpan = document.createElement('span');
+                            onsetSpan.className = 'text-muted font-mono';
+                            onsetSpan.style.fontSize = '0.75rem';
+                            onsetSpan.textContent = 'Onset: ' + vpnFormatTime(p.first_observed);
+                            row.appendChild(onsetSpan);
                         }
 
                         problemListElem.appendChild(row);

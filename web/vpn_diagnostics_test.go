@@ -682,7 +682,7 @@ function entry(id,label) {
  return children[index+1].innerHTML;
 }
 const series={};
-for (const [i,w] of ['15m','1h','6h','24h'].entries()) {
+for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
  const value=i+1;
  series['window_'+w]=[{
   t:100,rx_bps:999,tx_bps:999,rx_pps:999,tx_pps:999,traffic_available:false,
@@ -703,7 +703,7 @@ for (const [i,w] of ['15m','1h','6h','24h'].entries()) {
   backends:[{id:3,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,traffic_available:true,probe_available:false}]
  }];
 }
-for (const [i,w] of ['15m','1h','6h','24h'].entries()) {
+for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
  vpnHistoryWindow=w;seen.length=0;vpnRenderHistoryCharts(series);
  const v=i+1;
  assert.deepStrictEqual(seen.slice(0,4),[[null,3*v,0],[0,5*v,0],[null,6*v,0],[null,7*v,0]]);
@@ -2351,7 +2351,7 @@ const sessions = [
         connection_name: 'alice-phone',
         server_name: 'Frankfurt-1',
         assigned_ip: '10.8.0.2',
-        status: 'active'
+        status: 'connected'
     },
     {
         id: 2,
@@ -2361,7 +2361,7 @@ const sessions = [
         connection_name: 'bob-laptop',
         server_name: 'Frankfurt-1',
         assigned_ip: '10.8.0.3',
-        status: 'active'
+        status: 'connected'
     },
     {
         id: 3,
@@ -2371,7 +2371,7 @@ const sessions = [
         connection_name: 'charlie-pc',
         server_name: 'Frankfurt-2',
         assigned_ip: '10.8.0.99',
-        status: 'active'
+        status: 'connected'
     },
     {
         id: 4,
@@ -2381,7 +2381,7 @@ const sessions = [
         connection_name: 'dan-phone',
         server_name: 'Frankfurt-1',
         assigned_ip: '10.8.0.4',
-        status: 'active'
+        status: 'connected'
     }
 ];
 
@@ -2405,6 +2405,7 @@ assert(row0.children[4].textContent.includes('1.00 Mbps') && row0.children[4].te
 assert.strictEqual(row0.children[5].textContent, '0', 'col 5 must render 0 drops');
 assert.strictEqual(row0.children[6].textContent, '12/100', 'col 6 must render queue occupancy/capacity');
 assert(row0.children[7].textContent.includes('Active'), 'col 7 must render Active status badge');
+assert(row0.children[7].innerHTML.includes('badge-success'), 'col 7 must render badge-success for connected session');
 
 // Row 1 (bob - degraded correlated route):
 const row1 = tbody.children[1];
@@ -2490,6 +2491,8 @@ assert.strictEqual(filterText.textContent, 'All Connections', 'filter button tex
 assert.strictEqual(tbody.children.length, 2, 'degraded bob and unroutable charlie must remain in problem filter');
 assert(tbody.children[0].textContent.includes('bob'), 'bob must be visible in problem filter');
 assert(tbody.children[1].textContent.includes('charlie'), 'unroutable charlie must be visible in problem filter');
+assert(!Array.from(tbody.children).some(r => r.textContent.includes('alice')), 'Alice must be excluded from problems only filter');
+assert(!Array.from(tbody.children).some(r => r.textContent.includes('dan')), 'Dan must be excluded from problems only filter');
 
 // Filter OFF:
 vpnToggleSessionsProblemFilter();
@@ -2536,6 +2539,24 @@ const routeConnMatch = { session_id: 'sess-none', connection_id: 'conn-prio', as
 vpnLastStatus = { forwarder_available: true, all_routes: [routeSessionMatch, routeConnMatch] };
 const sessWithConnPrio = { session_id: 'sess-unmatched', connection_id: 'conn-prio', assigned_ip: '10.8.0.200' };
 assert.strictEqual(vpnFindRouteForSession(sessWithConnPrio), routeConnMatch, 'connection ID match must take precedence over IP match');
+
+// Hardened correlation: Different connection IDs but identical IP do NOT match
+const routeDiffConnSameIP = { connection_id: 'conn-route-99', assigned_ip: '10.8.0.150' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeDiffConnSameIP] };
+const sessDiffConnSameIP = { connection_id: 'conn-sess-11', assigned_ip: '10.8.0.150' };
+assert.strictEqual(vpnFindRouteForSession(sessDiffConnSameIP), null, 'session and route with different connection IDs but identical IP must NOT match');
+
+// Hardened correlation: Different session IDs but identical IP do NOT match
+const routeDiffSessSameIP = { session_id: 'sess-route-99', assigned_ip: '10.8.0.151' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeDiffSessSameIP] };
+const sessDiffSessSameIP = { session_id: 'sess-sess-11', assigned_ip: '10.8.0.151' };
+assert.strictEqual(vpnFindRouteForSession(sessDiffSessSameIP), null, 'session and route with different session IDs but identical IP must NOT match');
+
+// Durable IDs absent on both sides: match on IP fallback
+const routeNoDurableSameIP = { assigned_ip: '10.8.0.152' };
+vpnLastStatus = { forwarder_available: true, all_routes: [routeNoDurableSameIP] };
+const sessNoDurableSameIP = { assigned_ip: '10.8.0.152' };
+assert.strictEqual(vpnFindRouteForSession(sessNoDurableSameIP), routeNoDurableSameIP, 'session and route without durable IDs must match on IP fallback');
 `
 
 	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", enAssertions)
@@ -2581,7 +2602,7 @@ const sessions = [
         connection_name: 'иван-офис',
         server_name: 'Москва-1',
         assigned_ip: '10.8.0.10',
-        status: 'active'
+        status: 'connected'
     },
     {
         id: 2,
@@ -2591,7 +2612,7 @@ const sessions = [
         connection_name: 'петр-дом',
         server_name: 'Москва-1',
         assigned_ip: '10.8.0.20',
-        status: 'active'
+        status: 'connected'
     }
 ];
 
@@ -2646,5 +2667,214 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 		if !strings.Contains(renderedHTML, expectedRussianHeader) {
 			t.Fatalf("rendered Russian template missing header %q", expectedRussianHeader)
 		}
+	}
+}
+
+func TestVPNHorizonWindowToggles1mAnd5m(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	for _, expectedBtn := range []string{
+		`onclick="vpnSetHistoryWindow('1m')"`,
+		`onclick="vpnSetHistoryWindow('5m')"`,
+		`onclick="vpnSetHistoryWindow('15m')"`,
+		`onclick="vpnSetHistoryWindow('1h')"`,
+		`onclick="vpnSetHistoryWindow('6h')"`,
+		`onclick="vpnSetHistoryWindow('24h')"`,
+	} {
+		if !strings.Contains(tmplStr, expectedBtn) {
+			t.Fatalf("vpn.html missing toggle button %s", expectedBtn)
+		}
+	}
+
+	assertions := `
+const toggles = document.getElementById('vpn-history-window-toggles');
+assert(toggles, 'toggles container must exist');
+toggles.children = ['1m', '5m', '15m', '1h', '6h', '24h'].map(w => {
+    const btn = document.createElement('button');
+    btn.textContent = w;
+    btn.className = w === '15m' ? 'btn btn-sm btn-primary active' : 'btn btn-sm btn-secondary';
+    return btn;
+});
+toggles.querySelectorAll = (sel) => sel === 'button' ? toggles.children : [];
+const buttons = Array.from(toggles.querySelectorAll('button'));
+const btn1m = buttons.find(b => b.textContent.trim() === '1m');
+const btn5m = buttons.find(b => b.textContent.trim() === '5m');
+const btn15m = buttons.find(b => b.textContent.trim() === '15m');
+
+assert(btn1m, '1m button must exist');
+assert(btn5m, '5m button must exist');
+assert(btn15m, '15m button must exist');
+
+const mockSeries = {
+    window_1m: [
+        { traffic_available: true, rx_bps: 1000, tx_bps: 2000, q_pct: 10, drop_rates_available: true, drop_rate: 1 },
+        { traffic_available: true, rx_bps: 1100, tx_bps: 2200, q_pct: 12, drop_rates_available: true, drop_rate: 0 }
+    ],
+    window_5m: [
+        { traffic_available: true, rx_bps: 5000, tx_bps: 6000, q_pct: 50, drop_rates_available: true, drop_rate: 5 },
+        { traffic_available: true, rx_bps: 5500, tx_bps: 6500, q_pct: 55, drop_rates_available: true, drop_rate: 2 }
+    ],
+    window_15m: [
+        { traffic_available: true, rx_bps: 15000, tx_bps: 16000, q_pct: 30, drop_rates_available: true, drop_rate: 0 }
+    ]
+};
+
+vpnLastStatus = {
+    forwarder_available: true,
+    historical_series: mockSeries
+};
+
+const originalSparkline = vpnGenerateSparklineSVG;
+const seen = [];
+vpnGenerateSparklineSVG = (values, ...args) => {
+    seen.push(values);
+    return originalSparkline(values, ...args);
+};
+
+// 1. Click 1m horizon button
+seen.length = 0;
+vpnSetHistoryWindow('1m');
+assert(btn1m.className.includes('btn-primary'), '1m button must be primary when active');
+assert(btn1m.className.includes('active'), '1m button must have active class');
+assert(!btn5m.className.includes('btn-primary'), '5m button must not be primary');
+assert(!btn15m.className.includes('btn-primary'), '15m button must not be primary');
+assert.strictEqual(vpnHistoryWindow, '1m', 'vpnHistoryWindow must be 1m');
+// Verify points loaded from window_1m: throughput is (1000+2000) = 3000, (1100+2200) = 3300
+assert.deepStrictEqual(seen[0], [3000, 3300], 'throughput chart must load window_1m points');
+
+// 2. Click 5m horizon button
+seen.length = 0;
+vpnSetHistoryWindow('5m');
+assert(btn5m.className.includes('btn-primary'), '5m button must be primary when active');
+assert(btn5m.className.includes('active'), '5m button must have active class');
+assert(!btn1m.className.includes('btn-primary'), '1m button must not be primary');
+assert(!btn15m.className.includes('btn-primary'), '15m button must not be primary');
+assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
+// Verify points loaded from window_5m: throughput is (5000+6000) = 11000, (5500+6500) = 12000
+assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
+`
+
+	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
+	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnLossReasonLabels", "vpnDiagText", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
+		fn, err := extractJSFunction(tmplStr, "function "+name)
+		if err != nil {
+			t.Fatalf("extractJSFunction %s: %v", name, err)
+		}
+		script += "\n" + fn
+	}
+	script += "\nlet vpnHistoryWindow = '15m';\nlet vpnLastStatus = null;\n" + assertions
+
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("1m and 5m horizon window toggles test failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNSummaryHeaderCountsAndProblemCardOnset(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const el = id => document.getElementById(id);
+
+// 1. Degraded forwarder with 2 actionable problems across 1 user and 2 connection configs
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'DEGRADED',
+		summary: 'Packet loss observed on active connections',
+		actionable_problems: [
+			{
+				severity: 'DEGRADED',
+				message: 'Buffer pressure on forwarder route',
+				category: 'routing',
+				user_id: 'usr-1',
+				username: 'alice',
+				connection_id: 'conn-1',
+				connection_name: 'alice-phone',
+				assigned_ip: '10.8.0.2',
+				first_observed: '2026-10-07T12:30:00Z'
+			},
+			{
+				severity: 'CRITICAL',
+				message: 'Buffer full drops active',
+				category: 'dataplane',
+				user_id: 'usr-1',
+				username: 'alice',
+				connection_id: 'conn-2',
+				connection_name: 'alice-laptop',
+				assigned_ip: '10.8.0.3',
+				first_observed: '2026-10-07T12:35:00Z'
+			}
+		]
+	}
+});
+
+// Assert Summary Header Counts
+const summaryHeader = el('vpn-fwd-summary-header');
+assert(summaryHeader, 'summary header element must exist');
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when problems exist');
+assert(summaryHeader.textContent.includes('2 active problems'), 'must show 2 active problems');
+assert(summaryHeader.textContent.includes('1 affected users'), 'must show 1 unique affected user');
+assert(summaryHeader.textContent.includes('2 client configs'), 'must show 2 unique affected client configs');
+assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must have badge styling');
+
+// Assert Problem Card Onset Timestamps
+const problemList = el('vpn-fwd-problem-list');
+assert.strictEqual(problemList.children.length, 2, 'must render 2 problem cards');
+
+const card0 = problemList.children[0];
+assert(card0.className.includes('problem-card'), 'card 0 must have problem-card class');
+assert(card0.textContent.includes('Onset:'), 'card 0 must render onset label');
+assert(card0.textContent.includes('2026-10-07 12:30:00 UTC'), 'card 0 must render first_observed timestamp');
+assert(card0.textContent.includes('Config: alice-phone'));
+assert(card0.textContent.includes('User: alice'));
+
+const card1 = problemList.children[1];
+assert(card1.className.includes('problem-card'), 'card 1 must have problem-card class');
+assert(card1.textContent.includes('Onset:'), 'card 1 must render onset label');
+assert(card1.textContent.includes('2026-10-07 12:35:00 UTC'), 'card 1 must render first_observed timestamp');
+assert(card1.textContent.includes('Config: alice-laptop'));
+assert(card1.textContent.includes('User: alice'));
+
+// 2. Nominal forwarder (0 problems): summary header must be hidden, nominal green badge rendered
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'HEALTHY',
+		conditions: []
+	},
+	peer_sync: { actual_peers: 5, desired_peers: 5 },
+	backends: { healthy_count: 2, total_count: 2 }
+});
+
+assert.strictEqual(summaryHeader.style.display, 'none', 'summary header must be hidden when healthy (0 problems)');
+assert.strictEqual(problemList.children.length, 1);
+const greenBadge = problemList.children[0];
+assert(greenBadge.className.includes('badge-success'), 'nominal summary must have badge-success class');
+assert(greenBadge.textContent.includes('No active problems detected'), 'nominal green badge text must show when 0 problems');
+
+// 3. Unavailable forwarder: summary header must be hidden
+vpnRenderForwarderHealth(null);
+assert.strictEqual(summaryHeader.style.display, 'none', 'summary header must be hidden when unavailable');
+`
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("summary header counts and onset timestamp test failed: %v\n%s", err, out)
 	}
 }
