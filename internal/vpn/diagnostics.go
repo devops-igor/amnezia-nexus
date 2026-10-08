@@ -384,12 +384,13 @@ func (d RoutingConsistencyDiagnostics) OwnershipMismatchRatePPS() float64 {
 
 // HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
 type HandshakeFreshnessDiagnostics struct {
-	Under2mCount      int      `json:"under_2m_count"`
-	Between2m5mCount  int      `json:"between_2m_5m_count"`
-	Over5mCount       int      `json:"over_5m_count"`
-	NeverCount        int      `json:"never_count"`
-	TotalPeers        int      `json:"total_peers"`
-	StaleLiveSessions []string `json:"stale_live_sessions,omitempty"`
+	Under2mCount      int                  `json:"under_2m_count"`
+	Between2m5mCount  int                  `json:"between_2m_5m_count"`
+	Over5mCount       int                  `json:"over_5m_count"`
+	NeverCount        int                  `json:"never_count"`
+	TotalPeers        int                  `json:"total_peers"`
+	StaleLiveSessions []string             `json:"stale_live_sessions,omitempty"`
+	PeerHandshakes    map[string]time.Time `json:"-"`
 }
 
 // BackendTelemetryItem captures per-backend operational metrics.
@@ -1109,6 +1110,7 @@ func (inputs diagnosticsInputs) collectHandshakeDiagnostics() HandshakeFreshness
 	// of the masking scheme instead of the keys.
 	sort.Strings(diag.StaleLiveSessions)
 	redactKeySlice(diag.StaleLiveSessions)
+	diag.PeerHandshakes = peerHandshakes
 	return diag
 }
 
@@ -1708,8 +1710,9 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 
 	if len(handshake.StaleLiveSessions) > 0 {
 		conds = append(conds, HealthCondition{
-			Category: "sessions",
-			Severity: "WARNING",
+			Category:   "sessions",
+			Severity:   "WARNING",
+			MessageKey: "vpn_problem_stale_handshake",
 			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> %s)",
 				len(handshake.StaleLiveSessions), DefaultHealthThresholds.HandshakeStaleAge),
 		})
@@ -2549,7 +2552,7 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	}
 
 	// 10. Centralized Rule-Based Health Assessment
-	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions)
+	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions, status.HandshakeFreshness.PeerHandshakes)
 	status.HealthAssessment = EvaluateForwarderHealth(
 		status.ForwarderAvailable,
 		status.EngineRunning,
@@ -2610,9 +2613,9 @@ func SynthesizeActionableProblemsWithTracker(routes []forwarder.RouteInfo, sessi
 	return SynthesizeActionableProblemsAt(routes, sessions, observedAt, tracker)
 }
 
-// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
-// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
-func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
+// SynthesizeActionableProblemsWithHandshakes derives per-session/route actionable problem records
+// by correlating active routes, route pressure, active VPN sessions, and peer handshakes.
+func SynthesizeActionableProblemsWithHandshakes(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
@@ -2621,6 +2624,7 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 		sess, hasSess := findSessionForRoute(r, sessions)
 		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess, observedAt)...)
 	}
+	problems = append(problems, synthesizeStaleHandshakeProblems(sessions, peerHandshakes, observedAt)...)
 
 	var tr *problemOnsetTracker
 	if len(tracker) > 0 && tracker[0] != nil {
@@ -2658,6 +2662,12 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 
 	sortActionableProblems(problems)
 	return problems
+}
+
+// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
+// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
+func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
+	return SynthesizeActionableProblemsWithHandshakes(routes, sessions, nil, observedAt, tracker...)
 }
 
 func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bool) {
@@ -2750,6 +2760,37 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 				MessageKey:     "vpn_problem_session_without_route",
 				UserID:         sess.UserID,
 				SessionID:      sess.ID,
+				ConnectionName: sess.ConnectionName,
+				AssignedIP:     sess.AssignedIP,
+				BackendID:      sess.BackendTunnelID,
+				FirstObserved:  observedAt,
+			})
+		}
+	}
+	return problems
+}
+
+func synthesizeStaleHandshakeProblems(sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time) []ActionableProblem {
+	if len(peerHandshakes) == 0 {
+		return nil
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	var problems []ActionableProblem
+	for _, sess := range sessions {
+		if sess.PeerPublicKey == "" {
+			continue
+		}
+		hs, ok := peerHandshakes[sess.PeerPublicKey]
+		if !ok || hs.IsZero() || observedAt.Sub(hs) > DefaultHealthThresholds.HandshakeStaleAge {
+			problems = append(problems, ActionableProblem{
+				Severity:       "WARNING",
+				Category:       "sessions",
+				Message:        fmt.Sprintf("Upstream handshake stale (> %s)", DefaultHealthThresholds.HandshakeStaleAge),
+				MessageKey:     "vpn_problem_stale_handshake",
+				SessionID:      sess.ID,
+				UserID:         sess.UserID,
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
@@ -2933,12 +2974,12 @@ func (s *Service) fetchPeerIdentityMappings(ctx context.Context, peerKeys []stri
 	return connByPeer, userByPeer
 }
 
-func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time) []ActionableProblem {
 	var tracker *problemOnsetTracker
 	if s != nil {
 		tracker = s.getProblemOnsetTracker()
 	}
-	problems := SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC(), tracker)
+	problems := SynthesizeActionableProblemsWithHandshakes(routes, sessions, peerHandshakes, time.Now().UTC(), tracker)
 	if len(problems) == 0 || s == nil || s.db == nil {
 		return problems
 	}

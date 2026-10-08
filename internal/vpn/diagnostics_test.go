@@ -1047,6 +1047,99 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 	}
 }
 
+func TestSynthesizeActionableProblems_StaleHandshakes(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	freshSession := Session{
+		ID:              "sess-fresh",
+		UserID:          "user-fresh",
+		ConnectionName:  "user-fresh-client",
+		PeerPublicKey:   "pk-fresh",
+		AssignedIP:      "10.8.0.50",
+		BackendTunnelID: 105,
+		ConnectedAt:     now.Add(-10 * time.Minute),
+		Status:          "connected",
+	}
+
+	staleSession := Session{
+		ID:              "sess-stale",
+		UserID:          "user-stale",
+		ConnectionName:  "user-stale-client",
+		PeerPublicKey:   "pk-stale",
+		AssignedIP:      "10.8.0.60",
+		BackendTunnelID: 106,
+		ConnectedAt:     now.Add(-10 * time.Minute),
+		Status:          "connected",
+	}
+
+	sessions := []Session{freshSession, staleSession}
+
+	// Supply matching routes with no pressure so only handshake issues can trigger problems
+	routes := []forwarder.RouteInfo{
+		{
+			PeerKey:         "pk-fresh",
+			AssignedIP:      "10.8.0.50",
+			SessionID:       "sess-fresh",
+			BackendTunnelID: 105,
+		},
+		{
+			PeerKey:         "pk-stale",
+			AssignedIP:      "10.8.0.60",
+			SessionID:       "sess-stale",
+			BackendTunnelID: 106,
+		},
+	}
+
+	peerHandshakes := map[string]time.Time{
+		"pk-fresh": now.Add(-30 * time.Second),
+		"pk-stale": now.Add(-5 * time.Minute),
+	}
+
+	problems := SynthesizeActionableProblemsWithHandshakes(routes, sessions, peerHandshakes, now)
+	if len(problems) != 1 {
+		t.Fatalf("expected 1 problem for stale session, got %d: %+v", len(problems), problems)
+	}
+
+	prob := problems[0]
+	if prob.MessageKey != "vpn_problem_stale_handshake" {
+		t.Errorf("expected MessageKey vpn_problem_stale_handshake, got %q", prob.MessageKey)
+	}
+	if prob.Severity != "WARNING" {
+		t.Errorf("expected Severity WARNING, got %q", prob.Severity)
+	}
+	if prob.Category != "sessions" {
+		t.Errorf("expected Category sessions, got %q", prob.Category)
+	}
+	if prob.SessionID != "sess-stale" {
+		t.Errorf("expected SessionID sess-stale, got %q", prob.SessionID)
+	}
+	if prob.UserID != "user-stale" {
+		t.Errorf("expected UserID user-stale, got %q", prob.UserID)
+	}
+	if prob.AssignedIP != "10.8.0.60" {
+		t.Errorf("expected AssignedIP 10.8.0.60, got %q", prob.AssignedIP)
+	}
+	if prob.BackendID != 106 {
+		t.Errorf("expected BackendID 106, got %d", prob.BackendID)
+	}
+	if prob.ConnectionName != "user-stale-client" {
+		t.Errorf("expected ConnectionName user-stale-client, got %q", prob.ConnectionName)
+	}
+
+	// Assert fresh session does not emit a problem
+	for _, p := range problems {
+		if p.SessionID == "sess-fresh" || p.AssignedIP == "10.8.0.50" {
+			t.Errorf("fresh session must not emit a problem: %+v", p)
+		}
+	}
+
+	// Backwards-compatible call without peerHandshakes should not emit stale handshake problem
+	compatProblems := SynthesizeActionableProblemsAt(routes, sessions, now)
+	if len(compatProblems) != 0 {
+		t.Errorf("expected 0 problems from SynthesizeActionableProblemsAt, got %d: %+v", len(compatProblems), compatProblems)
+	}
+}
+
 func TestForwarderDrops_RestartDoesNotAttributePreRestartDrops(t *testing.T) {
 	db := setupTestDB(t)
 	svc, err := NewVPNService(db, nil)

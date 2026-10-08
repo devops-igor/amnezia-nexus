@@ -678,5 +678,6 @@
   "vpn_problem_route_queue_drops": "Активен сброс пакетов клиента в очереди возврата",
   "vpn_problem_write_stall": "Обнаружена задержка записи в устройство",
   "vpn_problem_write_errors": "Активны ошибки записи в устройство",
-  "vpn_problem_route_queue_pressure": "Обнаружена высокая нагрузка очереди на маршруте форвардера"
+  "vpn_problem_route_queue_pressure": "Обнаружена высокая нагрузка очереди на маршруте форвардера",
+  "vpn_problem_stale_handshake": "Устаревшее рукопожатие вышестоящего узла"
 }

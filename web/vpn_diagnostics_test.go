@@ -3050,6 +3050,79 @@ assert(summaryHeader.textContent.includes('1 active problems'), 'summary header 
 	}
 }
 
+func TestVPNForwarderStaleHandshakeActionableProblemDOM(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const el = id => document.getElementById(id);
+
+// Supply a status payload containing an actionable problem with message_key: "vpn_problem_stale_handshake" and user/connection identities
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'HEALTHY',
+		summary: 'Operational with 1 warning condition(s)',
+		actionable_problems: [
+			{
+				severity: 'WARNING',
+				message: 'Upstream handshake stale (> 3m0s)',
+				message_key: 'vpn_problem_stale_handshake',
+				category: 'sessions',
+				user_id: 'usr-1',
+				username: 'alice',
+				connection_id: 'conn-1',
+				connection_name: 'alice-phone',
+				assigned_ip: '10.8.0.2',
+				backend_id: 1,
+				first_observed: '2026-10-08T12:00:00Z'
+			}
+		],
+		conditions: [
+			{
+				severity: 'WARNING',
+				message: '1 active live session(s) have stale upstream handshakes (> 3m0s)',
+				message_key: 'vpn_problem_stale_handshake',
+				category: 'sessions'
+			}
+		]
+	}
+});
+
+// 1. Assert Summary Header: displays 1 active problems • 1 affected users • 1 client configs
+const summaryHeader = el('vpn-fwd-summary-header');
+assert(summaryHeader, 'summary header element must exist');
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem');
+assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must show 1 affected user');
+assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must show 1 client config');
+assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+
+// 2. Assert Problem Card: rendered with user and connection metadata badges
+const problemList = el('vpn-fwd-problem-list');
+assert.strictEqual(problemList.children.length, 1, 'must render 1 problem card');
+const card = problemList.children[0];
+assert(card.className.includes('problem-card'), 'card must have problem-card class');
+assert(card.textContent.includes('Upstream handshake stale'), 'card must render localized message');
+assert(card.textContent.includes('User: alice'), 'card must contain user badge');
+assert(card.textContent.includes('Config: alice-phone'), 'card must contain connection config badge');
+assert(card.textContent.includes('IP: 10.8.0.2'), 'card must contain IP badge');
+assert(card.textContent.includes('Backend 1'), 'card must contain backend badge');
+`
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("stale handshake DOM test failed: %v\n%s", err, out)
+	}
+}
+
 func TestVPNTranslationKeyParity(t *testing.T) {
 	transFS, err := GetTranslationsSubFS()
 	if err != nil {
