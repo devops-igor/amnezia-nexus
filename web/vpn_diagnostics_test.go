@@ -2939,6 +2939,110 @@ assert(summaryHeader.textContent.includes('0 client configs'), 'affected client 
 	}
 }
 
+func TestVPNForwarderCombinedActionableAndGenericConditions(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const el = id => document.getElementById(id);
+
+// Critical backend condition occurring simultaneously with a degraded route
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'CRITICAL',
+		summary: 'Active VPN session routing or dataplane issues detected',
+		actionable_problems: [
+			{
+				severity: 'DEGRADED',
+				message: 'Return queue full drops (5 recent) for 10.8.0.2',
+				category: 'dataplane',
+				user_id: 'usr-1',
+				username: 'alice',
+				connection_id: 'conn-1',
+				connection_name: 'alice-phone',
+				assigned_ip: '10.8.0.2',
+				backend_id: 1,
+				observed_rate: '2.5 drops/s',
+				first_observed: '2026-10-08T10:00:00Z'
+			}
+		],
+		conditions: [
+			{
+				severity: 'CRITICAL',
+				message: 'No healthy backends available to route traffic',
+				category: 'backend'
+			}
+		]
+	}
+});
+
+// 1. Assert Summary Header Counts both classes of problems
+const summaryHeader = el('vpn-fwd-summary-header');
+assert(summaryHeader, 'summary header element must exist');
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
+assert(summaryHeader.textContent.includes('2 active problems'), 'summary header must count both classes: 1 actionable + 1 condition = 2 active problems');
+assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must count 1 affected user from actionable problem');
+assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must count 1 client config from actionable problem');
+
+// 2. Assert Both Problem Cards are rendered in #vpn-fwd-problem-list
+const problemList = el('vpn-fwd-problem-list');
+assert.strictEqual(problemList.children.length, 2, 'problem list must render both problem cards');
+
+const card0 = problemList.children[0];
+assert(card0.className.includes('problem-card'), 'card 0 must have problem-card class');
+assert.strictEqual(card0.children[0].textContent, 'Degraded', 'card 0 severity must be Degraded');
+assert.strictEqual(card0.children[1].textContent, 'Return queue full drops (5 recent) for 10.8.0.2');
+assert(card0.textContent.includes('User: alice'));
+assert(card0.textContent.includes('Config: alice-phone'));
+assert(card0.textContent.includes('IP: 10.8.0.2'));
+assert(card0.textContent.includes('2.5 drops/s'));
+
+const card1 = problemList.children[1];
+assert(card1.className.includes('problem-card'), 'card 1 must have problem-card class');
+assert.strictEqual(card1.children[0].textContent, 'Critical', 'card 1 severity must be Critical');
+assert.strictEqual(card1.children[1].textContent, 'No healthy backends available to route traffic');
+assert(card1.textContent.includes('backend'));
+
+// 3. Deduplication: exact duplicate condition must not be rendered twice
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'DEGRADED',
+		summary: 'Degraded',
+		actionable_problems: [
+			{
+				severity: 'DEGRADED',
+				message: 'Duplicate event message',
+				category: 'dataplane'
+			}
+		],
+		conditions: [
+			{
+				severity: 'DEGRADED',
+				message: 'Duplicate event message',
+				category: 'dataplane'
+			}
+		]
+	}
+});
+assert.strictEqual(problemList.children.length, 1, 'duplicate event must not render redundant card');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must count 1 active problem when deduplicated');
+`
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("combined actionable and generic conditions test failed: %v\n%s", err, out)
+	}
+}
+
 func TestVPNTranslationKeyParity(t *testing.T) {
 	transFS, err := GetTranslationsSubFS()
 	if err != nil {

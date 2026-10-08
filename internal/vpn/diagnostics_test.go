@@ -998,8 +998,8 @@ func TestSynthesizeActionableProblems_PopulatesIdentityFields(t *testing.T) {
 	if dropsProb.BackendID != 102 {
 		t.Errorf("drops backend_id: got %d, want 102", dropsProb.BackendID)
 	}
-	if dropsProb.ObservedRate != "5 drops" {
-		t.Errorf("drops observed_rate: got %q, want '5 drops'", dropsProb.ObservedRate)
+	if dropsProb.ObservedRate != "5 drops/window" {
+		t.Errorf("drops observed_rate: got %q, want '5 drops/window'", dropsProb.ObservedRate)
 	}
 	if dropsProb.FirstObserved.Equal(sessions[1].ConnectedAt) {
 		t.Errorf("drops first_observed must not equal ConnectedAt: got %v", dropsProb.FirstObserved)
@@ -1938,5 +1938,194 @@ func TestEnrichActionableProblemsWithDatabase_MultiConfigDisambiguation(t *testi
 	}
 	if enriched[3].ConnectionName != "Bob Desktop" {
 		t.Errorf("p4 connectionName: got %q, want 'Bob Desktop'", enriched[3].ConnectionName)
+	}
+}
+
+func TestEvaluateForwarderHealth_EscalationFromActionableProblems(t *testing.T) {
+	baseQueue := QueuePressureDiagnostics{}
+	baseLatency := ForwardLatencyDiagnostics{}
+	baseDrops := DropCategoryBreakdown{}
+	baseVTUN := VirtualTUNDiagnostics{}
+	basePeerSync := &PeerSyncStatus{
+		DesiredPeers: 5,
+		ActualPeers:  5,
+	}
+	baseRouting := RoutingConsistencyDiagnostics{
+		IsConsistent: true,
+	}
+	baseHandshake := HandshakeFreshnessDiagnostics{}
+	baseBackends := BackendsDiagnostics{
+		HealthyCount: 2,
+		TotalCount:   2,
+	}
+
+	t.Run("DegradedRouteEscalatesHealthyStatusToDegraded", func(t *testing.T) {
+		degradedProblem := ActionableProblem{
+			Severity:     "DEGRADED",
+			Category:     "dataplane",
+			Message:      "Return queue full drops (5 recent) for 10.8.0.2",
+			MessageKey:   "vpn_problem_route_queue_drops",
+			AssignedIP:   "10.8.0.2",
+			ObservedRate: "2.5 drops/s",
+		}
+
+		health := EvaluateForwarderHealth(
+			true,
+			true,
+			baseQueue,
+			baseLatency,
+			baseDrops,
+			baseVTUN,
+			basePeerSync,
+			baseRouting,
+			baseHandshake,
+			baseBackends,
+			degradedProblem,
+		)
+
+		if health.Status != HealthDegraded {
+			t.Errorf("status: got %q, want %q", health.Status, HealthDegraded)
+		}
+		if !strings.Contains(health.Summary, "Active VPN session routing or dataplane issues detected") {
+			t.Errorf("summary: got %q, want to contain 'Active VPN session routing or dataplane issues detected'", health.Summary)
+		}
+		if len(health.ActionableProblems) != 1 {
+			t.Errorf("actionable problems length: got %d, want 1", len(health.ActionableProblems))
+		}
+	})
+
+	t.Run("UnroutableSessionEscalatesStatusToCritical", func(t *testing.T) {
+		unroutableProblem := ActionableProblem{
+			Severity:   "CRITICAL",
+			Category:   "routing",
+			Message:    "Session sess-1 has no active route",
+			MessageKey: "vpn_problem_session_without_route",
+			SessionID:  "sess-1",
+			AssignedIP: "10.8.0.10",
+		}
+
+		health := EvaluateForwarderHealth(
+			true,
+			true,
+			baseQueue,
+			baseLatency,
+			baseDrops,
+			baseVTUN,
+			basePeerSync,
+			baseRouting,
+			baseHandshake,
+			baseBackends,
+			unroutableProblem,
+		)
+
+		if health.Status != HealthCritical {
+			t.Errorf("status: got %q, want %q", health.Status, HealthCritical)
+		}
+		if !strings.Contains(health.Summary, "Active VPN session routing or dataplane issues detected") {
+			t.Errorf("summary: got %q, want to contain 'Active VPN session routing or dataplane issues detected'", health.Summary)
+		}
+	})
+}
+
+func TestSynthesizeActionableProblems_ObservedRateFormatting(t *testing.T) {
+	now := time.Now()
+	sessions := []Session{
+		{
+			ID:          "sess-1",
+			AssignedIP:  "10.8.0.2",
+			ConnectedAt: now.Add(-5 * time.Minute),
+			Status:      "connected",
+		},
+	}
+
+	tests := []struct {
+		name         string
+		route        forwarder.RouteInfo
+		wantKey      string
+		wantRate     string
+		wantSeverity string
+	}{
+		{
+			name: "drops with pps rate",
+			route: forwarder.RouteInfo{
+				SessionID:   "sess-1",
+				AssignedIP:  "10.8.0.2",
+				HasPressure: true,
+				Stats: forwarder.RouteQueueStats{
+					QueueFullDropsRecent: 10,
+					QueueFullDropRatePPS: 4.5,
+				},
+			},
+			wantKey:      "vpn_problem_route_queue_drops",
+			wantRate:     "4.5 drops/s",
+			wantSeverity: "DEGRADED",
+		},
+		{
+			name: "drops fallback to recent drops per window",
+			route: forwarder.RouteInfo{
+				SessionID:   "sess-1",
+				AssignedIP:  "10.8.0.2",
+				HasPressure: true,
+				Stats: forwarder.RouteQueueStats{
+					QueueFullDropsRecent: 7,
+					QueueFullDropRatePPS: 0,
+				},
+			},
+			wantKey:      "vpn_problem_route_queue_drops",
+			wantRate:     "7 drops/window",
+			wantSeverity: "DEGRADED",
+		},
+		{
+			name: "write stall duration ms",
+			route: forwarder.RouteInfo{
+				SessionID:   "sess-1",
+				AssignedIP:  "10.8.0.2",
+				HasPressure: true,
+				Stats: forwarder.RouteQueueStats{
+					OldestWriteMS:     350,
+					WriteStallsRecent: 0,
+				},
+			},
+			wantKey:      "vpn_problem_write_stall",
+			wantRate:     "350ms stall",
+			wantSeverity: "WARNING",
+		},
+		{
+			name: "queue pressure occupancy and percentage",
+			route: forwarder.RouteInfo{
+				SessionID:   "sess-1",
+				AssignedIP:  "10.8.0.2",
+				HasPressure: true,
+				Stats: forwarder.RouteQueueStats{
+					Occupancy: 85,
+					Capacity:  100,
+				},
+			},
+			wantKey:      "vpn_problem_route_queue_pressure",
+			wantRate:     "85/100 queued (85%)",
+			wantSeverity: "WARNING",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			problems := SynthesizeActionableProblemsAt([]forwarder.RouteInfo{tt.route}, sessions, now)
+			var matched *ActionableProblem
+			for i := range problems {
+				if problems[i].MessageKey == tt.wantKey {
+					matched = &problems[i]
+					break
+				}
+			}
+			if matched == nil {
+				t.Fatalf("expected problem with key %q, got %+v", tt.wantKey, problems)
+			}
+			if matched.ObservedRate != tt.wantRate {
+				t.Errorf("ObservedRate: got %q, want %q", matched.ObservedRate, tt.wantRate)
+			}
+			if matched.Severity != tt.wantSeverity {
+				t.Errorf("Severity: got %q, want %q", matched.Severity, tt.wantSeverity)
+			}
+		})
 	}
 }

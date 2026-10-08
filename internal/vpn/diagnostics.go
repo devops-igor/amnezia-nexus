@@ -1154,6 +1154,28 @@ func EvaluateForwarderHealth(
 
 	status, summary := summarizeHealthConditions(conditions)
 
+	hasCriticalActionable := false
+	hasDegradedActionable := false
+	for _, p := range actionable {
+		switch strings.ToUpper(p.Severity) {
+		case HealthCritical:
+			hasCriticalActionable = true
+		case HealthDegraded:
+			hasDegradedActionable = true
+		}
+	}
+
+	initialStatus := status
+	if hasCriticalActionable && status != "DOWN" {
+		status = HealthCritical
+	} else if hasDegradedActionable && (status == HealthHealthy || status == "WARNING") {
+		status = HealthDegraded
+	}
+
+	if (initialStatus == HealthHealthy || initialStatus == "WARNING") && status != initialStatus {
+		summary = "Active VPN session routing or dataplane issues detected"
+	}
+
 	return ForwarderHealthAssessment{
 		Status:             status,
 		Summary:            summary,
@@ -2738,7 +2760,13 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 	connID := r.ConnectionID
 	firstObserved := observedAt
 
-	if r.Stats.QueueFullDropsRecent > 0 {
+	if r.Stats.QueueFullDropsRecent > 0 || r.Stats.QueueFullDropRatePPS > 0 {
+		var rate string
+		if r.Stats.QueueFullDropRatePPS > 0 {
+			rate = fmt.Sprintf("%.1f drops/s", r.Stats.QueueFullDropRatePPS)
+		} else if r.Stats.QueueFullDropsRecent > 0 {
+			rate = fmt.Sprintf("%d drops/window", r.Stats.QueueFullDropsRecent)
+		}
 		problems = append(problems, ActionableProblem{
 			Severity:       "DEGRADED",
 			Category:       "dataplane",
@@ -2750,7 +2778,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
 			BackendID:      r.BackendTunnelID,
-			ObservedRate:   fmt.Sprintf("%d drops", r.Stats.QueueFullDropsRecent),
+			ObservedRate:   rate,
 			FirstObserved:  firstObserved,
 		})
 	}
@@ -2809,6 +2837,10 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 	}
 
 	if r.HasPressure && r.Stats.QueueFullDropsRecent == 0 && r.Stats.WriteStallsRecent == 0 && r.Stats.WriteErrorsRecent == 0 && r.Stats.OldestWriteMS < 100 {
+		pct := 0.0
+		if r.Stats.Capacity > 0 {
+			pct = float64(r.Stats.Occupancy) / float64(r.Stats.Capacity) * 100
+		}
 		problems = append(problems, ActionableProblem{
 			Severity:       "WARNING",
 			Category:       "queue_pressure",
@@ -2820,7 +2852,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
 			BackendID:      r.BackendTunnelID,
-			ObservedRate:   fmt.Sprintf("%.1f%%", float64(r.Stats.Occupancy)/float64(r.Stats.Capacity)*100),
+			ObservedRate:   fmt.Sprintf("%d/%d queued (%0.0f%%)", r.Stats.Occupancy, r.Stats.Capacity, pct),
 			FirstObserved:  firstObserved,
 		})
 	}
