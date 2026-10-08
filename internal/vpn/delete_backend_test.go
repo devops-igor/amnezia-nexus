@@ -312,3 +312,85 @@ func TestDeleteBackendDriftSweepSecondRowForSameServer(t *testing.T) {
 		t.Errorf("session %s status = %q, want draining after sweep reassignment", sess.ID, sess.Status)
 	}
 }
+
+func TestDeleteServer_TombstonesAndRejectsResurrection(t *testing.T) {
+	db := setupTestDB(t)
+	svc, serverID, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatal(err)
+	}
+	tun := tunMust(t, svc, serverID)
+
+	if err := svc.DeleteServer(ctx, serverID); err != nil {
+		t.Fatalf("DeleteServer failed: %v", err)
+	}
+
+	// Pool has no tunnel
+	if _, err := svc.pool.GetTunnel(serverID); !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Fatalf("expected tunnel removed from pool, got: %v", err)
+	}
+
+	// Backend device is cleaned up
+	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+		t.Fatalf("expected backend device removed, got: %v", dev)
+	}
+
+	// Subsequent EnableBackend is rejected by tombstone
+	if err := svc.EnableBackend(ctx, serverID); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("expected ErrServerNotFound on tombstoned server, got: %v", err)
+	}
+
+	// Subsequent DeleteBackend returns ErrBackendTunnelNotFound
+	if err := svc.DeleteBackend(ctx, serverID); !errors.Is(err, ErrBackendTunnelNotFound) {
+		t.Fatalf("expected ErrBackendTunnelNotFound on tombstoned server, got: %v", err)
+	}
+}
+
+func TestDeleteServer_NonVPNServer_TombstonesCleanly(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+
+	// Server 9999 has no backend tunnel
+	if err := svc.DeleteServer(ctx, 9999); err != nil {
+		t.Fatalf("DeleteServer for non-VPN server failed: %v", err)
+	}
+
+	// EnableBackend is rejected by tombstone
+	if err := svc.EnableBackend(ctx, 9999); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("expected ErrServerNotFound on tombstoned server, got: %v", err)
+	}
+}
+
+func TestDeleteServer_ErrorInjection_UnmarksTombstone(t *testing.T) {
+	db := setupTestDB(t)
+	svc, serverID, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatal(err)
+	}
+
+	injectedErr := errors.New("simulated teardown error")
+	svc.SetDeleteBackendErrorForTest(injectedErr)
+	defer svc.SetDeleteBackendErrorForTest(nil)
+
+	err := svc.DeleteServer(ctx, serverID)
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected error, got: %v", err)
+	}
+
+	// Tombstone must be unmarked (fail-closed, allows retry)
+	svc.mu.RLock()
+	deleted := svc.isServerDeletedLocked(serverID)
+	svc.mu.RUnlock()
+	if deleted {
+		t.Fatal("expected tombstone to be unmarked after error")
+	}
+}

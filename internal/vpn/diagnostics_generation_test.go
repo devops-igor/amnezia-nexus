@@ -750,5 +750,3 @@ func TestGenerationWindow_OlderGenerationResetIsNoop(t *testing.T) {
 		}
 	})
 }
-
-

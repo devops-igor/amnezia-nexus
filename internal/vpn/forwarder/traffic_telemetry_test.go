@@ -192,4 +192,3 @@ func TestGenerationTrafficWindow_OlderGenerationResetIsNoop(t *testing.T) {
 		t.Fatalf("baselines cleared by older reset")
 	}
 }
-
