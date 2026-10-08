@@ -25,9 +25,9 @@
 </p>
 
 
-Amnezia Nexus lets your users connect to one VPN address while you manage the servers behind it. You can split traffic across several backends, check which ones are working, and switch away from a failed server.
+Amnezia Nexus started as a solution to a problem my friends and I kept running into. Censorship-related IP blocks regularly made our self-hosted VPN servers unreachable. Every time this happened, we had to deploy a replacement server, generate new VPN configurations, and reimport them on all our devices.
 
-Normally, you can replace or add backend servers without asking users to import new VPN configs.
+I built Nexus to avoid repeating that process. It provides a single, stable VPN entry point while routing traffic through multiple backend servers. If a backend gets blocked or goes offline, Nexus can switch traffic to another available server. Backend servers can also be replaced without requiring users to update their VPN configurations.
 
 > [!NOTE]
 > Amnezia Nexus is an independent, non-commercial hobby project built for personal use and friends. It is not affiliated with or endorsed by Amnezia VPN or the AmneziaWG developers.
