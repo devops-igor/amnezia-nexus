@@ -351,10 +351,10 @@ type RoutingConsistencyDiagnostics struct {
 // disjoint populations (see ClientOwnershipMismatchDrops), so it counts each
 // refused packet exactly once.
 //
-// It exists so the CRITICAL gate has ONE number to compare against
-// OwnershipMismatchCriticalDrops. Each direction is still reported separately
-// in the routing condition and in the JSON payload; this is only the sum the
-// threshold is compared to, and it is never used to attribute a loss to a
+// It is used across the routing diagnostics and rate calculation to represent
+// total ownership mismatches across both directions. Each direction is still
+// reported separately in the routing condition and in the JSON payload; this is
+// the sum across both directions, and it is never used to attribute a loss to a
 // direction.
 func (d RoutingConsistencyDiagnostics) OwnershipMismatchRecentTotal() uint64 {
 	return d.OwnershipMismatchDropsRecent + d.ClientOwnershipMismatchDropsRecent
@@ -1185,43 +1185,39 @@ func EvaluateForwarderHealth(
 
 // evaluateRoutingConditions turns routing invariants into health conditions.
 //
-// A current-window ownership mismatch in EITHER direction escalates the whole
-// routing condition set to CRITICAL (issue #424 review round 9, blocker 3). The
-// escalation is applied to the set rather than to a single detail because the
-// routing details are not independent: duplicate IPs, unroutable sessions and
-// refused packets all describe the same routing plane, and a plane that is
-// refusing packets for ownership reasons in this window is failing now
-// regardless of which other invariant is also breached. Reporting one of them
-// as merely DEGRADED would understate the set, which is the defect blocker 3
-// reports.
-//
-// Without an ownership mismatch the classification is unchanged from before:
-// duplicate IPs and sessions with no route are CRITICAL, everything else is
-// DEGRADED. So no condition that was previously CRITICAL can become less
-// severe, and no DEGRADED routing condition is escalated except by the new
-// reason gate.
+// In issue #457, severity is evaluated per condition detail:
+//   - Duplicate IPs and unroutable sessions remain CRITICAL.
+//   - Client-direction ownership mismatches remain CRITICAL.
+//   - Return-direction ownership mismatches classify as CRITICAL if client mismatch
+//     is also present, DEGRADED if return drop rate reaches the degraded threshold,
+//     and WARNING for routine sparse drops.
+//   - Structural routing discrepancies remain DEGRADED.
 func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCondition {
 	if routing.IsConsistent {
 		return nil
 	}
 	th := defaultHealthThresholds()
-	// Default severity for an invariant breach, matching the pre-round-9
-	// classification: only duplicate IPs and unroutable sessions were critical.
-	sev := "DEGRADED"
-	if len(routing.DuplicateIPs) > 0 || len(routing.SessionsWithoutRoute) > 0 {
-		sev = "CRITICAL"
-	}
-	// Ownership mismatch is a correctness failure at any volume, so its
-	// severity is decided by the reason itself, from the CURRENT window in
-	// BOTH directions, and it overrides the default above.
-	if routing.OwnershipMismatchRecentTotal() >= th.OwnershipMismatchCriticalDrops {
-		sev = "CRITICAL"
-	}
 	conds := make([]HealthCondition, 0, len(routing.InconsistencyDetails))
 	for _, detail := range routing.InconsistencyDetails {
+		condSev := "DEGRADED"
+		if strings.Contains(detail, "duplicate IP") || strings.Contains(detail, "lack a forwarder route") {
+			condSev = "CRITICAL"
+		} else if strings.Contains(detail, "client-direction") {
+			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
+				condSev = "CRITICAL"
+			}
+		} else if strings.Contains(detail, "return-direction") {
+			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
+				condSev = "CRITICAL"
+			} else if routing.OwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS {
+				condSev = "DEGRADED"
+			} else if routing.OwnershipMismatchDropsRecent >= th.ReturnOwnershipMismatchWarningDrops {
+				condSev = "WARNING"
+			}
+		}
 		conds = append(conds, HealthCondition{
 			Category: "routing",
-			Severity: sev,
+			Severity: condSev,
 			Message:  detail,
 		})
 	}

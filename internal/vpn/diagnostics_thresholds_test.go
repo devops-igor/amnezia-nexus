@@ -124,6 +124,19 @@ func TestDefaultHealthThresholdsPreservePreviousLiterals(t *testing.T) {
 			t.Errorf("OwnershipMismatchCriticalDrops=%d, want 1 (the `recent > 0` gate it restates, as >= 1)",
 				th.OwnershipMismatchCriticalDrops)
 		}
+		// Issue #457 directional ownership mismatch thresholds.
+		if th.ClientOwnershipMismatchCriticalDrops != 1 {
+			t.Errorf("ClientOwnershipMismatchCriticalDrops=%d, want 1",
+				th.ClientOwnershipMismatchCriticalDrops)
+		}
+		if th.ReturnOwnershipMismatchWarningDrops != 1 {
+			t.Errorf("ReturnOwnershipMismatchWarningDrops=%d, want 1",
+				th.ReturnOwnershipMismatchWarningDrops)
+		}
+		if th.ReturnOwnershipMismatchDegradedRatePPS != 10.0 {
+			t.Errorf("ReturnOwnershipMismatchDegradedRatePPS=%v, want 10.0",
+				th.ReturnOwnershipMismatchDegradedRatePPS)
+		}
 		// Pre-round-9, evaluateLatencyConditions gated device write errors on
 		// `latency.WriteErrorRatePps > 0` against the same literal 0, and
 		// QueueActiveDropRatePPS is already 0 compared with >. The injection

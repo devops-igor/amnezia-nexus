@@ -88,9 +88,9 @@ func TestB3SparseClientOwnershipMismatchClassifiesAtReasonSeverity(t *testing.T)
 	if cond.Severity != "CRITICAL" {
 		t.Fatalf("sparse client ownership mismatch severity=%q, want CRITICAL: %q", cond.Severity, cond.Message)
 	}
-	if diag.ClientOwnershipMismatchDropsRecent < th.OwnershipMismatchCriticalDrops {
+	if diag.ClientOwnershipMismatchDropsRecent < th.ClientOwnershipMismatchCriticalDrops {
 		t.Fatalf("test does not exercise the critical threshold: recent=%d threshold=%d",
-			diag.ClientOwnershipMismatchDropsRecent, th.OwnershipMismatchCriticalDrops)
+			diag.ClientOwnershipMismatchDropsRecent, th.ClientOwnershipMismatchCriticalDrops)
 	}
 
 	// The headline must not be HEALTHY, and it must be CRITICAL rather than
@@ -107,9 +107,10 @@ func TestB3SparseClientOwnershipMismatchClassifiesAtReasonSeverity(t *testing.T)
 	}
 }
 
-// B3 regression: escalating RETURN-direction ownership mismatches reach CRITICAL.
-// Before the fix the aggregate drop-rate threshold downgraded them to DEGRADED.
-func TestB3EscalatingReturnOwnershipMismatchReachesCritical(t *testing.T) {
+// Issue #457: escalating RETURN-direction ownership mismatches reach DEGRADED
+// when sustained at high rate (>= ReturnOwnershipMismatchDegradedRatePPS).
+func TestB3EscalatingReturnOwnershipMismatchReachesDegraded(t *testing.T) {
+	th := DefaultHealthThresholds
 	svc := &Service{}
 	checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{}, 0)
 	time.Sleep(250 * time.Millisecond)
@@ -119,10 +120,60 @@ func TestB3EscalatingReturnOwnershipMismatchReachesCritical(t *testing.T) {
 	if diag.OwnershipMismatchDropsRecent != escalating {
 		t.Fatalf("return recent mismatch=%d, want %d", diag.OwnershipMismatchDropsRecent, escalating)
 	}
+	if diag.OwnershipMismatchRatePPS() < th.ReturnOwnershipMismatchDegradedRatePPS {
+		t.Fatalf("test does not exercise the degraded rate threshold: rate=%v threshold=%v",
+			diag.OwnershipMismatchRatePPS(), th.ReturnOwnershipMismatchDegradedRatePPS)
+	}
 	cond := assertSingleCondition(t, evaluateRoutingConditions(diag), "routing")
-	if cond.Severity != "CRITICAL" {
-		t.Fatalf("escalating return ownership mismatch severity=%q, want CRITICAL: %q",
+	if cond.Severity != "DEGRADED" {
+		t.Fatalf("escalating return ownership mismatch severity=%q, want DEGRADED: %q",
 			cond.Severity, cond.Message)
+	}
+}
+
+// Issue #457: sparse return-direction ownership mismatches classify as WARNING,
+// and do not degrade overall forwarder health (evaluates to HEALTHY with warning condition).
+func TestReturnOwnershipMismatch_SparseClassifiesAsWarning(t *testing.T) {
+	th := DefaultHealthThresholds
+
+	const sparseDrops = 19
+	const windowSec = 30.0
+
+	diag := RoutingConsistencyDiagnostics{
+		IsConsistent:                 false,
+		OwnershipMismatchDropsRecent: sparseDrops,
+		OwnershipMismatchWindowSec:   windowSec,
+	}
+	diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+	rate := diag.OwnershipMismatchRatePPS()
+	if rate >= th.ReturnOwnershipMismatchDegradedRatePPS {
+		t.Fatalf("test rate=%v must be below degraded rate threshold %v", rate, th.ReturnOwnershipMismatchDegradedRatePPS)
+	}
+	if diag.OwnershipMismatchDropsRecent < th.ReturnOwnershipMismatchWarningDrops {
+		t.Fatalf("test drops=%d must meet or exceed warning drops threshold %d",
+			diag.OwnershipMismatchDropsRecent, th.ReturnOwnershipMismatchWarningDrops)
+	}
+
+	conds := evaluateRoutingConditions(diag)
+	cond := assertSingleCondition(t, conds, "routing")
+	if cond.Severity != "WARNING" {
+		t.Fatalf("sparse return ownership mismatch severity=%q, want WARNING: %q", cond.Severity, cond.Message)
+	}
+
+	health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		DropCategoryBreakdown{}, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+
+	if health.Status == HealthCritical || health.Status == HealthDegraded {
+		t.Fatalf("headline=%s: sparse return ownership mismatch must not evaluate to CRITICAL or DEGRADED (%s)",
+			health.Status, health.Summary)
+	}
+	if health.Status != HealthHealthy {
+		t.Fatalf("headline=%s, want HEALTHY (operational with warning)", health.Status)
+	}
+	if !hasCondition(health.Conditions, "routing", "WARNING") {
+		t.Fatalf("expected routing WARNING condition in health assessment, got: %+v", health.Conditions)
 	}
 }
 
