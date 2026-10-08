@@ -1226,13 +1226,24 @@
         const tdLoss = document.createElement('td');
         tdLoss.className = 'font-mono text-sm';
         if (route) {
+            const dropRate = Number(route.queue_full_drop_rate_pps || 0);
             const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
             const recentDrops = Number(route.queue_full_drops_recent || 0);
-            const dropText = recentDrops > 0 ? `${recentDrops} recent / ${drops} total` : String(drops);
-            if (recentDrops > 0 || route.has_pressure === true) {
+            if (dropRate > 0 || recentDrops > 0 || route.has_pressure === true) {
+                let dropText = '';
+                if (dropRate > 0) {
+                    const lossFmt = _('vpn_fwd_loss_rate_format') || '%s drops/s (%d total)';
+                    dropText = lossFmt.replace('%s', dropRate.toFixed(1)).replace('%d', drops);
+                } else if (recentDrops > 0) {
+                    dropText = `${recentDrops} recent (${drops})`;
+                } else {
+                    dropText = String(drops);
+                }
                 tdLoss.innerHTML = `<span class="text-danger font-weight-600">${dropText}</span>`;
+            } else if (drops > 0) {
+                tdLoss.textContent = String(drops);
             } else {
-                tdLoss.textContent = dropText;
+                tdLoss.textContent = '0';
             }
         } else {
             tdLoss.textContent = '-';
@@ -1999,6 +2010,7 @@
                         max_write_ms:_('vpn_diag_max_write_historical'),
                         p95_write_samples:_('vpn_diag_write_samples'),
                         queue_full_drops_recent:_('vpn_diag_recent_queue_drops'),
+                        queue_full_drop_rate_pps:_('vpn_diag_drop_rate'),
                         write_errors_recent:_('vpn_diag_recent_write_errors'),
                         write_stalls_recent:_('vpn_diag_recent_write_stalls'),
                         session_age_sec:_('vpn_diag_session_age'),
@@ -2152,14 +2164,32 @@
         const s = (ha && ha.status) ? String(ha.status).toUpperCase() : '';
         const actionableProblems = (ha && Array.isArray(ha.actionable_problems)) ? ha.actionable_problems : [];
         const hasActionableProblems = actionableProblems.length > 0;
-        const activeProblemsCount = actionableProblems.length;
-        const affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.username || p.user_id; }).filter(Boolean)).size;
-        const affectedConfigsCount = new Set(actionableProblems.map(function(p) { return p.connection_name || p.connection_id; }).filter(Boolean)).size;
+        let activeProblemsCount = 0;
+        let affectedUsersCount = 0;
+        let affectedConfigsCount = 0;
+
+        if (hasActionableProblems) {
+            activeProblemsCount = actionableProblems.length;
+            affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.username || p.user_id; }).filter(Boolean)).size;
+            affectedConfigsCount = new Set(actionableProblems.map(function(p) { return p.connection_name || p.connection_id; }).filter(Boolean)).size;
+        } else if (ha && Array.isArray(ha.conditions) && ha.conditions.length > 0) {
+            if (s === 'DEGRADED' || s === 'CRITICAL' || s === 'DOWN') {
+                activeProblemsCount = ha.conditions.length;
+                affectedUsersCount = 0;
+                affectedConfigsCount = 0;
+            }
+        }
 
         const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');
         if (summaryHeaderElem) {
             if (activeProblemsCount > 0) {
-                summaryHeaderElem.innerHTML = `<span class="badge badge-warn" style="font-size: 0.8rem; padding: 2px 8px;">${activeProblemsCount} active problems • ${affectedUsersCount} affected users • ${affectedConfigsCount} client configs</span>`;
+                const problemsFmt = _('vpn_fwd_active_problems_count') || '%d active problems';
+                const usersFmt = _('vpn_fwd_affected_users_count') || '%d affected users';
+                const configsFmt = _('vpn_fwd_affected_configs_count') || '%d client configs';
+                const problemsText = problemsFmt.replace('%d', activeProblemsCount);
+                const usersText = usersFmt.replace('%d', affectedUsersCount);
+                const configsText = configsFmt.replace('%d', affectedConfigsCount);
+                summaryHeaderElem.innerHTML = `<span class="badge badge-warn" style="font-size: 0.8rem; padding: 2px 8px;">${problemsText} • ${usersText} • ${configsText}</span>`;
                 summaryHeaderElem.style.display = 'block';
             } else {
                 summaryHeaderElem.textContent = '';
@@ -2270,7 +2300,8 @@
                             const onsetSpan = document.createElement('span');
                             onsetSpan.className = 'text-muted font-mono';
                             onsetSpan.style.fontSize = '0.75rem';
-                            onsetSpan.textContent = 'Onset: ' + vpnFormatTime(p.first_observed);
+                            const onsetFmt = _('vpn_fwd_onset') || 'Onset: %s';
+                            onsetSpan.textContent = onsetFmt.replace('%s', vpnFormatTime(p.first_observed));
                             row.appendChild(onsetSpan);
                         }
 

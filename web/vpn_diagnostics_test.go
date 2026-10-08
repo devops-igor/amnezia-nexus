@@ -185,6 +185,11 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_nominal_peers",
 			"vpn_fwd_nominal_routes",
 			"vpn_fwd_nominal_backends",
+			"vpn_fwd_onset",
+			"vpn_fwd_active_problems_count",
+			"vpn_fwd_affected_users_count",
+			"vpn_fwd_affected_configs_count",
+			"vpn_fwd_loss_rate_format",
 			"vpn_col_live_traffic",
 			"vpn_col_packet_loss",
 			"vpn_col_queue_pressure",
@@ -459,7 +464,8 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 		Drops: 17, P95WriteMS: 18, HasPressure: true, PressureNote: "Recent write errors: 19",
 		WriteCount: 101, WriteErrors: 19, WriteStalls: 20, WritesInFlight: 21,
 		OldestWriteMS: 22, MaxWriteMS: 24, P95WriteSamples: 25, QueueFullDropsRecent: 26,
-		WriteErrorsRecent: 27, WriteStallsRecent: 28, SessionAgeSec: 29, LastTrafficAgeSec: 30,
+		QueueFullDropRatePPS: 2.4,
+		WriteErrorsRecent:    27, WriteStallsRecent: 28, SessionAgeSec: 29, LastTrafficAgeSec: 30,
 		Traffic: forwarder.TrafficSnapshot{RxBytes: 31, TxBytes: 32, RxPackets: 33, TxPackets: 34,
 			RxBytesPerSec: 35, TxBytesPerSec: 36, RxPps: 37, TxPps: 39, Available: true, WindowSec: 40},
 	}
@@ -491,6 +497,7 @@ const labels = {
  max_write_ms:_('vpn_diag_max_write_historical'),
  p95_write_samples:_('vpn_diag_write_samples'),
  queue_full_drops_recent:_('vpn_diag_recent_queue_drops'),
+ queue_full_drop_rate_pps:_('vpn_diag_drop_rate'),
  write_errors_recent:_('vpn_diag_recent_write_errors'),
  write_stalls_recent:_('vpn_diag_recent_write_stalls'),
  session_age_sec:_('vpn_diag_session_age'),
@@ -2291,6 +2298,7 @@ vpnLastStatus = {
             capacity: 100,
             drops: 15,
             queue_full_drops_recent: 5,
+            queue_full_drop_rate_pps: 2.4,
             has_pressure: true,
             traffic: {
                 available: true,
@@ -2318,6 +2326,7 @@ vpnLastStatus = {
             capacity: 100,
             drops: 10,
             queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
             has_pressure: false,
             traffic: {
                 available: true,
@@ -2412,6 +2421,7 @@ const row1 = tbody.children[1];
 assert.strictEqual(row1.children.length, 8);
 assert(row1.children[0].textContent.includes('bob'));
 assert(row1.children[5].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
+assert(row1.children[5].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
 assert(row1.children[5].textContent.includes('15'), 'drops count must be 15');
 assert(row1.children[6].innerHTML.includes('badge-warn'), 'queue pressure must be styled with badge-warn');
 assert.strictEqual(row1.children[6].textContent, '90/100');
@@ -2871,10 +2881,113 @@ assert(greenBadge.textContent.includes('No active problems detected'), 'nominal 
 // 3. Unavailable forwarder: summary header must be hidden
 vpnRenderForwarderHealth(null);
 assert.strictEqual(summaryHeader.style.display, 'none', 'summary header must be hidden when unavailable');
+
+// 4. Degraded forwarder with generic conditions but empty actionable_problems: summary header must display active problems count from conditions
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'DEGRADED',
+		summary: 'Fleet degradation detected',
+		conditions: [
+			{ severity: 'DEGRADED', message: 'High packet loss on gateway', category: 'dataplane' },
+			{ severity: 'WARN', message: 'Queue pressure elevated', category: 'routing' },
+			{ severity: 'DEGRADED', message: 'Backend latency elevated', category: 'backends' }
+		],
+		actionable_problems: []
+	}
+});
+
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when conditions exist during degradation');
+assert(summaryHeader.textContent.includes('3 active problems'), 'summary header must show 3 active problems from conditions');
+assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
+assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
+assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+
+// 5. Critical forwarder with 1 condition and missing actionable_problems: summary header fallback
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'CRITICAL',
+		summary: 'Critical failure',
+		conditions: [
+			{ severity: 'CRITICAL', message: 'Listener stopped' }
+		]
+	}
+});
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when critical with condition');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem from condition');
+assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
+assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
 `
 
 	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("summary header counts and onset timestamp test failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNTranslationKeyParity(t *testing.T) {
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	languages := []string{"en.json", "fa.json", "fr.json", "ru.json", "zh.json"}
+	dicts := make(map[string]map[string]string)
+	for _, langFile := range languages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		dicts[langFile] = dict
+	}
+
+	baseKeys := dicts["en.json"]
+	for _, langFile := range languages[1:] {
+		curDict := dicts[langFile]
+		if len(curDict) != len(baseKeys) {
+			t.Errorf("key count mismatch between en.json (%d) and %s (%d)", len(baseKeys), langFile, len(curDict))
+		}
+		for k, baseVal := range baseKeys {
+			val, ok := curDict[k]
+			if !ok {
+				t.Errorf("%s is missing key %q present in en.json", langFile, k)
+			} else if strings.TrimSpace(val) == "" {
+				t.Errorf("%s has empty translation for key %q", langFile, k)
+			}
+			for _, ph := range []string{"%s", "%d"} {
+				if strings.Contains(baseVal, ph) && !strings.Contains(val, ph) {
+					t.Errorf("%s key %q missing placeholder %q from en.json: %q vs %q", langFile, k, ph, val, baseVal)
+				}
+			}
+		}
+		for k := range curDict {
+			if _, ok := baseKeys[k]; !ok {
+				t.Errorf("%s has extra key %q not present in en.json", langFile, k)
+			}
+		}
+	}
+
+	newKeys := []string{
+		"vpn_fwd_onset",
+		"vpn_fwd_active_problems_count",
+		"vpn_fwd_affected_users_count",
+		"vpn_fwd_affected_configs_count",
+		"vpn_fwd_loss_rate_format",
+	}
+	for _, langFile := range languages {
+		for _, k := range newKeys {
+			val, ok := dicts[langFile][k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required key %q", langFile, k)
+			}
+			if strings.Contains(val, "\u2014") {
+				t.Errorf("%s new key %q contains prohibited em dash (\\u2014): %q", langFile, k, val)
+			}
+		}
 	}
 }
