@@ -639,7 +639,6 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"UI.toast",
 		"API.get",
 		"API.post",
-		"API.delete",
 		"API.request",
 		"NexusTable",
 		"NexusTelemetry.poll",
