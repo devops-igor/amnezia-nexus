@@ -191,6 +191,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_affected_configs_count",
 			"vpn_fwd_loss_rate_format",
 			"vpn_fwd_recent",
+			"vpn_col_user_device",
 			"vpn_col_live_traffic",
 			"vpn_col_packet_loss",
 			"vpn_col_queue_pressure",
@@ -2066,6 +2067,19 @@ vpnRenderForwarderHealth({
 });
 
 assert.strictEqual(el('vpn-fwd-tech-details').open, false, 'tech details must remain closed when healthy');
+
+// Operator manual expansion preserved across healthy poll (#461)
+el('vpn-fwd-tech-details').open = true;
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	routing_consistency: { is_consistent: true, active_routes_count: 5, active_sessions_count: 5 },
+	peer_sync: { actual_peers: 5, desired_peers: 5 },
+	backends: { healthy_count: 2, total_count: 2 }
+});
+assert.strictEqual(el('vpn-fwd-tech-details').open, true, 'tech details must remain open across healthy polling tick when manually opened');
+el('vpn-fwd-tech-details').open = false;
 assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'flex');
 assert.strictEqual(el('vpn-fwd-problem-list').children.length, 1);
 const greenBadge = el('vpn-fwd-problem-list').children[0];
@@ -2249,6 +2263,19 @@ func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
 		}
 	}
 
+	// Invariant: #vpnSessionsTable thead tr has 5 headers, and header 1 is vpn_col_user_device (#464)
+	tableMatches := regexp.MustCompile(`<table[^>]*id="vpnSessionsTable"[^>]*>([\s\S]*?)</table>`).FindStringSubmatch(tmplStr)
+	if len(tableMatches) < 2 {
+		t.Fatal("vpnSessionsTable not found in template")
+	}
+	thMatches := regexp.MustCompile(`<th[^>]*>([\s\S]*?)</th>`).FindAllStringSubmatch(tableMatches[1], -1)
+	if len(thMatches) != 5 {
+		t.Fatalf("expected 5 <th> headers in #vpnSessionsTable thead, got %d", len(thMatches))
+	}
+	if !strings.Contains(thMatches[0][1], `vpn_col_user_device`) {
+		t.Fatalf("expected header 1 to be vpn_col_user_device, got %q", thMatches[0][1])
+	}
+
 	// 1. English DOM assertions: 8 columns, correlation, telemetry, drilldown, and problem filter
 	enAssertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
@@ -2393,55 +2420,63 @@ const sessions = [
 vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
-// Assertion 1: Count badge and row count
+// Assertion 1: Count badge, row count, and thead 5-column contract
 assert.strictEqual(countBadge.textContent, '4', 'badge count must match session count');
 assert.strictEqual(tbody.children.length, 4, 'table must render 4 session rows');
 
 // Row 0 (alice - nominal correlated route):
 const row0 = tbody.children[0];
-assert.strictEqual(row0.children.length, 8, 'session row must have 8 columns');
+assert.strictEqual(row0.children.length, 5, 'session row must have 5 columns');
 assert(row0.children[0].textContent.includes('alice'), 'col 0 must render username');
+assert(row0.children[0].textContent.includes('alice-phone'), 'col 0 must render config subtitle');
+assert(row0.children[0].textContent.includes('10.8.0.2'), 'col 0 must render IP subtitle');
 assert.strictEqual(row0.children[0].style.cursor, 'pointer', 'user cell must have pointer style');
+assert.notStrictEqual(row0.children[0].style.display, 'flex', 'user cell td must NOT have style.display flex');
+assert(row0.children[0].innerHTML.includes('inline-flex'), 'user cell must contain inline-flex wrapper');
 assert(row0.children[0].innerHTML.includes('vpn-expand-icon'), 'user cell must render chevron icon');
-assert.strictEqual(row0.children[1].textContent, 'alice-phone', 'col 1 must render config name');
-assert.strictEqual(row0.children[2].textContent, 'Frankfurt-1', 'col 2 must render server name');
-assert.strictEqual(row0.children[3].textContent, '10.8.0.2', 'col 3 must render assigned IP');
-assert(row0.children[4].textContent.includes('1.00 Mbps') && row0.children[4].textContent.includes('2.00 Mbps'), 'col 4 must render live traffic rates');
-assert.strictEqual(row0.children[5].textContent, '0', 'col 5 must render 0 drops');
-assert.strictEqual(row0.children[6].textContent, '12/100', 'col 6 must render queue occupancy/capacity');
-assert(row0.children[7].textContent.includes('Active'), 'col 7 must render Active status badge');
-assert(row0.children[7].innerHTML.includes('badge-success'), 'col 7 must render badge-success for connected session');
+assert.strictEqual(row0.children[1].textContent, 'Frankfurt-1', 'col 1 must render server name');
+assert(row0.children[2].textContent.includes('1.00 Mbps') && row0.children[2].textContent.includes('2.00 Mbps'), 'col 2 must render live traffic rates');
+assert.strictEqual(row0.children[2].getAttribute('data-sort-value'), '3000000', 'tdTraffic must carry numeric data-sort-value');
+assert.strictEqual(row0.children[3].textContent, '0', 'col 3 must render 0 drops');
+assert.strictEqual(row0.children[3].getAttribute('data-sort-value'), '0', 'tdLoss must carry numeric data-sort-value');
+assert(row0.children[4].textContent.includes('Active'), 'col 4 must render Active status badge');
+assert(row0.children[4].innerHTML.includes('badge-success'), 'col 4 must render badge-success for connected session');
 
 // Row 1 (bob - degraded correlated route):
 const row1 = tbody.children[1];
-assert.strictEqual(row1.children.length, 8);
+assert.strictEqual(row1.children.length, 5, 'session row must have 5 columns');
 assert(row1.children[0].textContent.includes('bob'));
-assert(row1.children[5].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
-assert(row1.children[5].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
-assert(row1.children[5].textContent.includes('15'), 'drops count must be 15');
-assert(row1.children[6].innerHTML.includes('badge-warn'), 'queue pressure must be styled with badge-warn');
-assert.strictEqual(row1.children[6].textContent, '90/100');
-assert(row1.children[7].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
-assert(row1.children[7].textContent.includes('Degraded'), 'status text must show Degraded');
+assert.strictEqual(row1.children[1].textContent, 'Frankfurt-1');
+assert.strictEqual(row1.children[2].getAttribute('data-sort-value'), '600000');
+assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '2400015');
+assert(row1.children[3].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
+assert(row1.children[3].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
+assert(row1.children[3].textContent.includes('15'), 'drops count must be 15');
+assert(row1.children[4].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
+assert(row1.children[4].textContent.includes('Degraded'), 'status text must show Degraded');
 
 // Row 2 (charlie - active session without route):
 const row2 = tbody.children[2];
-assert.strictEqual(row2.children.length, 8);
+assert.strictEqual(row2.children.length, 5, 'session row must have 5 columns');
 assert(row2.children[0].textContent.includes('charlie'));
-assert.strictEqual(row2.children[4].textContent, '-', 'traffic must be dash when route is absent');
-assert.strictEqual(row2.children[5].textContent, '-', 'loss must be dash when route is absent');
-assert.strictEqual(row2.children[6].textContent, '-', 'pressure must be dash when route is absent');
-assert(row2.children[7].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
-assert(row2.children[7].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
+assert.strictEqual(row2.children[1].textContent, 'Frankfurt-2');
+assert.strictEqual(row2.children[2].textContent, '-', 'traffic must be dash when route is absent');
+assert.strictEqual(row2.children[2].getAttribute('data-sort-value'), '0');
+assert.strictEqual(row2.children[3].textContent, '-', 'loss must be dash when route is absent');
+assert.strictEqual(row2.children[3].getAttribute('data-sort-value'), '0');
+assert(row2.children[4].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
+assert(row2.children[4].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
 
 // Row 3 (dan - nominal session with historical drops):
 const row3 = tbody.children[3];
-assert.strictEqual(row3.children.length, 8);
+assert.strictEqual(row3.children.length, 5, 'session row must have 5 columns');
 assert(row3.children[0].textContent.includes('dan'));
-assert.strictEqual(row3.children[5].textContent, '10', 'historical drops must render count');
-assert(!row3.children[5].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
-assert(row3.children[7].textContent.includes('Active'), 'session with only historical drops must remain Active status');
-assert(row3.children[7].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
+assert.strictEqual(row3.children[1].textContent, 'Frankfurt-1');
+assert.strictEqual(row3.children[3].textContent, '10', 'historical drops must render count');
+assert(!row3.children[3].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
+assert.strictEqual(row3.children[3].getAttribute('data-sort-value'), '10');
+assert(row3.children[4].textContent.includes('Active'), 'session with only historical drops must remain Active status');
+assert(row3.children[4].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
 
 // Assertion 2: Expandable drilldown with 4 telemetry cards
 vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
@@ -2450,7 +2485,7 @@ assert(tbody.children[0].classList.contains('row-expanded'), 'row must gain row-
 assert.strictEqual(tbody.children.length, 5, 'tbody must have drilldown row inserted');
 const drilldown0 = tbody.children[1];
 assert(drilldown0.className.includes('vpn-session-drilldown-row'), 'drilldown row must have correct class');
-assert.strictEqual(drilldown0.children[0].colSpan, 8, 'drilldown td must span all 8 columns');
+assert.strictEqual(drilldown0.children[0].colSpan, 5, 'drilldown td must span all 5 columns');
 
 // 4 cards in drilldown:
 assert(drilldown0.innerHTML.includes('Latency Reservoirs'), 'drilldown must contain Latency Reservoirs card');
@@ -2527,11 +2562,11 @@ vpnLastStatus = {
 vpnRenderForwarderHealth(vpnLastStatus);
 assert.strictEqual(tbody.children.length, 4);
 const updatedAlice = tbody.children[0];
-assert(updatedAlice.children[4].textContent.includes('4.00 Mbps') && updatedAlice.children[4].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
-assert(updatedAlice.children[5].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
-assert(updatedAlice.children[6].innerHTML.includes('badge-warn'), 'queue pressure must update dynamically');
-assert.strictEqual(updatedAlice.children[6].textContent, '95/100');
-assert(updatedAlice.children[7].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
+assert(updatedAlice.children[2].textContent.includes('4.00 Mbps') && updatedAlice.children[2].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
+assert.strictEqual(updatedAlice.children[2].getAttribute('data-sort-value'), '12000000');
+assert(updatedAlice.children[3].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
+assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '42');
+assert(updatedAlice.children[4].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
 
 // Assertion 6: Correlation priority ordering (session_id > connection_id > assigned_ip)
 const routeSessionMatch = { session_id: 'sess-prio', connection_id: 'conn-other', assigned_ip: '10.8.0.200' };
@@ -2640,12 +2675,12 @@ assert.strictEqual(filterText.textContent, 'Только с проблемами
 
 // Russian degraded status badge
 const row0 = tbody.children[0];
-assert(row0.children[7].textContent.includes('Деградировано'), 'Russian degraded status label');
+assert(row0.children[4].textContent.includes('Деградировано'), 'Russian degraded status label');
 
 // Russian unroutable status badge for session without route
 const row1Before = tbody.children[1];
-assert(row1Before.children[7].textContent.includes('Немаршрутизируемый'), 'Russian unroutable status label');
-assert(row1Before.children[7].innerHTML.includes('badge-warn'));
+assert(row1Before.children[4].textContent.includes('Немаршрутизируемый'), 'Russian unroutable status label');
+assert(row1Before.children[4].innerHTML.includes('badge-warn'));
 
 // Russian drilldown cards titles
 vpnToggleSessionDrilldown(sessions[0], row0);
@@ -2671,9 +2706,9 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 	ruDict := vpnDiagnosticsLocale(t, "ru")
 	renderedHTML := vpnDiagnosticsRenderedHTML(t, tmplStr, ruDict)
 	for _, expectedRussianHeader := range []string{
+		"Пользователь и устройство",
 		"Текущий трафик",
 		"Потеря пакетов",
-		"Нагрузка на очередь",
 		"Диагностика подключений",
 		"Только с проблемами",
 	} {
@@ -3204,20 +3239,15 @@ assert.strictEqual(tbody.children.length, 2, 'table must render 2 session rows')
 
 // Row 0: Dan (historical drops + queue pressure)
 const rowDan = tbody.children[0];
-const lossDan = rowDan.children[5];
-const pressureDan = rowDan.children[6];
+const lossDan = rowDan.children[3];
 
 // Loss cell MUST NOT be colored red
 assert.strictEqual(lossDan.textContent, '10', 'Dan loss cell must display historical drops count 10');
 assert(!lossDan.innerHTML.includes('text-danger'), 'Dan loss cell must NOT be red when only historical drops + pressure');
 
-// Pressure cell MUST have warning badge
-assert(pressureDan.innerHTML.includes('badge-warn'), 'Dan pressure cell must have badge-warn');
-assert.strictEqual(pressureDan.textContent, '95/100', 'Dan pressure cell must show 95/100');
-
 // Row 1: Eve (recent drops without pps rate)
 const rowEve = tbody.children[1];
-const lossEve = rowEve.children[5];
+const lossEve = rowEve.children[3];
 
 // Loss cell MUST be colored red with localized format
 assert(lossEve.innerHTML.includes('text-danger'), 'Eve loss cell must have text-danger styling for recent drops');
@@ -3263,7 +3293,7 @@ const sessions = [
 vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
-const lossEve = tbody.children[0].children[5];
+const lossEve = tbody.children[0].children[3];
 assert(lossEve.innerHTML.includes('text-danger'), 'Russian: Eve loss cell must have text-danger');
 assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve loss cell must use localized "недавних"');
 `
@@ -3325,11 +3355,11 @@ assert.strictEqual(tbody.children.length, 1, 'tbody must have 1 session row');
 const row = tbody.children[0];
 
 // Assert drops column does NOT inherit the old route's drops (drops: 25)
-const dropsCell = row.children[5];
+const dropsCell = row.children[3];
 assert.strictEqual(dropsCell.textContent, '-', 'unroutable session must have dash for drops without inheriting old route telemetry');
 
 // Assert status column renders with Unroutable badge
-const statusCell = row.children[7];
+const statusCell = row.children[4];
 assert(statusCell.textContent.includes('Unroutable'), 'session without matching route must show Unroutable status badge');
 assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge must have badge-warn');
 
@@ -3337,7 +3367,7 @@ assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge mus
 vpnToggleSessionsProblemFilter();
 assert.strictEqual(tbody.children.length, 1, 'unroutable session must appear under Problems Only filter');
 const probRow = tbody.children[0];
-assert(probRow.children[7].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
+assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
 `
 
 	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
@@ -3454,9 +3484,15 @@ w.eval(tablesCode);
     };
 
     w.renderSessions(sessions);
+    // Table header assertion (Requirement 4):
+    // - #vpnSessionsTable thead tr has 5 headers, and header 1 is vpn_col_user_device.
+    const theadHeaders = Array.from(w.document.querySelectorAll('#vpnSessionsTable thead th'));
+    assert.strictEqual(theadHeaders.length, 5, '#vpnSessionsTable thead tr must have 5 headers');
+    assert(theadHeaders[0].textContent.includes('vpn_col_user_device'), 'header 1 must be vpn_col_user_device');
+
     const tbody = w.document.getElementById('vpn-sessions-tbody');
     function rowOrder() {
-        return Array.from(tbody.children).filter(r => r.style.display !== 'none').map(r => r.classList.contains('vpn-session-drilldown-row') ? 'DETAIL' : r.cells[0]?.textContent.trim());
+        return Array.from(tbody.children).filter(r => r.style.display !== 'none').map(r => r.classList.contains('vpn-session-drilldown-row') ? 'DETAIL' : (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()));
     }
 
     // 1. Sort ascending
@@ -3464,7 +3500,7 @@ w.eval(tablesCode);
     assert.deepStrictEqual(rowOrder(), ['alpha', 'bravo', 'zulu'], 'table must sort ascending by user');
 
     // 2. Expand alpha
-    const alpha = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    const alpha = Array.from(tbody.children).find(r => (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()) === 'alpha');
     assert(alpha, 'alpha row must exist');
     alpha.cells[0].click();
     assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'detail row must follow alpha');
@@ -3473,7 +3509,7 @@ w.eval(tablesCode);
     // 3. Polling refresh
     w.renderSessions(sessions);
     assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'order must be preserved after poll refresh');
-    const alphaAfterPoll = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    const alphaAfterPoll = Array.from(tbody.children).find(r => (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()) === 'alpha');
     const detailAfterPoll = alphaAfterPoll?.nextElementSibling;
     assert.strictEqual(detailAfterPoll?.classList.contains('vpn-session-drilldown-row'), true, 'detail row must remain adjacent to parent after poll refresh');
 

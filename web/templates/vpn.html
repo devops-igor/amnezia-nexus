@@ -427,19 +427,16 @@
         <table class="table interactive-table" id="vpnSessionsTable" style="width: 100%; min-width: 100%;">
             <thead>
                 <tr>
-                    <th class="sortable" data-sort-type="string">{{ _ "username" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_user_device" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
                     <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
                     <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_packet_loss" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_queue_pressure" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
                 </tr>
             </thead>
             <tbody id="vpn-sessions-tbody">
                 <tr id="vpn-sessions-loading" class="table-loading-row">
-                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                    <td colspan="5" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
                         <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
                         <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
                     </td>
@@ -1204,53 +1201,54 @@
         const tdUser = document.createElement('td');
         tdUser.className = 'font-weight-600';
         tdUser.style.cursor = 'pointer';
-        tdUser.style.display = 'flex';
-        tdUser.style.alignItems = 'center';
-        tdUser.style.gap = 'var(--space-xs)';
         const safeUsername = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.username) || '-') : ((s && s.username) || '-');
-        tdUser.innerHTML = `<svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg><span>${safeUsername}</span>`;
+        const safeConfig = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.connection_name) || '-') : ((s && s.connection_name) || '-');
+        const safeIP = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.assigned_ip) || '-') : ((s && s.assigned_ip) || '-');
+        tdUser.innerHTML = `
+            <div style="display: inline-flex; align-items: center; gap: var(--space-xs); white-space: nowrap;">
+                <svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; flex-shrink: 0; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg>
+                <div>
+                    <div class="font-weight-600">${safeUsername}</div>
+                    <div class="text-muted text-xs font-mono" style="font-weight: normal;">${safeConfig} &bull; ${safeIP}</div>
+                </div>
+            </div>
+        `;
         tdUser.onclick = function(e) {
             if (e && e.stopPropagation) e.stopPropagation();
             vpnToggleSessionDrilldown(s, tr);
         };
         tr.appendChild(tdUser);
 
-        // 2. Config cell
-        const tdConfig = document.createElement('td');
-        tdConfig.className = 'font-mono text-sm';
-        tdConfig.textContent = (s && s.connection_name) || '-';
-        tr.appendChild(tdConfig);
-
-        // 3. Server cell
+        // 2. Server cell
         const tdServer = document.createElement('td');
         tdServer.className = 'font-weight-600';
         tdServer.textContent = (s && s.server_name) || '-';
         tr.appendChild(tdServer);
 
-        // 4. Assigned IP cell
-        const tdIp = document.createElement('td');
-        tdIp.className = 'font-mono text-sm';
-        tdIp.textContent = (s && s.assigned_ip) || '-';
-        tr.appendChild(tdIp);
-
-        // 5. Live Traffic cell
+        // 3. Live Traffic cell
         const tdTraffic = document.createElement('td');
         tdTraffic.className = 'font-mono text-sm';
+        let rx = 0;
+        let tx = 0;
         if (route && route.traffic) {
-            const rx = route.traffic.rx_bps !== undefined ? route.traffic.rx_bps : ((route.traffic.rx_bytes_per_sec || 0) * 8);
-            const tx = route.traffic.tx_bps !== undefined ? route.traffic.tx_bps : ((route.traffic.tx_bytes_per_sec || 0) * 8);
+            rx = route.traffic.rx_bps !== undefined ? route.traffic.rx_bps : ((route.traffic.rx_bytes_per_sec || 0) * 8);
+            tx = route.traffic.tx_bps !== undefined ? route.traffic.tx_bps : ((route.traffic.tx_bytes_per_sec || 0) * 8);
             tdTraffic.textContent = `↓ ${fmtBps(rx)} ↑ ${fmtBps(tx)}`;
         } else {
             tdTraffic.textContent = '-';
         }
+        const totalBps = (route && route.traffic) ? (rx + tx) : 0;
+        tdTraffic.setAttribute('data-sort-value', String(totalBps));
         tr.appendChild(tdTraffic);
 
-        // 6. Packet Loss cell
+        // 4. Packet Loss cell
         const tdLoss = document.createElement('td');
         tdLoss.className = 'font-mono text-sm';
+        let dropRate = 0;
+        let drops = 0;
         if (route) {
-            const dropRate = Number(route.queue_full_drop_rate_pps || 0);
-            const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
+            dropRate = Number(route.queue_full_drop_rate_pps || 0);
+            drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
             const recentDrops = Number(route.queue_full_drops_recent || 0);
             if (dropRate > 0 || recentDrops > 0) {
                 let dropText = '';
@@ -1270,26 +1268,11 @@
         } else {
             tdLoss.textContent = '-';
         }
+        const sortLoss = route ? (dropRate * 1000000 + drops) : 0;
+        tdLoss.setAttribute('data-sort-value', String(sortLoss));
         tr.appendChild(tdLoss);
 
-        // 7. Queue Pressure cell
-        const tdPressure = document.createElement('td');
-        tdPressure.className = 'font-mono text-sm';
-        if (route) {
-            const occ = route.queue_occupancy !== undefined ? route.queue_occupancy : (route.occupancy || 0);
-            const cap = route.queue_capacity !== undefined ? route.queue_capacity : (route.capacity || 0);
-            const pressureStr = `${occ}/${cap}`;
-            if (route.has_pressure === true) {
-                tdPressure.innerHTML = `<span class="badge badge-warn">${pressureStr}</span>`;
-            } else {
-                tdPressure.textContent = pressureStr;
-            }
-        } else {
-            tdPressure.textContent = '-';
-        }
-        tr.appendChild(tdPressure);
-
-        // 8. Status cell
+        // 5. Status cell
         const tdStatus = document.createElement('td');
         const isNominalActive = s && (s.status === 'connected' || s.status === 'active');
         if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0) || (Number(route.write_errors_recent || 0) > 0) || (Number(route.write_stalls_recent || 0) > 0))) {
@@ -1329,7 +1312,7 @@
         }
 
         const td = document.createElement('td');
-        td.colSpan = 8;
+        td.colSpan = 5;
         td.style.background = 'var(--bg-surface-secondary, rgba(0,0,0,0.02))';
         td.style.padding = 'var(--space-md) var(--space-lg)';
 
@@ -1488,7 +1471,7 @@
         banner.className = 'table-empty-state';
         const safeStaleText = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_sessions_stale') || 'Session data unavailable - showing last known values') : (_('vpn_sessions_stale') || 'Session data unavailable - showing last known values');
         banner.innerHTML = `
-            <td colspan="8" style="padding: var(--space-md);">
+            <td colspan="5" style="padding: var(--space-md);">
                 <div class="empty-state" style="padding: 0;">
                     <div class="empty-title" style="display: flex; align-items: center; justify-content: center; gap: var(--space-sm); font-size: 0.9rem; font-weight: 600; margin: 0; color: var(--warning, #b45309);">
                         <svg class="icon" style="width: 18px; height: 18px; flex-shrink: 0;"><use href="#icon-x"></use></svg>
@@ -1650,7 +1633,7 @@
             const tr = document.createElement('tr');
             tr.className = 'table-empty-state';
             const td = document.createElement('td');
-            td.colSpan = 8;
+            td.colSpan = 5;
             td.style.padding = 'var(--space-2xl) var(--space-md)';
             td.style.textAlign = 'center';
             const safeNoSessions = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_no_sessions')) : (_('vpn_no_sessions') || 'No active sessions');
@@ -2607,10 +2590,10 @@
             }
         }
 
-        // Auto-expand technical details when degraded, down, or has active problems; remain closed when healthy.
+        // Auto-expand technical details when degraded, down, or has active problems; preserve manual expansion.
         const techDetails = document.getElementById('vpn-fwd-tech-details');
-        if (techDetails) {
-            techDetails.open = !!hasActiveProblems;
+        if (techDetails && hasActiveProblems && !techDetails.open) {
+            techDetails.open = true;
         }
 
         // Auto-expand route details only for current pressure.
