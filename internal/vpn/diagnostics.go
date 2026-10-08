@@ -122,6 +122,7 @@ type ActionableProblem struct {
 	MessageKey     string    `json:"message_key,omitempty"`
 	UserID         string    `json:"user_id,omitempty"`
 	Username       string    `json:"username,omitempty"`
+	SessionID      string    `json:"session_id,omitempty"`
 	ConnectionID   string    `json:"connection_id,omitempty"`
 	ConnectionName string    `json:"connection_name,omitempty"`
 	AssignedIP     string    `json:"assigned_ip,omitempty"`
@@ -451,6 +452,7 @@ type ProblemRouteItem struct {
 	MaxWriteMS           int64                     `json:"max_write_ms"`
 	P95WriteSamples      int                       `json:"p95_write_samples"`
 	QueueFullDropsRecent uint64                    `json:"queue_full_drops_recent"`
+	QueueFullDropRatePPS float64                   `json:"queue_full_drop_rate_pps"`
 	WriteErrorsRecent    uint64                    `json:"write_errors_recent"`
 	WriteStallsRecent    uint64                    `json:"write_stalls_recent"`
 	Traffic              forwarder.TrafficSnapshot `json:"traffic"`
@@ -1767,6 +1769,16 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 				MaxMS:   float64(r.Stats.MaxWriteDurationMS),
 			}
 		}
+		var dropRatePPS float64
+		if r.Stats.QueueFullDropRatePPS > 0 {
+			dropRatePPS = r.Stats.QueueFullDropRatePPS
+		} else if r.Stats.QueueFullDropsRecent > 0 {
+			windowSec := r.Traffic.WindowSec
+			if windowSec <= 0 {
+				windowSec = 1.0
+			}
+			dropRatePPS = float64(r.Stats.QueueFullDropsRecent) / windowSec
+		}
 		items[i] = ProblemRouteItem{
 			SessionID:            r.SessionID,
 			ConnectionID:         r.ConnectionID,
@@ -1781,6 +1793,7 @@ func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
 			MaxWriteMS:           r.Stats.MaxWriteDurationMS,
 			P95WriteSamples:      r.Stats.P95WriteSamples,
 			QueueFullDropsRecent: r.Stats.QueueFullDropsRecent,
+			QueueFullDropRatePPS: dropRatePPS,
 			WriteErrorsRecent:    r.Stats.WriteErrorsRecent,
 			WriteStallsRecent:    r.Stats.WriteStallsRecent,
 			Traffic:              r.Traffic,
@@ -2540,15 +2553,54 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	)
 }
 
+// problemOnsetTracker retains the original onset timestamp of active actionable problems
+// across polling ticks, clearing resolved problems when they recover.
+type problemOnsetTracker struct {
+	mu     sync.Mutex
+	onsets map[string]time.Time
+}
+
+// ProblemOnsetTracker is the exported alias for problemOnsetTracker.
+type ProblemOnsetTracker = problemOnsetTracker
+
+func newProblemOnsetTracker() *problemOnsetTracker {
+	return &problemOnsetTracker{
+		onsets: make(map[string]time.Time),
+	}
+}
+
+// NewProblemOnsetTracker creates a new persistent problem onset tracker.
+func NewProblemOnsetTracker() *ProblemOnsetTracker {
+	return newProblemOnsetTracker()
+}
+
+func (s *Service) getProblemOnsetTracker() *problemOnsetTracker {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.problemOnset == nil {
+		s.problemOnset = newProblemOnsetTracker()
+	}
+	return s.problemOnset
+}
+
 // SynthesizeActionableProblems derives per-session/route actionable problem records
 // by correlating active routes, route pressure, and active VPN sessions.
 func SynthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
 	return SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC())
 }
 
+// SynthesizeActionableProblemsWithTracker derives per-session/route actionable problem records
+// using a persistent onset tracker to retain onset across polling ticks.
+func SynthesizeActionableProblemsWithTracker(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker *ProblemOnsetTracker) []ActionableProblem {
+	return SynthesizeActionableProblemsAt(routes, sessions, observedAt, tracker)
+}
+
 // SynthesizeActionableProblemsAt derives per-session/route actionable problem records
-// relative to an explicit observation timestamp.
-func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time) []ActionableProblem {
+// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
+func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
@@ -2557,6 +2609,41 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 		sess, hasSess := findSessionForRoute(r, sessions)
 		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess, observedAt)...)
 	}
+
+	var tr *problemOnsetTracker
+	if len(tracker) > 0 && tracker[0] != nil {
+		tr = tracker[0]
+	}
+
+	if tr != nil {
+		activeKeys := make(map[string]struct{}, len(problems))
+		tr.mu.Lock()
+		for i := range problems {
+			p := &problems[i]
+			sessID := p.SessionID
+			if sessID == "" {
+				sessID = p.AssignedIP
+			}
+			msgKey := p.MessageKey
+			if msgKey == "" {
+				msgKey = p.Category
+			}
+			key := fmt.Sprintf("%s:%s:%s:%s:%d", p.Category, msgKey, sessID, p.ConnectionID, p.BackendID)
+			activeKeys[key] = struct{}{}
+			if existing, ok := tr.onsets[key]; ok && !existing.IsZero() {
+				p.FirstObserved = existing
+			} else {
+				tr.onsets[key] = p.FirstObserved
+			}
+		}
+		for k := range tr.onsets {
+			if _, active := activeKeys[k]; !active {
+				delete(tr.onsets, k)
+			}
+		}
+		tr.mu.Unlock()
+	}
+
 	sortActionableProblems(problems)
 	return problems
 }
@@ -2576,7 +2663,10 @@ func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bo
 			}
 		}
 	}
-	if r.AssignedIP != "" {
+	// Priority 3 (IP Fallback): ONLY permit s.AssignedIP == r.AssignedIP if the route has NO durable
+	// identity (r.SessionID == "" && r.PeerKey == "") AND the session has no contradictory match.
+	// If durable identifiers exist on both sides and do not match, NEVER fall back to IP match.
+	if r.SessionID == "" && r.PeerKey == "" && r.AssignedIP != "" {
 		for _, s := range sessions {
 			if s.AssignedIP == r.AssignedIP {
 				return s, true
@@ -2591,17 +2681,17 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 		observedAt = time.Now().UTC()
 	}
 	routesByPeer := make(map[string]struct{}, len(routes))
-	routesByIP := make(map[string]struct{}, len(routes))
 	routesBySessionID := make(map[string]struct{}, len(routes))
+	untaggedRoutesByIP := make(map[string]struct{}, len(routes))
 	for _, r := range routes {
+		if r.SessionID != "" {
+			routesBySessionID[r.SessionID] = struct{}{}
+		}
 		if r.PeerKey != "" {
 			routesByPeer[r.PeerKey] = struct{}{}
 		}
-		if r.AssignedIP != "" {
-			routesByIP[r.AssignedIP] = struct{}{}
-		}
-		if r.SessionID != "" {
-			routesBySessionID[r.SessionID] = struct{}{}
+		if r.SessionID == "" && r.PeerKey == "" && r.AssignedIP != "" {
+			untaggedRoutesByIP[r.AssignedIP] = struct{}{}
 		}
 	}
 
@@ -2610,16 +2700,26 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 		if sess.Status != "" && sess.Status != "connected" {
 			continue
 		}
-		_, hasPeer := routesByPeer[sess.PeerPublicKey]
-		_, hasIP := routesByIP[sess.AssignedIP]
-		_, hasSess := routesBySessionID[sess.ID]
-		if !hasPeer && !hasIP && !hasSess {
+		hasSess := false
+		if sess.ID != "" {
+			_, hasSess = routesBySessionID[sess.ID]
+		}
+		hasPeer := false
+		if sess.PeerPublicKey != "" {
+			_, hasPeer = routesByPeer[sess.PeerPublicKey]
+		}
+		hasUntaggedIP := false
+		if sess.AssignedIP != "" {
+			_, hasUntaggedIP = untaggedRoutesByIP[sess.AssignedIP]
+		}
+		if !hasSess && !hasPeer && !hasUntaggedIP {
 			problems = append(problems, ActionableProblem{
 				Severity:       "CRITICAL",
 				Category:       "routing",
 				Message:        fmt.Sprintf("Active session %s has no forwarder route", sess.ID),
 				MessageKey:     "vpn_problem_session_without_route",
 				UserID:         sess.UserID,
+				SessionID:      sess.ID,
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
@@ -2640,6 +2740,10 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 		userID = sess.UserID
 		connName = sess.ConnectionName
 	}
+	sessionID := r.SessionID
+	if sessionID == "" && hasSess {
+		sessionID = sess.ID
+	}
 	connID := r.ConnectionID
 	firstObserved := observedAt
 
@@ -2650,6 +2754,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			Message:        fmt.Sprintf("Return queue full drops (%d recent) for %s", r.Stats.QueueFullDropsRecent, r.AssignedIP),
 			MessageKey:     "vpn_problem_route_queue_drops",
 			UserID:         userID,
+			SessionID:      sessionID,
 			ConnectionID:   connID,
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
@@ -2676,12 +2781,16 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 		if r.Stats.OldestWriteMS > 0 {
 			stallFirstObserved = firstObserved.Add(-time.Duration(r.Stats.OldestWriteMS) * time.Millisecond)
 		}
+		if stallFirstObserved.After(firstObserved) {
+			stallFirstObserved = firstObserved
+		}
 		problems = append(problems, ActionableProblem{
 			Severity:       sev,
 			Category:       "dataplane",
 			Message:        msg,
 			MessageKey:     "vpn_problem_write_stall",
 			UserID:         userID,
+			SessionID:      sessionID,
 			ConnectionID:   connID,
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
@@ -2698,6 +2807,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			Message:        fmt.Sprintf("Device write errors (%d recent) for %s", r.Stats.WriteErrorsRecent, r.AssignedIP),
 			MessageKey:     "vpn_problem_write_errors",
 			UserID:         userID,
+			SessionID:      sessionID,
 			ConnectionID:   connID,
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
@@ -2714,6 +2824,7 @@ func synthesizeRoutePressureProblems(r forwarder.RouteInfo, sess Session, hasSes
 			Message:        fmt.Sprintf("Route queue pressure (%d/%d queued) for %s", r.Stats.Occupancy, r.Stats.Capacity, r.AssignedIP),
 			MessageKey:     "vpn_problem_route_queue_pressure",
 			UserID:         userID,
+			SessionID:      sessionID,
 			ConnectionID:   connID,
 			ConnectionName: connName,
 			AssignedIP:     r.AssignedIP,
@@ -2783,7 +2894,11 @@ func (s *Service) fetchPeerIdentityMappings(ctx context.Context, peerKeys []stri
 }
 
 func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
-	problems := SynthesizeActionableProblems(routes, sessions)
+	var tracker *problemOnsetTracker
+	if s != nil {
+		tracker = s.getProblemOnsetTracker()
+	}
+	problems := SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC(), tracker)
 	if len(problems) == 0 || s == nil || s.db == nil {
 		return problems
 	}
@@ -2805,7 +2920,7 @@ func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, ses
 			continue
 		}
 		for _, sess := range sessions {
-			match := (p.UserID != "" && sess.UserID == p.UserID) || (p.AssignedIP != "" && sess.AssignedIP == p.AssignedIP)
+			match := (p.UserID != "" && sess.UserID == p.UserID) || (p.SessionID != "" && sess.ID == p.SessionID)
 			if !match {
 				continue
 			}

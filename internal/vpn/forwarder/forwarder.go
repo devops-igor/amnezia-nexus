@@ -163,9 +163,10 @@ type RouteQueueStats struct {
 	// described in route_pressure.go (issue #424 round 6, finding 3). They
 	// are additive and drive the current-pressure decision; the lifetime
 	// fields above are untouched and stay visible as history.
-	QueueFullDropsRecent uint64 `json:"queue_full_drops_recent"`
-	WriteErrorsRecent    uint64 `json:"write_errors_recent"`
-	WriteStallsRecent    uint64 `json:"write_stalls_recent"`
+	QueueFullDropsRecent uint64  `json:"queue_full_drops_recent"`
+	QueueFullDropRatePPS float64 `json:"queue_full_drop_rate_pps,omitempty"`
+	WriteErrorsRecent    uint64  `json:"write_errors_recent"`
+	WriteStallsRecent    uint64  `json:"write_stalls_recent"`
 }
 
 type sessionRoute struct {
@@ -1423,7 +1424,9 @@ func (f *Forwarder) DropsPacketTooLargeSinceStartup() uint64 {
 	return f.DropsPacketTooLarge()
 }
 
-// RawDropStats returns lifetime return drop counters without startup baseline subtraction.
+// RawDropStats returns return drop counters for the current forwarder instance.
+// Note that drop counters are reset to zero upon Start(), so these values reflect
+// drops accumulated since the current Start() epoch rather than whole process lifetime.
 func (f *Forwarder) RawDropStats() (queueFull, noRoute, total uint64) {
 	if f == nil {
 		return 0, 0, 0
@@ -1431,7 +1434,9 @@ func (f *Forwarder) RawDropStats() (queueFull, noRoute, total uint64) {
 	return f.dropsQueueFull.Load(), f.dropsNoRoute.Load(), f.dropsTotal.Load()
 }
 
-// RawClientDropStats returns lifetime client drop counters without startup baseline subtraction.
+// RawClientDropStats returns client-to-backend drop counters for the current forwarder instance.
+// Note that drop counters are reset to zero upon Start(), so these values reflect
+// drops accumulated since the current Start() epoch rather than whole process lifetime.
 func (f *Forwarder) RawClientDropStats() (queueFull, rateLimited, noBackend, total uint64) {
 	if f == nil {
 		return 0, 0, 0, 0

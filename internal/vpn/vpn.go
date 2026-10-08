@@ -245,6 +245,7 @@ type Service struct {
 	diagRates          *diagRatesTracker
 	historyDiagRates   *diagRatesTracker
 	historyDropReasons dropReasonRatesTracker
+	problemOnset       *problemOnsetTracker
 	// diagGeneration is the diagnostics generation (issue #429 review
 	// blocker 1). It advances ONLY in Start, so every Start after Stop is an
 	// explicit new generation: every cumulative diagnostics baseline below is
@@ -707,6 +708,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		rollingHistory:         NewRollingHistory(),
 		diagRates:              newDiagRatesTracker(),
+		problemOnset:           newProblemOnsetTracker(),
 	}
 	revokeDispatch.bind(svc)
 
