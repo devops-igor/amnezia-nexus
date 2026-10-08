@@ -124,7 +124,7 @@ Create `docker-compose.yaml`:
 ```yaml
 services:
   amnezia-panel:
-    image: ghcr.io/devops-igor/amnezia-nexus:v2.1.0
+    image: ghcr.io/devops-igor/amnezia-nexus:v2.2.0
     container_name: amnezia-panel
     restart: unless-stopped
     ports:
@@ -152,7 +152,7 @@ volumes:
 
 ### 2. Start the container
 
-> **Image tags:** the compose file above pins the **stable release** (`v2.1.0` - Pulsar).
+> **Image tags:** the compose file above pins the **stable release** (`v2.2.0` - Voyager).
 > Alternatively, use `:latest` to always track the newest build from `main` (recommended only for testing, since it may include unreleased changes).
 > Available tags: https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus
 
