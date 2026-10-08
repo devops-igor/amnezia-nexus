@@ -1274,7 +1274,7 @@ func (f *Forwarder) AllRouteQueueStats() map[string]RouteQueueStats {
 			writes:         writes,
 			latencies:      route.writeLatencies,
 			occupancy:      len(route.clientQueue),
-			capacity:         cap(route.clientQueue),
+			capacity:       cap(route.clientQueue),
 			highWater:      int(route.queueHighWater.Load()), // #nosec G115 -- bounded by channel capacity.
 			queueFullDrops: route.queueFullDrops.Load(),
 		})

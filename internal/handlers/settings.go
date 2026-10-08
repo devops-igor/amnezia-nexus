@@ -343,8 +343,17 @@ func (h *Handlers) restoreBackupServers(ctx context.Context, servers []map[strin
 			s.ID = id
 		}
 		if s.Name != "" && s.Host != "" {
-			if _, err := h.db.CreateServer(ctx, s); err == nil {
+			if createdID, err := h.db.CreateServer(ctx, s); err == nil {
 				restored++
+				if h.vpnSvc != nil {
+					targetID := s.ID
+					if targetID <= 0 {
+						targetID = createdID
+					}
+					if targetID > 0 {
+						h.vpnSvc.ClearServerDeletedTombstone(targetID)
+					}
+				}
 			}
 		}
 	}

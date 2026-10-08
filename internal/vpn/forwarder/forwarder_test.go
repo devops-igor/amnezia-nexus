@@ -674,4 +674,3 @@ func TestForwarder_InspectRoutesConcurrentWithUpdateSessionBackend_Race(t *testi
 
 	wg.Wait()
 }
-

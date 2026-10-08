@@ -172,4 +172,3 @@ func BenchmarkInspectRoutes_Contention(b *testing.B) {
 	close(stop)
 	wg.Wait()
 }
-
