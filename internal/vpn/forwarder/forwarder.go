@@ -163,9 +163,10 @@ type RouteQueueStats struct {
 	// described in route_pressure.go (issue #424 round 6, finding 3). They
 	// are additive and drive the current-pressure decision; the lifetime
 	// fields above are untouched and stay visible as history.
-	QueueFullDropsRecent uint64 `json:"queue_full_drops_recent"`
-	WriteErrorsRecent    uint64 `json:"write_errors_recent"`
-	WriteStallsRecent    uint64 `json:"write_stalls_recent"`
+	QueueFullDropsRecent uint64  `json:"queue_full_drops_recent"`
+	QueueFullDropRatePPS float64 `json:"queue_full_drop_rate_pps,omitempty"`
+	WriteErrorsRecent    uint64  `json:"write_errors_recent"`
+	WriteStallsRecent    uint64  `json:"write_stalls_recent"`
 }
 
 type sessionRoute struct {
@@ -1358,35 +1359,46 @@ func (f *Forwarder) DeviceWriteStats() (errors uint64, total, max time.Duration)
 // DropStats returns the number of return packets dropped because a route's
 // client queue was full, the number of return packets dropped because no
 // registered session route matched the destination IP, and the total number
-// of return-path drops, including oversized packets. Both are exposed via
-// the stats API so a stalled
-// downstream path and unroutable sessions are visible without tailing logs
-// (issues #39, #151).
+// of return-path drops, including oversized packets, since the current startup epoch.
+// Both are exposed via the stats API so a stalled downstream path and unroutable
+// sessions are visible without tailing logs (issues #39, #151).
 func (f *Forwarder) DropStats() (queueFull, noRoute, total uint64) {
+	if f == nil {
+		return 0, 0, 0
+	}
 	return f.dropsQueueFull.Load(), f.dropsNoRoute.Load(), f.dropsTotal.Load()
 }
 
 // DropsNoRoute returns the number of return packets dropped because no
-// registered session route matched the packet's destination IP (issue #151).
+// registered session route matched the packet's destination IP since startup (issue #151).
 func (f *Forwarder) DropsNoRoute() uint64 {
+	if f == nil {
+		return 0
+	}
 	return f.dropsNoRoute.Load()
 }
 
 // DropsQueueFull returns the number of return packets dropped because a
-// route's client queue was full (issue #151).
+// route's client queue was full since startup (issue #151).
 func (f *Forwarder) DropsQueueFull() uint64 {
+	if f == nil {
+		return 0
+	}
 	return f.dropsQueueFull.Load()
 }
 
 // DropsPacketTooLarge returns the number of return packets dropped because
-// they exceed the payload size that can be safely budgeted in client queues.
+// they exceed the payload size that can be safely budgeted in client queues since startup.
 func (f *Forwarder) DropsPacketTooLarge() uint64 {
+	if f == nil {
+		return 0
+	}
 	return f.dropsPacketTooLarge.Load()
 }
 
 // ClientDropStats returns the number of client-to-backend packets dropped because
 // the backend queue was full, rate limited, or no backend was found, along with
-// the monotonic total of client-to-backend drops in the forwarder.
+// the monotonic total of client-to-backend drops in the forwarder since startup.
 func (f *Forwarder) ClientDropStats() (queueFull, rateLimited, noBackend, total uint64) {
 	if f == nil {
 		return 0, 0, 0, 0
@@ -1395,6 +1407,64 @@ func (f *Forwarder) ClientDropStats() (queueFull, rateLimited, noBackend, total 
 		f.clientDropsRateLimited.Load(),
 		f.clientDropsNoBackend.Load(),
 		f.clientDropsTotal.Load()
+}
+
+// ClientDropStatsSinceStartup returns client-to-backend drop counts since the current Start() epoch.
+func (f *Forwarder) ClientDropStatsSinceStartup() (queueFull, rateLimited, noBackend, total uint64) {
+	return f.ClientDropStats()
+}
+
+// DropsQueueFullSinceStartup returns return queue-full drops since the current Start() epoch.
+func (f *Forwarder) DropsQueueFullSinceStartup() uint64 {
+	return f.DropsQueueFull()
+}
+
+// DropsPacketTooLargeSinceStartup returns oversized packet drops since the current Start() epoch.
+func (f *Forwarder) DropsPacketTooLargeSinceStartup() uint64 {
+	return f.DropsPacketTooLarge()
+}
+
+// RawDropStats returns return drop counters for the current forwarder instance.
+// Note that drop counters are reset to zero upon Start(), so these values reflect
+// drops accumulated since the current Start() epoch rather than whole process lifetime.
+func (f *Forwarder) RawDropStats() (queueFull, noRoute, total uint64) {
+	if f == nil {
+		return 0, 0, 0
+	}
+	return f.dropsQueueFull.Load(), f.dropsNoRoute.Load(), f.dropsTotal.Load()
+}
+
+// RawClientDropStats returns client-to-backend drop counters for the current forwarder instance.
+// Note that drop counters are reset to zero upon Start(), so these values reflect
+// drops accumulated since the current Start() epoch rather than whole process lifetime.
+func (f *Forwarder) RawClientDropStats() (queueFull, rateLimited, noBackend, total uint64) {
+	if f == nil {
+		return 0, 0, 0, 0
+	}
+	return f.clientDropsQueueFull.Load(), f.clientDropsRateLimited.Load(), f.clientDropsNoBackend.Load(), f.clientDropsTotal.Load()
+}
+
+// SeedDropsForTest increments the raw monotonic drop counters for testing baseline behavior.
+func (f *Forwarder) SeedDropsForTest(queueFull, noRoute, tooLarge, clientQueueFull, clientRateLimited, clientNoBackend uint64) {
+	if f == nil {
+		return
+	}
+	f.dropsQueueFull.Add(queueFull)
+	f.dropsNoRoute.Add(noRoute)
+	f.dropsPacketTooLarge.Add(tooLarge)
+	f.dropsTotal.Add(queueFull + noRoute + tooLarge)
+	f.clientDropsQueueFull.Add(clientQueueFull)
+	f.clientDropsRateLimited.Add(clientRateLimited)
+	f.clientDropsNoBackend.Add(clientNoBackend)
+	f.clientDropsTotal.Add(clientQueueFull + clientRateLimited + clientNoBackend)
+}
+
+// ResetDropCounters resets monotonic drop counters to zero.
+func (f *Forwarder) ResetDropCounters() {
+	if f == nil {
+		return
+	}
+	f.resetDropCounters()
 }
 
 // InPortalSubnet reports whether ip belongs to the portal client pool.
@@ -1690,6 +1760,17 @@ func (f *Forwarder) resetBackendTrafficHistoryForGeneration(gen Generation, now 
 	}
 }
 
+func (f *Forwarder) resetDropCounters() {
+	f.dropsQueueFull.Store(0)
+	f.dropsNoRoute.Store(0)
+	f.dropsPacketTooLarge.Store(0)
+	f.dropsTotal.Store(0)
+	f.clientDropsQueueFull.Store(0)
+	f.clientDropsRateLimited.Store(0)
+	f.clientDropsNoBackend.Store(0)
+	f.clientDropsTotal.Store(0)
+}
+
 // Start marks the forwarder active and establishes a new diagnostics
 // generation: every cumulative telemetry baseline owned here is reset and
 // re-primes on its next sample (issue #429 review blocker 1).
@@ -1705,6 +1786,7 @@ func (f *Forwarder) Start(ctx context.Context) {
 	f.backendTrafficGeneration.Store(f.genEpoch.Load())
 	gen := Generation(f.genEpoch.Load())
 	f.resetRateTrackersForGeneration(gen)
+	f.resetDropCounters()
 	f.mu.Unlock()
 
 	// The baseline re-prime reads live counters (c.mu per counter), so it

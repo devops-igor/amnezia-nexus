@@ -110,3 +110,56 @@ func TestProblemRoutePressureNoteExactThreshold(t *testing.T) {
 		}
 	}
 }
+
+func TestGetStatus_CountersSince(t *testing.T) {
+	svc, err := NewVPNService(setupTestDB(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.forwarder = forwarder.NewForwarder(nil, "")
+	svc.cfg = &models.VPNConfig{PublicEndpoint: "nexus.invalid:51820"}
+
+	// 1. Before Start, startedAt is zero, CountersSince is omitted
+	status, err := svc.GetStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CountersSince != "" {
+		t.Fatalf("expected empty CountersSince before start, got %q", status.CountersSince)
+	}
+
+	// 2. Setting startedAt produces properly formatted baseline
+	fixedTime := time.Date(2026, 10, 7, 6, 14, 0, 0, time.UTC)
+	svc.mu.Lock()
+	svc.startedAt = fixedTime
+	svc.mu.Unlock()
+
+	status, err = svc.GetStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CountersSince != "2026-10-07 06:14 UTC" {
+		t.Fatalf("expected CountersSince '2026-10-07 06:14 UTC', got %q", status.CountersSince)
+	}
+
+	raw, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"counters_since":"2026-10-07 06:14 UTC"`) {
+		t.Fatalf("serialized status missing counters_since: %s", string(raw))
+	}
+
+	// 3. Stop resets startedAt
+	svc.running = true
+	if err := svc.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	status, err = svc.GetStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CountersSince != "" {
+		t.Fatalf("expected empty CountersSince after Stop, got %q", status.CountersSince)
+	}
+}

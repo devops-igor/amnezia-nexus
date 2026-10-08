@@ -104,6 +104,7 @@ func (f *Forwarder) InspectRoutes() []RouteInfo {
 			P95WriteMS:           p95.Milliseconds(),
 			P95WriteSamples:      item.latencies.count,
 			QueueFullDropsRecent: recent.QueueFullDropsRecent,
+			QueueFullDropRatePPS: recent.DropRatePPS,
 			WriteErrorsRecent:    recent.WriteErrorsRecent,
 			WriteStallsRecent:    recent.WriteStallsRecent,
 		}

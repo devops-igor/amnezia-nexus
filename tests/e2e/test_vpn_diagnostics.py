@@ -151,7 +151,9 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     for chart in charts:
         expect(page.locator(chart)).to_be_visible()
 
-    breakdown = page.locator("details").filter(has=page.locator("#vpn-chart-reasons"))
+    breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
+        has=page.locator("#vpn-chart-reasons")
+    )
     breakdown.locator("summary").click()
     for chart in ("#vpn-chart-reasons", "#vpn-chart-backends"):
         expect(page.locator(chart)).to_be_visible()

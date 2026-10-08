@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - Voyager - 2026-10-08
+
+Minor release introducing comprehensive forwarder health and operational diagnostics, redesigned Web UI telemetry with progressive disclosure, connection troubleshooting tables with user correlation, backend teardown on server deletion, and startup secret key persistence guarantees.
+
+### Added
+- Forwarder health and operational diagnostics: explicit health classification, route telemetry with opaque fingerprints, write duration histograms, per-backend traffic telemetry, and Prometheus metrics (#424, #429, #431, #432, #433, #434).
+- Redesigned VPN diagnostics dashboard: progressive disclosure panel wrapping technical diagnostics, actionable problem alert cards, and 1m and 5m rolling telemetry horizons (#447, #450).
+- User-to-config connection correlation: troubleshooting table with live throughput, packet loss alarms, queue pressure metrics, expandable drilldowns, and 5-language translation parity (#447, #450).
+- Multi-horizon forwarder history: rolling 1m and 5m ring buffers for loss and pressure rates alongside truthful start-epoch baselines (#447, #450).
+
+### Changed
+- VPN status schema v2: versioned status schema at `/api/vpn/status` with opaque route fingerprints, decoupled active packet loss rate from historical drop counters, and truth-in-advertising start-epoch telemetry (#424, #429, #447, #450).
+- Forwarder rate tracking and sampling: enforced whole-vector monotonicity, generation-aware rate sampling, and thread-safe route inspection (#424, #429).
+- Documentation structure: extracted architectural mechanics into `HOW_IT_WORKS.md` and streamlined `README.md` (#427, #428).
+
+### Fixed
+- In-memory backend teardown on server delete: dismantled in-memory VPN backend tunnels and quarantined interfaces upon server deletion, preventing resource leaks and tombstoning against concurrent resurrection (#443, #449).
+- Durability of encryption key generation: fail-fast startup enforcement if generated secret encryption keys cannot be atomically persisted and synced to disk, preventing unpersisted ephemeral key state (#345, #382).
+- Data directory durability: coordinated directory publishing with cross-process locks and guaranteed parent directory synchronization on first boot (#345, #382).
+
 ### Removed
-- Compatibility policy document (`useful_notes/COMPATIBILITY.md`) and its README documentation link. The policy governed API stability guarantees for external consumers; this project has none. Route, package and schema conventions remain enforced by their owning code and tests.
+- Compatibility policy document: removed redundant internal compatibility policy document (`useful_notes/COMPATIBILITY.md`) (#436).
+- Obsolete crypto telemetry fields: removed legacy custom-engine decryption counters from internal diagnostics payloads (#424, #429).
 
 ## [2.1.0] - Pulsar - 2026-10-02
 

@@ -36,6 +36,12 @@ func TestGetEnrichedActiveVPNSessionsJoins(t *testing.T) {
 		t.Fatalf("CreateBackendTunnel failed: %v", err)
 	}
 
+	if _, err := db.sqlDB.ExecContext(ctx,
+		`INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name) VALUES ('conn-joined', ?, ?, 'awg', 'peer-joined', 'Alice AWG')`,
+		uID, sID); err != nil {
+		t.Fatalf("insert user_connection failed: %v", err)
+	}
+
 	connected := &models.VPNSession{
 		ID:              "sess-joined",
 		UserID:          uID,
@@ -152,9 +158,15 @@ func TestGetEnrichedActiveVPNSessionsJoins(t *testing.T) {
 	if joined.Status != "connected" {
 		t.Errorf("status mismatch: got %q", joined.Status)
 	}
+	if joined.ConnectionID != "conn-joined" {
+		t.Errorf("connection_id not resolved from user_connections join: got %q, want %q", joined.ConnectionID, "conn-joined")
+	}
 
 	if orphan.Username != "unknown" {
 		t.Errorf("orphan username fallback: got %q, want %q", orphan.Username, "unknown")
+	}
+	if orphan.ConnectionID != "" {
+		t.Errorf("orphan connection_id should be empty: got %q", orphan.ConnectionID)
 	}
 	if orphan.ServerName != "Server #9999" {
 		t.Errorf("orphan server name fallback: got %q, want %q", orphan.ServerName, "Server #9999")
@@ -162,6 +174,9 @@ func TestGetEnrichedActiveVPNSessionsJoins(t *testing.T) {
 
 	if dangling.Username != "alice" {
 		t.Errorf("dangling-server username should resolve: got %q, want %q", dangling.Username, "alice")
+	}
+	if dangling.ConnectionID != "" {
+		t.Errorf("dangling-server connection_id should be empty: got %q", dangling.ConnectionID)
 	}
 	if dangling.ServerID != 8888 {
 		t.Errorf("dangling-server server id: got %d, want 8888", dangling.ServerID)

@@ -6590,3 +6590,150 @@ func TestNewVPNService_ExistingEmptySQLNullOrJSONNullConfigFailsAndPreservesRow(
 		}
 	})
 }
+
+func TestService_StartedAt_LifecycleAndFailure(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	defer func() { _ = svc.Stop() }()
+
+	// 1. Before Start: startedAt is zero
+	svc.mu.RLock()
+	if !svc.startedAt.IsZero() {
+		t.Fatalf("expected startedAt to be zero before Start, got %v", svc.startedAt)
+	}
+	svc.mu.RUnlock()
+
+	// 2. Start failure: canceled context guarantees Start fails during sync/invalidation
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := svc.Start(ctxCancel)
+	if err == nil {
+		t.Fatal("expected Start with canceled context to fail")
+	}
+
+	svc.mu.RLock()
+	if !svc.startedAt.IsZero() {
+		t.Fatalf("expected startedAt to remain zero after Start failure, got %v", svc.startedAt)
+	}
+	if svc.running {
+		t.Fatal("expected running to be false after Start failure")
+	}
+	svc.mu.RUnlock()
+
+	// 3. Start success: with active context
+	ctx := context.Background()
+	svc.mu.Lock()
+	svc.retiredIngressLosses.router.MalformedPacketDrops = 500
+	svc.retiredBackendDeviceDrops.ClientQueueFull = 100
+	svc.mu.Unlock()
+
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed, got %v", err)
+	}
+
+	svc.mu.RLock()
+	if svc.startedAt.IsZero() {
+		t.Fatal("expected startedAt to be non-zero after successful Start")
+	}
+	if !svc.running {
+		t.Fatal("expected running to be true after successful Start")
+	}
+	if svc.retiredIngressLosses.router.MalformedPacketDrops != 0 {
+		t.Errorf("expected retiredIngressLosses to be reset on Start, got %d", svc.retiredIngressLosses.router.MalformedPacketDrops)
+	}
+	if svc.retiredBackendDeviceDrops.ClientQueueFull != 0 {
+		t.Errorf("expected retiredBackendDeviceDrops to be reset on Start, got %d", svc.retiredBackendDeviceDrops.ClientQueueFull)
+	}
+	svc.mu.RUnlock()
+
+	// 4. Stop: resets startedAt to zero
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	svc.mu.RLock()
+	if !svc.startedAt.IsZero() {
+		t.Fatalf("expected startedAt to be zero after Stop, got %v", svc.startedAt)
+	}
+	if svc.running {
+		t.Fatal("expected running to be false after Stop")
+	}
+	svc.mu.RUnlock()
+}
+
+func TestSessionsLive_IncludesConnectionID(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{Name: "Live Server", Host: "198.51.100.5"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	uID, err := db.CreateUser(ctx, &models.User{Username: "bob", Enabled: true})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	peerKey := "bob-awg-peer-public-key"
+	connID := "conn-bob-live-123"
+
+	// Create user_connection with explicit ID and peer client_id
+	_, err = db.SQLDB().ExecContext(ctx,
+		`INSERT INTO user_connections (id, user_id, server_id, protocol, client_id, name) VALUES (?, ?, ?, 'awg', ?, 'bob-laptop')`,
+		connID, uID, sID, peerKey)
+	if err != nil {
+		t.Fatalf("failed to insert user_connection: %v", err)
+	}
+
+	tID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      sID,
+		InterfaceName: "awg-be-live",
+		PublicKey:     "pub-live",
+		PrivateKey:    "priv-live",
+		Endpoint:      "198.51.100.5:51820",
+		Status:        "active",
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	svc, err := NewVPNService(db, &models.VPNConfig{
+		Algorithm:          models.LBLeastConnections,
+		ListenPort:         51822,
+		SubnetCIDR:         "10.100.0.0/16",
+		HealthThresholdMS:  500,
+		MaxTotalPeers:      100,
+		MaxPeersPerBackend: 50,
+	})
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	sess, err := svc.sessionMgr.CreateSession(ctx, uID, peerKey, "10.100.1.5", tID, "bob-laptop")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	live, err := svc.SessionsLive(ctx)
+	if err != nil {
+		t.Fatalf("SessionsLive failed: %v", err)
+	}
+
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live session, got %d", len(live))
+	}
+
+	got := live[0]
+	if got.ID != sess.ID {
+		t.Errorf("session ID: got %q, want %q", got.ID, sess.ID)
+	}
+	if got.Username != "bob" {
+		t.Errorf("username: got %q, want 'bob'", got.Username)
+	}
+	if got.ConnectionID != connID {
+		t.Errorf("connection_id: got %q, want %q", got.ConnectionID, connID)
+	}
+	if got.ConnectionName != "bob-laptop" {
+		t.Errorf("connection_name: got %q, want 'bob-laptop'", got.ConnectionName)
+	}
+}
