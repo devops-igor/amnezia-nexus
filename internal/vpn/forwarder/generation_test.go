@@ -554,35 +554,37 @@ func TestGenerationSampler_ResetStaleGenerationNoOp(t *testing.T) {
 		t.Fatalf("sample at t2: want accepted=true deltas=[50 100] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
 	}
 
-	// Test same-generation w.Reset(2): assert primed == false, values == nil, gen == 2
+	// Test same-generation w.Reset(2): assert primed == false, values == nil, gen == 2, at.IsZero() == true
 	w.Reset(2)
 	w.mu.Lock()
 	primedReset2 := w.primed
 	valuesReset2 := w.values
 	genReset2 := w.gen
+	atReset2 := w.at
 	w.mu.Unlock()
-	if primedReset2 || valuesReset2 != nil || genReset2 != 2 {
-		t.Fatalf("Reset(2): want primed=false values=nil gen=2, got primed=%v values=%v gen=%d", primedReset2, valuesReset2, genReset2)
+	if primedReset2 || valuesReset2 != nil || genReset2 != 2 || !atReset2.IsZero() {
+		t.Fatalf("Reset(2): want primed=false values=nil gen=2 at.IsZero=true, got primed=%v values=%v gen=%d at=%v", primedReset2, valuesReset2, genReset2, atReset2)
 	}
 
 	// Re-prime generation 2 before testing newer-generation reset
 	t3 := t2.Add(1 * time.Second)
 	w.Sample(2, t3, GenerationSampleMinInterval, []uint64{250, 500})
 	w.mu.Lock()
-	if !w.primed || len(w.values) != 2 || w.gen != 2 {
+	if !w.primed || len(w.values) != 2 || w.gen != 2 || !w.at.Equal(t3) {
 		w.mu.Unlock()
 		t.Fatalf("re-prime gen 2 failed")
 	}
 	w.mu.Unlock()
 
-	// Test newer-generation w.Reset(3): assert primed == false, values == nil, gen == 3
+	// Test newer-generation w.Reset(3): assert primed == false, values == nil, gen == 3, at.IsZero() == true
 	w.Reset(3)
 	w.mu.Lock()
 	primedReset3 := w.primed
 	valuesReset3 := w.values
 	genReset3 := w.gen
+	atReset3 := w.at
 	w.mu.Unlock()
-	if primedReset3 || valuesReset3 != nil || genReset3 != 3 {
-		t.Fatalf("Reset(3): want primed=false values=nil gen=3, got primed=%v values=%v gen=%d", primedReset3, valuesReset3, genReset3)
+	if primedReset3 || valuesReset3 != nil || genReset3 != 3 || !atReset3.IsZero() {
+		t.Fatalf("Reset(3): want primed=false values=nil gen=3 at.IsZero=true, got primed=%v values=%v gen=%d at=%v", primedReset3, valuesReset3, genReset3, atReset3)
 	}
 }

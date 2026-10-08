@@ -238,6 +238,10 @@ func TestRateTracker_ResetStaleGenerationNoOp(t *testing.T) {
 	if !snap.Available {
 		t.Fatal("expected snap.Available == true")
 	}
+	pressureBefore := rt.PressureSnapshot(200, 400, 300, 7)
+	if pressureBefore.QueueFullDropRate != 2 {
+		t.Fatalf("expected QueueFullDropRate == 2 before stale reset, got %f", pressureBefore.QueueFullDropRate)
+	}
 
 	// Call rt.Reset(1) (stale generation)
 	rt.Reset(1)
@@ -252,6 +256,10 @@ func TestRateTracker_ResetStaleGenerationNoOp(t *testing.T) {
 	snapAfterStale := rt.Snapshot(200, 400)
 	if snapAfterStale != snap {
 		t.Fatalf("snapshot changed after stale Reset(1): got %+v, want %+v", snapAfterStale, snap)
+	}
+	pressureAfterStale := rt.PressureSnapshot(200, 400, 300, 7)
+	if pressureAfterStale != pressureBefore || pressureAfterStale.QueueFullDropRate != 2 {
+		t.Fatalf("pressure snapshot changed after stale Reset(1): got %+v, want %+v", pressureAfterStale, pressureBefore)
 	}
 
 	// Advance at t2 (t1 + 1s) with generation 2 sample: assert rates update smoothly
@@ -278,6 +286,10 @@ func TestRateTracker_ResetStaleGenerationNoOp(t *testing.T) {
 	if snapReset2.Available || snapReset2.RxBps != 0 || snapReset2.TxBps != 0 || snapReset2.RxPps != 0 || snapReset2.TxPps != 0 || snapReset2.DropRatePps != 0 || snapReset2.RxBpsAvg5m != 0 || snapReset2.TxBpsAvg5m != 0 || snapReset2.RxBpsAvg1h != 0 || snapReset2.TxBpsAvg1h != 0 {
 		t.Fatalf("expected all rates zeroed out after Reset(2), got %+v", snapReset2)
 	}
+	pressureReset2 := rt.PressureSnapshot(0, 0, 0, 0)
+	if pressureReset2.QueueFullDropRate != 0 {
+		t.Fatalf("expected queue drop rate zeroed out after Reset(2), got %v", pressureReset2.QueueFullDropRate)
+	}
 
 	// Re-prime and establish traffic on generation 2 before testing newer-generation reset
 	t3 := t2.Add(1 * time.Second)
@@ -299,5 +311,9 @@ func TestRateTracker_ResetStaleGenerationNoOp(t *testing.T) {
 	snapReset3 := rt.Snapshot(0, 0)
 	if snapReset3.Available || snapReset3.RxBps != 0 || snapReset3.TxBps != 0 || snapReset3.RxPps != 0 || snapReset3.TxPps != 0 || snapReset3.DropRatePps != 0 || snapReset3.RxBpsAvg5m != 0 || snapReset3.TxBpsAvg5m != 0 || snapReset3.RxBpsAvg1h != 0 || snapReset3.TxBpsAvg1h != 0 {
 		t.Fatalf("expected all rates zeroed out after Reset(3), got %+v", snapReset3)
+	}
+	pressureReset3 := rt.PressureSnapshot(0, 0, 0, 0)
+	if pressureReset3.QueueFullDropRate != 0 {
+		t.Fatalf("expected queue drop rate zeroed out after Reset(3), got %v", pressureReset3.QueueFullDropRate)
 	}
 }
