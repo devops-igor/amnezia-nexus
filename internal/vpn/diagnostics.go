@@ -2133,8 +2133,10 @@ func (t *diagRatesTracker) reset(gen diagGeneration) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if !t.window.reset(gen) {
+		return
+	}
 	t.primed = false
-	t.window.reset(gen)
 	t.lastSampleTime = time.Time{}
 	t.clientDropRate, t.returnDropRate = 0, 0
 	t.totalDropRate, t.writeErrorRate = 0, 0
@@ -2205,7 +2207,9 @@ func (t *diagDeltaTracker) reset(gen diagGeneration) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.window.reset(gen)
+	if !t.window.reset(gen) {
+		return
+	}
 	t.delta = 0
 	t.windowSeconds = 0
 }

@@ -240,7 +240,9 @@ func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.windows != nil {
-		t.windows.reset(gen)
+		if !t.windows.reset(gen) {
+			return
+		}
 	}
 	t.available = false
 }
