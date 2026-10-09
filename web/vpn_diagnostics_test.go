@@ -4484,6 +4484,167 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(peerDivergence_2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 6 desired vs 3 actual peers');
 
+    // 5p. Cumulative sync/enqueue counter growth alone (10 -> 11 cumulative) with unchanged recent activity -> must STAY closed
+    const activePeerSync_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 1 sync, 0 enqueue in the last 30.0s (10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on active peer sync failure condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with cumulative counter growth (10 -> 11 cumulative) and unchanged recent activity -> must STAY closed
+    const activePeerSync_cumTick = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 1 sync, 0 enqueue in the last 30.0s (11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_cumTick);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when cumulative sync counters advance with unchanged recent activity');
+
+    // Recent active sync failure escalates from 1 to 2 sync failures -> must AUTO-EXPAND
+    const activePeerSync_escalated = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 2 sync, 0 enqueue in the last 30.0s (12 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_escalated);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when active peer sync failures escalate from 1 to 2');
+    techDetails.open = false; // operator collapses accordion
+
+    // Repeated poll of 2 sync, 0 enqueue with further cumulative growth -> must STAY closed
+    const activePeerSync_escalated_cumTick = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 2 sync, 0 enqueue in the last 30.0s (13 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_escalated_cumTick);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of escalated active sync failures');
+
+    // 5q. Unresolved peer sync failure: cooling recent activity, advancing elapsed duration, and cumulative totals -> must STAY closed
+    const unresolvedSync_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 2m; recent activity: 1 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on unresolved peer sync failure condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll where recent activity cools from 1 to 0 recent sync failures -> must STAY closed
+    const unresolvedSync_coolActivity = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 2m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_coolActivity);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when recent activity cools from 1 to 0 on unresolved peer sync failure');
+
+    // Poll where elapsed duration alone advances (2m -> 3m) -> must STAY closed
+    const unresolvedSync_advancingDuration = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_advancingDuration);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when elapsed duration alone advances on unresolved peer sync failure');
+
+    // Poll where cumulative counters advance (10 -> 11 cumulative) -> must STAY closed
+    const unresolvedSync_advancingCumulative = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_advancingCumulative);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when cumulative counters advance on unresolved peer sync failure');
+
+    // Condition updates to a different unresolved error -> must AUTO-EXPAND
+    const unresolvedSync_differentError = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: context deadline exceeded (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_differentError);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when unresolved peer sync failure error changes');
+    techDetails.open = false; // operator collapses accordion
+
+    // Repeated poll of the new error -> must STAY closed
+    w.vpnRenderForwarderHealth(unresolvedSync_differentError);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement unresolved error');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,

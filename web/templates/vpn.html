@@ -2637,6 +2637,26 @@
                 return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
             });
 
+            // 2. Strip volatile cumulative telemetry and incident metadata BEFORE count protection
+            // Strip cumulative clauses: e.g. "(10 sync, 0 enqueue cumulative)" or "(... cumulative)"
+            s = s.replace(/\(\s*[^)]*cumulative\s*\)/gi, '');
+            s = s.replace(/;\s*[^;)]*cumulative\s*/gi, '');
+            s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue\s+cumulative\b/gi, '');
+
+            // For unresolved peer sync failures, the incident identity is the error message itself;
+            // volatile telemetry (last successful reconcile duration/timestamp, recent window activity, cumulative totals)
+            // must not alter the stable condition signature.
+            if (/\bUnresolved peer sync failure:/i.test(s)) {
+                s = s.replace(/(\bUnresolved peer sync failure:\s*[\s\S]*?)(?:\s*\(\s*(?:last successful reconcile|recent activity)[^)]*\))\s*$/gi, '$1');
+                s = s.replace(/;\s*(?:recent activity|last successful reconcile)[^;)]*/gi, '');
+                s = s.replace(/\brecent activity:\s*\d+\s+sync,\s*\d+\s+enqueue(?:failures)?(?:\s+in\s+the\s+last\s+[^;)]+)?/gi, '');
+                s = s.replace(/\blast successful reconcile\s+[^;)]+/gi, '');
+            }
+
+            // Strip duration windows ("in the last 30.0s", "for 10s") as volatile data
+            s = s.replace(/\b(?:in the last|in last)\s+\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?)\b/gi, '');
+            s = s.replace(/\bfor\s+\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?)\b/gi, '');
+
             // Protect ratio patterns representing incident scale/identity (e.g. \b\d+\s+of\s+\d+\b)
             const preservedRatios = [];
             s = s.replace(/\b\d+\s+of\s+\d+\b/gi, function(m) {
@@ -2652,12 +2672,14 @@
             }
 
             s = s.replace(/\b\d+\s+desired\s+vs\s+\d+\s+actual(?:\s+peers?)?\b/gi, preserveCountPhrase);
-            s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue(?:\s+failures)?\b/gi, preserveCountPhrase);
+            if (!/\bUnresolved peer sync failure:/i.test(s)) {
+                s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue(?:\s+failures)?\b/gi, preserveCountPhrase);
+            }
             s = s.replace(/\b\d+\s+(?:active\s+)?(?:live\s+)?sessions?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
             s = s.replace(/\b\d+\s+(?:invalid\s+)?(?:durable\s+)?(?:peer\s+)?rows?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
             s = s.replace(/\b\d+\s+(?:peers?|sessions?|users?|backends?|configs?|nodes?|rows?|interfaces?)(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
 
-            // 2. Strip volatile timestamps, time clocks, and telemetry metrics ONLY outside protected IP spans
+            // 3. Strip volatile timestamps, time clocks, and telemetry metrics ONLY outside protected IP spans
             s = s
                 .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
                 .replace(/(?<!:)\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b(?!:)/g, '')
@@ -2672,7 +2694,7 @@
                 .replace(/\s+/g, ' ')
                 .trim();
 
-            // 3. Restore protected IP placeholders for normalized stable condition code
+            // 4. Restore protected placeholders for normalized stable condition code
             let normalizedCode = s.replace(/__PRESERVED_IP_(\d+)__/g, function(_, idx) {
                 return preservedIps[Number(idx)] || '';
             });
