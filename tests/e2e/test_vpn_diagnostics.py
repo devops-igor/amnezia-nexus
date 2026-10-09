@@ -100,7 +100,7 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
 
     tech_details = page.locator("#vpn-fwd-tech-details")
     if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details summary").click()
+        page.locator("#vpn-fwd-tech-details > summary").click()
 
     # Assert exactly 4 operational cards
     cards = page.locator(
