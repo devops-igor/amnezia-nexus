@@ -4339,6 +4339,151 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(backendMove_2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of problem on backend-2');
 
+    // 5m. Stale sessions escalation (1 active live session(s) vs 2 active live session(s)) -> must AUTO-EXPAND
+    const staleSessions_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'WARNING',
+            conditions: [
+                {
+                    category: 'sessions',
+                    severity: 'WARNING',
+                    message: '1 active live session(s) have stale upstream handshakes (> 3m0s)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(staleSessions_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 active live session stale handshake condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same condition -> must STAY closed
+    w.vpnRenderForwarderHealth(staleSessions_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 active live session stale handshake');
+
+    // Condition updates to 2 active live sessions with total count remaining 1 and unchanged severity WARNING
+    const staleSessions_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'WARNING',
+            conditions: [
+                {
+                    category: 'sessions',
+                    severity: 'WARNING',
+                    message: '2 active live session(s) have stale upstream handshakes (> 3m0s)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(staleSessions_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when stale active live sessions escalate from 1 to 2');
+
+    // Operator collapses accordion after observing escalated stale sessions
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(staleSessions_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 active live sessions stale handshake');
+
+    // 5n. Invalid durable peer rows escalation (1 vs 2 invalid durable peer rows) -> must AUTO-EXPAND
+    const invalidPeerRows_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: '1 invalid durable peer row(s) excluded from the desired set; those peers are not enforced upstream and their traffic is unauthorized until the rows are repaired'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(invalidPeerRows_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 invalid durable peer row condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 1 invalid durable peer row condition -> must STAY closed
+    w.vpnRenderForwarderHealth(invalidPeerRows_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 invalid durable peer row');
+
+    // Condition updates to 2 invalid durable peer rows at unchanged total count 1 and severity DEGRADED
+    const invalidPeerRows_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: '2 invalid durable peer row(s) excluded from the desired set; those peers are not enforced upstream and their traffic is unauthorized until the rows are repaired'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(invalidPeerRows_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when invalid durable peer rows escalate from 1 to 2');
+
+    // Operator collapses accordion after observing escalated invalid peer rows
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(invalidPeerRows_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 invalid durable peer rows');
+
+    // 5o. Peer sync divergence escalation (5 desired vs 3 actual peers -> 6 desired vs 3 actual peers) -> must AUTO-EXPAND
+    const peerDivergence_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 10s: 5 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on peer sync divergence condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with elapsed time advancing (10s -> 20s) with same 5 desired vs 3 actual peers -> must STAY closed
+    const peerDivergence_1_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 20s: 5 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_1_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when divergence duration advances with unchanged peer counts');
+
+    // Condition updates to 6 desired vs 3 actual peers at unchanged count 1 and severity DEGRADED
+    const peerDivergence_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 20s: 6 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when peer sync divergence escalates from 5 to 6 desired peers');
+
+    // Operator collapses accordion after observing escalated peer divergence
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(peerDivergence_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 6 desired vs 3 actual peers');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,

@@ -2644,6 +2644,19 @@
                 return '__PRESERVED_RATIO_' + (preservedRatios.length - 1) + '__';
             });
 
+            // Protect affected entity/population count phrases representing incident scale
+            const preservedCounts = [];
+            function preserveCountPhrase(m) {
+                preservedCounts.push(m.replace(/\s+/g, ' '));
+                return '__PRESERVED_COUNT_' + (preservedCounts.length - 1) + '__';
+            }
+
+            s = s.replace(/\b\d+\s+desired\s+vs\s+\d+\s+actual(?:\s+peers?)?\b/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue(?:\s+failures)?\b/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+(?:active\s+)?(?:live\s+)?sessions?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+(?:invalid\s+)?(?:durable\s+)?(?:peer\s+)?rows?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+(?:peers?|sessions?|users?|backends?|configs?|nodes?|rows?|interfaces?)(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+
             // 2. Strip volatile timestamps, time clocks, and telemetry metrics ONLY outside protected IP spans
             s = s
                 .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
@@ -2665,6 +2678,9 @@
             });
             normalizedCode = normalizedCode.replace(/__PRESERVED_RATIO_(\d+)__/g, function(_, idx) {
                 return preservedRatios[Number(idx)] || '';
+            });
+            normalizedCode = normalizedCode.replace(/__PRESERVED_COUNT_(\d+)__/g, function(_, idx) {
+                return preservedCounts[Number(idx)] || '';
             });
 
             return { normalizedCode: normalizedCode, ips: ips };
