@@ -2613,16 +2613,33 @@
         }
 
         // Track active problem signature to auto-expand technical details on new problems without overriding manual collapse.
+        function deriveStableConditionCode(msg) {
+            if (!msg || typeof msg !== 'string') return '';
+            return msg
+                .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:drops\/sec|drops\/s|drops\/window|errors\/sec|stalls|pps|ms|sec|seconds|s|min|h|recent)\b/gi, '')
+                .replace(/\b\d+(?:[a-zµ]+\d*)+\b/gi, '')
+                .replace(/\b\d+(?:\.\d+)?%/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\b/g, '')
+                .replace(/\(\s*>?\s*\)/g, '')
+                .replace(/\(\s*\)/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
         const currentProblemKeys = new Set();
         if (isDegradedOrDown) {
             currentProblemKeys.add('status:' + s);
         }
         actionableProblems.forEach(function(p) {
-            const k = 'act:' + (p.message_key || '') + ':' + (p.message || '') + ':' + (p.connection_id || '') + ':' + (p.user_id || '') + ':' + (p.category || '') + ':' + (p.severity || '');
+            const pMsgKey = p.message_key || deriveStableConditionCode(p.message);
+            const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || '';
+            const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + ':' + (p.severity || '');
             currentProblemKeys.add(k);
         });
         qualifyingConditions.forEach(function(c) {
-            const k = 'cond:' + (c.message_key || '') + ':' + (c.message || '') + ':' + (c.category || '') + ':' + (c.severity || '');
+            const cKey = c.message_key || deriveStableConditionCode(c.message);
+            const k = 'cond:' + (c.category || '') + ':' + cKey + ':' + (c.severity || '');
             currentProblemKeys.add(k);
         });
         if (routeHasPressure) {

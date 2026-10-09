@@ -3826,13 +3826,172 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(degradedStatusA);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across poll tick 2 with same problem');
 
+    // 5a. Telemetry changes within existing actionable problem (rates, counters, message text change) -> must STAY closed
+    const degradedStatusA_tick3 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (10 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '2.0 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick3);
+    techDetails.open = false; // operator collapses
+
+    // Tick 4: telemetry fluctuates (10 recent -> 11 recent, rate 2.0 -> 2.1 drops/s) -> MUST STAY CLOSED
+    const degradedStatusA_tick4 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (11 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '2.1 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick4);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when actionable problem telemetry numbers fluctuate');
+
+    // Tick 5: telemetry fluctuates further (11 recent -> 15 recent, rate 2.1 -> 3.5 drops/s) -> MUST STAY CLOSED
+    const degradedStatusA_tick5 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (15 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '3.5 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick5);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across repeated telemetry counter updates');
+
+    // 5b. Unkeyed qualifying condition with fluctuating rates/counters -> must STAY closed
+    const degradedStatusCond_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message: 'Active queue drops: 2.0 drops/sec due to full return queues'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusCond_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusCond_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message: 'Active queue drops: 2.1 drops/sec due to full return queues'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusCond_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when unkeyed condition rate fluctuates');
+
+    // 5c. Keyed qualifying condition with fluctuating rates -> must STAY closed
+    const degradedStatusKeyedCond_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message_key: 'vpn_diag_condition_backend_device_unattributed',
+                    message: 'Backend device drops are active but detailed per-direction attribution is unavailable: 2.0 drops/sec'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusKeyedCond_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusKeyedCond_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message_key: 'vpn_diag_condition_backend_device_unattributed',
+                    message: 'Backend device drops are active but detailed per-direction attribution is unavailable: 2.1 drops/sec'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusKeyedCond_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when keyed condition rate fluctuates');
+
+    // 5d. Actionable problem lacking message_key where message text has changing telemetry counters -> must STAY closed
+    const degradedStatusUnkeyedAct_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (10 recent) for Client A', connection_id: 'c-10', username: 'charlie' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusUnkeyedAct_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusUnkeyedAct_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusUnkeyedAct_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when unkeyed actionable problem numbers fluctuate');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
         health_assessment: {
             status: 'DEGRADED',
             actionable_problems: [
-                { severity: 'DEGRADED', message: 'Queue full drops active', connection_id: 'c-1', username: 'alice' },
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' },
                 { severity: 'DEGRADED', message: 'Backend latency critical', connection_id: 'c-2', username: 'bob' }
             ]
         }
@@ -3844,6 +4003,26 @@ w.eval(tablesCode);
     techDetails.open = false;
     w.vpnRenderForwarderHealth(degradedStatusB);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed after second manual collapse');
+
+    // 7b. Increased count (from 2 to 3 problems) -> must AUTO-EXPAND
+    const degradedStatusC = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' },
+                { severity: 'DEGRADED', message: 'Backend latency critical', connection_id: 'c-2', username: 'bob' },
+                { severity: 'WARNING', message: 'High route pressure', connection_id: 'c-3', username: 'david' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusC);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when problem count increases');
+
+    // Operator manually collapses after observing 3 problems
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusC);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll with 3 problems');
 
     // 8. Problems resolve completely -> healthy state
     w.vpnRenderForwarderHealth({
