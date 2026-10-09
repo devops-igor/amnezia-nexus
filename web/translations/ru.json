@@ -655,6 +655,7 @@
   "vpn_diag_loss_return_backend_device_queue_full": "очередь устройства бэкенда на возврате заполнена",
   "vpn_diag_loss_return_backend_device_shutdown": "остановка устройства бэкенда на возврате",
   "vpn_diag_condition_backend_device_unattributed": "потери устройства бэкенда активны, но подробная атрибуция по направлениям недоступна",
+  "vpn_col_user_device": "Пользователь и устройство",
   "vpn_col_live_traffic": "Текущий трафик",
   "vpn_col_traffic": "Текущий трафик",
   "vpn_col_packet_loss": "Потеря пакетов",

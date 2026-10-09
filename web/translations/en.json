@@ -655,6 +655,7 @@
   "vpn_diag_loss_return_backend_device_queue_full": "return backend device queue full",
   "vpn_diag_loss_return_backend_device_shutdown": "return backend device shutdown",
   "vpn_diag_condition_backend_device_unattributed": "Backend device drops are active but detailed per-direction attribution is unavailable",
+  "vpn_col_user_device": "User & Device",
   "vpn_col_live_traffic": "Live Traffic",
   "vpn_col_traffic": "Live Traffic",
   "vpn_col_packet_loss": "Packet Loss",
