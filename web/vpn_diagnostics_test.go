@@ -4207,6 +4207,44 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement embedded-clock IPv6 condition');
 
+    // 5j. Table-driven mixed IPv6 duplicate-IP replacement cases -> must AUTO-EXPAND on IP change
+    const mixedIPv6Cases = [
+        { initial: '::1234:192.0.2.1', replacement: '::1235:192.0.2.1', desc: 'leading-compressed mixed IPv6 (::1234:192.0.2.1 vs ::1235:192.0.2.1)' },
+        { initial: '::ffff:0:192.0.2.1', replacement: '::ffff:1:192.0.2.1', desc: 'mapped-expanded mixed IPv6 (::ffff:0:192.0.2.1 vs ::ffff:1:192.0.2.1)' }
+    ];
+    for (const tc of mixedIPv6Cases) {
+        const makeDupStatus = (ip) => ({
+            forwarder_available: true,
+            health_assessment: {
+                status: 'CRITICAL',
+                conditions: [
+                    {
+                        category: 'routing',
+                        severity: 'CRITICAL',
+                        message: '1 duplicate IP address(es) detected across active routes: ' + ip
+                    }
+                ]
+            }
+        });
+        // 1. Initial mixed IPv6 duplicate-IP condition
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.initial));
+        assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on ' + tc.desc + ' duplicate-IP condition');
+        techDetails.open = false; // operator collapses accordion
+
+        // Repeated poll with same address -> must STAY closed
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.initial));
+        assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of ' + tc.desc + ' with same address');
+
+        // 2. Replacement duplicate-IP condition arrives with identical count 1 and severity CRITICAL
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.replacement));
+        assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different mixed IPv6 (' + tc.desc + ')');
+
+        // Operator collapses accordion after observing new incident
+        techDetails.open = false;
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.replacement));
+        assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement mixed IPv6 (' + tc.desc + ')');
+    }
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
