@@ -79,6 +79,85 @@
     </div>
 </div>
 
+<!-- BACKENDS TABLE -->
+<div class="card" style="margin-bottom: var(--space-lg);">
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
+        <div class="flex items-center gap-sm">
+            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-server"></use></svg>
+            <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_backends" }}</h3>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" onclick="vpnOpenAddBackendModal()">
+            <svg class="icon"><use href="#icon-plus"></use></svg>
+            <span>{{ _ "vpn_add_backend" }}</span>
+        </button>
+    </div>
+
+    <div class="table-container" id="vpnTableContainer">
+        <table class="table interactive-table" id="vpnBackendsTable" style="width: 100%; min-width: 100%;">
+            <thead>
+                <tr>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_endpoint" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_status" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_latency" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_connections" }}</th>
+                    <th data-sortable="false" style="text-align: right;">{{ _ "actions" }}</th>
+                </tr>
+            </thead>
+            <tbody id="vpn-backends-tbody">
+                <tr id="vpn-backends-loading" class="table-loading-row">
+                    <td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                        <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
+                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- ACTIVE SESSIONS / CONNECTION TROUBLESHOOTING TABLE -->
+<div class="card" style="margin-bottom: var(--space-lg);">
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
+        <div class="flex items-center gap-sm">
+            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-users"></use></svg>
+            <h3 class="card-title" id="vpn-troubleshooting-title" style="margin-bottom: 0;">{{ _ "vpn_troubleshooting_title" }}</h3>
+            <span id="vpn-sessions-count-badge" class="badge badge-secondary" style="font-size: 0.75rem;">0</span>
+        </div>
+        <div class="flex items-center gap-sm">
+            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" onclick="vpnToggleSessionsProblemFilter()" style="font-size: 0.8rem; display: inline-flex; align-items: center; gap: var(--space-xs);">
+                <svg class="icon" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
+                <span id="vpn-sessions-toggle-problems-text">{{ _ "vpn_show_problems_only" }}</span>
+            </button>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <table class="table interactive-table" id="vpnSessionsTable" style="width: 100%; min-width: 100%;">
+            <thead>
+                <tr>
+                    <th class="sortable" data-sort-type="string">{{ _ "username" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_packet_loss" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_queue_pressure" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
+                </tr>
+            </thead>
+            <tbody id="vpn-sessions-tbody">
+                <tr id="vpn-sessions-loading" class="table-loading-row">
+                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                        <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
+                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
 <!-- FORWARDER HEALTH & DIAGNOSTICS CARD -->
 <div class="card" id="vpn-forwarder-card" style="margin-bottom: var(--space-lg);">
     <!-- Top Headline Status Banner -->
@@ -368,85 +447,6 @@
     </details>
         </div>
     </details>
-</div>
-
-<!-- BACKENDS TABLE -->
-<div class="card">
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
-        <div class="flex items-center gap-sm">
-            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-server"></use></svg>
-            <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_backends" }}</h3>
-        </div>
-        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" onclick="vpnOpenAddBackendModal()">
-            <svg class="icon"><use href="#icon-plus"></use></svg>
-            <span>{{ _ "vpn_add_backend" }}</span>
-        </button>
-    </div>
-
-    <div class="table-container" id="vpnTableContainer">
-        <table class="table interactive-table" id="vpnBackendsTable" style="width: 100%; min-width: 100%;">
-            <thead>
-                <tr>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_endpoint" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_status" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_latency" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_connections" }}</th>
-                    <th data-sortable="false" style="text-align: right;">{{ _ "actions" }}</th>
-                </tr>
-            </thead>
-            <tbody id="vpn-backends-tbody">
-                <tr id="vpn-backends-loading" class="table-loading-row">
-                    <td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
-                        <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
-                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<!-- ACTIVE SESSIONS / CONNECTION TROUBLESHOOTING TABLE -->
-<div class="card" style="margin-top: var(--space-xl);">
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-md); flex-wrap: wrap; gap: var(--space-sm);">
-        <div class="flex items-center gap-sm">
-            <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-users"></use></svg>
-            <h3 class="card-title" id="vpn-troubleshooting-title" style="margin-bottom: 0;">{{ _ "vpn_troubleshooting_title" }}</h3>
-            <span id="vpn-sessions-count-badge" class="badge badge-secondary" style="font-size: 0.75rem;">0</span>
-        </div>
-        <div class="flex items-center gap-sm">
-            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" onclick="vpnToggleSessionsProblemFilter()" style="font-size: 0.8rem; display: inline-flex; align-items: center; gap: var(--space-xs);">
-                <svg class="icon" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
-                <span id="vpn-sessions-toggle-problems-text">{{ _ "vpn_show_problems_only" }}</span>
-            </button>
-        </div>
-    </div>
-
-    <div class="table-container">
-        <table class="table interactive-table" id="vpnSessionsTable" style="width: 100%; min-width: 100%;">
-            <thead>
-                <tr>
-                    <th class="sortable" data-sort-type="string">{{ _ "username" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_packet_loss" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_queue_pressure" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
-                </tr>
-            </thead>
-            <tbody id="vpn-sessions-tbody">
-                <tr id="vpn-sessions-loading" class="table-loading-row">
-                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
-                        <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
-                        <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
 </div>
 
 <!-- ADD BACKEND MODAL -->
