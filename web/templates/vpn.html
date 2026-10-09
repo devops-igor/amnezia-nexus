@@ -2615,16 +2615,64 @@
         // Track active problem signature to auto-expand technical details on new problems without overriding manual collapse.
         function deriveStableConditionCode(msg) {
             if (!msg || typeof msg !== 'string') return '';
-            return msg
+            // Protect IP addresses (both IPv4 and IPv6) so their digits are preserved
+            const preservedIps = [];
+            let s = msg.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, function(m) {
+                preservedIps.push(m);
+                return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
+            });
+            s = s.replace(/\b(?:[0-9a-fA-F]{1,4}:){1,7}(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|(?:::1)\b|\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b/g, function(m) {
+                preservedIps.push(m);
+                return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
+            });
+
+            s = s
                 .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
-                .replace(/\b\d+(?:\.\d+)?\s*(?:drops\/sec|drops\/s|drops\/window|errors\/sec|stalls|pps|ms|sec|seconds|s|min|h|recent)\b/gi, '')
-                .replace(/\b\d+(?:[a-zµ]+\d*)+\b/gi, '')
-                .replace(/\b\d+(?:\.\d+)?%/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:drops\/sec|drops\/s|drops\/window|errors\/sec|stalls\/sec|stalls|pps|bps|Kbps|Mbps|Gbps|B\/s|KB\/s|MB\/s)\b/gi, '')
+                .replace(/\b(?:\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?))+\b/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*%/g, '')
+                .replace(/\(\s*>?\s*\d+(?:\.\d+)?\s*(?:recent|drops|errors|stalls|samples|events|packets)?\s*\)/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:recent|drops|errors|stalls|events|samples|packets)\b/gi, '')
                 .replace(/\b\d+(?:\.\d+)?\b/g, '')
                 .replace(/\(\s*>?\s*\)/g, '')
                 .replace(/\(\s*\)/g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
+
+            return s.replace(/__PRESERVED_IP_(\d+)__/g, function(_, idx) {
+                return preservedIps[Number(idx)] || '';
+            });
+        }
+
+        function extractConditionEntities(item) {
+            if (!item) return '';
+            const direct = item.assigned_ip || item.peer_key || item.entity_id || item.connection_id || item.session_id || item.user_id || '';
+            const ips = [];
+            if (item.message && typeof item.message === 'string') {
+                const ipv4 = item.message.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g);
+                if (ipv4) {
+                    for (let i = 0; i < ipv4.length; i++) {
+                        if (!ips.includes(ipv4[i])) ips.push(ipv4[i]);
+                    }
+                }
+                const ipv6 = item.message.match(/\b(?:[0-9a-fA-F]{1,4}:){1,7}(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|(?:::1)\b|\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b/g);
+                if (ipv6) {
+                    for (let i = 0; i < ipv6.length; i++) {
+                        if (!ips.includes(ipv6[i])) ips.push(ipv6[i]);
+                    }
+                }
+            }
+            const parts = [];
+            if (direct) {
+                parts.push(direct);
+            }
+            ips.sort();
+            for (let i = 0; i < ips.length; i++) {
+                if (ips[i] !== direct && !parts.includes(ips[i])) {
+                    parts.push(ips[i]);
+                }
+            }
+            return parts.join(';');
         }
 
         const currentProblemKeys = new Set();
@@ -2633,13 +2681,14 @@
         }
         actionableProblems.forEach(function(p) {
             const pMsgKey = p.message_key || deriveStableConditionCode(p.message);
-            const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || '';
+            const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || p.entity_id || extractConditionEntities(p) || '';
             const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + ':' + (p.severity || '');
             currentProblemKeys.add(k);
         });
         qualifyingConditions.forEach(function(c) {
             const cKey = c.message_key || deriveStableConditionCode(c.message);
-            const k = 'cond:' + (c.category || '') + ':' + cKey + ':' + (c.severity || '');
+            const cEntityId = extractConditionEntities(c);
+            const k = 'cond:' + (c.category || '') + ':' + cKey + ':' + cEntityId + ':' + (c.severity || '');
             currentProblemKeys.add(k);
         });
         if (routeHasPressure) {

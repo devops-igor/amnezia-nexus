@@ -3425,6 +3425,13 @@ searchPaths.forEach(p => {
     }
 });
 
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
 let JSDOM;
 try {
     JSDOM = require('jsdom').JSDOM;
@@ -3561,6 +3568,9 @@ w.eval(tablesCode);
 		t.Fatalf("TestVPNNexusTableLifecycleDrilldownAndConfigDedup failed: %v\n%s", err, string(out))
 	}
 	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", out)
+		}
 		t.Skip("jsdom is not available in Node environment")
 	}
 }
@@ -3610,6 +3620,13 @@ searchPaths.forEach(p => {
         module.paths.push(p);
     }
 });
+
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
 
 let JSDOM;
 try {
@@ -3985,6 +4002,85 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(degradedStatusUnkeyedAct_tick2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when unkeyed actionable problem numbers fluctuate');
 
+    // 5e. Distinct routing conditions affecting different IPs with identical count and severity -> must AUTO-EXPAND
+    // 1. Operator closes #vpn-fwd-tech-details on duplicate-IP condition affecting 10.8.0.2
+    const degradedStatusDupIP_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 10.8.0.2'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 10.8.0.2 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of duplicate-IP condition');
+
+    // 2. Telemetry updates to a replacement duplicate-IP condition affecting 10.8.0.3 with the exact same count and severity
+    const degradedStatusDupIP_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 10.8.0.3'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different IP (10.8.0.3 vs 10.8.0.2)');
+
+    // Operator collapses accordion after observing new IP incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement condition');
+
+    // 5f. Routing ownership mismatch condition with fluctuating drop counts -> must STAY closed
+    const degradedStatusOwnership_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '3 client-direction and 2 return-direction ownership mismatch drop(s) in the last 30.0s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusOwnership_tick1);
+    techDetails.open = false; // operator collapses accordion
+
+    const degradedStatusOwnership_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '5 client-direction and 7 return-direction ownership mismatch drop(s) in the last 30.0s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusOwnership_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when ownership mismatch drop counts fluctuate');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
@@ -4047,6 +4143,9 @@ w.eval(tablesCode);
 		t.Fatalf("TestVPNSessionsTableSortingAndAccordionPersistence failed: %v\n%s", err, string(out))
 	}
 	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", out)
+		}
 		t.Skip("jsdom is not available in Node environment")
 	}
 }
