@@ -4081,6 +4081,86 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(degradedStatusOwnership_tick2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when ownership mismatch drop counts fluctuate');
 
+    // 5g. Distinct routing conditions affecting leading-compressed IPv6 addresses with identical count and severity -> must AUTO-EXPAND
+    // 1. Operator closes #vpn-fwd-tech-details on duplicate-IP condition affecting ::200
+    const degradedStatusDupIPv6_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: ::200'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on leading-compressed IPv6 duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same ::200 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of leading-compressed IPv6 condition');
+
+    // 2. Telemetry updates to a replacement duplicate-IP condition affecting ::201 with the exact same count and severity
+    const degradedStatusDupIPv6_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: ::201'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different leading-compressed IPv6 (::201 vs ::200)');
+
+    // Operator collapses accordion after observing new IPv6 incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement leading-compressed IPv6 condition');
+
+    // 5h. Space-separated timestamp condition updating -> must STAY closed
+    const degradedStatusSpaceTs_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: 'Last sample at 2026-10-09 09:00:00'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusSpaceTs_tick1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on space-separated timestamp condition');
+    techDetails.open = false; // operator collapses accordion
+
+    const degradedStatusSpaceTs_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: 'Last sample at 2026-10-09 09:00:05'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusSpaceTs_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when space-separated timestamp advances');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
