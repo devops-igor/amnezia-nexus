@@ -2232,6 +2232,8 @@ let vpnSessionsStale = false;
 let vpnSessionsFilterOnlyProblems = false;
 let vpnLastStatus = null;
 let vpnExpandedSessionIds = new Set();
+let vpnLastActiveProblemKeys = null;
+let vpnLastActiveProblemCount = 0;
 let vpnSessionsTableInstance = null;
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
@@ -2448,7 +2450,7 @@ assert.strictEqual(row1.children.length, 5, 'session row must have 5 columns');
 assert(row1.children[0].textContent.includes('bob'));
 assert.strictEqual(row1.children[1].textContent, 'Frankfurt-1');
 assert.strictEqual(row1.children[2].getAttribute('data-sort-value'), '600000');
-assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '2400015');
+assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '10000000002400');
 assert(row1.children[3].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
 assert(row1.children[3].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
 assert(row1.children[3].textContent.includes('15'), 'drops count must be 15');
@@ -2565,7 +2567,7 @@ const updatedAlice = tbody.children[0];
 assert(updatedAlice.children[2].textContent.includes('4.00 Mbps') && updatedAlice.children[2].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
 assert.strictEqual(updatedAlice.children[2].getAttribute('data-sort-value'), '12000000');
 assert(updatedAlice.children[3].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
-assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '42');
+assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '10000000012');
 assert(updatedAlice.children[4].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
 
 // Assertion 6: Correlation priority ordering (session_id > connection_id > assigned_ip)
@@ -3452,6 +3454,7 @@ w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'var vpnLastSessions = null, vpnLastStatus = null;' +
 'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
 'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
     'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
@@ -3556,6 +3559,313 @@ w.eval(tablesCode);
 	out, err := execNodeScript(node, testScript)
 	if err != nil {
 		t.Fatalf("TestVPNNexusTableLifecycleDrilldownAndConfigDedup failed: %v\n%s", err, string(out))
+	}
+	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		t.Skip("jsdom is not available in Node environment")
+	}
+}
+
+func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enData, err := fs.ReadFile(transFS, "en.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testScript := fmt.Sprintf(`
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
+const home = process.env.HOME || process.env.USERPROFILE || '';
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+
+const source = %q;
+const en = JSON.parse(%q);
+const tablesCode = %q;
+
+function extract(name) {
+    const start = source.indexOf('    function ' + name + '(');
+    assert(start >= 0, 'function not found: ' + name);
+    const rest = source.slice(start + 1);
+    const match = /^    (?:async )?function /m.exec(rest);
+    return source.slice(start, match ? start + 1 + match.index : source.indexOf('</script>', start));
+}
+
+const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
+const w = dom.window;
+w.eval('const translations = ' + JSON.stringify(en) + ';' +
+'function _(key) { return translations[key] || key; };' +
+'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
+'const UI = { escapeHtml };' +
+'var vpnLastSessions = null, vpnLastStatus = null;' +
+'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
+'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
+'var vpnHistoryWindow = "15m";\n' +
+[
+    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
+    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
+    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
+    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
+    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+].map(extract).join('\n'));
+
+w.eval(tablesCode);
+
+(async function() {
+    // 5 sessions covering:
+    // - Differing traffic rates (dan 50M > alice 20M > bob 1M > charlie 200k > eve 0)
+    // - Packet loss tiers:
+    //   Tier 1: active drop rates (alice 4.5 pps > bob 0.8 pps)
+    //   Tier 2: recent drops with zero rate (charlie 25 recent drops)
+    //   Tier 3: historical lifetime drops with zero recent (dan 10000 drops)
+    //   Tier 4: zero drops (eve 0 drops)
+    const sessions = [
+        { id: 's-dan', username: 'dan', connection_id: 'c-dan', assigned_ip: '10.8.0.4', status: 'connected' },
+        { id: 's-alice', username: 'alice', connection_id: 'c-alice', assigned_ip: '10.8.0.2', status: 'connected' },
+        { id: 's-bob', username: 'bob', connection_id: 'c-bob', assigned_ip: '10.8.0.3', status: 'connected' },
+        { id: 's-charlie', username: 'charlie', connection_id: 'c-charlie', assigned_ip: '10.8.0.5', status: 'connected' },
+        { id: 's-eve', username: 'eve', connection_id: 'c-eve', assigned_ip: '10.8.0.6', status: 'connected' }
+    ];
+
+    const routes = [
+        {
+            session_id: 's-dan',
+            connection_id: 'c-dan',
+            assigned_ip: '10.8.0.4',
+            occupancy: 10,
+            capacity: 100,
+            drops: 10000,
+            queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false,
+            traffic: { available: true, rx_bps: 25000000, tx_bps: 25000000 } // 50 Mbps
+        },
+        {
+            session_id: 's-alice',
+            connection_id: 'c-alice',
+            assigned_ip: '10.8.0.2',
+            occupancy: 90,
+            capacity: 100,
+            drops: 20,
+            queue_full_drops_recent: 10,
+            queue_full_drop_rate_pps: 4.5,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 10000000, tx_bps: 10000000 } // 20 Mbps
+        },
+        {
+            session_id: 's-bob',
+            connection_id: 'c-bob',
+            assigned_ip: '10.8.0.3',
+            occupancy: 50,
+            capacity: 100,
+            drops: 5,
+            queue_full_drops_recent: 2,
+            queue_full_drop_rate_pps: 0.8,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 500000, tx_bps: 500000 } // 1 Mbps
+        },
+        {
+            session_id: 's-charlie',
+            connection_id: 'c-charlie',
+            assigned_ip: '10.8.0.5',
+            occupancy: 30,
+            capacity: 100,
+            drops: 50,
+            queue_full_drops_recent: 25,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 100000, tx_bps: 100000 } // 200 Kbps
+        },
+        {
+            session_id: 's-eve',
+            connection_id: 'c-eve',
+            assigned_ip: '10.8.0.6',
+            occupancy: 0,
+            capacity: 100,
+            drops: 0,
+            queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false,
+            traffic: { available: true, rx_bps: 0, tx_bps: 0 } // 0 bps
+        }
+    ];
+
+    w.vpnLastSessions = { sessions: sessions };
+    w.vpnLastStatus = {
+        forwarder_available: true,
+        all_routes: routes
+    };
+
+    w.renderSessions(sessions);
+
+    const tbody = w.document.getElementById('vpn-sessions-tbody');
+    function rowOrder() {
+        return Array.from(tbody.children)
+            .filter(r => r.style.display !== 'none' && !r.classList.contains('table-loading-row') && !r.classList.contains('table-empty-state'))
+            .map(r => r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim());
+    }
+
+    const headers = Array.from(w.document.querySelectorAll('#vpnSessionsTable thead th'));
+    assert.strictEqual(headers.length, 5, 'must have 5 headers');
+
+    // Header 2: Live Traffic
+    const thTraffic = headers[2];
+    assert(thTraffic.textContent.includes('vpn_col_live_traffic'), 'col 2 must be live traffic header');
+
+    // Live Traffic Ascending (1st click)
+    thTraffic.click();
+    assert.strictEqual(thTraffic.getAttribute('aria-sort'), 'ascending');
+    assert.deepStrictEqual(rowOrder(), ['eve', 'charlie', 'bob', 'alice', 'dan'], 'traffic ascending: 0 < 200k < 1M < 20M < 50M');
+
+    // Live Traffic Descending (2nd click)
+    thTraffic.click();
+    assert.strictEqual(thTraffic.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['dan', 'alice', 'bob', 'charlie', 'eve'], 'traffic descending: 50M > 20M > 1M > 200k > 0');
+
+    // Header 3: Packet Loss
+    const thLoss = headers[3];
+    assert(thLoss.textContent.includes('vpn_col_packet_loss'), 'col 3 must be packet loss header');
+
+    // Packet Loss Ascending (1st click)
+    thLoss.click();
+    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'ascending');
+    assert.deepStrictEqual(rowOrder(), ['eve', 'dan', 'charlie', 'bob', 'alice'], 'loss ascending: Tier 4 (0) < Tier 3 (10k drops) < Tier 2 (25 recent) < Tier 1 (0.8 pps) < Tier 1 (4.5 pps)');
+
+    // Packet Loss Descending (2nd click)
+    thLoss.click();
+    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['alice', 'bob', 'charlie', 'dan', 'eve'], 'loss descending: Tier 1 (4.5 pps) > Tier 1 (0.8 pps) > Tier 2 (25 recent) > Tier 3 (10k drops) > Tier 4 (0)');
+
+    // Explicit verification of operational triage guarantees:
+    const descOrder = rowOrder();
+    const aliceIdx = descOrder.indexOf('alice');
+    const bobIdx = descOrder.indexOf('bob');
+    const charlieIdx = descOrder.indexOf('charlie');
+    const danIdx = descOrder.indexOf('dan');
+    const eveIdx = descOrder.indexOf('eve');
+
+    assert(aliceIdx < bobIdx, 'higher active drop rate (4.5 pps) must sort before lower rate (0.8 pps)');
+    assert(bobIdx < charlieIdx, 'active rate loss must sort before recent loss with 0 current rate');
+    assert(charlieIdx < danIdx, 'recent loss (25 recent drops) must sort before historical drops (10000 drops) despite lower total');
+    assert(danIdx < eveIdx, 'historical drops must sort before zero drops');
+
+    // Part B: Technical diagnostics accordion collapse persistence across multiple poll renders
+    const techDetails = w.document.getElementById('vpn-fwd-tech-details');
+    assert(techDetails, 'vpn-fwd-tech-details must exist in template');
+
+    // 1. Initial healthy state: accordion is closed
+    w.vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: { status: 'HEALTHY', conditions: [] }
+    });
+    assert.strictEqual(techDetails.open, false, 'techDetails must be closed initially when healthy');
+
+    // 2. Degraded state with Problem A appears -> auto-expands
+    const degradedStatusA = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Queue full drops active', connection_id: 'c-1', username: 'alice' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on active problem detection');
+
+    // 3. Operator manually collapses the details panel
+    techDetails.open = false;
+    assert.strictEqual(techDetails.open, false, 'operator manually collapsed techDetails');
+
+    // 4. Repeated polling render cycle 1 with identical degradedStatusA -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across poll tick 1 with same problem');
+
+    // 5. Repeated polling render cycle 2 with identical degradedStatusA -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across poll tick 2 with same problem');
+
+    // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
+    const degradedStatusB = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Queue full drops active', connection_id: 'c-1', username: 'alice' },
+                { severity: 'DEGRADED', message: 'Backend latency critical', connection_id: 'c-2', username: 'bob' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusB);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when a new problem appears');
+
+    // 7. Operator collapses again after observing new problem -> must STAY closed on poll with same 2 problems
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusB);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed after second manual collapse');
+
+    // 8. Problems resolve completely -> healthy state
+    w.vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: { status: 'HEALTHY', conditions: [] }
+    });
+    assert.strictEqual(techDetails.open, false, 'techDetails remains closed when healthy');
+
+    // 9. Problem recurs -> must AUTO-EXPAND again on transition from healthy to degraded
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when problem recurs from healthy state');
+
+    console.log('PASS');
+})().catch(e => {
+    console.error(e);
+    process.exit(1);
+});
+`, tmplStr, string(enData), string(tablesJS))
+
+	out, err := execNodeScript(node, testScript)
+	if err != nil {
+		t.Fatalf("TestVPNSessionsTableSortingAndAccordionPersistence failed: %v\n%s", err, string(out))
 	}
 	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
 		t.Skip("jsdom is not available in Node environment")

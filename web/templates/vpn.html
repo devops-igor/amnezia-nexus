@@ -570,6 +570,8 @@
     let vpnShowAllRoutes = false;
     let vpnLastStatus = null;
     let vpnExpandedSessionIds = new Set();
+    let vpnLastActiveProblemKeys = null;
+    let vpnLastActiveProblemCount = 0;
 
     function vpnFormatApiError(err, res, data) {
         const errMsg = (data && (data.detail || data.message || data.error)) ||
@@ -1246,10 +1248,11 @@
         tdLoss.className = 'font-mono text-sm';
         let dropRate = 0;
         let drops = 0;
+        let recentDrops = 0;
         if (route) {
             dropRate = Number(route.queue_full_drop_rate_pps || 0);
             drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
-            const recentDrops = Number(route.queue_full_drops_recent || 0);
+            recentDrops = Number(route.queue_full_drops_recent || 0);
             if (dropRate > 0 || recentDrops > 0) {
                 let dropText = '';
                 if (dropRate > 0) {
@@ -1268,7 +1271,20 @@
         } else {
             tdLoss.textContent = '-';
         }
-        const sortLoss = route ? (dropRate * 1000000 + drops) : 0;
+        let sortLoss = 0;
+        if (route) {
+            if (dropRate > 0) {
+                // Tier 1: Active drop rate (millidrops/sec integer encoding to preserve decimal precision without float loss)
+                const scaledRate = Math.max(1, Math.round(dropRate * 1000));
+                sortLoss = 1e13 + Math.min(scaledRate, 999999999);
+            } else if (recentDrops > 0) {
+                // Tier 2: Recent drops with zero active drop rate
+                sortLoss = 1e10 + Math.min(recentDrops, 999999999);
+            } else if (drops > 0) {
+                // Tier 3: Historical lifetime drops with zero recent and zero active drops
+                sortLoss = Math.min(drops, 999999999);
+            }
+        }
         tdLoss.setAttribute('data-sort-value', String(sortLoss));
         tr.appendChild(tdLoss);
 
@@ -1980,6 +1996,12 @@
             if (detailsElem) detailsElem.open = false;
             const techDetails = document.getElementById('vpn-fwd-tech-details');
             if (techDetails) techDetails.open = false;
+            if (typeof vpnLastActiveProblemKeys !== 'undefined') vpnLastActiveProblemKeys = null;
+            if (typeof vpnLastActiveProblemCount !== 'undefined') vpnLastActiveProblemCount = 0;
+            if (typeof globalThis !== 'undefined') {
+                globalThis.vpnLastActiveProblemKeys = null;
+                globalThis.vpnLastActiveProblemCount = 0;
+            }
 
             const kpiIds = ['vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure', 'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync', 'vpn-kpi-backends', 'vpn-kpi-slow-writes'];
             for (let i = 0; i < kpiIds.length; i++) {
@@ -2590,10 +2612,69 @@
             }
         }
 
-        // Auto-expand technical details when degraded, down, or has active problems; preserve manual expansion.
+        // Track active problem signature to auto-expand technical details on new problems without overriding manual collapse.
+        const currentProblemKeys = new Set();
+        if (isDegradedOrDown) {
+            currentProblemKeys.add('status:' + s);
+        }
+        actionableProblems.forEach(function(p) {
+            const k = 'act:' + (p.message_key || '') + ':' + (p.message || '') + ':' + (p.connection_id || '') + ':' + (p.user_id || '') + ':' + (p.category || '') + ':' + (p.severity || '');
+            currentProblemKeys.add(k);
+        });
+        qualifyingConditions.forEach(function(c) {
+            const k = 'cond:' + (c.message_key || '') + ':' + (c.message || '') + ':' + (c.category || '') + ':' + (c.severity || '');
+            currentProblemKeys.add(k);
+        });
+        if (routeHasPressure) {
+            currentProblemKeys.add('route_pressure');
+            allRouteList.forEach(function(r) {
+                if (r && (r.has_pressure || (Number(r.queue_full_drops_recent || 0) > 0) || (Number(r.write_errors_recent || 0) > 0) || (Number(r.write_stalls_recent || 0) > 0))) {
+                    currentProblemKeys.add('route_pressure:' + (r.session_id || r.connection_id || r.assigned_ip || r.peer_key || 'unknown'));
+                }
+            });
+        }
+        if (hasActiveProblems && currentProblemKeys.size === 0) {
+            currentProblemKeys.add('active_problem_generic');
+        }
+
+        const prevKeys = (typeof vpnLastActiveProblemKeys !== 'undefined' && vpnLastActiveProblemKeys !== null)
+            ? vpnLastActiveProblemKeys
+            : (typeof globalThis !== 'undefined' ? globalThis.vpnLastActiveProblemKeys : null);
+        const prevCount = (typeof vpnLastActiveProblemCount !== 'undefined')
+            ? vpnLastActiveProblemCount
+            : (typeof globalThis !== 'undefined' && globalThis.vpnLastActiveProblemCount !== undefined ? globalThis.vpnLastActiveProblemCount : 0);
+
+        let shouldAutoExpand = false;
+        if (hasActiveProblems) {
+            if (!prevKeys || prevKeys.size === 0) {
+                shouldAutoExpand = true;
+            } else {
+                for (const k of currentProblemKeys) {
+                    if (!prevKeys.has(k)) {
+                        shouldAutoExpand = true;
+                        break;
+                    }
+                }
+                if (activeProblemsCount > prevCount) {
+                    shouldAutoExpand = true;
+                }
+            }
+        }
+
         const techDetails = document.getElementById('vpn-fwd-tech-details');
-        if (techDetails && hasActiveProblems && !techDetails.open) {
+        if (techDetails && shouldAutoExpand) {
             techDetails.open = true;
+        }
+
+        if (typeof vpnLastActiveProblemKeys !== 'undefined') {
+            vpnLastActiveProblemKeys = currentProblemKeys;
+        }
+        if (typeof vpnLastActiveProblemCount !== 'undefined') {
+            vpnLastActiveProblemCount = activeProblemsCount;
+        }
+        if (typeof globalThis !== 'undefined') {
+            globalThis.vpnLastActiveProblemKeys = currentProblemKeys;
+            globalThis.vpnLastActiveProblemCount = activeProblemsCount;
         }
 
         // Auto-expand route details only for current pressure.
