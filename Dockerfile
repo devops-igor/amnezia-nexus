@@ -1,7 +1,7 @@
 # =============================================================================
 # Stage 1: Build Stage (Statically compiled Go binaries)
 # =============================================================================
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.9
 FROM golang:${GO_VERSION}-alpine AS builder
 
 WORKDIR /build

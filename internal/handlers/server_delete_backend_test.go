@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -582,6 +583,7 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_CannotResurrectZombieTunnel
 	if dev := vpnSvc.GetBackendDeviceForTest(tunBefore.ID); dev != nil {
 		t.Errorf("expected no backend device for tunnel %d, got %+v", tunBefore.ID, dev)
 	}
+	_ = vpnSvc.Stop()
 }
 
 func TestDeleteServerHandler_SelfHealing_CannotResurrectDeletedServer(t *testing.T) {
@@ -775,5 +777,145 @@ func TestDeleteServerHandler_BackupRestoreSameID_CanEnableBackend(t *testing.T) 
 	}
 	if !tunRestored.Enabled {
 		t.Errorf("expected restored tunnel to be enabled")
+	}
+}
+
+func TestDeleteServerHandler_ConcurrentEnableBackend_ServerGenerationChanged_RejectsOldEnable(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlersWithMockSSH(t, newAWGMockSSH())
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
+	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	h.vpnSvc = vpnSvc
+
+	// 1. Create server ID N (Gen A) with host and AWG protocol.
+	srvA := &models.Server{
+		Name:    "GenA-Server",
+		Host:    "192.168.10.90",
+		SSHPort: 22,
+		SSHUser: "root",
+		SSHPass: "pass123",
+		Protocols: map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": "backend-pubkey-gena",
+			},
+		},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+	serverID, err := db.CreateServer(ctx, srvA)
+	if err != nil {
+		t.Fatalf("failed to create server Gen A: %v", err)
+	}
+
+	// 2. Start EnableBackend(N) in a goroutine paused at enableBackendPreAddTunnelHook.
+	preAddCalled := make(chan struct{})
+	resumeAdd := make(chan struct{})
+	vpnSvc.SetEnableBackendPreAddTunnelHookForTest(func() {
+		close(preAddCalled)
+		<-resumeAdd
+	})
+	t.Cleanup(func() {
+		vpnSvc.SetEnableBackendPreAddTunnelHookForTest(nil)
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- vpnSvc.EnableBackend(ctx, serverID)
+	}()
+
+	select {
+	case <-preAddCalled:
+	case <-time.After(5 * time.Second):
+		close(resumeAdd)
+		t.Fatal("timed out waiting for goroutine to reach preAdd hook")
+	}
+
+	// 3. Delete server N via DeleteServerHandler (deletes DB rows and clears tombstone on return).
+	serverRouter := setupFullServerRouter(h)
+	reqDel := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/delete", serverID), nil)
+	wDel := httptest.NewRecorder()
+	serverRouter.ServeHTTP(wDel, reqDel)
+	if wDel.Code != http.StatusOK {
+		close(resumeAdd)
+		t.Fatalf("expected 200 OK on DeleteServerHandler, got %d (body: %s)", wDel.Code, wDel.Body.String())
+	}
+
+	// 4. Restore server N via restoreBackupServers with new parameters / new CreatedAt (Gen B).
+	serverBackup := map[string]any{
+		"id":       serverID,
+		"name":     "GenB-Server",
+		"host":     "192.168.10.90",
+		"ssh_user": "root",
+		"ssh_port": 22,
+		"ssh_pass": "pass123",
+		"protocols": map[string]any{
+			"awg": map[string]any{
+				"installed":  true,
+				"port":       51821,
+				"public_key": "backend-pubkey-genb",
+			},
+		},
+	}
+	restoredCount, _ := h.restoreBackupServers(ctx, []map[string]any{serverBackup})
+	if restoredCount != 1 {
+		close(resumeAdd)
+		t.Fatalf("expected 1 restored server, got %d", restoredCount)
+	}
+
+	// 5. Resume old EnableBackend(N) goroutine.
+	close(resumeAdd)
+	var enableErr error
+	select {
+	case enableErr = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for old EnableBackend goroutine to complete")
+	}
+	vpnSvc.SetEnableBackendPreAddTunnelHookForTest(nil)
+
+	// 6. Assert old EnableBackend fails with ErrServerNotFound ("generation changed").
+	if enableErr == nil {
+		t.Fatal("expected old EnableBackend to fail with generation changed, got nil")
+	}
+	if !errors.Is(enableErr, vpn.ErrServerNotFound) {
+		t.Errorf("expected ErrServerNotFound, got: %v", enableErr)
+	}
+	if !strings.Contains(enableErr.Error(), "generation changed") {
+		t.Errorf("expected 'generation changed' in error, got: %v", enableErr)
+	}
+
+	// 7. Assert no tunnel using Gen A is in pool.
+	tunAfterOld, err := vpnSvc.GetTunnel(serverID)
+	if err == nil && tunAfterOld != nil {
+		t.Fatalf("expected no tunnel in pool after old EnableBackend was rejected, got: %+v", tunAfterOld)
+	}
+	if !errors.Is(err, tunnel.ErrTunnelNotFound) {
+		t.Errorf("expected ErrTunnelNotFound, got: %v", err)
+	}
+
+	// 8. Run fresh EnableBackend(N) and assert it succeeds for Gen B.
+	if err := vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("expected fresh EnableBackend to succeed for Gen B, got: %v", err)
+	}
+
+	tunB, err := vpnSvc.GetTunnel(serverID)
+	if err != nil || tunB == nil {
+		t.Fatalf("expected backend tunnel for Gen B in pool, got: %v", err)
+	}
+	if !tunB.Enabled {
+		t.Errorf("expected Gen B tunnel to be enabled")
+	}
+	if tunB.Endpoint != "192.168.10.90:51821" {
+		t.Errorf("expected Gen B endpoint '192.168.10.90:51821', got %q", tunB.Endpoint)
+	}
+	if tunB.PublicKey != "backend-pubkey-genb" {
+		t.Errorf("expected Gen B public key 'backend-pubkey-genb', got %q", tunB.PublicKey)
 	}
 }

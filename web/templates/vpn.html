@@ -427,19 +427,16 @@
         <table class="table interactive-table" id="vpnSessionsTable" style="width: 100%; min-width: 100%;">
             <thead>
                 <tr>
-                    <th class="sortable" data-sort-type="string">{{ _ "username" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_config" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_user_device" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
-                    <th class="sortable" data-sort-type="string">{{ _ "vpn_col_assigned_ip" }}</th>
                     <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
                     <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_packet_loss" }}</th>
-                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_queue_pressure" }}</th>
                     <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
                 </tr>
             </thead>
             <tbody id="vpn-sessions-tbody">
                 <tr id="vpn-sessions-loading" class="table-loading-row">
-                    <td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
+                    <td colspan="5" style="text-align: center; color: var(--text-muted); padding: var(--space-2xl) var(--space-md);">
                         <div class="spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-sm);"></div>
                         <div style="font-size: 0.875rem;">{{ _ "loading" }}</div>
                     </td>
@@ -573,6 +570,8 @@
     let vpnShowAllRoutes = false;
     let vpnLastStatus = null;
     let vpnExpandedSessionIds = new Set();
+    let vpnLastActiveProblemKeys = null;
+    let vpnLastActiveProblemCount = 0;
 
     function vpnFormatApiError(err, res, data) {
         const errMsg = (data && (data.detail || data.message || data.error)) ||
@@ -1204,54 +1203,56 @@
         const tdUser = document.createElement('td');
         tdUser.className = 'font-weight-600';
         tdUser.style.cursor = 'pointer';
-        tdUser.style.display = 'flex';
-        tdUser.style.alignItems = 'center';
-        tdUser.style.gap = 'var(--space-xs)';
         const safeUsername = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.username) || '-') : ((s && s.username) || '-');
-        tdUser.innerHTML = `<svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg><span>${safeUsername}</span>`;
+        const safeConfig = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.connection_name) || '-') : ((s && s.connection_name) || '-');
+        const safeIP = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.assigned_ip) || '-') : ((s && s.assigned_ip) || '-');
+        tdUser.innerHTML = `
+            <div style="display: inline-flex; align-items: center; gap: var(--space-xs); max-width: 100%; min-width: 0;">
+                <svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; flex-shrink: 0; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg>
+                <div style="min-width: 0; max-width: 100%;">
+                    <div class="font-weight-600" style="white-space: nowrap;">${safeUsername}</div>
+                    <div class="text-muted text-xs font-mono" style="font-weight: normal; overflow: hidden; text-overflow: ellipsis; max-width: 100%;">${safeConfig} &bull; ${safeIP}</div>
+                </div>
+            </div>
+        `;
         tdUser.onclick = function(e) {
             if (e && e.stopPropagation) e.stopPropagation();
             vpnToggleSessionDrilldown(s, tr);
         };
         tr.appendChild(tdUser);
 
-        // 2. Config cell
-        const tdConfig = document.createElement('td');
-        tdConfig.className = 'font-mono text-sm';
-        tdConfig.textContent = (s && s.connection_name) || '-';
-        tr.appendChild(tdConfig);
-
-        // 3. Server cell
+        // 2. Server cell
         const tdServer = document.createElement('td');
         tdServer.className = 'font-weight-600';
         tdServer.textContent = (s && s.server_name) || '-';
         tr.appendChild(tdServer);
 
-        // 4. Assigned IP cell
-        const tdIp = document.createElement('td');
-        tdIp.className = 'font-mono text-sm';
-        tdIp.textContent = (s && s.assigned_ip) || '-';
-        tr.appendChild(tdIp);
-
-        // 5. Live Traffic cell
+        // 3. Live Traffic cell
         const tdTraffic = document.createElement('td');
         tdTraffic.className = 'font-mono text-sm';
+        let rx = 0;
+        let tx = 0;
         if (route && route.traffic) {
-            const rx = route.traffic.rx_bps !== undefined ? route.traffic.rx_bps : ((route.traffic.rx_bytes_per_sec || 0) * 8);
-            const tx = route.traffic.tx_bps !== undefined ? route.traffic.tx_bps : ((route.traffic.tx_bytes_per_sec || 0) * 8);
+            rx = route.traffic.rx_bps !== undefined ? route.traffic.rx_bps : ((route.traffic.rx_bytes_per_sec || 0) * 8);
+            tx = route.traffic.tx_bps !== undefined ? route.traffic.tx_bps : ((route.traffic.tx_bytes_per_sec || 0) * 8);
             tdTraffic.textContent = `↓ ${fmtBps(rx)} ↑ ${fmtBps(tx)}`;
         } else {
             tdTraffic.textContent = '-';
         }
+        const totalBps = (route && route.traffic) ? (rx + tx) : 0;
+        tdTraffic.setAttribute('data-sort-value', String(totalBps));
         tr.appendChild(tdTraffic);
 
-        // 6. Packet Loss cell
+        // 4. Packet Loss cell
         const tdLoss = document.createElement('td');
         tdLoss.className = 'font-mono text-sm';
+        let dropRate = 0;
+        let drops = 0;
+        let recentDrops = 0;
         if (route) {
-            const dropRate = Number(route.queue_full_drop_rate_pps || 0);
-            const drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
-            const recentDrops = Number(route.queue_full_drops_recent || 0);
+            dropRate = Number(route.queue_full_drop_rate_pps || 0);
+            drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
+            recentDrops = Number(route.queue_full_drops_recent || 0);
             if (dropRate > 0 || recentDrops > 0) {
                 let dropText = '';
                 if (dropRate > 0) {
@@ -1270,26 +1271,24 @@
         } else {
             tdLoss.textContent = '-';
         }
+        let sortLoss = 0;
+        if (route) {
+            if (dropRate > 0) {
+                // Tier 1: Active drop rate (millidrops/sec integer encoding to preserve decimal precision without float loss)
+                const scaledRate = Math.max(1, Math.round(dropRate * 1000));
+                sortLoss = 1e13 + Math.min(scaledRate, 999999999);
+            } else if (recentDrops > 0) {
+                // Tier 2: Recent drops with zero active drop rate
+                sortLoss = 1e10 + Math.min(recentDrops, 999999999);
+            } else if (drops > 0) {
+                // Tier 3: Historical lifetime drops with zero recent and zero active drops
+                sortLoss = Math.min(drops, 999999999);
+            }
+        }
+        tdLoss.setAttribute('data-sort-value', String(sortLoss));
         tr.appendChild(tdLoss);
 
-        // 7. Queue Pressure cell
-        const tdPressure = document.createElement('td');
-        tdPressure.className = 'font-mono text-sm';
-        if (route) {
-            const occ = route.queue_occupancy !== undefined ? route.queue_occupancy : (route.occupancy || 0);
-            const cap = route.queue_capacity !== undefined ? route.queue_capacity : (route.capacity || 0);
-            const pressureStr = `${occ}/${cap}`;
-            if (route.has_pressure === true) {
-                tdPressure.innerHTML = `<span class="badge badge-warn">${pressureStr}</span>`;
-            } else {
-                tdPressure.textContent = pressureStr;
-            }
-        } else {
-            tdPressure.textContent = '-';
-        }
-        tr.appendChild(tdPressure);
-
-        // 8. Status cell
+        // 5. Status cell
         const tdStatus = document.createElement('td');
         const isNominalActive = s && (s.status === 'connected' || s.status === 'active');
         if (route && (route.has_pressure || (Number(route.queue_full_drops_recent || 0) > 0) || (Number(route.write_errors_recent || 0) > 0) || (Number(route.write_stalls_recent || 0) > 0))) {
@@ -1329,7 +1328,7 @@
         }
 
         const td = document.createElement('td');
-        td.colSpan = 8;
+        td.colSpan = 5;
         td.style.background = 'var(--bg-surface-secondary, rgba(0,0,0,0.02))';
         td.style.padding = 'var(--space-md) var(--space-lg)';
 
@@ -1488,7 +1487,7 @@
         banner.className = 'table-empty-state';
         const safeStaleText = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_sessions_stale') || 'Session data unavailable - showing last known values') : (_('vpn_sessions_stale') || 'Session data unavailable - showing last known values');
         banner.innerHTML = `
-            <td colspan="8" style="padding: var(--space-md);">
+            <td colspan="5" style="padding: var(--space-md);">
                 <div class="empty-state" style="padding: 0;">
                     <div class="empty-title" style="display: flex; align-items: center; justify-content: center; gap: var(--space-sm); font-size: 0.9rem; font-weight: 600; margin: 0; color: var(--warning, #b45309);">
                         <svg class="icon" style="width: 18px; height: 18px; flex-shrink: 0;"><use href="#icon-x"></use></svg>
@@ -1650,7 +1649,7 @@
             const tr = document.createElement('tr');
             tr.className = 'table-empty-state';
             const td = document.createElement('td');
-            td.colSpan = 8;
+            td.colSpan = 5;
             td.style.padding = 'var(--space-2xl) var(--space-md)';
             td.style.textAlign = 'center';
             const safeNoSessions = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml(_('vpn_no_sessions')) : (_('vpn_no_sessions') || 'No active sessions');
@@ -1997,6 +1996,8 @@
             if (detailsElem) detailsElem.open = false;
             const techDetails = document.getElementById('vpn-fwd-tech-details');
             if (techDetails) techDetails.open = false;
+            if (typeof vpnLastActiveProblemKeys !== 'undefined') vpnLastActiveProblemKeys = null;
+            if (typeof vpnLastActiveProblemCount !== 'undefined') vpnLastActiveProblemCount = 0;
 
             const kpiIds = ['vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure', 'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync', 'vpn-kpi-backends', 'vpn-kpi-slow-writes'];
             for (let i = 0; i < kpiIds.length; i++) {
@@ -2607,10 +2608,182 @@
             }
         }
 
-        // Auto-expand technical details when degraded, down, or has active problems; remain closed when healthy.
+        // Track active problem signature to auto-expand technical details on new problems without overriding manual collapse.
+        function deriveStableConditionCode(msg) {
+            return parseConditionMessage(msg).normalizedCode;
+        }
+
+        function parseConditionMessage(msg) {
+            if (!msg || typeof msg !== 'string') return { normalizedCode: '', ips: [] };
+
+            // 1. Identify complete IP spans: match full/mixed IPv6 FIRST, then isolated IPv4
+            const preservedIps = [];
+            const ips = [];
+
+            const mixedIPv6 = '(?:[0-9a-fA-F]{1,4}:){1,6}(?:\\d{1,3}\\.){3}\\d{1,3}|::(?:[0-9a-fA-F]{1,4}:)*(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9a-fA-F]{1,4}:)+:(?:[0-9a-fA-F]{1,4}:)*(?:\\d{1,3}\\.){3}\\d{1,3}';
+            const pureIPv6 = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+(?::[0-9a-fA-F]{1,4})+|(?:[0-9a-fA-F]{1,4}:)+:|::(?:[0-9a-fA-F]{1,4})(?::[0-9a-fA-F]{1,4})*|::';
+            const ipv6Pattern = mixedIPv6 + '|' + pureIPv6;
+            const ipv6Regex = new RegExp('(?:^|(?<=[^0-9a-fA-F:]))(?:' + ipv6Pattern + ')(?:$|(?=[^0-9a-fA-F:.]|\\.(?!\\d)))', 'g');
+
+            let s = msg.replace(ipv6Regex, function(m) {
+                preservedIps.push(m);
+                if (!ips.includes(m)) ips.push(m);
+                return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
+            });
+
+            s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, function(m) {
+                preservedIps.push(m);
+                if (!ips.includes(m)) ips.push(m);
+                return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
+            });
+
+            // 2. Strip volatile cumulative telemetry and incident metadata BEFORE count protection
+            // Strip cumulative clauses: e.g. "(10 sync, 0 enqueue cumulative)" or "(... cumulative)"
+            s = s.replace(/\(\s*[^)]*cumulative\s*\)/gi, '');
+            s = s.replace(/;\s*[^;)]*cumulative\s*/gi, '');
+            s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue\s+cumulative\b/gi, '');
+
+            // For unresolved peer sync failures, the incident identity is the error message itself;
+            // volatile telemetry (last successful reconcile duration/timestamp, recent window activity, cumulative totals)
+            // must not alter the stable condition signature.
+            if (/\bUnresolved peer sync failure:/i.test(s)) {
+                s = s.replace(/(\bUnresolved peer sync failure:\s*[\s\S]*?)(?:\s*\(\s*(?:last successful reconcile|recent activity)[^)]*\))\s*$/gi, '$1');
+                s = s.replace(/;\s*(?:recent activity|last successful reconcile)[^;)]*/gi, '');
+                s = s.replace(/\brecent activity:\s*\d+\s+sync,\s*\d+\s+enqueue(?:failures)?(?:\s+in\s+the\s+last\s+[^;)]+)?/gi, '');
+                s = s.replace(/\blast successful reconcile\s+[^;)]+/gi, '');
+            }
+
+            // Strip duration windows ("in the last 30.0s", "for 10s") as volatile data
+            s = s.replace(/\b(?:in the last|in last)\s+\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?)\b/gi, '');
+            s = s.replace(/\bfor\s+\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?)\b/gi, '');
+
+            // Protect ratio patterns representing incident scale/identity (e.g. \b\d+\s+of\s+\d+\b)
+            const preservedRatios = [];
+            s = s.replace(/\b\d+\s+of\s+\d+\b/gi, function(m) {
+                preservedRatios.push(m.replace(/\s+/g, ' '));
+                return '__PRESERVED_RATIO_' + (preservedRatios.length - 1) + '__';
+            });
+
+            // Protect affected entity/population count phrases representing incident scale
+            const preservedCounts = [];
+            function preserveCountPhrase(m) {
+                preservedCounts.push(m.replace(/\s+/g, ' '));
+                return '__PRESERVED_COUNT_' + (preservedCounts.length - 1) + '__';
+            }
+
+            s = s.replace(/\b\d+\s+desired\s+vs\s+\d+\s+actual(?:\s+peers?)?\b/gi, preserveCountPhrase);
+            if (!/\bUnresolved peer sync failure:/i.test(s)) {
+                s = s.replace(/\b\d+\s+sync,\s+\d+\s+enqueue(?:\s+failures)?\b/gi, preserveCountPhrase);
+            }
+            s = s.replace(/\b\d+\s+(?:active\s+)?(?:live\s+)?sessions?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+(?:invalid\s+)?(?:durable\s+)?(?:peer\s+)?rows?(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+            s = s.replace(/\b\d+\s+(?:peers?|sessions?|users?|backends?|configs?|nodes?|rows?|interfaces?)(?:\(s\))?(?!\w)/gi, preserveCountPhrase);
+
+            // 3. Strip volatile timestamps, time clocks, and telemetry metrics ONLY outside protected IP spans
+            s = s
+                .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
+                .replace(/(?<!:)\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b(?!:)/g, '')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:drops\/sec|drops\/s|drops\/window|errors\/sec|stalls\/sec|stalls|pps|bps|Kbps|Mbps|Gbps|B\/s|KB\/s|MB\/s)\b/gi, '')
+                .replace(/\b(?:\d+(?:\.\d+)?\s*(?:hours?|hour|h|minutes?|minute|min|m|seconds?|second|sec|s|milliseconds?|millisecond|ms|microseconds?|microsecond|µs|us|nanoseconds?|nanosecond|ns|d|days?))+\b/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*%/g, '')
+                .replace(/\(\s*>?\s*\d+(?:\.\d+)?\s*(?:recent|drops|errors|stalls|samples|events|packets)?\s*\)/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\s*(?:recent|drops|errors|stalls|events|samples|packets)\b/gi, '')
+                .replace(/\b\d+(?:\.\d+)?\b/g, '')
+                .replace(/\(\s*>?\s*\)/g, '')
+                .replace(/\(\s*\)/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            // 4. Restore protected placeholders for normalized stable condition code
+            let normalizedCode = s.replace(/__PRESERVED_IP_(\d+)__/g, function(_, idx) {
+                return preservedIps[Number(idx)] || '';
+            });
+            normalizedCode = normalizedCode.replace(/__PRESERVED_RATIO_(\d+)__/g, function(_, idx) {
+                return preservedRatios[Number(idx)] || '';
+            });
+            normalizedCode = normalizedCode.replace(/__PRESERVED_COUNT_(\d+)__/g, function(_, idx) {
+                return preservedCounts[Number(idx)] || '';
+            });
+
+            return { normalizedCode: normalizedCode, ips: ips };
+        }
+
+        function extractConditionEntities(item) {
+            if (!item) return '';
+            const direct = item.assigned_ip || item.peer_key || item.entity_id || item.connection_id || item.session_id || item.user_id || '';
+            const parsed = parseConditionMessage(item.message);
+            const parts = [];
+            if (direct) {
+                parts.push(direct);
+            }
+            const ips = parsed.ips.slice().sort();
+            for (let i = 0; i < ips.length; i++) {
+                if (ips[i] !== direct && !parts.includes(ips[i])) {
+                    parts.push(ips[i]);
+                }
+            }
+            return parts.join(';');
+        }
+
+        const currentProblemKeys = new Set();
+        if (isDegradedOrDown) {
+            currentProblemKeys.add('status:' + s);
+        }
+        actionableProblems.forEach(function(p) {
+            const pMsgKey = p.message_key || deriveStableConditionCode(p.message);
+            const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || p.entity_id || extractConditionEntities(p) || '';
+            const pBackendId = p.backend_id ? (':' + p.backend_id) : '';
+            const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + pBackendId + ':' + (p.severity || '');
+            currentProblemKeys.add(k);
+        });
+        qualifyingConditions.forEach(function(c) {
+            const cKey = c.message_key || deriveStableConditionCode(c.message);
+            const cEntityId = extractConditionEntities(c);
+            const k = 'cond:' + (c.category || '') + ':' + cKey + ':' + cEntityId + ':' + (c.severity || '');
+            currentProblemKeys.add(k);
+        });
+        if (routeHasPressure) {
+            currentProblemKeys.add('route_pressure');
+            allRouteList.forEach(function(r) {
+                if (r && (r.has_pressure || (Number(r.queue_full_drops_recent || 0) > 0) || (Number(r.write_errors_recent || 0) > 0) || (Number(r.write_stalls_recent || 0) > 0))) {
+                    currentProblemKeys.add('route_pressure:' + (r.session_id || r.connection_id || r.assigned_ip || r.peer_key || 'unknown'));
+                }
+            });
+        }
+        if (hasActiveProblems && currentProblemKeys.size === 0) {
+            currentProblemKeys.add('active_problem_generic');
+        }
+
+        const prevKeys = typeof vpnLastActiveProblemKeys !== 'undefined' ? vpnLastActiveProblemKeys : null;
+        const prevCount = typeof vpnLastActiveProblemCount !== 'undefined' ? vpnLastActiveProblemCount : 0;
+
+        let shouldAutoExpand = false;
+        if (hasActiveProblems) {
+            if (!prevKeys || prevKeys.size === 0) {
+                shouldAutoExpand = true;
+            } else {
+                for (const k of currentProblemKeys) {
+                    if (!prevKeys.has(k)) {
+                        shouldAutoExpand = true;
+                        break;
+                    }
+                }
+                if (activeProblemsCount > prevCount) {
+                    shouldAutoExpand = true;
+                }
+            }
+        }
+
         const techDetails = document.getElementById('vpn-fwd-tech-details');
-        if (techDetails) {
-            techDetails.open = !!hasActiveProblems;
+        if (techDetails && shouldAutoExpand) {
+            techDetails.open = true;
+        }
+
+        if (typeof vpnLastActiveProblemKeys !== 'undefined') {
+            vpnLastActiveProblemKeys = currentProblemKeys;
+        }
+        if (typeof vpnLastActiveProblemCount !== 'undefined') {
+            vpnLastActiveProblemCount = activeProblemsCount;
         }
 
         // Auto-expand route details only for current pressure.
