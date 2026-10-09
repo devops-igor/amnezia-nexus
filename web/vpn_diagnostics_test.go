@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 
+	xhtml "golang.org/x/net/html"
+
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
@@ -322,6 +324,13 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+const renderedRouteRow = mockDoc.getElementById('vpn-fwd-routes-tbody').children[0];
+assert(renderedRouteRow, 'route row should be rendered');
+assert.strictEqual(renderedRouteRow.children[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteRow.children[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[4].style.textAlign, 'right', 'writes cell must have text-align: right');
 
 // Recovered KPIs keep lifetime evidence descriptive and show current availability.
 mockDoc.reset();
@@ -476,6 +485,12 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 	}
 	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const renderedRouteCells = document.getElementById('vpn-fwd-routes-tbody').children[0].children;
+assert.strictEqual(renderedRouteCells[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteCells[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[4].style.textAlign, 'right', 'writes cell must have text-align: right');
 const title = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
 const labels = {
  peer_key:_('vpn_forwarder_route_peer'),
@@ -4712,4 +4727,192 @@ w.eval(tablesCode);
 		}
 		t.Skip("jsdom is not available in Node environment")
 	}
+}
+
+func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	t.Run("TemplateDOMStructure", func(t *testing.T) {
+		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
+		if err != nil {
+			t.Fatalf("failed to parse vpn.html as HTML: %v", err)
+		}
+
+		var findByID func(*xhtml.Node, string) *xhtml.Node
+		findByID = func(n *xhtml.Node, id string) *xhtml.Node {
+			if n.Type == xhtml.ElementNode {
+				for _, a := range n.Attr {
+					if a.Key == "id" && a.Val == id {
+						return n
+					}
+				}
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if found := findByID(c, id); found != nil {
+					return found
+				}
+			}
+			return nil
+		}
+
+		getAttr := func(n *xhtml.Node, key string) string {
+			for _, a := range n.Attr {
+				if a.Key == key {
+					return a.Val
+				}
+			}
+			return ""
+		}
+
+		var findChildrenByTag func(*xhtml.Node, string) []*xhtml.Node
+		findChildrenByTag = func(n *xhtml.Node, tag string) []*xhtml.Node {
+			var results []*xhtml.Node
+			var walk func(*xhtml.Node)
+			walk = func(curr *xhtml.Node) {
+				if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
+					results = append(results, curr)
+					return
+				}
+				for c := curr.FirstChild; c != nil; c = c.NextSibling {
+					walk(c)
+				}
+			}
+			walk(n)
+			return results
+		}
+
+		table := findByID(doc, "vpn-fwd-routes-table")
+		if table == nil {
+			t.Fatal("table #vpn-fwd-routes-table not found in vpn.html")
+		}
+
+		// 1. Parent container of #vpn-fwd-routes-table has class table-container
+		parent := table.Parent
+		if parent == nil {
+			t.Fatal("parent container of #vpn-fwd-routes-table is nil")
+		}
+		if parent.Data != "div" {
+			t.Errorf("parent tag = %q, want div", parent.Data)
+		}
+		parentClass := getAttr(parent, "class")
+		parentClasses := strings.Fields(parentClass)
+		hasTableContainer := false
+		for _, c := range parentClasses {
+			if c == "table-container" {
+				hasTableContainer = true
+				break
+			}
+		}
+		if !hasTableContainer {
+			t.Errorf("parent container of #vpn-fwd-routes-table missing class table-container, got classes: %q", parentClass)
+		}
+
+		// 2. #vpn-fwd-routes-table has class data-table
+		tableClass := getAttr(table, "class")
+		tableClasses := strings.Fields(tableClass)
+		hasDataTable := false
+		for _, c := range tableClasses {
+			if c == "data-table" {
+				hasDataTable = true
+				break
+			}
+		}
+		if !hasDataTable {
+			t.Errorf("#vpn-fwd-routes-table missing class data-table, got classes: %q", tableClass)
+		}
+
+		// 3. Minimum width rule
+		tableStyle := getAttr(table, "style")
+		if !strings.Contains(tableStyle, "min-width: 540px") {
+			t.Errorf("#vpn-fwd-routes-table style missing min-width: 540px, got: %q", tableStyle)
+		}
+
+		// 4. Headers: Peer has white-space: nowrap, Queue, Peak, Drops, Writes have text-align: right
+		thNodes := findChildrenByTag(table, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("expected 5 <th> elements in #vpn-fwd-routes-table, found %d", len(thNodes))
+		}
+		thPeerStyle := getAttr(thNodes[0], "style")
+		if !strings.Contains(thPeerStyle, "white-space: nowrap") {
+			t.Errorf("peer header style = %q, want containing 'white-space: nowrap'", thPeerStyle)
+		}
+		for i, name := range []string{"queue", "peak", "drops", "writes"} {
+			thStyle := getAttr(thNodes[i+1], "style")
+			if !strings.Contains(thStyle, "text-align: right") {
+				t.Errorf("%s header style = %q, want containing 'text-align: right'", name, thStyle)
+			}
+		}
+	})
+
+	t.Run("RenderedCellFormattingInNode", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+
+		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + "\n" + f1 + "\n" + f2 + `
+document.reset();
+
+const sampleRoutes = [
+    { peer_key: 'peer1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
+    { peer_key: 'peer2', occupancy: 90, capacity: 100, high_water: 95, drops: 5, queue_full_drops_recent: 2, write_count: 50 },
+    { peer_key: 'peer3', occupancy: 0, capacity: 100, high_water: 10, drops: 0, pressure_note: 'Testing note' },
+    { peer_key: 'peer4', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, write_errors: 2, write_errors_recent: 1 },
+    { peer_key: 'peer5', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, p95_write_ms: 25.4 }
+];
+
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+const tbody = document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row has 5 cells');
+
+    // Peer cell has white-space: nowrap
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'row ' + i + ' peer cell must have white-space: nowrap');
+
+    // Numeric cells have text-align: right
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'row ' + i + ' queue cell must have text-align: right');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'row ' + i + ' peak cell must have text-align: right');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'row ' + i + ' drops cell must have text-align: right');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'row ' + i + ' writes cell must have text-align: right');
+}
+
+console.log('TABLE_FORMATTING_PASS');
+`
+		cmd := exec.Command(nodePath, "-e", runnerScript)
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Table formatting DOM tests failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "TABLE_FORMATTING_PASS") {
+			t.Fatalf("Table formatting DOM tests did not output TABLE_FORMATTING_PASS\nOutput:\n%s", string(out))
+		}
+	})
 }

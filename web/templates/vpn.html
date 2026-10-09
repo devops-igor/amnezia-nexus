@@ -347,18 +347,18 @@
                 </span>
             </div>
         </summary>
-        <div style="margin-top: var(--space-md); overflow-x: auto;">
+        <div class="table-container" style="margin-top: var(--space-md);">
             <div id="vpn-fwd-routes-empty" style="text-align: center; color: var(--text-muted); padding: var(--space-md); font-size: 0.85rem;">
                 {{ _ "vpn_forwarder_no_route_pressure" }}
             </div>
-            <table class="table" id="vpn-fwd-routes-table" style="width: 100%; min-width: 100%; font-size: 0.85rem; display: none;">
+            <table class="table data-table" id="vpn-fwd-routes-table" style="width: 100%; min-width: 540px; font-size: 0.85rem; display: none;">
                 <thead>
                     <tr>
-                        <th>{{ _ "vpn_forwarder_route_peer" }}</th>
-                        <th>{{ _ "vpn_forwarder_route_queue" }}</th>
-                        <th>{{ _ "vpn_forwarder_route_peak" }}</th>
-                        <th>{{ _ "vpn_forwarder_route_drops" }}</th>
-                        <th>{{ _ "vpn_forwarder_route_writes" }}</th>
+                        <th style="white-space: nowrap;">{{ _ "vpn_forwarder_route_peer" }}</th>
+                        <th style="text-align: right;">{{ _ "vpn_forwarder_route_queue" }}</th>
+                        <th style="text-align: right;">{{ _ "vpn_forwarder_route_peak" }}</th>
+                        <th style="text-align: right;">{{ _ "vpn_forwarder_route_drops" }}</th>
+                        <th style="text-align: right;">{{ _ "vpn_forwarder_route_writes" }}</th>
                     </tr>
                 </thead>
                 <tbody id="vpn-fwd-routes-tbody">
@@ -2181,6 +2181,7 @@
                 // Peer column (truncated + tooltip)
                 const tdPeer = document.createElement('td');
                 tdPeer.className = 'font-mono text-sm';
+                tdPeer.style.whiteSpace = 'nowrap';
                 tdPeer.title = routeTooltip(r);
                 tdPeer.textContent = vpnFormatPeerKey(peerKey);
                 tr.appendChild(tdPeer);
@@ -2188,6 +2189,7 @@
                 // Queue column
                 const tdQueue = document.createElement('td');
                 tdQueue.className = 'font-mono text-sm';
+                tdQueue.style.textAlign = 'right';
                 tdQueue.textContent = rCap > 0 ? (rOcc + ' / ' + rCap) : String(rOcc);
                 if (rCap > 0 && rOcc >= rCap * 0.8) {
                     tdQueue.style.color = 'var(--danger)';
@@ -2198,12 +2200,14 @@
                 // Peak column
                 const tdPeak = document.createElement('td');
                 tdPeak.className = 'font-mono text-sm';
+                tdPeak.style.textAlign = 'right';
                 tdPeak.textContent = String(rPeak);
                 tr.appendChild(tdPeak);
 
                 // Drops column
                 const tdDrops = document.createElement('td');
                 tdDrops.className = 'font-mono text-sm';
+                tdDrops.style.textAlign = 'right';
                 tdDrops.textContent = String(rDrops);
                 if (Number(r.queue_full_drops_recent || 0) > 0) {
                     tdDrops.style.color = 'var(--danger)';
@@ -2214,6 +2218,7 @@
                 // Writes column
                 const tdWrites = document.createElement('td');
                 tdWrites.className = 'font-mono text-sm text-muted';
+                tdWrites.style.textAlign = 'right';
                 if (rNote) {
                     tdWrites.textContent = rNote;
                     tdWrites.style.color = 'var(--warning)';
