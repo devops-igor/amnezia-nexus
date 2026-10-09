@@ -1607,11 +1607,12 @@ func vpnBackendDeviceReasonInventory(t *testing.T) []string {
 	return reasons
 }
 
-// vpnBackendDeviceReasonsBody is the shared renderer oracle. It supplies each
-// supported backend-device reason on its own, requires the alarm for it, and
-// pins the availability, zero, recovery, unknown and locale contracts around the
-// same KPI. It prints RESULT <json> so the caller can compare locales byte for
-// byte instead of trusting that one locale happened to be exercised.
+// vpnBackendDeviceReasonsBody is the shared renderer oracle for Card 2 drop reasons.
+// It supplies each supported backend-device reason on its own, requires the danger
+// alarm highlight for it in the drop reasons table, and pins the availability, zero,
+// recovery, unknown and locale contracts around the Card 2 drop reasons table.
+// It prints RESULT <json> so the caller can compare locales byte for byte instead
+// of trusting that one locale happened to be exercised.
 func vpnBackendDeviceReasonsBody(t *testing.T) string {
 	t.Helper()
 	inventory, err := json.Marshal(vpnBackendDeviceReasonInventory(t))
@@ -1626,12 +1627,21 @@ assert.deepStrictEqual(deviceReasons.slice().sort(), apiReasons,
 	'API-to-label backend-device reason inventory drifted');
 assert.strictEqual(deviceReasons.length, 7, 'backend-device reason count changed');
 assert(deviceReasons.includes('backend_device_unattributed'),
-	'backend_device_unattributed must drive the backend KPI alarm');
+	'backend_device_unattributed must drive the backend loss alarm');
 for (const retired of ['client_backend_device_retired_drops']) {
-	assert(!deviceReasons.includes(retired), 'retired-only reason must stay out of the KPI: ' + retired);
+	assert(!deviceReasons.includes(retired), 'retired-only reason must stay out of canonical map: ' + retired);
 }
-const kpi = () => document.getElementById('vpn-diag-be-drops');
-const alarm = () => kpi().style.color;
+const reasonRows = () => Array.from(document.getElementById('vpn-diag-drop-reasons').children);
+const findReasonRow = (reason) => {
+	const labelKey = vpnLossReasonLabels()[reason];
+	if (!labelKey) return undefined;
+	const label = _(labelKey);
+	return reasonRows().find(r => r.textContent.includes(label));
+};
+const reasonAlarm = (reason) => {
+	const row = findReasonRow(reason);
+	return row ? row.style.color : 'missing';
+};
 const observed = [];
 function render(drop_categories, backends) {
 	vpnRenderForwarderHealth(Object.assign({
@@ -1640,54 +1650,55 @@ function render(drop_categories, backends) {
 		health_assessment: {status: 'HEALTHY', conditions: []}
 	}, backends ? {backends} : {}, {drop_categories}));
 }
-// Every supported backend-device reason alarms on its own positive current rate.
+// Every supported backend-device reason alarms on its own positive current rate in Card 2.
 for (const reason of apiReasons) {
 	render({rates_available: true, reason_rates: {[reason]: 3}}, {total_drops: 17});
-	assert.strictEqual(alarm(), 'var(--danger)', reason + ' current backend loss must alarm');
-	observed.push(reason + '=' + alarm());
+	assert.strictEqual(reasonAlarm(reason), 'var(--danger)', reason + ' current backend loss must alarm');
+	observed.push(reason + '=' + reasonAlarm(reason));
 }
 // Nonzero lifetime alone is history, not a current alarm.
-render({rates_available: true, total_drops: 4242}, {total_drops: 4242});
-assert.strictEqual(alarm(), '', 'lifetime backend drops alone must not alarm');
-observed.push('lifetime=' + alarm());
+render({rates_available: true, total_drops: 4242, backend_device_unattributed: 4242}, {total_drops: 4242});
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), '', 'lifetime backend drops alone must not alarm');
+observed.push('lifetime=' + reasonAlarm('backend_device_unattributed'));
+
 // A measured zero rate clears a prior alarm while the loss stays visible.
-render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 3}}, {total_drops: 4242});
-assert.strictEqual(alarm(), 'var(--danger)', 'fresh current loss must alarm');
-observed.push('fresh=' + alarm());
-render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 0}}, {total_drops: 4242});
-assert.strictEqual(alarm(), '', 'measured zero must clear the alarm');
-observed.push('zero=' + alarm());
+render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 3}, backend_device_unattributed: 4242}, {total_drops: 4242});
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), 'var(--danger)', 'fresh current loss must alarm');
+observed.push('fresh=' + reasonAlarm('backend_device_unattributed'));
+render({rates_available: true, total_drops: 4242, reason_rates: {backend_device_unattributed: 0}, backend_device_unattributed: 4242}, {total_drops: 4242});
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), '', 'measured zero must clear the alarm');
+observed.push('zero=' + reasonAlarm('backend_device_unattributed'));
+
 // Unavailable rates and an unavailable forwarder both suppress the alarm.
-render({rates_available: false, total_drops: 4242, reason_rates: {backend_device_unattributed: 9}}, {total_drops: 4242});
-assert.strictEqual(alarm(), '', 'unavailable rates must not alarm');
-observed.push('unavailable=' + alarm());
+render({rates_available: false, total_drops: 4242, reason_rates: {backend_device_unattributed: 9}, backend_device_unattributed: 4242}, {total_drops: 4242});
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), '', 'unavailable rates must not alarm');
+observed.push('unavailable=' + reasonAlarm('backend_device_unattributed'));
 render({}, {total_drops: 4242});
-assert.strictEqual(alarm(), '', 'missing rates_available must not alarm');
-observed.push('missing-flag=' + alarm());
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), 'missing', 'missing rates_available must not alarm');
+observed.push('missing-flag=' + (reasonAlarm('backend_device_unattributed') === 'missing'));
 vpnRenderForwarderHealth({forwarder_available: false});
-assert.strictEqual(alarm(), '', 'unavailable forwarder must clear the alarm');
-observed.push('unavailable-forwarder=' + alarm());
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), 'missing', 'unavailable forwarder must clear the alarm');
+observed.push('unavailable-forwarder=' + (reasonAlarm('backend_device_unattributed') === 'missing'));
+
 // Unknown, retired-only and overlapping non-device reasons stay out of the sum.
 render({rates_available: true, total_drops: 7, reason_rates: {
 	client_backend_device_retired_drops: 5, future_reason: 5, return_injection_errors: 5,
 	client_backend_queue_full: 5}}, {total_drops: 7});
-assert.strictEqual(alarm(), '', 'retired, unknown and injection reasons must not alarm');
-observed.push('excluded=' + alarm());
+assert.strictEqual(reasonAlarm('backend_device_unattributed'), 'missing', 'unattributed stays out');
+observed.push('excluded=' + (reasonAlarm('backend_device_unattributed') === 'missing'));
+
 // Fresh recovery after an unavailable poll alarms again on a live reason.
 render({rates_available: true, reason_rates: {return_backend_device_shutdown: 1}}, {total_drops: 8});
-assert.strictEqual(alarm(), 'var(--danger)', 'recovered poll must alarm on live loss');
-observed.push('recovery=' + alarm());
+assert.strictEqual(reasonAlarm('return_backend_device_shutdown'), 'var(--danger)', 'recovered poll must alarm on live loss');
+observed.push('recovery=' + reasonAlarm('return_backend_device_shutdown'));
 console.log('RESULT ' + JSON.stringify(observed));
 `
 }
 
-// TestVPNBackendDeviceKPIAlarmCoverage pins the backend-device KPI against the
-// canonical reason map for every active locale. The defect under test: a second,
-// manually curated KPI subset omitted the unattributed backend-device reason
-// (backend_device_unattributed), so the detailed reason table showed the loss
-// while the KPI never alarmed.
+// TestVPNBackendDeviceKPIAlarmCoverage pins the backend-device reason contract against the
+// canonical reason map for every active locale. In Card 2, active backend-device loss
+// rates alarm with danger highlighting in the drop reasons table.
 func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
-	t.Skip("vpn-diag-be-drops removed in issue-466: consolidated into Card 4")
 	node, err := findNodeBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -1723,10 +1734,9 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 
 // TestVPNBackendDeviceKPIAlarmMutations proves the acceptance oracle above is
 // load-bearing in both directions: the alarm coverage must break when
-// backend_device_unattributed is dropped from the KPI subset, and the
-// API-to-label inventory must break when it is dropped from the canonical map.
+// reason danger styling is disabled, and the API-to-label inventory must break
+// when backend_device_unattributed is dropped from the canonical map.
 func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
-	t.Skip("vpn-diag-be-drops removed in issue-466: consolidated into Card 4")
 	node, err := findNodeBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -1738,10 +1748,10 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 	body := vpnBackendDeviceReasonsBody(t)
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		{
-			name:    "UnattributedDroppedFromKPISubset",
-			before:  "return key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0 || key === 'backend_device_unattributed';",
-			after:   "return key !== 'backend_device_unattributed' && (key.indexOf('client_backend_device_') === 0 || key.indexOf('return_backend_device_') === 0);",
-			failure: "backend_device_unattributed current backend loss must alarm",
+			name:    "ReasonDangerColorDisabled",
+			before:  "row.style.color = dc.rates_available === true && rateVal > 0 ? 'var(--danger)' : '';",
+			after:   "row.style.color = '';",
+			failure: "current backend loss must alarm",
 		},
 		{
 			name:    "UnattributedDroppedFromCanonicalMap",
@@ -1878,10 +1888,31 @@ vpnRenderForwarderHealth({...base,virtual_tun:{
  nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}}});
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Degraded');
 
-// Active recent drop rate degrades VirtualTUN
+// Moderate queue pressure (>= 50%, < 80%) marks VirtualTUN as Warning
 vpnRenderForwarderHealth({...base,virtual_tun:{
- upstream_to_nexus:{occupancy:1,capacity:10,peak:1,recent_drops:5},
+ upstream_to_nexus:{occupancy:5,capacity:10,peak:5,drops:0},
  nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Warning');
+
+// Active VirtualTUN drop rate (>= 10.0 pps) degrades VirtualTUN
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{occupancy:1,capacity:10,peak:1,drops:0},
+ nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}},
+ drop_categories:{rates_available:true,reason_rates:{client_virtualtun_drops:10.5}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Degraded');
+
+// Active VirtualTUN drop rate (> 0, < 10.0 pps) marks VirtualTUN as Warning
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{occupancy:1,capacity:10,peak:1,drops:0},
+ nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}},
+ drop_categories:{rates_available:true,reason_rates:{return_virtualtun_drops:2.0}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Warning');
+
+// Combined drop rate (client + return) >= 10.0 degrades VirtualTUN
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{occupancy:1,capacity:10,peak:1,drops:0},
+ nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}},
+ drop_categories:{rates_available:true,reason_rates:{client_virtualtun_drops:6.0,return_virtualtun_drops:4.5}}});
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Degraded');
 
 // Zero-capacity unmeasured queues render unavailable

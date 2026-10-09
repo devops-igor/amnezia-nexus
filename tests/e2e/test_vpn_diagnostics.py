@@ -98,11 +98,28 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
         "#vpn-diag-res-fd",
     ]
 
-    for loc in diag_fields:
-        el = page.locator(loc)
-        expect(el).to_be_visible()
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details summary").click()
 
-    for obsolete in ["#vpn-diag-packets", "#vpn-diag-res-goroutines", "#vpn-diag-res-gc", "#vpn-fwd-routes-details"]:
+    # Assert exactly 4 operational cards
+    cards = page.locator(
+        "#vpn-fwd-tech-details > div > div > div.card, "
+        "#vpn-fwd-tech-details > div > div.card"
+    )
+    expect(cards).to_have_count(4)
+
+    # Assert visibility of all 17 retained diagnostic fields
+    for loc in diag_fields:
+        expect(page.locator(loc)).to_be_visible()
+
+    # Assert absence of obsolete elements
+    for obsolete in [
+        "#vpn-diag-packets",
+        "#vpn-diag-res-goroutines",
+        "#vpn-diag-res-gc",
+        "#vpn-fwd-routes-details",
+    ]:
         expect(page.locator(obsolete)).to_have_count(0)
 
 

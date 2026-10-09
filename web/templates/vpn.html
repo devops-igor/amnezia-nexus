@@ -2553,26 +2553,44 @@
         // Card 3: Engine & Route Integrity
         const dEngine = document.getElementById('vpn-diag-engine-status');
         if (dEngine) {
-            const awgState = status.listener_running ? _('vpn_diag_state_active') : _('vpn_diag_state_stopped');
+            const awgState = status.listener_running ? (_('vpn_diag_state_active') || 'active') : (_('vpn_diag_state_stopped') || 'stopped');
             const vt = status.virtual_tun || {};
             const vtUp = vt.upstream_to_nexus || {};
             const vtNexus = vt.nexus_to_upstream || {};
-            const vtUnavailable = vt.available === false ||
-                (Number(vtUp.capacity || 0) === 0 && Number(vtNexus.capacity || 0) === 0 && !vtUp.occupancy && !vtNexus.occupancy);
-            const vtDegraded = !vtUnavailable && (
-                (vtUp.capacity > 0 && vtUp.occupancy / vtUp.capacity >= 0.8) ||
-                (vtNexus.capacity > 0 && vtNexus.occupancy / vtNexus.capacity >= 0.8) ||
-                (Number(vtUp.recent_drops || 0) > 0) || (Number(vtNexus.recent_drops || 0) > 0) ||
-                (Number(vtUp.drop_rate || 0) > 0) || (Number(vtNexus.drop_rate || 0) > 0)
-            );
-            let vtStatus = _('vpn_fwd_healthy');
-            if (vtUnavailable) {
-                vtStatus = _('vpn_diag_loss_unavailable');
-            } else if (vtDegraded) {
-                vtStatus = _('vpn_fwd_degraded');
+            const dc = status.drop_categories || {};
+            const rates = dc.reason_rates || {};
+            const vtDropRate = (dc.rates_available === true) ? (Number(rates['client_virtualtun_drops'] || 0) + Number(rates['return_virtualtun_drops'] || 0)) : 0;
+            const upCap = Number(vtUp.capacity || 0);
+            const nexusCap = Number(vtNexus.capacity || 0);
+            const upOcc = Number(vtUp.occupancy || 0);
+            const nexusOcc = Number(vtNexus.occupancy || 0);
+            const upUtil = upCap > 0 ? upOcc / upCap : 0;
+            const nexusUtil = nexusCap > 0 ? nexusOcc / nexusCap : 0;
+
+            let vtStatus = _('vpn_fwd_healthy') || 'Healthy';
+            let isVtDegraded = false;
+            let isVtWarning = false;
+
+            if (vt.available === false || (upCap === 0 && nexusCap === 0 && upOcc === 0 && nexusOcc === 0)) {
+                vtStatus = _('vpn_diag_loss_unavailable') || 'Unavailable';
+            } else if (upUtil >= 0.8 || nexusUtil >= 0.8 || vtDropRate >= 10.0) {
+                isVtDegraded = true;
+                vtStatus = _('vpn_fwd_degraded') || 'Degraded';
+            } else if (upUtil >= 0.5 || nexusUtil >= 0.5 || vtDropRate > 0) {
+                isVtWarning = true;
+                vtStatus = _('vpn_fwd_warning') || 'Warning';
             }
+
             dEngine.textContent = 'amneziawg-go (' + awgState + ') • VirtualTUN: ' + vtStatus;
-            dEngine.style.color = (status.listener_running && !vtDegraded && !vtUnavailable) ? 'var(--success)' : 'var(--danger)';
+            if (!status.listener_running || isVtDegraded) {
+                dEngine.style.color = 'var(--danger)';
+            } else if (isVtWarning) {
+                dEngine.style.color = 'var(--warning)';
+            } else if (vt.available === false || vtStatus === (_('vpn_diag_loss_unavailable') || 'Unavailable')) {
+                dEngine.style.color = 'var(--text-muted)';
+            } else {
+                dEngine.style.color = 'var(--success)';
+            }
         }
         const peerSyncUnavailable = _('vpn_diag_peer_sync_unavailable');
         const ps = status.peer_sync;
@@ -2603,7 +2621,10 @@
                 dRoutBadge.textContent = isConsistent ? _('vpn_fwd_consistent') : _('vpn_fwd_inconsistent');
             }
             if (dRoutCounts) {
-                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' sessions • ' + (rc.active_routes_count || 0) + ' routes • ' + (rc.return_owners_count || 0) + ' returns (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
+                const sLabel = _('vpn_diag_sessions') || 'sessions';
+                const rLabel = _('vpn_diag_routes') || 'routes';
+                const retLabel = _('vpn_diag_returns') || 'returns';
+                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' ' + sLabel + ' • ' + (rc.active_routes_count || 0) + ' ' + rLabel + ' • ' + (rc.return_owners_count || 0) + ' ' + retLabel + ' (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
             }
             if (dRoutAlerts) {
                 if (Array.isArray(rc.inconsistency_details) && rc.inconsistency_details.length > 0) {
