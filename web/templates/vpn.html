@@ -2543,7 +2543,9 @@
             if (renderedCount === 0) {
                 const emptyRow = document.createElement('div');
                 emptyRow.className = 'text-muted';
-                emptyRow.textContent = _('vpn_diag_no_active_drops') || 'No active drops';
+                emptyRow.textContent = dc.rates_available === false ?
+                    _('vpn_diag_loss_unavailable') :
+                    (_('vpn_diag_no_active_drops') || 'No active drops');
                 reasonTable.appendChild(emptyRow);
             }
         }
@@ -2551,16 +2553,26 @@
         // Card 3: Engine & Route Integrity
         const dEngine = document.getElementById('vpn-diag-engine-status');
         if (dEngine) {
-            const awgState = status.listener_running ? 'active' : 'stopped';
+            const awgState = status.listener_running ? _('vpn_diag_state_active') : _('vpn_diag_state_stopped');
             const vt = status.virtual_tun || {};
             const vtUp = vt.upstream_to_nexus || {};
             const vtNexus = vt.nexus_to_upstream || {};
-            const vtDegraded = (vtUp.capacity > 0 && vtUp.occupancy / vtUp.capacity >= 0.8) ||
+            const vtUnavailable = vt.available === false ||
+                (Number(vtUp.capacity || 0) === 0 && Number(vtNexus.capacity || 0) === 0 && !vtUp.occupancy && !vtNexus.occupancy);
+            const vtDegraded = !vtUnavailable && (
+                (vtUp.capacity > 0 && vtUp.occupancy / vtUp.capacity >= 0.8) ||
                 (vtNexus.capacity > 0 && vtNexus.occupancy / vtNexus.capacity >= 0.8) ||
-                (Number(vtUp.drops || 0) > 0) || (Number(vtNexus.drops || 0) > 0);
-            const vtStatus = vtDegraded ? 'Degraded' : 'Healthy';
+                (Number(vtUp.recent_drops || 0) > 0) || (Number(vtNexus.recent_drops || 0) > 0) ||
+                (Number(vtUp.drop_rate || 0) > 0) || (Number(vtNexus.drop_rate || 0) > 0)
+            );
+            let vtStatus = _('vpn_fwd_healthy');
+            if (vtUnavailable) {
+                vtStatus = _('vpn_diag_loss_unavailable');
+            } else if (vtDegraded) {
+                vtStatus = _('vpn_fwd_degraded');
+            }
             dEngine.textContent = 'amneziawg-go (' + awgState + ') • VirtualTUN: ' + vtStatus;
-            dEngine.style.color = (status.listener_running && !vtDegraded) ? 'var(--success)' : 'var(--danger)';
+            dEngine.style.color = (status.listener_running && !vtDegraded && !vtUnavailable) ? 'var(--success)' : 'var(--danger)';
         }
         const peerSyncUnavailable = _('vpn_diag_peer_sync_unavailable');
         const ps = status.peer_sync;
@@ -2591,7 +2603,7 @@
                 dRoutBadge.textContent = isConsistent ? _('vpn_fwd_consistent') : _('vpn_fwd_inconsistent');
             }
             if (dRoutCounts) {
-                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' / ' + (rc.active_routes_count || 0) + ' / ' + (rc.return_owners_count || 0) + ' (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
+                dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' sessions • ' + (rc.active_routes_count || 0) + ' routes • ' + (rc.return_owners_count || 0) + ' returns (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
             }
             if (dRoutAlerts) {
                 if (Array.isArray(rc.inconsistency_details) && rc.inconsistency_details.length > 0) {
@@ -2630,14 +2642,19 @@
         if (backendTraffic) {
             backendTraffic.textContent = '';
             const beList = (status.backends && status.backends.backends) || [];
-            if (beList.length > 0) {
-                const totalTraffic = beList.reduce((sum, b) => {
+            const activeBackends = beList.filter(b => b.enabled !== false && b.routable !== false);
+            if (activeBackends.length > 0) {
+                const measuredBackends = activeBackends.filter(b => b.traffic_available !== false);
+                const totalTraffic = measuredBackends.reduce((sum, b) => {
                     const rx = Number(b.rx_bytes_per_sec || 0);
                     const tx = Number(b.tx_bytes_per_sec || 0);
                     return sum + rx + tx;
                 }, 0);
-                const parts = beList.map(b => {
+                const parts = activeBackends.map(b => {
                     const name = b.server_name || ('Backend ' + (b.id !== undefined ? b.id : ''));
+                    if (b.traffic_available === false) {
+                        return name + ' (' + _('vpn_diag_loss_unavailable') + ')';
+                    }
                     const traffic = Number(b.rx_bytes_per_sec || 0) + Number(b.tx_bytes_per_sec || 0);
                     const pct = totalTraffic > 0 ? Math.round((traffic / totalTraffic) * 100) : 0;
                     return name + ' (' + pct + '%)';

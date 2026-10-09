@@ -546,7 +546,7 @@ assert.strictEqual(reasonRows[0].textContent, 'No active drops');
 assert.strictEqual(document.getElementById('vpn-diag-engine-status').textContent, 'amneziawg-go (active) • VirtualTUN: Healthy');
 assert.strictEqual(document.getElementById('vpn-diag-peers-status').textContent, '10 / 10');
 assert(document.getElementById('vpn-diag-hs-freshness').textContent.includes('<2m: 8'));
-assert(document.getElementById('vpn-diag-routing-counts').textContent.includes('10 / 10 / 10'));
+assert(document.getElementById('vpn-diag-routing-counts').textContent.includes('10 sessions • 10 routes • 10 returns'));
 
 // Card 4: System & Fleet Resources
 assert.strictEqual(document.getElementById('vpn-diag-res-cpu').textContent, '12.5%');
@@ -573,6 +573,36 @@ const activeReasonRows = document.getElementById('vpn-diag-drop-reasons').childr
 assert.strictEqual(activeReasonRows.length, 2);
 assert(activeReasonRows[0].textContent.includes('3.00 pps (12 cumulative)'));
 assert(activeReasonRows[1].textContent.includes('1.50 pps (5 cumulative)'));
+
+// 3. Unmeasured drop reasons: when rates_available is false and no drops, renders Loss rate unavailable
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    drop_categories: {
+        rates_available: false,
+        client_malformed: 0,
+        return_queue_full: 0
+    }
+});
+const unmeasuredReasonRows = document.getElementById('vpn-diag-drop-reasons').children;
+assert.strictEqual(unmeasuredReasonRows.length, 1);
+assert.strictEqual(unmeasuredReasonRows[0].textContent, 'Loss rate unavailable');
+
+// 4. Fleet traffic share edge cases: filters disabled and unroutable, displays unavailable for unsampled
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    backends: {
+        backends: [
+            { server_name: 'NodeActive', enabled: true, routable: true, rx_bytes_per_sec: 100, tx_bytes_per_sec: 100 },
+            { server_name: 'NodeUnsampled', enabled: true, routable: true, traffic_available: false },
+            { server_name: 'NodeDisabled', enabled: false, routable: true, rx_bytes_per_sec: 900, tx_bytes_per_sec: 900 },
+            { server_name: 'NodeUnroutable', enabled: true, routable: false, rx_bytes_per_sec: 900, tx_bytes_per_sec: 900 }
+        ]
+    }
+});
+const fleetRows = document.getElementById('vpn-diag-be-traffic').children;
+assert.strictEqual(fleetRows.length, 1);
+assert.strictEqual(fleetRows[0].textContent, 'NodeActive (100%) • NodeUnsampled (Loss rate unavailable)');
 `
 	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("operational diagnostics cards contract: %v\n%s", err, out)
@@ -1319,15 +1349,19 @@ const point={traffic_available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,sessions
  drop_rates_available:true,drop_reason_rates:{return_queue_full:0,future_reason:0},fwd_p95_ms:0,fwd_p95_samples:1,
  be_p95_ms:0,be_latency_samples:1,backends:[{id:3,rx_bps:0,traffic_available:true,probe_latency_ms:0,probe_available:true}],backends_omitted:5};
 const fixture={forwarder_available:true,forwarder_queue_capacity:100,listener_running:true,
+ virtual_tun:{
+  upstream_to_nexus:{occupancy:10,capacity:100,peak:20,drops:0},
+  nexus_to_upstream:{occupancy:15,capacity:100,peak:25,drops:0}},
  health_assessment:{status:'HEALTHY',conditions:[]},rates:{available:false,rx_bps:999,tx_bps:999},
  drop_categories:{rates_available:false,total_drops:12},routing_consistency:{is_consistent:false,ownership_mismatch_drops:4,inconsistency_details:['Server detail']},
  problem_routes:[route],all_routes:[route],
  queue_pressure:{total_seconds_above_50:65,consecutive_above_50_sec:2,total_seconds_above_80:3600,consecutive_above_80_sec:0},
  forward_latency:{p95_health_samples:0,stalls_recent:2,stalls:8,p50_ms:1.5,p95_ms:2.5,p99_ms:3.5,max_ms:7,in_flight:2,oldest_in_flight_ms:9,write_total:10,write_errors:3,write_error_rate_pps:1.25},
  backends:{eligibility_known:true,healthy_count:1,enabled_count:2,total_count:3,disabled_count:1,latency_samples:0,backends:[
- {server_name:'Server < & "quote">',enabled:false,traffic_available:false},
- {server_name:'Server 2',enabled:true,health_state:'active',traffic_available:true},
- {server_name:'Server 3',enabled:true,health_state:'future_state',traffic_available:true}]},
+  {server_name:'Server < & "quote">',enabled:true,traffic_available:false},
+  {server_name:'Server 2',enabled:true,health_state:'active',traffic_available:true},
+  {server_name:'Server 3',enabled:true,health_state:'future_state',traffic_available:true},
+  {server_name:'Server Disabled',enabled:false,traffic_available:true}]},
  historical_series:{window_15m:[point]},peer_sync:{desired_peers:1,actual_peers:1,sync_failures:3,sync_failures_recent:2}};
 const original=JSON.stringify(fixture);
 vpnRenderForwarderHealth(fixture);
@@ -1335,13 +1369,14 @@ assert.strictEqual(text('vpn-kpi-throughput'),E('vpn_diag_traffic_unavailable'),
 assert.strictEqual(text('vpn-diag-throughput'),E('vpn_diag_traffic_unavailable'));
 assert.strictEqual(text('vpn-kpi-packet-loss'),E('vpn_diag_with_cumulative',{value:E('vpn_diag_loss_unavailable'),count:12}),'unknown loss');
 assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_running')}),'engine running');
-assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (active) • VirtualTUN: Healthy');
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (' + E('vpn_diag_state_active') + ') • VirtualTUN: ' + E('vpn_fwd_healthy'));
 assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_inconsistent'),'routing state');
 assert.strictEqual(text('vpn-diag-routing-alerts'),'Server detail','server detail unchanged');
 assert(text('vpn-diag-routing-counts').includes(E('vpn_diag_mismatch_drops',{count:4})));
 assert.strictEqual(text('vpn-kpi-backends'),E('vpn_diag_healthy_count',{healthy:1,enabled:2})+E('vpn_diag_disabled_count',{count:1}));
 const backendRows=document.getElementById('vpn-diag-be-traffic').children;
-assert(backendRows[0].textContent.includes('Server < & "quote">') && backendRows[0].innerHTML==='','backend name uses text');
+assert(backendRows[0].textContent.includes('Server < & "quote"> (' + E('vpn_diag_loss_unavailable') + ')') && backendRows[0].innerHTML==='','backend name uses text');
+assert(!backendRows[0].textContent.includes('Server Disabled'),'disabled backend is excluded');
 assert.strictEqual(text('vpn-kpi-slow-writes'),E('vpn_diag_slow_writes',{count:2,latency:E('vpn_diag_latency_unavailable')}));
 assert.strictEqual(document.getElementById('vpn-kpi-slow-writes').title,E('vpn_diag_slow_writes_title',{count:8,latency:'2.5'}));
 assert.strictEqual(text('vpn-diag-lat-percentiles'),E('vpn_diag_historical_percentiles',{p50:'1.5',p95:'2.5',p99:'3.5'}),'percentile interpolation');
@@ -1370,6 +1405,7 @@ fixture.listener_running=false;fixture.routing_consistency.is_consistent=true;
 fixture.health_assessment={status:'HEALTHY',conditions:[]};
 vpnRenderForwarderHealth(fixture);
 assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_stopped')}));
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (' + E('vpn_diag_state_stopped') + ') • VirtualTUN: ' + E('vpn_fwd_healthy'));
 assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_consistent'));
 assert.strictEqual(text('vpn-fwd-headline-summary'),E('vpn_diag_summary_healthy'),'fallback summary');
 fixture.health_assessment.summary='Server summary';vpnRenderForwarderHealth(fixture);
@@ -1830,10 +1866,30 @@ func TestVPNDiagnosticsCurrentObservations(t *testing.T) {
 	script := vpnDiagnosticsHealthScript(t, string(source), `
 const text = id => document.getElementById(id).textContent;
 const base = {forwarder_available:true, health_assessment:{status:'HEALTHY'}, rates:{available:true}};
+// A recovered data path with historical cumulative drops must be Healthy, not Degraded
 vpnRenderForwarderHealth({...base,virtual_tun:{
  upstream_to_nexus:{occupancy:3,capacity:11,peak:7,drops:13},
  nexus_to_upstream:{occupancy:5,capacity:17,peak:9,drops:19}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Healthy');
+
+// Active queue pressure (>= 80%) degrades VirtualTUN
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{occupancy:9,capacity:10,peak:9,drops:0},
+ nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}}});
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Degraded');
+
+// Active recent drop rate degrades VirtualTUN
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{occupancy:1,capacity:10,peak:1,recent_drops:5},
+ nexus_to_upstream:{occupancy:1,capacity:10,peak:1,drops:0}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Degraded');
+
+// Zero-capacity unmeasured queues render unavailable
+vpnRenderForwarderHealth({...base,virtual_tun:{
+ upstream_to_nexus:{capacity:0,occupancy:0},
+ nexus_to_upstream:{capacity:0,occupancy:0}}});
+assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (stopped) • VirtualTUN: Loss rate unavailable');
+
 vpnRenderForwarderHealth({...base,listener_running:true,virtual_tun:{
  upstream_to_nexus:{occupancy:0,capacity:100,peak:0,drops:0},
  nexus_to_upstream:{occupancy:0,capacity:100,peak:0,drops:0}}});
