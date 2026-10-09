@@ -2618,7 +2618,7 @@
             // 1. Strip volatile timestamps first before IP address protection
             let s = msg
                 .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
-                .replace(/\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b/g, '');
+                .replace(/(?<!:)\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b(?!:)/g, '');
 
             // 2. Protect IP addresses (both IPv4 and IPv6) so their digits are preserved
             const preservedIps = [];
@@ -2626,8 +2626,8 @@
                 preservedIps.push(m);
                 return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
             });
-            const ipv6Pattern = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+(?::[0-9a-fA-F]{1,4})+|(?:[0-9a-fA-F]{1,4}:)+:|::(?:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|::(?:[0-9a-fA-F]{1,4})(?::[0-9a-fA-F]{1,4})*|::';
-            const ipv6Regex = new RegExp('(?:^|(?<=[^0-9a-fA-F:]))(?:' + ipv6Pattern + ')(?:$|(?=[^0-9a-fA-F:.]))', 'g');
+            const ipv6Pattern = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+(?::[0-9a-fA-F]{1,4})+|(?:[0-9a-fA-F]{1,4}:)+:|::(?:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9a-fA-F]{1,4}:)+(?::(?:[0-9a-fA-F]{1,4}:)*)?(?:\\d{1,3}\\.){3}\\d{1,3}|::(?:[0-9a-fA-F]{1,4})(?::[0-9a-fA-F]{1,4})*|::';
+            const ipv6Regex = new RegExp('(?:^|(?<=[^0-9a-fA-F:]))(?:' + ipv6Pattern + ')(?:$|(?=[^0-9a-fA-F:.]|\\.(?!\\d)))', 'g');
             s = s.replace(ipv6Regex, function(m) {
                 preservedIps.push(m);
                 return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
@@ -2659,7 +2659,7 @@
             if (item.message && typeof item.message === 'string') {
                 const cleanMsg = item.message
                     .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
-                    .replace(/\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b/g, '');
+                    .replace(/(?<!:)\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\b(?!:)/g, '');
 
                 const ipv4 = cleanMsg.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g);
                 if (ipv4) {
@@ -2667,8 +2667,8 @@
                         if (!ips.includes(ipv4[i])) ips.push(ipv4[i]);
                     }
                 }
-                const ipv6Pattern = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+(?::[0-9a-fA-F]{1,4})+|(?:[0-9a-fA-F]{1,4}:)+:|::(?:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|::(?:[0-9a-fA-F]{1,4})(?::[0-9a-fA-F]{1,4})*|::';
-                const ipv6Regex = new RegExp('(?:^|(?<=[^0-9a-fA-F:]))(?:' + ipv6Pattern + ')(?:$|(?=[^0-9a-fA-F:.]))', 'g');
+                const ipv6Pattern = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+(?::[0-9a-fA-F]{1,4})+|(?:[0-9a-fA-F]{1,4}:)+:|::(?:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9a-fA-F]{1,4}:)+(?::(?:[0-9a-fA-F]{1,4}:)*)?(?:\\d{1,3}\\.){3}\\d{1,3}|::(?:[0-9a-fA-F]{1,4})(?::[0-9a-fA-F]{1,4})*|::';
+                const ipv6Regex = new RegExp('(?:^|(?<=[^0-9a-fA-F:]))(?:' + ipv6Pattern + ')(?:$|(?=[^0-9a-fA-F:.]|\\.(?!\\d)))', 'g');
                 const ipv6 = cleanMsg.match(ipv6Regex);
                 if (ipv6) {
                     for (let i = 0; i < ipv6.length; i++) {

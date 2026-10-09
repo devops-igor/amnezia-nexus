@@ -4161,6 +4161,52 @@ w.eval(tablesCode);
     w.vpnRenderForwarderHealth(degradedStatusSpaceTs_tick2);
     assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when space-separated timestamp advances');
 
+    // 5i. Embedded-clock IPv6 replacement: 2001:db8::19:10:10 vs 2001:db8::19:10:15 -> must AUTO-EXPAND
+    // 1. Duplicate-IP condition affecting 2001:db8::19:10:10 is rendered
+    const degradedStatusDupClockIPv6_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 2001:db8::19:10:10'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on embedded-clock IPv6 duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 2001:db8::19:10:10 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of embedded-clock IPv6 condition');
+
+    // 2. Replacement duplicate-IP condition affecting 2001:db8::19:10:15 arrives with identical count 1 and severity CRITICAL
+    const degradedStatusDupClockIPv6_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 2001:db8::19:10:15'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different embedded-clock IPv6 (2001:db8::19:10:15 vs 2001:db8::19:10:10)');
+
+    // Operator collapses accordion after observing new IPv6 incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement embedded-clock IPv6 condition');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
