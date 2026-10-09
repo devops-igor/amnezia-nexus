@@ -1207,11 +1207,11 @@
         const safeConfig = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.connection_name) || '-') : ((s && s.connection_name) || '-');
         const safeIP = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.assigned_ip) || '-') : ((s && s.assigned_ip) || '-');
         tdUser.innerHTML = `
-            <div style="display: inline-flex; align-items: center; gap: var(--space-xs); white-space: nowrap;">
+            <div style="display: inline-flex; align-items: center; gap: var(--space-xs); max-width: 100%; min-width: 0;">
                 <svg class="icon vpn-expand-icon" style="width: 14px; height: 14px; flex-shrink: 0; transition: transform 0.15s ease;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#icon-chevron-right"></use></svg>
-                <div>
-                    <div class="font-weight-600">${safeUsername}</div>
-                    <div class="text-muted text-xs font-mono" style="font-weight: normal;">${safeConfig} &bull; ${safeIP}</div>
+                <div style="min-width: 0; max-width: 100%;">
+                    <div class="font-weight-600" style="white-space: nowrap;">${safeUsername}</div>
+                    <div class="text-muted text-xs font-mono" style="font-weight: normal; overflow: hidden; text-overflow: ellipsis; max-width: 100%;">${safeConfig} &bull; ${safeIP}</div>
                 </div>
             </div>
         `;
@@ -2637,6 +2637,13 @@
                 return '__PRESERVED_IP_' + (preservedIps.length - 1) + '__';
             });
 
+            // Protect ratio patterns representing incident scale/identity (e.g. \b\d+\s+of\s+\d+\b)
+            const preservedRatios = [];
+            s = s.replace(/\b\d+\s+of\s+\d+\b/gi, function(m) {
+                preservedRatios.push(m.replace(/\s+/g, ' '));
+                return '__PRESERVED_RATIO_' + (preservedRatios.length - 1) + '__';
+            });
+
             // 2. Strip volatile timestamps, time clocks, and telemetry metrics ONLY outside protected IP spans
             s = s
                 .replace(/\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi, '')
@@ -2653,8 +2660,11 @@
                 .trim();
 
             // 3. Restore protected IP placeholders for normalized stable condition code
-            const normalizedCode = s.replace(/__PRESERVED_IP_(\d+)__/g, function(_, idx) {
+            let normalizedCode = s.replace(/__PRESERVED_IP_(\d+)__/g, function(_, idx) {
                 return preservedIps[Number(idx)] || '';
+            });
+            normalizedCode = normalizedCode.replace(/__PRESERVED_RATIO_(\d+)__/g, function(_, idx) {
+                return preservedRatios[Number(idx)] || '';
             });
 
             return { normalizedCode: normalizedCode, ips: ips };
@@ -2684,7 +2694,8 @@
         actionableProblems.forEach(function(p) {
             const pMsgKey = p.message_key || deriveStableConditionCode(p.message);
             const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || p.entity_id || extractConditionEntities(p) || '';
-            const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + ':' + (p.severity || '');
+            const pBackendId = p.backend_id ? (':' + p.backend_id) : '';
+            const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + pBackendId + ':' + (p.severity || '');
             currentProblemKeys.add(k);
         });
         qualifyingConditions.forEach(function(c) {

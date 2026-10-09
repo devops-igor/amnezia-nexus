@@ -4245,6 +4245,100 @@ w.eval(tablesCode);
         assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement mixed IPv6 (' + tc.desc + ')');
     }
 
+    // 5k. Escalated backend degradation ratio (1 of 3 vs 2 of 3 enabled backends) -> must AUTO-EXPAND
+    const backendDegraded_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'backend',
+                    severity: 'DEGRADED',
+                    message: '1 of 3 enabled backends are degraded or unavailable (0 administratively disabled, not counted as failures)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendDegraded_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 of 3 backend degradation condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 1 of 3 backend condition -> must STAY closed
+    w.vpnRenderForwarderHealth(backendDegraded_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 of 3 backend condition');
+
+    // Condition updates to 2 of 3 enabled backends degraded with identical total condition count 1 and severity DEGRADED
+    const backendDegraded_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'backend',
+                    severity: 'DEGRADED',
+                    message: '2 of 3 enabled backends are degraded or unavailable (0 administratively disabled, not counted as failures)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendDegraded_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when backend degradation escalates from 1 of 3 to 2 of 3');
+
+    // Operator collapses accordion after observing escalated backend degradation
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(backendDegraded_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 of 3 backend condition');
+
+    // 5l. Actionable problem moving to a different backend node -> must AUTO-EXPAND
+    const backendMove_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    category: 'dataplane',
+                    severity: 'DEGRADED',
+                    message: 'High packet loss on egress for Client X',
+                    connection_id: 'c-100',
+                    username: 'charlie',
+                    backend_id: 'backend-1'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendMove_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on actionable problem on backend-1');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same backend-1 problem -> must STAY closed
+    w.vpnRenderForwarderHealth(backendMove_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of problem on backend-1');
+
+    // Problem shifts to backend-2 with identical count 1 and severity DEGRADED
+    const backendMove_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    category: 'dataplane',
+                    severity: 'DEGRADED',
+                    message: 'High packet loss on egress for Client X',
+                    connection_id: 'c-100',
+                    username: 'charlie',
+                    backend_id: 'backend-2'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendMove_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when actionable problem shifts to backend-2');
+
+    // Operator collapses accordion after observing shifted problem
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(backendMove_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of problem on backend-2');
+
     // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
     const degradedStatusB = {
         forwarder_available: true,
