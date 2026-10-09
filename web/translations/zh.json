@@ -655,6 +655,7 @@
   "vpn_diag_loss_return_backend_device_queue_full": "返回后端设备队列已满",
   "vpn_diag_loss_return_backend_device_shutdown": "返回后端设备关闭",
   "vpn_diag_condition_backend_device_unattributed": "后端设备丢包处于活动状态，但无法获得按方向的详细归因",
+  "vpn_col_user_device": "用户与设备",
   "vpn_col_live_traffic": "实时流量",
   "vpn_col_traffic": "实时流量",
   "vpn_col_packet_loss": "数据包丢失",

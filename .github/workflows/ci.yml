@@ -69,6 +69,16 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Pinned jsdom
+        run: |
+          npm install -g jsdom@29.1.1
+          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
 

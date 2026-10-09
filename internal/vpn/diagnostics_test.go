@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -2454,4 +2455,50 @@ func TestBackendCorrelation_ReconnectContradictorySessionIDDisqualified(t *testi
 	if len(diag.RoutesWithoutSession) != 1 || diag.RoutesWithoutSession[0] != expectedRedacted {
 		t.Errorf("RoutesWithoutSession: got %v, want [%s]", diag.RoutesWithoutSession, expectedRedacted)
 	}
+}
+
+func TestDiagnosticWrappers_ResetStaleGenerationNoOp(t *testing.T) {
+	base := time.Unix(1000, 0)
+	t.Run("diagRatesTracker", func(t *testing.T) {
+		tk := newDiagRatesTracker()
+		tk.reset(2)
+		tk.Sample(2, base, 100, 200, 300, 10)
+		tk.Sample(2, base.Add(time.Second), 110, 220, 330, 11)
+		before := []float64{tk.clientDropRate, tk.returnDropRate, tk.totalDropRate, tk.writeErrorRate}
+		if before[0] != 10 || !tk.primed {
+			t.Fatal("invalid measured fixture")
+		}
+		tk.reset(1)
+		after := []float64{tk.clientDropRate, tk.returnDropRate, tk.totalDropRate, tk.writeErrorRate}
+		if !reflect.DeepEqual(before, after) || !tk.primed || !tk.lastSampleTime.Equal(base.Add(time.Second)) {
+			t.Errorf("stale reset changed wrapper publication: before=%v after=%v primed=%v", before, after, tk.primed)
+		}
+	})
+	t.Run("diagDeltaTracker", func(t *testing.T) {
+		tk := &diagDeltaTracker{}
+		tk.reset(2)
+		tk.Sample(2, base, 100)
+		before := tk.Sample(2, base.Add(time.Second), 110)
+		if before.delta != 10 || before.windowSeconds != 1 {
+			t.Fatal("invalid measured fixture")
+		}
+		tk.reset(1)
+		after := deltaSnapshot{delta: tk.delta, windowSeconds: tk.windowSeconds}
+		if before != after {
+			t.Errorf("stale reset changed wrapper publication: before=%+v after=%+v", before, after)
+		}
+	})
+	t.Run("dropReasonRatesTracker", func(t *testing.T) {
+		tk := &dropReasonRatesTracker{}
+		tk.sample(2, base, map[string]uint64{"queue": 100})
+		before, availableBefore := tk.sample(2, base.Add(time.Second), map[string]uint64{"queue": 110})
+		if !availableBefore || before["queue"] != 10 {
+			t.Fatal("invalid measured fixture")
+		}
+		tk.reset(1)
+		after, availableAfter := tk.sample(2, base.Add(time.Second), map[string]uint64{"queue": 110})
+		if !availableAfter || !reflect.DeepEqual(before, after) {
+			t.Errorf("stale reset changed wrapper publication: before=%v available=%v after=%v available=%v", before, availableBefore, after, availableAfter)
+		}
+	})
 }

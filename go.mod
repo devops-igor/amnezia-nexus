@@ -2,7 +2,7 @@ module github.com/devops-igor/amnezia-nexus
 
 go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.9
 
 require (
 	github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20260828
