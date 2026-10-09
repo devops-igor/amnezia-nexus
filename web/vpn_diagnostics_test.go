@@ -3525,3 +3525,45 @@ w.eval(tablesCode);
 		t.Skip("jsdom is not available in Node environment")
 	}
 }
+
+func TestVPNDashboardSectionOrder(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	tmpl := string(vpnData)
+
+	idxStats := strings.Index(tmpl, `class="stats-grid"`)
+	if idxStats == -1 {
+		t.Fatal(`vpn.html missing class="stats-grid"`)
+	}
+
+	idxBackends := strings.Index(tmpl, `id="vpnBackendsTable"`)
+	if idxBackends == -1 {
+		t.Fatal(`vpn.html missing id="vpnBackendsTable"`)
+	}
+
+	idxSessions := strings.Index(tmpl, `id="vpnSessionsTable"`)
+	if idxSessions == -1 {
+		t.Fatal(`vpn.html missing id="vpnSessionsTable"`)
+	}
+
+	idxForwarder := strings.Index(tmpl, `id="vpn-forwarder-card"`)
+	if idxForwarder == -1 {
+		t.Fatal(`vpn.html missing id="vpn-forwarder-card"`)
+	}
+
+	if !(idxStats < idxBackends) {
+		t.Errorf("expected stats-grid (pos %d) before vpnBackendsTable (pos %d)", idxStats, idxBackends)
+	}
+	if !(idxBackends < idxSessions) {
+		t.Errorf("expected vpnBackendsTable (pos %d) before vpnSessionsTable (pos %d)", idxBackends, idxSessions)
+	}
+	if !(idxSessions < idxForwarder) {
+		t.Errorf("expected vpnSessionsTable (pos %d) before vpn-forwarder-card (pos %d)", idxSessions, idxForwarder)
+	}
+}
