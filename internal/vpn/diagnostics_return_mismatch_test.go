@@ -676,3 +676,77 @@ func TestReturnOwnershipMismatch_DivergentClientWindowDoesNotDiluteReturnRate(t 
 		})
 	})
 }
+
+// Issue #457 Rework Round 5: Under divergent directional windows, return mismatch losses
+// must be subtracted from total drop rate using the return tracker's own window duration,
+// preventing residual loss from triggering false DEGRADED routine-drop conditions.
+func TestReturnOwnershipMismatch_DivergentWindowsDoNotTriggerRoutineDropCondition(t *testing.T) {
+	// Return window is 0.25s with 3 drops (12 PPS, streak 1 -> WARNING).
+	// Client window is 1.50s with 0 drops.
+	diag := RoutingConsistencyDiagnostics{
+		IsConsistent:                                      false,
+		OwnershipMismatchDropsRecent:                      3,
+		ClientOwnershipMismatchDropsRecent:                0,
+		OwnershipMismatchWindowSec:                        1.50, // shared math.Max window (would dilute to 3 / 1.5 = 2.0 PPS)
+		ReturnOwnershipMismatchWindowSec:                  0.25, // return-specific window (3 / 0.25 = 12.0 PPS)
+		ClientOwnershipMismatchWindowSec:                  1.50, // client-specific window
+		ReturnOwnershipMismatchConsecutiveHighRateWindows: 1,    // single burst -> WARNING only
+	}
+	diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+	// Verify directional rate is 12.0 PPS and diluted aggregate is 2.0 PPS
+	if got := diag.DirectionalOwnershipMismatchRatePPS(); got != 12.0 {
+		t.Fatalf("expected DirectionalOwnershipMismatchRatePPS() 12.0 PPS, got %v", got)
+	}
+	if got := diag.OwnershipMismatchRatePPS(); got != 2.0 {
+		t.Fatalf("expected diluted OwnershipMismatchRatePPS() 2.0 PPS, got %v", got)
+	}
+
+	// DropCategoryBreakdown.TotalDropRatePps = 12.0 (all 3 drops from return mismatch)
+	drops := DropCategoryBreakdown{
+		RatesAvailable:   true,
+		TotalDropRatePps: 12.0,
+		TotalDrops:       3,
+	}
+
+	// Assert that evaluateVirtualTUNAndDropConditions() calculates routineRate == 0 (no routine drop condition emitted).
+	dropConds := evaluateVirtualTUNAndDropConditions(quietVirtualTUN(), drops, diag, 0)
+	for _, c := range dropConds {
+		if c.Category == "drops" {
+			t.Fatalf("unexpected routine drop condition emitted: severity=%s message=%q", c.Severity, c.Message)
+		}
+	}
+
+	// Routing conditions must produce exactly 1 WARNING condition
+	routingConds := evaluateRoutingConditions(diag)
+	routingCond := assertSingleCondition(t, routingConds, "routing")
+	if routingCond.Severity != "WARNING" {
+		t.Fatalf("routing condition severity=%s, want WARNING", routingCond.Severity)
+	}
+
+	// Assert that EvaluateForwarderHealth() produces overall headline HEALTHY (with 1 WARNING condition for routing, zero DEGRADED conditions).
+	health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		drops, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+
+	if health.Status != HealthHealthy {
+		t.Fatalf("headline status=%s, want HEALTHY", health.Status)
+	}
+
+	var degradedCount int
+	var warningCount int
+	for _, c := range health.Conditions {
+		if c.Severity == "DEGRADED" {
+			degradedCount++
+		}
+		if c.Severity == "WARNING" {
+			warningCount++
+		}
+	}
+	if degradedCount != 0 {
+		t.Fatalf("expected 0 DEGRADED conditions, got %d: %+v", degradedCount, health.Conditions)
+	}
+	if warningCount != 1 {
+		t.Fatalf("expected 1 WARNING condition, got %d: %+v", warningCount, health.Conditions)
+	}
+}

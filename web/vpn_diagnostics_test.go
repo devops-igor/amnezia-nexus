@@ -4876,3 +4876,141 @@ w.eval(tablesCode);
 		t.Skip("jsdom is not available in Node environment")
 	}
 }
+
+// Issue #457 Rework Round 5: Routing Consistency panel badge and alerts must be severity-aware.
+// Sparse/benign return mismatch drops produce WARNING severity and must render badge-warning
+// with var(--warning) alert color, while CRITICAL and DEGRADED routing issues retain badge-danger
+// and var(--danger).
+func TestVPNRoutingConsistencyBadgeSeverityAware(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const routBadge = document.getElementById('vpn-diag-routing-badge');
+const routAlerts = document.getElementById('vpn-diag-routing-alerts');
+
+// Case 1: Consistent routing -> badge-success
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: true,
+        active_routes_count: 5,
+        active_sessions_count: 5
+    },
+    health_assessment: {
+        status: 'HEALTHY',
+        conditions: []
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-success', 'consistent routing must have badge-success');
+assert.strictEqual(routBadge.textContent, _('vpn_fwd_consistent'), 'consistent routing badge text');
+assert.strictEqual(routAlerts.style.display, 'none', 'alerts hidden when consistent');
+
+// Case 2: Inconsistent with only WARNING routing condition (e.g. sparse return mismatch)
+// -> must render badge-warning and alert color var(--warning)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 3,
+        inconsistency_details: ['Return-direction ownership mismatch: 3 drops']
+    },
+    health_assessment: {
+        status: 'HEALTHY',
+        conditions: [
+            { category: 'routing', severity: 'WARNING', message: 'Return-direction ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-warning', 'routing with only WARNING condition must use badge-warning');
+assert.strictEqual(routBadge.textContent, _('vpn_fwd_inconsistent'), 'inconsistent text preserved');
+assert.strictEqual(routAlerts.style.display, 'block', 'alerts displayed');
+assert.strictEqual(routAlerts.style.color, 'var(--warning)', 'alerts text must use var(--warning) for WARNING routing condition');
+assert.strictEqual(routAlerts.textContent, 'Return-direction ownership mismatch: 3 drops');
+
+// Case 3: Inconsistent with status.conditions (direct array) having only WARNING routing condition
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 3,
+        inconsistency_details: ['Return-direction ownership mismatch: 3 drops']
+    },
+    conditions: [
+        { category: 'routing', severity: 'WARNING', message: 'Return-direction ownership mismatch' }
+    ]
+});
+assert.strictEqual(routBadge.className, 'badge badge-warning', 'direct status.conditions with only WARNING must use badge-warning');
+assert.strictEqual(routAlerts.style.color, 'var(--warning)', 'direct status.conditions alert must use var(--warning)');
+
+// Case 4: Inconsistent with DEGRADED routing condition (e.g. sustained return mismatch)
+// -> must retain badge-danger and alert color var(--danger)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 10,
+        inconsistency_details: ['Sustained return ownership mismatch: 10 drops']
+    },
+    health_assessment: {
+        status: 'DEGRADED',
+        conditions: [
+            { category: 'routing', severity: 'DEGRADED', message: 'Sustained return ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'degraded routing must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'degraded routing alerts must retain var(--danger)');
+
+// Case 5: Inconsistent with CRITICAL routing condition (e.g. client ownership mismatch)
+// -> must retain badge-danger and alert color var(--danger)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 1,
+        inconsistency_details: ['Client ownership mismatch: 1 drop']
+    },
+    health_assessment: {
+        status: 'CRITICAL',
+        conditions: [
+            { category: 'routing', severity: 'CRITICAL', message: 'Client ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'critical routing must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'critical routing alerts must retain var(--danger)');
+
+// Case 6: Mixed routing conditions (WARNING + CRITICAL) -> CRITICAL wins, must retain badge-danger
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 4,
+        inconsistency_details: ['Multiple routing anomalies']
+    },
+    health_assessment: {
+        status: 'CRITICAL',
+        conditions: [
+            { category: 'routing', severity: 'WARNING', message: 'Return ownership mismatch' },
+            { category: 'routing', severity: 'CRITICAL', message: 'Client ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'mixed routing conditions with CRITICAL must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alerts must retain var(--danger)');
+`
+
+	script := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "en", assertions)
+	out, err := execNodeScript(node, script)
+	if err != nil {
+		t.Fatalf("TestVPNRoutingConsistencyBadgeSeverityAware failed: %v\n%s", err, string(out))
+	}
+}
