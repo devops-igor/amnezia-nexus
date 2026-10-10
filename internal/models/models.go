@@ -323,6 +323,8 @@ type VPNSession struct {
 	// resolved at admission time. Legacy rows pre-dating the column carry ""
 	// and are never backfilled.
 	ConnectionName string `json:"connection_name" db:"connection_name"`
+	Username       string `json:"username,omitempty" db:"-"`
+	ConnectionID   string `json:"connection_id,omitempty" db:"-"`
 	// Generation tracks monotonic per-peer admission sequence numbers to prevent
 	// out-of-order commits from clobbering newer state.
 	Generation uint64 `json:"generation,omitempty" db:"-"`

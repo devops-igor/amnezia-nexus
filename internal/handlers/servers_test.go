@@ -1192,7 +1192,7 @@ func TestRenameServerHandler(t *testing.T) {
 	r := setupFullServerRouter(h)
 
 	// Capture slog audit output
-	var logBuf bytes.Buffer
+	var logBuf testSyncWriter
 	origLogger := slog.Default()
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)
@@ -1388,7 +1388,7 @@ func TestUpdateServerHostHandler(t *testing.T) {
 
 	r := setupFullServerRouter(h)
 
-	var logBuf bytes.Buffer
+	var logBuf testSyncWriter
 	origLogger := slog.Default()
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)
@@ -1719,13 +1719,12 @@ func TestUpdateServerHostHandler_ConcurrencySerialization(t *testing.T) {
 
 	r := setupFullServerRouter(h)
 
-	var logBuf bytes.Buffer
-	var logMu sync.Mutex
+	var logBuf testSyncWriter
 	origLogger := slog.Default()
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)
 	})
-	slog.SetDefault(slog.New(slog.NewTextHandler(&testSyncWriter{buf: &logBuf, mu: &logMu}, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
 
 	const numWorkers = 10
 	var wg sync.WaitGroup
@@ -1758,9 +1757,7 @@ func TestUpdateServerHostHandler_ConcurrencySerialization(t *testing.T) {
 	}
 
 	// Verify all 10 audit logs were written
-	logMu.Lock()
 	logContent := logBuf.String()
-	logMu.Unlock()
 
 	auditCount := strings.Count(logContent, "server.update_ip")
 	if auditCount != numWorkers {
@@ -2212,14 +2209,26 @@ func TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp(t *testing.T) {
 }
 
 type testSyncWriter struct {
-	buf *bytes.Buffer
-	mu  *sync.Mutex
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
 func (w *testSyncWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.buf.Write(p)
+}
+
+func (w *testSyncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func (w *testSyncWriter) Reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Reset()
 }
 
 func TestServerStatsHandler_Failures(t *testing.T) {
