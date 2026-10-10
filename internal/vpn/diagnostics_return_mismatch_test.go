@@ -413,6 +413,94 @@ func TestReturnOwnershipMismatch_ConcurrentResetMustNotRestoreOldStreak(t *testi
 		})
 	})
 
+	t.Run("deterministic_contention_sample_first", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var dts diagDeltaTrackers
+			base := time.Now()
+
+			// Prime generation 0.
+			dts.sampleOwnershipMismatch(0, base, 0)
+
+			// Contention order A: Sample acquires first, completing high-rate sample
+			// before reset acquires and clears the tracker.
+			sampleReady := make(chan struct{})
+			sampleDone := make(chan struct{})
+			resetDone := make(chan struct{})
+
+			go func() {
+				close(sampleReady)
+				snap := dts.sampleOwnershipMismatch(0, base.Add(250*time.Millisecond), 100)
+				if snap.consecutiveHighRateWindows != 1 {
+					t.Errorf("sample-first: want streak=1, got %d", snap.consecutiveHighRateWindows)
+				}
+				close(sampleDone)
+			}()
+
+			go func() {
+				<-sampleReady
+				<-sampleDone
+				dts.reset(1)
+				close(resetDone)
+			}()
+
+			<-resetDone
+			if streak := dts.consecutiveHighRateWindows(); streak != 0 {
+				t.Fatalf("sample-first contention: streak after reset(1)=%d, want 0", streak)
+			}
+
+			// Delayed stale sample from gen 0 must not restore streak.
+			staleSnap := dts.sampleOwnershipMismatch(0, base.Add(500*time.Millisecond), 200)
+			if staleSnap.consecutiveHighRateWindows != 0 {
+				t.Fatalf("sample-first contention: stale snapshot published streak=%d, want 0", staleSnap.consecutiveHighRateWindows)
+			}
+			if streak := dts.consecutiveHighRateWindows(); streak != 0 {
+				t.Fatalf("sample-first contention: stale sample restored streak to %d, want 0", streak)
+			}
+		})
+	})
+
+	t.Run("deterministic_contention_reset_first", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var dts diagDeltaTrackers
+			base := time.Now()
+
+			// Prime gen 0 and establish high-rate streak = 1.
+			dts.sampleOwnershipMismatch(0, base, 0)
+			dts.sampleOwnershipMismatch(0, base.Add(250*time.Millisecond), 100)
+			if dts.consecutiveHighRateWindows() != 1 {
+				t.Fatalf("expected streak=1 before reset, got %d", dts.consecutiveHighRateWindows())
+			}
+
+			// Contention order B: Reset acquires first, advancing generation to 1.
+			// The in-flight gen 0 sample executes immediately after and must be rejected.
+			inFlightReady := make(chan struct{})
+			resetDone := make(chan struct{})
+			var inFlightSnap returnOwnershipSnapshot
+			inFlightFinished := make(chan struct{})
+
+			go func() {
+				close(inFlightReady)
+				<-resetDone
+				inFlightSnap = dts.sampleOwnershipMismatch(0, base.Add(500*time.Millisecond), 200)
+				close(inFlightFinished)
+			}()
+
+			go func() {
+				<-inFlightReady
+				dts.reset(1)
+				close(resetDone)
+			}()
+
+			<-inFlightFinished
+			if inFlightSnap.consecutiveHighRateWindows != 0 {
+				t.Fatalf("reset-first contention: stale snapshot published streak=%d, want 0", inFlightSnap.consecutiveHighRateWindows)
+			}
+			if streak := dts.consecutiveHighRateWindows(); streak != 0 {
+				t.Fatalf("reset-first contention: stale gen 0 sample restored streak to %d, want 0", streak)
+			}
+		})
+	})
+
 	t.Run("concurrent_race_interleaving", func(t *testing.T) {
 		for iter := 0; iter < 50; iter++ {
 			var dts diagDeltaTrackers
@@ -448,5 +536,143 @@ func TestReturnOwnershipMismatch_ConcurrentResetMustNotRestoreOldStreak(t *testi
 				t.Fatalf("iter %d: old generation sample left streak=%d after reset(1), want 0", iter, streak)
 			}
 		}
+	})
+}
+
+// Issue #457: A longer quiet client window must NOT dilute the return-direction drop rate.
+// When the return window is 0.25s with 3 drops (12.0 PPS) and the client window is 1.50s with
+// 0 drops, ReturnOwnershipMismatchRatePPS() must report 12.0 PPS (not diluted to 2.0 PPS by math.Max),
+// and sustained return loss across consecutive windows must escalate to DEGRADED.
+func TestReturnOwnershipMismatch_DivergentClientWindowDoesNotDiluteReturnRate(t *testing.T) {
+	th := DefaultHealthThresholds
+
+	t.Run("direct_diagnostics_evaluation", func(t *testing.T) {
+		// Return window is 0.25s with 3 drops (12.0 PPS, streak 2).
+		// Client window is 1.50s with 0 drops (shared math.Max window would be 1.50s -> 2.0 PPS).
+		diag := RoutingConsistencyDiagnostics{
+			IsConsistent:                                      false,
+			OwnershipMismatchDropsRecent:                      3,
+			OwnershipMismatchWindowSec:                        1.50, // shared math.Max window
+			ReturnOwnershipMismatchWindowSec:                  0.25, // return-specific window
+			ReturnOwnershipMismatchConsecutiveHighRateWindows: 2,
+		}
+		diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+		// Aggregate rate is diluted by the client window (3 / 1.50 = 2.0 PPS).
+		aggregateRate := diag.OwnershipMismatchRatePPS()
+		if aggregateRate != 2.0 {
+			t.Fatalf("expected diluted aggregate rate 2.0 PPS, got %v", aggregateRate)
+		}
+
+		// Return-specific rate must NOT be diluted (3 / 0.25 = 12.0 PPS).
+		returnRate := diag.ReturnOwnershipMismatchRatePPS()
+		if returnRate != 12.0 {
+			t.Fatalf("expected ReturnOwnershipMismatchRatePPS() 12.0 PPS, got %v", returnRate)
+		}
+		if returnRate < th.ReturnOwnershipMismatchDegradedRatePPS {
+			t.Fatalf("returnRate %v must meet or exceed degraded threshold %v",
+				returnRate, th.ReturnOwnershipMismatchDegradedRatePPS)
+		}
+
+		// Severity must escalate to DEGRADED (not falsely downgraded to WARNING).
+		conds := evaluateRoutingConditions(diag)
+		cond := assertSingleCondition(t, conds, "routing")
+		if cond.Severity != "DEGRADED" {
+			t.Fatalf("expected DEGRADED severity, got %q: %q", cond.Severity, cond.Message)
+		}
+
+		// Headline health must be DEGRADED.
+		health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+			DropCategoryBreakdown{}, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+			BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+		if health.Status != HealthDegraded {
+			t.Fatalf("headline status=%s, want DEGRADED", health.Status)
+		}
+
+		// An isolated single burst (streak = 1) under divergent windows remains WARNING / headline HEALTHY.
+		diagSingle := diag
+		diagSingle.ReturnOwnershipMismatchConsecutiveHighRateWindows = 1
+		condsSingle := evaluateRoutingConditions(diagSingle)
+		condSingle := assertSingleCondition(t, condsSingle, "routing")
+		if condSingle.Severity != "WARNING" {
+			t.Fatalf("single burst under divergent windows severity=%q, want WARNING", condSingle.Severity)
+		}
+		healthSingle := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+			DropCategoryBreakdown{}, quietVirtualTUN(), nil, diagSingle, HandshakeFreshnessDiagnostics{},
+			BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+		if healthSingle.Status != HealthHealthy {
+			t.Fatalf("single burst headline status=%s, want HEALTHY", healthSingle.Status)
+		}
+
+		// Client mismatch drops under divergent windows strictly evaluate to CRITICAL.
+		diagClient := diag
+		diagClient.ClientOwnershipMismatchDropsRecent = 1
+		diagClient.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diagClient)}
+		condsClient := evaluateRoutingConditions(diagClient)
+		condClient := assertSingleCondition(t, condsClient, "routing")
+		if condClient.Severity != "CRITICAL" {
+			t.Fatalf("mixed client mismatch under divergent windows severity=%q, want CRITICAL", condClient.Severity)
+		}
+	})
+
+	t.Run("service_assembly_under_divergent_windows", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			svc := &Service{}
+
+			// Client tracker is primed at t0.
+			svc.diagDeltas.sampleClientOwnershipMismatch(0, time.Now(), 0)
+
+			// Advance 1250ms, then prime return tracker at t0 + 1250ms.
+			time.Sleep(1250 * time.Millisecond)
+			svc.diagDeltas.sampleOwnershipMismatch(0, time.Now(), 0)
+
+			// Advance 250ms to t0 + 1500ms: sample window 1 of return tracker.
+			// Return window = 250ms, 3 drops = 12 PPS, streak = 1.
+			time.Sleep(250 * time.Millisecond)
+			snap1 := svc.diagDeltas.sampleOwnershipMismatch(0, time.Now(), 3)
+			if snap1.consecutiveHighRateWindows != 1 {
+				t.Fatalf("return window 1 streak=%d, want 1", snap1.consecutiveHighRateWindows)
+			}
+
+			// Advance 250ms to t0 + 1750ms.
+			// At t0 + 1750ms:
+			//   Client elapsed window since prime (t0) = 1.75s (0 drops).
+			//   Return elapsed window since window 1 (t0 + 1500ms) = 0.25s (3 more drops -> cumulative 6).
+			// Calling checkRoutingInvariantsWithInputs simulates the status assembly pass.
+			time.Sleep(250 * time.Millisecond)
+			inputs := svc.captureDiagnosticsInputs()
+			diag := checkRoutingInvariantsWithInputs(svc, inputs, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: 6}, 0)
+
+			if diag.OwnershipMismatchDropsRecent != 3 {
+				t.Fatalf("recent return drops=%d, want 3", diag.OwnershipMismatchDropsRecent)
+			}
+			if diag.ClientOwnershipMismatchDropsRecent != 0 {
+				t.Fatalf("recent client drops=%d, want 0", diag.ClientOwnershipMismatchDropsRecent)
+			}
+			if diag.ReturnOwnershipMismatchConsecutiveHighRateWindows != 2 {
+				t.Fatalf("consecutive high rate windows=%d, want 2", diag.ReturnOwnershipMismatchConsecutiveHighRateWindows)
+			}
+			if diag.ReturnOwnershipMismatchWindowSec != 0.25 {
+				t.Fatalf("return-specific window=%.3fs, want 0.25s", diag.ReturnOwnershipMismatchWindowSec)
+			}
+			if diag.OwnershipMismatchWindowSec < 1.50 {
+				t.Fatalf("shared window=%.3fs must be at least 1.50s", diag.OwnershipMismatchWindowSec)
+			}
+
+			// Verify return-specific rate is 12.0 PPS and aggregate rate is diluted below 10.0 PPS.
+			if diag.ReturnOwnershipMismatchRatePPS() != 12.0 {
+				t.Fatalf("ReturnOwnershipMismatchRatePPS()=%.2f, want 12.0", diag.ReturnOwnershipMismatchRatePPS())
+			}
+			if diag.OwnershipMismatchRatePPS() >= 10.0 {
+				t.Fatalf("aggregate rate=%.2f should be diluted below 10.0 PPS", diag.OwnershipMismatchRatePPS())
+			}
+
+			// Condition severity must escalate to DEGRADED.
+			conds := evaluateRoutingConditions(diag)
+			cond := assertSingleCondition(t, conds, "routing")
+			if cond.Severity != "DEGRADED" {
+				t.Fatalf("severity under divergent service windows=%q, want DEGRADED: %q", cond.Severity, cond.Message)
+			}
+		})
 	})
 }

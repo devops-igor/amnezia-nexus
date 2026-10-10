@@ -338,6 +338,9 @@ type RoutingConsistencyDiagnostics struct {
 	// OwnershipMismatchWindowSec is the length of the sampling window behind
 	// OwnershipMismatchDropsRecent.
 	OwnershipMismatchWindowSec float64 `json:"ownership_mismatch_window_sec"`
+	// ReturnOwnershipMismatchWindowSec is the length of the sampling window specific
+	// to the return-direction ownership mismatch counter (issue #457).
+	ReturnOwnershipMismatchWindowSec float64 `json:"return_ownership_mismatch_window_sec,omitempty"`
 	// ReturnOwnershipMismatchConsecutiveHighRateWindows tracks the number of consecutive
 	// sampling windows in which the return-direction ownership mismatch drop rate met or
 	// exceeded ReturnOwnershipMismatchDegradedRatePPS (issue #457).
@@ -384,6 +387,17 @@ func (d RoutingConsistencyDiagnostics) OwnershipMismatchRatePPS() float64 {
 		return 0
 	}
 	return float64(d.OwnershipMismatchRecentTotal()) / d.OwnershipMismatchWindowSec
+}
+
+// ReturnOwnershipMismatchRatePPS computes the packet drop rate per second
+// specific to the return-direction ownership mismatch counter using its own
+// sampling window (issue #457). If ReturnOwnershipMismatchWindowSec is unset,
+// it falls back to OwnershipMismatchRatePPS() for backwards compatibility.
+func (d RoutingConsistencyDiagnostics) ReturnOwnershipMismatchRatePPS() float64 {
+	if d.ReturnOwnershipMismatchWindowSec > 0 {
+		return float64(d.OwnershipMismatchDropsRecent) / d.ReturnOwnershipMismatchWindowSec
+	}
+	return d.OwnershipMismatchRatePPS()
 }
 
 // HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
@@ -698,6 +712,7 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 		diag.OwnershipMismatchDropsRecent = returnSnapshot.delta
 		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
 		diag.OwnershipMismatchWindowSec = math.Max(returnSnapshot.windowSeconds, clientMismatchRate.windowSeconds)
+		diag.ReturnOwnershipMismatchWindowSec = returnSnapshot.windowSeconds
 		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = returnSnapshot.consecutiveHighRateWindows
 
 		if diag.OwnershipMismatchRecentTotal() > 0 {
@@ -1220,7 +1235,7 @@ func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCo
 			}
 			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
 				condSev = "CRITICAL"
-			} else if routing.OwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS &&
+			} else if routing.ReturnOwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS &&
 				routing.ReturnOwnershipMismatchConsecutiveHighRateWindows >= minConsecutive {
 				condSev = "DEGRADED"
 			} else if routing.OwnershipMismatchDropsRecent >= th.ReturnOwnershipMismatchWarningDrops {
