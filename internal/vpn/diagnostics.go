@@ -698,7 +698,7 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 		diag.OwnershipMismatchDropsRecent = mismatchRate.delta
 		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
 		diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
-		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = mismatchRate.consecutiveHighRateWindows
+		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = s.diagDeltas.consecutiveHighRateWindows()
 
 		if diag.OwnershipMismatchRecentTotal() > 0 {
 			diag.IsConsistent = false
@@ -2177,10 +2177,8 @@ type diagDeltaTracker struct {
 
 // deltaSnapshot is an immutable read of the tracker's last computed delta.
 type deltaSnapshot struct {
-	delta                      uint64
-	windowSeconds              float64
-	accepted                   bool
-	consecutiveHighRateWindows int
+	delta         uint64
+	windowSeconds float64
 }
 
 // Sample records cumulative and returns the increase since the previous
@@ -2194,18 +2192,23 @@ type deltaSnapshot struct {
 // baseline unchanged, so later activity up to the previously accepted value
 // can never be replayed as a fresh delta (issue #429 review blocker 1).
 func (t *diagDeltaTracker) Sample(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	snap, _ := t.sample(gen, now, cumulative)
+	return snap
+}
+
+func (t *diagDeltaTracker) sample(gen diagGeneration, now time.Time, cumulative uint64) (deltaSnapshot, bool) {
 	if t == nil {
-		return deltaSnapshot{}
+		return deltaSnapshot{}, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if accepted := t.window.sample(gen, now, []uint64{cumulative}); !accepted {
-		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds, accepted: false}
+		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}, false
 	}
 	deltas, elapsed, _ := t.window.last()
 	t.delta = deltas[0]
 	t.windowSeconds = elapsed
-	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds, accepted: true}
+	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}, true
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
@@ -2249,10 +2252,10 @@ func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time
 	if t == nil {
 		return deltaSnapshot{}
 	}
-	snap := t.ownershipMismatch.Sample(gen, now, cumulative)
+	snap, accepted := t.ownershipMismatch.sample(gen, now, cumulative)
 	t.returnConsecutiveMu.Lock()
 	defer t.returnConsecutiveMu.Unlock()
-	if snap.accepted {
+	if accepted {
 		th := defaultHealthThresholds()
 		var rate float64
 		if snap.windowSeconds > 0 {
@@ -2269,8 +2272,16 @@ func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time
 	}
 	// A throttled (<200ms) or stale rejected sample leaves returnConsecutiveHighRateWindows
 	// unchanged so repeated reads within one collection agree.
-	snap.consecutiveHighRateWindows = t.returnConsecutiveHighRateWindows
 	return snap
+}
+
+func (t *diagDeltaTrackers) consecutiveHighRateWindows() int {
+	if t == nil {
+		return 0
+	}
+	t.returnConsecutiveMu.Lock()
+	defer t.returnConsecutiveMu.Unlock()
+	return t.returnConsecutiveHighRateWindows
 }
 
 func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {

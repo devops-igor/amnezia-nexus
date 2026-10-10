@@ -368,25 +368,25 @@ func TestReturnOwnershipMismatch_LifecycleResetClearsConsecutiveCounter(t *testi
 	now = now.Add(250 * time.Millisecond)
 
 	// Window 2: sustained -> consecutive = 2
-	snap2 := dts.sampleOwnershipMismatch(0, now, 200)
-	if snap2.consecutiveHighRateWindows != 2 {
-		t.Fatalf("expected consecutive=2, got %d", snap2.consecutiveHighRateWindows)
+	dts.sampleOwnershipMismatch(0, now, 200)
+	if dts.consecutiveHighRateWindows() != 2 {
+		t.Fatalf("expected consecutive=2, got %d", dts.consecutiveHighRateWindows())
 	}
 
 	// Advance generation via reset(1)
 	dts.reset(1)
 
 	// Sample in generation 1: prime
-	snapPrime := dts.sampleOwnershipMismatch(1, now, 0)
-	if snapPrime.consecutiveHighRateWindows != 0 {
-		t.Fatalf("expected consecutive=0 after reset, got %d", snapPrime.consecutiveHighRateWindows)
+	dts.sampleOwnershipMismatch(1, now, 0)
+	if dts.consecutiveHighRateWindows() != 0 {
+		t.Fatalf("expected consecutive=0 after reset, got %d", dts.consecutiveHighRateWindows())
 	}
 
 	now = now.Add(250 * time.Millisecond)
 	// Window 1 of generation 1: fresh burst -> consecutive must be 1 (not 3)
-	snap3 := dts.sampleOwnershipMismatch(1, now, 100)
-	if snap3.consecutiveHighRateWindows != 1 {
-		t.Fatalf("expected consecutive=1 on fresh burst after reset, got %d", snap3.consecutiveHighRateWindows)
+	dts.sampleOwnershipMismatch(1, now, 100)
+	if dts.consecutiveHighRateWindows() != 1 {
+		t.Fatalf("expected consecutive=1 on fresh burst after reset, got %d", dts.consecutiveHighRateWindows())
 	}
 }
 
