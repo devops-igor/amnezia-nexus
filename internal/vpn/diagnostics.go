@@ -693,12 +693,12 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 
 	if s != nil {
 		now := time.Now()
-		mismatchRate := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
+		returnSnapshot := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
 		clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(inputs.generation, now, clientOwnershipMismatch)
-		diag.OwnershipMismatchDropsRecent = mismatchRate.delta
+		diag.OwnershipMismatchDropsRecent = returnSnapshot.delta
 		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
-		diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
-		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = s.diagDeltas.consecutiveHighRateWindows()
+		diag.OwnershipMismatchWindowSec = math.Max(returnSnapshot.windowSeconds, clientMismatchRate.windowSeconds)
+		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = returnSnapshot.consecutiveHighRateWindows
 
 		if diag.OwnershipMismatchRecentTotal() > 0 {
 			diag.IsConsistent = false
@@ -2228,11 +2228,125 @@ func (t *diagDeltaTracker) reset(gen diagGeneration) {
 	t.windowSeconds = 0
 }
 
+// returnOwnershipSnapshot is an immutable atomic read of the return-direction
+// ownership mismatch delta, sampling window, and consecutive high-rate streak
+// (issue #457).
+type returnOwnershipSnapshot struct {
+	deltaSnapshot
+	consecutiveHighRateWindows int
+}
+
+// returnOwnershipTracker tracks return-direction ownership mismatch drops across
+// sampling windows and maintains generation-scoped persistence for sustained
+// high-rate detection. A single mutex synchronizes generation gates, window
+// baseline tracking, and streak counting to eliminate split-lock races (issue #457).
+type returnOwnershipTracker struct {
+	mu                     sync.Mutex
+	gen                    diagGeneration
+	primed                 bool
+	window                 generationWindow[uint64]
+	delta                  uint64
+	windowSeconds          float64
+	consecutiveHighWindows int
+}
+
+// Sample records cumulative and returns the coherent delta, window length, and
+// consecutive high-rate window streak. If the sample belongs to an older generation,
+// it is rejected wholesale without mutating baseline, window, or streak.
+// Resampling sooner than 200ms returns the previous accepted snapshot.
+func (t *returnOwnershipTracker) Sample(gen diagGeneration, now time.Time, cumulative uint64) returnOwnershipSnapshot {
+	if t == nil {
+		return returnOwnershipSnapshot{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// If sample is from a stale generation, reject it: leave baseline, window,
+	// and streak completely untouched and return current published snapshot.
+	if gen < t.gen {
+		return returnOwnershipSnapshot{
+			deltaSnapshot: deltaSnapshot{
+				delta:         t.delta,
+				windowSeconds: t.windowSeconds,
+			},
+			consecutiveHighRateWindows: t.consecutiveHighWindows,
+		}
+	}
+
+	// If advancing to a newer generation or not yet primed: re-prime into gen.
+	if gen > t.gen || !t.primed {
+		t.gen = gen
+		t.primed = true
+		t.delta = 0
+		t.windowSeconds = 0
+		t.consecutiveHighWindows = 0
+		// Re-prime the baseline; window.sample always returns false on re-prime.
+		t.window.sample(gen, now, []uint64{cumulative})
+		return returnOwnershipSnapshot{}
+	}
+
+	accepted := t.window.sample(gen, now, []uint64{cumulative})
+	if accepted {
+		deltas, elapsed, _ := t.window.last()
+		t.delta = deltas[0]
+		t.windowSeconds = elapsed
+
+		th := defaultHealthThresholds()
+		var rate float64
+		if t.windowSeconds > 0 {
+			rate = float64(t.delta) / t.windowSeconds
+		}
+		if rate >= th.ReturnOwnershipMismatchDegradedRatePPS {
+			t.consecutiveHighWindows++
+		} else {
+			t.consecutiveHighWindows = 0
+		}
+	}
+	// A throttled (<200ms) or monotonic-stale rejected sample leaves
+	// delta, windowSeconds, and consecutiveHighRateWindows untouched.
+	return returnOwnershipSnapshot{
+		deltaSnapshot: deltaSnapshot{
+			delta:         t.delta,
+			windowSeconds: t.windowSeconds,
+		},
+		consecutiveHighRateWindows: t.consecutiveHighWindows,
+	}
+}
+
+// reset re-primes the tracker for a new diagnostics generation.
+// A generation lower than the accepted one is ignored (no-op, leaving published
+// delta and consecutive streak untouched).
+func (t *returnOwnershipTracker) reset(gen diagGeneration) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.window.reset(gen) {
+		return false
+	}
+	t.gen = gen
+	t.primed = false
+	t.delta = 0
+	t.windowSeconds = 0
+	t.consecutiveHighWindows = 0
+	return true
+}
+
+func (t *returnOwnershipTracker) consecutiveHighRateWindows() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.consecutiveHighWindows
+}
+
 // diagDeltaTrackers groups the per-counter windowed delta trackers. Each has
 // its own mutex (both the wrapper state and the embedded window are
 // synchronized), so a caller needs no outer lock.
 type diagDeltaTrackers struct {
-	ownershipMismatch diagDeltaTracker
+	ownershipMismatch returnOwnershipTracker
 	// clientOwnershipMismatch tracks the CLIENT-direction counterpart. It is a
 	// separate tracker, not a second field on the return one, because the two
 	// counters rise independently: sharing a tracker would let a burst in one
@@ -2243,45 +2357,20 @@ type diagDeltaTrackers struct {
 	enqueueFailures         diagDeltaTracker
 	writeStalls             diagDeltaTracker
 	reasons                 dropReasonRatesTracker
-
-	returnConsecutiveMu              sync.Mutex
-	returnConsecutiveHighRateWindows int
 }
 
-func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) returnOwnershipSnapshot {
 	if t == nil {
-		return deltaSnapshot{}
+		return returnOwnershipSnapshot{}
 	}
-	snap, accepted := t.ownershipMismatch.sample(gen, now, cumulative)
-	t.returnConsecutiveMu.Lock()
-	defer t.returnConsecutiveMu.Unlock()
-	if accepted {
-		th := defaultHealthThresholds()
-		var rate float64
-		if snap.windowSeconds > 0 {
-			rate = float64(snap.delta) / snap.windowSeconds
-		}
-		if rate >= th.ReturnOwnershipMismatchDegradedRatePPS {
-			t.returnConsecutiveHighRateWindows++
-		} else {
-			t.returnConsecutiveHighRateWindows = 0
-		}
-	} else if snap.windowSeconds == 0 {
-		// Priming sample or generation reset: reset consecutive counter.
-		t.returnConsecutiveHighRateWindows = 0
-	}
-	// A throttled (<200ms) or stale rejected sample leaves returnConsecutiveHighRateWindows
-	// unchanged so repeated reads within one collection agree.
-	return snap
+	return t.ownershipMismatch.Sample(gen, now, cumulative)
 }
 
 func (t *diagDeltaTrackers) consecutiveHighRateWindows() int {
 	if t == nil {
 		return 0
 	}
-	t.returnConsecutiveMu.Lock()
-	defer t.returnConsecutiveMu.Unlock()
-	return t.returnConsecutiveHighRateWindows
+	return t.ownershipMismatch.consecutiveHighRateWindows()
 }
 
 func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
@@ -2303,9 +2392,6 @@ func (t *diagDeltaTrackers) reset(gen diagGeneration) {
 	if t == nil {
 		return
 	}
-	t.returnConsecutiveMu.Lock()
-	t.returnConsecutiveHighRateWindows = 0
-	t.returnConsecutiveMu.Unlock()
 	t.ownershipMismatch.reset(gen)
 	t.clientOwnershipMismatch.reset(gen)
 	t.syncFailures.reset(gen)
