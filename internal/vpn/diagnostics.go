@@ -395,12 +395,15 @@ func (d RoutingConsistencyDiagnostics) OwnershipMismatchRatePPS() float64 {
 // ReturnOwnershipMismatchRatePPS computes the packet drop rate per second
 // specific to the return-direction ownership mismatch counter using its own
 // sampling window (issue #457). If ReturnOwnershipMismatchWindowSec is unset,
-// it falls back to OwnershipMismatchRatePPS() for backwards compatibility.
+// it falls back to using OwnershipMismatchWindowSec with return-direction drops.
 func (d RoutingConsistencyDiagnostics) ReturnOwnershipMismatchRatePPS() float64 {
 	if d.ReturnOwnershipMismatchWindowSec > 0 {
 		return float64(d.OwnershipMismatchDropsRecent) / d.ReturnOwnershipMismatchWindowSec
 	}
-	return d.OwnershipMismatchRatePPS()
+	if d.OwnershipMismatchWindowSec > 0 {
+		return float64(d.OwnershipMismatchDropsRecent) / d.OwnershipMismatchWindowSec
+	}
+	return 0
 }
 
 // ClientOwnershipMismatchRatePPS computes the packet drop rate per second
@@ -1483,15 +1486,23 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 	}
 
 	// The ROUTINE population: the aggregate minus every loss already claimed by
-	// a reason-specific condition, whichever evaluator owns it. The routing
-	// claim is measured through the routing windowed deltas using each
-	// direction's own sampling window (the same measurement the routing condition
-	// was decided on, issue #457); the drops claim through the reason rates.
-	// Clamped at zero because the two are sampled over the same window by
-	// independent trackers, so a small negative residue must never be reported
-	// as a negative loss rate.
+	// a reason-specific condition, whichever evaluator owns it. When drops.RatesAvailable
+	// is true and ownership reason rates are present, ownership mismatch losses are
+	// subtracted using the reason rates from the same loss observation window
+	// (drops.ReasonRates, issue #457 Rework Round 6) to eliminate cross-window sampling
+	// skew under concurrent collection. When unavailable or unpopulated in ReasonRates,
+	// fall back to routing.DirectionalOwnershipMismatchRatePPS().
+	var ownershipLossRate float64
+	_, hasReturn := drops.ReasonRates[reasonReturnOwnershipMismatch]
+	_, hasClient := drops.ReasonRates[reasonClientOwnershipMismatch]
+	if drops.RatesAvailable && (hasReturn || hasClient) {
+		ownershipLossRate = drops.ReasonRates[reasonReturnOwnershipMismatch] + drops.ReasonRates[reasonClientOwnershipMismatch]
+	} else {
+		ownershipLossRate = routing.DirectionalOwnershipMismatchRatePPS()
+	}
+
 	routineRate := drops.TotalDropRatePps -
-		routing.DirectionalOwnershipMismatchRatePPS() -
+		ownershipLossRate -
 		criticalReasonRatePps(drops, claimDrops) -
 		degradedReasonRatePps(drops, claimDrops)
 	// evaluateQueueConditions owns return-queue refusals. Its rate uses the
