@@ -679,5 +679,6 @@
   "vpn_problem_route_queue_drops": "Client packet drops active on return queue",
   "vpn_problem_write_stall": "Device write stall detected",
   "vpn_problem_write_errors": "Device write errors active",
-  "vpn_problem_route_queue_pressure": "High queue pressure detected on forwarder route"
+  "vpn_problem_route_queue_pressure": "High queue pressure detected on forwarder route",
+  "vpn_problem_stale_handshake": "Upstream handshake stale"
 }

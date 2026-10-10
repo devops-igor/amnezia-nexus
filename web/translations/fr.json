@@ -679,5 +679,6 @@
   "vpn_problem_route_queue_drops": "Pertes de paquets client actives dans la file de retour",
   "vpn_problem_write_stall": "Blocage d'écriture sur le périphérique détecté",
   "vpn_problem_write_errors": "Erreurs d'écriture sur le périphérique actives",
-  "vpn_problem_route_queue_pressure": "Forte pression de file d'attente détectée sur la route de redirection"
+  "vpn_problem_route_queue_pressure": "Forte pression de file d'attente détectée sur la route de redirection",
+  "vpn_problem_stale_handshake": "Handshake amont obsolète"
 }

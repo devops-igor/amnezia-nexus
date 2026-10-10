@@ -679,5 +679,6 @@
   "vpn_problem_route_queue_drops": "افت بسته کلاینت در صف بازگشت فعال است",
   "vpn_problem_write_stall": "توقف نوشتن دستگاه شناسایی شد",
   "vpn_problem_write_errors": "خطاهای نوشتن دستگاه فعال است",
-  "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد"
+  "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد",
+  "vpn_problem_stale_handshake": "دست‌دهی بالادستی قدیمی"
 }
