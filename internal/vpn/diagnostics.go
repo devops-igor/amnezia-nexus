@@ -2139,14 +2139,8 @@ type diagRatesTracker struct {
 	totalDropRate  float64
 	writeErrorRate float64
 
-	baselineClientDrops uint64
-	baselineReturnDrops uint64
-	baselineTotalDrops  uint64
-	baselineWriteErrors uint64
-
-	reasonBaselines map[string]uint64
-	reasonRates     map[string]float64
-	ratesAvailable  bool
+	reasonRates    map[string]float64
+	ratesAvailable bool
 }
 
 // newDiagRatesTracker returns an UNPRIMED tracker. lastSampleTime and every
@@ -2175,15 +2169,17 @@ func (t *diagRatesTracker) SampleWithAcceptance(gen diagGeneration, now time.Tim
 		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
 	}
 
+	if t.primed && t.reasonRates != nil {
+		// Tracker is established for whole-vector sampling; alternating vector
+		// widths must not silently re-prime an established accepted vector.
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
+	}
+
 	if gen > t.gen || !t.primed {
 		// First sample: prime time AND every counter baseline, report zero.
 		t.gen = gen
 		t.primed = true
 		t.lastSampleTime = now
-		t.baselineClientDrops = clientDrops
-		t.baselineReturnDrops = returnDrops
-		t.baselineTotalDrops = totalDrops
-		t.baselineWriteErrors = writeErrors
 		t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate = 0, 0, 0, 0
 		t.window.reset(gen)
 		t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
@@ -2205,10 +2201,6 @@ func (t *diagRatesTracker) SampleWithAcceptance(gen diagGeneration, now time.Tim
 	// deltas[3] is the writeErrors counter.
 	t.writeErrorRate = deltas[3] / elapsed
 	t.lastSampleTime = now
-	t.baselineClientDrops = clientDrops
-	t.baselineReturnDrops = returnDrops
-	t.baselineTotalDrops = totalDrops
-	t.baselineWriteErrors = writeErrors
 
 	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, true
 }
@@ -2223,105 +2215,47 @@ func (t *diagRatesTracker) publishRetainedLocked(drops *DropCategoryBreakdown) {
 
 // SampleLossVector records the complete loss-counter vector (aggregates and disjoint reasons),
 // reports rates computed from the single accepted window, and preserves all parts of the last
-// accepted publication together on rejection (issue #457 Rework Round 8).
+// accepted publication together on rejection (issue #457 Rework Round 8, Round 9).
 func (t *diagRatesTracker) SampleLossVector(gen diagGeneration, now time.Time, drops *DropCategoryBreakdown, writeErrors uint64) (writeErrorRate float64, accepted bool) {
 	if t == nil || drops == nil {
 		return 0, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// 1. Stale-generation isolation (R7-H2):
-	// Observations with gen < t.gen are strict no-ops. They never mutate
-	// wrapper priming, timestamp, baselines, or published rates.
 	if gen < t.gen {
 		t.publishRetainedLocked(drops)
 		return t.writeErrorRate, false
 	}
 
+	// Use the existing whole-vector window, not a second acceptance engine.
 	totals := dropReasonTotals(*drops)
-
-	// 2. Clean generation transition & lazy priming (R7-H2):
-	// When advancing to a newer generation or not yet primed in this generation,
-	// prime aggregate and all reason baselines together cleanly.
-	if gen > t.gen || !t.primed || t.reasonBaselines == nil {
-		t.gen = gen
-		t.primed = true
-		t.lastSampleTime = now
-		t.baselineClientDrops = drops.ClientTotalDrops
-		t.baselineReturnDrops = drops.ReturnTotalDrops
-		t.baselineTotalDrops = drops.TotalDrops
-		t.baselineWriteErrors = writeErrors
-		t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate = 0, 0, 0, 0
-		t.ratesAvailable = false
-		t.reasonBaselines = make(map[string]uint64, len(totals))
-		t.reasonRates = make(map[string]float64, len(totals))
-		for k, v := range totals {
-			t.reasonBaselines[k] = v
-			t.reasonRates[k] = 0
-		}
+	values := make([]uint64, 4+len(knownDropReasonKeys))
+	values[0], values[1], values[2], values[3] = drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors
+	for i, key := range knownDropReasonKeys {
+		values[4+i] = totals[key]
+	}
+	if gen > t.gen || !t.primed || t.reasonRates == nil {
+		t.gen, t.primed, t.lastSampleTime = gen, true, now
 		t.window.reset(gen)
-		t.window.sample(gen, now, []uint64{drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors})
-
-		drops.ClientDropRatePps = 0
-		drops.ReturnDropRatePps = 0
-		drops.TotalDropRatePps = 0
-		drops.ReasonRates = cloneReasonRates(t.reasonRates)
-		drops.RatesAvailable = false
-		return 0, false
+		t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate = 0, 0, 0, 0
+		t.reasonRates = make(map[string]float64, len(totals))
+		t.ratesAvailable = false
 	}
-
-	// 3. Throttle floor:
-	elapsed := now.Sub(t.lastSampleTime).Seconds()
-	if elapsed < diagEpochSampleFloor.Seconds() {
+	if !t.window.sample(gen, now, values) {
 		t.publishRetainedLocked(drops)
 		return t.writeErrorRate, false
 	}
 
-	// 4. Whole-vector monotonicity (R7-H1):
-	// If ANY component in the complete vector regresses (aggregate or reason),
-	// the entire observation is rejected as stale/incoherent.
-	if drops.ClientTotalDrops < t.baselineClientDrops ||
-		drops.ReturnTotalDrops < t.baselineReturnDrops ||
-		drops.TotalDrops < t.baselineTotalDrops ||
-		writeErrors < t.baselineWriteErrors {
-		t.publishRetainedLocked(drops)
-		return t.writeErrorRate, false
-	}
-	for k, v := range totals {
-		if base, ok := t.reasonBaselines[k]; ok && v < base {
-			t.publishRetainedLocked(drops)
-			return t.writeErrorRate, false
-		}
-	}
-
-	// 5. Atomic Acceptance of whole vector:
+	deltas, elapsed, _ := t.window.last()
 	t.lastSampleTime = now
-	t.window.sample(gen, now, []uint64{drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors})
-
-	t.clientDropRate = float64(drops.ClientTotalDrops-t.baselineClientDrops) / elapsed
-	t.returnDropRate = float64(drops.ReturnTotalDrops-t.baselineReturnDrops) / elapsed
-	t.totalDropRate = float64(drops.TotalDrops-t.baselineTotalDrops) / elapsed
-	t.writeErrorRate = float64(writeErrors-t.baselineWriteErrors) / elapsed
-
-	t.baselineClientDrops = drops.ClientTotalDrops
-	t.baselineReturnDrops = drops.ReturnTotalDrops
-	t.baselineTotalDrops = drops.TotalDrops
-	t.baselineWriteErrors = writeErrors
-
+	t.clientDropRate, t.returnDropRate = deltas[0]/elapsed, deltas[1]/elapsed
+	t.totalDropRate, t.writeErrorRate = deltas[2]/elapsed, deltas[3]/elapsed
 	rates := make(map[string]float64, len(totals))
-	for k, v := range totals {
-		rates[k] = float64(v-t.reasonBaselines[k]) / elapsed
-		t.reasonBaselines[k] = v
+	for i, key := range knownDropReasonKeys {
+		rates[key] = deltas[4+i] / elapsed
 	}
-	t.reasonRates = rates
-	t.ratesAvailable = true
-
-	drops.ClientDropRatePps = t.clientDropRate
-	drops.ReturnDropRatePps = t.returnDropRate
-	drops.TotalDropRatePps = t.totalDropRate
-	drops.ReasonRates = cloneReasonRates(t.reasonRates)
-	drops.RatesAvailable = true
+	t.reasonRates, t.ratesAvailable = rates, true
+	t.publishRetainedLocked(drops)
 	return t.writeErrorRate, true
 }
 
@@ -2360,11 +2294,6 @@ func (t *diagRatesTracker) reset(gen diagGeneration) {
 	t.lastSampleTime = time.Time{}
 	t.clientDropRate, t.returnDropRate = 0, 0
 	t.totalDropRate, t.writeErrorRate = 0, 0
-	t.baselineClientDrops = 0
-	t.baselineReturnDrops = 0
-	t.baselineTotalDrops = 0
-	t.baselineWriteErrors = 0
-	t.reasonBaselines = nil
 	t.reasonRates = nil
 	t.ratesAvailable = false
 }

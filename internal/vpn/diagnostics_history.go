@@ -222,85 +222,19 @@ func cloneReasonRates(rates map[string]float64) map[string]float64 {
 // before a lifecycle reset can never touch the new generation's windows.
 type dropReasonRatesTracker struct {
 	mu        sync.Mutex
-	gen       diagGeneration
-	primed    bool
-	at        time.Time
-	baselines map[string]uint64
 	windows   *diagCounterWindows
 	available bool
 	lastRates map[string]float64
 }
 
-func (t *dropReasonRatesTracker) primeLocked(gen diagGeneration, now time.Time, totals map[string]uint64) (map[string]float64, bool) {
-	t.gen = gen
-	t.primed = true
-	t.at = now
-	t.available = false
-	t.lastRates = nil
-	t.baselines = make(map[string]uint64, len(totals))
-	for k, v := range totals {
-		t.baselines[k] = v
-	}
-	if t.windows == nil {
-		t.windows = newDiagCounterWindows()
-	}
-	t.windows.reset(gen)
-	t.windows.sample(gen, now, totals)
-	rates := make(map[string]float64, len(totals))
-	for key := range totals {
-		rates[key] = 0
-	}
-	return rates, false
-}
-
-// retained returns the previously accepted reason rates snapshot when an observation
-// is rejected as stale by the aggregate sampler, preventing individual reason windows
-// from advancing independently and fabricating routine loss (issue #457 Rework Round 7).
-func (t *dropReasonRatesTracker) retained(totals map[string]uint64) (map[string]float64, bool) {
-	rates := make(map[string]float64, len(totals))
-	if t.available && t.lastRates != nil {
-		for key, rate := range t.lastRates {
-			rates[key] = rate
-		}
-	}
-	return rates, t.available
-}
-
 func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, totals map[string]uint64) (map[string]float64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Stale generation isolation (R7-H2):
-	if gen < t.gen {
-		return t.retained(totals)
-	}
-
-	if gen > t.gen || !t.primed {
-		return t.primeLocked(gen, now, totals)
-	}
-
-	// Throttle floor:
-	if now.Sub(t.at) < diagEpochSampleFloor {
-		return t.retained(totals)
-	}
-
-	// Whole-vector monotonicity across all keys (R7-H1):
-	for k, v := range totals {
-		if base, ok := t.baselines[k]; ok && v < base {
-			return t.retained(totals)
-		}
-	}
-
 	if t.windows == nil {
 		t.windows = newDiagCounterWindows()
 	}
-	accepted := t.windows.sample(gen, now, totals)
-	if accepted {
+	if accepted := t.windows.sample(gen, now, totals); accepted {
 		t.available = true
-		t.at = now
-		for k, v := range totals {
-			t.baselines[k] = v
-		}
 	}
 	rates := make(map[string]float64, len(totals))
 	for key := range totals {
@@ -310,14 +244,10 @@ func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, total
 			rates[key] = 0
 		}
 	}
-	if t.available && accepted {
+	if t.available {
 		t.lastRates = make(map[string]float64, len(rates))
 		for key, rate := range rates {
 			t.lastRates[key] = rate
-		}
-	} else if t.available && !accepted && t.lastRates != nil {
-		for key, rate := range t.lastRates {
-			rates[key] = rate
 		}
 	}
 	return rates, t.available
@@ -329,20 +259,11 @@ func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, total
 func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if gen < t.gen {
-		return
-	}
-	if gen > t.gen {
-		t.gen = gen
-	}
 	if t.windows != nil {
 		if !t.windows.reset(gen) {
 			return
 		}
 	}
-	t.primed = false
-	t.at = time.Time{}
-	t.baselines = nil
 	t.available = false
 	t.lastRates = nil
 }
