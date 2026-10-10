@@ -2148,16 +2148,22 @@ func newDiagRatesTracker() *diagRatesTracker {
 	return &diagRatesTracker{}
 }
 
-// Sample records the cumulative drop counters and reports the per-second rates
-// of the newly accepted window. The generation travels with the observation
-// (issue #429 review round 4, blocker 1): callers pass the generation the
-// snapshot was captured under, never a tracker-current value. Only
-// observations >= the accepted baseline advance it; an older/lower observation
-// reports the previous window and leaves the baseline unchanged (issue #429
-// review blocker 1).
-func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+func (t *diagRatesTracker) isPrimed() bool {
 	if t == nil {
-		return 0, 0, 0, 0
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.primed
+}
+
+// SampleWithAcceptance records the cumulative drop counters, reports the per-second
+// rates of the newly accepted window, and reports whether the observation was accepted
+// (issue #457 Rework Round 7). Callers use acceptance to publish aggregate and reason
+// loss rates coherently.
+func (t *diagRatesTracker) SampleWithAcceptance(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64, accepted bool) {
+	if t == nil {
+		return 0, 0, 0, 0, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -2167,10 +2173,10 @@ func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops
 		t.primed = true
 		t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
 		t.lastSampleTime = now
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, false
 	}
 	if accepted := t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors}); !accepted {
-		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
 	}
 	deltas, elapsed, _ := t.window.last()
 
@@ -2186,7 +2192,19 @@ func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops
 	t.writeErrorRate = deltas[3] / elapsed
 	t.lastSampleTime = now
 
-	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, true
+}
+
+// Sample records the cumulative drop counters and reports the per-second rates
+// of the newly accepted window. The generation travels with the observation
+// (issue #429 review round 4, blocker 1): callers pass the generation the
+// snapshot was captured under, never a tracker-current value. Only
+// observations >= the accepted baseline advance it; an older/lower observation
+// reports the previous window and leaves the baseline unchanged (issue #429
+// review blocker 1).
+func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+	clientDropRate, returnDropRate, totalDropRate, writeErrorRate, _ = t.SampleWithAcceptance(gen, now, clientDrops, returnDrops, totalDrops, writeErrors)
+	return
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
