@@ -2,12 +2,18 @@ package vpn
 
 import (
 	"errors"
+	"math"
+	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/clientawg"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 // Issue #457 Rework Round 5: Under divergent directional windows, return mismatch losses
@@ -532,85 +538,250 @@ func TestReturnOwnershipMismatch_StaleLossSnapshotDoesNotSplitAggregateAndReason
 // client or return drops when directional windows are partially populated.
 func TestRoutingConsistency_PartiallyPopulatedDirectionalFallback(t *testing.T) {
 	tests := []struct {
-		name                string
-		diag                RoutingConsistencyDiagnostics
-		wantReturnRate      float64
-		wantClientRate      float64
-		wantDirectionalRate float64
+		name                                                string
+		diag                                                RoutingConsistencyDiagnostics
+		wantReturnRate, wantClientRate, wantDirectionalRate float64
 	}{
 		{
-			name: "return_window_unset_client_window_set",
-			diag: RoutingConsistencyDiagnostics{
-				OwnershipMismatchDropsRecent:       3,
-				ClientOwnershipMismatchDropsRecent: 1,
-				OwnershipMismatchWindowSec:         1.0,
-				ClientOwnershipMismatchWindowSec:   0.25,
-			},
-			wantReturnRate:      3.0, // 3 / 1.0 (only return drops in numerator)
-			wantClientRate:      4.0, // 1 / 0.25 (only client drops in numerator)
-			wantDirectionalRate: 7.0, // 3.0 + 4.0; must NOT double-count client drops to 8.0
+			name:           "return_window_unset_client_window_set",
+			diag:           RoutingConsistencyDiagnostics{OwnershipMismatchDropsRecent: 3, ClientOwnershipMismatchDropsRecent: 1, OwnershipMismatchWindowSec: 1.0, ClientOwnershipMismatchWindowSec: 0.25},
+			wantReturnRate: 3.0, wantClientRate: 4.0, wantDirectionalRate: 7.0,
 		},
 		{
-			name: "client_window_unset_return_window_set",
-			diag: RoutingConsistencyDiagnostics{
-				OwnershipMismatchDropsRecent:       3,
-				ClientOwnershipMismatchDropsRecent: 1,
-				OwnershipMismatchWindowSec:         1.0,
-				ReturnOwnershipMismatchWindowSec:   0.25,
-			},
-			wantReturnRate:      12.0, // 3 / 0.25
-			wantClientRate:      1.0,  // 1 / 1.0
-			wantDirectionalRate: 13.0, // 12.0 + 1.0; must NOT double-count return drops
+			name:           "client_window_unset_return_window_set",
+			diag:           RoutingConsistencyDiagnostics{OwnershipMismatchDropsRecent: 3, ClientOwnershipMismatchDropsRecent: 1, OwnershipMismatchWindowSec: 1.0, ReturnOwnershipMismatchWindowSec: 0.25},
+			wantReturnRate: 12.0, wantClientRate: 1.0, wantDirectionalRate: 13.0,
 		},
 		{
-			name: "both_directional_windows_set",
-			diag: RoutingConsistencyDiagnostics{
-				OwnershipMismatchDropsRecent:       6,
-				ClientOwnershipMismatchDropsRecent: 2,
-				ReturnOwnershipMismatchWindowSec:   0.5,
-				ClientOwnershipMismatchWindowSec:   0.25,
-			},
-			wantReturnRate:      12.0, // 6 / 0.5
-			wantClientRate:      8.0,  // 2 / 0.25
-			wantDirectionalRate: 20.0, // 12.0 + 8.0
+			name:           "both_directional_windows_set",
+			diag:           RoutingConsistencyDiagnostics{OwnershipMismatchDropsRecent: 6, ClientOwnershipMismatchDropsRecent: 2, ReturnOwnershipMismatchWindowSec: 0.5, ClientOwnershipMismatchWindowSec: 0.25},
+			wantReturnRate: 12.0, wantClientRate: 8.0, wantDirectionalRate: 20.0,
 		},
 		{
-			name: "neither_directional_window_set",
-			diag: RoutingConsistencyDiagnostics{
-				OwnershipMismatchDropsRecent:       6,
-				ClientOwnershipMismatchDropsRecent: 2,
-				OwnershipMismatchWindowSec:         2.0,
-			},
-			wantReturnRate:      3.0, // 6 / 2.0
-			wantClientRate:      1.0, // 2 / 2.0
-			wantDirectionalRate: 4.0, // (6 + 2) / 2.0 = 4.0
+			name:           "neither_directional_window_set",
+			diag:           RoutingConsistencyDiagnostics{OwnershipMismatchDropsRecent: 6, ClientOwnershipMismatchDropsRecent: 2, OwnershipMismatchWindowSec: 2.0},
+			wantReturnRate: 3.0, wantClientRate: 1.0, wantDirectionalRate: 4.0,
 		},
 		{
-			name: "all_windows_unset",
-			diag: RoutingConsistencyDiagnostics{
-				OwnershipMismatchDropsRecent:       6,
-				ClientOwnershipMismatchDropsRecent: 2,
-			},
-			wantReturnRate:      0.0,
-			wantClientRate:      0.0,
-			wantDirectionalRate: 0.0,
+			name:           "all_windows_unset",
+			diag:           RoutingConsistencyDiagnostics{OwnershipMismatchDropsRecent: 6, ClientOwnershipMismatchDropsRecent: 2},
+			wantReturnRate: 0.0, wantClientRate: 0.0, wantDirectionalRate: 0.0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotReturn := tt.diag.ReturnOwnershipMismatchRatePPS()
-			if gotReturn != tt.wantReturnRate {
-				t.Errorf("ReturnOwnershipMismatchRatePPS() = %v, want %v", gotReturn, tt.wantReturnRate)
+			if got := tt.diag.ReturnOwnershipMismatchRatePPS(); got != tt.wantReturnRate {
+				t.Errorf("ReturnOwnershipMismatchRatePPS() = %v, want %v", got, tt.wantReturnRate)
 			}
-			gotClient := tt.diag.ClientOwnershipMismatchRatePPS()
-			if gotClient != tt.wantClientRate {
-				t.Errorf("ClientOwnershipMismatchRatePPS() = %v, want %v", gotClient, tt.wantClientRate)
+			if got := tt.diag.ClientOwnershipMismatchRatePPS(); got != tt.wantClientRate {
+				t.Errorf("ClientOwnershipMismatchRatePPS() = %v, want %v", got, tt.wantClientRate)
 			}
-			gotDirectional := tt.diag.DirectionalOwnershipMismatchRatePPS()
-			if gotDirectional != tt.wantDirectionalRate {
-				t.Errorf("DirectionalOwnershipMismatchRatePPS() = %v, want %v", gotDirectional, tt.wantDirectionalRate)
+			if got := tt.diag.DirectionalOwnershipMismatchRatePPS(); got != tt.wantDirectionalRate {
+				t.Errorf("DirectionalOwnershipMismatchRatePPS() = %v, want %v", got, tt.wantDirectionalRate)
 			}
+		})
+	}
+}
+
+func testLossAccountingFixture(t *testing.T) (*Service, diagnosticsInputs, func(int)) {
+	t.Helper()
+	f := forwarder.NewForwarder(nil, "192.0.2.0/24")
+	t.Cleanup(func() { _ = f.Stop() })
+	e := &IngressEngine{}
+	f.SetReturnRejectClassifier(e.classifyForwarderReject)
+	f.RegisterSessionWithReturnPath("review-session", "review-connection", "review-peer", "192.0.2.1", 1, forwarder.NewReturnPath(e.writeReturnPacket))
+	inputs := diagnosticsInputs{
+		forwarder: f, ingressEngine: e,
+		sessions: []Session{{ID: "review-session", PeerPublicKey: "review-peer", AssignedIP: "192.0.2.1"}},
+	}
+	mismatch := func(n int) {
+		for range n {
+			if err := f.RouteBackendToClient(2, nil, "192.0.2.1"); !errors.Is(err, forwarder.ErrReturnRouteMismatch) {
+				t.Fatalf("wrong-backend packet was not refused: %v", err)
+			}
+		}
+	}
+	return &Service{}, inputs, mismatch
+}
+
+func isolatedHealthAssessment(st Status) ForwarderHealthAssessment {
+	return EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		st.DropCategories, quietVirtualTUN(), nil, st.RoutingConsistency, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+}
+
+func assertLossConservation(t *testing.T, d DropCategoryBreakdown) {
+	t.Helper()
+	sum := 0.0
+	for _, rate := range d.ReasonRates {
+		sum += rate
+	}
+	if math.Abs(sum-d.TotalDropRatePps) > 1e-9 {
+		t.Errorf("accepted loss publications diverge: total=%g PPS sum(reasons)=%g PPS; reasons=%+v", d.TotalDropRatePps, sum, d.ReasonRates)
+	}
+}
+
+// Issue #457 Rework Round 8 (R7-H1): Overlapping/paused capture where ingress counter
+// regresses while forwarder counter increases must be rejected wholesale under whole-vector
+// acceptance, preserving publication and preventing fabricated routine DEGRADED loss.
+func TestReturnOwnershipMismatch_OverlappingCaptureWholeVectorRejection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc, inputs, mismatch := testLossAccountingFixture(t)
+		svc.forwarder = inputs.forwarder
+		svc.ingressEngine = inputs.ingressEngine
+		routes := inputs.forwarder.InspectRoutes()
+		var baseline, newer, followup Status
+
+		svc.populateOperationalDiagnosticsFromInputs(&baseline, routes, inputs)
+		historyBaseline := inputs.collectDropCategories()
+		svc.sampleHistoryDropRates(inputs.generation, time.Now(), &historyBaseline)
+
+		// t=250ms: 1 mismatch drop occurs. Paused collector captures ingress counters (mismatch=1).
+		time.Sleep(250 * time.Millisecond)
+		mismatch(1)
+		pausedIngressLosses := inputs.collectDropCategories()
+
+		// t=500ms: 6 more mismatch drops occur (total 7). Faster collector runs and samples.
+		time.Sleep(250 * time.Millisecond)
+		mismatch(6)
+		svc.populateOperationalDiagnosticsFromInputs(&newer, routes, inputs)
+		historyNewer := newer.DropCategories
+		svc.sampleHistoryDropRates(inputs.generation, time.Now(), &historyNewer)
+		if newer.DropCategories.TotalDropRatePps != 14.0 || newer.DropCategories.ReasonRates[reasonReturnOwnershipMismatch] != 14.0 {
+			t.Fatalf("newer collection incorrect: %+v", newer.DropCategories)
+		}
+		assertLossConservation(t, newer.DropCategories)
+
+		// t=750ms: 7 oversized drops occur on forwarder.
+		time.Sleep(250 * time.Millisecond)
+		oversizedPacket := buildTestIPv4Packet(net.ParseIP("192.0.2.2"), net.ParseIP("192.0.2.1"), forwarder.MaxClientQueuePacketBytes+1)
+		for range 7 {
+			if err := inputs.forwarder.RouteBackendToClient(1, oversizedPacket, "192.0.2.1"); !errors.Is(err, forwarder.ErrPacketTooLarge) {
+				t.Fatalf("oversized packet was not refused: %v", err)
+			}
+		}
+
+		// Paused collector resumes and reads forwarder counters, assembling delayed capture:
+		// ingress mismatch = 1 (captured at t=250ms), forwarder oversized = 7 (read at t=750ms).
+		// Summed total = 8 > baseline (7), BUT mismatch counter regressed (1 < 7).
+		delayedDrops := inputs.collectDropCategories()
+		delayedDrops.ReturnMismatch = pausedIngressLosses.ReturnMismatch
+		delayedDrops.ReturnTotalDrops = delayedDrops.ReturnMismatch + delayedDrops.ReturnPacketTooLarge
+		delayedDrops.TotalDrops = delayedDrops.ClientTotalDrops + delayedDrops.ReturnTotalDrops
+
+		delayed := Status{DropCategories: delayedDrops, RoutingConsistency: checkRoutingInvariantsWithInputs(svc, inputs, routes, inputs.ingressEngine.ReturnStats(), 0)}
+		// Sample delayed capture: whole-vector acceptance must reject it wholesale.
+		svc.sampleDropRates(inputs.generation, time.Now(), &delayed.DropCategories, 0)
+		d, dh := delayed.DropCategories, isolatedHealthAssessment(delayed)
+
+		if d.TotalDropRatePps != 14.0 || d.ReasonRates[reasonReturnOwnershipMismatch] != 14.0 || d.ReasonRates["return_packet_too_large"] != 0 {
+			t.Fatalf("delayed whole-vector rejection did not preserve previous publication: %+v", d)
+		}
+		assertLossConservation(t, d)
+		if hasCondition(dh.Conditions, "drops", "DEGRADED") {
+			t.Errorf("delayed observation emitted fabricated DEGRADED routine loss: %+v", dh.Conditions)
+		}
+
+		historyDelayed := delayedDrops
+		svc.sampleHistoryDropRates(inputs.generation, time.Now(), &historyDelayed)
+		if historyDelayed.TotalDropRatePps != 14.0 || historyDelayed.ReasonRates[reasonReturnOwnershipMismatch] != 14.0 {
+			t.Fatalf("history delayed rejection did not preserve publication: %+v", historyDelayed)
+		}
+		assertLossConservation(t, historyDelayed)
+
+		// t=1000ms: Followup capture with no new drops occurs (7 mismatches, 7 oversized = 14 total).
+		// Followup advances to a valid window. Previous ownership mismatch must NOT be replayed as routine DEGRADED loss.
+		time.Sleep(250 * time.Millisecond)
+		svc.populateOperationalDiagnosticsFromInputs(&followup, routes, inputs)
+		fd, fh := followup.DropCategories, isolatedHealthAssessment(followup)
+
+		assertLossConservation(t, fd)
+		historyFollowup := fd
+		svc.sampleHistoryDropRates(inputs.generation, time.Now(), &historyFollowup)
+		assertLossConservation(t, historyFollowup)
+
+		if fd.ReasonRates["return_packet_too_large"] != 14.0 || fd.TotalDropRatePps != 14.0 {
+			t.Fatalf("followup valid window failed to detect real oversized drops: %+v", fd)
+		}
+		if fd.ReasonRates["return_packet_too_large"] == 0 && hasCondition(fh.Conditions, "drops", "DEGRADED") {
+			t.Errorf("older ownership rejects replayed as fabricated DEGRADED routine loss: %+v", fh.Conditions)
+		}
+	})
+}
+
+// Issue #457 Rework Round 8 (R7-H2): Stale-generation observation delivered after lifecycle reset
+// does not poison priming; subsequent new-generation sample primes cleanly and detects real
+// CRITICAL return injection failure on the first measured window.
+func TestReturnOwnershipMismatch_StaleGenerationDoesNotPoisonPriming(t *testing.T) {
+	for _, oldCollector := range []bool{false, true} {
+		name := "without_delayed_old_collector"
+		if oldCollector {
+			name = "with_delayed_old_collector"
+		}
+		t.Run(name, func(t *testing.T) {
+			privateKey, publicKey := engineKeys(t)
+			portal, err := clientawg.NewDevice(clientawg.Config{
+				PrivateKey: privateKey, PublicKey: publicKey,
+				TUN: virtualtun.Config{Name: "round8-injection-refusal", MTU: 1280},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := portal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				svc, inputs, _ := testLossAccountingFixture(t)
+				inputs.ingressEngine.portal = portal
+				inputs.ingressEngine.resolver = ingress.NewResolver()
+				if err := inputs.ingressEngine.resolver.Update(ingress.PeerOwnership{PeerPublicKey: "review-peer", IP: netip.MustParseAddr("192.0.2.1")}); err != nil {
+					t.Fatal(err)
+				}
+				svc.forwarder = inputs.forwarder
+				svc.ingressEngine = inputs.ingressEngine
+				routes := inputs.forwarder.InspectRoutes()
+				var baseline, stale, prime, failure Status
+
+				svc.populateOperationalDiagnosticsFromInputs(&baseline, routes, inputs)
+				time.Sleep(250 * time.Millisecond)
+
+				// Dataplane reset advances diagnostics generation
+				svc.resetDiagnosticsGeneration()
+				if oldCollector {
+					// Delayed observation from old generation 0 delivered after reset
+					svc.populateOperationalDiagnosticsFromInputs(&stale, routes, inputs)
+				}
+
+				time.Sleep(250 * time.Millisecond)
+				current := inputs
+				current.generation = svc.currentDiagGeneration()
+				if current.generation != 1 || inputs.generation != 0 {
+					t.Fatal("fixture did not cross a real generation boundary")
+				}
+
+				// First sample of generation 1 must prime cleanly
+				svc.populateOperationalDiagnosticsFromInputs(&prime, routes, current)
+
+				time.Sleep(250 * time.Millisecond)
+				// Trigger a real closed-device injection failure
+				packet := buildTestIPv4Packet(net.ParseIP("192.0.2.2"), net.ParseIP("192.0.2.1"), 24)
+				if _, err := current.ingressEngine.writeReturnPacket("review-peer", "192.0.2.1", packet); !errors.Is(err, virtualtun.ErrClosed) {
+					t.Fatalf("expected real closed-device injection refusal, got %v", err)
+				}
+
+				// First measured window of generation 1 must detect real CRITICAL failure
+				svc.populateOperationalDiagnosticsFromInputs(&failure, routes, current)
+				d := failure.DropCategories
+				h := isolatedHealthAssessment(failure)
+
+				if !d.RatesAvailable || d.ReasonRates[reasonReturnInjectionErrors] != 4.0 || d.TotalDropRatePps != 4.0 {
+					t.Errorf("first accepted post-reset window lost real injection-error reason: %+v", d)
+				}
+				if !hasCondition(h.Conditions, "drops", "CRITICAL") || h.Status != HealthCritical {
+					t.Errorf("one real return-injection failure must remain CRITICAL, got %+v", h)
+				}
+			})
 		})
 	}
 }
