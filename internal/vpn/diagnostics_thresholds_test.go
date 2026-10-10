@@ -137,6 +137,10 @@ func TestDefaultHealthThresholdsPreservePreviousLiterals(t *testing.T) {
 			t.Errorf("ReturnOwnershipMismatchDegradedRatePPS=%v, want 10.0",
 				th.ReturnOwnershipMismatchDegradedRatePPS)
 		}
+		if th.ReturnOwnershipMismatchDegradedConsecutiveWindows != 2 {
+			t.Errorf("ReturnOwnershipMismatchDegradedConsecutiveWindows=%d, want 2",
+				th.ReturnOwnershipMismatchDegradedConsecutiveWindows)
+		}
 		// Pre-round-9, evaluateLatencyConditions gated device write errors on
 		// `latency.WriteErrorRatePps > 0` against the same literal 0, and
 		// QueueActiveDropRatePPS is already 0 compared with >. The injection
@@ -596,5 +600,64 @@ func TestProblemRoutePressureRatioBoundary(t *testing.T) {
 	// A zero-capacity route must never divide by zero into a bogus note.
 	if note := pressureNoteFor(50, 0); note != "" {
 		t.Errorf("a route with no queue capacity must produce no pressure note, got %q", note)
+	}
+}
+
+// TestReturnOwnershipMismatchSeverityBoundaries pins the classification across
+// drop rate and consecutive-window persistence thresholds for return mismatch (issue #457).
+func TestReturnOwnershipMismatchSeverityBoundaries(t *testing.T) {
+	th := DefaultHealthThresholds
+
+	cases := []struct {
+		name        string
+		drops       uint64
+		windowSec   float64
+		consecutive int
+		clientDrops uint64
+		want        string
+	}{
+		// Rate below degraded threshold (< 10.0 PPS): always WARNING regardless of consecutive windows
+		{"below degraded rate, consecutive=0", uint64(th.ReturnOwnershipMismatchDegradedRatePPS - 1), 1.0, 0, 0, "WARNING"},
+		{"below degraded rate, consecutive=1", uint64(th.ReturnOwnershipMismatchDegradedRatePPS - 1), 1.0, 1, 0, "WARNING"},
+		{"below degraded rate, consecutive=2", uint64(th.ReturnOwnershipMismatchDegradedRatePPS - 1), 1.0, 2, 0, "WARNING"},
+		{"below degraded rate, consecutive=3", uint64(th.ReturnOwnershipMismatchDegradedRatePPS - 1), 1.0, 3, 0, "WARNING"},
+
+		// Rate exactly at degraded threshold (10.0 PPS): requires consecutive >= 2
+		{"at degraded rate, consecutive=0", uint64(th.ReturnOwnershipMismatchDegradedRatePPS), 1.0, 0, 0, "WARNING"},
+		{"at degraded rate, consecutive=1 (just below)", uint64(th.ReturnOwnershipMismatchDegradedRatePPS), 1.0, th.ReturnOwnershipMismatchDegradedConsecutiveWindows - 1, 0, "WARNING"},
+		{"at degraded rate, consecutive=2 (exactly at)", uint64(th.ReturnOwnershipMismatchDegradedRatePPS), 1.0, th.ReturnOwnershipMismatchDegradedConsecutiveWindows, 0, "DEGRADED"},
+		{"at degraded rate, consecutive=3 (above)", uint64(th.ReturnOwnershipMismatchDegradedRatePPS), 1.0, th.ReturnOwnershipMismatchDegradedConsecutiveWindows + 1, 0, "DEGRADED"},
+
+		// Rate above degraded threshold (12.0 PPS): requires consecutive >= 2
+		{"above degraded rate, consecutive=1 (single burst)", uint64(th.ReturnOwnershipMismatchDegradedRatePPS + 2), 1.0, 1, 0, "WARNING"},
+		{"above degraded rate, consecutive=2 (sustained)", uint64(th.ReturnOwnershipMismatchDegradedRatePPS + 2), 1.0, 2, 0, "DEGRADED"},
+
+		// Zero drops: no condition fired
+		{"zero drops, quiet", 0, 1.0, 0, 0, ""},
+
+		// Client mismatch present: CRITICAL regardless of return rate or consecutive windows
+		{"mixed client mismatch, return consecutive=0", 10, 1.0, 0, th.ClientOwnershipMismatchCriticalDrops, "CRITICAL"},
+		{"mixed client mismatch, return consecutive=2", 10, 1.0, 2, th.ClientOwnershipMismatchCriticalDrops, "CRITICAL"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			diag := RoutingConsistencyDiagnostics{
+				IsConsistent:                                      tc.drops == 0 && tc.clientDrops == 0,
+				OwnershipMismatchDropsRecent:                      tc.drops,
+				ClientOwnershipMismatchDropsRecent:                tc.clientDrops,
+				OwnershipMismatchWindowSec:                        tc.windowSec,
+				ReturnOwnershipMismatchConsecutiveHighRateWindows: tc.consecutive,
+			}
+			if !diag.IsConsistent {
+				diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+			}
+			conds := evaluateRoutingConditions(diag)
+			got := severityIn(conds, "routing")
+			if got != tc.want {
+				t.Errorf("rate=%.2f pps, consecutive=%d, clientDrops=%d: got severity %q, want %q",
+					diag.OwnershipMismatchRatePPS(), tc.consecutive, tc.clientDrops, got, tc.want)
+			}
+		})
 	}
 }

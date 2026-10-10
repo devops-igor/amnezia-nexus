@@ -337,9 +337,13 @@ type RoutingConsistencyDiagnostics struct {
 	ClientOwnershipMismatchDropsRecent uint64 `json:"client_ownership_mismatch_drops_recent"`
 	// OwnershipMismatchWindowSec is the length of the sampling window behind
 	// OwnershipMismatchDropsRecent.
-	OwnershipMismatchWindowSec float64  `json:"ownership_mismatch_window_sec"`
-	IsConsistent               bool     `json:"is_consistent"`
-	InconsistencyDetails       []string `json:"inconsistency_details,omitempty"`
+	OwnershipMismatchWindowSec float64 `json:"ownership_mismatch_window_sec"`
+	// ReturnOwnershipMismatchConsecutiveHighRateWindows tracks the number of consecutive
+	// sampling windows in which the return-direction ownership mismatch drop rate met or
+	// exceeded ReturnOwnershipMismatchDegradedRatePPS (issue #457).
+	ReturnOwnershipMismatchConsecutiveHighRateWindows int      `json:"return_ownership_mismatch_consecutive_high_rate_windows,omitempty"`
+	IsConsistent                                      bool     `json:"is_consistent"`
+	InconsistencyDetails                              []string `json:"inconsistency_details,omitempty"`
 	// HistoricalDetails carries lifetime observations that are deliberately
 	// NOT inconsistencies, so a reader can see the incident without the
 	// headline status being pinned by it.
@@ -693,6 +697,7 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 		diag.OwnershipMismatchDropsRecent = mismatchRate.delta
 		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
 		diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
+		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = mismatchRate.consecutiveHighRateWindows
 
 		if diag.OwnershipMismatchRecentTotal() > 0 {
 			diag.IsConsistent = false
@@ -1207,9 +1212,14 @@ func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCo
 				condSev = "CRITICAL"
 			}
 		} else if strings.Contains(detail, "return-direction") {
+			minConsecutive := th.ReturnOwnershipMismatchDegradedConsecutiveWindows
+			if minConsecutive <= 0 {
+				minConsecutive = 1
+			}
 			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
 				condSev = "CRITICAL"
-			} else if routing.OwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS {
+			} else if routing.OwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS &&
+				routing.ReturnOwnershipMismatchConsecutiveHighRateWindows >= minConsecutive {
 				condSev = "DEGRADED"
 			} else if routing.OwnershipMismatchDropsRecent >= th.ReturnOwnershipMismatchWarningDrops {
 				condSev = "WARNING"
@@ -2162,8 +2172,10 @@ type diagDeltaTracker struct {
 
 // deltaSnapshot is an immutable read of the tracker's last computed delta.
 type deltaSnapshot struct {
-	delta         uint64
-	windowSeconds float64
+	delta                      uint64
+	windowSeconds              float64
+	accepted                   bool
+	consecutiveHighRateWindows int
 }
 
 // Sample records cumulative and returns the increase since the previous
@@ -2183,12 +2195,12 @@ func (t *diagDeltaTracker) Sample(gen diagGeneration, now time.Time, cumulative 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if accepted := t.window.sample(gen, now, []uint64{cumulative}); !accepted {
-		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds, accepted: false}
 	}
 	deltas, elapsed, _ := t.window.last()
 	t.delta = deltas[0]
 	t.windowSeconds = elapsed
-	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds, accepted: true}
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
@@ -2221,10 +2233,37 @@ type diagDeltaTrackers struct {
 	enqueueFailures         diagDeltaTracker
 	writeStalls             diagDeltaTracker
 	reasons                 dropReasonRatesTracker
+
+	returnConsecutiveMu              sync.Mutex
+	returnConsecutiveHighRateWindows int
 }
 
 func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
-	return t.ownershipMismatch.Sample(gen, now, cumulative)
+	if t == nil {
+		return deltaSnapshot{}
+	}
+	snap := t.ownershipMismatch.Sample(gen, now, cumulative)
+	t.returnConsecutiveMu.Lock()
+	defer t.returnConsecutiveMu.Unlock()
+	if snap.accepted {
+		th := defaultHealthThresholds()
+		var rate float64
+		if snap.windowSeconds > 0 {
+			rate = float64(snap.delta) / snap.windowSeconds
+		}
+		if rate >= th.ReturnOwnershipMismatchDegradedRatePPS {
+			t.returnConsecutiveHighRateWindows++
+		} else {
+			t.returnConsecutiveHighRateWindows = 0
+		}
+	} else if snap.windowSeconds == 0 {
+		// Priming sample or generation reset: reset consecutive counter.
+		t.returnConsecutiveHighRateWindows = 0
+	}
+	// A throttled (<200ms) or stale rejected sample leaves returnConsecutiveHighRateWindows
+	// unchanged so repeated reads within one collection agree.
+	snap.consecutiveHighRateWindows = t.returnConsecutiveHighRateWindows
+	return snap
 }
 
 func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
@@ -2243,6 +2282,12 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(gen diagGeneration, now time.T
 // peer-sync failures, enqueue failures, write stalls and the per-reason drop
 // rates — for a new diagnostics generation (issue #429 review blocker 1).
 func (t *diagDeltaTrackers) reset(gen diagGeneration) {
+	if t == nil {
+		return
+	}
+	t.returnConsecutiveMu.Lock()
+	t.returnConsecutiveHighRateWindows = 0
+	t.returnConsecutiveMu.Unlock()
 	t.ownershipMismatch.reset(gen)
 	t.clientOwnershipMismatch.reset(gen)
 	t.syncFailures.reset(gen)

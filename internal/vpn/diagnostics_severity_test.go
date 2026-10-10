@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -108,7 +109,8 @@ func TestB3SparseClientOwnershipMismatchClassifiesAtReasonSeverity(t *testing.T)
 }
 
 // Issue #457: escalating RETURN-direction ownership mismatches reach DEGRADED
-// when sustained at high rate (>= ReturnOwnershipMismatchDegradedRatePPS).
+// when sustained at high rate (>= ReturnOwnershipMismatchDegradedRatePPS) across
+// consecutive observation windows. A single initial burst remains WARNING.
 func TestB3EscalatingReturnOwnershipMismatchReachesDegraded(t *testing.T) {
 	th := DefaultHealthThresholds
 	svc := &Service{}
@@ -116,18 +118,36 @@ func TestB3EscalatingReturnOwnershipMismatchReachesDegraded(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 
 	const escalating = 500
-	diag := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: escalating}, 0)
-	if diag.OwnershipMismatchDropsRecent != escalating {
-		t.Fatalf("return recent mismatch=%d, want %d", diag.OwnershipMismatchDropsRecent, escalating)
+	// Window 1: high rate burst (rate >= 10 PPS). Initial window must remain WARNING.
+	diag1 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: escalating}, 0)
+	if diag1.OwnershipMismatchDropsRecent != escalating {
+		t.Fatalf("return recent mismatch=%d, want %d", diag1.OwnershipMismatchDropsRecent, escalating)
 	}
-	if diag.OwnershipMismatchRatePPS() < th.ReturnOwnershipMismatchDegradedRatePPS {
+	if diag1.OwnershipMismatchRatePPS() < th.ReturnOwnershipMismatchDegradedRatePPS {
 		t.Fatalf("test does not exercise the degraded rate threshold: rate=%v threshold=%v",
-			diag.OwnershipMismatchRatePPS(), th.ReturnOwnershipMismatchDegradedRatePPS)
+			diag1.OwnershipMismatchRatePPS(), th.ReturnOwnershipMismatchDegradedRatePPS)
 	}
-	cond := assertSingleCondition(t, evaluateRoutingConditions(diag), "routing")
-	if cond.Severity != "DEGRADED" {
-		t.Fatalf("escalating return ownership mismatch severity=%q, want DEGRADED: %q",
-			cond.Severity, cond.Message)
+	cond1 := assertSingleCondition(t, evaluateRoutingConditions(diag1), "routing")
+	if cond1.Severity != "WARNING" {
+		t.Fatalf("single burst return ownership mismatch severity=%q, want WARNING: %q",
+			cond1.Severity, cond1.Message)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Window 2: sustained high rate across consecutive windows. Escalates to DEGRADED.
+	diag2 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: escalating * 2}, 0)
+	if diag2.OwnershipMismatchDropsRecent != escalating {
+		t.Fatalf("return recent mismatch window 2=%d, want %d", diag2.OwnershipMismatchDropsRecent, escalating)
+	}
+	if diag2.OwnershipMismatchRatePPS() < th.ReturnOwnershipMismatchDegradedRatePPS {
+		t.Fatalf("window 2 rate=%v must meet degraded rate threshold %v",
+			diag2.OwnershipMismatchRatePPS(), th.ReturnOwnershipMismatchDegradedRatePPS)
+	}
+	cond2 := assertSingleCondition(t, evaluateRoutingConditions(diag2), "routing")
+	if cond2.Severity != "DEGRADED" {
+		t.Fatalf("sustained return ownership mismatch severity=%q, want DEGRADED: %q",
+			cond2.Severity, cond2.Message)
 	}
 }
 
@@ -174,6 +194,199 @@ func TestReturnOwnershipMismatch_SparseClassifiesAsWarning(t *testing.T) {
 	}
 	if !hasCondition(health.Conditions, "routing", "WARNING") {
 		t.Fatalf("expected routing WARNING condition in health assessment, got: %+v", health.Conditions)
+	}
+}
+
+// Issue #457: A single high-rate return-direction burst (e.g. 12 PPS in window 1)
+// evaluates to WARNING, preventing false DEGRADED alerts during routine migration tails.
+func TestReturnOwnershipMismatch_SingleHighRateBurstEvaluatesToWarning(t *testing.T) {
+	th := DefaultHealthThresholds
+
+	// 250ms window with 3 drops = 12.0 PPS (the exact counterexample from review).
+	const drops = 3
+	const windowSec = 0.25
+
+	diag := RoutingConsistencyDiagnostics{
+		IsConsistent:                                      false,
+		OwnershipMismatchDropsRecent:                      drops,
+		OwnershipMismatchWindowSec:                        windowSec,
+		ReturnOwnershipMismatchConsecutiveHighRateWindows: 1, // first window above rate threshold
+	}
+	diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+	rate := diag.OwnershipMismatchRatePPS()
+	if rate < th.ReturnOwnershipMismatchDegradedRatePPS {
+		t.Fatalf("test rate=%.2f must meet or exceed degraded rate threshold %.2f",
+			rate, th.ReturnOwnershipMismatchDegradedRatePPS)
+	}
+
+	conds := evaluateRoutingConditions(diag)
+	cond := assertSingleCondition(t, conds, "routing")
+	if cond.Severity != "WARNING" {
+		t.Fatalf("single high-rate burst severity=%q, want WARNING: %q", cond.Severity, cond.Message)
+	}
+
+	// Overall headline health must evaluate to HEALTHY (operational with warning).
+	health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		DropCategoryBreakdown{}, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+
+	if health.Status != HealthHealthy {
+		t.Fatalf("headline=%s, want HEALTHY (operational with warning condition)", health.Status)
+	}
+	if !hasCondition(health.Conditions, "routing", "WARNING") {
+		t.Fatalf("expected routing WARNING condition in health assessment, got: %+v", health.Conditions)
+	}
+}
+
+// Issue #457: Successive sustained high-rate bursts across consecutive observation windows
+// escalate return-direction ownership mismatch to DEGRADED.
+func TestReturnOwnershipMismatch_SustainedHighRateEvaluatesToDegraded(t *testing.T) {
+	th := DefaultHealthThresholds
+
+	diag := RoutingConsistencyDiagnostics{
+		IsConsistent:                                      false,
+		OwnershipMismatchDropsRecent:                      500,
+		OwnershipMismatchWindowSec:                        1.0,
+		ReturnOwnershipMismatchConsecutiveHighRateWindows: th.ReturnOwnershipMismatchDegradedConsecutiveWindows,
+	}
+	diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+	rate := diag.OwnershipMismatchRatePPS()
+	if rate < th.ReturnOwnershipMismatchDegradedRatePPS {
+		t.Fatalf("rate=%.2f must meet degraded rate threshold %.2f", rate, th.ReturnOwnershipMismatchDegradedRatePPS)
+	}
+
+	conds := evaluateRoutingConditions(diag)
+	cond := assertSingleCondition(t, conds, "routing")
+	if cond.Severity != "DEGRADED" {
+		t.Fatalf("sustained return mismatch severity=%q, want DEGRADED: %q", cond.Severity, cond.Message)
+	}
+
+	// Overall headline health must evaluate to DEGRADED.
+	health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+		DropCategoryBreakdown{}, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+		BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+
+	if health.Status != HealthDegraded {
+		t.Fatalf("headline=%s, want DEGRADED", health.Status)
+	}
+}
+
+// Issue #457: Recovery window (drop rate falls below threshold or drops reach zero)
+// clears DEGRADED, recovers health, and resets the persistence counter.
+func TestReturnOwnershipMismatch_RecoveryClearsDegradedAndResetsPersistence(t *testing.T) {
+	svc := &Service{}
+	// Window 1: prime tracker
+	checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{}, 0)
+	time.Sleep(250 * time.Millisecond)
+
+	const burst = 500
+	// Window 2: initial high-rate burst -> WARNING (consecutive = 1)
+	diag1 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: burst}, 0)
+	cond1 := assertSingleCondition(t, evaluateRoutingConditions(diag1), "routing")
+	if cond1.Severity != "WARNING" {
+		t.Fatalf("window 2 (burst) severity=%q, want WARNING", cond1.Severity)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Window 3: sustained high-rate -> DEGRADED (consecutive = 2)
+	diag2 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: burst * 2}, 0)
+	cond2 := assertSingleCondition(t, evaluateRoutingConditions(diag2), "routing")
+	if cond2.Severity != "DEGRADED" {
+		t.Fatalf("window 3 (sustained) severity=%q, want DEGRADED", cond2.Severity)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Window 4: recovery / quiet (zero new drops) -> clean recovery
+	diag3 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: burst * 2}, 0)
+	if !diag3.IsConsistent {
+		t.Fatalf("window 4 (quiet) must be consistent: %+v", diag3.InconsistencyDetails)
+	}
+	if got := evaluateRoutingConditions(diag3); len(got) != 0 {
+		t.Fatalf("window 4 (quiet) must produce no condition, got: %+v", got)
+	}
+	if diag3.ReturnOwnershipMismatchConsecutiveHighRateWindows != 0 {
+		t.Fatalf("consecutive counter must reset to 0 on quiet recovery, got %d",
+			diag3.ReturnOwnershipMismatchConsecutiveHighRateWindows)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Window 5: new isolated burst -> must be WARNING again because persistence was reset
+	diag4 := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: burst * 3}, 0)
+	cond4 := assertSingleCondition(t, evaluateRoutingConditions(diag4), "routing")
+	if cond4.Severity != "WARNING" {
+		t.Fatalf("window 5 (new burst after recovery) severity=%q, want WARNING (persistence did not reset)",
+			cond4.Severity)
+	}
+}
+
+// Issue #457: Mixed client and return drops evaluate strictly to CRITICAL regardless of persistence.
+func TestReturnOwnershipMismatch_MixedClientAndReturnDropsEvaluateToCritical(t *testing.T) {
+	for _, consecutive := range []int{0, 1, 2, 3} {
+		t.Run(fmt.Sprintf("consecutive=%d", consecutive), func(t *testing.T) {
+			diag := RoutingConsistencyDiagnostics{
+				IsConsistent:                                      false,
+				ClientOwnershipMismatchDropsRecent:                1,   // client-direction mismatch
+				OwnershipMismatchDropsRecent:                      500, // return-direction mismatch (high volume)
+				OwnershipMismatchWindowSec:                        1.0,
+				ReturnOwnershipMismatchConsecutiveHighRateWindows: consecutive,
+			}
+			diag.InconsistencyDetails = []string{describeOwnershipMismatchRecent(&diag)}
+
+			conds := evaluateRoutingConditions(diag)
+			cond := assertSingleCondition(t, conds, "routing")
+			if cond.Severity != "CRITICAL" {
+				t.Fatalf("mixed mismatch severity=%q, want CRITICAL: %q", cond.Severity, cond.Message)
+			}
+
+			health := EvaluateForwarderHealth(true, true, QueuePressureDiagnostics{}, ForwardLatencyDiagnostics{},
+				DropCategoryBreakdown{}, quietVirtualTUN(), nil, diag, HandshakeFreshnessDiagnostics{},
+				BackendsDiagnostics{HealthyCount: 1, TotalCount: 1, EligibilityKnown: true, EnabledCount: 1})
+
+			if health.Status != HealthCritical {
+				t.Fatalf("mixed mismatch headline=%s, want CRITICAL", health.Status)
+			}
+		})
+	}
+}
+
+// Issue #457: Lifecycle reset / re-priming on generation advance resets the consecutive tracker to zero.
+func TestReturnOwnershipMismatch_LifecycleResetClearsConsecutiveCounter(t *testing.T) {
+	var dts diagDeltaTrackers
+	now := time.Now()
+
+	// Prime generation 0
+	dts.sampleOwnershipMismatch(0, now, 0)
+	now = now.Add(250 * time.Millisecond)
+
+	// Window 1: burst
+	dts.sampleOwnershipMismatch(0, now, 100)
+	now = now.Add(250 * time.Millisecond)
+
+	// Window 2: sustained -> consecutive = 2
+	snap2 := dts.sampleOwnershipMismatch(0, now, 200)
+	if snap2.consecutiveHighRateWindows != 2 {
+		t.Fatalf("expected consecutive=2, got %d", snap2.consecutiveHighRateWindows)
+	}
+
+	// Advance generation via reset(1)
+	dts.reset(1)
+
+	// Sample in generation 1: prime
+	snapPrime := dts.sampleOwnershipMismatch(1, now, 0)
+	if snapPrime.consecutiveHighRateWindows != 0 {
+		t.Fatalf("expected consecutive=0 after reset, got %d", snapPrime.consecutiveHighRateWindows)
+	}
+
+	now = now.Add(250 * time.Millisecond)
+	// Window 1 of generation 1: fresh burst -> consecutive must be 1 (not 3)
+	snap3 := dts.sampleOwnershipMismatch(1, now, 100)
+	if snap3.consecutiveHighRateWindows != 1 {
+		t.Fatalf("expected consecutive=1 on fresh burst after reset, got %d", snap3.consecutiveHighRateWindows)
 	}
 }
 

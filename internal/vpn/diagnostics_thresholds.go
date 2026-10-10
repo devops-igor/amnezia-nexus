@@ -149,10 +149,17 @@ type HealthThresholds struct {
 	ReturnOwnershipMismatchWarningDrops uint64
 	// ReturnOwnershipMismatchDegradedRatePPS gates DEGRADED on sustained return-direction ownership mismatch rate.
 	ReturnOwnershipMismatchDegradedRatePPS float64
+	// ReturnOwnershipMismatchDegradedConsecutiveWindows gates DEGRADED on sustained return-direction
+	// ownership mismatch across consecutive observation windows. A single isolated window with
+	// return drop rate >= ReturnOwnershipMismatchDegradedRatePPS remains WARNING; only when high-rate
+	// loss persists for at least this many consecutive observation windows does severity escalate
+	// to DEGRADED (issue #457).
+	ReturnOwnershipMismatchDegradedConsecutiveWindows int
 
 	// OwnershipMismatchCriticalDrops is retained for backward compatibility (issue #457).
 	// Directional thresholds should be used instead: ClientOwnershipMismatchCriticalDrops,
-	// ReturnOwnershipMismatchWarningDrops, and ReturnOwnershipMismatchDegradedRatePPS.
+	// ReturnOwnershipMismatchWarningDrops, ReturnOwnershipMismatchDegradedRatePPS,
+	// and ReturnOwnershipMismatchDegradedConsecutiveWindows.
 	OwnershipMismatchCriticalDrops uint64
 
 	// InjectionFailureCriticalRatePPS gates CRITICAL on return-path injection
@@ -273,9 +280,10 @@ func defaultHealthThresholds() HealthThresholds {
 		DropRateDegradedPPS: 10.0,
 		DropRateWarningPPS:  1.0,
 
-		ClientOwnershipMismatchCriticalDrops:   1,
-		ReturnOwnershipMismatchWarningDrops:    1,
-		ReturnOwnershipMismatchDegradedRatePPS: 10.0,
+		ClientOwnershipMismatchCriticalDrops:              1,
+		ReturnOwnershipMismatchWarningDrops:               1,
+		ReturnOwnershipMismatchDegradedRatePPS:            10.0,
+		ReturnOwnershipMismatchDegradedConsecutiveWindows: 2,
 		// `> 0` on the already-gated mismatch counter, restated as >= 1.
 		OwnershipMismatchCriticalDrops: 1, // retained for backward compatibility
 		// `> 0`, matching the write-error and queue-drop rate idiom.
