@@ -337,9 +337,19 @@ type RoutingConsistencyDiagnostics struct {
 	ClientOwnershipMismatchDropsRecent uint64 `json:"client_ownership_mismatch_drops_recent"`
 	// OwnershipMismatchWindowSec is the length of the sampling window behind
 	// OwnershipMismatchDropsRecent.
-	OwnershipMismatchWindowSec float64  `json:"ownership_mismatch_window_sec"`
-	IsConsistent               bool     `json:"is_consistent"`
-	InconsistencyDetails       []string `json:"inconsistency_details,omitempty"`
+	OwnershipMismatchWindowSec float64 `json:"ownership_mismatch_window_sec"`
+	// ReturnOwnershipMismatchWindowSec is the length of the sampling window specific
+	// to the return-direction ownership mismatch counter (issue #457).
+	ReturnOwnershipMismatchWindowSec float64 `json:"return_ownership_mismatch_window_sec,omitempty"`
+	// ClientOwnershipMismatchWindowSec is the length of the sampling window specific
+	// to the client-direction ownership mismatch counter (issue #457).
+	ClientOwnershipMismatchWindowSec float64 `json:"client_ownership_mismatch_window_sec,omitempty"`
+	// ReturnOwnershipMismatchConsecutiveHighRateWindows tracks the number of consecutive
+	// sampling windows in which the return-direction ownership mismatch drop rate met or
+	// exceeded ReturnOwnershipMismatchDegradedRatePPS (issue #457).
+	ReturnOwnershipMismatchConsecutiveHighRateWindows int      `json:"return_ownership_mismatch_consecutive_high_rate_windows,omitempty"`
+	IsConsistent                                      bool     `json:"is_consistent"`
+	InconsistencyDetails                              []string `json:"inconsistency_details,omitempty"`
 	// HistoricalDetails carries lifetime observations that are deliberately
 	// NOT inconsistencies, so a reader can see the incident without the
 	// headline status being pinned by it.
@@ -351,10 +361,10 @@ type RoutingConsistencyDiagnostics struct {
 // disjoint populations (see ClientOwnershipMismatchDrops), so it counts each
 // refused packet exactly once.
 //
-// It exists so the CRITICAL gate has ONE number to compare against
-// OwnershipMismatchCriticalDrops. Each direction is still reported separately
-// in the routing condition and in the JSON payload; this is only the sum the
-// threshold is compared to, and it is never used to attribute a loss to a
+// It is used across the routing diagnostics and rate calculation to represent
+// total ownership mismatches across both directions. Each direction is still
+// reported separately in the routing condition and in the JSON payload; this is
+// the sum across both directions, and it is never used to attribute a loss to a
 // direction.
 func (d RoutingConsistencyDiagnostics) OwnershipMismatchRecentTotal() uint64 {
 	return d.OwnershipMismatchDropsRecent + d.ClientOwnershipMismatchDropsRecent
@@ -382,14 +392,55 @@ func (d RoutingConsistencyDiagnostics) OwnershipMismatchRatePPS() float64 {
 	return float64(d.OwnershipMismatchRecentTotal()) / d.OwnershipMismatchWindowSec
 }
 
+// ReturnOwnershipMismatchRatePPS computes the packet drop rate per second
+// specific to the return-direction ownership mismatch counter using its own
+// sampling window (issue #457). If ReturnOwnershipMismatchWindowSec is unset,
+// it falls back to using OwnershipMismatchWindowSec with return-direction drops.
+func (d RoutingConsistencyDiagnostics) ReturnOwnershipMismatchRatePPS() float64 {
+	if d.ReturnOwnershipMismatchWindowSec > 0 {
+		return float64(d.OwnershipMismatchDropsRecent) / d.ReturnOwnershipMismatchWindowSec
+	}
+	if d.OwnershipMismatchWindowSec > 0 {
+		return float64(d.OwnershipMismatchDropsRecent) / d.OwnershipMismatchWindowSec
+	}
+	return 0
+}
+
+// ClientOwnershipMismatchRatePPS computes the packet drop rate per second
+// specific to the client-direction ownership mismatch counter using its own
+// sampling window (issue #457). If ClientOwnershipMismatchWindowSec is unset,
+// it falls back to using OwnershipMismatchWindowSec.
+func (d RoutingConsistencyDiagnostics) ClientOwnershipMismatchRatePPS() float64 {
+	if d.ClientOwnershipMismatchWindowSec > 0 {
+		return float64(d.ClientOwnershipMismatchDropsRecent) / d.ClientOwnershipMismatchWindowSec
+	}
+	if d.OwnershipMismatchWindowSec > 0 {
+		return float64(d.ClientOwnershipMismatchDropsRecent) / d.OwnershipMismatchWindowSec
+	}
+	return 0
+}
+
+// DirectionalOwnershipMismatchRatePPS computes the sum of directional ownership
+// mismatch drop rates per second using each direction's own sampling window
+// (issue #457). This prevents dilution of return-direction drops when the client
+// window is longer and quiet, and preserves compatibility if directional windows
+// are unset.
+func (d RoutingConsistencyDiagnostics) DirectionalOwnershipMismatchRatePPS() float64 {
+	if d.ReturnOwnershipMismatchWindowSec > 0 || d.ClientOwnershipMismatchWindowSec > 0 {
+		return d.ReturnOwnershipMismatchRatePPS() + d.ClientOwnershipMismatchRatePPS()
+	}
+	return d.OwnershipMismatchRatePPS()
+}
+
 // HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
 type HandshakeFreshnessDiagnostics struct {
-	Under2mCount      int      `json:"under_2m_count"`
-	Between2m5mCount  int      `json:"between_2m_5m_count"`
-	Over5mCount       int      `json:"over_5m_count"`
-	NeverCount        int      `json:"never_count"`
-	TotalPeers        int      `json:"total_peers"`
-	StaleLiveSessions []string `json:"stale_live_sessions,omitempty"`
+	Under2mCount      int                  `json:"under_2m_count"`
+	Between2m5mCount  int                  `json:"between_2m_5m_count"`
+	Over5mCount       int                  `json:"over_5m_count"`
+	NeverCount        int                  `json:"never_count"`
+	TotalPeers        int                  `json:"total_peers"`
+	StaleLiveSessions []string             `json:"stale_live_sessions,omitempty"`
+	PeerHandshakes    map[string]time.Time `json:"-"`
 }
 
 // BackendTelemetryItem captures per-backend operational metrics.
@@ -688,11 +739,14 @@ func checkRoutingInvariantsWithInputs(s *Service, inputs diagnosticsInputs, rout
 
 	if s != nil {
 		now := time.Now()
-		mismatchRate := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
+		returnSnapshot := s.diagDeltas.sampleOwnershipMismatch(inputs.generation, now, retStats.OwnershipMismatchDrops)
 		clientMismatchRate := s.diagDeltas.sampleClientOwnershipMismatch(inputs.generation, now, clientOwnershipMismatch)
-		diag.OwnershipMismatchDropsRecent = mismatchRate.delta
+		diag.OwnershipMismatchDropsRecent = returnSnapshot.delta
 		diag.ClientOwnershipMismatchDropsRecent = clientMismatchRate.delta
-		diag.OwnershipMismatchWindowSec = math.Max(mismatchRate.windowSeconds, clientMismatchRate.windowSeconds)
+		diag.OwnershipMismatchWindowSec = math.Max(returnSnapshot.windowSeconds, clientMismatchRate.windowSeconds)
+		diag.ReturnOwnershipMismatchWindowSec = returnSnapshot.windowSeconds
+		diag.ClientOwnershipMismatchWindowSec = clientMismatchRate.windowSeconds
+		diag.ReturnOwnershipMismatchConsecutiveHighRateWindows = returnSnapshot.consecutiveHighRateWindows
 
 		if diag.OwnershipMismatchRecentTotal() > 0 {
 			diag.IsConsistent = false
@@ -1109,6 +1163,7 @@ func (inputs diagnosticsInputs) collectHandshakeDiagnostics() HandshakeFreshness
 	// of the masking scheme instead of the keys.
 	sort.Strings(diag.StaleLiveSessions)
 	redactKeySlice(diag.StaleLiveSessions)
+	diag.PeerHandshakes = peerHandshakes
 	return diag
 }
 
@@ -1185,43 +1240,44 @@ func EvaluateForwarderHealth(
 
 // evaluateRoutingConditions turns routing invariants into health conditions.
 //
-// A current-window ownership mismatch in EITHER direction escalates the whole
-// routing condition set to CRITICAL (issue #424 review round 9, blocker 3). The
-// escalation is applied to the set rather than to a single detail because the
-// routing details are not independent: duplicate IPs, unroutable sessions and
-// refused packets all describe the same routing plane, and a plane that is
-// refusing packets for ownership reasons in this window is failing now
-// regardless of which other invariant is also breached. Reporting one of them
-// as merely DEGRADED would understate the set, which is the defect blocker 3
-// reports.
-//
-// Without an ownership mismatch the classification is unchanged from before:
-// duplicate IPs and sessions with no route are CRITICAL, everything else is
-// DEGRADED. So no condition that was previously CRITICAL can become less
-// severe, and no DEGRADED routing condition is escalated except by the new
-// reason gate.
+// In issue #457, severity is evaluated per condition detail:
+//   - Duplicate IPs and unroutable sessions remain CRITICAL.
+//   - Client-direction ownership mismatches remain CRITICAL.
+//   - Return-direction ownership mismatches classify as CRITICAL if client mismatch
+//     is also present, DEGRADED if return drop rate reaches the degraded threshold,
+//     and WARNING for routine sparse drops.
+//   - Structural routing discrepancies remain DEGRADED.
 func evaluateRoutingConditions(routing RoutingConsistencyDiagnostics) []HealthCondition {
 	if routing.IsConsistent {
 		return nil
 	}
 	th := defaultHealthThresholds()
-	// Default severity for an invariant breach, matching the pre-round-9
-	// classification: only duplicate IPs and unroutable sessions were critical.
-	sev := "DEGRADED"
-	if len(routing.DuplicateIPs) > 0 || len(routing.SessionsWithoutRoute) > 0 {
-		sev = "CRITICAL"
-	}
-	// Ownership mismatch is a correctness failure at any volume, so its
-	// severity is decided by the reason itself, from the CURRENT window in
-	// BOTH directions, and it overrides the default above.
-	if routing.OwnershipMismatchRecentTotal() >= th.OwnershipMismatchCriticalDrops {
-		sev = "CRITICAL"
-	}
 	conds := make([]HealthCondition, 0, len(routing.InconsistencyDetails))
 	for _, detail := range routing.InconsistencyDetails {
+		condSev := "DEGRADED"
+		if strings.Contains(detail, "duplicate IP") || strings.Contains(detail, "lack a forwarder route") {
+			condSev = "CRITICAL"
+		} else if strings.Contains(detail, "client-direction") {
+			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
+				condSev = "CRITICAL"
+			}
+		} else if strings.Contains(detail, "return-direction") {
+			minConsecutive := th.ReturnOwnershipMismatchDegradedConsecutiveWindows
+			if minConsecutive <= 0 {
+				minConsecutive = 1
+			}
+			if routing.ClientOwnershipMismatchDropsRecent >= th.ClientOwnershipMismatchCriticalDrops {
+				condSev = "CRITICAL"
+			} else if routing.ReturnOwnershipMismatchRatePPS() >= th.ReturnOwnershipMismatchDegradedRatePPS &&
+				routing.ReturnOwnershipMismatchConsecutiveHighRateWindows >= minConsecutive {
+				condSev = "DEGRADED"
+			} else if routing.OwnershipMismatchDropsRecent >= th.ReturnOwnershipMismatchWarningDrops {
+				condSev = "WARNING"
+			}
+		}
 		conds = append(conds, HealthCondition{
 			Category: "routing",
-			Severity: sev,
+			Severity: condSev,
 			Message:  detail,
 		})
 	}
@@ -1430,14 +1486,23 @@ func evaluateVirtualTUNAndDropConditions(vtun VirtualTUNDiagnostics, drops DropC
 	}
 
 	// The ROUTINE population: the aggregate minus every loss already claimed by
-	// a reason-specific condition, whichever evaluator owns it. The routing
-	// claim is measured through the routing windowed deltas (the same
-	// measurement the routing condition was decided on); the drops claim
-	// through the reason rates. Clamped at zero because the two are sampled
-	// over the same window by independent trackers, so a small negative residue
-	// must never be reported as a negative loss rate.
+	// a reason-specific condition, whichever evaluator owns it. When drops.RatesAvailable
+	// is true and ownership reason rates are present, ownership mismatch losses are
+	// subtracted using the reason rates from the same loss observation window
+	// (drops.ReasonRates, issue #457 Rework Round 6) to eliminate cross-window sampling
+	// skew under concurrent collection. When unavailable or unpopulated in ReasonRates,
+	// fall back to routing.DirectionalOwnershipMismatchRatePPS().
+	var ownershipLossRate float64
+	_, hasReturn := drops.ReasonRates[reasonReturnOwnershipMismatch]
+	_, hasClient := drops.ReasonRates[reasonClientOwnershipMismatch]
+	if drops.RatesAvailable && (hasReturn || hasClient) {
+		ownershipLossRate = drops.ReasonRates[reasonReturnOwnershipMismatch] + drops.ReasonRates[reasonClientOwnershipMismatch]
+	} else {
+		ownershipLossRate = routing.DirectionalOwnershipMismatchRatePPS()
+	}
+
 	routineRate := drops.TotalDropRatePps -
-		routing.OwnershipMismatchRatePPS() -
+		ownershipLossRate -
 		criticalReasonRatePps(drops, claimDrops) -
 		degradedReasonRatePps(drops, claimDrops)
 	// evaluateQueueConditions owns return-queue refusals. Its rate uses the
@@ -1708,8 +1773,9 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 
 	if len(handshake.StaleLiveSessions) > 0 {
 		conds = append(conds, HealthCondition{
-			Category: "sessions",
-			Severity: "WARNING",
+			Category:   "sessions",
+			Severity:   "WARNING",
+			MessageKey: "vpn_problem_stale_handshake",
 			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> %s)",
 				len(handshake.StaleLiveSessions), DefaultHealthThresholds.HandshakeStaleAge),
 		})
@@ -2063,6 +2129,7 @@ type diagRatesTracker struct {
 	// 4, blocker 1): Sample takes it explicitly instead of reading a
 	// tracker-current field, so a snapshot captured before a lifecycle reset
 	// can never be sampled against the new generation.
+	gen            diagGeneration
 	primed         bool
 	window         generationWindow[float64]
 	lastSampleTime time.Time
@@ -2071,6 +2138,9 @@ type diagRatesTracker struct {
 	returnDropRate float64
 	totalDropRate  float64
 	writeErrorRate float64
+
+	reasonRates    map[string]float64
+	ratesAvailable bool
 }
 
 // newDiagRatesTracker returns an UNPRIMED tracker. lastSampleTime and every
@@ -2082,29 +2152,41 @@ func newDiagRatesTracker() *diagRatesTracker {
 	return &diagRatesTracker{}
 }
 
-// Sample records the cumulative drop counters and reports the per-second rates
-// of the newly accepted window. The generation travels with the observation
-// (issue #429 review round 4, blocker 1): callers pass the generation the
-// snapshot was captured under, never a tracker-current value. Only
-// observations >= the accepted baseline advance it; an older/lower observation
-// reports the previous window and leaves the baseline unchanged (issue #429
-// review blocker 1).
-func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+// SampleWithAcceptance records the cumulative drop counters, reports the per-second
+// rates of the newly accepted window, and reports whether the observation was accepted
+// (issue #457 Rework Round 7). Callers use acceptance to publish aggregate and reason
+// loss rates coherently.
+func (t *diagRatesTracker) SampleWithAcceptance(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64, accepted bool) {
 	if t == nil {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if !t.primed {
+	// R7-H2: Old-generation observations are strict no-ops.
+	// Do NOT mutate wrapper priming, timestamp, or published rates.
+	if gen < t.gen {
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
+	}
+
+	if t.primed && t.reasonRates != nil {
+		// Tracker is established for whole-vector sampling; alternating vector
+		// widths must not silently re-prime an established accepted vector.
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
+	}
+
+	if gen > t.gen || !t.primed {
 		// First sample: prime time AND every counter baseline, report zero.
+		t.gen = gen
 		t.primed = true
-		t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
 		t.lastSampleTime = now
-		return 0, 0, 0, 0
+		t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate = 0, 0, 0, 0
+		t.window.reset(gen)
+		t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors})
+		return 0, 0, 0, 0, false
 	}
 	if accepted := t.window.sample(gen, now, []uint64{clientDrops, returnDrops, totalDrops, writeErrors}); !accepted {
-		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+		return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, false
 	}
 	deltas, elapsed, _ := t.window.last()
 
@@ -2120,7 +2202,73 @@ func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops
 	t.writeErrorRate = deltas[3] / elapsed
 	t.lastSampleTime = now
 
-	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate
+	return t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate, true
+}
+
+func (t *diagRatesTracker) publishRetainedLocked(drops *DropCategoryBreakdown) {
+	drops.ClientDropRatePps = t.clientDropRate
+	drops.ReturnDropRatePps = t.returnDropRate
+	drops.TotalDropRatePps = t.totalDropRate
+	drops.ReasonRates = cloneReasonRates(t.reasonRates)
+	drops.RatesAvailable = t.ratesAvailable
+}
+
+// SampleLossVector records the complete loss-counter vector (aggregates and disjoint reasons),
+// reports rates computed from the single accepted window, and preserves all parts of the last
+// accepted publication together on rejection (issue #457 Rework Round 8, Round 9).
+func (t *diagRatesTracker) SampleLossVector(gen diagGeneration, now time.Time, drops *DropCategoryBreakdown, writeErrors uint64) (writeErrorRate float64, accepted bool) {
+	if t == nil || drops == nil {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if gen < t.gen {
+		t.publishRetainedLocked(drops)
+		return t.writeErrorRate, false
+	}
+
+	// Use the existing whole-vector window, not a second acceptance engine.
+	totals := dropReasonTotals(*drops)
+	values := make([]uint64, 4+len(knownDropReasonKeys))
+	values[0], values[1], values[2], values[3] = drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors
+	for i, key := range knownDropReasonKeys {
+		values[4+i] = totals[key]
+	}
+	if gen > t.gen || !t.primed || t.reasonRates == nil {
+		t.gen, t.primed, t.lastSampleTime = gen, true, now
+		t.window.reset(gen)
+		t.clientDropRate, t.returnDropRate, t.totalDropRate, t.writeErrorRate = 0, 0, 0, 0
+		t.reasonRates = make(map[string]float64, len(totals))
+		t.ratesAvailable = false
+	}
+	if !t.window.sample(gen, now, values) {
+		t.publishRetainedLocked(drops)
+		return t.writeErrorRate, false
+	}
+
+	deltas, elapsed, _ := t.window.last()
+	t.lastSampleTime = now
+	t.clientDropRate, t.returnDropRate = deltas[0]/elapsed, deltas[1]/elapsed
+	t.totalDropRate, t.writeErrorRate = deltas[2]/elapsed, deltas[3]/elapsed
+	rates := make(map[string]float64, len(totals))
+	for i, key := range knownDropReasonKeys {
+		rates[key] = deltas[4+i] / elapsed
+	}
+	t.reasonRates, t.ratesAvailable = rates, true
+	t.publishRetainedLocked(drops)
+	return t.writeErrorRate, true
+}
+
+// Sample records the cumulative drop counters and reports the per-second rates
+// of the newly accepted window. The generation travels with the observation
+// (issue #429 review round 4, blocker 1): callers pass the generation the
+// snapshot was captured under, never a tracker-current value. Only
+// observations >= the accepted baseline advance it; an older/lower observation
+// reports the previous window and leaves the baseline unchanged (issue #429
+// review blocker 1).
+func (t *diagRatesTracker) Sample(gen diagGeneration, now time.Time, clientDrops, returnDrops, totalDrops, writeErrors uint64) (clientDropRate, returnDropRate, totalDropRate, writeErrorRate float64) {
+	clientDropRate, returnDropRate, totalDropRate, writeErrorRate, _ = t.SampleWithAcceptance(gen, now, clientDrops, returnDrops, totalDrops, writeErrors)
+	return
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
@@ -2133,11 +2281,21 @@ func (t *diagRatesTracker) reset(gen diagGeneration) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if gen < t.gen {
+		return
+	}
+	if gen > t.gen {
+		t.gen = gen
+	}
+	if !t.window.reset(gen) {
+		return
+	}
 	t.primed = false
-	t.window.reset(gen)
 	t.lastSampleTime = time.Time{}
 	t.clientDropRate, t.returnDropRate = 0, 0
 	t.totalDropRate, t.writeErrorRate = 0, 0
+	t.reasonRates = nil
+	t.ratesAvailable = false
 }
 
 // diagDeltaTracker measures the increase of a single lifetime counter over
@@ -2181,18 +2339,23 @@ type deltaSnapshot struct {
 // baseline unchanged, so later activity up to the previously accepted value
 // can never be replayed as a fresh delta (issue #429 review blocker 1).
 func (t *diagDeltaTracker) Sample(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+	snap, _ := t.sample(gen, now, cumulative)
+	return snap
+}
+
+func (t *diagDeltaTracker) sample(gen diagGeneration, now time.Time, cumulative uint64) (deltaSnapshot, bool) {
 	if t == nil {
-		return deltaSnapshot{}
+		return deltaSnapshot{}, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if accepted := t.window.sample(gen, now, []uint64{cumulative}); !accepted {
-		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+		return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}, false
 	}
 	deltas, elapsed, _ := t.window.last()
 	t.delta = deltas[0]
 	t.windowSeconds = elapsed
-	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}
+	return deltaSnapshot{delta: t.delta, windowSeconds: t.windowSeconds}, true
 }
 
 // reset re-primes the tracker for a new diagnostics generation: subsequent
@@ -2205,16 +2368,132 @@ func (t *diagDeltaTracker) reset(gen diagGeneration) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.window.reset(gen)
+	if !t.window.reset(gen) {
+		return
+	}
 	t.delta = 0
 	t.windowSeconds = 0
+}
+
+// returnOwnershipSnapshot is an immutable atomic read of the return-direction
+// ownership mismatch delta, sampling window, and consecutive high-rate streak
+// (issue #457).
+type returnOwnershipSnapshot struct {
+	deltaSnapshot
+	consecutiveHighRateWindows int
+}
+
+// returnOwnershipTracker tracks return-direction ownership mismatch drops across
+// sampling windows and maintains generation-scoped persistence for sustained
+// high-rate detection. A single mutex synchronizes generation gates, window
+// baseline tracking, and streak counting to eliminate split-lock races (issue #457).
+type returnOwnershipTracker struct {
+	mu                     sync.Mutex
+	gen                    diagGeneration
+	primed                 bool
+	window                 generationWindow[uint64]
+	delta                  uint64
+	windowSeconds          float64
+	consecutiveHighWindows int
+}
+
+// Sample records cumulative and returns the coherent delta, window length, and
+// consecutive high-rate window streak. If the sample belongs to an older generation,
+// it is rejected wholesale without mutating baseline, window, or streak.
+// Resampling sooner than 200ms returns the previous accepted snapshot.
+func (t *returnOwnershipTracker) Sample(gen diagGeneration, now time.Time, cumulative uint64) returnOwnershipSnapshot {
+	if t == nil {
+		return returnOwnershipSnapshot{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// If sample is from a stale generation, reject it: leave baseline, window,
+	// and streak completely untouched and return current published snapshot.
+	if gen < t.gen {
+		return returnOwnershipSnapshot{
+			deltaSnapshot: deltaSnapshot{
+				delta:         t.delta,
+				windowSeconds: t.windowSeconds,
+			},
+			consecutiveHighRateWindows: t.consecutiveHighWindows,
+		}
+	}
+
+	// If advancing to a newer generation or not yet primed: re-prime into gen.
+	if gen > t.gen || !t.primed {
+		t.gen = gen
+		t.primed = true
+		t.delta = 0
+		t.windowSeconds = 0
+		t.consecutiveHighWindows = 0
+		// Re-prime the baseline; window.sample always returns false on re-prime.
+		t.window.sample(gen, now, []uint64{cumulative})
+		return returnOwnershipSnapshot{}
+	}
+
+	accepted := t.window.sample(gen, now, []uint64{cumulative})
+	if accepted {
+		deltas, elapsed, _ := t.window.last()
+		t.delta = deltas[0]
+		t.windowSeconds = elapsed
+
+		th := defaultHealthThresholds()
+		var rate float64
+		if t.windowSeconds > 0 {
+			rate = float64(t.delta) / t.windowSeconds
+		}
+		if rate >= th.ReturnOwnershipMismatchDegradedRatePPS {
+			t.consecutiveHighWindows++
+		} else {
+			t.consecutiveHighWindows = 0
+		}
+	}
+	// A throttled (<200ms) or monotonic-stale rejected sample leaves
+	// delta, windowSeconds, and consecutiveHighRateWindows untouched.
+	return returnOwnershipSnapshot{
+		deltaSnapshot: deltaSnapshot{
+			delta:         t.delta,
+			windowSeconds: t.windowSeconds,
+		},
+		consecutiveHighRateWindows: t.consecutiveHighWindows,
+	}
+}
+
+// reset re-primes the tracker for a new diagnostics generation.
+// A generation lower than the accepted one is ignored (no-op, leaving published
+// delta and consecutive streak untouched).
+func (t *returnOwnershipTracker) reset(gen diagGeneration) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.window.reset(gen) {
+		return false
+	}
+	t.gen = gen
+	t.primed = false
+	t.delta = 0
+	t.windowSeconds = 0
+	t.consecutiveHighWindows = 0
+	return true
+}
+
+func (t *returnOwnershipTracker) consecutiveHighRateWindows() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.consecutiveHighWindows
 }
 
 // diagDeltaTrackers groups the per-counter windowed delta trackers. Each has
 // its own mutex (both the wrapper state and the embedded window are
 // synchronized), so a caller needs no outer lock.
 type diagDeltaTrackers struct {
-	ownershipMismatch diagDeltaTracker
+	ownershipMismatch returnOwnershipTracker
 	// clientOwnershipMismatch tracks the CLIENT-direction counterpart. It is a
 	// separate tracker, not a second field on the return one, because the two
 	// counters rise independently: sharing a tracker would let a burst in one
@@ -2227,8 +2506,18 @@ type diagDeltaTrackers struct {
 	reasons                 dropReasonRatesTracker
 }
 
-func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
+func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) returnOwnershipSnapshot {
+	if t == nil {
+		return returnOwnershipSnapshot{}
+	}
 	return t.ownershipMismatch.Sample(gen, now, cumulative)
+}
+
+func (t *diagDeltaTrackers) consecutiveHighRateWindows() int {
+	if t == nil {
+		return 0
+	}
+	return t.ownershipMismatch.consecutiveHighRateWindows()
 }
 
 func (t *diagDeltaTrackers) sampleClientOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) deltaSnapshot {
@@ -2247,6 +2536,9 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(gen diagGeneration, now time.T
 // peer-sync failures, enqueue failures, write stalls and the per-reason drop
 // rates — for a new diagnostics generation (issue #429 review blocker 1).
 func (t *diagDeltaTrackers) reset(gen diagGeneration) {
+	if t == nil {
+		return
+	}
 	t.ownershipMismatch.reset(gen)
 	t.clientOwnershipMismatch.reset(gen)
 	t.syncFailures.reset(gen)
@@ -2549,7 +2841,7 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	}
 
 	// 10. Centralized Rule-Based Health Assessment
-	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions)
+	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions, status.HandshakeFreshness.PeerHandshakes)
 	status.HealthAssessment = EvaluateForwarderHealth(
 		status.ForwarderAvailable,
 		status.EngineRunning,
@@ -2610,9 +2902,9 @@ func SynthesizeActionableProblemsWithTracker(routes []forwarder.RouteInfo, sessi
 	return SynthesizeActionableProblemsAt(routes, sessions, observedAt, tracker)
 }
 
-// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
-// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
-func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
+// SynthesizeActionableProblemsWithHandshakes derives per-session/route actionable problem records
+// by correlating active routes, route pressure, active VPN sessions, and peer handshakes.
+func SynthesizeActionableProblemsWithHandshakes(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
@@ -2621,6 +2913,7 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 		sess, hasSess := findSessionForRoute(r, sessions)
 		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess, observedAt)...)
 	}
+	problems = append(problems, synthesizeStaleHandshakeProblems(sessions, peerHandshakes, observedAt)...)
 
 	var tr *problemOnsetTracker
 	if len(tracker) > 0 && tracker[0] != nil {
@@ -2658,6 +2951,12 @@ func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Ses
 
 	sortActionableProblems(problems)
 	return problems
+}
+
+// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
+// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
+func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
+	return SynthesizeActionableProblemsWithHandshakes(routes, sessions, nil, observedAt, tracker...)
 }
 
 func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bool) {
@@ -2750,6 +3049,39 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 				MessageKey:     "vpn_problem_session_without_route",
 				UserID:         sess.UserID,
 				SessionID:      sess.ID,
+				ConnectionName: sess.ConnectionName,
+				AssignedIP:     sess.AssignedIP,
+				BackendID:      sess.BackendTunnelID,
+				FirstObserved:  observedAt,
+			})
+		}
+	}
+	return problems
+}
+
+func synthesizeStaleHandshakeProblems(sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time) []ActionableProblem {
+	if peerHandshakes == nil {
+		return nil
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	var problems []ActionableProblem
+	for _, sess := range sessions {
+		if sess.PeerPublicKey == "" {
+			continue
+		}
+		hs, ok := peerHandshakes[sess.PeerPublicKey]
+		if !ok || hs.IsZero() || observedAt.Sub(hs) > DefaultHealthThresholds.HandshakeStaleAge {
+			problems = append(problems, ActionableProblem{
+				Severity:       "WARNING",
+				Category:       "sessions",
+				Message:        fmt.Sprintf("Upstream handshake stale (> %s)", DefaultHealthThresholds.HandshakeStaleAge),
+				MessageKey:     "vpn_problem_stale_handshake",
+				SessionID:      sess.ID,
+				UserID:         sess.UserID,
+				Username:       sess.Username,
+				ConnectionID:   sess.ConnectionID,
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
@@ -2933,12 +3265,12 @@ func (s *Service) fetchPeerIdentityMappings(ctx context.Context, peerKeys []stri
 	return connByPeer, userByPeer
 }
 
-func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
+func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time) []ActionableProblem {
 	var tracker *problemOnsetTracker
 	if s != nil {
 		tracker = s.getProblemOnsetTracker()
 	}
-	problems := SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC(), tracker)
+	problems := SynthesizeActionableProblemsWithHandshakes(routes, sessions, peerHandshakes, time.Now().UTC(), tracker)
 	if len(problems) == 0 || s == nil || s.db == nil {
 		return problems
 	}

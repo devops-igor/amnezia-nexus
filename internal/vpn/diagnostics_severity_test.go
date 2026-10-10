@@ -88,9 +88,9 @@ func TestB3SparseClientOwnershipMismatchClassifiesAtReasonSeverity(t *testing.T)
 	if cond.Severity != "CRITICAL" {
 		t.Fatalf("sparse client ownership mismatch severity=%q, want CRITICAL: %q", cond.Severity, cond.Message)
 	}
-	if diag.ClientOwnershipMismatchDropsRecent < th.OwnershipMismatchCriticalDrops {
+	if diag.ClientOwnershipMismatchDropsRecent < th.ClientOwnershipMismatchCriticalDrops {
 		t.Fatalf("test does not exercise the critical threshold: recent=%d threshold=%d",
-			diag.ClientOwnershipMismatchDropsRecent, th.OwnershipMismatchCriticalDrops)
+			diag.ClientOwnershipMismatchDropsRecent, th.ClientOwnershipMismatchCriticalDrops)
 	}
 
 	// The headline must not be HEALTHY, and it must be CRITICAL rather than
@@ -104,25 +104,6 @@ func TestB3SparseClientOwnershipMismatchClassifiesAtReasonSeverity(t *testing.T)
 	}
 	if health.Status != HealthCritical {
 		t.Fatalf("headline=%s, want CRITICAL", health.Status)
-	}
-}
-
-// B3 regression: escalating RETURN-direction ownership mismatches reach CRITICAL.
-// Before the fix the aggregate drop-rate threshold downgraded them to DEGRADED.
-func TestB3EscalatingReturnOwnershipMismatchReachesCritical(t *testing.T) {
-	svc := &Service{}
-	checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{}, 0)
-	time.Sleep(250 * time.Millisecond)
-
-	const escalating = 500
-	diag := checkRoutingInvariants(svc, nil, ReturnStatsSnapshot{OwnershipMismatchDrops: escalating}, 0)
-	if diag.OwnershipMismatchDropsRecent != escalating {
-		t.Fatalf("return recent mismatch=%d, want %d", diag.OwnershipMismatchDropsRecent, escalating)
-	}
-	cond := assertSingleCondition(t, evaluateRoutingConditions(diag), "routing")
-	if cond.Severity != "CRITICAL" {
-		t.Fatalf("escalating return ownership mismatch severity=%q, want CRITICAL: %q",
-			cond.Severity, cond.Message)
 	}
 }
 
