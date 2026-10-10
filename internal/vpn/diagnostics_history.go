@@ -199,6 +199,19 @@ func dropReasonTotals(d DropCategoryBreakdown) map[string]uint64 {
 	}
 }
 
+// cloneReasonRates returns a detached copy of published reason rates, guaranteeing
+// every known reason key is present and caller mutations never corrupt tracker state.
+func cloneReasonRates(rates map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(knownDropReasonKeys)+len(rates))
+	for _, k := range knownDropReasonKeys {
+		out[k] = 0
+	}
+	for k, v := range rates {
+		out[k] = v
+	}
+	return out
+}
+
 // dropReasonRatesTracker samples per-reason drop totals against independent
 // per-reason generation-aware windows (issue #429 review blocker 1): within a
 // generation an accepted per-reason baseline is monotonic — a stale LOWER
@@ -211,6 +224,7 @@ type dropReasonRatesTracker struct {
 	mu        sync.Mutex
 	windows   *diagCounterWindows
 	available bool
+	lastRates map[string]float64
 }
 
 func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, totals map[string]uint64) (map[string]float64, bool) {
@@ -230,6 +244,12 @@ func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, total
 			rates[key] = 0
 		}
 	}
+	if t.available {
+		t.lastRates = make(map[string]float64, len(rates))
+		for key, rate := range rates {
+			t.lastRates[key] = rate
+		}
+	}
 	return rates, t.available
 }
 
@@ -245,6 +265,7 @@ func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
 		}
 	}
 	t.available = false
+	t.lastRates = nil
 }
 
 // MaxHistoryBackends caps the fleet context within each existing fixed ring.
@@ -300,46 +321,39 @@ func cloneHistoryPoint(p HistoryPoint) HistoryPoint {
 	return p
 }
 
-// sampleDropRates publishes aggregate and reason rates as one operation.
-// The existing diagnostics lock prevents concurrent status/history callers
-// from returning rates from different intervals; all trackers use the same
-// clock. The generation travels with the observation (issue #429 review
-// round 4, blocker 1): gen is the generation the drop counters were captured
-// under, never read back from the trackers.
+// sampleDropRates publishes aggregate and reason rates as one coherent operation
+// under whole-vector acceptance (issue #457 Rework Round 8). The existing diagnostics
+// lock prevents concurrent status/history callers from returning rates from different
+// intervals; all trackers use the same clock. The generation travels with the observation
+// (issue #429 review round 4, blocker 1): gen is the generation the drop counters were
+// captured under, never read back from the trackers.
 func (s *Service) sampleDropRates(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown, writeErrors uint64) float64 {
 	s.diagRatesMu.Lock()
 	defer s.diagRatesMu.Unlock()
 	if s.diagRates == nil {
 		s.diagRates = newDiagRatesTracker()
 	}
-	var writeErrorRate float64
-	drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps, writeErrorRate = s.diagRates.Sample(
-		gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, writeErrors,
-	)
-	drops.ReasonRates, drops.RatesAvailable = s.diagDeltas.reasons.sample(gen, at, dropReasonTotals(*drops))
+	writeErrorRate, _ := s.diagRates.SampleLossVector(gen, at, drops, writeErrors)
 	return writeErrorRate
 }
 
 // sampleHistoryDropRates calculates drop rates for history against independent
 // history baselines, ensuring foreground status reads cannot consume deltas.
+// Gated on whole-vector acceptance (issue #457 Rework Round 8).
 func (s *Service) sampleHistoryDropRates(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown) {
 	s.diagRatesMu.Lock()
 	defer s.diagRatesMu.Unlock()
 	if s.historyDiagRates == nil {
 		s.historyDiagRates = newDiagRatesTracker()
 	}
-	drops.ClientDropRatePps, drops.ReturnDropRatePps, drops.TotalDropRatePps, _ = s.historyDiagRates.Sample(
-		gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0,
-	)
-	drops.ReasonRates, drops.RatesAvailable = s.historyDropReasons.sample(gen, at, dropReasonTotals(*drops))
+	s.historyDiagRates.SampleLossVector(gen, at, drops, 0)
 }
 
 func (s *Service) primeHistoryRatesLocked(gen diagGeneration, at time.Time, drops *DropCategoryBreakdown) {
 	if s.historyDiagRates == nil {
 		s.historyDiagRates = newDiagRatesTracker()
 	}
-	s.historyDiagRates.Sample(gen, at, drops.ClientTotalDrops, drops.ReturnTotalDrops, drops.TotalDrops, 0)
-	s.historyDropReasons.sample(gen, at, dropReasonTotals(*drops))
+	s.historyDiagRates.SampleLossVector(gen, at, drops, 0)
 }
 
 type ringBuffer struct {

@@ -143,18 +143,23 @@ type HealthThresholds struct {
 
 	// --- Reason-specific critical loss (issue #424 review round 9, blocker 3) ---
 
-	// OwnershipMismatchCriticalDrops gates CRITICAL on ownership mismatch in
-	// EITHER direction. It is a COUNT over the routing sampling window, not a
-	// rate, because the severity does not depend on volume: a packet refused
-	// because its ownership could not be verified is a correctness failure at
-	// any volume. Compared with >= against
-	// RoutingConsistencyDiagnostics.OwnershipMismatchRecentTotal.
-	//
-	// The value is 1, numerically identical to the `> 0` comparison that
-	// already gated routing inconsistency on this same counter in
-	// auditRoutingConsistencyDetails. Round 9 changes only the SEVERITY that
-	// boundary produces, never the boundary itself, so no incident that was
-	// already detected can become invisible.
+	// ClientOwnershipMismatchCriticalDrops gates CRITICAL on client-direction ownership mismatch.
+	ClientOwnershipMismatchCriticalDrops uint64
+	// ReturnOwnershipMismatchWarningDrops gates WARNING on routine return-direction ownership mismatch.
+	ReturnOwnershipMismatchWarningDrops uint64
+	// ReturnOwnershipMismatchDegradedRatePPS gates DEGRADED on sustained return-direction ownership mismatch rate.
+	ReturnOwnershipMismatchDegradedRatePPS float64
+	// ReturnOwnershipMismatchDegradedConsecutiveWindows gates DEGRADED on sustained return-direction
+	// ownership mismatch across consecutive observation windows. A single isolated window with
+	// return drop rate >= ReturnOwnershipMismatchDegradedRatePPS remains WARNING; only when high-rate
+	// loss persists for at least this many consecutive observation windows does severity escalate
+	// to DEGRADED (issue #457).
+	ReturnOwnershipMismatchDegradedConsecutiveWindows int
+
+	// OwnershipMismatchCriticalDrops is retained for backward compatibility (issue #457).
+	// Directional thresholds should be used instead: ClientOwnershipMismatchCriticalDrops,
+	// ReturnOwnershipMismatchWarningDrops, ReturnOwnershipMismatchDegradedRatePPS,
+	// and ReturnOwnershipMismatchDegradedConsecutiveWindows.
 	OwnershipMismatchCriticalDrops uint64
 
 	// InjectionFailureCriticalRatePPS gates CRITICAL on return-path injection
@@ -275,8 +280,12 @@ func defaultHealthThresholds() HealthThresholds {
 		DropRateDegradedPPS: 10.0,
 		DropRateWarningPPS:  1.0,
 
+		ClientOwnershipMismatchCriticalDrops:              1,
+		ReturnOwnershipMismatchWarningDrops:               1,
+		ReturnOwnershipMismatchDegradedRatePPS:            10.0,
+		ReturnOwnershipMismatchDegradedConsecutiveWindows: 2,
 		// `> 0` on the already-gated mismatch counter, restated as >= 1.
-		OwnershipMismatchCriticalDrops: 1,
+		OwnershipMismatchCriticalDrops: 1, // retained for backward compatibility
 		// `> 0`, matching the write-error and queue-drop rate idiom.
 		InjectionFailureCriticalRatePPS: 0,
 		// `> 0`, matching the queue-drop rate idiom for client backend queues.

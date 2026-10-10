@@ -2,6 +2,11 @@
 
 {{ define "content" }}
 <style>
+.badge-warning {
+    background: var(--warning-bg);
+    color: var(--warning);
+    border: 1px solid rgba(245, 158, 11, 0.25);
+}
 #vpnSessionsTable tr.row-expanded td {
     border-bottom: none !important;
 }
@@ -3183,8 +3188,30 @@
         if (dRoutBadge || dRoutCounts) {
             const rc = status.routing_consistency || {};
             const isConsistent = rc.is_consistent !== undefined ? rc.is_consistent : true;
+            let routBadgeClass = 'badge-danger';
+            let routAlertColor = 'var(--danger)';
+            if (isConsistent) {
+                routBadgeClass = 'badge-success';
+            } else {
+                const rawConds = Array.isArray(status.conditions)
+                    ? status.conditions
+                    : ((status.health_assessment && Array.isArray(status.health_assessment.conditions))
+                        ? status.health_assessment.conditions
+                        : []);
+                const routingConds = rawConds.filter(function(c) { return c && c.category === 'routing'; });
+                const hasCritOrDegraded = routingConds.some(function(c) {
+                    return c && (c.severity === 'CRITICAL' || c.severity === 'DEGRADED');
+                });
+                const isOnlyWarning = routingConds.length > 0 && !hasCritOrDegraded && routingConds.every(function(c) {
+                    return c && c.severity === 'WARNING';
+                });
+                if (isOnlyWarning) {
+                    routBadgeClass = 'badge-warning';
+                    routAlertColor = 'var(--warning)';
+                }
+            }
             if (dRoutBadge) {
-                dRoutBadge.className = 'badge ' + (isConsistent ? 'badge-success' : 'badge-danger');
+                dRoutBadge.className = 'badge ' + routBadgeClass;
                 dRoutBadge.textContent = isConsistent ? _('vpn_fwd_consistent') : _('vpn_fwd_inconsistent');
             }
             if (dRoutCounts) {
@@ -3194,7 +3221,7 @@
                 if (Array.isArray(rc.inconsistency_details) && rc.inconsistency_details.length > 0) {
                     dRoutAlerts.textContent = rc.inconsistency_details.join('; ');
                     dRoutAlerts.style.display = 'block';
-                    dRoutAlerts.style.color = 'var(--danger)';
+                    dRoutAlerts.style.color = routAlertColor;
                 } else {
                     dRoutAlerts.textContent = '';
                     dRoutAlerts.style.display = 'none';
