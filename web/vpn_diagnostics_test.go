@@ -15,8 +15,12 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	xhtml "golang.org/x/net/html"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 func findNodeBinary() (string, error) {
@@ -161,11 +165,6 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 				t.Errorf("#vpn-fwd-tech-details missing operational label %s", labelKey)
 			}
 		}
-
-		// Verify #vpn-fwd-routes-details is removed
-		if strings.Contains(vpnStr, "vpn-fwd-routes-details") {
-			t.Errorf("vpn.html should not contain #vpn-fwd-routes-details")
-		}
 	})
 
 	t.Run("TranslationKeysInAllLanguages", func(t *testing.T) {
@@ -218,6 +217,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_affected_configs_count",
 			"vpn_fwd_loss_rate_format",
 			"vpn_fwd_recent",
+			"vpn_col_user_device",
 			"vpn_col_live_traffic",
 			"vpn_col_packet_loss",
 			"vpn_col_queue_pressure",
@@ -346,6 +346,15 @@ vpnRenderForwarderHealth({
     all_routes:[{peer_key:'peer',capacity:100,occupancy:0,drops:5,has_pressure:true}]
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-tech-details').open, true);
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
+assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+const renderedRouteRow = mockDoc.getElementById('vpn-fwd-routes-tbody').children[0];
+assert(renderedRouteRow, 'route row should be rendered');
+assert.strictEqual(renderedRouteRow.children[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteRow.children[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[4].style.textAlign, 'right', 'writes cell must have text-align: right');
 
 // Recovered KPIs keep lifetime evidence descriptive and show current availability.
 mockDoc.reset();
@@ -457,6 +466,113 @@ assert(chart.innerHTML.includes('No data'), 'missing observation count is unavai
 `
 	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("history renderer: %v\n%s", err, out)
+	}
+}
+
+func TestVPNCompleteRouteTooltipContract(t *testing.T) {
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	render, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Marshal the production schema: a newly populated field cannot silently
+	// disappear between the status payload and the complete tooltip.
+	route := vpn.ProblemRouteItem{
+		PeerKey: "abcd...wxyz", AssignedIP: "192.0.2.8", BackendID: 38,
+		Occupancy: 23, Capacity: 100, HighWater: 47, UtilizationPct: 23, HighWaterPct: 47,
+		Drops: 17, P95WriteMS: 18, HasPressure: true, PressureNote: "Recent write errors: 19",
+		WriteCount: 101, WriteErrors: 19, WriteStalls: 20, WritesInFlight: 21,
+		OldestWriteMS: 22, MaxWriteMS: 24, P95WriteSamples: 25, QueueFullDropsRecent: 26,
+		QueueFullDropRatePPS: 2.4,
+		WriteErrorsRecent:    27, WriteStallsRecent: 28, SessionAgeSec: 29, LastTrafficAgeSec: 30,
+		Traffic: forwarder.TrafficSnapshot{RxBytes: 31, TxBytes: 32, RxPackets: 33, TxPackets: 34,
+			RxBytesPerSec: 35, TxBytesPerSec: 36, RxPps: 37, TxPps: 39, Available: true, WindowSec: 40},
+	}
+	encoded, err := json.Marshal(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const renderedRouteCells = document.getElementById('vpn-fwd-routes-tbody').children[0].children;
+assert.strictEqual(renderedRouteCells[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteCells[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[4].style.textAlign, 'right', 'writes cell must have text-align: right');
+const title = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+const labels = {
+ peer_key:_('vpn_forwarder_route_peer'),
+ assigned_ip:_('vpn_diag_assigned_address'),
+ backend_id:_('vpn_diag_backend'),
+ occupancy:_('vpn_forwarder_queue'),
+ capacity:_('vpn_diag_queue_capacity'),
+ high_water:_('vpn_diag_queue_high_water'),
+ utilization_pct:_('vpn_diag_queue_utilization'),
+ high_water_pct:_('vpn_diag_high_water_pct'),
+ drops:_('vpn_diag_queue_drops_cumulative'),
+ p95_write_ms:_('vpn_diag_write_p95_historical'),
+ has_pressure:_('vpn_diag_current_pressure'),
+ pressure_note:_('vpn_diag_pressure_reason'),
+ write_count:_('vpn_diag_writes_admitted'),
+ write_errors:_('vpn_diag_write_errors_cumulative'),
+ write_stalls:_('vpn_diag_write_stalls_cumulative'),
+ writes_in_flight:_('vpn_diag_writes_in_flight'),
+ oldest_write_ms:_('vpn_diag_oldest_write'),
+ max_write_ms:_('vpn_diag_max_write_historical'),
+ p95_write_samples:_('vpn_diag_write_samples'),
+ queue_full_drops_recent:_('vpn_diag_recent_queue_drops'),
+ queue_full_drop_rate_pps:_('vpn_diag_drop_rate'),
+ write_errors_recent:_('vpn_diag_recent_write_errors'),
+ write_stalls_recent:_('vpn_diag_recent_write_stalls'),
+ session_age_sec:_('vpn_diag_session_age'),
+ last_traffic_age_sec:_('vpn_diag_last_traffic_age'),
+ traffic:_('vpn_diag_directional_traffic')
+};
+const trafficLabels = {
+ rx_bytes:_('vpn_diag_rx_bytes'),
+ tx_bytes:_('vpn_diag_tx_bytes'),
+ rx_packets:_('vpn_diag_rx_packets'),
+ tx_packets:_('vpn_diag_tx_packets'),
+ rx_bytes_per_sec:_('vpn_diag_rx_bytes_rate'),
+ tx_bytes_per_sec:_('vpn_diag_tx_bytes_rate'),
+ rx_pps:_('vpn_diag_rx_packets_rate'),
+ tx_pps:_('vpn_diag_tx_packets_rate'),
+ available:_('vpn_diag_available'),
+ window_sec:_('vpn_diag_window')
+};
+assert.deepStrictEqual(Object.keys(route).sort(),Object.keys(labels).sort(),'payload/tooltip field contract drifted');
+for (const key of Object.keys(route)) {
+ if (key === 'traffic') {
+  for (const name of Object.keys(route.traffic)) {
+   assert(title.includes(_('vpn_diag_directional_traffic')+' '+trafficLabels[name]+': '+route.traffic[name]), name);
+  }
+ } else assert(title.includes(labels[key]+': '+route[key]),key);
+}
+route.traffic.available=false; route.last_traffic_age_sec=-1;route.p95_write_samples=0;
+vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const unknown = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
+assert(unknown.includes('Directional traffic RX bytes/s: Unavailable'));
+assert(unknown.includes('Write p95 (historical ms): Unavailable'));
+assert(unknown.includes('Last traffic age (s): Unavailable'));
+`
+	if out, err := execNodeScript(nodePath, script); err != nil {
+		t.Fatalf("complete route tooltip: %v\n%s", err, out)
 	}
 }
 
@@ -2133,6 +2249,19 @@ vpnRenderForwarderHealth({
 });
 
 assert.strictEqual(el('vpn-fwd-tech-details').open, false, 'tech details must remain closed when healthy');
+
+// Operator manual expansion preserved across healthy poll (#461)
+el('vpn-fwd-tech-details').open = true;
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: { status: 'HEALTHY', conditions: [] },
+	rates: { available: true },
+	routing_consistency: { is_consistent: true, active_routes_count: 5, active_sessions_count: 5 },
+	peer_sync: { actual_peers: 5, desired_peers: 5 },
+	backends: { healthy_count: 2, total_count: 2 }
+});
+assert.strictEqual(el('vpn-fwd-tech-details').open, true, 'tech details must remain open across healthy polling tick when manually opened');
+el('vpn-fwd-tech-details').open = false;
 assert.strictEqual(el('vpn-fwd-problem-list').style.display, 'flex');
 assert.strictEqual(el('vpn-fwd-problem-list').children.length, 1);
 const greenBadge = el('vpn-fwd-problem-list').children[0];
@@ -2285,6 +2414,8 @@ let vpnSessionsStale = false;
 let vpnSessionsFilterOnlyProblems = false;
 let vpnLastStatus = null;
 let vpnExpandedSessionIds = new Set();
+let vpnLastActiveProblemKeys = null;
+let vpnLastActiveProblemCount = 0;
 let vpnSessionsTableInstance = null;
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
@@ -2314,6 +2445,19 @@ func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
 		if !strings.Contains(tmplStr, `id="`+requiredID+`"`) {
 			t.Fatalf("vpn.html missing required ID %q", requiredID)
 		}
+	}
+
+	// Invariant: #vpnSessionsTable thead tr has 5 headers, and header 1 is vpn_col_user_device (#464)
+	tableMatches := regexp.MustCompile(`<table[^>]*id="vpnSessionsTable"[^>]*>([\s\S]*?)</table>`).FindStringSubmatch(tmplStr)
+	if len(tableMatches) < 2 {
+		t.Fatal("vpnSessionsTable not found in template")
+	}
+	thMatches := regexp.MustCompile(`<th[^>]*>([\s\S]*?)</th>`).FindAllStringSubmatch(tableMatches[1], -1)
+	if len(thMatches) != 5 {
+		t.Fatalf("expected 5 <th> headers in #vpnSessionsTable thead, got %d", len(thMatches))
+	}
+	if !strings.Contains(thMatches[0][1], `vpn_col_user_device`) {
+		t.Fatalf("expected header 1 to be vpn_col_user_device, got %q", thMatches[0][1])
 	}
 
 	// 1. English DOM assertions: 8 columns, correlation, telemetry, drilldown, and problem filter
@@ -2460,55 +2604,63 @@ const sessions = [
 vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
-// Assertion 1: Count badge and row count
+// Assertion 1: Count badge, row count, and thead 5-column contract
 assert.strictEqual(countBadge.textContent, '4', 'badge count must match session count');
 assert.strictEqual(tbody.children.length, 4, 'table must render 4 session rows');
 
 // Row 0 (alice - nominal correlated route):
 const row0 = tbody.children[0];
-assert.strictEqual(row0.children.length, 8, 'session row must have 8 columns');
+assert.strictEqual(row0.children.length, 5, 'session row must have 5 columns');
 assert(row0.children[0].textContent.includes('alice'), 'col 0 must render username');
+assert(row0.children[0].textContent.includes('alice-phone'), 'col 0 must render config subtitle');
+assert(row0.children[0].textContent.includes('10.8.0.2'), 'col 0 must render IP subtitle');
 assert.strictEqual(row0.children[0].style.cursor, 'pointer', 'user cell must have pointer style');
+assert.notStrictEqual(row0.children[0].style.display, 'flex', 'user cell td must NOT have style.display flex');
+assert(row0.children[0].innerHTML.includes('inline-flex'), 'user cell must contain inline-flex wrapper');
 assert(row0.children[0].innerHTML.includes('vpn-expand-icon'), 'user cell must render chevron icon');
-assert.strictEqual(row0.children[1].textContent, 'alice-phone', 'col 1 must render config name');
-assert.strictEqual(row0.children[2].textContent, 'Frankfurt-1', 'col 2 must render server name');
-assert.strictEqual(row0.children[3].textContent, '10.8.0.2', 'col 3 must render assigned IP');
-assert(row0.children[4].textContent.includes('1.00 Mbps') && row0.children[4].textContent.includes('2.00 Mbps'), 'col 4 must render live traffic rates');
-assert.strictEqual(row0.children[5].textContent, '0', 'col 5 must render 0 drops');
-assert.strictEqual(row0.children[6].textContent, '12/100', 'col 6 must render queue occupancy/capacity');
-assert(row0.children[7].textContent.includes('Active'), 'col 7 must render Active status badge');
-assert(row0.children[7].innerHTML.includes('badge-success'), 'col 7 must render badge-success for connected session');
+assert.strictEqual(row0.children[1].textContent, 'Frankfurt-1', 'col 1 must render server name');
+assert(row0.children[2].textContent.includes('1.00 Mbps') && row0.children[2].textContent.includes('2.00 Mbps'), 'col 2 must render live traffic rates');
+assert.strictEqual(row0.children[2].getAttribute('data-sort-value'), '3000000', 'tdTraffic must carry numeric data-sort-value');
+assert.strictEqual(row0.children[3].textContent, '0', 'col 3 must render 0 drops');
+assert.strictEqual(row0.children[3].getAttribute('data-sort-value'), '0', 'tdLoss must carry numeric data-sort-value');
+assert(row0.children[4].textContent.includes('Active'), 'col 4 must render Active status badge');
+assert(row0.children[4].innerHTML.includes('badge-success'), 'col 4 must render badge-success for connected session');
 
 // Row 1 (bob - degraded correlated route):
 const row1 = tbody.children[1];
-assert.strictEqual(row1.children.length, 8);
+assert.strictEqual(row1.children.length, 5, 'session row must have 5 columns');
 assert(row1.children[0].textContent.includes('bob'));
-assert(row1.children[5].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
-assert(row1.children[5].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
-assert(row1.children[5].textContent.includes('15'), 'drops count must be 15');
-assert(row1.children[6].innerHTML.includes('badge-warn'), 'queue pressure must be styled with badge-warn');
-assert.strictEqual(row1.children[6].textContent, '90/100');
-assert(row1.children[7].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
-assert(row1.children[7].textContent.includes('Degraded'), 'status text must show Degraded');
+assert.strictEqual(row1.children[1].textContent, 'Frankfurt-1');
+assert.strictEqual(row1.children[2].getAttribute('data-sort-value'), '600000');
+assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '10000000002400');
+assert(row1.children[3].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
+assert(row1.children[3].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
+assert(row1.children[3].textContent.includes('15'), 'drops count must be 15');
+assert(row1.children[4].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
+assert(row1.children[4].textContent.includes('Degraded'), 'status text must show Degraded');
 
 // Row 2 (charlie - active session without route):
 const row2 = tbody.children[2];
-assert.strictEqual(row2.children.length, 8);
+assert.strictEqual(row2.children.length, 5, 'session row must have 5 columns');
 assert(row2.children[0].textContent.includes('charlie'));
-assert.strictEqual(row2.children[4].textContent, '-', 'traffic must be dash when route is absent');
-assert.strictEqual(row2.children[5].textContent, '-', 'loss must be dash when route is absent');
-assert.strictEqual(row2.children[6].textContent, '-', 'pressure must be dash when route is absent');
-assert(row2.children[7].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
-assert(row2.children[7].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
+assert.strictEqual(row2.children[1].textContent, 'Frankfurt-2');
+assert.strictEqual(row2.children[2].textContent, '-', 'traffic must be dash when route is absent');
+assert.strictEqual(row2.children[2].getAttribute('data-sort-value'), '0');
+assert.strictEqual(row2.children[3].textContent, '-', 'loss must be dash when route is absent');
+assert.strictEqual(row2.children[3].getAttribute('data-sort-value'), '0');
+assert(row2.children[4].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
+assert(row2.children[4].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
 
 // Row 3 (dan - nominal session with historical drops):
 const row3 = tbody.children[3];
-assert.strictEqual(row3.children.length, 8);
+assert.strictEqual(row3.children.length, 5, 'session row must have 5 columns');
 assert(row3.children[0].textContent.includes('dan'));
-assert.strictEqual(row3.children[5].textContent, '10', 'historical drops must render count');
-assert(!row3.children[5].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
-assert(row3.children[7].textContent.includes('Active'), 'session with only historical drops must remain Active status');
-assert(row3.children[7].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
+assert.strictEqual(row3.children[1].textContent, 'Frankfurt-1');
+assert.strictEqual(row3.children[3].textContent, '10', 'historical drops must render count');
+assert(!row3.children[3].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
+assert.strictEqual(row3.children[3].getAttribute('data-sort-value'), '10');
+assert(row3.children[4].textContent.includes('Active'), 'session with only historical drops must remain Active status');
+assert(row3.children[4].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
 
 // Assertion 2: Expandable drilldown with 4 telemetry cards
 vpnToggleSessionDrilldown(sessions[0], tbody.children[0]);
@@ -2517,7 +2669,7 @@ assert(tbody.children[0].classList.contains('row-expanded'), 'row must gain row-
 assert.strictEqual(tbody.children.length, 5, 'tbody must have drilldown row inserted');
 const drilldown0 = tbody.children[1];
 assert(drilldown0.className.includes('vpn-session-drilldown-row'), 'drilldown row must have correct class');
-assert.strictEqual(drilldown0.children[0].colSpan, 8, 'drilldown td must span all 8 columns');
+assert.strictEqual(drilldown0.children[0].colSpan, 5, 'drilldown td must span all 5 columns');
 
 // 4 cards in drilldown:
 assert(drilldown0.innerHTML.includes('Latency Reservoirs'), 'drilldown must contain Latency Reservoirs card');
@@ -2594,11 +2746,11 @@ vpnLastStatus = {
 vpnRenderForwarderHealth(vpnLastStatus);
 assert.strictEqual(tbody.children.length, 4);
 const updatedAlice = tbody.children[0];
-assert(updatedAlice.children[4].textContent.includes('4.00 Mbps') && updatedAlice.children[4].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
-assert(updatedAlice.children[5].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
-assert(updatedAlice.children[6].innerHTML.includes('badge-warn'), 'queue pressure must update dynamically');
-assert.strictEqual(updatedAlice.children[6].textContent, '95/100');
-assert(updatedAlice.children[7].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
+assert(updatedAlice.children[2].textContent.includes('4.00 Mbps') && updatedAlice.children[2].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
+assert.strictEqual(updatedAlice.children[2].getAttribute('data-sort-value'), '12000000');
+assert(updatedAlice.children[3].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
+assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '10000000012');
+assert(updatedAlice.children[4].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
 
 // Assertion 6: Correlation priority ordering (session_id > connection_id > assigned_ip)
 const routeSessionMatch = { session_id: 'sess-prio', connection_id: 'conn-other', assigned_ip: '10.8.0.200' };
@@ -2707,12 +2859,12 @@ assert.strictEqual(filterText.textContent, 'Только с проблемами
 
 // Russian degraded status badge
 const row0 = tbody.children[0];
-assert(row0.children[7].textContent.includes('Деградировано'), 'Russian degraded status label');
+assert(row0.children[4].textContent.includes('Деградировано'), 'Russian degraded status label');
 
 // Russian unroutable status badge for session without route
 const row1Before = tbody.children[1];
-assert(row1Before.children[7].textContent.includes('Немаршрутизируемый'), 'Russian unroutable status label');
-assert(row1Before.children[7].innerHTML.includes('badge-warn'));
+assert(row1Before.children[4].textContent.includes('Немаршрутизируемый'), 'Russian unroutable status label');
+assert(row1Before.children[4].innerHTML.includes('badge-warn'));
 
 // Russian drilldown cards titles
 vpnToggleSessionDrilldown(sessions[0], row0);
@@ -2738,9 +2890,9 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 	ruDict := vpnDiagnosticsLocale(t, "ru")
 	renderedHTML := vpnDiagnosticsRenderedHTML(t, tmplStr, ruDict)
 	for _, expectedRussianHeader := range []string{
+		"Пользователь и устройство",
 		"Текущий трафик",
 		"Потеря пакетов",
-		"Нагрузка на очередь",
 		"Диагностика подключений",
 		"Только с проблемами",
 	} {
@@ -3117,6 +3269,168 @@ assert(summaryHeader.textContent.includes('1 active problems'), 'summary header 
 	}
 }
 
+func TestVPNForwarderStaleHandshakeActionableProblemDOM(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const el = id => document.getElementById(id);
+
+// Supply a status payload containing an actionable problem with message_key: "vpn_problem_stale_handshake" and user/connection identities
+vpnRenderForwarderHealth({
+	forwarder_available: true,
+	health_assessment: {
+		status: 'HEALTHY',
+		summary: 'Operational with 1 warning condition(s)',
+		actionable_problems: [
+			{
+				severity: 'WARNING',
+				message: 'Upstream handshake stale (> 3m0s)',
+				message_key: 'vpn_problem_stale_handshake',
+				category: 'sessions',
+				user_id: 'usr-1',
+				username: 'alice',
+				connection_id: 'conn-1',
+				connection_name: 'alice-phone',
+				assigned_ip: '10.8.0.2',
+				backend_id: 1,
+				first_observed: '2026-10-08T12:00:00Z'
+			}
+		],
+		conditions: [
+			{
+				severity: 'WARNING',
+				message: '1 active live session(s) have stale upstream handshakes (> 3m0s)',
+				message_key: 'vpn_problem_stale_handshake',
+				category: 'sessions'
+			}
+		]
+	}
+});
+
+// 1. Assert Summary Header: displays 1 active problems • 1 affected users • 1 client configs
+const summaryHeader = el('vpn-fwd-summary-header');
+assert(summaryHeader, 'summary header element must exist');
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem');
+assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must show 1 affected user');
+assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must show 1 client config');
+assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+
+// 2. Assert Problem Card: rendered with user and connection metadata badges
+const problemList = el('vpn-fwd-problem-list');
+assert.strictEqual(problemList.children.length, 1, 'must render 1 problem card');
+const card = problemList.children[0];
+assert(card.className.includes('problem-card'), 'card must have problem-card class');
+assert(card.textContent.includes('Upstream handshake stale'), 'card must render localized message');
+assert(card.textContent.includes('User: alice'), 'card must contain user badge');
+assert(card.textContent.includes('Config: alice-phone'), 'card must contain connection config badge');
+assert(card.textContent.includes('IP: 10.8.0.2'), 'card must contain IP badge');
+assert(card.textContent.includes('Backend 1'), 'card must contain backend badge');
+`
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("stale handshake DOM test failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNForwarderStaleHandshakeEmptySnapshotMatchingCountsDOM(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	// 1. Synthesize actionable problems with an empty non-nil peer map (0 portal peers snapshot)
+	now := time.Now().UTC()
+	sess := vpn.Session{
+		ID:              "sess-empty-snap",
+		UserID:          "usr-bob",
+		Username:        "bob",
+		ConnectionID:    "conn-bob",
+		ConnectionName:  "bob-tablet",
+		PeerPublicKey:   "pk-bob",
+		AssignedIP:      "10.8.0.22",
+		BackendTunnelID: 1,
+		Status:          "connected",
+	}
+	routes := []forwarder.RouteInfo{
+		{
+			PeerKey:         "pk-bob",
+			AssignedIP:      "10.8.0.22",
+			SessionID:       "sess-empty-snap",
+			ConnectionID:    "conn-bob",
+			BackendTunnelID: 1,
+		},
+	}
+	emptyPeerHandshakes := make(map[string]time.Time)
+	problems := vpn.SynthesizeActionableProblemsWithHandshakes(routes, []vpn.Session{sess}, emptyPeerHandshakes, now)
+	if len(problems) != 1 {
+		t.Fatalf("expected 1 problem synthesized from empty peer snapshot, got %d", len(problems))
+	}
+
+	payloadJSON, err := json.Marshal(map[string]any{
+		"forwarder_available": true,
+		"health_assessment": map[string]any{
+			"status":              "HEALTHY",
+			"summary":             "Operational with 1 warning condition(s)",
+			"actionable_problems": problems,
+			"conditions": []map[string]any{
+				{
+					"severity":    "WARNING",
+					"message":     "1 active live session(s) have stale upstream handshakes (> 3m0s)",
+					"message_key": "vpn_problem_stale_handshake",
+					"category":    "sessions",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	assertions := fmt.Sprintf(`
+const el = id => document.getElementById(id);
+
+vpnRenderForwarderHealth(%s);
+
+// Verify summary header displays matching non-zero user and config counts:
+// 1 active problems • 1 affected users • 1 client configs
+const summaryHeader = el('vpn-fwd-summary-header');
+assert(summaryHeader, 'summary header element must exist');
+assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
+assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem');
+assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must show 1 affected user');
+assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must show 1 client config');
+assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+
+// Verify problem card renders with user and config badges
+const problemList = el('vpn-fwd-problem-list');
+assert.strictEqual(problemList.children.length, 1, 'must render 1 problem card');
+const card = problemList.children[0];
+assert(card.textContent.includes('User: bob'), 'card must contain user badge');
+assert(card.textContent.includes('Config: bob-tablet'), 'card must contain connection config badge');
+assert(card.textContent.includes('IP: 10.8.0.22'), 'card must contain IP badge');
+`, string(payloadJSON))
+
+	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
+	if out, err := execNodeScript(node, script); err != nil {
+		t.Fatalf("empty peer snapshot DOM test failed: %v\n%s", err, out)
+	}
+}
+
 func TestVPNTranslationKeyParity(t *testing.T) {
 	transFS, err := GetTranslationsSubFS()
 	if err != nil {
@@ -3271,20 +3585,15 @@ assert.strictEqual(tbody.children.length, 2, 'table must render 2 session rows')
 
 // Row 0: Dan (historical drops + queue pressure)
 const rowDan = tbody.children[0];
-const lossDan = rowDan.children[5];
-const pressureDan = rowDan.children[6];
+const lossDan = rowDan.children[3];
 
 // Loss cell MUST NOT be colored red
 assert.strictEqual(lossDan.textContent, '10', 'Dan loss cell must display historical drops count 10');
 assert(!lossDan.innerHTML.includes('text-danger'), 'Dan loss cell must NOT be red when only historical drops + pressure');
 
-// Pressure cell MUST have warning badge
-assert(pressureDan.innerHTML.includes('badge-warn'), 'Dan pressure cell must have badge-warn');
-assert.strictEqual(pressureDan.textContent, '95/100', 'Dan pressure cell must show 95/100');
-
 // Row 1: Eve (recent drops without pps rate)
 const rowEve = tbody.children[1];
-const lossEve = rowEve.children[5];
+const lossEve = rowEve.children[3];
 
 // Loss cell MUST be colored red with localized format
 assert(lossEve.innerHTML.includes('text-danger'), 'Eve loss cell must have text-danger styling for recent drops');
@@ -3330,7 +3639,7 @@ const sessions = [
 vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
-const lossEve = tbody.children[0].children[5];
+const lossEve = tbody.children[0].children[3];
 assert(lossEve.innerHTML.includes('text-danger'), 'Russian: Eve loss cell must have text-danger');
 assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve loss cell must use localized "недавних"');
 `
@@ -3392,11 +3701,11 @@ assert.strictEqual(tbody.children.length, 1, 'tbody must have 1 session row');
 const row = tbody.children[0];
 
 // Assert drops column does NOT inherit the old route's drops (drops: 25)
-const dropsCell = row.children[5];
+const dropsCell = row.children[3];
 assert.strictEqual(dropsCell.textContent, '-', 'unroutable session must have dash for drops without inheriting old route telemetry');
 
 // Assert status column renders with Unroutable badge
-const statusCell = row.children[7];
+const statusCell = row.children[4];
 assert(statusCell.textContent.includes('Unroutable'), 'session without matching route must show Unroutable status badge');
 assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge must have badge-warn');
 
@@ -3404,7 +3713,7 @@ assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge mus
 vpnToggleSessionsProblemFilter();
 assert.strictEqual(tbody.children.length, 1, 'unroutable session must appear under Problems Only filter');
 const probRow = tbody.children[0];
-assert(probRow.children[7].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
+assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
 `
 
 	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
@@ -3460,6 +3769,13 @@ searchPaths.forEach(p => {
     }
 });
 
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && fs.existsSync(globalRoot) && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
 let JSDOM;
 try {
     JSDOM = require('jsdom').JSDOM;
@@ -3489,6 +3805,7 @@ w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'var vpnLastSessions = null, vpnLastStatus = null;' +
 'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
 'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
     'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
@@ -3521,9 +3838,15 @@ w.eval(tablesCode);
     };
 
     w.renderSessions(sessions);
+    // Table header assertion (Requirement 4):
+    // - #vpnSessionsTable thead tr has 5 headers, and header 1 is vpn_col_user_device.
+    const theadHeaders = Array.from(w.document.querySelectorAll('#vpnSessionsTable thead th'));
+    assert.strictEqual(theadHeaders.length, 5, '#vpnSessionsTable thead tr must have 5 headers');
+    assert(theadHeaders[0].textContent.includes('vpn_col_user_device'), 'header 1 must be vpn_col_user_device');
+
     const tbody = w.document.getElementById('vpn-sessions-tbody');
     function rowOrder() {
-        return Array.from(tbody.children).filter(r => r.style.display !== 'none').map(r => r.classList.contains('vpn-session-drilldown-row') ? 'DETAIL' : r.cells[0]?.textContent.trim());
+        return Array.from(tbody.children).filter(r => r.style.display !== 'none').map(r => r.classList.contains('vpn-session-drilldown-row') ? 'DETAIL' : (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()));
     }
 
     // 1. Sort ascending
@@ -3531,7 +3854,7 @@ w.eval(tablesCode);
     assert.deepStrictEqual(rowOrder(), ['alpha', 'bravo', 'zulu'], 'table must sort ascending by user');
 
     // 2. Expand alpha
-    const alpha = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    const alpha = Array.from(tbody.children).find(r => (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()) === 'alpha');
     assert(alpha, 'alpha row must exist');
     alpha.cells[0].click();
     assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'detail row must follow alpha');
@@ -3540,7 +3863,7 @@ w.eval(tablesCode);
     // 3. Polling refresh
     w.renderSessions(sessions);
     assert.deepStrictEqual(rowOrder(), ['alpha', 'DETAIL', 'bravo', 'zulu'], 'order must be preserved after poll refresh');
-    const alphaAfterPoll = Array.from(tbody.children).find(r => r.cells[0]?.textContent.trim() === 'alpha');
+    const alphaAfterPoll = Array.from(tbody.children).find(r => (r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim()) === 'alpha');
     const detailAfterPoll = alphaAfterPoll?.nextElementSibling;
     assert.strictEqual(detailAfterPoll?.classList.contains('vpn-session-drilldown-row'), true, 'detail row must remain adjacent to parent after poll refresh');
 
@@ -3589,8 +3912,1957 @@ w.eval(tablesCode);
 		t.Fatalf("TestVPNNexusTableLifecycleDrilldownAndConfigDedup failed: %v\n%s", err, string(out))
 	}
 	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", out)
+		}
 		t.Skip("jsdom is not available in Node environment")
 	}
+}
+
+func findHTMLNodeByID(n *xhtml.Node, id string) *xhtml.Node {
+	if n == nil {
+		return nil
+	}
+	if n.Type == xhtml.ElementNode {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == id {
+				return n
+			}
+		}
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findHTMLNodeByID(c, id); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func getHTMLNodeAttr(n *xhtml.Node, key string) string {
+	if n == nil {
+		return ""
+	}
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func findHTMLNodesByTag(n *xhtml.Node, tag string) []*xhtml.Node {
+	var results []*xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
+			results = append(results, curr)
+			return
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return results
+}
+
+func getHTMLNodeText(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr.Type == xhtml.TextNode {
+			b.WriteString(curr.Data)
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(b.String())
+}
+
+const jsdomBootstrapSnippet = `
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
+const home = process.env.HOME || process.env.USERPROFILE || '';
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+`
+
+func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
+	t.Helper()
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", outStr)
+		}
+		t.Skip("jsdom is not available in Node environment")
+	}
+	return outStr
+}
+
+func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssBytes)
+
+	t.Run("TemplateDOMStructure", func(t *testing.T) {
+		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
+		if err != nil {
+			t.Fatalf("failed to parse vpn.html as HTML: %v", err)
+		}
+
+		table := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
+		if table == nil {
+			t.Fatal("table #vpn-fwd-routes-table not found in vpn.html")
+		}
+
+		// 1. Parent container of #vpn-fwd-routes-table has class table-container
+		parent := table.Parent
+		if parent == nil {
+			t.Fatal("parent container of #vpn-fwd-routes-table is nil")
+		}
+		if parent.Data != "div" {
+			t.Errorf("parent tag = %q, want div", parent.Data)
+		}
+		parentClass := getHTMLNodeAttr(parent, "class")
+		parentClasses := strings.Fields(parentClass)
+		hasTableContainer := false
+		for _, c := range parentClasses {
+			if c == "table-container" {
+				hasTableContainer = true
+				break
+			}
+		}
+		if !hasTableContainer {
+			t.Errorf("parent container of #vpn-fwd-routes-table missing class table-container, got classes: %q", parentClass)
+		}
+
+		// 2. #vpn-fwd-routes-table has class data-table and does not have obsolete class table
+		tableClass := getHTMLNodeAttr(table, "class")
+		tableClasses := strings.Fields(tableClass)
+		hasDataTable := false
+		hasTable := false
+		for _, c := range tableClasses {
+			if c == "data-table" {
+				hasDataTable = true
+			}
+			if c == "table" {
+				hasTable = true
+			}
+		}
+		if !hasDataTable {
+			t.Errorf("#vpn-fwd-routes-table missing class data-table, got classes: %q", tableClass)
+		}
+		if hasTable {
+			t.Errorf("#vpn-fwd-routes-table has obsolete class table, got classes: %q", tableClass)
+		}
+
+		// 3. Minimum width rule
+		tableStyle := getHTMLNodeAttr(table, "style")
+		if !strings.Contains(tableStyle, "min-width: 540px") {
+			t.Errorf("#vpn-fwd-routes-table style missing min-width: 540px, got: %q", tableStyle)
+		}
+
+		// 4. Headers: Peer has white-space: nowrap, Queue, Peak, Drops, Writes have text-align: right
+		thNodes := findHTMLNodesByTag(table, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("expected 5 <th> elements in #vpn-fwd-routes-table, found %d", len(thNodes))
+		}
+		thPeerStyle := getHTMLNodeAttr(thNodes[0], "style")
+		if !strings.Contains(thPeerStyle, "white-space: nowrap") {
+			t.Errorf("peer header style = %q, want containing 'white-space: nowrap'", thPeerStyle)
+		}
+		for i, name := range []string{"queue", "peak", "drops", "writes"} {
+			thStyle := getHTMLNodeAttr(thNodes[i+1], "style")
+			if !strings.Contains(thStyle, "text-align: right") {
+				t.Errorf("%s header style = %q, want containing 'text-align: right'", name, thStyle)
+			}
+		}
+	})
+
+	t.Run("RenderedCellFormattingInNode", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+
+		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + "\n" + f1 + "\n" + f2 + `
+document.reset();
+
+const sampleRoutes = [
+    { peer_key: 'peer1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
+    { peer_key: 'peer2', occupancy: 90, capacity: 100, high_water: 95, drops: 5, queue_full_drops_recent: 2, write_count: 50 },
+    { peer_key: 'peer3', occupancy: 0, capacity: 100, high_water: 10, drops: 0, pressure_note: 'Testing note' },
+    { peer_key: 'peer4', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, write_errors: 2, write_errors_recent: 1 },
+    { peer_key: 'peer5', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, p95_write_ms: 25.4 }
+];
+
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+const tbody = document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row has 5 cells');
+
+    // Peer cell has white-space: nowrap
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'row ' + i + ' peer cell must have white-space: nowrap');
+
+    // Numeric cells have text-align: right
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'row ' + i + ' queue cell must have text-align: right');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'row ' + i + ' peak cell must have text-align: right');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'row ' + i + ' drops cell must have text-align: right');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'row ' + i + ' writes cell must have text-align: right');
+}
+
+console.log('TABLE_FORMATTING_PASS');
+`
+		cmd := exec.Command(nodePath, "-e", runnerScript)
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Table formatting DOM tests failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "TABLE_FORMATTING_PASS") {
+			t.Fatalf("Table formatting DOM tests did not output TABLE_FORMATTING_PASS\nOutput:\n%s", string(out))
+		}
+	})
+
+	t.Run("PersianRTLRendering", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		faDict := vpnDiagnosticsLocale(t, "fa")
+		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, faDict)
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "fa")
+
+		// 1. Static assertion on Go template output under Persian locale
+		doc, err := xhtml.Parse(strings.NewReader(renderedHTML))
+		if err != nil {
+			t.Fatalf("failed to parse rendered Persian HTML: %v", err)
+		}
+		tableNode := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
+		if tableNode == nil {
+			t.Fatal("table #vpn-fwd-routes-table not found in rendered Persian HTML")
+		}
+		thNodes := findHTMLNodesByTag(tableNode, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("expected 5 <th> elements in Persian table, found %d", len(thNodes))
+		}
+		expectedHeaders := []struct {
+			key       string
+			alignment string
+			nowrap    bool
+		}{
+			{"vpn_forwarder_route_peer", "", true},
+			{"vpn_forwarder_route_queue", "text-align: right", false},
+			{"vpn_forwarder_route_peak", "text-align: right", false},
+			{"vpn_forwarder_route_drops", "text-align: right", false},
+			{"vpn_forwarder_route_writes", "text-align: right", false},
+		}
+		for i, exp := range expectedHeaders {
+			gotText := getHTMLNodeText(thNodes[i])
+			wantText := faDict[exp.key]
+			if gotText != wantText {
+				t.Errorf("Persian header %d (%s) = %q, want %q", i, exp.key, gotText, wantText)
+			}
+			style := getHTMLNodeAttr(thNodes[i], "style")
+			if exp.nowrap && !strings.Contains(style, "white-space: nowrap") {
+				t.Errorf("Persian header %d missing 'white-space: nowrap', style=%q", i, style)
+			}
+			if exp.alignment != "" && !strings.Contains(style, exp.alignment) {
+				t.Errorf("Persian header %d missing %q, style=%q", i, exp.alignment, style)
+			}
+		}
+
+		// 2. Dynamic RTL rendering with JSDOM
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
+    pretendToBeVisual: true,
+    runScripts: 'outside-only'
+});
+const w = dom.window;
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+
+assert.strictEqual(w.document.documentElement.getAttribute('dir'), 'rtl', 'document has dir=rtl');
+
+const table = w.document.getElementById('vpn-fwd-routes-table');
+assert(table, '#vpn-fwd-routes-table must exist');
+const tableComputed = w.getComputedStyle(table);
+assert.strictEqual(tableComputed.direction, 'rtl', 'table computed direction must be rtl under dir=rtl root');
+
+const thElements = w.document.querySelectorAll('#vpn-fwd-routes-table thead th');
+assert.strictEqual(thElements.length, 5, 'must have 5 th headers');
+assert.strictEqual(thElements[0].textContent.trim(), w.translations['vpn_forwarder_route_peer'], 'localized peer header');
+assert.strictEqual(thElements[1].textContent.trim(), w.translations['vpn_forwarder_route_queue'], 'localized queue header');
+assert.strictEqual(thElements[2].textContent.trim(), w.translations['vpn_forwarder_route_peak'], 'localized peak header');
+assert.strictEqual(thElements[3].textContent.trim(), w.translations['vpn_forwarder_route_drops'], 'localized drops header');
+assert.strictEqual(thElements[4].textContent.trim(), w.translations['vpn_forwarder_route_writes'], 'localized writes header');
+
+assert.strictEqual(thElements[0].style.whiteSpace, 'nowrap', 'peer header white-space nowrap under RTL');
+assert.strictEqual(thElements[1].style.textAlign, 'right', 'queue header text-align right under RTL');
+assert.strictEqual(thElements[2].style.textAlign, 'right', 'peak header text-align right under RTL');
+assert.strictEqual(thElements[3].style.textAlign, 'right', 'drops header text-align right under RTL');
+assert.strictEqual(thElements[4].style.textAlign, 'right', 'writes header text-align right under RTL');
+
+const sampleRoutes = [
+    { peer_key: 'fa_peer_1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
+    { peer_key: 'fa_peer_2', occupancy: 85, capacity: 100, high_water: 90, drops: 3, queue_full_drops_recent: 1, write_count: 60 },
+    { peer_key: 'fa_peer_3', occupancy: 0, capacity: 100, high_water: 10, drops: 0, pressure_note: 'توضیحات' }
+];
+
+w.vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+const tbody = w.document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered under RTL');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row ' + i + ' has 5 cells under RTL');
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'row ' + i + ' peer cell must have white-space: nowrap under RTL');
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'row ' + i + ' queue cell must have text-align: right under RTL');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'row ' + i + ' peak cell must have text-align: right under RTL');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'row ' + i + ' drops cell must have text-align: right under RTL');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'row ' + i + ' writes cell must have text-align: right under RTL');
+}
+
+console.log('PERSIAN_RTL_PASS');
+`, cssStr, renderedHTML, translationsJS, f1, f2)
+
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "PERSIAN_RTL_PASS") {
+			t.Fatalf("Persian RTL test did not output PERSIAN_RTL_PASS\nOutput:\n%s", out)
+		}
+	})
+
+	t.Run("NarrowViewportLayout", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		enDict := vpnDiagnosticsLocale(t, "en")
+		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "en")
+
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
+    pretendToBeVisual: true,
+    runScripts: 'outside-only'
+});
+const w = dom.window;
+w.innerWidth = 375;
+w.outerWidth = 375;
+
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+
+const table = w.document.getElementById('vpn-fwd-routes-table');
+assert(table, '#vpn-fwd-routes-table must exist');
+const container = table.closest('.table-container');
+assert(container, 'parent .table-container must exist');
+
+// 1. Verify container .table-container has overflow handling (overflow-x: auto)
+const containerStyle = w.getComputedStyle(container);
+assert.strictEqual(containerStyle.overflowX, 'auto', 'container must have overflow-x: auto');
+
+// 2. Verify #vpn-fwd-routes-table style has min-width: 540px
+const tableComputed = w.getComputedStyle(table);
+assert.strictEqual(tableComputed.minWidth, '540px', 'table computed min-width must be 540px');
+assert.strictEqual(table.style.minWidth, '540px', 'table inline style min-width must be 540px');
+
+// 3. Verify min-width exceeds mobile viewport (~375px), preventing columns from collapsing
+const minWidthPx = parseInt(tableComputed.minWidth, 10);
+assert.strictEqual(minWidthPx, 540, 'min-width must be 540px');
+assert(minWidthPx > w.innerWidth, 'table min-width (' + minWidthPx + 'px) exceeds narrow viewport (' + w.innerWidth + 'px), preserving columns and enabling horizontal scroll');
+
+// 4. Render sample routes and verify table renders without collapsing columns
+const sampleRoutes = [
+    { peer_key: 'peer_mobile_1', occupancy: 25, capacity: 100, high_water: 50, drops: 0, write_count: 100 },
+    { peer_key: 'peer_mobile_2', occupancy: 95, capacity: 100, high_water: 100, drops: 12, queue_full_drops_recent: 3, write_count: 200 }
+];
+
+w.vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+assert.strictEqual(table.style.display, '', 'table is displayed when routes exist');
+const tbody = w.document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row has 5 cells');
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'peer cell retains white-space nowrap on narrow viewport');
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'queue cell text-align right');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'peak cell text-align right');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'drops cell text-align right');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'writes cell text-align right');
+}
+
+console.log('NARROW_VIEWPORT_PASS');
+`, cssStr, renderedHTML, translationsJS, f1, f2)
+
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
+			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", out)
+		}
+	})
+}
+
+func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enData, err := fs.ReadFile(transFS, "en.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testScript := fmt.Sprintf(`
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
+const home = process.env.HOME || process.env.USERPROFILE || '';
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+
+const source = %q;
+const en = JSON.parse(%q);
+const tablesCode = %q;
+
+function extract(name) {
+    const start = source.indexOf('    function ' + name + '(');
+    assert(start >= 0, 'function not found: ' + name);
+    const rest = source.slice(start + 1);
+    const match = /^    (?:async )?function /m.exec(rest);
+    return source.slice(start, match ? start + 1 + match.index : source.indexOf('</script>', start));
+}
+
+const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
+const w = dom.window;
+w.eval('const translations = ' + JSON.stringify(en) + ';' +
+'function _(key) { return translations[key] || key; };' +
+'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
+'const UI = { escapeHtml };' +
+'var vpnLastSessions = null, vpnLastStatus = null;' +
+'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
+'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
+'var vpnHistoryWindow = "15m";\n' +
+[
+    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
+    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
+    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
+    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
+    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+].map(extract).join('\n'));
+
+w.eval(tablesCode);
+
+(async function() {
+    // 5 sessions covering:
+    // - Differing traffic rates (dan 50M > alice 20M > bob 1M > charlie 200k > eve 0)
+    // - Packet loss tiers:
+    //   Tier 1: active drop rates (alice 4.5 pps > bob 0.8 pps)
+    //   Tier 2: recent drops with zero rate (charlie 25 recent drops)
+    //   Tier 3: historical lifetime drops with zero recent (dan 10000 drops)
+    //   Tier 4: zero drops (eve 0 drops)
+    const sessions = [
+        { id: 's-dan', username: 'dan', connection_id: 'c-dan', assigned_ip: '10.8.0.4', status: 'connected' },
+        { id: 's-alice', username: 'alice', connection_id: 'c-alice', assigned_ip: '10.8.0.2', status: 'connected' },
+        { id: 's-bob', username: 'bob', connection_id: 'c-bob', assigned_ip: '10.8.0.3', status: 'connected' },
+        { id: 's-charlie', username: 'charlie', connection_id: 'c-charlie', assigned_ip: '10.8.0.5', status: 'connected' },
+        { id: 's-eve', username: 'eve', connection_id: 'c-eve', assigned_ip: '10.8.0.6', status: 'connected' }
+    ];
+
+    const routes = [
+        {
+            session_id: 's-dan',
+            connection_id: 'c-dan',
+            assigned_ip: '10.8.0.4',
+            occupancy: 10,
+            capacity: 100,
+            drops: 10000,
+            queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false,
+            traffic: { available: true, rx_bps: 25000000, tx_bps: 25000000 } // 50 Mbps
+        },
+        {
+            session_id: 's-alice',
+            connection_id: 'c-alice',
+            assigned_ip: '10.8.0.2',
+            occupancy: 90,
+            capacity: 100,
+            drops: 20,
+            queue_full_drops_recent: 10,
+            queue_full_drop_rate_pps: 4.5,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 10000000, tx_bps: 10000000 } // 20 Mbps
+        },
+        {
+            session_id: 's-bob',
+            connection_id: 'c-bob',
+            assigned_ip: '10.8.0.3',
+            occupancy: 50,
+            capacity: 100,
+            drops: 5,
+            queue_full_drops_recent: 2,
+            queue_full_drop_rate_pps: 0.8,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 500000, tx_bps: 500000 } // 1 Mbps
+        },
+        {
+            session_id: 's-charlie',
+            connection_id: 'c-charlie',
+            assigned_ip: '10.8.0.5',
+            occupancy: 30,
+            capacity: 100,
+            drops: 50,
+            queue_full_drops_recent: 25,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: true,
+            traffic: { available: true, rx_bps: 100000, tx_bps: 100000 } // 200 Kbps
+        },
+        {
+            session_id: 's-eve',
+            connection_id: 'c-eve',
+            assigned_ip: '10.8.0.6',
+            occupancy: 0,
+            capacity: 100,
+            drops: 0,
+            queue_full_drops_recent: 0,
+            queue_full_drop_rate_pps: 0,
+            has_pressure: false,
+            traffic: { available: true, rx_bps: 0, tx_bps: 0 } // 0 bps
+        }
+    ];
+
+    w.vpnLastSessions = { sessions: sessions };
+    w.vpnLastStatus = {
+        forwarder_available: true,
+        all_routes: routes
+    };
+
+    w.renderSessions(sessions);
+
+    const tbody = w.document.getElementById('vpn-sessions-tbody');
+    function rowOrder() {
+        return Array.from(tbody.children)
+            .filter(r => r.style.display !== 'none' && !r.classList.contains('table-loading-row') && !r.classList.contains('table-empty-state'))
+            .map(r => r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim() || r.cells[0]?.textContent.trim());
+    }
+
+    const headers = Array.from(w.document.querySelectorAll('#vpnSessionsTable thead th'));
+    assert.strictEqual(headers.length, 5, 'must have 5 headers');
+
+    // Header 2: Live Traffic
+    const thTraffic = headers[2];
+    assert(thTraffic.textContent.includes('vpn_col_live_traffic'), 'col 2 must be live traffic header');
+
+    // Live Traffic Ascending (1st click)
+    thTraffic.click();
+    assert.strictEqual(thTraffic.getAttribute('aria-sort'), 'ascending');
+    assert.deepStrictEqual(rowOrder(), ['eve', 'charlie', 'bob', 'alice', 'dan'], 'traffic ascending: 0 < 200k < 1M < 20M < 50M');
+
+    // Live Traffic Descending (2nd click)
+    thTraffic.click();
+    assert.strictEqual(thTraffic.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['dan', 'alice', 'bob', 'charlie', 'eve'], 'traffic descending: 50M > 20M > 1M > 200k > 0');
+
+    // Header 3: Packet Loss
+    const thLoss = headers[3];
+    assert(thLoss.textContent.includes('vpn_col_packet_loss'), 'col 3 must be packet loss header');
+
+    // Packet Loss Ascending (1st click)
+    thLoss.click();
+    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'ascending');
+    assert.deepStrictEqual(rowOrder(), ['eve', 'dan', 'charlie', 'bob', 'alice'], 'loss ascending: Tier 4 (0) < Tier 3 (10k drops) < Tier 2 (25 recent) < Tier 1 (0.8 pps) < Tier 1 (4.5 pps)');
+
+    // Packet Loss Descending (2nd click)
+    thLoss.click();
+    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['alice', 'bob', 'charlie', 'dan', 'eve'], 'loss descending: Tier 1 (4.5 pps) > Tier 1 (0.8 pps) > Tier 2 (25 recent) > Tier 3 (10k drops) > Tier 4 (0)');
+
+    // Explicit verification of operational triage guarantees:
+    const descOrder = rowOrder();
+    const aliceIdx = descOrder.indexOf('alice');
+    const bobIdx = descOrder.indexOf('bob');
+    const charlieIdx = descOrder.indexOf('charlie');
+    const danIdx = descOrder.indexOf('dan');
+    const eveIdx = descOrder.indexOf('eve');
+
+    assert(aliceIdx < bobIdx, 'higher active drop rate (4.5 pps) must sort before lower rate (0.8 pps)');
+    assert(bobIdx < charlieIdx, 'active rate loss must sort before recent loss with 0 current rate');
+    assert(charlieIdx < danIdx, 'recent loss (25 recent drops) must sort before historical drops (10000 drops) despite lower total');
+    assert(danIdx < eveIdx, 'historical drops must sort before zero drops');
+
+    // Part B: Technical diagnostics accordion collapse persistence across multiple poll renders
+    const techDetails = w.document.getElementById('vpn-fwd-tech-details');
+    assert(techDetails, 'vpn-fwd-tech-details must exist in template');
+
+    // 1. Initial healthy state: accordion is closed
+    w.vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: { status: 'HEALTHY', conditions: [] }
+    });
+    assert.strictEqual(techDetails.open, false, 'techDetails must be closed initially when healthy');
+
+    // 2. Degraded state with Problem A appears -> auto-expands
+    const degradedStatusA = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Queue full drops active', connection_id: 'c-1', username: 'alice' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on active problem detection');
+
+    // 3. Operator manually collapses the details panel
+    techDetails.open = false;
+    assert.strictEqual(techDetails.open, false, 'operator manually collapsed techDetails');
+
+    // 4. Repeated polling render cycle 1 with identical degradedStatusA -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across poll tick 1 with same problem');
+
+    // 5. Repeated polling render cycle 2 with identical degradedStatusA -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across poll tick 2 with same problem');
+
+    // 5a. Telemetry changes within existing actionable problem (rates, counters, message text change) -> must STAY closed
+    const degradedStatusA_tick3 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (10 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '2.0 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick3);
+    techDetails.open = false; // operator collapses
+
+    // Tick 4: telemetry fluctuates (10 recent -> 11 recent, rate 2.0 -> 2.1 drops/s) -> MUST STAY CLOSED
+    const degradedStatusA_tick4 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (11 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '2.1 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick4);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when actionable problem telemetry numbers fluctuate');
+
+    // Tick 5: telemetry fluctuates further (11 recent -> 15 recent, rate 2.1 -> 3.5 drops/s) -> MUST STAY CLOSED
+    const degradedStatusA_tick5 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    severity: 'DEGRADED',
+                    category: 'dataplane',
+                    message_key: 'vpn_problem_route_queue_drops',
+                    message: 'Return queue full drops (15 recent) for 10.0.0.2',
+                    connection_id: 'c-1',
+                    assigned_ip: '10.0.0.2',
+                    username: 'alice',
+                    observed_rate: '3.5 drops/s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusA_tick5);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed across repeated telemetry counter updates');
+
+    // 5b. Unkeyed qualifying condition with fluctuating rates/counters -> must STAY closed
+    const degradedStatusCond_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message: 'Active queue drops: 2.0 drops/sec due to full return queues'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusCond_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusCond_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message: 'Active queue drops: 2.1 drops/sec due to full return queues'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusCond_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when unkeyed condition rate fluctuates');
+
+    // 5c. Keyed qualifying condition with fluctuating rates -> must STAY closed
+    const degradedStatusKeyedCond_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message_key: 'vpn_diag_condition_backend_device_unattributed',
+                    message: 'Backend device drops are active but detailed per-direction attribution is unavailable: 2.0 drops/sec'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusKeyedCond_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusKeyedCond_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'drops',
+                    severity: 'DEGRADED',
+                    message_key: 'vpn_diag_condition_backend_device_unattributed',
+                    message: 'Backend device drops are active but detailed per-direction attribution is unavailable: 2.1 drops/sec'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusKeyedCond_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when keyed condition rate fluctuates');
+
+    // 5d. Actionable problem lacking message_key where message text has changing telemetry counters -> must STAY closed
+    const degradedStatusUnkeyedAct_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (10 recent) for Client A', connection_id: 'c-10', username: 'charlie' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusUnkeyedAct_tick1);
+    techDetails.open = false; // operator collapses
+
+    const degradedStatusUnkeyedAct_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusUnkeyedAct_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when unkeyed actionable problem numbers fluctuate');
+
+    // 5e. Distinct routing conditions affecting different IPs with identical count and severity -> must AUTO-EXPAND
+    // 1. Operator closes #vpn-fwd-tech-details on duplicate-IP condition affecting 10.8.0.2
+    const degradedStatusDupIP_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 10.8.0.2'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 10.8.0.2 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of duplicate-IP condition');
+
+    // 2. Telemetry updates to a replacement duplicate-IP condition affecting 10.8.0.3 with the exact same count and severity
+    const degradedStatusDupIP_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 10.8.0.3'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different IP (10.8.0.3 vs 10.8.0.2)');
+
+    // Operator collapses accordion after observing new IP incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupIP_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement condition');
+
+    // 5f. Routing ownership mismatch condition with fluctuating drop counts -> must STAY closed
+    const degradedStatusOwnership_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '3 client-direction and 2 return-direction ownership mismatch drop(s) in the last 30.0s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusOwnership_tick1);
+    techDetails.open = false; // operator collapses accordion
+
+    const degradedStatusOwnership_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '5 client-direction and 7 return-direction ownership mismatch drop(s) in the last 30.0s'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusOwnership_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when ownership mismatch drop counts fluctuate');
+
+    // 5g. Distinct routing conditions affecting leading-compressed IPv6 addresses with identical count and severity -> must AUTO-EXPAND
+    // 1. Operator closes #vpn-fwd-tech-details on duplicate-IP condition affecting ::200
+    const degradedStatusDupIPv6_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: ::200'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on leading-compressed IPv6 duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same ::200 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of leading-compressed IPv6 condition');
+
+    // 2. Telemetry updates to a replacement duplicate-IP condition affecting ::201 with the exact same count and severity
+    const degradedStatusDupIPv6_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: ::201'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different leading-compressed IPv6 (::201 vs ::200)');
+
+    // Operator collapses accordion after observing new IPv6 incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupIPv6_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement leading-compressed IPv6 condition');
+
+    // 5h. Space-separated timestamp condition updating -> must STAY closed
+    const degradedStatusSpaceTs_tick1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: 'Last sample at 2026-10-09 09:00:00'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusSpaceTs_tick1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on space-separated timestamp condition');
+    techDetails.open = false; // operator collapses accordion
+
+    const degradedStatusSpaceTs_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: 'Last sample at 2026-10-09 09:00:05'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusSpaceTs_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when space-separated timestamp advances');
+
+    // 5i. Embedded-clock IPv6 replacement: 2001:db8::19:10:10 vs 2001:db8::19:10:15 -> must AUTO-EXPAND
+    // 1. Duplicate-IP condition affecting 2001:db8::19:10:10 is rendered
+    const degradedStatusDupClockIPv6_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 2001:db8::19:10:10'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on embedded-clock IPv6 duplicate-IP condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 2001:db8::19:10:10 duplicate IP condition -> must STAY closed
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of embedded-clock IPv6 condition');
+
+    // 2. Replacement duplicate-IP condition affecting 2001:db8::19:10:15 arrives with identical count 1 and severity CRITICAL
+    const degradedStatusDupClockIPv6_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            conditions: [
+                {
+                    category: 'routing',
+                    severity: 'CRITICAL',
+                    message: '1 duplicate IP address(es) detected across active routes: 2001:db8::19:10:15'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_2);
+    // 3. Assert that #vpn-fwd-tech-details AUTO-EXPANDS (techDetails.open === true) because the affected IP identity changed!
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different embedded-clock IPv6 (2001:db8::19:10:15 vs 2001:db8::19:10:10)');
+
+    // Operator collapses accordion after observing new IPv6 incident
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusDupClockIPv6_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement embedded-clock IPv6 condition');
+
+    // 5j. Table-driven mixed IPv6 duplicate-IP replacement cases -> must AUTO-EXPAND on IP change
+    const mixedIPv6Cases = [
+        { initial: '::1234:192.0.2.1', replacement: '::1235:192.0.2.1', desc: 'leading-compressed mixed IPv6 (::1234:192.0.2.1 vs ::1235:192.0.2.1)' },
+        { initial: '::ffff:0:192.0.2.1', replacement: '::ffff:1:192.0.2.1', desc: 'mapped-expanded mixed IPv6 (::ffff:0:192.0.2.1 vs ::ffff:1:192.0.2.1)' }
+    ];
+    for (const tc of mixedIPv6Cases) {
+        const makeDupStatus = (ip) => ({
+            forwarder_available: true,
+            health_assessment: {
+                status: 'CRITICAL',
+                conditions: [
+                    {
+                        category: 'routing',
+                        severity: 'CRITICAL',
+                        message: '1 duplicate IP address(es) detected across active routes: ' + ip
+                    }
+                ]
+            }
+        });
+        // 1. Initial mixed IPv6 duplicate-IP condition
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.initial));
+        assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on ' + tc.desc + ' duplicate-IP condition');
+        techDetails.open = false; // operator collapses accordion
+
+        // Repeated poll with same address -> must STAY closed
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.initial));
+        assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of ' + tc.desc + ' with same address');
+
+        // 2. Replacement duplicate-IP condition arrives with identical count 1 and severity CRITICAL
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.replacement));
+        assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when replacement duplicate-IP condition affects a different mixed IPv6 (' + tc.desc + ')');
+
+        // Operator collapses accordion after observing new incident
+        techDetails.open = false;
+        w.vpnRenderForwarderHealth(makeDupStatus(tc.replacement));
+        assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement mixed IPv6 (' + tc.desc + ')');
+    }
+
+    // 5k. Escalated backend degradation ratio (1 of 3 vs 2 of 3 enabled backends) -> must AUTO-EXPAND
+    const backendDegraded_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'backend',
+                    severity: 'DEGRADED',
+                    message: '1 of 3 enabled backends are degraded or unavailable (0 administratively disabled, not counted as failures)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendDegraded_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 of 3 backend degradation condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 1 of 3 backend condition -> must STAY closed
+    w.vpnRenderForwarderHealth(backendDegraded_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 of 3 backend condition');
+
+    // Condition updates to 2 of 3 enabled backends degraded with identical total condition count 1 and severity DEGRADED
+    const backendDegraded_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'backend',
+                    severity: 'DEGRADED',
+                    message: '2 of 3 enabled backends are degraded or unavailable (0 administratively disabled, not counted as failures)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendDegraded_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when backend degradation escalates from 1 of 3 to 2 of 3');
+
+    // Operator collapses accordion after observing escalated backend degradation
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(backendDegraded_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 of 3 backend condition');
+
+    // 5l. Actionable problem moving to a different backend node -> must AUTO-EXPAND
+    const backendMove_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    category: 'dataplane',
+                    severity: 'DEGRADED',
+                    message: 'High packet loss on egress for Client X',
+                    connection_id: 'c-100',
+                    username: 'charlie',
+                    backend_id: 'backend-1'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendMove_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on actionable problem on backend-1');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same backend-1 problem -> must STAY closed
+    w.vpnRenderForwarderHealth(backendMove_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of problem on backend-1');
+
+    // Problem shifts to backend-2 with identical count 1 and severity DEGRADED
+    const backendMove_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                {
+                    category: 'dataplane',
+                    severity: 'DEGRADED',
+                    message: 'High packet loss on egress for Client X',
+                    connection_id: 'c-100',
+                    username: 'charlie',
+                    backend_id: 'backend-2'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(backendMove_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when actionable problem shifts to backend-2');
+
+    // Operator collapses accordion after observing shifted problem
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(backendMove_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of problem on backend-2');
+
+    // 5m. Stale sessions escalation (1 active live session(s) vs 2 active live session(s)) -> must AUTO-EXPAND
+    const staleSessions_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'WARNING',
+            conditions: [
+                {
+                    category: 'sessions',
+                    severity: 'WARNING',
+                    message: '1 active live session(s) have stale upstream handshakes (> 3m0s)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(staleSessions_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 active live session stale handshake condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same condition -> must STAY closed
+    w.vpnRenderForwarderHealth(staleSessions_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 active live session stale handshake');
+
+    // Condition updates to 2 active live sessions with total count remaining 1 and unchanged severity WARNING
+    const staleSessions_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'WARNING',
+            conditions: [
+                {
+                    category: 'sessions',
+                    severity: 'WARNING',
+                    message: '2 active live session(s) have stale upstream handshakes (> 3m0s)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(staleSessions_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when stale active live sessions escalate from 1 to 2');
+
+    // Operator collapses accordion after observing escalated stale sessions
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(staleSessions_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 active live sessions stale handshake');
+
+    // 5n. Invalid durable peer rows escalation (1 vs 2 invalid durable peer rows) -> must AUTO-EXPAND
+    const invalidPeerRows_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: '1 invalid durable peer row(s) excluded from the desired set; those peers are not enforced upstream and their traffic is unauthorized until the rows are repaired'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(invalidPeerRows_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on 1 invalid durable peer row condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with same 1 invalid durable peer row condition -> must STAY closed
+    w.vpnRenderForwarderHealth(invalidPeerRows_1);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 1 invalid durable peer row');
+
+    // Condition updates to 2 invalid durable peer rows at unchanged total count 1 and severity DEGRADED
+    const invalidPeerRows_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: '2 invalid durable peer row(s) excluded from the desired set; those peers are not enforced upstream and their traffic is unauthorized until the rows are repaired'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(invalidPeerRows_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when invalid durable peer rows escalate from 1 to 2');
+
+    // Operator collapses accordion after observing escalated invalid peer rows
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(invalidPeerRows_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 2 invalid durable peer rows');
+
+    // 5o. Peer sync divergence escalation (5 desired vs 3 actual peers -> 6 desired vs 3 actual peers) -> must AUTO-EXPAND
+    const peerDivergence_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 10s: 5 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on peer sync divergence condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with elapsed time advancing (10s -> 20s) with same 5 desired vs 3 actual peers -> must STAY closed
+    const peerDivergence_1_tick2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 20s: 5 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_1_tick2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when divergence duration advances with unchanged peer counts');
+
+    // Condition updates to 6 desired vs 3 actual peers at unchanged count 1 and severity DEGRADED
+    const peerDivergence_2 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Peer sync divergence for 20s: 6 desired vs 3 actual peers'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(peerDivergence_2);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when peer sync divergence escalates from 5 to 6 desired peers');
+
+    // Operator collapses accordion after observing escalated peer divergence
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(peerDivergence_2);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of 6 desired vs 3 actual peers');
+
+    // 5p. Cumulative sync/enqueue counter growth alone (10 -> 11 cumulative) with unchanged recent activity -> must STAY closed
+    const activePeerSync_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 1 sync, 0 enqueue in the last 30.0s (10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on active peer sync failure condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll with cumulative counter growth (10 -> 11 cumulative) and unchanged recent activity -> must STAY closed
+    const activePeerSync_cumTick = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 1 sync, 0 enqueue in the last 30.0s (11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_cumTick);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when cumulative sync counters advance with unchanged recent activity');
+
+    // Recent active sync failure escalates from 1 to 2 sync failures -> must AUTO-EXPAND
+    const activePeerSync_escalated = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 2 sync, 0 enqueue in the last 30.0s (12 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_escalated);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when active peer sync failures escalate from 1 to 2');
+    techDetails.open = false; // operator collapses accordion
+
+    // Repeated poll of 2 sync, 0 enqueue with further cumulative growth -> must STAY closed
+    const activePeerSync_escalated_cumTick = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Active peer sync failures: 2 sync, 0 enqueue in the last 30.0s (13 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(activePeerSync_escalated_cumTick);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of escalated active sync failures');
+
+    // 5q. Unresolved peer sync failure: cooling recent activity, advancing elapsed duration, and cumulative totals -> must STAY closed
+    const unresolvedSync_1 = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 2m; recent activity: 1 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_1);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand on unresolved peer sync failure condition');
+    techDetails.open = false; // operator collapses accordion
+
+    // Poll where recent activity cools from 1 to 0 recent sync failures -> must STAY closed
+    const unresolvedSync_coolActivity = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 2m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_coolActivity);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when recent activity cools from 1 to 0 on unresolved peer sync failure');
+
+    // Poll where elapsed duration alone advances (2m -> 3m) -> must STAY closed
+    const unresolvedSync_advancingDuration = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 10 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_advancingDuration);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when elapsed duration alone advances on unresolved peer sync failure');
+
+    // Poll where cumulative counters advance (10 -> 11 cumulative) -> must STAY closed
+    const unresolvedSync_advancingCumulative = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: database unavailable (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_advancingCumulative);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed when cumulative counters advance on unresolved peer sync failure');
+
+    // Condition updates to a different unresolved error -> must AUTO-EXPAND
+    const unresolvedSync_differentError = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            conditions: [
+                {
+                    category: 'peer_sync',
+                    severity: 'DEGRADED',
+                    message: 'Unresolved peer sync failure: context deadline exceeded (last successful reconcile 3m; recent activity: 0 sync, 0 enqueue failures in the last 30.0s; 11 sync, 0 enqueue cumulative)'
+                }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(unresolvedSync_differentError);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when unresolved peer sync failure error changes');
+    techDetails.open = false; // operator collapses accordion
+
+    // Repeated poll of the new error -> must STAY closed
+    w.vpnRenderForwarderHealth(unresolvedSync_differentError);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll of replacement unresolved error');
+
+    // 6. Polling render cycle 3 with NEW Problem B added -> must AUTO-EXPAND
+    const degradedStatusB = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' },
+                { severity: 'DEGRADED', message: 'Backend latency critical', connection_id: 'c-2', username: 'bob' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusB);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when a new problem appears');
+
+    // 7. Operator collapses again after observing new problem -> must STAY closed on poll with same 2 problems
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusB);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed after second manual collapse');
+
+    // 7b. Increased count (from 2 to 3 problems) -> must AUTO-EXPAND
+    const degradedStatusC = {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'DEGRADED',
+            actionable_problems: [
+                { severity: 'DEGRADED', message: 'Return queue full drops (11 recent) for Client A', connection_id: 'c-10', username: 'charlie' },
+                { severity: 'DEGRADED', message: 'Backend latency critical', connection_id: 'c-2', username: 'bob' },
+                { severity: 'WARNING', message: 'High route pressure', connection_id: 'c-3', username: 'david' }
+            ]
+        }
+    };
+    w.vpnRenderForwarderHealth(degradedStatusC);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when problem count increases');
+
+    // Operator manually collapses after observing 3 problems
+    techDetails.open = false;
+    w.vpnRenderForwarderHealth(degradedStatusC);
+    assert.strictEqual(techDetails.open, false, 'techDetails must remain closed on repeated poll with 3 problems');
+
+    // 8. Problems resolve completely -> healthy state
+    w.vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: { status: 'HEALTHY', conditions: [] }
+    });
+    assert.strictEqual(techDetails.open, false, 'techDetails remains closed when healthy');
+
+    // 9. Problem recurs -> must AUTO-EXPAND again on transition from healthy to degraded
+    w.vpnRenderForwarderHealth(degradedStatusA);
+    assert.strictEqual(techDetails.open, true, 'techDetails must auto-expand when problem recurs from healthy state');
+
+    console.log('PASS');
+})().catch(e => {
+    console.error(e);
+    process.exit(1);
+});
+`, tmplStr, string(enData), string(tablesJS))
+
+	out, err := execNodeScript(node, testScript)
+	if err != nil {
+		t.Fatalf("TestVPNSessionsTableSortingAndAccordionPersistence failed: %v\n%s", err, string(out))
+	}
+	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", out)
+		}
+		t.Skip("jsdom is not available in Node environment")
+	}
+}
+
+// Issue #457 Rework Round 5: Routing Consistency panel badge and alerts must be severity-aware.
+// Sparse/benign return mismatch drops produce WARNING severity and must render badge-warning
+// with var(--warning) alert color, while CRITICAL and DEGRADED routing issues retain badge-danger
+// and var(--danger).
+func TestVPNRoutingConsistencyBadgeSeverityAware(t *testing.T) {
+	node, err := findNodeBinary()
+	if err != nil {
+		t.Fatal("Node is required for diagnostics verification")
+	}
+	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(source)
+
+	assertions := `
+const routBadge = document.getElementById('vpn-diag-routing-badge');
+const routAlerts = document.getElementById('vpn-diag-routing-alerts');
+
+// Case 1: Consistent routing -> badge-success
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: true,
+        active_routes_count: 5,
+        active_sessions_count: 5
+    },
+    health_assessment: {
+        status: 'HEALTHY',
+        conditions: []
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-success', 'consistent routing must have badge-success');
+assert.strictEqual(routBadge.textContent, _('vpn_fwd_consistent'), 'consistent routing badge text');
+assert.strictEqual(routAlerts.style.display, 'none', 'alerts hidden when consistent');
+
+// Case 2: Inconsistent with only WARNING routing condition (e.g. sparse return mismatch)
+// -> must render badge-warning and alert color var(--warning)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 3,
+        inconsistency_details: ['Return-direction ownership mismatch: 3 drops']
+    },
+    health_assessment: {
+        status: 'HEALTHY',
+        conditions: [
+            { category: 'routing', severity: 'WARNING', message: 'Return-direction ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-warning', 'routing with only WARNING condition must use badge-warning');
+assert.strictEqual(routBadge.textContent, _('vpn_fwd_inconsistent'), 'inconsistent text preserved');
+assert.strictEqual(routAlerts.style.display, 'block', 'alerts displayed');
+assert.strictEqual(routAlerts.style.color, 'var(--warning)', 'alerts text must use var(--warning) for WARNING routing condition');
+assert.strictEqual(routAlerts.textContent, 'Return-direction ownership mismatch: 3 drops');
+
+// Case 3: Inconsistent with status.conditions (direct array) having only WARNING routing condition
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 3,
+        inconsistency_details: ['Return-direction ownership mismatch: 3 drops']
+    },
+    conditions: [
+        { category: 'routing', severity: 'WARNING', message: 'Return-direction ownership mismatch' }
+    ]
+});
+assert.strictEqual(routBadge.className, 'badge badge-warning', 'direct status.conditions with only WARNING must use badge-warning');
+assert.strictEqual(routAlerts.style.color, 'var(--warning)', 'direct status.conditions alert must use var(--warning)');
+
+// Case 4: Inconsistent with DEGRADED routing condition (e.g. sustained return mismatch)
+// -> must retain badge-danger and alert color var(--danger)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 10,
+        inconsistency_details: ['Sustained return ownership mismatch: 10 drops']
+    },
+    health_assessment: {
+        status: 'DEGRADED',
+        conditions: [
+            { category: 'routing', severity: 'DEGRADED', message: 'Sustained return ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'degraded routing must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'degraded routing alerts must retain var(--danger)');
+
+// Case 5: Inconsistent with CRITICAL routing condition (e.g. client ownership mismatch)
+// -> must retain badge-danger and alert color var(--danger)
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 1,
+        inconsistency_details: ['Client ownership mismatch: 1 drop']
+    },
+    health_assessment: {
+        status: 'CRITICAL',
+        conditions: [
+            { category: 'routing', severity: 'CRITICAL', message: 'Client ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'critical routing must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'critical routing alerts must retain var(--danger)');
+
+// Case 6: Mixed routing conditions (WARNING + CRITICAL) -> CRITICAL wins, must retain badge-danger
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    routing_consistency: {
+        is_consistent: false,
+        ownership_mismatch_drops: 4,
+        inconsistency_details: ['Multiple routing anomalies']
+    },
+    health_assessment: {
+        status: 'CRITICAL',
+        conditions: [
+            { category: 'routing', severity: 'WARNING', message: 'Return ownership mismatch' },
+            { category: 'routing', severity: 'CRITICAL', message: 'Client ownership mismatch' }
+        ]
+    }
+});
+assert.strictEqual(routBadge.className, 'badge badge-danger', 'mixed routing conditions with CRITICAL must retain badge-danger');
+assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alerts must retain var(--danger)');
+`
+
+	script := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "en", assertions)
+	out, err := execNodeScript(node, script)
+	if err != nil {
+		t.Fatalf("TestVPNRoutingConsistencyBadgeSeverityAware failed: %v\n%s", err, string(out))
+	}
+}
+
+func hasHTMLClass(n *xhtml.Node, className string) bool {
+	if n == nil {
+		return false
+	}
+	for _, c := range strings.Fields(getHTMLNodeAttr(n, "class")) {
+		if c == className {
+			return true
+		}
+	}
+	return false
+}
+
+func findClosestEnclosingCard(n *xhtml.Node) *xhtml.Node {
+	for curr := n.Parent; curr != nil; curr = curr.Parent {
+		if curr.Type == xhtml.ElementNode && hasHTMLClass(curr, "card") {
+			return curr
+		}
+	}
+	return nil
+}
+
+func isHTMLDescendant(ancestor, node *xhtml.Node) bool {
+	if ancestor == nil || node == nil {
+		return false
+	}
+	for curr := node.Parent; curr != nil; curr = curr.Parent {
+		if curr == ancestor {
+			return true
+		}
+	}
+	return false
+}
+
+func countHTMLNodesByID(root *xhtml.Node, id string) int {
+	count := 0
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && getHTMLNodeAttr(n, "id") == id {
+			count++
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return count
+}
+
+func findTopLevelStatsGrid(doc *xhtml.Node) *xhtml.Node {
+	var walk func(*xhtml.Node) *xhtml.Node
+	walk = func(n *xhtml.Node) *xhtml.Node {
+		if n == nil {
+			return nil
+		}
+		if n.Type == xhtml.ElementNode && hasHTMLClass(n, "stats-grid") {
+			// Top-level KPI grid must not be enclosed inside another card (e.g. forwarder card)
+			if findClosestEnclosingCard(n) == nil {
+				return n
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if found := walk(c); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	return walk(doc)
+}
+
+func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
+	if doc == nil {
+		return errors.New("nil document")
+	}
+
+	// 1. Top-level KPI grid container (.stats-grid)
+	topGrid := findTopLevelStatsGrid(doc)
+	if topGrid == nil {
+		return errors.New("top-level .stats-grid container not found")
+	}
+
+	// 2. #vpnBackendsTable and closest enclosing outer .card
+	if count := countHTMLNodesByID(doc, "vpnBackendsTable"); count != 1 {
+		return fmt.Errorf("expected exactly 1 #vpnBackendsTable element, found %d", count)
+	}
+	backendsTable := findHTMLNodeByID(doc, "vpnBackendsTable")
+	if backendsTable == nil {
+		return errors.New("#vpnBackendsTable not found")
+	}
+	backendsCard := findClosestEnclosingCard(backendsTable)
+	if backendsCard == nil {
+		return errors.New("closest enclosing .card for #vpnBackendsTable not found")
+	}
+
+	// 3. #vpnSessionsTable and closest enclosing outer .card
+	if count := countHTMLNodesByID(doc, "vpnSessionsTable"); count != 1 {
+		return fmt.Errorf("expected exactly 1 #vpnSessionsTable element, found %d", count)
+	}
+	sessionsTable := findHTMLNodeByID(doc, "vpnSessionsTable")
+	if sessionsTable == nil {
+		return errors.New("#vpnSessionsTable not found")
+	}
+	sessionsCard := findClosestEnclosingCard(sessionsTable)
+	if sessionsCard == nil {
+		return errors.New("closest enclosing .card for #vpnSessionsTable not found")
+	}
+
+	// 4. #vpn-forwarder-card
+	if count := countHTMLNodesByID(doc, "vpn-forwarder-card"); count != 1 {
+		return fmt.Errorf("expected exactly 1 #vpn-forwarder-card element, found %d", count)
+	}
+	forwarderCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
+	if forwarderCard == nil {
+		return errors.New("#vpn-forwarder-card not found")
+	}
+
+	sections := []*xhtml.Node{topGrid, backendsCard, sessionsCard, forwarderCard}
+	sectionNames := []string{"stats-grid", "backends card", "sessions card", "vpn-forwarder-card"}
+
+	// Assert distinct elements
+	for i := 0; i < len(sections); i++ {
+		for j := i + 1; j < len(sections); j++ {
+			if sections[i] == sections[j] {
+				return fmt.Errorf("sections %s and %s resolve to identical element", sectionNames[i], sectionNames[j])
+			}
+		}
+	}
+
+	// Assert no section is a descendant of another
+	for i := 0; i < len(sections); i++ {
+		for j := 0; j < len(sections); j++ {
+			if i != j && isHTMLDescendant(sections[i], sections[j]) {
+				return fmt.Errorf("section %s is nested within / descendant of section %s", sectionNames[j], sectionNames[i])
+			}
+		}
+	}
+
+	// Assert all 4 section containers share the exact same immediate parent element
+	parent := topGrid.Parent
+	if parent == nil {
+		return errors.New("top-level .stats-grid has nil parent")
+	}
+	for i, s := range sections {
+		if s.Parent != parent {
+			return fmt.Errorf("section %s does not share immediate parent with stats-grid", sectionNames[i])
+		}
+	}
+
+	// Sibling index sequence in parent container strictly:
+	// stats-grid -> backends card -> sessions card -> vpn-forwarder-card
+	getSiblingIndex := func(target *xhtml.Node) int {
+		idx := 0
+		for c := parent.FirstChild; c != nil; c = c.NextSibling {
+			if c == target {
+				return idx
+			}
+			idx++
+		}
+		return -1
+	}
+
+	idxStats := getSiblingIndex(topGrid)
+	idxBackends := getSiblingIndex(backendsCard)
+	idxSessions := getSiblingIndex(sessionsCard)
+	idxForwarder := getSiblingIndex(forwarderCard)
+
+	if idxStats == -1 || idxBackends == -1 || idxSessions == -1 || idxForwarder == -1 {
+		return errors.New("failed to resolve sibling indices in immediate parent")
+	}
+
+	if !(idxStats < idxBackends && idxBackends < idxSessions && idxSessions < idxForwarder) {
+		return fmt.Errorf("invalid sibling order: stats-grid=%d, backends-card=%d, sessions-card=%d, vpn-forwarder-card=%d (expected stats < backends < sessions < forwarder)",
+			idxStats, idxBackends, idxSessions, idxForwarder)
+	}
+
+	return nil
 }
 
 func TestVPNDashboardSectionOrder(t *testing.T) {
@@ -3602,35 +5874,83 @@ func TestVPNDashboardSectionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
-	tmpl := string(vpnData)
 
-	idxStats := strings.Index(tmpl, `class="stats-grid"`)
-	if idxStats == -1 {
-		t.Fatal(`vpn.html missing class="stats-grid"`)
-	}
-
-	idxBackends := strings.Index(tmpl, `id="vpnBackendsTable"`)
-	if idxBackends == -1 {
-		t.Fatal(`vpn.html missing id="vpnBackendsTable"`)
+	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
+	if err != nil {
+		t.Fatalf("failed to parse vpn.html: %v", err)
 	}
 
-	idxSessions := strings.Index(tmpl, `id="vpnSessionsTable"`)
-	if idxSessions == -1 {
-		t.Fatal(`vpn.html missing id="vpnSessionsTable"`)
+	if err := validateVPNDashboardDOMOrder(doc); err != nil {
+		t.Fatalf("vpn.html failed dashboard section order validation: %v", err)
 	}
 
-	idxForwarder := strings.Index(tmpl, `id="vpn-forwarder-card"`)
-	if idxForwarder == -1 {
-		t.Fatal(`vpn.html missing id="vpn-forwarder-card"`)
-	}
+	t.Run("RejectsDecoyComments", func(t *testing.T) {
+		// Old pre-fix order with ordered ID strings placed inside an HTML comment before forwarder
+		decoyHTML := `
+			<div class="stats-grid"></div>
+			<!-- id="vpnBackendsTable" id="vpnSessionsTable" id="vpn-forwarder-card" -->
+			<div class="card" id="vpn-forwarder-card"></div>
+			<div class="card"><table id="vpnBackendsTable"></table></div>
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+		`
+		decoyDoc, err := xhtml.Parse(strings.NewReader(decoyHTML))
+		if err != nil {
+			t.Fatalf("failed to parse decoy HTML: %v", err)
+		}
+		if err := validateVPNDashboardDOMOrder(decoyDoc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject decoy comment fixture, but it passed")
+		}
+	})
 
-	if !(idxStats < idxBackends) {
-		t.Errorf("expected stats-grid (pos %d) before vpnBackendsTable (pos %d)", idxStats, idxBackends)
-	}
-	if !(idxBackends < idxSessions) {
-		t.Errorf("expected vpnBackendsTable (pos %d) before vpnSessionsTable (pos %d)", idxBackends, idxSessions)
-	}
-	if !(idxSessions < idxForwarder) {
-		t.Errorf("expected vpnSessionsTable (pos %d) before vpn-forwarder-card (pos %d)", idxSessions, idxForwarder)
-	}
+	t.Run("RejectsNestedCards", func(t *testing.T) {
+		// Sessions card nested inside backends card
+		nestedHTML := `
+			<div class="stats-grid"></div>
+			<div class="card">
+				<table id="vpnBackendsTable"></table>
+				<div class="card"><table id="vpnSessionsTable"></table></div>
+			</div>
+			<div class="card" id="vpn-forwarder-card"></div>
+		`
+		nestedDoc, err := xhtml.Parse(strings.NewReader(nestedHTML))
+		if err != nil {
+			t.Fatalf("failed to parse nested HTML: %v", err)
+		}
+		if err := validateVPNDashboardDOMOrder(nestedDoc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject nested card fixture, but it passed")
+		}
+	})
+
+	t.Run("RejectsSwappedSections", func(t *testing.T) {
+		swappedHTML := `
+			<div class="stats-grid"></div>
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+			<div class="card"><table id="vpnBackendsTable"></table></div>
+			<div class="card" id="vpn-forwarder-card"></div>
+		`
+		swappedDoc, err := xhtml.Parse(strings.NewReader(swappedHTML))
+		if err != nil {
+			t.Fatalf("failed to parse swapped HTML: %v", err)
+		}
+		if err := validateVPNDashboardDOMOrder(swappedDoc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject swapped sections fixture, but it passed")
+		}
+	})
+
+	t.Run("RejectsDuplicateIDs", func(t *testing.T) {
+		dupHTML := `
+			<div class="stats-grid"></div>
+			<div class="card"><table id="vpnBackendsTable"></table></div>
+			<div class="card"><table id="vpnBackendsTable"></table></div>
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+			<div class="card" id="vpn-forwarder-card"></div>
+		`
+		dupDoc, err := xhtml.Parse(strings.NewReader(dupHTML))
+		if err != nil {
+			t.Fatalf("failed to parse duplicate ID HTML: %v", err)
+		}
+		if err := validateVPNDashboardDOMOrder(dupDoc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject duplicate ID fixture, but it passed")
+		}
+	})
 }

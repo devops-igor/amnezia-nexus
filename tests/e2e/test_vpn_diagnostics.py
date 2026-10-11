@@ -104,8 +104,7 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
 
     # Assert exactly 4 operational cards
     cards = page.locator(
-        "#vpn-fwd-tech-details > div > div > div.card, "
-        "#vpn-fwd-tech-details > div > div.card"
+        "#vpn-fwd-tech-details > div > div > div.card, " "#vpn-fwd-tech-details > div > div.card"
     )
     expect(cards).to_have_count(4)
 
@@ -118,7 +117,6 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
         "#vpn-diag-packets",
         "#vpn-diag-res-goroutines",
         "#vpn-diag-res-gc",
-        "#vpn-fwd-routes-details",
     ]:
         expect(page.locator(obsolete)).to_have_count(0)
 
@@ -167,6 +165,35 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
 
 @pytest.mark.e2e
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
+    """Navigate to /vpn -> Problem Routes details and 'Show all routes' toggle."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
+    details = page.locator("#vpn-fwd-routes-details")
+    expect(details).to_be_visible()
+
+    toggle_btn = page.locator("#vpn-routes-toggle-all-btn")
+    expect(toggle_btn).to_be_visible()
+
+    initial_text = toggle_btn.text_content()
+    toggle_btn.click()
+
+    # Text toggles after click
+    updated_text = toggle_btn.text_content()
+    assert updated_text != initial_text
+
+    # Click again to revert
+    toggle_btn.click()
+    assert toggle_btn.text_content() == initial_text
+
+
+@pytest.mark.e2e
+def test_vpn_sessions_problems_toggle(authenticated_page: Page, base_url: str) -> None:
     """Verify Connection Troubleshooting problems filter toggle button."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn")
@@ -180,6 +207,132 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     assert updated_text != initial_text
     toggle_btn.click()
     assert toggle_btn.text_content() == initial_text
+
+
+@pytest.mark.e2e
+def test_vpn_routes_table_mobile_containment_and_scrolling(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Verify forwarder routes table mobile containment, horizontal scrolling, and RTL behavior."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 375, "height": 667})
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Open the #vpn-fwd-routes-details disclosure accordion using direct child selector
+    page.locator("#vpn-fwd-routes-details > summary").click()
+
+    result = page.evaluate("""() => {
+            const table = document.getElementById('vpn-fwd-routes-table');
+            if (!table) throw new Error('#vpn-fwd-routes-table not found');
+            const wrapper = table.closest('.table-container');
+            if (!wrapper) throw new Error('parent .table-container not found');
+
+            // Render sample routes if currently hidden/empty to ensure rows exist
+            if (table.style.display === 'none' || !table.querySelector('tbody tr')) {
+                if (typeof window.vpnRenderForwarderHealth === 'function') {
+                    const sampleRoutes = [
+                        { peer_key: 'peer_m1', occupancy: 20, capacity: 100, high_water: 30, drops: 0, write_count: 50 },
+                        { peer_key: 'peer_m2', occupancy: 85, capacity: 100, high_water: 90, drops: 5, write_count: 80 }
+                    ];
+                    window.vpnRenderForwarderHealth({
+                        forwarder_available: true,
+                        forwarder_queue_capacity: 100,
+                        problem_routes: sampleRoutes,
+                        all_routes: sampleRoutes
+                    });
+                } else {
+                    table.style.display = '';
+                }
+            }
+
+            const wrapperComputed = window.getComputedStyle(wrapper);
+            const wrapperClientWidth = wrapper.clientWidth;
+            const tableScrollWidth = table.scrollWidth;
+            const tableStyleMinWidth = table.style.minWidth;
+            const wrapperScrollWidth = wrapper.scrollWidth;
+            const wrapperOverflowX = wrapperComputed.overflowX;
+
+            // Test horizontal scrolling in LTR
+            wrapper.scrollLeft = 50;
+            const scrollLeftLTR = wrapper.scrollLeft;
+
+            // Body scrollWidth to verify no page overflow
+            const bodyScrollWidthLTR = document.body.scrollWidth;
+
+            // Test Persian RTL
+            document.documentElement.dir = 'rtl';
+            const tableComputedRTL = window.getComputedStyle(table);
+            const tableDirectionRTL = tableComputedRTL.direction;
+
+            wrapper.scrollLeft = -50;
+            let scrollLeftRTL = wrapper.scrollLeft;
+            if (scrollLeftRTL === 0) {
+                wrapper.scrollLeft = 50;
+                scrollLeftRTL = wrapper.scrollLeft;
+            }
+            const rtlScrolled = Math.abs(scrollLeftRTL) > 0;
+            const bodyScrollWidthRTL = document.body.scrollWidth;
+
+            // Restore dir
+            document.documentElement.dir = '';
+
+            return {
+                wrapper_client_width: wrapperClientWidth,
+                table_scroll_width: tableScrollWidth,
+                table_min_width_style: tableStyleMinWidth,
+                wrapper_scroll_width: wrapperScrollWidth,
+                wrapper_overflow_x: wrapperOverflowX,
+                scroll_left_ltr: scrollLeftLTR,
+                body_scroll_width_ltr: bodyScrollWidthLTR,
+                table_direction_rtl: tableDirectionRTL,
+                rtl_scrolled: rtlScrolled,
+                scroll_left_rtl: scrollLeftRTL,
+                body_scroll_width_rtl: bodyScrollWidthRTL,
+            };
+        }""")
+
+    # 1. Verify wrapper clientWidth <= 375 (constrained to mobile viewport)
+    assert (
+        result["wrapper_client_width"] <= 375
+    ), f"wrapper clientWidth {result['wrapper_client_width']} exceeds 375px"
+
+    # 2. Verify table scrollWidth >= 540 and table style minWidth === '540px'
+    assert (
+        result["table_scroll_width"] >= 540
+    ), f"table scrollWidth {result['table_scroll_width']} < 540px"
+    assert (
+        result["table_min_width_style"] == "540px"
+    ), f"table style minWidth {result['table_min_width_style']!r} != '540px'"
+
+    # 3. Verify wrapper scrollWidth > wrapper.clientWidth (table overflows wrapper)
+    assert (
+        result["wrapper_scroll_width"] > result["wrapper_client_width"]
+    ), f"wrapper scrollWidth {result['wrapper_scroll_width']} <= clientWidth {result['wrapper_client_width']}"
+
+    # 4. Verify wrapper overflowX === 'auto'
+    assert (
+        result["wrapper_overflow_x"] == "auto"
+    ), f"wrapper overflowX {result['wrapper_overflow_x']!r} != 'auto'"
+
+    # 5. Test horizontal scrolling: set wrapper.scrollLeft = 50, verify wrapper.scrollLeft > 0
+    assert result["scroll_left_ltr"] > 0, f"LTR scrollLeft {result['scroll_left_ltr']} not > 0"
+
+    # 6. Verify document body scrollWidth <= 375 (wrapper contains the table without horizontal page overflow)
+    assert (
+        result["body_scroll_width_ltr"] <= 375
+    ), f"body scrollWidth {result['body_scroll_width_ltr']} exceeds 375px in LTR"
+
+    # 7. Persian RTL: verify table computed direction === 'rtl' and horizontal scrolling works in RTL
+    assert (
+        result["table_direction_rtl"] == "rtl"
+    ), f"table computed direction {result['table_direction_rtl']!r} != 'rtl'"
+    assert result[
+        "rtl_scrolled"
+    ], f"RTL horizontal scrolling failed, scrollLeft={result['scroll_left_rtl']}"
+    assert (
+        result["body_scroll_width_rtl"] <= 375
+    ), f"body scrollWidth {result['body_scroll_width_rtl']} exceeds 375px in RTL"
 
 
 _LOSS_REASONS = {
@@ -647,3 +800,55 @@ def test_vpn_metrics_requires_authentication(page: Page, base_url: str) -> None:
     response = page.request.get(f"{base_url}/api/vpn/metrics")
     assert response.status == 401
     assert response.json().get("error") == "unauthorized"
+
+
+@pytest.mark.e2e
+def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Navigate to /vpn -> assert strictly increasing visual y-order and non-overlapping vertical layout."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Locate the 4 sections
+    stats_grid = page.locator(".stats-grid").first
+    backends_card = page.locator("#vpnBackendsTable").locator(
+        "xpath=ancestor::div[contains(@class, 'card')][1]"
+    )
+    sessions_card = page.locator("#vpnSessionsTable").locator(
+        "xpath=ancestor::div[contains(@class, 'card')][1]"
+    )
+    forwarder_card = page.locator("#vpn-forwarder-card")
+
+    sections = [
+        ("stats-grid", stats_grid),
+        ("backends-card", backends_card),
+        ("sessions-card", sessions_card),
+        ("forwarder-card", forwarder_card),
+    ]
+
+    boxes = []
+    for name, locator in sections:
+        expect(locator).to_be_visible()
+        box = locator.bounding_box()
+        assert box is not None, f"Bounding box for {name} was not found"
+        boxes.append((name, box))
+
+    # Assert box["y"] strictly increases: y(stats) < y(backends) < y(sessions) < y(forwarder)
+    for i in range(len(boxes) - 1):
+        curr_name, curr_box = boxes[i]
+        next_name, next_box = boxes[i + 1]
+        assert (
+            curr_box["y"] < next_box["y"]
+        ), f"Expected y({curr_name}) ({curr_box['y']}) < y({next_name}) ({next_box['y']})"
+
+    # Assert non-overlapping vertical layout:
+    # box_next["y"] >= box_curr["y"] + box_curr["height"] - 1 (allowing for subpixel border overlap)
+    for i in range(len(boxes) - 1):
+        curr_name, curr_box = boxes[i]
+        next_name, next_box = boxes[i + 1]
+        assert next_box["y"] >= curr_box["y"] + curr_box["height"] - 1, (
+            f"Expected {next_name} y ({next_box['y']}) >= "
+            f"{curr_name} bottom ({curr_box['y'] + curr_box['height'] - 1})"
+        )

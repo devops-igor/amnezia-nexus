@@ -125,12 +125,13 @@ func (w *generationWindow[N]) sample(gen diagGeneration, now time.Time, values [
 }
 
 // reset explicitly starts a new generation: the baseline is cleared so the
-// next sample re-primes into it. Older generations are ignored.
-func (w *generationWindow[N]) reset(gen diagGeneration) {
+// next sample re-primes into it. Older generations are ignored and return false;
+// accepted resets return true.
+func (w *generationWindow[N]) reset(gen diagGeneration) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if gen < w.gen {
-		return
+		return false
 	}
 	if gen > w.gen {
 		w.gen = gen
@@ -140,6 +141,7 @@ func (w *generationWindow[N]) reset(gen diagGeneration) {
 	w.baseline = nil
 	w.delta = nil
 	w.window = 0
+	return true
 }
 
 // last returns the last computed window: deltas, its length in seconds, and
@@ -238,12 +240,13 @@ func (d *diagCounterWindows) rate(key string) (float64, bool) {
 	return deltas[0] / windowSec, true
 }
 
-// reset starts a new generation for the whole keyed set.
-func (d *diagCounterWindows) reset(gen diagGeneration) {
+// reset starts a new generation for the whole keyed set. It returns false
+// if the generation is older than the current set generation, and true otherwise.
+func (d *diagCounterWindows) reset(gen diagGeneration) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if gen < d.gen {
-		return
+		return false
 	}
 	if gen > d.gen {
 		d.gen = gen
@@ -253,4 +256,5 @@ func (d *diagCounterWindows) reset(gen diagGeneration) {
 	for _, w := range d.windows {
 		w.reset(d.gen)
 	}
+	return true
 }
