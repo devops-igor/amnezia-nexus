@@ -788,3 +788,55 @@ def test_vpn_metrics_requires_authentication(page: Page, base_url: str) -> None:
     response = page.request.get(f"{base_url}/api/vpn/metrics")
     assert response.status == 401
     assert response.json().get("error") == "unauthorized"
+
+
+@pytest.mark.e2e
+def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Navigate to /vpn -> assert strictly increasing visual y-order and non-overlapping vertical layout."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Locate the 4 sections
+    stats_grid = page.locator(".stats-grid").first
+    backends_card = page.locator("#vpnBackendsTable").locator(
+        "xpath=ancestor::div[contains(@class, 'card')][1]"
+    )
+    sessions_card = page.locator("#vpnSessionsTable").locator(
+        "xpath=ancestor::div[contains(@class, 'card')][1]"
+    )
+    forwarder_card = page.locator("#vpn-forwarder-card")
+
+    sections = [
+        ("stats-grid", stats_grid),
+        ("backends-card", backends_card),
+        ("sessions-card", sessions_card),
+        ("forwarder-card", forwarder_card),
+    ]
+
+    boxes = []
+    for name, locator in sections:
+        expect(locator).to_be_visible()
+        box = locator.bounding_box()
+        assert box is not None, f"Bounding box for {name} was not found"
+        boxes.append((name, box))
+
+    # Assert box["y"] strictly increases: y(stats) < y(backends) < y(sessions) < y(forwarder)
+    for i in range(len(boxes) - 1):
+        curr_name, curr_box = boxes[i]
+        next_name, next_box = boxes[i + 1]
+        assert (
+            curr_box["y"] < next_box["y"]
+        ), f"Expected y({curr_name}) ({curr_box['y']}) < y({next_name}) ({next_box['y']})"
+
+    # Assert non-overlapping vertical layout:
+    # box_next["y"] >= box_curr["y"] + box_curr["height"] - 1 (allowing for subpixel border overlap)
+    for i in range(len(boxes) - 1):
+        curr_name, curr_box = boxes[i]
+        next_name, next_box = boxes[i + 1]
+        assert next_box["y"] >= curr_box["y"] + curr_box["height"] - 1, (
+            f"Expected {next_name} y ({next_box['y']}) >= "
+            f"{curr_name} bottom ({curr_box['y'] + curr_box['height'] - 1})"
+        )
