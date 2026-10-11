@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	xhtml "golang.org/x/net/html"
+
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
@@ -323,6 +325,13 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-summary-status').textContent, 'Pressure Detected');
 assert.strictEqual(mockDoc.getElementById('vpn-fwd-routes-details').open, true);
+const renderedRouteRow = mockDoc.getElementById('vpn-fwd-routes-tbody').children[0];
+assert(renderedRouteRow, 'route row should be rendered');
+assert.strictEqual(renderedRouteRow.children[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteRow.children[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteRow.children[4].style.textAlign, 'right', 'writes cell must have text-align: right');
 
 // Recovered KPIs keep lifetime evidence descriptive and show current availability.
 mockDoc.reset();
@@ -477,6 +486,12 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 	}
 	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
+const renderedRouteCells = document.getElementById('vpn-fwd-routes-tbody').children[0].children;
+assert.strictEqual(renderedRouteCells[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
+assert.strictEqual(renderedRouteCells[1].style.textAlign, 'right', 'queue cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[2].style.textAlign, 'right', 'peak cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[3].style.textAlign, 'right', 'drops cell must have text-align: right');
+assert.strictEqual(renderedRouteCells[4].style.textAlign, 'right', 'writes cell must have text-align: right');
 const title = document.getElementById('vpn-fwd-routes-tbody').children[0].children[0].title;
 const labels = {
  peer_key:_('vpn_forwarder_route_peer'),
@@ -3736,6 +3751,494 @@ w.eval(tablesCode);
 		}
 		t.Skip("jsdom is not available in Node environment")
 	}
+}
+
+func findHTMLNodeByID(n *xhtml.Node, id string) *xhtml.Node {
+	if n == nil {
+		return nil
+	}
+	if n.Type == xhtml.ElementNode {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == id {
+				return n
+			}
+		}
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findHTMLNodeByID(c, id); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func getHTMLNodeAttr(n *xhtml.Node, key string) string {
+	if n == nil {
+		return ""
+	}
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func findHTMLNodesByTag(n *xhtml.Node, tag string) []*xhtml.Node {
+	var results []*xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
+			results = append(results, curr)
+			return
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return results
+}
+
+func getHTMLNodeText(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr.Type == xhtml.TextNode {
+			b.WriteString(curr.Data)
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(b.String())
+}
+
+const jsdomBootstrapSnippet = `
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
+const home = process.env.HOME || process.env.USERPROFILE || '';
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+`
+
+func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
+	t.Helper()
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", outStr)
+		}
+		t.Skip("jsdom is not available in Node environment")
+	}
+	return outStr
+}
+
+func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	vpnStr := string(vpnData)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssBytes)
+
+	t.Run("TemplateDOMStructure", func(t *testing.T) {
+		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
+		if err != nil {
+			t.Fatalf("failed to parse vpn.html as HTML: %v", err)
+		}
+
+		table := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
+		if table == nil {
+			t.Fatal("table #vpn-fwd-routes-table not found in vpn.html")
+		}
+
+		// 1. Parent container of #vpn-fwd-routes-table has class table-container
+		parent := table.Parent
+		if parent == nil {
+			t.Fatal("parent container of #vpn-fwd-routes-table is nil")
+		}
+		if parent.Data != "div" {
+			t.Errorf("parent tag = %q, want div", parent.Data)
+		}
+		parentClass := getHTMLNodeAttr(parent, "class")
+		parentClasses := strings.Fields(parentClass)
+		hasTableContainer := false
+		for _, c := range parentClasses {
+			if c == "table-container" {
+				hasTableContainer = true
+				break
+			}
+		}
+		if !hasTableContainer {
+			t.Errorf("parent container of #vpn-fwd-routes-table missing class table-container, got classes: %q", parentClass)
+		}
+
+		// 2. #vpn-fwd-routes-table has class data-table and does not have obsolete class table
+		tableClass := getHTMLNodeAttr(table, "class")
+		tableClasses := strings.Fields(tableClass)
+		hasDataTable := false
+		hasTable := false
+		for _, c := range tableClasses {
+			if c == "data-table" {
+				hasDataTable = true
+			}
+			if c == "table" {
+				hasTable = true
+			}
+		}
+		if !hasDataTable {
+			t.Errorf("#vpn-fwd-routes-table missing class data-table, got classes: %q", tableClass)
+		}
+		if hasTable {
+			t.Errorf("#vpn-fwd-routes-table has obsolete class table, got classes: %q", tableClass)
+		}
+
+		// 3. Minimum width rule
+		tableStyle := getHTMLNodeAttr(table, "style")
+		if !strings.Contains(tableStyle, "min-width: 540px") {
+			t.Errorf("#vpn-fwd-routes-table style missing min-width: 540px, got: %q", tableStyle)
+		}
+
+		// 4. Headers: Peer has white-space: nowrap, Queue, Peak, Drops, Writes have text-align: right
+		thNodes := findHTMLNodesByTag(table, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("expected 5 <th> elements in #vpn-fwd-routes-table, found %d", len(thNodes))
+		}
+		thPeerStyle := getHTMLNodeAttr(thNodes[0], "style")
+		if !strings.Contains(thPeerStyle, "white-space: nowrap") {
+			t.Errorf("peer header style = %q, want containing 'white-space: nowrap'", thPeerStyle)
+		}
+		for i, name := range []string{"queue", "peak", "drops", "writes"} {
+			thStyle := getHTMLNodeAttr(thNodes[i+1], "style")
+			if !strings.Contains(thStyle, "text-align: right") {
+				t.Errorf("%s header style = %q, want containing 'text-align: right'", name, thStyle)
+			}
+		}
+	})
+
+	t.Run("RenderedCellFormattingInNode", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+
+		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + "\n" + f1 + "\n" + f2 + `
+document.reset();
+
+const sampleRoutes = [
+    { peer_key: 'peer1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
+    { peer_key: 'peer2', occupancy: 90, capacity: 100, high_water: 95, drops: 5, queue_full_drops_recent: 2, write_count: 50 },
+    { peer_key: 'peer3', occupancy: 0, capacity: 100, high_water: 10, drops: 0, pressure_note: 'Testing note' },
+    { peer_key: 'peer4', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, write_errors: 2, write_errors_recent: 1 },
+    { peer_key: 'peer5', occupancy: 0, capacity: 100, high_water: 10, drops: 0, write_count: 10, p95_write_ms: 25.4 }
+];
+
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+const tbody = document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row has 5 cells');
+
+    // Peer cell has white-space: nowrap
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'row ' + i + ' peer cell must have white-space: nowrap');
+
+    // Numeric cells have text-align: right
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'row ' + i + ' queue cell must have text-align: right');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'row ' + i + ' peak cell must have text-align: right');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'row ' + i + ' drops cell must have text-align: right');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'row ' + i + ' writes cell must have text-align: right');
+}
+
+console.log('TABLE_FORMATTING_PASS');
+`
+		cmd := exec.Command(nodePath, "-e", runnerScript)
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Table formatting DOM tests failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "TABLE_FORMATTING_PASS") {
+			t.Fatalf("Table formatting DOM tests did not output TABLE_FORMATTING_PASS\nOutput:\n%s", string(out))
+		}
+	})
+
+	t.Run("PersianRTLRendering", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		faDict := vpnDiagnosticsLocale(t, "fa")
+		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, faDict)
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "fa")
+
+		// 1. Static assertion on Go template output under Persian locale
+		doc, err := xhtml.Parse(strings.NewReader(renderedHTML))
+		if err != nil {
+			t.Fatalf("failed to parse rendered Persian HTML: %v", err)
+		}
+		tableNode := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
+		if tableNode == nil {
+			t.Fatal("table #vpn-fwd-routes-table not found in rendered Persian HTML")
+		}
+		thNodes := findHTMLNodesByTag(tableNode, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("expected 5 <th> elements in Persian table, found %d", len(thNodes))
+		}
+		expectedHeaders := []struct {
+			key       string
+			alignment string
+			nowrap    bool
+		}{
+			{"vpn_forwarder_route_peer", "", true},
+			{"vpn_forwarder_route_queue", "text-align: right", false},
+			{"vpn_forwarder_route_peak", "text-align: right", false},
+			{"vpn_forwarder_route_drops", "text-align: right", false},
+			{"vpn_forwarder_route_writes", "text-align: right", false},
+		}
+		for i, exp := range expectedHeaders {
+			gotText := getHTMLNodeText(thNodes[i])
+			wantText := faDict[exp.key]
+			if gotText != wantText {
+				t.Errorf("Persian header %d (%s) = %q, want %q", i, exp.key, gotText, wantText)
+			}
+			style := getHTMLNodeAttr(thNodes[i], "style")
+			if exp.nowrap && !strings.Contains(style, "white-space: nowrap") {
+				t.Errorf("Persian header %d missing 'white-space: nowrap', style=%q", i, style)
+			}
+			if exp.alignment != "" && !strings.Contains(style, exp.alignment) {
+				t.Errorf("Persian header %d missing %q, style=%q", i, exp.alignment, style)
+			}
+		}
+
+		// 2. Dynamic RTL rendering with JSDOM
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
+    pretendToBeVisual: true,
+    runScripts: 'outside-only'
+});
+const w = dom.window;
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+
+assert.strictEqual(w.document.documentElement.getAttribute('dir'), 'rtl', 'document has dir=rtl');
+
+const table = w.document.getElementById('vpn-fwd-routes-table');
+assert(table, '#vpn-fwd-routes-table must exist');
+const tableComputed = w.getComputedStyle(table);
+assert.strictEqual(tableComputed.direction, 'rtl', 'table computed direction must be rtl under dir=rtl root');
+
+const thElements = w.document.querySelectorAll('#vpn-fwd-routes-table thead th');
+assert.strictEqual(thElements.length, 5, 'must have 5 th headers');
+assert.strictEqual(thElements[0].textContent.trim(), w.translations['vpn_forwarder_route_peer'], 'localized peer header');
+assert.strictEqual(thElements[1].textContent.trim(), w.translations['vpn_forwarder_route_queue'], 'localized queue header');
+assert.strictEqual(thElements[2].textContent.trim(), w.translations['vpn_forwarder_route_peak'], 'localized peak header');
+assert.strictEqual(thElements[3].textContent.trim(), w.translations['vpn_forwarder_route_drops'], 'localized drops header');
+assert.strictEqual(thElements[4].textContent.trim(), w.translations['vpn_forwarder_route_writes'], 'localized writes header');
+
+assert.strictEqual(thElements[0].style.whiteSpace, 'nowrap', 'peer header white-space nowrap under RTL');
+assert.strictEqual(thElements[1].style.textAlign, 'right', 'queue header text-align right under RTL');
+assert.strictEqual(thElements[2].style.textAlign, 'right', 'peak header text-align right under RTL');
+assert.strictEqual(thElements[3].style.textAlign, 'right', 'drops header text-align right under RTL');
+assert.strictEqual(thElements[4].style.textAlign, 'right', 'writes header text-align right under RTL');
+
+const sampleRoutes = [
+    { peer_key: 'fa_peer_1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
+    { peer_key: 'fa_peer_2', occupancy: 85, capacity: 100, high_water: 90, drops: 3, queue_full_drops_recent: 1, write_count: 60 },
+    { peer_key: 'fa_peer_3', occupancy: 0, capacity: 100, high_water: 10, drops: 0, pressure_note: 'توضیحات' }
+];
+
+w.vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+const tbody = w.document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered under RTL');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row ' + i + ' has 5 cells under RTL');
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'row ' + i + ' peer cell must have white-space: nowrap under RTL');
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'row ' + i + ' queue cell must have text-align: right under RTL');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'row ' + i + ' peak cell must have text-align: right under RTL');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'row ' + i + ' drops cell must have text-align: right under RTL');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'row ' + i + ' writes cell must have text-align: right under RTL');
+}
+
+console.log('PERSIAN_RTL_PASS');
+`, cssStr, renderedHTML, translationsJS, f1, f2)
+
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "PERSIAN_RTL_PASS") {
+			t.Fatalf("Persian RTL test did not output PERSIAN_RTL_PASS\nOutput:\n%s", out)
+		}
+	})
+
+	t.Run("NarrowViewportLayout", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for diagnostics verification")
+		}
+
+		enDict := vpnDiagnosticsLocale(t, "en")
+		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
+
+		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		if err != nil {
+			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
+		}
+		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		if err != nil {
+			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
+		}
+		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "en")
+
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
+    pretendToBeVisual: true,
+    runScripts: 'outside-only'
+});
+const w = dom.window;
+w.innerWidth = 375;
+w.outerWidth = 375;
+
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+
+const table = w.document.getElementById('vpn-fwd-routes-table');
+assert(table, '#vpn-fwd-routes-table must exist');
+const container = table.closest('.table-container');
+assert(container, 'parent .table-container must exist');
+
+// 1. Verify container .table-container has overflow handling (overflow-x: auto)
+const containerStyle = w.getComputedStyle(container);
+assert.strictEqual(containerStyle.overflowX, 'auto', 'container must have overflow-x: auto');
+
+// 2. Verify #vpn-fwd-routes-table style has min-width: 540px
+const tableComputed = w.getComputedStyle(table);
+assert.strictEqual(tableComputed.minWidth, '540px', 'table computed min-width must be 540px');
+assert.strictEqual(table.style.minWidth, '540px', 'table inline style min-width must be 540px');
+
+// 3. Verify min-width exceeds mobile viewport (~375px), preventing columns from collapsing
+const minWidthPx = parseInt(tableComputed.minWidth, 10);
+assert.strictEqual(minWidthPx, 540, 'min-width must be 540px');
+assert(minWidthPx > w.innerWidth, 'table min-width (' + minWidthPx + 'px) exceeds narrow viewport (' + w.innerWidth + 'px), preserving columns and enabling horizontal scroll');
+
+// 4. Render sample routes and verify table renders without collapsing columns
+const sampleRoutes = [
+    { peer_key: 'peer_mobile_1', occupancy: 25, capacity: 100, high_water: 50, drops: 0, write_count: 100 },
+    { peer_key: 'peer_mobile_2', occupancy: 95, capacity: 100, high_water: 100, drops: 12, queue_full_drops_recent: 3, write_count: 200 }
+];
+
+w.vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forwarder_queue_capacity: 100,
+    problem_routes: sampleRoutes,
+    all_routes: sampleRoutes
+});
+
+assert.strictEqual(table.style.display, '', 'table is displayed when routes exist');
+const tbody = w.document.getElementById('vpn-fwd-routes-tbody');
+assert.strictEqual(tbody.children.length, sampleRoutes.length, 'all sample routes rendered');
+
+for (let i = 0; i < tbody.children.length; i++) {
+    const row = tbody.children[i];
+    const cells = row.children;
+    assert.strictEqual(cells.length, 5, 'row has 5 cells');
+    assert.strictEqual(cells[0].style.whiteSpace, 'nowrap', 'peer cell retains white-space nowrap on narrow viewport');
+    assert.strictEqual(cells[1].style.textAlign, 'right', 'queue cell text-align right');
+    assert.strictEqual(cells[2].style.textAlign, 'right', 'peak cell text-align right');
+    assert.strictEqual(cells[3].style.textAlign, 'right', 'drops cell text-align right');
+    assert.strictEqual(cells[4].style.textAlign, 'right', 'writes cell text-align right');
+}
+
+console.log('NARROW_VIEWPORT_PASS');
+`, cssStr, renderedHTML, translationsJS, f1, f2)
+
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
+			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", out)
+		}
+	})
 }
 
 func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
