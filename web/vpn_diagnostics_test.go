@@ -3753,6 +3753,123 @@ w.eval(tablesCode);
 	}
 }
 
+func findHTMLNodeByID(n *xhtml.Node, id string) *xhtml.Node {
+	if n == nil {
+		return nil
+	}
+	if n.Type == xhtml.ElementNode {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == id {
+				return n
+			}
+		}
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findHTMLNodeByID(c, id); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func getHTMLNodeAttr(n *xhtml.Node, key string) string {
+	if n == nil {
+		return ""
+	}
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func findHTMLNodesByTag(n *xhtml.Node, tag string) []*xhtml.Node {
+	var results []*xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
+			results = append(results, curr)
+			return
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return results
+}
+
+func getHTMLNodeText(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(curr *xhtml.Node) {
+		if curr == nil {
+			return
+		}
+		if curr.Type == xhtml.TextNode {
+			b.WriteString(curr.Data)
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(b.String())
+}
+
+const jsdomBootstrapSnippet = `
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
+const home = process.env.HOME || process.env.USERPROFILE || '';
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
+});
+
+try {
+    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
+} catch (_) {}
+
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(0);
+}
+`
+
+func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
+	t.Helper()
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", outStr)
+		}
+		t.Skip("jsdom is not available in Node environment")
+	}
+	return outStr
+}
+
 func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 	tmplFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -3764,56 +3881,23 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 	}
 	vpnStr := string(vpnData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+	cssStr := string(cssBytes)
+
 	t.Run("TemplateDOMStructure", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
 		if err != nil {
 			t.Fatalf("failed to parse vpn.html as HTML: %v", err)
 		}
 
-		var findByID func(*xhtml.Node, string) *xhtml.Node
-		findByID = func(n *xhtml.Node, id string) *xhtml.Node {
-			if n.Type == xhtml.ElementNode {
-				for _, a := range n.Attr {
-					if a.Key == "id" && a.Val == id {
-						return n
-					}
-				}
-			}
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				if found := findByID(c, id); found != nil {
-					return found
-				}
-			}
-			return nil
-		}
-
-		getAttr := func(n *xhtml.Node, key string) string {
-			for _, a := range n.Attr {
-				if a.Key == key {
-					return a.Val
-				}
-			}
-			return ""
-		}
-
-		var findChildrenByTag func(*xhtml.Node, string) []*xhtml.Node
-		findChildrenByTag = func(n *xhtml.Node, tag string) []*xhtml.Node {
-			var results []*xhtml.Node
-			var walk func(*xhtml.Node)
-			walk = func(curr *xhtml.Node) {
-				if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
-					results = append(results, curr)
-					return
-				}
-				for c := curr.FirstChild; c != nil; c = c.NextSibling {
-					walk(c)
-				}
-			}
-			walk(n)
-			return results
-		}
-
-		table := findByID(doc, "vpn-fwd-routes-table")
+		table := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
 		if table == nil {
 			t.Fatal("table #vpn-fwd-routes-table not found in vpn.html")
 		}
@@ -3826,7 +3910,7 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 		if parent.Data != "div" {
 			t.Errorf("parent tag = %q, want div", parent.Data)
 		}
-		parentClass := getAttr(parent, "class")
+		parentClass := getHTMLNodeAttr(parent, "class")
 		parentClasses := strings.Fields(parentClass)
 		hasTableContainer := false
 		for _, c := range parentClasses {
@@ -3840,7 +3924,7 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 		}
 
 		// 2. #vpn-fwd-routes-table has class data-table and does not have obsolete class table
-		tableClass := getAttr(table, "class")
+		tableClass := getHTMLNodeAttr(table, "class")
 		tableClasses := strings.Fields(tableClass)
 		hasDataTable := false
 		hasTable := false
@@ -3860,22 +3944,22 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 		}
 
 		// 3. Minimum width rule
-		tableStyle := getAttr(table, "style")
+		tableStyle := getHTMLNodeAttr(table, "style")
 		if !strings.Contains(tableStyle, "min-width: 540px") {
 			t.Errorf("#vpn-fwd-routes-table style missing min-width: 540px, got: %q", tableStyle)
 		}
 
 		// 4. Headers: Peer has white-space: nowrap, Queue, Peak, Drops, Writes have text-align: right
-		thNodes := findChildrenByTag(table, "th")
+		thNodes := findHTMLNodesByTag(table, "th")
 		if len(thNodes) != 5 {
 			t.Fatalf("expected 5 <th> elements in #vpn-fwd-routes-table, found %d", len(thNodes))
 		}
-		thPeerStyle := getAttr(thNodes[0], "style")
+		thPeerStyle := getHTMLNodeAttr(thNodes[0], "style")
 		if !strings.Contains(thPeerStyle, "white-space: nowrap") {
 			t.Errorf("peer header style = %q, want containing 'white-space: nowrap'", thPeerStyle)
 		}
 		for i, name := range []string{"queue", "peak", "drops", "writes"} {
-			thStyle := getAttr(thNodes[i+1], "style")
+			thStyle := getHTMLNodeAttr(thNodes[i+1], "style")
 			if !strings.Contains(thStyle, "text-align: right") {
 				t.Errorf("%s header style = %q, want containing 'text-align: right'", name, thStyle)
 			}
@@ -3970,52 +4054,11 @@ console.log('TABLE_FORMATTING_PASS');
 		if err != nil {
 			t.Fatalf("failed to parse rendered Persian HTML: %v", err)
 		}
-		var findByID func(*xhtml.Node, string) *xhtml.Node
-		findByID = func(n *xhtml.Node, id string) *xhtml.Node {
-			if n.Type == xhtml.ElementNode {
-				for _, a := range n.Attr {
-					if a.Key == "id" && a.Val == id {
-						return n
-					}
-				}
-			}
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				if found := findByID(c, id); found != nil {
-					return found
-				}
-			}
-			return nil
-		}
-		tableNode := findByID(doc, "vpn-fwd-routes-table")
+		tableNode := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
 		if tableNode == nil {
 			t.Fatal("table #vpn-fwd-routes-table not found in rendered Persian HTML")
 		}
-		var findTh func(*xhtml.Node) []*xhtml.Node
-		findTh = func(n *xhtml.Node) []*xhtml.Node {
-			var results []*xhtml.Node
-			if n.Type == xhtml.ElementNode && n.Data == "th" {
-				results = append(results, n)
-			}
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				results = append(results, findTh(c)...)
-			}
-			return results
-		}
-		nodeText := func(n *xhtml.Node) string {
-			var b strings.Builder
-			var walk func(*xhtml.Node)
-			walk = func(curr *xhtml.Node) {
-				if curr.Type == xhtml.TextNode {
-					b.WriteString(curr.Data)
-				}
-				for c := curr.FirstChild; c != nil; c = c.NextSibling {
-					walk(c)
-				}
-			}
-			walk(n)
-			return strings.TrimSpace(b.String())
-		}
-		thNodes := findTh(tableNode)
+		thNodes := findHTMLNodesByTag(tableNode, "th")
 		if len(thNodes) != 5 {
 			t.Fatalf("expected 5 <th> elements in Persian table, found %d", len(thNodes))
 		}
@@ -4031,17 +4074,12 @@ console.log('TABLE_FORMATTING_PASS');
 			{"vpn_forwarder_route_writes", "text-align: right", false},
 		}
 		for i, exp := range expectedHeaders {
-			gotText := nodeText(thNodes[i])
+			gotText := getHTMLNodeText(thNodes[i])
 			wantText := faDict[exp.key]
 			if gotText != wantText {
 				t.Errorf("Persian header %d (%s) = %q, want %q", i, exp.key, gotText, wantText)
 			}
-			var style string
-			for _, a := range thNodes[i].Attr {
-				if a.Key == "style" {
-					style = a.Val
-				}
-			}
+			style := getHTMLNodeAttr(thNodes[i], "style")
 			if exp.nowrap && !strings.Contains(style, "white-space: nowrap") {
 				t.Errorf("Persian header %d missing 'white-space: nowrap', style=%q", i, style)
 			}
@@ -4051,45 +4089,20 @@ console.log('TABLE_FORMATTING_PASS');
 		}
 
 		// 2. Dynamic RTL rendering with JSDOM
-		testScript := fmt.Sprintf(`
-const fs = require('fs');
-const assert = require('assert');
-const path = require('path');
-
-const home = process.env.HOME || process.env.USERPROFILE || '';
-const searchPaths = [
-    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
-    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
-    process.env.NODE_PATH || ''
-].filter(Boolean);
-searchPaths.forEach(p => {
-    if (fs.existsSync(p) && !module.paths.includes(p)) {
-        module.paths.push(p);
-    }
-});
-
-try {
-    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
-    if (globalRoot && !module.paths.includes(globalRoot)) {
-        module.paths.push(globalRoot);
-    }
-} catch (_) {}
-
-let JSDOM;
-try {
-    JSDOM = require('jsdom').JSDOM;
-} catch (e) {
-    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
-    process.exit(0);
-}
-
-const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head></head><body>' + %q + '</body></html>', {
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
+    pretendToBeVisual: true,
     runScripts: 'outside-only'
 });
 const w = dom.window;
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
 
 assert.strictEqual(w.document.documentElement.getAttribute('dir'), 'rtl', 'document has dir=rtl');
+
+const table = w.document.getElementById('vpn-fwd-routes-table');
+assert(table, '#vpn-fwd-routes-table must exist');
+const tableComputed = w.getComputedStyle(table);
+assert.strictEqual(tableComputed.direction, 'rtl', 'table computed direction must be rtl under dir=rtl root');
 
 const thElements = w.document.querySelectorAll('#vpn-fwd-routes-table thead th');
 assert.strictEqual(thElements.length, 5, 'must have 5 th headers');
@@ -4133,20 +4146,11 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('PERSIAN_RTL_PASS');
-`, renderedHTML, translationsJS, f1, f2)
+`, cssStr, renderedHTML, translationsJS, f1, f2)
 
-		out, err := execNodeScript(nodePath, testScript)
-		if err != nil {
-			t.Fatalf("Persian RTL test failed: %v\nOutput:\n%s", err, string(out))
-		}
-		if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
-			if os.Getenv("CI") != "" {
-				t.Fatalf("jsdom is not available in CI environment: %s", out)
-			}
-			t.Skip("jsdom is not available in Node environment")
-		}
-		if !strings.Contains(string(out), "PERSIAN_RTL_PASS") {
-			t.Fatalf("Persian RTL test did not output PERSIAN_RTL_PASS\nOutput:\n%s", string(out))
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "PERSIAN_RTL_PASS") {
+			t.Fatalf("Persian RTL test did not output PERSIAN_RTL_PASS\nOutput:\n%s", out)
 		}
 	})
 
@@ -4155,16 +4159,6 @@ console.log('PERSIAN_RTL_PASS');
 		if err != nil {
 			t.Fatal("Node is required for diagnostics verification")
 		}
-
-		staticFS, err := GetStaticSubFS()
-		if err != nil {
-			t.Fatalf("GetStaticSubFS failed: %v", err)
-		}
-		cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
-		if err != nil {
-			t.Fatalf("failed to read css/style.css: %v", err)
-		}
-		cssStr := string(cssBytes)
 
 		enDict := vpnDiagnosticsLocale(t, "en")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
@@ -4179,38 +4173,7 @@ console.log('PERSIAN_RTL_PASS');
 		}
 		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "en")
 
-		testScript := fmt.Sprintf(`
-const fs = require('fs');
-const assert = require('assert');
-const path = require('path');
-
-const home = process.env.HOME || process.env.USERPROFILE || '';
-const searchPaths = [
-    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
-    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
-    process.env.NODE_PATH || ''
-].filter(Boolean);
-searchPaths.forEach(p => {
-    if (fs.existsSync(p) && !module.paths.includes(p)) {
-        module.paths.push(p);
-    }
-});
-
-try {
-    const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
-    if (globalRoot && !module.paths.includes(globalRoot)) {
-        module.paths.push(globalRoot);
-    }
-} catch (_) {}
-
-let JSDOM;
-try {
-    JSDOM = require('jsdom').JSDOM;
-} catch (e) {
-    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
-    process.exit(0);
-}
-
+		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
     pretendToBeVisual: true,
     runScripts: 'outside-only'
@@ -4271,18 +4234,9 @@ for (let i = 0; i < tbody.children.length; i++) {
 console.log('NARROW_VIEWPORT_PASS');
 `, cssStr, renderedHTML, translationsJS, f1, f2)
 
-		out, err := execNodeScript(nodePath, testScript)
-		if err != nil {
-			t.Fatalf("Narrow viewport test failed: %v\nOutput:\n%s", err, string(out))
-		}
-		if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
-			if os.Getenv("CI") != "" {
-				t.Fatalf("jsdom is not available in CI environment: %s", out)
-			}
-			t.Skip("jsdom is not available in Node environment")
-		}
-		if !strings.Contains(string(out), "NARROW_VIEWPORT_PASS") {
-			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", string(out))
+		out := runJSDOMTestScript(t, nodePath, testScript)
+		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
+			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", out)
 		}
 	})
 }

@@ -197,6 +197,132 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     assert toggle_btn.text_content() == initial_text
 
 
+@pytest.mark.e2e
+def test_vpn_routes_table_mobile_containment_and_scrolling(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Verify forwarder routes table mobile containment, horizontal scrolling, and RTL behavior."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 375, "height": 667})
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Open the #vpn-fwd-routes-details disclosure accordion using direct child selector
+    page.locator("#vpn-fwd-routes-details > summary").click()
+
+    result = page.evaluate("""() => {
+            const table = document.getElementById('vpn-fwd-routes-table');
+            if (!table) throw new Error('#vpn-fwd-routes-table not found');
+            const wrapper = table.closest('.table-container');
+            if (!wrapper) throw new Error('parent .table-container not found');
+
+            // Render sample routes if currently hidden/empty to ensure rows exist
+            if (table.style.display === 'none' || !table.querySelector('tbody tr')) {
+                if (typeof window.vpnRenderForwarderHealth === 'function') {
+                    const sampleRoutes = [
+                        { peer_key: 'peer_m1', occupancy: 20, capacity: 100, high_water: 30, drops: 0, write_count: 50 },
+                        { peer_key: 'peer_m2', occupancy: 85, capacity: 100, high_water: 90, drops: 5, write_count: 80 }
+                    ];
+                    window.vpnRenderForwarderHealth({
+                        forwarder_available: true,
+                        forwarder_queue_capacity: 100,
+                        problem_routes: sampleRoutes,
+                        all_routes: sampleRoutes
+                    });
+                } else {
+                    table.style.display = '';
+                }
+            }
+
+            const wrapperComputed = window.getComputedStyle(wrapper);
+            const wrapperClientWidth = wrapper.clientWidth;
+            const tableScrollWidth = table.scrollWidth;
+            const tableStyleMinWidth = table.style.minWidth;
+            const wrapperScrollWidth = wrapper.scrollWidth;
+            const wrapperOverflowX = wrapperComputed.overflowX;
+
+            // Test horizontal scrolling in LTR
+            wrapper.scrollLeft = 50;
+            const scrollLeftLTR = wrapper.scrollLeft;
+
+            // Body scrollWidth to verify no page overflow
+            const bodyScrollWidthLTR = document.body.scrollWidth;
+
+            // Test Persian RTL
+            document.documentElement.dir = 'rtl';
+            const tableComputedRTL = window.getComputedStyle(table);
+            const tableDirectionRTL = tableComputedRTL.direction;
+
+            wrapper.scrollLeft = -50;
+            let scrollLeftRTL = wrapper.scrollLeft;
+            if (scrollLeftRTL === 0) {
+                wrapper.scrollLeft = 50;
+                scrollLeftRTL = wrapper.scrollLeft;
+            }
+            const rtlScrolled = Math.abs(scrollLeftRTL) > 0;
+            const bodyScrollWidthRTL = document.body.scrollWidth;
+
+            // Restore dir
+            document.documentElement.dir = '';
+
+            return {
+                wrapper_client_width: wrapperClientWidth,
+                table_scroll_width: tableScrollWidth,
+                table_min_width_style: tableStyleMinWidth,
+                wrapper_scroll_width: wrapperScrollWidth,
+                wrapper_overflow_x: wrapperOverflowX,
+                scroll_left_ltr: scrollLeftLTR,
+                body_scroll_width_ltr: bodyScrollWidthLTR,
+                table_direction_rtl: tableDirectionRTL,
+                rtl_scrolled: rtlScrolled,
+                scroll_left_rtl: scrollLeftRTL,
+                body_scroll_width_rtl: bodyScrollWidthRTL,
+            };
+        }""")
+
+    # 1. Verify wrapper clientWidth <= 375 (constrained to mobile viewport)
+    assert (
+        result["wrapper_client_width"] <= 375
+    ), f"wrapper clientWidth {result['wrapper_client_width']} exceeds 375px"
+
+    # 2. Verify table scrollWidth >= 540 and table style minWidth === '540px'
+    assert (
+        result["table_scroll_width"] >= 540
+    ), f"table scrollWidth {result['table_scroll_width']} < 540px"
+    assert (
+        result["table_min_width_style"] == "540px"
+    ), f"table style minWidth {result['table_min_width_style']!r} != '540px'"
+
+    # 3. Verify wrapper scrollWidth > wrapper.clientWidth (table overflows wrapper)
+    assert (
+        result["wrapper_scroll_width"] > result["wrapper_client_width"]
+    ), f"wrapper scrollWidth {result['wrapper_scroll_width']} <= clientWidth {result['wrapper_client_width']}"
+
+    # 4. Verify wrapper overflowX === 'auto'
+    assert (
+        result["wrapper_overflow_x"] == "auto"
+    ), f"wrapper overflowX {result['wrapper_overflow_x']!r} != 'auto'"
+
+    # 5. Test horizontal scrolling: set wrapper.scrollLeft = 50, verify wrapper.scrollLeft > 0
+    assert result["scroll_left_ltr"] > 0, f"LTR scrollLeft {result['scroll_left_ltr']} not > 0"
+
+    # 6. Verify document body scrollWidth <= 375 (wrapper contains the table without horizontal page overflow)
+    assert (
+        result["body_scroll_width_ltr"] <= 375
+    ), f"body scrollWidth {result['body_scroll_width_ltr']} exceeds 375px in LTR"
+
+    # 7. Persian RTL: verify table computed direction === 'rtl' and horizontal scrolling works in RTL
+    assert (
+        result["table_direction_rtl"] == "rtl"
+    ), f"table computed direction {result['table_direction_rtl']!r} != 'rtl'"
+    assert result[
+        "rtl_scrolled"
+    ], f"RTL horizontal scrolling failed, scrollLeft={result['scroll_left_rtl']}"
+    assert (
+        result["body_scroll_width_rtl"] <= 375
+    ), f"body scrollWidth {result['body_scroll_width_rtl']} exceeds 375px in RTL"
+
+
 _LOSS_REASONS = {
     "client_malformed",
     "client_unmapped_source",
