@@ -3590,7 +3590,7 @@ searchPaths.forEach(p => {
 
 try {
     const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
-    if (globalRoot && !module.paths.includes(globalRoot)) {
+    if (globalRoot && fs.existsSync(globalRoot) && !module.paths.includes(globalRoot)) {
         module.paths.push(globalRoot);
     }
 } catch (_) {}

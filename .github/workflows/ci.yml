@@ -69,7 +69,7 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: Set up Node.js
+      - name: Set up Node.js for JSDOM Integration Tests
         uses: actions/setup-node@v4
         with:
           node-version: '20'
