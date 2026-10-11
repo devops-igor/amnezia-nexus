@@ -75,59 +75,50 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     page.wait_for_load_state("networkidle")
 
     diag_fields = [
-        # Panel 1: Traffic & Capacity
+        # Card 1: Data Plane Performance
         "#vpn-diag-throughput",
-        "#vpn-diag-packets",
         "#vpn-diag-ewma5m",
         "#vpn-diag-ewma1h",
-        # Panel 2: Queue Pressure & High-Water
-        "#vpn-diag-queue-occ",
-        "#vpn-diag-queue-peak",
-        "#vpn-diag-queue-dur50",
-        "#vpn-diag-queue-dur80",
-        "#vpn-diag-queue-drops",
-        # Panel 3: Forwarding Latency & Write Stalls
         "#vpn-diag-lat-percentiles",
         "#vpn-diag-lat-max",
-        "#vpn-diag-lat-inflight",
-        "#vpn-diag-lat-stalls",
-        "#vpn-diag-lat-errors",
-        # Panel 4: Drop Diagnostics
+        "#vpn-diag-queue-occ",
+        "#vpn-diag-queue-peak",
+        # Card 2: Traffic Drops & Loss Diagnostics
         "#vpn-diag-drops-client",
         "#vpn-diag-drops-return",
         "#vpn-diag-drops-total",
-        # Panel 5: VirtualTUN Health
-        "#vpn-diag-vtun-upstream",
-        "#vpn-diag-vtun-nexus",
-        # Panel 6: Upstream AWG & Peer Sync
+        # Card 3: Engine & Route Integrity
         "#vpn-diag-engine-status",
         "#vpn-diag-peers-status",
-        "#vpn-diag-sync-failures",
-        "#vpn-diag-peer-sync-invalid",
-        "#vpn-diag-peer-sync-enqueue",
-        "#vpn-diag-peer-sync-reconcile",
-        "#vpn-diag-peer-sync-error",
-        "#vpn-diag-peer-sync-restart",
         "#vpn-diag-hs-freshness",
-        # Panel 7: Routing Consistency Invariants
-        "#vpn-diag-routing-badge",
         "#vpn-diag-routing-counts",
-        # Panel 8: Backend Operational Telemetry
-        "#vpn-diag-be-counts",
-        "#vpn-diag-be-latency",
-        "#vpn-diag-be-skew",
-        "#vpn-diag-be-drops",
-        # Panel 9: Runtime Resources
+        # Card 4: System & Fleet Resources
         "#vpn-diag-res-cpu",
         "#vpn-diag-res-mem",
-        "#vpn-diag-res-goroutines",
-        "#vpn-diag-res-gc",
         "#vpn-diag-res-fd",
     ]
 
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
+    # Assert exactly 4 operational cards
+    cards = page.locator(
+        "#vpn-fwd-tech-details > div > div > div.card, " "#vpn-fwd-tech-details > div > div.card"
+    )
+    expect(cards).to_have_count(4)
+
+    # Assert visibility of all 17 retained diagnostic fields
     for loc in diag_fields:
-        el = page.locator(loc)
-        expect(el).to_be_visible()
+        expect(page.locator(loc)).to_be_visible()
+
+    # Assert absence of obsolete elements
+    for obsolete in [
+        "#vpn-diag-packets",
+        "#vpn-diag-res-goroutines",
+        "#vpn-diag-res-gc",
+    ]:
+        expect(page.locator(obsolete)).to_have_count(0)
 
 
 @pytest.mark.e2e
@@ -179,6 +170,10 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
     details = page.locator("#vpn-fwd-routes-details")
     expect(details).to_be_visible()
 
@@ -193,6 +188,23 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     assert updated_text != initial_text
 
     # Click again to revert
+    toggle_btn.click()
+    assert toggle_btn.text_content() == initial_text
+
+
+@pytest.mark.e2e
+def test_vpn_sessions_problems_toggle(authenticated_page: Page, base_url: str) -> None:
+    """Verify Connection Troubleshooting problems filter toggle button."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    toggle_btn = page.locator("#vpn-sessions-toggle-problems-btn")
+    expect(toggle_btn).to_be_visible()
+    initial_text = toggle_btn.text_content()
+    toggle_btn.click()
+    updated_text = toggle_btn.text_content()
+    assert updated_text != initial_text
     toggle_btn.click()
     assert toggle_btn.text_content() == initial_text
 
