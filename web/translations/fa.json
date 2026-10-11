@@ -655,6 +655,7 @@
   "vpn_diag_loss_return_backend_device_queue_full": "صف دستگاه سرور پشتیبان بازگشت پر است",
   "vpn_diag_loss_return_backend_device_shutdown": "خاموشی دستگاه سرور پشتیبان بازگشت",
   "vpn_diag_condition_backend_device_unattributed": "حذف دستگاه سرور پشتیبان فعال است، اما انتساب دقیق جهت‌به‌جهت در دسترس نیست",
+  "vpn_col_user_device": "کاربر و دستگاه",
   "vpn_col_live_traffic": "ترافیک زنده",
   "vpn_col_traffic": "ترافیک زنده",
   "vpn_col_packet_loss": "از دست رفتن بسته‌ها",
@@ -678,5 +679,6 @@
   "vpn_problem_route_queue_drops": "افت بسته کلاینت در صف بازگشت فعال است",
   "vpn_problem_write_stall": "توقف نوشتن دستگاه شناسایی شد",
   "vpn_problem_write_errors": "خطاهای نوشتن دستگاه فعال است",
-  "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد"
+  "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد",
+  "vpn_problem_stale_handshake": "دست‌دهی بالادستی قدیمی"
 }

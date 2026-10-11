@@ -41,7 +41,7 @@ func TestInstallProtocolHandler_FailureLogged(t *testing.T) {
 	r := setupFullServerRouter(h)
 
 	// Capture slog default-logger output (same pattern as TestRenameServerHandler).
-	var logBuf bytes.Buffer
+	var logBuf testSyncWriter
 	origLogger := slog.Default()
 	t.Cleanup(func() {
 		slog.SetDefault(origLogger)

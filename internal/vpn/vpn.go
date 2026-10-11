@@ -2479,6 +2479,10 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 			s.mu.Unlock()
 			return fmt.Errorf("%w: server %d not found in database", ErrServerNotFound, serverID)
 		}
+		if !srv.CreatedAt.Equal(server.CreatedAt) || srv.Host != server.Host {
+			s.mu.Unlock()
+			return fmt.Errorf("%w: server %d generation changed during enable", ErrServerNotFound, serverID)
+		}
 	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
 	var postRefreshVersion int64
