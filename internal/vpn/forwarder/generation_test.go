@@ -509,3 +509,82 @@ func TestGenerationSampler_WholeVectorMonotonicity(t *testing.T) {
 		}
 	})
 }
+
+func TestGenerationSampler_ResetStaleGenerationNoOp(t *testing.T) {
+	w := NewGenerationSampler(2)
+	t0 := time.Now()
+
+	// Prime generation 2 with a sample at t0
+	deltas, elapsed, accepted := w.Sample(2, t0, GenerationSampleMinInterval, []uint64{100, 200})
+	if accepted || deltas != nil || elapsed != 0 {
+		t.Fatalf("prime at t0: want accepted=false deltas=nil elapsed=0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+	}
+
+	// Accept a second sample at t1 (t0 + 1s) with []uint64{150, 300}
+	t1 := t0.Add(1 * time.Second)
+	deltas, elapsed, accepted = w.Sample(2, t1, GenerationSampleMinInterval, []uint64{150, 300})
+	if !accepted || len(deltas) != 2 || deltas[0] != 50 || deltas[1] != 100 || math.Abs(elapsed-1.0) > 1e-9 {
+		t.Fatalf("sample at t1: want accepted=true deltas=[50 100] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+	}
+
+	// Verify baseline is primed, generation is 2, values are accepted
+	val0, at0, primed0, gen0 := w.Baseline(0)
+	if !primed0 || gen0 != 2 || val0 != 150 || !at0.Equal(t1) {
+		t.Fatalf("baseline 0: want val=150 primed=true gen=2 at=%v, got val=%d primed=%v gen=%d at=%v", t1, val0, primed0, gen0, at0)
+	}
+	val1, at1, primed1, gen1 := w.Baseline(1)
+	if !primed1 || gen1 != 2 || val1 != 300 || !at1.Equal(t1) {
+		t.Fatalf("baseline 1: want val=300 primed=true gen=2 at=%v, got val=%d primed=%v gen=%d at=%v", t1, val1, primed1, gen1, at1)
+	}
+
+	// Call w.Reset(1) (stale generation)
+	w.Reset(1)
+
+	// Assert w.Baseline(0) still returns value=150, primed=true, gen=2
+	val0After, at0After, primed0After, gen0After := w.Baseline(0)
+	if !primed0After || gen0After != 2 || val0After != 150 || !at0After.Equal(t1) {
+		t.Fatalf("baseline 0 after stale Reset(1): want val=150 primed=true gen=2 at=%v, got val=%d primed=%v gen=%d at=%v", t1, val0After, primed0After, gen0After, at0After)
+	}
+
+	// Submit a third sample at t2 (t1 + 1s) with []uint64{200, 400} on generation 2
+	t2 := t1.Add(1 * time.Second)
+	deltas, elapsed, accepted = w.Sample(2, t2, GenerationSampleMinInterval, []uint64{200, 400})
+	// Assert sample is accepted, deltas[0] == 50, deltas[1] == 100, elapsed time calculated from t1 baseline
+	if !accepted || len(deltas) != 2 || deltas[0] != 50 || deltas[1] != 100 || math.Abs(elapsed-1.0) > 1e-9 {
+		t.Fatalf("sample at t2: want accepted=true deltas=[50 100] elapsed=1.0, got accepted=%v deltas=%v elapsed=%v", accepted, deltas, elapsed)
+	}
+
+	// Test same-generation w.Reset(2): assert primed == false, values == nil, gen == 2, at.IsZero() == true
+	w.Reset(2)
+	w.mu.Lock()
+	primedReset2 := w.primed
+	valuesReset2 := w.values
+	genReset2 := w.gen
+	atReset2 := w.at
+	w.mu.Unlock()
+	if primedReset2 || valuesReset2 != nil || genReset2 != 2 || !atReset2.IsZero() {
+		t.Fatalf("Reset(2): want primed=false values=nil gen=2 at.IsZero=true, got primed=%v values=%v gen=%d at=%v", primedReset2, valuesReset2, genReset2, atReset2)
+	}
+
+	// Re-prime generation 2 before testing newer-generation reset
+	t3 := t2.Add(1 * time.Second)
+	w.Sample(2, t3, GenerationSampleMinInterval, []uint64{250, 500})
+	w.mu.Lock()
+	if !w.primed || len(w.values) != 2 || w.gen != 2 || !w.at.Equal(t3) {
+		w.mu.Unlock()
+		t.Fatalf("re-prime gen 2 failed")
+	}
+	w.mu.Unlock()
+
+	// Test newer-generation w.Reset(3): assert primed == false, values == nil, gen == 3, at.IsZero() == true
+	w.Reset(3)
+	w.mu.Lock()
+	primedReset3 := w.primed
+	valuesReset3 := w.values
+	genReset3 := w.gen
+	atReset3 := w.at
+	w.mu.Unlock()
+	if primedReset3 || valuesReset3 != nil || genReset3 != 3 || !atReset3.IsZero() {
+		t.Fatalf("Reset(3): want primed=false values=nil gen=3 at.IsZero=true, got primed=%v values=%v gen=%d at=%v", primedReset3, valuesReset3, genReset3, atReset3)
+	}
+}
