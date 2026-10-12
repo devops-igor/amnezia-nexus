@@ -344,12 +344,6 @@
             </div>
         </div>
         <div id="vpn-chart-tooltip" style="position: absolute; display: none; pointer-events: none; z-index: 100; background: var(--bg-surface, #1e293b); border: 1px solid var(--border-color, #334155); border-radius: var(--radius-sm, 4px); padding: 4px 8px; font-size: 0.75rem; color: var(--text-main, #f8fafc); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); white-space: nowrap;"></div>
-        <div style="display: none;" aria-hidden="true">
-            <div id="vpn-chart-directions"></div>
-            <div id="vpn-chart-packets"></div>
-            <div id="vpn-chart-sessions-routes"></div>
-            <div id="vpn-chart-backend-latency"></div>
-        </div>
         <details><summary>{{ _ "vpn_diag_loss_backend_history" }}</summary>
             <div id="vpn-chart-reasons"></div>
             <div id="vpn-chart-backends"></div>
@@ -1723,6 +1717,14 @@
     }
 
     function vpnRenderHistoryCharts(series) {
+        const tip = document.getElementById('vpn-chart-tooltip');
+        if (tip) tip.style.display = 'none';
+        const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
+            ? document.querySelectorAll('.chart-crosshair')
+            : [];
+        for (let i = 0; i < crosshairs.length; i++) {
+            crosshairs[i].style.display = 'none';
+        }
         if (!series || typeof series !== 'object') return;
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
@@ -1734,7 +1736,7 @@
         else points = series.window_15m || [];
 
         const tData = points.map(function(p) { return p.traffic_available !== true ? null : (p.rx_bps || 0) + (p.tx_bps || 0); });
-        const qData = points.map(function(p) { return (p.q_pct || 0); });
+        const qData = points.map(function(p) { return Number.isFinite(p.q_pct) ? p.q_pct : null; });
         const dData = points.map(function(p) { return p.drop_rates_available !== true ? null : (p.drop_rate || 0); });
         // An absent observation count is UNKNOWN, not an available zero: only a
         // positive explicit sample count makes the percentile plottable. Same
@@ -1756,17 +1758,19 @@
 
         function computeCurrentPeak(data) {
             let current = null;
-            let peak = null;
-            for (let i = data.length - 1; i >= 0; i--) {
-                if (Number.isFinite(data[i])) {
-                    current = data[i];
-                    break;
+            if (data && data.length > 0) {
+                const latest = data[data.length - 1];
+                if (Number.isFinite(latest)) {
+                    current = latest;
                 }
             }
-            for (let i = 0; i < data.length; i++) {
-                if (Number.isFinite(data[i])) {
-                    if (peak === null || data[i] > peak) {
-                        peak = data[i];
+            let peak = null;
+            if (data) {
+                for (let i = 0; i < data.length; i++) {
+                    if (Number.isFinite(data[i])) {
+                        if (peak === null || data[i] > peak) {
+                            peak = data[i];
+                        }
                     }
                 }
             }
@@ -1783,7 +1787,8 @@
                 return (Bps / 1024).toFixed(1) + ' ' + (_('vpn_unit_kbps') || 'KB/s');
             }
             if (Bps > 0) {
-                return (Bps / 1048576).toFixed(2) + ' ' + (_('vpn_unit_mbps') || 'MB/s');
+                const unit = (_('vpn_unit_bps') && _('vpn_unit_bps') !== 'vpn_unit_bps') ? _('vpn_unit_bps') : 'B/s';
+                return (Bps >= 1 ? Math.round(Bps) : Bps.toFixed(1)) + ' ' + unit;
             }
             return '0.0 ' + (_('vpn_unit_mbps') || 'MB/s');
         }
@@ -1987,24 +1992,6 @@
                 element.appendChild(graph);
             }
         }
-        function known(p, key, availability) {
-            return p[availability] !== true || !Number.isFinite(p[key]) ? null : p[key];
-        }
-        renderSeries('vpn-chart-directions', [
-            {label:_('vpn_diag_rx_direction'), values:points.map(p => known(p,'rx_bps','traffic_available'))},
-            {label:_('vpn_diag_tx_direction'), values:points.map(p => known(p,'tx_bps','traffic_available')), color:'var(--info, #06b6d4)'}
-        ]);
-        renderSeries('vpn-chart-packets', [
-            {label:_('vpn_diag_rx_packets_rate'),values:points.map(p => known(p,'rx_pps','traffic_available'))},
-            {label:_('vpn_diag_tx_packets_rate'),values:points.map(p => known(p,'tx_pps','traffic_available')),color:'var(--info, #06b6d4)'}
-        ]);
-        renderSeries('vpn-chart-sessions-routes', [
-            {label:_('vpn_diag_active_sessions'),values:points.map(p => Number.isFinite(p.sessions) ? p.sessions : null)},
-            {label:_('vpn_diag_active_routes'),values:points.map(p => Number.isFinite(p.routes) ? p.routes : null),color:'var(--info, #06b6d4)'}
-        ]);
-        renderSeries('vpn-chart-backend-latency', [
-            {label:_('vpn_diag_backend_probe_p95'),values:points.map(p => !(p.be_latency_samples > 0) || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
-        ]);
         const lossLabels = vpnLossReasonLabels();
         const allReasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
         const reasons = allReasons.filter(key => {
@@ -2041,6 +2028,14 @@
     }
 
     function vpnSetHistoryWindow(w) {
+        const tip = document.getElementById('vpn-chart-tooltip');
+        if (tip) tip.style.display = 'none';
+        const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
+            ? document.querySelectorAll('.chart-crosshair')
+            : [];
+        for (let i = 0; i < crosshairs.length; i++) {
+            crosshairs[i].style.display = 'none';
+        }
         vpnHistoryWindow = w;
         const toggles = document.getElementById('vpn-history-window-toggles');
         if (toggles) {
@@ -2198,7 +2193,7 @@
             // "unavailable" badge. Assigning both textContent and innerHTML
             // empties either shape, and a blank container deliberately renders
             // no placeholder curve, so no data is invented here.
-            const historyIds = ['vpn-chart-throughput', 'vpn-chart-packets', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-directions', 'vpn-chart-reasons', 'vpn-chart-sessions-routes', 'vpn-chart-backends', 'vpn-chart-backend-latency', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
+            const historyIds = ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-reasons', 'vpn-chart-backends', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
             for (let i = 0; i < historyIds.length; i++) {
                 const el = document.getElementById(historyIds[i]);
                 if (el) { el.textContent = ''; el.innerHTML = ''; }

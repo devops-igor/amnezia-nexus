@@ -702,5 +702,6 @@
   "vpn_unit_kbps": "KB/s",
   "vpn_unit_dps": "drops/s",
   "vpn_unit_ms": "ms",
-  "vpn_unit_pct": "%"
+  "vpn_unit_pct": "%",
+  "vpn_unit_bps": "B/s"
 }

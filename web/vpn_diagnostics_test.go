@@ -842,7 +842,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"directions", "packets", "sessions-routes", "backend-latency", "reasons", "backends"} {
+	for _, id := range []string{"throughput", "queue", "drops", "latency", "reasons", "backends"} {
 		if !strings.Contains(string(data), `id="vpn-chart-`+id+`"`) {
 			t.Fatalf("missing history chart %s", id)
 		}
@@ -892,13 +892,8 @@ for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
  vpnHistoryWindow=w;seen.length=0;vpnRenderHistoryCharts(series);
  const v=i+1;
  assert.deepStrictEqual(seen.slice(0,4),[[null,3*v,0],[0,5*v,0],[null,6*v,0],[null,7*v,0]]);
- assert.deepStrictEqual(seen.slice(4,11),[[null,v,0],[null,2*v,0],[null,3*v,0],[null,4*v,0],[0,9*v,0],[0,10*v,0],[null,8*v,null]]);
- assert.deepStrictEqual(seen.slice(11),[[null,4*v,0],[null,2*v,0],[null,11*v,0],[null,12*v,0],[null,13*v,0],[null,14*v,0],[null,15*v,null]]);
+ assert.deepStrictEqual(seen.slice(4),[[null,4*v,0],[null,2*v,0],[null,11*v,0],[null,12*v,0],[null,13*v,0],[null,14*v,0],[null,15*v,null]]);
  for (const [id,label] of [
-  ['vpn-chart-directions','RX client to backend (bps)'],['vpn-chart-directions','TX backend to client (bps)'],
-  ['vpn-chart-packets','RX packets/s'],['vpn-chart-packets','TX packets/s'],
-  ['vpn-chart-sessions-routes','Active sessions'],['vpn-chart-sessions-routes','Active routes'],
-  ['vpn-chart-backend-latency','Eligible backend probe p95 (ms)'],
   ['vpn-chart-reasons','return queue full (drops/s)'],['vpn-chart-reasons','client backend device queue full (drops/s)'],
   ['vpn-chart-backends','Backend 3 RX (bps)'],['vpn-chart-backends','Backend 3 TX (bps)'],
   ['vpn-chart-backends','Backend 3 RX packets/s'],['vpn-chart-backends','Backend 3 TX packets/s'],
@@ -913,7 +908,6 @@ vpnRenderHistoryCharts({window_15m:[series.window_15m[0]]});
 assert(document.getElementById('vpn-chart-backends').textContent.includes('No data (15m)'), 'pre-provision fleet context must remain visible');
 assert(document.getElementById('vpn-chart-throughput').innerHTML.includes('No data'));
 assert(document.getElementById('vpn-chart-drops').innerHTML.includes('No data'));
-assert(entry('vpn-chart-directions','RX client to backend (bps)').includes('No data'));
 assert(entry('vpn-chart-reasons','return queue full (drops/s)').includes('No data'));
 // Retired/re-registered backend IDs form gaps, never zero-filled continuity.
 vpnRenderHistoryCharts({window_15m:[
@@ -953,9 +947,8 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{
-		"vpn-chart-throughput", "vpn-chart-packets", "vpn-chart-queue", "vpn-chart-latency",
-		"vpn-chart-drops", "vpn-chart-directions", "vpn-chart-reasons",
-		"vpn-chart-sessions-routes", "vpn-chart-backends", "vpn-chart-backend-latency",
+		"vpn-chart-throughput", "vpn-chart-queue", "vpn-chart-latency",
+		"vpn-chart-drops", "vpn-chart-reasons", "vpn-chart-backends",
 		"vpn-diag-be-traffic", "vpn-history-fleet-note",
 	} {
 		if !strings.Contains(string(data), `id="`+id+`"`) {
@@ -994,8 +987,7 @@ let vpnShowAllRoutes=false;
 // of its own; the mock only needs it to answer a querySelectorAll probe.
 document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
 const SVG_CHARTS=['vpn-chart-throughput','vpn-chart-queue','vpn-chart-drops','vpn-chart-latency'];
-const SERIES_CHARTS=['vpn-chart-directions','vpn-chart-packets','vpn-chart-sessions-routes',
- 'vpn-chart-backend-latency','vpn-chart-reasons','vpn-chart-backends'];
+const SERIES_CHARTS=['vpn-chart-reasons','vpn-chart-backends'];
 // Seed realistic stale state: measured series render SVG into the sparkline
 // containers and label/child pairs into the renderSeries containers.
 vpnRenderHistoryCharts({window_15m:[
@@ -1497,7 +1489,6 @@ assert.strictEqual(text('vpn-diag-lat-max'),E('vpn_diag_historical_ms',{value:7}
 function seriesLabel(id,label) {
  return document.getElementById(id).children.some(child=>child.textContent===label+' ('+vpnHistoryWindow+')');
 }
-assert(seriesLabel('vpn-chart-directions',E('vpn_diag_rx_direction')),'history direction label');
 assert(seriesLabel('vpn-chart-reasons',E('vpn_diag_loss_return_queue_full')+' (drops/s)'),'known loss label');
 assert(seriesLabel('vpn-chart-reasons','future reason (drops/s)'),'unknown reason unchanged');
 assert(seriesLabel('vpn-chart-backends',E('vpn_diag_backend_series',{id:3,label:'RX (bps)'})),'backend history label');
@@ -1538,7 +1529,7 @@ assert.strictEqual(vpnLastStatus,null);
 vpnToggleShowAllRoutes();vpnSetHistoryWindow('1h');
 assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_unavailable'),'unavailable remains localized');
 assert.strictEqual(text('vpn-kpi-throughput'),'-','no stale throughput');
-assert.strictEqual(document.getElementById('vpn-chart-directions').children.length,0);
+assert.strictEqual(document.getElementById('vpn-chart-reasons').children.length,0);
 fixture.rates={available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0};
 fixture.drop_categories={rates_available:true,total_drops:12,total_drop_rate_pps:0};
 fixture.problem_routes[0].traffic={available:true,rx_bytes_per_sec:0,rx_pps:0};
@@ -1658,7 +1649,7 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		{"HardcodedTrafficState", "_('vpn_diag_traffic_unavailable')", "'Traffic unavailable'", "traffic state"},
 		{"WrongAuthoritativeSeverity", "statusText.textContent = _('vpn_forwarder_degraded');", "statusText.textContent = _('vpn_forwarder_warning');", "authoritative severity DEGRADED"},
-		{"HardcodedHistoryLabel", "_('vpn_diag_rx_direction')", "'RX client to backend (bps)'", "history direction label"},
+		{"HardcodedHistoryLabel", "_(lossLabels[key])", "'return queue full'", "known loss label"},
 		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
@@ -6011,6 +6002,18 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 		t.Errorf("expected floating tooltip #vpn-chart-tooltip to exist")
 	}
 
+	obsoleteIDs := []string{
+		"vpn-chart-directions",
+		"vpn-chart-packets",
+		"vpn-chart-sessions-routes",
+		"vpn-chart-backend-latency",
+	}
+	for _, id := range obsoleteIDs {
+		if node := findHTMLNodeByID(doc, id); node != nil {
+			t.Errorf("expected obsolete chart container #%s to be completely removed from DOM", id)
+		}
+	}
+
 	t.Run("JSRenderContract", func(t *testing.T) {
 		nodePath, err := findNodeBinary()
 		if err != nil {
@@ -6074,6 +6077,55 @@ assert(document.getElementById('vpn-chart-reasons').textContent.includes('No dat
 const tChart = document.getElementById('vpn-chart-throughput').innerHTML;
 assert(tChart.includes('chart-crosshair'), 'sparkline contains crosshair');
 assert(tChart.includes('chart-overlay'), 'sparkline contains overlay');
+
+// Check Fix R1: newest sample unavailable -> Current is '—', Peak evaluates past samples
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 8000000, tx_bps: 8000000, traffic_available: true, q_pct: 25, drop_rate: 2, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 12.5, fwd_p95_samples: 1, backends: [] },
+        { t: 1700000060, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, backends: [] }
+    ]
+});
+const tBadgesUnavail = document.getElementById('vpn-chart-throughput-badges').textContent;
+assert(tBadgesUnavail.includes('Current: —'), 'throughput unavailable Current: ' + tBadgesUnavail);
+assert(tBadgesUnavail.includes('Peak:'), 'throughput preserved Peak: ' + tBadgesUnavail);
+
+const dBadgesUnavail = document.getElementById('vpn-chart-drops-badges').textContent;
+assert(dBadgesUnavail.includes('Current: —'), 'drops unavailable Current: ' + dBadgesUnavail);
+assert(dBadgesUnavail.includes('Peak: 2 drops/s'), 'drops preserved Peak: ' + dBadgesUnavail);
+
+const lBadgesUnavail = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesUnavail.includes('Current: —'), 'latency unavailable Current: ' + lBadgesUnavail);
+assert(lBadgesUnavail.includes('Peak: 12.5 ms'), 'latency preserved Peak: ' + lBadgesUnavail);
+
+// Check Fix R1: valid zero is rendered (not —)
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 1, backends: [] }
+    ]
+});
+const tBadgesZero = document.getElementById('vpn-chart-throughput-badges').textContent;
+assert(tBadgesZero.includes('Current: 0.0 MB/s'), 'throughput zero Current: ' + tBadgesZero);
+const dBadgesZero = document.getElementById('vpn-chart-drops-badges').textContent;
+assert(dBadgesZero.includes('Current: 0 drops/s'), 'drops zero Current: ' + dBadgesZero);
+const qBadgesZero = document.getElementById('vpn-chart-queue-badges').textContent;
+assert(qBadgesZero.includes('Current: 0%'), 'queue zero Current: ' + qBadgesZero);
+const lBadgesZero = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesZero.includes('Current: 0 ms'), 'latency zero Current: ' + lBadgesZero);
+
+// Check Fix R2: tooltip reset at beginning of render
+const tipEl = document.getElementById('vpn-chart-tooltip');
+tipEl.style.display = 'block';
+vpnRenderHistoryCharts({ window_15m: [] });
+assert.strictEqual(tipEl.style.display, 'none', 'tooltip hidden at beginning of render');
+
+// Check Fix R5: low positive throughput formatting (<1KB/s formatted as B/s)
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 400, tx_bps: 400, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, backends: [] }
+    ]
+});
+const tBadgesLow = document.getElementById('vpn-chart-throughput-badges').textContent;
+assert(tBadgesLow.includes('Current: 100 B/s'), 'throughput sub-KB formatted as B/s: ' + tBadgesLow);
 `
 		if out, err := execNodeScript(nodePath, script); err != nil {
 			t.Fatalf("historical charts JS render contract failed: %v\n%s", err, out)

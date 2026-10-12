@@ -138,15 +138,14 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     for chart in charts:
         expect(page.locator(chart)).to_be_visible()
 
-    # Redundant sparkline containers are removed / non-rendered
+    # Redundant sparkline containers are completely removed
     for obsolete in [
         "#vpn-chart-directions",
         "#vpn-chart-packets",
         "#vpn-chart-sessions-routes",
         "#vpn-chart-backend-latency",
     ]:
-        expect(page.locator(f"{obsolete}:visible")).to_have_count(0)
-        expect(page.locator(obsolete)).not_to_be_visible()
+        expect(page.locator(obsolete)).to_have_count(0)
 
     breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
         has=page.locator("#vpn-chart-reasons")
@@ -178,6 +177,11 @@ def test_vpn_historical_charts_interaction_and_kpis(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
+    # Ensure technical details disclosure is open
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
     # Ensure window toggles container is visible
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
@@ -194,15 +198,25 @@ def test_vpn_historical_charts_interaction_and_kpis(
         expect(chart).to_be_visible()
         expect(chart.locator("svg")).to_be_visible()
 
-    # Assert header badge containers are visible
-    badge_ids = [
-        "#vpn-chart-throughput-badges",
-        "#vpn-chart-drops-badges",
-        "#vpn-chart-queue-badges",
-        "#vpn-chart-latency-badges",
-    ]
-    for bid in badge_ids:
-        expect(page.locator(bid)).to_be_visible()
+    # Assert header badge containers are visible and match expected patterns
+    badge_patterns = {
+        "#vpn-chart-throughput-badges": re.compile(
+            r"Current:\s*(?:\d+(?:\.\d+)?\s*(?:MB/s|KB/s|B/s)|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*(?:MB/s|KB/s|B/s)|—)"
+        ),
+        "#vpn-chart-drops-badges": re.compile(
+            r"Current:\s*(?:\d+(?:\.\d+)?\s*drops/s|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*drops/s|—)"
+        ),
+        "#vpn-chart-queue-badges": re.compile(
+            r"Current:\s*(?:\d+%\s*|—)\s*\|\s*Peak:\s*(?:\d+%\s*|—)"
+        ),
+        "#vpn-chart-latency-badges": re.compile(
+            r"Current:\s*(?:\d+(?:\.\d+)?\s*ms|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
+        ),
+    }
+    for bid, pattern in badge_patterns.items():
+        badge = page.locator(bid)
+        expect(badge).to_be_visible()
+        expect(badge).to_have_text(pattern)
 
     # Assert time axes are rendered
     axis_ids = [
