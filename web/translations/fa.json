@@ -695,5 +695,12 @@
   "vpn_problem_write_stall": "توقف نوشتن دستگاه شناسایی شد",
   "vpn_problem_write_errors": "خطاهای نوشتن دستگاه فعال است",
   "vpn_problem_route_queue_pressure": "فشار بالای صف در مسیر فورواردر شناسایی شد",
-  "vpn_problem_stale_handshake": "دست‌دهی بالادستی قدیمی"
+  "vpn_problem_stale_handshake": "دست‌دهی بالادستی قدیمی",
+  "vpn_chart_current": "فعلی",
+  "vpn_chart_peak": "اوج",
+  "vpn_unit_mbps": "MB/s",
+  "vpn_unit_kbps": "KB/s",
+  "vpn_unit_dps": "drops/s",
+  "vpn_unit_ms": "ms",
+  "vpn_unit_pct": "%"
 }

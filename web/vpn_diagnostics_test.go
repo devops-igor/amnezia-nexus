@@ -1146,8 +1146,8 @@ const freshAvailableStatus = {
  problem_routes: [],
  historical_series: {
   window_15m: [
-   { t: 200, rx_bps: 2000, tx_bps: 2000, traffic_available: true, q_pct: 10, drop_rate: 0, drop_rates_available: true,
-     drop_reason_rates: { return_queue_full: 0 }, fwd_p95_ms: 30, fwd_p95_samples: 1, be_p95_ms: 25, be_latency_samples: 1,
+   { t: 200, rx_bps: 2000, tx_bps: 2000, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true,
+     drop_reason_rates: { return_queue_full: 1 }, fwd_p95_ms: 30, fwd_p95_samples: 1, be_p95_ms: 25, be_latency_samples: 1,
      sessions: 2, routes: 1, backends_omitted: 0,
      backends: [{ id: 4, rx_bps: 2000, tx_bps: 2000, traffic_available: true, probe_latency_ms: 25, probe_available: true }] }
   ]
@@ -1427,12 +1427,9 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
 		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_forward_p95",
 	} {
-		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `"`)
+		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`)
 		match := pattern.FindStringSubmatch(rendered)
 		expected := dict[key]
-		if id == "throughput" {
-			expected += " (bps)"
-		}
 		if len(match) != 2 || html.UnescapeString(match[1]) != expected {
 			return fmt.Errorf("static chart %s is not localized", id)
 		}
@@ -1462,7 +1459,7 @@ const route={peer_key:'abcd…',assigned_ip:'<client-address>',backend_id:3,occu
  high_water:0,drops:0,p95_write_ms:0,p95_write_samples:0,last_traffic_age_sec:-1,pressure_note:'',
  write_count:7,write_errors:2,traffic:{available:false,rx_bytes_per_sec:999,rx_pps:999},future_field:17};
 const point={traffic_available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0,sessions:0,routes:0,
- drop_rates_available:true,drop_reason_rates:{return_queue_full:0,future_reason:0},fwd_p95_ms:0,fwd_p95_samples:1,
+ drop_rates_available:true,drop_reason_rates:{return_queue_full:1,future_reason:1},fwd_p95_ms:0,fwd_p95_samples:1,
  be_p95_ms:0,be_latency_samples:1,backends:[{id:3,rx_bps:0,traffic_available:true,probe_latency_ms:0,probe_available:true}],backends_omitted:5};
 const fixture={forwarder_available:true,forwarder_queue_capacity:100,listener_running:true,
  virtual_tun:{
@@ -5951,6 +5948,135 @@ func TestVPNDashboardSectionOrder(t *testing.T) {
 		}
 		if err := validateVPNDashboardDOMOrder(dupDoc); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject duplicate ID fixture, but it passed")
+		}
+	})
+}
+
+// TestVPNHistoricalChartsContract verifies that the historical trends panel contains
+// the 4 core operational chart containers, their header badge containers, their time
+// axis containers, and the floating tooltip element (#459).
+func TestVPNHistoricalChartsContract(t *testing.T) {
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn.html: %v", err)
+	}
+	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
+	if err != nil {
+		t.Fatalf("failed to parse vpn.html: %v", err)
+	}
+
+	chartIDs := []string{
+		"vpn-chart-throughput",
+		"vpn-chart-drops",
+		"vpn-chart-queue",
+		"vpn-chart-latency",
+	}
+	badgeIDs := []string{
+		"vpn-chart-throughput-badges",
+		"vpn-chart-drops-badges",
+		"vpn-chart-queue-badges",
+		"vpn-chart-latency-badges",
+	}
+	axisIDs := []string{
+		"vpn-chart-throughput-axis",
+		"vpn-chart-drops-axis",
+		"vpn-chart-queue-axis",
+		"vpn-chart-latency-axis",
+	}
+
+	for _, id := range chartIDs {
+		node := findHTMLNodeByID(doc, id)
+		if node == nil {
+			t.Errorf("expected chart container #%s to exist", id)
+		}
+	}
+	for _, id := range badgeIDs {
+		node := findHTMLNodeByID(doc, id)
+		if node == nil {
+			t.Errorf("expected header badge container #%s to exist", id)
+		}
+	}
+	for _, id := range axisIDs {
+		node := findHTMLNodeByID(doc, id)
+		if node == nil {
+			t.Errorf("expected time axis container #%s to exist", id)
+		}
+	}
+
+	if tooltipNode := findHTMLNodeByID(doc, "vpn-chart-tooltip"); tooltipNode == nil {
+		t.Errorf("expected floating tooltip #vpn-chart-tooltip to exist")
+	}
+
+	t.Run("JSRenderContract", func(t *testing.T) {
+		nodePath, err := findNodeBinary()
+		if err != nil {
+			t.Fatal("Node is required for contract verification")
+		}
+		sparkline, err := extractJSFunction(string(vpnData), "function vpnGenerateSparklineSVG")
+		if err != nil {
+			t.Fatal(err)
+		}
+		history, err := extractJSFunction(string(vpnData), "function vpnRenderHistoryCharts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := vpnDOMMock(t, string(vpnData)) + "\n" +
+			vpnDiagnosticsTranslationsJS(t, string(vpnData), "en") + "\n" +
+			sparkline + "\n" + history + `
+let vpnHistoryWindow = '15m';
+const series = {
+    window_15m: [
+        { t: 1700000000, rx_bps: 8000000, tx_bps: 8000000, traffic_available: true, q_pct: 25, drop_rate: 2, drop_rates_available: true, drop_reason_rates: { return_queue_full: 2, return_malformed: 0 }, fwd_p95_ms: 12.5, fwd_p95_samples: 1, be_p95_ms: 8, be_latency_samples: 1, backends: [] },
+        { t: 1700000060, rx_bps: 16000000, tx_bps: 16000000, traffic_available: true, q_pct: 50, drop_rate: 5, drop_rates_available: true, drop_reason_rates: { return_queue_full: 5, return_malformed: 0 }, fwd_p95_ms: 25.0, fwd_p95_samples: 1, be_p95_ms: 15, be_latency_samples: 1, backends: [] }
+    ]
+};
+vpnRenderHistoryCharts(series);
+
+// Check badges
+const tBadges = document.getElementById('vpn-chart-throughput-badges').textContent;
+assert(tBadges.includes('Current:') && tBadges.includes('Peak:'), 'throughput badges text: ' + tBadges);
+assert(tBadges.includes('MB/s'), 'throughput unit MB/s: ' + tBadges);
+
+const dBadges = document.getElementById('vpn-chart-drops-badges').textContent;
+assert(dBadges.includes('Current:') && dBadges.includes('Peak:'), 'drops badges text: ' + dBadges);
+assert(dBadges.includes('drops/s'), 'drops unit drops/s: ' + dBadges);
+
+const qBadges = document.getElementById('vpn-chart-queue-badges').textContent;
+assert(qBadges.includes('Current:') && qBadges.includes('Peak:'), 'queue badges text: ' + qBadges);
+assert(qBadges.includes('%'), 'queue unit %: ' + qBadges);
+
+const lBadges = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadges.includes('Current:') && lBadges.includes('Peak:'), 'latency badges text: ' + lBadges);
+assert(lBadges.includes('ms'), 'latency unit ms: ' + lBadges);
+
+// Check time axes
+const tAxis = document.getElementById('vpn-chart-throughput-axis').innerHTML;
+assert(tAxis.includes('<span>') && tAxis.includes('</span>'), 'throughput axis contains timestamp spans');
+
+// Check reasons suppression: return_queue_full has drops, return_malformed has 0
+const reasonsEl = document.getElementById('vpn-chart-reasons');
+assert(reasonsEl.textContent.includes('return queue full'), 'active reason rendered');
+assert(!reasonsEl.textContent.includes('return malformed'), 'zero-drop reason suppressed');
+
+// Check all zero reasons display empty state
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: { return_malformed: 0 }, fwd_p95_ms: 0, fwd_p95_samples: 0, backends: [] }
+    ]
+});
+assert(document.getElementById('vpn-chart-reasons').textContent.includes('No data (15m)'), 'all zero reasons show empty state');
+
+// Check SVG contains crosshair and overlay
+const tChart = document.getElementById('vpn-chart-throughput').innerHTML;
+assert(tChart.includes('chart-crosshair'), 'sparkline contains crosshair');
+assert(tChart.includes('chart-overlay'), 'sparkline contains overlay');
+`
+		if out, err := execNodeScript(nodePath, script); err != nil {
+			t.Fatalf("historical charts JS render contract failed: %v\n%s", err, out)
 		}
 	})
 }

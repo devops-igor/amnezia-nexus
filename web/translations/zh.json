@@ -695,5 +695,12 @@
   "vpn_problem_write_stall": "检测到设备写入停顿",
   "vpn_problem_write_errors": "设备写入错误处于活动状态",
   "vpn_problem_route_queue_pressure": "在转发器路由上检测到较高的队列压力",
-  "vpn_problem_stale_handshake": "上游握手超时"
+  "vpn_problem_stale_handshake": "上游握手超时",
+  "vpn_chart_current": "当前",
+  "vpn_chart_peak": "峰值",
+  "vpn_unit_mbps": "MB/s",
+  "vpn_unit_kbps": "KB/s",
+  "vpn_unit_dps": "drops/s",
+  "vpn_unit_ms": "ms",
+  "vpn_unit_pct": "%"
 }

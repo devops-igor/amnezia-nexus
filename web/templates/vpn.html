@@ -310,22 +310,41 @@
             </div>
         </div>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-sm);">
-            <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_fwd_kpi_throughput" }} (bps)</div>
-                <div id="vpn-chart-throughput" style="height: 60px; width: 100%;"></div>
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm);">
+                <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); font-size: 0.75rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_fwd_kpi_throughput" }}</div>
+                    <div id="vpn-chart-throughput-badges" class="text-muted font-mono" style="font-size: 0.7rem;"></div>
+                </div>
+                <div id="vpn-chart-throughput" style="height: 60px; width: 100%; position: relative;"></div>
+                <div id="vpn-chart-throughput-axis" class="flex justify-between text-muted" style="font-size: 0.65rem; margin-top: 2px; font-family: monospace;"></div>
             </div>
-            <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_queue_utilization" }}</div>
-                <div id="vpn-chart-queue" style="height: 60px; width: 100%;"></div>
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm);">
+                <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); font-size: 0.75rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_drop_rate" }}</div>
+                    <div id="vpn-chart-drops-badges" class="text-muted font-mono" style="font-size: 0.7rem;"></div>
+                </div>
+                <div id="vpn-chart-drops" style="height: 60px; width: 100%; position: relative;"></div>
+                <div id="vpn-chart-drops-axis" class="flex justify-between text-muted" style="font-size: 0.65rem; margin-top: 2px; font-family: monospace;"></div>
             </div>
-            <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_drop_rate" }}</div>
-                <div id="vpn-chart-drops" style="height: 60px; width: 100%;"></div>
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm);">
+                <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); font-size: 0.75rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_queue_utilization" }}</div>
+                    <div id="vpn-chart-queue-badges" class="text-muted font-mono" style="font-size: 0.7rem;"></div>
+                </div>
+                <div id="vpn-chart-queue" style="height: 60px; width: 100%; position: relative;"></div>
+                <div id="vpn-chart-queue-axis" class="flex justify-between text-muted" style="font-size: 0.65rem; margin-top: 2px; font-family: monospace;"></div>
             </div>
-            <div>
-                <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_forward_p95" }}</div>
-                <div id="vpn-chart-latency" style="height: 60px; width: 100%;"></div>
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm);">
+                <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); font-size: 0.75rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_forward_p95" }}</div>
+                    <div id="vpn-chart-latency-badges" class="text-muted font-mono" style="font-size: 0.7rem;"></div>
+                </div>
+                <div id="vpn-chart-latency" style="height: 60px; width: 100%; position: relative;"></div>
+                <div id="vpn-chart-latency-axis" class="flex justify-between text-muted" style="font-size: 0.65rem; margin-top: 2px; font-family: monospace;"></div>
             </div>
+        </div>
+        <div id="vpn-chart-tooltip" style="position: absolute; display: none; pointer-events: none; z-index: 100; background: var(--bg-surface, #1e293b); border: 1px solid var(--border-color, #334155); border-radius: var(--radius-sm, 4px); padding: 4px 8px; font-size: 0.75rem; color: var(--text-main, #f8fafc); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); white-space: nowrap;"></div>
+        <div style="display: none;" aria-hidden="true">
             <div id="vpn-chart-directions"></div>
             <div id="vpn-chart-packets"></div>
             <div id="vpn-chart-sessions-routes"></div>
@@ -1695,10 +1714,12 @@
                 dots += '<circle cx="' + points[0][0] + '" cy="' + points[0][1] + '" r="1.5" fill="' + color + '" />';
             }
         }
-        return '<svg viewBox="0 0 ' + width + ' ' + height + '" width="100%" height="' + height + '" preserveAspectRatio="none" style="display:block;">' +
+        const crosshair = '<line class="chart-crosshair" x1="0" y1="0" x2="0" y2="' + height + '" stroke="var(--text-muted, #94a3b8)" stroke-width="1" stroke-dasharray="2,2" style="display:none; pointer-events:none;" />';
+        const overlay = '<rect class="chart-overlay" x="0" y="0" width="' + width + '" height="' + height + '" fill="transparent" style="cursor:crosshair; pointer-events:all;" />';
+        return '<svg viewBox="0 0 ' + width + ' ' + height + '" width="100%" height="' + height + '" preserveAspectRatio="none" style="display:block; overflow:visible;">' +
             '<path d="' + fillD + '" fill="' + color + '" fill-opacity="' + (fillOpacity || 0.15) + '" />' +
             '<path d="' + pathD + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />' +
-            dots + '</svg>';
+            dots + crosshair + overlay + '</svg>';
     }
 
     function vpnRenderHistoryCharts(series) {
@@ -1732,6 +1753,222 @@
         if (chartD) chartD.innerHTML = vpnGenerateSparklineSVG(dData, 'var(--danger, #ef4444)');
         const chartL = document.getElementById('vpn-chart-latency');
         if (chartL) chartL.innerHTML = vpnGenerateSparklineSVG(lData, 'var(--info, #06b6d4)');
+
+        function computeCurrentPeak(data) {
+            let current = null;
+            let peak = null;
+            for (let i = data.length - 1; i >= 0; i--) {
+                if (Number.isFinite(data[i])) {
+                    current = data[i];
+                    break;
+                }
+            }
+            for (let i = 0; i < data.length; i++) {
+                if (Number.isFinite(data[i])) {
+                    if (peak === null || data[i] > peak) {
+                        peak = data[i];
+                    }
+                }
+            }
+            return { current: current, peak: peak };
+        }
+
+        function vpnFmtThroughput(bps) {
+            if (!Number.isFinite(bps)) return '—';
+            const Bps = bps / 8;
+            if (Bps >= 1048576) {
+                return (Bps / 1048576).toFixed(1) + ' ' + (_('vpn_unit_mbps') || 'MB/s');
+            }
+            if (Bps >= 1024) {
+                return (Bps / 1024).toFixed(1) + ' ' + (_('vpn_unit_kbps') || 'KB/s');
+            }
+            if (Bps > 0) {
+                return (Bps / 1048576).toFixed(2) + ' ' + (_('vpn_unit_mbps') || 'MB/s');
+            }
+            return '0.0 ' + (_('vpn_unit_mbps') || 'MB/s');
+        }
+
+        function vpnFmtDrops(drops) {
+            if (!Number.isFinite(drops)) return '—';
+            const d = Number(drops);
+            const str = (d % 1 === 0) ? d.toFixed(0) : d.toFixed(1);
+            return str + ' ' + (_('vpn_unit_dps') || 'drops/s');
+        }
+
+        function vpnFmtQueue(q) {
+            if (!Number.isFinite(q)) return '—';
+            return Math.round(q) + (_('vpn_unit_pct') || '%');
+        }
+
+        function vpnFmtLatency(ms) {
+            if (!Number.isFinite(ms)) return '—';
+            const num = Number(ms);
+            const str = (num % 1 === 0) ? num.toFixed(0) : num.toFixed(1);
+            return str + ' ' + (_('vpn_unit_ms') || 'ms');
+        }
+
+        function renderBadges(badgeId, current, peak, formatFn) {
+            const el = document.getElementById(badgeId);
+            if (!el) return;
+            const curStr = Number.isFinite(current) ? formatFn(current) : '—';
+            const peakStr = Number.isFinite(peak) ? formatFn(peak) : '—';
+            const curLabel = _('vpn_chart_current') || 'Current';
+            const peakLabel = _('vpn_chart_peak') || 'Peak';
+            el.textContent = curLabel + ': ' + curStr + ' | ' + peakLabel + ': ' + peakStr;
+        }
+
+        const tStats = computeCurrentPeak(tData);
+        renderBadges('vpn-chart-throughput-badges', tStats.current, tStats.peak, vpnFmtThroughput);
+        const dStats = computeCurrentPeak(dData);
+        renderBadges('vpn-chart-drops-badges', dStats.current, dStats.peak, vpnFmtDrops);
+        const qStats = computeCurrentPeak(qData);
+        renderBadges('vpn-chart-queue-badges', qStats.current, qStats.peak, vpnFmtQueue);
+        const lStats = computeCurrentPeak(lData);
+        renderBadges('vpn-chart-latency-badges', lStats.current, lStats.peak, vpnFmtLatency);
+
+        function vpnFormatTime(t) {
+            if (!t && t !== 0) return '--:--:--';
+            let d;
+            if (t > 1e11) {
+                d = new Date(t);
+            } else if (t > 1e8) {
+                d = new Date(t * 1000);
+            } else {
+                const s = Math.floor(Math.abs(t) % 86400);
+                const hrs = String(Math.floor(s / 3600)).padStart(2, '0');
+                const mins = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+                const secs = String(s % 60).padStart(2, '0');
+                return hrs + ':' + mins + ':' + secs;
+            }
+            const hrs = String(d.getHours()).padStart(2, '0');
+            const mins = String(d.getMinutes()).padStart(2, '0');
+            const secs = String(d.getSeconds()).padStart(2, '0');
+            return hrs + ':' + mins + ':' + secs;
+        }
+
+        function renderTimeAxis(axisId) {
+            const axisEl = document.getElementById(axisId);
+            if (!axisEl) return;
+            if (!points || points.length === 0) {
+                axisEl.innerHTML = '<span>--:--:--</span><span>--:--:--</span>';
+                return;
+            }
+            const startT = points[0] ? points[0].t : null;
+            const endT = points[points.length - 1] ? points[points.length - 1].t : null;
+            axisEl.innerHTML = '<span>' + escapeHtml(vpnFormatTime(startT)) + '</span><span>' + escapeHtml(vpnFormatTime(endT)) + '</span>';
+        }
+
+        renderTimeAxis('vpn-chart-throughput-axis');
+        renderTimeAxis('vpn-chart-drops-axis');
+        renderTimeAxis('vpn-chart-queue-axis');
+        renderTimeAxis('vpn-chart-latency-axis');
+
+        function attachInteraction(chartId, data, formatTooltipFn) {
+            const container = document.getElementById(chartId);
+            if (!container || typeof container.addEventListener !== 'function') return;
+            if (!points || !points.length) return;
+
+            const crosshair = container.querySelector ? container.querySelector('.chart-crosshair') : null;
+            const overlay = container.querySelector ? container.querySelector('.chart-overlay') : null;
+            const tooltip = document.getElementById('vpn-chart-tooltip');
+            const target = overlay || container;
+
+            if (target._vpnMouseMove) {
+                target.removeEventListener('mousemove', target._vpnMouseMove);
+                target.removeEventListener('mouseleave', target._vpnMouseLeave);
+            }
+
+            const onMouseMove = function(e) {
+                const rect = container.getBoundingClientRect ? container.getBoundingClientRect() : null;
+                if (!rect || !rect.width) return;
+                const mouseX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+                const frac = rect.width > 0 ? (mouseX / rect.width) : 0;
+                const idx = Math.min(points.length - 1, Math.max(0, Math.round(frac * (points.length - 1))));
+                const pt = points[idx];
+                const val = data[idx];
+
+                if (crosshair && typeof crosshair.setAttribute === 'function') {
+                    const width = 200;
+                    const padding = 2;
+                    const step = (width - padding * 2) / Math.max(points.length - 1, 1);
+                    const svgX = (padding + idx * step).toFixed(1);
+                    crosshair.setAttribute('x1', svgX);
+                    crosshair.setAttribute('x2', svgX);
+                    crosshair.style.display = 'block';
+                }
+
+                if (tooltip) {
+                    const timeStr = vpnFormatTime(pt ? pt.t : null);
+                    tooltip.innerHTML = formatTooltipFn(timeStr, val, pt, idx);
+                    tooltip.style.display = 'block';
+
+                    const tooltipWidth = tooltip.offsetWidth || 140;
+                    let left = (e.pageX || 0) + 12;
+                    if (typeof window !== 'undefined' && window.innerWidth && left + tooltipWidth > window.innerWidth - 10) {
+                        left = (e.pageX || 0) - tooltipWidth - 12;
+                    }
+                    const top = Math.max(10, (e.pageY || 0) - 35);
+                    tooltip.style.left = left + 'px';
+                    tooltip.style.top = top + 'px';
+                }
+            };
+
+            const onMouseLeave = function() {
+                if (crosshair) crosshair.style.display = 'none';
+                if (tooltip) tooltip.style.display = 'none';
+            };
+
+            target._vpnMouseMove = onMouseMove;
+            target._vpnMouseLeave = onMouseLeave;
+            target.addEventListener('mousemove', onMouseMove);
+            target.addEventListener('mouseleave', onMouseLeave);
+        }
+
+        attachInteraction('vpn-chart-throughput', tData, function(timeStr, val, pt) {
+            let html = '<div style="font-weight:600;margin-bottom:2px;">' + escapeHtml(timeStr) + '</div>';
+            html += '<div>' + escapeHtml(_('vpn_fwd_kpi_throughput')) + ': <strong>' + escapeHtml(vpnFmtThroughput(val)) + '</strong></div>';
+            if (pt && pt.traffic_available === true) {
+                const rx = Number.isFinite(pt.rx_bps) ? vpnFmtThroughput(pt.rx_bps) : '—';
+                const tx = Number.isFinite(pt.tx_bps) ? vpnFmtThroughput(pt.tx_bps) : '—';
+                html += '<div style="font-size:0.7rem;color:var(--text-muted,#94a3b8);margin-top:2px;">RX: ' + escapeHtml(rx) + ' | TX: ' + escapeHtml(tx) + '</div>';
+            }
+            return html;
+        });
+
+        attachInteraction('vpn-chart-drops', dData, function(timeStr, val, pt) {
+            let html = '<div style="font-weight:600;margin-bottom:2px;">' + escapeHtml(timeStr) + '</div>';
+            html += '<div>' + escapeHtml(_('vpn_diag_drop_rate')) + ': <strong>' + escapeHtml(vpnFmtDrops(val)) + '</strong></div>';
+            if (pt && pt.drop_rates_available === true && pt.drop_reason_rates) {
+                const lossLabels = vpnLossReasonLabels();
+                const active = [];
+                for (const [k, rate] of Object.entries(pt.drop_reason_rates)) {
+                    if (Number.isFinite(rate) && rate > 0) {
+                        const lbl = lossLabels[k] ? _(lossLabels[k]) : k.replace(/_/g, ' ');
+                        active.push(escapeHtml(lbl) + ': ' + escapeHtml(vpnFmtDrops(rate)));
+                    }
+                }
+                if (active.length > 0) {
+                    html += '<div style="font-size:0.7rem;color:var(--text-muted,#94a3b8);margin-top:2px;">' + active.join('<br>') + '</div>';
+                }
+            }
+            return html;
+        });
+
+        attachInteraction('vpn-chart-queue', qData, function(timeStr, val, pt) {
+            let html = '<div style="font-weight:600;margin-bottom:2px;">' + escapeHtml(timeStr) + '</div>';
+            html += '<div>' + escapeHtml(_('vpn_diag_queue_utilization')) + ': <strong>' + escapeHtml(vpnFmtQueue(val)) + '</strong></div>';
+            return html;
+        });
+
+        attachInteraction('vpn-chart-latency', lData, function(timeStr, val, pt) {
+            let html = '<div style="font-weight:600;margin-bottom:2px;">' + escapeHtml(timeStr) + '</div>';
+            html += '<div>' + escapeHtml(_('vpn_diag_forward_p95')) + ': <strong>' + escapeHtml(vpnFmtLatency(val)) + '</strong></div>';
+            if (pt && Number(pt.be_latency_samples) > 0 && Number.isFinite(pt.be_p95_ms)) {
+                html += '<div style="font-size:0.7rem;color:var(--text-muted,#94a3b8);margin-top:2px;">' + escapeHtml(_('vpn_diag_backend_probe_p95')) + ': ' + escapeHtml(vpnFmtLatency(pt.be_p95_ms)) + '</div>';
+            }
+            return html;
+        });
+
         function renderSeries(id, entries) {
             const element = document.getElementById(id);
             if (!element) return;
@@ -1769,7 +2006,10 @@
             {label:_('vpn_diag_backend_probe_p95'),values:points.map(p => !(p.be_latency_samples > 0) || !Number.isFinite(p.be_p95_ms) ? null : p.be_p95_ms)}
         ]);
         const lossLabels = vpnLossReasonLabels();
-        const reasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
+        const allReasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
+        const reasons = allReasons.filter(key => {
+            return points.some(p => p && p.drop_reason_rates && Number.isFinite(p.drop_reason_rates[key]) && p.drop_reason_rates[key] > 0);
+        });
         renderSeries('vpn-chart-reasons', reasons.map(key => ({
             label:(lossLabels[key] ? _(lossLabels[key]) : key.replace(/_/g,' ')) + ' (drops/s)',
             values:points.map(p => p.drop_rates_available !== true || !p.drop_reason_rates || !Number.isFinite(p.drop_reason_rates[key]) ? null : p.drop_reason_rates[key]),
@@ -1963,6 +2203,16 @@
                 const el = document.getElementById(historyIds[i]);
                 if (el) { el.textContent = ''; el.innerHTML = ''; }
             }
+            const extraHistoryIds = [
+                'vpn-chart-throughput-badges', 'vpn-chart-drops-badges', 'vpn-chart-queue-badges', 'vpn-chart-latency-badges',
+                'vpn-chart-throughput-axis', 'vpn-chart-drops-axis', 'vpn-chart-queue-axis', 'vpn-chart-latency-axis'
+            ];
+            for (let i = 0; i < extraHistoryIds.length; i++) {
+                const el = document.getElementById(extraHistoryIds[i]);
+                if (el) { el.textContent = ''; el.innerHTML = ''; }
+            }
+            const tipEl = document.getElementById('vpn-chart-tooltip');
+            if (tipEl) { tipEl.style.display = 'none'; tipEl.innerHTML = ''; }
             // Invalidate the cached available status so local toggles (such as
             // history-window or show-all-routes) cannot resurrect stale health,
             // throughput, routes, or backends while the forwarder is unavailable (#424).

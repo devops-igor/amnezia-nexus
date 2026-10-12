@@ -695,5 +695,12 @@
   "vpn_problem_write_stall": "Обнаружена задержка записи в устройство",
   "vpn_problem_write_errors": "Активны ошибки записи в устройство",
   "vpn_problem_route_queue_pressure": "Обнаружена высокая нагрузка очереди на маршруте форвардера",
-  "vpn_problem_stale_handshake": "Устаревшее рукопожатие вышестоящего узла"
+  "vpn_problem_stale_handshake": "Устаревшее рукопожатие вышестоящего узла",
+  "vpn_chart_current": "Текущее",
+  "vpn_chart_peak": "Пик",
+  "vpn_unit_mbps": "MB/s",
+  "vpn_unit_kbps": "KB/s",
+  "vpn_unit_dps": "drops/s",
+  "vpn_unit_ms": "ms",
+  "vpn_unit_pct": "%"
 }
