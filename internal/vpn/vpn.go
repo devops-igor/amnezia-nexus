@@ -242,12 +242,11 @@ type Service struct {
 	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
 
-	rollingHistory     *RollingHistory
-	diagRatesMu        sync.Mutex
-	diagRates          *diagRatesTracker
-	historyDiagRates   *diagRatesTracker
-	historyDropReasons dropReasonRatesTracker
-	problemOnset       *problemOnsetTracker
+	rollingHistory   *RollingHistory
+	diagRatesMu      sync.Mutex
+	diagRates        *diagRatesTracker
+	historyDiagRates *diagRatesTracker
+	problemOnset     *problemOnsetTracker
 	// diagGeneration is the diagnostics generation (issue #429 review
 	// blocker 1). It advances ONLY in Start, so every Start after Stop is an
 	// explicit new generation: every cumulative diagnostics baseline below is
@@ -1243,7 +1242,6 @@ func (s *Service) resetDiagnosticsGeneration() {
 	if s.historyDiagRates != nil {
 		s.historyDiagRates.reset(gen)
 	}
-	s.historyDropReasons.reset(gen)
 	s.diagDeltas.reset(gen)
 	// historyPrimed is keyed to the generation (historyPrimedGen): bumping
 	// diagGeneration invalidates it by itself, so the next history read

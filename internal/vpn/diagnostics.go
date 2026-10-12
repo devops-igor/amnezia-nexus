@@ -2503,7 +2503,6 @@ type diagDeltaTrackers struct {
 	syncFailures            diagDeltaTracker
 	enqueueFailures         diagDeltaTracker
 	writeStalls             diagDeltaTracker
-	reasons                 dropReasonRatesTracker
 }
 
 func (t *diagDeltaTrackers) sampleOwnershipMismatch(gen diagGeneration, now time.Time, cumulative uint64) returnOwnershipSnapshot {
@@ -2533,8 +2532,8 @@ func (t *diagDeltaTrackers) sampleEnqueueFailures(gen diagGeneration, now time.T
 }
 
 // reset re-primes every sub-tracker — ownership mismatch (both directions),
-// peer-sync failures, enqueue failures, write stalls and the per-reason drop
-// rates — for a new diagnostics generation (issue #429 review blocker 1).
+// peer-sync failures, enqueue failures, and write stalls — for a new
+// diagnostics generation (issue #429 review blocker 1).
 func (t *diagDeltaTrackers) reset(gen diagGeneration) {
 	if t == nil {
 		return
@@ -2544,7 +2543,6 @@ func (t *diagDeltaTrackers) reset(gen diagGeneration) {
 	t.syncFailures.reset(gen)
 	t.enqueueFailures.reset(gen)
 	t.writeStalls.reset(gen)
-	t.reasons.reset(gen)
 }
 
 func (s *Service) collectDropCategories() DropCategoryBreakdown {
