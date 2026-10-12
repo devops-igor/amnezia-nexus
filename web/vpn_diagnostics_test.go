@@ -6023,12 +6023,17 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		dispose, err := extractJSFunction(string(vpnData), "function vpnDisposeChartInteractions")
+		if err != nil {
+			t.Fatal(err)
+		}
 		history, err := extractJSFunction(string(vpnData), "function vpnRenderHistoryCharts")
 		if err != nil {
 			t.Fatal(err)
 		}
 		script := vpnDOMMock(t, string(vpnData)) + "\n" +
 			vpnDiagnosticsTranslationsJS(t, string(vpnData), "en") + "\n" +
+			dispose + "\n" +
 			sparkline + "\n" + history + `
 let vpnHistoryWindow = '15m';
 const series = {

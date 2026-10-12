@@ -1716,7 +1716,7 @@
             dots + crosshair + overlay + '</svg>';
     }
 
-    function vpnRenderHistoryCharts(series) {
+    function vpnDisposeChartInteractions() {
         const tip = document.getElementById('vpn-chart-tooltip');
         if (tip) tip.style.display = 'none';
         const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
@@ -1727,21 +1727,17 @@
         }
         ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-drops', 'vpn-chart-latency'].forEach(function(id) {
             const el = document.getElementById(id);
-            if (el) {
-                if (el._vpnCleanup) {
-                    el._vpnCleanup();
-                    el._vpnCleanup = null;
-                }
-                if (el._vpnMouseMove) {
-                    if (typeof el.removeEventListener === 'function') {
-                        el.removeEventListener('mousemove', el._vpnMouseMove);
-                        el.removeEventListener('mouseleave', el._vpnMouseLeave);
-                    }
-                    el._vpnMouseMove = null;
-                    el._vpnMouseLeave = null;
-                }
+            if (el && el._vpnCleanup) {
+                el._vpnCleanup();
+                el._vpnCleanup = null;
             }
         });
+    }
+
+    function vpnRenderHistoryCharts(series) {
+        if (typeof vpnDisposeChartInteractions === 'function') {
+            vpnDisposeChartInteractions();
+        }
         if (!series || typeof series !== 'object') return;
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
@@ -1888,19 +1884,6 @@
         function attachInteraction(chartId, data, formatTooltipFn) {
             const container = document.getElementById(chartId);
             if (!container) return;
-
-            if (container._vpnCleanup) {
-                container._vpnCleanup();
-                container._vpnCleanup = null;
-            }
-            if (container._vpnMouseMove) {
-                if (typeof container.removeEventListener === 'function') {
-                    container.removeEventListener('mousemove', container._vpnMouseMove);
-                    container.removeEventListener('mouseleave', container._vpnMouseLeave);
-                }
-                container._vpnMouseMove = null;
-                container._vpnMouseLeave = null;
-            }
 
             if (!points || !points.length) return;
             const overlay = container.querySelector ? container.querySelector('.chart-overlay') : null;
@@ -2062,31 +2045,9 @@
     }
 
     function vpnSetHistoryWindow(w) {
-        const tip = document.getElementById('vpn-chart-tooltip');
-        if (tip) tip.style.display = 'none';
-        const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
-            ? document.querySelectorAll('.chart-crosshair')
-            : [];
-        for (let i = 0; i < crosshairs.length; i++) {
-            crosshairs[i].style.display = 'none';
+        if (typeof vpnDisposeChartInteractions === 'function') {
+            vpnDisposeChartInteractions();
         }
-        ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-drops', 'vpn-chart-latency'].forEach(function(id) {
-            const el = document.getElementById(id);
-            if (el) {
-                if (el._vpnCleanup) {
-                    el._vpnCleanup();
-                    el._vpnCleanup = null;
-                }
-                if (el._vpnMouseMove) {
-                    if (typeof el.removeEventListener === 'function') {
-                        el.removeEventListener('mousemove', el._vpnMouseMove);
-                        el.removeEventListener('mouseleave', el._vpnMouseLeave);
-                    }
-                    el._vpnMouseMove = null;
-                    el._vpnMouseLeave = null;
-                }
-            }
-        });
         vpnHistoryWindow = w;
         const toggles = document.getElementById('vpn-history-window-toggles');
         if (toggles) {
@@ -2244,22 +2205,13 @@
             // "unavailable" badge. Assigning both textContent and innerHTML
             // empties either shape, and a blank container deliberately renders
             // no placeholder curve, so no data is invented here.
+            if (typeof vpnDisposeChartInteractions === 'function') {
+                vpnDisposeChartInteractions();
+            }
             const historyIds = ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-reasons', 'vpn-chart-backends', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
             for (let i = 0; i < historyIds.length; i++) {
                 const el = document.getElementById(historyIds[i]);
                 if (el) {
-                    if (el._vpnCleanup) {
-                        el._vpnCleanup();
-                        el._vpnCleanup = null;
-                    }
-                    if (el._vpnMouseMove) {
-                        if (typeof el.removeEventListener === 'function') {
-                            el.removeEventListener('mousemove', el._vpnMouseMove);
-                            el.removeEventListener('mouseleave', el._vpnMouseLeave);
-                        }
-                        el._vpnMouseMove = null;
-                        el._vpnMouseLeave = null;
-                    }
                     el.textContent = '';
                     el.innerHTML = '';
                 }

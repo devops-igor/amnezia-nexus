@@ -262,6 +262,78 @@ def test_vpn_historical_charts_interaction_and_kpis(
 
 
 @pytest.mark.e2e
+def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Verify chart availability transition from unavailable to recovered and empty clearing."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Open technical details disclosure if collapsed
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
+    # Inject an unavailable history series with unavailable flags and zero sample count
+    page.evaluate("""() => {
+            vpnRenderHistoryCharts({
+                window_15m: [
+                    { t: 36000, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, fwd_p95_ms: 0, fwd_p95_samples: 0 },
+                    { t: 36060, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, fwd_p95_ms: 0, fwd_p95_samples: 0 }
+                ]
+            });
+        }""")
+
+    # Inject a recovered history series with available metrics and distinctly newer timestamps (10 MB/s at 23:00:00)
+    # 83886080 bps = 10.0 MB/s (10 * 8 * 1048576)
+    page.evaluate("""() => {
+            vpnRenderHistoryCharts({
+                window_15m: [
+                    { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 },
+                    { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 }
+                ]
+            });
+        }""")
+
+    # Dispatch mousemove to the center of #vpn-chart-throughput svg .chart-overlay
+    overlay = page.locator("#vpn-chart-throughput svg .chart-overlay")
+    expect(overlay).to_be_visible()
+    overlay.scroll_into_view_if_needed()
+    box = overlay.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    # Read the tooltip text from #vpn-chart-tooltip
+    tooltip = page.locator("#vpn-chart-tooltip")
+    expect(tooltip).to_be_visible()
+    assert tooltip.evaluate("el => el.style.display !== 'none'")
+    tip_text = tooltip.text_content() or ""
+
+    # Assert tooltip contains the NEW timestamp and rate, and does NOT contain stale unavailable '—'
+    assert "23:00" in tip_text
+    assert "MB/s" in tip_text or "vpn_unit_mbps" in tip_text
+    assert "—" not in tip_text
+    assert "10:00" not in tip_text
+
+    # Render an empty series via vpnRenderHistoryCharts({ window_15m: [] })
+    page.evaluate("() => vpnRenderHistoryCharts({ window_15m: [] })")
+
+    # Move the mouse away then back over #vpn-chart-throughput
+    page.mouse.move(0, 0)
+    chart = page.locator("#vpn-chart-throughput")
+    c_box = chart.bounding_box()
+    assert c_box is not None
+    page.mouse.move(c_box["x"] + c_box["width"] / 2, c_box["y"] + c_box["height"] / 2)
+
+    # Assert #vpn-chart-tooltip remains hidden (display === 'none')
+    expect(tooltip).not_to_be_visible()
+    assert tooltip.evaluate(
+        "el => el.style.display === 'none' || window.getComputedStyle(el).display === 'none'"
+    )
+
+
+@pytest.mark.e2e
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to /vpn -> Problem Routes details and 'Show all routes' toggle."""
     page = authenticated_page
