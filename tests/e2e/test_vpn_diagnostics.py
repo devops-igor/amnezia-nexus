@@ -9,6 +9,52 @@ from playwright.sync_api import Page, expect
 from tests.e2e.conftest import api_get, assert_response_shape
 
 
+def _ensure_tech_details_open(page: Page) -> None:
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
+
+def _assert_tooltip_hidden(tooltip) -> None:
+    expect(tooltip).not_to_be_visible()
+    assert tooltip.evaluate(
+        "el => el.style.display === \x27none\x27 || window.getComputedStyle(el).display === \x27none\x27"
+    )
+
+
+def _hover_center(page: Page, locator) -> None:
+    box = locator.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+
+_HISTORICAL_CHARTS = (
+    "#vpn-chart-throughput",
+    "#vpn-chart-drops",
+    "#vpn-chart-queue",
+    "#vpn-chart-latency",
+)
+_OBSOLETE_CHARTS = (
+    "#vpn-chart-directions",
+    "#vpn-chart-packets",
+    "#vpn-chart-sessions-routes",
+    "#vpn-chart-backend-latency",
+)
+
+
+def _chart_badge_re(unit: str) -> re.Pattern[str]:
+    v = rf"(?:\d+(?:\.\d+)?\s*{unit}|—)"
+    return re.compile(rf"Current:\s*{v}\s*\|\s*Peak:\s*{v}")
+
+
+_CHART_BADGE_PATTERNS = {
+    "#vpn-chart-throughput-badges": _chart_badge_re(r"(?:MB/s|KB/s|B/s)"),
+    "#vpn-chart-drops-badges": _chart_badge_re(r"drops/s"),
+    "#vpn-chart-queue-badges": re.compile(r"Current:\s*(?:\d+%\s*|—)\s*\|\s*Peak:\s*(?:\d+%\s*|—)"),
+    "#vpn-chart-latency-badges": _chart_badge_re(r"ms"),
+}
+
+
 @pytest.mark.e2e
 def test_vpn_dashboard_navigation_and_banner(authenticated_page: Page, base_url: str) -> None:
     """Navigate to /vpn -> sees headline forwarder health status banner."""
@@ -21,14 +67,12 @@ def test_vpn_dashboard_navigation_and_banner(authenticated_page: Page, base_url:
     assert "/vpn" in page.url
 
     # Headline status banner elements
-    badge = page.locator("#vpn-fwd-status-badge")
-    expect(badge).to_be_visible()
-
-    status_text = page.locator("#vpn-fwd-status-text")
-    expect(status_text).to_be_visible()
-
-    headline_summary = page.locator("#vpn-fwd-headline-summary")
-    expect(headline_summary).to_be_visible()
+    for loc in (
+        "#vpn-fwd-status-badge",
+        "#vpn-fwd-status-text",
+        "#vpn-fwd-headline-summary",
+    ):
+        expect(page.locator(loc)).to_be_visible()
 
 
 @pytest.mark.e2e
@@ -38,20 +82,12 @@ def test_vpn_kpi_summary_bar(authenticated_page: Page, base_url: str) -> None:
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    kpi_locators = [
-        "#vpn-kpi-throughput",
-        "#vpn-kpi-routes-sessions",
-        "#vpn-kpi-queue-pressure",
-        "#vpn-kpi-packet-loss",
-        "#vpn-kpi-client-engine",
-        "#vpn-kpi-peer-sync",
-        "#vpn-kpi-backends",
-        "#vpn-kpi-slow-writes",
-    ]
-
-    for loc in kpi_locators:
-        el = page.locator(loc)
-        expect(el).to_be_visible()
+    kpi_keys = (
+        "throughput routes-sessions queue-pressure packet-loss "
+        "client-engine peer-sync backends slow-writes"
+    ).split()
+    for loc in [f"#vpn-kpi-{k}" for k in kpi_keys]:
+        expect(page.locator(loc)).to_be_visible()
 
     # The Peer Sync tile reports SYNCHRONIZATION (desired vs actual peers from
     # status.peer_sync), not the handshake peer count it used to render
@@ -74,50 +110,26 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    diag_fields = [
-        # Card 1: Data Plane Performance
-        "#vpn-diag-throughput",
-        "#vpn-diag-ewma5m",
-        "#vpn-diag-ewma1h",
-        "#vpn-diag-lat-percentiles",
-        "#vpn-diag-lat-max",
-        "#vpn-diag-queue-occ",
-        "#vpn-diag-queue-peak",
-        # Card 2: Traffic Drops & Loss Diagnostics
-        "#vpn-diag-drops-client",
-        "#vpn-diag-drops-return",
-        "#vpn-diag-drops-total",
-        # Card 3: Engine & Route Integrity
-        "#vpn-diag-engine-status",
-        "#vpn-diag-peers-status",
-        "#vpn-diag-hs-freshness",
-        "#vpn-diag-routing-counts",
-        # Card 4: System & Fleet Resources
-        "#vpn-diag-res-cpu",
-        "#vpn-diag-res-mem",
-        "#vpn-diag-res-fd",
-    ]
+    _ensure_tech_details_open(page)
 
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
-
-    # Assert exactly 4 operational cards
     cards = page.locator(
-        "#vpn-fwd-tech-details > div > div > div.card, " "#vpn-fwd-tech-details > div > div.card"
+        "#vpn-fwd-tech-details > div > div > div.card, #vpn-fwd-tech-details > div > div.card"
     )
     expect(cards).to_have_count(4)
 
-    # Assert visibility of all 17 retained diagnostic fields
-    for loc in diag_fields:
-        expect(page.locator(loc)).to_be_visible()
+    diag_fields = (
+        "throughput ewma5m ewma1h lat-percentiles lat-max queue-occ queue-peak "
+        "drops-client drops-return drops-total engine-status peers-status "
+        "hs-freshness routing-counts res-cpu res-mem res-fd"
+    ).split()
+    for f in diag_fields:
+        expect(page.locator(f"#vpn-diag-{f}")).to_be_visible()
 
-    # Assert absence of obsolete elements
-    for obsolete in [
+    for obsolete in (
         "#vpn-diag-packets",
         "#vpn-diag-res-goroutines",
         "#vpn-diag-res-gc",
-    ]:
+    ):
         expect(page.locator(obsolete)).to_have_count(0)
 
 
@@ -129,27 +141,11 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     page.wait_for_load_state("networkidle")
 
     # Ensure technical details disclosure is open
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+    _ensure_tech_details_open(page)
 
-    # Historical trends container and chart containers (4 consolidated charts)
-    charts = [
-        "#vpn-chart-throughput",
-        "#vpn-chart-queue",
-        "#vpn-chart-drops",
-        "#vpn-chart-latency",
-    ]
-    for chart in charts:
+    for chart in _HISTORICAL_CHARTS:
         expect(page.locator(chart)).to_be_visible()
-
-    # Redundant sparkline containers are completely removed
-    for obsolete in [
-        "#vpn-chart-directions",
-        "#vpn-chart-packets",
-        "#vpn-chart-sessions-routes",
-        "#vpn-chart-backend-latency",
-    ]:
+    for obsolete in _OBSOLETE_CHARTS:
         expect(page.locator(obsolete)).to_have_count(0)
 
     breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
@@ -160,16 +156,15 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
         expect(page.locator(chart)).to_be_visible()
     expect(page.locator("#vpn-history-fleet-note")).to_be_attached()
 
-    toggles_container = page.locator("#vpn-history-window-toggles")
-    expect(toggles_container).to_be_visible()
+    toggles = page.locator("#vpn-history-window-toggles")
+    expect(toggles).to_be_visible()
 
-    windows = ["1h", "6h", "24h", "15m"]
-    for win in windows:
-        btn = toggles_container.locator(f"button:has-text('{win}')")
+    for win in ("1h", "6h", "24h", "15m"):
+        btn = toggles.locator(f"button:has-text('{win}')")
         expect(btn).to_be_visible()
         btn.click()
         expect(btn).to_have_class("btn btn-sm btn-primary active")
-        for chart in charts + ["#vpn-chart-reasons", "#vpn-chart-backends"]:
+        for chart in _HISTORICAL_CHARTS + ("#vpn-chart-reasons", "#vpn-chart-backends"):
             expect(page.locator(chart)).to_be_visible()
 
 
@@ -183,57 +178,21 @@ def test_vpn_historical_charts_interaction_and_kpis(
     page.wait_for_load_state("networkidle")
 
     # Ensure technical details disclosure is open
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+    _ensure_tech_details_open(page)
 
-    # Ensure window toggles container is visible
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
 
-    # Assert all 4 chart containers are visible and contain rendered <svg> elements
-    chart_ids = [
-        "#vpn-chart-throughput",
-        "#vpn-chart-drops",
-        "#vpn-chart-queue",
-        "#vpn-chart-latency",
-    ]
-    for cid in chart_ids:
+    for cid in _HISTORICAL_CHARTS:
         chart = page.locator(cid)
         expect(chart).to_be_visible()
         expect(chart.locator("svg")).to_be_visible()
+        expect(page.locator(f"{cid}-axis")).to_be_visible()
 
-    # Assert header badge containers are visible and match expected patterns
-    badge_patterns = {
-        "#vpn-chart-throughput-badges": re.compile(
-            r"Current:\s*(?:\d+(?:\.\d+)?\s*(?:MB/s|KB/s|B/s)|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*(?:MB/s|KB/s|B/s)|—)"
-        ),
-        "#vpn-chart-drops-badges": re.compile(
-            r"Current:\s*(?:\d+(?:\.\d+)?\s*drops/s|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*drops/s|—)"
-        ),
-        "#vpn-chart-queue-badges": re.compile(
-            r"Current:\s*(?:\d+%\s*|—)\s*\|\s*Peak:\s*(?:\d+%\s*|—)"
-        ),
-        "#vpn-chart-latency-badges": re.compile(
-            r"Current:\s*(?:\d+(?:\.\d+)?\s*ms|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
-        ),
-    }
-    for bid, pattern in badge_patterns.items():
-        badge = page.locator(bid)
-        expect(badge).to_be_visible()
-        expect(badge).to_have_text(pattern)
+    for bid, pattern in _CHART_BADGE_PATTERNS.items():
+        expect(page.locator(bid)).to_be_visible()
+        expect(page.locator(bid)).to_have_text(pattern)
 
-    # Assert time axes are rendered
-    axis_ids = [
-        "#vpn-chart-throughput-axis",
-        "#vpn-chart-drops-axis",
-        "#vpn-chart-queue-axis",
-        "#vpn-chart-latency-axis",
-    ]
-    for aid in axis_ids:
-        expect(page.locator(aid)).to_be_visible()
-
-    # Test hover interaction: hover over #vpn-chart-throughput svg
     throughput_svg = page.locator("#vpn-chart-throughput svg")
     expect(throughput_svg).to_be_visible()
     throughput_svg.hover()
@@ -243,21 +202,15 @@ def test_vpn_historical_charts_interaction_and_kpis(
     assert tooltip.evaluate("el => el.style.display !== 'none'")
     assert (tooltip.text_content() or "").strip() != ""
 
-    # Move mouse away and assert tooltip hides
     page.mouse.move(0, 0)
-    expect(tooltip).not_to_be_visible()
-    assert tooltip.evaluate(
-        "el => el.style.display === 'none' || window.getComputedStyle(el).display === 'none'"
-    )
+    _assert_tooltip_hidden(tooltip)
 
-    # Test time window toggle: click 1h toggle button
     btn_1h = toggles.locator("button:has-text('1h')")
     expect(btn_1h).to_be_visible()
     btn_1h.click()
     expect(btn_1h).to_have_class(re.compile(r"\bactive\b"))
 
-    # Assert charts re-render after toggle
-    for cid in chart_ids:
+    for cid in _HISTORICAL_CHARTS:
         expect(page.locator(f"{cid} svg")).to_be_visible()
 
 
@@ -271,48 +224,35 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
     page.wait_for_load_state("networkidle")
 
     # Open technical details disclosure if collapsed
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+    _ensure_tech_details_open(page)
 
     # Inject an unavailable history series with unavailable flags and zero sample count
     page.evaluate("""() => {
-            vpnRenderHistoryCharts({
-                window_15m: [
-                    { t: 36000, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, fwd_p95_ms: 0, fwd_p95_samples: 0 },
-                    { t: 36060, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, fwd_p95_ms: 0, fwd_p95_samples: 0 }
-                ]
-            });
-        }""")
+        const u = { t: 36000, rx_bps: 0, tx_bps: 0, traffic_available: false, q_pct: null, drop_rate: 0, drop_rates_available: false, fwd_p95_ms: 0, fwd_p95_samples: 0 };
+        vpnRenderHistoryCharts({ window_15m: [u, { ...u, t: 36060 }] });
+    }""")
 
-    # Inject a recovered history series with available metrics and distinctly newer timestamps (10 MB/s at 23:00:00)
-    # 83886080 bps = 10.0 MB/s (10 * 8 * 1048576)
+    # Inject recovered series (10.0 MB/s at 23:00:00; 41943040 bps rx/tx)
     page.evaluate("""() => {
-            vpnRenderHistoryCharts({
-                window_15m: [
-                    { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 },
-                    { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 }
-                ]
-            });
-        }""")
+        const r = { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
+        vpnRenderHistoryCharts({ window_15m: [r, r] });
+    }""")
 
-    # Dispatch mousemove to the center of #vpn-chart-throughput svg .chart-overlay
     overlay = page.locator("#vpn-chart-throughput svg .chart-overlay")
     expect(overlay).to_be_visible()
     overlay.scroll_into_view_if_needed()
-    box = overlay.bounding_box()
-    assert box is not None
-    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    _hover_center(page, overlay)
 
-    # Read the tooltip text from #vpn-chart-tooltip
     tooltip = page.locator("#vpn-chart-tooltip")
     expect(tooltip).to_be_visible()
     assert tooltip.evaluate("el => el.style.display !== 'none'")
     tip_text = tooltip.text_content() or ""
 
-    # Assert tooltip contains the NEW timestamp and rate, and does NOT contain stale unavailable '—'
+    # Assert tooltip contains exact recovered rate and timestamp, rejecting placeholders
     assert "23:00" in tip_text
-    assert "MB/s" in tip_text or "vpn_unit_mbps" in tip_text
+    assert "10.0 MB/s" in tip_text or "10 MB/s" in tip_text
+    assert "5.0 MB/s" in tip_text or "5 MB/s" in tip_text
+    assert "vpn_unit_mbps" not in tip_text
     assert "—" not in tip_text
     assert "10:00" not in tip_text
 
@@ -321,16 +261,8 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
 
     # Move the mouse away then back over #vpn-chart-throughput
     page.mouse.move(0, 0)
-    chart = page.locator("#vpn-chart-throughput")
-    c_box = chart.bounding_box()
-    assert c_box is not None
-    page.mouse.move(c_box["x"] + c_box["width"] / 2, c_box["y"] + c_box["height"] / 2)
-
-    # Assert #vpn-chart-tooltip remains hidden (display === 'none')
-    expect(tooltip).not_to_be_visible()
-    assert tooltip.evaluate(
-        "el => el.style.display === 'none' || window.getComputedStyle(el).display === 'none'"
-    )
+    _hover_center(page, page.locator("#vpn-chart-throughput"))
+    _assert_tooltip_hidden(tooltip)
 
 
 @pytest.mark.e2e
@@ -340,9 +272,7 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+    _ensure_tech_details_open(page)
 
     details = page.locator("#vpn-fwd-routes-details")
     expect(details).to_be_visible()
@@ -462,73 +392,28 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
             };
         }""")
 
-    # 1. Verify wrapper clientWidth <= 375 (constrained to mobile viewport)
-    assert (
-        result["wrapper_client_width"] <= 375
-    ), f"wrapper clientWidth {result['wrapper_client_width']} exceeds 375px"
-
-    # 2. Verify table scrollWidth >= 540 and table style minWidth === '540px'
-    assert (
-        result["table_scroll_width"] >= 540
-    ), f"table scrollWidth {result['table_scroll_width']} < 540px"
-    assert (
-        result["table_min_width_style"] == "540px"
-    ), f"table style minWidth {result['table_min_width_style']!r} != '540px'"
-
-    # 3. Verify wrapper scrollWidth > wrapper.clientWidth (table overflows wrapper)
-    assert (
-        result["wrapper_scroll_width"] > result["wrapper_client_width"]
-    ), f"wrapper scrollWidth {result['wrapper_scroll_width']} <= clientWidth {result['wrapper_client_width']}"
-
-    # 4. Verify wrapper overflowX === 'auto'
-    assert (
-        result["wrapper_overflow_x"] == "auto"
-    ), f"wrapper overflowX {result['wrapper_overflow_x']!r} != 'auto'"
-
-    # 5. Test horizontal scrolling: set wrapper.scrollLeft = 50, verify wrapper.scrollLeft > 0
-    assert result["scroll_left_ltr"] > 0, f"LTR scrollLeft {result['scroll_left_ltr']} not > 0"
-
-    # 6. Verify document body scrollWidth <= 375 (wrapper contains the table without horizontal page overflow)
-    assert (
-        result["body_scroll_width_ltr"] <= 375
-    ), f"body scrollWidth {result['body_scroll_width_ltr']} exceeds 375px in LTR"
-
-    # 7. Persian RTL: verify table computed direction === 'rtl' and horizontal scrolling works in RTL
-    assert (
-        result["table_direction_rtl"] == "rtl"
-    ), f"table computed direction {result['table_direction_rtl']!r} != 'rtl'"
-    assert result[
-        "rtl_scrolled"
-    ], f"RTL horizontal scrolling failed, scrollLeft={result['scroll_left_rtl']}"
-    assert (
-        result["body_scroll_width_rtl"] <= 375
-    ), f"body scrollWidth {result['body_scroll_width_rtl']} exceeds 375px in RTL"
+    assert result["wrapper_client_width"] <= 375
+    assert result["table_scroll_width"] >= 540
+    assert result["table_min_width_style"] == "540px"
+    assert result["wrapper_scroll_width"] > result["wrapper_client_width"]
+    assert result["wrapper_overflow_x"] == "auto"
+    assert result["scroll_left_ltr"] > 0
+    assert result["body_scroll_width_ltr"] <= 375
+    assert result["table_direction_rtl"] == "rtl"
+    assert result["rtl_scrolled"]
+    assert result["body_scroll_width_rtl"] <= 375
 
 
-_LOSS_REASONS = {
-    "client_malformed",
-    "client_unmapped_source",
-    "client_mismatch",
-    "client_rejected",
-    "client_backend_queue_full",
-    "client_rate_limited",
-    "client_no_healthy_backend",
-    "client_virtualtun_drops",
-    "client_backend_device_queue_full",
-    "client_backend_device_oversized",
-    "client_backend_device_shutdown",
-    "client_backend_device_external",
-    "backend_device_unattributed",
-    "return_malformed",
-    "return_unmapped",
-    "return_mismatch",
-    "return_injection_errors",
-    "return_virtualtun_drops",
-    "return_queue_full",
-    "return_packet_too_large",
-    "return_backend_device_queue_full",
-    "return_backend_device_shutdown",
-}
+_LOSS_REASONS = set(
+    "client_malformed client_unmapped_source client_mismatch client_rejected "
+    "client_backend_queue_full client_rate_limited client_no_healthy_backend "
+    "client_virtualtun_drops client_backend_device_queue_full "
+    "client_backend_device_oversized client_backend_device_shutdown "
+    "client_backend_device_external backend_device_unattributed return_malformed "
+    "return_unmapped return_mismatch return_injection_errors return_virtualtun_drops "
+    "return_queue_full return_packet_too_large return_backend_device_queue_full "
+    "return_backend_device_shutdown".split()
+)
 
 
 def _assert_nonnegative_rates(values: dict) -> None:
@@ -853,30 +738,22 @@ def test_vpn_status_api(authenticated_page: Page, base_url: str) -> None:
     drops = status_data["drop_categories"]
     assert "client_virtualtun_drops" in drops
     assert "return_injection_tun_drops" in drops
-    client_categories = (
-        drops["client_malformed"]
-        + drops["client_unmapped_source"]
-        + drops["client_mismatch"]
-        + drops["client_rejected"]
-        + drops["client_backend_queue_full"]
-        + drops["client_rate_limited"]
-        + drops["client_no_healthy_backend"]
-        + drops["client_virtualtun_drops"]
-        + drops["client_backend_device_queue_full"]
-        + drops["client_backend_device_oversized"]
-        + drops["client_backend_device_shutdown"]
-        + drops["client_backend_device_external"]
+    client_categories = sum(
+        drops[f"client_{r}"]
+        for r in (
+            "malformed unmapped_source mismatch rejected backend_queue_full "
+            "rate_limited no_healthy_backend virtualtun_drops "
+            "backend_device_queue_full backend_device_oversized "
+            "backend_device_shutdown backend_device_external"
+        ).split()
     )
-    return_categories = (
-        drops["return_malformed"]
-        + drops["return_unmapped"]
-        + drops["return_mismatch"]
-        + drops["return_injection_errors"]
-        + drops["return_virtualtun_drops"]
-        + drops["return_queue_full"]
-        + drops["return_packet_too_large"]
-        + drops["return_backend_device_queue_full"]
-        + drops["return_backend_device_shutdown"]
+    return_categories = sum(
+        drops[f"return_{r}"]
+        for r in (
+            "malformed unmapped mismatch injection_errors virtualtun_drops "
+            "queue_full packet_too_large backend_device_queue_full "
+            "backend_device_shutdown"
+        ).split()
     )
     assert client_categories == drops["client_total_drops"], (
         f"client categories sum {client_categories} != client_total_drops "
@@ -1005,20 +882,10 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
         assert box is not None, f"Bounding box for {name} was not found"
         boxes.append((name, box))
 
-    # Assert box["y"] strictly increases: y(stats) < y(backends) < y(sessions) < y(forwarder)
     for i in range(len(boxes) - 1):
         curr_name, curr_box = boxes[i]
         next_name, next_box = boxes[i + 1]
+        assert curr_box["y"] < next_box["y"], f"Expected y({curr_name}) < y({next_name})"
         assert (
-            curr_box["y"] < next_box["y"]
-        ), f"Expected y({curr_name}) ({curr_box['y']}) < y({next_name}) ({next_box['y']})"
-
-    # Assert non-overlapping vertical layout:
-    # box_next["y"] >= box_curr["y"] + box_curr["height"] - 1 (allowing for subpixel border overlap)
-    for i in range(len(boxes) - 1):
-        curr_name, curr_box = boxes[i]
-        next_name, next_box = boxes[i + 1]
-        assert next_box["y"] >= curr_box["y"] + curr_box["height"] - 1, (
-            f"Expected {next_name} y ({next_box['y']}) >= "
-            f"{curr_name} bottom ({curr_box['y'] + curr_box['height'] - 1})"
-        )
+            next_box["y"] >= curr_box["y"] + curr_box["height"] - 1
+        ), f"Expected {next_name} y >= {curr_name} bottom"
