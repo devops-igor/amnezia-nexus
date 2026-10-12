@@ -569,7 +569,7 @@
   "vpn_diag_handshake_freshness": "Fraîcheur des échanges",
   "vpn_diag_routing_counts": "Sessions / Routes / Retours",
   "vpn_diag_healthy_total": "Sains / Total",
-  "vpn_diag_latency_p95": "Latence p95",
+  "vpn_diag_latency_p95": "Latence p95 (ms)",
   "vpn_diag_load_skew": "Déséquilibre de charge",
   "vpn_diag_device_drops": "Pertes du périphérique",
   "vpn_diag_cpu_usage": "Utilisation du CPU",
@@ -695,5 +695,18 @@
   "vpn_problem_write_stall": "Blocage d'écriture sur le périphérique détecté",
   "vpn_problem_write_errors": "Erreurs d'écriture sur le périphérique actives",
   "vpn_problem_route_queue_pressure": "Forte pression de file d'attente détectée sur la route de redirection",
-  "vpn_problem_stale_handshake": "Handshake amont obsolète"
+  "vpn_problem_stale_handshake": "Handshake amont obsolète",
+  "vpn_chart_current": "Actuel",
+  "vpn_chart_peak": "Pic",
+  "vpn_chart_write": "Écriture",
+  "vpn_chart_probe": "Sonde",
+  "vpn_unit_mbps": "MB/s",
+  "vpn_unit_kbps": "KB/s",
+  "vpn_unit_dps": "drops/s",
+  "vpn_unit_ms": "ms",
+  "vpn_unit_pct": "%",
+  "vpn_unit_bps": "B/s",
+  "vpn_diag_probe_suffix": " (sonde)",
+  "vpn_diag_write_suffix": " (écriture)",
+  "vpn_diag_backend_option": "Serveur #{id}"
 }

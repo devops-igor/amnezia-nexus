@@ -569,7 +569,7 @@
   "vpn_diag_handshake_freshness": "Давность рукопожатий",
   "vpn_diag_routing_counts": "Сессии / маршруты / обратные маршруты",
   "vpn_diag_healthy_total": "Исправные / всего",
-  "vpn_diag_latency_p95": "Задержка p95",
+  "vpn_diag_latency_p95": "Задержка p95 (мс)",
   "vpn_diag_load_skew": "Дисбаланс нагрузки",
   "vpn_diag_device_drops": "Потери устройства",
   "vpn_diag_cpu_usage": "Загрузка CPU",
@@ -695,5 +695,18 @@
   "vpn_problem_write_stall": "Обнаружена задержка записи в устройство",
   "vpn_problem_write_errors": "Активны ошибки записи в устройство",
   "vpn_problem_route_queue_pressure": "Обнаружена высокая нагрузка очереди на маршруте форвардера",
-  "vpn_problem_stale_handshake": "Устаревшее рукопожатие вышестоящего узла"
+  "vpn_problem_stale_handshake": "Устаревшее рукопожатие вышестоящего узла",
+  "vpn_chart_current": "Текущее",
+  "vpn_chart_peak": "Пик",
+  "vpn_chart_write": "Запись",
+  "vpn_chart_probe": "Проба",
+  "vpn_unit_mbps": "MB/s",
+  "vpn_unit_kbps": "KB/s",
+  "vpn_unit_dps": "drops/s",
+  "vpn_unit_ms": "ms",
+  "vpn_unit_pct": "%",
+  "vpn_unit_bps": "B/s",
+  "vpn_diag_probe_suffix": " (проба)",
+  "vpn_diag_write_suffix": " (запись)",
+  "vpn_diag_backend_option": "Бэкенд #{id}"
 }
