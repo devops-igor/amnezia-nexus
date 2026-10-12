@@ -128,6 +128,11 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
+    # Ensure technical details disclosure is open
+    tech_details = page.locator("#vpn-fwd-tech-details")
+    if not tech_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-tech-details > summary").click()
+
     # Historical trends container and chart containers (4 consolidated charts)
     charts = [
         "#vpn-chart-throughput",

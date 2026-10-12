@@ -1725,6 +1725,23 @@
         for (let i = 0; i < crosshairs.length; i++) {
             crosshairs[i].style.display = 'none';
         }
+        ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-drops', 'vpn-chart-latency'].forEach(function(id) {
+            const el = document.getElementById(id);
+            if (el) {
+                if (el._vpnCleanup) {
+                    el._vpnCleanup();
+                    el._vpnCleanup = null;
+                }
+                if (el._vpnMouseMove) {
+                    if (typeof el.removeEventListener === 'function') {
+                        el.removeEventListener('mousemove', el._vpnMouseMove);
+                        el.removeEventListener('mouseleave', el._vpnMouseLeave);
+                    }
+                    el._vpnMouseMove = null;
+                    el._vpnMouseLeave = null;
+                }
+            }
+        });
         if (!series || typeof series !== 'object') return;
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
@@ -1870,18 +1887,27 @@
 
         function attachInteraction(chartId, data, formatTooltipFn) {
             const container = document.getElementById(chartId);
-            if (!container || typeof container.addEventListener !== 'function') return;
+            if (!container) return;
+
+            if (container._vpnCleanup) {
+                container._vpnCleanup();
+                container._vpnCleanup = null;
+            }
+            if (container._vpnMouseMove) {
+                if (typeof container.removeEventListener === 'function') {
+                    container.removeEventListener('mousemove', container._vpnMouseMove);
+                    container.removeEventListener('mouseleave', container._vpnMouseLeave);
+                }
+                container._vpnMouseMove = null;
+                container._vpnMouseLeave = null;
+            }
+
             if (!points || !points.length) return;
+            const overlay = container.querySelector ? container.querySelector('.chart-overlay') : null;
+            if (!overlay || typeof overlay.addEventListener !== 'function') return;
 
             const crosshair = container.querySelector ? container.querySelector('.chart-crosshair') : null;
-            const overlay = container.querySelector ? container.querySelector('.chart-overlay') : null;
             const tooltip = document.getElementById('vpn-chart-tooltip');
-            const target = overlay || container;
-
-            if (target._vpnMouseMove) {
-                target.removeEventListener('mousemove', target._vpnMouseMove);
-                target.removeEventListener('mouseleave', target._vpnMouseLeave);
-            }
 
             const onMouseMove = function(e) {
                 const rect = container.getBoundingClientRect ? container.getBoundingClientRect() : null;
@@ -1923,10 +1949,18 @@
                 if (tooltip) tooltip.style.display = 'none';
             };
 
-            target._vpnMouseMove = onMouseMove;
-            target._vpnMouseLeave = onMouseLeave;
-            target.addEventListener('mousemove', onMouseMove);
-            target.addEventListener('mouseleave', onMouseLeave);
+            overlay._vpnMouseMove = onMouseMove;
+            overlay._vpnMouseLeave = onMouseLeave;
+            overlay.addEventListener('mousemove', onMouseMove);
+            overlay.addEventListener('mouseleave', onMouseLeave);
+
+            container._vpnCleanup = function() {
+                overlay.removeEventListener('mousemove', onMouseMove);
+                overlay.removeEventListener('mouseleave', onMouseLeave);
+                overlay._vpnMouseMove = null;
+                overlay._vpnMouseLeave = null;
+                if (crosshair) crosshair.style.display = 'none';
+            };
         }
 
         attachInteraction('vpn-chart-throughput', tData, function(timeStr, val, pt) {
@@ -2036,6 +2070,23 @@
         for (let i = 0; i < crosshairs.length; i++) {
             crosshairs[i].style.display = 'none';
         }
+        ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-drops', 'vpn-chart-latency'].forEach(function(id) {
+            const el = document.getElementById(id);
+            if (el) {
+                if (el._vpnCleanup) {
+                    el._vpnCleanup();
+                    el._vpnCleanup = null;
+                }
+                if (el._vpnMouseMove) {
+                    if (typeof el.removeEventListener === 'function') {
+                        el.removeEventListener('mousemove', el._vpnMouseMove);
+                        el.removeEventListener('mouseleave', el._vpnMouseLeave);
+                    }
+                    el._vpnMouseMove = null;
+                    el._vpnMouseLeave = null;
+                }
+            }
+        });
         vpnHistoryWindow = w;
         const toggles = document.getElementById('vpn-history-window-toggles');
         if (toggles) {
@@ -2196,7 +2247,22 @@
             const historyIds = ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-reasons', 'vpn-chart-backends', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
             for (let i = 0; i < historyIds.length; i++) {
                 const el = document.getElementById(historyIds[i]);
-                if (el) { el.textContent = ''; el.innerHTML = ''; }
+                if (el) {
+                    if (el._vpnCleanup) {
+                        el._vpnCleanup();
+                        el._vpnCleanup = null;
+                    }
+                    if (el._vpnMouseMove) {
+                        if (typeof el.removeEventListener === 'function') {
+                            el.removeEventListener('mousemove', el._vpnMouseMove);
+                            el.removeEventListener('mouseleave', el._vpnMouseLeave);
+                        }
+                        el._vpnMouseMove = null;
+                        el._vpnMouseLeave = null;
+                    }
+                    el.textContent = '';
+                    el.innerHTML = '';
+                }
             }
             const extraHistoryIds = [
                 'vpn-chart-throughput-badges', 'vpn-chart-drops-badges', 'vpn-chart-queue-badges', 'vpn-chart-latency-badges',
