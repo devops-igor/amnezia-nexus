@@ -50,8 +50,12 @@ def _chart_badge_re(unit: str) -> re.Pattern[str]:
 _CHART_BADGE_PATTERNS = {
     "#vpn-chart-throughput-badges": _chart_badge_re(r"(?:MB/s|KB/s|B/s)"),
     "#vpn-chart-drops-badges": _chart_badge_re(r"drops/s"),
-    "#vpn-chart-queue-badges": re.compile(r"Current:\s*(?:\d+%\s*|—)\s*\|\s*Peak:\s*(?:\d+%\s*|—)"),
-    "#vpn-chart-latency-badges": _chart_badge_re(r"ms"),
+    "#vpn-chart-queue-badges": re.compile(
+        r"Current:\s*(?:\d+(?:\.\d+)?%\s*|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?%\s*|—)"
+    ),
+    "#vpn-chart-latency-badges": re.compile(
+        r"Current:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
+    ),
 }
 
 

@@ -895,9 +895,9 @@ for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
  assert.deepStrictEqual(seen.slice(4),[[null,4*v,0],[null,2*v,0],[null,11*v,0],[null,12*v,0],[null,13*v,0],[null,14*v,0],[null,15*v,null]]);
  for (const [id,label] of [
   ['vpn-chart-reasons','return queue full (drops/s)'],['vpn-chart-reasons','client backend device queue full (drops/s)'],
-  ['vpn-chart-backends','Backend 3 RX (bps)'],['vpn-chart-backends','Backend 3 TX (bps)'],
-  ['vpn-chart-backends','Backend 3 RX packets/s'],['vpn-chart-backends','Backend 3 TX packets/s'],
-  ['vpn-chart-backends','Backend 3 Probe latency (ms)']
+  ['vpn-chart-backend-series','Backend 3 RX (bps)'],['vpn-chart-backend-series','Backend 3 TX (bps)'],
+  ['vpn-chart-backend-series','Backend 3 RX packets/s'],['vpn-chart-backend-series','Backend 3 TX packets/s'],
+  ['vpn-chart-backend-series','Backend 3 Probe latency (ms)']
  ]) assert(entry(id,label).includes('<svg'),label);
 }
 vpnHistoryWindow='15m';
@@ -914,12 +914,13 @@ vpnRenderHistoryCharts({window_15m:[
  {backends:[{id:3,rx_bps:10,traffic_available:true}]},{backends:[]},
  {backends:[{id:3,rx_bps:0,traffic_available:true}]}
 ]});
-const gap=entry('vpn-chart-backends','Backend 3 RX (bps)');
+const gap=entry('vpn-chart-backend-series','Backend 3 RX (bps)');
 assert.strictEqual((gap.match(/<circle /g)||[]).length,2);
 const gapStroke=gap.match(/<path d="([^"]+)" fill="none"/);
 assert(gapStroke && !gapStroke[1].includes(' L '),'isolated backend samples must not bridge lifecycle gap');
 vpnRenderHistoryCharts({window_15m:[{backends:Array.from({length:129},(_,id)=>({id})),backends_omitted:5}]});
-assert.strictEqual(document.getElementById('vpn-chart-backends').children.length,128*5*2,'fleet churn renderer must remain bounded');
+assert.strictEqual(document.getElementById('vpn-history-backend-select').children.length,128,'fleet churn selector must remain bounded');
+assert.strictEqual(document.getElementById('vpn-chart-backend-series').children.length,5*2,'only selected backend series are rendered');
 assert(document.getElementById('vpn-history-fleet-note').textContent.includes('5 omitted'));
 `
 	if out, err := execNodeScript(nodePath, script); err != nil {
@@ -1491,7 +1492,7 @@ function seriesLabel(id,label) {
 }
 assert(seriesLabel('vpn-chart-reasons',E('vpn_diag_loss_return_queue_full')+' (drops/s)'),'known loss label');
 assert(seriesLabel('vpn-chart-reasons','future reason (drops/s)'),'unknown reason unchanged');
-assert(seriesLabel('vpn-chart-backends',E('vpn_diag_backend_series',{id:3,label:'RX (bps)'})),'backend history label');
+assert(seriesLabel('vpn-chart-backend-series',E('vpn_diag_backend_series',{id:3,label:'RX (bps)'})),'backend history label');
 assert.strictEqual(text('vpn-history-fleet-note'),E('vpn_diag_fleet_limit',{count:5}));
 assert.strictEqual(JSON.stringify(fixture),original,'renderer must not alter API values');
 
@@ -6001,6 +6002,12 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	if tooltipNode := findHTMLNodeByID(doc, "vpn-chart-tooltip"); tooltipNode == nil {
 		t.Errorf("expected floating tooltip #vpn-chart-tooltip to exist")
 	}
+	if selectNode := findHTMLNodeByID(doc, "vpn-history-backend-select"); selectNode == nil {
+		t.Errorf("expected backend selector #vpn-history-backend-select to exist")
+	}
+	if seriesNode := findHTMLNodeByID(doc, "vpn-chart-backend-series"); seriesNode == nil {
+		t.Errorf("expected backend series container #vpn-chart-backend-series to exist")
+	}
 
 	obsoleteIDs := []string{
 		"vpn-chart-directions",
@@ -6131,6 +6138,56 @@ vpnRenderHistoryCharts({
 });
 const tBadgesLow = document.getElementById('vpn-chart-throughput-badges').textContent;
 assert(tBadgesLow.includes('Current: 100 B/s'), 'throughput sub-KB formatted as B/s: ' + tBadgesLow);
+
+// Rework Round 5: Idle forwarder with backend probe latency: latency chart must be available and interactive
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 15.5, be_latency_samples: 1, backends: [] }
+    ]
+});
+const lChartIdle = document.getElementById('vpn-chart-latency').innerHTML;
+assert(!lChartIdle.includes('No data'), 'idle forwarder with probe latency must not show No data');
+assert(lChartIdle.includes('<path'), 'idle forwarder with probe latency must render curve');
+assert(lChartIdle.includes('chart-overlay'), 'idle forwarder latency chart must include overlay');
+const lBadgesIdle = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesIdle.includes('Current: 15.5 ms (probe)'), 'latency idle Current (probe): ' + lBadgesIdle);
+assert(lBadgesIdle.includes('Peak: 15.5 ms'), 'latency idle Peak: ' + lBadgesIdle);
+
+// Rework Round 5: Backend selector and fractional queue formatting
+vpnRenderHistoryCharts({
+    window_15m: [
+        {
+            t: 1700000000, rx_bps: 1000, tx_bps: 1000, traffic_available: true, q_pct: 0.4, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 5, fwd_p95_samples: 1, be_p95_ms: 5, be_latency_samples: 1,
+            backends: [
+                { id: 1, rx_bps: 100, tx_bps: 200, rx_pps: 10, tx_pps: 20, traffic_available: true, probe_latency_ms: 8, probe_available: true },
+                { id: 2, rx_bps: 300, tx_bps: 400, rx_pps: 30, tx_pps: 40, traffic_available: true, probe_latency_ms: 12, probe_available: true }
+            ]
+        }
+    ]
+});
+const bSelect = document.getElementById('vpn-history-backend-select');
+assert(bSelect && bSelect.children.length === 2, 'backend selector options count');
+assert.strictEqual(bSelect.children[0].value, '1');
+assert.strictEqual(bSelect.children[1].value, '2');
+const bSeries = document.getElementById('vpn-chart-backend-series');
+assert(bSeries.textContent.includes('Backend 1'), 'default renders backend 1 series');
+bSelect.value = '2';
+bSelect.onchange();
+assert(bSeries.textContent.includes('Backend 2'), 'onchange re-renders selected backend 2 series');
+
+const qBadgesFrac = document.getElementById('vpn-chart-queue-badges').textContent;
+assert(qBadgesFrac.includes('Current: 0.4%'), 'queue fractional formatting: ' + qBadgesFrac);
+
+// Rework Round 5: Time-proportional X-axis
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 100, rx_bps: 100, tx_bps: 100, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 10, fwd_p95_samples: 1, backends: [] },
+        { t: 125, rx_bps: 200, tx_bps: 200, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 20, fwd_p95_samples: 1, backends: [] },
+        { t: 200, rx_bps: 300, tx_bps: 300, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 30, fwd_p95_samples: 1, backends: [] }
+    ]
+});
+const strokeT = document.getElementById('vpn-chart-throughput').innerHTML.match(/<path d="([^"]+)" fill="none"/);
+assert(strokeT && strokeT[1].includes('51.0'), 'time-proportional X mapping: ' + strokeT[1]);
 `
 		if out, err := execNodeScript(nodePath, script); err != nil {
 			t.Fatalf("historical charts JS render contract failed: %v\n%s", err, out)

@@ -346,7 +346,10 @@
         <div id="vpn-chart-tooltip" style="position: absolute; display: none; pointer-events: none; z-index: 100; background: var(--bg-surface, #1e293b); border: 1px solid var(--border-color, #334155); border-radius: var(--radius-sm, 4px); padding: 4px 8px; font-size: 0.75rem; color: var(--text-main, #f8fafc); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); white-space: nowrap;"></div>
         <details><summary>{{ _ "vpn_diag_loss_backend_history" }}</summary>
             <div id="vpn-chart-reasons"></div>
-            <div id="vpn-chart-backends"></div>
+            <div id="vpn-chart-backends">
+                <select id="vpn-history-backend-select" class="form-select form-select-sm" style="max-width: 260px; margin-bottom: var(--space-sm); display: none;"></select>
+                <div id="vpn-chart-backend-series"></div>
+            </div>
             <div id="vpn-history-fleet-note" class="text-muted text-sm"></div>
         </details>
     </div>
@@ -1670,7 +1673,7 @@
         };
     }
 
-    function vpnGenerateSparklineSVG(data, color, fillOpacity) {
+    function vpnGenerateSparklineSVG(data, color, fillOpacity, points) {
         if (!data || !data.some(Number.isFinite)) {
             return '<svg viewBox="0 0 200 40" width="100%" height="40" style="display:block;"><text x="100" y="24" text-anchor="middle" fill="var(--text-muted, #888)" font-size="10">' + escapeHtml(_('no_data')) + '</text></svg>';
         }
@@ -1683,6 +1686,22 @@
         }
         if (maxVal <= 0) maxVal = 1;
         const step = (width - padding * 2) / Math.max(data.length - 1, 1);
+        let hasTimestamps = false;
+        let minT = Infinity;
+        let maxT = -Infinity;
+        if (Array.isArray(points) && points.length > 0) {
+            for (let i = 0; i < points.length; i++) {
+                const pt = points[i];
+                const t = (pt && typeof pt.t === 'number' && Number.isFinite(pt.t)) ? pt.t : null;
+                if (t !== null) {
+                    if (t < minT) minT = t;
+                    if (t > maxT) maxT = t;
+                }
+            }
+            if (minT < Infinity && maxT > minT) {
+                hasTimestamps = true;
+            }
+        }
         const segments = [];
         let segment = [];
         for (let i = 0; i < data.length; i++) {
@@ -1691,7 +1710,12 @@
                 segment = [];
                 continue;
             }
-            const x = (padding + i * step).toFixed(1);
+            let x;
+            if (hasTimestamps && points[i] && typeof points[i].t === 'number' && Number.isFinite(points[i].t)) {
+                x = (padding + (points[i].t - minT) / (maxT - minT) * (width - 2 * padding)).toFixed(1);
+            } else {
+                x = (padding + i * step).toFixed(1);
+            }
             const y = (height - padding - data[i] / maxVal * (height - padding * 2)).toFixed(1);
             segment.push([x, y]);
         }
@@ -1700,12 +1724,12 @@
         let pathD = '';
         let fillD = '';
         let dots = '';
-        for (const points of segments) {
-            const line = points.map(function(p, i) { return (i === 0 ? 'M ' : ' L ') + p[0] + ' ' + p[1]; }).join('');
+        for (const pts of segments) {
+            const line = pts.map(function(p, i) { return (i === 0 ? 'M ' : ' L ') + p[0] + ' ' + p[1]; }).join('');
             pathD += line + ' ';
-            fillD += line + ' L ' + points[points.length - 1][0] + ' ' + height + ' L ' + points[0][0] + ' ' + height + ' Z ';
-            if (points.length === 1) {
-                dots += '<circle cx="' + points[0][0] + '" cy="' + points[0][1] + '" r="1.5" fill="' + color + '" />';
+            fillD += line + ' L ' + pts[pts.length - 1][0] + ' ' + height + ' L ' + pts[0][0] + ' ' + height + ' Z ';
+            if (pts.length === 1) {
+                dots += '<circle cx="' + pts[0][0] + '" cy="' + pts[0][1] + '" r="1.5" fill="' + color + '" />';
             }
         }
         const crosshair = '<line class="chart-crosshair" x1="0" y1="0" x2="0" y2="' + height + '" stroke="var(--text-muted, #94a3b8)" stroke-width="1" stroke-dasharray="2,2" style="display:none; pointer-events:none;" />';
@@ -1751,23 +1775,28 @@
         const tData = points.map(function(p) { return p.traffic_available !== true ? null : (p.rx_bps || 0) + (p.tx_bps || 0); });
         const qData = points.map(function(p) { return Number.isFinite(p.q_pct) ? p.q_pct : null; });
         const dData = points.map(function(p) { return p.drop_rates_available !== true ? null : (p.drop_rate || 0); });
-        // An absent observation count is UNKNOWN, not an available zero: only a
-        // positive explicit sample count makes the percentile plottable. Same
-        // availability-honesty rule as traffic_available / drop_rates_available
-        // and be_latency_samples above.
-        const lData = points.map(function(p) {
+        // Forward-write P95 and backend-probe P95 are independent series.
+        // Latency chart remains available whenever at least one is measured.
+        const fwdLatencyData = points.map(function(p) {
             if (!(Number(p.fwd_p95_samples) > 0)) return null;
             return Number.isFinite(p.fwd_p95_ms) ? p.fwd_p95_ms : null;
         });
+        const beLatencyData = points.map(function(p) {
+            if (!(Number(p.be_latency_samples) > 0)) return null;
+            return Number.isFinite(p.be_p95_ms) ? p.be_p95_ms : null;
+        });
+        const hasFwd = fwdLatencyData.some(Number.isFinite);
+        const hasBe = beLatencyData.some(Number.isFinite);
+        const lData = hasFwd ? fwdLatencyData : (hasBe ? beLatencyData : fwdLatencyData);
 
         const chartT = document.getElementById('vpn-chart-throughput');
-        if (chartT) chartT.innerHTML = vpnGenerateSparklineSVG(tData, 'var(--primary, #3b82f6)');
+        if (chartT) chartT.innerHTML = vpnGenerateSparklineSVG(tData, 'var(--primary, #3b82f6)', 0.15, points);
         const chartQ = document.getElementById('vpn-chart-queue');
-        if (chartQ) chartQ.innerHTML = vpnGenerateSparklineSVG(qData, 'var(--warning, #f59e0b)');
+        if (chartQ) chartQ.innerHTML = vpnGenerateSparklineSVG(qData, 'var(--warning, #f59e0b)', 0.15, points);
         const chartD = document.getElementById('vpn-chart-drops');
-        if (chartD) chartD.innerHTML = vpnGenerateSparklineSVG(dData, 'var(--danger, #ef4444)');
+        if (chartD) chartD.innerHTML = vpnGenerateSparklineSVG(dData, 'var(--danger, #ef4444)', 0.15, points);
         const chartL = document.getElementById('vpn-chart-latency');
-        if (chartL) chartL.innerHTML = vpnGenerateSparklineSVG(lData, 'var(--info, #06b6d4)');
+        if (chartL) chartL.innerHTML = vpnGenerateSparklineSVG(lData, 'var(--info, #06b6d4)', 0.15, points);
 
         function computeCurrentPeak(data) {
             let current = null;
@@ -1814,8 +1843,10 @@
         }
 
         function vpnFmtQueue(q) {
-            if (!Number.isFinite(q)) return '—';
-            return Math.round(q) + (_('vpn_unit_pct') || '%');
+            if (q === null || typeof q === 'undefined' || !Number.isFinite(q)) return '—';
+            const rounded = Math.round(q * 10) / 10;
+            const unit = (_('vpn_unit_pct') && _('vpn_unit_pct') !== 'vpn_unit_pct') ? _('vpn_unit_pct') : '%';
+            return (rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toFixed(1)) + unit;
         }
 
         function vpnFmtLatency(ms) {
@@ -1841,8 +1872,22 @@
         renderBadges('vpn-chart-drops-badges', dStats.current, dStats.peak, vpnFmtDrops);
         const qStats = computeCurrentPeak(qData);
         renderBadges('vpn-chart-queue-badges', qStats.current, qStats.peak, vpnFmtQueue);
-        const lStats = computeCurrentPeak(lData);
-        renderBadges('vpn-chart-latency-badges', lStats.current, lStats.peak, vpnFmtLatency);
+        const fwdStats = computeCurrentPeak(fwdLatencyData);
+        const beStats = computeCurrentPeak(beLatencyData);
+        if (hasFwd) {
+            renderBadges('vpn-chart-latency-badges', fwdStats.current, fwdStats.peak, vpnFmtLatency);
+        } else if (hasBe) {
+            const el = document.getElementById('vpn-chart-latency-badges');
+            if (el) {
+                const curStr = Number.isFinite(beStats.current) ? (vpnFmtLatency(beStats.current) + ' (probe)') : '—';
+                const peakStr = Number.isFinite(beStats.peak) ? vpnFmtLatency(beStats.peak) : '—';
+                const curLabel = _('vpn_chart_current') || 'Current';
+                const peakLabel = _('vpn_chart_peak') || 'Peak';
+                el.textContent = curLabel + ': ' + curStr + ' | ' + peakLabel + ': ' + peakStr;
+            }
+        } else {
+            renderBadges('vpn-chart-latency-badges', null, null, vpnFmtLatency);
+        }
 
         function vpnFormatTime(t) {
             if (!t && t !== 0) return '--:--:--';
@@ -1892,20 +1937,57 @@
             const crosshair = container.querySelector ? container.querySelector('.chart-crosshair') : null;
             const tooltip = document.getElementById('vpn-chart-tooltip');
 
+            let hasTimestamps = false;
+            let minT = Infinity;
+            let maxT = -Infinity;
+            for (let i = 0; i < points.length; i++) {
+                const pt = points[i];
+                const t = (pt && typeof pt.t === 'number' && Number.isFinite(pt.t)) ? pt.t : null;
+                if (t !== null) {
+                    if (t < minT) minT = t;
+                    if (t > maxT) maxT = t;
+                }
+            }
+            if (minT < Infinity && maxT > minT) {
+                hasTimestamps = true;
+            }
+
             const onMouseMove = function(e) {
                 const rect = container.getBoundingClientRect ? container.getBoundingClientRect() : null;
                 if (!rect || !rect.width) return;
                 const mouseX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
                 const frac = rect.width > 0 ? (mouseX / rect.width) : 0;
-                const idx = Math.min(points.length - 1, Math.max(0, Math.round(frac * (points.length - 1))));
+                let idx = 0;
+                if (hasTimestamps) {
+                    const targetT = minT + frac * (maxT - minT);
+                    let bestDist = Infinity;
+                    for (let i = 0; i < points.length; i++) {
+                        const pt = points[i];
+                        const t = (pt && typeof pt.t === 'number' && Number.isFinite(pt.t)) ? pt.t : null;
+                        if (t !== null) {
+                            const dist = Math.abs(t - targetT);
+                            if (dist < bestDist) {
+                                bestDist = dist;
+                                idx = i;
+                            }
+                        }
+                    }
+                } else {
+                    idx = Math.min(points.length - 1, Math.max(0, Math.round(frac * (points.length - 1))));
+                }
                 const pt = points[idx];
                 const val = data[idx];
 
                 if (crosshair && typeof crosshair.setAttribute === 'function') {
                     const width = 200;
                     const padding = 2;
-                    const step = (width - padding * 2) / Math.max(points.length - 1, 1);
-                    const svgX = (padding + idx * step).toFixed(1);
+                    let svgX;
+                    if (hasTimestamps && pt && typeof pt.t === 'number' && Number.isFinite(pt.t)) {
+                        svgX = (padding + (pt.t - minT) / (maxT - minT) * (width - 2 * padding)).toFixed(1);
+                    } else {
+                        const step = (width - padding * 2) / Math.max(points.length - 1, 1);
+                        svgX = (padding + idx * step).toFixed(1);
+                    }
                     crosshair.setAttribute('x1', svgX);
                     crosshair.setAttribute('x2', svgX);
                     crosshair.style.display = 'block';
@@ -1984,9 +2066,13 @@
 
         attachInteraction('vpn-chart-latency', lData, function(timeStr, val, pt) {
             let html = '<div style="font-weight:600;margin-bottom:2px;">' + escapeHtml(timeStr) + '</div>';
-            html += '<div>' + escapeHtml(_('vpn_diag_forward_p95')) + ': <strong>' + escapeHtml(vpnFmtLatency(val)) + '</strong></div>';
-            if (pt && Number(pt.be_latency_samples) > 0 && Number.isFinite(pt.be_p95_ms)) {
-                html += '<div style="font-size:0.7rem;color:var(--text-muted,#94a3b8);margin-top:2px;">' + escapeHtml(_('vpn_diag_backend_probe_p95')) + ': ' + escapeHtml(vpnFmtLatency(pt.be_p95_ms)) + '</div>';
+            if (hasFwd) {
+                html += '<div>' + escapeHtml(_('vpn_diag_forward_p95')) + ': <strong>' + escapeHtml(vpnFmtLatency(val)) + '</strong></div>';
+                if (pt && Number(pt.be_latency_samples) > 0 && Number.isFinite(pt.be_p95_ms)) {
+                    html += '<div style="font-size:0.7rem;color:var(--text-muted,#94a3b8);margin-top:2px;">' + escapeHtml(_('vpn_diag_backend_probe_p95')) + ': ' + escapeHtml(vpnFmtLatency(pt.be_p95_ms)) + '</div>';
+                }
+            } else {
+                html += '<div>' + escapeHtml(_('vpn_diag_backend_probe_p95')) + ': <strong>' + escapeHtml(vpnFmtLatency(val)) + '</strong></div>';
             }
             return html;
         });
@@ -2004,7 +2090,7 @@
                 label.textContent = entry.label + ' (' + w + ')';
                 label.className = 'text-muted text-sm';
                 const graph = document.createElement('div');
-                graph.innerHTML = vpnGenerateSparklineSVG(entry.values, entry.color || 'var(--primary, #3b82f6)');
+                graph.innerHTML = vpnGenerateSparklineSVG(entry.values, entry.color || 'var(--primary, #3b82f6)', 0.15, points);
                 element.appendChild(label);
                 element.appendChild(graph);
             }
@@ -2022,20 +2108,81 @@
         // The stored fleet context is capped; the renderer also caps churn
         // across one window, keeping a large retired fleet from expanding the page.
         const ids = Array.from(new Set(points.flatMap(p => (p.backends || []).map(b => b.id)))).sort((a,b) => a-b);
-        const backendEntries = [];
-        for (const id of ids.slice(0,128)) {
-            for (const [key,label,availability] of [
-                ['rx_bps','RX (bps)','traffic_available'],['tx_bps','TX (bps)','traffic_available'],
-                ['rx_pps',_('vpn_diag_rx_packets_rate'),'traffic_available'],['tx_pps',_('vpn_diag_tx_packets_rate'),'traffic_available'],
-                ['probe_latency_ms',_('vpn_diag_probe_latency'),'probe_available']
-            ]) {
-                backendEntries.push({label:vpnDiagText('vpn_diag_backend_series', {id:id, label:label}), values:points.map(p => {
-                    const b = (p.backends || []).find(b => b.id === id);
-                    return !b || !b[availability] || !Number.isFinite(b[key]) ? null : b[key];
-                })});
+        const backendsContainer = document.getElementById('vpn-chart-backends');
+        let selectEl = document.getElementById('vpn-history-backend-select');
+        let seriesEl = document.getElementById('vpn-chart-backend-series');
+
+        if (backendsContainer) {
+            const hasSelect = backendsContainer.children && Array.prototype.indexOf.call(backendsContainer.children, selectEl) !== -1;
+            if (!selectEl || !hasSelect) {
+                if (!selectEl) {
+                    selectEl = document.createElement('select');
+                    selectEl.id = 'vpn-history-backend-select';
+                    selectEl.className = 'form-select form-select-sm';
+                    selectEl.style.maxWidth = '260px';
+                    selectEl.style.marginBottom = 'var(--space-sm)';
+                }
+                backendsContainer.appendChild(selectEl);
+            }
+            const hasSeries = backendsContainer.children && Array.prototype.indexOf.call(backendsContainer.children, seriesEl) !== -1;
+            if (!seriesEl || !hasSeries) {
+                if (!seriesEl) {
+                    seriesEl = document.createElement('div');
+                    seriesEl.id = 'vpn-chart-backend-series';
+                }
+                backendsContainer.appendChild(seriesEl);
+            }
+
+            if (ids.length === 0) {
+                selectEl.style.display = 'none';
+                selectEl.innerHTML = '';
+                seriesEl.textContent = _('no_data') + ' (' + w + ')';
+            } else {
+                selectEl.style.display = 'block';
+                const boundedIds = ids.slice(0, 128);
+                const prevSelected = selectEl.value ? Number(selectEl.value) : null;
+                const selectedId = (prevSelected !== null && boundedIds.includes(prevSelected)) ? prevSelected : boundedIds[0];
+
+                selectEl.innerHTML = '';
+                for (const id of boundedIds) {
+                    const opt = document.createElement('option');
+                    opt.value = String(id);
+                    opt.textContent = 'Backend #' + id;
+                    if (id === selectedId) {
+                        opt.selected = true;
+                    }
+                    selectEl.appendChild(opt);
+                }
+                selectEl.value = String(selectedId);
+
+                function renderSelectedBackend(targetId) {
+                    const backendEntries = [];
+                    for (const [key, label, availability] of [
+                        ['rx_bps', 'RX (bps)', 'traffic_available'],
+                        ['tx_bps', 'TX (bps)', 'traffic_available'],
+                        ['rx_pps', _('vpn_diag_rx_packets_rate'), 'traffic_available'],
+                        ['tx_pps', _('vpn_diag_tx_packets_rate'), 'traffic_available'],
+                        ['probe_latency_ms', _('vpn_diag_probe_latency'), 'probe_available']
+                    ]) {
+                        backendEntries.push({
+                            label: vpnDiagText('vpn_diag_backend_series', {id: targetId, label: label}),
+                            values: points.map(function(p) {
+                                const b = (p.backends || []).find(function(item) { return item.id === targetId; });
+                                return (!b || !b[availability] || !Number.isFinite(b[key])) ? null : b[key];
+                            })
+                        });
+                    }
+                    renderSeries('vpn-chart-backend-series', backendEntries);
+                }
+
+                renderSelectedBackend(selectedId);
+
+                selectEl.onchange = function() {
+                    const chosenId = Number(selectEl.value);
+                    renderSelectedBackend(chosenId);
+                };
             }
         }
-        renderSeries('vpn-chart-backends', backendEntries);
         const fleetNote = document.getElementById('vpn-history-fleet-note');
         if (fleetNote) {
             const omitted = points.reduce((max,p) => Math.max(max,Number(p.backends_omitted || 0)),0);
