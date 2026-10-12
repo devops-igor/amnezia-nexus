@@ -336,7 +336,7 @@
             </div>
             <div style="background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm);">
                 <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); font-size: 0.75rem;">
-                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_forward_p95" }}</div>
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">{{ _ "vpn_diag_latency_p95" }}</div>
                     <div id="vpn-chart-latency-badges" class="text-muted font-mono" style="font-size: 0.7rem;"></div>
                 </div>
                 <div id="vpn-chart-latency" style="height: 60px; width: 100%; position: relative;"></div>
@@ -1906,22 +1906,29 @@
         if (elL) {
             const curLabel = _('vpn_chart_current') || 'Current';
             const peakLabel = _('vpn_chart_peak') || 'Peak';
+            const writeLabel = _('vpn_chart_write') || 'Write';
+            const probeLabel = _('vpn_chart_probe') || 'Probe';
+            const writeSuffix = _('vpn_diag_write_suffix') || ' (write)';
             const probeSuffix = _('vpn_diag_probe_suffix') || ' (probe)';
-            const hasFwdCur = Number.isFinite(fwdStats.current);
-            const hasBeCur = Number.isFinite(beStats.current);
-            const peakVal = (Number.isFinite(fwdStats.peak) && Number.isFinite(beStats.peak))
-                ? Math.max(fwdStats.peak, beStats.peak)
-                : (Number.isFinite(fwdStats.peak) ? fwdStats.peak : beStats.peak);
-            const peakStr = Number.isFinite(peakVal) ? vpnFmtLatency(peakVal) : '—';
+            const hasFwdWin = Number.isFinite(fwdStats.peak);
+            const hasBeWin = Number.isFinite(beStats.peak);
+            const fwdCurStr = Number.isFinite(fwdStats.current) ? vpnFmtLatency(fwdStats.current) : '—';
+            const beCurStr = Number.isFinite(beStats.current) ? vpnFmtLatency(beStats.current) : '—';
 
-            if (hasFwdCur && hasBeCur) {
-                elL.textContent = 'Write: ' + vpnFmtLatency(fwdStats.current) + ' | Probe: ' + vpnFmtLatency(beStats.current) + ' | ' + peakLabel + ': ' + peakStr;
-            } else if (hasFwdCur) {
-                elL.textContent = curLabel + ': ' + vpnFmtLatency(fwdStats.current) + ' | ' + peakLabel + ': ' + peakStr;
-            } else if (hasBeCur) {
-                elL.textContent = curLabel + ': ' + vpnFmtLatency(beStats.current) + probeSuffix + ' | ' + peakLabel + ': ' + peakStr;
+            if (hasFwdWin && hasBeWin) {
+                const peakVal = Math.max(fwdStats.peak, beStats.peak);
+                const peakStr = Number.isFinite(peakVal) ? vpnFmtLatency(peakVal) : '—';
+                const peakSuffix = fwdStats.peak >= beStats.peak ? writeSuffix : probeSuffix;
+                elL.textContent = writeLabel + ': ' + fwdCurStr + ' | ' + probeLabel + ': ' + beCurStr + ' | ' + peakLabel + ': ' + peakStr + peakSuffix;
+            } else if (hasBeWin) {
+                const peakStr = Number.isFinite(beStats.peak) ? vpnFmtLatency(beStats.peak) : '—';
+                const curPart = Number.isFinite(beStats.current) ? (beCurStr + probeSuffix) : '—';
+                elL.textContent = curLabel + ': ' + curPart + ' | ' + peakLabel + ': ' + peakStr + probeSuffix;
+            } else if (hasFwdWin) {
+                const peakStr = Number.isFinite(fwdStats.peak) ? vpnFmtLatency(fwdStats.peak) : '—';
+                elL.textContent = curLabel + ': ' + fwdCurStr + ' | ' + peakLabel + ': ' + peakStr;
             } else {
-                elL.textContent = curLabel + ': — | ' + peakLabel + ': ' + peakStr;
+                elL.textContent = curLabel + ': — | ' + peakLabel + ': —';
             }
         }
 

@@ -1422,7 +1422,7 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	}
 	for id, key := range map[string]string{
 		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
-		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_forward_p95",
+		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_latency_p95",
 	} {
 		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`)
 		match := pattern.FindStringSubmatch(rendered)
@@ -6069,7 +6069,7 @@ assert(qBadges.includes('Current:') && qBadges.includes('Peak:'), 'queue badges 
 assert(qBadges.includes('%'), 'queue unit %: ' + qBadges);
 
 const lBadges = document.getElementById('vpn-chart-latency-badges').textContent;
-assert((lBadges.includes('Write:') || lBadges.includes('Current:')) && lBadges.includes('Peak:'), 'latency badges text: ' + lBadges);
+assert(lBadges.includes('Write: 25 ms') && lBadges.includes('Probe: 15 ms') && lBadges.includes('Peak: 25 ms (write)'), 'latency badges text: ' + lBadges);
 assert(lBadges.includes('ms'), 'latency unit ms: ' + lBadges);
 
 // Check time axes
@@ -6155,7 +6155,7 @@ assert(lChartIdle.includes('<path'), 'idle forwarder with probe latency must ren
 assert(lChartIdle.includes('chart-overlay'), 'idle forwarder latency chart must include overlay');
 const lBadgesIdle = document.getElementById('vpn-chart-latency-badges').textContent;
 assert(lBadgesIdle.includes('Current: 15.5 ms (probe)'), 'latency idle Current (probe): ' + lBadgesIdle);
-assert(lBadgesIdle.includes('Peak: 15.5 ms'), 'latency idle Peak: ' + lBadgesIdle);
+assert(lBadgesIdle.includes('Peak: 15.5 ms (probe)'), 'latency idle Peak: ' + lBadgesIdle);
 
 // Rework Round 5: Backend selector and fractional queue formatting
 vpnRenderHistoryCharts({
@@ -6202,11 +6202,63 @@ vpnRenderHistoryCharts({
     ]
 });
 const lBadgesMixed = document.getElementById('vpn-chart-latency-badges').textContent;
-assert(lBadgesMixed.includes('Current: 30 ms (probe)'), 'mixed window probe current: ' + lBadgesMixed);
-assert(lBadgesMixed.includes('Peak: 30 ms'), 'mixed window peak: ' + lBadgesMixed);
+assert(lBadgesMixed.includes('Write: —') && lBadgesMixed.includes('Probe: 30 ms'), 'mixed window probe current: ' + lBadgesMixed);
+assert(lBadgesMixed.includes('Peak: 30 ms (probe)'), 'mixed window peak: ' + lBadgesMixed);
 const lChartMixedHTML = document.getElementById('vpn-chart-latency').innerHTML;
 const strokeMatches = lChartMixedHTML.match(/<path [^>]*stroke=/g) || [];
 assert.strictEqual(strokeMatches.length, 2, 'latency chart renders two stroke paths for both series');
+
+// Rework Round 8: Mixed window with forward write peak
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 100, fwd_p95_samples: 1, be_p95_ms: 20, be_latency_samples: 1, backends: [] },
+        { t: 1700000060, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 30, be_latency_samples: 1, backends: [] }
+    ]
+});
+const lBadgesFwdPeak = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesFwdPeak.includes('Write: —') && lBadgesFwdPeak.includes('Probe: 30 ms'), 'mixed window fwd peak current: ' + lBadgesFwdPeak);
+assert(lBadgesFwdPeak.includes('Peak: 100 ms (write)'), 'mixed window fwd peak attributed: ' + lBadgesFwdPeak);
+
+// Rework Round 8: Mixed window with probe peak and forward current
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 2, fwd_p95_samples: 1, be_p95_ms: 80, be_latency_samples: 1, backends: [] },
+        { t: 1700000060, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 3, fwd_p95_samples: 1, be_p95_ms: 0, be_latency_samples: 0, backends: [] }
+    ]
+});
+const lBadgesProbePeak = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesProbePeak.includes('Write: 3 ms') && lBadgesProbePeak.includes('Probe: —'), 'mixed window probe peak current: ' + lBadgesProbePeak);
+assert(lBadgesProbePeak.includes('Peak: 80 ms (probe)'), 'mixed window probe peak attributed: ' + lBadgesProbePeak);
+
+// Rework Round 8: Non-English localization (Russian)
+const origWrite = translations.vpn_chart_write;
+const origProbe = translations.vpn_chart_probe;
+const origPeak = translations.vpn_chart_peak;
+const origWriteSuffix = translations.vpn_diag_write_suffix;
+const origProbeSuffix = translations.vpn_diag_probe_suffix;
+const origUnitMs = translations.vpn_unit_ms;
+
+translations.vpn_chart_write = 'Запись';
+translations.vpn_chart_probe = 'Проба';
+translations.vpn_chart_peak = 'Пик';
+translations.vpn_diag_write_suffix = ' (запись)';
+translations.vpn_diag_probe_suffix = ' (проба)';
+translations.vpn_unit_ms = 'мс';
+
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 3, fwd_p95_samples: 1, be_p95_ms: 20, be_latency_samples: 1, backends: [] }
+    ]
+});
+const lBadgesRu = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesRu.includes('Запись: 3 мс') && lBadgesRu.includes('Проба: 20 мс') && lBadgesRu.includes('Пик: 20 мс (проба)'), 'ru localized dual badges: ' + lBadgesRu);
+
+translations.vpn_chart_write = origWrite;
+translations.vpn_chart_probe = origProbe;
+translations.vpn_chart_peak = origPeak;
+translations.vpn_diag_write_suffix = origWriteSuffix;
+translations.vpn_diag_probe_suffix = origProbeSuffix;
+translations.vpn_unit_ms = origUnitMs;
 
 // Neither latency available -> no overlay, empty badge
 vpnRenderHistoryCharts({

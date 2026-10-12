@@ -568,9 +568,9 @@
   "vpn_diag_engine": "引擎",
   "vpn_diag_handshake_freshness": "握手新鲜度",
   "vpn_diag_routing_counts": "会话 / 路由 / 返回路由",
-  "vpn_diag_healthy_total": "健康 / 总数",
-  "vpn_diag_latency_p95": "延迟 p95",
-  "vpn_diag_load_skew": "负载偏差",
+  "vpn_diag_healthy_total": "健康 / 总计",
+  "vpn_diag_latency_p95": "延迟 p95 (ms)",
+  "vpn_diag_load_skew": "负载偏斜",
   "vpn_diag_device_drops": "设备丢包",
   "vpn_diag_cpu_usage": "CPU 使用率",
   "vpn_diag_memory": "堆内存（已分配 / 限制）",
@@ -698,6 +698,8 @@
   "vpn_problem_stale_handshake": "上游握手超时",
   "vpn_chart_current": "当前",
   "vpn_chart_peak": "峰值",
+  "vpn_chart_write": "写入",
+  "vpn_chart_probe": "探测",
   "vpn_unit_mbps": "MB/s",
   "vpn_unit_kbps": "KB/s",
   "vpn_unit_dps": "drops/s",
@@ -705,5 +707,6 @@
   "vpn_unit_pct": "%",
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (探测)",
+  "vpn_diag_write_suffix": " (写入)",
   "vpn_diag_backend_option": "后端 #{id}"
 }

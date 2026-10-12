@@ -568,9 +568,9 @@
   "vpn_diag_engine": "موتور",
   "vpn_diag_handshake_freshness": "تازگی دست‌دهی",
   "vpn_diag_routing_counts": "نشست‌ها / مسیرها / مسیرهای بازگشت",
-  "vpn_diag_healthy_total": "سالم / مجموع",
-  "vpn_diag_latency_p95": "تأخیر p95",
-  "vpn_diag_load_skew": "عدم توازن بار",
+  "vpn_diag_healthy_total": "سالم / کل",
+  "vpn_diag_latency_p95": "تأخیر p95 (میلی‌ثانیه)",
+  "vpn_diag_load_skew": "عدم تعادل بار",
   "vpn_diag_device_drops": "بسته‌های حذف‌شده در دستگاه",
   "vpn_diag_cpu_usage": "مصرف CPU",
   "vpn_diag_memory": "حافظه هیپ (تخصیص / محدودیت)",
@@ -698,6 +698,8 @@
   "vpn_problem_stale_handshake": "دست‌دهی بالادستی قدیمی",
   "vpn_chart_current": "فعلی",
   "vpn_chart_peak": "اوج",
+  "vpn_chart_write": "نوشتن",
+  "vpn_chart_probe": "کاوش",
   "vpn_unit_mbps": "MB/s",
   "vpn_unit_kbps": "KB/s",
   "vpn_unit_dps": "drops/s",
@@ -705,5 +707,6 @@
   "vpn_unit_pct": "%",
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (کاوش)",
+  "vpn_diag_write_suffix": " (نوشتن)",
   "vpn_diag_backend_option": "پشتیبان #{id}"
 }

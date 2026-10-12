@@ -569,7 +569,7 @@
   "vpn_diag_handshake_freshness": "Handshake Freshness",
   "vpn_diag_routing_counts": "Sessions vs Routes vs Returns",
   "vpn_diag_healthy_total": "Healthy / Total",
-  "vpn_diag_latency_p95": "Latency p95",
+  "vpn_diag_latency_p95": "Latency p95 (ms)",
   "vpn_diag_load_skew": "Load Skew",
   "vpn_diag_device_drops": "Device Drops",
   "vpn_diag_cpu_usage": "CPU Usage",
@@ -698,6 +698,8 @@
   "vpn_problem_stale_handshake": "Upstream handshake stale",
   "vpn_chart_current": "Current",
   "vpn_chart_peak": "Peak",
+  "vpn_chart_write": "Write",
+  "vpn_chart_probe": "Probe",
   "vpn_unit_mbps": "MB/s",
   "vpn_unit_kbps": "KB/s",
   "vpn_unit_dps": "drops/s",
@@ -705,5 +707,6 @@
   "vpn_unit_pct": "%",
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (probe)",
+  "vpn_diag_write_suffix": " (write)",
   "vpn_diag_backend_option": "Backend #{id}"
 }

@@ -54,7 +54,9 @@ _CHART_BADGE_PATTERNS = {
         r"Current:\s*(?:\d+(?:\.\d+)?%\s*|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?%\s*|—)"
     ),
     "#vpn-chart-latency-badges": re.compile(
-        r"(?:Write:\s*(?:\d+(?:\.\d+)?\s*ms|—)\s*\|\s*Probe:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—)|Current:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—))\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
+        r"(?:Write:\s*(?:\d+(?:\.\d+)?\s*ms|—)\s*\|\s*Probe:\s*(?:\d+(?:\.\d+)?\s*ms|—)|"
+        r"Current:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—))\s*\|\s*"
+        r"Peak:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\((?:write|probe)\))?|—)"
     ),
 }
 
