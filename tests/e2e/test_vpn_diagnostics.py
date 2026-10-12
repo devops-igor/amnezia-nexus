@@ -128,19 +128,25 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Historical trends container and chart containers
+    # Historical trends container and chart containers (4 consolidated charts)
     charts = [
         "#vpn-chart-throughput",
         "#vpn-chart-queue",
         "#vpn-chart-drops",
         "#vpn-chart-latency",
+    ]
+    for chart in charts:
+        expect(page.locator(chart)).to_be_visible()
+
+    # Redundant sparkline containers are removed / non-rendered
+    for obsolete in [
         "#vpn-chart-directions",
         "#vpn-chart-packets",
         "#vpn-chart-sessions-routes",
         "#vpn-chart-backend-latency",
-    ]
-    for chart in charts:
-        expect(page.locator(chart)).to_be_visible()
+    ]:
+        expect(page.locator(f"{obsolete}:visible")).to_have_count(0)
+        expect(page.locator(obsolete)).not_to_be_visible()
 
     breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
         has=page.locator("#vpn-chart-reasons")
@@ -161,6 +167,79 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
         expect(btn).to_have_class("btn btn-sm btn-primary active")
         for chart in charts + ["#vpn-chart-reasons", "#vpn-chart-backends"]:
             expect(page.locator(chart)).to_be_visible()
+
+
+@pytest.mark.e2e
+def test_vpn_historical_charts_interaction_and_kpis(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Verify consolidated historical charts, KPI badges, time axes, and hover tooltips."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    # Ensure window toggles container is visible
+    toggles = page.locator("#vpn-history-window-toggles")
+    expect(toggles).to_be_visible()
+
+    # Assert all 4 chart containers are visible and contain rendered <svg> elements
+    chart_ids = [
+        "#vpn-chart-throughput",
+        "#vpn-chart-drops",
+        "#vpn-chart-queue",
+        "#vpn-chart-latency",
+    ]
+    for cid in chart_ids:
+        chart = page.locator(cid)
+        expect(chart).to_be_visible()
+        expect(chart.locator("svg")).to_be_visible()
+
+    # Assert header badge containers are visible
+    badge_ids = [
+        "#vpn-chart-throughput-badges",
+        "#vpn-chart-drops-badges",
+        "#vpn-chart-queue-badges",
+        "#vpn-chart-latency-badges",
+    ]
+    for bid in badge_ids:
+        expect(page.locator(bid)).to_be_visible()
+
+    # Assert time axes are rendered
+    axis_ids = [
+        "#vpn-chart-throughput-axis",
+        "#vpn-chart-drops-axis",
+        "#vpn-chart-queue-axis",
+        "#vpn-chart-latency-axis",
+    ]
+    for aid in axis_ids:
+        expect(page.locator(aid)).to_be_visible()
+
+    # Test hover interaction: hover over #vpn-chart-throughput svg
+    throughput_svg = page.locator("#vpn-chart-throughput svg")
+    expect(throughput_svg).to_be_visible()
+    throughput_svg.hover()
+
+    tooltip = page.locator("#vpn-chart-tooltip")
+    expect(tooltip).to_be_visible()
+    assert tooltip.evaluate("el => el.style.display !== 'none'")
+    assert (tooltip.text_content() or "").strip() != ""
+
+    # Move mouse away and assert tooltip hides
+    page.mouse.move(0, 0)
+    expect(tooltip).not_to_be_visible()
+    assert tooltip.evaluate(
+        "el => el.style.display === 'none' || window.getComputedStyle(el).display === 'none'"
+    )
+
+    # Test time window toggle: click 1h toggle button
+    btn_1h = toggles.locator("button:has-text('1h')")
+    expect(btn_1h).to_be_visible()
+    btn_1h.click()
+    expect(btn_1h).to_have_class(re.compile(r"\bactive\b"))
+
+    # Assert charts re-render after toggle
+    for cid in chart_ids:
+        expect(page.locator(f"{cid} svg")).to_be_visible()
 
 
 @pytest.mark.e2e
