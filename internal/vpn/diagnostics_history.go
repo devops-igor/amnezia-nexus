@@ -212,62 +212,6 @@ func cloneReasonRates(rates map[string]float64) map[string]float64 {
 	return out
 }
 
-// dropReasonRatesTracker samples per-reason drop totals against independent
-// per-reason generation-aware windows (issue #429 review blocker 1): within a
-// generation an accepted per-reason baseline is monotonic — a stale LOWER
-// total reports a zero rate and never replaces the baseline — and a lifecycle
-// reset re-primes instead of inferring a restart from totals that moved
-// backwards. The generation travels with the observation (issue #429 review
-// round 4, blocker 1): sample takes it explicitly, so a snapshot captured
-// before a lifecycle reset can never touch the new generation's windows.
-type dropReasonRatesTracker struct {
-	mu        sync.Mutex
-	windows   *diagCounterWindows
-	available bool
-	lastRates map[string]float64
-}
-
-func (t *dropReasonRatesTracker) sample(gen diagGeneration, now time.Time, totals map[string]uint64) (map[string]float64, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.windows == nil {
-		t.windows = newDiagCounterWindows()
-	}
-	if accepted := t.windows.sample(gen, now, totals); accepted {
-		t.available = true
-	}
-	rates := make(map[string]float64, len(totals))
-	for key := range totals {
-		if rate, ok := t.windows.rate(key); ok {
-			rates[key] = rate
-		} else {
-			rates[key] = 0
-		}
-	}
-	if t.available {
-		t.lastRates = make(map[string]float64, len(rates))
-		for key, rate := range rates {
-			t.lastRates[key] = rate
-		}
-	}
-	return rates, t.available
-}
-
-// reset re-primes the per-reason windows for a new diagnostics generation:
-// subsequent samples are tagged with the generation their snapshot captured,
-// and the windows re-prime on their next call (issue #429 review blocker 1).
-func (t *dropReasonRatesTracker) reset(gen diagGeneration) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.windows != nil {
-		if !t.windows.reset(gen) {
-			return
-		}
-	}
-	t.available = false
-	t.lastRates = nil
-}
-
 // MaxHistoryBackends caps the fleet context within each existing fixed ring.
 // If a fleet exceeds this limit, samples state the omitted count. Removed
 // backend IDs exist only in old ring points, and disappear when those expire.

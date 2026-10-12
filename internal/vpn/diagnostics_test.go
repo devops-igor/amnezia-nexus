@@ -2488,17 +2488,4 @@ func TestDiagnosticWrappers_ResetStaleGenerationNoOp(t *testing.T) {
 			t.Errorf("stale reset changed wrapper publication: before=%+v after=%+v", before, after)
 		}
 	})
-	t.Run("dropReasonRatesTracker", func(t *testing.T) {
-		tk := &dropReasonRatesTracker{}
-		tk.sample(2, base, map[string]uint64{"queue": 100})
-		before, availableBefore := tk.sample(2, base.Add(time.Second), map[string]uint64{"queue": 110})
-		if !availableBefore || before["queue"] != 10 {
-			t.Fatal("invalid measured fixture")
-		}
-		tk.reset(1)
-		after, availableAfter := tk.sample(2, base.Add(time.Second), map[string]uint64{"queue": 110})
-		if !availableAfter || !reflect.DeepEqual(before, after) {
-			t.Errorf("stale reset changed wrapper publication: before=%v available=%v after=%v available=%v", before, availableBefore, after, availableAfter)
-		}
-	})
 }

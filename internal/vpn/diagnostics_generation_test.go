@@ -44,32 +44,6 @@ func TestDiagGeneration_OutOfOrderNeverRewindsBaselines(t *testing.T) {
 		}
 	})
 
-	t.Run("per_reason_drops", func(t *testing.T) {
-		var tr dropReasonRatesTracker
-		base := time.Now()
-
-		// Window 1: 100 -> 110 for client_queue_full over 1s.
-		tr.sample(0, base, map[string]uint64{"client_queue_full": 100})
-		rates, avail := tr.sample(0, base.Add(1*time.Second), map[string]uint64{"client_queue_full": 110})
-		if !avail || rates["client_queue_full"] != 10 {
-			t.Fatalf("window 1: want rate 10 avail true, got %v avail=%v", rates, avail)
-		}
-
-		// Out-of-order: the pre-restart total 100 replays after 110 was
-		// accepted. The stale observation is rejected wholesale (round 3,
-		// blocker 2: nothing mutates), so the tracker keeps publishing the
-		// last accepted window's rate and keeps 110 accepted.
-		rates, avail = tr.sample(0, base.Add(2*time.Second), map[string]uint64{"client_queue_full": 100})
-		if !avail || rates["client_queue_full"] != 10 {
-			t.Fatalf("lower observation must keep the last accepted rate, got %v avail=%v", rates, avail)
-		}
-		// Back to 110: still zero — the baseline was never rewound.
-		rates, avail = tr.sample(0, base.Add(3*time.Second), map[string]uint64{"client_queue_full": 110})
-		if avail && rates["client_queue_full"] != 0 {
-			t.Fatalf("activity up to the accepted baseline must not replay, got %v avail=%v", rates, avail)
-		}
-	})
-
 	t.Run("ownership_mismatch_delta", func(t *testing.T) {
 		var dts diagDeltaTrackers
 		base := time.Now()
@@ -255,36 +229,6 @@ func TestGenerationWindow_FullyStaleObservationNeverAdvancesWindow(t *testing.T)
 		if math.Abs(c-10/9.2) > 1e-9 || math.Abs(r-10/9.2) > 1e-9 ||
 			math.Abs(tot-20/9.2) > 1e-9 || math.Abs(w-2/9.2) > 1e-9 {
 			t.Fatalf("rates must use the preserved denominator (9.2s), got client=%v return=%v total=%v writeErr=%v", c, r, tot, w)
-		}
-	})
-
-	t.Run("per_reason_windows", func(t *testing.T) {
-		// diagCounterWindows must mirror the primitive: a fully stale set
-		// advances neither the per-key windows nor the shared window. Per the
-		// documented contract the stale counter's published delta is ZEROED
-		// for that window (baseline untouched), so the tracker publishes a
-		// zero rate while availability is retained.
-		var tr dropReasonRatesTracker
-		base := time.Now()
-		tr.sample(0, base, map[string]uint64{"client_malformed": 100})
-		rates, avail := tr.sample(0, base.Add(1*time.Second), map[string]uint64{"client_malformed": 110})
-		if !avail || rates["client_malformed"] != 10 {
-			t.Fatalf("window 1: want rate 10, got %v avail=%v", rates, avail)
-		}
-		rates, avail = tr.sample(0, base.Add(10*time.Second), map[string]uint64{"client_malformed": 100})
-		if !avail {
-			t.Fatal("availability must survive a stale observation")
-		}
-		if rates["client_malformed"] != 10 {
-			t.Fatalf("stale observation must keep the last accepted rate, got %v", rates["client_malformed"])
-		}
-		rates, avail = tr.sample(0, base.Add(10200*time.Millisecond), map[string]uint64{"client_malformed": 120})
-		if !avail {
-			t.Fatal("valid window must keep availability")
-		}
-		if math.Abs(rates["client_malformed"]-10/9.2) > 1e-9 {
-			t.Fatalf("rate=%v, want ~%v: the shared window must keep its true denominator (9.2s), not the corrupted 0.2s",
-				rates["client_malformed"], 10/9.2)
 		}
 	})
 

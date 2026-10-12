@@ -400,7 +400,7 @@ func TestReturnOwnershipMismatch_StaleLossSnapshotDoesNotSplitAggregateAndReason
 		// At t0 + 750ms, Collector A delivers its older snapshot late.
 		// Its total drops (3) < accepted baseline (6), so s.diagRates rejects it (accepted=false)
 		// and retains TotalDropRatePps = 12.0.
-		// Under coherent publication gating (R6-H1), s.diagDeltas.reasons does NOT advance
+		// Under coherent publication gating (R6-H1), s.diagRates does NOT advance
 		// its windows or report a quiet 0 PPS ownership window; it retains the previously accepted
 		// reason rates snapshot (ownership=6.0, malformed=6.0).
 		at750 := base.Add(750 * time.Millisecond)

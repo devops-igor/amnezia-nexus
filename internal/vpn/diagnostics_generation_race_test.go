@@ -77,9 +77,6 @@ func TestDiagDeltaTrackersConcurrentResetAll(t *testing.T) {
 					dts.ownershipMismatch.Sample(0, at, uint64(j))
 					dts.syncFailures.Sample(0, at, uint64(j))
 					dts.writeStalls.Sample(0, at, uint64(j))
-					if i == 0 {
-						dts.reasons.sample(0, at, map[string]uint64{"client_malformed": uint64(j)})
-					}
 				}
 			}(i)
 		}
