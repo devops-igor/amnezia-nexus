@@ -912,7 +912,7 @@ vpnRenderHistoryCharts({window_15m:[series.window_15m[0]]});
 assert(document.getElementById('vpn-chart-backends').textContent.includes('No data (15m)'), 'pre-provision fleet context must remain visible');
 assert(document.getElementById('vpn-chart-throughput').innerHTML.includes('No data'));
 assert(document.getElementById('vpn-chart-drops').innerHTML.includes('No data'));
-assert(entry('vpn-chart-reasons','return queue full (drops/s)').includes('No data'));
+assert(document.getElementById('vpn-chart-reasons').textContent.includes('No data (15m)'), 'unavailable reasons show empty state rather than ghost sparkline');
 // Retired/re-registered backend IDs form gaps, never zero-filled continuity.
 vpnRenderHistoryCharts({window_15m:[
  {backends:[{id:3,rx_bps:10,traffic_available:true}]},{backends:[]},
@@ -6270,6 +6270,23 @@ const lChartNoneHTML = document.getElementById('vpn-chart-latency').innerHTML;
 assert(!lChartNoneHTML.includes('chart-overlay'), 'no overlay when neither latency available');
 const lBadgesNone = document.getElementById('vpn-chart-latency-badges').textContent;
 assert(lBadgesNone.includes('Current: —') && lBadgesNone.includes('Peak: —'), 'neither latency badges empty: ' + lBadgesNone);
+
+// Check legend dot indicators in dual latency badges
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 5, fwd_p95_samples: 1, be_p95_ms: 10, be_latency_samples: 1, backends: [] }
+    ]
+});
+const lBadgesDots = document.getElementById('vpn-chart-latency-badges').innerHTML;
+assert(lBadgesDots.includes('chart-legend-dot'), 'latency badges include legend dot indicators: ' + lBadgesDots);
+
+// Check drop reason suppression when drop_rates_available is false
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: false, drop_reason_rates: { return_queue_full: 10 }, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 0, be_latency_samples: 0, backends: [] }
+    ]
+});
+assert(document.getElementById('vpn-chart-reasons').textContent.includes('No data (15m)'), 'drop reason with drop_rates_available false is suppressed');
 `
 		if out, err := execNodeScript(nodePath, script); err != nil {
 			t.Fatalf("historical charts JS render contract failed: %v\n%s", err, out)

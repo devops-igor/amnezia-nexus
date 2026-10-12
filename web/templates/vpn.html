@@ -1765,9 +1765,15 @@
             pathsMarkup + crosshair + overlay + '</svg>';
     }
 
-    function vpnDisposeChartInteractions() {
+    function vpnDisposeChartInteractions(clearActiveHover) {
+        if (clearActiveHover === true && typeof window !== 'undefined') {
+            window._vpnActiveChartHover = null;
+        }
         const tip = document.getElementById('vpn-chart-tooltip');
-        if (tip) tip.style.display = 'none';
+        const hasActiveHover = typeof window !== 'undefined' && !!window._vpnActiveChartHover;
+        if (tip && (!hasActiveHover || clearActiveHover === true)) {
+            tip.style.display = 'none';
+        }
         const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
             ? document.querySelectorAll('.chart-crosshair')
             : [];
@@ -1787,7 +1793,12 @@
         if (typeof vpnDisposeChartInteractions === 'function') {
             vpnDisposeChartInteractions();
         }
-        if (!series || typeof series !== 'object') return;
+        if (!series || typeof series !== 'object') {
+            if (typeof window !== 'undefined') window._vpnActiveChartHover = null;
+            const tip = document.getElementById('vpn-chart-tooltip');
+            if (tip) tip.style.display = 'none';
+            return;
+        }
         const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
         let points = [];
         if (w === '1m') points = series.window_1m || [];
@@ -1914,19 +1925,21 @@
             const hasBeWin = Number.isFinite(beStats.peak);
             const fwdCurStr = Number.isFinite(fwdStats.current) ? vpnFmtLatency(fwdStats.current) : '—';
             const beCurStr = Number.isFinite(beStats.current) ? vpnFmtLatency(beStats.current) : '—';
+            const writeDot = '<span class="chart-legend-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background-color:var(--info, #06b6d4);margin-right:4px;vertical-align:middle;"></span>';
+            const probeDot = '<span class="chart-legend-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background-color:#a855f7;margin-right:4px;vertical-align:middle;"></span>';
 
             if (hasFwdWin && hasBeWin) {
                 const peakVal = Math.max(fwdStats.peak, beStats.peak);
                 const peakStr = Number.isFinite(peakVal) ? vpnFmtLatency(peakVal) : '—';
                 const peakSuffix = fwdStats.peak >= beStats.peak ? writeSuffix : probeSuffix;
-                elL.textContent = writeLabel + ': ' + fwdCurStr + ' | ' + probeLabel + ': ' + beCurStr + ' | ' + peakLabel + ': ' + peakStr + peakSuffix;
+                elL.innerHTML = writeDot + escapeHtml(writeLabel) + ': ' + escapeHtml(fwdCurStr) + ' | ' + probeDot + escapeHtml(probeLabel) + ': ' + escapeHtml(beCurStr) + ' | ' + escapeHtml(peakLabel) + ': ' + escapeHtml(peakStr) + escapeHtml(peakSuffix);
             } else if (hasBeWin) {
                 const peakStr = Number.isFinite(beStats.peak) ? vpnFmtLatency(beStats.peak) : '—';
                 const curPart = Number.isFinite(beStats.current) ? (beCurStr + probeSuffix) : '—';
-                elL.textContent = curLabel + ': ' + curPart + ' | ' + peakLabel + ': ' + peakStr + probeSuffix;
+                elL.innerHTML = probeDot + escapeHtml(curLabel) + ': ' + escapeHtml(curPart) + ' | ' + escapeHtml(peakLabel) + ': ' + escapeHtml(peakStr) + escapeHtml(probeSuffix);
             } else if (hasFwdWin) {
                 const peakStr = Number.isFinite(fwdStats.peak) ? vpnFmtLatency(fwdStats.peak) : '—';
-                elL.textContent = curLabel + ': ' + fwdCurStr + ' | ' + peakLabel + ': ' + peakStr;
+                elL.innerHTML = writeDot + escapeHtml(curLabel) + ': ' + escapeHtml(fwdCurStr) + ' | ' + escapeHtml(peakLabel) + ': ' + escapeHtml(peakStr);
             } else {
                 elL.textContent = curLabel + ': — | ' + peakLabel + ': —';
             }
@@ -1996,6 +2009,15 @@
             }
 
             const onMouseMove = function(e) {
+                if (typeof window !== 'undefined') {
+                    window._vpnActiveChartHover = {
+                        chartId: chartId,
+                        clientX: e.clientX,
+                        clientY: e.clientY,
+                        pageX: (typeof e.pageX === 'number') ? e.pageX : e.clientX,
+                        pageY: (typeof e.pageY === 'number') ? e.pageY : e.clientY
+                    };
+                }
                 const rect = container.getBoundingClientRect ? container.getBoundingClientRect() : null;
                 if (!rect || !rect.width) return;
                 const mouseX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
@@ -2055,6 +2077,9 @@
             };
 
             const onMouseLeave = function() {
+                if (typeof window !== 'undefined') {
+                    window._vpnActiveChartHover = null;
+                }
                 if (crosshair) crosshair.style.display = 'none';
                 if (tooltip) tooltip.style.display = 'none';
             };
@@ -2150,7 +2175,7 @@
         const lossLabels = vpnLossReasonLabels();
         const allReasons = Array.from(new Set(points.flatMap(p => Object.keys(p.drop_reason_rates || {})))).sort();
         const reasons = allReasons.filter(key => {
-            return points.some(p => p && p.drop_reason_rates && Number.isFinite(p.drop_reason_rates[key]) && p.drop_reason_rates[key] > 0);
+            return points.some(p => p && p.drop_rates_available === true && p.drop_reason_rates && Number.isFinite(p.drop_reason_rates[key]) && p.drop_reason_rates[key] > 0);
         });
         renderSeries('vpn-chart-reasons', reasons.map(key => ({
             label:(lossLabels[key] ? _(lossLabels[key]) : key.replace(/_/g,' ')) + ' (drops/s)',
@@ -2241,11 +2266,28 @@
             fleetNote.textContent = omitted || ids.length > 128 ? vpnDiagText('vpn_diag_fleet_limit', {count:Math.max(omitted,ids.length-128)}) : '';
         }
 
+        if (typeof window !== 'undefined' && window._vpnActiveChartHover) {
+            const activeHover = window._vpnActiveChartHover;
+            const activeContainer = document.getElementById(activeHover.chartId);
+            const activeOverlay = activeContainer ? activeContainer.querySelector('.chart-overlay') : null;
+            if (activeOverlay && typeof activeOverlay._vpnMouseMove === 'function' && points && points.length > 0) {
+                activeOverlay._vpnMouseMove({
+                    clientX: activeHover.clientX,
+                    clientY: activeHover.clientY,
+                    pageX: (typeof activeHover.pageX === 'number') ? activeHover.pageX : activeHover.clientX,
+                    pageY: (typeof activeHover.pageY === 'number') ? activeHover.pageY : activeHover.clientY
+                });
+            } else {
+                window._vpnActiveChartHover = null;
+                const tip = document.getElementById('vpn-chart-tooltip');
+                if (tip) tip.style.display = 'none';
+            }
+        }
     }
 
     function vpnSetHistoryWindow(w) {
         if (typeof vpnDisposeChartInteractions === 'function') {
-            vpnDisposeChartInteractions();
+            vpnDisposeChartInteractions(true);
         }
         vpnHistoryWindow = w;
         const toggles = document.getElementById('vpn-history-window-toggles');
@@ -2405,7 +2447,7 @@
             // empties either shape, and a blank container deliberately renders
             // no placeholder curve, so no data is invented here.
             if (typeof vpnDisposeChartInteractions === 'function') {
-                vpnDisposeChartInteractions();
+                vpnDisposeChartInteractions(true);
             }
             const historyIds = ['vpn-chart-throughput', 'vpn-chart-queue', 'vpn-chart-latency', 'vpn-chart-drops', 'vpn-chart-reasons', 'vpn-chart-backends', 'vpn-diag-be-traffic', 'vpn-history-fleet-note'];
             for (let i = 0; i < historyIds.length; i++) {
@@ -2425,6 +2467,7 @@
             }
             const tipEl = document.getElementById('vpn-chart-tooltip');
             if (tipEl) { tipEl.style.display = 'none'; tipEl.innerHTML = ''; }
+            if (typeof window !== 'undefined') window._vpnActiveChartHover = null;
             // Invalidate the cached available status so local toggles (such as
             // history-window or show-all-routes) cannot resurrect stale health,
             // throughput, routes, or backends while the forwarder is unavailable (#424).

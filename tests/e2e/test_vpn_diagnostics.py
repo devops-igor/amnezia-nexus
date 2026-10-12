@@ -272,6 +272,45 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
 
 
 @pytest.mark.e2e
+def test_vpn_historical_charts_hover_preserved_across_live_polling(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Verify active chart tooltip and hover are preserved across live polling."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+
+    _ensure_tech_details_open(page)
+
+    page.evaluate("""() => {
+        const pt = { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
+        vpnRenderHistoryCharts({ window_15m: [pt, pt] });
+    }""")
+
+    overlay = page.locator("#vpn-chart-throughput svg .chart-overlay")
+    expect(overlay).to_be_visible()
+    overlay.scroll_into_view_if_needed()
+    _hover_center(page, overlay)
+
+    tooltip = page.locator("#vpn-chart-tooltip")
+    expect(tooltip).to_be_visible()
+    assert tooltip.evaluate("el => el.style.display !== 'none'")
+    assert "10.0 MB/s" in (tooltip.text_content() or "")
+
+    # Trigger a new vpnRenderHistoryCharts with refreshed 20.0 MB/s without moving mouse
+    page.evaluate("""() => {
+        const pt = { t: 82800, rx_bps: 83886080, tx_bps: 83886080, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
+        vpnRenderHistoryCharts({ window_15m: [pt, pt] });
+    }""")
+
+    expect(tooltip).to_be_visible()
+    assert tooltip.evaluate("el => el.style.display !== 'none'")
+    tip_text = tooltip.text_content() or ""
+    assert "20.0 MB/s" in tip_text
+    assert re.search(r"RX:\s*10\.0 MB/s\s*\|\s*TX:\s*10\.0 MB/s\b", tip_text)
+
+
+@pytest.mark.e2e
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to /vpn -> Problem Routes details and 'Show all routes' toggle."""
     page = authenticated_page
