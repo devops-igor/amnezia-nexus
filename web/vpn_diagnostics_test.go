@@ -891,7 +891,11 @@ for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
 for (const [i,w] of ['1m','5m','15m','1h','6h','24h'].entries()) {
  vpnHistoryWindow=w;seen.length=0;vpnRenderHistoryCharts(series);
  const v=i+1;
- assert.deepStrictEqual(seen.slice(0,4),[[null,3*v,0],[0,5*v,0],[null,6*v,0],[null,7*v,0]]);
+ assert.deepStrictEqual(seen.slice(0,3),[[null,3*v,0],[0,5*v,0],[null,6*v,0]]);
+ assert.deepStrictEqual(seen[3],[
+  { data: [null,7*v,0], color: 'var(--info, #06b6d4)', fillOpacity: 0.12 },
+  { data: [null,8*v,null], color: '#a855f7', fillOpacity: 0.12 }
+ ]);
  assert.deepStrictEqual(seen.slice(4),[[null,4*v,0],[null,2*v,0],[null,11*v,0],[null,12*v,0],[null,13*v,0],[null,14*v,0],[null,15*v,null]]);
  for (const [id,label] of [
   ['vpn-chart-reasons','return queue full (drops/s)'],['vpn-chart-reasons','client backend device queue full (drops/s)'],
@@ -6065,7 +6069,7 @@ assert(qBadges.includes('Current:') && qBadges.includes('Peak:'), 'queue badges 
 assert(qBadges.includes('%'), 'queue unit %: ' + qBadges);
 
 const lBadges = document.getElementById('vpn-chart-latency-badges').textContent;
-assert(lBadges.includes('Current:') && lBadges.includes('Peak:'), 'latency badges text: ' + lBadges);
+assert((lBadges.includes('Write:') || lBadges.includes('Current:')) && lBadges.includes('Peak:'), 'latency badges text: ' + lBadges);
 assert(lBadges.includes('ms'), 'latency unit ms: ' + lBadges);
 
 // Check time axes
@@ -6188,6 +6192,32 @@ vpnRenderHistoryCharts({
 });
 const strokeT = document.getElementById('vpn-chart-throughput').innerHTML.match(/<path d="([^"]+)" fill="none"/);
 assert(strokeT && strokeT[1].includes('51.0'), 'time-proportional X mapping: ' + strokeT[1]);
+
+// Rework Round 6: Dual-curve latency rendering, mixed window
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 5, fwd_p95_samples: 1, be_p95_ms: 10, be_latency_samples: 1, backends: [] },
+        { t: 1700000060, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 20, be_latency_samples: 1, backends: [] },
+        { t: 1700000120, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 30, be_latency_samples: 1, backends: [] }
+    ]
+});
+const lBadgesMixed = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesMixed.includes('Current: 30 ms (probe)'), 'mixed window probe current: ' + lBadgesMixed);
+assert(lBadgesMixed.includes('Peak: 30 ms'), 'mixed window peak: ' + lBadgesMixed);
+const lChartMixedHTML = document.getElementById('vpn-chart-latency').innerHTML;
+const strokeMatches = lChartMixedHTML.match(/<path [^>]*stroke=/g) || [];
+assert.strictEqual(strokeMatches.length, 2, 'latency chart renders two stroke paths for both series');
+
+// Neither latency available -> no overlay, empty badge
+vpnRenderHistoryCharts({
+    window_15m: [
+        { t: 1700000000, rx_bps: 0, tx_bps: 0, traffic_available: true, q_pct: 0, drop_rate: 0, drop_rates_available: true, drop_reason_rates: {}, fwd_p95_ms: 0, fwd_p95_samples: 0, be_p95_ms: 0, be_latency_samples: 0, backends: [] }
+    ]
+});
+const lChartNoneHTML = document.getElementById('vpn-chart-latency').innerHTML;
+assert(!lChartNoneHTML.includes('chart-overlay'), 'no overlay when neither latency available');
+const lBadgesNone = document.getElementById('vpn-chart-latency-badges').textContent;
+assert(lBadgesNone.includes('Current: —') && lBadgesNone.includes('Peak: —'), 'neither latency badges empty: ' + lBadgesNone);
 `
 		if out, err := execNodeScript(nodePath, script); err != nil {
 			t.Fatalf("historical charts JS render contract failed: %v\n%s", err, out)

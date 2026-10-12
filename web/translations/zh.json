@@ -703,5 +703,7 @@
   "vpn_unit_dps": "drops/s",
   "vpn_unit_ms": "ms",
   "vpn_unit_pct": "%",
-  "vpn_unit_bps": "B/s"
+  "vpn_unit_bps": "B/s",
+  "vpn_diag_probe_suffix": " (探测)",
+  "vpn_diag_backend_option": "后端 #{id}"
 }

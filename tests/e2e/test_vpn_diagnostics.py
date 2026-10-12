@@ -54,7 +54,7 @@ _CHART_BADGE_PATTERNS = {
         r"Current:\s*(?:\d+(?:\.\d+)?%\s*|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?%\s*|—)"
     ),
     "#vpn-chart-latency-badges": re.compile(
-        r"Current:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—)\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
+        r"(?:Write:\s*(?:\d+(?:\.\d+)?\s*ms|—)\s*\|\s*Probe:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—)|Current:\s*(?:\d+(?:\.\d+)?\s*ms(?:\s*\(probe\))?|—))\s*\|\s*Peak:\s*(?:\d+(?:\.\d+)?\s*ms|—)"
     ),
 }
 
@@ -254,8 +254,8 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
 
     # Assert tooltip contains exact recovered rate and timestamp, rejecting placeholders
     assert "23:00" in tip_text
-    assert "10.0 MB/s" in tip_text or "10 MB/s" in tip_text
-    assert "5.0 MB/s" in tip_text or "5 MB/s" in tip_text
+    assert re.search(r":\s*10\.0 MB/s\b", tip_text)
+    assert re.search(r"RX:\s*5\.0 MB/s\s*\|\s*TX:\s*5\.0 MB/s\b", tip_text)
     assert "vpn_unit_mbps" not in tip_text
     assert "—" not in tip_text
     assert "10:00" not in tip_text
