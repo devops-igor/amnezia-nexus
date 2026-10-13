@@ -4,6 +4,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // lossClaim names the evaluator that OWNS a critical reason's losses. Exactly
@@ -454,4 +456,213 @@ func (rh *RollingHistory) Snapshot() HistoricalSeries {
 		Window6h:  w6h,
 		Window24h: w24h,
 	}
+}
+
+func (s *Service) startRollingHistory() {
+	s.mu.Lock()
+	if s.rollingHistory == nil {
+		s.rollingHistory = NewRollingHistory()
+	}
+	if s.historyStopCh != nil {
+		s.mu.Unlock()
+		return
+	}
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	s.historyStopCh = stopCh
+	s.historyDoneCh = doneCh
+	fwd := s.forwarder
+	s.mu.Unlock()
+	s.primeHistory(time.Now(), fwd)
+
+	go func() {
+		defer close(doneCh)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				s.sampleRollingHistory()
+			}
+		}
+	}()
+}
+
+func (s *Service) stopRollingHistory() {
+	s.mu.Lock()
+	stopCh := s.historyStopCh
+	doneCh := s.historyDoneCh
+	s.historyStopCh = nil
+	s.historyDoneCh = nil
+	s.mu.Unlock()
+
+	if stopCh != nil {
+		close(stopCh)
+		select {
+		case <-doneCh:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Service) primeHistory(now time.Time, fwd *forwarder.Forwarder) {
+	inputs := s.captureDiagnosticsInputs()
+	s.primeHistoryFromDrops(now, fwd, inputs.generation, inputs.collectDropCategories())
+}
+
+// historyPrimedForCurrentGenerationLocked reports whether the history
+// baselines are already primed FOR THE CURRENT generation. It requires
+// s.diagRatesMu. The priming state is keyed to s.diagGeneration (issue #429
+// review blocker 1): after a lifecycle reset in Service.Start the generation
+// no longer matches, so priming is re-done instead of the sticky flag
+// suppressing history for the process lifetime.
+func (s *Service) historyPrimedForCurrentGenerationLocked() bool {
+	return s.historyPrimed && s.historyPrimedGen == diagGeneration(s.diagGeneration.Load())
+}
+
+func (s *Service) primeHistoryFromDrops(now time.Time, fwd *forwarder.Forwarder, gen diagGeneration, drops DropCategoryBreakdown) {
+	// Generation rejection happens FIRST, under diagRatesMu, before ANY
+	// mutation (issue #429 review round 5, blocker 1). The previous order
+	// primed and marked with the tracker-current generation substituted for
+	// the observation's and only then ran the stale guard, so a stale
+	// pre-restart snapshot resuming between the lifecycle reset and the new
+	// generation's first genuine collection re-baselined the new generation
+	// from old high totals and its primed-mark suppressed the genuine
+	// re-prime.
+	//
+	// gen != current, not gen < current: priming must record the live
+	// generation the baselines actually belong to, so only an observation
+	// captured under it may prime or mark. A generation lower than current
+	// is a pre-restart snapshot; a higher one cannot legitimately occur (the
+	// generation travels inside the snapshot and only resetDiagnostics-
+	// Generation bumps it under diagRatesMu), but priming or marking on one
+	// would equally suppress the CURRENT generation's genuine re-prime.
+	s.diagRatesMu.Lock()
+	current := s.currentDiagGeneration()
+	if gen != current {
+		s.diagRatesMu.Unlock()
+		return
+	}
+	// historyPrimed is NOT a sticky flag: it is the per-generation priming
+	// state (accepted gen == current gen && baselines exist), so a new
+	// generation from Service.Start re-primes here automatically instead of
+	// the call returning early forever (issue #429 review blocker 1, Stop/
+	// Start epoch reuse). The per-generation keying matters: after a bump
+	// the mark is still true but recorded for the OLD generation, so the
+	// first genuine observation of the new one re-primes and re-marks.
+	if s.historyPrimedForCurrentGenerationLocked() {
+		s.diagRatesMu.Unlock()
+		return
+	}
+	// Prime with the OBSERVATION'S generation. Both checks above ran under
+	// this lock hold, so gen == current here: the recorded historyPrimedGen
+	// is the live generation and the mark can never stand in for a newer
+	// one.
+	s.primeHistoryRatesLocked(gen, now, &drops)
+	s.historyPrimedGen = gen
+	s.historyPrimed = true
+	s.diagRatesMu.Unlock()
+
+	// The forwarder's own history baselines carry independent locks, so they
+	// prime after the diagRatesMu release — but under the SAME generation
+	// decision made above, before any mutation: a rejected snapshot primes
+	// nothing, forwarder history included.
+	if fwd != nil {
+		fwd.PrimeHistoryRates(now)
+		fwd.PrimeBackendTrafficHistory(now)
+	}
+}
+
+func (s *Service) sampleRollingHistory() {
+	now := time.Now()
+
+	inputs := s.captureDiagnosticsInputs()
+	rh, fwd, sessMgr := inputs.rollingHistory, inputs.forwarder, inputs.sessionMgr
+	drops := inputs.collectDropCategories()
+
+	if rh == nil {
+		return
+	}
+
+	s.diagRatesMu.Lock()
+	isPrimed := s.historyPrimedForCurrentGenerationLocked()
+	s.diagRatesMu.Unlock()
+
+	if !isPrimed {
+		s.primeHistoryFromDrops(now, fwd, inputs.generation, drops)
+	}
+
+	// 1. Forwarder traffic rates (independent history baseline)
+	var fRates forwarder.TrafficRates
+	if fwd != nil {
+		fRates = fwd.HistoryRates(now)
+	}
+	// History samples use the generation the snapshot was captured under
+	// (issue #429 review round 4, blocker 1): a snapshot taken before a
+	// lifecycle reset can never advance the new generation's baselines.
+	s.sampleHistoryDropRates(inputs.generation, now, &drops)
+
+	// 3. Queue utilization
+	var queueUtilPct float64
+	if fwd != nil {
+		occ, cap, _ := fwd.AggregateQueueStats()
+		if cap > 0 {
+			queueUtilPct = float64(occ) / float64(cap) * 100.0
+		}
+	}
+
+	// 4. Latency
+	var fwdP95MS float64
+	var fwdP95Samples int
+	if fwd != nil {
+		writes := fwd.DeviceWriteSnapshot()
+		fwdP95MS = float64(writes.P95HealthDuration.Microseconds()) / 1000.0
+		fwdP95Samples = writes.P95HealthSamples
+	}
+
+	// 5. Active routes
+	activeRoutes := 0
+	if fwd != nil {
+		activeRoutes = fwd.ActiveRoutesCount()
+	}
+
+	// 6. Connected sessions
+	activeSessions := 0
+	if sessMgr != nil {
+		activeSessions = sessMgr.ActiveCount()
+	}
+
+	// 7. Backends diagnostics with history traffic snapshot
+	var traffic map[int64]forwarder.TrafficSnapshot
+	if fwd != nil {
+		traffic = fwd.BackendTrafficHistorySnapshot(now)
+	}
+	beDiag := inputs.collectBackendDiagnosticsWithTraffic(traffic)
+	backends, omitted := backendHistory(beDiag.Backends)
+
+	point := HistoryPoint{
+		RxPps:                 fRates.RxPps,
+		TxPps:                 fRates.TxPps,
+		TrafficAvailable:      fRates.Available,
+		DropRatesAvailable:    drops.RatesAvailable,
+		DropReasonRates:       drops.ReasonRates,
+		ActiveRoutes:          activeRoutes,
+		BackendLatencySamples: beDiag.LatencySamples,
+		Backends:              backends,
+		BackendsOmitted:       omitted,
+		Timestamp:             now.Unix(),
+		RxBps:                 fRates.RxBps,
+		TxBps:                 fRates.TxBps,
+		QueueUtilPct:          queueUtilPct,
+		TotalDropRate:         drops.TotalDropRatePps,
+		ForwardP95MS:          fwdP95MS,
+		ForwardP95Samples:     fwdP95Samples,
+		ActiveSessions:        activeSessions,
+		BackendP95MS:          beDiag.LatencyP95MS,
+	}
+
+	rh.Add(point)
 }
