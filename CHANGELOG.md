@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - Horizon - 2026-10-13
+
+Feature and stability release introducing streamlined VPN operational diagnostics, consolidated historical telemetry charts with tooltips and KPI badges, actionable upstream handshake problem detection, and resilience against WAF method blocking.
+
+### Added
+- Consolidated historical charts: unified throughput, latency, loss, and queue pressure charts with interactive tooltips, time-aligned axes, and KPI badges (#459).
+- Actionable problem detection for stale upstream handshakes: synthesized diagnostics warnings when peer handshakes exceed timeout thresholds (#458).
+- POST route for backend deletion: added POST endpoint alongside DELETE to prevent WAF and reverse-proxy method blocking (#443).
+- Server generation fencing: fenced `EnableBackend` calls against concurrent server generation changes to prevent race conditions during reconfiguration (#451).
+
+### Changed
+- Streamlined VPN diagnostics dashboard: reorganized dashboard layout placing backends and active sessions above forwarder health, and streamlined technical diagnostics into four focused operational cards (#465, #466).
+- Streamlined sessions table: consolidated connection troubleshooting table to five key columns with persistent section collapse states (#461, #462, #463, #464).
+- Decoupled return-direction ownership mismatch severity: adjusted return-path routing severity to warning and scoped loss rate publication to observation windows (#457).
+
+### Fixed
+- Stale generation resets in telemetry: ensured GenerationSampler and RateTracker resets guard against stale generations without corrupting active counters (#445).
+- Upstream handshake attribution: attributed stale handshakes correctly when peer snapshots are initially empty (#458).
+- Mobile viewport containment: fixed route and connection table layout and text overflow on narrow and RTL screens (#381).
+- Toolchain and dependency updates: updated Go toolchain to 1.26.9 to eliminate stdlib security advisories and pinned jsdom in CI test suites (#381, #452).
+
+### Refactored
+- Diagnostics subsystem decomposition: modularized diagnostics collection into dedicated input, routing, backend fleet, handshake freshness, and runtime resource components (#486, #487, #488, #489, #490).
+- Removed legacy reason-rate tracking infrastructure from the forwarder data plane (#523).
+
 ## [2.2.0] - Voyager - 2026-10-08
 
 Minor release introducing comprehensive forwarder health and operational diagnostics, redesigned Web UI telemetry with progressive disclosure, connection troubleshooting tables with user correlation, backend teardown on server deletion, and startup secret key persistence guarantees.
