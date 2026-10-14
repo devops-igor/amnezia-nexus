@@ -49,30 +49,30 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
 | 31 | `dropLogUntil` | `atomic.Int64` | Atomic primitives | `pumpBackendReturns` | In-memory rate limiter | Lock-free atomic Unix timestamp. |
 | 32 | `lastReconcileTime` | `time.Time` | `s.mu.Lock` | `reconcileConnectionCounts` | In-memory timestamp | Pure memory timestamp. |
 | 33 | `lastReconcileByTunnel` | `map[int64]time.Time` | `s.mu.Lock` | Lazy-initialized on first reconcile pass; mutated in `reconcileConnectionCounts`, `reapIngressSession` | In-memory map | Pure memory map. |
-| 34 | `reconcilePostSnapshotHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetReconcilePostSnapshotHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `reconcileConnectionCounts`. |
-| 35 | `reconcilePreApplyHook` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetReconcilePreApplyHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `reconcileConnectionCounts` prior to applying connection count changes. |
-| 36 | `reconcilePreCommitHook` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetReconcilePreCommitHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `reconcileConnectionCounts` prior to committing `SetConnectionCount`. |
-| 37 | `ensureDevicePreLockHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnsureDevicePreLockHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `ensureBackendDeviceAttached`. |
+| 34 | `reconcilePostSnapshotHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetReconcilePostSnapshotHook`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `reconcileConnectionCounts`. |
+| 35 | `reconcilePreApplyHook` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetReconcilePreApplyHook`) | Test hook | Invoked INSIDE `s.mu.Lock` in `reconcileConnectionCounts` prior to applying connection count changes. |
+| 36 | `reconcilePreCommitHook` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetReconcilePreCommitHook`) | Test hook | Invoked INSIDE `s.mu.Lock` in `reconcileConnectionCounts` prior to committing `SetConnectionCount`. |
+| 37 | `ensureDevicePreLockHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnsureDevicePreLockHook`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `ensureBackendDeviceAttached`. |
 | 38 | `preCommitMigrationHookForTest` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetPreCommitMigrationHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `MigrateSession` (step 4.5) prior to transferring connection counters. |
 | 39 | `preAdoptHookForTest` | `func(string, string)` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetPreAdoptHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `ensureBackendSessionForIngress` before calling `AdoptSessionForIngress`. |
 | 40 | `preIngressRouteRegistrationHookForTest` | `func()` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetPreIngressRouteRegistrationHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `ensureBackendSessionForIngress` prior to route registration. |
 | 41 | `preRevokeCloseHookForTest` | `func(string, string)` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetPreRevokeCloseHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `revokeSessionDirectLocked` before session closure. |
-| 42 | `postCommitRevokeHookForTest` | `func(database.PeerRevokeKind, string, string)` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetPostCommitRevokeHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` in `runPostCommitRevoke` on DB commit notification. |
-| 43 | `updateBackendServerHostPreLockHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetUpdateBackendServerHostPreLockHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `UpdateBackendServerHost`. |
-| 44 | `updateBackendServerHostErr` | `error` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetUpdateBackendServerHostErrForTest`) | Test fault injection | Read under `s.mu.Lock` in `syncBackendForwarderOnHostUpdateLocked`. |
-| 45 | `deleteBackendErr` | `error` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetDeleteBackendErrForTest`) | Test fault injection | Read under `s.mu.Lock` in `DeleteServer`. |
+| 42 | `postCommitRevokeHookForTest` | `func(database.PeerRevokeKind, string, string)` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetPostCommitRevokeHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` in `runPostCommitRevoke` on DB commit notification. |
+| 43 | `updateBackendServerHostPreLockHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetUpdateBackendServerHostPreLockHook`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `UpdateBackendServerHost`. |
+| 44 | `updateBackendServerHostErr` | `error` | `s.mu` (`RLock` read / `Lock` write) | Set in tests (`SetUpdateBackendServerHostErrorForTest`) | Test fault injection | Read under `s.mu.RLock` in `UpdateBackendServerHost` (`vpn.go:3165`); set under `s.mu.Lock` in `SetUpdateBackendServerHostErrorForTest` (`vpn.go:927`). |
+| 45 | `deleteBackendErr` | `error` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetDeleteBackendErrorForTest`) | Test fault injection | Read under `s.mu.Lock` in `DeleteServer` (`vpn.go:3292`) and `DeleteBackend` (`vpn.go:3342`). |
 | 46 | `syncBackendForwarderHook` | `func() error` | Pointer read/write under `s.mu.Lock` | Set in tests (`SetSyncBackendForwarderHookForTest`) | Test hook | Invoked INSIDE `s.mu.Lock` in `syncBackendForwarderOnHostUpdateLocked`. |
-| 47 | `enableBackendPreAddTunnelHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnableBackendPreAddTunnelHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `EnableBackend`. |
-| 48 | `enableBackendPostAddTunnelHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnableBackendPostAddTunnelHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOCATED OUTSIDE `s.mu` after `s.mu.Unlock` in `EnableBackend`. |
-| 49 | `reaperHook` | `func(context.Context, *models.VPNSession)` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetReaperHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock` in `SweepTimedOutSessions`; hook is INVOCATED OUTSIDE `s.mu` for each timed-out session. |
+| 47 | `enableBackendPreAddTunnelHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnableBackendPreAddTunnelHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` before acquiring `s.mu.Lock` in `EnableBackend`. |
+| 48 | `enableBackendPostAddTunnelHook` | `func()` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetEnableBackendPostAddTunnelHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock`; hook is INVOKED OUTSIDE `s.mu` after `s.mu.Unlock` in `EnableBackend`. |
+| 49 | `reaperHook` | `func(context.Context, *models.VPNSession)` | Pointer read under `s.mu.RLock` / write under test setter | Set in tests (`SetSessionReaperHookForTest`) | Test hook | Pointer snapshotted under `s.mu.RLock` in `SweepTimedOutSessions`; hook is INVOKED OUTSIDE `s.mu` for each timed-out session. |
 | 50 | `rollingHistory` | `*RollingHistory` | Pointer read under `s.mu.RLock` / write under `s.mu.Lock` | Lazy-initialized under `s.mu.Lock` in `startRollingHistory()` | In-memory metrics ring buffer | Synchronized via `RollingHistory.mu`. Prohibits I/O. |
 | 51 | `diagRatesMu` | `sync.Mutex` | Self (Primitive) | `resetDiagnosticsGeneration`, rates sampling | Diagnostics synchronization | Prohibits all I/O. Lock order must strictly be `diagRatesMu` -> `s.mu`. Never acquire `diagRatesMu` while holding `s.mu`. |
 | 52 | `diagRates` | `*diagRatesTracker` | `s.diagRatesMu` | `NewVPNService`, `resetDiagnosticsGeneration`, sampling | In-memory rates | Pure memory calculations. |
 | 53 | `historyDiagRates` | `*diagRatesTracker` | `s.diagRatesMu` | Initialized in `resetDiagnosticsGeneration`, sampling | In-memory rates | Pure memory calculations. |
 | 54 | `problemOnset` | `*problemOnsetTracker` | `s.mu.Lock` (lazy-init) / internal tracker mutex | Lazy-initialized under `s.mu.Lock` in `getProblemOnsetTracker()` | In-memory incident tracking | Internal mutex synchronization. Prohibits I/O. |
 | 55 | `diagGeneration` | `atomic.Uint64` | Atomic primitives | Advanced via atomic increment under `diagRatesMu` in `resetDiagnosticsGeneration` during `Start()` | In-memory generation epoch | Lock-free atomic load in `currentDiagGeneration` and `diagnosticsInputsLocked`. |
-| 56 | `historyPrimedGen` | `diagGeneration` | `s.diagRatesMu` | Lazy-assigned in `primeHistoryRatesLocked` | In-memory generation tag | Pure memory value. |
-| 57 | `historyPrimed` | `bool` | `s.diagRatesMu` | Lazy-assigned in `primeHistoryRatesLocked` | In-memory flag | Pure memory flag. |
+| 56 | `historyPrimedGen` | `diagGeneration` | `s.diagRatesMu` | Lazy-assigned in `primeHistoryFromDrops` (`diagnostics_history.go:564`) | In-memory generation tag | Pure memory value. |
+| 57 | `historyPrimed` | `bool` | `s.diagRatesMu` | Lazy-assigned in `primeHistoryFromDrops` (`diagnostics_history.go:564`) | In-memory flag | Pure memory flag. |
 | 58 | `diagDeltas` | `diagDeltaTrackers` | `s.diagRatesMu` | Initialized in `resetDiagnosticsGeneration`, sampling | In-memory deltas | Pure memory calculations. |
 | 59 | `historyStopCh` | `chan struct{}` | `s.mu.Lock` | Allocated under `s.mu.Lock` in `startRollingHistory()`, nil'd in `stopRollingHistory()` | In-memory worker lifecycle signal | Channel signaling only. |
 | 60 | `historyDoneCh` | `chan struct{}` | `s.mu.Lock` | Allocated under `s.mu.Lock` in `startRollingHistory()`, nil'd in `stopRollingHistory()` | In-memory worker lifecycle signal | Channel signaling only. |
@@ -168,7 +168,7 @@ The check-then-allocate capacity pattern for backend tunnels is safe under concu
 2. **Dataplane Forwarder Route Invariants**:
    - The forwarder maintains an in-memory routing table mapping IP prefixes to backend tunnels.
    - Admission follows an "admission-then-register" invariant: session creation and counter increments occur first, and `forwarder.TryRegisterSessionWithReturnPath` is checked last.
-   - If route registration fails (e.g., duplicate IP or forwarder route capacity exhausted), all state created for the admission is rolled back immediately in reverse order.
+   - If route registration fails (e.g., duplicate IP or forwarder route capacity exhausted), a best-effort compensation attempt executes immediately in reverse order (see Section 4.4 for residual state semantics).
 
 ### 4.3 Reconnect, Session Failover, and Migration Race Invariants
 
@@ -190,7 +190,7 @@ The check-then-allocate capacity pattern for backend tunnels is safe under concu
    - Step 4: The database session record is migrated (`db.MigrateVPNSessionBackend`).
    - Step 5: Connection counters are atomically transferred (`pool.TransferConnectionsIfActive`).
    - Step 6: Sticky affinity is updated (`stickyMgr.AssignPeerAffinity`).
-   - If any step fails, `rollbackMigration` reverts completed mutations in reverse order.
+   - If any step fails, `rollbackMigration` executes a best-effort compensation attempt in reverse order (see Section 4.4 for attempt budgets and residual state semantics).
 4. **Reaper versus Concurrent Admission Race**:
    - The session reaper (`reapIngressSession`) runs under `s.mu.Lock()`.
    - Before retiring a route, it queries `sessionMgr.GetSessionSnapshotByPeer(sess.PeerPublicKey)`:
@@ -210,9 +210,9 @@ Compound operations spanning memory, database, and dataplane forwarders execute 
      * Releases `s.mu` before awaiting route retirement completion (`retirement.Wait()`).
    - **Residual State on Cross-Backend Replacement ($A \rightarrow B$)**: The replacement hook previously decremented backend $A$ and marked the old session disconnected. If admission subsequently fails on backend $B$, compensation decrements $B$, but does NOT resurrect the old session on $A$. The old session remains invalidated, and the admission fails closed.
 2. **Migration Rollback (`rollbackMigration`)**:
-   - **Bounded Attempt Window**: Compensation executes under a non-cancelable timeout context: `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`. This 5-second window is an *attempt budget*, not an unconditional completion guarantee. If the database or forwarder hangs indefinitely, compensation times out.
+   - **Bounded Database Attempt Window**: Compensation derives a non-cancelable timeout context: `rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`. This 5-second timeout budget is passed *only* to `db.MigrateVPNSessionBackend` (`internal/vpn/vpn.go:3886`). Subsequent rollback calls (`sessionMgr.RollbackSessionBackend` and `forwarder.UpdateSessionBackend`) do NOT accept a context deadline and block synchronously on standard mutexes (`SessionManager.mu` and `Forwarder.mu`). Thus, the 5-second deadline is a cooperative database attempt window, NOT a wall-clock completion bound on the whole rollback.
    - **Partial Failure Aggregation**: Compensation steps execute sequentially (DB session row revert, session manager revert, forwarder route revert). All encountered errors are collected and returned via `errors.Join(rollbackErrs...)`.
-   - **Residual Inconsistency**: If compensation partially fails, in-memory routes and database session records may temporarily diverge until repaired by background reconciliation (`reconcileConnectionCounts`) or session reapers.
+   - **Residual Inconsistency**: If compensation partially fails, in-memory routes and database session records may temporarily diverge. Periodic reconciliation (`reconcileConnectionCounts`) is *gauge-only* (it updates pool gauges and timestamps; does not repair forwarder routes or session backend identity). Session reaping provides *conditional idle retirement* for inactive sessions, NOT guaranteed route or database self-repair.
 3. **Backend Administrative Disable Residual State (`disableBackendLocked`)**:
    - If `forwarder.UpdateSessionBackend` fails during failover migration, the error is logged while connection counter moves (`DecrementConnections` on disabled backend, `IncrementConnections` on target backend) proceed.
    - The detached backend device is closed immediately, guaranteeing no further traffic traverses the disabled backend regardless of residual route state.
@@ -258,15 +258,18 @@ The table below maps the documented state invariants against verified unit, race
 
 The following coverage gaps represent opportunities for enhanced resilience testing as Phase 4 decomposition proceeds:
 
-1. **Multi-Backend Cascade Failover Under Ingress Burst**:
+1. **Multi-Backend Cascade Failover Under Ingress Burst (Issue #557)**:
+   - *Tracking Issue*: Issue #557 (`[P3][Tests] Add multi-backend cascade failover stress suite under sustained ingress load`)
    - *Current Coverage*: `capacity_stress_test.go` verifies 200 concurrent admissions contending on a single backend, and `faultinjection_test.go` verifies `TestDisconnectConcurrentWithFailover`.
    - *Gap*: Concurrent administrative disable or failure of multiple backends while hundreds of incoming client admissions and rekeys arrive simultaneously across remaining backends.
    - *Recommendation*: Introduce a multi-backend capacity stress test that disables 50% of available backends mid-run to verify that gauge invariants hold across mass failovers without counter drift.
-2. **Partial Rollback Persistence Seam Injection during Ingress Replacement**:
-   - *Current Coverage*: `TestIngressDifferentBackendReplacementRollbackNoPhantom` tests replacement rollback, and `TestPartialSessionCreationLeavesNoOrphans` tests closed-database handling.
-   - *Gap*: Explicit fault injection where `sessionMgr.CloseSession` fails during `rollbackIngressSession` under concurrent session reaper sweeps to verify residual logged state and gauge convergence.
-   - *Recommendation*: Add a test matrix simulating partial DB failures during ingress replacement rollback to verify gauge and reaper self-healing behavior.
-3. **Concurrent IPAM Lease Exhaustion Racing Re-Hydration**:
+2. **Context Cancellation Across Session Migration Transaction Checkpoints (Issue #558)**:
+   - *Tracking Issue*: Issue #558 (`[P3][Tests] Add context cancellation tests across session migration transaction checkpoints`)
+   - *Current Coverage*: `rebalance_migration_test.go` (`TestVPNRebalanceLiveMigration`, `TestVPNRebalanceRollbackOnDBFailure`, `TestVPNRebalanceCheckToCommitRace_CompensatingDBRollbackSurvivesCanceledContext`) and `ingress_replacement_accounting_test.go` (`TestIngressDifferentBackendReplacementRollbackNoPhantom`).
+   - *Gap*: While compensating database rollback under canceled context is tested in `rebalance_migration_test.go`, verifying that context cancellation at each discrete intermediate checkpoint of `MigrateSession` (DB commit, session manager update, forwarder route redirect) triggers appropriate compensating actions without hanging or leaking lock state lacks dedicated regression coverage.
+   - *Recommendation*: Add checkpoint cancellation test suites exercising `MigrateSession` across intermediate transaction boundaries to verify that cooperative timeout contexts abort bounded operations without deadlocks or state corruption.
+3. **Concurrent IPAM Lease Exhaustion Racing Re-Hydration (Issue #559)**:
+   - *Tracking Issue*: Issue #559 (`[P3][Tests] Add high-concurrency IPAM lease pool exhaustion stress tests`)
    - *Current Coverage*: `issue338_ipam_collision_test.go` comprehensively validates collision resolution, and `ipam_test.go` covers sequential exhaustion.
    - *Gap*: Concurrent client configuration generation racing against `reservePersistedClientIPs` during a service re-initialization window near subnet boundary exhaustion.
    - *Recommendation*: Implement an IPAM boundary stress test validating that exhaustion cleanly rejects requests without leaking lease reservations or corrupting `user_connections`.
