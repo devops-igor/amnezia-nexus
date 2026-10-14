@@ -24,7 +24,6 @@ func isCIEnvironment() bool {
 	return ci == "true" || ci == "1" || (ci != "" && ci != "0" && strings.ToLower(ci) != "false")
 }
 
-// findNodeBinary locates the node executable in PATH or standard user/system directories.
 func findNodeBinary() (string, error) {
 	if p, err := exec.LookPath("node"); err == nil {
 		return p, nil
@@ -32,9 +31,7 @@ func findNodeBinary() (string, error) {
 	homeDir, _ := os.UserHomeDir()
 	candidates := []string{
 		filepath.Join(homeDir, ".local", "bin", "node"),
-		"/usr/local/bin/node",
-		"/usr/bin/node",
-		"/bin/node",
+		"/usr/local/bin/node", "/usr/bin/node", "/bin/node",
 	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
@@ -42,6 +39,12 @@ func findNodeBinary() (string, error) {
 		}
 	}
 	return "", errors.New("node binary not found in PATH or standard locations")
+}
+
+func execNodeScript(nodePath, script string) ([]byte, error) {
+	cmd := exec.Command(nodePath)
+	cmd.Stdin = strings.NewReader(script)
+	return cmd.CombinedOutput()
 }
 
 // requireNode discovers the node binary with a strict CI fail-closed invariant:
@@ -58,17 +61,17 @@ func requireNode(t *testing.T) string {
 	return nodePath
 }
 
-// execNodeScript executes a JavaScript snippet using the provided node binary via standard input.
-func execNodeScript(nodePath, script string) ([]byte, error) {
-	cmd := exec.Command(nodePath)
-	cmd.Stdin = strings.NewReader(script)
-	return cmd.CombinedOutput()
-}
-
-// checkJSDOMOutput verifies execution output against JSDOM availability.
-// Under CI, missing JSDOM triggers t.Fatalf (fail-closed); in local environments it skips.
-func checkJSDOMOutput(t *testing.T, out []byte) {
+// requireJSDOM ensures both Node and JSDOM are available, failing closed under CI.
+func requireJSDOM(t *testing.T) string {
 	t.Helper()
+	nodePath := requireNode(t)
+	out, err := execNodeScript(nodePath, jsdomBootstrapSnippet+`console.log("JSDOM_READY");`)
+	if err != nil {
+		if isCIEnvironment() {
+			t.Fatalf("jsdom probe failed in CI environment: %v\nOutput:\n%s", err, string(out))
+		}
+		t.Skipf("skipping test: jsdom probe failed: %v", err)
+	}
 	outStr := string(out)
 	if strings.Contains(outStr, "JSDOM_NOT_AVAILABLE") {
 		if isCIEnvironment() {
@@ -76,47 +79,33 @@ func checkJSDOMOutput(t *testing.T, out []byte) {
 		}
 		t.Skip("jsdom is not available in Node environment")
 	}
-}
-
-// runJSDOMTestScript executes a script with node and enforces JSDOM fail-closed/skip semantics.
-func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
-	t.Helper()
-	out, err := execNodeScript(nodePath, testScript)
-	if err != nil {
-		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
-	}
-	checkJSDOMOutput(t, out)
-	return string(out)
-}
-
-// requireJSDOM ensures both Node and JSDOM are available, failing closed under CI.
-func requireJSDOM(t *testing.T) string {
-	t.Helper()
-	nodePath := requireNode(t)
-	probeScript := jsdomBootstrapSnippet + `console.log("JSDOM_READY");`
-	out, err := execNodeScript(nodePath, probeScript)
-	if err != nil {
-		if isCIEnvironment() {
-			t.Fatalf("jsdom probe failed in CI environment: %v\nOutput:\n%s", err, string(out))
-		}
-		t.Skipf("skipping test: jsdom probe failed: %v", err)
-	}
-	checkJSDOMOutput(t, out)
 	return nodePath
 }
 
 const jsdomBootstrapSnippet = `
-const fs = require('fs'), assert = require('assert'), path = require('path');
+const fs = require('fs');
+const assert = require('assert');
+const path = require('path');
+
 const home = process.env.HOME || process.env.USERPROFILE || '';
-[home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
- home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
- process.env.NODE_PATH || ''].filter(Boolean).forEach(p => {
-    if (fs.existsSync(p) && !module.paths.includes(p)) module.paths.push(p);
+const searchPaths = [
+    home ? path.join(home, '.hermes', 'hermes-agent', 'node_modules') : '',
+    home ? path.join(home, '.cache', 'typescript', '6.0', 'node_modules') : '',
+    process.env.NODE_PATH || ''
+].filter(Boolean);
+searchPaths.forEach(p => {
+    if (fs.existsSync(p) && !module.paths.includes(p)) {
+        module.paths.push(p);
+    }
 });
+
 try {
     const globalRoot = require('child_process').execSync('npm root -g').toString().trim();
-    if (globalRoot && !module.paths.includes(globalRoot)) module.paths.push(globalRoot);
+    if (globalRoot && !module.paths.includes(globalRoot)) {
+        module.paths.push(globalRoot);
+    }
 } catch (_) {}
+
 let JSDOM;
 try {
     JSDOM = require('jsdom').JSDOM;
@@ -129,18 +118,9 @@ try {
 const jsdomFakeClockSnippet = `
 class FakeClock {
     constructor() { this.now = 0; this.timers = []; this.nextId = 1; }
-    setTimeout(fn, delay, ...args) {
-        const id = this.nextId++;
-        this.timers.push({ id, fn, time: this.now + Math.max(0, delay || 0), args, interval: 0 });
-        return id;
-    }
+    setTimeout(fn, delay, ...args) { const id = this.nextId++; this.timers.push({ id, fn, time: this.now + Math.max(0, delay || 0), args, interval: 0 }); return id; }
     clearTimeout(id) { this.timers = this.timers.filter(t => t.id !== id); }
-    setInterval(fn, delay, ...args) {
-        const id = this.nextId++;
-        const interval = Math.max(1, delay || 1);
-        this.timers.push({ id, fn, time: this.now + interval, args, interval });
-        return id;
-    }
+    setInterval(fn, delay, ...args) { const id = this.nextId++; const interval = Math.max(1, delay || 1); this.timers.push({ id, fn, time: this.now + interval, args, interval }); return id; }
     clearInterval(id) { this.clearTimeout(id); }
     tick(ms) {
         const target = this.now + ms;
@@ -203,21 +183,15 @@ type JSDOMHarnessOptions struct {
 // In CI environments, missing Node binary fails closed with t.Fatalf.
 func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	t.Helper()
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	tmplFS, err1 := GetTemplatesSubFS()
+	staticFS, err2 := GetStaticSubFS()
+	if err := errors.Join(err1, err2); err != nil {
+		t.Fatalf("filesystem sub-FS initialization failed: %v", err)
 	}
-	vpnBytes, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
-	}
-	staticFS, err := GetStaticSubFS()
-	if err != nil {
-		t.Fatalf("GetStaticSubFS failed: %v", err)
-	}
-	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
-	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+	vpnBytes, err1 := fs.ReadFile(tmplFS, "vpn.html")
+	cssBytes, err2 := fs.ReadFile(staticFS, "css/style.css")
+	if err := errors.Join(err1, err2); err != nil {
+		t.Fatalf("failed reading fixture files: %v", err)
 	}
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnBytes)))
 	if err != nil {
@@ -235,6 +209,16 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 		ParsedDOM:    doc,
 		MockFetches:  make(map[string]string),
 	}
+}
+
+// WithT returns a shallow copy of the fixture bound to the active subtest *testing.T.
+func (f *VPNTestFixture) WithT(t *testing.T) *VPNTestFixture {
+	if t != nil {
+		t.Helper()
+	}
+	clone := *f
+	clone.t = t
+	return &clone
 }
 
 func (f *VPNTestFixture) RequireNode() string {
@@ -316,16 +300,13 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 		extracted.WriteString(code + "\n")
 	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
-		dir, strings.ReplaceAll(f.StyleCSS, "`", "\\`"), strings.ReplaceAll(htmlBody, "`", "\\`"))
+		dir, f.StyleCSS, htmlBody)
 	b.WriteString(fmt.Sprintf(`
 const dom = new JSDOM(%q, { pretendToBeVisual: true, runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 if (typeof fakeClock !== 'undefined') {
     w.fakeClock = fakeClock;
-    w.setTimeout = fakeClock.setTimeout.bind(fakeClock);
-    w.clearTimeout = fakeClock.clearTimeout.bind(fakeClock);
-    w.setInterval = fakeClock.setInterval.bind(fakeClock);
-    w.clearInterval = fakeClock.clearInterval.bind(fakeClock);
+    ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].forEach(m => { w[m] = fakeClock[m].bind(fakeClock); });
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
@@ -338,20 +319,31 @@ w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
 
 func (f *VPNTestFixture) RunJSDOM(script string) string {
 	f.t.Helper()
-	nodePath := f.RequireNode()
-	return runJSDOMTestScript(f.t, nodePath, script)
+	return runJSDOMTestScript(f.t, f.RequireNode(), script)
+}
+
+func (f *VPNTestFixture) RunJSDOMForT(t *testing.T, script string) string {
+	t.Helper()
+	return f.WithT(t).RunJSDOM(script)
 }
 
 func findHTMLNodeByID(n *xhtml.Node, id string) *xhtml.Node {
+	if id == "" {
+		return nil
+	}
 	if n == nil {
 		return nil
 	}
-	if n.Type == xhtml.ElementNode && getHTMLNodeAttr(n, "id") == id {
-		return n
+	if n.Type == xhtml.ElementNode {
+		for _, attr := range n.Attr {
+			if attr.Key == "id" && attr.Val == id {
+				return n
+			}
+		}
 	}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		if found := findHTMLNodeByID(c, id); found != nil {
-			return found
+		if res := findHTMLNodeByID(c, id); res != nil {
+			return res
 		}
 	}
 	return nil
@@ -369,7 +361,8 @@ func getHTMLNodeAttr(n *xhtml.Node, key string) string {
 	return ""
 }
 
-func findHTMLNodesByTag(n *xhtml.Node, tag string) (results []*xhtml.Node) {
+func findHTMLNodesByTag(n *xhtml.Node, tag string) []*xhtml.Node {
+	var results []*xhtml.Node
 	var walk func(*xhtml.Node)
 	walk = func(curr *xhtml.Node) {
 		if curr == nil {
@@ -405,6 +398,22 @@ func getHTMLNodeText(n *xhtml.Node) string {
 	return strings.TrimSpace(b.String())
 }
 
+func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
+	t.Helper()
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "JSDOM_NOT_AVAILABLE") {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("jsdom is not available in CI environment: %s", outStr)
+		}
+		t.Skip("jsdom is not available in Node environment")
+	}
+	return outStr
+}
+
 func hasHTMLClass(n *xhtml.Node, className string) bool {
 	if n == nil {
 		return false
@@ -438,7 +447,8 @@ func isHTMLDescendant(ancestor, node *xhtml.Node) bool {
 	return false
 }
 
-func countHTMLNodesByID(root *xhtml.Node, id string) (count int) {
+func countHTMLNodesByID(root *xhtml.Node, id string) int {
+	count := 0
 	var walk func(*xhtml.Node)
 	walk = func(n *xhtml.Node) {
 		if n == nil {
@@ -461,8 +471,11 @@ func findTopLevelStatsGrid(doc *xhtml.Node) *xhtml.Node {
 		if n == nil {
 			return nil
 		}
-		if n.Type == xhtml.ElementNode && hasHTMLClass(n, "stats-grid") && findClosestEnclosingCard(n) == nil {
-			return n
+		if n.Type == xhtml.ElementNode && hasHTMLClass(n, "stats-grid") {
+			// Top-level KPI grid must not be enclosed inside another card (e.g. forwarder card)
+			if findClosestEnclosingCard(n) == nil {
+				return n
+			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			if found := walk(c); found != nil {
@@ -474,37 +487,44 @@ func findTopLevelStatsGrid(doc *xhtml.Node) *xhtml.Node {
 	return walk(doc)
 }
 
-func findEnclosingCardByID(doc *xhtml.Node, id string) (*xhtml.Node, error) {
-	if count := countHTMLNodesByID(doc, id); count != 1 {
-		return nil, fmt.Errorf("expected exactly 1 #%s element, found %d", id, count)
-	}
-	node := findHTMLNodeByID(doc, id)
-	if node == nil {
-		return nil, fmt.Errorf("#%s not found", id)
-	}
-	card := findClosestEnclosingCard(node)
-	if card == nil {
-		return nil, fmt.Errorf("closest enclosing .card for #%s not found", id)
-	}
-	return card, nil
-}
-
 func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 	if doc == nil {
 		return errors.New("nil document")
 	}
+
+	// 1. Top-level KPI grid container (.stats-grid)
 	topGrid := findTopLevelStatsGrid(doc)
 	if topGrid == nil {
 		return errors.New("top-level .stats-grid container not found")
 	}
-	backendsCard, err := findEnclosingCardByID(doc, "vpnBackendsTable")
-	if err != nil {
-		return err
+
+	// 2. #vpnBackendsTable and closest enclosing outer .card
+	if count := countHTMLNodesByID(doc, "vpnBackendsTable"); count != 1 {
+		return fmt.Errorf("expected exactly 1 #vpnBackendsTable element, found %d", count)
 	}
-	sessionsCard, err := findEnclosingCardByID(doc, "vpnSessionsTable")
-	if err != nil {
-		return err
+	backendsTable := findHTMLNodeByID(doc, "vpnBackendsTable")
+	if backendsTable == nil {
+		return errors.New("#vpnBackendsTable not found")
 	}
+	backendsCard := findClosestEnclosingCard(backendsTable)
+	if backendsCard == nil {
+		return errors.New("closest enclosing .card for #vpnBackendsTable not found")
+	}
+
+	// 3. #vpnSessionsTable and closest enclosing outer .card
+	if count := countHTMLNodesByID(doc, "vpnSessionsTable"); count != 1 {
+		return fmt.Errorf("expected exactly 1 #vpnSessionsTable element, found %d", count)
+	}
+	sessionsTable := findHTMLNodeByID(doc, "vpnSessionsTable")
+	if sessionsTable == nil {
+		return errors.New("#vpnSessionsTable not found")
+	}
+	sessionsCard := findClosestEnclosingCard(sessionsTable)
+	if sessionsCard == nil {
+		return errors.New("closest enclosing .card for #vpnSessionsTable not found")
+	}
+
+	// 4. #vpn-forwarder-card
 	if count := countHTMLNodesByID(doc, "vpn-forwarder-card"); count != 1 {
 		return fmt.Errorf("expected exactly 1 #vpn-forwarder-card element, found %d", count)
 	}
@@ -515,18 +535,26 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 
 	sections := []*xhtml.Node{topGrid, backendsCard, sessionsCard, forwarderCard}
 	sectionNames := []string{"stats-grid", "backends card", "sessions card", "vpn-forwarder-card"}
+
+	// Assert distinct elements
 	for i := 0; i < len(sections); i++ {
 		for j := i + 1; j < len(sections); j++ {
 			if sections[i] == sections[j] {
 				return fmt.Errorf("sections %s and %s resolve to identical element", sectionNames[i], sectionNames[j])
 			}
 		}
+	}
+
+	// Assert no section is a descendant of another
+	for i := 0; i < len(sections); i++ {
 		for j := 0; j < len(sections); j++ {
 			if i != j && isHTMLDescendant(sections[i], sections[j]) {
 				return fmt.Errorf("section %s is nested within / descendant of section %s", sectionNames[j], sectionNames[i])
 			}
 		}
 	}
+
+	// Assert all 4 section containers share the exact same immediate parent element
 	parent := topGrid.Parent
 	if parent == nil {
 		return errors.New("top-level .stats-grid has nil parent")
@@ -537,6 +565,8 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		}
 	}
 
+	// Sibling index sequence in parent container strictly:
+	// stats-grid -> backends card -> sessions card -> vpn-forwarder-card
 	getSiblingIndex := func(target *xhtml.Node) int {
 		idx := 0
 		for c := parent.FirstChild; c != nil; c = c.NextSibling {
@@ -547,15 +577,21 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		}
 		return -1
 	}
-	idxStats, idxBackends := getSiblingIndex(topGrid), getSiblingIndex(backendsCard)
-	idxSessions, idxForwarder := getSiblingIndex(sessionsCard), getSiblingIndex(forwarderCard)
+
+	idxStats := getSiblingIndex(topGrid)
+	idxBackends := getSiblingIndex(backendsCard)
+	idxSessions := getSiblingIndex(sessionsCard)
+	idxForwarder := getSiblingIndex(forwarderCard)
+
 	if idxStats == -1 || idxBackends == -1 || idxSessions == -1 || idxForwarder == -1 {
 		return errors.New("failed to resolve sibling indices in immediate parent")
 	}
+
 	if !(idxStats < idxBackends && idxBackends < idxSessions && idxSessions < idxForwarder) {
 		return fmt.Errorf("invalid sibling order: stats-grid=%d, backends-card=%d, sessions-card=%d, vpn-forwarder-card=%d (expected stats < backends < sessions < forwarder)",
 			idxStats, idxBackends, idxSessions, idxForwarder)
 	}
+
 	return nil
 }
 
@@ -569,7 +605,8 @@ func extractJSFunction(source, funcName string) (string, error) {
 		return "", fmt.Errorf("opening brace for %s not found", funcName)
 	}
 	braceStart += startIdx
-	depth, idx := 1, braceStart+1
+	depth := 1
+	idx := braceStart + 1
 	for idx < len(source) && depth > 0 {
 		if source[idx] == '{' {
 			depth++
@@ -598,23 +635,70 @@ func vpnDOMMock(t *testing.T, source string) string {
 class Element {
  constructor() { this.children=[];this._text='';this._html='';this.style={};this.className='';this.title='';this.open=false;this.attributes={};this.parentNode=null; }
  set textContent(s) { this._text=String(s);this._html='';this.children=[]; }
- get textContent() { return this._text || (this.children && this.children.length > 0 ? this.children.map(c => c.textContent).join('') : (this._html ? this._html.replace(/<[^>]*>/g, '') : '')); }
+ get textContent() {
+   if (this._text) return this._text;
+   if (this.children && this.children.length > 0) return this.children.map(c => c.textContent).join('');
+   if (this._html) return this._html.replace(/<[^>]*>/g, '');
+   return '';
+ }
  set innerHTML(s) { this._html=String(s);this._text='';this.children=[]; }
- get innerHTML() { return this._html || (this.children && this.children.length > 0 ? this.children.map(c => c.innerHTML).join('') : ''); }
+ get innerHTML() {
+   if (this._html) return this._html;
+   if (this.children && this.children.length > 0) return this.children.map(c => c.innerHTML).join('');
+   return '';
+ }
  appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
- insertBefore(child, ref) { child.parentNode = this; const idx = ref ? this.children.indexOf(ref) : -1; if (idx >= 0) this.children.splice(idx, 0, child); else this.children.push(child); return child; }
- remove() { if (this.parentNode && Array.isArray(this.parentNode.children)) { const idx = this.parentNode.children.indexOf(this); if (idx >= 0) this.parentNode.children.splice(idx, 1); } }
- get nextElementSibling() { if (!this.parentNode || !Array.isArray(this.parentNode.children)) return null; const idx = this.parentNode.children.indexOf(this); return (idx >= 0 && idx + 1 < this.parentNode.children.length) ? this.parentNode.children[idx + 1] : null; }
+ insertBefore(child, ref) {
+   child.parentNode = this;
+   const idx = ref ? this.children.indexOf(ref) : -1;
+   if (idx >= 0) {
+     this.children.splice(idx, 0, child);
+   } else {
+     this.children.push(child);
+   }
+   return child;
+ }
+ remove() {
+   if (this.parentNode && Array.isArray(this.parentNode.children)) {
+     const idx = this.parentNode.children.indexOf(this);
+     if (idx >= 0) this.parentNode.children.splice(idx, 1);
+   }
+ }
+ get nextElementSibling() {
+   if (!this.parentNode || !Array.isArray(this.parentNode.children)) return null;
+   const idx = this.parentNode.children.indexOf(this);
+   if (idx >= 0 && idx + 1 < this.parentNode.children.length) {
+     return this.parentNode.children[idx + 1];
+   }
+   return null;
+ }
  get nextSibling() { return this.nextElementSibling; }
  get firstChild() { return this.children && this.children.length > 0 ? this.children[0] : null; }
  get lastChild() { return this.children && this.children.length > 0 ? this.children[this.children.length - 1] : null; }
  get classList() {
-   const self = this, getSet = () => new Set((self.className || '').split(/\s+/).filter(Boolean));
+   const self = this;
    return {
-     add(...classes) { const s = getSet(); classes.forEach(c => s.add(c)); self.className = Array.from(s).join(' '); },
-     remove(...classes) { const s = getSet(); classes.forEach(c => s.delete(c)); self.className = Array.from(s).join(' '); },
-     contains(c) { return getSet().has(c); },
-     toggle(c, force) { const s = getSet(); const has = s.has(c), want = force !== undefined ? !!force : !has; if (want) s.add(c); else s.delete(c); self.className = Array.from(s).join(' '); return want; }
+     add(...classes) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       for (const c of classes) set.add(c);
+       self.className = Array.from(set).join(' ');
+     },
+     remove(...classes) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       for (const c of classes) set.delete(c);
+       self.className = Array.from(set).join(' ');
+     },
+     contains(c) {
+       return (self.className || '').split(/\s+/).filter(Boolean).includes(c);
+     },
+     toggle(c, force) {
+       const set = new Set((self.className || '').split(/\s+/).filter(Boolean));
+       const has = set.has(c);
+       const want = force !== undefined ? !!force : !has;
+       if (want) set.add(c); else set.delete(c);
+       self.className = Array.from(set).join(' ');
+       return want;
+     }
    };
  }
  set id(val) { this._id = String(val); elements.set(String(val), this); }
@@ -624,10 +708,16 @@ class Element {
  querySelector() { return null; }
  querySelectorAll() { return []; }
 }
-const elements = new Map(), dynamicIDs = new Set(['vpnSessionsStaleBanner']);
+const elements = new Map();
+const dynamicIDs = new Set(['vpnSessionsStaleBanner']);
 const document = {
- reset() { elements.clear(); for (const id of templateIDs) elements.set(id, new Element()); },
- getElementById(id) { if (elements.has(id)) return elements.get(id); if (dynamicIDs.has(id)) return null; assert(elements.has(id), 'DOM id missing from actual template: '+id); return null; },
+ reset() { elements.clear(); for (const id of templateIDs) elements.set(id,new Element()); },
+ getElementById(id) {
+   if (elements.has(id)) return elements.get(id);
+   if (dynamicIDs.has(id)) return null;
+   assert(elements.has(id), 'DOM id missing from actual template: '+id);
+   return null;
+ },
  createElement() { return new Element(); },
  createTextNode(s) { const el = new Element(); el.textContent = String(s); return el; }
 };
@@ -646,7 +736,8 @@ func vpnDiagnosticsLocale(t *testing.T, lang string) map[string]string {
 		t.Fatal(err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
 		t.Fatalf("invalid locale object: %s", lang)
 	}
 	dict := make(map[string]string)
@@ -694,6 +785,8 @@ func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
 	}
 	result := "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
 	for _, name := range []string{"vpnDiagText", "vpnStatusLabel", "vpnLossReasonLabels"} {
+		// The original template has no interpolation helper; baseline repro still
+		// executes its real renderer instead of failing only on missing source.
 		if !strings.Contains(source, "function "+name+"(") {
 			continue
 		}
@@ -728,16 +821,25 @@ func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]str
 
 func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	fields := map[string]string{
-		"vpn-diag-throughput": "vpn_fwd_kpi_throughput", "vpn-diag-ewma5m": "vpn_diag_avg_5m",
-		"vpn-diag-ewma1h": "vpn_diag_avg_1h", "vpn-diag-queue-occ": "vpn_diag_occupancy",
-		"vpn-diag-queue-peak": "vpn_forwarder_peak", "vpn-diag-lat-max": "vpn_diag_max_duration",
-		"vpn-diag-drops-client": "vpn_diag_drops_outbound", "vpn-diag-drops-return": "vpn_diag_drops_inbound",
-		"vpn-diag-drops-total": "vpn_diag_total_drop_rate", "vpn-diag-engine-status": "vpn_diag_engine",
-		"vpn-diag-hs-freshness": "vpn_diag_handshake_freshness", "vpn-diag-routing-counts": "vpn_diag_route_integrity",
-		"vpn-diag-res-cpu": "vpn_diag_cpu_usage", "vpn-diag-res-mem": "vpn_diag_memory", "vpn-diag-res-fd": "vpn_diag_file_descriptors",
+		"vpn-diag-throughput":     "vpn_fwd_kpi_throughput",
+		"vpn-diag-ewma5m":         "vpn_diag_avg_5m",
+		"vpn-diag-ewma1h":         "vpn_diag_avg_1h",
+		"vpn-diag-queue-occ":      "vpn_diag_occupancy",
+		"vpn-diag-queue-peak":     "vpn_forwarder_peak",
+		"vpn-diag-lat-max":        "vpn_diag_max_duration",
+		"vpn-diag-drops-client":   "vpn_diag_drops_outbound",
+		"vpn-diag-drops-return":   "vpn_diag_drops_inbound",
+		"vpn-diag-drops-total":    "vpn_diag_total_drop_rate",
+		"vpn-diag-engine-status":  "vpn_diag_engine",
+		"vpn-diag-hs-freshness":   "vpn_diag_handshake_freshness",
+		"vpn-diag-routing-counts": "vpn_diag_route_integrity",
+		"vpn-diag-res-cpu":        "vpn_diag_cpu_usage",
+		"vpn-diag-res-mem":        "vpn_diag_memory",
+		"vpn-diag-res-fd":         "vpn_diag_file_descriptors",
 	}
 	labels := make(map[string]string)
-	for _, match := range regexp.MustCompile(`<div class="flex justify-between"><span class="text-muted">([^<]+)</span><span class="font-mono" id="([^"]+)"`).FindAllStringSubmatch(rendered, -1) {
+	fieldPattern := regexp.MustCompile(`<div class="flex justify-between"><span class="text-muted">([^<]+)</span><span class="font-mono" id="([^"]+)"`)
+	for _, match := range fieldPattern.FindAllStringSubmatch(rendered, -1) {
 		labels[match[2]] = html.UnescapeString(match[1])
 	}
 	for id, key := range fields {
@@ -745,9 +847,14 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key]+":")
 		}
 	}
-	for id, key := range map[string]string{"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization", "drops": "vpn_diag_drop_rate", "latency": "vpn_diag_latency_p95"} {
-		match := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);\">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`).FindStringSubmatch(rendered)
-		if len(match) != 2 || html.UnescapeString(match[1]) != dict[key] {
+	for id, key := range map[string]string{
+		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
+		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_latency_p95",
+	} {
+		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`)
+		match := pattern.FindStringSubmatch(rendered)
+		expected := dict[key]
+		if len(match) != 2 || html.UnescapeString(match[1]) != expected {
 			return fmt.Errorf("static chart %s is not localized", id)
 		}
 	}
@@ -788,25 +895,30 @@ func TestVPNTestFixture(t *testing.T) {
 	}
 
 	t.Run("DOMQueryHelpers", func(t *testing.T) {
-		topCard := fixture.FindByID("vpn-forwarder-card")
+		fx := fixture.WithT(t)
+		topCard := fx.FindByID("vpn-forwarder-card")
 		if topCard == nil {
 			t.Fatal("expected to find #vpn-forwarder-card")
 		}
-		tables := fixture.FindByTag("table")
+		tables := fx.FindByTag("table")
 		if len(tables) == 0 {
 			t.Fatal("expected at least one table in vpn.html")
 		}
-		if err := fixture.ValidateDashboardOrder(); err != nil {
+		if err := fx.ValidateDashboardOrder(); err != nil {
 			t.Fatalf("dashboard DOM order validation failed: %v", err)
+		}
+		if none := fx.FindByID(""); none != nil {
+			t.Fatalf("expected FindByID(\"\") to return nil, got %v", none)
 		}
 	})
 
 	t.Run("LocalizationInjection", func(t *testing.T) {
-		enDict := fixture.Locale("en")
+		fx := fixture.WithT(t)
+		enDict := fx.Locale("en")
 		if len(enDict) == 0 {
 			t.Fatal("expected non-empty en locale dict")
 		}
-		rendered := fixture.RenderedHTML("en")
+		rendered := fx.RenderedHTML("en")
 		if len(rendered) == 0 {
 			t.Fatal("expected non-empty rendered HTML")
 		}
@@ -816,8 +928,9 @@ func TestVPNTestFixture(t *testing.T) {
 	})
 
 	t.Run("JSDOMFakeClockAndMockFetch", func(t *testing.T) {
-		fixture.MockEndpoint("/api/vpn/status", `{"forwarder_available": true, "status": "HEALTHY"}`)
-		testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		fx := fixture.WithT(t)
+		fx.MockEndpoint("/api/vpn/status", `{"forwarder_available": true, "status": "HEALTHY"}`)
+		testScript := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
 			IncludeFakeClock: true,
 			IncludeFetchMock: true,
 			ExtraJS: `
@@ -827,34 +940,47 @@ func TestVPNTestFixture(t *testing.T) {
     assert.strictEqual(timerFired, false, 'timer should not fire before tick');
     w.fakeClock.tick(500);
     assert.strictEqual(timerFired, true, 'timer should fire after tick');
-
     const res = await w.fetch('/api/vpn/status');
     const data = await res.json();
     assert.strictEqual(data.forwarder_available, true, 'mock fetch must return payload');
     assert.strictEqual(data.status, 'HEALTHY', 'mock fetch payload match');
-
     console.log('FIXTURE_JSDOM_PASS');
-})().catch(e => {
-    console.error(e);
-    process.exit(1);
-});
+})().catch(e => { console.error(e); process.exit(1); });
 `,
 		})
-		out := fixture.RunJSDOM(testScript)
+		out := fx.RunJSDOM(testScript)
 		if !strings.Contains(out, "FIXTURE_JSDOM_PASS") {
 			t.Fatalf("expected FIXTURE_JSDOM_PASS, got: %s", out)
+		}
+	})
+
+	t.Run("BacktickPreservationInHarness", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		harness := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
+			HTML: `<div id="backtick-test">` + "`literal_backtick`" + `</div>`,
+		})
+		if strings.Contains(harness, `\`+"`") {
+			t.Fatalf("BuildJSDOMHarness must not escape backticks with backslashes; found backslash-escaped backtick")
+		}
+		if !strings.Contains(harness, "`literal_backtick`") {
+			t.Fatalf("BuildJSDOMHarness must contain raw backtick literal")
+		}
+	})
+
+	t.Run("WithTSubtestBinding", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		if fx.t != t {
+			t.Fatalf("expected fx.t to be subtest t, got %v", fx.t)
 		}
 	})
 
 	t.Run("FailClosedCIInvariant", func(t *testing.T) {
 		origCI := os.Getenv("CI")
 		defer os.Setenv("CI", origCI)
-
 		os.Setenv("CI", "")
 		if isCIEnvironment() {
 			t.Fatal("expected isCIEnvironment() to be false when CI=''")
 		}
-
 		for _, v := range []string{"true", "1", "TRUE"} {
 			os.Setenv("CI", v)
 			if !isCIEnvironment() {
