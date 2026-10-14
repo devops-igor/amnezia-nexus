@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder/thresholds"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 )
 
 // problemOnsetTracker retains the original onset timestamp of active actionable problems
@@ -517,4 +519,82 @@ func enrichByUserID(p *ActionableProblem, sessions []Session, connByPeer, userBy
 			}
 		}
 	}
+}
+
+// collectProblemRoutes converts forwarder RouteInfo slices into ProblemRouteItem diagnostics.
+func collectProblemRoutes(routes []forwarder.RouteInfo) []ProblemRouteItem {
+	items := make([]ProblemRouteItem, len(routes))
+	for i, r := range routes {
+		var note string
+		if r.HasPressure {
+			switch {
+			case r.Stats.QueueFullDropsRecent > 0:
+				note = fmt.Sprintf("Recent queue drops: %d", r.Stats.QueueFullDropsRecent)
+			case r.Stats.Capacity > 0 && float64(r.Stats.Occupancy)/float64(r.Stats.Capacity) >= thresholds.RoutePressureUtilization():
+				note = fmt.Sprintf("Queue pressure: %d/%d queued", r.Stats.Occupancy, r.Stats.Capacity)
+			case r.Stats.WriteErrorsRecent > 0:
+				note = fmt.Sprintf("Recent write errors: %d", r.Stats.WriteErrorsRecent)
+			case r.Stats.WriteStallsRecent > 0:
+				note = fmt.Sprintf("Recent write stalls: %d", r.Stats.WriteStallsRecent)
+			case r.Stats.OldestWriteMS >= forwarder.DeviceWriteStallThreshold.Milliseconds():
+				note = fmt.Sprintf("Write in flight: %dms", r.Stats.OldestWriteMS)
+			}
+		}
+
+		var utilization, highWaterPct float64
+		if r.Stats.Capacity > 0 {
+			utilization = float64(r.Stats.Occupancy) / float64(r.Stats.Capacity) * 100
+			highWaterPct = float64(r.Stats.HighWater) / float64(r.Stats.Capacity) * 100
+		}
+		var reservoir *RouteReservoirItem
+		if r.Stats.P95WriteSamples > 0 || r.Stats.MaxWriteDurationMS > 0 || r.Stats.P95WriteMS > 0 {
+			reservoir = &RouteReservoirItem{
+				P95MS:   float64(r.Stats.P95WriteMS),
+				Samples: r.Stats.P95WriteSamples,
+				MaxMS:   float64(r.Stats.MaxWriteDurationMS),
+			}
+		}
+		dropRatePPS := r.Stats.QueueFullDropRatePPS
+		items[i] = ProblemRouteItem{
+			SessionID:            r.SessionID,
+			ConnectionID:         r.ConnectionID,
+			Reservoir:            reservoir,
+			UtilizationPct:       utilization,
+			HighWaterPct:         highWaterPct,
+			WriteCount:           r.Stats.WriteCount,
+			WriteErrors:          r.Stats.WriteErrors,
+			WriteStalls:          r.Stats.WriteStalls,
+			WritesInFlight:       r.Stats.WritesInFlight,
+			OldestWriteMS:        r.Stats.OldestWriteMS,
+			MaxWriteMS:           r.Stats.MaxWriteDurationMS,
+			P95WriteSamples:      r.Stats.P95WriteSamples,
+			QueueFullDropsRecent: r.Stats.QueueFullDropsRecent,
+			QueueFullDropRatePPS: dropRatePPS,
+			WriteErrorsRecent:    r.Stats.WriteErrorsRecent,
+			WriteStallsRecent:    r.Stats.WriteStallsRecent,
+			Traffic:              r.Traffic,
+			SessionAgeSec:        r.SessionAgeSec,
+			LastTrafficAgeSec:    r.LastTrafficAgeSec,
+			// Redacted at the API boundary, not in the UI (issue #424 round 4,
+			// item E). The JSON payload IS the disclosure surface: a raw peer
+			// public key shipped to a browser, a log shipper or a support
+			// bundle is already disclosed even if every template masks it. The
+			// value uses ingress.RedactKey, the redaction convention the rest of
+			// the system already uses for peer keys, so the diagnostics surface
+			// renders keys identically to ingress errors and counters. The key
+			// name, presence and non-emptiness are unchanged: an admin still
+			// sees a stable per-route identifier.
+			PeerKey:      ingress.RedactKey(r.PeerKey),
+			AssignedIP:   r.AssignedIP,
+			BackendID:    r.BackendTunnelID,
+			Occupancy:    r.Stats.Occupancy,
+			Capacity:     r.Stats.Capacity,
+			HighWater:    r.Stats.HighWater,
+			Drops:        r.Stats.QueueFullDrops,
+			P95WriteMS:   float64(r.Stats.P95WriteMS),
+			HasPressure:  r.HasPressure,
+			PressureNote: note,
+		}
+	}
+	return items
 }
