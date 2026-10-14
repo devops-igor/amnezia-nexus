@@ -41,10 +41,13 @@ The inline script in `web/templates/vpn.html` spans lines 501–3757 (~3,256 lin
 |   Table      |   | - KPI Status Bar  |  | - Condition Parsers|  |   SVG Math   |   |   Table DOM  |
 | - Drilldown  |   | - Headline Status |  | - Entity Extraction|  | - 1m..24h    |   | - Add/Edit   |
 |   Rows       |   | - Route Tooltips  |  | - Severity Badges  |  |   Window Tgl |   |   Modal      |
-| - Stale      |   | - Formatters      |  | - Tech Details     |  | - Tooltips & |   | - Quick Ping |
-|   Banner     |   |   (fmtBps/fmtPps) |  |   Accordion        |  |   Hover Pres |   |   SSH Check  |
-| - Problem    |   |                   |  | - Diag Panels 1-4  |  | - Series     |   | - Endpoint   |
+| - Stale      |   | - Nested          |  | - Tech Details     |  | - Tooltips & |   | - Quick Ping |
+|   Banner     |   |   Formatters      |  |   Accordion        |  |   Hover Pres |   |   SSH Check  |
+| - Problem    |   |   (fmtBps/fmtPps) |  | - Diag Panels 1-4  |  | - Series     |   | - Endpoint   |
 |   Filter     |   |                   |  |                    |  |   Rendering  |   |   Modal      |
+| - Rate       |   |                   |  |                    |  |              |   |              |
+|   Formatters |   |                   |  |                    |  |              |   |              |
+|   (Top-Level)|   |                   |  |                    |  |              |   |              |
 +--------------+   +-------------------+  +--------------------+  +--------------+   +--------------+
        \                    \                     /                     /                    /
         \                    \                   /                     /                    /
@@ -67,13 +70,15 @@ The inline script in `web/templates/vpn.html` spans lines 501–3757 (~3,256 lin
 
 1. **`web/static/js/vpn/sessions.js` (Target Issue #495 — ~520 lines)**:
    - **Responsibilities**: Session troubleshooting table rendering, row drilldown generation, accordion toggling, problem-only filtering, stale session state handling, sorting/filtering via `NexusTable`.
-   - **Primary Functions**: `renderSessions`, `vpnRenderSessionRow`, `vpnCreateSessionDrilldownRow`, `vpnToggleSessionDrilldown`, `vpnSyncExpandedDrilldowns`, `vpnToggleSessionsProblemFilter`, `vpnRenderSessionsStaleBanner`, `vpnFindSessionById`, `vpnFindRouteForSession`, `vpnWrapSessionsTableRender`, `vpnFormatBytes`.
-   - **Note on Helpers**: Formatting functions `fmtBps` and `fmtPps` are scoped internally within `vpnRenderForwarderHealth` (`vpn.html:2328-2336`), rather than top-level session helpers.
+   - **Primary Functions**: `renderSessions`, `vpnRenderSessionRow`, `vpnCreateSessionDrilldownRow`, `vpnToggleSessionDrilldown`, `vpnSyncExpandedDrilldowns`, `vpnToggleSessionsProblemFilter`, `vpnRenderSessionsStaleBanner`, `vpnFindSessionById`, `vpnFindRouteForSession`, `vpnWrapSessionsTableRender`, `vpnFormatBytes`, `fmtBps` (top-level rate formatter), `fmtPps` (top-level packet rate formatter).
+   - **Rate Formatter Scoping Contract (Dual-Scope Invariant — Finding 1)**: In `web/templates/vpn.html`, two distinct scopes of rate formatters exist:
+     * *Top-Level Formatters (`vpn.html:1027–1040`)*: Globally defined functions `fmtBps(bps)` and `fmtPps(pps)`. These are actively invoked by the sessions table traffic cell renderer (`tdTraffic.textContent = ↓ ${fmtBps(rx)} ↑ ${fmtBps(tx)}` at line 1186) and the session drilldown row renderer (lines 1311–1314: `fmtPps(trf.rx_pps)`, `fmtBps(...)`). They are assigned to `web/static/js/vpn/sessions.js` (or a shared formatting utility loaded before sessions), ensuring sessions rendering retains formatter availability throughout progressive migration waves.
+     * *Health-Nested Shadowing Formatters (`vpn.html:2328–2339`)*: Identically named helpers defined locally inside `function vpnRenderForwarderHealth(status)` for forwarder headline and KPI summary rendering. These health-local shadowing formatters remain encapsulated within `web/static/js/vpn/health_summary.js`.
    - **State Ownership**: `vpnSessionsTableInstance`, `vpnLastSessions`, `vpnSessionsStale`, `vpnSessionsFilterOnlyProblems`, `vpnExpandedSessionIds`.
 
 2. **`web/static/js/vpn/health_summary.js` (Target Issue #496a — ~450 lines)**:
    - **Responsibilities**: Forwarder health status banner, forwarder headline status, KPI summary bar (throughput, routes/sessions, queue pressure, packet loss, client engine, peer sync, healthy backends, slow writes), route tooltip generation, duration and rate formatting helpers.
-   - **Primary Functions**: `vpnRenderForwarderHealth` (top-level orchestration and summary sections), `routeTooltip`, `fmtBps` (nested bps formatter), `fmtPps` (nested pps formatter), `fmtDurationSec`, `vpnFormatCountersSince`.
+   - **Primary Functions**: `vpnRenderForwarderHealth` (top-level orchestration and summary sections), `routeTooltip`, `fmtBps` (health-nested shadowing bps formatter, `vpn.html:2328–2334`), `fmtPps` (health-nested shadowing pps formatter, `vpn.html:2335–2340`), `fmtDurationSec`, `vpnFormatCountersSince`.
    - **State Ownership**: `vpnShowAllRoutes`, reads `vpnLastStatus`.
 
 3. **`web/static/js/vpn/health_problems.js` (Target Issue #496b — ~850 lines)**:
@@ -109,10 +114,23 @@ The inline script in `web/templates/server.html` spans lines 598–1795 (~1,198 
 #### Breaking Dependency Cycles (Finding 2)
 In the existing monolithic script:
 - Server actions call `checkServer` (`server.html:989`) upon container toggles.
-- Monitoring's `checkServer` calls `getProtoTitle` (`server.html:771`).
-- `updateProtocolCard` dynamically constructs DOM nodes with action handlers (`uninstallProtocol`, `selectProtocolForConns` in `server.html:883-966`).
+- Monitoring's `checkServer` calls `getProtoTitle` (`server.html:771`) and `updateProtocolCard` (`server.html:766`).
+- `updateProtocolCard` dynamically constructs DOM nodes with action handlers (`uninstallProtocol`, `selectProtocolForConns`, `toggleContainer`, `showServerConfig` in `server.html:883–966`) and directly invokes `showConnectionsSection()` (`server.html:898`).
 
-Placing these into two mutually dependent modules (`actions.js` and `monitoring.js`) creates a circular dependency. Under Phase 3, this cycle is broken by introducing an explicit shared helper layer: `web/static/js/server/shared.js`:
+If `showConnectionsSection` remains in monitoring, this introduces a reverse dependency cycle: `monitoring.js` -> `shared.js` -> `monitoring.js`. Furthermore, directly wiring action handlers creates tight coupling from the card builder into both `actions.js` and `monitoring.js`.
+
+Under Phase 3, these dependency cycles are broken by establishing a strictly unidirectional architecture anchored by `web/static/js/server/shared.js`:
+1. **Shared Section-Visibility Primitives**: Move `showConnectionsSection` (`server.html:1035–1038`) and `hideConnectionsSection` (`server.html:1040–1051`) into `web/static/js/server/shared.js`. Because section visibility is a shared DOM primitive, `updateProtocolCard` invokes `showConnectionsSection` entirely within `server/shared.js`. Both `server/monitoring.js` (`checkServer:782` calling `hideConnectionsSection`) and `server/actions.js` consume section visibility directly from `server/shared.js`.
+2. **Action Callback Registration & Event Dispatch Interface**: Decouple protocol card buttons from direct module functions via an explicit action registry and event dispatch contract:
+   - `server/shared.js` provides `registerProtocolActionHandler(action, handler)` and `dispatchProtocolAction(action, proto)` (or delegates via custom DOM events on `#protocolCardsGrid`: `nexus:protocol-action` with detail `{ action, proto }`).
+   - `server/monitoring.js` registers its handler for `selectProtocolForConns` (`action === 'select-conns'`).
+   - `server/actions.js` registers handlers for `uninstallProtocol` (`action === 'uninstall'`), `toggleContainer` (`action === 'toggle'`), and `showServerConfig` (`action === 'config'`).
+   - When actions complete (e.g. after container toggle or uninstall), `server/actions.js` dispatches a `nexus:server-refresh` event (or calls `ServerShared.requestServerCheck()`) that `monitoring.js` subscribes to, eliminating direct cyclic calls into `checkServer`.
+3. **Strictly Acyclic Directed Graph**:
+   - `server/shared.js` is an independent leaf module with **ZERO outgoing dependencies** on `monitoring.js` or `actions.js`.
+   - `server/monitoring.js` depends downward on `server/shared.js` (for card building, protocol metadata, section visibility, and action registration).
+   - `server/actions.js` depends downward on `server/shared.js` (for section visibility, date formatting, action registration, and event notification).
+   - All dependency arrows point strictly downward to `server/shared.js`.
 
 ```
 +-----------------------------------------------------------------------------+
@@ -131,12 +149,14 @@ Placing these into two mutually dependent modules (`actions.js` and `monitoring.
 |       (Issue #501)               |        |       (Issue #502)               |
 |                                  |        |                                  |
 | - Protocol Installation Stepper  |        | - Background Telemetry Polling   |
-| - Protocol Uninstall & Toggles   |        | - Reachability Auto-Trial Badges |
-| - Server Config View / Save      |        | - Protocol Card Live Status      |
-| - Server Rename Modal            |        | - Client Connections Table Fetch |
-| - Edit Host Modal (RFC/IP check) |        | - Telemetry.poll Registration    |
-| - Reboot / Clear / Remove Ops    |        | - In-memory connectionsStore     |
-| - Connection Add/Edit/Delete     |        | - Section Visibility Toggles     |
+| - Protocol Uninstall Handler     |        | - Reachability Auto-Trial Badges |
+| - Container Toggle Handler       |        | - Protocol Card Live Status      |
+| - Server Config View / Save      |        | - Client Connections Table Fetch |
+| - Server Rename Modal            |        | - Telemetry.poll Registration    |
+| - Edit Host Modal (RFC/IP check) |        | - In-memory connectionsStore     |
+| - Reboot / Clear / Remove Ops    |        | - Registers selectProtocolForConns|
+| - Connection Add/Edit/Delete     |        | - Subscribes to server-refresh   |
+| - Dispatches nexus:server-refresh|        | - Consumes shared visibility     |
 | - QR Code & Config Tab Switching |        |                                  |
 +----------------------------------+        +----------------------------------+
           \                                                   /
@@ -146,13 +166,17 @@ Placing these into two mutually dependent modules (`actions.js` and `monitoring.
                                     v
                      +-----------------------------+
                      |      server/shared.js       |
+                     |       (Issue #501a)         |
                      |                             |
                      | - Protocol Titles & Metas   |
                      |   (getProtoTitle)           |
                      | - Card Builders & Formatters|
                      |   (updateProtocolCard)      |
+                     | - Section Visibility Roots  |
+                     |   (show/hideConnectionsSec) |
+                     | - Action Registry & Dispatch|
+                     |   (registerActionHandler)   |
                      | - Status Count Summaries    |
-                     | - Shared Event Dispatchers  |
                      | - Date/Time Formatters      |
                      +-----------------------------+
 ```
@@ -160,19 +184,19 @@ Placing these into two mutually dependent modules (`actions.js` and `monitoring.
 #### Module Specifications for Server Subsystem:
 
 1. **`web/static/js/server/shared.js` (~200 lines)**:
-   - **Responsibilities**: Shared protocol metadata definitions, protocol title formatting (`getProtoTitle`), protocol status card generator (`updateProtocolCard`), status count calculation (`updateStatusCounts`), shared date/time formatting (`formatDate`), and action event dispatch hooks.
-   - **Primary Functions**: `getProtoTitle`, `updateProtocolCard`, `updateStatusCounts`, `formatDate`.
+   - **Responsibilities**: Shared protocol metadata definitions, protocol title formatting (`getProtoTitle`), protocol status card generator (`updateProtocolCard`), shared section visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), protocol action callback registration and event dispatch hooks (`registerProtocolActionHandler`, `dispatchProtocolAction`), status count calculation (`updateStatusCounts`), and shared date/time formatting (`formatDate`).
+   - **Primary Functions**: `getProtoTitle`, `updateProtocolCard`, `showConnectionsSection`, `hideConnectionsSection`, `registerProtocolActionHandler`, `dispatchProtocolAction`, `updateStatusCounts`, `formatDate`.
    - **State Ownership**: `installedProtocols`.
 
 2. **`web/static/js/server/actions.js` (Target Issue #501 — ~580 lines)**:
-   - **Responsibilities**: Protocol installation modal with animated step progress, protocol parameter configuration (AWG port, MTU, CPS protocol, Telemt secret/domain), container toggle, configuration editor modal (`/api/servers/${SERVER_ID}/server_config`), server operations (reboot, clear, remove), server rename modal, edit host modal with client-side RFC 1123 hostname and IPv4/IPv6 address validation, client connection CRUD operations (add, edit, remove, toggle, mimicry rotation, copy config, QR code display).
+   - **Responsibilities**: Protocol installation modal with animated step progress, protocol parameter configuration (AWG port, MTU, CPS protocol, Telemt secret/domain), container toggle, configuration editor modal (`/api/servers/${SERVER_ID}/server_config`), server operations (reboot, clear, remove), server rename modal, edit host modal with client-side RFC 1123 hostname and IPv4/IPv6 address validation, client connection CRUD operations (add, edit, remove, toggle, mimicry rotation, copy config, QR code display), action registration with `server/shared.js`, and dispatching `nexus:server-refresh` after container/protocol mutations.
    - **Primary Functions**: `switchCategory`, `toggleContainer`, `showServerConfig`, `saveServerConfig`, `openInstallModal`, `installProtocol`, `uninstallProtocol`, `openRenameServerModal`, `closeRenameServerModal`, `submitRenameServer`, `isValidHost`, `openEditHostModal`, `closeEditHostModal`, `submitEditHost`, `rebootServer`, `clearServer`, `removeServer`, `openAddConnectionModal`, `addConnection`, `editConnection`, `removeConnection`, `toggleConnection`, `rotateClientMimicry`, `copyConnectionConfig`, `showConnectionConfig`, `switchConfigTab`, `generateQR`.
    - **Pre-existing Technical Debt (Finding 4)**: In `server.html:1116-1145`, the install progress interval (`progressInterval`) is cleared on success, but the `catch (err)` handler fails to invoke `clearInterval(progressInterval)`. During extraction, this timer cleanup MUST be moved to a `finally` block or guaranteed on error exit.
    - **State Ownership**: `currentInstallProto`, `currentConfig`, `currentVpnLink`, `currentConfigName`, `serverConfigFilename`, `isEditingConn`, `editingClientId`, `renameServerId`, `editHostServerId`.
 
 3. **`web/static/js/server/monitoring.js` (Target Issue #502 — ~420 lines)**:
-   - **Responsibilities**: Background telemetry polling coordination, server system statistics retrieval (`/api/servers/${SERVER_ID}/stats`), network reachability evaluation (`/api/servers/${SERVER_ID}/reachability`), auto-trial protocol badge rendering (TLS, QUIC, DNS, SIP), server health check invocation, client connections listing and table population (`/api/servers/${SERVER_ID}/connections?protocol=${proto}`).
-   - **Primary Functions**: `loadServerStats`, `updateReachability`, `checkServer`, `selectProtocolForConns`, `loadConnections`, `showConnectionsSection`, `hideConnectionsSection`.
+   - **Responsibilities**: Background telemetry polling coordination, server system statistics retrieval (`/api/servers/${SERVER_ID}/stats`), network reachability evaluation (`/api/servers/${SERVER_ID}/reachability`), auto-trial protocol badge rendering (TLS, QUIC, DNS, SIP), server health check invocation (`checkServer`), client connections listing and table population (`/api/servers/${SERVER_ID}/connections?protocol=${proto}`), registering `selectProtocolForConns` via `server/shared.js`, and subscribing to `nexus:server-refresh` events. Consumes section visibility primitives (`showConnectionsSection`, `hideConnectionsSection`) from `server/shared.js`.
+   - **Primary Functions**: `loadServerStats`, `updateReachability`, `checkServer`, `selectProtocolForConns`, `loadConnections`.
    - **State Ownership**: `SERVER_ID`, `STATS_REFRESH_INTERVAL_MS`, `connectionsTableInstance`, `window.connectionsStore`.
 
 4. **`web/templates/server.html` (Target Issue #503 — ~600 lines)**:
@@ -190,7 +214,7 @@ Placing these into two mutually dependent modules (`actions.js` and `monitoring.
   * Line 438: `{{ if .current_user }}{{ .current_user.ID }}{{ end }}` (3 actions)
 - **Intervening HTML** (lines 1135–1189, 55 lines): Share user modal markup containing **11 Go-template actions** across 10 lines (`{{ _ "share_access" }}`, `{{ _ "cancel" }}`, `{{ _ "enable_public_access" }}`, `{{ _ "share_password_label" }}`, `{{ _ "new_password_hint" }}`, `{{ _ "share_password_hint" }}`, `{{ _ "public_link_label" }}`, two instances of `{{ _ "copy" }}`, `{{ _ "cancel" }}`, `{{ _ "save" }}`).
 - **Block 2** (lines 1190–1309, 120 lines): User editing and public share access setup. Contains **0 Go-template actions** (pure JavaScript).
-- **Total Go-Template Actions**: Exactly **21 actions** across all three segments (10 in script block 1, 0 in script block 2, 11 in share modal markup) (Finding 5).
+- **Audited Region vs. Template Scope (Finding 5)**: Exactly **21 Go-template actions** reside across the audited JavaScript migration region (10 in script block 1, 0 in script block 2, and 11 in the intervening share modal markup). In contrast, the complete `web/templates/users.html` template contains **141 total Go-template actions** across its full HTML markup, navigation bars, user tables, and modal structures.
 
 #### Base Asset Dependencies & Load Order (Finding 5)
 `web/templates/base.html` loads prerequisite libraries in `<head>` in strict order before page-level scripts execute:
@@ -272,6 +296,10 @@ The table below catalogs every variable and function exposed on `window` or resi
 | `vpnLastActiveProblemKeys` | `Set<string>` | `vpn.html:521` | `vpnRenderForwarderHealth` | Updated on poll; triggers `#vpn-fwd-tech-details.open = true` on new keys. |
 | `vpnLastActiveProblemCount` | `number` | `vpn.html:522` | `vpnRenderForwarderHealth` | Updated on poll; triggers auto-expansion when count increases. |
 | `window._vpnActiveChartHover` | `Object` | `vpn.html:2013` | `attachInteraction`, `vpnDisposeChartInteractions`, `renderSeries` | Tracks `{ chartId, clientX, clientY, pageX, pageY }` (matching `vpn.html:2013-2019`); preserved across polls. |
+| `fmtBps` (top-level) | `function` | `vpn.html:1027` | `renderSessions` (`vpn.html:1186`), `vpnCreateSessionDrilldownRow` (`vpn.html:1313-1314`) | Top-level rate formatter (bps/Kbps/Mbps/Gbps); assigned to `web/static/js/vpn/sessions.js` to ensure sessions rendering retains formatter availability throughout migration waves. |
+| `fmtPps` (top-level) | `function` | `vpn.html:1035` | `vpnCreateSessionDrilldownRow` (`vpn.html:1311-1312`) | Top-level packet rate formatter (pps/Kpps/Mpps); assigned to `web/static/js/vpn/sessions.js` for drilldown packet rate rendering. |
+| `fmtBps` (health-nested) | `function` | `vpn.html:2328` | Internal to `vpnRenderForwarderHealth` (`vpn.html:2352+`) | Locally scoped shadowing helper inside `vpnRenderForwarderHealth`; assigned to `web/static/js/vpn/health_summary.js`. |
+| `fmtPps` (health-nested) | `function` | `vpn.html:2335` | Internal to `vpnRenderForwarderHealth` | Locally scoped shadowing helper inside `vpnRenderForwarderHealth`; assigned to `web/static/js/vpn/health_summary.js`. |
 | `SERVER_ID` | `number` | `server.html:599` | All API calls in `server.html` | Immutable constant injected via Go template (`{{ .server_id }}`). |
 | `STATS_REFRESH_INTERVAL_MS` | `number` | `server.html:600` | `Telemetry.poll` registrations | Constant: `30000` (30 seconds). |
 | `currentInstallProto` | `string` | `server.html:601` | `openInstallModal`, `installProtocol` | Default `'awg'`; set when opening protocol install modal. |
@@ -280,6 +308,8 @@ The table below catalogs every variable and function exposed on `window` or resi
 | `currentConfigName` | `string` | `server.html:604`, `users.html:426` | Config download buttons (`UI.downloadFile`) | Default `'connection'`; set to connection name on modal open. |
 | `installedProtocols` | `Object` | `server.html:605` | `checkServer`, `updateProtocolCard` | Updated when server check completes. |
 | `connectionsTableInstance` | `NexusTable` | `server.html:606` | `loadConnections` (`#connectionsTableContainer`) | Instantiated on connection table load; refreshed on filter change. |
+| `showConnectionsSection` | `function` | `server.html:1035` | `updateProtocolCard` (`server.html:898`), `actions.js` | Section visibility primitive displaying `#connectionsSection`; assigned to `web/static/js/server/shared.js`. |
+| `hideConnectionsSection` | `function` | `server.html:1040` | `checkServer` (`server.html:782`) | Section visibility and protocol reset primitive; assigned to `web/static/js/server/shared.js`. |
 | `serverConfigFilename` | `string` | `server.html:827` | `showServerConfig`, download button | Default `'server.conf'`; updated based on inspected protocol. |
 | `window.connectionsStore` | `Object` | `server.html:1214` | `loadConnections`, `editConnection` | In-memory map of `clientId -> userData` for editing connections. |
 | `isEditingConn` | `boolean` | `server.html:1446` | `openAddConnectionModal`, `addConnection` | Flag distinguishing connection addition from in-place edit. |
@@ -343,7 +373,7 @@ The repository displays three distinct interpolation patterns:
      ```
    - **Script Block 2 (lines 1190–1309)** contains **0 Go-template actions** (pure JavaScript).
    - **Intervening Share Modal HTML (lines 1135–1189)** contains **11 Go-template actions** across 10 lines (`{{ _ "share_access" }}`, `{{ _ "cancel" }}`, `{{ _ "enable_public_access" }}`, `{{ _ "share_password_label" }}`, `{{ _ "new_password_hint" }}`, `{{ _ "share_password_hint" }}`, `{{ _ "public_link_label" }}`, two instances of `{{ _ "copy" }}`, `{{ _ "cancel" }}`, `{{ _ "save" }}`).
-   - **Total**: Exactly **21 Go-template actions** across the entire file (Finding 5).
+   - **Audited Region vs. Template Scope (Finding 5)**: Exactly **21 Go-template actions** reside across the audited JavaScript migration region (10 in script block 1, 0 in script block 2, and 11 in the intervening share modal markup). In contrast, the complete `web/templates/users.html` file contains **141 total Go-template actions** across its complete HTML markup, navigation, user table, and modal templates.
    - *Escaping Contracts*:
      * `{{ .servers | json }}`: Serialized via Go's trusted JSON helper, wrapping output as `template.JS` safe for assignment to a JavaScript variable.
      * `currentAdminUsername` / `currentUserID`: String values wrapped in single quotes, contextually escaped by Go's `html/template`.
@@ -402,45 +432,48 @@ Polling across Amnezia Nexus is managed by the `NexusTelemetry` engine (`web/sta
 
 ### 6.1 Test Suites Breakdown (`web/vpn_diagnostics_test.go`)
 
-`web/vpn_diagnostics_test.go` contains 33 verified Go test functions. The test suite comprises two distinct verification strategies (Finding 6):
-- **DOM / JSDOM Tests (32 functions)**: Tests 1–15 and 17–33 evaluate frontend JavaScript execution inside simulated browser environments using Node.js and JSDOM, or directly assert DOM structure.
+`web/vpn_diagnostics_test.go` contains 33 verified Go test functions. The test suite comprises five distinct verification harnesses (Finding 4):
+- **Pure Go Dictionary Checks (2 functions)**: Tests 8 and 25 verify translation key parity, completeness, and `{placeholder}` consistency across all 5 JSON locale files without any DOM or Node.js execution.
 - **Token-Based String Verification (1 function)**: Test 16 (`TestVPNDiagnosticsPollingContract`) is a static token-checking test. It reads `templates/vpn.html` via `TemplatesFS.ReadFile` and uses Go string counts (`strings.Count`, `strings.Contains`) to assert the literal presence of polling and handler tokens (`NexusTelemetry.poll('vpn-status'`, `API.get('/api/vpn/status')`, `vpnRenderForwarderHealth(status)`), without executing Node.js or JSDOM.
+- **Go HTML-Parser DOM Tests (1 function)**: Test 32 (`TestVPNDashboardSectionOrder`) parses `templates/vpn.html` using Go's `golang.org/x/net/html` (`xhtml.Parse`) to assert visual container sibling order (`stats-grid -> backends card -> sessions card -> vpn-forwarder-card`, visual order: `stats -> backends -> sessions -> forwarder`) and verifies rejection of decoy HTML comments.
+- **Node.js with Custom DOM Mock (27 functions)**: Tests 1–7, 9–15, 17–24, 26–27, 29, 31, and 33 extract target JavaScript functions from `vpn.html` and execute them inside Node.js against a lightweight Go-synthesized mock DOM (`vpnDOMMock`) implementing element structures, attributes, and class lists. Specifically, Test 15 (`TestVPNDiagnosticsTemplateDOMOracle`) uses this Node/custom DOM mock harness to verify that mutated element IDs fail the DOM oracle check against the template's element registry.
+- **Headless JSDOM Environment (2 functions)**: Tests 28 and 30 execute in Node.js using the full headless `jsdom` npm package to validate complete browser DOM lifecycles, event dispatching, and `NexusTable` sorting and accordion state persistence.
 
 | # | Test Function Name | Test Type | Tested Function / UI Component | Key Invariants Verified |
 |---|---|---|---|---|
-| 1 | `TestVPNDiagnosticsHealthAndStructure` | JSDOM | `vpnRenderForwarderHealth`, DOM structure | Validates banner status, forwarder headline, badges, and card hierarchies. |
-| 2 | `TestVPNHistoryChartLatencyAvailability` | JSDOM | `vpnRenderHistoryCharts`, `renderBadges` | Verifies latency badge reflects availability flags without NaN rendering. |
-| 3 | `TestVPNCompleteRouteTooltipContract` | JSDOM | `routeTooltip`, `vpnFormatPeerKey` | Validates tooltip text for healthy, pressure, and error route states. |
-| 4 | `TestVPNOperationalDiagnosticsCardsContract` | JSDOM | Cards 1–4 diagnostic panels | Verifies CPU, memory, FD, queue occupancy, drop categories, and rate strings. |
-| 5 | `TestVPNCompleteHistoryAllWindowRenderers` | JSDOM | `vpnRenderHistoryCharts`, window toggles | Exercises 1m, 5m, 15m, 1h, 6h, 24h historical chart transformations. |
-| 6 | `TestVPNUnavailableForwarderClearsStaleHistoryState` | JSDOM | `vpnRenderForwarderHealth`, charts | Ensures unavailable forwarder clears stale canvas/SVG series. |
-| 7 | `TestVPNPanelRateAvailability` | JSDOM | `vpnDiagText`, rate formatters | Tests availability toggling across throughput, drops, and latency rates. |
-| 8 | `TestVPNDiagnosticsLocalizationDictionaries` | Static Go | i18n dictionaries (`en`, `ru`, `fa`, etc.) | Verifies presence of all required diagnostics keys in localization files. |
-| 9 | `TestVPNDiagnosticsLocalization` | JSDOM | `vpnRenderForwarderHealth`, `_()` | Asserts correct language translation rendering in JSDOM across all 5 locales. |
-| 10 | `TestVPNDiagnosticsLocalizationMutations` | JSDOM | i18n mutations | Checks fault-injection resilience when translation keys are missing or malformed. |
-| 11 | `TestVPNBackendDeviceKPIAlarmCoverage` | JSDOM | KPI Summary Bar | Validates color alarms (danger/warning) on backend drop rates and stalls. |
-| 12 | `TestVPNBackendDeviceKPIAlarmMutations` | JSDOM | KPI alarm state transitions | Ensures transitions between healthy, warning, and critical preserve DOM classes. |
-| 13 | `TestVPNBackendDeviceUnattributedConditionRendering`| JSDOM | Condition synthesis | Validates fallback rendering when condition entities lack backend IDs. |
-| 14 | `TestVPNDiagnosticsCurrentObservations` | JSDOM | Current vs cumulative metrics | Asserts live horizon (`Current / Live`) vs reset horizon (`Since Startup / Reset`). |
-| 15 | `TestVPNDiagnosticsTemplateDOMOracle` | Static Go | Static HTML DOM validation | Oracle testing verifying that template DOM matches expected ID structure. |
-| 16 | `TestVPNDiagnosticsPollingContract` | Token String Check | Polling string tokens | Checks literal presence of `NexusTelemetry.poll`, `API.get`, and health handlers via `strings.Count`/`strings.Contains`. |
-| 17 | `TestVPNForwarderHealthDecouplingAndHorizon` | JSDOM | Horizon decoupling | Verifies decoupling of forwarder status from peer-sync availability. |
-| 18 | `TestVPNProgressiveDisclosureAndActiveProblems` | JSDOM | `#vpn-fwd-tech-details` | Verifies auto-expansion on new problem keys and preservation of manual closure. |
-| 19 | `TestVPNConnectionTroubleshootingTableAndCorrelation`| JSDOM | `renderSessions`, `vpnFindRouteForSession`| Verifies session-to-route correlation and diagnostic badge display. |
-| 20 | `TestVPNHorizonWindowToggles1mAnd5m` | JSDOM | `vpnSetHistoryWindow` | Verifies 1m and 5m short-horizon window toggling and SVG regeneration. |
-| 21 | `TestVPNSummaryHeaderCountsAndProblemCardOnset` | JSDOM | Problem card onset | Verifies onset timestamps and problem counter in summary header. |
-| 22 | `TestVPNForwarderCombinedActionableAndGenericConditions`| JSDOM | Condition rendering | Tests mixed actionable conditions and generic fallback condition rendering. |
-| 23 | `TestVPNForwarderStaleHandshakeActionableProblemDOM` | JSDOM | Stale handshake synthesis | Verifies DOM output when peer handshakes exceed timeout thresholds. |
-| 24 | `TestVPNForwarderStaleHandshakeEmptySnapshotMatchingCountsDOM`| JSDOM | Empty snapshot handling | Ensures stale handshake logic handles zero-peer snapshots gracefully. |
-| 25 | `TestVPNTranslationKeyParity` | Static Go | Translation dictionaries | Strict parity check across all supported translation files. |
-| 26 | `TestVPNPacketLossCellDecoupledFromQueuePressure` | JSDOM | Sessions table loss cell | Ensures packet loss cell is decoupled from queue pressure calculations. |
-| 27 | `TestVPNReconnectSessionIDMismatchShowsUnroutable` | JSDOM | Route drilldown | Displays unroutable badge when session ID does not match active route ID. |
-| 28 | `TestVPNNexusTableLifecycleDrilldownAndConfigDedup`| JSDOM | `vpnCreateSessionDrilldownRow` | Asserts drilldown DOM lifecycle, action buttons, and config deduplication. |
-| 29 | `TestVPNForwarderRoutesTableFormatting` | JSDOM | Route formatting | Asserts numeric formatting, bytes/sec, and packet rates in routes table. |
-| 30 | `TestVPNSessionsTableSortingAndAccordionPersistence`| JSDOM | `NexusTable`, `vpnExpandedSessionIds`| Tests sorting by bytes/loss and validates accordion persistence across sort. |
-| 31 | `TestVPNRoutingConsistencyBadgeSeverityAware` | JSDOM | Severity badge logic | Tests CRITICAL, DEGRADED, and WARNING severity badge color assignment. |
-| 32 | `TestVPNDashboardSectionOrder` | JSDOM | Visual DOM section ordering | Validates layout order: KPI summary -> cards -> troubleshooting -> backends. |
-| 33 | `TestVPNHistoricalChartsContract` | JSDOM | `vpnRenderHistoryCharts` | Full contract test verifying chart canvases, axes, legends, and series. |
+| 1 | `TestVPNDiagnosticsHealthAndStructure` | Node.js (vpnDOMMock) | `vpnRenderForwarderHealth`, DOM structure | Validates banner status, forwarder headline, badges, and card hierarchies. |
+| 2 | `TestVPNHistoryChartLatencyAvailability` | Node.js (vpnDOMMock) | `vpnRenderHistoryCharts`, `renderBadges` | Verifies latency badge reflects availability flags without NaN rendering. |
+| 3 | `TestVPNCompleteRouteTooltipContract` | Node.js (vpnDOMMock) | `routeTooltip`, `vpnFormatPeerKey` | Validates tooltip text for healthy, pressure, and error route states. |
+| 4 | `TestVPNOperationalDiagnosticsCardsContract` | Node.js (vpnDOMMock) | Cards 1–4 diagnostic panels | Verifies CPU, memory, FD, queue occupancy, drop categories, and rate strings. |
+| 5 | `TestVPNCompleteHistoryAllWindowRenderers` | Node.js (vpnDOMMock) | `vpnRenderHistoryCharts`, window toggles | Exercises 1m, 5m, 15m, 1h, 6h, 24h historical chart transformations. |
+| 6 | `TestVPNUnavailableForwarderClearsStaleHistoryState` | Node.js (vpnDOMMock) | `vpnRenderForwarderHealth`, charts | Ensures unavailable forwarder clears stale canvas/SVG series. |
+| 7 | `TestVPNPanelRateAvailability` | Node.js (vpnDOMMock) | `vpnDiagText`, rate formatters | Tests availability toggling across throughput, drops, and latency rates. |
+| 8 | `TestVPNDiagnosticsLocalizationDictionaries` | Pure Go Dictionary | i18n dictionaries (`en`, `ru`, `fa`, etc.) | Pure Go dictionary check verifying key presence, count equality, and placeholder parity across JSON files without DOM or Node. |
+| 9 | `TestVPNDiagnosticsLocalization` | Node.js (vpnDOMMock) | `vpnRenderForwarderHealth`, `_()` | Asserts correct language translation rendering in Node/DOM mock across all 5 locales. |
+| 10 | `TestVPNDiagnosticsLocalizationMutations` | Node.js (vpnDOMMock) | i18n mutations | Checks fault-injection resilience when translation keys are missing or malformed. |
+| 11 | `TestVPNBackendDeviceKPIAlarmCoverage` | Node.js (vpnDOMMock) | KPI Summary Bar | Validates color alarms (danger/warning) on backend drop rates and stalls. |
+| 12 | `TestVPNBackendDeviceKPIAlarmMutations` | Node.js (vpnDOMMock) | KPI alarm state transitions | Ensures transitions between healthy, warning, and critical preserve DOM classes. |
+| 13 | `TestVPNBackendDeviceUnattributedConditionRendering`| Node.js (vpnDOMMock) | Condition synthesis | Validates fallback rendering when condition entities lack backend IDs. |
+| 14 | `TestVPNDiagnosticsCurrentObservations` | Node.js (vpnDOMMock) | Current vs cumulative metrics | Asserts live horizon (`Current / Live`) vs reset horizon (`Since Startup / Reset`). |
+| 15 | `TestVPNDiagnosticsTemplateDOMOracle` | Node.js (vpnDOMMock) | Static HTML DOM validation | Executes Node.js with custom `vpnDOMMock` to verify that mutating template element IDs is caught by the DOM oracle. |
+| 16 | `TestVPNDiagnosticsPollingContract` | Token String Check | Polling string tokens | Checks literal presence of `NexusTelemetry.poll`, `API.get`, and health handlers via `strings.Count`/`strings.Contains` without DOM or Node. |
+| 17 | `TestVPNForwarderHealthDecouplingAndHorizon` | Node.js (vpnDOMMock) | Horizon decoupling | Verifies decoupling of forwarder status from peer-sync availability. |
+| 18 | `TestVPNProgressiveDisclosureAndActiveProblems` | Node.js (vpnDOMMock) | `#vpn-fwd-tech-details` | Verifies auto-expansion on new problem keys and preservation of manual closure. |
+| 19 | `TestVPNConnectionTroubleshootingTableAndCorrelation`| Node.js (vpnDOMMock) | `renderSessions`, `vpnFindRouteForSession`| Verifies session-to-route correlation and diagnostic badge display. |
+| 20 | `TestVPNHorizonWindowToggles1mAnd5m` | Node.js (vpnDOMMock) | `vpnSetHistoryWindow` | Verifies 1m and 5m short-horizon window toggling and SVG regeneration. |
+| 21 | `TestVPNSummaryHeaderCountsAndProblemCardOnset` | Node.js (vpnDOMMock) | Problem card onset | Verifies onset timestamps and problem counter in summary header. |
+| 22 | `TestVPNForwarderCombinedActionableAndGenericConditions`| Node.js (vpnDOMMock) | Condition rendering | Tests mixed actionable conditions and generic fallback condition rendering. |
+| 23 | `TestVPNForwarderStaleHandshakeActionableProblemDOM` | Node.js (vpnDOMMock) | Stale handshake synthesis | Verifies DOM output when peer handshakes exceed timeout thresholds. |
+| 24 | `TestVPNForwarderStaleHandshakeEmptySnapshotMatchingCountsDOM`| Node.js (vpnDOMMock) | Empty snapshot handling | Ensures stale handshake logic handles zero-peer snapshots gracefully. |
+| 25 | `TestVPNTranslationKeyParity` | Pure Go Dictionary | Translation dictionaries | Strict 100% key parity check across all supported translation files against en.json without DOM or Node. |
+| 26 | `TestVPNPacketLossCellDecoupledFromQueuePressure` | Node.js (vpnDOMMock) | Sessions table loss cell | Ensures packet loss cell is decoupled from queue pressure calculations. |
+| 27 | `TestVPNReconnectSessionIDMismatchShowsUnroutable` | Node.js (vpnDOMMock) | Route drilldown | Displays unroutable badge when session ID does not match active route ID. |
+| 28 | `TestVPNNexusTableLifecycleDrilldownAndConfigDedup`| Headless JSDOM | `vpnCreateSessionDrilldownRow` | Asserts drilldown DOM lifecycle, action buttons, and config deduplication using Node with jsdom. |
+| 29 | `TestVPNForwarderRoutesTableFormatting` | Node.js (vpnDOMMock) | Route formatting | Asserts numeric formatting, bytes/sec, and packet rates in routes table. |
+| 30 | `TestVPNSessionsTableSortingAndAccordionPersistence`| Headless JSDOM | `NexusTable`, `vpnExpandedSessionIds`| Tests sorting by bytes/loss and validates accordion persistence across sort using Node with jsdom. |
+| 31 | `TestVPNRoutingConsistencyBadgeSeverityAware` | Node.js (vpnDOMMock) | Severity badge logic | Tests CRITICAL, DEGRADED, and WARNING severity badge color assignment. |
+| 32 | `TestVPNDashboardSectionOrder` | Go HTML-Parser (xhtml.Parse) | Visual DOM section ordering | Validates layout order: stats-grid -> backends card -> sessions card -> vpn-forwarder-card (visual order: stats -> backends -> sessions -> forwarder); rejects decoy comments. |
+| 33 | `TestVPNHistoricalChartsContract` | Node.js (vpnDOMMock) | `vpnRenderHistoryCharts` | Full contract test verifying chart canvases, axes, legends, and series. |
 
 ---
 
@@ -510,7 +543,7 @@ The repository contains Playwright integration suites in `tests/e2e/*.py` that e
    - `test_vpn_problem_routes_toggle`: Toggles `#vpn-routes-toggle-all-btn` and checks table row count transitions.
    - `test_vpn_sessions_problems_toggle`: Toggles `#vpn-sessions-toggle-problems-btn` and verifies problem filtering.
    - `test_vpn_routes_table_mobile_containment_and_scrolling`: Asserts table responsiveness under mobile viewports.
-   - `test_vpn_dashboard_sections_visual_order_and_vertical_layout`: Validates strict visual vertical ordering of sections.
+   - `test_vpn_dashboard_sections_visual_order_and_vertical_layout`: Validates strict visual vertical ordering of sections (stats -> backends -> sessions -> forwarder).
 
 2. **`tests/e2e/test_servers.py`**:
    - `test_server_list_loads`: Validates server grid rendering.
@@ -536,8 +569,9 @@ The repository contains Playwright integration suites in `tests/e2e/*.py` that e
 
 To maintain reviewability, prevent regression risk, and satisfy the project guideline of remaining strictly below 1,000 lines per PR, Phase 3 modularization is structured into sequential waves.
 
-### Sizing and Line Ceiling Protocol (Finding 1)
-- **Static JavaScript modules** MUST strictly remain below 1,000 lines upon creation.
+### Sizing and Line Ceiling Protocol (Finding 1 & Finding 3)
+- **Per-File Physical Line Ceiling**: Every newly created static JavaScript module must strictly adhere to the project line ceiling of under 1,000 physical lines (`health_summary.js` is ~450 physical lines; `health_problems.js` is ~850 physical lines).
+- **PR Diff Lines vs. Physical File Lines (Finding 3)**: PR diff line counts during file extractions reflect code movement (e.g. adding ~1,300 lines of static JS and deleting ~1,300 lines of inline template script). PR diff line counts must not be confused with physical file line limits; the sub-1,000 line rule governs the physical size of individual source files.
 - **Monolithic HTML templates** (e.g. `vpn.html` at 3,758 lines) shrink progressively across the waves. They are exempt from the sub-1,000 line rule during transitional states until reaching their final thin template PR (<600 lines).
 - **Atomic Loading & Harness Updates**: Each wave atomically updates the template's script inclusion tags and the test fixture function extractor to ensure all tests remain green at every PR boundary.
 
@@ -549,9 +583,9 @@ Wave 1: Test Harness & Contract Prerequisites
        |
        v
 Wave 2: VPN Feature Controllers Extraction (Atomic Script & Fixture Updates)
-  [ ] Step 1: #495  -> web/static/js/vpn/sessions.js (~520 lines)
-  [ ] Step 2a: #496a -> web/static/js/vpn/health_summary.js (~450 lines)
-  [ ] Step 2b: #496b -> web/static/js/vpn/health_problems.js (~850 lines)
+  [ ] Step 1: #495  -> web/static/js/vpn/sessions.js (~520 lines, includes top-level fmtBps/fmtPps)
+  [ ] Step 2a: #496b -> web/static/js/vpn/health_problems.js (~850 lines, leaf problem & diagnostic helpers extracted first while inline template orchestrator calls them)
+  [ ] Step 2b: #496a -> web/static/js/vpn/health_summary.js (~450 lines, headline & KPI orchestrator invoking health_problems delegates; OR atomic two-file extraction for #496)
   [ ] Step 3: #497  -> web/static/js/vpn/charts.js (~520 lines)
   [ ] Step 4: #498  -> web/static/js/vpn/backends.js (~480 lines)
        |
@@ -583,24 +617,27 @@ Wave 6: Stylesheet Partitioning
 
 #### Step 1: Issue #495 — Extract VPN Sessions & Troubleshooting Controller
 - **Destination**: `web/static/js/vpn/sessions.js` (~520 lines).
-- **Scope**: Extract `renderSessions`, `vpnRenderSessionRow`, `vpnCreateSessionDrilldownRow`, `vpnToggleSessionDrilldown`, `vpnSyncExpandedDrilldowns`, `vpnToggleSessionsProblemFilter`, `vpnRenderSessionsStaleBanner`, `vpnFindSessionById`, `vpnFindRouteForSession`, and formatting helpers.
-- **Contract Guardrails**: Preserve all DOM IDs (`#vpn-sessions-tbody`, `#vpnSessionsStaleBanner`, `#vpn-sessions-toggle-problems-btn`), `NexusTable` sorting on traffic/packet loss, and expanded accordion persistence across poll cycles (`vpnExpandedSessionIds`). Scoped helpers `fmtBps` and `fmtPps` remain in health module.
+- **Scope**: Extract `renderSessions`, `vpnRenderSessionRow`, `vpnCreateSessionDrilldownRow`, `vpnToggleSessionDrilldown`, `vpnSyncExpandedDrilldowns`, `vpnToggleSessionsProblemFilter`, `vpnRenderSessionsStaleBanner`, `vpnFindSessionById`, `vpnFindRouteForSession`, top-level rate formatters (`fmtBps`, `fmtPps`), and formatting helpers (`vpnFormatBytes`).
+- **Contract Guardrails**: Preserve all DOM IDs (`#vpn-sessions-tbody`, `#vpnSessionsStaleBanner`, `#vpn-sessions-toggle-problems-btn`), `NexusTable` sorting on traffic/packet loss, and expanded accordion persistence across poll cycles (`vpnExpandedSessionIds`). Top-level rate formatters `fmtBps` and `fmtPps` (`vpn.html:1027–1040`) are extracted with `sessions.js` to ensure `renderSessions` (line 1186) and session drilldown rows (lines 1311–1314) retain access throughout migration waves. The health module retains its independent shadowing definitions (`vpn.html:2328–2339`).
 - **Atomic Staging**: Add `<script src="/static/js/vpn/sessions.js"></script>` to `vpn.html` and update `extractJSFunction`/`VPNTestFixture` atomically in this PR.
 - **Test Baseline**: Verify `TestVPNSessionsTableSortingAndAccordionPersistence`, `TestVPNConnectionTroubleshootingTableAndCorrelation`, and `TestVPNPacketLossCellDecoupledFromQueuePressure`.
 
-#### Step 2a: Issue #496a — Extract VPN Health Headline & KPI Summary Controller
+#### Step 2a: Issue #496b — Extract VPN Health Problems & Technical Diagnostics Controller
+- **Destination**: `web/static/js/vpn/health_problems.js` (~850 lines).
+- **Transitional Scope**: Extract active actionable problem cards, condition parsers (`deriveStableConditionCode`, `parseConditionMessage`), entity extractors (`extractConditionEntities`), severity badge generators (`createSeverityBadge`), tech diagnostics accordion disclosure logic (`#vpn-fwd-tech-details`), and diagnostic cards 1–4.
+- **Transitional Contract (Finding 3)**: Extracting `health_problems.js` first in Wave 2 leaves the top-level orchestrator `vpnRenderForwarderHealth` inline in `web/templates/vpn.html` directly invoking the extracted functions loaded via `<script src="/static/js/vpn/health_problems.js"></script>`. This guarantees continuous test passability with zero missing delegates.
+- **Contract Guardrails**: Strictly enforce sub-1,000 physical line ceiling (~850 lines). Preserve auto-disclosure of `#vpn-fwd-tech-details` on new problem keys and manual collapse preservation. Retain message parsing and entity extraction byte-for-byte.
+- **Atomic Staging**: Add `<script src="/static/js/vpn/health_problems.js"></script>` to `vpn.html` and update `VPNTestFixture` atomically.
+- **Test Baseline**: Verify all diagnostic and progressive disclosure tests (`TestVPNProgressiveDisclosureAndActiveProblems`, `TestVPNOperationalDiagnosticsCardsContract`).
+
+#### Step 2b: Issue #496a — Extract VPN Health Headline & KPI Summary Controller
 - **Destination**: `web/static/js/vpn/health_summary.js` (~450 lines).
-- **Scope**: Extract top-level `vpnRenderForwarderHealth` headline orchestration, KPI summary bar rendering (throughput, routes/sessions, queue pressure, packet loss, client engine, peer sync, healthy backends, slow writes), route tooltip generator (`routeTooltip`), and nested formatters (`fmtBps`, `fmtPps`, `fmtDurationSec`, `vpnFormatCountersSince`).
-- **Contract Guardrails**: Enforce sub-1,000 line ceiling. Guarantee that `vpnRenderForwarderHealth` correctly invokes problem rendering delegates in `health_problems.js`.
+- **Scope**: Extract top-level `vpnRenderForwarderHealth` headline orchestration, KPI summary bar rendering (throughput, routes/sessions, queue pressure, packet loss, client engine, peer sync, healthy backends, slow writes), route tooltip generator (`routeTooltip`), and health-nested shadowing formatters (`fmtBps`, `fmtPps`, `fmtDurationSec`, `vpnFormatCountersSince`).
+- **Transitional Contract (Finding 3)**: Because `health_problems.js` was already extracted and loaded in Step 2a, `vpnRenderForwarderHealth` seamlessly invokes delegates in `health_problems.js` without broken dependencies.
+- **Alternative Atomic Two-File Staging (Finding 3)**: If preferred during PR implementation, Step 2 can land atomically as a single PR for Issue #496 containing both `health_summary.js` (~450 lines) and `health_problems.js` (~850 lines). Both files individually comply with the sub-1,000 physical line ceiling, while aggregate PR diff line additions and deletions reflect standard file relocation.
+- **Contract Guardrails**: Enforce sub-1,000 physical line ceiling (~450 lines). Scoped helpers `fmtBps` and `fmtPps` (`vpn.html:2328–2339`) shadow top-level formatters for health summary calculations.
 - **Atomic Staging**: Add `<script src="/static/js/vpn/health_summary.js"></script>` to `vpn.html` and update `VPNTestFixture` atomically.
 - **Test Baseline**: Verify `TestVPNDiagnosticsHealthAndStructure`, `TestVPNBackendDeviceKPIAlarmCoverage`, and route tooltip contracts.
-
-#### Step 2b: Issue #496b — Extract VPN Health Problems & Technical Diagnostics Controller
-- **Destination**: `web/static/js/vpn/health_problems.js` (~850 lines).
-- **Scope**: Extract active actionable problem cards, condition parsers (`deriveStableConditionCode`, `parseConditionMessage`), entity extractors (`extractConditionEntities`), severity badge generators (`createSeverityBadge`), tech diagnostics accordion disclosure logic (`#vpn-fwd-tech-details`), and diagnostic cards 1–4.
-- **Contract Guardrails**: Enforce sub-1,000 line ceiling. Preserve auto-disclosure of `#vpn-fwd-tech-details` on new problem keys and manual collapse preservation. Retain message parsing and entity extraction byte-for-byte.
-- **Atomic Staging**: Add `<script src="/static/js/vpn/health_problems.js"></script>` to `vpn.html` and update `VPNTestFixture` atomically.
-- **Test Baseline**: Verify all JSDOM diagnostic and progressive disclosure tests (`TestVPNProgressiveDisclosureAndActiveProblems`, `TestVPNOperationalDiagnosticsCardsContract`).
 
 #### Step 3: Issue #497 — Extract Historical Telemetry Charts & Controls
 - **Destination**: `web/static/js/vpn/charts.js` (~520 lines).
@@ -642,13 +679,13 @@ Wave 6: Stylesheet Partitioning
 #### Step 7: Issue #542 — Extract Users Page JavaScript (`web/static/js/users.js`)
 - **Destination**: `web/static/js/users.js` (~840 lines) and thin `web/templates/users.html`.
 - **Scope**: Merge both inline script blocks (714 + 120 lines) into `web/static/js/users.js`. Relocate Share Modal HTML out of the script boundary.
-- **Contract Guardrails**: Account for all 21 Go template actions (10 in block 1, 0 in block 2, 11 in share modal markup). Retain minimal Go-template bootstrap for `serversData`, `currentAdminUsername`, `currentIsAdmin`, and `currentUserID`. Retain `pageSize = 12` and 300 ms search debounce. Wire DOM event listeners for selects (`users.html:695-717`). Rely on `api.js` for `X-CSRF-Token` injection.
+- **Contract Guardrails**: Account for all 21 Go template actions across the audited script and share-modal region (10 in block 1, 0 in block 2, 11 in share modal markup; out of 141 total actions across `users.html`). Retain minimal Go-template bootstrap for `serversData`, `currentAdminUsername`, `currentIsAdmin`, and `currentUserID`. Retain `pageSize = 12` and 300 ms search debounce. Wire DOM event listeners for selects (`users.html:695-717`). Rely on `api.js` for `X-CSRF-Token` injection.
 - **Test Baseline**: Verify `TestIssue113UsersUIModernization`, `TestUsersTemplatePageSize`, and `tests/e2e/test_users.py`.
 
 #### Step 8: Issue #501a — Extract Server Shared Helpers & Protocol Layer
 - **Destination**: `web/static/js/server/shared.js` (~200 lines).
-- **Scope**: Extract `getProtoTitle`, `updateProtocolCard`, `updateStatusCounts`, `formatDate`, and container action event dispatchers to break the cyclic dependency between actions and monitoring.
-- **Contract Guardrails**: Must be loaded before `actions.js` and `monitoring.js`.
+- **Scope**: Extract `getProtoTitle`, `updateProtocolCard`, shared section-visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), `updateStatusCounts`, `formatDate`, and the protocol action callback registration and event dispatch interface (`registerProtocolActionHandler`, `dispatchProtocolAction`) to eliminate circular dependencies between actions and monitoring.
+- **Contract Guardrails**: Must be loaded before `actions.js` and `monitoring.js`. Card builders delegate action clicks through registered callbacks or `nexus:protocol-action` custom DOM events. Section visibility is owned by `server/shared.js`.
 
 #### Step 9: Issue #501b — Extract Server Management Forms & Actions
 - **Destination**: `web/static/js/server/actions.js` (~580 lines).
@@ -658,7 +695,7 @@ Wave 6: Stylesheet Partitioning
 
 #### Step 10: Issue #502 — Extract Server Telemetry & Background Polling
 - **Destination**: `web/static/js/server/monitoring.js` (~420 lines).
-- **Scope**: Extract `loadServerStats`, `updateReachability`, protocol status updates, reachability auto-trial badge rendering, and connection list polling.
+- **Scope**: Extract `loadServerStats`, `updateReachability`, protocol status updates, reachability auto-trial badge rendering, and connection list polling. Consumes section-visibility primitives (`showConnectionsSection`, `hideConnectionsSection`) from `server/shared.js`, registers `selectProtocolForConns` via the shared action registry, and subscribes to `nexus:server-refresh` events.
 - **Contract Guardrails**: Maintain 30s polling intervals for `server-stats` and `server-reachability` with exponential backoff capped at 60,000 ms. Retain `connectionsStore` caching.
 - **Test Baseline**: Verify `TestServerTemplate_TelemetryPolling` and `test_server_stats`.
 
