@@ -115,16 +115,22 @@ The inline script in `web/templates/server.html` spans lines 598–1795 (~1,198 
 In the existing monolithic script:
 - Server actions call `checkServer` (`server.html:989`) upon container toggles.
 - Monitoring's `checkServer` calls `getProtoTitle` (`server.html:771`) and `updateProtocolCard` (`server.html:766`).
-- `updateProtocolCard` dynamically constructs DOM nodes with action handlers (`uninstallProtocol`, `selectProtocolForConns`, `toggleContainer`, `showServerConfig` in `server.html:883–966`) and directly invokes `showConnectionsSection()` (`server.html:898`).
+- `updateProtocolCard` dynamically constructs DOM nodes with action handlers (`openInstallModal`, `uninstallProtocol`, `selectProtocolForConns`, `toggleContainer`, `showServerConfig` in `server.html:883–966`) and directly invokes `showConnectionsSection()` (`server.html:898`).
 
 If `showConnectionsSection` remains in monitoring, this introduces a reverse dependency cycle: `monitoring.js` -> `shared.js` -> `monitoring.js`. Furthermore, directly wiring action handlers creates tight coupling from the card builder into both `actions.js` and `monitoring.js`.
 
 Under Phase 3, these dependency cycles are broken by establishing a strictly unidirectional architecture anchored by `web/static/js/server/shared.js`:
 1. **Shared Section-Visibility Primitives**: Move `showConnectionsSection` (`server.html:1035–1038`) and `hideConnectionsSection` (`server.html:1040–1051`) into `web/static/js/server/shared.js`. Because section visibility is a shared DOM primitive, `updateProtocolCard` invokes `showConnectionsSection` entirely within `server/shared.js`. Both `server/monitoring.js` (`checkServer:782` calling `hideConnectionsSection`) and `server/actions.js` consume section visibility directly from `server/shared.js`.
 2. **Action Callback Registration & Event Dispatch Interface**: Decouple protocol card buttons from direct module functions via an explicit action registry and event dispatch contract:
-   - `server/shared.js` provides `registerProtocolActionHandler(action, handler)` and `dispatchProtocolAction(action, proto)` (or delegates via custom DOM events on `#protocolCardsGrid`: `nexus:protocol-action` with detail `{ action, proto }`).
-   - `server/monitoring.js` registers its handler for `selectProtocolForConns` (`action === 'select-conns'`).
-   - `server/actions.js` registers handlers for `uninstallProtocol` (`action === 'uninstall'`), `toggleContainer` (`action === 'toggle'`), and `showServerConfig` (`action === 'config'`).
+   - `server/shared.js` provides `registerProtocolActionHandler(action, handler)` and `dispatchProtocolAction(action, proto, payload = {})` (or delegates via custom DOM events on `#protocolCardsGrid`: `nexus:protocol-action` with detail `{ action, proto, isRunning }`):
+     - `install`: delegates to `openInstallModal(proto)` (registered by `server/actions.js`).
+     - `reinstall`: delegates to `openInstallModal(proto)` (registered by `server/actions.js`).
+     - `start`: delegates to `toggleContainer(proto, false)` (or `toggle` with `{ isRunning: false }`; registered by `server/actions.js`).
+     - `stop`: delegates to `toggleContainer(proto, true)` (or `toggle` with `{ isRunning: true }`; registered by `server/actions.js`).
+     - `uninstall`: delegates to `uninstallProtocol(proto)` (registered by `server/actions.js`).
+     - `select-conns`: delegates to `selectProtocolForConns(proto)` (registered by `server/monitoring.js`).
+     - `config`: delegates to `showServerConfig(proto)` (registered by `server/actions.js`).
+   - Card builders in `server/shared.js` preserve the `isRunning` boolean state when binding or dispatching container toggles: running containers pass `isRunning: true` (ensuring `toggleContainer` presents the danger-styled `stop_container_confirm` dialog), while stopped containers pass `isRunning: false` (triggering the primary-styled `start_container_confirm` dialog).
    - When actions complete (e.g. after container toggle or uninstall), `server/actions.js` dispatches a `nexus:server-refresh` event (or calls `ServerShared.requestServerCheck()`) that `monitoring.js` subscribes to, eliminating direct cyclic calls into `checkServer`.
 3. **Strictly Acyclic Directed Graph**:
    - `server/shared.js` is an independent leaf module with **ZERO outgoing dependencies** on `monitoring.js` or `actions.js`.
@@ -184,7 +190,7 @@ Under Phase 3, these dependency cycles are broken by establishing a strictly uni
 #### Module Specifications for Server Subsystem:
 
 1. **`web/static/js/server/shared.js` (~200 lines)**:
-   - **Responsibilities**: Shared protocol metadata definitions, protocol title formatting (`getProtoTitle`), protocol status card generator (`updateProtocolCard`), shared section visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), protocol action callback registration and event dispatch hooks (`registerProtocolActionHandler`, `dispatchProtocolAction`), status count calculation (`updateStatusCounts`), and shared date/time formatting (`formatDate`).
+   - **Responsibilities**: Shared protocol metadata definitions, protocol title formatting (`getProtoTitle`), protocol status card generator (`updateProtocolCard`), shared section visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), protocol card action callback registration and event dispatch hooks (`registerProtocolActionHandler`, `dispatchProtocolAction` supporting `install`, `reinstall`, `start`, `stop`/`toggle` with `isRunning`, `uninstall`, `select-conns`, `config`), status count calculation (`updateStatusCounts`), and shared date/time formatting (`formatDate`).
    - **Primary Functions**: `getProtoTitle`, `updateProtocolCard`, `showConnectionsSection`, `hideConnectionsSection`, `registerProtocolActionHandler`, `dispatchProtocolAction`, `updateStatusCounts`, `formatDate`.
    - **State Ownership**: `installedProtocols`.
 
@@ -432,12 +438,17 @@ Polling across Amnezia Nexus is managed by the `NexusTelemetry` engine (`web/sta
 
 ### 6.1 Test Suites Breakdown (`web/vpn_diagnostics_test.go`)
 
-`web/vpn_diagnostics_test.go` contains 33 verified Go test functions. The test suite comprises five distinct verification harnesses (Finding 4):
+`web/vpn_diagnostics_test.go` contains 33 verified Go test functions. The test suite comprises distinct verification harnesses across pure Go checks, DOM parsers, mock DOMs, headless JSDOM, and mixed multi-paradigm suites (Finding 4):
 - **Pure Go Dictionary Checks (2 functions)**: Tests 8 and 25 verify translation key parity, completeness, and `{placeholder}` consistency across all 5 JSON locale files without any DOM or Node.js execution.
 - **Token-Based String Verification (1 function)**: Test 16 (`TestVPNDiagnosticsPollingContract`) is a static token-checking test. It reads `templates/vpn.html` via `TemplatesFS.ReadFile` and uses Go string counts (`strings.Count`, `strings.Contains`) to assert the literal presence of polling and handler tokens (`NexusTelemetry.poll('vpn-status'`, `API.get('/api/vpn/status')`, `vpnRenderForwarderHealth(status)`), without executing Node.js or JSDOM.
-- **Go HTML-Parser DOM Tests (1 function)**: Test 32 (`TestVPNDashboardSectionOrder`) parses `templates/vpn.html` using Go's `golang.org/x/net/html` (`xhtml.Parse`) to assert visual container sibling order (`stats-grid -> backends card -> sessions card -> vpn-forwarder-card`, visual order: `stats -> backends -> sessions -> forwarder`) and verifies rejection of decoy HTML comments.
-- **Node.js with Custom DOM Mock (27 functions)**: Tests 1–7, 9–15, 17–24, 26–27, 29, 31, and 33 extract target JavaScript functions from `vpn.html` and execute them inside Node.js against a lightweight Go-synthesized mock DOM (`vpnDOMMock`) implementing element structures, attributes, and class lists. Specifically, Test 15 (`TestVPNDiagnosticsTemplateDOMOracle`) uses this Node/custom DOM mock harness to verify that mutated element IDs fail the DOM oracle check against the template's element registry.
-- **Headless JSDOM Environment (2 functions)**: Tests 28 and 30 execute in Node.js using the full headless `jsdom` npm package to validate complete browser DOM lifecycles, event dispatching, and `NexusTable` sorting and accordion state persistence.
+- **Go HTML-Parser DOM Tests (1 function standalone)**: Test 32 (`TestVPNDashboardSectionOrder`) parses `templates/vpn.html` using Go's `golang.org/x/net/html` (`xhtml.Parse`) to assert visual container sibling order (`stats-grid -> backends card -> sessions card -> vpn-forwarder-card`, visual order: `stats -> backends -> sessions -> forwarder`) and verifies rejection of decoy HTML comments.
+- **Node.js with Custom DOM Mock (26 functions)**: Tests 1–7, 9–15, 17–24, 26–27, 31, and 33 extract target JavaScript functions from `vpn.html` and execute them inside Node.js against a lightweight Go-synthesized mock DOM (`vpnDOMMock`) implementing element structures, attributes, and class lists. Specifically, Test 15 (`TestVPNDiagnosticsTemplateDOMOracle`) uses this Node/custom DOM mock harness to verify that mutated element IDs fail the DOM oracle check against the template's element registry.
+- **Mixed-Harness Test (1 function)**: Test 29 (`TestVPNForwarderRoutesTableFormatting`) is a mixed multi-paradigm test with 4 distinct subtests:
+  * `TemplateDOMStructure`: Go `golang.org/x/net/html` (`xhtml.Parse`) parser verifying `#vpn-fwd-routes-table` container hierarchy (`.table-container`), classes (`.data-table`), minimum width (`min-width: 540px`), and table header styles.
+  * `RenderedCellFormattingInNode`: Node.js with custom `vpnDOMMock` executing extracted `vpnFormatPeerKey` and `vpnRenderForwarderHealth` to assert 5 rendered cells per row with `white-space: nowrap` and `text-align: right`.
+  * `PersianRTLRendering`: Hybrid Go `xhtml.Parse` Persian header assertion plus real headless JSDOM execution via `jsdomBootstrapSnippet` and `runJSDOMTestScript` under `dir="rtl"` validating computed direction (`direction: rtl`), localized headers, and cell formatting.
+  * `NarrowViewportLayout`: Real headless JSDOM execution via `runJSDOMTestScript` at 375px mobile viewport (`w.innerWidth = 375`) asserting `.table-container` computed `overflow-x: auto` and table `min-width: 540px`.
+- **Headless JSDOM Environment (2 standalone functions; 3 functions total containing JSDOM execution)**: Tests 28 and 30 execute entirely in Node.js using the full headless `jsdom` npm package to validate complete browser DOM lifecycles, event dispatching, and `NexusTable` sorting and accordion state persistence. Across the entire test suite, tests 28, 29, and 30 all contain JSDOM execution.
 
 | # | Test Function Name | Test Type | Tested Function / UI Component | Key Invariants Verified |
 |---|---|---|---|---|
@@ -469,7 +480,7 @@ Polling across Amnezia Nexus is managed by the `NexusTelemetry` engine (`web/sta
 | 26 | `TestVPNPacketLossCellDecoupledFromQueuePressure` | Node.js (vpnDOMMock) | Sessions table loss cell | Ensures packet loss cell is decoupled from queue pressure calculations. |
 | 27 | `TestVPNReconnectSessionIDMismatchShowsUnroutable` | Node.js (vpnDOMMock) | Route drilldown | Displays unroutable badge when session ID does not match active route ID. |
 | 28 | `TestVPNNexusTableLifecycleDrilldownAndConfigDedup`| Headless JSDOM | `vpnCreateSessionDrilldownRow` | Asserts drilldown DOM lifecycle, action buttons, and config deduplication using Node with jsdom. |
-| 29 | `TestVPNForwarderRoutesTableFormatting` | Node.js (vpnDOMMock) | Route formatting | Asserts numeric formatting, bytes/sec, and packet rates in routes table. |
+| 29 | `TestVPNForwarderRoutesTableFormatting` | Mixed (Go xhtml.Parse + Node vpnDOMMock + Headless JSDOM) | Route table layout & formatting (4 subtests) | Validates table DOM hierarchy (`TemplateDOMStructure` via Go `xhtml.Parse`), cell formatting (`RenderedCellFormattingInNode` via `vpnDOMMock`), RTL rendering (`PersianRTLRendering` via `xhtml.Parse` + JSDOM), and responsive overflow (`NarrowViewportLayout` via JSDOM 375px). |
 | 30 | `TestVPNSessionsTableSortingAndAccordionPersistence`| Headless JSDOM | `NexusTable`, `vpnExpandedSessionIds`| Tests sorting by bytes/loss and validates accordion persistence across sort using Node with jsdom. |
 | 31 | `TestVPNRoutingConsistencyBadgeSeverityAware` | Node.js (vpnDOMMock) | Severity badge logic | Tests CRITICAL, DEGRADED, and WARNING severity badge color assignment. |
 | 32 | `TestVPNDashboardSectionOrder` | Go HTML-Parser (xhtml.Parse) | Visual DOM section ordering | Validates layout order: stats-grid -> backends card -> sessions card -> vpn-forwarder-card (visual order: stats -> backends -> sessions -> forwarder); rejects decoy comments. |
@@ -567,7 +578,7 @@ The repository contains Playwright integration suites in `tests/e2e/*.py` that e
 
 ## 7. Phased Extraction & Migration Plan (Phase 3 & #542)
 
-To maintain reviewability, prevent regression risk, and satisfy the project guideline of remaining strictly below 1,000 lines per PR, Phase 3 modularization is structured into sequential waves.
+To maintain reviewability, prevent regression risk, and satisfy the project guideline of remaining strictly below 1,000 physical lines per static JavaScript module, Phase 3 modularization is structured into sequential waves.
 
 ### Sizing and Line Ceiling Protocol (Finding 1 & Finding 3)
 - **Per-File Physical Line Ceiling**: Every newly created static JavaScript module must strictly adhere to the project line ceiling of under 1,000 physical lines (`health_summary.js` is ~450 physical lines; `health_problems.js` is ~850 physical lines).
@@ -684,8 +695,8 @@ Wave 6: Stylesheet Partitioning
 
 #### Step 8: Issue #501a — Extract Server Shared Helpers & Protocol Layer
 - **Destination**: `web/static/js/server/shared.js` (~200 lines).
-- **Scope**: Extract `getProtoTitle`, `updateProtocolCard`, shared section-visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), `updateStatusCounts`, `formatDate`, and the protocol action callback registration and event dispatch interface (`registerProtocolActionHandler`, `dispatchProtocolAction`) to eliminate circular dependencies between actions and monitoring.
-- **Contract Guardrails**: Must be loaded before `actions.js` and `monitoring.js`. Card builders delegate action clicks through registered callbacks or `nexus:protocol-action` custom DOM events. Section visibility is owned by `server/shared.js`.
+- **Scope**: Extract `getProtoTitle`, `updateProtocolCard`, shared section-visibility primitives (`showConnectionsSection`, `hideConnectionsSection`), `updateStatusCounts`, `formatDate`, and the protocol action callback registration and event dispatch interface (`registerProtocolActionHandler`, `dispatchProtocolAction`) supporting all card actions (`install`, `reinstall`, `start`, `stop`/`toggle` with `isRunning`, `uninstall`, `select-conns`, `config`) to eliminate circular dependencies between actions and monitoring.
+- **Contract Guardrails**: Must be loaded before `actions.js` and `monitoring.js`. Card builders delegate action clicks through registered callbacks or `nexus:protocol-action` custom DOM events with payload `{ action, proto, isRunning }` (ensuring `openInstallModal` delegation for install/reinstall and preserving `isRunning` state for start/stop confirmation styling). Section visibility is owned by `server/shared.js`.
 
 #### Step 9: Issue #501b — Extract Server Management Forms & Actions
 - **Destination**: `web/static/js/server/actions.js` (~580 lines).
