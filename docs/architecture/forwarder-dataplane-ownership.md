@@ -21,7 +21,7 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `routesByPeer` | `map[string]*sessionRoute` | Primary route index keyed by peer public key (`peerKey`) | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Modified on session registration, unregistration, and retirement |
 | `routesByIP` | `map[string]*sessionRoute` | Reverse route index keyed by client VIP (`assignedIP`) | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Modified on session registration, unregistration, and retirement |
 | `backendTraffic` | `map[int64]*trafficCounters` | Per-backend tunnel cumulative traffic and rate monitoring | `Forwarder.mu.Lock` (map access), per-counter `trafficCounters.mu` | Entries created in `ensureBackendTrafficLocked`, cleared in `DetachBackendDevice` |
-| `backendQueues` | `map[int64]chan []byte` | Egress packet queues toward backend tunnels | `Forwarder.mu.Lock` (map access), Go channel synchronization | Queues created on route registration or backend attachment; cleared in `DetachBackendDevice` |
+| `backendQueues` | `map[int64]chan []byte` | Egress packet queues toward backend tunnels | `Forwarder.mu.Lock` (map access), Go channel synchronization | Created on route registration or backend attachment; preserved across `DetachBackendDevice` |
 | `backendDevices` | `map[int64]PacketDevice` | Attached backend network interfaces / TUN devices | `Forwarder.mu.Lock` (map access) | Attached in `AttachBackendDevice`, removed in `DetachBackendDevice` |
 | `backendPumpStops` | `map[int64]chan struct{}` | Per-backend pump termination signaling channels | `Forwarder.mu.Lock` (map access) | Created in `AttachBackendDevice`/`StartPumps`, closed on detach or stop |
 | `backendPumpDones` | `map[int64]chan struct{}` | Per-backend pump exit completion notification channels | `Forwarder.mu.Lock` (map access) | Created alongside `backendPumpStops`, closed on pump goroutine exit |
@@ -29,10 +29,10 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `backendBufSize` | `int` | Capacity for backend egress queues (default 2048) | Immutable after construction | Set at construction (`DefaultBackendQueueSize`) |
 | `maxActiveRoutes` | `int` | Upper bound for concurrently registered active peer routes | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Set at construction; updated via `ReconfigureClientQueueConfig` |
 | `portalSubnet` | `*net.IPNet` | Authorized client CIDR pool used to validate inner source IPs | Immutable after construction | Initialized from CIDR string at constructor |
-| `totalRxBytes` | `atomic.Int64` | Monotonic count of bytes forwarded from client to backend | `sync/atomic` operations | Reset on `Start()`; incremented on successful backend enqueue |
-| `totalTxBytes` | `atomic.Int64` | Monotonic count of bytes forwarded from backend to client | `sync/atomic` operations | Reset on `Start()`; incremented on successful client enqueue |
-| `totalRxPackets` | `atomic.Uint64` | Monotonic count of packets forwarded client to backend | `sync/atomic` operations | Reset on `Start()`; incremented on successful backend enqueue |
-| `totalTxPackets` | `atomic.Uint64` | Monotonic count of packets forwarded backend to client | `sync/atomic` operations | Reset on `Start()`; incremented on successful client enqueue |
+| `totalRxBytes` | `atomic.Int64` | Cumulative lifetime throughput bytes client to backend | `sync/atomic` operations | Not reset on `Start()`; incremented on successful backend enqueue |
+| `totalTxBytes` | `atomic.Int64` | Cumulative lifetime throughput bytes backend to client | `sync/atomic` operations | Not reset on `Start()`; incremented on successful client enqueue |
+| `totalRxPackets` | `atomic.Uint64` | Cumulative lifetime throughput packets client to backend | `sync/atomic` operations | Not reset on `Start()`; incremented on successful backend enqueue |
+| `totalTxPackets` | `atomic.Uint64` | Cumulative lifetime throughput packets backend to client | `sync/atomic` operations | Not reset on `Start()`; incremented on successful client enqueue |
 | `dropsQueueFull` | `atomic.Uint64` | Return packets dropped due to full client route queue | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
 | `dropsNoRoute` | `atomic.Uint64` | Return packets dropped due to unmapped VIP or backend mismatch | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
 | `dropsPacketTooLarge` | `atomic.Uint64` | Return packets dropped exceeding `MaxClientQueuePacketBytes` | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
@@ -43,7 +43,7 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `clientDropsTotal` | `atomic.Uint64` | Monotonic total of all client-to-backend packet drops | `sync/atomic` operations | Reset on `Start()`; incremented on every client drop event |
 | `spoofedRebinds` | `atomic.Uint64` | Monotonic count of inner source IPs failing rebind checks | `sync/atomic` operations | Incremented in `routeClientToBackend` on spoof attempt |
 | `returnRejectClassifier`| `func(ReturnRejectReason)`| Hook receiving return-path drop classifications | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (snapshot) | Registered via `SetReturnRejectClassifier`; invoked outside locks |
-| `writeErrLogUntil` | `atomic.Int64` | Monotonic UNIX deadline throttling device write error logs | `sync/atomic` CAS | Updated in `writeClientPacket` on `dev.Write` failure (max 1 log/sec) |
+| `writeErrLogUntil` | `atomic.Int64` | Wall-clock Unix timestamp throttling device write error logs | Atomic Load/Store | Updated in `writeClientPacket` on `dev.Write` failure (independent Load/Store) |
 | `writeMetricsMu` | `sync.Mutex` | Protects aggregate device write timings and reservoirs | `writeMetricsMu.Lock` | Initialized at struct allocation |
 | `writeMetrics` | `DeviceWriteTelemetry` | Aggregate device write latency and stall statistics | `Forwarder.writeMetricsMu` | Updated in `writeClientPacket` and read in `DeviceWriteSnapshot` |
 | `writeHistogram` | `writeDurationHistogram` | Histogram binning completed client device write latencies | `Forwarder.writeMetricsMu` | Updated in `writeClientPacket`; exported via `WriteDurationMetrics` |
@@ -59,7 +59,7 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `aggregateQueueHighWater`| `atomic.Uint64` | Peak aggregate occupancy reached across all client queues | `sync/atomic` CAS | Updated during packet enqueue under `aggregateQueueMu` |
 | `aggregateQueueMu` | `sync.Mutex` | Serializes aggregate queue accounting and occupancy updates | `aggregateQueueMu.Lock` | Initialized at struct allocation |
 | `running` | `bool` | Lifecycle flag indicating whether forwarder is active | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Set `true` in `Start()`; set `false` in `Stop()` |
-| `stopCh` | `chan struct{}` | Global termination signal for the forwarder instance | Channel synchronization | Created at constructor; closed on termination |
+| `stopCh` | `chan struct{}` | Instance stop signal channel allocated at construction | Channel synchronization | Created at constructor; never closed by `Stop()` (subsystems use dedicated stop channels) |
 | `pumpsRunning` | `bool` | Indicates whether background pump workers are currently active| `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Set `true` in `StartPumps()`; set `false` in `stopPumpsSignalOnly()` |
 | `pumpsStopCh` | `chan struct{}` | Termination signal broadcast to all active pump workers | Channel synchronization | Created in `StartPumps()`; closed in `stopPumpsSignalOnly()` |
 | `pumpsWg` | `sync.WaitGroup` | Tracks active pump worker goroutines | `sync.WaitGroup` methods | Incremented on pump spawn; decremented on pump termination |
@@ -79,7 +79,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 | `peerKey` | `string` | Public key fingerprint identifying the peer | Immutable after route creation | Initialized in `registerSessionLocked` |
 | `assignedIP` | `string` | Virtual IP allocated to the peer | Immutable after route creation | Initialized in `registerSessionLocked` |
 | `backendTunnelID` | `int64` | ID of the backend tunnel handling this route's traffic | `Forwarder.mu.Lock` | Set at creation; updated in `UpdateSessionBackend` |
-| `returnPath` | `*ReturnPath` | Dedicated return path engine binding (nil for legacy TUN) | Immutable after route creation | Set at creation; re-bound via `BindSessionReturnPath` |
+| `returnPath` | `*ReturnPath` | Dedicated return path engine binding (nil for legacy TUN) | Immutable per route generation | Set at creation; changed owner replaces route generation in `BindSessionReturnPath` |
 | `clientQueue` | `chan []byte` | Buffered downstream packet channel toward client | Channel operations; protected against close | Created at route creation; never closed |
 | `queueReady` | `chan struct{}` | Coalesced notification channel waking the client pump worker | Channel synchronization (cap 1) | Signaled on enqueue; drained on dequeue |
 | `queueHighWater` | `atomic.Uint64` | Peak occupancy observed on this specific client queue | `sync/atomic` CAS | Updated on packet enqueue |
@@ -105,8 +105,8 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 ### 2.3 Supporting Dataplane Structs
 
 - **`TokenBucket`**: Mutex-guarded (`tb.mu`) token bucket rate limiter. Tracks `rate`, burst `capacity`, current `tokens`, and `lastUpdate`. `Allow(n)` deducts tokens if available; non-positive rates are treated as nil (unlimited).
-- **`ReturnPath`**: Mutex-guarded (`ReturnPath.mu`) lifetime owner for client engine return writes. Owns `closed bool` and `write func(peerKey, assignedIP string, packet []byte) (int, error)`. `Close()` rejects future writes while allowing in-flight writes to complete.
-- **`Retirement`**: Represents a retired route generation undergoing teardown. Carries `route *sessionRoute`. `Wait()` and `WaitContext(ctx)` block until all in-flight device writes admitted under `route.writeMu` finish.
+- **`ReturnPath`**: Mutex-guarded (`ReturnPath.mu`) lifetime owner for client engine return writes. Owns `closed bool` and `write func(peerKey, assignedIP string, packet []byte) (int, error)`. `Write()` holds `ReturnPath.mu.RLock()` across writer callbacks; `Close()` acquires write `Lock()` and joins in-flight writes.
+- **`Retirement`**: Represents a retired route generation undergoing teardown. Carries `route *sessionRoute`. `Wait()` and `WaitContext(ctx)` block until all in-flight device writes admitted under `route.writeMu` finish. Device write quiescence is guaranteed strictly upon **successful** completion of `WaitContext`; on timeout, it returns `ErrRetirementTimeout` and its joining helper goroutine remains blocked on `writeMu` until the write returns.
 - **`routePressureWindow`**: Mutex-guarded (`mu`) sliding-window tracker over monotonic route failure counters (`queueFullDrops`, write errors, write stalls). Enforces a 200ms evaluation floor (`routePressureSampleInterval`) to prevent multi-pass telemetry queries from clearing recent incident deltas.
 - **`queueDwellTracker`**: Unlocked struct owned strictly by `Forwarder.aggregateQueueMu`. Measures cumulative and consecutive time aggregate queue occupancy dwells above 50% and 80% capacity thresholds.
 - **`RateTracker`**: Mutex-guarded (`mu`) generation-aware rate calculator. Owns `GenerationSampler`, computing instant rates, packet rates, drop rates, and 5-minute / 1-hour exponential moving averages (EWMA).
@@ -120,11 +120,12 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 ```
                   +----------------------------------------------+
                   |               Forwarder.Start()              |
+                  |  (Initializes generations & drop baselines)  |
                   +----------------------------------------------+
-                                         |
-                                         v
+
                   +----------------------------------------------+
                   |             Forwarder.StartPumps()           |
+                  |  (Separate caller invocation spawns workers) |
                   +----------------------------------------------+
                                /                    \
                               /                      \
@@ -133,7 +134,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
             |  go pumpBackendQueue() |      |   go pumpClientQueue() |
             +------------------------+      +------------------------+
             | Reads: backendQueues   |      | Reads: clientQueue     |
-            | Writes: PacketDevice   |      | Writes: ReturnPath/Dev |
+            | Writes: PacketDevice   |      | Writes: ReturnPath     |
             +------------------------+      +------------------------+
                          |                              |
          (DetachBackendDevice/StopPumps)        (Route Retirement/StopPumps)
@@ -157,8 +158,8 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
   1. Checks termination signals (`stopCh` or `route.stopCh`).
   2. Acquires `f.aggregateQueueMu.Lock()`, reconciles occupancy, and performs a non-blocking read from `route.clientQueue`.
   3. If queue is empty: unlocks `f.aggregateQueueMu` and blocks on `select { case <-stopCh: ... case <-routeStopCh: ... case <-route.queueReady: }`.
-  4. If packet is retrieved: unlocks `f.aggregateQueueMu`, acquires `f.mu.RLock()` to resolve the active `packetWriter` (`ReturnPath` or legacy device), and releases `f.mu.RLock()`.
-  5. Invokes `writeClientPacket(route, dev, pkt)`.
+  4. If packet is retrieved: unlocks `f.aggregateQueueMu`, acquires `f.mu.RLock()` to resolve the active `packetWriter` (strictly via `routeWriter` wrapping non-nil `ReturnPath`; if `route.returnPath == nil`, dequeued packets have no writer and are discarded), and releases `f.mu.RLock()`.
+  5. If writer is non-nil, invokes `writeClientPacket(route, dev, pkt)`.
 - **Termination & Cleanup**:
   - Exits when `pumpsStopCh` (global forwarder stop) or `route.stopCh` (route unregistration/retirement) is closed.
   - Calls `defer f.pumpsWg.Done()`.
@@ -177,9 +178,10 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 #### 3. Worker Shutdown Signaling
 - **Graceful Forwarder Shutdown (`Stop`)**:
   1. Calls `wait := f.RetireAllRoutes()`. Under `f.mu.Lock()`, every active route is retired via `stopRoutePumpLocked` (closing `route.stopCh`, setting `route.retired = true`), queues are drained via `drainRouteQueueLocked`, and routing tables are cleared.
-  2. Runs `wait(ctx)` outside locks with a deadline (default 5s) to join all in-flight device writes.
-  3. Calls `StopPumps()`, which invokes `stopPumpsSignalOnly()` (closes `pumpsStopCh` and all `backendPumpStops`) and waits on `f.pumpsWg.Wait()`.
-  4. Flushes and terminates `TrafficAccountant`. Sets `f.running = false`.
+  2. Runs `wait(ctx)` outside locks with a deadline (default 5s) to join all in-flight device writes. Device write quiescence is guaranteed strictly upon successful completion.
+  3. If `wait(ctx)` returns a timeout error (`ErrRetirementTimeout`), `Stop()` enters its timeout recovery path: calls `f.stopPumpsSignalOnly()` (closing `pumpsStopCh` and all `backendPumpStops`), marks `f.running = false` under `f.mu.Lock()`, stops `TrafficAccountant`, and returns the timeout error immediately without blocking on `f.pumpsWg.Wait()`. The background helper goroutines spawned to join `writeMu` remain blocked until the writes finish.
+  4. On successful quiescence, calls `StopPumps()`, which invokes `stopPumpsSignalOnly()` and waits on `f.pumpsWg.Wait()`. Note that `StopPumps()` has no timeout mechanism and cannot interrupt a backend device permanently blocked in `dev.Write(pkt)`.
+  5. Flushes and terminates `TrafficAccountant`. Sets `f.running = false`.
 
 ---
 
@@ -217,14 +219,14 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 ```
 
 1. **Ingress Read**: Network listener reads encrypted payload, decrypts plaintext IP packet into an ingress buffer, and calls `RouteClientToBackend(peerKey, packet)`.
-2. **Route Resolution & Anti-Spoofing**: Under `f.mu.RLock()`, the forwarder resolves `sessionRoute` by `peerKey`. The packet's inner IPv4 source IP is validated: if non-zero and not equal to `route.assignedIP`, `spoofedRebinds` is incremented and `ErrSpoofedSourceIP` is returned (packet dropped).
+2. **Route Resolution & Anti-Spoofing**: Under `f.mu.RLock()`, the forwarder resolves `sessionRoute` by `peerKey`. The packet's inner IPv4 source IP is validated: if non-zero and not equal to `route.assignedIP`, `spoofedRebinds` is incremented and `ErrSpoofedSourceIP` is returned (packet dropped). The forwarder unconditionally rejects mismatched non-zero inner source IPs; there is no dynamic self-heal rebind path in production routing.
 3. **Token Bucket Evaluation**: Evaluates `tbUp.Allow(pktLen)`. If tokens are insufficient, drops are counted and `ErrRateLimitExceeded` is returned.
 4. **Buffer Detachment & Allocation**: An independent byte slice is allocated:
    ```go
    pktCopy := make([]byte, len(packet))
    copy(pktCopy, packet)
    ```
-   *Invariant*: The enqueued slice is completely decoupled from the caller's stack/arena buffer.
+   *Invariant*: The enqueued slice is completely decoupled from the caller's stack/arena buffer. There is **NO forwarder-owned `sync.Pool`**: packet slices are independent heap allocations reclaimed by Go garbage collection once channel references are consumed and released.
 5. **Backend Enqueue**: A non-blocking send submits `pktCopy` to `backendQueue`:
    - *Success*: Increments `totalRxBytes`, `totalRxPackets`, route/backend traffic counters, and accountant Rx.
    - *Queue Full*: Increments `clientDropsQueueFull` and returns `ErrQueueFull`. `pktCopy` becomes immediately unreachable and is garbage collected.
@@ -252,17 +254,18 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
         |       \-- Saturated: Return ErrRateLimitExceeded
         |
         +---> [ Packet Slice Allocation: make([]byte, len(packet)) + copy ]
+        |       \-- Independent heap allocation; reclaimed by GC
         |
-        +---> [ Re-verify Route & Enqueue under f.aggregateQueueMu ]
+        +---> [ Re-verify Route & Enqueue under f.mu.RLock() and f.aggregateQueueMu ]
         |       |-- Check routesByIP[destIP] == route (guards against concurrent delete)
-        |       |-- Non-blocking enqueue: route.clientQueue <- pktCopy
+        |       |-- Non-blocking enqueue: select { case route.clientQueue <- pktCopy: ... default: ... }
         |       |-- Success: Notify route.queueReady, update high-water mark, record Tx
         |       \-- Saturated: Increment route.queueFullDrops, dropsQueueFull
         v
 [ pumpClientQueue ]
         |
         +---> Dequeue under f.aggregateQueueMu; update occupancy
-        +---> Resolve writer (routeWriter with ReturnPath) under f.mu.RLock()
+        +---> Resolve writer (routeWriter with ReturnPath; discarded if nil) under f.mu.RLock()
         +---> [ writeClientPacket ]
         |       |-- Acquire route.writeMu
         |       |-- Check !route.retired.Load()
@@ -271,7 +274,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
         |       |-- Update writeMetrics, writeLatencies, writeHistogram
         |       \-- Release route.writeMu
         v
-[ Client TUN / ReturnPath Callback ]
+[ Client ReturnPath Callback ]
         \-- Slice released; garbage collected
 ```
 
@@ -284,12 +287,13 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
    - Packets exceeding `MaxClientQueuePacketBytes` (1500 bytes) are rejected with `ErrPacketTooLarge`.
    - Checks `tbDown.Allow(pktLen)`. Saturated buckets return `ErrRateLimitExceeded`.
 5. **Buffer Allocation & Enqueue**:
-   - Allocates `pktCopy := make([]byte, len(packet))` and copies payload.
-   - Re-acquires `f.mu.RLock()` to verify `routesByIP[destIP] == route` (preventing delivery to a replaced route generation).
-   - Under `f.aggregateQueueMu.Lock()`, attempts non-blocking send to `route.clientQueue`.
-   - *Success*: Updates aggregate occupancy, sets `route.queueHighWater` and `f.aggregateQueueHighWater`, posts notification to `route.queueReady`, and records Tx statistics.
-   - *Queue Full*: Increments `route.queueFullDrops` and returns `ErrQueueFull`.
-6. **Consumer Pump Dequeue**: `pumpClientQueue` wakes, dequeues `pktCopy` under `aggregateQueueMu`, resolves the `packetWriter` under `f.mu.RLock()`, and executes `writeClientPacket`.
+   - Allocates `pktCopy := make([]byte, len(packet))` and copies payload (independent heap slice; no forwarder-owned `sync.Pool`).
+   - Re-acquires `f.mu.RLock()` and verifies `routesByIP[destIP] == route`.
+   - Retaining `f.mu.RLock()`, acquires `f.aggregateQueueMu.Lock()` and attempts non-blocking send (`select { case clientQueue <- pktCopy: ... default: ... }`) to `route.clientQueue`.
+   - *Success*: Updates aggregate occupancy, sets `route.queueHighWater` and `f.aggregateQueueHighWater`, posts notification to `route.queueReady`, records Tx statistics, releases `aggregateQueueMu` then `f.mu.RLock()`.
+   - *Queue Full*: Releases locks, increments `route.queueFullDrops` and returns `ErrQueueFull`.
+   - *Linearization with Retirement*: Because `RetireAllRoutes`, `UnregisterSession`, and `RetireRoutesByReturnPath` acquire `f.mu.Lock()` exclusively, return packet enqueue strictly precedes route retirement/drain, OR if retirement runs first, subsequent return packets find the route missing in `routesByIP` and return `ErrSessionNotRegistered` before any enqueue attempt. Retired queues are never refilled.
+6. **Consumer Pump Dequeue**: `pumpClientQueue` wakes, dequeues `pktCopy` under `aggregateQueueMu`, resolves the `packetWriter` strictly via non-nil `ReturnPath` under `f.mu.RLock()` (if `ReturnPath` is nil, dequeued packets have no writer and are discarded), and executes `writeClientPacket`.
 7. **Device Write & Retirement Fence**:
    - In `writeClientPacket`, acquires `route.writeMu`.
    - Verifies `!route.retired.Load()`. If retired, the packet is discarded immediately.
@@ -304,8 +308,8 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 
 ```
 +------------------------------------------------------------------------+
-|            Aggregate Client Queue Memory Budget (8 GiB)                |
-|                    MaxClientQueueMemoryBytes                           |
+|          Aggregate Client Queued-Payload Byte Budget (8 GiB)           |
+|                       MaxClientQueueMemoryBytes                        |
 +------------------------------------------------------------------------+
        |                                                    |
        v (Default Population: 1,000 routes)                 v (Explicit Route Limits)
@@ -318,13 +322,15 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 
 - **MTU Bounds**: Target WireGuard VPN MTU is 1420 bytes.
 - **Maximum Queued Packet Size**: `MaxClientQueuePacketBytes = 1500` bytes (conservative upper bound per queued packet).
-- **Aggregate Client Memory Ceiling**: `MaxClientQueueMemoryBytes = 8 << 30` (8 GiB).
+- **Aggregate Client Queued-Payload Byte Budget**: `MaxClientQueueMemoryBytes = 8 << 30` (8 GiB).
+  *Important*: The 8 GiB formula is strictly a **queued payload byte budget** (`forwarder.go:329–340`), not an aggregate process memory ceiling. It explicitly excludes Go channel descriptors, GC allocator overhead, route struct metadata, in-flight stack buffers, and backend queues (`backendQueues`).
+- **Buffer Pool Lifecycle**: There is **NO forwarder-owned `sync.Pool`**. Packet slices are independent heap allocations (`make([]byte, ...)`) reclaimed by Go garbage collection once channel references are consumed and released.
 - **Maximum Supported Active Routes**: `MaxBudgetedActiveRoutes = 8 GiB / 1500 B = 5,726,623` routes. Default active route limit is `MaxSupportedActiveRoutes = 1000`.
 - **Queue Sizing Calculation**:
   ```go
   maxPackets := MaxClientQueueMemoryBytes / (activeRoutes * MaxClientQueuePacketBytes)
   ```
-  With 1,000 routes, the mathematical maximum queue capacity is 5,726 packets. The forwarder caps `DefaultClientQueueSize` at 2,048 packets (~2.8 MB per client).
+  With the default 1,000 routes, the mathematical maximum queue capacity is 5,726 packets. The forwarder caps `DefaultClientQueueSize` at 2,048 packets (~2.8 MB per client) as the default queue capacity, not universal. Explicit configurations via `ReconfigureClientQueueConfig` derive per-route queue capacities bounded by the configured route limit.
 - **Queue Memory Isolation**: Client queue sizes (`bufSize`) and backend queue sizes (`backendBufSize` = 2048) are configured independently. Reconfiguring client route queue limits never mutates backend queue allocations.
 
 ---
@@ -373,7 +379,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 #### 2. Live Backend Update (`UpdateSessionBackend`)
 - Modifies `route.backendTunnelID` under `f.mu.Lock()`.
 - Ensures backend queue and traffic structures exist for the new tunnel.
-- *Zero Disruption Invariant*: Existing `clientQueue`, token buckets, session IDs, and pump workers remain entirely untouched. No packet loss or teardown occurs during backend failover.
+- *Preservation & Failover Delivery Semantics*: Existing `sessionRoute` objects, `clientQueue`, token buckets, session IDs, and pump workers remain entirely untouched. However, `UpdateSessionBackend` does not migrate packets already queued in the upstream backend queue, and in-flight return packets arriving from the old backend tunnel will fail return-path validation (`ErrReturnRouteMismatch`) and be dropped.
 
 #### 3. Unregistration & Teardown (`BeginUnregisterSession`, `RetireAllRoutes`, `RetireRoutesByReturnPath`)
 - **Generational Identity Guard**: `BeginUnregisterSession(peerKey, sessionID)` verifies `route.sessionID == sessionID`. A delayed teardown call for an expired session cannot unregister a newer session that replaced it.
@@ -388,7 +394,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 1. **Inner Source IP Anti-Spoofing Guard**:
    - In `routeClientToBackend`, the inner packet source IP (`srcIP`) is extracted from the IPv4 header.
    - If `srcIP` is non-zero and does not equal `route.assignedIP`, the packet is dropped, `spoofedRebinds` is atomically incremented, and `ErrSpoofedSourceIP` is returned.
-   - The forwarder never rebinds route ownership based on arbitrary packet headers. Dynamic self-heal is restricted strictly to unassigned IPs within `portalSubnet`.
+   - The forwarder unconditionally rejects mismatched non-zero inner source IPs (`routeClientToBackend` in `forwarder.go:855–872`). There is no dynamic self-heal rebind path to unassigned subnet addresses in production routing.
 2. **Cross-Session Return Path Isolation (`ErrReturnRouteMismatch`)**:
    - In `RouteBackendToClient`, return packets arriving from backend tunnel `B` intended for client VIP `destIP` are verified:
      ```go
@@ -409,61 +415,70 @@ A critical concurrency pitfall in network dataplanes is the `send on closed chan
 
 1. **The Client Channel Is NEVER Closed**:
    - `route.clientQueue` is created during route allocation and is **never** closed by `UnregisterSession`, `RetireAllRoutes`, or `stopRoutePumpLocked`.
-   - *Reason*: `RouteBackendToClient` resolves `route.clientQueue` under `f.mu.RLock()` and attempts enqueue after releasing `f.mu`. If `clientQueue` were closed upon route retirement, concurrent return-path packet sends would trigger a fatal Go runtime panic.
-2. **Termination Signaling via Dedicated Stop Channel**:
+   - *Reason*: Channel non-closure guarantees zero risk of a fatal `send on closed channel` runtime panic across concurrent senders.
+2. **Retirement Linearization & Lock-Protected Enqueue**:
+   - Return packet enqueue in `RouteBackendToClient` (`forwarder.go:991–1036`) acquires `f.mu.RLock()`, re-validates `routesByIP[destIP] == route`, and retains `f.mu.RLock()` across `f.aggregateQueueMu.Lock()` and the nonblocking channel send (`select { case clientQueue <- pktCopy: ... default: ... }`).
+   - Because `RetireAllRoutes`, `UnregisterSession`, and `RetireRoutesByReturnPath` acquire `f.mu.Lock()` exclusively, return packet enqueue strictly precedes route retirement/drain, OR if retirement runs first, subsequent return packets find the route missing in `routesByIP` and return `ErrSessionNotRegistered` before any enqueue attempt.
+   - Retired queues are never refilled after being drained.
+   - Managed nonblocking channel sends under table locks (`f.mu.RLock()`) are safe and permitted, distinguishing them from blocking channel operations or device I/O.
+3. **Termination Signaling via Dedicated Stop Channel**:
    - Goroutine shutdown is signaled exclusively by closing `route.stopCh`.
    - `route.stopped` guards against closing `stopCh` multiple times.
-3. **Synchronous Queue Drain**:
+4. **Synchronous Queue Drain**:
    - During retirement, `drainRouteQueueLocked(route)` drains all buffered packets from `route.clientQueue` under `aggregateQueueMu.Lock()`.
-   - Late return packets sent to the retired route after queue drainage simply hit a full queue buffer (`ErrQueueFull`) or remain unread until the route struct is garbage collected.
-4. **Device Write Join Contract (`writeMu`)**:
+5. **Device Write Join Contract (`writeMu`) & Timeout Quiescence**:
    - Active device writes hold `route.writeMu`.
    - Retirement sets `route.retired.Store(true)` and returns a `Retirement` struct.
-   - `Retirement.WaitContext(ctx)` acquires and releases `route.writeMu`. Once it returns, no goroutine can begin or execute a device write for that route generation.
+   - `Retirement.WaitContext(ctx)` (`client_write.go:188–209`) spawns a helper goroutine that acquires and releases `route.writeMu`. Device write quiescence is guaranteed strictly upon **successful** completion of `WaitContext`.
+   - When `WaitContext` times out before the admitted write finishes, it returns `ErrRetirementTimeout`. The helper goroutine remains blocked on `route.writeMu` until the underlying write finishes (it is NOT forcefully canceled).
 
 ---
 
 ## 5. Lock Hierarchy & Synchronization Rules
 
-To guarantee deadlock-free concurrency across high-throughput packet pumps and administrative endpoints, lock acquisition must strictly follow this hierarchy:
+To guarantee deadlock-free concurrency across high-throughput packet pumps and administrative endpoints, lock acquisition strictly follows two disjoint partial lock graphs:
 
 ```
-+-------------------------------------------------------------------------+
-| Level 1: Outer Service Locks (e.g. Service.mu)                          |
-+-------------------------------------------------------------------------+
-       | (Never acquire Service.mu while holding any Forwarder lock)
-       v
-+-------------------------------------------------------------------------+
-| Level 2: Forwarder Routing Table Lock (Forwarder.mu)                    |
-+-------------------------------------------------------------------------+
-       | (Held for map lookups and route state transitions)
-       v
-+-------------------------------------------------------------------------+
-| Level 3: Aggregate Queue Lock (Forwarder.aggregateQueueMu)              |
-+-------------------------------------------------------------------------+
-       | (Held during queue enqueue, dequeue, capacity change, and dwell)
-       v
-+-------------------------------------------------------------------------+
-| Level 4: Device Write Telemetry Lock (Forwarder.writeMetricsMu)         |
-+-------------------------------------------------------------------------+
-       | (Briefly held to record write start/stop, latencies, and stalls)
-       v
-+-------------------------------------------------------------------------+
-| Level 5: Per-Route Write Admission Lock (sessionRoute.writeMu)          |
-+-------------------------------------------------------------------------+
+[ Snapshot & Telemetry Path ]                 [ Packet Write Path ]
+
+    Outer Service Locks                       sessionRoute.writeMu
+     (e.g. Service.mu)                      (Device write admission)
+            |                                          |
+            v                                          v
+       Forwarder.mu                         Forwarder.writeMetricsMu
+   (Routing table lock)                     (Latency & error stats)
+            |
+            v
+ Forwarder.aggregateQueueMu
+(Queue occupancy & counters)
+            |
+            v
+ Forwarder.writeMetricsMu
+ (Device write telemetry)
 ```
 
-### Prohibited Lock Combinations & Deadlock Rules:
-1. **Never acquire `Forwarder.mu` while holding `sessionRoute.writeMu`**: Device writes may block or experience kernel I/O delays; holding `Forwarder.mu` across `writeMu` would stall the entire dataplane.
-2. **Never call `Retirement.Wait()` while holding `Forwarder.mu` or `Service.mu`**: `Retirement.Wait()` blocks waiting for `route.writeMu`. If the thread executing `dev.Write` requires an outer lock, deadlock results.
-3. **Never perform I/O while holding `Forwarder.mu` or `aggregateQueueMu`**: `dev.Write` and channel sends must occur outside table locks.
-4. **Classifier callbacks run outside `Forwarder.mu`**: `classifyReturnReject` snapshots `f.returnRejectClassifier` under `f.mu.RLock()` and invokes it after releasing the lock, preventing deadlocks with ingress telemetry counters.
+Additionally, `ReturnPath.mu` synchronizes client return writer callbacks:
+- `ReturnPath.Write()` acquires `ReturnPath.mu.RLock()` across writer callbacks.
+- `ReturnPath.Close()` acquires `ReturnPath.mu.Lock()` and joins in-flight writes.
+
+### Disjointness & Deadlock Rules:
+1. **`Forwarder.mu` and `sessionRoute.writeMu` are strictly disjoint**:
+   - Code holding `Forwarder.mu` MUST NEVER acquire `sessionRoute.writeMu` or invoke `Retirement.Wait()` / `route.waitForWriteContext()` (`forwarder.go:189`).
+   - Code holding `sessionRoute.writeMu` MUST NEVER acquire `Forwarder.mu`.
+   - In `client_write.go:216–231`, `route.writeMu.Lock()` is acquired first and `f.writeMetricsMu.Lock()` is acquired second. Device writes execute kernel/network I/O; holding `Forwarder.mu` across `writeMu` would stall global routing.
+2. **Never call `Retirement.Wait()` while holding `Forwarder.mu` or `Service.mu`**:
+   - `Retirement.Wait()` blocks waiting for `route.writeMu`. Calling it while holding an outer mutex leads to immediate deadlock.
+3. **No blocking I/O under `Forwarder.mu` or `aggregateQueueMu`**:
+   - Device writes (`dev.Write`) and blocking channel operations must never execute under table locks.
+   - Nonblocking managed channel operations (`select ... default`) are permitted under `f.mu.RLock()` and `aggregateQueueMu.Lock()`.
+4. **Classifier callbacks run outside `Forwarder.mu`**:
+   - `classifyReturnReject` snapshots `f.returnRejectClassifier` under `f.mu.RLock()` and invokes it after releasing the lock, preventing deadlocks with ingress telemetry counters.
 
 ---
 
 ## 6. Verified Test Baseline
 
-Every test listed below is verified in the repository (`internal/vpn/forwarder/`) and guards the invariants documented above:
+Every test listed below is verified in the repository (`internal/vpn/forwarder/`) across 82 verified test functions and guards the invariants documented above:
 
 | Test Name | File Location | Guarded Dataplane Invariant |
 | :--- | :--- | :--- |
@@ -522,7 +537,7 @@ Every test listed below is verified in the repository (`internal/vpn/forwarder/`
 | `TestMismatchedSourceIPRejectedWithoutMutation` | `rebind_guard_test.go:109` | Mismatched source IP rejected without altering route state |
 | `TestSpoofedRebindsOutsideSubnet` | `rebind_guard_test.go:173` | Source IP outside `portalSubnet` counted as spoofed rebind |
 | `TestReturnPathRoutesOnlyMatchingBackendAndDestination` | `return_path_test.go:26` | Return path validates backend ownership and destination VIP |
-| `TestReturnPathBindingRetiresOldWriterAndPreservesReuse` | `return_path_test.go:74` | Binding new ReturnPath retires old writer while keeping queues |
+| `TestReturnPathBindingRetiresOldWriterAndPreservesReuse` | `return_path_test.go:74` | Binding new ReturnPath replaces route generation and queue; same-owner reuse preserves queues |
 | `TestReturnPathClosedAndTUNPressureIsBounded` | `return_path_test.go:130` | Closed ReturnPath rejects writes without unbounded backpressure|
 | `TestReturnPathCloseJoinsConcurrentWrites` | `return_path_test.go:181` | ReturnPath `Close()` waits for admitted concurrent writes |
 | `TestReturnRetirementClassification` | `return_path_test.go:200` | Return rejection classifier receives correct failure reasons |
@@ -568,19 +583,19 @@ Decomposing `forwarder.go` into same-package modular files must proceed sequenti
   - Invariants: f.mu lock boundaries, atomic retirement, zero-panic queue drain
                                 |
                                 v
-[ Issue #518: Queues, Buffer Pools & Rate Limiting ]
+[ Issue #518: Queues, Memory Budgets & Rate Limiting ]
   - Target: internal/vpn/forwarder/queues.go & rate_limit.go
   - Scope: TokenBucket, ValidateClientRouteLimit, MaxClientQueuePacketsForRoutes,
            ReconfigureClientQueueConfig, reconcileQueueOccupancyLocked,
            aggregateQueueSnapshot, AggregateQueueStats, RouteQueueStats
-  - Invariants: aggregateQueueMu synchronization, 8 GiB memory budget ceiling
+  - Invariants: aggregateQueueMu synchronization, 8 GiB queued-payload budget
                                 |
                                 v
 [ Issue #519: Ingress and Egress Routing Pumps ]
   - Target: internal/vpn/forwarder/pumps.go
   - Scope: RouteClientToBackend*, RouteBackendToClient, pumpClientQueue,
            pumpBackendQueue, StartPumps, StopPumps, AttachBackendDevice,
-           DetachBackendDevice, writeClientPacket
+           DetachBackendDevice (note: writeClientPacket lives in client_write.go)
   - Invariants: Memory copy isolation, validReturnDestination, route.writeMu join
                                 |
                                 v
@@ -605,11 +620,11 @@ Decomposing `forwarder.go` into same-package modular files must proceed sequenti
 - **Extracted Responsibilities**: Rate limiters (`TokenBucket`, `NewTokenBucket`, `Allow`, `SetPeerRateLimit`, `GetPeerRateLimit`), memory budget calculations (`ValidateClientRouteLimit`, `MaxClientQueuePacketsForRoutes`, `ReconfigureClientQueueConfig`, `ReconfigureClientQueueSize`), queue capacity mutations (`changeQueueCapacityLocked`), aggregate occupancy reconciliation (`reconcileQueueOccupancyLocked`, `reconcileBeforeQueueMutationLocked`), and queue statistics (`AggregateQueueStats`, `aggregateQueueSnapshot`, `RouteQueueStats`, `AllRouteQueueStats`).
 - **Critical Invariants**:
   - All aggregate queue occupancy mutations require `aggregateQueueMu.Lock()`.
-  - Aggregate memory budget of 8 GiB and 1500-byte packet assumption must remain strictly enforced.
+  - Aggregate queued-payload budget of 8 GiB and 1500-byte packet assumption must remain strictly enforced.
   - Channel accessors (`GetClientPacketChannel`, `GetBackendPacketChannel`) remain read-only observation handles.
 
 #### 3. Issue #519: Ingress and Egress Routing Pumps (`pumps.go`)
-- **Extracted Responsibilities**: Forwarding path (`RouteClientToBackend`, `RouteClientToBackendWithReturnPath`, `routeClientToBackend`, `RouteBackendToClient`), pump workers (`pumpClientQueue`, `pumpBackendQueue`), device management (`AttachBackendDevice`, `DetachBackendDevice`), pump controllers (`StartPumps`, `StopPumps`, `stopPumpsSignalOnly`), and device write admission (`writeClientPacket`).
+- **Extracted Responsibilities**: Forwarding path (`RouteClientToBackend`, `RouteClientToBackendWithReturnPath`, `routeClientToBackend`, `RouteBackendToClient`), pump workers (`pumpClientQueue`, `pumpBackendQueue`), device management (`AttachBackendDevice`, `DetachBackendDevice`), pump controllers (`StartPumps`, `StopPumps`, `stopPumpsSignalOnly`), and pump integration with device write admission (`writeClientPacket` in `client_write.go`).
 - **Critical Invariants**:
   - Packet slices enqueued to channels must be independent allocations (`copy`).
   - Destination shape and backend ownership must be validated before client delivery (`validReturnDestination`).
