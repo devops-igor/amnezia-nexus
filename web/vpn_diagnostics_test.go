@@ -330,10 +330,8 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	}
 
 	t.Run("JSRenderContract", func(t *testing.T) {
-		nodePath, err := findNodeBinary()
-		if err != nil {
-			t.Fatal("Node is required for contract verification")
-		}
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
 		sparkline, err := extractJSFunction(string(vpnData), "function vpnGenerateSparklineSVG")
 		if err != nil {
 			t.Fatal(err)
@@ -347,7 +345,7 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		script := vpnDOMMock(t, string(vpnData)) + "\n" +
-			vpnDiagnosticsTranslationsJS(t, string(vpnData), "en") + "\n" +
+			fixture.TranslationsJS("en") + "\n" +
 			dispose + "\n" +
 			sparkline + "\n" + history + `
 let vpnHistoryWindow = '15m';

@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"io/fs"
 	"strings"
 	"testing"
 
@@ -11,27 +10,17 @@ import (
 )
 
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
 	if err != nil {
 		t.Fatal(err)
 	}
-	templateData, err := fs.ReadFile(tmplFS, "vpn.html")
+	render, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sparkline, err := extractJSFunction(string(templateData), "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(string(templateData), "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDiagnosticsTranslationsJS(t, string(templateData), "en") + `const assert = require('assert');
+	script := fixture.TranslationsJS("en") + `const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
 ` + sparkline + "\n" + render + `
@@ -60,26 +49,9 @@ assert(chart.innerHTML.includes('No data'), 'missing observation count is unavai
 }
 
 func TestVPNCompleteRouteTooltipContract(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	peer, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+
 	// Marshal the production schema: a newly populated field cannot silently
 	// disappear between the status payload and the complete tooltip.
 	route := vpn.ProblemRouteItem{
@@ -97,7 +69,7 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
+	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
 const renderedRouteCells = document.getElementById('vpn-fwd-routes-tbody').children[0].children;
 assert.strictEqual(renderedRouteCells[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
@@ -167,32 +139,23 @@ assert(unknown.includes('Last traffic age (s): Unavailable'));
 }
 
 func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+	data := fixture.TemplateHTML
 	for _, id := range []string{"throughput", "queue", "drops", "latency", "reasons", "backends"} {
-		if !strings.Contains(string(data), `id="vpn-chart-`+id+`"`) {
+		if !strings.Contains(data, `id="vpn-chart-`+id+`"`) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	sparkline, err := extractJSFunction(string(data), "function vpnGenerateSparklineSVG")
+	sparkline, err := extractJSFunction(data, "function vpnGenerateSparklineSVG")
 	if err != nil {
 		t.Fatal(err)
 	}
-	render, err := extractJSFunction(string(data), "function vpnRenderHistoryCharts")
+	render, err := extractJSFunction(data, "function vpnRenderHistoryCharts")
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + sparkline + "\n" + render + `
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + sparkline + "\n" + render + `
 let vpnHistoryWindow='15m';
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
@@ -276,52 +239,35 @@ assert(document.getElementById('vpn-history-fleet-note').textContent.includes('5
 // empty is what makes this regression meaningful. Starting from empty
 // containers would prove nothing.
 func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+
 	for _, id := range []string{
 		"vpn-chart-throughput", "vpn-chart-queue", "vpn-chart-latency",
 		"vpn-chart-drops", "vpn-chart-reasons", "vpn-chart-backends",
 		"vpn-diag-be-traffic", "vpn-history-fleet-note",
 	} {
-		if !strings.Contains(string(data), `id="`+id+`"`) {
+		if !strings.Contains(fixture.TemplateHTML, `id="`+id+`"`) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
-	formatPeerKey, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
+	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sparkline, err := extractJSFunction(string(data), "function vpnGenerateSparklineSVG")
+	history, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
 	if err != nil {
 		t.Fatal(err)
 	}
-	history, err := extractJSFunction(string(data), "function vpnRenderHistoryCharts")
+	setWindow, err := extractJSFunction(fixture.TemplateHTML, "function vpnSetHistoryWindow")
 	if err != nil {
 		t.Fatal(err)
 	}
-	health, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
+	toggleRoutes, err := extractJSFunction(fixture.TemplateHTML, "function vpnToggleShowAllRoutes")
 	if err != nil {
 		t.Fatal(err)
 	}
-	setWindow, err := extractJSFunction(string(data), "function vpnSetHistoryWindow")
-	if err != nil {
-		t.Fatal(err)
-	}
-	toggleRoutes, err := extractJSFunction(string(data), "function vpnToggleShowAllRoutes")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + formatPeerKey + "\n" + sparkline + "\n" + history + "\n" + health + "\n" + setWindow + "\n" + toggleRoutes + `
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + sparkline + "\n" + history + "\n" + setWindow + "\n" + toggleRoutes + `
 let vpnHistoryWindow='15m';
 let vpnLastStatus=null;
 let vpnShowAllRoutes=false;
@@ -528,23 +474,9 @@ assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.lengt
 }
 
 func TestVPNPanelRateAvailability(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	health, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + health + `
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 let vpnLastStatus = null;
 let vpnShowAllRoutes = false;
 
@@ -636,15 +568,10 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color,
 }
 
 func TestVPNHorizonWindowToggles1mAnd5m(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	combined := fixture.CombinedSource()
 
 	for _, expectedBtn := range []string{
 		`onclick="vpnSetHistoryWindow('1m')"`,
@@ -727,9 +654,9 @@ assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
 assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
 `
 
-	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
+	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, combined, "en")
 	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnLossReasonLabels", "vpnDiagText", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
-		fn, err := extractJSFunction(tmplStr, "function "+name)
+		fn, err := extractJSFunction(combined, "function "+name)
 		if err != nil {
 			t.Fatalf("extractJSFunction %s: %v", name, err)
 		}

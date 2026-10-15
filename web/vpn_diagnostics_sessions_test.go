@@ -14,6 +14,7 @@ import (
 func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	vpnStr := fixture.TemplateHTML
+	combined := fixture.CombinedSource()
 	cssStr := fixture.StyleCSS
 
 	t.Run("TemplateDOMStructure", func(t *testing.T) {
@@ -97,16 +98,16 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 			t.Fatal("Node is required for diagnostics verification")
 		}
 
-		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
 		if err != nil {
 			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
 		}
-		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
 		if err != nil {
 			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
 		}
 
-		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + "\n" + f1 + "\n" + f2 + `
+		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, combined, "en") + "\n" + f1 + "\n" + f2 + `
 document.reset();
 
 const sampleRoutes = [
@@ -164,15 +165,15 @@ console.log('TABLE_FORMATTING_PASS');
 		faDict := vpnDiagnosticsLocale(t, "fa")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, faDict)
 
-		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
 		if err != nil {
 			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
 		}
-		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
 		if err != nil {
 			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
 		}
-		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "fa")
+		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "fa")
 
 		// 1. Static assertion on Go template output under Persian locale
 		doc, err := xhtml.Parse(strings.NewReader(renderedHTML))
@@ -288,15 +289,15 @@ console.log('PERSIAN_RTL_PASS');
 		enDict := vpnDiagnosticsLocale(t, "en")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
 
-		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
+		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
 		if err != nil {
 			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
 		}
-		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
+		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
 		if err != nil {
 			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
 		}
-		translationsJS := vpnDiagnosticsTranslationsJS(t, vpnStr, "en")
+		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "en")
 
 		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
@@ -373,12 +374,14 @@ console.log('NARROW_VIEWPORT_PASS');
 			}
 		}
 		// Callers needing only template functions remain restricted strictly to fixture.TemplateHTML
-		if _, err := extractJSFunction(fixture.TemplateHTML, "function vpnFormatPeerKey"); err != nil {
-			t.Fatalf("extractJSFunction vpnFormatPeerKey from TemplateHTML failed: %v", err)
+		if _, err := extractJSFunction(fixture.TemplateHTML, "function vpnStatusLabel"); err != nil {
+			t.Fatalf("extractJSFunction vpnStatusLabel from TemplateHTML failed: %v", err)
 		}
-		// TemplateHTML must not contain sessions functions (scoping strictly limited to source)
-		if _, err := extractJSFunction(fixture.TemplateHTML, "function renderSessions"); err == nil {
-			t.Fatal("expected error extracting renderSessions from TemplateHTML without fallback")
+		// TemplateHTML must not contain moved functions (scoping strictly limited to source)
+		for _, fn := range []string{"renderSessions", "vpnFormatPeerKey"} {
+			if _, err := extractJSFunction(fixture.TemplateHTML, "function "+fn); err == nil {
+				t.Fatalf("expected error extracting %s from TemplateHTML without fallback", fn)
+			}
 		}
 	})
 }
@@ -443,6 +446,8 @@ const source = %q;
 const en = JSON.parse(%q);
 const tablesCode = %q;
 const sessionsCode = %q;
+const healthProblemsCode = %q;
+const healthSummaryCode = %q;
 
 function extract(name) {
     const start = source.indexOf('    function ' + name + '(');
@@ -455,16 +460,16 @@ function extract(name) {
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
+w.eval(healthProblemsCode);
+w.eval(healthSummaryCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
 'var vpnLastStatus = null;' +
-'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
-    'vpnStatusLabel', 'vpnFormatPeerKey',
-    'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+    'vpnStatusLabel'
 ].map(extract).join('\n'));
 
 w.eval(tablesCode);
@@ -612,7 +617,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS))
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

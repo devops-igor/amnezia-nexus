@@ -2,6 +2,7 @@ package web
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -101,8 +102,9 @@ func TestVPNTestFixture(t *testing.T) {
 	t.Run("CombinedSourceAndExactBoundaryExtraction", func(t *testing.T) {
 		fx := fixture.WithT(t)
 		combined := fx.CombinedSource()
-		if !strings.Contains(combined, fx.TemplateHTML) || !strings.Contains(combined, fx.SessionsJS) {
-			t.Fatal("CombinedSource must contain both TemplateHTML and SessionsJS")
+		if !strings.Contains(combined, fx.TemplateHTML) || !strings.Contains(combined, fx.SessionsJS) ||
+			!strings.Contains(combined, fx.HealthProblemsJS) || !strings.Contains(combined, fx.HealthSummaryJS) {
+			t.Fatal("CombinedSource must contain TemplateHTML, SessionsJS, HealthProblemsJS, and HealthSummaryJS")
 		}
 		if fx.CombinedVPNSessionsSource() != combined {
 			t.Fatal("CombinedVPNSessionsSource must match CombinedSource")
@@ -123,6 +125,33 @@ func TestVPNTestFixture(t *testing.T) {
 		}
 	})
 
+	t.Run("TemplateOnlyLookupOfMovedFunctionsFails", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		movedFunctions := []string{
+			"renderSessions",
+			"vpnFormatPeerKey",
+			"vpnDiagText",
+			"vpnLossReasonLabels",
+			"createSeverityBadge",
+			"deriveStableConditionCode",
+			"parseConditionMessage",
+			"extractConditionEntities",
+			"vpnRenderActiveProblemsCards",
+			"vpnRenderTechDiagnosticCards",
+			"vpnResetHealthProblems",
+			"vpnResetTechDiagnosticCards",
+			"vpnRenderForwarderHealth",
+		}
+		for _, name := range movedFunctions {
+			if _, err := extractJSFunction(fx.TemplateHTML, "function "+name); err == nil {
+				t.Fatalf("expected extractJSFunction %s from TemplateHTML to fail, but succeeded", name)
+			}
+			if _, err := extractJSFunction(fx.CombinedSource(), "function "+name); err != nil {
+				t.Fatalf("expected extractJSFunction %s from CombinedSource to succeed: %v", name, err)
+			}
+		}
+	})
+
 	t.Run("FailClosedCIInvariant", func(t *testing.T) {
 		origCI := os.Getenv("CI")
 		defer os.Setenv("CI", origCI)
@@ -137,4 +166,43 @@ func TestVPNTestFixture(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestVPNFixtureAssetFailClosed(t *testing.T) {
+	if os.Getenv("TEST_VPN_ASSET_FAIL_CLOSED") != "" {
+		asset := os.Getenv("TEST_VPN_ASSET_FAIL_CLOSED")
+		fx := NewVPNTestFixture(t)
+		clone := *fx
+		switch asset {
+		case "empty_health_problems":
+			clone.HealthProblemsJS = "   \n	  "
+		case "empty_health_summary":
+			clone.HealthSummaryJS = ""
+		case "empty_sessions":
+			clone.SessionsJS = " "
+		}
+		clone.BuildJSDOMHarness(JSDOMHarnessOptions{})
+		return
+	}
+
+	for _, assetCase := range []struct {
+		envVal    string
+		errSubstr string
+	}{
+		{"empty_health_problems", "failed to read static health problems asset"},
+		{"empty_health_summary", "failed to read static health summary asset"},
+		{"empty_sessions", "failed to read static sessions asset"},
+	} {
+		t.Run(assetCase.envVal, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureAssetFailClosed$")
+			cmd.Env = append(os.Environ(), "TEST_VPN_ASSET_FAIL_CLOSED="+assetCase.envVal)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("expected failure for %s, but process exited cleanly", assetCase.envVal)
+			}
+			if !strings.Contains(string(out), assetCase.errSubstr) {
+				t.Fatalf("expected output to contain %q, got:\n%s", assetCase.errSubstr, string(out))
+			}
+		})
+	}
 }
