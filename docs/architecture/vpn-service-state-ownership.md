@@ -103,8 +103,9 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
      * Administrative disable persistence (`s.pool.SetTunnelEnabled` at `vpn.go:3027`): Persists backend disabled status (`db.UpdateBackendTunnel`) under `s.mu.Lock()`.
      * Failover session reads and moves (`s.stickyMgr.HandleFailover` at `vpn.go:3063` calling `loadbalancer/sticky.go:444–520`): Executes synchronous session read `sm.db.GetActiveVPNSessions` (`sticky.go:456`) and synchronous updates `sm.persistFailoverMoves` (`sticky.go:513` calling `db.MigrateVPNSessionBackend` / `CreateVPNSession`) while holding `s.mu.Lock()`.
      * Failover counter persistence: Calls `s.pool.DecrementConnections` and `s.pool.IncrementConnections` (`vpn.go:3090–3091`), triggering underlying `persistConnectionCount` (`db.UpdateBackendTunnel` at `tunnel/pool.go:672–708`) for each migrated session under `s.mu.Lock()`.
-   - **Backend Deletion (`vpn.go:3338–3385`)**:
-     * `DeleteBackend` acquires `s.mu.Lock()` at line 3339, invokes `disableBackendLocked` (executing all the disable/failover DB I/O above), and then executes `s.pool.RemoveTunnel` (`vpn.go:3369` calling `db.DeleteBackendTunnel`) and defensive cleanup `s.db.DeleteBackendTunnel` (`vpn.go:3381`) under `s.mu.Lock()`.
+   - **Backend Deletion (`vpn.go:3338–3438`)**:
+     * In-Lock Removal (Phase 1 & Phase 2, `vpn.go:3339–3396`): `DeleteBackend` acquires `s.mu.Lock()` at line 3339, invokes `disableBackendLocked` at line 3363 (executing all the disable/failover DB I/O above), and then executes `s.pool.RemoveTunnel` (`vpn.go:3369` calling `db.DeleteBackendTunnel`) under `s.mu.Lock()`.
+     * Unlocked Defensive Cleanup Sweep (Phase 3, `vpn.go:3397–3435`): `s.mu` is explicitly unlocked at line 3397 (`s.mu.Unlock()`). The subsequent orphan session lookup (`s.db.GetBackendTunnelByServerID` at line 3398, `s.db.GetActiveVPNSessions` at line 3413), session reassignment (`s.db.UpdateVPNSessionBackendTunnel` at line 3424), and leftover row deletion (`s.db.DeleteBackendTunnel` at line 3431) execute outside `s.mu`. `s.mu.Lock()` is then re-acquired at line 3435 before returning (satisfying the deferred `s.mu.Unlock()` at line 3340).
    - **Runtime Configuration Updates (`vpn.go:3476, 3553`)**:
      * `SaveVPNConfig`: Configuration persistence and compensating rollback executed under `s.mu.Lock()`.
    - **Session Migration Protocol (`vpn.go:3928, 3976, 3989`)**:
@@ -120,7 +121,7 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
    - **Operations Safely Decoupled Outside `s.mu`**:
      * *Durable Peer Authentication (`AuthenticatePeer`)*: Read-only query executed prior to acquiring `s.mu.Lock()`. A lightweight version/generation token can be verified after taking `s.mu` if state changes need detection.
      * *Active Connection Gauge Persistence (`pool.persistConnectionCount` / `SetConnectionCount`)*: Connection counts are in-memory routing weights and diagnostic telemetry; persistent counters in `backend_tunnels` are already asynchronously reconciled. These updates can be enqueued to an asynchronous persistence worker or dispatched after lock release without compromising correctness.
-     * *Backend Deletion Row Removal (`db.DeleteBackendTunnel`)*: Once in-memory routing and device handles are removed under `s.mu`, deleting the persistent database rows can proceed asynchronously outside `s.mu`.
+     * *Backend Deletion Primary Row Removal (`pool.RemoveTunnel` / `db.DeleteBackendTunnel`)*: While the Phase 3 defensive sweep (`vpn.go:3397–3435`) already executes outside `s.mu`, the primary row deletion in `s.pool.RemoveTunnel` (`vpn.go:3369`) currently executes under `s.mu.Lock()`. In Phase 4, once in-memory routing and device handles are removed under `s.mu`, deleting the persistent database row in `RemoveTunnel` can likewise proceed asynchronously outside `s.mu`.
      * *Configuration Persistence (`SaveVPNConfig`)*: Validate and persist configuration changes to the database before acquiring `s.mu.Lock()` for an atomic pointer swap.
 
 ### 3.2 Diagnostics Mutex: `diagRatesMu` (`sync.Mutex`)
