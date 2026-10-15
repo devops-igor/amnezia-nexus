@@ -308,4 +308,29 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 			t.Fatalf("expected output to mention SUMMARY_MODULE_INIT_FAILURE, got:\n%s", string(out))
 		}
 	})
+
+	t.Run("TroubleshootingHarnessHealthProblemsExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.HealthProblemsJS = "throw new Error('TROUBLESHOOTING_MODULE_FAILURE');\n" + fixture.HealthProblemsJS
+
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `assert(true);`)
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "TROUBLESHOOTING_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention TROUBLESHOOTING_MODULE_FAILURE, got:\n%s", string(out))
+		}
+	})
+}
+
+func TestTemplateMarkerNotFoundFailsClosed(t *testing.T) {
+	_, err := vpnDiagnosticsHealthScriptLocale(t, "function vpnRenderForwarderHealth() { return 1; }", "en", "vpnRenderForwarderHealth();")
+	if err == nil {
+		t.Fatal("expected error when template marker is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "template marker not found in source") {
+		t.Fatalf("expected error mentioning 'template marker not found in source', got: %v", err)
+	}
 }

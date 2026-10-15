@@ -16,17 +16,12 @@ import (
 
 func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string {
 	t.Helper()
-	endMarker := "{{ end }}"
-	var templateSource, companionScripts string
-	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
-		templateSource = source[:idx+len(endMarker)]
-		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
-	} else {
-		templateSource = source
-		companionScripts = source
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
 	}
 
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
 	script += "\n" + companionScripts
 
 	for _, name := range []string{

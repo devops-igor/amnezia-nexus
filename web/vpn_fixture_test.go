@@ -302,9 +302,18 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 	return vpnDiagnosticsRenderedHTML(f.t, f.TemplateHTML, f.Locale(lang))
 }
 
+// vpnCompanionBoundaryMarker separates template HTML from companion JS modules in CombinedSource.
+const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
+
+// CompanionScripts returns the concatenated companion JS modules in evaluation order:
+// sessions.js -> health_problems.js -> health_summary.js.
+func (f *VPNTestFixture) CompanionScripts() string {
+	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS
+}
+
 // CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
 func (f *VPNTestFixture) CombinedSource() string {
-	return f.TemplateHTML + "\n" + f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS
+	return f.TemplateHTML + vpnCompanionBoundaryMarker + f.CompanionScripts()
 }
 
 // CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
@@ -696,6 +705,46 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	return nil
 }
 
+// splitVPNTemplateAndCompanionScripts cleanly splits a combined VPN source into template HTML
+// and companion scripts. It checks for the explicit companion boundary marker first. If absent,
+// it checks for the template end marker ("{{ end }}"). If neither marker is found, it fails closed
+// with an explicit error instead of silently treating HTML as JavaScript.
+func splitVPNTemplateAndCompanionScripts(source string) (templateSource, companionScripts string, err error) {
+	if idx := strings.Index(source, vpnCompanionBoundaryMarker); idx >= 0 {
+		templateSource = source[:idx]
+		companionScripts = strings.TrimPrefix(source[idx+len(vpnCompanionBoundaryMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	endMarker := "\n{{ end }}"
+	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
+		templateSource = source[:idx+len(endMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	fallbackMarker := "{{ end }}"
+	if idx := strings.LastIndex(source, fallbackMarker); idx >= 0 {
+		templateSource = source[:idx+len(fallbackMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(fallbackMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	return "", "", errors.New("template marker not found in source")
+}
+
+// assembleVPNHealthScript builds an executable health diagnostics test script from explicit template HTML and companion scripts.
+func assembleVPNHealthScript(t *testing.T, templateHTML, companionScripts, lang, assertions string) (string, error) {
+	t.Helper()
+	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
+		return "", errors.New("source lacks function vpnRenderForwarderHealth")
+	}
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, templateHTML, lang)
+	return script + "\n" + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
+}
+
+// AssembleHealthScript builds a health diagnostics test script from explicit fixture components.
+func (f *VPNTestFixture) AssembleHealthScript(lang, assertions string) (string, error) {
+	return assembleVPNHealthScript(f.t, f.TemplateHTML, f.CompanionScripts(), lang, assertions)
+}
+
 func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string {
 	t.Helper()
 	script, err := vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
@@ -711,20 +760,10 @@ func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions str
 		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
 
-	endMarker := "{{ end }}"
-	var templateSource, companionScripts string
-	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
-		templateSource = source[:idx+len(endMarker)]
-		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
-	} else {
-		templateSource = source
-		companionScripts = source
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		return "", err
 	}
 
-	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
-		return "", errors.New("source lacks function vpnRenderForwarderHealth")
-	}
-
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
-	return script + "\n" + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
+	return assembleVPNHealthScript(t, templateSource, companionScripts, lang, assertions)
 }

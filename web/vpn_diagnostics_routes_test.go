@@ -11,50 +11,27 @@ import (
 
 func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assertions string) string {
 	t.Helper()
-	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, lang)
-	for _, name := range []string{
-		"fmtBps",
-		"fmtPps",
-		"vpnFormatBytes",
-		"vpnFormatPeerKey",
-		"vpnFormatTime",
-		"vpnDiagText",
-		"vpnLossReasonLabels",
-		"parseConditionMessage",
-		"deriveStableConditionCode",
-		"extractConditionEntities",
-		"createSeverityBadge",
-		"vpnRenderActiveProblemsCards",
-		"vpnRenderTechDiagnosticCards",
-		"vpnResetHealthProblems",
-		"vpnResetTechDiagnosticCards",
-		"vpnFindRouteForSession",
-		"vpnRenderSessionRow",
-		"vpnCreateSessionDrilldownRow",
-		"vpnToggleSessionDrilldown",
-		"vpnToggleSessionsProblemFilter",
-		"vpnRenderSessionsStaleBanner",
-		"vpnFindSessionById",
-		"vpnSyncExpandedDrilldowns",
-		"vpnWrapSessionsTableRender",
-		"renderSessions",
-		"vpnRenderForwarderHealth",
-	} {
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatalf("extractJSFunction %s: %v", name, err)
-		}
-		script += "\n" + function
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
 	}
+
+	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+
+	for _, name := range []string{"vpnStatusLabel"} {
+		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
+			function, err := extractJSFunction(templateSource, "function "+name)
+			if err != nil {
+				t.Fatalf("extractJSFunction %s: %v", name, err)
+			}
+			script += "\n" + function
+		}
+	}
+
+	script += "\n" + companionScripts
 	return script + `
-let vpnLastSessions = null;
-let vpnSessionsStale = false;
-let vpnSessionsFilterOnlyProblems = false;
 let vpnLastStatus = null;
-let vpnExpandedSessionIds = new Set();
-let vpnLastActiveProblemKeys = null;
-let vpnLastActiveProblemCount = 0;
-let vpnSessionsTableInstance = null;
+let vpnShowAllRoutes = false;
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
 }

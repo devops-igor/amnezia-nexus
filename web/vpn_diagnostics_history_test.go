@@ -571,7 +571,6 @@ func TestVPNHorizonWindowToggles1mAnd5m(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
-	combined := fixture.CombinedSource()
 
 	for _, expectedBtn := range []string{
 		`onclick="vpnSetHistoryWindow('1m')"`,
@@ -654,9 +653,10 @@ assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
 assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
 `
 
-	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, combined, "en")
-	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnLossReasonLabels", "vpnDiagText", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
-		fn, err := extractJSFunction(combined, "function "+name)
+	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
+	script += "\n" + fixture.HealthProblemsJS
+	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
+		fn, err := extractJSFunction(tmplStr, "function "+name)
 		if err != nil {
 			t.Fatalf("extractJSFunction %s: %v", name, err)
 		}
