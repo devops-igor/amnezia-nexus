@@ -164,6 +164,7 @@ type VPNTestFixture struct {
 	NodePath     string
 	TemplateHTML string
 	StyleCSS     string
+	SessionsJS   string
 	ParsedDOM    *xhtml.Node
 	MockFetches  map[string]string
 }
@@ -201,11 +202,14 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	if err != nil && isCIEnvironment() {
 		t.Fatalf("node binary is required under CI: %v", err)
 	}
+	sessionsBytes, _ := fs.ReadFile(staticFS, "js/vpn/sessions.js")
+	sessionsJS := string(sessionsBytes)
 	return &VPNTestFixture{
 		t:            t,
 		NodePath:     nodePath,
 		TemplateHTML: string(vpnBytes),
 		StyleCSS:     string(cssBytes),
+		SessionsJS:   sessionsJS,
 		ParsedDOM:    doc,
 		MockFetches:  make(map[string]string),
 	}
@@ -309,8 +313,9 @@ if (typeof fakeClock !== 'undefined') {
     ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].forEach(m => { w[m] = fakeClock[m].bind(fakeClock); });
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
+if (%t) { w.eval(%q); }
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.SessionsJS != "", f.SessionsJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -598,6 +603,18 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 func extractJSFunction(source, funcName string) (string, error) {
 	startIdx := strings.Index(source, funcName)
 	if startIdx == -1 {
+		// Fallback: search static JS files in StaticFS (e.g. static/js/vpn/sessions.js)
+		if entries, err := fs.ReadDir(StaticFS, "static/js/vpn"); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".js") {
+					if content, err := fs.ReadFile(StaticFS, "static/js/vpn/"+entry.Name()); err == nil {
+						if strings.Index(string(content), funcName) != -1 {
+							return extractJSFunction(string(content), funcName)
+						}
+					}
+				}
+			}
+		}
 		return "", fmt.Errorf("function %s not found in source", funcName)
 	}
 	braceStart := strings.Index(source[startIdx:], "{")

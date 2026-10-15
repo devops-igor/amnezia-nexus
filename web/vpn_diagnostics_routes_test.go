@@ -622,6 +622,11 @@ func TestVPNNexusTableLifecycleDrilldownAndConfigDedup(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sessionsJS, err := fs.ReadFile(staticFS, "js/vpn/sessions.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	transFS, err := GetTranslationsSubFS()
 	if err != nil {
 		t.Fatal(err)
@@ -667,6 +672,7 @@ try {
 const source = %q;
 const en = JSON.parse(%q);
 const tablesCode = %q;
+const sessionsCode = %q;
 
 function extract(name) {
     const start = source.indexOf('    function ' + name + '(');
@@ -678,21 +684,17 @@ function extract(name) {
 
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
+w.eval(sessionsCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastSessions = null, vpnLastStatus = null;' +
-'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
-'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastStatus = null;' +
 'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
-    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
-    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
-    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
-    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
-    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+    'vpnStatusLabel', 'vpnFormatPeerKey',
+    'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
 ].map(extract).join('\n'));
 
 w.eval(tablesCode);
@@ -785,7 +787,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS))
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS))
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {
