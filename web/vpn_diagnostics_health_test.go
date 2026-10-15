@@ -485,10 +485,8 @@ func TestVPNForwarderHealthDecouplingAndHorizon(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := []byte(fixture.CombinedSource())
 
 	assertions := `
 const text = id => document.getElementById(id).textContent;
@@ -556,7 +554,10 @@ assert.strictEqual(text('vpn-fwd-status-text'), 'В норме');
 assert.strictEqual(text('vpn-fwd-counters-since'), 'Счетчики с: 2026-10-07 06:14 UTC');
 assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Текущий / Онлайн: 0.00 pps | С запуска / Сброса: 109');
 `
-	ruScript := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
+	ruScript, err := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian decoupling test failed: %v\n%s", err, out)
 	}
@@ -567,11 +568,8 @@ func TestVPNProgressiveDisclosureAndActiveProblems(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	// 1. Invariant: <details id="vpn-fwd-tech-details"> must be present in template.
 	if !strings.Contains(tmplStr, `<details id="vpn-fwd-tech-details"`) {
@@ -722,7 +720,10 @@ assert.strictEqual(
 	'✓ Активных проблем не обнаружено • 12/12 пиров синхронизировано • Все маршруты согласованы • 3/3 бэкендов в норме'
 );
 `
-	ruScript := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
+	ruScript, err := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian progressive disclosure nominal badge test failed: %v\n%s", err, out)
 	}

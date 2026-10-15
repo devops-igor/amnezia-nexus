@@ -206,3 +206,66 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestHealthSummaryFailsClosedWithoutHealthProblems(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+
+	// 1. Available forwarder with CRITICAL status throws ReferenceError when health_problems.js is missing
+	availableScript := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthSummaryJS + `
+try {
+    vpnRenderForwarderHealth({
+        forwarder_available: true,
+        health_assessment: { status: 'CRITICAL', conditions: [{ severity: 'CRITICAL', message: 'Failure' }] }
+    });
+    console.log('FAIL_OPEN_AVAILABLE');
+} catch (e) {
+    if (e instanceof ReferenceError) {
+        console.log('FAIL_CLOSED_REFERENCE_ERROR_AVAILABLE');
+    } else {
+        throw e;
+    }
+}
+`
+	out, err := execNodeScript(nodePath, availableScript)
+	if err != nil {
+		t.Fatalf("unexpected execution failure: %v\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "FAIL_CLOSED_REFERENCE_ERROR_AVAILABLE") {
+		t.Fatalf("expected ReferenceError on available render without health_problems.js, got:\n%s", string(out))
+	}
+
+	// 2. Unavailable forwarder (null status) throws ReferenceError when resetting without health_problems.js
+	unavailableScript := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthSummaryJS + `
+try {
+    vpnRenderForwarderHealth(null);
+    console.log('FAIL_OPEN_UNAVAILABLE');
+} catch (e) {
+    if (e instanceof ReferenceError) {
+        console.log('FAIL_CLOSED_REFERENCE_ERROR_UNAVAILABLE');
+    } else {
+        throw e;
+    }
+}
+`
+	out2, err := execNodeScript(nodePath, unavailableScript)
+	if err != nil {
+		t.Fatalf("unexpected execution failure: %v\n%s", err, string(out2))
+	}
+	if !strings.Contains(string(out2), "FAIL_CLOSED_REFERENCE_ERROR_UNAVAILABLE") {
+		t.Fatalf("expected ReferenceError on unavailable reset without health_problems.js, got:\n%s", string(out2))
+	}
+}
+
+func TestSuppliedSourceIsolationInHealthScriptLocale(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+
+	// Supplying TemplateHTML (which lacks function vpnRenderForwarderHealth declaration) must return error
+	_, err := vpnDiagnosticsHealthScriptLocale(t, fixture.TemplateHTML, "en", `vpnRenderForwarderHealth(null);`)
+	if err == nil {
+		t.Fatal("expected error when supplying template-only source lacking vpnRenderForwarderHealth, got nil")
+	}
+	if !strings.Contains(err.Error(), "vpnRenderForwarderHealth") {
+		t.Fatalf("expected error mentioning vpnRenderForwarderHealth, got: %v", err)
+	}
+}

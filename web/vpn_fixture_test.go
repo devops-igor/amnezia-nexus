@@ -698,32 +698,36 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 
 func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string {
 	t.Helper()
-	return vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
+	script, err := vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return script
 }
 
-func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions string) string {
+func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions string) (string, error) {
 	t.Helper()
-	fixture := NewVPNTestFixture(t)
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, fixture.CombinedSource(), lang)
+	if !strings.Contains(source, "function vpnRenderForwarderHealth") {
+		return "", errors.New("source lacks function vpnRenderForwarderHealth")
+	}
+	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, source, lang)
 
 	var companionScripts string
-	if strings.Contains(source, "function vpnRenderForwarderHealth") {
-		for _, name := range []string{
-			"vpnFormatTime", "vpnFormatPeerKey", "vpnDiagText", "vpnLossReasonLabels",
-			"parseConditionMessage", "deriveStableConditionCode", "extractConditionEntities", "createSeverityBadge",
-			"vpnRenderActiveProblemsCards", "vpnRenderTechDiagnosticCards",
-			"vpnResetHealthProblems", "vpnResetTechDiagnosticCards",
-			"vpnRenderForwarderHealth",
-		} {
-			if strings.Contains(source, "function "+name+"(") || strings.Contains(source, "function "+name+" ") {
-				if fn, err := extractJSFunction(source, "function "+name); err == nil {
-					companionScripts += "\n" + fn
-				}
+	for _, name := range []string{
+		"vpnFormatTime(val)", "vpnFormatPeerKey", "vpnDiagText", "vpnLossReasonLabels",
+		"parseConditionMessage", "deriveStableConditionCode", "extractConditionEntities", "createSeverityBadge",
+		"vpnRenderActiveProblemsCards", "vpnRenderTechDiagnosticCards",
+		"vpnResetHealthProblems", "vpnResetTechDiagnosticCards",
+		"vpnRenderForwarderHealth",
+	} {
+		if strings.Contains(source, "function "+name+"(") || strings.Contains(source, "function "+name+" ") {
+			fn, err := extractJSFunction(source, "function "+name)
+			if err != nil {
+				return "", fmt.Errorf("failed to extract %s from source: %w", name, err)
 			}
+			companionScripts += "\n" + fn
 		}
-	} else {
-		companionScripts = "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS
 	}
 
-	return script + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions
+	return script + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
 }

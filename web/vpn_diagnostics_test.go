@@ -13,10 +13,8 @@ func TestVPNDiagnosticsCurrentObservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := []byte(fixture.CombinedSource())
 	script := vpnDiagnosticsHealthScript(t, string(source), `
 const text = id => document.getElementById(id).textContent;
 const base = {forwarder_available:true, health_assessment:{status:'HEALTHY'}, rates:{available:true}};
@@ -130,10 +128,8 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := []byte(fixture.CombinedSource())
 	mutated := strings.Replace(string(source), `id="vpn-diag-throughput"`, `id="vpn-diag-throughput-typo"`, 1)
 	script := vpnDiagnosticsHealthScript(t, mutated, `vpnRenderForwarderHealth({forwarder_available:true});`)
 	if out, err := execNodeScript(node, script); err == nil ||

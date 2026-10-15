@@ -26,9 +26,11 @@ func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string 
 		"vpnSetHistoryWindow", "vpnToggleShowAllRoutes",
 	} {
 		if strings.Contains(source, "function "+name+"(") || strings.Contains(source, "function "+name+" ") {
-			if function, err := extractJSFunction(source, "function "+name); err == nil {
-				script += "\n" + function
+			function, err := extractJSFunction(source, "function "+name)
+			if err != nil {
+				t.Fatalf("extract %s failed: %v", name, err)
 			}
+			script += "\n" + function
 		}
 	}
 	return script + `
@@ -365,15 +367,16 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := fixture.CombinedSource()
 	body := vpnBackendDeviceReasonsBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("backend KPI alarm coverage: %v\n%s", err, out)
@@ -422,7 +425,10 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 				t.Fatal("mutation target missing from combined source")
 			}
 			mutated := strings.Replace(original, mutation.before, mutation.after, 1)
-			script := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
 				t.Fatalf("mutation escaped its acceptance oracle: %v\n%s", err, out)
@@ -491,15 +497,16 @@ func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := fixture.CombinedSource()
 	body := vpnBackendDeviceConditionBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("unattributed condition rendering: %v\n%s", err, out)

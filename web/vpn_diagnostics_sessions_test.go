@@ -98,16 +98,7 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 			t.Fatal("Node is required for diagnostics verification")
 		}
 
-		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
-		if err != nil {
-			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
-		}
-		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
-		if err != nil {
-			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
-		}
-
-		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, combined, "en") + "\n" + f1 + "\n" + f2 + `
+		runnerScript := vpnDiagnosticsHealthScript(t, combined, `
 document.reset();
 
 const sampleRoutes = [
@@ -144,7 +135,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('TABLE_FORMATTING_PASS');
-`
+`)
 		cmd := exec.Command(nodePath, "-e", runnerScript)
 		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
@@ -165,14 +156,6 @@ console.log('TABLE_FORMATTING_PASS');
 		faDict := vpnDiagnosticsLocale(t, "fa")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, faDict)
 
-		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
-		if err != nil {
-			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
-		}
-		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
-		if err != nil {
-			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
-		}
 		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "fa")
 
 		// 1. Static assertion on Go template output under Persian locale
@@ -221,7 +204,9 @@ const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head><style>' + %q + '</s
     runScripts: 'outside-only'
 });
 const w = dom.window;
-w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+w.eval(%q);
+w.eval(%q);
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
 
 assert.strictEqual(w.document.documentElement.getAttribute('dir'), 'rtl', 'document has dir=rtl');
 
@@ -272,7 +257,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('PERSIAN_RTL_PASS');
-`, cssStr, renderedHTML, translationsJS, f1, f2)
+`, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
 
 		out := runJSDOMTestScript(t, nodePath, testScript)
 		if !strings.Contains(out, "PERSIAN_RTL_PASS") {
@@ -289,14 +274,6 @@ console.log('PERSIAN_RTL_PASS');
 		enDict := vpnDiagnosticsLocale(t, "en")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
 
-		f1, err := extractJSFunction(combined, "function vpnFormatPeerKey")
-		if err != nil {
-			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
-		}
-		f2, err := extractJSFunction(combined, "function vpnRenderForwarderHealth")
-		if err != nil {
-			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
-		}
 		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "en")
 
 		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
@@ -308,7 +285,9 @@ const w = dom.window;
 w.innerWidth = 375;
 w.outerWidth = 375;
 
-w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q + "\n" + %q);
+w.eval(%q);
+w.eval(%q);
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
 
 const table = w.document.getElementById('vpn-fwd-routes-table');
 assert(table, '#vpn-fwd-routes-table must exist');
@@ -358,7 +337,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('NARROW_VIEWPORT_PASS');
-`, cssStr, renderedHTML, translationsJS, f1, f2)
+`, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
 
 		out := runJSDOMTestScript(t, nodePath, testScript)
 		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
