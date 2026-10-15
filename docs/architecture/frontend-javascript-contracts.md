@@ -91,7 +91,7 @@ The inline script in `web/templates/vpn.html` spans lines 501–3757 (~3,256 lin
      *Explicit Extraction Interface*:
      - `createSeverityBadge(sev: string): { badge: HTMLElement, upperSev: string }`: Maps severity string (`CRITICAL`, `DEGRADED`, `WARNING`, `INFO`) to badge DOM element and uppercase severity token.
      - `parseConditionMessage(msg: string): { normalizedCode: string, ips: string[] }`: Parses raw condition strings into normalized condition codes and extracted IP lists.
-     - `extractConditionEntities(item: Object): string`: Extracts durable identity tokens (`connection_id`, `session_id`, `user_id`, `peer_key`), falling back to sorted IP entities from `parseConditionMessage(item.message).ips.slice().sort().join(',')`.
+     - `extractConditionEntities(item: Object): string`: Returns an empty string `""` if `item` is null or undefined. Extracts preferred direct identity (`item.assigned_ip || item.peer_key || item.entity_id || item.connection_id || item.session_id || item.user_id || ''`), appends any sorted, deduplicated IPs from `parseConditionMessage(item.message).ips` that differ from the direct identity, and joins all distinct entity parts with semicolons (`parts.join(';')`, e.g. `conn-A;192.0.2.1;203.0.113.2`).
      - `deriveStableConditionCode(msg: string): string`: Accepts a condition message string (e.g. `p.message` or `c.message`) and returns the normalized condition code (with empty string fallback for non-string or empty inputs).
      - `vpnRenderActiveProblemsCards(status: Object, container: HTMLElement)` & `vpnRenderTechDiagnosticCards(status: Object, container: HTMLElement)`: Problem card and diagnostic panel rendering delegates invoked by `vpnRenderForwarderHealth`.
      *Module Boundary Strategy*:
@@ -728,7 +728,7 @@ Wave 6: Stylesheet Partitioning
   *Interface Contract*:
   - `createSeverityBadge(sev: string): { badge: HTMLElement, upperSev: string }`: Maps severity string (`CRITICAL`, `DEGRADED`, `WARNING`, `INFO`) to badge DOM element and uppercase severity token.
   - `parseConditionMessage(msg: string): { normalizedCode: string, ips: string[] }`: Parses raw condition strings into normalized condition codes and extracted IP lists.
-  - `extractConditionEntities(item: Object): string`: Extracts durable identity tokens (`connection_id`, `session_id`, `user_id`, `peer_key`), falling back to sorted IP entities from `parseConditionMessage(item.message).ips.slice().sort().join(',')`.
+  - `extractConditionEntities(item: Object): string`: Returns an empty string `""` if `item` is null or undefined. Extracts preferred direct identity (`item.assigned_ip || item.peer_key || item.entity_id || item.connection_id || item.session_id || item.user_id || ''`), appends any sorted, deduplicated IPs from `parseConditionMessage(item.message).ips` that differ from the direct identity, and joins all distinct entity parts with semicolons (`parts.join(';')`, e.g. `conn-A;192.0.2.1;203.0.113.2`).
   - `deriveStableConditionCode(msg: string): string`: Accepts a condition message string (e.g. `p.message` or `c.message`) and returns the normalized condition code (with empty string fallback for non-string or empty inputs).
   - State: `vpnLastActiveProblemKeys` (`Set<string>`), `vpnLastActiveProblemCount` (`number`).
 - **Contract Guardrails**: Strictly enforce sub-1,000 physical line ceiling (~850 lines). Preserve auto-disclosure of `#vpn-fwd-tech-details` on new problem keys and manual collapse preservation. Retain message parsing and entity extraction byte-for-byte.
