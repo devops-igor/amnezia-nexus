@@ -259,7 +259,9 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
         +---> [ Re-verify Route & Enqueue under f.mu.RLock() and f.aggregateQueueMu ]
         |       |-- Check routesByIP[destIP] == route (guards against concurrent delete)
         |       |-- Non-blocking enqueue: select { case route.clientQueue <- pktCopy: ... default: ... }
-        |       |-- Success: Notify route.queueReady, update high-water mark, record Tx
+        |       |-- Under Locks: Update occupancy, update high-water marks, notify route.queueReady
+        |       |-- Lock Release: Release aggregateQueueMu, then release f.mu.RLock()
+        |       |-- Post-Lock Accounting: Record Tx counters, traffic stats, accountant
         |       \-- Saturated: Increment route.queueFullDrops, dropsQueueFull
         v
 [ pumpClientQueue ]
@@ -290,8 +292,10 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
    - Allocates `pktCopy := make([]byte, len(packet))` and copies payload (independent heap slice; no forwarder-owned `sync.Pool`).
    - Re-acquires `f.mu.RLock()` and verifies `routesByIP[destIP] == route`.
    - Retaining `f.mu.RLock()`, acquires `f.aggregateQueueMu.Lock()` and attempts non-blocking send (`select { case clientQueue <- pktCopy: ... default: ... }`) to `route.clientQueue`.
-   - *Success*: Updates aggregate occupancy, sets `route.queueHighWater` and `f.aggregateQueueHighWater`, posts notification to `route.queueReady`, records Tx statistics, releases `aggregateQueueMu` then `f.mu.RLock()`.
-   - *Queue Full*: Releases locks, increments `route.queueFullDrops` and returns `ErrQueueFull`.
+   - *Under Locks*: On successful send, updates aggregate queue occupancy, updates route (`route.queueHighWater`) and forwarder (`f.aggregateQueueHighWater`) high-water marks, and posts non-blocking notification to `route.queueReady`.
+   - *Lock Release*: Releases `f.aggregateQueueMu`, then releases `f.mu.RLock()`.
+   - *Post-Lock Accounting*: Admitted throughput counters (`totalTxBytes`, `totalTxPackets`), route and backend traffic statistics (`route.traffic.record`, `backendTraffic.record`), and `f.accountant.RecordTx` execute strictly **outside** table and queue locks.
+   - *Queue Full*: Releases `f.aggregateQueueMu` then `f.mu.RLock()`, increments `route.queueFullDrops` and returns `ErrQueueFull`.
    - *Linearization with Retirement*: Because `RetireAllRoutes`, `UnregisterSession`, and `RetireRoutesByReturnPath` acquire `f.mu.Lock()` exclusively, return packet enqueue strictly precedes route retirement/drain, OR if retirement runs first, subsequent return packets find the route missing in `routesByIP` and return `ErrSessionNotRegistered` before any enqueue attempt. Retired queues are never refilled.
 6. **Consumer Pump Dequeue**: `pumpClientQueue` wakes, dequeues `pktCopy` under `aggregateQueueMu`, resolves the `packetWriter` strictly via non-nil `ReturnPath` under `f.mu.RLock()` (if `ReturnPath` is nil, dequeued packets have no writer and are discarded), and executes `writeClientPacket`.
 7. **Device Write & Retirement Fence**:
@@ -379,7 +383,12 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 #### 2. Live Backend Update (`UpdateSessionBackend`)
 - Modifies `route.backendTunnelID` under `f.mu.Lock()`.
 - Ensures backend queue and traffic structures exist for the new tunnel.
-- *Preservation & Failover Delivery Semantics*: Existing `sessionRoute` objects, `clientQueue`, token buckets, session IDs, and pump workers remain entirely untouched. However, `UpdateSessionBackend` does not migrate packets already queued in the upstream backend queue, and in-flight return packets arriving from the old backend tunnel will fail return-path validation (`ErrReturnRouteMismatch`) and be dropped.
+- *Preservation & Failover Delivery Semantics*: Existing `sessionRoute` objects, `clientQueue`, token buckets, session IDs, and pump workers remain entirely untouched.
+- *Failover Return Packet Handling*: Return packets arriving from the old backend tunnel fail return-path validation with `ErrReturnRouteMismatch` (and are dropped) when a route with a non-nil `ReturnPath` observes the updated `backendTunnelID` during its initial validation phase under `f.mu.RLock()`. Nil-path compatibility routes do not validate backend tunnel identity and bypass this check.
+- *Not a Retroactive Migration Fence*: `UpdateSessionBackend` is **NOT a retroactive migration fence**:
+  - Packets already buffered in `route.clientQueue` prior to migration remain in the queue and will be delivered; `routeWriter.Write` verifies destination identity, not backend tunnel ID.
+  - Return packets from the old backend that pass initial validation in `RouteBackendToClient` before `UpdateSessionBackend` acquires `f.mu.Lock()` can still enqueue after migration because the enqueue recheck verifies only route pointer identity (`routesByIP[destIP] == route`), not `backendTunnelID`.
+  - Packets already queued in the upstream backend queue are not migrated.
 
 #### 3. Unregistration & Teardown (`BeginUnregisterSession`, `RetireAllRoutes`, `RetireRoutesByReturnPath`)
 - **Generational Identity Guard**: `BeginUnregisterSession(peerKey, sessionID)` verifies `route.sessionID == sessionID`. A delayed teardown call for an expired session cannot unregister a newer session that replaced it.
@@ -396,13 +405,19 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
    - If `srcIP` is non-zero and does not equal `route.assignedIP`, the packet is dropped, `spoofedRebinds` is atomically incremented, and `ErrSpoofedSourceIP` is returned.
    - The forwarder unconditionally rejects mismatched non-zero inner source IPs (`routeClientToBackend` in `forwarder.go:855–872`). There is no dynamic self-heal rebind path to unassigned subnet addresses in production routing.
 2. **Cross-Session Return Path Isolation (`ErrReturnRouteMismatch`)**:
-   - In `RouteBackendToClient`, return packets arriving from backend tunnel `B` intended for client VIP `destIP` are verified:
+   - In `RouteBackendToClient`, return packets arriving from backend tunnel `B` intended for client VIP `destIP` are verified during the initial route resolution phase under `f.mu.RLock()`:
      ```go
      if route.returnPath != nil && backendTunnelID != route.backendTunnelID {
          return ErrReturnRouteMismatch
      }
      ```
-   - *Protection*: Guarantees that traffic arriving from an unexpected backend cannot leak into another peer's session during tunnel failover or rebalancing.
+   - *Protection & Qualification*:
+     - Old-backend return packets arriving after tunnel failover or rebalancing are rejected with `ErrReturnRouteMismatch` (classified `ReturnRejectedMismatch`) when a route with a non-nil `ReturnPath` observes the updated `backendTunnelID` during this initial validation phase.
+     - Nil-path compatibility routes (`route.returnPath == nil`) bypass backend ID validation entirely.
+   - *Not a Retroactive Migration Fence*:
+     - `UpdateSessionBackend` is **NOT a retroactive migration fence**.
+     - Packets already buffered in `route.clientQueue` prior to migration remain in the queue and will be delivered to the client; `routeWriter.Write` verifies destination identity, not backend tunnel ID.
+     - Return packets from the old backend that pass initial validation before `UpdateSessionBackend` acquires `f.mu.Lock()` can still enqueue after migration because the subsequent enqueue recheck validates route pointer identity (`routesByIP[destIP] == route`), not `backendTunnelID`.
 3. **Payload Destination Verification (`validReturnDestination`)**:
    - Return packets must have a valid IPv4 header (`version == 4`, `ihl >= 5`, `totalLength <= len(packet)`).
    - The packet header's destination IP must exactly match `route.assignedIP`.
