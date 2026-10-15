@@ -12,25 +12,9 @@ import (
 )
 
 func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
-	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
-	}
-	vpnStr := string(vpnData)
-
-	staticFS, err := GetStaticSubFS()
-	if err != nil {
-		t.Fatalf("GetStaticSubFS failed: %v", err)
-	}
-	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
-	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
-	}
-	cssStr := string(cssBytes)
+	fixture := NewVPNTestFixture(t)
+	vpnStr := fixture.TemplateHTML
+	cssStr := fixture.StyleCSS
 
 	t.Run("TemplateDOMStructure", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
@@ -380,29 +364,36 @@ console.log('NARROW_VIEWPORT_PASS');
 			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", out)
 		}
 	})
+
+	t.Run("CombinedSourceAndTemplateScoping", func(t *testing.T) {
+		combined := fixture.CombinedSource()
+		for _, fn := range []string{"renderSessions", "vpnRenderSessionRow", "vpnFormatPeerKey"} {
+			if _, err := extractJSFunction(combined, "function "+fn); err != nil {
+				t.Fatalf("extractJSFunction %s from combined source failed: %v", fn, err)
+			}
+		}
+		// Callers needing only template functions remain restricted strictly to fixture.TemplateHTML
+		if _, err := extractJSFunction(fixture.TemplateHTML, "function vpnFormatPeerKey"); err != nil {
+			t.Fatalf("extractJSFunction vpnFormatPeerKey from TemplateHTML failed: %v", err)
+		}
+		// TemplateHTML must not contain sessions functions (scoping strictly limited to source)
+		if _, err := extractJSFunction(fixture.TemplateHTML, "function renderSessions"); err == nil {
+			t.Fatal("expected error extracting renderSessions from TemplateHTML without fallback")
+		}
+	})
 }
 
 func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	sessionsJS := fixture.SessionsJS
 
 	staticFS, err := GetStaticSubFS()
 	if err != nil {
 		t.Fatal(err)
 	}
 	tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sessionsJS, err := fs.ReadFile(staticFS, "js/vpn/sessions.js")
 	if err != nil {
 		t.Fatal(err)
 	}

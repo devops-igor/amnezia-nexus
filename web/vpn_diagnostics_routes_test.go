@@ -49,15 +49,10 @@ const UI = { escapeHtml: escapeHtml };
 }
 
 func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	combinedSource := fixture.CombinedSource()
 
 	// Structural invariants in template
 	for _, requiredID := range []string{
@@ -418,7 +413,7 @@ const sessNoDurableSameIP = { assigned_ip: '10.8.0.152' };
 assert.strictEqual(vpnFindRouteForSession(sessNoDurableSameIP), routeNoDurableSameIP, 'session and route without durable IDs must match on IP fallback');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", enAssertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", enAssertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("English connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -508,7 +503,7 @@ const drilldown1 = tbody.children[3];
 assert(drilldown1.textContent.includes('Телеметрия маршрута форвардера недоступна для этой сессии'), 'Russian drilldown no-telemetry fallback');
 `
 
-	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -530,15 +525,9 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 }
 
 func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	combinedSource := fixture.CombinedSource()
 
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
@@ -596,33 +585,23 @@ const probRow = tbody.children[0];
 assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("TestVPNReconnectSessionIDMismatchShowsUnroutable failed: %v\n%s", err, out)
 	}
 }
 
 func TestVPNNexusTableLifecycleDrilldownAndConfigDedup(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	sessionsJS := fixture.SessionsJS
 
 	staticFS, err := GetStaticSubFS()
 	if err != nil {
 		t.Fatal(err)
 	}
 	tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sessionsJS, err := fs.ReadFile(staticFS, "js/vpn/sessions.js")
 	if err != nil {
 		t.Fatal(err)
 	}

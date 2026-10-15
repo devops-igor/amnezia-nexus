@@ -571,15 +571,9 @@ assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alert
 }
 
 func TestVPNPacketLossCellDecoupledFromQueuePressure(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	combinedSource := fixture.CombinedSource()
 
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
@@ -662,7 +656,7 @@ assert(lossEve.innerHTML.includes('text-danger'), 'Eve loss cell must have text-
 assert(lossEve.textContent.includes('5 recent (20)'), 'Eve loss cell must format as "5 recent (20)"');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("packet loss decoupling test (en) failed: %v\n%s", err, out)
 	}
@@ -705,7 +699,7 @@ const lossEve = tbody.children[0].children[3];
 assert(lossEve.innerHTML.includes('text-danger'), 'Russian: Eve loss cell must have text-danger');
 assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve loss cell must use localized "недавних"');
 `
-	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("packet loss decoupling test (ru) failed: %v\n%s", err, out)
 	}

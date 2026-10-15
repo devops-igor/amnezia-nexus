@@ -277,6 +277,16 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 	return vpnDiagnosticsRenderedHTML(f.t, f.TemplateHTML, f.Locale(lang))
 }
 
+// CombinedSource returns the concatenated vpn.html template and sessions.js script.
+func (f *VPNTestFixture) CombinedSource() string {
+	return f.TemplateHTML + "\n" + f.SessionsJS
+}
+
+// CombinedVPNSessionsSource returns the concatenated vpn.html template and sessions.js script.
+func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
+	return f.CombinedSource()
+}
+
 func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	f.t.Helper()
 	lang, dir := opts.Language, opts.Direction
@@ -302,9 +312,10 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if opts.IncludeFetchMock && len(f.MockFetches) > 0 {
 		b.WriteString(buildFetchMockSnippet(f.MockFetches) + "\n")
 	}
+	combined := f.CombinedSource()
 	var extracted strings.Builder
 	for _, fn := range opts.ExtractedFuncs {
-		code, err := extractJSFunction(f.TemplateHTML, "function "+fn)
+		code, err := extractJSFunction(combined, "function "+fn)
 		if err != nil {
 			f.t.Fatalf("extractJSFunction %s failed: %v", fn, err)
 		}
@@ -611,41 +622,50 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 }
 
 func extractJSFunction(source, funcName string) (string, error) {
-	startIdx := strings.Index(source, funcName)
-	if startIdx == -1 {
-		// Fallback: search static JS files in StaticFS (e.g. static/js/vpn/sessions.js)
-		if entries, err := fs.ReadDir(StaticFS, "static/js/vpn"); err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".js") {
-					if content, err := fs.ReadFile(StaticFS, "static/js/vpn/"+entry.Name()); err == nil {
-						if strings.Index(string(content), funcName) != -1 {
-							return extractJSFunction(string(content), funcName)
-						}
-					}
-				}
-			}
-		}
+	cleanName := strings.TrimSpace(funcName)
+	if strings.HasPrefix(cleanName, "async function ") {
+		cleanName = strings.TrimSpace(strings.TrimPrefix(cleanName, "async function "))
+	} else if strings.HasPrefix(cleanName, "function ") {
+		cleanName = strings.TrimSpace(strings.TrimPrefix(cleanName, "function "))
+	}
+	if cleanName == "" {
 		return "", fmt.Errorf("function %s not found in source", funcName)
 	}
-	braceStart := strings.Index(source[startIdx:], "{")
-	if braceStart == -1 {
-		return "", fmt.Errorf("opening brace for %s not found", funcName)
+
+	pattern := `(?m)\b(?:async\s+)?function\s+` + regexp.QuoteMeta(cleanName) + `(?:\s*\(|[\s\r\n])`
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid function pattern for %s: %w", funcName, err)
 	}
-	braceStart += startIdx
-	depth := 1
-	idx := braceStart + 1
-	for idx < len(source) && depth > 0 {
-		if source[idx] == '{' {
-			depth++
-		} else if source[idx] == '}' {
-			depth--
+
+	locs := re.FindAllStringIndex(source, -1)
+	if len(locs) == 0 {
+		return "", fmt.Errorf("function %s not found in source", funcName)
+	}
+
+	for _, loc := range locs {
+		startIdx := loc[0]
+		braceStart := strings.Index(source[startIdx:], "{")
+		if braceStart == -1 {
+			continue
 		}
-		idx++
+		braceStart += startIdx
+		depth := 1
+		idx := braceStart + 1
+		for idx < len(source) && depth > 0 {
+			if source[idx] == '{' {
+				depth++
+			} else if source[idx] == '}' {
+				depth--
+			}
+			idx++
+		}
+		if depth == 0 {
+			return source[startIdx:idx], nil
+		}
 	}
-	if depth != 0 {
-		return "", fmt.Errorf("unbalanced braces in function %s", funcName)
-	}
-	return source[startIdx:idx], nil
+
+	return "", fmt.Errorf("function %s not found in source", funcName)
 }
 
 func vpnDOMMock(t *testing.T, source string) string {

@@ -98,6 +98,31 @@ func TestVPNTestFixture(t *testing.T) {
 		}
 	})
 
+	t.Run("CombinedSourceAndExactBoundaryExtraction", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		combined := fx.CombinedSource()
+		if !strings.Contains(combined, fx.TemplateHTML) || !strings.Contains(combined, fx.SessionsJS) {
+			t.Fatal("CombinedSource must contain both TemplateHTML and SessionsJS")
+		}
+		if fx.CombinedVPNSessionsSource() != combined {
+			t.Fatal("CombinedVPNSessionsSource must match CombinedSource")
+		}
+		if _, err := extractJSFunction(combined, "function renderSessions"); err != nil {
+			t.Fatalf("extractJSFunction renderSessions from combined source failed: %v", err)
+		}
+		if _, err := extractJSFunction(fx.TemplateHTML, "function renderSessions"); err == nil {
+			t.Fatal("expected error extracting renderSessions from TemplateHTML without fallback")
+		}
+		dummySource := "function testFooBar() { return 1; }\nfunction testFoo() { return 2; }"
+		fn, err := extractJSFunction(dummySource, "function testFoo")
+		if err != nil {
+			t.Fatalf("extractJSFunction testFoo failed: %v", err)
+		}
+		if !strings.Contains(fn, "return 2;") {
+			t.Fatalf("extractJSFunction matched prefix instead of exact boundary: %s", fn)
+		}
+	})
+
 	t.Run("FailClosedCIInvariant", func(t *testing.T) {
 		origCI := os.Getenv("CI")
 		defer os.Setenv("CI", origCI)
