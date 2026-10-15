@@ -710,24 +710,21 @@ func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions str
 	if !strings.Contains(source, "function vpnRenderForwarderHealth") {
 		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, source, lang)
 
-	var companionScripts string
-	for _, name := range []string{
-		"vpnFormatTime(val)", "vpnFormatPeerKey", "vpnDiagText", "vpnLossReasonLabels",
-		"parseConditionMessage", "deriveStableConditionCode", "extractConditionEntities", "createSeverityBadge",
-		"vpnRenderActiveProblemsCards", "vpnRenderTechDiagnosticCards",
-		"vpnResetHealthProblems", "vpnResetTechDiagnosticCards",
-		"vpnRenderForwarderHealth",
-	} {
-		if strings.Contains(source, "function "+name+"(") || strings.Contains(source, "function "+name+" ") {
-			fn, err := extractJSFunction(source, "function "+name)
-			if err != nil {
-				return "", fmt.Errorf("failed to extract %s from source: %w", name, err)
-			}
-			companionScripts += "\n" + fn
-		}
+	endMarker := "{{ end }}"
+	var templateSource, companionScripts string
+	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
+		templateSource = source[:idx+len(endMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
+	} else {
+		templateSource = source
+		companionScripts = source
 	}
 
-	return script + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
+	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
+		return "", errors.New("source lacks function vpnRenderForwarderHealth")
+	}
+
+	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	return script + "\n" + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
 }

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -136,9 +135,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 
 console.log('TABLE_FORMATTING_PASS');
 `)
-		cmd := exec.Command(nodePath, "-e", runnerScript)
-		cmd.Env = os.Environ()
-		out, err := cmd.CombinedOutput()
+		out, err := execNodeScript(nodePath, runnerScript)
 		if err != nil {
 			t.Fatalf("Table formatting DOM tests failed: %v\nOutput:\n%s", err, string(out))
 		}

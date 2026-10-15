@@ -16,17 +16,25 @@ import (
 
 func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string {
 	t.Helper()
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, source, lang)
+	endMarker := "{{ end }}"
+	var templateSource, companionScripts string
+	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
+		templateSource = source[:idx+len(endMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
+	} else {
+		templateSource = source
+		companionScripts = source
+	}
+
+	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	script += "\n" + companionScripts
+
 	for _, name := range []string{
-		"vpnFormatTime", "vpnFormatPeerKey",
-		"parseConditionMessage", "deriveStableConditionCode", "extractConditionEntities", "createSeverityBadge",
-		"vpnRenderActiveProblemsCards", "vpnRenderTechDiagnosticCards",
-		"vpnResetHealthProblems", "vpnResetTechDiagnosticCards",
-		"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnRenderForwarderHealth",
+		"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts",
 		"vpnSetHistoryWindow", "vpnToggleShowAllRoutes",
 	} {
-		if strings.Contains(source, "function "+name+"(") || strings.Contains(source, "function "+name+" ") {
-			function, err := extractJSFunction(source, "function "+name)
+		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
+			function, err := extractJSFunction(templateSource, "function "+name)
 			if err != nil {
 				t.Fatalf("extract %s failed: %v", name, err)
 			}

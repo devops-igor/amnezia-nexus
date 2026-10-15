@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -337,9 +335,7 @@ assert(!mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('unav
 console.log('VPN_HEALTH_PASS');
 `
 
-		cmd := exec.Command(nodePath, "-e", runnerScript)
-		cmd.Env = os.Environ()
-		out, err := cmd.CombinedOutput()
+		out, err := execNodeScript(nodePath, runnerScript)
 		if err != nil {
 			t.Fatalf("VPN health DOM tests failed: %v\nOutput:\n%s", err, string(out))
 		}

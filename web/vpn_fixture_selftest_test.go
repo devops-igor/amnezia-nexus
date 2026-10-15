@@ -269,3 +269,43 @@ func TestSuppliedSourceIsolationInHealthScriptLocale(t *testing.T) {
 		t.Fatalf("expected error mentioning vpnRenderForwarderHealth, got: %v", err)
 	}
 }
+
+func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
+	t.Run("HealthProblemsModuleExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.HealthProblemsJS = "throw new Error('AUDIT_MODULE_EXECUTION_FAILURE');\n" + fixture.HealthProblemsJS
+
+		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `vpnRenderForwarderHealth({forwarder_available:true});`)
+		if err != nil {
+			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+		}
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "AUDIT_MODULE_EXECUTION_FAILURE") {
+			t.Fatalf("expected output to mention AUDIT_MODULE_EXECUTION_FAILURE, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("HealthSummaryModuleExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.HealthSummaryJS = "throw new Error('SUMMARY_MODULE_INIT_FAILURE');\n" + fixture.HealthSummaryJS
+
+		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `vpnRenderForwarderHealth({forwarder_available:true});`)
+		if err != nil {
+			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+		}
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "SUMMARY_MODULE_INIT_FAILURE") {
+			t.Fatalf("expected output to mention SUMMARY_MODULE_INIT_FAILURE, got:\n%s", string(out))
+		}
+	})
+}
