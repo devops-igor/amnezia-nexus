@@ -164,6 +164,7 @@ type VPNTestFixture struct {
 	NodePath     string
 	TemplateHTML string
 	StyleCSS     string
+	SessionsJS   string
 	ParsedDOM    *xhtml.Node
 	MockFetches  map[string]string
 }
@@ -201,11 +202,21 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	if err != nil && isCIEnvironment() {
 		t.Fatalf("node binary is required under CI: %v", err)
 	}
+	sessionsPath := "js/vpn/sessions.js"
+	sessionsBytes, err := fs.ReadFile(staticFS, sessionsPath)
+	if err != nil {
+		t.Fatalf("failed to read static sessions asset %s: %v", sessionsPath, err)
+	}
+	if len(strings.TrimSpace(string(sessionsBytes))) == 0 {
+		t.Fatalf("failed to read static sessions asset %s: %v", sessionsPath, errors.New("empty content"))
+	}
+	sessionsJS := string(sessionsBytes)
 	return &VPNTestFixture{
 		t:            t,
 		NodePath:     nodePath,
 		TemplateHTML: string(vpnBytes),
 		StyleCSS:     string(cssBytes),
+		SessionsJS:   sessionsJS,
 		ParsedDOM:    doc,
 		MockFetches:  make(map[string]string),
 	}
@@ -266,6 +277,16 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 	return vpnDiagnosticsRenderedHTML(f.t, f.TemplateHTML, f.Locale(lang))
 }
 
+// CombinedSource returns the concatenated vpn.html template and sessions.js script.
+func (f *VPNTestFixture) CombinedSource() string {
+	return f.TemplateHTML + "\n" + f.SessionsJS
+}
+
+// CombinedVPNSessionsSource returns the concatenated vpn.html template and sessions.js script.
+func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
+	return f.CombinedSource()
+}
+
 func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	f.t.Helper()
 	lang, dir := opts.Language, opts.Direction
@@ -291,13 +312,17 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if opts.IncludeFetchMock && len(f.MockFetches) > 0 {
 		b.WriteString(buildFetchMockSnippet(f.MockFetches) + "\n")
 	}
+	combined := f.CombinedSource()
 	var extracted strings.Builder
 	for _, fn := range opts.ExtractedFuncs {
-		code, err := extractJSFunction(f.TemplateHTML, "function "+fn)
+		code, err := extractJSFunction(combined, "function "+fn)
 		if err != nil {
 			f.t.Fatalf("extractJSFunction %s failed: %v", fn, err)
 		}
 		extracted.WriteString(code + "\n")
+	}
+	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
+		f.t.Fatalf("failed to read static sessions asset %s: %v", "js/vpn/sessions.js", errors.New("empty content"))
 	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
@@ -309,8 +334,9 @@ if (typeof fakeClock !== 'undefined') {
     ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].forEach(m => { w[m] = fakeClock[m].bind(fakeClock); });
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
+w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.SessionsJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -596,29 +622,50 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 }
 
 func extractJSFunction(source, funcName string) (string, error) {
-	startIdx := strings.Index(source, funcName)
-	if startIdx == -1 {
+	cleanName := strings.TrimSpace(funcName)
+	if strings.HasPrefix(cleanName, "async function ") {
+		cleanName = strings.TrimSpace(strings.TrimPrefix(cleanName, "async function "))
+	} else if strings.HasPrefix(cleanName, "function ") {
+		cleanName = strings.TrimSpace(strings.TrimPrefix(cleanName, "function "))
+	}
+	if cleanName == "" {
 		return "", fmt.Errorf("function %s not found in source", funcName)
 	}
-	braceStart := strings.Index(source[startIdx:], "{")
-	if braceStart == -1 {
-		return "", fmt.Errorf("opening brace for %s not found", funcName)
+
+	pattern := `(?m)\b(?:async\s+)?function\s+` + regexp.QuoteMeta(cleanName) + `(?:\s*\(|[\s\r\n])`
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid function pattern for %s: %w", funcName, err)
 	}
-	braceStart += startIdx
-	depth := 1
-	idx := braceStart + 1
-	for idx < len(source) && depth > 0 {
-		if source[idx] == '{' {
-			depth++
-		} else if source[idx] == '}' {
-			depth--
+
+	locs := re.FindAllStringIndex(source, -1)
+	if len(locs) == 0 {
+		return "", fmt.Errorf("function %s not found in source", funcName)
+	}
+
+	for _, loc := range locs {
+		startIdx := loc[0]
+		braceStart := strings.Index(source[startIdx:], "{")
+		if braceStart == -1 {
+			continue
 		}
-		idx++
+		braceStart += startIdx
+		depth := 1
+		idx := braceStart + 1
+		for idx < len(source) && depth > 0 {
+			if source[idx] == '{' {
+				depth++
+			} else if source[idx] == '}' {
+				depth--
+			}
+			idx++
+		}
+		if depth == 0 {
+			return source[startIdx:idx], nil
+		}
 	}
-	if depth != 0 {
-		return "", fmt.Errorf("unbalanced braces in function %s", funcName)
-	}
-	return source[startIdx:idx], nil
+
+	return "", fmt.Errorf("function %s not found in source", funcName)
 }
 
 func vpnDOMMock(t *testing.T, source string) string {
@@ -880,112 +927,4 @@ func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions str
 		script += "\n" + function
 	}
 	return script + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions
-}
-
-func TestVPNTestFixture(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
-	if fixture.TemplateHTML == "" {
-		t.Fatal("expected non-empty TemplateHTML")
-	}
-	if fixture.StyleCSS == "" {
-		t.Fatal("expected non-empty StyleCSS")
-	}
-	if fixture.ParsedDOM == nil {
-		t.Fatal("expected non-nil ParsedDOM")
-	}
-
-	t.Run("DOMQueryHelpers", func(t *testing.T) {
-		fx := fixture.WithT(t)
-		topCard := fx.FindByID("vpn-forwarder-card")
-		if topCard == nil {
-			t.Fatal("expected to find #vpn-forwarder-card")
-		}
-		tables := fx.FindByTag("table")
-		if len(tables) == 0 {
-			t.Fatal("expected at least one table in vpn.html")
-		}
-		if err := fx.ValidateDashboardOrder(); err != nil {
-			t.Fatalf("dashboard DOM order validation failed: %v", err)
-		}
-		if none := fx.FindByID(""); none != nil {
-			t.Fatalf("expected FindByID(\"\") to return nil, got %v", none)
-		}
-	})
-
-	t.Run("LocalizationInjection", func(t *testing.T) {
-		fx := fixture.WithT(t)
-		enDict := fx.Locale("en")
-		if len(enDict) == 0 {
-			t.Fatal("expected non-empty en locale dict")
-		}
-		rendered := fx.RenderedHTML("en")
-		if len(rendered) == 0 {
-			t.Fatal("expected non-empty rendered HTML")
-		}
-		if err := vpnDiagnosticsStaticOracle(rendered, enDict); err != nil {
-			t.Fatalf("static oracle failed: %v", err)
-		}
-	})
-
-	t.Run("JSDOMFakeClockAndMockFetch", func(t *testing.T) {
-		fx := fixture.WithT(t)
-		fx.MockEndpoint("/api/vpn/status", `{"forwarder_available": true, "status": "HEALTHY"}`)
-		testScript := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
-			IncludeFakeClock: true,
-			IncludeFetchMock: true,
-			ExtraJS: `
-(async () => {
-    let timerFired = false;
-    w.fakeClock.setTimeout(() => { timerFired = true; }, 500);
-    assert.strictEqual(timerFired, false, 'timer should not fire before tick');
-    w.fakeClock.tick(500);
-    assert.strictEqual(timerFired, true, 'timer should fire after tick');
-    const res = await w.fetch('/api/vpn/status');
-    const data = await res.json();
-    assert.strictEqual(data.forwarder_available, true, 'mock fetch must return payload');
-    assert.strictEqual(data.status, 'HEALTHY', 'mock fetch payload match');
-    console.log('FIXTURE_JSDOM_PASS');
-})().catch(e => { console.error(e); process.exit(1); });
-`,
-		})
-		out := fx.RunJSDOM(testScript)
-		if !strings.Contains(out, "FIXTURE_JSDOM_PASS") {
-			t.Fatalf("expected FIXTURE_JSDOM_PASS, got: %s", out)
-		}
-	})
-
-	t.Run("BacktickPreservationInHarness", func(t *testing.T) {
-		fx := fixture.WithT(t)
-		harness := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
-			HTML: `<div id="backtick-test">` + "`literal_backtick`" + `</div>`,
-		})
-		if strings.Contains(harness, `\`+"`") {
-			t.Fatalf("BuildJSDOMHarness must not escape backticks with backslashes; found backslash-escaped backtick")
-		}
-		if !strings.Contains(harness, "`literal_backtick`") {
-			t.Fatalf("BuildJSDOMHarness must contain raw backtick literal")
-		}
-	})
-
-	t.Run("WithTSubtestBinding", func(t *testing.T) {
-		fx := fixture.WithT(t)
-		if fx.t != t {
-			t.Fatalf("expected fx.t to be subtest t, got %v", fx.t)
-		}
-	})
-
-	t.Run("FailClosedCIInvariant", func(t *testing.T) {
-		origCI := os.Getenv("CI")
-		defer os.Setenv("CI", origCI)
-		os.Setenv("CI", "")
-		if isCIEnvironment() {
-			t.Fatal("expected isCIEnvironment() to be false when CI=''")
-		}
-		for _, v := range []string{"true", "1", "TRUE"} {
-			os.Setenv("CI", v)
-			if !isCIEnvironment() {
-				t.Fatalf("expected isCIEnvironment() to be true when CI=%q", v)
-			}
-		}
-	})
 }

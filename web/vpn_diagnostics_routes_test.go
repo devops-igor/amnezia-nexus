@@ -49,15 +49,10 @@ const UI = { escapeHtml: escapeHtml };
 }
 
 func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	combinedSource := fixture.CombinedSource()
 
 	// Structural invariants in template
 	for _, requiredID := range []string{
@@ -418,7 +413,7 @@ const sessNoDurableSameIP = { assigned_ip: '10.8.0.152' };
 assert.strictEqual(vpnFindRouteForSession(sessNoDurableSameIP), routeNoDurableSameIP, 'session and route without durable IDs must match on IP fallback');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", enAssertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", enAssertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("English connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -508,7 +503,7 @@ const drilldown1 = tbody.children[3];
 assert(drilldown1.textContent.includes('Телеметрия маршрута форвардера недоступна для этой сессии'), 'Russian drilldown no-telemetry fallback');
 `
 
-	ruScript := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "ru", ruAssertions)
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -530,15 +525,9 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 }
 
 func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	combinedSource := fixture.CombinedSource()
 
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
@@ -596,22 +585,17 @@ const probRow = tbody.children[0];
 assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, tmplStr, "en", assertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("TestVPNReconnectSessionIDMismatchShowsUnroutable failed: %v\n%s", err, out)
 	}
 }
 
 func TestVPNNexusTableLifecycleDrilldownAndConfigDedup(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	sessionsJS := fixture.SessionsJS
 
 	staticFS, err := GetStaticSubFS()
 	if err != nil {
@@ -667,6 +651,7 @@ try {
 const source = %q;
 const en = JSON.parse(%q);
 const tablesCode = %q;
+const sessionsCode = %q;
 
 function extract(name) {
     const start = source.indexOf('    function ' + name + '(');
@@ -678,21 +663,17 @@ function extract(name) {
 
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
+w.eval(sessionsCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastSessions = null, vpnLastStatus = null;' +
-'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
-'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastStatus = null;' +
 'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
-    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
-    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
-    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
-    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
-    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+    'vpnStatusLabel', 'vpnFormatPeerKey',
+    'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
 ].map(extract).join('\n'));
 
 w.eval(tablesCode);
@@ -785,7 +766,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS))
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS))
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

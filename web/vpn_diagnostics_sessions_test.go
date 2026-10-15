@@ -12,25 +12,9 @@ import (
 )
 
 func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
-	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
-	}
-	vpnStr := string(vpnData)
-
-	staticFS, err := GetStaticSubFS()
-	if err != nil {
-		t.Fatalf("GetStaticSubFS failed: %v", err)
-	}
-	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
-	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
-	}
-	cssStr := string(cssBytes)
+	fixture := NewVPNTestFixture(t)
+	vpnStr := fixture.TemplateHTML
+	cssStr := fixture.StyleCSS
 
 	t.Run("TemplateDOMStructure", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
@@ -380,18 +364,30 @@ console.log('NARROW_VIEWPORT_PASS');
 			t.Fatalf("Narrow viewport test did not output NARROW_VIEWPORT_PASS\nOutput:\n%s", out)
 		}
 	})
+
+	t.Run("CombinedSourceAndTemplateScoping", func(t *testing.T) {
+		combined := fixture.CombinedSource()
+		for _, fn := range []string{"renderSessions", "vpnRenderSessionRow", "vpnFormatPeerKey"} {
+			if _, err := extractJSFunction(combined, "function "+fn); err != nil {
+				t.Fatalf("extractJSFunction %s from combined source failed: %v", fn, err)
+			}
+		}
+		// Callers needing only template functions remain restricted strictly to fixture.TemplateHTML
+		if _, err := extractJSFunction(fixture.TemplateHTML, "function vpnFormatPeerKey"); err != nil {
+			t.Fatalf("extractJSFunction vpnFormatPeerKey from TemplateHTML failed: %v", err)
+		}
+		// TemplateHTML must not contain sessions functions (scoping strictly limited to source)
+		if _, err := extractJSFunction(fixture.TemplateHTML, "function renderSessions"); err == nil {
+			t.Fatal("expected error extracting renderSessions from TemplateHTML without fallback")
+		}
+	})
 }
 
 func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
+	tmplStr := fixture.TemplateHTML
+	sessionsJS := fixture.SessionsJS
 
 	staticFS, err := GetStaticSubFS()
 	if err != nil {
@@ -446,6 +442,7 @@ try {
 const source = %q;
 const en = JSON.parse(%q);
 const tablesCode = %q;
+const sessionsCode = %q;
 
 function extract(name) {
     const start = source.indexOf('    function ' + name + '(');
@@ -457,21 +454,17 @@ function extract(name) {
 
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
+w.eval(sessionsCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastSessions = null, vpnLastStatus = null;' +
-'var vpnSessionsStale = false, vpnSessionsFilterOnlyProblems = false;' +
-'var vpnExpandedSessionIds = new Set(), vpnSessionsTableInstance = null;' +
+'var vpnLastStatus = null;' +
 'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
-    'fmtBps', 'fmtPps', 'vpnStatusLabel', 'vpnFormatBytes', 'vpnFormatPeerKey',
-    'vpnFindRouteForSession', 'vpnRenderSessionRow', 'vpnCreateSessionDrilldownRow',
-    'vpnToggleSessionDrilldown', 'vpnToggleSessionsProblemFilter', 'vpnRenderSessionsStaleBanner',
-    'vpnFindSessionById', 'vpnSyncExpandedDrilldowns', 'vpnWrapSessionsTableRender',
-    'renderSessions', 'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+    'vpnStatusLabel', 'vpnFormatPeerKey',
+    'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
 ].map(extract).join('\n'));
 
 w.eval(tablesCode);
@@ -619,7 +612,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS))
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS))
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {
