@@ -17,14 +17,14 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
 | # | Field Name | Type | Guarding Primitive | Mutation Lifecycle Paths | Authority | I/O Boundary Rules & Technical Debt |
 |---|---|---|---|---|---|---|
 | 1 | `retiredIngressLosses` | `ingressLossTotals` | `s.mu.Lock` | `Start`, `Stop` | In-memory | Prohibits all I/O. Memory-only accumulator for closed engine losses. |
-| 2 | `mu` | `sync.RWMutex` | Self (Primitive) | Service lifecycle | Primary state synchronization | **Normative Invariant**: Prohibits all disk, database, and network I/O.<br>**Observed Technical Debt**: Bounded DB calls (`AuthenticatePeer`, `SaveVPNConfig`, migration persistence, reconciliation `SetConnectionCount`) run under lock; targeted for Phase 4 (#91) refactoring. |
+| 2 | `mu` | `sync.RWMutex` | Self (Primitive) | Service lifecycle | Primary state synchronization | **Normative Invariant**: Prohibits all disk, database, and network I/O.<br>**Observed Technical Debt**: Multiple synchronous DB operations (`AuthenticatePeer`, `CreateVPNSession`/`CloseVPNSession`, `SetTunnelEnabled`, `RemoveTunnel`, `GetActiveVPNSessions`/failover moves, `SaveVPNConfig`, migration persistence, connection counter persistence `db.UpdateBackendTunnel`) run under lock; targeted for Phase 4 (#91) refactoring. |
 | 3 | `assignmentMu` | `sync.Mutex` | Self (Primitive) | `Start`, `renderClientConfigForConnection` | In-memory lease serialization | Permits DB queries and transactions (`reservePersistedClientIPs`, `InvalidateVPNSessionsForRestart`, `UpdateConnection`). Prohibits network I/O. Disjoint from `s.mu`. |
 | 4 | `db` | `*database.DB` | Read-only pointer post-init | `NewVPNService` | Persistent Database (SQLite) | DB handle. Queries executed according to caller lock context. |
 | 5 | `cfg` | `*models.VPNConfig` | `s.mu` (`RLock` read / `Lock` write) | `NewVPNService`, `UpdateConfig` | Database-backed (`vpn_configs`), cached in memory | `GetConfig` is pure memory copy under `s.mu.RLock`. `UpdateConfig` persisting to DB under `s.mu.Lock` is technical debt. |
 | 6 | `sessionMgr` | `*session.SessionManager` | Read-only pointer post-init | `NewVPNService` | In-memory live sessions, DB-backed | Internal locking via `SessionManager.mu`. Lock order must strictly be `s.mu` -> `SessionManager.mu`. |
 | 7 | `ipam` | `*ipam.IPAM` | Read-only pointer post-init | `NewVPNService` | In-memory CIDR allocator | Pure memory operations. Allocations coordinated with DB leases under `assignmentMu`. |
 | 8 | `auth` | `*auth.DBAuthenticator` | Read-only pointer post-init | `NewVPNService` | Database-backed lookup | Executes database read queries. Calling `AuthenticatePeer` in admission under `s.mu.Lock` is technical debt. |
-| 9 | `pool` | `*tunnel.Pool` | Read-only pointer post-init | `NewVPNService`, `Stop` | In-memory pool, DB-backed | Pool gauge mutators (`IncrementConnections`, `DecrementConnections`, `TransferConnectionsIfActive`) MUST run under `s.mu.Lock` (Issue #86 invariant). `SetConnectionCount` persisting to DB under `s.mu.Lock` is technical debt. |
+| 9 | `pool` | `*tunnel.Pool` | Read-only pointer post-init | `NewVPNService`, `Stop` | In-memory pool, DB-backed | Pool gauge mutators (`IncrementConnections`, `DecrementConnections`, `TransferConnectionsIfActive`) run under `s.mu.Lock`. Serializes admission capacity, but migration and failover paths do not validate destination capacity (known debt). Synchronous `persistConnectionCount` and `SetConnectionCount` writes under `s.mu.Lock` are technical debt. |
 | 10 | `prober` | `*tunnel.HealthProber` | `s.mu` (pointer swap) / internal | `NewVPNService`, `SetHealthProber`, `Start`, `Stop` | Runtime health evaluation | Network UDP probes run asynchronously in background prober routines outside `s.mu`. |
 | 11 | `reconnectMgr` | `*tunnel.ReconnectManager` | Read-only pointer post-init | `NewVPNService`, `Start`, `Stop` | Reconnection state machine | Background reconnects execute asynchronously outside `s.mu`. |
 | 12 | `balancer` | `loadbalancer.LoadBalancer` | `s.mu` (`RLock` read / `Lock` write) | `NewVPNService`, `UpdateConfig` | In-memory algorithm | Pure in-memory calculation; no I/O permitted. |
@@ -92,13 +92,36 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
 2. **Normative Architectural Invariant: NO I/O Under `Service.mu`**:
    - **Target Rule**: NO disk, database, or network I/O is permitted while holding `s.mu.Lock()` or `s.mu.RLock()`.
    - **Rationale**: I/O operations have unbounded latency. Holding a service-wide state lock across I/O blocks concurrent packet routing, health probes, and API requests, inducing thread pool starvation, queue overflows, and cascading watchdog timeouts.
-3. **Observed Technical Debt (Phase 4 / Issue #91 Remediation Targets)**:
-   Existing implementations contain database operations executed directly under `s.mu.Lock()`. These call sites are explicitly classified as known technical debt to be decoupled in Phase 4:
-   - `AuthenticatePeer` in `vpn_ingress.go:124,143`: Durable peer lookup executed under `s.mu.Lock()` during serialized ingress admission.
-   - `SaveVPNConfig` in `vpn.go:3476,3553`: Configuration persistence and rollback executed under `s.mu.Lock()` during runtime config updates.
-   - Migration persistence and compensation in `vpn.go:3928,3976`: `db.MigrateVPNSessionBackend` and `rollbackMigration` executed under `s.mu.Lock()` in `MigrateSession`.
-   - Connection count reconciliation in `vpn.go:1634,1693`: `s.pool.SetConnectionCount` calling `db.UpdateBackendTunnel` under `s.mu.Lock()` during gauge reconciliation passes.
-   *Phase 4 Remediation Strategy*: Pre-read and authenticate outside the mutex, acquire `s.mu.Lock()` strictly for atomic in-memory state transition, and execute persistence or rollback compensation outside `s.mu`.
+3. **Observed Technical Debt Inventory (Phase 4 / Issue #91 Remediation Targets)**:
+   Existing implementations contain database read and write operations executed directly under `s.mu.Lock()`. These call sites are explicitly classified as known technical debt to be decoupled in Phase 4:
+   - **Ingress Admission (`vpn_ingress.go:124, 231–259`)**:
+     * Durable peer authentication (`s.auth.AuthenticatePeer` at `vpn_ingress.go:143`): Durable user and connection lookup query executed under `s.mu.Lock()`.
+     * Session lifecycle persistence (`s.sessionMgr.CreateSessionWithDeltaAndSource` at `vpn_ingress.go:231` calling `session.go:207, 243`): Executes `sm.db.CloseVPNSession` (if replacing an existing session) and `sm.db.CreateVPNSession` under `s.mu.Lock()`.
+     * Connection count persistence (`s.pool.IncrementConnections` at `vpn_ingress.go:259`): Calls underlying `persistConnectionCount` (`tunnel/pool.go:672–708`), executing `db.UpdateBackendTunnel` under `s.mu.Lock()` to persist the updated `active_connections` gauge.
+     * Compensation on route registration failure (`rollbackIngressSession` at `vpn_ingress.go:269`): Executes `sm.db.CloseVPNSession` under `s.mu.Lock()`.
+   - **Backend Disable & Failover (`vpn.go:3009–3092`)**:
+     * Administrative disable persistence (`s.pool.SetTunnelEnabled` at `vpn.go:3027`): Persists backend disabled status (`db.UpdateBackendTunnel`) under `s.mu.Lock()`.
+     * Failover session reads and moves (`s.stickyMgr.HandleFailover` at `vpn.go:3063` calling `loadbalancer/sticky.go:444–520`): Executes synchronous session read `sm.db.GetActiveVPNSessions` (`sticky.go:456`) and synchronous updates `sm.persistFailoverMoves` (`sticky.go:513` calling `db.MigrateVPNSessionBackend` / `CreateVPNSession`) while holding `s.mu.Lock()`.
+     * Failover counter persistence: Calls `s.pool.DecrementConnections` and `s.pool.IncrementConnections` (`vpn.go:3090–3091`), triggering underlying `persistConnectionCount` (`db.UpdateBackendTunnel` at `tunnel/pool.go:672–708`) for each migrated session under `s.mu.Lock()`.
+   - **Backend Deletion (`vpn.go:3338–3385`)**:
+     * `DeleteBackend` acquires `s.mu.Lock()` at line 3339, invokes `disableBackendLocked` (executing all the disable/failover DB I/O above), and then executes `s.pool.RemoveTunnel` (`vpn.go:3369` calling `db.DeleteBackendTunnel`) and defensive cleanup `s.db.DeleteBackendTunnel` (`vpn.go:3381`) under `s.mu.Lock()`.
+   - **Runtime Configuration Updates (`vpn.go:3476, 3553`)**:
+     * `SaveVPNConfig`: Configuration persistence and compensating rollback executed under `s.mu.Lock()`.
+   - **Session Migration Protocol (`vpn.go:3928, 3976, 3989`)**:
+     * `MigrateSession`: Executes `db.MigrateVPNSessionBackend` and compensating `rollbackMigration` under `s.mu.Lock()`.
+     * Counter transfer persistence: `s.pool.TransferConnectionsIfActive` (`vpn.go:3989` calling `tunnel/pool.go:755–807`) executes `persistConnectionCount` twice (`db.UpdateBackendTunnel`) under `s.mu.Lock()`.
+   - **Periodic Connection Count Reconciliation (`vpn.go:1634, 1693`)**:
+     * `reconcileConnectionCounts`: Executes `s.pool.SetConnectionCount` calling `db.UpdateBackendTunnel` under `s.mu.Lock()` during periodic gauge reconciliation passes.
+4. **Phase 4 Decoupling Strategy & Synchronization Classification**:
+   When decoupling database operations from `s.mu` in Phase 4, operations are partitioned into two architectural categories:
+   - **Operations Requiring Ordered In-Memory Synchronization**:
+     * *Ingress Session Creation & Route Commitment*: In-memory slot allocation, capacity checking, and dataplane route registration must remain atomic under lock. In Phase 4, this should follow a staged pattern: validate pre-conditions, acquire `s.mu` strictly to check capacity and reserve the in-memory slot, release `s.mu`, and execute database persistence (`CreateVPNSession`, `db.UpdateBackendTunnel`) outside the lock. If the subsequent database write fails, a compensating rollback cancels the reservation.
+     * *Administrative Disable & Dataplane Teardown*: Detaching dataplane devices and disabling routes must happen synchronously under lock. However, querying active sessions (`GetActiveVPNSessions`) and persisting failover destination records (`db.MigrateVPNSessionBackend`) must be decoupled outside `s.mu` to prevent blocking live packet processing across unrelated tunnels.
+   - **Operations Safely Decoupled Outside `s.mu`**:
+     * *Durable Peer Authentication (`AuthenticatePeer`)*: Read-only query executed prior to acquiring `s.mu.Lock()`. A lightweight version/generation token can be verified after taking `s.mu` if state changes need detection.
+     * *Active Connection Gauge Persistence (`pool.persistConnectionCount` / `SetConnectionCount`)*: Connection counts are in-memory routing weights and diagnostic telemetry; persistent counters in `backend_tunnels` are already asynchronously reconciled. These updates can be enqueued to an asynchronous persistence worker or dispatched after lock release without compromising correctness.
+     * *Backend Deletion Row Removal (`db.DeleteBackendTunnel`)*: Once in-memory routing and device handles are removed under `s.mu`, deleting the persistent database rows can proceed asynchronously outside `s.mu`.
+     * *Configuration Persistence (`SaveVPNConfig`)*: Validate and persist configuration changes to the database before acquiring `s.mu.Lock()` for an atomic pointer swap.
 
 ### 3.2 Diagnostics Mutex: `diagRatesMu` (`sync.Mutex`)
 
@@ -146,18 +169,25 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
 
 ### 4.1 Multi-Backend Capacity Select and Reserve Semantics (Issue #86 Invariant)
 
-The check-then-allocate capacity pattern for backend tunnels is safe under concurrent traffic because and only because every production mutator of `tunnel.Pool.ActiveConnections` is serialized under `s.mu.Lock()`:
+The multi-backend architecture governs tunnel capacity across admission, session replacement, live migration, and administrative failover. The guarantees provided by mutex serialization versus capacity enforcement are distinct:
 
-1. **Serialized Admission Sequence**:
-   `EnsureBackendSessionForIngress` acquires `s.mu.Lock()` for the entire sequence:
-   $$\text{Peer Lookup} \longrightarrow \text{FilterHealthy} \longrightarrow \text{Select Backend} \longrightarrow \text{CreateSession} \longrightarrow \text{IncrementConnections} \longrightarrow \text{Route Registration}$$
-2. **Prevention of Capacity Overshoot**:
-   Because `s.mu` is held continuously across capacity checks and increments, no concurrent goroutine can observe a below-cap connection count and double-allocate. Even under race conditions with hundreds of concurrent admissions, the active connection count on any backend cannot exceed `MaxPeersPerBackend`, nor can total sessions exceed `MaxTotalPeers`.
-3. **Exactly-Once Counter Accounting on Replacement (Issue #388 Rework D)**:
+1. **Serialized Admission Select-and-Reserve Guarantee**:
+   Admission select-and-reserve is strictly serialized and capacity-checked under `s.mu.Lock()`. `EnsureBackendSessionForIngress` (and `HandleIncomingPeer`) acquires `s.mu.Lock()` for the entire sequence:
+   $$\text{Peer Lookup} \longrightarrow \text{FilterHealthy (Capacity Check)} \longrightarrow \text{Select Backend} \longrightarrow \text{CreateSession} \longrightarrow \text{IncrementConnections} \longrightarrow \text{Route Registration}$$
+   Because `s.mu` is held continuously across capacity filtering (`FilterHealthy` verifies `ActiveConnections < MaxPeersPerBackend`) and counter incrementing, no concurrent admission goroutine can observe a below-cap connection count and double-allocate. On this pure ingress admission path, active connections on any backend cannot exceed `MaxPeersPerBackend`, nor can total sessions exceed `MaxTotalPeers`.
+2. **Migration and Failover Capacity Accounting (No Destination Enforcement)**:
+   Mutex serialization under `s.mu` prevents concurrent memory races during counter updates, but does NOT by itself enforce backend capacity limits when sequential migration or failover paths omit capacity validation:
+   - **In-Flight Session Migration (`MigrateSession`)**: Calls `tunnel.Pool.TransferConnectionsIfActive` (`internal/vpn/tunnel/pool.go:755–807`). This function verifies that the destination backend is enabled and active and checks expected state versions, but unconditionally increments `toTun.ActiveConnections` without checking `MaxPeersPerBackend`.
+   - **Administrative Failover (`disableBackendLocked`)**: When a backend is disabled (`internal/vpn/vpn.go:3057–3092`), `stickyMgr.HandleFailover` (`internal/vpn/loadbalancer/sticky.go:474–499`) plans new destination backends for all degraded peers against a point-in-time snapshot of healthy tunnels (`availableTunnels`). Because selection occurs in a loop against the initial snapshot, multiple degraded sessions can be assigned to the same destination tunnel. When `disableBackendLocked` sequentially moves these sessions and invokes `s.pool.IncrementConnections(m.NewBackendTunnelID)`, the destination backend's counter can overshoot `MaxPeersPerBackend` (e.g., if destination backend $B$ has 249 active connections against a limit of 250, failing over two peers from disabled backend $A$ to $B$ drives $B$ to 251 active connections).
+3. **Known Technical Debt & Invariant Scope (Phase 4 / Issue #91)**:
+   - Strict capacity bounds across session migration and failover paths are **NOT currently enforced** by the runtime.
+   - The capacity invariant is strictly bounded: ingress admission is guaranteed not to allocate beyond `MaxPeersPerBackend`, but administrative failover and migration transfers may temporarily exceed configured backend limits under multi-peer failover.
+   - Closing this enforcement gap by adding destination capacity checking, quota-aware failover planning, and load shedding across migration/failover is tracked as known technical debt for Phase 4 / Issue #91, with stress test suites tracked under Issue #557 (multi-backend cascade failover under sustained ingress load) and Issue #559 (concurrent lease exhaustion).
+4. **Exactly-Once Counter Accounting on Replacement (Issue #388 Rework D)**:
    When an incoming peer handshake matches an existing peer key, session replacement accounting is handled with mathematical precision based on `CreateSessionWithDeltaAndSource`:
    - **Fresh Admission (no prior session)**: The replacement hook does not fire; the admission path increments the selected backend counter ($+1$).
    - **Same-Backend Replacement ($A \rightarrow A$)**: The replacement hook decrements backend $A$ ($-1$) and does not increment because source equals target. The admission path restores the count by re-incrementing backend $A$ ($+1$). The peer's count on backend $A$ remains exactly 1.
-   - **Cross-Backend Replacement ($A \\rightarrow B$)**: The replacement hook transfers the count by decrementing $A$ ($-1$) and incrementing $B$ ($+1$). The admission path observes `delta.HasInc == true` and performs NO additional increment. Backend $B$ count remains exactly 1.
+   - **Cross-Backend Replacement ($A \rightarrow B$)**: The replacement hook transfers the count by decrementing $A$ ($-1$) and incrementing $B$ ($+1$). The admission path observes `delta.HasInc == true` and performs NO additional increment. Backend $B$ count remains exactly 1.
 
 ### 4.2 Peer and Assigned IP Uniqueness Guarantees
 
@@ -190,7 +220,7 @@ The check-then-allocate capacity pattern for backend tunnels is safe under concu
    - Step 4: The database session record is migrated (`db.MigrateVPNSessionBackend`).
    - Step 5: Connection counters are atomically transferred (`pool.TransferConnectionsIfActive`).
    - Step 6: Sticky affinity is updated (`stickyMgr.AssignPeerAffinity`).
-   - If any step fails, `rollbackMigration` executes a best-effort compensation attempt in reverse order (see Section 4.4 for attempt budgets and residual state semantics).
+   - Failure Handling & Rollback Boundaries: If an initial failure occurs during Step 2 (`forwarder.UpdateSessionBackend` returning an error other than `forwarder.ErrSessionNotRegistered`), `MigrateSession` aborts immediately and returns the error without invoking `rollbackMigration`, because no state mutations have yet succeeded (`internal/vpn/vpn.go:3959–3966`). Once migration state mutations have commenced (failure during Step 3 in-memory session update, Step 4 database persistence, or Step 5 counter transfer), `rollbackMigration` executes a best-effort compensation attempt in reverse order to revert modified components (see Section 4.4 for attempt budgets and residual state semantics).
 4. **Reaper versus Concurrent Admission Race**:
    - The session reaper (`reapIngressSession`) runs under `s.mu.Lock()`.
    - Before retiring a route, it queries `sessionMgr.GetSessionSnapshotByPeer(sess.PeerPublicKey)`:
@@ -210,6 +240,7 @@ Compound operations spanning memory, database, and dataplane forwarders execute 
      * Releases `s.mu` before awaiting route retirement completion (`retirement.Wait()`).
    - **Residual State on Cross-Backend Replacement ($A \rightarrow B$)**: The replacement hook previously decremented backend $A$ and marked the old session disconnected. If admission subsequently fails on backend $B$, compensation decrements $B$, but does NOT resurrect the old session on $A$. The old session remains invalidated, and the admission fails closed.
 2. **Migration Rollback (`rollbackMigration`)**:
+   - **Invocation Triggers & Scope**: `rollbackMigration` is invoked only after state mutations have commenced (e.g. following a failure in `sessionMgr.UpdateSessionBackend`, `db.MigrateVPNSessionBackend`, or `pool.TransferConnectionsIfActive`). If the initial `forwarder.UpdateSessionBackend` call fails (with any error other than `forwarder.ErrSessionNotRegistered`), `MigrateSession` returns immediately without invoking `rollbackMigration`, as no prior state mutations were committed.
    - **Bounded Database Attempt Window**: Compensation derives a non-cancelable timeout context: `rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`. This 5-second timeout budget is passed *only* to `db.MigrateVPNSessionBackend` (`internal/vpn/vpn.go:3886`). Subsequent rollback calls (`sessionMgr.RollbackSessionBackend` and `forwarder.UpdateSessionBackend`) do NOT accept a context deadline and block synchronously on standard mutexes (`SessionManager.mu` and `Forwarder.mu`). Thus, the 5-second deadline is a cooperative database attempt window, NOT a wall-clock completion bound on the whole rollback.
    - **Partial Failure Aggregation**: Compensation steps execute sequentially (DB session row revert, session manager revert, forwarder route revert). All encountered errors are collected and returned via `errors.Join(rollbackErrs...)`.
    - **Residual Inconsistency**: If compensation partially fails, in-memory routes and database session records may temporarily diverge. Periodic reconciliation (`reconcileConnectionCounts`) is *gauge-only* (it updates pool gauges and timestamps; does not repair forwarder routes or session backend identity). Session reaping provides *conditional idle retirement* for inactive sessions, NOT guaranteed route or database self-repair.
@@ -245,7 +276,7 @@ The table below maps the documented state invariants against verified unit, race
 
 | Invariant Category | Documented Contract | Validating Test Suites & Specific Test Cases |
 |---|---|---|
-| Multi-Backend Capacity | Check-then-allocate serialization (#86) | `internal/vpn/capacity_stress_test.go` (`TestHandleIncomingPeerCapacityStress`)<br>`internal/vpn/vpn_ingress_test.go` (`TestIngressAdmissionExactlyOnceConcurrentBurst`)<br>`internal/vpn/ingress_concurrent_legacy_mix_test.go` (`TestIngressCountersWithConcurrentLegacyCreateSession`) |
+| Multi-Backend Capacity | Admission check-then-allocate serialization (#86); migration/failover destination unconstrained (known debt) | `internal/vpn/capacity_stress_test.go` (`TestHandleIncomingPeerCapacityStress`)<br>`internal/vpn/vpn_ingress_test.go` (`TestIngressAdmissionExactlyOnceConcurrentBurst`)<br>`internal/vpn/ingress_concurrent_legacy_mix_test.go` (`TestIngressCountersWithConcurrentLegacyCreateSession`) |
 | Replacement Accounting | Exactly-once counter deltas (#388) | `internal/vpn/ingress_replacement_accounting_test.go` (`TestIngressDifferentBackendReplacementExactlyOnce`, `TestIngressSameBackendReplacementNetOne`, `TestIngressDifferentBackendReplacementRollbackNoPhantom`)<br>`internal/vpn/rekey_replacement_regression_test.go` (`TestRekeyReplacementAcrossBackends`, `TestRekeyKeepsGaugeAtBaseline`) |
 | Peer & IP Uniqueness | CIDR allocation & durable lease precedence | `internal/vpn/vpn_ipam_test.go` (`TestGenerateClientConfig_IPAMPersistence`, `TestGenerateClientConfig_ServerRestartIPAMRestoration`, `TestHandleIncomingPeer_IPAMPersistenceFallbackAndCollision`)<br>`internal/vpn/issue338_ipam_collision_test.go` (`TestStartupIPAMCollision_ResolvesDuplicateAndSelfHeals`, `TestStartupIPAMCollision_Scenario1_TwoUsersTwoPeers_OldestWinsOtherQuarantined`, `TestReservePersistedClientIPs_PeerAddressMismatch`)<br>`internal/vpn/issue297_remote_ipam_test.go` (`TestAuthenticatePeerRejectsRemoteServerConnection`) |
 | Route Registration & Rollback | Admission-then-register; best-effort reverse rollback | `internal/vpn/vpn_ingress_test.go` (`TestEnsureBackendSessionForIngressRollsBackOnRouteCapacity`)<br>`internal/vpn/faultinjection_test.go` (`TestPartialSessionCreationLeavesNoOrphans`)<br>`internal/vpn/ingress_replacement_accounting_test.go` (`TestIngressDifferentBackendReplacementRollbackNoPhantom`) |
@@ -261,8 +292,8 @@ The following coverage gaps represent opportunities for enhanced resilience test
 1. **Multi-Backend Cascade Failover Under Ingress Burst (Issue #557)**:
    - *Tracking Issue*: Issue #557 (`[P3][Tests] Add multi-backend cascade failover stress suite under sustained ingress load`)
    - *Current Coverage*: `capacity_stress_test.go` verifies 200 concurrent admissions contending on a single backend, and `faultinjection_test.go` verifies `TestDisconnectConcurrentWithFailover`.
-   - *Gap*: Concurrent administrative disable or failure of multiple backends while hundreds of incoming client admissions and rekeys arrive simultaneously across remaining backends.
-   - *Recommendation*: Introduce a multi-backend capacity stress test that disables 50% of available backends mid-run to verify that gauge invariants hold across mass failovers without counter drift.
+   - *Gap*: Concurrent administrative disable or failure of multiple backends while hundreds of incoming client admissions and rekeys arrive simultaneously across remaining backends, including destination capacity overshoot when mass failover transfers sessions without checking `MaxPeersPerBackend`.
+   - *Recommendation*: Introduce a multi-backend capacity stress test that disables 50% of available backends mid-run to verify that gauge invariants hold across mass failovers without counter drift and to evaluate destination capacity bounds.
 2. **Context Cancellation Across Session Migration Transaction Checkpoints (Issue #558)**:
    - *Tracking Issue*: Issue #558 (`[P3][Tests] Add context cancellation tests across session migration transaction checkpoints`)
    - *Current Coverage*: `rebalance_migration_test.go` (`TestVPNRebalanceLiveMigration`, `TestVPNRebalanceRollbackOnDBFailure`, `TestVPNRebalanceCheckToCommitRace_CompensatingDBRollbackSurvivesCanceledContext`) and `ingress_replacement_accounting_test.go` (`TestIngressDifferentBackendReplacementRollbackNoPhantom`).
@@ -280,8 +311,8 @@ The following coverage gaps represent opportunities for enhanced resilience test
 
 When decomposing `Service` into dedicated controllers (e.g. `AdmissionController`, `DeviceManager`, `MigrationCoordinator`, `DiagnosticsCollector`):
 
-1. **Eliminate I/O Technical Debt Under State Locks**: Migrate all database persistence (`AuthenticatePeer`, `SaveVPNConfig`, `MigrateVPNSessionBackend`, `SetConnectionCount`) outside state mutexes by splitting operations into pre-validation, atomic in-memory transitions, and post-transition persistence.
-2. **Preserve Single Admission Mutex**: The select-and-reserve capacity decision must remain serialized under a single lock across all backends. Decomposing admission into a sub-service must retain this mutex boundary.
+1. **Eliminate I/O Technical Debt Under State Locks**: Migrate all database operations (`AuthenticatePeer`, session creation/closure `CreateVPNSession`/`CloseVPNSession`, administrative disable `SetTunnelEnabled`, backend removal `RemoveTunnel`, failover session reads `GetActiveVPNSessions` and persistence `persistFailoverMoves`, runtime configuration `SaveVPNConfig`, session migration `MigrateVPNSessionBackend`, and gauge writes `persistConnectionCount`/`SetConnectionCount`) outside state mutexes by splitting operations into pre-validation, atomic in-memory transitions, and post-transition persistence.
+2. **Preserve Single Admission Mutex & Enforce Migration Capacity**: The select-and-reserve capacity decision must remain serialized under a single lock across all backends. Decomposing admission into a sub-service must retain this mutex boundary. In addition, Phase 4 should introduce destination capacity checks and quota handling to `TransferConnectionsIfActive` and `HandleFailover` to eliminate the failover capacity overshoot debt.
 3. **Maintain Strict Lock Hierarchy**: Never allow extracted controllers to create circular locking dependencies with `SessionManager`, `tunnel.Pool`, or `DiagnosticsTracker`.
 4. **Retain Reverse-Order Rollback**: Extracted admission and migration paths must continue to roll back partial state in strict reverse order of creation, preserving explicit residual state classification.
 5. **Isolate I/O from Dataplane Locks**: Network operations and unbound disk/database queries must remain strictly outside dataplane routing and capacity locks.
