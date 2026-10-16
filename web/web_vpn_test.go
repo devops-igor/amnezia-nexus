@@ -8,32 +8,25 @@ import (
 )
 
 func TestPhase5VPNAndUsersModernization(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	vpnStr := fixture.TemplateHTML
+	backendsStr := fixture.BackendsJS
+
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	// 1. Assert vpn.html modernizations
-	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
-	}
-	vpnStr := string(vpnData)
-
+	// 1. Assert vpn.html and backends.js modernizations
 	requiredVPNTokens := []string{
 		"href=\"#icon-shield\"",
 		"href=\"#icon-network\"",
 		"href=\"#icon-server\"",
 		"href=\"#icon-plus\"",
 		"href=\"#icon-pencil\"",
-		"href=\"#icon-trash\"",
 		"href=\"#icon-activity\"",
 		"href=\"#icon-x\"",
-		"UI.confirm",
-		"UI.toast",
 		"API.get",
-		"API.post",
-		"API.request",
 		"NexusTable",
 		"NexusTelemetry.poll",
 		"Telemetry.formatBytes",
@@ -42,8 +35,6 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"data-sort-type",
 		"vpn-listener-badge",
 		"vpn-public-endpoint",
-		"vpn_delete",
-		"vpn_confirm_delete",
 	}
 	for _, token := range requiredVPNTokens {
 		if !strings.Contains(vpnStr, token) {
@@ -51,15 +42,32 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		}
 	}
 
-	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html
-	if strings.Contains(vpnStr, "if (!confirm(") || strings.Contains(vpnStr, "if(!confirm(") {
-		t.Errorf("vpn.html should not use raw confirm(), must use UI.confirm")
+	requiredBackendTokens := []string{
+		"href=\"#icon-trash\"",
+		"UI.confirm",
+		"UI.toast",
+		"API.post",
+		"API.request",
+		"vpn_delete",
+		"vpn_confirm_delete",
 	}
-	if strings.Contains(vpnStr, "apiCall(") {
-		t.Errorf("vpn.html should not use apiCall(), must use API client")
+	for _, token := range requiredBackendTokens {
+		if !strings.Contains(backendsStr, token) {
+			t.Errorf("backends.js missing required modernized token %q", token)
+		}
 	}
-	if strings.Contains(vpnStr, "showToast(") {
-		t.Errorf("vpn.html should not use showToast(), must use UI.toast")
+
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html and backends.js
+	for name, src := range map[string]string{"vpn.html": vpnStr, "backends.js": backendsStr} {
+		if strings.Contains(src, "if (!confirm(") || strings.Contains(src, "if(!confirm(") {
+			t.Errorf("%s should not use raw confirm(), must use UI.confirm", name)
+		}
+		if strings.Contains(src, "apiCall(") {
+			t.Errorf("%s should not use apiCall(), must use API client", name)
+		}
+		if strings.Contains(src, "showToast(") {
+			t.Errorf("%s should not use showToast(), must use UI.toast", name)
+		}
 	}
 
 	// 2. Assert users.html modernizations
@@ -256,6 +264,10 @@ func TestModernClientDashboardPage(t *testing.T) {
 }
 
 func TestIssue101VPNModernization(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	vpnStr := fixture.TemplateHTML
+	backendsStr := fixture.BackendsJS
+
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
@@ -272,12 +284,6 @@ func TestIssue101VPNModernization(t *testing.T) {
 	}
 
 	// 1. Assert vpn.html contains all 36 required DOM element IDs
-	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
-	}
-	vpnStr := string(vpnData)
-
 	requiredDOMIDs := []string{
 		"vpn-listener-badge",
 		"vpn-listen-port",
@@ -323,14 +329,15 @@ func TestIssue101VPNModernization(t *testing.T) {
 	}
 
 	// 2. Assert broken 8px yellow speck is eliminated and replaced with pause/play icon buttons
-	if strings.Contains(vpnStr, "width:8px") || strings.Contains(vpnStr, "height:8px") {
-		t.Errorf("vpn.html should not contain broken 8px dot toggle button")
+	if strings.Contains(vpnStr, "width:8px") || strings.Contains(vpnStr, "height:8px") ||
+		strings.Contains(backendsStr, "width:8px") || strings.Contains(backendsStr, "height:8px") {
+		t.Errorf("vpn dashboard should not contain broken 8px dot toggle button")
 	}
-	if !strings.Contains(vpnStr, `href="#icon-pause"`) {
-		t.Errorf("vpn.html missing href=\"#icon-pause\" for active backend toggle")
+	if !strings.Contains(backendsStr, `href="#icon-pause"`) {
+		t.Errorf("backends.js missing href=\"#icon-pause\" for active backend toggle")
 	}
-	if !strings.Contains(vpnStr, `href="#icon-play"`) {
-		t.Errorf("vpn.html missing href=\"#icon-play\" for disabled backend toggle")
+	if !strings.Contains(backendsStr, `href="#icon-play"`) {
+		t.Errorf("backends.js missing href=\"#icon-play\" for disabled backend toggle")
 	}
 
 	// 3. Assert latency tiers and indicators in JS
@@ -342,8 +349,8 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"latency-dot",
 	}
 	for _, token := range requiredLatencyTokens {
-		if !strings.Contains(vpnStr, token) {
-			t.Errorf("vpn.html missing required latency token %q", token)
+		if !strings.Contains(backendsStr, token) {
+			t.Errorf("backends.js missing required latency token %q", token)
 		}
 	}
 
