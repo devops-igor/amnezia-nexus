@@ -138,22 +138,18 @@ func collectScriptNodes(n *html.Node) []*html.Node {
 	return scripts
 }
 
-func hasAttr(n *html.Node, key string) bool {
+func getAttr(n *html.Node, key string) (string, bool) {
 	for _, a := range n.Attr {
 		if strings.EqualFold(a.Key, key) {
-			return true
+			return a.Val, true
 		}
 	}
-	return false
+	return "", false
 }
 
-func getAttr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if strings.EqualFold(a.Key, key) {
-			return a.Val
-		}
-	}
-	return ""
+func hasAttr(n *html.Node, key string) bool {
+	_, ok := getAttr(n, key)
+	return ok
 }
 
 func getNodeText(n *html.Node) string {
@@ -171,33 +167,46 @@ func getNodeText(n *html.Node) string {
 	return sb.String()
 }
 
+func nodeText(n *html.Node) string {
+	return getNodeText(n)
+}
+
+func validateClassicExecutionAttributes(s *html.Node) error {
+	if hasAttr(s, "async") {
+		return errors.New("script must not have async attribute")
+	}
+	if hasAttr(s, "defer") {
+		return errors.New("script must not have defer attribute")
+	}
+	if hasAttr(s, "nomodule") {
+		return errors.New("script must not have nomodule attribute")
+	}
+	rawType, hasType := getAttr(s, "type")
+	if hasType {
+		normType := strings.ToLower(strings.TrimSpace(rawType))
+		if normType != "" && normType != "text/javascript" && normType != "application/javascript" {
+			return fmt.Errorf("script has non-classic type %q", rawType)
+		}
+	}
+	return nil
+}
+
 // validateScriptElement verifies that a script node has the expected src,
 // executes strictly as a classic blocking script (no async, defer, or nomodule),
 // has an allowed classic JavaScript MIME type (or omitted), and has an empty body.
 func validateScriptElement(s *html.Node, expectedSrc string) error {
-	src := getAttr(s, "src")
+	if err := validateClassicExecutionAttributes(s); err != nil {
+		return err
+	}
+	if !hasAttr(s, "src") {
+		return fmt.Errorf("script missing src attribute, expected %q", expectedSrc)
+	}
+	src, _ := getAttr(s, "src")
 	if src != expectedSrc {
 		return fmt.Errorf("expected src %q, got %q", expectedSrc, src)
 	}
-	if hasAttr(s, "async") {
-		return fmt.Errorf("script %q must not have async attribute", src)
-	}
-	if hasAttr(s, "defer") {
-		return fmt.Errorf("script %q must not have defer attribute", src)
-	}
-	if hasAttr(s, "nomodule") {
-		return fmt.Errorf("script %q must not have nomodule attribute", src)
-	}
-	rawType := getAttr(s, "type")
-	normType := strings.ToLower(strings.TrimSpace(rawType))
-	switch normType {
-	case "", "text/javascript", "application/javascript":
-		// valid classic script execution type
-	default:
-		return fmt.Errorf("script %q must not have type %q", src, rawType)
-	}
-	body := strings.TrimSpace(getNodeText(s))
-	if body != "" {
+	body := strings.TrimSpace(nodeText(s))
+	if len(body) != 0 {
 		return fmt.Errorf("script %q must have empty body, got: %q", src, body)
 	}
 	return nil
@@ -272,17 +281,16 @@ func validateRenderedVPNPage(renderedHTML string) error {
 
 	// Check index 0: inline theme script
 	themeScript := allScripts[0]
-	if src := getAttr(themeScript, "src"); src != "" {
-		return fmt.Errorf("expected first script to be inline theme script without src, got src %q", src)
+	if hasAttr(themeScript, "src") {
+		return errors.New("inline theme script must not have src attribute")
 	}
-	if hasAttr(themeScript, "async") || hasAttr(themeScript, "defer") || hasAttr(themeScript, "nomodule") {
-		return errors.New("inline theme script must not have async/defer/nomodule attributes")
+	if err := validateClassicExecutionAttributes(themeScript); err != nil {
+		return fmt.Errorf("inline theme script execution attribute validation failed: %w", err)
 	}
-	themeType := strings.ToLower(strings.TrimSpace(getAttr(themeScript, "type")))
-	if themeType != "" && themeType != "text/javascript" && themeType != "application/javascript" {
-		return fmt.Errorf("inline theme script has invalid type %q", themeType)
+	themeBody := strings.TrimSpace(nodeText(themeScript))
+	if len(themeBody) == 0 {
+		return errors.New("inline theme script must have non-empty body")
 	}
-	themeBody := getNodeText(themeScript)
 	if !strings.Contains(themeBody, "data-theme") && !strings.Contains(themeBody, "theme") {
 		return errors.New("expected inline theme script at index 0")
 	}
@@ -297,16 +305,20 @@ func validateRenderedVPNPage(renderedHTML string) error {
 
 	// 5. Verify the base bootstrap script itself at bootstrapIdx
 	bootstrapScript := allScripts[bootstrapIdx]
-	if src := getAttr(bootstrapScript, "src"); src != "" {
-		return fmt.Errorf("base bootstrap script must be inline, found src %q", src)
+	if hasAttr(bootstrapScript, "src") {
+		return errors.New("base bootstrap script must not have src attribute")
 	}
-	if hasAttr(bootstrapScript, "async") || hasAttr(bootstrapScript, "defer") || hasAttr(bootstrapScript, "nomodule") {
-		return errors.New("base bootstrap script must not have async/defer/nomodule attributes")
+	if err := validateClassicExecutionAttributes(bootstrapScript); err != nil {
+		return fmt.Errorf("base bootstrap script execution attribute validation failed: %w", err)
+	}
+	bootstrapBody := nodeText(bootstrapScript)
+	if !strings.Contains(bootstrapBody, "window.I18N") && !strings.Contains(bootstrapBody, "window.translations") {
+		return errors.New("base bootstrap script must contain translation initialization")
 	}
 
 	// 6. Ensure NO VPN companion scripts exist at or before bootstrapIdx
 	for i := 0; i <= bootstrapIdx; i++ {
-		src := getAttr(allScripts[i], "src")
+		src, _ := getAttr(allScripts[i], "src")
 		for _, vpnScript := range canonicalVPNScripts {
 			if src == vpnScript {
 				return fmt.Errorf("VPN script %q placed at or before base bootstrap (index %d vs %d)",
@@ -550,6 +562,66 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 		}
 		if err := validateRenderedVPNPage(mutated); err == nil {
 			t.Fatal("expected validateRenderedVPNPage to reject core script nomodule attribute, but it passed")
+		}
+	})
+}
+
+func TestRenderedVPNTemplateRejectBootstrapMutants(t *testing.T) {
+	rendered := renderBaseAndVPNTemplate(t)
+
+	mutateBootstrap := func(t *testing.T, tagReplacement string) string {
+		t.Helper()
+		const marker = "window.I18N"
+		idx := strings.Index(rendered, marker)
+		if idx == -1 {
+			t.Fatalf("translation bootstrap marker %q not found in rendered template", marker)
+		}
+		scriptIdx := strings.LastIndex(rendered[:idx], "<script>")
+		if scriptIdx == -1 {
+			t.Fatalf("opening <script> tag before translation bootstrap marker not found; prefix: %q", rendered[max(0, idx-100):idx])
+		}
+		return rendered[:scriptIdx] + tagReplacement + rendered[scriptIdx+len("<script>"):]
+	}
+
+	t.Run("BootstrapApplicationJSON", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script type="application/json">`)
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap type application/json, but it passed")
+		}
+	})
+
+	t.Run("BootstrapTextPlain", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script type="text/plain">`)
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap type text/plain, but it passed")
+		}
+	})
+
+	t.Run("BootstrapModule", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script type="module">`)
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap type module, but it passed")
+		}
+	})
+
+	t.Run("BootstrapModuleUppercase", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script type="MODULE">`)
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap type MODULE, but it passed")
+		}
+	})
+
+	t.Run("BootstrapEmptySrc", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script src="">`)
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap src=\"\", but it passed")
+		}
+	})
+
+	t.Run("BootstrapValidClassicMIME", func(t *testing.T) {
+		mutated := mutateBootstrap(t, `<script type="text/javascript">`)
+		if err := validateRenderedVPNPage(mutated); err != nil {
+			t.Fatalf("expected validateRenderedVPNPage to accept valid classic MIME type text/javascript, got: %v", err)
 		}
 	})
 }
