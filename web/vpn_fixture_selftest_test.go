@@ -162,6 +162,8 @@ func TestVPNTestFixture(t *testing.T) {
 			"vpnOnServerSelected",
 			"vpnTriggerQuickCheck",
 			"vpnSubmitAddBackend",
+			"vpnLoadData",
+			"vpnToggleShowAllRoutes",
 		}
 		for _, name := range movedFunctions {
 			if _, err := extractJSFunction(fx.TemplateHTML, "function "+name); err == nil {
@@ -202,6 +204,14 @@ func TestVPNTestFixture(t *testing.T) {
 				t.Fatalf("expected extractJSFunction %s from BackendsJS to succeed: %v", name, err)
 			}
 		}
+		for _, name := range []string{
+			"vpnLoadData",
+			"vpnToggleShowAllRoutes",
+		} {
+			if _, err := extractJSFunction(fx.PageJS, "function "+name); err != nil {
+				t.Fatalf("expected extractJSFunction %s from PageJS to succeed: %v", name, err)
+			}
+		}
 	})
 
 	t.Run("FailClosedCIInvariant", func(t *testing.T) {
@@ -236,6 +246,8 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 			clone.ChartsJS = "   \n	  "
 		case "empty_backends":
 			clone.BackendsJS = "   \n	  "
+		case "empty_page":
+			clone.PageJS = "   \n	  "
 		}
 		clone.BuildJSDOMHarness(JSDOMHarnessOptions{})
 		return
@@ -250,6 +262,7 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 		{"empty_sessions", "failed to read static sessions asset"},
 		{"empty_charts", "failed to read static charts asset"},
 		{"empty_backends", "failed to read static backends asset"},
+		{"empty_page", "failed to read static page asset"},
 	} {
 		t.Run(assetCase.envVal, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureAssetFailClosed$")
@@ -497,6 +510,85 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
 		}
 	})
+
+	t.Run("PageModuleJSDOMExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireJSDOM()
+		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
+
+		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+			ExtraJS: `console.log('UNREACHABLE_AFTER_PAGE_ERROR');`,
+		})
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in JSDOM harness, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "PAGE_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention PAGE_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_PAGE_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_PAGE_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("PageModuleHealthScriptExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
+
+		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_PAGE_ERROR');`)
+		if err != nil {
+			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+		}
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in health script, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "PAGE_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention PAGE_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_PAGE_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_PAGE_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("PageModuleTroubleshootingHarnessExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
+
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_PAGE_ERROR');`)
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "PAGE_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention PAGE_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_PAGE_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_PAGE_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("PageModuleLocalizationScriptExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
+
+		script := vpnDiagnosticsLocalizationScript(t, fixture.CombinedSource(), "en") + "\nconsole.log('UNREACHABLE_AFTER_PAGE_ERROR');\n"
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in localization script, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "PAGE_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention PAGE_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_PAGE_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_PAGE_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
 }
 
 func TestVPNBackendsExportAuthorityFailsClosed(t *testing.T) {
@@ -564,6 +656,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
 			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
 			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
+			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
 		}
 		switch mode {
 		case "missing_charts":
@@ -574,7 +667,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		case "empty_charts":
 			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("")}
 		case "whitespace_charts":
-			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("   \n\t  \r\n")}
+			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
 		case "missing_backends":
 			delete(baseFS, "static/js/vpn/backends.js")
 		case "decoy_alternate_root_backends":
@@ -583,7 +676,16 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		case "empty_backends":
 			baseFS["static/js/vpn/backends.js"] = &fstest.MapFile{Data: []byte("")}
 		case "whitespace_backends":
-			baseFS["static/js/vpn/backends.js"] = &fstest.MapFile{Data: []byte("   \n\t  \r\n")}
+			baseFS["static/js/vpn/backends.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
+		case "missing_page":
+			delete(baseFS, "static/js/vpn/page.js")
+		case "decoy_alternate_root_page":
+			delete(baseFS, "static/js/vpn/page.js")
+			baseFS["js/vpn/page.js"] = &fstest.MapFile{Data: []byte("function vpnLoadData() { /* decoy */ }")}
+		case "empty_page":
+			baseFS["static/js/vpn/page.js"] = &fstest.MapFile{Data: []byte("")}
+		case "whitespace_page":
+			baseFS["static/js/vpn/page.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
 		default:
 			t.Fatalf("unknown test mode: %s", mode)
 		}
@@ -603,6 +705,10 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		{"decoy_alternate_root_backends", "failed to read static backends asset static/js/vpn/backends.js"},
 		{"empty_backends", "failed to read static backends asset static/js/vpn/backends.js: empty content"},
 		{"whitespace_backends", "failed to read static backends asset static/js/vpn/backends.js: empty content"},
+		{"missing_page", "failed to read static page asset static/js/vpn/page.js"},
+		{"decoy_alternate_root_page", "failed to read static page asset static/js/vpn/page.js"},
+		{"empty_page", "failed to read static page asset static/js/vpn/page.js: empty content"},
+		{"whitespace_page", "failed to read static page asset static/js/vpn/page.js: empty content"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureLoaderSeamAssetFailClosed$")
@@ -625,6 +731,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
 			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
 			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
+			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
 		}
 		fx := newVPNTestFixtureWithFS(t, validFS)
 		if fx == nil {
@@ -635,6 +742,9 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		}
 		if fx.BackendsJS != "function vpnRenderBackendRow() {}" {
 			t.Fatalf("unexpected BackendsJS content: %s", fx.BackendsJS)
+		}
+		if fx.PageJS != "function vpnLoadData() {}" {
+			t.Fatalf("unexpected PageJS content: %s", fx.PageJS)
 		}
 	})
 }
@@ -648,3 +758,59 @@ func TestTemplateMarkerNotFoundFailsClosed(t *testing.T) {
 		t.Fatalf("expected error mentioning 'template marker not found in source', got: %v", err)
 	}
 }
+
+func TestVPNPageLifecycleDOMContentLoadedMutationFailsClosed(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	fixture.RequireJSDOM()
+
+	if !strings.Contains(fixture.PageJS, "DOMContentLoaded") {
+		t.Fatal("expected fixture.PageJS to contain DOMContentLoaded")
+	}
+
+	mutatedFx := *fixture
+	mutatedFx.PageJS = strings.Replace(fixture.PageJS, "DOMContentLoaded", "never-fired-mutant", 1)
+
+	testScript := mutatedFx.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+// Install real NexusTelemetry
+const candidatePaths = ['static/js/telemetry.js', 'web/static/js/telemetry.js'];
+let telemetryCode = '';
+for (const cp of candidatePaths) {
+    if (fs.existsSync(cp)) { telemetryCode = fs.readFileSync(cp, 'utf8'); break; }
+}
+if (!telemetryCode) { throw new Error('telemetry.js not found in candidate paths'); }
+const sTel = w.document.createElement('script');
+sTel.textContent = telemetryCode;
+w.document.body.appendChild(sTel);
+
+w.API = {
+    get: async () => ({})
+};
+
+(async () => {
+    // Await natural readiness
+    await new Promise(resolve => w.document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    // Since DOMContentLoaded was mutated to never-fired-mutant, vpn-status should NOT be registered
+    const activeStreams = w.NexusTelemetry.getActiveStreams();
+    assert.ok(activeStreams.includes('vpn-status'), 'vpn-status must be registered in active streams');
+    console.log('MUTATION_UNEXPECTEDLY_PASSED');
+})().catch(e => {
+    console.error('MUTATION_FAILED_CLOSED: ' + e.message);
+    if (dom && dom.window) dom.window.close();
+    process.exit(1);
+});
+`,
+	})
+
+	out, err := execNodeScript(fixture.RequireNode(), testScript)
+	if err == nil {
+		t.Fatalf("expected mutant script to fail, but process succeeded with output:\n%s", string(out))
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, "MUTATION_FAILED_CLOSED") || !strings.Contains(outStr, "vpn-status must be registered") {
+		t.Fatalf("expected failure output mentioning 'MUTATION_FAILED_CLOSED' and 'vpn-status must be registered', got:\n%s", outStr)
+	}
+}
+

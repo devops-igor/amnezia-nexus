@@ -234,7 +234,7 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
-	toggleRoutes, err := extractJSFunction(fixture.TemplateHTML, "function vpnToggleShowAllRoutes")
+	toggleRoutes, err := extractJSFunction(fixture.CombinedSource(), "function vpnToggleShowAllRoutes")
 	if err != nil {
 		t.Fatal(err)
 	}

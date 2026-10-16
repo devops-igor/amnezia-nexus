@@ -35,8 +35,11 @@ func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string 
 			script += "\n" + function
 		}
 	}
-	return script + `
-let vpnLastStatus=null, vpnShowAllRoutes=false;
+	extraDecls := ""
+	if !strings.Contains(companionScripts, "vpnLastStatus") {
+		extraDecls = "\nlet vpnLastStatus=null, vpnShowAllRoutes=false;\n"
+	}
+	return script + extraDecls + `
 document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
 const text=id=>document.getElementById(id).textContent;
 const E=(key,values={})=>{assert(Object.prototype.hasOwnProperty.call(translations,key),'missing oracle key '+key);return Object.entries(values).reduce((result,[name,value])=>result.split('{'+name+'}').join(String(value)),translations[key]);};

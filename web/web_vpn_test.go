@@ -11,13 +11,14 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	vpnStr := fixture.TemplateHTML
 	backendsStr := fixture.BackendsJS
+	pageStr := fixture.PageJS
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	// 1. Assert vpn.html and backends.js modernizations
+	// 1. Assert vpn.html, backends.js, and page.js modernizations
 	requiredVPNTokens := []string{
 		"href=\"#icon-shield\"",
 		"href=\"#icon-network\"",
@@ -26,19 +27,28 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"href=\"#icon-pencil\"",
 		"href=\"#icon-activity\"",
 		"href=\"#icon-x\"",
-		"API.get",
-		"NexusTable",
-		"NexusTelemetry.poll",
-		"Telemetry.formatBytes",
 		"vpnBackendsTable",
 		"vpnTableContainer",
 		"data-sort-type",
 		"vpn-listener-badge",
 		"vpn-public-endpoint",
+		"/static/js/vpn/page.js",
 	}
 	for _, token := range requiredVPNTokens {
 		if !strings.Contains(vpnStr, token) {
 			t.Errorf("vpn.html missing required modernized token %q", token)
+		}
+	}
+
+	requiredPageTokens := []string{
+		"API.get",
+		"NexusTable",
+		"NexusTelemetry.poll",
+		"Telemetry.formatBytes",
+	}
+	for _, token := range requiredPageTokens {
+		if !strings.Contains(pageStr, token) {
+			t.Errorf("page.js missing required modernized token %q", token)
 		}
 	}
 
@@ -57,8 +67,8 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		}
 	}
 
-	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html and backends.js
-	for name, src := range map[string]string{"vpn.html": vpnStr, "backends.js": backendsStr} {
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html, backends.js, and page.js
+	for name, src := range map[string]string{"vpn.html": vpnStr, "backends.js": backendsStr, "page.js": pageStr} {
 		if strings.Contains(src, "if (!confirm(") || strings.Contains(src, "if(!confirm(") {
 			t.Errorf("%s should not use raw confirm(), must use UI.confirm", name)
 		}
@@ -267,6 +277,7 @@ func TestIssue101VPNModernization(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	vpnStr := fixture.TemplateHTML
 	backendsStr := fixture.BackendsJS
+	pageStr := fixture.PageJS
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -362,8 +373,8 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"emptyMessage",
 	}
 	for _, opt := range requiredTableOptions {
-		if !strings.Contains(vpnStr, opt) {
-			t.Errorf("vpn.html missing NexusTable option %q", opt)
+		if !strings.Contains(pageStr, opt) {
+			t.Errorf("page.js missing NexusTable option %q", opt)
 		}
 	}
 
@@ -635,12 +646,17 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 		}
 	}
 
-	// Assert vpn.html JS fallback uses simplified strings
-	if !strings.Contains(vpnStr, `'Auto: %s'`) {
-		t.Errorf("vpn.html missing 'Auto: %%s' fallback")
+	// Assert page.js JS fallback uses simplified strings
+	pageData, err := fs.ReadFile(staticFS, "js/vpn/page.js")
+	if err != nil {
+		t.Fatalf("failed to read js/vpn/page.js: %v", err)
 	}
-	if !strings.Contains(vpnStr, `'Auto-detect'`) {
-		t.Errorf("vpn.html missing 'Auto-detect' fallback")
+	pageStr := string(pageData)
+	if !strings.Contains(pageStr, `'Auto: %s'`) {
+		t.Errorf("page.js missing 'Auto: %%s' fallback")
+	}
+	if !strings.Contains(pageStr, `'Auto-detect'`) {
+		t.Errorf("page.js missing 'Auto-detect' fallback")
 	}
 
 	// 3. VPN Backends table width 100%

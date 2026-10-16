@@ -169,6 +169,7 @@ type VPNTestFixture struct {
 	HealthSummaryJS  string
 	ChartsJS         string
 	BackendsJS       string
+	PageJS           string
 	ParsedDOM        *xhtml.Node
 	MockFetches      map[string]string
 }
@@ -270,6 +271,16 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	}
 	backendsJS := string(backendsBytes)
 
+	pagePath := "static/js/vpn/page.js"
+	pageBytes, err := readFixtureStaticAsset(staticFS, pagePath)
+	if err != nil {
+		t.Fatalf("failed to read static page asset %s: %v", pagePath, err)
+	}
+	if len(strings.TrimSpace(string(pageBytes))) == 0 {
+		t.Fatalf("failed to read static page asset %s: %v", pagePath, errors.New("empty content"))
+	}
+	pageJS := string(pageBytes)
+
 	return &VPNTestFixture{
 		t:                t,
 		NodePath:         nodePath,
@@ -280,6 +291,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 		HealthSummaryJS:  healthSummaryJS,
 		ChartsJS:         chartsJS,
 		BackendsJS:       backendsJS,
+		PageJS:           pageJS,
 		ParsedDOM:        doc,
 		MockFetches:      make(map[string]string),
 	}
@@ -344,17 +356,17 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
 // CompanionScripts returns the concatenated companion JS modules in evaluation order:
-// sessions.js -> health_problems.js -> health_summary.js -> charts.js -> backends.js.
+// sessions.js -> health_problems.js -> health_summary.js -> charts.js -> backends.js -> page.js.
 func (f *VPNTestFixture) CompanionScripts() string {
-	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.BackendsJS
+	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.BackendsJS + "\n" + f.PageJS
 }
 
-// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, and backends.js scripts.
+// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, backends.js, and page.js scripts.
 func (f *VPNTestFixture) CombinedSource() string {
 	return f.TemplateHTML + vpnCompanionBoundaryMarker + f.CompanionScripts()
 }
 
-// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, and backends.js scripts.
+// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, backends.js, and page.js scripts.
 func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
 	return f.CombinedSource()
 }
@@ -408,23 +420,57 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if len(strings.TrimSpace(f.BackendsJS)) == 0 {
 		f.t.Fatalf("failed to read static backends asset %s: %v", "static/js/vpn/backends.js", errors.New("empty content"))
 	}
+	if len(strings.TrimSpace(f.PageJS)) == 0 {
+		f.t.Fatalf("failed to read static page asset %s: %v", "static/js/vpn/page.js", errors.New("empty content"))
+	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
 	b.WriteString(fmt.Sprintf(`
-const dom = new JSDOM(%q, { pretendToBeVisual: true, runScripts: 'outside-only', url: 'https://review.invalid' });
+const virtualConsole = new (require('jsdom').VirtualConsole)();
+virtualConsole.on('jsdomError', (err) => {
+    console.error(err.stack || err.message);
+    process.exit(1);
+});
+const dom = new JSDOM(%q, { virtualConsole, pretendToBeVisual: true, runScripts: 'dangerously', url: 'https://review.invalid' });
 const w = dom.window;
+w.API = {
+    get: async () => ({}),
+    post: async () => ({}),
+    request: async () => ({}),
+};
+w.NexusTelemetry = {
+    poll: () => {},
+    stop: () => {},
+};
+w.Telemetry = {
+    formatBytes: (n) => String(n),
+};
+w.UI = {
+    escapeHtml: (s) => (s == null ? '' : String(s)),
+    toast: () => {},
+    confirm: async () => true,
+};
 if (typeof fakeClock !== 'undefined') {
     w.fakeClock = fakeClock;
     ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].forEach(m => { w[m] = fakeClock[m].bind(fakeClock); });
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
-w.eval(%q);
-w.eval(%q);
-w.eval(%q);
-w.eval(%q);
-w.eval(%q);
-w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.BackendsJS, f.TranslationsJS(lang), extracted.String()))
+function addScript(code) { const s = w.document.createElement('script'); s.textContent = code; w.document.body.appendChild(s); }
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
+['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
+    Object.defineProperty(w, prop, {
+        get() { return w.eval(prop); },
+        set(v) { w['__' + prop + 'Ref'] = v; w.eval(prop + ' = window.__' + prop + 'Ref;'); },
+        configurable: true
+    });
+});
+`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.BackendsJS, f.PageJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -602,7 +648,9 @@ const document = {
    return null;
  },
  createElement() { return new Element(); },
- createTextNode(s) { const el = new Element(); el.textContent = String(s); return el; }
+ createTextNode(s) { const el = new Element(); el.textContent = String(s); return el; },
+ addEventListener(event, fn) {},
+ removeEventListener(event, fn) {},
 };
 document.reset();
 if (typeof window === 'undefined') {
@@ -783,7 +831,11 @@ func assembleVPNHealthScript(t *testing.T, templateHTML, companionScripts, lang,
 		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
 	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, templateHTML, lang)
-	return script + "\n" + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
+	extraDecls := ""
+	if !strings.Contains(companionScripts, "vpnLastStatus") {
+		extraDecls = "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n"
+	}
+	return script + "\n" + companionScripts + extraDecls + assertions, nil
 }
 
 // AssembleHealthScript builds a health diagnostics test script from explicit fixture components.
