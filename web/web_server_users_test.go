@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"regexp"
 	"strings"
@@ -127,10 +128,32 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 		t.Errorf("users.js missing href=\"#icon-play\" for disabled user toggle control")
 	}
 
-	// 2. Assert users.html does not contain the old dot toggle markup for user toggling
-	if strings.Contains(usersStr, "badge-dot") {
-		t.Errorf("users.html must not contain legacy dot toggle markup (badge-dot)")
+	// 2. Assert users.html and users.js do not contain the old dot toggle markup for user toggling
+	assertNoBadgeDot := func(name, content string) error {
+		if strings.Contains(content, "badge-dot") {
+			return fmt.Errorf("%s must not contain legacy dot toggle markup (badge-dot)", name)
+		}
+		return nil
 	}
+	for name, content := range map[string]string{
+		"users.html": usersStr,
+		"users.js":   usersJsStr,
+	} {
+		if err := assertNoBadgeDot(name, content); err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Negative mutation test: verify that injecting badge-dot into usersJsStr fails closed
+	t.Run("BadgeDotProhibitionMutationFailsClosed", func(t *testing.T) {
+		mutatedJs := strings.Replace(usersJsStr, `class="badge ${roleClass}"`, `class="badge badge-dot ${roleClass}"`, 1)
+		if !strings.Contains(mutatedJs, "badge-dot") {
+			t.Fatal("failed to apply badge-dot mutation to users.js")
+		}
+		if err := assertNoBadgeDot("users.js", mutatedJs); err == nil {
+			t.Errorf("negative mutation test failed: injecting badge-dot into users.js did not fail closed")
+		}
+	})
 
 	// 3. Assert #userConnsTable has width: 100% and min-width: 100%
 	if !strings.Contains(usersStr, `<table class="table interactive-table" id="userConnsTable" style="width: 100%; min-width: 100%;">`) {
