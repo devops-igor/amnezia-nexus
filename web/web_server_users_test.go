@@ -742,3 +742,66 @@ func TestClientSideHostValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestIssue542UsersPageFiveSupportedLocalesMatrix(t *testing.T) {
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Verify all 5 supported languages exist and contain core users management keys
+	supportedLanguages := []string{"en.json", "ru.json", "fr.json", "zh.json", "fa.json"}
+	coreUsersKeys := []string{
+		"users_title",
+		"nav_users",
+		"add_user",
+		"add_connection",
+		"delete_user_title",
+		"delete_user_confirm",
+		"config",
+	}
+
+	for _, langFile := range supportedLanguages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range coreUsersKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required users key %q", langFile, k)
+			}
+		}
+	}
+
+	// 2. French (fr.json) specific key verification
+	frData, err := fs.ReadFile(transFS, "fr.json")
+	if err != nil {
+		t.Fatalf("failed to read fr.json: %v", err)
+	}
+	var frDict map[string]string
+	if err := json.Unmarshal(frData, &frDict); err != nil {
+		t.Fatalf("failed to parse fr.json: %v", err)
+	}
+	expectedFr := map[string]string{
+		"users_title":         "Utilisateurs",
+		"nav_users":           "Utilisateurs",
+		"add_connection":      "Ajouter une connexion",
+		"delete_user_title":   "Supprimer l'utilisateur",
+		"delete_user_confirm": "Supprimer l'utilisateur ? Ses connexions seront supprimées.",
+	}
+	for k, want := range expectedFr {
+		if got := frDict[k]; got != want {
+			t.Errorf("fr.json[%q] = %q, want %q", k, got, want)
+		}
+	}
+
+	// 3. Fallback verification: unsupported locale (e.g. es.json) is not bundled
+	if _, err := fs.ReadFile(transFS, "es.json"); err == nil {
+		t.Errorf("es.json should not exist in bundled translations; es must rely on en fallback")
+	}
+}
