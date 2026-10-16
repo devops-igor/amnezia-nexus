@@ -1,6 +1,8 @@
 package web
 
 import (
+	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
 )
@@ -15,7 +17,15 @@ func TestVPNRenderBackendRowFleet(t *testing.T) {
     const assert = require('assert');
 
     w.UI = {
-        escapeHtml: (s) => String(s == null ? '' : s)
+        escapeHtml: (s) => {
+            if (s === null || s === undefined) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
     };
 
     w.vpnCachedServers = [
@@ -118,6 +128,24 @@ func TestVPNRenderBackendRowFleet(t *testing.T) {
     assert(rowFallback.querySelector('td:nth-child(2)').textContent.includes('-'), 'empty endpoint renders dash');
     assert(rowFallback.querySelector('td:nth-child(4)').textContent.includes('-'), 'null latency renders dash');
 
+    // 5. Malicious server name with XSS payload rendered as plain text
+    w.vpnCachedServers.push({
+        id: 104,
+        name: '<img src=x onerror="window.__pwned=1">'
+    });
+    const xssBackend = {
+        server_id: 104,
+        endpoint: '203.0.113.40:51820',
+        enabled: true,
+        status: 'active',
+        latency_ms: 10,
+        active_connections: 0
+    };
+    const rowXSS = w.vpnRenderBackendRow(xssBackend);
+    assert(!rowXSS.querySelector('img'), 'malicious server name must not create img element in DOM');
+    assert(rowXSS.textContent.includes('<img src=x'), 'malicious server name must render as plain text');
+    assert.strictEqual(w.__pwned, undefined, 'script injection in server name must not execute');
+
     console.log('PASS_RENDER_BACKEND_ROW');
 })();
 `,
@@ -213,6 +241,17 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
     assert.strictEqual(loadDataCount, 1, 'vpnLoadData must be called after successful delete');
     assert(uiToasts.some(t => t.variant === 'success'), 'success toast emitted on delete');
 
+    // 6. Toggle backend when API.post rejects
+    confirmResult = true;
+    w.API.post = async () => { throw new Error('toggle network failure'); };
+    await w.vpnToggleBackend(101, 'disable');
+    assert(uiToasts.some(t => t.variant === 'error' && t.msg.includes('toggle network failure')), 'error toast emitted on toggle failure');
+
+    // 7. Delete backend when API.post rejects
+    w.API.post = async () => { throw new Error('delete network failure'); };
+    await w.vpnDeleteBackend(103);
+    assert(uiToasts.some(t => t.variant === 'error' && t.msg.includes('delete network failure')), 'error toast emitted on delete failure');
+
     console.log('PASS_TOGGLE_AND_DELETE');
 })().catch(e => {
     console.error(e);
@@ -249,7 +288,15 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
     w.UI = {
         toast: (msg, variant) => {},
         confirm: async () => true,
-        escapeHtml: (s) => String(s == null ? '' : s)
+        escapeHtml: (s) => {
+            if (s === null || s === undefined) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
     };
     w.vpnLoadData = async () => { loadDataCount++; };
 
@@ -331,6 +378,37 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
     assert(closedModals.includes('editEndpointModal'), 'editEndpointModal closed');
     assert.strictEqual(loadDataCount, 2, 'vpnLoadData called after endpoint update');
 
+    // 6. Quick check failure & spinner restoration (finally block)
+    select.value = '2';
+    w.vpnOnServerSelected();
+    w.API.post = async (endpoint) => {
+        if (endpoint.includes('/check')) throw new Error('check server offline');
+        return { ok: true };
+    };
+    await w.vpnTriggerQuickCheck();
+    assert.strictEqual(w.document.getElementById('vpnQuickCheckBtn').disabled, false, 'quick check button re-enabled on failure');
+    assert(w.document.getElementById('vpnQuickCheckSpinner').classList.contains('hidden'), 'spinner hidden on failure');
+    assert(!w.document.getElementById('vpnQuickCheckIcon').classList.contains('hidden'), 'icon restored on failure');
+    assert(w.document.getElementById('vpnModalError').textContent.includes('check server offline'), 'error message displayed in modal error box');
+
+    // 7. Edit endpoint rejection & button restoration (finally block)
+    w.API.request = async () => { throw new Error('endpoint update rejected'); };
+    const editBtn = w.document.getElementById('vpnEditEndpointSubmitBtn');
+    input.value = 'vpn.fail.domain:51820';
+    await w.vpnSubmitEditEndpoint();
+    assert.strictEqual(editBtn.disabled, false, 'edit endpoint button re-enabled on failure');
+    assert(w.document.getElementById('vpnEndpointModalError').textContent.includes('endpoint update rejected'), 'endpoint modal error displayed');
+
+    // 8. Add backend enable rejection & button restoration (finally block)
+    w.API.post = async (endpoint) => {
+        if (endpoint.includes('/enable')) throw new Error('backend enable rejected');
+        return { ok: true };
+    };
+    const addBtn = w.document.getElementById('vpnAddBackendSubmitBtn');
+    await w.vpnSubmitAddBackend();
+    assert.strictEqual(addBtn.disabled, false, 'add backend button re-enabled on failure');
+    assert(w.document.getElementById('vpnModalError').textContent.includes('backend enable rejected'), 'add backend error box displays error');
+
     console.log('PASS_MODAL_INTERACTIONS');
 })().catch(e => {
     console.error(e);
@@ -346,4 +424,170 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
 	if !strings.Contains(string(out), "PASS_MODAL_INTERACTIONS") {
 		t.Fatalf("expected output to contain PASS_MODAL_INTERACTIONS, got:\n%s", string(out))
 	}
+}
+
+func buildVPNBackendsProductionOrderScript(markup, uiJS, backendsJS, inlineScript, extraJS string) string {
+	return fmt.Sprintf(`%s
+const docHTML = '<!DOCTYPE html><html><body>' + %q + '</body></html>';
+const dom = new JSDOM(docHTML, { runScripts: 'dangerously', url: 'https://review.invalid' });
+const w = dom.window;
+function addScript(code) { const s = w.document.createElement('script'); s.textContent = code; w.document.body.appendChild(s); }
+
+const calls = [];
+let tableCtor = 0, tableRefresh = 0;
+w.__calls = calls;
+addScript(%q);
+w.eval(`+"`"+`
+  window._ = k => ({active:'Active', vpn_disable:'Disable', vpn_enable:'Enable', vpn_delete:'Delete'})[k] || k;
+  window.openModal = () => {}; window.closeModal = () => {};
+  window.renderSessions = () => {}; window.vpnRenderForwarderHealth = () => {};
+  window.Telemetry = { formatBytes: n => String(n) };
+  window.NexusTelemetry = { poll: () => {} };
+  window.UI.toast = () => {}; window.UI.confirm = async () => true;
+`+"`"+`);
+w.NexusTable = function () { tableCtor++; this.refresh = () => { tableRefresh++; }; };
+let backendList = [{ server_id: 7, endpoint: '203.0.113.7:1', enabled: true, status: 'active', latency_ms: 10 }];
+w.API = {
+  get: async (u) => { calls.push(['GET', u]);
+    if (u === '/api/vpn/backends') return { backends: backendList };
+    if (u === '/api/servers') return [{ id: 7, name: '<img src=x onerror=\"window.__pwned=1\">', protocols: { awg: true } }, { id: 8, name: 'Eight', protocols: {} }];
+    if (u === '/api/vpn/config') return { public_endpoint: '  vpn.example.test:443  ' };
+    return {}; },
+  post: async (u, b) => { calls.push(['POST', u, b]); return {}; },
+  request: async (u, o) => { calls.push([o.method, u, o.body]); return {}; },
+};
+addScript(%q);
+addScript(%q);
+%s
+`, jsdomBootstrapSnippet, markup, uiJS, backendsJS, inlineScript, extraJS)
+}
+
+func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireJSDOM()
+
+	start := strings.Index(fixture.TemplateHTML, "<script>")
+	if start == -1 {
+		t.Fatal("<script> tag not found in TemplateHTML")
+	}
+	start += len("<script>")
+	end := strings.Index(fixture.TemplateHTML[start:], "</script>")
+	if end == -1 {
+		t.Fatal("</script> tag not found in TemplateHTML")
+	}
+	inlineScript := fixture.TemplateHTML[start : start+end]
+
+	srcIdx := strings.Index(fixture.TemplateHTML, "<script src=")
+	if srcIdx == -1 {
+		t.Fatal("<script src= tag not found in TemplateHTML")
+	}
+	markup := fixture.TemplateHTML[:srcIdx]
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	uiBytes, err := fs.ReadFile(staticFS, "js/ui.js")
+	if err != nil {
+		t.Fatalf("failed to read js/ui.js: %v", err)
+	}
+	uiJS := string(uiBytes)
+
+	t.Run("ProductionOrderBootstrapAndState", func(t *testing.T) {
+		testScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.BackendsJS, inlineScript, `
+(async () => {
+  // State variables are lexical bindings, not window properties (H2: no window globals)
+  assert.strictEqual(w.vpnCachedServers, undefined, 'vpnCachedServers must not be a window property');
+  assert.strictEqual(w.vpnCurrentBackends, undefined, 'vpnCurrentBackends must not be a window property');
+  assert.strictEqual(w.vpnConfiguredPublicEndpoint, undefined, 'vpnConfiguredPublicEndpoint must not be a window property');
+  assert.strictEqual(typeof w.vpnRenderBackendRow, 'function', 'vpnRenderBackendRow exported on window');
+
+  // Drive real vpnLoadData()
+  await w.eval('vpnLoadData()');
+  assert.strictEqual(w.eval('vpnCurrentBackends.length'), 1, 'vpnLoadData wrote live lexical binding');
+  assert.strictEqual(w.eval('vpnConfiguredPublicEndpoint'), 'vpn.example.test:443', 'vpnLoadData stored trimmed endpoint');
+  assert.strictEqual(tableCtor, 1, 'NexusTable constructed once on nonempty backends');
+
+  // Add modal reads live vpnCurrentBackends and reassigns live vpnCachedServers
+  await w.vpnOpenAddBackendModal();
+  const sel = w.document.getElementById('vpnServerSelect');
+  assert.ok(sel.options[1].textContent.endsWith(' - Active'), 'existing backend annotated: ' + sel.options[1].textContent);
+  assert.ok(!sel.options[2].textContent.includes('Active'), 'unconfigured server not annotated Active');
+  assert.strictEqual(w.eval('vpnCachedServers.length'), 2, 'modal reassigned live lexical cache');
+
+  // Edit modal reads configured (trimmed) value
+  w.vpnOpenEditEndpointModal();
+  assert.strictEqual(w.document.getElementById('vpnPublicEndpointInput').value, 'vpn.example.test:443', 'edit modal reads trimmed endpoint');
+
+  // Real row rendering with real UI.escapeHtml after reload: name must be text, not markup
+  await w.eval('vpnLoadData()');
+  assert.strictEqual(tableCtor, 1, 'no second NexusTable instance');
+  assert.strictEqual(tableRefresh, 1, 'NexusTable refreshed on reload');
+  const row = w.document.querySelector('#vpn-backends-tbody tr');
+  assert.ok(!row.querySelector('img'), 'server name must not inject markup');
+  assert.ok(row.textContent.includes('<img src=x'), 'server name rendered as escaped text');
+
+  // Row button clicks trigger confirmation, then POST, then exactly one reload
+  const before = calls.filter(c => c[1] === '/api/vpn/backends').length;
+  row.querySelector('button[aria-label="Disable"]').click();
+  await new Promise(r => setTimeout(r, 20));
+  assert.ok(calls.some(c => c[0] === 'POST' && c[1] === '/api/vpn/backends/7/disable'), 'row disable click dispatched POST');
+  assert.strictEqual(calls.filter(c => c[1] === '/api/vpn/backends').length, before + 1, 'toggle awaited real vpnLoadData exactly once');
+
+  // Delete backend encodes URI component and uses POST
+  await w.vpnDeleteBackend('a/b c');
+  assert.ok(calls.some(c => c[0] === 'POST' && c[1] === '/api/vpn/backends/a%2Fb%20c/delete'), 'delete uses POST + encodeURIComponent');
+  assert.ok(!calls.some(c => c[0] === 'DELETE'), 'delete must never use HTTP DELETE method');
+
+  // Empty list after nonempty: null-guarded refresh path without reconstructing table
+  backendList = [];
+  await w.eval('vpnLoadData()');
+  assert.strictEqual(tableRefresh, 4, 'refresh called across reloads and empty transition');
+  assert.strictEqual(tableCtor, 1, 'empty path never constructs additional NexusTable');
+
+  // Endpoint PUT trimmed
+  w.document.getElementById('vpnPublicEndpointInput').value = '  new.example.test:443 ';
+  await w.vpnSubmitEditEndpoint();
+  assert.ok(calls.some(c => c[0] === 'PUT' && c[1] === '/api/vpn/config' && c[2].public_endpoint === 'new.example.test:443'), 'endpoint PUT trimmed');
+
+  // Submit preflight: server without AWG, rejected check still enables (dynamic fallback)
+  w.API.post = async (u) => { calls.push(['POST', u]); if (u.endsWith('/check')) throw new Error('ssh down'); return {}; };
+  sel.value = '8';
+  await w.vpnSubmitAddBackend();
+  assert.ok(calls.some(c => c[1] === '/api/servers/8/check'), 'check invoked');
+  assert.ok(calls.some(c => c[1] === '/api/vpn/backends/8/enable'), 'enable attempted after rejected check');
+  assert.strictEqual(w.document.getElementById('vpnAddBackendSubmitBtn').disabled, false, 'finally block restored submit button');
+  assert.strictEqual(w.__pwned, undefined, 'no XSS execution');
+
+  console.log('PASS_PRODUCTION_ORDER_BOOTSTRAP');
+})().catch(e => { console.error(e); process.exit(1); });
+`)
+		out, err := execNodeScript(nodePath, testScript)
+		if err != nil {
+			t.Fatalf("TestVPNBackendsProductionOrderBootstrapIntegration failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "PASS_PRODUCTION_ORDER_BOOTSTRAP") {
+			t.Fatalf("expected output to contain PASS_PRODUCTION_ORDER_BOOTSTRAP, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("RedeclarationMutationFails", func(t *testing.T) {
+		mutatedBackends := "var vpnTableInstance = null;\n" + fixture.BackendsJS
+		mutatedScript := buildVPNBackendsProductionOrderScript(markup, uiJS, mutatedBackends, inlineScript, `
+(async () => {
+  await w.eval('vpnLoadData()');
+  console.log('UNREACHABLE_AFTER_REDECLARATION_MUTATION');
+})().catch(e => { console.error(e); process.exit(1); });
+`)
+		out, err := execNodeScript(nodePath, mutatedScript)
+		if err == nil {
+			t.Fatalf("expected redeclaration mutation to fail, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "has already been declared") && !strings.Contains(string(out), "SyntaxError") {
+			t.Fatalf("expected output to mention redeclaration SyntaxError, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_REDECLARATION_MUTATION") {
+			t.Fatalf("downstream code must not execute on redeclaration mutation:\n%s", string(out))
+		}
+	})
 }

@@ -435,6 +435,123 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
 			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
 		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("BackendsModuleHealthScriptExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
+
+		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
+		if err != nil {
+			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+		}
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in health script, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("BackendsModuleTroubleshootingHarnessExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
+
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("BackendsModuleLocalizationScriptExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
+
+		script := vpnDiagnosticsLocalizationScript(t, fixture.CombinedSource(), "en") + "\nconsole.log('UNREACHABLE_AFTER_BACKENDS_ERROR');\n"
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in localization script, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
+		}
+	})
+}
+
+func TestVPNBackendsExportAuthorityFailsClosed(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireJSDOM()
+
+	fnCode, err := extractJSFunction(fixture.BackendsJS, "function vpnStatusLabel")
+	if err != nil {
+		t.Fatalf("extractJSFunction vpnStatusLabel from BackendsJS failed: %v", err)
+	}
+	strippedBackends := strings.Replace(fixture.BackendsJS, fnCode, "", 1)
+
+	// 1. Static extraction of missing export function must fail closed
+	if _, err := extractJSFunction(strippedBackends, "function vpnStatusLabel"); err == nil {
+		t.Fatal("expected extractJSFunction for vpnStatusLabel to fail when stripped, got nil")
+	}
+
+	// 2. Harness execution with stripped export must fail closed
+	t.Run("JSDOMHarnessExecutionFails", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		fx.BackendsJS = strippedBackends
+		script := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
+			ExtraJS: `
+assert.strictEqual(typeof w.vpnStatusLabel, 'function', 'vpnStatusLabel must be exported');
+w.vpnStatusLabel('active');
+console.log('UNREACHABLE_AFTER_EXPORT_STRIP');
+`,
+		})
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure when vpnStatusLabel is stripped, got nil error\nOutput:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_EXPORT_STRIP") {
+			t.Fatalf("downstream marker UNREACHABLE_AFTER_EXPORT_STRIP must be absent, got:\n%s", string(out))
+		}
+	})
+
+	// 3. Sessions and routes runner depending on vpnStatusLabel must fail closed
+	t.Run("SessionsRoutesRunnerFails", func(t *testing.T) {
+		fx := fixture.WithT(t)
+		fx.BackendsJS = strippedBackends
+		script := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
+			ExtraJS: `
+const row = w.vpnRenderBackendRow({ server_id: 1, endpoint: '203.0.113.1:51820', enabled: true, status: 'active', latency_ms: 10 });
+assert(row, 'row rendered');
+console.log('UNREACHABLE_AFTER_ROW_RENDER_WITHOUT_STATUS_LABEL');
+`,
+		})
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected runner depending on vpnStatusLabel to fail, got nil error\nOutput:\n%s", string(out))
+		}
+		if strings.Contains(string(out), "UNREACHABLE_AFTER_ROW_RENDER_WITHOUT_STATUS_LABEL") {
+			t.Fatalf("downstream marker must be absent, got:\n%s", string(out))
+		}
 	})
 }
 
