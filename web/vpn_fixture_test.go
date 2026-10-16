@@ -194,20 +194,7 @@ func readFixtureStaticAsset(staticFS fs.FS, path string) ([]byte, error) {
 	if staticFS == nil {
 		return nil, os.ErrNotExist
 	}
-	data, err := fs.ReadFile(staticFS, path)
-	if err == nil {
-		return data, nil
-	}
-	if strings.HasPrefix(path, "static/") {
-		if subData, subErr := fs.ReadFile(staticFS, strings.TrimPrefix(path, "static/")); subErr == nil {
-			return subData, nil
-		}
-	} else {
-		if subData, subErr := fs.ReadFile(staticFS, "static/"+path); subErr == nil {
-			return subData, nil
-		}
-	}
-	return nil, err
+	return fs.ReadFile(staticFS, path)
 }
 
 func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {

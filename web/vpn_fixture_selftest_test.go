@@ -392,6 +392,9 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		switch mode {
 		case "missing_charts":
 			// static/js/vpn/charts.js omitted
+		case "decoy_alternate_root_charts":
+			// static/js/vpn/charts.js omitted; decoy at alternate root must not satisfy loader
+			baseFS["js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() { /* decoy */ }")}
 		case "empty_charts":
 			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("")}
 		case "whitespace_charts":
@@ -408,6 +411,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		errSubstr string
 	}{
 		{"missing_charts", "failed to read static charts asset static/js/vpn/charts.js"},
+		{"decoy_alternate_root_charts", "failed to read static charts asset static/js/vpn/charts.js"},
 		{"empty_charts", "failed to read static charts asset static/js/vpn/charts.js: empty content"},
 		{"whitespace_charts", "failed to read static charts asset static/js/vpn/charts.js: empty content"},
 	} {
