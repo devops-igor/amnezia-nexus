@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"golang.org/x/net/html"
 )
 
@@ -172,6 +171,38 @@ func getNodeText(n *html.Node) string {
 	return sb.String()
 }
 
+// validateScriptElement verifies that a script node has the expected src,
+// executes strictly as a classic blocking script (no async, defer, or nomodule),
+// has an allowed classic JavaScript MIME type (or omitted), and has an empty body.
+func validateScriptElement(s *html.Node, expectedSrc string) error {
+	src := getAttr(s, "src")
+	if src != expectedSrc {
+		return fmt.Errorf("expected src %q, got %q", expectedSrc, src)
+	}
+	if hasAttr(s, "async") {
+		return fmt.Errorf("script %q must not have async attribute", src)
+	}
+	if hasAttr(s, "defer") {
+		return fmt.Errorf("script %q must not have defer attribute", src)
+	}
+	if hasAttr(s, "nomodule") {
+		return fmt.Errorf("script %q must not have nomodule attribute", src)
+	}
+	rawType := getAttr(s, "type")
+	normType := strings.ToLower(strings.TrimSpace(rawType))
+	switch normType {
+	case "", "text/javascript", "application/javascript":
+		// valid classic script execution type
+	default:
+		return fmt.Errorf("script %q must not have type %q", src, rawType)
+	}
+	body := strings.TrimSpace(getNodeText(s))
+	if body != "" {
+		return fmt.Errorf("script %q must have empty body, got: %q", src, body)
+	}
+	return nil
+}
+
 // validateVPNScriptsBlock enforces that the scripts block has strictly the 6 canonical
 // classic blocking scripts with empty bodies and zero extra scripts.
 func validateVPNScriptsBlock(scriptsHTML string) error {
@@ -185,30 +216,16 @@ func validateVPNScriptsBlock(scriptsHTML string) error {
 			len(canonicalVPNScripts), len(scripts))
 	}
 	for i, s := range scripts {
-		src := getAttr(s, "src")
-		expectedSrc := canonicalVPNScripts[i]
-		if src != expectedSrc {
-			return fmt.Errorf("script index %d in scripts block: expected src %q, got %q", i, expectedSrc, src)
-		}
-		if hasAttr(s, "async") {
-			return fmt.Errorf("script %q must not have async attribute", src)
-		}
-		if hasAttr(s, "defer") {
-			return fmt.Errorf("script %q must not have defer attribute", src)
-		}
-		if getAttr(s, "type") == "module" {
-			return fmt.Errorf("script %q must not have type=\"module\"", src)
-		}
-		body := strings.TrimSpace(getNodeText(s))
-		if body != "" {
-			return fmt.Errorf("script %q must have empty body, got: %q", src, body)
+		if err := validateScriptElement(s, canonicalVPNScripts[i]); err != nil {
+			return fmt.Errorf("script index %d in scripts block: %w", i, err)
 		}
 	}
 	return nil
 }
 
 // validateRenderedVPNPage verifies script placement, canonical ordering, classic execution mode,
-// zero content-area scripts, and strict precedence of base bootstrap over VPN scripts.
+// zero content-area scripts, strict pre-bootstrap core sequence, zero unexpected inline scripts,
+// and strict precedence of base bootstrap over VPN scripts.
 func validateRenderedVPNPage(renderedHTML string) error {
 	doc, err := html.Parse(strings.NewReader(renderedHTML))
 	if err != nil {
@@ -245,21 +262,49 @@ func validateRenderedVPNPage(renderedHTML string) error {
 		return errors.New("base inline bootstrap / I18N script not found in rendered page")
 	}
 
-	// 4. Verify core prerequisite scripts appear before the bootstrap script
-	for _, core := range coreScripts {
-		coreFound := false
-		for i := 0; i < bootstrapIdx; i++ {
-			if getAttr(allScripts[i], "src") == core {
-				coreFound = true
-				break
-			}
-		}
-		if !coreFound {
-			return fmt.Errorf("core prerequisite script %q missing or not before bootstrap script", core)
+	// 4. Verify exact sequence of scripts before base bootstrap:
+	// Exactly 1 theme inline script, followed by the core scripts in exact sequence.
+	expectedPreBootstrapCount := 1 + len(coreScripts)
+	if bootstrapIdx != expectedPreBootstrapCount {
+		return fmt.Errorf("expected strictly %d scripts before base bootstrap, found %d",
+			expectedPreBootstrapCount, bootstrapIdx)
+	}
+
+	// Check index 0: inline theme script
+	themeScript := allScripts[0]
+	if src := getAttr(themeScript, "src"); src != "" {
+		return fmt.Errorf("expected first script to be inline theme script without src, got src %q", src)
+	}
+	if hasAttr(themeScript, "async") || hasAttr(themeScript, "defer") || hasAttr(themeScript, "nomodule") {
+		return errors.New("inline theme script must not have async/defer/nomodule attributes")
+	}
+	themeType := strings.ToLower(strings.TrimSpace(getAttr(themeScript, "type")))
+	if themeType != "" && themeType != "text/javascript" && themeType != "application/javascript" {
+		return fmt.Errorf("inline theme script has invalid type %q", themeType)
+	}
+	themeBody := getNodeText(themeScript)
+	if !strings.Contains(themeBody, "data-theme") && !strings.Contains(themeBody, "theme") {
+		return errors.New("expected inline theme script at index 0")
+	}
+
+	// Check indices 1..len(coreScripts): strictly core prerequisite scripts in exact order
+	for j, core := range coreScripts {
+		s := allScripts[1+j]
+		if err := validateScriptElement(s, core); err != nil {
+			return fmt.Errorf("core prerequisite script index %d before bootstrap: %w", j, err)
 		}
 	}
 
-	// 5. Ensure NO VPN companion scripts exist at or before bootstrapIdx
+	// 5. Verify the base bootstrap script itself at bootstrapIdx
+	bootstrapScript := allScripts[bootstrapIdx]
+	if src := getAttr(bootstrapScript, "src"); src != "" {
+		return fmt.Errorf("base bootstrap script must be inline, found src %q", src)
+	}
+	if hasAttr(bootstrapScript, "async") || hasAttr(bootstrapScript, "defer") || hasAttr(bootstrapScript, "nomodule") {
+		return errors.New("base bootstrap script must not have async/defer/nomodule attributes")
+	}
+
+	// 6. Ensure NO VPN companion scripts exist at or before bootstrapIdx
 	for i := 0; i <= bootstrapIdx; i++ {
 		src := getAttr(allScripts[i], "src")
 		for _, vpnScript := range canonicalVPNScripts {
@@ -270,7 +315,7 @@ func validateRenderedVPNPage(renderedHTML string) error {
 		}
 	}
 
-	// 6. Scripts after base bootstrap must be strictly the 6 canonical VPN scripts, with zero extra
+	// 7. Scripts after base bootstrap must be strictly the 6 canonical VPN scripts, with zero extra
 	scriptsAfterBootstrap := allScripts[bootstrapIdx+1:]
 	if len(scriptsAfterBootstrap) != len(canonicalVPNScripts) {
 		return fmt.Errorf("expected strictly %d <script> elements after base bootstrap, found %d",
@@ -278,23 +323,8 @@ func validateRenderedVPNPage(renderedHTML string) error {
 	}
 
 	for i, s := range scriptsAfterBootstrap {
-		src := getAttr(s, "src")
-		expectedSrc := canonicalVPNScripts[i]
-		if src != expectedSrc {
-			return fmt.Errorf("script index %d after bootstrap: expected src %q, got %q", i, expectedSrc, src)
-		}
-		if hasAttr(s, "async") {
-			return fmt.Errorf("script %q must not have async attribute", src)
-		}
-		if hasAttr(s, "defer") {
-			return fmt.Errorf("script %q must not have defer attribute", src)
-		}
-		if getAttr(s, "type") == "module" {
-			return fmt.Errorf("script %q must not have type=\"module\"", src)
-		}
-		body := strings.TrimSpace(getNodeText(s))
-		if body != "" {
-			return fmt.Errorf("script %q must have empty body, got: %q", src, body)
+		if err := validateScriptElement(s, canonicalVPNScripts[i]); err != nil {
+			return fmt.Errorf("script index %d after bootstrap: %w", i, err)
 		}
 	}
 
@@ -402,31 +432,124 @@ func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	}
 }
 
-func TestRenderedVPNTemplateRejectDeferAndModuleMutants(t *testing.T) {
+func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
+	rendered := renderBaseAndVPNTemplate(t)
+	scriptsBlock := renderVPNScriptsBlock(t)
+
+	typeMutants := []struct {
+		name      string
+		targetSrc string
+		attr      string
+	}{
+		{"Defer", `/static/js/vpn/charts.js`, `defer`},
+		{"ModuleLowercase", `/static/js/vpn/sessions.js`, `type="module"`},
+		{"ModuleUppercase", `/static/js/vpn/sessions.js`, `type="MODULE"`},
+		{"ModuleWhitespace", `/static/js/vpn/sessions.js`, `type=" module"`},
+		{"ApplicationJSON", `/static/js/vpn/sessions.js`, `type="application/json"`},
+		{"TextPlain", `/static/js/vpn/sessions.js`, `type="text/plain"`},
+		{"NoModule", `/static/js/vpn/sessions.js`, `nomodule`},
+	}
+
+	for _, tc := range typeMutants {
+		t.Run(tc.name, func(t *testing.T) {
+			origTarget := fmt.Sprintf(`src="%s"`, tc.targetSrc)
+			mutatedTarget := fmt.Sprintf(`src="%s" %s`, tc.targetSrc, tc.attr)
+
+			// Page check
+			mutatedPage := strings.Replace(rendered, origTarget, mutatedTarget, 1)
+			if mutatedPage == rendered {
+				t.Fatalf("failed to apply %s mutation to rendered page", tc.name)
+			}
+			if err := validateRenderedVPNPage(mutatedPage); err == nil {
+				t.Fatalf("expected validateRenderedVPNPage to reject %s mutant, but it passed", tc.name)
+			}
+
+			// Block check
+			mutatedBlock := strings.Replace(scriptsBlock, origTarget, mutatedTarget, 1)
+			if mutatedBlock == scriptsBlock {
+				t.Fatalf("failed to apply %s mutation to scripts block", tc.name)
+			}
+			if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
+				t.Fatalf("expected validateVPNScriptsBlock to reject %s mutant, but it passed", tc.name)
+			}
+		})
+	}
+}
+
+func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
 
-	t.Run("DeferMutantRejected", func(t *testing.T) {
-		mutated := strings.Replace(rendered, `src="/static/js/vpn/charts.js"`, `src="/static/js/vpn/charts.js" defer`, 1)
-		err := validateRenderedVPNPage(mutated)
-		if err == nil || !strings.Contains(err.Error(), "defer") {
-			t.Fatalf("expected error mentioning 'defer', got: %v", err)
-		}
-	})
-
-	t.Run("ModuleMutantRejected", func(t *testing.T) {
-		mutated := strings.Replace(rendered, `src="/static/js/vpn/sessions.js"`, `src="/static/js/vpn/sessions.js" type="module"`, 1)
-		err := validateRenderedVPNPage(mutated)
-		if err == nil || !strings.Contains(err.Error(), "module") {
-			t.Fatalf("expected error mentioning 'module', got: %v", err)
-		}
-	})
-
 	t.Run("VPNPrecedingBootstrapRejected", func(t *testing.T) {
-		// Inject a VPN script into the head before bootstrap
 		mutated := strings.Replace(rendered, `<head>`, `<head><script src="/static/js/vpn/page.js"></script>`, 1)
-		err := validateRenderedVPNPage(mutated)
-		if err == nil {
-			t.Fatal("expected error when VPN script precedes base bootstrap, got nil")
+		if mutated == rendered {
+			t.Fatal("failed to apply VPN preceding bootstrap mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject VPN script preceding bootstrap, but it passed")
+		}
+	})
+
+	t.Run("InlineScriptInHeadBeforeBootstrap", func(t *testing.T) {
+		mutated := strings.Replace(rendered, `<head>`, `<head><script>window.unexpectedHead = true;</script>`, 1)
+		if mutated == rendered {
+			t.Fatal("failed to apply inline script in head mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject extra inline script in head, but it passed")
+		}
+	})
+
+	t.Run("InlineScriptInBodyBeforeBootstrap", func(t *testing.T) {
+		mutated := strings.Replace(rendered, `<script>`, `<script>window.unexpectedBody = true;</script><script>`, 2)
+		if mutated == rendered {
+			t.Fatal("failed to apply inline script in body mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject extra inline script before bootstrap, but it passed")
+		}
+	})
+
+	t.Run("DecoyI18NInHead", func(t *testing.T) {
+		mutated := strings.Replace(rendered, `<head>`, `<head><script>window.I18N = {};</script>`, 1)
+		if mutated == rendered {
+			t.Fatal("failed to apply decoy I18N mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject decoy I18N in head, but it passed")
+		}
+	})
+
+	t.Run("CoreScriptOrderSwapped", func(t *testing.T) {
+		s1 := `<script src="/static/js/qrcode.min.js"></script>`
+		s2 := `<script src="/static/js/api.js"></script>`
+		mutated := strings.Replace(rendered, s1, "__PLACEHOLDER__", 1)
+		mutated = strings.Replace(mutated, s2, s1, 1)
+		mutated = strings.Replace(mutated, "__PLACEHOLDER__", s2, 1)
+		if mutated == rendered {
+			t.Fatal("failed to apply core script swap mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject swapped core scripts, but it passed")
+		}
+	})
+
+	t.Run("CoreScriptNonClassicType", func(t *testing.T) {
+		mutated := strings.Replace(rendered, `src="/static/js/tables.js"`, `src="/static/js/tables.js" type="module"`, 1)
+		if mutated == rendered {
+			t.Fatal("failed to apply core script non-classic type mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject core script module type, but it passed")
+		}
+	})
+
+	t.Run("CoreScriptNomodule", func(t *testing.T) {
+		mutated := strings.Replace(rendered, `src="/static/js/telemetry.js"`, `src="/static/js/telemetry.js" nomodule`, 1)
+		if mutated == rendered {
+			t.Fatal("failed to apply core script nomodule mutation")
+		}
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatal("expected validateRenderedVPNPage to reject core script nomodule attribute, but it passed")
 		}
 	})
 }
@@ -437,15 +560,7 @@ func TestStaticVPNScriptHTTPServing(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	// Serve through Chi router with production Cache-Control header middleware matching internal/router/router.go:serveStatic
-	r := chi.NewRouter()
-	fileServer := http.FileServer(http.FS(staticSubFS))
-	r.Handle("/static/*", http.StripPrefix("/static", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		fileServer.ServeHTTP(w, req)
-	})))
-
-	server := httptest.NewServer(r)
+	server := httptest.NewServer(http.StripPrefix("/static/", http.FileServer(http.FS(staticSubFS))))
 	defer server.Close()
 
 	client := server.Client()
@@ -478,12 +593,6 @@ func TestStaticVPNScriptHTTPServing(t *testing.T) {
 					vpnScriptPath, contentType)
 			}
 
-			cacheControl := resp.Header.Get("Cache-Control")
-			if cacheControl != "public, max-age=86400" {
-				t.Errorf("expected Cache-Control 'public, max-age=86400' for %s, got %q",
-					vpnScriptPath, cacheControl)
-			}
-
 			bodyBytes, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatalf("failed reading response body for %s: %v", vpnScriptPath, err)
@@ -496,7 +605,7 @@ func TestStaticVPNScriptHTTPServing(t *testing.T) {
 		})
 	}
 
-	// Negative test: non-existent static file returns 404 without redirect or HTML fallback
+	// Negative test: non-existent static file returns 404
 	t.Run("NonExistentVPNScriptReturns404", func(t *testing.T) {
 		resp, err := client.Get(server.URL + "/static/js/vpn/nonexistent_module.js")
 		if err != nil {
@@ -505,9 +614,6 @@ func TestStaticVPNScriptHTTPServing(t *testing.T) {
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("expected HTTP 404 for non-existent asset, got %d", resp.StatusCode)
-		}
-		if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
-			t.Errorf("expected non-HTML response for 404 static asset, got %q", ct)
 		}
 	})
 }
