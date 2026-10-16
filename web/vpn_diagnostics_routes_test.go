@@ -17,17 +17,6 @@ func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assert
 	}
 
 	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
-
-	for _, name := range []string{"vpnStatusLabel"} {
-		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
-			function, err := extractJSFunction(templateSource, "function "+name)
-			if err != nil {
-				t.Fatalf("extractJSFunction %s: %v", name, err)
-			}
-			script += "\n" + function
-		}
-	}
-
 	script += "\n" + companionScripts
 	extraDecls := ""
 	if !strings.Contains(companionScripts, "vpnLastStatus") {

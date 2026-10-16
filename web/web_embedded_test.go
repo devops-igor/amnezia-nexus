@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"io/fs"
 	"regexp"
@@ -67,10 +68,32 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"js/tables.js",
 		"js/telemetry.js",
 		"favicon.svg",
+		"js/vpn/backends.js",
+		"js/vpn/health_problems.js",
+		"js/vpn/health_summary.js",
+		"js/vpn/charts.js",
+		"js/vpn/sessions.js",
+		"js/vpn/page.js",
 	}
 	for _, file := range staticFiles {
-		if data, err := fs.ReadFile(staticFS, file); err != nil || len(data) == 0 {
-			t.Errorf("static/%s missing or empty: %v", file, err)
+		subData, err := fs.ReadFile(staticFS, file)
+		if err != nil {
+			t.Errorf("static/%s missing from GetStaticSubFS: %v", file, err)
+			continue
+		}
+		if len(bytes.TrimSpace(subData)) == 0 {
+			t.Errorf("static/%s in GetStaticSubFS is empty or whitespace", file)
+		}
+		embedData, err := fs.ReadFile(StaticFS, "static/"+file)
+		if err != nil {
+			t.Errorf("static/%s missing from StaticFS: %v", file, err)
+			continue
+		}
+		if len(bytes.TrimSpace(embedData)) == 0 {
+			t.Errorf("static/%s in StaticFS is empty or whitespace", file)
+		}
+		if !bytes.Equal(subData, embedData) {
+			t.Errorf("static/%s content mismatch between GetStaticSubFS and StaticFS", file)
 		}
 	}
 

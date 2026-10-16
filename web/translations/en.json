@@ -532,6 +532,7 @@
   "vpn_sessions": "Connected Sessions",
   "vpn_sessions_stale": "Session data unavailable — showing last known values",
   "vpn_status": "VPN Status",
+  "vpn_status_active": "Active",
   "vpn_stopped": "Stopped",
   "vpn_subnet": "Subnet",
   "vpn_telemetry_live": "Live telemetry",

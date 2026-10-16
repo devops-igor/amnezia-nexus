@@ -24,17 +24,6 @@ func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string 
 	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
 	script += "\n" + companionScripts
 
-	for _, name := range []string{
-		"vpnToggleShowAllRoutes",
-	} {
-		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
-			function, err := extractJSFunction(templateSource, "function "+name)
-			if err != nil {
-				t.Fatalf("extract %s failed: %v", name, err)
-			}
-			script += "\n" + function
-		}
-	}
 	extraDecls := ""
 	if !strings.Contains(companionScripts, "vpnLastStatus") {
 		extraDecls = "\nlet vpnLastStatus=null, vpnShowAllRoutes=false;\n"

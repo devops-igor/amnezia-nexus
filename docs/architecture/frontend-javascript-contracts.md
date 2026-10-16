@@ -687,7 +687,7 @@ Wave 2: VPN Feature Controllers Extraction (Atomic Script & Fixture Updates)
        v
 Wave 3: VPN Page Bootstrap & Template Finalization
   [ ] Step 5: #499 -> web/static/js/vpn/page.js (~200 lines, includes TestVPNDiagnosticsPollingContract migration)
-  [ ] Step 6: #500 -> web/templates/vpn.html (Thin markup template, ~500 lines, CSP data-* migration)
+  [ ] Step 6: #500 -> web/templates/vpn.html (Thin markup template, script block slot stabilization, canonical order; inline event delegation deferred to follow-up)
        |
        v
 Wave 4: Users Page Modularization
@@ -767,19 +767,19 @@ Wave 6: Stylesheet Partitioning
 
 #### Step 6: Issue #500 — Finalize Thin `vpn.html` Template
 - **Destination**: `web/templates/vpn.html` (~500 lines markup).
-- **Scope**: Remove remaining inline `<script>` contents from `vpn.html`. Convert inline event handlers (`onclick`, `onchange`, `onsubmit`) to `data-*` attributes with delegated listeners per Section 5.3 CSP roadmap. Finalize script tag structure:
+- **Scope**: Finalize thin markup template and script-slot placement in `vpn.html`. Close `{{ define "content" }}` before scripts and define `{{ define "scripts" }}` containing the 6 companion scripts in canonical order. Migration of inline event handlers (`onclick`, `onchange`, `onsubmit`) to `data-*` attributes is explicitly deferred to dedicated follow-up issue `[P3][Frontend] Migrate VPN dashboard inline event handlers to delegated data-* listeners for strict CSP`; existing inline event attributes and current CSP behavior are preserved in Issue #500. Canonical script tag structure:
   ```html
   {{ define "scripts" }}
   <script src="/static/js/vpn/backends.js"></script>
-  <script src="/static/js/vpn/charts.js"></script>
   <script src="/static/js/vpn/health_problems.js"></script>
   <script src="/static/js/vpn/health_summary.js"></script>
+  <script src="/static/js/vpn/charts.js"></script>
   <script src="/static/js/vpn/sessions.js"></script>
   <script src="/static/js/vpn/page.js"></script>
   {{ end }}
   ```
 - **Contract Guardrails**: Ensure `web/web_embedded_test.go` verifies asset resolution via `embed.FS`. Finalize `VPNTestFixture` in `web/vpn_fixture_test.go`.
-- **Acceptance Gate**: Full CI test run (`CI=true go test -count=1 ./web/...`) and Playwright E2E suite (`pytest tests/e2e/test_vpn_diagnostics.py`).
+- **Acceptance Gate**: Full CI test run (`CI=true go test -count=1 ./web/... ./internal/handlers/...`) and Playwright E2E suite (`pytest tests/e2e/test_vpn_diagnostics.py`).
 
 #### Step 7: Issue #542 — Extract Users Page JavaScript (`web/static/js/users.js`)
 - **Destination**: `web/static/js/users.js` (~840 lines) and thin `web/templates/users.html`.
