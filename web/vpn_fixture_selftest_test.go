@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestVPNTestFixture(t *testing.T) {
@@ -358,6 +359,85 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		}
 		if !strings.Contains(string(out), "CHARTS_MODULE_FAILURE") {
 			t.Fatalf("expected output to mention CHARTS_MODULE_FAILURE, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("ChartsModuleJSDOMExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireJSDOM()
+		fixture.ChartsJS = "throw new Error('CHARTS_JSDOM_FAILURE');\n" + fixture.ChartsJS
+
+		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+			ExtraJS: `console.log('UNREACHABLE_AFTER_CHARTS_ERROR');`,
+		})
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error in JSDOM harness, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "CHARTS_JSDOM_FAILURE") {
+			t.Fatalf("expected output to mention CHARTS_JSDOM_FAILURE, got:\n%s", string(out))
+		}
+	})
+}
+
+func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
+	if mode := os.Getenv("TEST_VPN_LOADER_SEAM_CASE"); mode != "" {
+		baseFS := fstest.MapFS{
+			"static/css/style.css":             &fstest.MapFile{Data: []byte("body { margin: 0; }")},
+			"static/js/vpn/sessions.js":        &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
+			"static/js/vpn/health_problems.js": &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
+			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
+		}
+		switch mode {
+		case "missing_charts":
+			// static/js/vpn/charts.js omitted
+		case "empty_charts":
+			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("")}
+		case "whitespace_charts":
+			baseFS["static/js/vpn/charts.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
+		default:
+			t.Fatalf("unknown test mode: %s", mode)
+		}
+		newVPNTestFixtureWithFS(t, baseFS)
+		return
+	}
+
+	for _, tc := range []struct {
+		mode      string
+		errSubstr string
+	}{
+		{"missing_charts", "failed to read static charts asset static/js/vpn/charts.js"},
+		{"empty_charts", "failed to read static charts asset static/js/vpn/charts.js: empty content"},
+		{"whitespace_charts", "failed to read static charts asset static/js/vpn/charts.js: empty content"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureLoaderSeamAssetFailClosed$")
+			cmd.Env = append(os.Environ(), "TEST_VPN_LOADER_SEAM_CASE="+tc.mode)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("expected failure for %s, but process exited cleanly", tc.mode)
+			}
+			if !strings.Contains(string(out), tc.errSubstr) {
+				t.Fatalf("expected output to contain %q, got:\n%s", tc.errSubstr, string(out))
+			}
+		})
+	}
+
+	t.Run("ValidMapFS", func(t *testing.T) {
+		validFS := fstest.MapFS{
+			"static/css/style.css":             &fstest.MapFile{Data: []byte("body { margin: 0; }")},
+			"static/js/vpn/sessions.js":        &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
+			"static/js/vpn/health_problems.js": &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
+			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
+			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
+		}
+		fx := newVPNTestFixtureWithFS(t, validFS)
+		if fx == nil {
+			t.Fatal("expected non-nil fixture from valid MapFS")
+		}
+		if fx.ChartsJS != "function vpnRenderHistoryCharts() {}" {
+			t.Fatalf("unexpected ChartsJS content: %s", fx.ChartsJS)
 		}
 	})
 }
