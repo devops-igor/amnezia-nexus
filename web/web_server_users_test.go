@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"regexp"
 	"strings"
@@ -113,18 +114,46 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 	}
 	usersStr := string(usersData)
 
-	// 1. Assert users.html references #icon-pause and #icon-play for user toggle controls
-	if !strings.Contains(usersStr, `href="#icon-pause"`) {
-		t.Errorf("users.html missing href=\"#icon-pause\" for active user toggle control")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
+	if err != nil {
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	if !strings.Contains(usersStr, `href="#icon-play"`) {
-		t.Errorf("users.html missing href=\"#icon-play\" for disabled user toggle control")
+	usersJsStr := string(usersJsData)
+
+	// 1. Assert users.js references #icon-pause and #icon-play for user toggle controls
+	if !strings.Contains(usersJsStr, `href="#icon-pause"`) {
+		t.Errorf("users.js missing href=\"#icon-pause\" for active user toggle control")
+	}
+	if !strings.Contains(usersJsStr, `href="#icon-play"`) {
+		t.Errorf("users.js missing href=\"#icon-play\" for disabled user toggle control")
 	}
 
-	// 2. Assert users.html does not contain the old dot toggle markup for user toggling
-	if strings.Contains(usersStr, "badge-dot") {
-		t.Errorf("users.html must not contain legacy dot toggle markup (badge-dot)")
+	// 2. Assert users.html and users.js do not contain the old dot toggle markup for user toggling
+	assertNoBadgeDot := func(name, content string) error {
+		if strings.Contains(content, "badge-dot") {
+			return fmt.Errorf("%s must not contain legacy dot toggle markup (badge-dot)", name)
+		}
+		return nil
 	}
+	for name, content := range map[string]string{
+		"users.html": usersStr,
+		"users.js":   usersJsStr,
+	} {
+		if err := assertNoBadgeDot(name, content); err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Negative mutation test: verify that injecting badge-dot into usersJsStr fails closed
+	t.Run("BadgeDotProhibitionMutationFailsClosed", func(t *testing.T) {
+		mutatedJs := strings.Replace(usersJsStr, `class="badge ${roleClass}"`, `class="badge badge-dot ${roleClass}"`, 1)
+		if !strings.Contains(mutatedJs, "badge-dot") {
+			t.Fatal("failed to apply badge-dot mutation to users.js")
+		}
+		if err := assertNoBadgeDot("users.js", mutatedJs); err == nil {
+			t.Errorf("negative mutation test failed: injecting badge-dot into users.js did not fail closed")
+		}
+	})
 
 	// 3. Assert #userConnsTable has width: 100% and min-width: 100%
 	if !strings.Contains(usersStr, `<table class="table interactive-table" id="userConnsTable" style="width: 100%; min-width: 100%;">`) {
@@ -140,11 +169,11 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 	}
 
 	// 5. Assert action buttons use standardized button classes and danger hover
-	if !strings.Contains(usersStr, `btn-danger-hover`) {
-		t.Errorf("users.html missing btn-danger-hover class on delete action buttons")
+	if !strings.Contains(usersJsStr, `btn-danger-hover`) {
+		t.Errorf("users.js missing btn-danger-hover class on delete action buttons")
 	}
-	if !strings.Contains(usersStr, `btn-success-hover`) {
-		t.Errorf("users.html missing btn-success-hover class on play toggle button")
+	if !strings.Contains(usersJsStr, `btn-success-hover`) {
+		t.Errorf("users.js missing btn-success-hover class on play toggle button")
 	}
 
 	// 6. Assert required DOM element IDs are preserved
@@ -344,58 +373,58 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 }
 
 func TestUsersTemplateServerZeroHandling(t *testing.T) {
-	templatesFS, err := GetTemplatesSubFS()
+	staticFS, err := GetStaticSubFS()
 	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
-	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
 	if err != nil {
-		t.Fatalf("failed to read users.html: %v", err)
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	usersStr := string(usersData)
+	usersJsStr := string(usersJsData)
 
 	// Check Server 0 display name mapping
-	if !strings.Contains(usersStr, `(Number(c.server_id) === 0) ? 'Cluster (Auto)'`) {
-		t.Errorf("users.html must render 'Cluster (Auto)' when server_id is 0")
+	if !strings.Contains(usersJsStr, `(Number(c.server_id) === 0) ? 'Cluster (Auto)'`) {
+		t.Errorf("users.js must render 'Cluster (Auto)' when server_id is 0")
 	}
 
 	// Check that action buttons pass connection ID
-	if !strings.Contains(usersStr, `onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html copyUserConnectionDirect must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js copyUserConnectionDirect must pass connection ID")
 	}
-	if !strings.Contains(usersStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html showUserConnectionConfig must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js showUserConnectionConfig must pass connection ID")
 	}
-	if !strings.Contains(usersStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html unlinkUserConnection must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js unlinkUserConnection must pass connection ID")
 	}
 
 	// Check fallback/direct connection endpoint calls
-	if !strings.Contains(usersStr, `/api/connections/${connId}/delete`) {
-		t.Errorf("users.html unlinkUserConnection must support /api/connections/${connId}/delete")
+	if !strings.Contains(usersJsStr, `/api/connections/${connId}/delete`) {
+		t.Errorf("users.js unlinkUserConnection must support /api/connections/${connId}/delete")
 	}
-	if !strings.Contains(usersStr, `/api/connections/${connId}/config`) {
-		t.Errorf("users.html showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
+	if !strings.Contains(usersJsStr, `/api/connections/${connId}/config`) {
+		t.Errorf("users.js showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
 	}
 }
 
 func TestUsersTemplatePageSize(t *testing.T) {
-	templatesFS, err := GetTemplatesSubFS()
+	staticFS, err := GetStaticSubFS()
 	if err != nil {
-		t.Fatalf("failed to get templates sub FS: %v", err)
+		t.Fatalf("failed to get static sub FS: %v", err)
 	}
 
-	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
 	if err != nil {
-		t.Fatalf("failed to read users.html: %v", err)
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	usersStr := string(usersData)
+	usersJsStr := string(usersJsData)
 
-	if !strings.Contains(usersStr, "let pageSize = 12;") {
-		t.Errorf("users.html must configure 'let pageSize = 12;' for 3-column responsive grid layout")
+	if !strings.Contains(usersJsStr, "let pageSize = 12;") {
+		t.Errorf("users.js must configure 'let pageSize = 12;' for 3-column responsive grid layout")
 	}
-	if strings.Contains(usersStr, "let pageSize = 10;") {
-		t.Errorf("users.html must not contain obsolete 'let pageSize = 10;'")
+	if strings.Contains(usersJsStr, "let pageSize = 10;") {
+		t.Errorf("users.js must not contain obsolete 'let pageSize = 10;'")
 	}
 }
 
@@ -711,5 +740,68 @@ func TestClientSideHostValidation(t *testing.T) {
 		if got != tc.valid {
 			t.Errorf("isValidHost(%q) = %v, want %v", tc.input, got, tc.valid)
 		}
+	}
+}
+
+func TestIssue542UsersPageFiveSupportedLocalesMatrix(t *testing.T) {
+	transFS, err := GetTranslationsSubFS()
+	if err != nil {
+		t.Fatalf("GetTranslationsSubFS failed: %v", err)
+	}
+
+	// 1. Verify all 5 supported languages exist and contain core users management keys
+	supportedLanguages := []string{"en.json", "ru.json", "fr.json", "zh.json", "fa.json"}
+	coreUsersKeys := []string{
+		"users_title",
+		"nav_users",
+		"add_user",
+		"add_connection",
+		"delete_user_title",
+		"delete_user_confirm",
+		"config",
+	}
+
+	for _, langFile := range supportedLanguages {
+		data, err := fs.ReadFile(transFS, langFile)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", langFile, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(data, &dict); err != nil {
+			t.Fatalf("failed to parse %s as JSON: %v", langFile, err)
+		}
+		for _, k := range coreUsersKeys {
+			val, ok := dict[k]
+			if !ok || strings.TrimSpace(val) == "" {
+				t.Errorf("%s missing or empty required users key %q", langFile, k)
+			}
+		}
+	}
+
+	// 2. French (fr.json) specific key verification
+	frData, err := fs.ReadFile(transFS, "fr.json")
+	if err != nil {
+		t.Fatalf("failed to read fr.json: %v", err)
+	}
+	var frDict map[string]string
+	if err := json.Unmarshal(frData, &frDict); err != nil {
+		t.Fatalf("failed to parse fr.json: %v", err)
+	}
+	expectedFr := map[string]string{
+		"users_title":         "Utilisateurs",
+		"nav_users":           "Utilisateurs",
+		"add_connection":      "Ajouter une connexion",
+		"delete_user_title":   "Supprimer l'utilisateur",
+		"delete_user_confirm": "Supprimer l'utilisateur ? Ses connexions seront supprimées.",
+	}
+	for k, want := range expectedFr {
+		if got := frDict[k]; got != want {
+			t.Errorf("fr.json[%q] = %q, want %q", k, got, want)
+		}
+	}
+
+	// 3. Fallback verification: unsupported locale (e.g. es.json) is not bundled
+	if _, err := fs.ReadFile(transFS, "es.json"); err == nil {
+		t.Errorf("es.json should not exist in bundled translations; es must rely on en fallback")
 	}
 }
