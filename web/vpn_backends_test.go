@@ -466,17 +466,6 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireJSDOM()
 
-	start := strings.Index(fixture.TemplateHTML, "<script>")
-	if start == -1 {
-		t.Fatal("<script> tag not found in TemplateHTML")
-	}
-	start += len("<script>")
-	end := strings.Index(fixture.TemplateHTML[start:], "</script>")
-	if end == -1 {
-		t.Fatal("</script> tag not found in TemplateHTML")
-	}
-	inlineScript := fixture.TemplateHTML[start : start+end]
-
 	srcIdx := strings.Index(fixture.TemplateHTML, "<script src=")
 	if srcIdx == -1 {
 		t.Fatal("<script src= tag not found in TemplateHTML")
@@ -492,9 +481,10 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
 		t.Fatalf("failed to read js/ui.js: %v", err)
 	}
 	uiJS := string(uiBytes)
+	pageScript := fixture.PageJS
 
 	t.Run("ProductionOrderBootstrapAndState", func(t *testing.T) {
-		testScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.BackendsJS, inlineScript, `
+		testScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.BackendsJS, pageScript, `
 (async () => {
   // State variables are lexical bindings, not window properties (H2: no window globals)
   assert.strictEqual(w.vpnCachedServers, undefined, 'vpnCachedServers must not be a window property');
@@ -573,7 +563,7 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
 
 	t.Run("RedeclarationMutationFails", func(t *testing.T) {
 		mutatedBackends := "var vpnTableInstance = null;\n" + fixture.BackendsJS
-		mutatedScript := buildVPNBackendsProductionOrderScript(markup, uiJS, mutatedBackends, inlineScript, `
+		mutatedScript := buildVPNBackendsProductionOrderScript(markup, uiJS, mutatedBackends, pageScript, `
 (async () => {
   await w.eval('vpnLoadData()');
   console.log('UNREACHABLE_AFTER_REDECLARATION_MUTATION');

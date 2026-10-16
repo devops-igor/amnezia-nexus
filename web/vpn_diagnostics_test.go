@@ -2,6 +2,7 @@ package web
 
 import (
 	"io/fs"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -139,7 +140,7 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 }
 
 func TestVPNDiagnosticsPollingContract(t *testing.T) {
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
+	pageSource, err := fs.ReadFile(StaticFS, "static/js/vpn/page.js")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,14 +148,28 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 		"NexusTelemetry.poll('vpn-status'": 1,
 		"API.get('/api/vpn/status')":       1,
 	} {
-		if got := strings.Count(string(source), token); got != want {
+		if got := strings.Count(string(pageSource), token); got != want {
 			t.Errorf("%s count=%d, want%d", token, got, want)
 		}
 	}
 	for _, token := range []string{"vpnRenderForwarderHealth(status)", "vpnRenderForwarderHealth(null)"} {
-		if !strings.Contains(string(source), token) {
+		if !strings.Contains(string(pageSource), token) {
 			t.Errorf("polling must handle %s", token)
 		}
+	}
+
+	tmplSource, err := TemplatesFS.ReadFile("templates/vpn.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmplStr := string(tmplSource)
+	if !strings.Contains(tmplStr, `<script src="/static/js/vpn/page.js"></script>`) {
+		t.Errorf("expected rendered templates/vpn.html to contain '<script src=\"/static/js/vpn/page.js\"></script>'")
+	}
+
+	inlineScriptRegex := regexp.MustCompile(`(?s)<script(?:\s+type="[^"]*")?>\s*[^<]`)
+	if inlineScriptRegex.MatchString(tmplStr) {
+		t.Errorf("templates/vpn.html must not contain inline <script> blocks")
 	}
 }
 

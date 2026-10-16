@@ -29,9 +29,11 @@ func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assert
 	}
 
 	script += "\n" + companionScripts
-	return script + `
-let vpnLastStatus = null;
-let vpnShowAllRoutes = false;
+	extraDecls := ""
+	if !strings.Contains(companionScripts, "vpnLastStatus") {
+		extraDecls = "\nlet vpnLastStatus = null;\nlet vpnShowAllRoutes = false;\n"
+	}
+	return script + extraDecls + `
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
 }
@@ -644,7 +646,7 @@ const healthProblemsCode = %q;
 const healthSummaryCode = %q;
 const backendsCode = %q;
 
-const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
+const dom = new JSDOM(source, { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
 w.eval(healthProblemsCode);

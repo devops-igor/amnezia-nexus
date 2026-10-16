@@ -425,7 +425,7 @@ const healthProblemsCode = %q;
 const healthSummaryCode = %q;
 const backendsCode = %q;
 
-const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
+const dom = new JSDOM(source, { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
 w.eval(healthProblemsCode);
