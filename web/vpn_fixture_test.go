@@ -167,6 +167,7 @@ type VPNTestFixture struct {
 	SessionsJS       string
 	HealthProblemsJS string
 	HealthSummaryJS  string
+	ChartsJS         string
 	ParsedDOM        *xhtml.Node
 	MockFetches      map[string]string
 }
@@ -186,14 +187,28 @@ type JSDOMHarnessOptions struct {
 // In CI environments, missing Node binary fails closed with t.Fatalf.
 func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	t.Helper()
-	tmplFS, err1 := GetTemplatesSubFS()
-	staticFS, err2 := GetStaticSubFS()
-	if err := errors.Join(err1, err2); err != nil {
+	return newVPNTestFixtureWithFS(t, StaticFS)
+}
+
+func readFixtureStaticAsset(staticFS fs.FS, path string) ([]byte, error) {
+	if staticFS == nil {
+		return nil, os.ErrNotExist
+	}
+	return fs.ReadFile(staticFS, path)
+}
+
+func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
+	t.Helper()
+	tmplFS, err := GetTemplatesSubFS()
+	if err != nil {
 		t.Fatalf("filesystem sub-FS initialization failed: %v", err)
 	}
-	vpnBytes, err1 := fs.ReadFile(tmplFS, "vpn.html")
-	cssBytes, err2 := fs.ReadFile(staticFS, "css/style.css")
-	if err := errors.Join(err1, err2); err != nil {
+	vpnBytes, err := fs.ReadFile(tmplFS, "vpn.html")
+	if err != nil {
+		t.Fatalf("failed reading fixture files: %v", err)
+	}
+	cssBytes, err := readFixtureStaticAsset(staticFS, "static/css/style.css")
+	if err != nil {
 		t.Fatalf("failed reading fixture files: %v", err)
 	}
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnBytes)))
@@ -204,8 +219,8 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	if err != nil && isCIEnvironment() {
 		t.Fatalf("node binary is required under CI: %v", err)
 	}
-	sessionsPath := "js/vpn/sessions.js"
-	sessionsBytes, err := fs.ReadFile(staticFS, sessionsPath)
+	sessionsPath := "static/js/vpn/sessions.js"
+	sessionsBytes, err := readFixtureStaticAsset(staticFS, sessionsPath)
 	if err != nil {
 		t.Fatalf("failed to read static sessions asset %s: %v", sessionsPath, err)
 	}
@@ -214,8 +229,8 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	}
 	sessionsJS := string(sessionsBytes)
 
-	problemsPath := "js/vpn/health_problems.js"
-	problemsBytes, err := fs.ReadFile(staticFS, problemsPath)
+	problemsPath := "static/js/vpn/health_problems.js"
+	problemsBytes, err := readFixtureStaticAsset(staticFS, problemsPath)
 	if err != nil {
 		t.Fatalf("failed to read static health problems asset %s: %v", problemsPath, err)
 	}
@@ -224,8 +239,8 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	}
 	healthProblemsJS := string(problemsBytes)
 
-	summaryPath := "js/vpn/health_summary.js"
-	summaryBytes, err := fs.ReadFile(staticFS, summaryPath)
+	summaryPath := "static/js/vpn/health_summary.js"
+	summaryBytes, err := readFixtureStaticAsset(staticFS, summaryPath)
 	if err != nil {
 		t.Fatalf("failed to read static health summary asset %s: %v", summaryPath, err)
 	}
@@ -233,6 +248,16 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 		t.Fatalf("failed to read static health summary asset %s: %v", summaryPath, errors.New("empty content"))
 	}
 	healthSummaryJS := string(summaryBytes)
+
+	chartsPath := "static/js/vpn/charts.js"
+	chartsBytes, err := readFixtureStaticAsset(staticFS, chartsPath)
+	if err != nil {
+		t.Fatalf("failed to read static charts asset %s: %v", chartsPath, err)
+	}
+	if len(strings.TrimSpace(string(chartsBytes))) == 0 {
+		t.Fatalf("failed to read static charts asset %s: %v", chartsPath, errors.New("empty content"))
+	}
+	chartsJS := string(chartsBytes)
 
 	return &VPNTestFixture{
 		t:                t,
@@ -242,6 +267,7 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 		SessionsJS:       sessionsJS,
 		HealthProblemsJS: healthProblemsJS,
 		HealthSummaryJS:  healthSummaryJS,
+		ChartsJS:         chartsJS,
 		ParsedDOM:        doc,
 		MockFetches:      make(map[string]string),
 	}
@@ -306,17 +332,17 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
 // CompanionScripts returns the concatenated companion JS modules in evaluation order:
-// sessions.js -> health_problems.js -> health_summary.js.
+// sessions.js -> health_problems.js -> health_summary.js -> charts.js.
 func (f *VPNTestFixture) CompanionScripts() string {
-	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS
+	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS
 }
 
-// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
+// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, and charts.js scripts.
 func (f *VPNTestFixture) CombinedSource() string {
 	return f.TemplateHTML + vpnCompanionBoundaryMarker + f.CompanionScripts()
 }
 
-// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
+// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, and charts.js scripts.
 func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
 	return f.CombinedSource()
 }
@@ -356,13 +382,16 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 		extracted.WriteString(code + "\n")
 	}
 	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
-		f.t.Fatalf("failed to read static sessions asset %s: %v", "js/vpn/sessions.js", errors.New("empty content"))
+		f.t.Fatalf("failed to read static sessions asset %s: %v", "static/js/vpn/sessions.js", errors.New("empty content"))
 	}
 	if len(strings.TrimSpace(f.HealthProblemsJS)) == 0 {
-		f.t.Fatalf("failed to read static health problems asset %s: %v", "js/vpn/health_problems.js", errors.New("empty content"))
+		f.t.Fatalf("failed to read static health problems asset %s: %v", "static/js/vpn/health_problems.js", errors.New("empty content"))
 	}
 	if len(strings.TrimSpace(f.HealthSummaryJS)) == 0 {
-		f.t.Fatalf("failed to read static health summary asset %s: %v", "js/vpn/health_summary.js", errors.New("empty content"))
+		f.t.Fatalf("failed to read static health summary asset %s: %v", "static/js/vpn/health_summary.js", errors.New("empty content"))
+	}
+	if len(strings.TrimSpace(f.ChartsJS)) == 0 {
+		f.t.Fatalf("failed to read static charts asset %s: %v", "static/js/vpn/charts.js", errors.New("empty content"))
 	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
@@ -377,8 +406,9 @@ if (typeof installFetchMock === 'function') { installFetchMock(w); }
 w.eval(%q);
 w.eval(%q);
 w.eval(%q);
+w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}

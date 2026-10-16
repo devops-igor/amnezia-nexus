@@ -328,23 +328,9 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	t.Run("JSRenderContract", func(t *testing.T) {
 		fixture := NewVPNTestFixture(t)
 		nodePath := fixture.RequireNode()
-		sparkline, err := extractJSFunction(string(vpnData), "function vpnGenerateSparklineSVG")
-		if err != nil {
-			t.Fatal(err)
-		}
-		dispose, err := extractJSFunction(string(vpnData), "function vpnDisposeChartInteractions")
-		if err != nil {
-			t.Fatal(err)
-		}
-		history, err := extractJSFunction(string(vpnData), "function vpnRenderHistoryCharts")
-		if err != nil {
-			t.Fatal(err)
-		}
 		script := vpnDOMMock(t, string(vpnData)) + "\n" +
 			fixture.TranslationsJS("en") + "\n" +
-			dispose + "\n" +
-			sparkline + "\n" + history + `
-let vpnHistoryWindow = '15m';
+			fixture.ChartsJS + `
 const series = {
     window_15m: [
         { t: 1700000000, rx_bps: 8000000, tx_bps: 8000000, traffic_available: true, q_pct: 25, drop_rate: 2, drop_rates_available: true, drop_reason_rates: { return_queue_full: 2, return_malformed: 0 }, fwd_p95_ms: 12.5, fwd_p95_samples: 1, be_p95_ms: 8, be_latency_samples: 1, backends: [] },

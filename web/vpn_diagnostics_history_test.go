@@ -12,18 +12,10 @@ import (
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireNode()
-	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
 	script := fixture.TranslationsJS("en") + `const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
-` + sparkline + "\n" + render + `
+` + "\n" + fixture.ChartsJS + `
 vpnRenderHistoryCharts({window_15m:[
     {fwd_p95_ms:200,fwd_p95_samples:1},
     {fwd_p95_ms:200,fwd_p95_samples:0},
@@ -147,16 +139,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	sparkline, err := extractJSFunction(data, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(data, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + sparkline + "\n" + render + `
-let vpnHistoryWindow='15m';
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.ChartsJS + `
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
 vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
@@ -251,24 +234,11 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
-	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	history, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	setWindow, err := extractJSFunction(fixture.TemplateHTML, "function vpnSetHistoryWindow")
-	if err != nil {
-		t.Fatal(err)
-	}
 	toggleRoutes, err := extractJSFunction(fixture.TemplateHTML, "function vpnToggleShowAllRoutes")
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + sparkline + "\n" + history + "\n" + setWindow + "\n" + toggleRoutes + `
-let vpnHistoryWindow='15m';
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + fixture.ChartsJS + "\n" + toggleRoutes + `
 let vpnLastStatus=null;
 let vpnShowAllRoutes=false;
 // The window-toggle control is a persistent button group with no stale data
@@ -654,17 +624,136 @@ assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load wind
 `
 
 	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
-	script += "\n" + fixture.HealthProblemsJS
-	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
-		fn, err := extractJSFunction(tmplStr, "function "+name)
-		if err != nil {
-			t.Fatalf("extractJSFunction %s: %v", name, err)
-		}
-		script += "\n" + fn
-	}
-	script += "\nlet vpnHistoryWindow = '15m';\nlet vpnLastStatus = null;\n" + assertions
+	script += "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS
+	script += "\nlet vpnLastStatus = null;\n" + assertions
 
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("1m and 5m horizon window toggles test failed: %v\n%s", err, out)
+	}
+}
+
+func TestVPNHistoricalChartsHoverPreservedAcrossRerender(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireJSDOM()
+
+	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+(() => {
+    const ids = ['throughput', 'queue', 'drops', 'latency'].map(x => 'vpn-chart-' + x);
+    for (const id of ids) {
+        const el = w.document.getElementById(id);
+        assert(el, 'chart container ' + id + ' must exist in DOM');
+        el.getBoundingClientRect = () => ({ width: 200, left: 0, top: 0, height: 40 });
+    }
+
+    const tooltip = w.document.getElementById('vpn-chart-tooltip');
+    assert(tooltip, 'vpn-chart-tooltip must exist in DOM');
+
+    const point = {
+        t: 36000,
+        traffic_available: true,
+        rx_bps: 8000,
+        tx_bps: 8000,
+        q_pct: 10,
+        drop_rates_available: true,
+        drop_rate: 2,
+        fwd_p95_ms: 5,
+        fwd_p95_samples: 1,
+        be_p95_ms: 8,
+        be_latency_samples: 1
+    };
+
+    const initialSeries = {
+        window_15m: [point, { ...point, t: 36060 }]
+    };
+
+    // 1. Initial render
+    w.vpnRenderHistoryCharts(initialSeries);
+
+    // 2. Test hover retention and detached listener cleanup across all 4 charts
+    for (const id of ids) {
+        const el = w.document.getElementById(id);
+        const overlay = el.querySelector('.chart-overlay');
+        assert(overlay, 'chart ' + id + ' must have .chart-overlay');
+
+        // Dispatch real mousemove event
+        overlay.dispatchEvent(new w.MouseEvent('mousemove', { clientX: 100, clientY: 70 }));
+
+        // Assert window._vpnActiveChartHover coordinates are recorded and tooltip displayed
+        assert(w._vpnActiveChartHover, 'window._vpnActiveChartHover must be recorded');
+        assert.strictEqual(w._vpnActiveChartHover.chartId, id);
+        assert.strictEqual(w._vpnActiveChartHover.clientX, 100);
+        assert.strictEqual(w._vpnActiveChartHover.clientY, 70);
+        assert.strictEqual(tooltip.style.display, 'block', 'tooltip must be displayed on hover');
+        assert.strictEqual(tooltip.style.left, '112px', 'tooltip left position must match hover clientX + 12');
+        assert.strictEqual(tooltip.style.top, '35px', 'tooltip top position must match hover clientY - 35');
+        assert.strictEqual(el.querySelector('.chart-crosshair').style.display, 'block', 'crosshair must be visible');
+
+        const hoverSnapshot = JSON.stringify(w._vpnActiveChartHover);
+
+        // 3. Rerender with updated series data (simulating a 5s live polling sweep)
+        const updatedSeries = {
+            window_15m: [point, { ...point, t: 36060 }, { ...point, t: 36065, rx_bps: 9000, tx_bps: 9500 }]
+        };
+        const oldOverlay = overlay;
+        w.vpnRenderHistoryCharts(updatedSeries);
+
+        // Assert hover coordinates and tooltip position are restored
+        assert.strictEqual(JSON.stringify(w._vpnActiveChartHover), hoverSnapshot, 'hover coordinates must be restored after rerender');
+        assert.strictEqual(tooltip.style.display, 'block', 'tooltip must remain displayed after rerender');
+        assert.strictEqual(tooltip.style.left, '112px', 'tooltip left position must remain preserved');
+        assert.strictEqual(tooltip.style.top, '35px', 'tooltip top position must remain preserved');
+        assert.strictEqual(el.querySelector('.chart-crosshair').style.display, 'block', 'crosshair must remain visible after rerender');
+
+        // 4. Verify detached listeners do not accumulate
+        assert.strictEqual(oldOverlay._vpnMouseMove, null, 'detached overlay _vpnMouseMove must be cleaned up');
+        assert.strictEqual(oldOverlay._vpnMouseLeave, null, 'detached overlay _vpnMouseLeave must be cleaned up');
+
+        // Old overlay event dispatch must not affect active hover state
+        oldOverlay.dispatchEvent(new w.MouseEvent('mouseleave'));
+        assert.strictEqual(JSON.stringify(w._vpnActiveChartHover), hoverSnapshot, 'dispatching on detached overlay must not clear hover');
+        oldOverlay.dispatchEvent(new w.MouseEvent('mousemove', { clientX: 10, clientY: 10 }));
+        assert.strictEqual(JSON.stringify(w._vpnActiveChartHover), hoverSnapshot, 'dispatching on detached overlay must not alter hover');
+
+        // Clear hover via mouseleave on the new overlay before next chart iteration
+        el.querySelector('.chart-overlay').dispatchEvent(new w.MouseEvent('mouseleave'));
+        assert.strictEqual(w._vpnActiveChartHover, null, 'mouseleave on active overlay must clear hover');
+        assert.strictEqual(tooltip.style.display, 'none', 'tooltip must hide after mouseleave');
+    }
+
+    // 5. Test vpnDisposeChartInteractions lifecycle
+    w.vpnRenderHistoryCharts(initialSeries);
+    const throughputOverlay = w.document.querySelector('#vpn-chart-throughput .chart-overlay');
+    throughputOverlay.dispatchEvent(new w.MouseEvent('mousemove', { clientX: 120, clientY: 60 }));
+    assert(w._vpnActiveChartHover, 'active hover must be set');
+    const hoverToPreserve = JSON.stringify(w._vpnActiveChartHover);
+
+    // Verify vpnDisposeChartInteractions(false) preserves hover coordinates
+    w.vpnDisposeChartInteractions(false);
+    assert.strictEqual(JSON.stringify(w._vpnActiveChartHover), hoverToPreserve, 'vpnDisposeChartInteractions(false) must preserve hover');
+    for (const id of ids) {
+        assert.strictEqual(w.document.getElementById(id)._vpnCleanup, null, '_vpnCleanup should be null after dispose');
+    }
+
+    // Verify vpnDisposeChartInteractions(true) clears window._vpnActiveChartHover and hides tooltip
+    w.vpnDisposeChartInteractions(true);
+    assert.strictEqual(w._vpnActiveChartHover, null, 'vpnDisposeChartInteractions(true) must clear active hover');
+    assert.strictEqual(tooltip.style.display, 'none', 'vpnDisposeChartInteractions(true) must hide tooltip');
+
+    // Repeated call should remain safe and clean
+    w.vpnDisposeChartInteractions(true);
+    assert.strictEqual(w._vpnActiveChartHover, null);
+
+    console.log('HOVER_LIFECYCLE_TEST_PASS');
+})();
+`,
+	})
+
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("hover lifecycle test failed: %v\nOutput:\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "HOVER_LIFECYCLE_TEST_PASS") {
+		t.Fatalf("expected HOVER_LIFECYCLE_TEST_PASS, got:\n%s", string(out))
 	}
 }
