@@ -167,10 +167,6 @@ func getNodeText(n *html.Node) string {
 	return sb.String()
 }
 
-func nodeText(n *html.Node) string {
-	return getNodeText(n)
-}
-
 func validateClassicExecutionAttributes(s *html.Node) error {
 	if hasAttr(s, "async") {
 		return errors.New("script must not have async attribute")
@@ -205,7 +201,7 @@ func validateScriptElement(s *html.Node, expectedSrc string) error {
 	if src != expectedSrc {
 		return fmt.Errorf("expected src %q, got %q", expectedSrc, src)
 	}
-	body := strings.TrimSpace(nodeText(s))
+	body := strings.TrimSpace(getNodeText(s))
 	if len(body) != 0 {
 		return fmt.Errorf("script %q must have empty body, got: %q", src, body)
 	}
@@ -287,7 +283,7 @@ func validateRenderedVPNPage(renderedHTML string) error {
 	if err := validateClassicExecutionAttributes(themeScript); err != nil {
 		return fmt.Errorf("inline theme script execution attribute validation failed: %w", err)
 	}
-	themeBody := strings.TrimSpace(nodeText(themeScript))
+	themeBody := strings.TrimSpace(getNodeText(themeScript))
 	if len(themeBody) == 0 {
 		return errors.New("inline theme script must have non-empty body")
 	}
@@ -311,9 +307,9 @@ func validateRenderedVPNPage(renderedHTML string) error {
 	if err := validateClassicExecutionAttributes(bootstrapScript); err != nil {
 		return fmt.Errorf("base bootstrap script execution attribute validation failed: %w", err)
 	}
-	bootstrapBody := nodeText(bootstrapScript)
-	if !strings.Contains(bootstrapBody, "window.I18N") && !strings.Contains(bootstrapBody, "window.translations") {
-		return errors.New("base bootstrap script must contain translation initialization")
+	bootstrapBody := getNodeText(bootstrapScript)
+	if !strings.Contains(bootstrapBody, "window.I18N =") && !strings.Contains(bootstrapBody, "window.translations =") {
+		return errors.New("base bootstrap script must contain translation initialization assignment (window.I18N = or window.translations =)")
 	}
 
 	// 6. Ensure NO VPN companion scripts exist at or before bootstrapIdx
@@ -622,6 +618,45 @@ func TestRenderedVPNTemplateRejectBootstrapMutants(t *testing.T) {
 		mutated := mutateBootstrap(t, `<script type="text/javascript">`)
 		if err := validateRenderedVPNPage(mutated); err != nil {
 			t.Fatalf("expected validateRenderedVPNPage to accept valid classic MIME type text/javascript, got: %v", err)
+		}
+	})
+
+	t.Run("BootstrapAssignmentDeleted", func(t *testing.T) {
+		const marker = "window.I18N ="
+		idx := strings.Index(rendered, marker)
+		if idx == -1 {
+			t.Fatalf("bootstrap assignment marker %q not found in rendered template", marker)
+		}
+		semiIdx := strings.Index(rendered[idx:], ";")
+		if semiIdx == -1 {
+			t.Fatalf("semicolon after %q not found", marker)
+		}
+		end := idx + semiIdx + 1
+		mutated := rendered[:idx] + rendered[end:]
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap with assignment deleted, but it passed")
+		}
+	})
+
+	t.Run("BootstrapReferenceOnly", func(t *testing.T) {
+		const marker = "window.I18N"
+		idx := strings.Index(rendered, marker)
+		if idx == -1 {
+			t.Fatalf("translation bootstrap marker %q not found in rendered template", marker)
+		}
+		scriptIdx := strings.LastIndex(rendered[:idx], "<script>")
+		if scriptIdx == -1 {
+			t.Fatalf("opening <script> tag before translation bootstrap marker not found")
+		}
+		closeIdx := strings.Index(rendered[idx:], "</script>")
+		if closeIdx == -1 {
+			t.Fatalf("closing </script> tag after translation bootstrap marker not found")
+		}
+		endScriptIdx := idx + closeIdx
+		bodyStart := scriptIdx + len("<script>")
+		mutated := rendered[:bodyStart] + "window.I18N;" + rendered[endScriptIdx:]
+		if err := validateRenderedVPNPage(mutated); err == nil {
+			t.Fatalf("expected validateRenderedVPNPage to reject bootstrap with reference only, but it passed")
 		}
 	})
 }
