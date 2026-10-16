@@ -74,6 +74,7 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"js/vpn/charts.js",
 		"js/vpn/sessions.js",
 		"js/vpn/page.js",
+		"js/users.js",
 	}
 	for _, file := range staticFiles {
 		subData, err := fs.ReadFile(staticFS, file)
@@ -331,12 +332,22 @@ func TestIssue113TranslationParityAndValidity(t *testing.T) {
 		}
 	}
 
-	// 3. Assert all template and JS translation keys in users.html exist across all 5 languages
+	// 3. Assert all template and JS translation keys in users.html and users.js exist across all 5 languages
 	usersData, err := fs.ReadFile(templatesFS, "users.html")
 	if err != nil {
 		t.Fatalf("failed to read users.html: %v", err)
 	}
 	usersStr := string(usersData)
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
+	if err != nil {
+		t.Fatalf("failed to read js/users.js: %v", err)
+	}
+	usersJsStr := string(usersJsData)
 
 	tmplRe := regexp.MustCompile(`\{\{\s*_\s*"([^"]+)"\s*\}\}`)
 	jsRe := regexp.MustCompile(`_\(\s*['"]([^'"]+)['"]\s*\)`)
@@ -348,11 +359,14 @@ func TestIssue113TranslationParityAndValidity(t *testing.T) {
 	for _, m := range jsRe.FindAllStringSubmatch(usersStr, -1) {
 		usersKeys[m[1]] = struct{}{}
 	}
+	for _, m := range jsRe.FindAllStringSubmatch(usersJsStr, -1) {
+		usersKeys[m[1]] = struct{}{}
+	}
 
 	for k := range usersKeys {
 		for _, langFile := range languages {
 			if val, ok := dicts[langFile][k]; !ok || strings.TrimSpace(val) == "" {
-				t.Errorf("%s missing or empty translation for users.html key %q", langFile, k)
+				t.Errorf("%s missing or empty translation for users key %q", langFile, k)
 			}
 		}
 	}

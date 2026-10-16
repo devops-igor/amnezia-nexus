@@ -113,12 +113,18 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 	}
 	usersStr := string(usersData)
 
-	// 1. Assert users.html references #icon-pause and #icon-play for user toggle controls
-	if !strings.Contains(usersStr, `href="#icon-pause"`) {
-		t.Errorf("users.html missing href=\"#icon-pause\" for active user toggle control")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
+	if err != nil {
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	if !strings.Contains(usersStr, `href="#icon-play"`) {
-		t.Errorf("users.html missing href=\"#icon-play\" for disabled user toggle control")
+	usersJsStr := string(usersJsData)
+
+	// 1. Assert users.js references #icon-pause and #icon-play for user toggle controls
+	if !strings.Contains(usersJsStr, `href="#icon-pause"`) {
+		t.Errorf("users.js missing href=\"#icon-pause\" for active user toggle control")
+	}
+	if !strings.Contains(usersJsStr, `href="#icon-play"`) {
+		t.Errorf("users.js missing href=\"#icon-play\" for disabled user toggle control")
 	}
 
 	// 2. Assert users.html does not contain the old dot toggle markup for user toggling
@@ -140,11 +146,11 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 	}
 
 	// 5. Assert action buttons use standardized button classes and danger hover
-	if !strings.Contains(usersStr, `btn-danger-hover`) {
-		t.Errorf("users.html missing btn-danger-hover class on delete action buttons")
+	if !strings.Contains(usersJsStr, `btn-danger-hover`) {
+		t.Errorf("users.js missing btn-danger-hover class on delete action buttons")
 	}
-	if !strings.Contains(usersStr, `btn-success-hover`) {
-		t.Errorf("users.html missing btn-success-hover class on play toggle button")
+	if !strings.Contains(usersJsStr, `btn-success-hover`) {
+		t.Errorf("users.js missing btn-success-hover class on play toggle button")
 	}
 
 	// 6. Assert required DOM element IDs are preserved
@@ -344,58 +350,58 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 }
 
 func TestUsersTemplateServerZeroHandling(t *testing.T) {
-	templatesFS, err := GetTemplatesSubFS()
+	staticFS, err := GetStaticSubFS()
 	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
-	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
 	if err != nil {
-		t.Fatalf("failed to read users.html: %v", err)
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	usersStr := string(usersData)
+	usersJsStr := string(usersJsData)
 
 	// Check Server 0 display name mapping
-	if !strings.Contains(usersStr, `(Number(c.server_id) === 0) ? 'Cluster (Auto)'`) {
-		t.Errorf("users.html must render 'Cluster (Auto)' when server_id is 0")
+	if !strings.Contains(usersJsStr, `(Number(c.server_id) === 0) ? 'Cluster (Auto)'`) {
+		t.Errorf("users.js must render 'Cluster (Auto)' when server_id is 0")
 	}
 
 	// Check that action buttons pass connection ID
-	if !strings.Contains(usersStr, `onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html copyUserConnectionDirect must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="copyUserConnectionDirect('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js copyUserConnectionDirect must pass connection ID")
 	}
-	if !strings.Contains(usersStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html showUserConnectionConfig must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js showUserConnectionConfig must pass connection ID")
 	}
-	if !strings.Contains(usersStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.html unlinkUserConnection must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
+		t.Errorf("users.js unlinkUserConnection must pass connection ID")
 	}
 
 	// Check fallback/direct connection endpoint calls
-	if !strings.Contains(usersStr, `/api/connections/${connId}/delete`) {
-		t.Errorf("users.html unlinkUserConnection must support /api/connections/${connId}/delete")
+	if !strings.Contains(usersJsStr, `/api/connections/${connId}/delete`) {
+		t.Errorf("users.js unlinkUserConnection must support /api/connections/${connId}/delete")
 	}
-	if !strings.Contains(usersStr, `/api/connections/${connId}/config`) {
-		t.Errorf("users.html showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
+	if !strings.Contains(usersJsStr, `/api/connections/${connId}/config`) {
+		t.Errorf("users.js showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")
 	}
 }
 
 func TestUsersTemplatePageSize(t *testing.T) {
-	templatesFS, err := GetTemplatesSubFS()
+	staticFS, err := GetStaticSubFS()
 	if err != nil {
-		t.Fatalf("failed to get templates sub FS: %v", err)
+		t.Fatalf("failed to get static sub FS: %v", err)
 	}
 
-	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
 	if err != nil {
-		t.Fatalf("failed to read users.html: %v", err)
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	usersStr := string(usersData)
+	usersJsStr := string(usersJsData)
 
-	if !strings.Contains(usersStr, "let pageSize = 12;") {
-		t.Errorf("users.html must configure 'let pageSize = 12;' for 3-column responsive grid layout")
+	if !strings.Contains(usersJsStr, "let pageSize = 12;") {
+		t.Errorf("users.js must configure 'let pageSize = 12;' for 3-column responsive grid layout")
 	}
-	if strings.Contains(usersStr, "let pageSize = 10;") {
-		t.Errorf("users.html must not contain obsolete 'let pageSize = 10;'")
+	if strings.Contains(usersJsStr, "let pageSize = 10;") {
+		t.Errorf("users.js must not contain obsolete 'let pageSize = 10;'")
 	}
 }
 

@@ -80,7 +80,7 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		}
 	}
 
-	// 2. Assert users.html modernizations
+	// 2. Assert users.html and users.js modernizations
 	usersData, err := fs.ReadFile(templatesFS, "users.html")
 	if err != nil {
 		t.Fatalf("failed to read users.html: %v", err)
@@ -92,7 +92,6 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"href=\"#icon-user\"",
 		"href=\"#icon-plus\"",
 		"href=\"#icon-pencil\"",
-		"href=\"#icon-trash\"",
 		"href=\"#icon-search\"",
 		"href=\"#icon-file-text\"",
 		"href=\"#icon-network\"",
@@ -104,14 +103,8 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"table-filter-chips",
 		"filter-chip",
 		"roleFilterChips",
-		"UI.confirm",
-		"UI.copy",
-		"UI.toast",
-		"API.get",
-		"API.post",
-		"NexusTable",
 		"userConnsTable",
-		"Telemetry.formatBytes",
+		"/static/js/users.js",
 	}
 	for _, token := range requiredUsersTokens {
 		if !strings.Contains(usersStr, token) {
@@ -119,15 +112,44 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		}
 	}
 
-	// Ensure raw confirm(), apiCall(), showToast() are eliminated from users.html
-	if strings.Contains(usersStr, "if (!confirm(") || strings.Contains(usersStr, "if(!confirm(") {
-		t.Errorf("users.html should not use raw confirm(), must use UI.confirm")
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
-	if strings.Contains(usersStr, "apiCall(") {
-		t.Errorf("users.html should not use apiCall(), must use API client")
+
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
+	if err != nil {
+		t.Fatalf("failed to read js/users.js: %v", err)
 	}
-	if strings.Contains(usersStr, "showToast(") {
-		t.Errorf("users.html should not use showToast(), must use UI.toast")
+	usersJsStr := string(usersJsData)
+
+	requiredUsersJsTokens := []string{
+		"href=\"#icon-trash\"",
+		"UI.confirm",
+		"UI.copy",
+		"UI.toast",
+		"API.get",
+		"API.post",
+		"NexusTable",
+		"Telemetry.formatBytes",
+	}
+	for _, token := range requiredUsersJsTokens {
+		if !strings.Contains(usersJsStr, token) {
+			t.Errorf("users.js missing required modernized token %q", token)
+		}
+	}
+
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from users.html and users.js
+	for name, src := range map[string]string{"users.html": usersStr, "users.js": usersJsStr} {
+		if strings.Contains(src, "if (!confirm(") || strings.Contains(src, "if(!confirm(") {
+			t.Errorf("%s should not use raw confirm(), must use UI.confirm", name)
+		}
+		if strings.Contains(src, "apiCall(") {
+			t.Errorf("%s should not use apiCall(), must use API client", name)
+		}
+		if strings.Contains(src, "showToast(") {
+			t.Errorf("%s should not use showToast(), must use UI.toast", name)
+		}
 	}
 }
 
@@ -551,8 +573,19 @@ func TestIssue101ShowConfigIconRework(t *testing.T) {
 	if !strings.Contains(usersStr, `href="#icon-file-text"`) {
 		t.Errorf("users.html must contain href=\"#icon-file-text\"")
 	}
-	if !strings.Contains(usersStr, `showUserConnectionConfig`) {
-		t.Errorf("users.html missing showUserConnectionConfig")
+
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	usersJsData, err := fs.ReadFile(staticFS, "js/users.js")
+	if err != nil {
+		t.Fatalf("failed to read js/users.js: %v", err)
+	}
+	usersJsStr := string(usersJsData)
+
+	if !strings.Contains(usersJsStr, `showUserConnectionConfig`) {
+		t.Errorf("users.js missing showUserConnectionConfig")
 	}
 
 	// 3. server.html: No #icon-key, connections config button uses #icon-file-text
