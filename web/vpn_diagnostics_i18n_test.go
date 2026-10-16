@@ -16,13 +16,25 @@ import (
 
 func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string {
 	t.Helper()
-	script := vpnDOMMock(t, source) + "\n" + vpnDiagnosticsTranslationsJS(t, source, lang)
-	for _, name := range []string{"vpnFormatPeerKey", "vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnRenderForwarderHealth", "vpnSetHistoryWindow", "vpnToggleShowAllRoutes"} {
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatal(err)
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
+	}
+
+	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	script += "\n" + companionScripts
+
+	for _, name := range []string{
+		"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts",
+		"vpnSetHistoryWindow", "vpnToggleShowAllRoutes",
+	} {
+		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
+			function, err := extractJSFunction(templateSource, "function "+name)
+			if err != nil {
+				t.Fatalf("extract %s failed: %v", name, err)
+			}
+			script += "\n" + function
 		}
-		script += "\n" + function
 	}
 	return script + `
 let vpnHistoryWindow='15m', vpnLastStatus=null, vpnShowAllRoutes=false;
@@ -155,19 +167,14 @@ func TestVPNDiagnosticsLocalizationDictionaries(t *testing.T) {
 }
 
 func TestVPNDiagnosticsLocalization(t *testing.T) {
-	data, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(data)
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics localization acceptance")
-	}
+	fixture := NewVPNTestFixture(t)
+	tmplHTML := fixture.TemplateHTML
+	source := fixture.CombinedSource()
+	nodePath := fixture.RequireNode()
 	for _, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
 			dict := vpnDiagnosticsLocale(t, lang)
-			rendered := vpnDiagnosticsRenderedHTML(t, source, dict)
+			rendered := vpnDiagnosticsRenderedHTML(t, tmplHTML, dict)
 			if err := vpnDiagnosticsStaticOracle(rendered, dict); err != nil {
 				t.Fatal(err)
 			}
@@ -180,7 +187,7 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 	t.Run("StaticEscapingAndRTL", func(t *testing.T) {
 		dict := vpnDiagnosticsLocale(t, "fa")
 		dict["vpn_diag_cpu_usage"] = "<translated & \"quoted\">"
-		rendered := vpnDiagnosticsRenderedHTML(t, source, dict)
+		rendered := vpnDiagnosticsRenderedHTML(t, tmplHTML, dict)
 		if !strings.Contains(rendered, html.EscapeString(dict["vpn_diag_cpu_usage"])) || strings.Contains(rendered, "<translated") {
 			t.Fatal("static translation escaped incorrectly")
 		}
@@ -206,30 +213,25 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 }
 
 func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
-	data, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(data)
+	fixture := NewVPNTestFixture(t)
+	tmplHTML := fixture.TemplateHTML
+	source := fixture.CombinedSource()
 	lang := "ru"
 	dict := vpnDiagnosticsLocale(t, lang)
 	t.Run("HardcodedStaticLabel", func(t *testing.T) {
 		before := `{{ _ "vpn_diag_avg_5m" }}`
-		if !strings.Contains(source, before) {
+		if !strings.Contains(tmplHTML, before) {
 			t.Fatal("static mutation target missing")
 		}
-		mutated := strings.Replace(source, before, "5-Min Average", 1)
+		mutated := strings.Replace(tmplHTML, before, "5-Min Average", 1)
 		err := vpnDiagnosticsStaticOracle(vpnDiagnosticsRenderedHTML(t, mutated, dict), dict)
 		if err == nil || !strings.Contains(err.Error(), "vpn-diag-ewma5m") {
 			t.Fatalf("hardcoded static label escaped the rendered oracle: %v", err)
 		}
 	})
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics localization acceptance")
-	}
+	nodePath := fixture.RequireNode()
 	for _, mutation := range []struct{ name, before, after, failure string }{
-		{"HardcodedTrafficState", "_('vpn_diag_traffic_unavailable')", "'Traffic unavailable'", "traffic state"},
+		{"HardcodedTrafficState", "rates.available !== true ? _('vpn_diag_traffic_unavailable')", "rates.available !== true ? 'Traffic unavailable'", "traffic state"},
 		{"WrongAuthoritativeSeverity", "statusText.textContent = _('vpn_forwarder_degraded');", "statusText.textContent = _('vpn_forwarder_warning');", "authoritative severity DEGRADED"},
 		{"HardcodedHistoryLabel", "_(lossLabels[key])", "'return queue full'", "known loss label"},
 		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
@@ -368,15 +370,16 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := fixture.CombinedSource()
 	body := vpnBackendDeviceReasonsBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("backend KPI alarm coverage: %v\n%s", err, out)
@@ -402,14 +405,8 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 // reason danger styling is disabled, and the API-to-label inventory must break
 // when backend_device_unattributed is dropped from the canonical map.
 func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
-	node, err := findNodeBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	node := fixture.RequireNode()
 	body := vpnBackendDeviceReasonsBody(t)
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		{
@@ -420,18 +417,21 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 		},
 		{
 			name:    "UnattributedDroppedFromCanonicalMap",
-			before:  "backend_device_unattributed: 'vpn_diag_loss_backend_device_unattributed',\n            ",
+			before:  "backend_device_unattributed: 'vpn_diag_loss_backend_device_unattributed',",
 			after:   "",
 			failure: "API-to-label backend-device reason inventory drifted",
 		},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
-			original := string(source)
+			original := fixture.CombinedSource()
 			if !strings.Contains(original, mutation.before) {
-				t.Fatal("mutation target missing from template")
+				t.Fatal("mutation target missing from combined source")
 			}
 			mutated := strings.Replace(original, mutation.before, mutation.after, 1)
-			script := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
 				t.Fatalf("mutation escaped its acceptance oracle: %v\n%s", err, out)
@@ -500,15 +500,16 @@ func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := fixture.CombinedSource()
 	body := vpnBackendDeviceConditionBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script := vpnDiagnosticsHealthScriptLocale(t, string(source), lang, body)
+			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			if err != nil {
+				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+			}
 			out, err := execNodeScript(node, script)
 			if err != nil {
 				t.Fatalf("unattributed condition rendering: %v\n%s", err, out)

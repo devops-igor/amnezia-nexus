@@ -15,11 +15,8 @@ func TestVPNSummaryHeaderCountsAndProblemCardOnset(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	assertions := `
 const el = id => document.getElementById(id);
@@ -171,11 +168,8 @@ func TestVPNForwarderCombinedActionableAndGenericConditions(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	assertions := `
 const el = id => document.getElementById(id);
@@ -275,11 +269,8 @@ func TestVPNForwarderStaleHandshakeActionableProblemDOM(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	assertions := `
 const el = id => document.getElementById(id);
@@ -348,11 +339,8 @@ func TestVPNForwarderStaleHandshakeEmptySnapshotMatchingCountsDOM(t *testing.T) 
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	// 1. Synthesize actionable problems with an empty non-nil peer map (0 portal peers snapshot)
 	now := time.Now().UTC()
@@ -441,11 +429,8 @@ func TestVPNRoutingConsistencyBadgeSeverityAware(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	assertions := `
 const routBadge = document.getElementById('vpn-diag-routing-badge');
@@ -563,7 +548,10 @@ assert.strictEqual(routBadge.className, 'badge badge-danger', 'mixed routing con
 assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alerts must retain var(--danger)');
 `
 
-	script := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "en", assertions)
+	script, err := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	out, err := execNodeScript(node, script)
 	if err != nil {
 		t.Fatalf("TestVPNRoutingConsistencyBadgeSeverityAware failed: %v\n%s", err, string(out))

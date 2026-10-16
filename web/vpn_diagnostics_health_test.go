@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -198,16 +196,8 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			t.Fatal("Node is required for diagnostics verification")
 		}
 
-		f1, err := extractJSFunction(vpnStr, "function vpnFormatPeerKey")
-		if err != nil {
-			t.Fatalf("extract vpnFormatPeerKey failed: %v", err)
-		}
-		f2, err := extractJSFunction(vpnStr, "function vpnRenderForwarderHealth")
-		if err != nil {
-			t.Fatalf("extract vpnRenderForwarderHealth failed: %v", err)
-		}
-
-		runnerScript := vpnDOMMock(t, vpnStr) + "\n" + vpnDiagnosticsTranslationsJS(t, vpnStr, "en") + "\n" + f1 + "\n" + f2 + `
+		fixture := NewVPNTestFixture(t)
+		runnerScript := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 const mockDoc = document;
 // Test 1: HEALTHY state
 mockDoc.reset();
@@ -345,9 +335,7 @@ assert(!mockDoc.getElementById('vpn-kpi-packet-loss').textContent.includes('unav
 console.log('VPN_HEALTH_PASS');
 `
 
-		cmd := exec.Command(nodePath, "-e", runnerScript)
-		cmd.Env = os.Environ()
-		out, err := cmd.CombinedOutput()
+		out, err := execNodeScript(nodePath, runnerScript)
 		if err != nil {
 			t.Fatalf("VPN health DOM tests failed: %v\nOutput:\n%s", err, string(out))
 		}
@@ -358,27 +346,9 @@ console.log('VPN_HEALTH_PASS');
 }
 
 func TestVPNOperationalDiagnosticsCardsContract(t *testing.T) {
-	nodePath, err := findNodeBinary()
-	if err != nil {
-		t.Fatal("Node is required for diagnostics verification")
-	}
-	tmplFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := fs.ReadFile(tmplFS, "vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	peer, err := extractJSFunction(string(data), "function vpnFormatPeerKey")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(string(data), "function vpnRenderForwarderHealth")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, string(data)) + "\n" + vpnDiagnosticsTranslationsJS(t, string(data), "en") + "\n" + peer + "\n" + render + `
+	fixture := NewVPNTestFixture(t)
+	nodePath := fixture.RequireNode()
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 // 1. Nominal / Healthy state with traffic & backends
 vpnRenderForwarderHealth({
     forwarder_available: true,
@@ -511,10 +481,8 @@ func TestVPNForwarderHealthDecouplingAndHorizon(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := NewVPNTestFixture(t)
+	source := []byte(fixture.CombinedSource())
 
 	assertions := `
 const text = id => document.getElementById(id).textContent;
@@ -582,7 +550,10 @@ assert.strictEqual(text('vpn-fwd-status-text'), 'В норме');
 assert.strictEqual(text('vpn-fwd-counters-since'), 'Счетчики с: 2026-10-07 06:14 UTC');
 assert.strictEqual(text('vpn-kpi-packet-loss-sub'), 'Текущий / Онлайн: 0.00 pps | С запуска / Сброса: 109');
 `
-	ruScript := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
+	ruScript, err := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian decoupling test failed: %v\n%s", err, out)
 	}
@@ -593,11 +564,8 @@ func TestVPNProgressiveDisclosureAndActiveProblems(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	source, err := TemplatesFS.ReadFile("templates/vpn.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmplStr := string(source)
+	fixture := NewVPNTestFixture(t)
+	tmplStr := fixture.CombinedSource()
 
 	// 1. Invariant: <details id="vpn-fwd-tech-details"> must be present in template.
 	if !strings.Contains(tmplStr, `<details id="vpn-fwd-tech-details"`) {
@@ -748,7 +716,10 @@ assert.strictEqual(
 	'✓ Активных проблем не обнаружено • 12/12 пиров синхронизировано • Все маршруты согласованы • 3/3 бэкендов в норме'
 );
 `
-	ruScript := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
+	ruScript, err := vpnDiagnosticsHealthScriptLocale(t, tmplStr, "ru", ruAssertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian progressive disclosure nominal badge test failed: %v\n%s", err, out)
 	}

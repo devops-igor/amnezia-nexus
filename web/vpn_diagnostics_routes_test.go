@@ -11,39 +11,27 @@ import (
 
 func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assertions string) string {
 	t.Helper()
-	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, lang)
-	for _, name := range []string{
-		"fmtBps",
-		"fmtPps",
-		"vpnFormatBytes",
-		"vpnFormatPeerKey",
-		"vpnFindRouteForSession",
-		"vpnRenderSessionRow",
-		"vpnCreateSessionDrilldownRow",
-		"vpnToggleSessionDrilldown",
-		"vpnToggleSessionsProblemFilter",
-		"vpnRenderSessionsStaleBanner",
-		"vpnFindSessionById",
-		"vpnSyncExpandedDrilldowns",
-		"vpnWrapSessionsTableRender",
-		"renderSessions",
-		"vpnRenderForwarderHealth",
-	} {
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatalf("extractJSFunction %s: %v", name, err)
-		}
-		script += "\n" + function
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
 	}
+
+	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+
+	for _, name := range []string{"vpnStatusLabel"} {
+		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
+			function, err := extractJSFunction(templateSource, "function "+name)
+			if err != nil {
+				t.Fatalf("extractJSFunction %s: %v", name, err)
+			}
+			script += "\n" + function
+		}
+	}
+
+	script += "\n" + companionScripts
 	return script + `
-let vpnLastSessions = null;
-let vpnSessionsStale = false;
-let vpnSessionsFilterOnlyProblems = false;
 let vpnLastStatus = null;
-let vpnExpandedSessionIds = new Set();
-let vpnLastActiveProblemKeys = null;
-let vpnLastActiveProblemCount = 0;
-let vpnSessionsTableInstance = null;
+let vpnShowAllRoutes = false;
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
 }
@@ -652,6 +640,8 @@ const source = %q;
 const en = JSON.parse(%q);
 const tablesCode = %q;
 const sessionsCode = %q;
+const healthProblemsCode = %q;
+const healthSummaryCode = %q;
 
 function extract(name) {
     const start = source.indexOf('    function ' + name + '(');
@@ -664,16 +654,16 @@ function extract(name) {
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
+w.eval(healthProblemsCode);
+w.eval(healthSummaryCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
 'var vpnLastStatus = null;' +
-'var vpnLastActiveProblemKeys = null, vpnLastActiveProblemCount = 0;' +
 'var vpnHistoryWindow = "15m";\n' +
 [
-    'vpnStatusLabel', 'vpnFormatPeerKey',
-    'vpnDiagText', 'vpnLossReasonLabels', 'vpnRenderForwarderHealth'
+    'vpnStatusLabel'
 ].map(extract).join('\n'));
 
 w.eval(tablesCode);
@@ -766,7 +756,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS))
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

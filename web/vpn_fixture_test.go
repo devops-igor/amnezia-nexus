@@ -160,13 +160,15 @@ function installFetchMock(w) {
 
 // VPNTestFixture provides a centralized harness for testing VPN dashboard templates and scripts.
 type VPNTestFixture struct {
-	t            *testing.T
-	NodePath     string
-	TemplateHTML string
-	StyleCSS     string
-	SessionsJS   string
-	ParsedDOM    *xhtml.Node
-	MockFetches  map[string]string
+	t                *testing.T
+	NodePath         string
+	TemplateHTML     string
+	StyleCSS         string
+	SessionsJS       string
+	HealthProblemsJS string
+	HealthSummaryJS  string
+	ParsedDOM        *xhtml.Node
+	MockFetches      map[string]string
 }
 
 // JSDOMHarnessOptions configures a JSDOM evaluation harness.
@@ -211,14 +213,37 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 		t.Fatalf("failed to read static sessions asset %s: %v", sessionsPath, errors.New("empty content"))
 	}
 	sessionsJS := string(sessionsBytes)
+
+	problemsPath := "js/vpn/health_problems.js"
+	problemsBytes, err := fs.ReadFile(staticFS, problemsPath)
+	if err != nil {
+		t.Fatalf("failed to read static health problems asset %s: %v", problemsPath, err)
+	}
+	if len(strings.TrimSpace(string(problemsBytes))) == 0 {
+		t.Fatalf("failed to read static health problems asset %s: %v", problemsPath, errors.New("empty content"))
+	}
+	healthProblemsJS := string(problemsBytes)
+
+	summaryPath := "js/vpn/health_summary.js"
+	summaryBytes, err := fs.ReadFile(staticFS, summaryPath)
+	if err != nil {
+		t.Fatalf("failed to read static health summary asset %s: %v", summaryPath, err)
+	}
+	if len(strings.TrimSpace(string(summaryBytes))) == 0 {
+		t.Fatalf("failed to read static health summary asset %s: %v", summaryPath, errors.New("empty content"))
+	}
+	healthSummaryJS := string(summaryBytes)
+
 	return &VPNTestFixture{
-		t:            t,
-		NodePath:     nodePath,
-		TemplateHTML: string(vpnBytes),
-		StyleCSS:     string(cssBytes),
-		SessionsJS:   sessionsJS,
-		ParsedDOM:    doc,
-		MockFetches:  make(map[string]string),
+		t:                t,
+		NodePath:         nodePath,
+		TemplateHTML:     string(vpnBytes),
+		StyleCSS:         string(cssBytes),
+		SessionsJS:       sessionsJS,
+		HealthProblemsJS: healthProblemsJS,
+		HealthSummaryJS:  healthSummaryJS,
+		ParsedDOM:        doc,
+		MockFetches:      make(map[string]string),
 	}
 }
 
@@ -269,7 +294,7 @@ func (f *VPNTestFixture) Locale(lang string) map[string]string {
 
 func (f *VPNTestFixture) TranslationsJS(lang string) string {
 	f.t.Helper()
-	return vpnDiagnosticsTranslationsJS(f.t, f.TemplateHTML, lang)
+	return vpnDiagnosticsTranslationsJS(f.t, f.CombinedSource(), lang)
 }
 
 func (f *VPNTestFixture) RenderedHTML(lang string) string {
@@ -277,12 +302,21 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 	return vpnDiagnosticsRenderedHTML(f.t, f.TemplateHTML, f.Locale(lang))
 }
 
-// CombinedSource returns the concatenated vpn.html template and sessions.js script.
-func (f *VPNTestFixture) CombinedSource() string {
-	return f.TemplateHTML + "\n" + f.SessionsJS
+// vpnCompanionBoundaryMarker separates template HTML from companion JS modules in CombinedSource.
+const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
+
+// CompanionScripts returns the concatenated companion JS modules in evaluation order:
+// sessions.js -> health_problems.js -> health_summary.js.
+func (f *VPNTestFixture) CompanionScripts() string {
+	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS
 }
 
-// CombinedVPNSessionsSource returns the concatenated vpn.html template and sessions.js script.
+// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
+func (f *VPNTestFixture) CombinedSource() string {
+	return f.TemplateHTML + vpnCompanionBoundaryMarker + f.CompanionScripts()
+}
+
+// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
 func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
 	return f.CombinedSource()
 }
@@ -324,6 +358,12 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
 		f.t.Fatalf("failed to read static sessions asset %s: %v", "js/vpn/sessions.js", errors.New("empty content"))
 	}
+	if len(strings.TrimSpace(f.HealthProblemsJS)) == 0 {
+		f.t.Fatalf("failed to read static health problems asset %s: %v", "js/vpn/health_problems.js", errors.New("empty content"))
+	}
+	if len(strings.TrimSpace(f.HealthSummaryJS)) == 0 {
+		f.t.Fatalf("failed to read static health summary asset %s: %v", "js/vpn/health_summary.js", errors.New("empty content"))
+	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
 	b.WriteString(fmt.Sprintf(`
@@ -335,8 +375,10 @@ if (typeof fakeClock !== 'undefined') {
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
 w.eval(%q);
+w.eval(%q);
+w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.SessionsJS, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -353,77 +395,6 @@ func (f *VPNTestFixture) RunJSDOMForT(t *testing.T, script string) string {
 	return f.WithT(t).RunJSDOM(script)
 }
 
-func findHTMLNodeByID(n *xhtml.Node, id string) *xhtml.Node {
-	if id == "" {
-		return nil
-	}
-	if n == nil {
-		return nil
-	}
-	if n.Type == xhtml.ElementNode {
-		for _, attr := range n.Attr {
-			if attr.Key == "id" && attr.Val == id {
-				return n
-			}
-		}
-	}
-	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		if res := findHTMLNodeByID(c, id); res != nil {
-			return res
-		}
-	}
-	return nil
-}
-
-func getHTMLNodeAttr(n *xhtml.Node, key string) string {
-	if n == nil {
-		return ""
-	}
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
-		}
-	}
-	return ""
-}
-
-func findHTMLNodesByTag(n *xhtml.Node, tag string) []*xhtml.Node {
-	var results []*xhtml.Node
-	var walk func(*xhtml.Node)
-	walk = func(curr *xhtml.Node) {
-		if curr == nil {
-			return
-		}
-		if curr != n && curr.Type == xhtml.ElementNode && curr.Data == tag {
-			results = append(results, curr)
-			return
-		}
-		for c := curr.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(n)
-	return results
-}
-
-func getHTMLNodeText(n *xhtml.Node) string {
-	var b strings.Builder
-	var walk func(*xhtml.Node)
-	walk = func(curr *xhtml.Node) {
-		if curr == nil {
-			return
-		}
-		if curr.Type == xhtml.TextNode {
-			b.WriteString(curr.Data)
-		}
-		for c := curr.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(n)
-	return strings.TrimSpace(b.String())
-}
-
 func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
 	t.Helper()
 	out, err := execNodeScript(nodePath, testScript)
@@ -438,187 +409,6 @@ func runJSDOMTestScript(t *testing.T, nodePath, testScript string) string {
 		t.Skip("jsdom is not available in Node environment")
 	}
 	return outStr
-}
-
-func hasHTMLClass(n *xhtml.Node, className string) bool {
-	if n == nil {
-		return false
-	}
-	for _, c := range strings.Fields(getHTMLNodeAttr(n, "class")) {
-		if c == className {
-			return true
-		}
-	}
-	return false
-}
-
-func findClosestEnclosingCard(n *xhtml.Node) *xhtml.Node {
-	for curr := n.Parent; curr != nil; curr = curr.Parent {
-		if curr.Type == xhtml.ElementNode && hasHTMLClass(curr, "card") {
-			return curr
-		}
-	}
-	return nil
-}
-
-func isHTMLDescendant(ancestor, node *xhtml.Node) bool {
-	if ancestor == nil || node == nil {
-		return false
-	}
-	for curr := node.Parent; curr != nil; curr = curr.Parent {
-		if curr == ancestor {
-			return true
-		}
-	}
-	return false
-}
-
-func countHTMLNodesByID(root *xhtml.Node, id string) int {
-	count := 0
-	var walk func(*xhtml.Node)
-	walk = func(n *xhtml.Node) {
-		if n == nil {
-			return
-		}
-		if n.Type == xhtml.ElementNode && getHTMLNodeAttr(n, "id") == id {
-			count++
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(root)
-	return count
-}
-
-func findTopLevelStatsGrid(doc *xhtml.Node) *xhtml.Node {
-	var walk func(*xhtml.Node) *xhtml.Node
-	walk = func(n *xhtml.Node) *xhtml.Node {
-		if n == nil {
-			return nil
-		}
-		if n.Type == xhtml.ElementNode && hasHTMLClass(n, "stats-grid") {
-			// Top-level KPI grid must not be enclosed inside another card (e.g. forwarder card)
-			if findClosestEnclosingCard(n) == nil {
-				return n
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if found := walk(c); found != nil {
-				return found
-			}
-		}
-		return nil
-	}
-	return walk(doc)
-}
-
-func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
-	if doc == nil {
-		return errors.New("nil document")
-	}
-
-	// 1. Top-level KPI grid container (.stats-grid)
-	topGrid := findTopLevelStatsGrid(doc)
-	if topGrid == nil {
-		return errors.New("top-level .stats-grid container not found")
-	}
-
-	// 2. #vpnBackendsTable and closest enclosing outer .card
-	if count := countHTMLNodesByID(doc, "vpnBackendsTable"); count != 1 {
-		return fmt.Errorf("expected exactly 1 #vpnBackendsTable element, found %d", count)
-	}
-	backendsTable := findHTMLNodeByID(doc, "vpnBackendsTable")
-	if backendsTable == nil {
-		return errors.New("#vpnBackendsTable not found")
-	}
-	backendsCard := findClosestEnclosingCard(backendsTable)
-	if backendsCard == nil {
-		return errors.New("closest enclosing .card for #vpnBackendsTable not found")
-	}
-
-	// 3. #vpnSessionsTable and closest enclosing outer .card
-	if count := countHTMLNodesByID(doc, "vpnSessionsTable"); count != 1 {
-		return fmt.Errorf("expected exactly 1 #vpnSessionsTable element, found %d", count)
-	}
-	sessionsTable := findHTMLNodeByID(doc, "vpnSessionsTable")
-	if sessionsTable == nil {
-		return errors.New("#vpnSessionsTable not found")
-	}
-	sessionsCard := findClosestEnclosingCard(sessionsTable)
-	if sessionsCard == nil {
-		return errors.New("closest enclosing .card for #vpnSessionsTable not found")
-	}
-
-	// 4. #vpn-forwarder-card
-	if count := countHTMLNodesByID(doc, "vpn-forwarder-card"); count != 1 {
-		return fmt.Errorf("expected exactly 1 #vpn-forwarder-card element, found %d", count)
-	}
-	forwarderCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
-	if forwarderCard == nil {
-		return errors.New("#vpn-forwarder-card not found")
-	}
-
-	sections := []*xhtml.Node{topGrid, backendsCard, sessionsCard, forwarderCard}
-	sectionNames := []string{"stats-grid", "backends card", "sessions card", "vpn-forwarder-card"}
-
-	// Assert distinct elements
-	for i := 0; i < len(sections); i++ {
-		for j := i + 1; j < len(sections); j++ {
-			if sections[i] == sections[j] {
-				return fmt.Errorf("sections %s and %s resolve to identical element", sectionNames[i], sectionNames[j])
-			}
-		}
-	}
-
-	// Assert no section is a descendant of another
-	for i := 0; i < len(sections); i++ {
-		for j := 0; j < len(sections); j++ {
-			if i != j && isHTMLDescendant(sections[i], sections[j]) {
-				return fmt.Errorf("section %s is nested within / descendant of section %s", sectionNames[j], sectionNames[i])
-			}
-		}
-	}
-
-	// Assert all 4 section containers share the exact same immediate parent element
-	parent := topGrid.Parent
-	if parent == nil {
-		return errors.New("top-level .stats-grid has nil parent")
-	}
-	for i, s := range sections {
-		if s.Parent != parent {
-			return fmt.Errorf("section %s does not share immediate parent with stats-grid", sectionNames[i])
-		}
-	}
-
-	// Sibling index sequence in parent container strictly:
-	// stats-grid -> backends card -> sessions card -> vpn-forwarder-card
-	getSiblingIndex := func(target *xhtml.Node) int {
-		idx := 0
-		for c := parent.FirstChild; c != nil; c = c.NextSibling {
-			if c == target {
-				return idx
-			}
-			idx++
-		}
-		return -1
-	}
-
-	idxStats := getSiblingIndex(topGrid)
-	idxBackends := getSiblingIndex(backendsCard)
-	idxSessions := getSiblingIndex(sessionsCard)
-	idxForwarder := getSiblingIndex(forwarderCard)
-
-	if idxStats == -1 || idxBackends == -1 || idxSessions == -1 || idxForwarder == -1 {
-		return errors.New("failed to resolve sibling indices in immediate parent")
-	}
-
-	if !(idxStats < idxBackends && idxBackends < idxSessions && idxSessions < idxForwarder) {
-		return fmt.Errorf("invalid sibling order: stats-grid=%d, backends-card=%d, sessions-card=%d, vpn-forwarder-card=%d (expected stats < backends < sessions < forwarder)",
-			idxStats, idxBackends, idxSessions, idxForwarder)
-	}
-
-	return nil
 }
 
 func extractJSFunction(source, funcName string) (string, error) {
@@ -769,6 +559,10 @@ const document = {
  createTextNode(s) { const el = new Element(); el.textContent = String(s); return el; }
 };
 document.reset();
+if (typeof window === 'undefined') {
+  global.window = global;
+}
+window.document = document;
 `
 }
 
@@ -911,20 +705,65 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	return nil
 }
 
-func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string {
-	t.Helper()
-	return vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
+// splitVPNTemplateAndCompanionScripts cleanly splits a combined VPN source into template HTML
+// and companion scripts. It checks for the explicit companion boundary marker first. If absent,
+// it checks for the template end marker ("{{ end }}"). If neither marker is found, it fails closed
+// with an explicit error instead of silently treating HTML as JavaScript.
+func splitVPNTemplateAndCompanionScripts(source string) (templateSource, companionScripts string, err error) {
+	if idx := strings.Index(source, vpnCompanionBoundaryMarker); idx >= 0 {
+		templateSource = source[:idx]
+		companionScripts = strings.TrimPrefix(source[idx+len(vpnCompanionBoundaryMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	endMarker := "\n{{ end }}"
+	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
+		templateSource = source[:idx+len(endMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	fallbackMarker := "{{ end }}"
+	if idx := strings.LastIndex(source, fallbackMarker); idx >= 0 {
+		templateSource = source[:idx+len(fallbackMarker)]
+		companionScripts = strings.TrimPrefix(source[idx+len(fallbackMarker):], "\n")
+		return templateSource, companionScripts, nil
+	}
+	return "", "", errors.New("template marker not found in source")
 }
 
-func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions string) string {
+// assembleVPNHealthScript builds an executable health diagnostics test script from explicit template HTML and companion scripts.
+func assembleVPNHealthScript(t *testing.T, templateHTML, companionScripts, lang, assertions string) (string, error) {
 	t.Helper()
-	script := vpnDOMMock(t, source) + vpnDiagnosticsTranslationsJS(t, source, lang)
-	for _, name := range []string{"vpnFormatPeerKey", "vpnRenderForwarderHealth"} {
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		script += "\n" + function
+	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
+		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
-	return script + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, templateHTML, lang)
+	return script + "\n" + companionScripts + "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n" + assertions, nil
+}
+
+// AssembleHealthScript builds a health diagnostics test script from explicit fixture components.
+func (f *VPNTestFixture) AssembleHealthScript(lang, assertions string) (string, error) {
+	return assembleVPNHealthScript(f.t, f.TemplateHTML, f.CompanionScripts(), lang, assertions)
+}
+
+func vpnDiagnosticsHealthScript(t *testing.T, source, assertions string) string {
+	t.Helper()
+	script, err := vpnDiagnosticsHealthScriptLocale(t, source, "en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func vpnDiagnosticsHealthScriptLocale(t *testing.T, source, lang, assertions string) (string, error) {
+	t.Helper()
+	if !strings.Contains(source, "function vpnRenderForwarderHealth") {
+		return "", errors.New("source lacks function vpnRenderForwarderHealth")
+	}
+
+	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
+	if err != nil {
+		return "", err
+	}
+
+	return assembleVPNHealthScript(t, templateSource, companionScripts, lang, assertions)
 }
