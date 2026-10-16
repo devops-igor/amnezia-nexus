@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/web"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -226,11 +228,18 @@ func TestPageHandlers(t *testing.T) {
 		if !strings.Contains(body, "vpnOpenAddBackendModal") {
 			t.Errorf("expected rendered vpn.html to contain 'vpnOpenAddBackendModal'")
 		}
-		if !strings.Contains(body, "data.detail || data.message || data.error") {
-			t.Errorf("expected rendered vpn.html to extract detailed error messages")
+		if !strings.Contains(body, "/static/js/vpn/backends.js") {
+			t.Errorf("expected rendered vpn.html to load '/static/js/vpn/backends.js'")
 		}
-		if !strings.Contains(body, "HTTP ${res.status}") {
-			t.Errorf("expected rendered vpn.html to have HTTP status fallback for non-JSON errors")
+		backendsJS, err := fs.ReadFile(web.StaticFS, "static/js/vpn/backends.js")
+		if err != nil {
+			t.Fatalf("failed to read static/js/vpn/backends.js from web.StaticFS: %v", err)
+		}
+		if !strings.Contains(string(backendsJS), "data.detail || data.message || data.error") {
+			t.Errorf("expected backends.js to extract detailed error messages")
+		}
+		if !strings.Contains(string(backendsJS), "HTTP ${res.status}") {
+			t.Errorf("expected backends.js to have HTTP status fallback for non-JSON errors")
 		}
 		if strings.Contains(body, "Template Not Found") {
 			t.Fatalf("CRITICAL REGRESSION: /vpn returned 'Template Not Found'")
