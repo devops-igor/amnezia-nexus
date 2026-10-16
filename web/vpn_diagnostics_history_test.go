@@ -12,18 +12,10 @@ import (
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireNode()
-	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
 	script := fixture.TranslationsJS("en") + `const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
-` + sparkline + "\n" + render + `
+` + "\n" + fixture.ChartsJS + `
 vpnRenderHistoryCharts({window_15m:[
     {fwd_p95_ms:200,fwd_p95_samples:1},
     {fwd_p95_ms:200,fwd_p95_samples:0},
@@ -147,16 +139,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	sparkline, err := extractJSFunction(data, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	render, err := extractJSFunction(data, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + sparkline + "\n" + render + `
-let vpnHistoryWindow='15m';
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.ChartsJS + `
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
 vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
@@ -251,24 +234,11 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
-	sparkline, err := extractJSFunction(fixture.TemplateHTML, "function vpnGenerateSparklineSVG")
-	if err != nil {
-		t.Fatal(err)
-	}
-	history, err := extractJSFunction(fixture.TemplateHTML, "function vpnRenderHistoryCharts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	setWindow, err := extractJSFunction(fixture.TemplateHTML, "function vpnSetHistoryWindow")
-	if err != nil {
-		t.Fatal(err)
-	}
 	toggleRoutes, err := extractJSFunction(fixture.TemplateHTML, "function vpnToggleShowAllRoutes")
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + sparkline + "\n" + history + "\n" + setWindow + "\n" + toggleRoutes + `
-let vpnHistoryWindow='15m';
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + fixture.ChartsJS + "\n" + toggleRoutes + `
 let vpnLastStatus=null;
 let vpnShowAllRoutes=false;
 // The window-toggle control is a persistent button group with no stale data
@@ -654,15 +624,8 @@ assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load wind
 `
 
 	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
-	script += "\n" + fixture.HealthProblemsJS
-	for _, name := range []string{"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts", "vpnSetHistoryWindow"} {
-		fn, err := extractJSFunction(tmplStr, "function "+name)
-		if err != nil {
-			t.Fatalf("extractJSFunction %s: %v", name, err)
-		}
-		script += "\n" + fn
-	}
-	script += "\nlet vpnHistoryWindow = '15m';\nlet vpnLastStatus = null;\n" + assertions
+	script += "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS
+	script += "\nlet vpnLastStatus = null;\n" + assertions
 
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("1m and 5m horizon window toggles test failed: %v\n%s", err, out)

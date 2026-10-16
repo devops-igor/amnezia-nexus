@@ -103,8 +103,9 @@ func TestVPNTestFixture(t *testing.T) {
 		fx := fixture.WithT(t)
 		combined := fx.CombinedSource()
 		if !strings.Contains(combined, fx.TemplateHTML) || !strings.Contains(combined, fx.SessionsJS) ||
-			!strings.Contains(combined, fx.HealthProblemsJS) || !strings.Contains(combined, fx.HealthSummaryJS) {
-			t.Fatal("CombinedSource must contain TemplateHTML, SessionsJS, HealthProblemsJS, and HealthSummaryJS")
+			!strings.Contains(combined, fx.HealthProblemsJS) || !strings.Contains(combined, fx.HealthSummaryJS) ||
+			!strings.Contains(combined, fx.ChartsJS) {
+			t.Fatal("CombinedSource must contain TemplateHTML, SessionsJS, HealthProblemsJS, HealthSummaryJS, and ChartsJS")
 		}
 		if fx.CombinedVPNSessionsSource() != combined {
 			t.Fatal("CombinedVPNSessionsSource must match CombinedSource")
@@ -141,6 +142,10 @@ func TestVPNTestFixture(t *testing.T) {
 			"vpnResetHealthProblems",
 			"vpnResetTechDiagnosticCards",
 			"vpnRenderForwarderHealth",
+			"vpnGenerateSparklineSVG",
+			"vpnDisposeChartInteractions",
+			"vpnRenderHistoryCharts",
+			"vpnSetHistoryWindow",
 		}
 		for _, name := range movedFunctions {
 			if _, err := extractJSFunction(fx.TemplateHTML, "function "+name); err == nil {
@@ -148,6 +153,16 @@ func TestVPNTestFixture(t *testing.T) {
 			}
 			if _, err := extractJSFunction(fx.CombinedSource(), "function "+name); err != nil {
 				t.Fatalf("expected extractJSFunction %s from CombinedSource to succeed: %v", name, err)
+			}
+		}
+		for _, name := range []string{
+			"vpnGenerateSparklineSVG",
+			"vpnDisposeChartInteractions",
+			"vpnRenderHistoryCharts",
+			"vpnSetHistoryWindow",
+		} {
+			if _, err := extractJSFunction(fx.ChartsJS, "function "+name); err != nil {
+				t.Fatalf("expected extractJSFunction %s from ChartsJS to succeed: %v", name, err)
 			}
 		}
 	})
@@ -180,6 +195,8 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 			clone.HealthSummaryJS = ""
 		case "empty_sessions":
 			clone.SessionsJS = " "
+		case "empty_charts":
+			clone.ChartsJS = "   \n	  "
 		}
 		clone.BuildJSDOMHarness(JSDOMHarnessOptions{})
 		return
@@ -192,6 +209,7 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 		{"empty_health_problems", "failed to read static health problems asset"},
 		{"empty_health_summary", "failed to read static health summary asset"},
 		{"empty_sessions", "failed to read static sessions asset"},
+		{"empty_charts", "failed to read static charts asset"},
 	} {
 		t.Run(assetCase.envVal, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureAssetFailClosed$")
@@ -321,6 +339,25 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		}
 		if !strings.Contains(string(out), "TROUBLESHOOTING_MODULE_FAILURE") {
 			t.Fatalf("expected output to mention TROUBLESHOOTING_MODULE_FAILURE, got:\n%s", string(out))
+		}
+	})
+
+	t.Run("ChartsModuleExecutionError", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireNode()
+		fixture.ChartsJS = "throw new Error('CHARTS_MODULE_FAILURE');\n" + fixture.ChartsJS
+
+		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `assert(true);`)
+		if err != nil {
+			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+		}
+
+		out, err := execNodeScript(nodePath, script)
+		if err == nil {
+			t.Fatalf("expected execution failure on injected companion module error, got nil error\nOutput:\n%s", string(out))
+		}
+		if !strings.Contains(string(out), "CHARTS_MODULE_FAILURE") {
+			t.Fatalf("expected output to mention CHARTS_MODULE_FAILURE, got:\n%s", string(out))
 		}
 	})
 }

@@ -660,8 +660,7 @@ w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastStatus = null;' +
-'var vpnHistoryWindow = "15m";\n' +
+'var vpnLastStatus = null;\n' +
 [
     'vpnStatusLabel'
 ].map(extract).join('\n'));

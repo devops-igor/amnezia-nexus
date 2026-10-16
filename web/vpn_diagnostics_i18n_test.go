@@ -25,8 +25,7 @@ func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string 
 	script += "\n" + companionScripts
 
 	for _, name := range []string{
-		"vpnGenerateSparklineSVG", "vpnRenderHistoryCharts",
-		"vpnSetHistoryWindow", "vpnToggleShowAllRoutes",
+		"vpnToggleShowAllRoutes",
 	} {
 		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
 			function, err := extractJSFunction(templateSource, "function "+name)
@@ -37,7 +36,7 @@ func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string 
 		}
 	}
 	return script + `
-let vpnHistoryWindow='15m', vpnLastStatus=null, vpnShowAllRoutes=false;
+let vpnLastStatus=null, vpnShowAllRoutes=false;
 document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
 const text=id=>document.getElementById(id).textContent;
 const E=(key,values={})=>{assert(Object.prototype.hasOwnProperty.call(translations,key),'missing oracle key '+key);return Object.entries(values).reduce((result,[name,value])=>result.split('{'+name+'}').join(String(value)),translations[key]);};

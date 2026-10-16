@@ -167,6 +167,7 @@ type VPNTestFixture struct {
 	SessionsJS       string
 	HealthProblemsJS string
 	HealthSummaryJS  string
+	ChartsJS         string
 	ParsedDOM        *xhtml.Node
 	MockFetches      map[string]string
 }
@@ -234,6 +235,16 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	}
 	healthSummaryJS := string(summaryBytes)
 
+	chartsPath := "js/vpn/charts.js"
+	chartsBytes, err := fs.ReadFile(staticFS, chartsPath)
+	if err != nil {
+		t.Fatalf("failed to read static charts asset %s: %v", chartsPath, err)
+	}
+	if len(strings.TrimSpace(string(chartsBytes))) == 0 {
+		t.Fatalf("failed to read static charts asset %s: %v", chartsPath, errors.New("empty content"))
+	}
+	chartsJS := string(chartsBytes)
+
 	return &VPNTestFixture{
 		t:                t,
 		NodePath:         nodePath,
@@ -242,6 +253,7 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 		SessionsJS:       sessionsJS,
 		HealthProblemsJS: healthProblemsJS,
 		HealthSummaryJS:  healthSummaryJS,
+		ChartsJS:         chartsJS,
 		ParsedDOM:        doc,
 		MockFetches:      make(map[string]string),
 	}
@@ -306,17 +318,17 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
 // CompanionScripts returns the concatenated companion JS modules in evaluation order:
-// sessions.js -> health_problems.js -> health_summary.js.
+// sessions.js -> health_problems.js -> health_summary.js -> charts.js.
 func (f *VPNTestFixture) CompanionScripts() string {
-	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS
+	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS
 }
 
-// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
+// CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, and charts.js scripts.
 func (f *VPNTestFixture) CombinedSource() string {
 	return f.TemplateHTML + vpnCompanionBoundaryMarker + f.CompanionScripts()
 }
 
-// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, and health_summary.js scripts.
+// CombinedVPNSessionsSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, and charts.js scripts.
 func (f *VPNTestFixture) CombinedVPNSessionsSource() string {
 	return f.CombinedSource()
 }
@@ -364,6 +376,9 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if len(strings.TrimSpace(f.HealthSummaryJS)) == 0 {
 		f.t.Fatalf("failed to read static health summary asset %s: %v", "js/vpn/health_summary.js", errors.New("empty content"))
 	}
+	if len(strings.TrimSpace(f.ChartsJS)) == 0 {
+		f.t.Fatalf("failed to read static charts asset %s: %v", "js/vpn/charts.js", errors.New("empty content"))
+	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
 	b.WriteString(fmt.Sprintf(`
@@ -377,8 +392,9 @@ if (typeof installFetchMock === 'function') { installFetchMock(w); }
 w.eval(%q);
 w.eval(%q);
 w.eval(%q);
+w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
-`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.TranslationsJS(lang), extracted.String()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
