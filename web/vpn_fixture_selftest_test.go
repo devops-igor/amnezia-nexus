@@ -758,3 +758,59 @@ func TestTemplateMarkerNotFoundFailsClosed(t *testing.T) {
 		t.Fatalf("expected error mentioning 'template marker not found in source', got: %v", err)
 	}
 }
+
+func TestVPNPageLifecycleDOMContentLoadedMutationFailsClosed(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	fixture.RequireJSDOM()
+
+	if !strings.Contains(fixture.PageJS, "DOMContentLoaded") {
+		t.Fatal("expected fixture.PageJS to contain DOMContentLoaded")
+	}
+
+	mutatedFx := *fixture
+	mutatedFx.PageJS = strings.Replace(fixture.PageJS, "DOMContentLoaded", "never-fired-mutant", 1)
+
+	testScript := mutatedFx.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+// Install real NexusTelemetry
+const candidatePaths = ['static/js/telemetry.js', 'web/static/js/telemetry.js'];
+let telemetryCode = '';
+for (const cp of candidatePaths) {
+    if (fs.existsSync(cp)) { telemetryCode = fs.readFileSync(cp, 'utf8'); break; }
+}
+if (!telemetryCode) { throw new Error('telemetry.js not found in candidate paths'); }
+const sTel = w.document.createElement('script');
+sTel.textContent = telemetryCode;
+w.document.body.appendChild(sTel);
+
+w.API = {
+    get: async () => ({})
+};
+
+(async () => {
+    // Await natural readiness
+    await new Promise(resolve => w.document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    // Since DOMContentLoaded was mutated to never-fired-mutant, vpn-status should NOT be registered
+    const activeStreams = w.NexusTelemetry.getActiveStreams();
+    assert.ok(activeStreams.includes('vpn-status'), 'vpn-status must be registered in active streams');
+    console.log('MUTATION_UNEXPECTEDLY_PASSED');
+})().catch(e => {
+    console.error('MUTATION_FAILED_CLOSED: ' + e.message);
+    if (dom && dom.window) dom.window.close();
+    process.exit(1);
+});
+`,
+	})
+
+	out, err := execNodeScript(fixture.RequireNode(), testScript)
+	if err == nil {
+		t.Fatalf("expected mutant script to fail, but process succeeded with output:\n%s", string(out))
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, "MUTATION_FAILED_CLOSED") || !strings.Contains(outStr, "vpn-status must be registered") {
+		t.Fatalf("expected failure output mentioning 'MUTATION_FAILED_CLOSED' and 'vpn-status must be registered', got:\n%s", outStr)
+	}
+}
+
