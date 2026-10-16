@@ -343,7 +343,7 @@ func (f *VPNTestFixture) Locale(lang string) map[string]string {
 
 func (f *VPNTestFixture) TranslationsJS(lang string) string {
 	f.t.Helper()
-	return vpnDiagnosticsTranslationsJS(f.t, f.CombinedSource(), lang)
+	return vpnDiagnosticsTranslationsJS(f.t, lang)
 }
 
 func (f *VPNTestFixture) RenderedHTML(lang string) string {
@@ -442,13 +442,13 @@ if (typeof fakeClock !== 'undefined') {
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
 function addScript(code) { const s = w.document.createElement('script'); s.textContent = code; w.document.body.appendChild(s); }
-addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
 addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
+addScript(%q);
 ['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
     Object.defineProperty(w, prop, {
         get() { return w.eval(prop); },
@@ -456,7 +456,7 @@ addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
         configurable: true
     });
 });
-`, docHTML, f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS, f.TranslationsJS(lang)))
+`, docHTML, f.TranslationsJS(lang), f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -686,7 +686,7 @@ func vpnDiagnosticsLocale(t *testing.T, lang string) map[string]string {
 	return dict
 }
 
-func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
+func vpnDiagnosticsTranslationsJS(t *testing.T, lang string) string {
 	t.Helper()
 	encoded, err := json.Marshal(vpnDiagnosticsLocale(t, lang))
 	if err != nil {
@@ -704,20 +704,7 @@ func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
-	for _, name := range []string{"vpnDiagText", "vpnLossReasonLabels"} {
-		// The original template has no interpolation helper; baseline repro still
-		// executes its real renderer instead of failing only on missing source.
-		if !strings.Contains(source, "function "+name+"(") {
-			continue
-		}
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result += function + "\n"
-	}
-	return result
+	return "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
 }
 
 func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]string) string {
@@ -803,12 +790,8 @@ func assembleVPNHealthScript(t *testing.T, templateHTML, companionScripts, lang,
 	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
 		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
-	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, templateHTML, lang)
-	extraDecls := ""
-	if !strings.Contains(companionScripts, "vpnLastStatus") {
-		extraDecls = "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n"
-	}
-	return script + "\n" + companionScripts + extraDecls + assertions, nil
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, lang)
+	return script + "\n" + companionScripts + "\n" + assertions, nil
 }
 
 // AssembleHealthScript builds a health diagnostics test script from explicit fixture components.

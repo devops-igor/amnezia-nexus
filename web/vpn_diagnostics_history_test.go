@@ -12,7 +12,8 @@ import (
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireNode()
-	script := fixture.TranslationsJS("en") + `const assert = require('assert');
+	script := fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + `
+const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
 ` + "\n" + fixture.ChartsJS + `
@@ -139,7 +140,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.ChartsJS + `
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS + `
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
 vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
@@ -623,7 +624,7 @@ assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
 assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
 `
 
-	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
+	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, "en")
 	script += "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS
 	script += "\nlet vpnLastStatus = null;\n" + assertions
 

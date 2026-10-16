@@ -9,20 +9,15 @@ import (
 	"testing"
 )
 
-func vpnConnectionTroubleshootingScriptLocale(t *testing.T, source, lang, assertions string) string {
+func vpnConnectionTroubleshootingScriptLocale(t *testing.T, templateHTML, companionScripts, lang, assertions string) string {
 	t.Helper()
-	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
-	if err != nil {
-		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
+	if !strings.Contains(companionScripts, "function renderSessions") {
+		t.Fatal("companionScripts lacks function renderSessions")
 	}
 
-	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, lang)
 	script += "\n" + companionScripts
-	extraDecls := ""
-	if !strings.Contains(companionScripts, "vpnLastStatus") {
-		extraDecls = "\nlet vpnLastStatus = null;\nlet vpnShowAllRoutes = false;\n"
-	}
-	return script + extraDecls + `
+	return script + `
 const UI = { escapeHtml: escapeHtml };
 ` + assertions
 }
@@ -31,7 +26,6 @@ func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
-	combinedSource := fixture.CombinedSource()
 
 	// Structural invariants in template
 	for _, requiredID := range []string{
@@ -392,7 +386,7 @@ const sessNoDurableSameIP = { assigned_ip: '10.8.0.152' };
 assert.strictEqual(vpnFindRouteForSession(sessNoDurableSameIP), routeNoDurableSameIP, 'session and route without durable IDs must match on IP fallback');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", enAssertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", enAssertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("English connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -482,7 +476,7 @@ const drilldown1 = tbody.children[3];
 assert(drilldown1.textContent.includes('Телеметрия маршрута форвардера недоступна для этой сессии'), 'Russian drilldown no-telemetry fallback');
 `
 
-	ruScript := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "ru", ruAssertions)
+	ruScript := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
 		t.Fatalf("Russian connection troubleshooting table test failed: %v\n%s", err, out)
 	}
@@ -506,7 +500,6 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	node := fixture.RequireNode()
-	combinedSource := fixture.CombinedSource()
 
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
@@ -564,7 +557,7 @@ const probRow = tbody.children[0];
 assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Problems Only must show Unroutable status');
 `
 
-	script := vpnConnectionTroubleshootingScriptLocale(t, combinedSource, "en", assertions)
+	script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("TestVPNReconnectSessionIDMismatchShowsUnroutable failed: %v\n%s", err, out)
 	}

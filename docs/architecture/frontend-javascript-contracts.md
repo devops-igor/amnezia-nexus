@@ -687,7 +687,7 @@ Wave 2: VPN Feature Controllers Extraction (Atomic Script & Fixture Updates)
        v
 Wave 3: VPN Page Bootstrap & Template Finalization
   [ ] Step 5: #499 -> web/static/js/vpn/page.js (~200 lines, includes TestVPNDiagnosticsPollingContract migration)
-  [ ] Step 6: #500 -> web/templates/vpn.html (Thin markup template, script block slot stabilization, canonical order; inline event delegation deferred to follow-up)
+  [ ] Step 6: #500 -> web/templates/vpn.html (Thin markup template, script block slot stabilization, canonical order; inline event delegation deferred to follow-up #574)
        |
        v
 Wave 4: Users Page Modularization
@@ -767,7 +767,7 @@ Wave 6: Stylesheet Partitioning
 
 #### Step 6: Issue #500 — Finalize Thin `vpn.html` Template
 - **Destination**: `web/templates/vpn.html` (~500 lines markup).
-- **Scope**: Finalize thin markup template and script-slot placement in `vpn.html`. Close `{{ define "content" }}` before scripts and define `{{ define "scripts" }}` containing the 6 companion scripts in canonical order. Migration of inline event handlers (`onclick`, `onchange`, `onsubmit`) to `data-*` attributes is explicitly deferred to dedicated follow-up issue `[P3][Frontend] Migrate VPN dashboard inline event handlers to delegated data-* listeners for strict CSP`; existing inline event attributes and current CSP behavior are preserved in Issue #500. Canonical script tag structure:
+- **Scope**: Finalize thin markup template and script-slot placement in `vpn.html`. Close `{{ define "content" }}` before scripts and define `{{ define "scripts" }}` containing the 6 companion scripts in canonical order. Migration of inline event handlers (`onclick`, `onchange`, `onsubmit`) to `data-*` attributes is explicitly deferred to dedicated follow-up issue [#574: [P3][Frontend] Migrate VPN dashboard inline event handlers to delegated data-* listeners for strict CSP](https://github.com/devops-igor/amnezia-nexus/issues/574); existing inline event attributes and current CSP behavior are preserved in Issue #500. Canonical script tag structure:
   ```html
   {{ define "scripts" }}
   <script src="/static/js/vpn/backends.js"></script>

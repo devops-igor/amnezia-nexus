@@ -1,7 +1,6 @@
 package web
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"regexp"
@@ -113,23 +112,9 @@ func extractVPNTranslationKeys(t *testing.T) (keys []string, staticCount int) {
 
 func loadLocaleDictionaries(t *testing.T) map[string]map[string]string {
 	t.Helper()
-	transFS, err := GetTranslationsSubFS()
-	if err != nil {
-		t.Fatalf("GetTranslationsSubFS failed: %v", err)
-	}
-
-	dicts := make(map[string]map[string]string)
+	dicts := make(map[string]map[string]string, len(requiredLocales))
 	for _, loc := range requiredLocales {
-		fileName := loc + ".json"
-		data, err := fs.ReadFile(transFS, fileName)
-		if err != nil {
-			t.Fatalf("failed to read translation file %s: %v", fileName, err)
-		}
-		var dict map[string]string
-		if err := json.Unmarshal(data, &dict); err != nil {
-			t.Fatalf("failed to parse %s: %v", fileName, err)
-		}
-		dicts[loc] = dict
+		dicts[loc] = vpnDiagnosticsLocale(t, loc)
 	}
 	return dicts
 }
