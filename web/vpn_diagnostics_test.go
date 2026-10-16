@@ -345,6 +345,7 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		script := vpnDOMMock(t, string(vpnData)) + "\n" +
 			fixture.TranslationsJS("en") + "\n" +
+			fixture.HealthProblemsJS + "\n" +
 			fixture.ChartsJS + `
 const series = {
     window_15m: [

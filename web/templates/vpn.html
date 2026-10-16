@@ -497,11 +497,13 @@
         </form>
     </div>
 </div>
+{{ end }}
 
-<script src="/static/js/vpn/sessions.js"></script>
+{{ define "scripts" }}
+<script src="/static/js/vpn/backends.js"></script>
 <script src="/static/js/vpn/health_problems.js"></script>
 <script src="/static/js/vpn/health_summary.js"></script>
 <script src="/static/js/vpn/charts.js"></script>
-<script src="/static/js/vpn/backends.js"></script>
+<script src="/static/js/vpn/sessions.js"></script>
 <script src="/static/js/vpn/page.js"></script>
 {{ end }}

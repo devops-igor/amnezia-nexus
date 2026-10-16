@@ -385,7 +385,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		fixture.HealthProblemsJS = "throw new Error('TROUBLESHOOTING_MODULE_FAILURE');\n" + fixture.HealthProblemsJS
 
-		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `assert(true);`)
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", `assert(true);`)
 		out, err := execNodeScript(nodePath, script)
 		if err == nil {
 			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
@@ -480,7 +480,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
 
-		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
 		out, err := execNodeScript(nodePath, script)
 		if err == nil {
 			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
@@ -498,7 +498,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
 
-		script := vpnDiagnosticsLocalizationScript(t, fixture.CombinedSource(), "en") + "\nconsole.log('UNREACHABLE_AFTER_BACKENDS_ERROR');\n"
+		script := vpnDiagnosticsLocalizationScript(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en") + "\nconsole.log('UNREACHABLE_AFTER_BACKENDS_ERROR');\n"
 		out, err := execNodeScript(nodePath, script)
 		if err == nil {
 			t.Fatalf("expected execution failure on injected companion module error in localization script, got nil error\nOutput:\n%s", string(out))
@@ -559,7 +559,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
-		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_PAGE_ERROR');`)
+		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", `console.log('UNREACHABLE_AFTER_PAGE_ERROR');`)
 		out, err := execNodeScript(nodePath, script)
 		if err == nil {
 			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
@@ -577,7 +577,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		nodePath := fixture.RequireNode()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
-		script := vpnDiagnosticsLocalizationScript(t, fixture.CombinedSource(), "en") + "\nconsole.log('UNREACHABLE_AFTER_PAGE_ERROR');\n"
+		script := vpnDiagnosticsLocalizationScript(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en") + "\nconsole.log('UNREACHABLE_AFTER_PAGE_ERROR');\n"
 		out, err := execNodeScript(nodePath, script)
 		if err == nil {
 			t.Fatalf("expected execution failure on injected companion module error in localization script, got nil error\nOutput:\n%s", string(out))
@@ -813,4 +813,3 @@ w.API = {
 		t.Fatalf("expected failure output mentioning 'MUTATION_FAILED_CLOSED' and 'vpn-status must be registered', got:\n%s", outStr)
 	}
 }
-

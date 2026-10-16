@@ -181,7 +181,6 @@ type JSDOMHarnessOptions struct {
 	Direction        string
 	IncludeFakeClock bool
 	IncludeFetchMock bool
-	ExtractedFuncs   []string
 	ExtraJS          string
 }
 
@@ -344,7 +343,7 @@ func (f *VPNTestFixture) Locale(lang string) map[string]string {
 
 func (f *VPNTestFixture) TranslationsJS(lang string) string {
 	f.t.Helper()
-	return vpnDiagnosticsTranslationsJS(f.t, f.CombinedSource(), lang)
+	return vpnDiagnosticsTranslationsJS(f.t, lang)
 }
 
 func (f *VPNTestFixture) RenderedHTML(lang string) string {
@@ -356,9 +355,9 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
 // CompanionScripts returns the concatenated companion JS modules in evaluation order:
-// sessions.js -> health_problems.js -> health_summary.js -> charts.js -> backends.js -> page.js.
+// backends.js -> health_problems.js -> health_summary.js -> charts.js -> sessions.js -> page.js.
 func (f *VPNTestFixture) CompanionScripts() string {
-	return f.SessionsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.BackendsJS + "\n" + f.PageJS
+	return f.BackendsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.SessionsJS + "\n" + f.PageJS
 }
 
 // CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, backends.js, and page.js scripts.
@@ -382,11 +381,7 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	}
 	htmlBody := opts.HTML
 	if htmlBody == "" {
-		if idx := strings.Index(f.TemplateHTML, "<script>"); idx >= 0 {
-			htmlBody = f.TemplateHTML[:idx]
-		} else {
-			htmlBody = f.TemplateHTML
-		}
+		htmlBody = f.TemplateHTML
 	}
 	var b strings.Builder
 	b.WriteString(jsdomBootstrapSnippet + "\n")
@@ -396,17 +391,8 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if opts.IncludeFetchMock && len(f.MockFetches) > 0 {
 		b.WriteString(buildFetchMockSnippet(f.MockFetches) + "\n")
 	}
-	combined := f.CombinedSource()
-	var extracted strings.Builder
-	for _, fn := range opts.ExtractedFuncs {
-		code, err := extractJSFunction(combined, "function "+fn)
-		if err != nil {
-			f.t.Fatalf("extractJSFunction %s failed: %v", fn, err)
-		}
-		extracted.WriteString(code + "\n")
-	}
-	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
-		f.t.Fatalf("failed to read static sessions asset %s: %v", "static/js/vpn/sessions.js", errors.New("empty content"))
+	if len(strings.TrimSpace(f.BackendsJS)) == 0 {
+		f.t.Fatalf("failed to read static backends asset %s: %v", "static/js/vpn/backends.js", errors.New("empty content"))
 	}
 	if len(strings.TrimSpace(f.HealthProblemsJS)) == 0 {
 		f.t.Fatalf("failed to read static health problems asset %s: %v", "static/js/vpn/health_problems.js", errors.New("empty content"))
@@ -417,8 +403,8 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if len(strings.TrimSpace(f.ChartsJS)) == 0 {
 		f.t.Fatalf("failed to read static charts asset %s: %v", "static/js/vpn/charts.js", errors.New("empty content"))
 	}
-	if len(strings.TrimSpace(f.BackendsJS)) == 0 {
-		f.t.Fatalf("failed to read static backends asset %s: %v", "static/js/vpn/backends.js", errors.New("empty content"))
+	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
+		f.t.Fatalf("failed to read static sessions asset %s: %v", "static/js/vpn/sessions.js", errors.New("empty content"))
 	}
 	if len(strings.TrimSpace(f.PageJS)) == 0 {
 		f.t.Fatalf("failed to read static page asset %s: %v", "static/js/vpn/page.js", errors.New("empty content"))
@@ -456,13 +442,13 @@ if (typeof fakeClock !== 'undefined') {
 }
 if (typeof installFetchMock === 'function') { installFetchMock(w); }
 function addScript(code) { const s = w.document.createElement('script'); s.textContent = code; w.document.body.appendChild(s); }
+addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
 addScript(%q);
 addScript(%q);
 addScript(%q);
 addScript(%q);
 addScript(%q);
 addScript(%q);
-addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
 ['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
     Object.defineProperty(w, prop, {
         get() { return w.eval(prop); },
@@ -470,7 +456,7 @@ addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n" + %q);
         configurable: true
     });
 });
-`, docHTML, f.SessionsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.BackendsJS, f.PageJS, f.TranslationsJS(lang), extracted.String()))
+`, docHTML, f.TranslationsJS(lang), f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -700,7 +686,7 @@ func vpnDiagnosticsLocale(t *testing.T, lang string) map[string]string {
 	return dict
 }
 
-func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
+func vpnDiagnosticsTranslationsJS(t *testing.T, lang string) string {
 	t.Helper()
 	encoded, err := json.Marshal(vpnDiagnosticsLocale(t, lang))
 	if err != nil {
@@ -718,20 +704,7 @@ func vpnDiagnosticsTranslationsJS(t *testing.T, source, lang string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
-	for _, name := range []string{"vpnDiagText", "vpnLossReasonLabels"} {
-		// The original template has no interpolation helper; baseline repro still
-		// executes its real renderer instead of failing only on missing source.
-		if !strings.Contains(source, "function "+name+"(") {
-			continue
-		}
-		function, err := extractJSFunction(source, "function "+name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result += function + "\n"
-	}
-	return result
+	return "const translations = " + string(encoded) + ";\nconst _ = key => translations[key] || key;\n" + escape + "\n"
 }
 
 func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]string) string {
@@ -800,25 +773,12 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 }
 
 // splitVPNTemplateAndCompanionScripts cleanly splits a combined VPN source into template HTML
-// and companion scripts. It checks for the explicit companion boundary marker first. If absent,
-// it checks for the template end marker ("{{ end }}"). If neither marker is found, it fails closed
+// and companion scripts using the explicit companion boundary marker. If absent, it fails closed
 // with an explicit error instead of silently treating HTML as JavaScript.
 func splitVPNTemplateAndCompanionScripts(source string) (templateSource, companionScripts string, err error) {
 	if idx := strings.Index(source, vpnCompanionBoundaryMarker); idx >= 0 {
 		templateSource = source[:idx]
 		companionScripts = strings.TrimPrefix(source[idx+len(vpnCompanionBoundaryMarker):], "\n")
-		return templateSource, companionScripts, nil
-	}
-	endMarker := "\n{{ end }}"
-	if idx := strings.LastIndex(source, endMarker); idx >= 0 {
-		templateSource = source[:idx+len(endMarker)]
-		companionScripts = strings.TrimPrefix(source[idx+len(endMarker):], "\n")
-		return templateSource, companionScripts, nil
-	}
-	fallbackMarker := "{{ end }}"
-	if idx := strings.LastIndex(source, fallbackMarker); idx >= 0 {
-		templateSource = source[:idx+len(fallbackMarker)]
-		companionScripts = strings.TrimPrefix(source[idx+len(fallbackMarker):], "\n")
 		return templateSource, companionScripts, nil
 	}
 	return "", "", errors.New("template marker not found in source")
@@ -830,12 +790,8 @@ func assembleVPNHealthScript(t *testing.T, templateHTML, companionScripts, lang,
 	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
 		return "", errors.New("source lacks function vpnRenderForwarderHealth")
 	}
-	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, templateHTML, lang)
-	extraDecls := ""
-	if !strings.Contains(companionScripts, "vpnLastStatus") {
-		extraDecls = "\nlet vpnLastStatus=null;let vpnShowAllRoutes=false;\n"
-	}
-	return script + "\n" + companionScripts + extraDecls + assertions, nil
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, lang)
+	return script + "\n" + companionScripts + "\n" + assertions, nil
 }
 
 // AssembleHealthScript builds a health diagnostics test script from explicit fixture components.

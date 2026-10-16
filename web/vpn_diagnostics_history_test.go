@@ -12,7 +12,8 @@ import (
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireNode()
-	script := fixture.TranslationsJS("en") + `const assert = require('assert');
+	script := fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + `
+const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
 ` + "\n" + fixture.ChartsJS + `
@@ -139,7 +140,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.ChartsJS + `
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS + `
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
 vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
@@ -234,13 +235,7 @@ func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
 			t.Fatalf("missing stale-clearing target %s", id)
 		}
 	}
-	toggleRoutes, err := extractJSFunction(fixture.CombinedSource(), "function vpnToggleShowAllRoutes")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + "\n" + fixture.ChartsJS + "\n" + toggleRoutes + `
-let vpnLastStatus=null;
-let vpnShowAllRoutes=false;
+	assertions := `
 // The window-toggle control is a persistent button group with no stale data
 // of its own; the mock only needs it to answer a querySelectorAll probe.
 document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
@@ -438,6 +433,10 @@ assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
 
 `
+	script, err := fixture.AssembleHealthScript("en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("unavailable-forwarder history clearing: %v\n%s", err, out)
 	}
@@ -446,10 +445,7 @@ assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.lengt
 func TestVPNPanelRateAvailability(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	nodePath := fixture.RequireNode()
-	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
-let vpnLastStatus = null;
-let vpnShowAllRoutes = false;
-
+	assertions := `
 // 1. Both rate flags false: detail panels must show explicit unavailable text, NOT measured zero.
 vpnRenderForwarderHealth({
 	forwarder_available: true,
@@ -532,6 +528,10 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color,
 
 
 `
+	script, err := fixture.AssembleHealthScript("en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out, err := execNodeScript(nodePath, script); err != nil {
 		t.Fatalf("panel rate availability: %v\n%s", err, out)
 	}
@@ -623,9 +623,10 @@ assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
 assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
 `
 
-	script := vpnDOMMock(t, tmplStr) + "\n" + vpnDiagnosticsTranslationsJS(t, tmplStr, "en")
-	script += "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS
-	script += "\nlet vpnLastStatus = null;\n" + assertions
+	script, err := fixture.AssembleHealthScript("en", assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if out, err := execNodeScript(node, script); err != nil {
 		t.Fatalf("1m and 5m horizon window toggles test failed: %v\n%s", err, out)

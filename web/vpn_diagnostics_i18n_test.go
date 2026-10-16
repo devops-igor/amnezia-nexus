@@ -14,32 +14,15 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
-func vpnDiagnosticsLocalizationScript(t *testing.T, source, lang string) string {
+func vpnDiagnosticsLocalizationScript(t *testing.T, templateHTML, companionScripts, lang string) string {
 	t.Helper()
-	templateSource, companionScripts, err := splitVPNTemplateAndCompanionScripts(source)
-	if err != nil {
-		t.Fatalf("splitVPNTemplateAndCompanionScripts failed: %v", err)
+	if !strings.Contains(companionScripts, "function vpnRenderForwarderHealth") {
+		t.Fatal("companionScripts lacks function vpnRenderForwarderHealth")
 	}
 
-	script := vpnDOMMock(t, templateSource) + "\n" + vpnDiagnosticsTranslationsJS(t, templateSource, lang)
+	script := vpnDOMMock(t, templateHTML) + "\n" + vpnDiagnosticsTranslationsJS(t, lang)
 	script += "\n" + companionScripts
-
-	for _, name := range []string{
-		"vpnToggleShowAllRoutes",
-	} {
-		if strings.Contains(templateSource, "function "+name+"(") || strings.Contains(templateSource, "function "+name+" ") {
-			function, err := extractJSFunction(templateSource, "function "+name)
-			if err != nil {
-				t.Fatalf("extract %s failed: %v", name, err)
-			}
-			script += "\n" + function
-		}
-	}
-	extraDecls := ""
-	if !strings.Contains(companionScripts, "vpnLastStatus") {
-		extraDecls = "\nlet vpnLastStatus=null, vpnShowAllRoutes=false;\n"
-	}
-	return script + extraDecls + `
+	return script + `
 document.getElementById('vpn-history-window-toggles').querySelectorAll=()=>[];
 const text=id=>document.getElementById(id).textContent;
 const E=(key,values={})=>{assert(Object.prototype.hasOwnProperty.call(translations,key),'missing oracle key '+key);return Object.entries(values).reduce((result,[name,value])=>result.split('{'+name+'}').join(String(value)),translations[key]);};
@@ -171,7 +154,7 @@ func TestVPNDiagnosticsLocalizationDictionaries(t *testing.T) {
 func TestVPNDiagnosticsLocalization(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	tmplHTML := fixture.TemplateHTML
-	source := fixture.CombinedSource()
+	companionScripts := fixture.CompanionScripts()
 	nodePath := fixture.RequireNode()
 	for _, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
@@ -180,7 +163,7 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 			if err := vpnDiagnosticsStaticOracle(rendered, dict); err != nil {
 				t.Fatal(err)
 			}
-			script := vpnDiagnosticsLocalizationScript(t, source, lang)
+			script := vpnDiagnosticsLocalizationScript(t, tmplHTML, companionScripts, lang)
 			if out, err := execNodeScript(nodePath, script); err != nil {
 				t.Fatalf("locale renderer: %v\n%s", err, out)
 			}
@@ -217,7 +200,7 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	tmplHTML := fixture.TemplateHTML
-	source := fixture.CombinedSource()
+	companionScripts := fixture.CompanionScripts()
 	lang := "ru"
 	dict := vpnDiagnosticsLocale(t, lang)
 	t.Run("HardcodedStaticLabel", func(t *testing.T) {
@@ -239,11 +222,11 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
-			if !strings.Contains(source, mutation.before) {
+			if !strings.Contains(companionScripts, mutation.before) {
 				t.Fatal("renderer mutation target missing")
 			}
-			mutated := strings.Replace(source, mutation.before, mutation.after, 1)
-			out, err := execNodeScript(nodePath, vpnDiagnosticsLocalizationScript(t, mutated, lang))
+			mutated := strings.Replace(companionScripts, mutation.before, mutation.after, 1)
+			out, err := execNodeScript(nodePath, vpnDiagnosticsLocalizationScript(t, tmplHTML, mutated, lang))
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
 				t.Fatalf("mutation escaped its behavioral oracle: %v\n%s", err, out)
 			}
@@ -373,14 +356,13 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := NewVPNTestFixture(t)
-	source := fixture.CombinedSource()
 	body := vpnBackendDeviceReasonsBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			script, err := assembleVPNHealthScript(t, fixture.TemplateHTML, fixture.CompanionScripts(), lang, body)
 			if err != nil {
-				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+				t.Fatalf("assembleVPNHealthScript failed: %v", err)
 			}
 			out, err := execNodeScript(node, script)
 			if err != nil {
@@ -425,14 +407,14 @@ func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
 		},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
-			original := fixture.CombinedSource()
+			original := fixture.CompanionScripts()
 			if !strings.Contains(original, mutation.before) {
-				t.Fatal("mutation target missing from combined source")
+				t.Fatal("mutation target missing from companion scripts")
 			}
 			mutated := strings.Replace(original, mutation.before, mutation.after, 1)
-			script, err := vpnDiagnosticsHealthScriptLocale(t, mutated, "en", body)
+			script, err := assembleVPNHealthScript(t, fixture.TemplateHTML, mutated, "en", body)
 			if err != nil {
-				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+				t.Fatalf("assembleVPNHealthScript failed: %v", err)
 			}
 			out, err := execNodeScript(node, script)
 			if err == nil || !strings.Contains(string(out), mutation.failure) {
@@ -503,14 +485,13 @@ func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := NewVPNTestFixture(t)
-	source := fixture.CombinedSource()
 	body := vpnBackendDeviceConditionBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
 		t.Run(lang, func(t *testing.T) {
-			script, err := vpnDiagnosticsHealthScriptLocale(t, source, lang, body)
+			script, err := assembleVPNHealthScript(t, fixture.TemplateHTML, fixture.CompanionScripts(), lang, body)
 			if err != nil {
-				t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+				t.Fatalf("assembleVPNHealthScript failed: %v", err)
 			}
 			out, err := execNodeScript(node, script)
 			if err != nil {

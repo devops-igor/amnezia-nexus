@@ -153,7 +153,7 @@ console.log('TABLE_FORMATTING_PASS');
 		faDict := vpnDiagnosticsLocale(t, "fa")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, faDict)
 
-		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "fa")
+		translationsJS := vpnDiagnosticsTranslationsJS(t, "fa")
 
 		// 1. Static assertion on Go template output under Persian locale
 		doc, err := xhtml.Parse(strings.NewReader(renderedHTML))
@@ -271,7 +271,7 @@ console.log('PERSIAN_RTL_PASS');
 		enDict := vpnDiagnosticsLocale(t, "en")
 		renderedHTML := vpnDiagnosticsRenderedHTML(t, vpnStr, enDict)
 
-		translationsJS := vpnDiagnosticsTranslationsJS(t, combined, "en")
+		translationsJS := vpnDiagnosticsTranslationsJS(t, "en")
 
 		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
