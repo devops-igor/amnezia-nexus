@@ -642,28 +642,19 @@ const tablesCode = %q;
 const sessionsCode = %q;
 const healthProblemsCode = %q;
 const healthSummaryCode = %q;
-
-function extract(name) {
-    const start = source.indexOf('    function ' + name + '(');
-    assert(start >= 0, 'function not found: ' + name);
-    const rest = source.slice(start + 1);
-    const match = /^    (?:async )?function /m.exec(rest);
-    return source.slice(start, match ? start + 1 + match.index : source.indexOf('</script>', start));
-}
+const backendsCode = %q;
 
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
 w.eval(healthProblemsCode);
 w.eval(healthSummaryCode);
+w.eval(backendsCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastStatus = null;\n' +
-[
-    'vpnStatusLabel'
-].map(extract).join('\n'));
+'var vpnLastStatus = null;\n');
 
 w.eval(tablesCode);
 
@@ -755,7 +746,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS)
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

@@ -349,12 +349,11 @@ console.log('NARROW_VIEWPORT_PASS');
 				t.Fatalf("extractJSFunction %s from combined source failed: %v", fn, err)
 			}
 		}
-		// Callers needing only template functions remain restricted strictly to fixture.TemplateHTML
-		if _, err := extractJSFunction(fixture.TemplateHTML, "function vpnStatusLabel"); err != nil {
-			t.Fatalf("extractJSFunction vpnStatusLabel from TemplateHTML failed: %v", err)
+		if _, err := extractJSFunction(fixture.BackendsJS, "function vpnStatusLabel"); err != nil {
+			t.Fatalf("extractJSFunction vpnStatusLabel from BackendsJS failed: %v", err)
 		}
 		// TemplateHTML must not contain moved functions (scoping strictly limited to source)
-		for _, fn := range []string{"renderSessions", "vpnFormatPeerKey"} {
+		for _, fn := range []string{"renderSessions", "vpnFormatPeerKey", "vpnStatusLabel"} {
 			if _, err := extractJSFunction(fixture.TemplateHTML, "function "+fn); err == nil {
 				t.Fatalf("expected error extracting %s from TemplateHTML without fallback", fn)
 			}
@@ -424,28 +423,19 @@ const tablesCode = %q;
 const sessionsCode = %q;
 const healthProblemsCode = %q;
 const healthSummaryCode = %q;
-
-function extract(name) {
-    const start = source.indexOf('    function ' + name + '(');
-    assert(start >= 0, 'function not found: ' + name);
-    const rest = source.slice(start + 1);
-    const match = /^    (?:async )?function /m.exec(rest);
-    return source.slice(start, match ? start + 1 + match.index : source.indexOf('</script>', start));
-}
+const backendsCode = %q;
 
 const dom = new JSDOM(source.slice(0, source.indexOf('<script>')), { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
 w.eval(sessionsCode);
 w.eval(healthProblemsCode);
 w.eval(healthSummaryCode);
+w.eval(backendsCode);
 w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function _(key) { return translations[key] || key; };' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
-'var vpnLastStatus = null;\n' +
-[
-    'vpnStatusLabel'
-].map(extract).join('\n'));
+'var vpnLastStatus = null;\n');
 
 w.eval(tablesCode);
 
@@ -592,7 +582,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS)
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {
