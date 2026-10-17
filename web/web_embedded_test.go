@@ -550,3 +550,42 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 		t.Error("style.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
 	}
 }
+
+func TestServerStaticAssetsProductionServing(t *testing.T) {
+	staticSubFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	serverAssets := []string{
+		"js/server_actions.js",
+		"js/server_telemetry.js",
+	}
+
+	for _, relPath := range serverAssets {
+		t.Run(relPath, func(t *testing.T) {
+			expectedBytes, err := fs.ReadFile(staticSubFS, relPath)
+			if err != nil {
+				t.Fatalf("failed to read embedded %s from GetStaticSubFS: %v", relPath, err)
+			}
+			if len(bytes.TrimSpace(expectedBytes)) == 0 {
+				t.Fatalf("embedded %s is empty or whitespace", relPath)
+			}
+
+			directEmbedBytes, err := fs.ReadFile(StaticFS, "static/"+relPath)
+			if err != nil {
+				t.Fatalf("failed to read direct embedded %s from StaticFS: %v", relPath, err)
+			}
+			if !bytes.Equal(expectedBytes, directEmbedBytes) {
+				t.Fatalf("content mismatch between StaticFS and GetStaticSubFS for %s", relPath)
+			}
+		})
+	}
+
+	t.Run("NonExistentServerAssetFailsRead", func(t *testing.T) {
+		_, err := fs.ReadFile(staticSubFS, "js/nonexistent_server_script.js")
+		if err == nil {
+			t.Fatalf("expected error reading non-existent server asset from staticSubFS, got nil")
+		}
+	})
+}

@@ -220,7 +220,7 @@
                     <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
                         {{ _ "tls_emulation" }}
                         <label class="switch">
-                            <input type="checkbox" id="installTelemtTls" checked onchange="document.getElementById('telemtDomainGroup').style.display = this.checked ? 'block' : 'none'">
+                            <input type="checkbox" id="installTelemtTls" checked>
                             <span class="slider"></span>
                         </label>
                     </label>
@@ -265,7 +265,7 @@
             </div>
             <div class="log-output" id="installLog"></div>
             <div class="mt-md" id="installDone" style="display:none;">
-                <button class="btn btn-primary" onclick="closeModal('installModal'); window.location.reload();" style="width:100%">{{ _ "done" }}</button>
+                <button class="btn btn-primary" onclick="finishProtocolInstall()" style="width:100%">{{ _ "done" }}</button>
             </div>
         </div>
     </div>
@@ -385,8 +385,8 @@
             <textarea class="form-input" id="serverConfigText"
                 style="width:100%; height:40vh; resize:vertical; font-family:monospace; white-space:pre; padding:var(--space-sm);"></textarea>
             <div class="config-actions" style="margin-top:var(--space-sm);">
-                <button class="btn btn-secondary btn-sm" onclick="UI.copy(document.getElementById('serverConfigText').value, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
-                <button class="btn btn-secondary btn-sm" onclick="UI.downloadFile(document.getElementById('serverConfigText').value, serverConfigFilename)" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }}</button>
+                <button class="btn btn-secondary btn-sm" onclick="copyServerConfig(this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
+                <button class="btn btn-secondary btn-sm" onclick="downloadServerConfig()" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }}</button>
                 <button class="btn btn-primary btn-sm" onclick="saveServerConfig()" style="flex:1" id="saveServerConfigBtn">{{ _ "save" }}</button>
             </div>
         </div>
@@ -407,7 +407,7 @@
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
-            <input type="text" id="renameServerInput" class="form-input" maxlength="255" placeholder="{{ _ "rename_server_placeholder" }}" onkeydown="if(event.key==='Enter'){event.preventDefault();submitRenameServer();}">
+            <input type="text" id="renameServerInput" class="form-input" maxlength="255" placeholder="{{ _ "rename_server_placeholder" }}">
         </div>
         <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
             <button class="btn btn-primary" onclick="submitRenameServer()">{{ _ "save" }}</button>
@@ -430,7 +430,7 @@
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="editHostInput">{{ _ "edit_server_host_placeholder" }}</label>
-            <input type="text" id="editHostInput" class="form-input" maxlength="255" placeholder="{{ _ "edit_server_host_placeholder" }}" onkeydown="if(event.key==='Enter'){event.preventDefault();submitEditHost();}">
+            <input type="text" id="editHostInput" class="form-input" maxlength="255" placeholder="{{ _ "edit_server_host_placeholder" }}">
         </div>
         <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
             <button class="btn btn-primary" onclick="submitEditHost()">{{ _ "save" }}</button>
@@ -441,9 +441,11 @@
 {{ end }}
 
 {{ define "scripts" }}
+<!-- Server Actions & Telemetry Scripts -->
 <script src="/static/js/server_actions.js"></script>
 <script src="/static/js/server_telemetry.js"></script>
 <script>
+    // Server Page Telemetry Bootstrap
     const SERVER_ID = {{ .server_id }};
     initServerTelemetry();
 </script>
