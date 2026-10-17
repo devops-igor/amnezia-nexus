@@ -532,13 +532,15 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 		t.Errorf("server_telemetry.js loadServerStats must re-throw errors for Telemetry.poll failure tracking")
 	}
 
-	loadStatsIdx := strings.Index(serverTelemetryStr, "async function loadServerStats()")
-	if loadStatsIdx == -1 {
-		t.Fatalf("server_telemetry.js missing loadServerStats function")
+	loadStatsBlock, err := extractJSFunction(serverTelemetryStr, "async function loadServerStats")
+	if err != nil {
+		t.Fatalf("server_telemetry.js missing loadServerStats function: %v", err)
 	}
-	loadStatsBlock := serverTelemetryStr[loadStatsIdx : loadStatsIdx+strings.Index(serverTelemetryStr[loadStatsIdx:], "\n    }")]
 	if strings.Contains(loadStatsBlock, "innerHTML = ''") || strings.Contains(loadStatsBlock, "innerHTML = \"\"") {
 		t.Errorf("loadServerStats must not blank DOM innerHTML on error")
+	}
+	if !strings.Contains(loadStatsBlock, "catch (err)") || !strings.Contains(loadStatsBlock, "throw err;") {
+		t.Errorf("loadServerStats must include catch (err) and re-throw error")
 	}
 }
 

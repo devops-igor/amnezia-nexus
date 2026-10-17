@@ -150,6 +150,10 @@ virtualConsole.on('jsdomError', (err) => {
 let confirmOptions = null;
 let lastToast = null;
 let apiCalls = [];
+const failUrls = new Set();
+const telemetryRegistrations = [];
+const telemetryStops = [];
+const activeIntervals = new Set();
 
 const dom = new JSDOM(docHtml, {
     virtualConsole,
@@ -157,6 +161,17 @@ const dom = new JSDOM(docHtml, {
     pretendToBeVisual: true,
     url: 'https://nexus.invalid/servers/42',
     beforeParse(w) {
+        const origSetInterval = w.setInterval;
+        const origClearInterval = w.clearInterval;
+        w.setInterval = function(...args) {
+            const id = origSetInterval.apply(this, args);
+            activeIntervals.add(id);
+            return id;
+        };
+        w.clearInterval = function(id) {
+            activeIntervals.delete(id);
+            return origClearInterval.apply(this, arguments);
+        };
         w._ = (k) => 'T:' + k;
         w.UI = {
             toast: (msg, type) => { lastToast = { msg, type }; },
@@ -169,6 +184,11 @@ const dom = new JSDOM(docHtml, {
         w.API = {
             get: async (url, opts) => {
                 apiCalls.push({ method: 'GET', url, opts });
+                for (const pattern of failUrls) {
+                    if (url.includes(pattern)) {
+                        throw new Error('API get failed for ' + pattern);
+                    }
+                }
                 if (url.includes('/reachability')) {
                     return { reachable: true, latency_ms: 35, last_checked: '2026-10-17 12:00:00' };
                 }
@@ -179,18 +199,33 @@ const dom = new JSDOM(docHtml, {
             },
             post: async (url, body, opts) => {
                 apiCalls.push({ method: 'POST', url, body, opts });
+                for (const pattern of failUrls) {
+                    if (url.includes(pattern)) {
+                        throw new Error('API post failed for ' + pattern);
+                    }
+                }
                 if (url.includes('/stats')) {
                     return { cpu: 15, ram_used: 1024, ram_total: 4096, ram_percent: 25, disk_used: 5000, disk_total: 20000, disk_percent: 25, net_rx: 100, net_tx: 200 };
                 }
                 if (url.includes('/check')) {
                     return { connection: 'ok', docker_installed: true, protocols: { awg: { container_running: true, port: 55424 } } };
                 }
+                if (url.includes('/install')) {
+                    return { log: ['Installed successfully'] };
+                }
                 return {};
             },
         };
         w.openModal = () => {};
         w.closeModal = () => {};
-        w.Telemetry = { poll: () => {}, stop: () => {} };
+        w.Telemetry = {
+            poll: (id, fn, interval) => {
+                telemetryRegistrations.push({ id, fn, interval });
+            },
+            stop: (id) => {
+                telemetryStops.push(id);
+            },
+        };
         w.NexusTable = class { constructor() {} refresh() {} };
         w.QRCode = function() {};
         w.QRCode.CorrectLevel = { L: 'L' };
@@ -309,10 +344,37 @@ const d = w.document;
     const statsResult = await w.loadServerStats();
     assert(statsResult && statsResult.cpu === 15, 'loadServerStats must return stats payload');
     assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/stats'), 'loadServerStats must post to /api/servers/42/stats');
+    const prevStatsHtml = d.getElementById('serverStats').innerHTML;
+    assert(prevStatsHtml.length > 0, 'serverStats must have content after successful stats call');
+
+    // Failed poll: stats error must reject and leave DOM unchanged (Finding H1)
+    failUrls.add('/stats');
+    let statsErrorCaught = false;
+    try {
+        await w.loadServerStats();
+    } catch (err) {
+        statsErrorCaught = true;
+    } finally {
+        failUrls.delete('/stats');
+    }
+    assert(statsErrorCaught, 'loadServerStats must reject when API call fails');
+    assert.strictEqual(d.getElementById('serverStats').innerHTML, prevStatsHtml, 'serverStats DOM content must remain unchanged on stats error');
 
     const reachResult = await w.updateReachability();
     assert(reachResult && reachResult.reachable === true, 'updateReachability must return reachability payload');
     assert(apiCalls.some(c => c.method === 'GET' && c.url === '/api/servers/42/reachability'), 'updateReachability must get /api/servers/42/reachability');
+
+    // Failed poll: reachability error must rethrow (Finding H1)
+    failUrls.add('/reachability');
+    let reachErrorCaught = false;
+    try {
+        await w.updateReachability();
+    } catch (err) {
+        reachErrorCaught = true;
+    } finally {
+        failUrls.delete('/reachability');
+    }
+    assert(reachErrorCaught, 'updateReachability must rethrow when API call fails');
 
     // Flow 4.8: connections section toggle & protocol select
     w.showConnectionsSection();
@@ -320,17 +382,64 @@ const d = w.document;
     w.hideConnectionsSection();
     assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'hideConnectionsSection must set display: none');
 
-    await w.selectProtocolForConns('awg');
-    assert(apiCalls.some(c => c.method === 'GET' && c.url.includes('/api/servers/42/connections')), 'selectProtocolForConns must trigger loadConnections');
+    // selectProtocolForConns with missing option does NOT inject option or trigger API call (Finding M1)
+    apiCalls = [];
+    w.selectProtocolForConns('nonexistent_proto');
+    assert.strictEqual(apiCalls.filter(c => c.url.includes('/connections')).length, 0, 'selectProtocolForConns with missing option must not trigger API call');
+    assert.strictEqual(Array.from(d.getElementById('connProtoSelect').options).some(o => o.value === 'nonexistent_proto'), false, 'selectProtocolForConns must not inject option for missing protocol');
 
     // Flow 4.9: checkServer execution
     await w.checkServer();
     assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/check'), 'checkServer must post to /api/servers/42/check');
+    const badgesSuccessHtml = d.getElementById('statusBadges').innerHTML;
+    assert(badgesSuccessHtml.includes('ssh_ok'), 'statusBadges must show ssh_ok badge on success');
+    assert(!badgesSuccessHtml.includes('check_error'), 'statusBadges must not show check_error on success');
 
-    // Flow 4.10: polling lifecycle functions
+    // selectProtocolForConns with protocol populated by checkServer triggers loadConnections
+    apiCalls = [];
+    w.selectProtocolForConns('awg');
+    assert(apiCalls.some(c => c.method === 'GET' && c.url.includes('/api/servers/42/connections')), 'selectProtocolForConns must trigger loadConnections');
+
+    // Failed checkServer: check error must render check_error badge and re-enable button (Finding H1)
+    failUrls.add('/check');
+    await w.checkServer();
+    failUrls.delete('/check');
+    const badgesErrorHtml = d.getElementById('statusBadges').innerHTML;
+    assert(badgesErrorHtml.includes('check_error'), 'statusBadges must show check_error badge on failure');
+    assert.strictEqual(d.getElementById('checkBtn').disabled, false, 'checkBtn must be re-enabled after failed check');
+
+    // Flow 4.10: installProtocol rejection verifies progressInterval is cleared (Finding H1 / #478)
+    w.openInstallModal('awg');
+    failUrls.add('/install');
+    await w.installProtocol();
+    failUrls.delete('/install');
+    assert.strictEqual(activeIntervals.size, 0, 'installProtocol rejection must leave 0 live intervals');
+
+    // Flow 4.11: polling lifecycle functions & exact Telemetry.poll registrations (Finding H1 & M2)
+    telemetryRegistrations.length = 0;
+    telemetryStops.length = 0;
     w.startServerTelemetryPolling();
+
+    const statsPoll = telemetryRegistrations.find(r => r.id === 'server-stats-42');
+    assert(statsPoll, 'Telemetry.poll must be registered for server-stats-42');
+    assert.strictEqual(statsPoll.fn, w.loadServerStats, 'server-stats poll handler must be loadServerStats');
+    assert.strictEqual(statsPoll.interval, 30000, 'server-stats poll interval must be 30000');
+
+    const reachPoll = telemetryRegistrations.find(r => r.id === 'server-reachability-42');
+    assert(reachPoll, 'Telemetry.poll must be registered for server-reachability-42');
+    assert.strictEqual(reachPoll.fn, w.updateReachability, 'server-reachability poll handler must be updateReachability');
+    assert.strictEqual(reachPoll.interval, 30000, 'server-reachability poll interval must be 30000');
+
     w.stopServerTelemetryPolling();
-    w.initServerTelemetry(42);
+    assert(telemetryStops.includes('server-stats-42'), 'stopServerTelemetryPolling must stop server-stats-42');
+    assert(telemetryStops.includes('server-reachability-42'), 'stopServerTelemetryPolling must stop server-reachability-42');
+
+    // Idempotent initServerTelemetry guard (Finding M2)
+    telemetryRegistrations.length = 0;
+    w.initServerTelemetry();
+    assert.strictEqual(telemetryRegistrations.length, 2, 'initServerTelemetry must register stats and reachability once');
+    w.initServerTelemetry();
+    assert.strictEqual(telemetryRegistrations.length, 2, 'second initServerTelemetry call must be a no-op');
     w.stopServerTelemetryPolling();
 
     console.log('JSDOM_TEST_SUCCESS');

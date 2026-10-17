@@ -2,7 +2,7 @@
 // Extracted from web/templates/server.html per Issue #502 (Epic #475 Phase 3).
 
 const STATS_REFRESH_INTERVAL_MS = 30000;
-let statsTimer = null;
+let telemetryInitialized = false;
 let installedProtocols = {};
 let connectionsTableInstance = null;
 
@@ -368,20 +368,13 @@ function selectProtocolForConns(proto) {
     if (section) section.style.display = '';
     const select = document.getElementById('connProtoSelect');
     if (select) {
-        const hasOpt = Array.from(select.options).some(o => o.value === proto);
-        if (!hasOpt) {
-            const opt = document.createElement('option');
-            opt.value = proto;
-            opt.textContent = typeof getProtoTitle === 'function' ? getProtoTitle(proto) : proto;
-            select.appendChild(opt);
-        }
-        select.value = proto;
+        const hasOpt = Array.from(select.options || []).some(o => o.value === proto);
+        select.value = hasOpt ? proto : '';
     }
-    const promise = loadConnections();
+    loadConnections();
     if (section && typeof section.scrollIntoView === 'function') {
         section.scrollIntoView({ behavior: 'smooth' });
     }
-    return promise;
 }
 
 async function loadConnections() {
@@ -542,9 +535,6 @@ function startServerTelemetryPolling() {
     if (typeof Telemetry !== 'undefined' && typeof Telemetry.poll === 'function') {
         Telemetry.poll('server-stats-' + SERVER_ID, loadServerStats, STATS_REFRESH_INTERVAL_MS);
         Telemetry.poll('server-reachability-' + SERVER_ID, updateReachability, STATS_REFRESH_INTERVAL_MS);
-    } else {
-        if (statsTimer) clearInterval(statsTimer);
-        statsTimer = setInterval(loadServerStats, STATS_REFRESH_INTERVAL_MS);
     }
 }
 
@@ -553,21 +543,12 @@ function stopServerTelemetryPolling() {
         Telemetry.stop('server-stats-' + SERVER_ID);
         Telemetry.stop('server-reachability-' + SERVER_ID);
     }
-    if (statsTimer) {
-        clearInterval(statsTimer);
-        statsTimer = null;
-    }
+    telemetryInitialized = false;
 }
 
-function initServerTelemetry(serverId) {
-    if (serverId !== undefined && serverId !== null) {
-        window.SERVER_ID = serverId;
-    }
+function initServerTelemetry() {
+    if (telemetryInitialized) return;
+    telemetryInitialized = true;
     checkServer();
     startServerTelemetryPolling();
-}
-
-// Auto-run if SERVER_ID is already defined in global scope
-if (typeof SERVER_ID !== 'undefined') {
-    initServerTelemetry();
 }
