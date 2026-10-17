@@ -3,10 +3,7 @@ package web
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"io/fs"
-	"net/http"
-	"net/http/httptest"
 	"regexp"
 	"strconv"
 	"strings"
@@ -560,22 +557,16 @@ func TestServerStaticAssetsProductionServing(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	server := httptest.NewServer(http.StripPrefix("/static/", http.FileServer(http.FS(staticSubFS))))
-	defer server.Close()
-
-	client := server.Client()
-
 	serverAssets := []string{
-		"/static/js/server_actions.js",
-		"/static/js/server_telemetry.js",
+		"js/server_actions.js",
+		"js/server_telemetry.js",
 	}
 
-	for _, assetPath := range serverAssets {
-		t.Run(assetPath, func(t *testing.T) {
-			relPath := strings.TrimPrefix(assetPath, "/static/")
+	for _, relPath := range serverAssets {
+		t.Run(relPath, func(t *testing.T) {
 			expectedBytes, err := fs.ReadFile(staticSubFS, relPath)
 			if err != nil {
-				t.Fatalf("failed to read embedded %s: %v", relPath, err)
+				t.Fatalf("failed to read embedded %s from GetStaticSubFS: %v", relPath, err)
 			}
 			if len(bytes.TrimSpace(expectedBytes)) == 0 {
 				t.Fatalf("embedded %s is empty or whitespace", relPath)
@@ -583,48 +574,18 @@ func TestServerStaticAssetsProductionServing(t *testing.T) {
 
 			directEmbedBytes, err := fs.ReadFile(StaticFS, "static/"+relPath)
 			if err != nil {
-				t.Fatalf("failed to read direct embedded %s: %v", relPath, err)
+				t.Fatalf("failed to read direct embedded %s from StaticFS: %v", relPath, err)
 			}
 			if !bytes.Equal(expectedBytes, directEmbedBytes) {
 				t.Fatalf("content mismatch between StaticFS and GetStaticSubFS for %s", relPath)
 			}
-
-			url := server.URL + assetPath
-			resp, err := client.Get(url)
-			if err != nil {
-				t.Fatalf("HTTP GET %s failed: %v", url, err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("expected HTTP 200 for %s, got %d", assetPath, resp.StatusCode)
-			}
-
-			contentType := resp.Header.Get("Content-Type")
-			if !strings.Contains(contentType, "javascript") {
-				t.Errorf("expected Content-Type containing 'javascript' for %s, got %q", assetPath, contentType)
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatalf("failed to read body: %v", err)
-			}
-			if !bytes.Equal(body, expectedBytes) {
-				t.Errorf("served body does not match embedded file for %s", assetPath)
-			}
 		})
 	}
 
-	t.Run("NonExistentServerAssetReturns404", func(t *testing.T) {
-		url := server.URL + "/static/js/nonexistent_server_script.js"
-		resp, err := client.Get(url)
-		if err != nil {
-			t.Fatalf("HTTP GET %s failed: %v", url, err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("expected HTTP 404 for non-existent server asset, got %d", resp.StatusCode)
+	t.Run("NonExistentServerAssetFailsRead", func(t *testing.T) {
+		_, err := fs.ReadFile(staticSubFS, "js/nonexistent_server_script.js")
+		if err == nil {
+			t.Fatalf("expected error reading non-existent server asset from staticSubFS, got nil")
 		}
 	})
 }

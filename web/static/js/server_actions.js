@@ -501,9 +501,19 @@ function downloadServerConfig() {
     UI.downloadFile(val, serverConfigFilename);
 }
 
+function reloadServerPage() {
+    if (typeof UI !== 'undefined' && typeof UI.reload === 'function') {
+        UI.reload();
+    } else if (typeof window.reloadPage === 'function') {
+        window.reloadPage();
+    } else {
+        window.location.reload();
+    }
+}
+
 function finishProtocolInstall() {
     closeModal('installModal');
-    window.location.reload();
+    reloadServerPage();
 }
 
 // ========== Server Management Modals ==========

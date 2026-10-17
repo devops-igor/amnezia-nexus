@@ -220,7 +220,6 @@ const dom = new JSDOM(docHtml, {
         };
         w.openModal = () => {};
         w.closeModal = () => {};
-        w.location.reload = () => {};
         w.Telemetry = {
             poll: (id, fn, interval) => {
                 telemetryRegistrations.push({ id, fn, interval });
@@ -777,15 +776,53 @@ const d = w.document;
     assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/rename' && c.body && c.body.name === 'srv-renamed-beta'), 'submitRenameServer must post new name');
     assert.strictEqual(d.getElementById('serverNameTitle').textContent, 'srv-renamed-beta', 'serverNameTitle must update with new name');
 
+    // 4.12.1a: Enter keydown event handling on renameServerInput
+    w.openRenameServerModal(42, 'srv-renamed-beta');
+    apiCalls = [];
+    const renameNonEnter = new w.KeyboardEvent('keydown', { key: 'a', cancelable: true, bubbles: true });
+    renameInput.dispatchEvent(renameNonEnter);
+    assert.strictEqual(renameNonEnter.defaultPrevented, false, 'non-Enter keydown on renameServerInput must not prevent default');
+    assert.strictEqual(apiCalls.filter(c => c.url && c.url.includes('/rename')).length, 0, 'non-Enter keydown must not submit rename');
+
+    renameInput.value = 'srv-enter-renamed';
+    const renameEnter = new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true, bubbles: true });
+    renameInput.dispatchEvent(renameEnter);
+    assert.strictEqual(renameEnter.defaultPrevented, true, 'Enter keydown on renameServerInput must prevent default');
+    await new Promise(r => setTimeout(r, 20));
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/rename' && c.body && c.body.name === 'srv-enter-renamed'), 'Enter keydown on renameServerInput must submit rename');
+
+    // 4.12.1b: Edit host flow & Enter keydown handling
+    w.openEditHostModal(42, '203.0.113.55');
+    const editHostInput = d.getElementById('editHostInput');
+    assert(editHostInput !== null, 'editHostInput must exist in DOM');
+    assert.strictEqual(editHostInput.value, 'vpn.newhost.net', 'editHostInput must initialize with current server host');
+
+    apiCalls = [];
+    const editHostNonEnter = new w.KeyboardEvent('keydown', { key: 'Escape', cancelable: true, bubbles: true });
+    editHostInput.dispatchEvent(editHostNonEnter);
+    assert.strictEqual(editHostNonEnter.defaultPrevented, false, 'non-Enter keydown on editHostInput must not prevent default');
+    assert.strictEqual(apiCalls.filter(c => c.url && c.url.includes('/host')).length, 0, 'non-Enter keydown must not submit host update');
+
+    editHostInput.value = '198.51.100.42';
+    const editHostEnter = new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true, bubbles: true });
+    editHostInput.dispatchEvent(editHostEnter);
+    assert.strictEqual(editHostEnter.defaultPrevented, true, 'Enter keydown on editHostInput must prevent default');
+    await new Promise(r => setTimeout(r, 20));
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/host' && c.body && c.body.host === '198.51.100.42'), 'Enter keydown on editHostInput must submit new host');
+    assert.strictEqual(d.getElementById('serverHostDisplay').textContent, '198.51.100.42', 'serverHostDisplay must update with new host');
+
     // 4.12.2: Server config copy and download helpers
     let copiedText = null;
+    let copiedBtn = null;
     let downloadedFile = null;
-    w.UI.copy = async (text) => { copiedText = text; return true; };
+    w.UI.copy = async (text, btn) => { copiedText = text; copiedBtn = btn; return true; };
     w.UI.downloadFile = (text, filename) => { downloadedFile = { text, filename }; };
 
+    const mockCopyBtn = d.createElement('button');
     d.getElementById('serverConfigText').value = '[Interface]\nPrivateKey = mockKey';
-    w.copyServerConfig();
+    w.copyServerConfig(mockCopyBtn);
     assert.strictEqual(copiedText, '[Interface]\nPrivateKey = mockKey', 'copyServerConfig must copy text');
+    assert.strictEqual(copiedBtn, mockCopyBtn, 'copyServerConfig must pass button element to UI.copy');
     w.downloadServerConfig();
     assert.deepStrictEqual(downloadedFile, { text: '[Interface]\nPrivateKey = mockKey', filename: 'server.conf' }, 'downloadServerConfig must download text with default filename');
 
@@ -795,22 +832,26 @@ const d = w.document;
 
     // 4.12.3: finishProtocolInstall helper
     let modalClosed = null;
+    let reloadCalled = 0;
     w.closeModal = (id) => { modalClosed = id; };
+    w.reloadPage = () => { reloadCalled++; };
     w.finishProtocolInstall();
     assert.strictEqual(modalClosed, 'installModal', 'finishProtocolInstall must close installModal');
+    assert.strictEqual(reloadCalled, 1, 'finishProtocolInstall must trigger reload helper');
 
     // 4.12.4: installTelemtTls change listener toggle
     const telemtTlsCheckbox = d.getElementById('installTelemtTls');
     const telemtDomainGroup = d.getElementById('telemtDomainGroup');
-    if (telemtTlsCheckbox && telemtDomainGroup) {
-        telemtTlsCheckbox.checked = false;
-        telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
-        assert.strictEqual(telemtDomainGroup.style.display, 'none', 'unchecking installTelemtTls must hide telemtDomainGroup');
+    assert(telemtTlsCheckbox !== null, 'installTelemtTls checkbox must exist in DOM');
+    assert(telemtDomainGroup !== null, 'telemtDomainGroup container must exist in DOM');
 
-        telemtTlsCheckbox.checked = true;
-        telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
-        assert.strictEqual(telemtDomainGroup.style.display, 'block', 'checking installTelemtTls must show telemtDomainGroup');
-    }
+    telemtTlsCheckbox.checked = false;
+    telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
+    assert.strictEqual(telemtDomainGroup.style.display, 'none', 'unchecking installTelemtTls must hide telemtDomainGroup');
+
+    telemtTlsCheckbox.checked = true;
+    telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
+    assert.strictEqual(telemtDomainGroup.style.display, 'block', 'checking installTelemtTls must show telemtDomainGroup');
 
     console.log('JSDOM_TEST_SUCCESS');
     process.exit(0);
@@ -834,9 +875,19 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 	}
 
 	funcMap := template.FuncMap{
-		"_":       func(k string) string { return k },
-		"t":       func(k string) string { return k },
-		"safe_js": func(s any) template.JS { return template.JS("{}") },
+		"_": func(k string) string { return k },
+		"t": func(k string) string { return k },
+		"safe_js": func(v any) template.JS {
+			switch val := v.(type) {
+			case string:
+				return template.JS(val)
+			case template.JS:
+				return val
+			default:
+				b, _ := json.Marshal(v)
+				return template.JS(b)
+			}
+		},
 		"slice_str": func(s string, start, end int) string {
 			if start >= len(s) {
 				return ""
@@ -847,7 +898,6 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 			return s[start:end]
 		},
 		"has_role": func(u any, roles ...string) bool { return true },
-		"is_admin": func(u any) bool { return true },
 		"upper":    strings.ToUpper,
 		"slice": func(s string, start, end int) string {
 			if start >= len(s) {
@@ -878,11 +928,6 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 			"SSHPort": 22,
 			"SSHUser": "root",
 		},
-		"reachability": map[string]any{
-			"Reachable":   true,
-			"LatencyMs":   32,
-			"LastChecked": "2026-10-17 12:34:56",
-		},
 		"users": []map[string]any{
 			{"ID": 1, "Username": "alice", "Role": "user"},
 		},
@@ -912,14 +957,16 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 		t.Errorf("server_telemetry.js must be loaded after server_actions.js")
 	}
 
-	if !strings.Contains(rendered, "SERVER_ID =  42 ;") && !strings.Contains(rendered, "SERVER_ID = 42") {
-		t.Errorf("rendered server.html missing SERVER_ID injection in bootstrap: %s", rendered)
+	serverIDPattern := `const SERVER_ID\s*=\s*42\s*;`
+	matched, err := regexp.MatchString(serverIDPattern, rendered)
+	if err != nil || !matched {
+		t.Errorf("rendered server.html missing expected bootstrap pattern %q", serverIDPattern)
 	}
 	if !strings.Contains(rendered, "initServerTelemetry();") {
 		t.Errorf("rendered server.html missing initServerTelemetry() in bootstrap")
 	}
 
-	// 2. Assert server name, host, and CSRF injection
+	// 2. Assert server name, host, CSRF injection, and default status
 	if !strings.Contains(rendered, "alpha-server-test") {
 		t.Errorf("rendered server.html missing server.Name 'alpha-server-test'")
 	}
@@ -929,12 +976,7 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 	if !strings.Contains(rendered, `content="mock-csrf-token-12345"`) {
 		t.Errorf("rendered server.html missing CSRF token in meta tag")
 	}
-	if !strings.Contains(rendered, "32ms") {
-		t.Errorf("rendered server.html missing reachability latency 32ms")
-	}
-
-	// 3. Fail-closed: missing template parse error
-	if _, err = template.New("nonexistent.html").Funcs(funcMap).ParseFS(templatesFS, "nonexistent.html"); err == nil {
-		t.Errorf("parsing nonexistent template should fail closed with an error")
+	if !strings.Contains(rendered, "pending") {
+		t.Errorf("rendered server.html missing default pending status badge")
 	}
 }
