@@ -78,7 +78,7 @@ async function vpnLoadData() {
                     </div>
                     <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${UI.escapeHtml(_('vpn_no_backends'))}</div>
                     <div class="empty-desc" style="font-size: 0.875rem; color: var(--text-muted); max-width: 420px; margin: 0 auto var(--space-md);">${UI.escapeHtml(_('vpn_no_backends_desc'))}</div>
-                    <button type="button" class="btn btn-primary btn-sm" onclick="vpnOpenAddBackendModal()">
+                    <button type="button" class="btn btn-primary btn-sm" data-action="vpn-open-add-backend">
                         <svg class="icon"><use href="#icon-plus"></use></svg>
                         <span>${UI.escapeHtml(_('vpn_add_backend'))}</span>
                     </button>
@@ -135,6 +135,50 @@ function vpnStopPolling() {
     }
 }
 
+const VPN_ACTIONS = {
+    'vpn-open-edit-endpoint': function () {
+        if (typeof vpnOpenEditEndpointModal === 'function') vpnOpenEditEndpointModal();
+    },
+    'vpn-open-add-backend': function () {
+        if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
+    },
+    'vpn-toggle-problems-filter': function () {
+        if (typeof vpnToggleSessionsProblemFilter === 'function') vpnToggleSessionsProblemFilter();
+    },
+    'vpn-toggle-show-all-routes': function () {
+        if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
+    },
+    'vpn-set-history-window': function (btn) {
+        const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
+        if (typeof vpnSetHistoryWindow === 'function') vpnSetHistoryWindow(win);
+    },
+    'vpn-close-modal': function (btn) {
+        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
+        if (typeof closeModal === 'function') {
+            closeModal(modalId);
+        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
+            UI.modal.close(modalId);
+        }
+    },
+    'vpn-trigger-quick-check': function () {
+        if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
+    },
+    'vpn-toggle-backend': function (btn) {
+        const srvId = btn.dataset ? btn.dataset.serverId : (btn.getAttribute ? btn.getAttribute('data-server-id') : null);
+        const action = btn.dataset ? btn.dataset.backendAction : (btn.getAttribute ? btn.getAttribute('data-backend-action') : null);
+        if (typeof vpnToggleBackend === 'function') vpnToggleBackend(srvId, action);
+    },
+    'vpn-delete-backend': function (btn) {
+        const srvId = btn.dataset ? btn.dataset.serverId : (btn.getAttribute ? btn.getAttribute('data-server-id') : null);
+        if (typeof vpnDeleteBackend === 'function') vpnDeleteBackend(srvId);
+    },
+    'vpn-toggle-session': function (btn) {
+        const sessId = btn.dataset ? btn.dataset.sessionId : (btn.getAttribute ? btn.getAttribute('data-session-id') : null);
+        const tr = btn.closest ? btn.closest('tr') : null;
+        if (typeof vpnToggleSessionDrilldown === 'function') vpnToggleSessionDrilldown(sessId, tr);
+    }
+};
+
 let vpnListenersInitialized = false;
 
 function initVpnEventListeners() {
@@ -176,43 +220,13 @@ function initVpnEventListeners() {
                 if (!btn) return;
 
                 const action = btn.dataset ? btn.dataset.action : (btn.getAttribute ? btn.getAttribute('data-action') : null);
-                if (!action) return;
+                if (!action || !Object.prototype.hasOwnProperty.call(VPN_ACTIONS, action)) return;
 
-                if (btn.tagName === 'BUTTON' || btn.tagName === 'A' || (btn.getAttribute && btn.getAttribute('type') === 'button')) {
-                    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                if (e && typeof e.preventDefault === 'function') {
+                    e.preventDefault();
                 }
 
-                switch (action) {
-                    case 'vpn-open-edit-endpoint':
-                        if (typeof vpnOpenEditEndpointModal === 'function') vpnOpenEditEndpointModal();
-                        break;
-                    case 'vpn-open-add-backend':
-                        if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
-                        break;
-                    case 'vpn-toggle-problems-filter':
-                        if (typeof vpnToggleSessionsProblemFilter === 'function') vpnToggleSessionsProblemFilter();
-                        break;
-                    case 'vpn-toggle-show-all-routes':
-                        if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
-                        break;
-                    case 'vpn-set-history-window': {
-                        const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
-                        if (typeof vpnSetHistoryWindow === 'function') vpnSetHistoryWindow(win);
-                        break;
-                    }
-                    case 'vpn-close-modal': {
-                        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
-                        if (typeof closeModal === 'function') {
-                            closeModal(modalId);
-                        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
-                            UI.modal.close(modalId);
-                        }
-                        break;
-                    }
-                    case 'vpn-trigger-quick-check':
-                        if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
-                        break;
-                }
+                VPN_ACTIONS[action](btn);
             });
         }
     }

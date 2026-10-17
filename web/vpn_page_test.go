@@ -367,7 +367,8 @@ func TestVPNPageLoadDataEmptyBackendsAndErrorFallback(t *testing.T) {
     await w.vpnLoadData();
     const tbody = w.document.getElementById('vpn-backends-tbody');
     assert.ok(tbody.innerHTML.includes('empty-state'), 'empty-state container rendered');
-    assert.ok(tbody.innerHTML.includes('vpnOpenAddBackendModal()'), 'add backend modal trigger button present');
+    assert.ok(tbody.innerHTML.includes('data-action="vpn-open-add-backend"'), 'add backend modal trigger button present');
+    assert.strictEqual(tbody.innerHTML.includes('onclick='), false, 'empty-state CTA must not use inline onclick');
 
     // 2. API rejection enters error fallback without throwing
     w.API = {
@@ -589,6 +590,14 @@ func TestVPNPageDelegatedEventListeners(t *testing.T) {
     addIcon.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
     assert.strictEqual(addBackendModalOpened, 1, 'vpnOpenAddBackendModal called on child icon click');
 
+    // 1b. Empty-state CTA button click triggers vpnOpenAddBackendModal
+    const emptyCtaContainer = w.document.createElement('div');
+    emptyCtaContainer.innerHTML = '<button type="button" class="btn btn-primary btn-sm" data-action="vpn-open-add-backend"><span>Add</span></button>';
+    w.document.body.appendChild(emptyCtaContainer);
+    const emptyCtaBtn = emptyCtaContainer.querySelector('button[data-action="vpn-open-add-backend"]');
+    emptyCtaBtn.click();
+    assert.strictEqual(addBackendModalOpened, 2, 'vpnOpenAddBackendModal called on empty-state CTA click');
+
     // 2. Filter & display toggle buttons
     const toggleProblemsBtn = w.document.getElementById('vpn-sessions-toggle-problems-btn');
     assert.ok(toggleProblemsBtn, '#vpn-sessions-toggle-problems-btn must exist');
@@ -597,8 +606,10 @@ func TestVPNPageDelegatedEventListeners(t *testing.T) {
 
     const toggleRoutesBtn = w.document.getElementById('vpn-routes-toggle-all-btn');
     assert.ok(toggleRoutesBtn, '#vpn-routes-toggle-all-btn must exist');
-    toggleRoutesBtn.click();
+    const routesEvt = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+    toggleRoutesBtn.dispatchEvent(routesEvt);
     assert.strictEqual(showAllRoutesToggled, 1, 'vpnToggleShowAllRoutes called on click');
+    assert.strictEqual(routesEvt.defaultPrevented, true, 'show-all-routes click default prevented');
 
     // 3. History window chips (6 buttons)
     const togglesContainer = w.document.getElementById('vpn-history-window-toggles');
@@ -655,6 +666,45 @@ func TestVPNPageDelegatedEventListeners(t *testing.T) {
     assert.ok(serverSelect, '#vpnServerSelect must exist');
     serverSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
     assert.strictEqual(serverSelectedCalls, 1, 'vpnOnServerSelected called on change');
+
+    // 8. Dynamically generated row controls delegation
+    let backendToggled = null;
+    let backendDeleted = null;
+    let sessionToggled = null;
+    w.vpnToggleBackend = (srvId, action) => { backendToggled = { srvId, action }; };
+    w.vpnDeleteBackend = (srvId) => { backendDeleted = srvId; };
+    w.vpnToggleSessionDrilldown = (sessId) => { sessionToggled = sessId; };
+
+    const dynamicRowContainer = w.document.createElement('div');
+    dynamicRowContainer.innerHTML = '<button type="button" data-action="vpn-toggle-backend" data-server-id="101" data-backend-action="enable">Enable</button>' +
+        '<button type="button" data-action="vpn-delete-backend" data-server-id="102">Delete</button>' +
+        '<table><tbody><tr data-session-id="sess-99"><td data-action="vpn-toggle-session" data-session-id="sess-99">User</td></tr></tbody></table>';
+    w.document.body.appendChild(dynamicRowContainer);
+
+    const toggleBackendBtn = dynamicRowContainer.querySelector('[data-action="vpn-toggle-backend"]');
+    toggleBackendBtn.click();
+    assert.deepStrictEqual(backendToggled, { srvId: '101', action: 'enable' }, 'vpnToggleBackend dispatched from row toggle button');
+
+    const deleteBackendBtn = dynamicRowContainer.querySelector('[data-action="vpn-delete-backend"]');
+    deleteBackendBtn.click();
+    assert.strictEqual(backendDeleted, '102', 'vpnDeleteBackend dispatched from row delete button');
+
+    const toggleSessionTd = dynamicRowContainer.querySelector('[data-action="vpn-toggle-session"]');
+    toggleSessionTd.click();
+    assert.strictEqual(sessionToggled, 'sess-99', 'vpnToggleSessionDrilldown dispatched from session row');
+
+    // 9. Foreign data-action does NOT prevent default
+    const foreignLink = w.document.createElement('a');
+    foreignLink.href = '#other';
+    foreignLink.setAttribute('data-action', 'foreign-feature-action');
+    w.document.body.appendChild(foreignLink);
+    const foreignEvt = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+    foreignLink.dispatchEvent(foreignEvt);
+    assert.strictEqual(foreignEvt.defaultPrevented, false, 'unrecognized data-action must not prevent default');
+
+    // 10. Verify no inline event attributes anywhere in document
+    const inlineHandlerEls = w.document.querySelectorAll('[onclick],[onchange],[onsubmit]');
+    assert.strictEqual(inlineHandlerEls.length, 0, 'no inline on* attributes allowed in DOM');
 
     console.log('PASS_DELEGATED_EVENT_LISTENERS');
 })();

@@ -627,6 +627,7 @@ const sessionsCode = %q;
 const healthProblemsCode = %q;
 const healthSummaryCode = %q;
 const backendsCode = %q;
+const pageCode = %q;
 
 const dom = new JSDOM(source, { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
@@ -639,6 +640,7 @@ w.eval('const translations = ' + JSON.stringify(en) + ';' +
 'function escapeHtml(s) { const el = document.createElement("div"); el.textContent = String(s == null ? "" : s); return el.innerHTML; };' +
 'const UI = { escapeHtml };' +
 'var vpnLastStatus = null;\n');
+w.eval(pageCode);
 
 w.eval(tablesCode);
 
@@ -730,7 +732,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS)
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS, fixture.PageJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

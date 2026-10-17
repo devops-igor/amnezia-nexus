@@ -126,6 +126,7 @@ function vpnRenderSessionRow(s, route) {
     if (sessId !== null && sessId !== undefined && sessId !== '') {
         tr.setAttribute('data-session-id', sessId);
     }
+    tr._sessionData = s;
     if (sessId && vpnExpandedSessionIds && vpnExpandedSessionIds.has(sessId)) {
         if (tr.classList) tr.classList.add('row-expanded');
         else tr.className = ((tr.className || '') + ' row-expanded').trim();
@@ -135,6 +136,10 @@ function vpnRenderSessionRow(s, route) {
     const tdUser = document.createElement('td');
     tdUser.className = 'font-weight-600';
     tdUser.style.cursor = 'pointer';
+    tdUser.setAttribute('data-action', 'vpn-toggle-session');
+    if (sessId !== null && sessId !== undefined && sessId !== '') {
+        tdUser.setAttribute('data-session-id', sessId);
+    }
     const safeUsername = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.username) || '-') : ((s && s.username) || '-');
     const safeConfig = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.connection_name) || '-') : ((s && s.connection_name) || '-');
     const safeIP = (typeof UI !== 'undefined' && UI.escapeHtml) ? UI.escapeHtml((s && s.assigned_ip) || '-') : ((s && s.assigned_ip) || '-');
@@ -147,10 +152,6 @@ function vpnRenderSessionRow(s, route) {
             </div>
         </div>
     `;
-    tdUser.onclick = function(e) {
-        if (e && e.stopPropagation) e.stopPropagation();
-        vpnToggleSessionDrilldown(s, tr);
-    };
     tr.appendChild(tdUser);
 
     // 2. Server cell
@@ -344,7 +345,28 @@ function vpnCreateSessionDrilldownRow(s, route) {
 }
 
 function vpnToggleSessionDrilldown(s, tr) {
-    const sessId = s ? (s.session_id || s.id) : null;
+    let sessId = null;
+    if (s && typeof s === 'object') {
+        sessId = s.session_id || s.id || null;
+    } else if (s !== null && s !== undefined && s !== '') {
+        sessId = String(s);
+    }
+
+    if (!tr && sessId && typeof document !== 'undefined') {
+        tr = document.querySelector(`tr[data-session-id="${sessId}"]`);
+    }
+    if (!tr) return;
+
+    if (!s || typeof s !== 'object') {
+        if (tr._sessionData) {
+            s = tr._sessionData;
+        } else if (vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
+            s = vpnLastSessions.sessions.find(x => String(x.session_id || x.id) === sessId) || { id: sessId, session_id: sessId };
+        } else {
+            s = { id: sessId, session_id: sessId };
+        }
+    }
+
     const isExpanded = sessId ? vpnExpandedSessionIds.has(sessId) : (tr.classList && tr.classList.contains('row-expanded'));
 
     if (isExpanded) {
