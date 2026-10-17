@@ -78,7 +78,7 @@ async function vpnLoadData() {
                     </div>
                     <div class="empty-title" style="font-size: 1.1rem; font-weight: 600; margin-bottom: var(--space-xs); color: var(--text-primary);">${UI.escapeHtml(_('vpn_no_backends'))}</div>
                     <div class="empty-desc" style="font-size: 0.875rem; color: var(--text-muted); max-width: 420px; margin: 0 auto var(--space-md);">${UI.escapeHtml(_('vpn_no_backends_desc'))}</div>
-                    <button type="button" class="btn btn-primary btn-sm" onclick="vpnOpenAddBackendModal()">
+                    <button type="button" class="btn btn-primary btn-sm" data-action="vpn-open-add-backend">
                         <svg class="icon"><use href="#icon-plus"></use></svg>
                         <span>${UI.escapeHtml(_('vpn_add_backend'))}</span>
                     </button>
@@ -135,7 +135,113 @@ function vpnStopPolling() {
     }
 }
 
+const VPN_ACTIONS = {
+    'vpn-open-edit-endpoint': function () {
+        if (typeof vpnOpenEditEndpointModal === 'function') vpnOpenEditEndpointModal();
+    },
+    'vpn-open-add-backend': function () {
+        if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
+    },
+    'vpn-toggle-problems-filter': function () {
+        if (typeof vpnToggleSessionsProblemFilter === 'function') vpnToggleSessionsProblemFilter();
+    },
+    'vpn-toggle-show-all-routes': function () {
+        if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
+    },
+    'vpn-set-history-window': function (btn) {
+        const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
+        if (typeof vpnSetHistoryWindow === 'function') vpnSetHistoryWindow(win);
+    },
+    'vpn-close-modal': function (btn) {
+        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
+        if (typeof closeModal === 'function') {
+            closeModal(modalId);
+        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
+            UI.modal.close(modalId);
+        }
+    },
+    'vpn-trigger-quick-check': function () {
+        if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
+    },
+    'vpn-toggle-backend': function (btn) {
+        const srvId = btn.dataset ? btn.dataset.serverId : (btn.getAttribute ? btn.getAttribute('data-server-id') : null);
+        const action = btn.dataset ? btn.dataset.backendAction : (btn.getAttribute ? btn.getAttribute('data-backend-action') : null);
+        if (typeof vpnToggleBackend === 'function') vpnToggleBackend(srvId, action);
+    },
+    'vpn-delete-backend': function (btn) {
+        const srvId = btn.dataset ? btn.dataset.serverId : (btn.getAttribute ? btn.getAttribute('data-server-id') : null);
+        if (typeof vpnDeleteBackend === 'function') vpnDeleteBackend(srvId);
+    },
+    'vpn-toggle-session': function (btn) {
+        const sessId = btn.dataset ? btn.dataset.sessionId : (btn.getAttribute ? btn.getAttribute('data-session-id') : null);
+        const tr = btn.closest ? btn.closest('tr') : null;
+        if (typeof vpnToggleSessionDrilldown === 'function') vpnToggleSessionDrilldown(sessId, tr);
+    }
+};
+
+function getVpnContainerRoots() {
+    if (typeof document === 'undefined') return [];
+    const vpnRoot = (typeof document.querySelector === 'function' && (document.querySelector('#vpn-app') || document.querySelector('main'))) || document.body;
+    if (!vpnRoot) return [];
+    const roots = [vpnRoot];
+    ['addBackendModal', 'editEndpointModal'].forEach(function (id) {
+        const modal = typeof document.getElementById === 'function' ? document.getElementById(id) : null;
+        if (modal && !roots.some(function (r) { return r === modal || (r.contains && r.contains(modal)); })) {
+            roots.push(modal);
+        }
+    });
+    return roots;
+}
+
+function initVpnEventListeners() {
+    if (typeof document === 'undefined') return;
+
+    const roots = getVpnContainerRoots();
+    roots.forEach(function (root) {
+        if (!root || root._vpnListenersBound || typeof root.addEventListener !== 'function') return;
+        root._vpnListenersBound = true;
+
+        root.addEventListener('click', function (e) {
+            const btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+            if (!btn) return;
+
+            const action = btn.dataset ? btn.dataset.action : (btn.getAttribute ? btn.getAttribute('data-action') : null);
+            if (!action || !Object.prototype.hasOwnProperty.call(VPN_ACTIONS, action)) return;
+
+            if (e && typeof e.preventDefault === 'function') {
+                e.preventDefault();
+            }
+
+            VPN_ACTIONS[action](btn);
+        });
+
+        root.addEventListener('submit', function (e) {
+            if (!e.target) return;
+            const targetId = e.target.id || (e.target.closest ? (e.target.closest('form') || {}).id : null);
+            if (targetId === 'addBackendForm') {
+                if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                if (typeof vpnSubmitAddBackend === 'function') vpnSubmitAddBackend();
+            } else if (targetId === 'editEndpointForm') {
+                if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                if (typeof vpnSubmitEditEndpoint === 'function') vpnSubmitEditEndpoint();
+            }
+        });
+
+        root.addEventListener('change', function (e) {
+            if (e && e.target && e.target.id === 'vpnServerSelect') {
+                if (typeof vpnOnServerSelected === 'function') vpnOnServerSelected();
+            }
+        });
+    });
+}
+
+if (typeof document !== 'undefined') {
+    initVpnEventListeners();
+}
+
 document.addEventListener('DOMContentLoaded', function () {
+    initVpnEventListeners();
+
     // Also precache server metadata for quick name matching
     if (typeof API !== 'undefined' && typeof API.get === 'function') {
         API.get('/api/servers').then(servers => {
@@ -155,4 +261,5 @@ if (typeof window !== 'undefined') {
     window.vpnLoadData = vpnLoadData;
     window.vpnToggleShowAllRoutes = vpnToggleShowAllRoutes;
     window.vpnStopPolling = vpnStopPolling;
+    window.initVpnEventListeners = initVpnEventListeners;
 }

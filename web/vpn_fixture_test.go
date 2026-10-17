@@ -549,6 +549,8 @@ func vpnDOMMock(t *testing.T, source string) string {
 	return "const templateIDs = " + string(encoded) + ";\n" + `const assert = require('assert');
 class Element {
  constructor() { this.children=[];this._text='';this._html='';this.style={};this.className='';this.title='';this.open=false;this.attributes={};this.parentNode=null; }
+ addEventListener(event, fn) {}
+ removeEventListener(event, fn) {}
  set textContent(s) { this._text=String(s);this._html='';this.children=[]; }
  get textContent() {
    if (this._text) return this._text;

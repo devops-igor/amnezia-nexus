@@ -43,7 +43,7 @@
     <div class="card stat-card">
         <div class="stat-card-header">
             <span class="stat-card-title">{{ _ "vpn_public_endpoint" }}</span>
-            <button type="button" class="btn btn-ghost btn-sm btn-icon" id="vpn-edit-endpoint-btn" onclick="vpnOpenEditEndpointModal()" title="{{ _ "vpn_edit_endpoint" }}" aria-label="{{ _ "vpn_edit_endpoint" }}">
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" id="vpn-edit-endpoint-btn" data-action="vpn-open-edit-endpoint" title="{{ _ "vpn_edit_endpoint" }}" aria-label="{{ _ "vpn_edit_endpoint" }}">
                 <svg class="icon"><use href="#icon-pencil"></use></svg>
             </button>
         </div>
@@ -91,7 +91,7 @@
             <svg class="icon text-muted" style="width: 20px; height: 20px;"><use href="#icon-server"></use></svg>
             <h3 class="card-title" style="margin-bottom: 0;">{{ _ "vpn_backends" }}</h3>
         </div>
-        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" onclick="vpnOpenAddBackendModal()">
+        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" data-action="vpn-open-add-backend">
             <svg class="icon"><use href="#icon-plus"></use></svg>
             <span>{{ _ "vpn_add_backend" }}</span>
         </button>
@@ -130,7 +130,7 @@
             <span id="vpn-sessions-count-badge" class="badge badge-secondary" style="font-size: 0.75rem;">0</span>
         </div>
         <div class="flex items-center gap-sm">
-            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" onclick="vpnToggleSessionsProblemFilter()" style="font-size: 0.8rem; display: inline-flex; align-items: center; gap: var(--space-xs);">
+            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" data-action="vpn-toggle-problems-filter" style="font-size: 0.8rem; display: inline-flex; align-items: center; gap: var(--space-xs);">
                 <svg class="icon" style="width: 14px; height: 14px;"><use href="#icon-alert-triangle"></use></svg>
                 <span id="vpn-sessions-toggle-problems-text">{{ _ "vpn_show_problems_only" }}</span>
             </button>
@@ -301,12 +301,12 @@
         <div class="flex items-center justify-between" style="margin-bottom: var(--space-xs); flex-wrap: wrap; gap: var(--space-xs);">
             <div style="font-weight: 600; font-size: 0.85rem;">{{ _ "vpn_fwd_panel_history" }}</div>
             <div class="btn-group" id="vpn-history-window-toggles">
-                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('1m')">1m</button>
-                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('5m')">5m</button>
-                <button type="button" class="btn btn-sm btn-primary active" onclick="vpnSetHistoryWindow('15m')">15m</button>
-                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('1h')">1h</button>
-                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('6h')">6h</button>
-                <button type="button" class="btn btn-sm btn-secondary" onclick="vpnSetHistoryWindow('24h')">24h</button>
+                <button type="button" class="btn btn-sm btn-secondary" data-action="vpn-set-history-window" data-window="1m">1m</button>
+                <button type="button" class="btn btn-sm btn-secondary" data-action="vpn-set-history-window" data-window="5m">5m</button>
+                <button type="button" class="btn btn-sm btn-primary active" data-action="vpn-set-history-window" data-window="15m">15m</button>
+                <button type="button" class="btn btn-sm btn-secondary" data-action="vpn-set-history-window" data-window="1h">1h</button>
+                <button type="button" class="btn btn-sm btn-secondary" data-action="vpn-set-history-window" data-window="6h">6h</button>
+                <button type="button" class="btn btn-sm btn-secondary" data-action="vpn-set-history-window" data-window="24h">24h</button>
             </div>
         </div>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-sm);">
@@ -363,7 +363,7 @@
                 <span id="vpn-fwd-routes-badge" class="badge badge-secondary" style="font-size: 0.75rem; margin-left: var(--space-xs);">0</span>
             </div>
             <div class="flex items-center gap-sm">
-                <button type="button" class="btn btn-sm btn-ghost" id="vpn-routes-toggle-all-btn" onclick="event.preventDefault(); vpnToggleShowAllRoutes();" style="font-size: 0.75rem; padding: 2px 6px;">
+                <button type="button" class="btn btn-sm btn-ghost" id="vpn-routes-toggle-all-btn" data-action="vpn-toggle-show-all-routes" style="font-size: 0.75rem; padding: 2px 6px;">
                     {{ _ "vpn_fwd_show_all" }}
                 </button>
                 <span id="vpn-fwd-routes-summary-status" class="text-muted" style="font-size: 0.8rem; font-weight: normal;">
@@ -402,18 +402,18 @@
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-plus"></use></svg>
                 <h2 class="modal-title">{{ _ "vpn_add_backend" }}</h2>
             </div>
-            <button type="button" class="modal-close" onclick="closeModal('addBackendModal')" aria-label="{{ _ "cancel" }}">
+            <button type="button" class="modal-close" data-action="vpn-close-modal" data-modal="addBackendModal" aria-label="{{ _ "cancel" }}">
                 <svg class="icon"><use href="#icon-x"></use></svg>
             </button>
         </div>
-        <form id="addBackendForm" onsubmit="event.preventDefault(); vpnSubmitAddBackend();">
+        <form id="addBackendForm">
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: var(--space-md);">
                 {{ _ "vpn_add_backend_hint" }}
             </p>
 
             <div class="form-group">
                 <label class="form-label" for="vpnServerSelect">{{ _ "vpn_select_server" }}</label>
-                <select class="form-select" id="vpnServerSelect" required onchange="vpnOnServerSelected()">
+                <select class="form-select" id="vpnServerSelect" required>
                     <option value="">- {{ _ "select" }} -</option>
                 </select>
             </div>
@@ -440,7 +440,7 @@
                 </div>
                 <div id="vpnServerDetailCheckRow" style="display: none; margin-top: var(--space-sm); padding-top: var(--space-sm); border-top: 1px dashed var(--border-color); align-items: center; justify-content: space-between; gap: var(--space-sm);">
                     <span style="color: var(--text-muted); font-size: 0.8rem;" id="vpnServerDetailCheckHint"></span>
-                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" onclick="vpnTriggerQuickCheck()" style="padding: 2px 10px; font-size: 0.8rem; flex-shrink: 0;">
+                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" data-action="vpn-trigger-quick-check" style="padding: 2px 10px; font-size: 0.8rem; flex-shrink: 0;">
                         <svg class="icon" id="vpnQuickCheckIcon" style="width:14px;height:14px;"><use href="#icon-refresh"></use></svg>
                         <span id="vpnQuickCheckBtnText">{{ _ "server_check" }}</span>
                         <div class="spinner hidden" id="vpnQuickCheckSpinner" style="width:12px;height:12px;border-width:2px;"></div>
@@ -455,7 +455,7 @@
             <div id="vpnModalError" class="modal-notice-error" style="display: none;"></div>
 
             <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
-                <button type="button" class="btn btn-secondary" onclick="closeModal('addBackendModal')">{{ _ "cancel" }}</button>
+                <button type="button" class="btn btn-secondary" data-action="vpn-close-modal" data-modal="addBackendModal">{{ _ "cancel" }}</button>
                 <button type="submit" class="btn btn-primary" id="vpnAddBackendSubmitBtn">
                     {{ _ "vpn_enable_backend" }}
                 </button>
@@ -472,11 +472,11 @@
                 <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-pencil"></use></svg>
                 <h2 class="modal-title">{{ _ "vpn_edit_endpoint" }}</h2>
             </div>
-            <button type="button" class="modal-close" onclick="closeModal('editEndpointModal')" aria-label="{{ _ "cancel" }}">
+            <button type="button" class="modal-close" data-action="vpn-close-modal" data-modal="editEndpointModal" aria-label="{{ _ "cancel" }}">
                 <svg class="icon"><use href="#icon-x"></use></svg>
             </button>
         </div>
-        <form id="editEndpointForm" onsubmit="event.preventDefault(); vpnSubmitEditEndpoint();">
+        <form id="editEndpointForm">
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: var(--space-md);">
                 {{ _ "vpn_public_endpoint_hint" }}
             </p>
@@ -489,7 +489,7 @@
             <div id="vpnEndpointModalError" class="modal-notice-error" style="display: none;"></div>
 
             <div class="modal-footer" style="margin-top: var(--space-lg); padding-top: var(--space-md); border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: var(--space-sm);">
-                <button type="button" class="btn btn-secondary" onclick="closeModal('editEndpointModal')">{{ _ "cancel" }}</button>
+                <button type="button" class="btn btn-secondary" data-action="vpn-close-modal" data-modal="editEndpointModal">{{ _ "cancel" }}</button>
                 <button type="submit" class="btn btn-primary" id="vpnEditEndpointSubmitBtn">
                     {{ _ "save" }}
                 </button>
