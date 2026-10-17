@@ -588,18 +588,24 @@ func TestIssue101ShowConfigIconRework(t *testing.T) {
 		t.Errorf("users.js missing showUserConnectionConfig")
 	}
 
-	// 3. server.html: No #icon-key, connections config button uses #icon-file-text
+	// 3. server page: No #icon-key, connections config button uses #icon-file-text
 	serverData, err := fs.ReadFile(templatesFS, "server.html")
 	if err != nil {
 		t.Fatalf("failed to read server.html: %v", err)
 	}
 	serverStr := string(serverData)
 
-	if strings.Contains(serverStr, `href="#icon-key"`) {
-		t.Errorf("server.html must not contain href=\"#icon-key\"")
+	telemetryData, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
 	}
-	if !strings.Contains(serverStr, `href="#icon-file-text"`) {
-		t.Errorf("server.html must contain href=\"#icon-file-text\" for client config button")
+	serverCombinedStr := serverStr + "\n" + string(telemetryData)
+
+	if strings.Contains(serverCombinedStr, `href="#icon-key"`) {
+		t.Errorf("server page must not contain href=\"#icon-key\"")
+	}
+	if !strings.Contains(serverCombinedStr, `href="#icon-file-text"`) {
+		t.Errorf("server page must contain href=\"#icon-file-text\" for client config button")
 	}
 
 	// 4. Assert zero templates contain href="#icon-key"

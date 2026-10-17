@@ -64,7 +64,11 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read js/server_actions.js: %v", err)
 	}
-	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+	serverTelemetryData, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData) + "\n" + string(serverTelemetryData)
 
 	requiredServerTokens := []string{
 		"href=\"#icon-server\"",
@@ -347,7 +351,11 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read js/server_actions.js: %v", err)
 	}
-	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+	serverTelemetryData, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData) + "\n" + string(serverTelemetryData)
 
 	// 1. Verify that server.html contains NO Cyrillic characters (regex [\x{0400}-\x{04FF}])
 	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
@@ -356,6 +364,9 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 	}
 	if matches := cyrillicRe.FindAllString(string(serverActionsData), -1); len(matches) > 0 {
 		t.Errorf("server_actions.js contains hardcoded Cyrillic characters (%d occurrences): %v", len(matches), matches)
+	}
+	if matches := cyrillicRe.FindAllString(string(serverTelemetryData), -1); len(matches) > 0 {
+		t.Errorf("server_telemetry.js contains hardcoded Cyrillic characters (%d occurrences): %v", len(matches), matches)
 	}
 
 	// 2. Verify server page references required translation tokens
@@ -463,52 +474,73 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 	}
 	serverStr := string(serverData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	serverTelemetryData, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
+	}
+	serverTelemetryStr := string(serverTelemetryData)
+
+	// 0. Verify server.html includes server_telemetry.js script tag and minimal bootstrap
+	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js"></script>`
+	if !strings.Contains(serverStr, expectedTelemetryScript) {
+		t.Errorf("server.html missing script tag %q", expectedTelemetryScript)
+	}
+	if !strings.Contains(serverStr, "initServerTelemetry()") {
+		t.Errorf("server.html must bootstrap telemetry with initServerTelemetry()")
+	}
+
 	// 1. Verify STATS_REFRESH_INTERVAL_MS definition
 	const expectedInterval = "const STATS_REFRESH_INTERVAL_MS = 30000;"
-	if !strings.Contains(serverStr, expectedInterval) {
-		t.Errorf("server.html must define %q", expectedInterval)
+	if !strings.Contains(serverTelemetryStr, expectedInterval) {
+		t.Errorf("server_telemetry.js must define %q", expectedInterval)
 	}
 
 	// 2. Verify registration of Telemetry.poll for server-stats and server-reachability
 	expectedStatsPoll := "Telemetry.poll('server-stats-' + SERVER_ID, loadServerStats, STATS_REFRESH_INTERVAL_MS);"
-	if !strings.Contains(serverStr, expectedStatsPoll) {
-		t.Errorf("server.html missing Telemetry.poll for server-stats: expected %q", expectedStatsPoll)
+	if !strings.Contains(serverTelemetryStr, expectedStatsPoll) {
+		t.Errorf("server_telemetry.js missing Telemetry.poll for server-stats: expected %q", expectedStatsPoll)
 	}
 
 	expectedReachPoll := "Telemetry.poll('server-reachability-' + SERVER_ID, updateReachability, STATS_REFRESH_INTERVAL_MS);"
-	if !strings.Contains(serverStr, expectedReachPoll) {
-		t.Errorf("server.html missing Telemetry.poll for server-reachability: expected %q", expectedReachPoll)
+	if !strings.Contains(serverTelemetryStr, expectedReachPoll) {
+		t.Errorf("server_telemetry.js missing Telemetry.poll for server-reachability: expected %q", expectedReachPoll)
 	}
 
 	// 3. Verify no bare setInterval(updateReachability) remains
-	if strings.Contains(serverStr, "setInterval(updateReachability") {
-		t.Errorf("server.html must not contain bare unmanaged 'setInterval(updateReachability'")
+	if strings.Contains(serverTelemetryStr, "setInterval(updateReachability") {
+		t.Errorf("server_telemetry.js must not contain bare unmanaged 'setInterval(updateReachability'")
 	}
 
 	// 4. Verify error preservation behavior in loadServerStats
-	if !strings.Contains(serverStr, "if (!stats || typeof stats !== 'object'") {
-		t.Errorf("server.html loadServerStats must validate stats payload before DOM updates")
+	if !strings.Contains(serverTelemetryStr, "if (!stats || typeof stats !== 'object'") {
+		t.Errorf("server_telemetry.js loadServerStats must validate stats payload before DOM updates")
 	}
 	expectedZeroCheck := "stats.ram_total === 0 && stats.disk_total === 0"
-	if !strings.Contains(serverStr, expectedZeroCheck) {
-		t.Errorf("server.html loadServerStats must check for zero totals: expected %q", expectedZeroCheck)
+	if !strings.Contains(serverTelemetryStr, expectedZeroCheck) {
+		t.Errorf("server_telemetry.js loadServerStats must check for zero totals: expected %q", expectedZeroCheck)
 	}
 
-	if !strings.Contains(serverStr, "return stats;") {
-		t.Errorf("server.html loadServerStats must return stats payload")
+	if !strings.Contains(serverTelemetryStr, "return stats;") {
+		t.Errorf("server_telemetry.js loadServerStats must return stats payload")
 	}
 
-	if !strings.Contains(serverStr, "throw err;") {
-		t.Errorf("server.html loadServerStats must re-throw errors for Telemetry.poll failure tracking")
+	if !strings.Contains(serverTelemetryStr, "throw err;") {
+		t.Errorf("server_telemetry.js loadServerStats must re-throw errors for Telemetry.poll failure tracking")
 	}
 
-	loadStatsIdx := strings.Index(serverStr, "async function loadServerStats()")
-	if loadStatsIdx == -1 {
-		t.Fatalf("server.html missing loadServerStats function")
+	loadStatsBlock, err := extractJSFunction(serverTelemetryStr, "async function loadServerStats")
+	if err != nil {
+		t.Fatalf("server_telemetry.js missing loadServerStats function: %v", err)
 	}
-	loadStatsBlock := serverStr[loadStatsIdx : loadStatsIdx+strings.Index(serverStr[loadStatsIdx:], "\n    }")]
 	if strings.Contains(loadStatsBlock, "innerHTML = ''") || strings.Contains(loadStatsBlock, "innerHTML = \"\"") {
 		t.Errorf("loadServerStats must not blank DOM innerHTML on error")
+	}
+	if !strings.Contains(loadStatsBlock, "catch (err)") || !strings.Contains(loadStatsBlock, "throw err;") {
+		t.Errorf("loadServerStats must include catch (err) and re-throw error")
 	}
 }
 

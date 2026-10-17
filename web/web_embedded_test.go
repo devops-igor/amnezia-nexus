@@ -76,6 +76,7 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"js/vpn/page.js",
 		"js/users.js",
 		"js/server_actions.js",
+		"js/server_telemetry.js",
 	}
 	for _, file := range staticFiles {
 		subData, err := fs.ReadFile(staticFS, file)

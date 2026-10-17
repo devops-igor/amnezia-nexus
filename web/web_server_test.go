@@ -31,15 +31,29 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	}
 	actionsJS := string(actionsBytes)
 
-	// 1. Assert server.html contains <script src="/static/js/server_actions.js"></script> before the inline <script> block.
+	telemetryBytes, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
+	}
+	telemetryJS := string(telemetryBytes)
+
+	// 1. Assert server.html contains <script src="/static/js/server_actions.js"></script> and <script src="/static/js/server_telemetry.js"></script> before the inline <script> block.
 	const scriptTag = `<script src="/static/js/server_actions.js"></script>`
+	const telemetryScriptTag = `<script src="/static/js/server_telemetry.js"></script>`
 	scriptIdx := strings.Index(serverHTML, scriptTag)
 	if scriptIdx == -1 {
 		t.Fatalf("server.html missing required script tag: %q", scriptTag)
 	}
-	inlineScriptRelIdx := strings.Index(serverHTML[scriptIdx:], "<script>")
+	telemetryScriptIdx := strings.Index(serverHTML, telemetryScriptTag)
+	if telemetryScriptIdx == -1 {
+		t.Fatalf("server.html missing required script tag: %q", telemetryScriptTag)
+	}
+	if telemetryScriptIdx < scriptIdx {
+		t.Fatalf("server_telemetry.js must be loaded after server_actions.js")
+	}
+	inlineScriptRelIdx := strings.Index(serverHTML[telemetryScriptIdx:], "<script>")
 	if inlineScriptRelIdx == -1 {
-		t.Fatalf("server.html must include inline <script> block after %q", scriptTag)
+		t.Fatalf("server.html must include inline <script> block after %q", telemetryScriptTag)
 	}
 
 	// Extract all onclick function calls to assert they resolve on window.
@@ -72,6 +86,10 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal actionsJS failed: %v", err)
 	}
+	telemetryJSJSON, err := json.Marshal(telemetryJS)
+	if err != nil {
+		t.Fatalf("json.Marshal telemetryJS failed: %v", err)
+	}
 	expectedFunctionsJSON, err := json.Marshal(expectedFunctions)
 	if err != nil {
 		t.Fatalf("json.Marshal expectedFunctions failed: %v", err)
@@ -81,10 +99,13 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	sb.WriteString(jsdomBootstrapSnippet)
 	sb.WriteString("\nconst serverHtmlRaw = " + string(serverHTMLJSON) + ";\n")
 	sb.WriteString("const serverActionsJs = " + string(actionsJSJSON) + ";\n")
+	sb.WriteString("const serverTelemetryJs = " + string(telemetryJSJSON) + ";\n")
 	sb.WriteString("const expectedFunctions = " + string(expectedFunctionsJSON) + ";\n")
 	sb.WriteString(`
 const scriptTag = '<script src="/static/js/server_actions.js"></script>';
+const telemetryScriptTag = '<script src="/static/js/server_telemetry.js"></script>';
 assert(serverHtmlRaw.includes(scriptTag), 'serverHtmlRaw must contain server_actions.js script tag');
+assert(serverHtmlRaw.includes(telemetryScriptTag), 'serverHtmlRaw must contain server_telemetry.js script tag');
 
 // Render template with realistic substitutions
 let rendered = serverHtmlRaw;
@@ -110,9 +131,11 @@ rendered = rendered.replace(/\{\{[^}]*\}\}/g, '');
 
 assert(!rendered.includes('{{'), 'all template directives must be resolved');
 assert(rendered.includes(scriptTag), 'scriptTag must remain intact before script replacement');
+assert(rendered.includes(telemetryScriptTag), 'telemetryScriptTag must remain intact before script replacement');
 
-// Replace script tag with inlined server_actions.js
+// Replace script tags with inlined server_actions.js and server_telemetry.js
 rendered = rendered.replace(scriptTag, '<script>\n' + serverActionsJs + '\n</script>');
+rendered = rendered.replace(telemetryScriptTag, '<script>\n' + serverTelemetryJs + '\n</script>');
 
 const docHtml = '<!DOCTYPE html><html><head></head><body>' + rendered + '</body></html>';
 
@@ -127,6 +150,10 @@ virtualConsole.on('jsdomError', (err) => {
 let confirmOptions = null;
 let lastToast = null;
 let apiCalls = [];
+const failUrls = new Set();
+const telemetryRegistrations = [];
+const telemetryStops = [];
+const activeIntervals = new Set();
 
 const dom = new JSDOM(docHtml, {
     virtualConsole,
@@ -134,22 +161,71 @@ const dom = new JSDOM(docHtml, {
     pretendToBeVisual: true,
     url: 'https://nexus.invalid/servers/42',
     beforeParse(w) {
+        const origSetInterval = w.setInterval;
+        const origClearInterval = w.clearInterval;
+        w.setInterval = function(...args) {
+            const id = origSetInterval.apply(this, args);
+            activeIntervals.add(id);
+            return id;
+        };
+        w.clearInterval = function(id) {
+            activeIntervals.delete(id);
+            return origClearInterval.apply(this, arguments);
+        };
         w._ = (k) => 'T:' + k;
         w.UI = {
             toast: (msg, type) => { lastToast = { msg, type }; },
             confirm: async (opts) => { confirmOptions = opts; return true; },
             copy: async () => true,
             downloadFile: () => {},
-            escapeHtml: (s) => (s == null ? '' : String(s)),
+            escapeHtml: (s) => (s == null ? '' : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')),
             formatBytes: (n) => String(n) + 'B',
         };
         w.API = {
-            get: async (url, opts) => { apiCalls.push({ method: 'GET', url, opts }); return {}; },
-            post: async (url, body, opts) => { apiCalls.push({ method: 'POST', url, body, opts }); return {}; },
+            get: async (url, opts) => {
+                apiCalls.push({ method: 'GET', url, opts });
+                for (const pattern of failUrls) {
+                    if (url.includes(pattern)) {
+                        throw new Error('API get failed for ' + pattern);
+                    }
+                }
+                if (url.includes('/reachability')) {
+                    return { reachable: true, latency_ms: 35, last_checked: '2026-10-17 12:00:00' };
+                }
+                if (url.includes('/connections')) {
+                    return { clients: [{ clientId: 'c1', name: 'Alice', enabled: true }] };
+                }
+                return {};
+            },
+            post: async (url, body, opts) => {
+                apiCalls.push({ method: 'POST', url, body, opts });
+                for (const pattern of failUrls) {
+                    if (url.includes(pattern)) {
+                        throw new Error('API post failed for ' + pattern);
+                    }
+                }
+                if (url.includes('/stats')) {
+                    return { cpu: 15, ram_used: 1024, ram_total: 4096, ram_percent: 25, disk_used: 5000, disk_total: 20000, disk_percent: 25, net_rx: 100, net_tx: 200 };
+                }
+                if (url.includes('/check')) {
+                    return { connection: 'ok', docker_installed: true, protocols: { awg: { container_running: true, port: 55424 } } };
+                }
+                if (url.includes('/install')) {
+                    return { log: ['Installed successfully'] };
+                }
+                return {};
+            },
         };
         w.openModal = () => {};
         w.closeModal = () => {};
-        w.Telemetry = { poll: () => {} };
+        w.Telemetry = {
+            poll: (id, fn, interval) => {
+                telemetryRegistrations.push({ id, fn, interval });
+            },
+            stop: (id) => {
+                telemetryStops.push(id);
+            },
+        };
         w.NexusTable = class { constructor() {} refresh() {} };
         w.QRCode = function() {};
         w.QRCode.CorrectLevel = { L: 'L' };
@@ -164,6 +240,25 @@ const d = w.document;
     assert(expectedFunctions.length > 0, 'expectedFunctions must not be empty');
     for (const fn of expectedFunctions) {
         assert.strictEqual(typeof w[fn], 'function', 'Function ' + fn + ' must be defined on window');
+    }
+
+    // 3.1 Assert telemetry functions resolve on window
+    const expectedTelemetryFunctions = [
+        'loadServerStats',
+        'updateReachability',
+        'checkServer',
+        'updateStatusCounts',
+        'updateProtocolCard',
+        'showConnectionsSection',
+        'hideConnectionsSection',
+        'selectProtocolForConns',
+        'loadConnections',
+        'initServerTelemetry',
+        'startServerTelemetryPolling',
+        'stopServerTelemetryPolling',
+    ];
+    for (const fn of expectedTelemetryFunctions) {
+        assert.strictEqual(typeof w[fn], 'function', 'Telemetry function ' + fn + ' must be defined on window');
     }
 
     // 4. Drive flows:
@@ -243,6 +338,424 @@ const d = w.document;
     assert.strictEqual(w.getProtoTitle('telemt'), 'MTProxyL');
     assert.strictEqual(w.getProtoTitle('dns'), 'AmneziaDNS');
     assert.strictEqual(w.getProtoTitle('other'), 'other');
+
+    // Flow 4.7: server telemetry & reachability execution
+    apiCalls = [];
+    const statsResult = await w.loadServerStats();
+    assert(statsResult && statsResult.cpu === 15, 'loadServerStats must return stats payload');
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/stats'), 'loadServerStats must post to /api/servers/42/stats');
+    const prevStatsHtml = d.getElementById('serverStats').innerHTML;
+    assert(prevStatsHtml.length > 0, 'serverStats must have content after successful stats call');
+
+    // Failed poll: stats error must reject and leave DOM unchanged (Finding H1 & L2)
+    failUrls.add('/stats');
+    let statsErrorCaught = false;
+    const prevStatsDisplay = d.getElementById('serverStats').style.display;
+    try {
+        await w.loadServerStats();
+    } catch (err) {
+        statsErrorCaught = true;
+    } finally {
+        failUrls.delete('/stats');
+    }
+    assert(statsErrorCaught, 'loadServerStats must reject when API call fails');
+    assert.strictEqual(d.getElementById('serverStats').innerHTML, prevStatsHtml, 'serverStats DOM content must remain unchanged on stats error');
+    assert.strictEqual(d.getElementById('serverStats').style.display, prevStatsDisplay, 'serverStats display style must remain unchanged on stats error');
+
+    const reachResult = await w.updateReachability();
+    assert(reachResult && reachResult.reachable === true, 'updateReachability must return reachability payload');
+    assert(apiCalls.some(c => c.method === 'GET' && c.url === '/api/servers/42/reachability'), 'updateReachability must get /api/servers/42/reachability');
+
+    // Failed poll: reachability error must rethrow (Finding H1)
+    failUrls.add('/reachability');
+    let reachErrorCaught = false;
+    try {
+        await w.updateReachability();
+    } catch (err) {
+        reachErrorCaught = true;
+    } finally {
+        failUrls.delete('/reachability');
+    }
+    assert(reachErrorCaught, 'updateReachability must rethrow when API call fails');
+
+    // Flow 4.8: connections section toggle & protocol select
+    w.showConnectionsSection();
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'block', 'showConnectionsSection must set display: block');
+    w.hideConnectionsSection();
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'hideConnectionsSection must set display: none');
+
+    // selectProtocolForConns with missing option does NOT inject option, reveal stale UI, or trigger API call (Finding M1, L1)
+    apiCalls = [];
+    d.getElementById('connectionsTableBody').innerHTML = '<tr><td>stale-row</td></tr>';
+    d.getElementById('connectionsSection').style.display = '';
+    d.getElementById('connProtoSelect').value = 'awg';
+    w.selectProtocolForConns('nonexistent');
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection must be hidden when selecting unavailable protocol');
+    assert.strictEqual(d.getElementById('connProtoSelect').value, '', 'connProtoSelect value must be reset to empty');
+    assert.strictEqual(apiCalls.filter(c => c.url.includes('/connections')).length, 0, 'selectProtocolForConns with missing option must not trigger API call');
+    assert.strictEqual(Array.from(d.getElementById('connProtoSelect').options).some(o => o.value === 'nonexistent'), false, 'selectProtocolForConns must not inject option for missing protocol');
+
+    // Flow 4.9: checkServer execution
+    await w.checkServer();
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/check'), 'checkServer must post to /api/servers/42/check');
+    const badgesSuccessHtml = d.getElementById('statusBadges').innerHTML;
+    assert(badgesSuccessHtml.includes('ssh_ok'), 'statusBadges must show ssh_ok badge on success');
+    assert(!badgesSuccessHtml.includes('check_error'), 'statusBadges must not show check_error on success');
+
+    // selectProtocolForConns with protocol populated by checkServer triggers loadConnections
+    apiCalls = [];
+    w.selectProtocolForConns('awg');
+    assert(apiCalls.some(c => c.method === 'GET' && c.url.includes('/api/servers/42/connections')), 'selectProtocolForConns must trigger loadConnections');
+
+    // Failed checkServer: check error must render check_error badge and re-enable button (Finding H1)
+    failUrls.add('/check');
+    await w.checkServer();
+    failUrls.delete('/check');
+    const badgesErrorHtml = d.getElementById('statusBadges').innerHTML;
+    assert(badgesErrorHtml.includes('check_error'), 'statusBadges must show check_error badge on failure');
+    assert.strictEqual(d.getElementById('checkBtn').disabled, false, 'checkBtn must be re-enabled after failed check');
+
+    // Flow 4.9b: CheckServer with succeeding /check but failing /reachability must not emit unhandled rejection (#502 Finding 2)
+    failUrls.add('/reachability');
+    let unhandledRejectionCaught = null;
+    const unhandledHandler = (reason) => {
+        unhandledRejectionCaught = reason;
+    };
+    process.on('unhandledRejection', unhandledHandler);
+    try {
+        const checkResultWithReachError = await w.checkServer();
+        await new Promise(r => setTimeout(r, 20));
+        assert.strictEqual(unhandledRejectionCaught, null, 'checkServer must safely catch reachability failure without unhandled rejection');
+        assert(checkResultWithReachError && checkResultWithReachError.connection === 'ok', 'checkServer must return check result when reachability rejects');
+        const badgesWithReachError = d.getElementById('statusBadges').innerHTML;
+        assert(badgesWithReachError.includes('ssh_ok'), 'statusBadges must show check results even if reachability rejects');
+    } finally {
+        process.removeListener('unhandledRejection', unhandledHandler);
+        failUrls.delete('/reachability');
+    }
+
+    // Flow 4.9c: Out-of-order connection response race protection & date escaping (#502 Findings 1 & 3, H1)
+    {
+        const protoSelect = d.getElementById('connProtoSelect');
+        if (!Array.from(protoSelect.options).some(o => o.value === 'telemt')) {
+            const opt = d.createElement('option');
+            opt.value = 'telemt';
+            opt.textContent = 'MTProxyL';
+            protoSelect.appendChild(opt);
+        }
+        if (!Array.from(protoSelect.options).some(o => o.value === 'awg')) {
+            const opt = d.createElement('option');
+            opt.value = 'awg';
+            opt.textContent = 'AmneziaWG';
+            protoSelect.appendChild(opt);
+        }
+
+        const origGet = w.API.get;
+
+        // Sub-case 1: Cross-protocol race (awg -> telemt) & creationDate HTML escaping
+        {
+            let resolveAwg = null;
+            let resolveTelemt = null;
+            const awgPromise = new Promise(resolve => { resolveAwg = resolve; });
+            const telemtPromise = new Promise(resolve => { resolveTelemt = resolve; });
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return awgPromise;
+                }
+                if (url.includes('/connections') && url.includes('protocol=telemt')) {
+                    return telemtPromise;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // Request A: awg
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // Request B: telemt (rapid switch)
+                protoSelect.value = 'telemt';
+                const reqB = w.loadConnections();
+
+                // Request B resolves first
+                resolveTelemt({
+                    clients: [
+                        {
+                            clientId: 'telemt-client-1',
+                            name: 'Telemt Client',
+                            enabled: true,
+                            userData: {
+                                total_octets: 1024,
+                                creationDate: '<malicious-date-tag>',
+                            }
+                        }
+                    ]
+                });
+                await reqB;
+
+                assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must have telemt client from Request B');
+                assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must not have awg client yet');
+                let tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(tableHtml.includes('Telemt Client'), 'table must display telemt client from Request B');
+                // Verify creationDate HTML escaping (Finding 3)
+                assert(tableHtml.includes('&lt;malicious-date-tag&gt;'), 'table must escape creationDate in metaHtml');
+                assert(!tableHtml.includes('<malicious-date-tag>'), 'table must not contain unescaped creationDate HTML sink');
+
+                // Request A resolves later (out of order / stale)
+                resolveAwg({
+                    clients: [
+                        {
+                            clientId: 'awg-client-1',
+                            name: 'AWG Client',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqA;
+
+                // Assert table and connectionsStore strictly retain telemt and reject stale awg
+                assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must strictly retain telemt client');
+                assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must reject stale awg client');
+                tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(tableHtml.includes('Telemt Client'), 'table must strictly display telemt client');
+                assert(!tableHtml.includes('AWG Client'), 'table must reject stale awg client data');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 2: Same-protocol out-of-order race (kills mutants R7 & R2)
+        {
+            protoSelect.value = 'awg';
+            let resolveA = null;
+            let resolveB = null;
+            const promiseA = new Promise(resolve => { resolveA = resolve; });
+            const promiseB = new Promise(resolve => { resolveB = resolve; });
+            let awgReqCount = 0;
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    awgReqCount++;
+                    if (awgReqCount === 1) return promiseA;
+                    if (awgReqCount === 2) return promiseB;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // Request A (awg, older generation)
+                const reqA = w.loadConnections();
+                // Request B (awg, newer generation)
+                const reqB = w.loadConnections();
+
+                // Resolve B first with fresh data
+                resolveB({
+                    clients: [
+                        {
+                            clientId: 'awg-fresh',
+                            name: 'AWG Fresh',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqB;
+
+                assert(w.connectionsStore['awg-fresh'], 'connectionsStore must contain awg-fresh');
+                assert.strictEqual(Object.keys(w.connectionsStore).length, 1, 'connectionsStore must have strictly 1 entry');
+                let rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 1, 'connectionsTableBody must have strictly 1 row after reqB');
+                assert(d.getElementById('connectionsTableBody').innerHTML.includes('AWG Fresh'), 'table must display awg-fresh');
+
+                // Resolve A second with stale data
+                resolveA({
+                    clients: [
+                        {
+                            clientId: 'awg-stale',
+                            name: 'AWG Stale',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqA;
+
+                // Assert table strictly contains 1 row (awg-fresh) and connectionsStore contains only awg-fresh
+                assert(w.connectionsStore['awg-fresh'], 'connectionsStore must strictly retain awg-fresh');
+                assert(!w.connectionsStore['awg-stale'], 'connectionsStore must reject stale awg-stale');
+                assert.strictEqual(Object.keys(w.connectionsStore).length, 1, 'connectionsStore must strictly have 1 entry (awg-fresh only)');
+                rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 1, 'connectionsTableBody must strictly contain 1 row (awg-fresh)');
+                const bodyHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(bodyHtml.includes('AWG Fresh'), 'table must retain awg-fresh');
+                assert(!bodyHtml.includes('AWG Stale'), 'table must reject stale awg-stale');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 3: Superseded rejection does not emit error toast (kills mutant R6)
+        {
+            lastToast = null;
+            let rejectA = null;
+            let resolveB = null;
+            const promiseA = new Promise((_, reject) => { rejectA = reject; });
+            const promiseB = new Promise(resolve => { resolveB = resolve; });
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return promiseA;
+                }
+                if (url.includes('/connections') && url.includes('protocol=telemt')) {
+                    return promiseB;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // Start request A ('awg')
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // Start request B ('telemt')
+                protoSelect.value = 'telemt';
+                const reqB = w.loadConnections();
+
+                // Resolve B
+                resolveB({
+                    clients: [
+                        {
+                            clientId: 'telemt-fresh',
+                            name: 'Telemt Fresh',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqB;
+
+                // Reject request A
+                rejectA(new Error('superseded network error'));
+                await reqA;
+
+                // Assert that lastToast is NOT loading_connections_error
+                assert(!lastToast || !lastToast.msg || !lastToast.msg.includes('loading_connections_error'),
+                    'superseded rejection must not display loading_connections_error toast');
+                assert.strictEqual(lastToast, null, 'superseded rejection must not trigger any toast');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 4: Invalidate in-flight requests when selecting unavailable protocol (Finding H1 / #502 Cycle 6)
+        {
+            w.connectionsStore = {};
+            d.getElementById('connectionsTableBody').innerHTML = '';
+            d.getElementById('connectionsTableContainer').style.display = 'none';
+
+            let resolveA = null;
+            const promiseA = new Promise(resolve => { resolveA = resolve; });
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return promiseA;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // 1. Start an in-flight connection request for 'awg'
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // 2. Call selectProtocolForConns('nonexistent')
+                w.selectProtocolForConns('nonexistent');
+
+                // 3. Resolve the pending 'awg' connection request with [{id: 'stale-awg'}]
+                const stalePayload = [
+                    {
+                        clientId: 'stale-awg',
+                        id: 'stale-awg',
+                        name: 'Stale AWG',
+                        enabled: true,
+                        userData: {}
+                    }
+                ];
+                stalePayload.clients = stalePayload;
+                resolveA(stalePayload);
+                await reqA;
+
+                // 4. Assert that #connectionsTableBody rows remain empty ([]),
+                //    window.connectionsStore remains empty ({}),
+                //    and #connectionsSection.style.display === 'none'.
+                const rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 0, 'connectionsTableBody rows must remain empty');
+                assert.deepStrictEqual(w.connectionsStore, {}, 'window.connectionsStore must remain empty');
+                assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection.style.display must remain none');
+                assert.strictEqual(d.getElementById('connectionsTableContainer').style.display, 'none', 'connectionsTableContainer must remain hidden');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+    }
+
+    // Flow 4.10: installProtocol rejection verifies progressInterval is cleared (Finding H1 / #478, Finding 4)
+    w.openInstallModal('awg');
+    failUrls.add('/install');
+    let installAttempted = false;
+    let liveIntervalsDuringInstall = 0;
+    const origPostForInstall = w.API.post;
+    w.API.post = async function(url, ...args) {
+        if (url.includes('/install')) {
+            installAttempted = true;
+            liveIntervalsDuringInstall = activeIntervals.size;
+        }
+        return origPostForInstall.apply(this, [url, ...args]);
+    };
+    try {
+        await w.installProtocol();
+    } finally {
+        w.API.post = origPostForInstall;
+        failUrls.delete('/install');
+    }
+    assert(installAttempted, 'installProtocol must attempt /install API call');
+    assert(liveIntervalsDuringInstall > 0, 'installProtocol must start a progress timer before awaiting install API call');
+    assert.strictEqual(activeIntervals.size, 0, 'installProtocol rejection must leave 0 live intervals');
+
+    // Flow 4.11: polling lifecycle functions & exact Telemetry.poll registrations (Finding H1 & M2)
+    telemetryRegistrations.length = 0;
+    telemetryStops.length = 0;
+    w.startServerTelemetryPolling();
+
+    const statsPoll = telemetryRegistrations.find(r => r.id === 'server-stats-42');
+    assert(statsPoll, 'Telemetry.poll must be registered for server-stats-42');
+    assert.strictEqual(statsPoll.fn, w.loadServerStats, 'server-stats poll handler must be loadServerStats');
+    assert.strictEqual(statsPoll.interval, 30000, 'server-stats poll interval must be 30000');
+
+    const reachPoll = telemetryRegistrations.find(r => r.id === 'server-reachability-42');
+    assert(reachPoll, 'Telemetry.poll must be registered for server-reachability-42');
+    assert.strictEqual(reachPoll.fn, w.updateReachability, 'server-reachability poll handler must be updateReachability');
+    assert.strictEqual(reachPoll.interval, 30000, 'server-reachability poll interval must be 30000');
+
+    w.stopServerTelemetryPolling();
+    assert(telemetryStops.includes('server-stats-42'), 'stopServerTelemetryPolling must stop server-stats-42');
+    assert(telemetryStops.includes('server-reachability-42'), 'stopServerTelemetryPolling must stop server-reachability-42');
+
+    // Idempotent initServerTelemetry guard & boot check assertion (Finding M2, L2)
+    telemetryRegistrations.length = 0;
+    apiCalls = [];
+    w.initServerTelemetry();
+    assert.strictEqual(telemetryRegistrations.length, 2, 'initServerTelemetry must register stats and reachability once');
+    const checkCallsAfterFirstInit = apiCalls.filter(c => c.method === 'POST' && c.url.includes('/api/servers/42/check')).length;
+    assert.strictEqual(checkCallsAfterFirstInit, 1, 'initServerTelemetry must trigger checkServer exactly once on initial call');
+
+    w.initServerTelemetry();
+    assert.strictEqual(telemetryRegistrations.length, 2, 'second initServerTelemetry call must be a no-op');
+    const checkCallsAfterSecondInit = apiCalls.filter(c => c.method === 'POST' && c.url.includes('/api/servers/42/check')).length;
+    assert.strictEqual(checkCallsAfterSecondInit, 1, 'second initServerTelemetry must not trigger checkServer again');
+    w.stopServerTelemetryPolling();
 
     console.log('JSDOM_TEST_SUCCESS');
     process.exit(0);

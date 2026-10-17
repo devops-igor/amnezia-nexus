@@ -157,6 +157,7 @@ async function installProtocol() {
     logEl.innerHTML = `<div class="log-line info">${_('start_install')}</div>`;
     fillEl.style.width = '10%';
     fillEl.style.background = '';
+    let progressInterval = null;
     try {
         const progressSteps = [
             { pct: 20, msg: _('check_docker') },
@@ -164,7 +165,7 @@ async function installProtocol() {
             { pct: 50, msg: _('build_container') },
         ];
         let stepIdx = 0;
-        const progressInterval = setInterval(() => {
+        progressInterval = setInterval(() => {
             if (stepIdx < progressSteps.length) {
                 fillEl.style.width = progressSteps[stepIdx].pct + '%';
                 logEl.innerHTML += `<div class="log-line info">${progressSteps[stepIdx].msg}</div>`;
@@ -193,7 +194,6 @@ async function installProtocol() {
             }
         }
         const result = await API.post(`/api/servers/${SERVER_ID}/install`, params);
-        clearInterval(progressInterval);
         fillEl.style.width = '100%';
         if (result.log) {
             result.log.forEach(line => {
@@ -210,6 +210,11 @@ async function installProtocol() {
         logEl.scrollTop = logEl.scrollHeight;
         UI.toast(_('install_error') + err.message, 'error');
         document.getElementById('installDone').style.display = '';
+    } finally {
+        if (progressInterval) {
+            clearInterval(progressInterval);
+            progressInterval = null;
+        }
     }
 }
 
