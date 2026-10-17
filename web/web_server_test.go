@@ -31,15 +31,29 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	}
 	actionsJS := string(actionsBytes)
 
-	// 1. Assert server.html contains <script src="/static/js/server_actions.js"></script> before the inline <script> block.
+	telemetryBytes, err := fs.ReadFile(staticFS, "js/server_telemetry.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_telemetry.js: %v", err)
+	}
+	telemetryJS := string(telemetryBytes)
+
+	// 1. Assert server.html contains <script src="/static/js/server_actions.js"></script> and <script src="/static/js/server_telemetry.js"></script> before the inline <script> block.
 	const scriptTag = `<script src="/static/js/server_actions.js"></script>`
+	const telemetryScriptTag = `<script src="/static/js/server_telemetry.js"></script>`
 	scriptIdx := strings.Index(serverHTML, scriptTag)
 	if scriptIdx == -1 {
 		t.Fatalf("server.html missing required script tag: %q", scriptTag)
 	}
-	inlineScriptRelIdx := strings.Index(serverHTML[scriptIdx:], "<script>")
+	telemetryScriptIdx := strings.Index(serverHTML, telemetryScriptTag)
+	if telemetryScriptIdx == -1 {
+		t.Fatalf("server.html missing required script tag: %q", telemetryScriptTag)
+	}
+	if telemetryScriptIdx < scriptIdx {
+		t.Fatalf("server_telemetry.js must be loaded after server_actions.js")
+	}
+	inlineScriptRelIdx := strings.Index(serverHTML[telemetryScriptIdx:], "<script>")
 	if inlineScriptRelIdx == -1 {
-		t.Fatalf("server.html must include inline <script> block after %q", scriptTag)
+		t.Fatalf("server.html must include inline <script> block after %q", telemetryScriptTag)
 	}
 
 	// Extract all onclick function calls to assert they resolve on window.
@@ -72,6 +86,10 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal actionsJS failed: %v", err)
 	}
+	telemetryJSJSON, err := json.Marshal(telemetryJS)
+	if err != nil {
+		t.Fatalf("json.Marshal telemetryJS failed: %v", err)
+	}
 	expectedFunctionsJSON, err := json.Marshal(expectedFunctions)
 	if err != nil {
 		t.Fatalf("json.Marshal expectedFunctions failed: %v", err)
@@ -81,10 +99,13 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	sb.WriteString(jsdomBootstrapSnippet)
 	sb.WriteString("\nconst serverHtmlRaw = " + string(serverHTMLJSON) + ";\n")
 	sb.WriteString("const serverActionsJs = " + string(actionsJSJSON) + ";\n")
+	sb.WriteString("const serverTelemetryJs = " + string(telemetryJSJSON) + ";\n")
 	sb.WriteString("const expectedFunctions = " + string(expectedFunctionsJSON) + ";\n")
 	sb.WriteString(`
 const scriptTag = '<script src="/static/js/server_actions.js"></script>';
+const telemetryScriptTag = '<script src="/static/js/server_telemetry.js"></script>';
 assert(serverHtmlRaw.includes(scriptTag), 'serverHtmlRaw must contain server_actions.js script tag');
+assert(serverHtmlRaw.includes(telemetryScriptTag), 'serverHtmlRaw must contain server_telemetry.js script tag');
 
 // Render template with realistic substitutions
 let rendered = serverHtmlRaw;
@@ -110,9 +131,11 @@ rendered = rendered.replace(/\{\{[^}]*\}\}/g, '');
 
 assert(!rendered.includes('{{'), 'all template directives must be resolved');
 assert(rendered.includes(scriptTag), 'scriptTag must remain intact before script replacement');
+assert(rendered.includes(telemetryScriptTag), 'telemetryScriptTag must remain intact before script replacement');
 
-// Replace script tag with inlined server_actions.js
+// Replace script tags with inlined server_actions.js and server_telemetry.js
 rendered = rendered.replace(scriptTag, '<script>\n' + serverActionsJs + '\n</script>');
+rendered = rendered.replace(telemetryScriptTag, '<script>\n' + serverTelemetryJs + '\n</script>');
 
 const docHtml = '<!DOCTYPE html><html><head></head><body>' + rendered + '</body></html>';
 
@@ -144,12 +167,30 @@ const dom = new JSDOM(docHtml, {
             formatBytes: (n) => String(n) + 'B',
         };
         w.API = {
-            get: async (url, opts) => { apiCalls.push({ method: 'GET', url, opts }); return {}; },
-            post: async (url, body, opts) => { apiCalls.push({ method: 'POST', url, body, opts }); return {}; },
+            get: async (url, opts) => {
+                apiCalls.push({ method: 'GET', url, opts });
+                if (url.includes('/reachability')) {
+                    return { reachable: true, latency_ms: 35, last_checked: '2026-10-17 12:00:00' };
+                }
+                if (url.includes('/connections')) {
+                    return { clients: [{ clientId: 'c1', name: 'Alice', enabled: true }] };
+                }
+                return {};
+            },
+            post: async (url, body, opts) => {
+                apiCalls.push({ method: 'POST', url, body, opts });
+                if (url.includes('/stats')) {
+                    return { cpu: 15, ram_used: 1024, ram_total: 4096, ram_percent: 25, disk_used: 5000, disk_total: 20000, disk_percent: 25, net_rx: 100, net_tx: 200 };
+                }
+                if (url.includes('/check')) {
+                    return { connection: 'ok', docker_installed: true, protocols: { awg: { container_running: true, port: 55424 } } };
+                }
+                return {};
+            },
         };
         w.openModal = () => {};
         w.closeModal = () => {};
-        w.Telemetry = { poll: () => {} };
+        w.Telemetry = { poll: () => {}, stop: () => {} };
         w.NexusTable = class { constructor() {} refresh() {} };
         w.QRCode = function() {};
         w.QRCode.CorrectLevel = { L: 'L' };
@@ -164,6 +205,25 @@ const d = w.document;
     assert(expectedFunctions.length > 0, 'expectedFunctions must not be empty');
     for (const fn of expectedFunctions) {
         assert.strictEqual(typeof w[fn], 'function', 'Function ' + fn + ' must be defined on window');
+    }
+
+    // 3.1 Assert telemetry functions resolve on window
+    const expectedTelemetryFunctions = [
+        'loadServerStats',
+        'updateReachability',
+        'checkServer',
+        'updateStatusCounts',
+        'updateProtocolCard',
+        'showConnectionsSection',
+        'hideConnectionsSection',
+        'selectProtocolForConns',
+        'loadConnections',
+        'initServerTelemetry',
+        'startServerTelemetryPolling',
+        'stopServerTelemetryPolling',
+    ];
+    for (const fn of expectedTelemetryFunctions) {
+        assert.strictEqual(typeof w[fn], 'function', 'Telemetry function ' + fn + ' must be defined on window');
     }
 
     // 4. Drive flows:
@@ -243,6 +303,35 @@ const d = w.document;
     assert.strictEqual(w.getProtoTitle('telemt'), 'MTProxyL');
     assert.strictEqual(w.getProtoTitle('dns'), 'AmneziaDNS');
     assert.strictEqual(w.getProtoTitle('other'), 'other');
+
+    // Flow 4.7: server telemetry & reachability execution
+    apiCalls = [];
+    const statsResult = await w.loadServerStats();
+    assert(statsResult && statsResult.cpu === 15, 'loadServerStats must return stats payload');
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/stats'), 'loadServerStats must post to /api/servers/42/stats');
+
+    const reachResult = await w.updateReachability();
+    assert(reachResult && reachResult.reachable === true, 'updateReachability must return reachability payload');
+    assert(apiCalls.some(c => c.method === 'GET' && c.url === '/api/servers/42/reachability'), 'updateReachability must get /api/servers/42/reachability');
+
+    // Flow 4.8: connections section toggle & protocol select
+    w.showConnectionsSection();
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'block', 'showConnectionsSection must set display: block');
+    w.hideConnectionsSection();
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'hideConnectionsSection must set display: none');
+
+    await w.selectProtocolForConns('awg');
+    assert(apiCalls.some(c => c.method === 'GET' && c.url.includes('/api/servers/42/connections')), 'selectProtocolForConns must trigger loadConnections');
+
+    // Flow 4.9: checkServer execution
+    await w.checkServer();
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/check'), 'checkServer must post to /api/servers/42/check');
+
+    // Flow 4.10: polling lifecycle functions
+    w.startServerTelemetryPolling();
+    w.stopServerTelemetryPolling();
+    w.initServerTelemetry(42);
+    w.stopServerTelemetryPolling();
 
     console.log('JSDOM_TEST_SUCCESS');
     process.exit(0);
