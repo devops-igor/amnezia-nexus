@@ -11,28 +11,6 @@ let editingClientId = null;
 let renameServerId = null;
 let editHostServerId = null;
 
-// Synchronize state with window for inline onclick handlers in server.html
-Object.defineProperty(window, 'currentConfig', {
-    get: () => currentConfig,
-    set: (v) => { currentConfig = v; },
-    configurable: true
-});
-Object.defineProperty(window, 'currentVpnLink', {
-    get: () => currentVpnLink,
-    set: (v) => { currentVpnLink = v; },
-    configurable: true
-});
-Object.defineProperty(window, 'currentConfigName', {
-    get: () => currentConfigName,
-    set: (v) => { currentConfigName = v; },
-    configurable: true
-});
-Object.defineProperty(window, 'serverConfigFilename', {
-    get: () => serverConfigFilename,
-    set: (v) => { serverConfigFilename = v; },
-    configurable: true
-});
-
 function switchCategory(cat) {
     const grids = ['protocols-grid', 'services-grid', 'management-grid'];
     const tabs = ['tab-protocols', 'tab-services', 'tab-management'];
@@ -393,7 +371,7 @@ function openAddConnectionModal(isEdit = false, clientData = null) {
 }
 
 function editConnection(clientId) {
-    const userData = window.connectionsStore ? window.connectionsStore[clientId] : null;
+    const userData = window.connectionsStore[clientId];
     if (userData) {
         userData.clientId = clientId;
         openAddConnectionModal(true, userData);
@@ -556,6 +534,7 @@ async function removeServer() {
     const confirmed = await UI.confirm({
         title: _('remove_server') || 'Remove Server',
         message: 'Are you sure you want to remove this server from the panel? (The server itself will not be erased).',
+        confirmText: 'Remove',
         confirmVariant: 'danger'
     });
     if (!confirmed) return;
@@ -696,33 +675,3 @@ if (document.readyState === 'loading') {
     initServerActions();
 }
 
-// Global availability for inline event handlers
-window.switchCategory = switchCategory;
-window.getProtoTitle = getProtoTitle;
-window.toggleContainer = toggleContainer;
-window.showServerConfig = showServerConfig;
-window.saveServerConfig = saveServerConfig;
-window.openInstallModal = openInstallModal;
-window.installProtocol = installProtocol;
-window.uninstallProtocol = uninstallProtocol;
-window.copyConnectionConfig = copyConnectionConfig;
-window.rotateClientMimicry = rotateClientMimicry;
-window.addConnection = addConnection;
-window.openAddConnectionModal = openAddConnectionModal;
-window.editConnection = editConnection;
-window.removeConnection = removeConnection;
-window.showConnectionConfig = showConnectionConfig;
-window.toggleConnection = toggleConnection;
-window.switchConfigTab = switchConfigTab;
-window.generateQR = generateQR;
-window.formatDate = formatDate;
-window.rebootServer = rebootServer;
-window.clearServer = clearServer;
-window.removeServer = removeServer;
-window.openRenameServerModal = openRenameServerModal;
-window.closeRenameServerModal = closeRenameServerModal;
-window.submitRenameServer = submitRenameServer;
-window.isValidHost = isValidHost;
-window.openEditHostModal = openEditHostModal;
-window.closeEditHostModal = closeEditHostModal;
-window.submitEditHost = submitEditHost;
