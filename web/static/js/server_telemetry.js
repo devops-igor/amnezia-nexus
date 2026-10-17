@@ -371,6 +371,7 @@ function selectProtocolForConns(proto) {
     const select = document.getElementById('connProtoSelect');
     const hasOpt = Boolean(select && Array.from(select.options || []).some(o => o.value === proto));
     if (!hasOpt) {
+        connectionRequestGen++;
         if (select) select.value = '';
         if (section) section.style.display = 'none';
         return;

@@ -384,12 +384,14 @@ const d = w.document;
     w.hideConnectionsSection();
     assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'hideConnectionsSection must set display: none');
 
-    // selectProtocolForConns with missing option does NOT inject option, reveal stale UI, or trigger API call (Finding M1)
+    // selectProtocolForConns with missing option does NOT inject option, reveal stale UI, or trigger API call (Finding M1, L1)
     apiCalls = [];
     d.getElementById('connectionsTableBody').innerHTML = '<tr><td>stale-row</td></tr>';
-    d.getElementById('connectionsSection').style.display = 'none';
+    d.getElementById('connectionsSection').style.display = '';
+    d.getElementById('connProtoSelect').value = 'awg';
     w.selectProtocolForConns('nonexistent');
-    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection must remain hidden when selecting unavailable protocol');
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection must be hidden when selecting unavailable protocol');
+    assert.strictEqual(d.getElementById('connProtoSelect').value, '', 'connProtoSelect value must be reset to empty');
     assert.strictEqual(apiCalls.filter(c => c.url.includes('/connections')).length, 0, 'selectProtocolForConns with missing option must not trigger API call');
     assert.strictEqual(Array.from(d.getElementById('connProtoSelect').options).some(o => o.value === 'nonexistent'), false, 'selectProtocolForConns must not inject option for missing protocol');
 
@@ -642,6 +644,57 @@ const d = w.document;
                 assert(!lastToast || !lastToast.msg || !lastToast.msg.includes('loading_connections_error'),
                     'superseded rejection must not display loading_connections_error toast');
                 assert.strictEqual(lastToast, null, 'superseded rejection must not trigger any toast');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 4: Invalidate in-flight requests when selecting unavailable protocol (Finding H1 / #502 Cycle 6)
+        {
+            w.connectionsStore = {};
+            d.getElementById('connectionsTableBody').innerHTML = '';
+            d.getElementById('connectionsTableContainer').style.display = 'none';
+
+            let resolveA = null;
+            const promiseA = new Promise(resolve => { resolveA = resolve; });
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return promiseA;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // 1. Start an in-flight connection request for 'awg'
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // 2. Call selectProtocolForConns('nonexistent')
+                w.selectProtocolForConns('nonexistent');
+
+                // 3. Resolve the pending 'awg' connection request with [{id: 'stale-awg'}]
+                const stalePayload = [
+                    {
+                        clientId: 'stale-awg',
+                        id: 'stale-awg',
+                        name: 'Stale AWG',
+                        enabled: true,
+                        userData: {}
+                    }
+                ];
+                stalePayload.clients = stalePayload;
+                resolveA(stalePayload);
+                await reqA;
+
+                // 4. Assert that #connectionsTableBody rows remain empty ([]),
+                //    window.connectionsStore remains empty ({}),
+                //    and #connectionsSection.style.display === 'none'.
+                const rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 0, 'connectionsTableBody rows must remain empty');
+                assert.deepStrictEqual(w.connectionsStore, {}, 'window.connectionsStore must remain empty');
+                assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection.style.display must remain none');
+                assert.strictEqual(d.getElementById('connectionsTableContainer').style.display, 'none', 'connectionsTableContainer must remain hidden');
             } finally {
                 w.API.get = origGet;
             }
