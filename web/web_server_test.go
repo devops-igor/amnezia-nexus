@@ -347,9 +347,10 @@ const d = w.document;
     const prevStatsHtml = d.getElementById('serverStats').innerHTML;
     assert(prevStatsHtml.length > 0, 'serverStats must have content after successful stats call');
 
-    // Failed poll: stats error must reject and leave DOM unchanged (Finding H1)
+    // Failed poll: stats error must reject and leave DOM unchanged (Finding H1 & L2)
     failUrls.add('/stats');
     let statsErrorCaught = false;
+    const prevStatsDisplay = d.getElementById('serverStats').style.display;
     try {
         await w.loadServerStats();
     } catch (err) {
@@ -359,6 +360,7 @@ const d = w.document;
     }
     assert(statsErrorCaught, 'loadServerStats must reject when API call fails');
     assert.strictEqual(d.getElementById('serverStats').innerHTML, prevStatsHtml, 'serverStats DOM content must remain unchanged on stats error');
+    assert.strictEqual(d.getElementById('serverStats').style.display, prevStatsDisplay, 'serverStats display style must remain unchanged on stats error');
 
     const reachResult = await w.updateReachability();
     assert(reachResult && reachResult.reachable === true, 'updateReachability must return reachability payload');
@@ -427,7 +429,7 @@ const d = w.document;
         failUrls.delete('/reachability');
     }
 
-    // Flow 4.9c: Out-of-order connection response race protection & date escaping (#502 Findings 1 & 3)
+    // Flow 4.9c: Out-of-order connection response race protection & date escaping (#502 Findings 1 & 3, H1)
     {
         const protoSelect = d.getElementById('connProtoSelect');
         if (!Array.from(protoSelect.options).some(o => o.value === 'telemt')) {
@@ -443,76 +445,203 @@ const d = w.document;
             protoSelect.appendChild(opt);
         }
 
-        let resolveAwg = null;
-        let resolveTelemt = null;
-        const awgPromise = new Promise(resolve => { resolveAwg = resolve; });
-        const telemtPromise = new Promise(resolve => { resolveTelemt = resolve; });
-
         const origGet = w.API.get;
-        w.API.get = function(url, ...args) {
-            if (url.includes('/connections') && url.includes('protocol=awg')) {
-                return awgPromise;
-            }
-            if (url.includes('/connections') && url.includes('protocol=telemt')) {
-                return telemtPromise;
-            }
-            return origGet.apply(this, [url, ...args]);
-        };
 
-        try {
-            // Request A: awg
-            protoSelect.value = 'awg';
-            const reqA = w.loadConnections();
+        // Sub-case 1: Cross-protocol race (awg -> telemt) & creationDate HTML escaping
+        {
+            let resolveAwg = null;
+            let resolveTelemt = null;
+            const awgPromise = new Promise(resolve => { resolveAwg = resolve; });
+            const telemtPromise = new Promise(resolve => { resolveTelemt = resolve; });
 
-            // Request B: telemt (rapid switch)
-            protoSelect.value = 'telemt';
-            const reqB = w.loadConnections();
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return awgPromise;
+                }
+                if (url.includes('/connections') && url.includes('protocol=telemt')) {
+                    return telemtPromise;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
 
-            // Request B resolves first
-            resolveTelemt({
-                clients: [
-                    {
-                        clientId: 'telemt-client-1',
-                        name: 'Telemt Client',
-                        enabled: true,
-                        userData: {
-                            total_octets: 1024,
-                            creationDate: '<malicious-date-tag>',
+            try {
+                // Request A: awg
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // Request B: telemt (rapid switch)
+                protoSelect.value = 'telemt';
+                const reqB = w.loadConnections();
+
+                // Request B resolves first
+                resolveTelemt({
+                    clients: [
+                        {
+                            clientId: 'telemt-client-1',
+                            name: 'Telemt Client',
+                            enabled: true,
+                            userData: {
+                                total_octets: 1024,
+                                creationDate: '<malicious-date-tag>',
+                            }
                         }
-                    }
-                ]
-            });
-            await reqB;
+                    ]
+                });
+                await reqB;
 
-            assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must have telemt client from Request B');
-            assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must not have awg client yet');
-            let tableHtml = d.getElementById('connectionsTableBody').innerHTML;
-            assert(tableHtml.includes('Telemt Client'), 'table must display telemt client from Request B');
-            // Verify creationDate HTML escaping (Finding 3)
-            assert(tableHtml.includes('&lt;malicious-date-tag&gt;'), 'table must escape creationDate in metaHtml');
-            assert(!tableHtml.includes('<malicious-date-tag>'), 'table must not contain unescaped creationDate HTML sink');
+                assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must have telemt client from Request B');
+                assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must not have awg client yet');
+                let tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(tableHtml.includes('Telemt Client'), 'table must display telemt client from Request B');
+                // Verify creationDate HTML escaping (Finding 3)
+                assert(tableHtml.includes('&lt;malicious-date-tag&gt;'), 'table must escape creationDate in metaHtml');
+                assert(!tableHtml.includes('<malicious-date-tag>'), 'table must not contain unescaped creationDate HTML sink');
 
-            // Request A resolves later (out of order / stale)
-            resolveAwg({
-                clients: [
-                    {
-                        clientId: 'awg-client-1',
-                        name: 'AWG Client',
-                        enabled: true,
-                        userData: {}
-                    }
-                ]
-            });
-            await reqA;
+                // Request A resolves later (out of order / stale)
+                resolveAwg({
+                    clients: [
+                        {
+                            clientId: 'awg-client-1',
+                            name: 'AWG Client',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqA;
 
-            // Assert table and connectionsStore strictly retain telemt and reject stale awg
-            assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must strictly retain telemt client');
-            assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must reject stale awg client');
-            tableHtml = d.getElementById('connectionsTableBody').innerHTML;
-            assert(tableHtml.includes('Telemt Client'), 'table must strictly display telemt client');
-            assert(!tableHtml.includes('AWG Client'), 'table must reject stale awg client data');
-        } finally {
-            w.API.get = origGet;
+                // Assert table and connectionsStore strictly retain telemt and reject stale awg
+                assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must strictly retain telemt client');
+                assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must reject stale awg client');
+                tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(tableHtml.includes('Telemt Client'), 'table must strictly display telemt client');
+                assert(!tableHtml.includes('AWG Client'), 'table must reject stale awg client data');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 2: Same-protocol out-of-order race (kills mutants R7 & R2)
+        {
+            protoSelect.value = 'awg';
+            let resolveA = null;
+            let resolveB = null;
+            const promiseA = new Promise(resolve => { resolveA = resolve; });
+            const promiseB = new Promise(resolve => { resolveB = resolve; });
+            let awgReqCount = 0;
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    awgReqCount++;
+                    if (awgReqCount === 1) return promiseA;
+                    if (awgReqCount === 2) return promiseB;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // Request A (awg, older generation)
+                const reqA = w.loadConnections();
+                // Request B (awg, newer generation)
+                const reqB = w.loadConnections();
+
+                // Resolve B first with fresh data
+                resolveB({
+                    clients: [
+                        {
+                            clientId: 'awg-fresh',
+                            name: 'AWG Fresh',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqB;
+
+                assert(w.connectionsStore['awg-fresh'], 'connectionsStore must contain awg-fresh');
+                assert.strictEqual(Object.keys(w.connectionsStore).length, 1, 'connectionsStore must have strictly 1 entry');
+                let rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 1, 'connectionsTableBody must have strictly 1 row after reqB');
+                assert(d.getElementById('connectionsTableBody').innerHTML.includes('AWG Fresh'), 'table must display awg-fresh');
+
+                // Resolve A second with stale data
+                resolveA({
+                    clients: [
+                        {
+                            clientId: 'awg-stale',
+                            name: 'AWG Stale',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqA;
+
+                // Assert table strictly contains 1 row (awg-fresh) and connectionsStore contains only awg-fresh
+                assert(w.connectionsStore['awg-fresh'], 'connectionsStore must strictly retain awg-fresh');
+                assert(!w.connectionsStore['awg-stale'], 'connectionsStore must reject stale awg-stale');
+                assert.strictEqual(Object.keys(w.connectionsStore).length, 1, 'connectionsStore must strictly have 1 entry (awg-fresh only)');
+                rows = d.getElementById('connectionsTableBody').querySelectorAll('tr');
+                assert.strictEqual(rows.length, 1, 'connectionsTableBody must strictly contain 1 row (awg-fresh)');
+                const bodyHtml = d.getElementById('connectionsTableBody').innerHTML;
+                assert(bodyHtml.includes('AWG Fresh'), 'table must retain awg-fresh');
+                assert(!bodyHtml.includes('AWG Stale'), 'table must reject stale awg-stale');
+            } finally {
+                w.API.get = origGet;
+            }
+        }
+
+        // Sub-case 3: Superseded rejection does not emit error toast (kills mutant R6)
+        {
+            lastToast = null;
+            let rejectA = null;
+            let resolveB = null;
+            const promiseA = new Promise((_, reject) => { rejectA = reject; });
+            const promiseB = new Promise(resolve => { resolveB = resolve; });
+
+            w.API.get = function(url, ...args) {
+                if (url.includes('/connections') && url.includes('protocol=awg')) {
+                    return promiseA;
+                }
+                if (url.includes('/connections') && url.includes('protocol=telemt')) {
+                    return promiseB;
+                }
+                return origGet.apply(this, [url, ...args]);
+            };
+
+            try {
+                // Start request A ('awg')
+                protoSelect.value = 'awg';
+                const reqA = w.loadConnections();
+
+                // Start request B ('telemt')
+                protoSelect.value = 'telemt';
+                const reqB = w.loadConnections();
+
+                // Resolve B
+                resolveB({
+                    clients: [
+                        {
+                            clientId: 'telemt-fresh',
+                            name: 'Telemt Fresh',
+                            enabled: true,
+                            userData: {}
+                        }
+                    ]
+                });
+                await reqB;
+
+                // Reject request A
+                rejectA(new Error('superseded network error'));
+                await reqA;
+
+                // Assert that lastToast is NOT loading_connections_error
+                assert(!lastToast || !lastToast.msg || !lastToast.msg.includes('loading_connections_error'),
+                    'superseded rejection must not display loading_connections_error toast');
+                assert.strictEqual(lastToast, null, 'superseded rejection must not trigger any toast');
+            } finally {
+                w.API.get = origGet;
+            }
         }
     }
 
@@ -558,12 +687,18 @@ const d = w.document;
     assert(telemetryStops.includes('server-stats-42'), 'stopServerTelemetryPolling must stop server-stats-42');
     assert(telemetryStops.includes('server-reachability-42'), 'stopServerTelemetryPolling must stop server-reachability-42');
 
-    // Idempotent initServerTelemetry guard (Finding M2)
+    // Idempotent initServerTelemetry guard & boot check assertion (Finding M2, L2)
     telemetryRegistrations.length = 0;
+    apiCalls = [];
     w.initServerTelemetry();
     assert.strictEqual(telemetryRegistrations.length, 2, 'initServerTelemetry must register stats and reachability once');
+    const checkCallsAfterFirstInit = apiCalls.filter(c => c.method === 'POST' && c.url.includes('/api/servers/42/check')).length;
+    assert.strictEqual(checkCallsAfterFirstInit, 1, 'initServerTelemetry must trigger checkServer exactly once on initial call');
+
     w.initServerTelemetry();
     assert.strictEqual(telemetryRegistrations.length, 2, 'second initServerTelemetry call must be a no-op');
+    const checkCallsAfterSecondInit = apiCalls.filter(c => c.method === 'POST' && c.url.includes('/api/servers/42/check')).length;
+    assert.strictEqual(checkCallsAfterSecondInit, 1, 'second initServerTelemetry must not trigger checkServer again');
     w.stopServerTelemetryPolling();
 
     console.log('JSDOM_TEST_SUCCESS');

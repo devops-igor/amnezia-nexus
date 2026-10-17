@@ -345,12 +345,15 @@ function updateProtocolCard(proto, info) {
     }
 }
 
+let connectionRequestGen = 0;
+
 function showConnectionsSection() {
     const section = document.getElementById('connectionsSection');
     if (section) section.style.display = 'block';
 }
 
 function hideConnectionsSection() {
+    connectionRequestGen++;
     const section = document.getElementById('connectionsSection');
     if (section) section.style.display = 'none';
     const select = document.getElementById('connProtoSelect');
@@ -377,9 +380,8 @@ function selectProtocolForConns(proto) {
     }
 }
 
-let connectionRequestGen = 0;
-
 async function loadConnections() {
+    const currentGen = ++connectionRequestGen;
     const selectEl = document.getElementById('connProtoSelect');
     const proto = selectEl ? selectEl.value : '';
     const loading = document.getElementById('connectionsLoading');
@@ -392,16 +394,13 @@ async function loadConnections() {
         return;
     }
 
-    const currentGen = ++connectionRequestGen;
-
     if (loading) loading.style.display = '';
     if (emptyEl) emptyEl.classList.add('hidden');
     if (tableContainer) tableContainer.style.display = 'none';
     if (tableBody) tableBody.innerHTML = '';
     try {
         const data = await API.get(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
-        const activeProto = (document.getElementById('connProtoSelect')?.value || (typeof currentInstallProto !== 'undefined' ? currentInstallProto : ''));
-        if (currentGen !== connectionRequestGen || proto !== activeProto) return;
+        if (currentGen !== connectionRequestGen) return;
         if (loading) loading.style.display = 'none';
         if (!data || !data.clients || data.clients.length === 0) {
             if (emptyEl) emptyEl.classList.remove('hidden');
