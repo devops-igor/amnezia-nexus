@@ -489,12 +489,21 @@ function generateQR(text) {
     }
 }
 
-function formatDate(dateStr) {
-    try {
-        const d = new Date(dateStr);
-        if (isNaN(d)) return dateStr;
-        return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-    } catch { return dateStr; }
+function copyServerConfig(btnEl) {
+    const el = document.getElementById('serverConfigText');
+    const val = el ? el.value : '';
+    UI.copy(val, btnEl);
+}
+
+function downloadServerConfig() {
+    const el = document.getElementById('serverConfigText');
+    const val = el ? el.value : '';
+    UI.downloadFile(val, serverConfigFilename);
+}
+
+function finishProtocolInstall() {
+    closeModal('installModal');
+    window.location.reload();
 }
 
 // ========== Server Management Modals ==========
@@ -669,6 +678,36 @@ function initServerActions() {
             const cpsGroup = document.getElementById('awgCpsProtocolGroup');
             if (cpsGroup) {
                 cpsGroup.style.display = (this.value === 'pro') ? 'block' : 'none';
+            }
+        });
+    }
+
+    const telemtTlsEl = document.getElementById('installTelemtTls');
+    if (telemtTlsEl) {
+        telemtTlsEl.addEventListener('change', function() {
+            const domainGroup = document.getElementById('telemtDomainGroup');
+            if (domainGroup) {
+                domainGroup.style.display = this.checked ? 'block' : 'none';
+            }
+        });
+    }
+
+    const renameInput = document.getElementById('renameServerInput');
+    if (renameInput) {
+        renameInput.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                submitRenameServer();
+            }
+        });
+    }
+
+    const editHostInput = document.getElementById('editHostInput');
+    if (editHostInput) {
+        editHostInput.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                submitEditHost();
             }
         });
     }
