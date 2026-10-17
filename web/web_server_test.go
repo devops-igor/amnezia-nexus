@@ -178,7 +178,7 @@ const dom = new JSDOM(docHtml, {
             confirm: async (opts) => { confirmOptions = opts; return true; },
             copy: async () => true,
             downloadFile: () => {},
-            escapeHtml: (s) => (s == null ? '' : String(s)),
+            escapeHtml: (s) => (s == null ? '' : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')),
             formatBytes: (n) => String(n) + 'B',
         };
         w.API = {
@@ -408,11 +408,135 @@ const d = w.document;
     assert(badgesErrorHtml.includes('check_error'), 'statusBadges must show check_error badge on failure');
     assert.strictEqual(d.getElementById('checkBtn').disabled, false, 'checkBtn must be re-enabled after failed check');
 
-    // Flow 4.10: installProtocol rejection verifies progressInterval is cleared (Finding H1 / #478)
+    // Flow 4.9b: CheckServer with succeeding /check but failing /reachability must not emit unhandled rejection (#502 Finding 2)
+    failUrls.add('/reachability');
+    let unhandledRejectionCaught = null;
+    const unhandledHandler = (reason) => {
+        unhandledRejectionCaught = reason;
+    };
+    process.on('unhandledRejection', unhandledHandler);
+    try {
+        const checkResultWithReachError = await w.checkServer();
+        await new Promise(r => setTimeout(r, 20));
+        assert.strictEqual(unhandledRejectionCaught, null, 'checkServer must safely catch reachability failure without unhandled rejection');
+        assert(checkResultWithReachError && checkResultWithReachError.connection === 'ok', 'checkServer must return check result when reachability rejects');
+        const badgesWithReachError = d.getElementById('statusBadges').innerHTML;
+        assert(badgesWithReachError.includes('ssh_ok'), 'statusBadges must show check results even if reachability rejects');
+    } finally {
+        process.removeListener('unhandledRejection', unhandledHandler);
+        failUrls.delete('/reachability');
+    }
+
+    // Flow 4.9c: Out-of-order connection response race protection & date escaping (#502 Findings 1 & 3)
+    {
+        const protoSelect = d.getElementById('connProtoSelect');
+        if (!Array.from(protoSelect.options).some(o => o.value === 'telemt')) {
+            const opt = d.createElement('option');
+            opt.value = 'telemt';
+            opt.textContent = 'MTProxyL';
+            protoSelect.appendChild(opt);
+        }
+        if (!Array.from(protoSelect.options).some(o => o.value === 'awg')) {
+            const opt = d.createElement('option');
+            opt.value = 'awg';
+            opt.textContent = 'AmneziaWG';
+            protoSelect.appendChild(opt);
+        }
+
+        let resolveAwg = null;
+        let resolveTelemt = null;
+        const awgPromise = new Promise(resolve => { resolveAwg = resolve; });
+        const telemtPromise = new Promise(resolve => { resolveTelemt = resolve; });
+
+        const origGet = w.API.get;
+        w.API.get = function(url, ...args) {
+            if (url.includes('/connections') && url.includes('protocol=awg')) {
+                return awgPromise;
+            }
+            if (url.includes('/connections') && url.includes('protocol=telemt')) {
+                return telemtPromise;
+            }
+            return origGet.apply(this, [url, ...args]);
+        };
+
+        try {
+            // Request A: awg
+            protoSelect.value = 'awg';
+            const reqA = w.loadConnections();
+
+            // Request B: telemt (rapid switch)
+            protoSelect.value = 'telemt';
+            const reqB = w.loadConnections();
+
+            // Request B resolves first
+            resolveTelemt({
+                clients: [
+                    {
+                        clientId: 'telemt-client-1',
+                        name: 'Telemt Client',
+                        enabled: true,
+                        userData: {
+                            total_octets: 1024,
+                            creationDate: '<malicious-date-tag>',
+                        }
+                    }
+                ]
+            });
+            await reqB;
+
+            assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must have telemt client from Request B');
+            assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must not have awg client yet');
+            let tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+            assert(tableHtml.includes('Telemt Client'), 'table must display telemt client from Request B');
+            // Verify creationDate HTML escaping (Finding 3)
+            assert(tableHtml.includes('&lt;malicious-date-tag&gt;'), 'table must escape creationDate in metaHtml');
+            assert(!tableHtml.includes('<malicious-date-tag>'), 'table must not contain unescaped creationDate HTML sink');
+
+            // Request A resolves later (out of order / stale)
+            resolveAwg({
+                clients: [
+                    {
+                        clientId: 'awg-client-1',
+                        name: 'AWG Client',
+                        enabled: true,
+                        userData: {}
+                    }
+                ]
+            });
+            await reqA;
+
+            // Assert table and connectionsStore strictly retain telemt and reject stale awg
+            assert(w.connectionsStore['telemt-client-1'], 'connectionsStore must strictly retain telemt client');
+            assert(!w.connectionsStore['awg-client-1'], 'connectionsStore must reject stale awg client');
+            tableHtml = d.getElementById('connectionsTableBody').innerHTML;
+            assert(tableHtml.includes('Telemt Client'), 'table must strictly display telemt client');
+            assert(!tableHtml.includes('AWG Client'), 'table must reject stale awg client data');
+        } finally {
+            w.API.get = origGet;
+        }
+    }
+
+    // Flow 4.10: installProtocol rejection verifies progressInterval is cleared (Finding H1 / #478, Finding 4)
     w.openInstallModal('awg');
     failUrls.add('/install');
-    await w.installProtocol();
-    failUrls.delete('/install');
+    let installAttempted = false;
+    let liveIntervalsDuringInstall = 0;
+    const origPostForInstall = w.API.post;
+    w.API.post = async function(url, ...args) {
+        if (url.includes('/install')) {
+            installAttempted = true;
+            liveIntervalsDuringInstall = activeIntervals.size;
+        }
+        return origPostForInstall.apply(this, [url, ...args]);
+    };
+    try {
+        await w.installProtocol();
+    } finally {
+        w.API.post = origPostForInstall;
+        failUrls.delete('/install');
+    }
+    assert(installAttempted, 'installProtocol must attempt /install API call');
+    assert(liveIntervalsDuringInstall > 0, 'installProtocol must start a progress timer before awaiting install API call');
     assert.strictEqual(activeIntervals.size, 0, 'installProtocol rejection must leave 0 live intervals');
 
     // Flow 4.11: polling lifecycle functions & exact Telemetry.poll registrations (Finding H1 & M2)

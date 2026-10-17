@@ -168,7 +168,7 @@ async function checkServer() {
             }
         }
         updateStatusCounts((data && data.protocols) || {});
-        updateReachability();
+        updateReachability().catch(() => {});
         UI.toast(_('check_done'), 'success');
         return data;
     } catch (err) {
@@ -377,6 +377,8 @@ function selectProtocolForConns(proto) {
     }
 }
 
+let connectionRequestGen = 0;
+
 async function loadConnections() {
     const selectEl = document.getElementById('connProtoSelect');
     const proto = selectEl ? selectEl.value : '';
@@ -390,12 +392,16 @@ async function loadConnections() {
         return;
     }
 
+    const currentGen = ++connectionRequestGen;
+
     if (loading) loading.style.display = '';
     if (emptyEl) emptyEl.classList.add('hidden');
     if (tableContainer) tableContainer.style.display = 'none';
     if (tableBody) tableBody.innerHTML = '';
     try {
         const data = await API.get(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
+        const activeProto = (document.getElementById('connProtoSelect')?.value || (typeof currentInstallProto !== 'undefined' ? currentInstallProto : ''));
+        if (currentGen !== connectionRequestGen || proto !== activeProto) return;
         if (loading) loading.style.display = 'none';
         if (!data || !data.clients || data.clients.length === 0) {
             if (emptyEl) emptyEl.classList.remove('hidden');
@@ -425,7 +431,7 @@ async function loadConnections() {
             // Metadata tags below name
             let metaHtml = '';
             if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;"><svg class="icon" style="width:10px;height:10px;"><use href="#icon-user"></use></svg> ${UI.escapeHtml(assignedUser)}</span>`;
-            if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
+            if (created) metaHtml += `<span>📅 ${UI.escapeHtml(formatDate(created))}</span>`;
 
             // Status & Mimicry column
             let statusHtml = '';
@@ -525,6 +531,7 @@ async function loadConnections() {
             });
         }
     } catch (err) {
+        if (currentGen !== connectionRequestGen) return;
         if (loading) loading.style.display = 'none';
         UI.toast(_('loading_connections_error') + ': ' + (err && err.message ? err.message : String(err)), 'error');
     }
