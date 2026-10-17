@@ -368,12 +368,17 @@ function hideConnectionsSection() {
 
 function selectProtocolForConns(proto) {
     const section = document.getElementById('connectionsSection');
-    if (section) section.style.display = '';
     const select = document.getElementById('connProtoSelect');
-    if (select) {
-        const hasOpt = Array.from(select.options || []).some(o => o.value === proto);
-        select.value = hasOpt ? proto : '';
+    const hasOpt = Boolean(select && Array.from(select.options || []).some(o => o.value === proto));
+    if (!hasOpt) {
+        if (select) select.value = '';
+        if (section) section.style.display = 'none';
+        return;
     }
+    if (select) {
+        select.value = proto;
+    }
+    if (section) section.style.display = '';
     loadConnections();
     if (section && typeof section.scrollIntoView === 'function') {
         section.scrollIntoView({ behavior: 'smooth' });

@@ -384,11 +384,14 @@ const d = w.document;
     w.hideConnectionsSection();
     assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'hideConnectionsSection must set display: none');
 
-    // selectProtocolForConns with missing option does NOT inject option or trigger API call (Finding M1)
+    // selectProtocolForConns with missing option does NOT inject option, reveal stale UI, or trigger API call (Finding M1)
     apiCalls = [];
-    w.selectProtocolForConns('nonexistent_proto');
+    d.getElementById('connectionsTableBody').innerHTML = '<tr><td>stale-row</td></tr>';
+    d.getElementById('connectionsSection').style.display = 'none';
+    w.selectProtocolForConns('nonexistent');
+    assert.strictEqual(d.getElementById('connectionsSection').style.display, 'none', 'connectionsSection must remain hidden when selecting unavailable protocol');
     assert.strictEqual(apiCalls.filter(c => c.url.includes('/connections')).length, 0, 'selectProtocolForConns with missing option must not trigger API call');
-    assert.strictEqual(Array.from(d.getElementById('connProtoSelect').options).some(o => o.value === 'nonexistent_proto'), false, 'selectProtocolForConns must not inject option for missing protocol');
+    assert.strictEqual(Array.from(d.getElementById('connProtoSelect').options).some(o => o.value === 'nonexistent'), false, 'selectProtocolForConns must not inject option for missing protocol');
 
     // Flow 4.9: checkServer execution
     await w.checkServer();
