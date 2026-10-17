@@ -1,7 +1,9 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"html/template"
 	"io/fs"
 	"regexp"
 	"strings"
@@ -757,6 +759,100 @@ const d = w.document;
     assert.strictEqual(checkCallsAfterSecondInit, 1, 'second initServerTelemetry must not trigger checkServer again');
     w.stopServerTelemetryPolling();
 
+    // Flow 4.12: Server actions glue cleanup & modal functions
+    // 4.12.1: Rename server flow
+    w.openRenameServerModal(42, 'srv-alpha');
+    const renameInput = d.getElementById('renameServerInput');
+    assert(renameInput !== null, 'renameServerInput must exist in DOM');
+    assert.strictEqual(renameInput.value, 'srv-alpha', 'renameServerInput must initialize with server name');
+
+    apiCalls = [];
+    renameInput.value = '';
+    await w.submitRenameServer();
+    assert.strictEqual(apiCalls.filter(c => c.url && c.url.includes('/rename')).length, 0, 'empty server name must not call API');
+
+    renameInput.value = 'srv-renamed-beta';
+    await w.submitRenameServer();
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/rename' && c.body && c.body.name === 'srv-renamed-beta'), 'submitRenameServer must post new name');
+    assert.strictEqual(d.getElementById('serverNameTitle').textContent, 'srv-renamed-beta', 'serverNameTitle must update with new name');
+
+    // 4.12.1a: Enter keydown event handling on renameServerInput
+    w.openRenameServerModal(42, 'srv-renamed-beta');
+    apiCalls = [];
+    const renameNonEnter = new w.KeyboardEvent('keydown', { key: 'a', cancelable: true, bubbles: true });
+    renameInput.dispatchEvent(renameNonEnter);
+    assert.strictEqual(renameNonEnter.defaultPrevented, false, 'non-Enter keydown on renameServerInput must not prevent default');
+    assert.strictEqual(apiCalls.filter(c => c.url && c.url.includes('/rename')).length, 0, 'non-Enter keydown must not submit rename');
+
+    renameInput.value = 'srv-enter-renamed';
+    const renameEnter = new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true, bubbles: true });
+    renameInput.dispatchEvent(renameEnter);
+    assert.strictEqual(renameEnter.defaultPrevented, true, 'Enter keydown on renameServerInput must prevent default');
+    await new Promise(r => setTimeout(r, 20));
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/rename' && c.body && c.body.name === 'srv-enter-renamed'), 'Enter keydown on renameServerInput must submit rename');
+
+    // 4.12.1b: Edit host flow & Enter keydown handling
+    w.openEditHostModal(42, '203.0.113.55');
+    const editHostInput = d.getElementById('editHostInput');
+    assert(editHostInput !== null, 'editHostInput must exist in DOM');
+    assert.strictEqual(editHostInput.value, 'vpn.newhost.net', 'editHostInput must initialize with current server host');
+
+    apiCalls = [];
+    const editHostNonEnter = new w.KeyboardEvent('keydown', { key: 'Escape', cancelable: true, bubbles: true });
+    editHostInput.dispatchEvent(editHostNonEnter);
+    assert.strictEqual(editHostNonEnter.defaultPrevented, false, 'non-Enter keydown on editHostInput must not prevent default');
+    assert.strictEqual(apiCalls.filter(c => c.url && c.url.includes('/host')).length, 0, 'non-Enter keydown must not submit host update');
+
+    editHostInput.value = '198.51.100.42';
+    const editHostEnter = new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true, bubbles: true });
+    editHostInput.dispatchEvent(editHostEnter);
+    assert.strictEqual(editHostEnter.defaultPrevented, true, 'Enter keydown on editHostInput must prevent default');
+    await new Promise(r => setTimeout(r, 20));
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/host' && c.body && c.body.host === '198.51.100.42'), 'Enter keydown on editHostInput must submit new host');
+    assert.strictEqual(d.getElementById('serverHostDisplay').textContent, '198.51.100.42', 'serverHostDisplay must update with new host');
+
+    // 4.12.2: Server config copy and download helpers
+    let copiedText = null;
+    let copiedBtn = null;
+    let downloadedFile = null;
+    w.UI.copy = async (text, btn) => { copiedText = text; copiedBtn = btn; return true; };
+    w.UI.downloadFile = (text, filename) => { downloadedFile = { text, filename }; };
+
+    const mockCopyBtn = d.createElement('button');
+    d.getElementById('serverConfigText').value = '[Interface]\nPrivateKey = mockKey';
+    w.copyServerConfig(mockCopyBtn);
+    assert.strictEqual(copiedText, '[Interface]\nPrivateKey = mockKey', 'copyServerConfig must copy text');
+    assert.strictEqual(copiedBtn, mockCopyBtn, 'copyServerConfig must pass button element to UI.copy');
+    w.downloadServerConfig();
+    assert.deepStrictEqual(downloadedFile, { text: '[Interface]\nPrivateKey = mockKey', filename: 'server.conf' }, 'downloadServerConfig must download text with default filename');
+
+    await w.showServerConfig('awg');
+    w.downloadServerConfig();
+    assert.strictEqual(downloadedFile.filename, 'server_awg.conf', 'downloadServerConfig must use protocol filename');
+
+    // 4.12.3: finishProtocolInstall helper
+    let modalClosed = null;
+    let reloadCalled = 0;
+    w.closeModal = (id) => { modalClosed = id; };
+    w.reloadPage = () => { reloadCalled++; };
+    w.finishProtocolInstall();
+    assert.strictEqual(modalClosed, 'installModal', 'finishProtocolInstall must close installModal');
+    assert.strictEqual(reloadCalled, 1, 'finishProtocolInstall must trigger reload helper');
+
+    // 4.12.4: installTelemtTls change listener toggle
+    const telemtTlsCheckbox = d.getElementById('installTelemtTls');
+    const telemtDomainGroup = d.getElementById('telemtDomainGroup');
+    assert(telemtTlsCheckbox !== null, 'installTelemtTls checkbox must exist in DOM');
+    assert(telemtDomainGroup !== null, 'telemtDomainGroup container must exist in DOM');
+
+    telemtTlsCheckbox.checked = false;
+    telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
+    assert.strictEqual(telemtDomainGroup.style.display, 'none', 'unchecking installTelemtTls must hide telemtDomainGroup');
+
+    telemtTlsCheckbox.checked = true;
+    telemtTlsCheckbox.dispatchEvent(new w.Event('change'));
+    assert.strictEqual(telemtDomainGroup.style.display, 'block', 'checking installTelemtTls must show telemtDomainGroup');
+
     console.log('JSDOM_TEST_SUCCESS');
     process.exit(0);
 })();
@@ -769,5 +865,118 @@ const d = w.document;
 	}
 	if !strings.Contains(string(out), "JSDOM_TEST_SUCCESS") {
 		t.Fatalf("JSDOM test did not report success. Output:\n%s", string(out))
+	}
+}
+
+func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	funcMap := template.FuncMap{
+		"_": func(k string) string { return k },
+		"t": func(k string) string { return k },
+		"safe_js": func(v any) template.JS {
+			switch val := v.(type) {
+			case string:
+				return template.JS(val)
+			case template.JS:
+				return val
+			default:
+				b, _ := json.Marshal(v)
+				return template.JS(b)
+			}
+		},
+		"slice_str": func(s string, start, end int) string {
+			if start >= len(s) {
+				return ""
+			}
+			if end > len(s) {
+				end = len(s)
+			}
+			return s[start:end]
+		},
+		"has_role": func(u any, roles ...string) bool { return true },
+		"upper":    strings.ToUpper,
+		"slice": func(s string, start, end int) string {
+			if start >= len(s) {
+				return ""
+			}
+			if end > len(s) {
+				end = len(s)
+			}
+			return s[start:end]
+		},
+	}
+
+	tmpl, err := template.New("base.html").Funcs(funcMap).ParseFS(templatesFS, "base.html", "server.html")
+	if err != nil {
+		t.Fatalf("failed to parse base.html and server.html: %v", err)
+	}
+
+	data := map[string]any{
+		"lang":              "en",
+		"active_page":       "servers",
+		"csrf_token":        "mock-csrf-token-12345",
+		"translations_json": "{}",
+		"server_id":         42,
+		"server": map[string]any{
+			"ID":      42,
+			"Name":    "alpha-server-test",
+			"Host":    "203.0.113.55",
+			"SSHPort": 22,
+			"SSHUser": "root",
+		},
+		"users": []map[string]any{
+			{"ID": 1, "Username": "alice", "Role": "user"},
+		},
+		"site_settings": map[string]any{"Title": "Amnezia Nexus"},
+		"current_user":  map[string]any{"Username": "admin", "Role": "admin"},
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "base.html", data); err != nil {
+		t.Fatalf("failed to execute server.html template: %v", err)
+	}
+
+	rendered := buf.String()
+
+	// 1. Assert script loading sequence and bootstrap
+	const expectedActionsScript = `<script src="/static/js/server_actions.js"></script>`
+	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js"></script>`
+	actionsIdx := strings.Index(rendered, expectedActionsScript)
+	if actionsIdx == -1 {
+		t.Errorf("rendered server.html missing script tag %q", expectedActionsScript)
+	}
+	telemetryIdx := strings.Index(rendered, expectedTelemetryScript)
+	if telemetryIdx == -1 {
+		t.Errorf("rendered server.html missing script tag %q", expectedTelemetryScript)
+	}
+	if telemetryIdx < actionsIdx {
+		t.Errorf("server_telemetry.js must be loaded after server_actions.js")
+	}
+
+	serverIDPattern := `const SERVER_ID\s*=\s*42\s*;`
+	matched, err := regexp.MatchString(serverIDPattern, rendered)
+	if err != nil || !matched {
+		t.Errorf("rendered server.html missing expected bootstrap pattern %q", serverIDPattern)
+	}
+	if !strings.Contains(rendered, "initServerTelemetry();") {
+		t.Errorf("rendered server.html missing initServerTelemetry() in bootstrap")
+	}
+
+	// 2. Assert server name, host, CSRF injection, and default status
+	if !strings.Contains(rendered, "alpha-server-test") {
+		t.Errorf("rendered server.html missing server.Name 'alpha-server-test'")
+	}
+	if !strings.Contains(rendered, "203.0.113.55") {
+		t.Errorf("rendered server.html missing server.Host '203.0.113.55'")
+	}
+	if !strings.Contains(rendered, `content="mock-csrf-token-12345"`) {
+		t.Errorf("rendered server.html missing CSRF token in meta tag")
+	}
+	if !strings.Contains(rendered, "pending") {
+		t.Errorf("rendered server.html missing default pending status badge")
 	}
 }
