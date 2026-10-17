@@ -367,7 +367,8 @@ func TestVPNPageLoadDataEmptyBackendsAndErrorFallback(t *testing.T) {
     await w.vpnLoadData();
     const tbody = w.document.getElementById('vpn-backends-tbody');
     assert.ok(tbody.innerHTML.includes('empty-state'), 'empty-state container rendered');
-    assert.ok(tbody.innerHTML.includes('vpnOpenAddBackendModal()'), 'add backend modal trigger button present');
+    assert.ok(tbody.innerHTML.includes('data-action="vpn-open-add-backend"'), 'add backend modal trigger button present');
+    assert.strictEqual(tbody.innerHTML.includes('onclick='), false, 'empty-state CTA must not use inline onclick');
 
     // 2. API rejection enters error fallback without throwing
     w.API = {
@@ -536,5 +537,233 @@ w.API = {
 	out := fixture.RunJSDOM(testScript)
 	if !strings.Contains(out, "PASS_POLLING_AND_TEARDOWN") {
 		t.Fatalf("expected PASS_POLLING_AND_TEARDOWN, got:\n%s", out)
+	}
+}
+
+func TestVPNPageDelegatedEventListeners(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	fixture.RequireJSDOM()
+
+	// Verify template HTML has 0 inline onclick/onchange/onsubmit handlers
+	for _, attr := range []string{"onclick=", "onchange=", "onsubmit="} {
+		if strings.Contains(fixture.TemplateHTML, attr) {
+			t.Fatalf("expected vpn.html to contain 0 %s attributes, found at least one", attr)
+		}
+	}
+
+	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+(() => {
+    const assert = require('assert');
+
+    let editEndpointModalOpened = 0;
+    let addBackendModalOpened = 0;
+    let sessionsProblemFilterToggled = 0;
+    let showAllRoutesToggled = 0;
+    const historyWindowsCalled = [];
+    const modalsClosed = [];
+    let quickCheckTriggered = 0;
+    let addBackendSubmitted = 0;
+    let editEndpointSubmitted = 0;
+    let serverSelectedCalls = 0;
+
+    w.vpnOpenEditEndpointModal = () => { editEndpointModalOpened++; };
+    w.vpnOpenAddBackendModal = () => { addBackendModalOpened++; };
+    w.vpnToggleSessionsProblemFilter = () => { sessionsProblemFilterToggled++; };
+    w.vpnToggleShowAllRoutes = () => { showAllRoutesToggled++; };
+    w.vpnSetHistoryWindow = (win) => { historyWindowsCalled.push(win); };
+    w.closeModal = (modalId) => { modalsClosed.push(modalId); };
+    w.vpnTriggerQuickCheck = () => { quickCheckTriggered++; };
+    w.vpnSubmitAddBackend = () => { addBackendSubmitted++; };
+    w.vpnSubmitEditEndpoint = () => { editEndpointSubmitted++; };
+    w.vpnOnServerSelected = () => { serverSelectedCalls++; };
+
+    // 1. Modal open buttons (including child target click)
+    const editEpBtn = w.document.getElementById('vpn-edit-endpoint-btn');
+    assert.ok(editEpBtn, '#vpn-edit-endpoint-btn must exist');
+    editEpBtn.click();
+    assert.strictEqual(editEndpointModalOpened, 1, 'vpnOpenEditEndpointModal called on click');
+
+    const addBackendBtn = w.document.getElementById('vpn-add-backend-btn');
+    assert.ok(addBackendBtn, '#vpn-add-backend-btn must exist');
+    const addIcon = addBackendBtn.querySelector('svg') || addBackendBtn;
+    addIcon.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.strictEqual(addBackendModalOpened, 1, 'vpnOpenAddBackendModal called on child icon click');
+
+    // 1b. Empty-state CTA button click triggers vpnOpenAddBackendModal
+    const emptyCtaContainer = w.document.createElement('div');
+    emptyCtaContainer.innerHTML = '<button type="button" class="btn btn-primary btn-sm" data-action="vpn-open-add-backend"><span>Add</span></button>';
+    w.document.body.appendChild(emptyCtaContainer);
+    const emptyCtaBtn = emptyCtaContainer.querySelector('button[data-action="vpn-open-add-backend"]');
+    emptyCtaBtn.click();
+    assert.strictEqual(addBackendModalOpened, 2, 'vpnOpenAddBackendModal called on empty-state CTA click');
+
+    // 2. Filter & display toggle buttons
+    const toggleProblemsBtn = w.document.getElementById('vpn-sessions-toggle-problems-btn');
+    assert.ok(toggleProblemsBtn, '#vpn-sessions-toggle-problems-btn must exist');
+    toggleProblemsBtn.click();
+    assert.strictEqual(sessionsProblemFilterToggled, 1, 'vpnToggleSessionsProblemFilter called on click');
+
+    const toggleRoutesBtn = w.document.getElementById('vpn-routes-toggle-all-btn');
+    assert.ok(toggleRoutesBtn, '#vpn-routes-toggle-all-btn must exist');
+    const routesEvt = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+    toggleRoutesBtn.dispatchEvent(routesEvt);
+    assert.strictEqual(showAllRoutesToggled, 1, 'vpnToggleShowAllRoutes called on click');
+    assert.strictEqual(routesEvt.defaultPrevented, true, 'show-all-routes click default prevented');
+
+    // 3. History window chips (6 buttons)
+    const togglesContainer = w.document.getElementById('vpn-history-window-toggles');
+    assert.ok(togglesContainer, '#vpn-history-window-toggles must exist');
+    const chips = Array.from(togglesContainer.querySelectorAll('button[data-action="vpn-set-history-window"]'));
+    assert.strictEqual(chips.length, 6, 'expected 6 history window chips');
+    for (const chip of chips) {
+        chip.click();
+    }
+    assert.deepStrictEqual(historyWindowsCalled, ['1m', '5m', '15m', '1h', '6h', '24h'], 'history window chips called with correct values');
+
+    // 4. Modal close buttons (4 buttons across 2 modals)
+    const addBackendModal = w.document.getElementById('addBackendModal');
+    assert.ok(addBackendModal, '#addBackendModal must exist');
+    const addModalCloseBtns = Array.from(addBackendModal.querySelectorAll('button[data-action="vpn-close-modal"]'));
+    assert.strictEqual(addModalCloseBtns.length, 2, 'expected 2 close buttons in addBackendModal');
+    for (const btn of addModalCloseBtns) {
+        btn.click();
+    }
+    assert.deepStrictEqual(modalsClosed.slice(0, 2), ['addBackendModal', 'addBackendModal'], 'addBackendModal closed twice');
+
+    const editEndpointModal = w.document.getElementById('editEndpointModal');
+    assert.ok(editEndpointModal, '#editEndpointModal must exist');
+    const editModalCloseBtns = Array.from(editEndpointModal.querySelectorAll('button[data-action="vpn-close-modal"]'));
+    assert.strictEqual(editModalCloseBtns.length, 2, 'expected 2 close buttons in editEndpointModal');
+    for (const btn of editModalCloseBtns) {
+        btn.click();
+    }
+    assert.deepStrictEqual(modalsClosed.slice(2, 4), ['editEndpointModal', 'editEndpointModal'], 'editEndpointModal closed twice');
+
+    // 5. Quick check button
+    const quickCheckBtn = w.document.getElementById('vpnQuickCheckBtn');
+    assert.ok(quickCheckBtn, '#vpnQuickCheckBtn must exist');
+    quickCheckBtn.click();
+    assert.strictEqual(quickCheckTriggered, 1, 'vpnTriggerQuickCheck called on click');
+
+    // 6. Form submissions
+    const addBackendForm = w.document.getElementById('addBackendForm');
+    assert.ok(addBackendForm, '#addBackendForm must exist');
+    const addEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    addBackendForm.dispatchEvent(addEvt);
+    assert.strictEqual(addBackendSubmitted, 1, 'vpnSubmitAddBackend called on submit');
+    assert.strictEqual(addEvt.defaultPrevented, true, 'addBackendForm submit default prevented');
+
+    const editEndpointForm = w.document.getElementById('editEndpointForm');
+    assert.ok(editEndpointForm, '#editEndpointForm must exist');
+    const editEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    editEndpointForm.dispatchEvent(editEvt);
+    assert.strictEqual(editEndpointSubmitted, 1, 'vpnSubmitEditEndpoint called on submit');
+    assert.strictEqual(editEvt.defaultPrevented, true, 'editEndpointForm submit default prevented');
+
+    // 7. Select change
+    const serverSelect = w.document.getElementById('vpnServerSelect');
+    assert.ok(serverSelect, '#vpnServerSelect must exist');
+    serverSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
+    assert.strictEqual(serverSelectedCalls, 1, 'vpnOnServerSelected called on change');
+
+    // 7b. Form & select DOM element replacement survives without reinitializing listeners
+    const oldAddForm = w.document.getElementById('addBackendForm');
+    const replacementAddForm = w.document.createElement('form');
+    replacementAddForm.id = 'addBackendForm';
+    oldAddForm.parentNode.replaceChild(replacementAddForm, oldAddForm);
+    const replSubmitEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    replacementAddForm.dispatchEvent(replSubmitEvt);
+    assert.strictEqual(addBackendSubmitted, 2, 'vpnSubmitAddBackend called on replaced form submit');
+    assert.strictEqual(replSubmitEvt.defaultPrevented, true, 'replaced addBackendForm submit default prevented');
+
+    const oldSelect = w.document.getElementById('vpnServerSelect');
+    const replacementSelect = w.document.createElement('select');
+    replacementSelect.id = 'vpnServerSelect';
+    if (oldSelect && oldSelect.parentNode) {
+        oldSelect.parentNode.replaceChild(replacementSelect, oldSelect);
+    } else {
+        w.document.body.appendChild(replacementSelect);
+    }
+    replacementSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
+    assert.strictEqual(serverSelectedCalls, 2, 'vpnOnServerSelected called on replaced select');
+
+    // 8. Dynamically generated real-row controls delegation (vpnRenderBackendRow & vpnRenderSessionRow)
+    const backendToggles = [];
+    const backendDeletes = [];
+    let sessionToggledId = null;
+    let sessionToggledTr = null;
+    w.vpnToggleBackend = (srvId, action) => { backendToggles.push({ srvId: String(srvId), action }); };
+    w.vpnDeleteBackend = (srvId) => { backendDeletes.push(String(srvId)); };
+    w.vpnToggleSessionDrilldown = (sessId, tr) => { sessionToggledId = sessId; sessionToggledTr = tr; };
+
+    w.vpnCachedServers = [
+        { id: 101, name: 'Server 101' },
+        { id: 102, name: 'Server 102' }
+    ];
+
+    // Real backend row 1: disabled backend -> enable action
+    const backendRow1 = w.vpnRenderBackendRow({ server_id: 101, enabled: false, status: 'disabled' });
+    const backendsTbody = w.document.getElementById('vpn-backends-tbody');
+    assert.ok(backendsTbody, '#vpn-backends-tbody must exist');
+    backendsTbody.appendChild(backendRow1);
+
+    // Real backend row 2: enabled backend -> disable action
+    const backendRow2 = w.vpnRenderBackendRow({ server_id: 102, enabled: true, status: 'running' });
+    backendsTbody.appendChild(backendRow2);
+
+    // Test clicking enable on real backend row 1
+    const toggleBackendBtn1 = backendRow1.querySelector('[data-action="vpn-toggle-backend"]');
+    assert.ok(toggleBackendBtn1, 'backendRow1 must contain data-action="vpn-toggle-backend" button');
+    toggleBackendBtn1.click();
+    assert.deepStrictEqual(backendToggles[0], { srvId: '101', action: 'enable' }, 'vpnToggleBackend enable dispatched from real row 1');
+
+    // Test clicking disable on real backend row 2
+    const toggleBackendBtn2 = backendRow2.querySelector('[data-action="vpn-toggle-backend"]');
+    assert.ok(toggleBackendBtn2, 'backendRow2 must contain data-action="vpn-toggle-backend" button');
+    toggleBackendBtn2.click();
+    assert.deepStrictEqual(backendToggles[1], { srvId: '102', action: 'disable' }, 'vpnToggleBackend disable dispatched from real row 2');
+
+    // Test clicking delete button on real backend row 2 (child icon dispatch)
+    const deleteBackendBtn = backendRow2.querySelector('[data-action="vpn-delete-backend"]');
+    assert.ok(deleteBackendBtn, 'backendRow2 must contain data-action="vpn-delete-backend" button');
+    const deleteIcon = deleteBackendBtn.querySelector('svg') || deleteBackendBtn;
+    deleteIcon.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.deepStrictEqual(backendDeletes, ['102'], 'vpnDeleteBackend dispatched from real row 2 delete button');
+
+    // Real session row
+    const sessionData = { session_id: 'sess-99', username: 'alice', server_name: 'Server 101', status: 'connected' };
+    const sessionRow = w.vpnRenderSessionRow(sessionData);
+    const sessionsTbody = w.document.getElementById('vpn-sessions-tbody');
+    assert.ok(sessionsTbody, '#vpn-sessions-tbody must exist');
+    sessionsTbody.appendChild(sessionRow);
+
+    const toggleSessionTd = sessionRow.querySelector('[data-action="vpn-toggle-session"]');
+    assert.ok(toggleSessionTd, 'sessionRow must contain cell with data-action="vpn-toggle-session"');
+    toggleSessionTd.click();
+    assert.strictEqual(sessionToggledId, 'sess-99', 'vpnToggleSessionDrilldown received session id from real session row');
+    assert.strictEqual(sessionToggledTr, sessionRow, 'vpnToggleSessionDrilldown received tr element from real session row');
+
+    // 9. Foreign data-action does NOT prevent default
+    const foreignLink = w.document.createElement('a');
+    foreignLink.href = '#other';
+    foreignLink.setAttribute('data-action', 'foreign-feature-action');
+    w.document.body.appendChild(foreignLink);
+    const foreignEvt = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+    foreignLink.dispatchEvent(foreignEvt);
+    assert.strictEqual(foreignEvt.defaultPrevented, false, 'unrecognized data-action must not prevent default');
+
+    // 10. Verify no inline event attributes anywhere in document
+    const inlineHandlerEls = w.document.querySelectorAll('[onclick],[onchange],[onsubmit]');
+    assert.strictEqual(inlineHandlerEls.length, 0, 'no inline on* attributes allowed in DOM');
+
+    console.log('PASS_DELEGATED_EVENT_LISTENERS');
+})();
+`,
+	})
+
+	out := fixture.RunJSDOM(testScript)
+	if !strings.Contains(out, "PASS_DELEGATED_EVENT_LISTENERS") {
+		t.Fatalf("expected PASS_DELEGATED_EVENT_LISTENERS, got:\n%s", out)
 	}
 }

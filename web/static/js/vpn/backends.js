@@ -182,12 +182,12 @@ function vpnRenderBackendRow(b) {
     toggleBtn.className = 'btn btn-ghost btn-sm btn-icon' + (disabledBackend ? ' btn-success-hover' : '');
     toggleBtn.title = disabledBackend ? _('vpn_enable') : _('vpn_disable');
     toggleBtn.setAttribute('aria-label', disabledBackend ? _('vpn_enable') : _('vpn_disable'));
+    toggleBtn.setAttribute('data-action', 'vpn-toggle-backend');
+    toggleBtn.setAttribute('data-server-id', String(srvId));
+    toggleBtn.setAttribute('data-backend-action', disabledBackend ? 'enable' : 'disable');
     toggleBtn.innerHTML = disabledBackend
         ? `<svg class="icon" style="color: var(--success);"><use href="#icon-play"></use></svg>`
         : `<svg class="icon text-muted"><use href="#icon-pause"></use></svg>`;
-    toggleBtn.addEventListener('click', function () {
-        vpnToggleBackend(srvId, disabledBackend ? 'enable' : 'disable');
-    });
     actionsDiv.appendChild(toggleBtn);
 
     // Delete backend
@@ -197,10 +197,9 @@ function vpnRenderBackendRow(b) {
     delBtn.style.color = 'var(--danger)';
     delBtn.title = _('vpn_delete');
     delBtn.setAttribute('aria-label', _('vpn_delete'));
+    delBtn.setAttribute('data-action', 'vpn-delete-backend');
+    delBtn.setAttribute('data-server-id', String(srvId));
     delBtn.innerHTML = `<svg class="icon"><use href="#icon-trash"></use></svg>`;
-    delBtn.addEventListener('click', function () {
-        vpnDeleteBackend(srvId);
-    });
     actionsDiv.appendChild(delBtn);
 
     tdActions.appendChild(actionsDiv);
