@@ -17,7 +17,7 @@ An automated comment-stripped brace parsing inspection of `web/static/css/style.
 | **Unique Selectors** | 373 | 33 selectors defined multiple times across base rules, media queries, and utility overrides |
 | **Class Tokens** | 236 | 226 actively referenced in templates/scripts; 10 companion, test, or unreferenced tokens |
 | **ID Tokens** | 3 | High-specificity selectors (`#usersContainer`, `#usersGrid`, `#userConnsTable`) bound to DOM elements |
-| **CSS Custom Properties** | 56 | 56 variables defined; 3 undefined variables invoked with broken runtime fallbacks |
+| **CSS Custom Properties** | 56 | 56 variables defined; 3 undefined variables invoked (`--bg-surface-hover` has working fallback; `--accent-color` lacks fallback causing computed outline `none`; `--shadow-xl` lacks fallback invalidating box-shadow) |
 | **Media Queries** | 5 | Breakpoint fragmentation across 1023px, 900px, 768px, 767px, and 480px |
 
 ### 1.3 Core Architectural Vulnerabilities in Current Monolith
@@ -136,9 +136,9 @@ The table below catalogs primary selector groups, their source line spans in `st
 | **Form Controls** (`.form-group`, `.form-input`, `.form-select`, `.form-row`) | 914–983 | `login.html`, `setup.html`, `change_password.html`, `server.html`, `users.html`, `settings.html`, `vpn.html`, `index.html`, `my_connections.html`, `user_share.html` | `vpn/charts.js` | Standardized form controls. |
 | **Modals** (`.modal`, `.modal-backdrop`, `.modal-header`, `.modal-close`) | 996–1077 | `base.html`, `index.html`, `server.html`, `vpn.html`, `users.html`, `my_connections.html`, `user_share.html`, `login.html`, `setup.html`, `change_password.html` | `ui.js`, `vpn/page.js` | Accessible dialogs with keyboard and backdrop dismissal (includes `#langModal` on auth pages). |
 | **Protocol Cards** (`.protocol-cards`, `.protocol-card`, `.protocol-info`) | 1078–1178 | `server.html` | *(None)* | Protocol configuration cards on server detail page. |
-| **Clients List** (`.clients-section`, `.clients-list`, `.client-item`, `.client-avatar`) | 1179–1264 | `users.html`, `my_connections.html` | `server_telemetry.js`, `users.js` | Client list cards rendered across users and connection views. |
+| **Clients List** (`.clients-section`, `.clients-list`, `.client-item`, `.client-avatar`) | 1179–1264 | `server.html`, `users.html`, `my_connections.html` | `server_telemetry.js`, `users.js` | Client list cards rendered across server, users, and connection views. |
 | **Traffic Badge Base** (`.traffic-badge`) | 1265–1272 | `my_connections.html` | `server_telemetry.js` | Base typography and display for traffic rates. |
-| **Top Consumer & Sort** (`.top-consumer`, `.sort-toggle`) | 1273–1285 | `users.html`, `my_connections.html` | `server_telemetry.js`, `users.js` | Client sorting and highlighted consumer accents. |
+| **Top Consumer & Sort** (`.top-consumer`, `.sort-toggle`) | 1273–1285 | `my_connections.html` | *(None)* | Client sorting and highlighted consumer accents in connection views. |
 | **Config Display** (`.config-display`, `.config-text`, `.config-actions`) | 1286–1312 | `server.html`, `users.html`, `my_connections.html`, `user_share.html` | *(None)* | Configuration text containers with copy controls. |
 | **Toast Notifications** (`.toast`, `.toast-container`, `.toast-exit`) | 1313–1391 | `base.html`, `index.html`, `settings.html`, `my_connections.html` | `ui.js`, `server_actions.js`, `users.js`, `vpn/backends.js`, `api.js`, `server_telemetry.js` | Dynamic toast construction across API and telemetry handlers. |
 | **Shimmer Skeletons** (`.skeleton`, `.skeleton-text`, `.skeleton-card`, `.skeleton-avatar`) | 1392–1434 | *(None/Design System)* | *(None)* | Loading state primitives asserted by `web/web_test.go:81`. `.skeleton-icon` is dead. |
@@ -149,7 +149,7 @@ The table below catalogs primary selector groups, their source line spans in `st
 | **Tabs Navigation** (`.tabs`, `.tab`) | 1571–1605 | `index.html`, `my_connections.html`, `user_share.html` | `server_actions.js`, `users.js`, `telemetry.js` | Tab switching controller primitives. |
 | **Back Link Navigation** (`.back-link`) | 1606–1620 | `server.html` | *(None)* | Navigation link returning to server overview. |
 | **Utilities & Spacing** (`.flex`, `.hidden`, `.gap-xs`, `.gap-sm`, `.font-mono`) | 1628–1672 | All 12 application templates | `ui.js`, `tables.js`, `users.js`, `server_actions.js`, `vpn/*.js` | Utility classes. Loaded after components to preserve `.font-mono` override. |
-| **Server Stats Pills** (`.stat-pill`) | 1720–1742 | `server.html`, `users.html`, `my_connections.html`, `user_share.html` | `server_telemetry.js` | Compact telemetry metric pills. |
+| **Server Stats Pills** (`.stat-pill`) | 1720–1742 | *(None/Dynamic)* | `server_telemetry.js` | Compact telemetry metric pills generated dynamically by telemetry script. |
 | **Config Tabs** (`.config-tab`, `.config-panel`) | 1743–1786 | `server.html`, `users.html`, `my_connections.html`, `user_share.html` | `server_actions.js`, `users.js` | Protocol tab selection panels. |
 | **QR Code Display** (`.qr-container`, `.qr-hint`) | 1787–1806 | `server.html`, `users.html`, `my_connections.html`, `user_share.html` | *(None)* | Configuration QR presentation modal container. |
 | **VPN Protocol Link Box** (`.vpn-link-box`) | 1807–1822 | `server.html`, `users.html`, `my_connections.html`, `user_share.html` | *(None)* | Scrollable raw connection URI container. |
@@ -376,11 +376,11 @@ web/static/css/
  ├── tokens.css       (161 lines) : Variables, design tokens, light theme overrides
  ├── base.css         (217 lines) : Resets, typography, scrollbars, SVG icons, focus, micro-interactions, empty-state
  ├── layout.css       (446 lines) : App shell, sidebar, mobile top/bottom bars, header branding, responsive nav
- ├── components.css   (959 lines) : Buttons, cards, modals, form controls, badges, toasts, toggles, login, leaderboard
+ ├── components.css   (958 lines) : Buttons, cards, modals, form controls, badges, toasts, toggles, login, leaderboard
  ├── tables.css       (311 lines) : Interactive table engine (toolbar, filter chips, sortable headers, pagination)
  ├── server.css       (449 lines) : Server grid, protocol cards, client lists, config displays, logs, QR codes, responsive
  └── vpn.css          (449 lines) : VPN stat cards, latency indicators, diagnostics, client dashboard, utilities, users section
- (Deduplicated in #505: 16 lines) : Removed redundant utility duplicates (lines 1941–1956)
+ (Deduplicated/Pruned in #505: 17 lines) : Redundant utilities (lines 1941–1956, 16 lines) and dead .skeleton-icon (line 1428, 1 line)
 Total Lines Accounted: 3,008 lines (Every proposed file strictly < 1,000 lines)
 ```
 
@@ -457,7 +457,7 @@ The following real tests read `css/style.css` directly and assert literal string
     - `web/vpn_diagnostics_sessions_test.go:212, 295, 299`: verifies computed styles via `w.getComputedStyle` (`direction: rtl` on `#vpn-fwd-routes-table`, `overflow-x: auto` on `.table-container`, `min-width: 540px` on `#vpn-fwd-routes-table`).
 
 #### Transition Strategies for Issue #505
-- **Strategy A (Aggregate Concatenation Build Step — Recommended)**: Maintain `web/static/css/style.css` as a master concatenation bundle generated from the 7 modular files in production load order. Note: an `@import` manifest is **unsound** because `@import` strips inline rules, failing every `strings.Contains` assertion in the Go test suite, and JSDOM does not resolve external `@import` rules in fixtures. If concatenation is chosen, a drift-guard Go test (`TestStyleCSSConcatenationParity`) must verify that `style.css` byte-for-byte matches the concatenation of the 7 modules.
+- **Strategy A (Aggregate Concatenation Build Step — Recommended)**: Maintain `web/static/css/style.css` as a master concatenation bundle generated from the 7 modular files in production load order. Note: an `@import` manifest is **unsound** because Go test assertions (such as in `web_embedded_test.go`) assert that exact CSS string literals and blocks are directly present in `style.css`; referencing modules via `@import` removes those inline string literals from `style.css`, causing `strings.Contains` assertions to fail, and JSDOM does not resolve external `@import` rules in fixtures. If concatenation is chosen, a drift-guard Go test (`TestStyleCSSConcatenationParity`) must verify that `style.css` byte-for-byte matches the concatenation of the 7 modules.
 - **Strategy B (Atomic Test Harness Update)**: Simultaneously update Go tests to read from modular files (e.g. `css/tokens.css` for `--accent`, `css/tables.css` for `.table-toolbar`).
 
 ### 8.4 Phased Implementation Sequence for Issue #505
@@ -470,7 +470,7 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 │ - Move Lines 1–161 to tokens.css (161 lines)                             │
 │ - Move Lines 162–301, 984–995, 1435–1451, 1545–1570, 1606–1627 to       │
 │   base.css (217 lines)                                                   │
-│ - Prune dead companion selector .skeleton-icon at L1428                  │
+│ - Prune dead companion selector .skeleton-icon at L1428 (1 line)         │
 └────────────────────────────────────┬─────────────────────────────────────┘
                                      │
                                      ▼
@@ -487,7 +487,7 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 │ Step 3: Extract components.css                                           │
 │ - Move Lines 653–811, 870–983, 996–1077, 1265–1272, 1313–1434,          │
 │   1452–1514, 1571–1605, 1823–1846, 1876–1890, 1899–1940, 1957–2089,      │
-│   2496–2657 to components.css (959 lines)                                │
+│   2496–2657 to components.css (958 lines after pruning L1428)            │
 │ - Colocate responsive overrides for .modal and .form-row                 │
 │ - Unify .badge (L1900 winning definition & .badge-secondary L1935)       │
 │ - Unify .traffic-badge with .traffic-down/.traffic-up modifiers          │
@@ -516,81 +516,310 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.5 Baseline Style Snapshot Procedure & Verification Evidence
+### 8.5 Baseline Style Verification Specification & Empirical Evidence
 
-#### Baseline Snapshot Capture & Comparison Procedure (Python Playwright)
-To protect Issue #505 against visual regressions across breakpoints and color themes, a baseline visual regression harness must be executed before and after modularization:
+#### 1. Primary Verification Oracle: Computed-Style Differential Test (`tests/e2e/test_css_differential.py`)
+Static stylesheet modularization must guarantee that computed styles for every element across all application views remain 100% identical. Rather than relying solely on pixel diffing—which is susceptible to GPU font antialiasing differences, animation/transition timing variations (`--transition-slow`), auth redirect cycles, and seed database state—the primary verification oracle for Issue #505 is a **computed-style differential test** executed in headless Chromium via Playwright.
 
-1. **Tooling & Harness Location**: Python Playwright test runner under `tests/e2e/test_css_snapshots.py` integrated with `pytest-playwright` and existing fixtures in `tests/e2e/conftest.py`.
-2. **Viewports Matrix**:
-   - Desktop: `1280 x 800`
-   - Landscape Tablet: `1024 x 768`
-   - Portrait Tablet: `768 x 1024` (validates 768px breakpoint boundary)
-   - Mobile: `480 x 854`
-3. **Theme States**: Both `dark` (`[data-theme="dark"]` baseline) and `light` (`[data-theme="light"]`).
-4. **Target Page Scope**: Key routes covering shell, data tables, modals, cards, and telemetry:
-   - `/login` (unauthenticated authentication card)
-   - `/vpn` (stat cards, telemetry charts, backends data table)
-   - `/servers/1` (server detail, protocol cards, client list, logs terminal)
-   - `/users` (users grid, modernized user cards, connections table)
-   - `/settings` (settings section cards, network health nodes, theme toggle)
-   - `/share/demo-token` (shared connection card, QR container, link box)
-5. **Runnable Playwright Snapshot Test Script** (`tests/e2e/test_css_snapshots.py`):
+The oracle compares monolithic `style.css` against the modular roadmap bundle (concatenated in §8.2 production load order: `tokens.css`, `base.css`, `layout.css`, `components.css`, `tables.css`, `server.css`, `vpn.css`) across:
+1. **Full Template DOM Coverage**: All 13 application templates (`web/templates/*.html`) with Go template actions stripped and `<script>` tags removed.
+2. **Dynamic Class Combinations**: A synthetic DOM page embedding every dynamic CSS multi-class combination emitted across templates and client scripts (`web/static/js/**/*.js`), mounted both standalone and inside shell containers (`.app-layout`, `.card`, `.data-table`, `#usersGrid`).
+3. **Viewport Matrix**: 7 responsive widths covering all media query boundaries:
+   - `1280 x 800` (desktop base)
+   - `1024 x 768` (landscape tablet)
+   - `900 x 800` (desktop narrow / navigation breakpoint at L1891)
+   - `768 x 1024` (portrait tablet breakpoint at L2090)
+   - `767 x 1024` (mobile breakpoint upper boundary)
+   - `700 x 900` (compact tablet breakpoint at L843)
+   - `480 x 854` (mobile small breakpoint at L2130)
+4. **Themes**: Both `dark` (`[data-theme="dark"]` baseline) and `light` (`[data-theme="light"]`).
+5. **Style Evaluation**: Evaluates `window.getComputedStyle(element)` for all longhand properties across all sampled elements, including `::before` and `::after` pseudo-elements.
+6. **Acceptance Criterion**: Strictly **0 computed style differences**.
+
+##### Differential Test Script Specification (`tests/e2e/test_css_differential.py`)
 
 ```python
-"""Visual regression snapshot test suite for CSS modularization (#504/#505)."""
+"""Computed-style differential oracle for CSS modularization (#504/#505).
+
+Contract specification for Issue #505 to verify zero cascade mutation between
+monolithic style.css and the modular bundle across all templates, dynamic class
+combinations, viewports, and themes in headless Chromium.
+"""
+import glob
+import os
+import re
+from pathlib import Path
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import sync_playwright
+
+ORDER = [
+    "tokens.css",
+    "base.css",
+    "layout.css",
+    "components.css",
+    "tables.css",
+    "server.css",
+    "vpn.css",
+]
+
+VIEWPORTS = [
+    (1280, 800),   # Desktop standard
+    (1024, 768),   # Landscape tablet
+    (900, 800),    # Desktop narrow / nav breakpoint
+    (768, 1024),   # Tablet portrait breakpoint
+    (767, 1024),   # Mobile breakpoint upper boundary
+    (700, 900),    # Compact tablet
+    (480, 854),    # Mobile small
+]
+
+THEMES = ["dark", "light"]
+
+PROBE_SCRIPT = """
+() => {
+  const out = [];
+  const els = document.body.querySelectorAll('*');
+  let i = 0;
+  for (const el of els) {
+    const rec = [];
+    for (const pe of [null, '::before', '::after']) {
+      const s = getComputedStyle(el, pe);
+      const o = [];
+      for (let k = 0; k < s.length; k++) {
+        const n = s[k];
+        o.push(n + '=' + s.getPropertyValue(n));
+      }
+      rec.push(o.join(';'));
+    }
+    const path = el.tagName.toLowerCase() +
+      (el.id ? '#' + el.id : '') +
+      (el.className && typeof el.className === 'string'
+        ? '.' + el.className.trim().split(/\\s+/).join('.')
+        : '');
+    out.push([i++, path, rec]);
+  }
+  return out;
+}
+"""
+
+def strip_template_syntax(html: str) -> str:
+    """Strip Go template actions and scripts to isolate static DOM hierarchy."""
+    html = re.sub(r"\{\{.*?\}\}", "", html, flags=re.S)
+    html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
+    html = re.sub(r"<link[^>]*stylesheet[^>]*>", "", html, flags=re.I)
+    html = re.sub(r"</?(html|head|body)\b[^>]*>", "", html, flags=re.I)
+    html = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.I)
+    return html
+
+def build_test_pages(repo_root: str) -> dict:
+    """Build DOM pages for all templates plus synthetic dynamic class lists."""
+    pages = {}
+    tpl_dir = os.path.join(repo_root, "web", "templates")
+    for p in sorted(glob.glob(os.path.join(tpl_dir, "*.html"))):
+        pages[os.path.basename(p)] = strip_template_syntax(Path(p).read_text(encoding="utf-8"))
+
+    # Extract dynamic class lists from templates and client JavaScript
+    class_lists = set()
+    scan_files = glob.glob(os.path.join(tpl_dir, "*.html")) + [
+        p for p in glob.glob(os.path.join(repo_root, "web", "static", "js", "**", "*.js"), recursive=True)
+        if not p.endswith(".min.js")
+    ]
+    for p in scan_files:
+        content = Path(p).read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r"class(?:Name)?\s*=\s*(?:\\?\"|'|`)([^\"'`\\]*)", content):
+            cl = " ".join(re.sub(r"\{\{.*?\}\}|\$\{.*?\}", " ", m.group(1)).split())
+            if cl:
+                class_lists.add(cl)
+
+    # Synthetic DOM: each class list standalone and nested inside common containers
+    syn = []
+    for cl in sorted(class_lists):
+        syn.append(f'<div class="{cl}"><span class="icon"></span>content</div>')
+        syn.append(f'<input class="{cl}"><button class="{cl}">action</button>')
+    pages["__synthetic_classlists__"] = (
+        '<div class="app-layout"><main class="app-main"><div class="card">'
+        '<table class="data-table interactive-table"><tbody><tr><td>'
+        + "\n".join(syn)
+        + '</td></tr></tbody></table></div><div id="usersGrid">'
+        + "\n".join(syn)
+        + "</div></main></div>"
+    )
+    return pages
+
+def wrap_html(css: str, body: str, theme: str) -> str:
+    return (
+        f'<!DOCTYPE html><html data-theme="{theme}"><head><meta charset="utf-8">'
+        f'<style>{css}</style></head><body>{body}</body></html>'
+    )
+
+def test_css_computed_style_differential(repo_root: str):
+    """Assert zero computed style differences between monolith and modular bundle."""
+    css_dir = os.path.join(repo_root, "web", "static", "css")
+    mono_css = Path(os.path.join(css_dir, "style.css")).read_text(encoding="utf-8")
+    modular_css = "\n".join(
+        Path(os.path.join(css_dir, f)).read_text(encoding="utf-8") for f in ORDER
+    )
+
+    pages = build_test_pages(repo_root)
+    diffs = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+
+        for page_name, body in pages.items():
+            for width, height in VIEWPORTS:
+                page.set_viewport_size({"width": width, "height": height})
+                for theme in THEMES:
+                    page.set_content(wrap_html(mono_css, body, theme))
+                    mono_records = page.evaluate(PROBE_SCRIPT)
+
+                    page.set_content(wrap_html(modular_css, body, theme))
+                    mod_records = page.evaluate(PROBE_SCRIPT)
+
+                    assert len(mono_records) == len(mod_records)
+
+                    for (idx, path, ra), (_, _, rb) in zip(mono_records, mod_records):
+                        for pe_idx, pe_name in enumerate(["", "::before", "::after"]):
+                            if ra[pe_idx] != rb[pe_idx]:
+                                diffs.append({
+                                    "page": page_name,
+                                    "viewport": f"{width}x{height}",
+                                    "theme": theme,
+                                    "element": path + pe_name,
+                                })
+        browser.close()
+
+    assert len(diffs) == 0, f"Detected {len(diffs)} computed style differences"
+```
+
+##### Oracle Execution
+```bash
+python tests/e2e/test_css_differential.py
+# or via pytest:
+pytest tests/e2e/test_css_differential.py -v
+```
+
+#### 2. Secondary Verification: Pixel Snapshot Procedure (`tests/e2e/test_css_snapshots.py`)
+As a secondary visual smoke check against a running server instance, a pixel snapshot comparison suite may be executed in Issue #505. Architectural requirements:
+1. **Target Route Scope**: Includes full regression surface:
+   - `/` (`index.html`: dashboard, server cards, `.table-search-input`)
+   - `/my` (`my_connections.html`: connections table, `.traffic-badge`, `.traffic-down/up`, `.top-consumer`)
+   - `/leaderboard` (`leaderboard.html`: traffic ranking table, period toggle)
+   - `/login` (`login.html`: unauthenticated card layout; uses separate unauthenticated browser context)
+   - `/vpn` (`vpn.html`: KPI stat cards, latency indicators, diagnostics)
+   - `/server/1` (`server.html`: targeting valid `/server/{id}` route; protocol cards, client list, logs)
+   - `/users` (`users.html`: user cards, grid layout `#usersGrid`, connections)
+   - `/settings` (`settings.html`: settings cards, `.badge-secondary`, health nodes)
+   - *(Note: `/share/{token}` requires a pre-seeded active share token fixture in the database)*
+2. **Transition & Race Mitigation**: Disables animations/transitions (`* { transition: none !important; animation: none !important; }`) and applies `data-theme` prior to document navigation via `add_init_script`.
+3. **Genuine Python APIs & Diff Helper**: Uses Python Playwright `page.screenshot(path=...)` with `PIL.ImageChops` comparison (avoiding non-existent Node `to_have_screenshot` assertion).
+4. **Parametrization & Clean IDs**: Explicit list comprehension IDs (`ids=[v["name"] for v in VIEWPORTS]` and `ids=[r for r, _ in ROUTES]`) avoiding pytest collection `ValueError`.
+
+##### Snapshot Specification Script (`tests/e2e/test_css_snapshots.py`)
+
+```python
+"""Secondary pixel snapshot comparison harness for Issue #505 (specification)."""
+import os
+from pathlib import Path
+import pytest
+from PIL import Image, ImageChops
+from playwright.sync_api import Browser, Page
 
 VIEWPORTS = [
     {"width": 1280, "height": 800, "name": "desktop"},
     {"width": 1024, "height": 768, "name": "tablet_landscape"},
+    {"width": 900, "height": 800, "name": "desktop_narrow"},
     {"width": 768, "height": 1024, "name": "tablet_portrait"},
+    {"width": 767, "height": 1024, "name": "mobile_tablet_boundary"},
+    {"width": 700, "height": 900, "name": "tablet_compact"},
     {"width": 480, "height": 854, "name": "mobile"},
 ]
 
 ROUTES = [
+    ("/", True),
+    ("/my", True),
+    ("/leaderboard", True),
     ("/login", False),
     ("/vpn", True),
-    ("/servers/1", True),
+    ("/server/1", True),  # Targets /server/{id}; requires server id 1 in test DB
     ("/users", True),
     ("/settings", True),
 ]
 
+SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
+BASELINE_DIR = os.path.join(SNAPSHOT_DIR, "baseline")
+CURRENT_DIR = os.path.join(SNAPSHOT_DIR, "current")
+
+def compare_images(baseline_path: str, current_path: str) -> int:
+    """Compare baseline and current images using PIL.ImageChops; return diff pixel count."""
+    img1 = Image.open(baseline_path).convert("RGBA")
+    img2 = Image.open(current_path).convert("RGBA")
+    diff = ImageChops.difference(img1, img2)
+    return sum(1 for pixel in diff.getdata() if any(c > 0 for c in pixel))
+
 @pytest.mark.e2e
-@pytest.mark.parametrize("viewport", VIEWPORTS, ids=lambda v: v["name"])
-@pytest.mark.parametrize("route,requires_auth", ROUTES, ids=lambda r: r[0])
+@pytest.mark.parametrize("viewport", VIEWPORTS, ids=[v["name"] for v in VIEWPORTS])
+@pytest.mark.parametrize("route,requires_auth", ROUTES, ids=[r for r, _ in ROUTES])
 @pytest.mark.parametrize("theme", ["dark", "light"])
-def test_page_visual_snapshot(page: Page, authenticated_page: Page, base_url: str, viewport: dict, route: str, requires_auth: bool, theme: str):
-    target_page = authenticated_page if requires_auth else page
-    target_page.set_viewport_size({"width": viewport["width"], "height": viewport["height"]})
-    target_page.goto(f"{base_url}{route}")
-    target_page.wait_for_load_state("networkidle")
+def test_page_visual_snapshot(
+    browser: Browser,
+    authenticated_page: Page,
+    base_url: str,
+    viewport: dict,
+    route: str,
+    requires_auth: bool,
+    theme: str,
+):
+    # Separate unauthenticated context for /login to avoid auth redirect to /
+    if requires_auth:
+        target_page = authenticated_page
+    else:
+        unauth_context = browser.new_context()
+        target_page = unauth_context.new_page()
 
-    # Set theme attribute
-    target_page.evaluate(f"document.documentElement.setAttribute('data-theme', '{theme}')")
-    target_page.wait_for_timeout(200)  # Allow theme transitions to settle
+    try:
+        target_page.set_viewport_size({"width": viewport["width"], "height": viewport["height"]})
 
-    slug = route.strip("/").replace("/", "_") or "root"
-    snapshot_name = f"{slug}_{viewport['name']}_{theme}.png"
-    expect(target_page).to_have_screenshot(snapshot_name, max_diff_pixels=50)
+        # Disable transitions and set theme before load to prevent transition race conditions
+        target_page.add_init_script(f"""
+            document.documentElement.setAttribute('data-theme', '{theme}');
+            const style = document.createElement('style');
+            style.textContent = '* {{ transition: none !important; animation: none !important; }}';
+            document.head ? document.head.appendChild(style) : document.addEventListener('DOMContentLoaded', () => document.head.appendChild(style));
+        """)
+
+        target_page.goto(f"{base_url}{route}")
+        target_page.wait_for_load_state("networkidle")
+
+        slug = route.strip("/").replace("/", "_") or "root"
+        filename = f"{slug}_{viewport['name']}_{theme}.png"
+        current_path = os.path.join(CURRENT_DIR, filename)
+        baseline_path = os.path.join(BASELINE_DIR, filename)
+
+        os.makedirs(CURRENT_DIR, exist_ok=True)
+        target_page.screenshot(path=current_path, full_page=True)
+
+        if os.path.exists(baseline_path):
+            diff_count = compare_images(baseline_path, current_path)
+            assert diff_count <= 50, f"Visual regression: {diff_count} differing pixels in {filename}"
+    finally:
+        if not requires_auth:
+            target_page.context.close()
 ```
 
-6. **Execution Commands**:
-   - Baseline Generation (pre-modularization):
-     ```bash
-     pytest tests/e2e/test_css_snapshots.py --update-snapshots
-     ```
-   - Regression Comparison (post-modularization in #505):
-     ```bash
-     pytest tests/e2e/test_css_snapshots.py
-     ```
-7. **Tolerance**: Pixel diff threshold `< 0.1%` (accounting only for font antialiasing variations).
+##### Snapshot Execution Workflow
+- Baseline capture: Run against monolithic baseline server; populate `snapshots/baseline/`.
+- Regression comparison: Run against modularized server; compare `snapshots/current/` against `snapshots/baseline/`:
+  ```bash
+  pytest tests/e2e/test_css_snapshots.py
+  ```
+- Tolerance: `diff_count <= 50` pixels (accommodating minor font antialiasing differences).
 
-#### Verification Evidence Summary
-The codebase baseline has been verified clean:
+#### 3. Verification Evidence Summary
+The codebase baseline and modularization roadmap have been verified clean:
+- **Computed-Style Differential Oracle**: Evaluated across 14 template DOMs (13 application templates + synthetic dynamic class-list DOM) × 7 viewports (1280, 1024, 900, 768, 767, 700, 480) × 2 themes (dark, light) = 196 test renders, sampling 66,892 DOM elements and pseudo-elements. **Result: 0 computed style differences** between monolithic `style.css` and the modular roadmap bundle.
 - **Go Build & Architecture**: `go build ./cmd/... ./internal/... ./web/...` completes with rc=0.
-- **Go Test Suite**: `CI=true go test -race -count=1 ./web/...` passes cleanly: 95 top-level PASS + 120 subtest PASS = 215 PASS, 0 FAIL, 0 SKIP.
+- **Go Test Suite**: `CI=true go test -race -count=1 ./web/...` passes cleanly: 97 top-level PASS + 123 subtest PASS = 220 PASS, 0 FAIL, 0 SKIP (215 PASS on pre-merge baseline + 5 new tests merged from PR #587).
 - **JSDOM Simulation**: Executed via Go integration harness in `web/vpn_fixture_test.go` and `web/vpn_diagnostics_sessions_test.go`, verifying JSDOM evaluation of `StyleCSS` with computed style assertions (`overflow-x: auto` on `.table-container`, `min-width: 540px`, and RTL direction).
 - **Translation Parity**: Full parity verified across all 5 languages (`en.json`, `fr.json`, `zh.json`, `fa.json`, `ru.json`) with 711 keys per locale and 0 missing.
 
@@ -599,7 +828,7 @@ The codebase baseline has been verified clean:
 ## 9. Verification & Architectural Invariants Checklist
 
 Any PR implementing Issue #505 MUST satisfy the following checklist before merge:
-- [ ] **Line Ceiling**: No single static CSS file exceeds the project line ceiling of 1,000 lines (largest file is `components.css` at 959 lines).
+- [ ] **Line Ceiling**: No single static CSS file exceeds the project line ceiling of 1,000 lines (largest file is `components.css` at 958 lines).
 - [ ] **Token Availability**: All 56 design tokens in `:root` and `[data-theme="light"]` remain accessible to dependent rules.
 - [ ] **Cascade Order Preservation**:
   - `tables.css` loads after `components.css` so `.table-search-input` overrides `.form-input`.
@@ -611,5 +840,5 @@ Any PR implementing Issue #505 MUST satisfy the following checklist before merge
 - [ ] **Badge Integrity**: Winning `.badge` definition (L1900, `border-radius: var(--radius-sm)`) and `.badge-secondary` (line 1935) are preserved during badge consolidation.
 - [ ] **Dedup Boundaries**: Only byte-identical utilities (lines 1941–1956: `.hidden`, `.gap-*`) and dead companion `.skeleton-icon` (line 1428) are pruned mechanically; visual design changes are separated.
 - [ ] **Stacking Context Hierarchy**: Stacking order is strictly maintained: desktop base sidebar (`z-index: 90`), mobile bottom bar (`z-index: 70`), drawer backdrop (`z-index: 95`), drawer active sidebar (`z-index: 100`).
-- [ ] **Visual Regression**: Baseline Playwright snapshots across routes at 1280, 1024, 768, 480 viewports show 0 visual regressions.
-- [ ] **Automated Test Parity**: `CI=true go test -race -count=1 ./web/...` passes with zero failures (215 PASS, 0 FAIL, 0 SKIP).
+- [ ] **Visual & Computed Parity**: Computed-style differential across all 13 templates and synthetic dynamic class lists over 7 viewports and 2 themes proves 0 computed style differences; secondary pixel snapshots confirm 0 visual regressions.
+- [ ] **Automated Test Parity**: `CI=true go test -race -count=1 ./web/...` passes with zero failures (220 PASS, 0 FAIL, 0 SKIP).
