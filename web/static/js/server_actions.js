@@ -194,10 +194,6 @@ async function installProtocol() {
             }
         }
         const result = await API.post(`/api/servers/${SERVER_ID}/install`, params);
-        if (progressInterval) {
-            clearInterval(progressInterval);
-            progressInterval = null;
-        }
         fillEl.style.width = '100%';
         if (result.log) {
             result.log.forEach(line => {
@@ -208,10 +204,6 @@ async function installProtocol() {
         UI.toast(_('install_success'), 'success');
         document.getElementById('installDone').style.display = '';
     } catch (err) {
-        if (progressInterval) {
-            clearInterval(progressInterval);
-            progressInterval = null;
-        }
         fillEl.style.width = '100%';
         fillEl.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
         logEl.innerHTML += `<div class="log-line error">✕ ${_('error')}: ${err.message}</div>`;
