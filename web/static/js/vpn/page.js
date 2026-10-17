@@ -135,7 +135,98 @@ function vpnStopPolling() {
     }
 }
 
+let vpnListenersInitialized = false;
+
+function initVpnEventListeners() {
+    if (typeof document === 'undefined') return;
+
+    function bindFormsAndSelects() {
+        const addForm = document.getElementById('addBackendForm');
+        if (addForm && typeof addForm.addEventListener === 'function' && !addForm._vpnBound) {
+            addForm._vpnBound = true;
+            addForm.addEventListener('submit', function (e) {
+                if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                if (typeof vpnSubmitAddBackend === 'function') vpnSubmitAddBackend();
+            });
+        }
+
+        const editForm = document.getElementById('editEndpointForm');
+        if (editForm && typeof editForm.addEventListener === 'function' && !editForm._vpnBound) {
+            editForm._vpnBound = true;
+            editForm.addEventListener('submit', function (e) {
+                if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                if (typeof vpnSubmitEditEndpoint === 'function') vpnSubmitEditEndpoint();
+            });
+        }
+
+        const serverSelect = document.getElementById('vpnServerSelect');
+        if (serverSelect && typeof serverSelect.addEventListener === 'function' && !serverSelect._vpnBound) {
+            serverSelect._vpnBound = true;
+            serverSelect.addEventListener('change', function () {
+                if (typeof vpnOnServerSelected === 'function') vpnOnServerSelected();
+            });
+        }
+    }
+
+    if (!vpnListenersInitialized) {
+        vpnListenersInitialized = true;
+        if (typeof document.addEventListener === 'function') {
+            document.addEventListener('click', function (e) {
+                const btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+                if (!btn) return;
+
+                const action = btn.dataset ? btn.dataset.action : (btn.getAttribute ? btn.getAttribute('data-action') : null);
+                if (!action) return;
+
+                if (btn.tagName === 'BUTTON' || btn.tagName === 'A' || (btn.getAttribute && btn.getAttribute('type') === 'button')) {
+                    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+                }
+
+                switch (action) {
+                    case 'vpn-open-edit-endpoint':
+                        if (typeof vpnOpenEditEndpointModal === 'function') vpnOpenEditEndpointModal();
+                        break;
+                    case 'vpn-open-add-backend':
+                        if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
+                        break;
+                    case 'vpn-toggle-problems-filter':
+                        if (typeof vpnToggleSessionsProblemFilter === 'function') vpnToggleSessionsProblemFilter();
+                        break;
+                    case 'vpn-toggle-show-all-routes':
+                        if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
+                        break;
+                    case 'vpn-set-history-window': {
+                        const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
+                        if (typeof vpnSetHistoryWindow === 'function') vpnSetHistoryWindow(win);
+                        break;
+                    }
+                    case 'vpn-close-modal': {
+                        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
+                        if (typeof closeModal === 'function') {
+                            closeModal(modalId);
+                        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
+                            UI.modal.close(modalId);
+                        }
+                        break;
+                    }
+                    case 'vpn-trigger-quick-check':
+                        if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
+                        break;
+                }
+            });
+        }
+    }
+
+    bindFormsAndSelects();
+}
+
+if (typeof document !== 'undefined') {
+    initVpnEventListeners();
+}
+
 document.addEventListener('DOMContentLoaded', function () {
+    initVpnEventListeners();
+
     // Also precache server metadata for quick name matching
     if (typeof API !== 'undefined' && typeof API.get === 'function') {
         API.get('/api/servers').then(servers => {
@@ -155,4 +246,5 @@ if (typeof window !== 'undefined') {
     window.vpnLoadData = vpnLoadData;
     window.vpnToggleShowAllRoutes = vpnToggleShowAllRoutes;
     window.vpnStopPolling = vpnStopPolling;
+    window.initVpnEventListeners = initVpnEventListeners;
 }

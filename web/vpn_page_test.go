@@ -538,3 +538,131 @@ w.API = {
 		t.Fatalf("expected PASS_POLLING_AND_TEARDOWN, got:\n%s", out)
 	}
 }
+
+func TestVPNPageDelegatedEventListeners(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+	fixture.RequireJSDOM()
+
+	// Verify template HTML has 0 inline onclick/onchange/onsubmit handlers
+	for _, attr := range []string{"onclick=", "onchange=", "onsubmit="} {
+		if strings.Contains(fixture.TemplateHTML, attr) {
+			t.Fatalf("expected vpn.html to contain 0 %s attributes, found at least one", attr)
+		}
+	}
+
+	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+(() => {
+    const assert = require('assert');
+
+    let editEndpointModalOpened = 0;
+    let addBackendModalOpened = 0;
+    let sessionsProblemFilterToggled = 0;
+    let showAllRoutesToggled = 0;
+    const historyWindowsCalled = [];
+    const modalsClosed = [];
+    let quickCheckTriggered = 0;
+    let addBackendSubmitted = 0;
+    let editEndpointSubmitted = 0;
+    let serverSelectedCalls = 0;
+
+    w.vpnOpenEditEndpointModal = () => { editEndpointModalOpened++; };
+    w.vpnOpenAddBackendModal = () => { addBackendModalOpened++; };
+    w.vpnToggleSessionsProblemFilter = () => { sessionsProblemFilterToggled++; };
+    w.vpnToggleShowAllRoutes = () => { showAllRoutesToggled++; };
+    w.vpnSetHistoryWindow = (win) => { historyWindowsCalled.push(win); };
+    w.closeModal = (modalId) => { modalsClosed.push(modalId); };
+    w.vpnTriggerQuickCheck = () => { quickCheckTriggered++; };
+    w.vpnSubmitAddBackend = () => { addBackendSubmitted++; };
+    w.vpnSubmitEditEndpoint = () => { editEndpointSubmitted++; };
+    w.vpnOnServerSelected = () => { serverSelectedCalls++; };
+
+    // 1. Modal open buttons (including child target click)
+    const editEpBtn = w.document.getElementById('vpn-edit-endpoint-btn');
+    assert.ok(editEpBtn, '#vpn-edit-endpoint-btn must exist');
+    editEpBtn.click();
+    assert.strictEqual(editEndpointModalOpened, 1, 'vpnOpenEditEndpointModal called on click');
+
+    const addBackendBtn = w.document.getElementById('vpn-add-backend-btn');
+    assert.ok(addBackendBtn, '#vpn-add-backend-btn must exist');
+    const addIcon = addBackendBtn.querySelector('svg') || addBackendBtn;
+    addIcon.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.strictEqual(addBackendModalOpened, 1, 'vpnOpenAddBackendModal called on child icon click');
+
+    // 2. Filter & display toggle buttons
+    const toggleProblemsBtn = w.document.getElementById('vpn-sessions-toggle-problems-btn');
+    assert.ok(toggleProblemsBtn, '#vpn-sessions-toggle-problems-btn must exist');
+    toggleProblemsBtn.click();
+    assert.strictEqual(sessionsProblemFilterToggled, 1, 'vpnToggleSessionsProblemFilter called on click');
+
+    const toggleRoutesBtn = w.document.getElementById('vpn-routes-toggle-all-btn');
+    assert.ok(toggleRoutesBtn, '#vpn-routes-toggle-all-btn must exist');
+    toggleRoutesBtn.click();
+    assert.strictEqual(showAllRoutesToggled, 1, 'vpnToggleShowAllRoutes called on click');
+
+    // 3. History window chips (6 buttons)
+    const togglesContainer = w.document.getElementById('vpn-history-window-toggles');
+    assert.ok(togglesContainer, '#vpn-history-window-toggles must exist');
+    const chips = Array.from(togglesContainer.querySelectorAll('button[data-action="vpn-set-history-window"]'));
+    assert.strictEqual(chips.length, 6, 'expected 6 history window chips');
+    for (const chip of chips) {
+        chip.click();
+    }
+    assert.deepStrictEqual(historyWindowsCalled, ['1m', '5m', '15m', '1h', '6h', '24h'], 'history window chips called with correct values');
+
+    // 4. Modal close buttons (4 buttons across 2 modals)
+    const addBackendModal = w.document.getElementById('addBackendModal');
+    assert.ok(addBackendModal, '#addBackendModal must exist');
+    const addModalCloseBtns = Array.from(addBackendModal.querySelectorAll('button[data-action="vpn-close-modal"]'));
+    assert.strictEqual(addModalCloseBtns.length, 2, 'expected 2 close buttons in addBackendModal');
+    for (const btn of addModalCloseBtns) {
+        btn.click();
+    }
+    assert.deepStrictEqual(modalsClosed.slice(0, 2), ['addBackendModal', 'addBackendModal'], 'addBackendModal closed twice');
+
+    const editEndpointModal = w.document.getElementById('editEndpointModal');
+    assert.ok(editEndpointModal, '#editEndpointModal must exist');
+    const editModalCloseBtns = Array.from(editEndpointModal.querySelectorAll('button[data-action="vpn-close-modal"]'));
+    assert.strictEqual(editModalCloseBtns.length, 2, 'expected 2 close buttons in editEndpointModal');
+    for (const btn of editModalCloseBtns) {
+        btn.click();
+    }
+    assert.deepStrictEqual(modalsClosed.slice(2, 4), ['editEndpointModal', 'editEndpointModal'], 'editEndpointModal closed twice');
+
+    // 5. Quick check button
+    const quickCheckBtn = w.document.getElementById('vpnQuickCheckBtn');
+    assert.ok(quickCheckBtn, '#vpnQuickCheckBtn must exist');
+    quickCheckBtn.click();
+    assert.strictEqual(quickCheckTriggered, 1, 'vpnTriggerQuickCheck called on click');
+
+    // 6. Form submissions
+    const addBackendForm = w.document.getElementById('addBackendForm');
+    assert.ok(addBackendForm, '#addBackendForm must exist');
+    const addEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    addBackendForm.dispatchEvent(addEvt);
+    assert.strictEqual(addBackendSubmitted, 1, 'vpnSubmitAddBackend called on submit');
+    assert.strictEqual(addEvt.defaultPrevented, true, 'addBackendForm submit default prevented');
+
+    const editEndpointForm = w.document.getElementById('editEndpointForm');
+    assert.ok(editEndpointForm, '#editEndpointForm must exist');
+    const editEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    editEndpointForm.dispatchEvent(editEvt);
+    assert.strictEqual(editEndpointSubmitted, 1, 'vpnSubmitEditEndpoint called on submit');
+    assert.strictEqual(editEvt.defaultPrevented, true, 'editEndpointForm submit default prevented');
+
+    // 7. Select change
+    const serverSelect = w.document.getElementById('vpnServerSelect');
+    assert.ok(serverSelect, '#vpnServerSelect must exist');
+    serverSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
+    assert.strictEqual(serverSelectedCalls, 1, 'vpnOnServerSelected called on change');
+
+    console.log('PASS_DELEGATED_EVENT_LISTENERS');
+})();
+`,
+	})
+
+	out := fixture.RunJSDOM(testScript)
+	if !strings.Contains(out, "PASS_DELEGATED_EVENT_LISTENERS") {
+		t.Fatalf("expected PASS_DELEGATED_EVENT_LISTENERS, got:\n%s", out)
+	}
+}

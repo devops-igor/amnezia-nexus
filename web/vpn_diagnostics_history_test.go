@@ -543,12 +543,12 @@ func TestVPNHorizonWindowToggles1mAnd5m(t *testing.T) {
 	tmplStr := fixture.TemplateHTML
 
 	for _, expectedBtn := range []string{
-		`onclick="vpnSetHistoryWindow('1m')"`,
-		`onclick="vpnSetHistoryWindow('5m')"`,
-		`onclick="vpnSetHistoryWindow('15m')"`,
-		`onclick="vpnSetHistoryWindow('1h')"`,
-		`onclick="vpnSetHistoryWindow('6h')"`,
-		`onclick="vpnSetHistoryWindow('24h')"`,
+		`data-action="vpn-set-history-window" data-window="1m"`,
+		`data-action="vpn-set-history-window" data-window="5m"`,
+		`data-action="vpn-set-history-window" data-window="15m"`,
+		`data-action="vpn-set-history-window" data-window="1h"`,
+		`data-action="vpn-set-history-window" data-window="6h"`,
+		`data-action="vpn-set-history-window" data-window="24h"`,
 	} {
 		if !strings.Contains(tmplStr, expectedBtn) {
 			t.Fatalf("vpn.html missing toggle button %s", expectedBtn)
