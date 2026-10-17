@@ -2,47 +2,12 @@
 
 {{ define "head_extra" }}
 <style>
-    .client-actions {
-        display: flex !important;
-        flex-direction: row !important;
-        flex-wrap: nowrap !important;
-        gap: var(--space-xs) !important;
-        align-items: center;
-        justify-content: flex-end;
-    }
-    .nav-tab {
-        background: none;
-        border: none;
-        padding: 10px 16px;
-        font-size: 0.95rem;
-        color: var(--text-muted);
-        cursor: pointer;
-        border-bottom: 2px solid transparent;
-        font-weight: 500;
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        transition: var(--transition-fast);
-    }
-    .nav-tab:hover {
-        color: var(--text-primary);
-    }
-    .nav-tab.active {
-        color: var(--text-primary);
-        border-bottom-color: var(--accent);
-        font-weight: 600;
-    }
-    .conn-name-cell {
-        display: flex;
-        align-items: center;
-        gap: var(--space-sm);
-    }
-    .traffic-cell {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        font-size: 0.8rem;
-    }
+    .client-actions { display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; gap: var(--space-xs) !important; align-items: center; justify-content: flex-end; }
+    .nav-tab { background: none; border: none; padding: 10px 16px; font-size: 0.95rem; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; font-weight: 500; display: inline-flex; align-items: center; gap: 8px; transition: var(--transition-fast); }
+    .nav-tab:hover { color: var(--text-primary); }
+    .nav-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 600; }
+    .conn-name-cell { display: flex; align-items: center; gap: var(--space-sm); }
+    .traffic-cell { display: flex; flex-direction: column; gap: 2px; font-size: 0.8rem; }
 </style>
 {{ end }}
 
@@ -53,31 +18,21 @@
 <div class="card" style="margin-bottom: var(--space-xl);">
     <div class="flex items-center justify-between" style="flex-wrap: wrap; gap: var(--space-md);">
         <div class="flex items-center gap-md">
-            <div class="server-icon" style="width:56px; height:56px;">
-                <svg class="icon" style="width:28px;height:28px;color:#fff;"><use href="#icon-server"></use></svg>
-            </div>
+            <div class="server-icon" style="width:56px; height:56px;"><svg class="icon" style="width:28px;height:28px;color:#fff;"><use href="#icon-server"></use></svg></div>
             <div>
                 <div class="flex items-center gap-sm">
                     <h1 id="serverNameTitle" style="font-size:1.4rem; font-weight:700; margin:0;">{{ .server.Name }}</h1>
-                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openRenameServerModal({{ .server.ID }}, '{{ .server.Name }}')" title="{{ _ "rename_server" }}">
-                        <svg class="icon"><use href="#icon-pencil"></use></svg>
-                    </button>
+                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openRenameServerModal({{ .server.ID }}, '{{ .server.Name }}')" title="{{ _ "rename_server" }}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>
                 </div>
                 <div class="font-mono text-muted text-sm flex items-center gap-xs">
                     <span id="serverHostDisplay">{{ .server.Host }}</span>:{{ .server.SSHPort }} • {{ .server.SSHUser }}
-                    <button class="btn btn-ghost btn-sm btn-icon" style="padding:2px; height:auto; min-height:unset;" onclick="openEditHostModal({{ .server.ID }}, '{{ .server.Host }}')" title="{{ _ "edit_server_host" }}">
-                        <svg class="icon" style="width:14px;height:14px;"><use href="#icon-pencil"></use></svg>
-                    </button>
+                    <button class="btn btn-ghost btn-sm btn-icon" style="padding:2px; height:auto; min-height:unset;" onclick="openEditHostModal({{ .server.ID }}, '{{ .server.Host }}')" title="{{ _ "edit_server_host" }}"><svg class="icon" style="width:14px;height:14px;"><use href="#icon-pencil"></use></svg></button>
                 </div>
             </div>
         </div>
         <div class="flex gap-sm items-center">
             <div class="flex gap-sm items-center" id="serverStats" style="display:none;"></div>
-            <button class="btn btn-secondary btn-sm" onclick="checkServer()" id="checkBtn">
-                <svg class="icon" id="checkIcon"><use href="#icon-refresh"></use></svg>
-                <span id="checkBtnText">{{ _ "server_check" }}</span>
-                <div class="spinner hidden" id="checkSpinner"></div>
-            </button>
+            <button class="btn btn-secondary btn-sm" onclick="checkServer()" id="checkBtn"><svg class="icon" id="checkIcon"><use href="#icon-refresh"></use></svg><span id="checkBtnText">{{ _ "server_check" }}</span><div class="spinner hidden" id="checkSpinner"></div></button>
         </div>
     </div>
     <div id="serverStatus" class="mt-md hidden">
@@ -94,27 +49,17 @@
                     {{ if .reachability }}
                     {{ if .reachability.Reachable }}
                     {{ if ge .reachability.LatencyMs 150 }}
-                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;">
-                        <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
-                    </span>
+                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms</span>
                     {{ else if ge .reachability.LatencyMs 50 }}
-                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;">
-                        <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
-                    </span>
+                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms</span>
                     {{ else }}
-                    <span class="badge badge-success" style="font-size: 0.75rem; padding: 2px 8px;">
-                        <span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms
-                    </span>
+                    <span class="badge badge-success" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> {{ .reachability.LatencyMs }}ms</span>
                     {{ end }}
                     {{ else }}
-                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;">
-                        <span class="badge-dot"></span> {{ _ "unreachable" }}
-                    </span>
+                    <span class="badge badge-danger" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> {{ _ "unreachable" }}</span>
                     {{ end }}
                     {{ else }}
-                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;">
-                        <span class="badge-dot"></span> {{ _ "pending" }}
-                    </span>
+                    <span class="badge badge-warn" style="font-size: 0.75rem; padding: 2px 8px;"><span class="badge-dot"></span> {{ _ "pending" }}</span>
                     {{ end }}
                 </span>
                 <span id="reachabilityLastChecked" style="font-size: 0.75rem; color: var(--text-muted, #94a3b8); margin-left: 4px;">
@@ -146,53 +91,31 @@
     <!-- AmneziaWG Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">
-                <svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-shield"></use></svg>
-            </div>
+            <div class="protocol-icon"><svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-shield"></use></svg></div>
             <div class="flex gap-sm" id="awg-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">AmneziaWG</div>
-        <div class="protocol-desc">
-            {{ _ "awg_desc" }}
-        </div>
-        <div class="protocol-status" id="awg-status">
-            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span>
-        </div>
+        <div class="protocol-desc">{{ _ "awg_desc" }}</div>
+        <div class="protocol-status" id="awg-status"><span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span></div>
         <div id="awg-mimicry-health" class="flex gap-xs" style="margin-top: var(--space-xs); flex-wrap: wrap;"></div>
-        <div id="awg-info" class="hidden">
-            <div class="protocol-info" id="awg-info-grid"></div>
-        </div>
+        <div id="awg-info" class="hidden"><div class="protocol-info" id="awg-info-grid"></div></div>
         <div class="flex gap-sm" id="awg-actions">
-            <button class="btn btn-primary btn-sm" onclick="openInstallModal('awg')" id="awg-install-btn"
-                style="flex:1">
-                {{ _ "install" }}
-            </button>
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('awg')" id="awg-install-btn" style="flex:1">{{ _ "install" }}</button>
         </div>
     </div>
 
     <!-- MTProxyL Card -->
     <div class="card card-hover protocol-card protocol-telemt" id="proto-telemt">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">
-                <svg class="icon" style="width:24px;height:24px;color:var(--info);"><use href="#icon-network"></use></svg>
-            </div>
+            <div class="protocol-icon"><svg class="icon" style="width:24px;height:24px;color:var(--info);"><use href="#icon-network"></use></svg></div>
             <div class="flex gap-sm" id="telemt-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">MTProxyL (Telegram Proxy)</div>
-        <div class="protocol-desc">
-            {{ _ "telemt_desc" }}
-        </div>
-        <div class="protocol-status" id="telemt-status">
-            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span>
-        </div>
-        <div id="telemt-info" class="hidden">
-            <div class="protocol-info" id="telemt-info-grid"></div>
-        </div>
+        <div class="protocol-desc">{{ _ "telemt_desc" }}</div>
+        <div class="protocol-status" id="telemt-status"><span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span></div>
+        <div id="telemt-info" class="hidden"><div class="protocol-info" id="telemt-info-grid"></div></div>
         <div class="flex gap-sm" id="telemt-actions">
-            <button class="btn btn-primary btn-sm" onclick="openInstallModal('telemt')" id="telemt-install-btn"
-                style="flex:1">
-                {{ _ "install" }}
-            </button>
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('telemt')" id="telemt-install-btn" style="flex:1">{{ _ "install" }}</button>
         </div>
     </div>
 </div>
@@ -201,26 +124,15 @@
     <!-- DNS Card -->
     <div class="card card-hover protocol-card protocol-dns" id="proto-dns">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">
-                <svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-search"></use></svg>
-            </div>
+            <div class="protocol-icon"><svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-search"></use></svg></div>
             <div class="flex gap-sm" id="dns-ctrl" style="display:none!important;"></div>
         </div>
         <div class="protocol-name">AmneziaDNS</div>
-        <div class="protocol-desc">
-            {{ _ "dns_desc" }}
-        </div>
-        <div class="protocol-status" id="dns-status">
-            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span>
-        </div>
-        <div id="dns-info" class="hidden">
-            <div class="protocol-info" id="dns-info-grid"></div>
-        </div>
+        <div class="protocol-desc">{{ _ "dns_desc" }}</div>
+        <div class="protocol-status" id="dns-status"><span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span></div>
+        <div id="dns-info" class="hidden"><div class="protocol-info" id="dns-info-grid"></div></div>
         <div class="flex gap-sm" id="dns-actions">
-            <button class="btn btn-primary btn-sm" onclick="openInstallModal('dns')" id="dns-install-btn"
-                style="flex:1">
-                {{ _ "install" }}
-            </button>
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('dns')" id="dns-install-btn" style="flex:1">{{ _ "install" }}</button>
         </div>
     </div>
 </div>
@@ -232,18 +144,10 @@
             {{ _ "server_management_desc" }}
         </div>
         <div class="flex" style="flex-direction: column; gap: var(--space-sm);">
-            <button class="btn btn-secondary" onclick="checkServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "check_server_services" }}
-            </button>
-            <button class="btn btn-secondary" onclick="rebootServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "reboot_server" }}
-            </button>
-            <button class="btn btn-danger" onclick="clearServer()" style="justify-content: flex-start; padding: 12px 20px; background: rgba(239, 68, 68, 0.05);">
-                <svg class="icon" style="margin-right: 8px;"><use href="#icon-trash"></use></svg> {{ _ "clear_server" }}
-            </button>
-            <button class="btn btn-danger" onclick="removeServer()" style="justify-content: flex-start; padding: 12px 20px;">
-                <svg class="icon" style="margin-right: 8px;"><use href="#icon-x"></use></svg> {{ _ "remove_server" }}
-            </button>
+            <button class="btn btn-secondary" onclick="checkServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "check_server_services" }}</button>
+            <button class="btn btn-secondary" onclick="rebootServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "reboot_server" }}</button>
+            <button class="btn btn-danger" onclick="clearServer()" style="justify-content: flex-start; padding: 12px 20px; background: rgba(239, 68, 68, 0.05);"><svg class="icon" style="margin-right: 8px;"><use href="#icon-trash"></use></svg> {{ _ "clear_server" }}</button>
+            <button class="btn btn-danger" onclick="removeServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-x"></use></svg> {{ _ "remove_server" }}</button>
         </div>
     </div>
 </div>
@@ -256,8 +160,7 @@
             {{ _ "connections" }}
         </h2>
         <div class="flex gap-sm items-center">
-            <select class="form-select" id="connProtoSelect" onchange="loadConnections()"
-                style="width:auto; min-width:160px;">
+            <select class="form-select" id="connProtoSelect" onchange="loadConnections()" style="width:auto; min-width:160px;">
                 <option value="awg">AmneziaWG</option>
                 <option value="telemt">MTProxyL</option>
             </select>
@@ -317,8 +220,7 @@
                     <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
                         {{ _ "tls_emulation" }}
                         <label class="switch">
-                            <input type="checkbox" id="installTelemtTls" checked
-                                onchange="document.getElementById('telemtDomainGroup').style.display = this.checked ? 'block' : 'none'">
+                            <input type="checkbox" id="installTelemtTls" checked onchange="document.getElementById('telemtDomainGroup').style.display = this.checked ? 'block' : 'none'">
                             <span class="slider"></span>
                         </label>
                     </label>
@@ -346,21 +248,14 @@
                 </div>
                 <div class="form-group" id="awgCpsProtocolGroup" style="display:none;">
                     <label class="form-label">{{ _ "awg_cps_protocol" }}</label>
-                    <select class="form-input" id="installAwgCpsProtocol">
-                        <option value="quic" selected>QUIC</option>
-                        <option value="dns">DNS</option>
-                        <option value="sip">SIP</option>
-                    </select>
+                    <select class="form-input" id="installAwgCpsProtocol"><option value="quic" selected>QUIC</option><option value="dns">DNS</option><option value="sip">SIP</option></select>
                     <div class="form-hint">{{ _ "awg_cps_protocol_hint" }}</div>
                 </div>
             </div>
 
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('installModal')">{{ _ "cancel" }}</button>
-                <button class="btn btn-primary" onclick="installProtocol()" id="installBtn">
-                    <span id="installBtnText">{{ _ "install" }}</span>
-                    <div class="spinner hidden" id="installSpinner"></div>
-                </button>
+                <button class="btn btn-primary" onclick="installProtocol()" id="installBtn"><span id="installBtnText">{{ _ "install" }}</span><div class="spinner hidden" id="installSpinner"></div></button>
             </div>
         </div>
 
@@ -370,10 +265,7 @@
             </div>
             <div class="log-output" id="installLog"></div>
             <div class="mt-md" id="installDone" style="display:none;">
-                <button class="btn btn-primary" onclick="closeModal('installModal'); window.location.reload();"
-                    style="width:100%">
-                    {{ _ "done" }}
-                </button>
+                <button class="btn btn-primary" onclick="closeModal('installModal'); window.location.reload();" style="width:100%">{{ _ "done" }}</button>
             </div>
         </div>
     </div>
@@ -405,44 +297,23 @@
             </select>
         </div>
 
-        <div id="telemtConnOptions"
-            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
-            <div class="form-group">
-                <label class="form-label">Quota (Bytes)</label>
-                <input class="form-input" type="number" id="telemtQuota" placeholder="Optional (e.g. 1073741824)"
-                    min="0">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Max Unique IPs</label>
-                <input class="form-input" type="number" id="telemtMaxIps" placeholder="Optional (e.g. 16)" min="1">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Expiration Date (ISO 8601)</label>
-                <input class="form-input" type="text" id="telemtExpiry" placeholder="e.g. 2026-12-31T23:59:59Z">
-            </div>
+        <div id="telemtConnOptions" style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+            <div class="form-group"><label class="form-label">Quota (Bytes)</label><input class="form-input" type="number" id="telemtQuota" placeholder="Optional (e.g. 1073741824)" min="0"></div>
+            <div class="form-group"><label class="form-label">Max Unique IPs</label><input class="form-input" type="number" id="telemtMaxIps" placeholder="Optional (e.g. 16)" min="1"></div>
+            <div class="form-group"><label class="form-label">Expiration Date (ISO 8601)</label><input class="form-input" type="text" id="telemtExpiry" placeholder="e.g. 2026-12-31T23:59:59Z"></div>
         </div>
 
-        <div id="awgMimicryOptions"
-            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+        <div id="awgMimicryOptions" style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
             <div class="form-group">
                 <label class="form-label">{{ _ "awg_mimicry" }}</label>
-                <select class="form-select" id="awgMimicryProfile">
-                    <option value="auto" selected>{{ _ "mimicry_auto" }}</option>
-                    <option value="tls">{{ _ "mimicry_tls" }}</option>
-                    <option value="quic">{{ _ "mimicry_quic" }}</option>
-                    <option value="dns">{{ _ "mimicry_dns" }}</option>
-                    <option value="sip">{{ _ "mimicry_sip" }}</option>
-                </select>
+                <select class="form-select" id="awgMimicryProfile"><option value="auto" selected>{{ _ "mimicry_auto" }}</option><option value="tls">{{ _ "mimicry_tls" }}</option><option value="quic">{{ _ "mimicry_quic" }}</option><option value="dns">{{ _ "mimicry_dns" }}</option><option value="sip">{{ _ "mimicry_sip" }}</option></select>
                 <div class="form-hint">Auto enables continuous handshake monitoring and intelligent DPI failover.</div>
             </div>
         </div>
 
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('addConnectionModal')">{{ _ "cancel" }}</button>
-            <button class="btn btn-primary" onclick="addConnection()" id="addConnBtn">
-                <span id="addConnBtnText">{{ _ "create" }}</span>
-                <div class="spinner hidden" id="addConnSpinner"></div>
-            </button>
+            <button class="btn btn-primary" onclick="addConnection()" id="addConnBtn"><span id="addConnBtnText">{{ _ "create" }}</span><div class="spinner hidden" id="addConnSpinner"></div></button>
         </div>
     </div>
 </div>
@@ -469,13 +340,8 @@
             <div class="config-display">
                 <div class="config-text" id="configText"></div>
                 <div class="config-actions">
-                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
-                        <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
-                    </button>
-                    <button class="btn btn-primary btn-sm"
-                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
-                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
-                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
+                    <button class="btn btn-primary btn-sm" onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}</button>
                 </div>
             </div>
         </div>
@@ -484,9 +350,7 @@
         <div class="config-panel" id="panel-vpn">
             <div class="vpn-link-box" id="vpnLinkText"></div>
             <div class="config-actions" style="margin-top: var(--space-sm);">
-                <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentVpnLink, this)" style="flex:1">
-                    <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_key" }}
-                </button>
+                <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentVpnLink, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_key" }}</button>
             </div>
             <div class="form-hint" style="margin-top: var(--space-sm);">
                 {{ _ "vpn_link_hint" }}
@@ -499,12 +363,8 @@
                 <div id="qrCode"></div>
                 <div class="qr-hint" id="qrHint">{{ _ "qr_hint" }}</div>
                 <div class="config-actions" style="margin-top: var(--space-md); width: 100%; max-width: 280px;">
-                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
-                        <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
-                    </button>
-                    <button class="btn btn-primary btn-sm" onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
-                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
-                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
+                    <button class="btn btn-primary btn-sm" onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}</button>
                 </div>
             </div>
         </div>
@@ -525,19 +385,9 @@
             <textarea class="form-input" id="serverConfigText"
                 style="width:100%; height:40vh; resize:vertical; font-family:monospace; white-space:pre; padding:var(--space-sm);"></textarea>
             <div class="config-actions" style="margin-top:var(--space-sm);">
-                <button class="btn btn-secondary btn-sm"
-                    onclick="UI.copy(document.getElementById('serverConfigText').value, this)" style="flex:1">
-                    <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}
-                </button>
-                <button class="btn btn-secondary btn-sm"
-                    onclick="UI.downloadFile(document.getElementById('serverConfigText').value, serverConfigFilename)"
-                    style="flex:1">
-                    <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }}
-                </button>
-                <button class="btn btn-primary btn-sm" onclick="saveServerConfig()" style="flex:1"
-                    id="saveServerConfigBtn">
-                    {{ _ "save" }}
-                </button>
+                <button class="btn btn-secondary btn-sm" onclick="UI.copy(document.getElementById('serverConfigText').value, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
+                <button class="btn btn-secondary btn-sm" onclick="UI.downloadFile(document.getElementById('serverConfigText').value, serverConfigFilename)" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }}</button>
+                <button class="btn btn-primary btn-sm" onclick="saveServerConfig()" style="flex:1" id="saveServerConfigBtn">{{ _ "save" }}</button>
             </div>
         </div>
     </div>
@@ -557,9 +407,7 @@
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="renameServerInput">{{ _ "rename_server_placeholder" }}</label>
-            <input type="text" id="renameServerInput" class="form-input" maxlength="255"
-                   placeholder="{{ _ "rename_server_placeholder" }}"
-                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitRenameServer();}">
+            <input type="text" id="renameServerInput" class="form-input" maxlength="255" placeholder="{{ _ "rename_server_placeholder" }}" onkeydown="if(event.key==='Enter'){event.preventDefault();submitRenameServer();}">
         </div>
         <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
             <button class="btn btn-primary" onclick="submitRenameServer()">{{ _ "save" }}</button>
@@ -582,9 +430,7 @@
         </div>
         <div class="form-group" style="padding: var(--space-sm) 0;">
             <label class="form-label" for="editHostInput">{{ _ "edit_server_host_placeholder" }}</label>
-            <input type="text" id="editHostInput" class="form-input" maxlength="255"
-                   placeholder="{{ _ "edit_server_host_placeholder" }}"
-                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitEditHost();}">
+            <input type="text" id="editHostInput" class="form-input" maxlength="255" placeholder="{{ _ "edit_server_host_placeholder" }}" onkeydown="if(event.key==='Enter'){event.preventDefault();submitEditHost();}">
         </div>
         <div class="flex gap-sm" style="padding-bottom: var(--space-sm);">
             <button class="btn btn-primary" onclick="submitEditHost()">{{ _ "save" }}</button>
@@ -595,44 +441,12 @@
 {{ end }}
 
 {{ define "scripts" }}
+<script src="/static/js/server_actions.js"></script>
 <script>
     const SERVER_ID = {{ .server_id }};
     const STATS_REFRESH_INTERVAL_MS = 30000;
-    let currentInstallProto = 'awg';
-    let currentConfig = '';
-    let currentVpnLink = '';
-    let currentConfigName = 'connection';
     let installedProtocols = {};
     let connectionsTableInstance = null;
-
-    function switchCategory(cat) {
-        const grids = ['protocols-grid', 'services-grid', 'management-grid'];
-        const tabs = ['tab-protocols', 'tab-services', 'tab-management'];
-        
-        grids.forEach(g => {
-            const el = document.getElementById(g);
-            if (el) el.classList.add('hidden');
-        });
-        tabs.forEach(t => {
-            const el = document.getElementById(t);
-            if (el) el.classList.remove('active');
-        });
-
-        const activeGrid = document.getElementById(cat + '-grid');
-        const activeTab = document.getElementById('tab-' + cat);
-        
-        if (activeGrid) activeGrid.classList.remove('hidden');
-        if (activeTab) activeTab.classList.add('active');
-    }
-
-    function getProtoTitle(proto) {
-        switch (proto) {
-            case 'awg': return 'AmneziaWG';
-            case 'telemt': return 'MTProxyL';
-            case 'dns': return 'AmneziaDNS';
-            default: return proto;
-        }
-    }
 
     // ========== Server Stats ==========
     async function loadServerStats() {
@@ -809,22 +623,17 @@
     function updateStatusCounts(protocols) {
         const protos = ['awg', 'telemt'];
         const servs = ['dns'];
-
         let pRunning = 0, pTotal = protos.length;
         let sRunning = 0, sTotal = servs.length;
-
         protos.forEach(p => {
             if (protocols[p] && protocols[p].container_running) pRunning++;
         });
         servs.forEach(s => {
             if (protocols[s] && protocols[s].container_running) sRunning++;
         });
-
         document.getElementById('protocols-count').textContent = `${pRunning}/${pTotal}`;
         document.getElementById('services-count').textContent = `${sRunning}/${sTotal}`;
     }
-
-    let serverConfigFilename = 'server.conf';
 
     function updateProtocolCard(proto, info) {
         const protoKey = proto.replace('_', '-');
@@ -851,32 +660,24 @@
                 // AWG obfuscation params
                 if (proto === 'awg' && info.awg_params) {
                     const p = info.awg_params;
-                    if (p.mtu) {
-                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_mtu')}</span><span class="protocol-info-value">${p.mtu}</span></div>`;
-                    }
+                    if (p.mtu) grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_mtu')}</span><span class="protocol-info-value">${p.mtu}</span></div>`;
                     const jParts = [];
                     if (p.junk_packet_count) jParts.push(`Jc=${UI.escapeHtml(String(p.junk_packet_count))}`);
                     if (p.junk_packet_min_size) jParts.push(`Jmin=${UI.escapeHtml(String(p.junk_packet_min_size))}`);
                     if (p.junk_packet_max_size) jParts.push(`Jmax=${UI.escapeHtml(String(p.junk_packet_max_size))}`);
-                    if (jParts.length) {
-                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_packets')}</span><span class="protocol-info-value">${jParts.join(' ')}</span></div>`;
-                    }
+                    if (jParts.length) grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_packets')}</span><span class="protocol-info-value">${jParts.join(' ')}</span></div>`;
                     const sParts = [];
                     const sLabels = {init_packet_junk_size:'S1', response_packet_junk_size:'S2', cookie_reply_packet_junk_size:'S3', transport_packet_junk_size:'S4'};
                     for (const [key, label] of Object.entries(sLabels)) {
                         if (p[key]) sParts.push(`${label}=${UI.escapeHtml(String(p[key]))}`);
                     }
-                    if (sParts.length) {
-                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_sizes')}</span><span class="protocol-info-value">${sParts.join(' ')}</span></div>`;
-                    }
+                    if (sParts.length) grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_junk_sizes')}</span><span class="protocol-info-value">${sParts.join(' ')}</span></div>`;
                     const hLabels = {init_packet_magic_header:'H1', response_packet_magic_header:'H2', underload_packet_magic_header:'H3', transport_packet_magic_header:'H4'};
                     const hParts = [];
                     for (const [key, label] of Object.entries(hLabels)) {
                         if (p[key]) hParts.push(`${label}=${UI.escapeHtml(String(p[key]))}`);
                     }
-                    if (hParts.length) {
-                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_magic_headers')}</span><span class="protocol-info-value">${hParts.join(' ')}</span></div>`;
-                    }
+                    if (hParts.length) grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_magic_headers')}</span><span class="protocol-info-value">${hParts.join(' ')}</span></div>`;
                 }
                 infoGrid.innerHTML = grid;
             }
@@ -971,67 +772,6 @@
         }
     }
 
-    // Toggle Docker container start/stop
-    async function toggleContainer(proto, isRunning) {
-        const name = getProtoTitle(proto);
-        const action = isRunning ? _('stopping') : _('starting');
-        const confirmed = await UI.confirm({
-            title: isRunning ? (_('stop_btn') || 'Stop') : (_('start_btn') || 'Start'),
-            message: `${isRunning ? _('stop_container_confirm') : _('start_container_confirm')}`.replace('{}', name),
-            confirmVariant: isRunning ? 'danger' : 'primary'
-        });
-        if (!confirmed) return;
-
-        try {
-            UI.toast(`${action} ${name}...`, 'info');
-            const res = await API.post(`/api/servers/${SERVER_ID}/container/toggle`, { protocol: proto });
-            UI.toast(`${name} ${res.action === 'stopped' ? _('stopped') : _('started')}`, 'success');
-            setTimeout(() => checkServer(), 1500);
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    // View server-side config
-    async function showServerConfig(proto) {
-        const name = getProtoTitle(proto);
-        try {
-            UI.toast(_('loading'), 'info');
-            const res = await API.post(`/api/servers/${SERVER_ID}/server_config`, { protocol: proto });
-            document.getElementById('serverConfigModalTitle').textContent = `${_('server_config')} — ${name}`;
-            document.getElementById('serverConfigProto').value = proto;
-            document.getElementById('serverConfigText').value = res.config || '';
-            serverConfigFilename = `server_${proto}.conf`;
-            openModal('serverConfigModal');
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    // Save server config changes
-    async function saveServerConfig() {
-        const proto = document.getElementById('serverConfigProto').value;
-        const newConfig = document.getElementById('serverConfigText').value;
-        const btn = document.getElementById('saveServerConfigBtn');
-        const oldText = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = _('saving');
-
-        try {
-            await API.post(`/api/servers/${SERVER_ID}/server_config/save`, {
-                protocol: proto,
-                config: newConfig
-            });
-            UI.toast(_('success'), 'success');
-            closeModal('serverConfigModal');
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = oldText;
-        }
-    }
-
     function showConnectionsSection() {
         const section = document.getElementById('connectionsSection');
         if (section) section.style.display = 'block';
@@ -1050,136 +790,6 @@
         }
     }
 
-    // ========== Protocol Installation ==========
-    function openInstallModal(proto) {
-        currentInstallProto = proto;
-        const name = getProtoTitle(proto);
-        document.getElementById('installModalTitle').textContent = `${_('install')} ${name}`;
-
-        const portInput = document.getElementById('installPort');
-        const portLabel = document.getElementById('installPortLabel');
-        const portHint = document.getElementById('installPortHint');
-        const telemtOpts = document.getElementById('telemtOptions');
-        const awgOpts = document.getElementById('awgOptions');
-
-        telemtOpts.style.display = 'none';
-        awgOpts.style.display = 'none';
-
-        if (proto === 'dns') {
-            portLabel.textContent = _('port') + ' (Internal)';
-            portInput.value = '53';
-            portInput.disabled = true;
-            portHint.textContent = _('internal_network_hint');
-        } else if (proto === 'telemt') {
-            portLabel.textContent = _('port') + ' (TCP)';
-            portInput.value = '443';
-            portInput.disabled = false;
-            portHint.textContent = _('port_telemt_hint');
-            telemtOpts.style.display = 'block';
-        } else {
-            portLabel.textContent = _('port') + ' (UDP)';
-            portInput.value = '55424';
-            portInput.disabled = false;
-            portHint.textContent = _('port_default_hint');
-            awgOpts.style.display = 'block';
-        }
-
-        document.getElementById('installForm').classList.remove('hidden');
-        document.getElementById('installProgress').classList.add('hidden');
-        document.getElementById('installDone').style.display = 'none';
-        openModal('installModal');
-    }
-
-    async function installProtocol() {
-        const port = document.getElementById('installPort').value;
-        const btn = document.getElementById('installBtn');
-        const text = document.getElementById('installBtnText');
-        const spinner = document.getElementById('installSpinner');
-        btn.disabled = true;
-        text.textContent = _('installing');
-        spinner.classList.remove('hidden');
-        document.getElementById('installForm').classList.add('hidden');
-        const progressDiv = document.getElementById('installProgress');
-        progressDiv.classList.remove('hidden');
-        const logEl = document.getElementById('installLog');
-        const fillEl = document.getElementById('installProgressFill');
-        logEl.innerHTML = `<div class="log-line info">${_('start_install')}</div>`;
-        fillEl.style.width = '10%';
-        fillEl.style.background = '';
-        try {
-            const progressSteps = [
-                { pct: 20, msg: _('check_docker') },
-                { pct: 40, msg: _('prepare_host') },
-                { pct: 50, msg: _('build_container') },
-            ];
-            let stepIdx = 0;
-            const progressInterval = setInterval(() => {
-                if (stepIdx < progressSteps.length) {
-                    fillEl.style.width = progressSteps[stepIdx].pct + '%';
-                    logEl.innerHTML += `<div class="log-line info">${progressSteps[stepIdx].msg}</div>`;
-                    logEl.scrollTop = logEl.scrollHeight;
-                    stepIdx++;
-                }
-            }, 2000);
-            const params = {
-                protocol: currentInstallProto, port: port,
-            };
-            if (currentInstallProto === 'telemt') {
-                params.tls_emulation = document.getElementById('installTelemtTls').checked;
-                params.tls_domain = document.getElementById('installTelemtDomain').value;
-                params.max_connections = parseInt(document.getElementById('installTelemtMaxConns').value) || 0;
-            }
-            if (['awg'].includes(currentInstallProto)) {
-                const profileSelect = document.getElementById('installAwgProfile');
-                if (profileSelect && profileSelect.value) {
-                    params.awg_profile = profileSelect.value;
-                }
-                if (profileSelect && profileSelect.value === 'pro') {
-                    const cpsSelect = document.getElementById('installAwgCpsProtocol');
-                    if (cpsSelect && cpsSelect.value) {
-                        params.awg_cps_protocol = cpsSelect.value;
-                    }
-                }
-            }
-            const result = await API.post(`/api/servers/${SERVER_ID}/install`, params);
-            clearInterval(progressInterval);
-            fillEl.style.width = '100%';
-            if (result.log) {
-                result.log.forEach(line => {
-                    logEl.innerHTML += `<div class="log-line success">✓ ${line}</div>`;
-                });
-            }
-            logEl.scrollTop = logEl.scrollHeight;
-            UI.toast(_('install_success'), 'success');
-            document.getElementById('installDone').style.display = '';
-        } catch (err) {
-            fillEl.style.width = '100%';
-            fillEl.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
-            logEl.innerHTML += `<div class="log-line error">✕ ${_('error')}: ${err.message}</div>`;
-            logEl.scrollTop = logEl.scrollHeight;
-            UI.toast(_('install_error') + err.message, 'error');
-            document.getElementById('installDone').style.display = '';
-        }
-    }
-
-    async function uninstallProtocol(proto) {
-        const name = getProtoTitle(proto);
-        const confirmed = await UI.confirm({
-            title: _('uninstall') || 'Uninstall Protocol',
-            message: _('uninstall_confirm').replace('{}', name),
-            confirmVariant: 'danger'
-        });
-        if (!confirmed) return;
-        try {
-            await API.post(`/api/servers/${SERVER_ID}/uninstall`, { protocol: proto });
-            UI.toast(`${name} ${_('stopped')}`, 'success');
-            setTimeout(() => window.location.reload(), 800);
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    // ========== Connection Management ==========
     function selectProtocolForConns(proto) {
         document.getElementById('connectionsSection').style.display = '';
         document.getElementById('connProtoSelect').value = proto;
@@ -1240,9 +850,7 @@
                 let statusHtml = '';
                 if (enabled) {
                     statusHtml += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('active') || 'Active'}</span>`;
-                    if (handshake) {
-                        statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🤝 ${UI.escapeHtml(handshake)}</span>`;
-                    }
+                    if (handshake) statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🤝 ${UI.escapeHtml(handshake)}</span>`;
                 } else {
                     statusHtml += `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`;
                 }
@@ -1254,10 +862,8 @@
                     } else {
                         statusHtml += ` <span class="badge badge-success" style="font-size:0.65rem;">🔒 ${UI.escapeHtml(mimicry.toUpperCase())}</span>`;
                     }
-                } else if (proto === 'telemt') {
-                    if (userData.current_connections !== undefined) {
-                        statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🔌 ${UI.escapeHtml(String(userData.current_connections))} conns</span>`;
-                    }
+                } else if (proto === 'telemt' && userData.current_connections !== undefined) {
+                    statusHtml += ` <span style="font-size:0.75rem; color:var(--text-muted);">🔌 ${UI.escapeHtml(String(userData.current_connections))} conns</span>`;
                 }
 
                 // Traffic Rx/Tx column
@@ -1268,12 +874,7 @@
                     numericBytes = octets;
                     trafficHtml = `<span class="traffic-badge">📊 ${UI.escapeHtml(UI.formatBytes(octets))}</span>`;
                 } else {
-                    trafficHtml = `
-                        <div class="traffic-cell">
-                            <span class="traffic-badge traffic-down">↓ ${UI.escapeHtml(received || '0 B')}</span>
-                            <span class="traffic-badge traffic-up">↑ ${UI.escapeHtml(sent || '0 B')}</span>
-                        </div>
-                    `;
+                    trafficHtml = `<div class="traffic-cell"><span class="traffic-badge traffic-down">↓ ${UI.escapeHtml(received || '0 B')}</span><span class="traffic-badge traffic-up">↑ ${UI.escapeHtml(sent || '0 B')}</span></div>`;
                 }
 
                 // Quota badge (telemt quota shares the traffic column)
@@ -1345,447 +946,6 @@
         } catch (err) {
             loading.style.display = 'none';
             UI.toast(_('loading_connections_error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function copyConnectionConfig(clientId, connName, btnEl) {
-        const proto = document.getElementById('connProtoSelect').value;
-        try {
-            UI.toast(_('loading'), 'info');
-            const result = await API.post(`/api/servers/${SERVER_ID}/connections/config`, {
-                protocol: proto,
-                client_id: clientId,
-            });
-            if (result && result.config) {
-                await UI.copy(result.config, btnEl);
-            } else {
-                UI.toast(_('config_unavailable') || 'Config unavailable', 'warning');
-            }
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function rotateClientMimicry(clientId) {
-        try {
-            UI.toast(_('loading'), 'info');
-            const res = await API.post(`/api/servers/${SERVER_ID}/connections/${clientId}/rotate-mimicry`);
-            UI.toast(`Rotated to ${(res.rotation && res.rotation.awg_mimicry ? res.rotation.awg_mimicry : 'next').toUpperCase()}`, 'success');
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function addConnection() {
-        const proto = document.getElementById('connProtoSelect').value;
-        const connName = document.getElementById('connectionName').value.trim();
-        const userId = document.getElementById('connectionUserId').value || null;
-        const btn = document.getElementById('addConnBtn');
-        const text = document.getElementById('addConnBtnText');
-        const spinner = document.getElementById('addConnSpinner');
-        btn.disabled = true;
-        text.textContent = isEditingConn ? _('saving') : _('creating');
-        spinner.classList.remove('hidden');
-        try {
-            const params = {
-                protocol: proto, user_id: userId,
-            };
-            if (isEditingConn) {
-                params.client_id = editingClientId;
-                if (connName) {
-                    params.name = connName;
-                }
-            } else {
-                params.name = connName || 'Connection';
-            }
-            if (proto === 'awg') {
-                const mimicrySelect = document.getElementById('awgMimicryProfile');
-                if (mimicrySelect && mimicrySelect.value) {
-                    params.awg_mimicry = mimicrySelect.value;
-                }
-            }
-            if (proto === 'telemt' && isEditingConn) {
-                params.telemt_quota = document.getElementById('telemtQuota').value || null;
-                params.telemt_max_ips = parseInt(document.getElementById('telemtMaxIps').value) || null;
-                params.telemt_expiry = document.getElementById('telemtExpiry').value || null;
-            }
-            const result = await API.post(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, params);
-            if (isEditingConn) {
-                UI.toast(_('connection_updated'), 'success');
-                closeModal('addConnectionModal');
-            } else {
-                UI.toast(_('connection_created').replace('{}', connName || 'Connection'), 'success');
-                closeModal('addConnectionModal');
-                document.getElementById('connectionName').value = '';
-                if (result.config) {
-                    currentConfig = result.config;
-                    currentVpnLink = result.vpn_link || '';
-                    currentConfigName = (connName || 'Connection').replace(/\s+/g, '_');
-                    document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName || 'Connection'}`;
-                    document.getElementById('configText').textContent = result.config;
-                    document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                    document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-                    document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
-                    document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
-                    switchConfigTab('conf');
-                    openModal('configModal');
-                    generateQR(result.config);
-                }
-            }
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        } finally {
-            btn.disabled = false;
-            text.textContent = isEditingConn ? _('save') : _('create');
-            spinner.classList.add('hidden');
-        }
-    }
-
-    let isEditingConn = false;
-    let editingClientId = null;
-
-    function openAddConnectionModal(isEdit = false, clientData = null) {
-        isEditingConn = isEdit;
-        const proto = document.getElementById('connProtoSelect').value;
-        const telemtOpts = document.getElementById('telemtConnOptions');
-        const awgMimicryOpts = document.getElementById('awgMimicryOptions');
-
-        document.getElementById('addConnectionModalTitle').textContent = isEdit ? _('edit_connection') : _('add_connection');
-        document.getElementById('addConnBtnText').textContent = isEdit ? _('save') : _('create');
-        document.getElementById('connectionNameGroup').style.display = 'block';
-        document.getElementById('connectionName').value = (isEdit && clientData && (clientData.name || clientData.clientName)) ? (clientData.name || clientData.clientName) : '';
-        document.getElementById('connectionUserId').value = (isEdit && clientData && clientData.assigned_user_id) ? clientData.assigned_user_id : '';
-
-        if (proto === 'awg') {
-            if (awgMimicryOpts) awgMimicryOpts.style.display = isEdit ? 'none' : 'block';
-            if (!isEdit) {
-                if (document.getElementById('awgMimicryProfile')) document.getElementById('awgMimicryProfile').value = 'auto';
-            }
-        } else {
-            if (awgMimicryOpts) awgMimicryOpts.style.display = 'none';
-        }
-
-        if (isEdit && clientData) {
-            editingClientId = (clientData && (clientData.clientId || clientData.clientName)) || null;
-        } else {
-            editingClientId = null;
-        }
-
-        if (proto === 'telemt' && isEdit) {
-            telemtOpts.style.display = 'block';
-            if (isEdit && clientData) {
-                document.getElementById('telemtQuota').value = clientData.quota || '';
-                document.getElementById('telemtMaxIps').value = clientData.active_ips || '';
-                document.getElementById('telemtExpiry').value = clientData.expiry || '';
-            } else {
-                document.getElementById('telemtQuota').value = '';
-                document.getElementById('telemtMaxIps').value = '';
-                document.getElementById('telemtExpiry').value = '';
-            }
-        } else {
-            telemtOpts.style.display = 'none';
-        }
-        openModal('addConnectionModal', '#connectionName');
-    }
-
-    function editConnection(clientId) {
-        const userData = window.connectionsStore[clientId];
-        if (userData) {
-            userData.clientId = clientId;
-            openAddConnectionModal(true, userData);
-        }
-    }
-
-    async function removeConnection(clientId) {
-        const confirmed = await UI.confirm({
-            title: _('delete') || 'Delete Connection',
-            message: _('delete_connection_confirm') || 'Are you sure you want to delete this connection?',
-            confirmVariant: 'danger'
-        });
-        if (!confirmed) return;
-
-        const proto = document.getElementById('connProtoSelect').value;
-        try {
-            await API.post(`/api/servers/${SERVER_ID}/connections/remove`, {
-                protocol: proto, client_id: clientId,
-            });
-            UI.toast(_('connection_deleted'), 'success');
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function showConnectionConfig(clientId, connName, hasKey) {
-        const proto = document.getElementById('connProtoSelect').value;
-
-        document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-        document.getElementById('panel-qr').style.display = '';
-        document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
-        document.querySelectorAll('.config-tab')[2].style.display = '';
-
-        document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
-
-        if (!hasKey) {
-            document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
-            currentConfig = '';
-            currentVpnLink = '';
-            currentConfigName = connName.replace(/\s+/g, '_');
-            document.getElementById('configText').innerHTML = `<div style="padding:var(--space-md);background:var(--bg-primary);border-radius:var(--radius-md);border:1px solid var(--border-color);"><div style="font-size:1.4rem;margin-bottom:var(--space-sm);">⚠️</div><div style="font-weight:600;margin-bottom:var(--space-sm);">${_('config_unavailable')}</div><div style="font-size:0.85rem;color:var(--text-muted);line-height:1.6;">${_('config_unavailable_desc').replace(/\\n/g, '<br>')}<br><br><strong>${_('client_public_key')}</strong><br><code style="word-break:break-all;font-size:0.78rem;">${UI.escapeHtml(clientId)}</code></div></div>`;
-            document.getElementById('vpnLinkText').textContent = '';
-            document.getElementById('panel-vpn').style.display = 'none';
-            document.getElementById('panel-qr').style.display = 'none';
-            document.querySelectorAll('.config-tab')[1].style.display = 'none';
-            document.querySelectorAll('.config-tab')[2].style.display = 'none';
-            switchConfigTab('conf');
-            openModal('configModal');
-            return;
-        }
-
-        try {
-            UI.toast(_('loading'), 'info');
-            const result = await API.post(`/api/servers/${SERVER_ID}/connections/config`, {
-                protocol: proto, client_id: clientId,
-            });
-            if (result.config) {
-                currentConfig = result.config;
-                currentVpnLink = result.vpn_link || '';
-                currentConfigName = connName.replace(/\s+/g, '_');
-                document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
-                document.getElementById('configText').textContent = result.config;
-                document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                switchConfigTab('conf');
-                openModal('configModal');
-                generateQR(result.config);
-            }
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    async function toggleConnection(clientId, enable) {
-        const proto = document.getElementById('connProtoSelect').value;
-        try {
-            UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabling') : _('disabling')) + '...', 'info');
-            await API.post(`/api/servers/${SERVER_ID}/connections/toggle`, {
-                protocol: proto, client_id: clientId, enable: enable,
-            });
-            UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabled') : _('disabled')), 'success');
-            loadConnections();
-        } catch (err) {
-            UI.toast(_('error') + ': ' + err.message, 'error');
-        }
-    }
-
-    function switchConfigTab(tab) {
-        document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
-        const tabs = document.querySelectorAll('.config-tab');
-        const panels = { conf: 'panel-conf', vpn: 'panel-vpn', qr: 'panel-qr' };
-        const tabIdx = { conf: 0, vpn: 1, qr: 2 };
-        if (tabs[tabIdx[tab]]) tabs[tabIdx[tab]].classList.add('active');
-        if (document.getElementById(panels[tab])) document.getElementById(panels[tab]).classList.add('active');
-    }
-
-    function generateQR(text) {
-        const container = document.getElementById('qrCode');
-        container.innerHTML = '';
-        try {
-            new QRCode(container, {
-                text: text, width: 280, height: 280,
-                colorDark: '#000000', colorLight: '#ffffff',
-                correctLevel: QRCode.CorrectLevel.L
-            });
-        } catch (e) {
-            console.error('QR lib error:', e);
-            container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
-        }
-    }
-
-    function formatDate(dateStr) {
-        try {
-            const d = new Date(dateStr);
-            if (isNaN(d)) return dateStr;
-            return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-        } catch { return dateStr; }
-    }
-
-    async function rebootServer() {
-        const confirmed = await UI.confirm({
-            title: _('reboot_server') || 'Reboot Server',
-            message: 'Are you sure you want to reboot the server? Disconnections will occur.',
-            confirmText: 'Reboot',
-            confirmVariant: 'warning'
-        });
-        if (!confirmed) return;
-
-        try {
-            UI.toast('Rebooting server...', 'info');
-            await API.post(`/api/servers/${SERVER_ID}/reboot`);
-            UI.toast('Server is rebooting', 'success');
-        } catch (err) {
-            UI.toast('Error: ' + err.message, 'error');
-        }
-    }
-
-    async function clearServer() {
-        const confirmed = await UI.confirm({
-            title: _('clear_server') || 'Clear Server',
-            message: '⚠️ WARNING: This will completely delete all Amnezia configurations, containers, and data from /opt/amnezia on the server! Are you absolutely sure?',
-            confirmText: 'Clear Server Data',
-            confirmVariant: 'danger'
-        });
-        if (!confirmed) return;
-
-        try {
-            UI.toast('Clearing server from Amnezia software...', 'info');
-            await API.post(`/api/servers/${SERVER_ID}/clear`);
-            UI.toast('Server cleared successfully!', 'success');
-            setTimeout(() => location.reload(), 1500);
-        } catch (err) {
-            UI.toast('Error: ' + err.message, 'error');
-        }
-    }
-
-    async function removeServer() {
-        const confirmed = await UI.confirm({
-            title: _('remove_server') || 'Remove Server',
-            message: 'Are you sure you want to remove this server from the panel? (The server itself will not be erased).',
-            confirmText: 'Remove',
-            confirmVariant: 'danger'
-        });
-        if (!confirmed) return;
-
-        try {
-            await API.post(`/api/servers/${SERVER_ID}/delete`);
-            window.location.href = '/';
-        } catch (err) {
-            UI.toast('Error: ' + err.message, 'error');
-        }
-    }
-
-    document.getElementById('installAwgProfile').addEventListener('change', function() {
-        const cpsGroup = document.getElementById('awgCpsProtocolGroup');
-        if (this.value === 'pro') {
-            cpsGroup.style.display = 'block';
-        } else {
-            cpsGroup.style.display = 'none';
-        }
-    });
-
-    let renameServerId = null;
-
-    function openRenameServerModal(serverId, currentName) {
-        renameServerId = serverId;
-        const titleEl = document.getElementById('serverNameTitle');
-        const name = titleEl ? titleEl.textContent.trim() : (currentName || '');
-        const input = document.getElementById('renameServerInput');
-        if (input) {
-            input.value = name;
-        }
-        openModal('renameServerModal', '#renameServerInput');
-    }
-
-    function closeRenameServerModal() {
-        closeModal('renameServerModal');
-        renameServerId = null;
-    }
-
-    async function submitRenameServer() {
-        if (!renameServerId) return;
-        const input = document.getElementById('renameServerInput');
-        const newName = input ? input.value.trim() : '';
-        if (!newName) {
-            UI.toast(_('validation_failed') || 'Name cannot be empty', 'error');
-            return;
-        }
-        try {
-            await API.post(`/api/servers/${renameServerId}/rename`, { name: newName });
-            UI.toast(_('server_renamed') || 'Server renamed', 'success');
-            closeRenameServerModal();
-            const titleEl = document.getElementById('serverNameTitle');
-            if (titleEl) {
-                titleEl.textContent = newName;
-            }
-            document.title = document.title.replace(/— .*$/, `— ${newName}`);
-        } catch (err) {
-            UI.toast(err.message, 'error');
-        }
-    }
-
-    let editHostServerId = null;
-
-    function isValidHost(host) {
-        if (typeof host !== 'string') return false;
-        host = host.trim();
-        if (!host) return false;
-        if (/\s/.test(host)) return false;
-        if (host.includes('://')) return false;
-
-        // IPv4 validation: 4 octets, 0-255
-        const ipv4Regex = /^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$/;
-        if (ipv4Regex.test(host)) {
-            return true;
-        }
-
-        // If string consists only of digits and dots, it is an invalid IPv4
-        if (/^[\d.]+$/.test(host)) {
-            return false;
-        }
-
-        // IPv6 validation: hex segments, colons, bracketed or unbracketed
-        let ipv6Candidate = host;
-        if (ipv6Candidate.startsWith('[') && ipv6Candidate.endsWith(']')) {
-            ipv6Candidate = ipv6Candidate.slice(1, -1);
-        }
-        if (ipv6Candidate.includes(':')) {
-            const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
-            return ipv6Regex.test(ipv6Candidate);
-        }
-
-        // Hostname / FQDN validation: valid domain labels, a-z, 0-9, hyphens, dots, no leading/trailing hyphen
-        if (host.length > 253) return false;
-        const hostnameRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
-        return hostnameRegex.test(host);
-    }
-
-    function openEditHostModal(serverId, currentHost) {
-        editHostServerId = serverId;
-        const hostEl = document.getElementById('serverHostDisplay');
-        const host = hostEl ? hostEl.textContent.trim() : (currentHost || '');
-        const input = document.getElementById('editHostInput');
-        if (input) {
-            input.value = host;
-        }
-        openModal('editHostModal', '#editHostInput');
-    }
-
-    function closeEditHostModal() {
-        closeModal('editHostModal');
-        editHostServerId = null;
-    }
-
-    async function submitEditHost() {
-        if (!editHostServerId) return;
-        const serverId = editHostServerId;
-        const input = document.getElementById('editHostInput');
-        const newHost = input ? input.value.trim() : '';
-        if (!isValidHost(newHost)) {
-            UI.toast(_('validation_failed') || 'Invalid IP address or hostname', 'error');
-            return;
-        }
-        try {
-            await API.post('/api/servers/' + serverId + '/host', { host: newHost });
-            UI.toast(_('server_host_updated') || 'Server IP updated', 'success');
-            closeEditHostModal();
-            const hostEl = document.getElementById('serverHostDisplay');
-            if (hostEl) {
-                hostEl.textContent = newHost;
-            }
-        } catch (err) {
-            UI.toast(err.message, 'error');
         }
     }
 

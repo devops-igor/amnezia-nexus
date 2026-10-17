@@ -56,6 +56,16 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 	}
 	serverStr := string(serverData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	serverActionsData, err := fs.ReadFile(staticFS, "js/server_actions.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_actions.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+
 	requiredServerTokens := []string{
 		"href=\"#icon-server\"",
 		"href=\"#icon-pencil\"",
@@ -81,20 +91,20 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 		"reachabilityOverallBadge",
 	}
 	for _, token := range requiredServerTokens {
-		if !strings.Contains(serverStr, token) {
-			t.Errorf("server.html missing required modernized token %q", token)
+		if !strings.Contains(serverCombinedStr, token) {
+			t.Errorf("server page missing required modernized token %q", token)
 		}
 	}
 
-	// Ensure raw confirm(), apiCall(), showToast() are not used in server.html
-	if strings.Contains(serverStr, "if (!confirm(") || strings.Contains(serverStr, "if(!confirm(") {
-		t.Errorf("server.html should not use raw confirm(), must use UI.confirm")
+	// Ensure raw confirm(), apiCall(), showToast() are not used in server page
+	if strings.Contains(serverCombinedStr, "if (!confirm(") || strings.Contains(serverCombinedStr, "if(!confirm(") {
+		t.Errorf("server page should not use raw confirm(), must use UI.confirm")
 	}
-	if strings.Contains(serverStr, "apiCall(") {
-		t.Errorf("server.html should not use apiCall(), must use API client")
+	if strings.Contains(serverCombinedStr, "apiCall(") {
+		t.Errorf("server page should not use apiCall(), must use API client")
 	}
-	if strings.Contains(serverStr, "showToast(") {
-		t.Errorf("server.html should not use showToast(), must use UI.toast")
+	if strings.Contains(serverCombinedStr, "showToast(") {
+		t.Errorf("server page should not use showToast(), must use UI.toast")
 	}
 }
 
@@ -329,21 +339,34 @@ func TestServerTemplateI18nAndTranslations(t *testing.T) {
 	}
 	serverStr := string(serverData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	serverActionsData, err := fs.ReadFile(staticFS, "js/server_actions.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_actions.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+
 	// 1. Verify that server.html contains NO Cyrillic characters (regex [\x{0400}-\x{04FF}])
 	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
 	if matches := cyrillicRe.FindAllString(serverStr, -1); len(matches) > 0 {
 		t.Errorf("server.html contains hardcoded Cyrillic characters (%d occurrences): %v", len(matches), matches)
 	}
+	if matches := cyrillicRe.FindAllString(string(serverActionsData), -1); len(matches) > 0 {
+		t.Errorf("server_actions.js contains hardcoded Cyrillic characters (%d occurrences): %v", len(matches), matches)
+	}
 
-	// 2. Verify server.html references required translation tokens
+	// 2. Verify server page references required translation tokens
 	requiredTokens := []string{
 		"${_('start_install')}",
 		"_('port_telemt_hint')",
 		"${_('config')}",
 	}
 	for _, token := range requiredTokens {
-		if !strings.Contains(serverStr, token) {
-			t.Errorf("server.html missing required token %q", token)
+		if !strings.Contains(serverCombinedStr, token) {
+			t.Errorf("server page missing required token %q", token)
 		}
 	}
 
@@ -552,6 +575,16 @@ func TestIssue278EditServerHostUIAndTranslations(t *testing.T) {
 	}
 	serverStr := string(serverData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	serverActionsData, err := fs.ReadFile(staticFS, "js/server_actions.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_actions.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+
 	requiredServerElements := []string{
 		`id="serverHostDisplay"`,
 		`openEditHostModal`,
@@ -565,15 +598,15 @@ func TestIssue278EditServerHostUIAndTranslations(t *testing.T) {
 		`server_host_updated`,
 	}
 	for _, elem := range requiredServerElements {
-		if !strings.Contains(serverStr, elem) {
-			t.Errorf("server.html missing required edit host element %q", elem)
+		if !strings.Contains(serverCombinedStr, elem) {
+			t.Errorf("server.html or server_actions.js missing required edit host element %q", elem)
 		}
 	}
 
-	// Ensure no hardcoded Cyrillic was added to server.html
+	// Ensure no hardcoded Cyrillic was added to server.html or server_actions.js
 	cyrillicRe := regexp.MustCompile(`[\x{0400}-\x{04FF}]`)
-	if matches := cyrillicRe.FindAllString(serverStr, -1); len(matches) > 0 {
-		t.Errorf("server.html contains hardcoded Cyrillic characters: %v", matches)
+	if matches := cyrillicRe.FindAllString(serverCombinedStr, -1); len(matches) > 0 {
+		t.Errorf("server.html or server_actions.js contains hardcoded Cyrillic characters: %v", matches)
 	}
 
 	// 3. Verify index.html elements and JavaScript
@@ -616,6 +649,16 @@ func TestClientSideHostValidation(t *testing.T) {
 	}
 	serverStr := string(serverData)
 
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+	serverActionsData, err := fs.ReadFile(staticFS, "js/server_actions.js")
+	if err != nil {
+		t.Fatalf("failed to read js/server_actions.js: %v", err)
+	}
+	serverCombinedStr := serverStr + "\n" + string(serverActionsData)
+
 	indexData, err := fs.ReadFile(templatesFS, "index.html")
 	if err != nil {
 		t.Fatalf("failed to read index.html: %v", err)
@@ -626,7 +669,7 @@ func TestClientSideHostValidation(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"server.html", serverStr},
+		{"server.html", serverCombinedStr},
 		{"index.html", indexStr},
 	} {
 		if !strings.Contains(tmpl.content, "function isValidHost(host)") {
