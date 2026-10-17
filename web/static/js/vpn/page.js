@@ -179,8 +179,6 @@ const VPN_ACTIONS = {
     }
 };
 
-let vpnListenersInitialized = false;
-
 function getVpnContainerRoots() {
     if (typeof document === 'undefined') return [];
     const vpnRoot = (typeof document.querySelector === 'function' && (document.querySelector('#vpn-app') || document.querySelector('main'))) || document.body;
@@ -235,8 +233,6 @@ function initVpnEventListeners() {
             }
         });
     });
-
-    vpnListenersInitialized = true;
 }
 
 if (typeof document !== 'undefined') {
