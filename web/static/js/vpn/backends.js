@@ -209,15 +209,6 @@ function vpnRenderBackendRow(b) {
 }
 
 async function vpnToggleBackend(serverId, action) {
-    if (!action && typeof document !== 'undefined') {
-        const btn = document.querySelector(`[data-action="vpn-toggle-backend"][data-server-id="${serverId}"]`);
-        if (btn && btn.dataset && btn.dataset.backendAction) {
-            action = btn.dataset.backendAction;
-        } else if (btn && btn.getAttribute) {
-            action = btn.getAttribute('data-backend-action');
-        }
-    }
-
     if (action === 'disable') {
         const confirmed = await UI.confirm({
             title: _('vpn_disable') || 'Disable Backend',

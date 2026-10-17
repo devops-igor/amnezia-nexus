@@ -181,57 +181,62 @@ const VPN_ACTIONS = {
 
 let vpnListenersInitialized = false;
 
+function getVpnContainerRoots() {
+    if (typeof document === 'undefined') return [];
+    const vpnRoot = (typeof document.querySelector === 'function' && (document.querySelector('#vpn-app') || document.querySelector('main'))) || document.body;
+    if (!vpnRoot) return [];
+    const roots = [vpnRoot];
+    ['addBackendModal', 'editEndpointModal'].forEach(function (id) {
+        const modal = typeof document.getElementById === 'function' ? document.getElementById(id) : null;
+        if (modal && !roots.some(function (r) { return r === modal || (r.contains && r.contains(modal)); })) {
+            roots.push(modal);
+        }
+    });
+    return roots;
+}
+
 function initVpnEventListeners() {
     if (typeof document === 'undefined') return;
 
-    function bindFormsAndSelects() {
-        const addForm = document.getElementById('addBackendForm');
-        if (addForm && typeof addForm.addEventListener === 'function' && !addForm._vpnBound) {
-            addForm._vpnBound = true;
-            addForm.addEventListener('submit', function (e) {
+    const roots = getVpnContainerRoots();
+    roots.forEach(function (root) {
+        if (!root || root._vpnListenersBound || typeof root.addEventListener !== 'function') return;
+        root._vpnListenersBound = true;
+
+        root.addEventListener('click', function (e) {
+            const btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+            if (!btn) return;
+
+            const action = btn.dataset ? btn.dataset.action : (btn.getAttribute ? btn.getAttribute('data-action') : null);
+            if (!action || !Object.prototype.hasOwnProperty.call(VPN_ACTIONS, action)) return;
+
+            if (e && typeof e.preventDefault === 'function') {
+                e.preventDefault();
+            }
+
+            VPN_ACTIONS[action](btn);
+        });
+
+        root.addEventListener('submit', function (e) {
+            if (!e.target) return;
+            const targetId = e.target.id || (e.target.closest ? (e.target.closest('form') || {}).id : null);
+            if (targetId === 'addBackendForm') {
                 if (e && typeof e.preventDefault === 'function') e.preventDefault();
                 if (typeof vpnSubmitAddBackend === 'function') vpnSubmitAddBackend();
-            });
-        }
-
-        const editForm = document.getElementById('editEndpointForm');
-        if (editForm && typeof editForm.addEventListener === 'function' && !editForm._vpnBound) {
-            editForm._vpnBound = true;
-            editForm.addEventListener('submit', function (e) {
+            } else if (targetId === 'editEndpointForm') {
                 if (e && typeof e.preventDefault === 'function') e.preventDefault();
                 if (typeof vpnSubmitEditEndpoint === 'function') vpnSubmitEditEndpoint();
-            });
-        }
+            }
+        });
 
-        const serverSelect = document.getElementById('vpnServerSelect');
-        if (serverSelect && typeof serverSelect.addEventListener === 'function' && !serverSelect._vpnBound) {
-            serverSelect._vpnBound = true;
-            serverSelect.addEventListener('change', function () {
+        root.addEventListener('change', function (e) {
+            if (e && e.target && e.target.id === 'vpnServerSelect') {
                 if (typeof vpnOnServerSelected === 'function') vpnOnServerSelected();
-            });
-        }
-    }
+            }
+        });
+    });
 
-    if (!vpnListenersInitialized) {
-        vpnListenersInitialized = true;
-        if (typeof document.addEventListener === 'function') {
-            document.addEventListener('click', function (e) {
-                const btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
-                if (!btn) return;
-
-                const action = btn.dataset ? btn.dataset.action : (btn.getAttribute ? btn.getAttribute('data-action') : null);
-                if (!action || !Object.prototype.hasOwnProperty.call(VPN_ACTIONS, action)) return;
-
-                if (e && typeof e.preventDefault === 'function') {
-                    e.preventDefault();
-                }
-
-                VPN_ACTIONS[action](btn);
-            });
-        }
-    }
-
-    bindFormsAndSelects();
+    vpnListenersInitialized = true;
 }
 
 if (typeof document !== 'undefined') {

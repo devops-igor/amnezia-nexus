@@ -667,31 +667,82 @@ func TestVPNPageDelegatedEventListeners(t *testing.T) {
     serverSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
     assert.strictEqual(serverSelectedCalls, 1, 'vpnOnServerSelected called on change');
 
-    // 8. Dynamically generated row controls delegation
-    let backendToggled = null;
-    let backendDeleted = null;
-    let sessionToggled = null;
-    w.vpnToggleBackend = (srvId, action) => { backendToggled = { srvId, action }; };
-    w.vpnDeleteBackend = (srvId) => { backendDeleted = srvId; };
-    w.vpnToggleSessionDrilldown = (sessId) => { sessionToggled = sessId; };
+    // 7b. Form & select DOM element replacement survives without reinitializing listeners
+    const oldAddForm = w.document.getElementById('addBackendForm');
+    const replacementAddForm = w.document.createElement('form');
+    replacementAddForm.id = 'addBackendForm';
+    oldAddForm.parentNode.replaceChild(replacementAddForm, oldAddForm);
+    const replSubmitEvt = new w.Event('submit', { bubbles: true, cancelable: true });
+    replacementAddForm.dispatchEvent(replSubmitEvt);
+    assert.strictEqual(addBackendSubmitted, 2, 'vpnSubmitAddBackend called on replaced form submit');
+    assert.strictEqual(replSubmitEvt.defaultPrevented, true, 'replaced addBackendForm submit default prevented');
 
-    const dynamicRowContainer = w.document.createElement('div');
-    dynamicRowContainer.innerHTML = '<button type="button" data-action="vpn-toggle-backend" data-server-id="101" data-backend-action="enable">Enable</button>' +
-        '<button type="button" data-action="vpn-delete-backend" data-server-id="102">Delete</button>' +
-        '<table><tbody><tr data-session-id="sess-99"><td data-action="vpn-toggle-session" data-session-id="sess-99">User</td></tr></tbody></table>';
-    w.document.body.appendChild(dynamicRowContainer);
+    const oldSelect = w.document.getElementById('vpnServerSelect');
+    const replacementSelect = w.document.createElement('select');
+    replacementSelect.id = 'vpnServerSelect';
+    if (oldSelect && oldSelect.parentNode) {
+        oldSelect.parentNode.replaceChild(replacementSelect, oldSelect);
+    } else {
+        w.document.body.appendChild(replacementSelect);
+    }
+    replacementSelect.dispatchEvent(new w.Event('change', { bubbles: true }));
+    assert.strictEqual(serverSelectedCalls, 2, 'vpnOnServerSelected called on replaced select');
 
-    const toggleBackendBtn = dynamicRowContainer.querySelector('[data-action="vpn-toggle-backend"]');
-    toggleBackendBtn.click();
-    assert.deepStrictEqual(backendToggled, { srvId: '101', action: 'enable' }, 'vpnToggleBackend dispatched from row toggle button');
+    // 8. Dynamically generated real-row controls delegation (vpnRenderBackendRow & vpnRenderSessionRow)
+    const backendToggles = [];
+    const backendDeletes = [];
+    let sessionToggledId = null;
+    let sessionToggledTr = null;
+    w.vpnToggleBackend = (srvId, action) => { backendToggles.push({ srvId: String(srvId), action }); };
+    w.vpnDeleteBackend = (srvId) => { backendDeletes.push(String(srvId)); };
+    w.vpnToggleSessionDrilldown = (sessId, tr) => { sessionToggledId = sessId; sessionToggledTr = tr; };
 
-    const deleteBackendBtn = dynamicRowContainer.querySelector('[data-action="vpn-delete-backend"]');
-    deleteBackendBtn.click();
-    assert.strictEqual(backendDeleted, '102', 'vpnDeleteBackend dispatched from row delete button');
+    w.vpnCachedServers = [
+        { id: 101, name: 'Server 101' },
+        { id: 102, name: 'Server 102' }
+    ];
 
-    const toggleSessionTd = dynamicRowContainer.querySelector('[data-action="vpn-toggle-session"]');
+    // Real backend row 1: disabled backend -> enable action
+    const backendRow1 = w.vpnRenderBackendRow({ server_id: 101, enabled: false, status: 'disabled' });
+    const backendsTbody = w.document.getElementById('vpn-backends-tbody');
+    assert.ok(backendsTbody, '#vpn-backends-tbody must exist');
+    backendsTbody.appendChild(backendRow1);
+
+    // Real backend row 2: enabled backend -> disable action
+    const backendRow2 = w.vpnRenderBackendRow({ server_id: 102, enabled: true, status: 'running' });
+    backendsTbody.appendChild(backendRow2);
+
+    // Test clicking enable on real backend row 1
+    const toggleBackendBtn1 = backendRow1.querySelector('[data-action="vpn-toggle-backend"]');
+    assert.ok(toggleBackendBtn1, 'backendRow1 must contain data-action="vpn-toggle-backend" button');
+    toggleBackendBtn1.click();
+    assert.deepStrictEqual(backendToggles[0], { srvId: '101', action: 'enable' }, 'vpnToggleBackend enable dispatched from real row 1');
+
+    // Test clicking disable on real backend row 2
+    const toggleBackendBtn2 = backendRow2.querySelector('[data-action="vpn-toggle-backend"]');
+    assert.ok(toggleBackendBtn2, 'backendRow2 must contain data-action="vpn-toggle-backend" button');
+    toggleBackendBtn2.click();
+    assert.deepStrictEqual(backendToggles[1], { srvId: '102', action: 'disable' }, 'vpnToggleBackend disable dispatched from real row 2');
+
+    // Test clicking delete button on real backend row 2 (child icon dispatch)
+    const deleteBackendBtn = backendRow2.querySelector('[data-action="vpn-delete-backend"]');
+    assert.ok(deleteBackendBtn, 'backendRow2 must contain data-action="vpn-delete-backend" button');
+    const deleteIcon = deleteBackendBtn.querySelector('svg') || deleteBackendBtn;
+    deleteIcon.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+    assert.deepStrictEqual(backendDeletes, ['102'], 'vpnDeleteBackend dispatched from real row 2 delete button');
+
+    // Real session row
+    const sessionData = { session_id: 'sess-99', username: 'alice', server_name: 'Server 101', status: 'connected' };
+    const sessionRow = w.vpnRenderSessionRow(sessionData);
+    const sessionsTbody = w.document.getElementById('vpn-sessions-tbody');
+    assert.ok(sessionsTbody, '#vpn-sessions-tbody must exist');
+    sessionsTbody.appendChild(sessionRow);
+
+    const toggleSessionTd = sessionRow.querySelector('[data-action="vpn-toggle-session"]');
+    assert.ok(toggleSessionTd, 'sessionRow must contain cell with data-action="vpn-toggle-session"');
     toggleSessionTd.click();
-    assert.strictEqual(sessionToggled, 'sess-99', 'vpnToggleSessionDrilldown dispatched from session row');
+    assert.strictEqual(sessionToggledId, 'sess-99', 'vpnToggleSessionDrilldown received session id from real session row');
+    assert.strictEqual(sessionToggledTr, sessionRow, 'vpnToggleSessionDrilldown received tr element from real session row');
 
     // 9. Foreign data-action does NOT prevent default
     const foreignLink = w.document.createElement('a');
