@@ -225,9 +225,9 @@ func TestPageHandlers(t *testing.T) {
 		if !strings.Contains(body, "vpnAddBackendSubmitBtn") {
 			t.Errorf("expected rendered vpn.html to contain 'vpnAddBackendSubmitBtn'")
 		}
-		if !strings.Contains(body, "vpnOpenAddBackendModal") {
-			t.Errorf("expected rendered vpn.html to contain 'vpnOpenAddBackendModal'")
-		}
+		if !strings.Contains(body, "vpn-open-add-backend") {
+				t.Errorf("expected rendered vpn.html to contain delegated data-action 'vpn-open-add-backend'")
+			}
 		if !strings.Contains(body, "/static/js/vpn/backends.js") {
 			t.Errorf("expected rendered vpn.html to load '/static/js/vpn/backends.js'")
 		}
