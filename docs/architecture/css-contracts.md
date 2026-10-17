@@ -262,10 +262,11 @@ The table below catalogs every rule whose correct rendering depends on source-or
 | `.table-search-input` vs `.form-input` | L929 (`components.css` `.form-input`) | L2186 (`tables.css` `.table-search-input`) | `padding: 8px 36px 8px 36px` (overrides `11px 16px`), `border-radius: 8px` | `tables.css` MUST load after `components.css`. 36px horizontal padding prevents text colliding with search icon. |
 | `.font-mono` vs `.form-input` | L929 (`components.css` `.form-input`) | L1665 (`vpn.css` / utilities `.font-mono`) | `font-family: 'SF Mono', 'Fira Code', monospace` | Utilities load after `components.css` so `.form-input.font-mono` retains monospace font. |
 | `.btn` transition | L666 (`components.css` `.btn`) | L1877 (`components.css` theme hook) | Multi-property theme transition overrides `transition: all var(--transition-base)` | Place theme transition hook (L1876–1890) at end of `components.css`. |
-| `.modal` @<=768px | L1017 (`components.css`) | L1687 (`server.css` query) | `width: 95%` (base is 90%) | Colocate responsive `@media` override in `components.css` after base rule. |
-| `.server-grid` @<=768px | L813 (`server.css`) | L1675 (`server.css` query) | `grid-template-columns: 1fr` | Colocate responsive `@media` override in `server.css` after base rule. |
-| `.protocol-cards` @<=768px | L1079 (`server.css`) | L1679 (`server.css` query) | `grid-template-columns: 1fr` | Colocate responsive `@media` override in `server.css` after base rule. |
-| `.client-item` @<=768px | L1199 (`server.css`) | L1692 (`server.css` query) | `flex-direction: column` | Colocate responsive `@media` override in `server.css` after base rule. |
+| `.modal` @<=768px | L1017 (`components.css`) | L1687 (`server.css` query) | `width: 95%` (base is 90%) | Assigned to `server.css` within contiguous responsive block (L1673–1719); `server.css` loads after `components.css`, ensuring override wins without splitting media query. |
+| `.form-row` @<=768px | L978 (`components.css`) | L1683 (`server.css` query) | `grid-template-columns: 1fr` | Assigned to `server.css` within contiguous responsive block (L1673–1719); `server.css` loads after `components.css`, ensuring 1-col override wins. |
+| `.server-grid` @<=768px | L813 (`server.css`) | L1675 (`server.css` query) | `grid-template-columns: 1fr` | Assigned to `server.css` within contiguous responsive block (L1673–1719) after base definitions. |
+| `.protocol-cards` @<=768px | L1079 (`server.css`) | L1679 (`server.css` query) | `grid-template-columns: 1fr` | Assigned to `server.css` within contiguous responsive block (L1673–1719) after base definitions. |
+| `.client-item` @<=768px | L1199 (`server.css`) | L1692 (`server.css` query) | `flex-direction: column` | Assigned to `server.css` within contiguous responsive block (L1673–1719) after base definitions. |
 | `.nav-link` @<=900px | L1848 (`layout.css`) | L1893 (`layout.css` query) | `padding: 6px 12px; font-size: 0.8rem` | Colocate 900px query in `layout.css` immediately following `.nav-link`. |
 | `.card.client-item.user-card` | L1199 (`server.css` `.client-item`) | L1877 (`components.css`), L2979 (`vpn.css` `.user-card`) | `transition: border-color ..., box-shadow ...` | Colocate users section in `vpn.css` (loads last); ensure fast border transitions don't clobber theme transitions. |
 | `.hidden` vs `.login-error-box` | L1669 / L1942 (`.hidden`) | L2633 (`components.css` `.login-error-box`) | `display: none !important;` vs `display: none;` | Safe by specification: `!important` on `.hidden` guarantees hidden state wins over normal display rules. |
@@ -360,8 +361,8 @@ The stylesheet relies on five distinct `@media` breakpoints:
 ### 7.2 The 768px vs. 767px Threshold Collision
 At exactly `768px`: 768px queries trigger (single-column cards, modal expands), but 767px queries do not (`.mobile-bottom-bar` remains hidden). Aligning or standardizing these breakpoints is a visual design adjustment deferred to post-modularization.
 
-### 7.3 Cascade Order Mandate: Media Query Colocation
-To guarantee zero specificity or precedence regressions during modularization, all responsive overrides must remain in the same file as, and placed after, their base rules (e.g. `.modal` 768px override in `components.css`; `.server-grid` override in `server.css`; `.nav-link` 900px override in `layout.css`).
+### 7.3 Cascade Order Mandate: Media Query Placement
+To guarantee zero specificity or precedence regressions during modularization, responsive overrides must either be colocated in the same file after their base rules (e.g. `.nav-link` 900px override in `layout.css`) or reside in a downstream module in the cascade order. Specifically, the contiguous 768px/480px responsive media query block (lines 1673–1719) is preserved intact in `server.css`; because `server.css` loads after `components.css`, responsive overrides for `.modal` (L1687) and `.form-row` (L1683) naturally supersede base definitions without fragmenting the block across files.
 
 ---
 
@@ -488,7 +489,8 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 │ - Move Lines 653–811, 870–983, 996–1077, 1265–1272, 1313–1434,          │
 │   1452–1514, 1571–1605, 1823–1846, 1876–1890, 1899–1940, 1957–2089,      │
 │   2496–2657 to components.css (958 lines after pruning L1428)            │
-│ - Colocate responsive overrides for .modal and .form-row                 │
+│ - Responsive overrides for .modal and .form-row preserved downstream in  │
+│   server.css (L1673–1719)                                                │
 │ - Unify .badge (L1900 winning definition & .badge-secondary L1935)       │
 │ - Unify .traffic-badge with .traffic-down/.traffic-up modifiers          │
 │ - Place theme transition hook (L1876–1890) at end of components.css     │
@@ -507,6 +509,8 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 │ Step 5: Extract server.css & vpn.css                                     │
 │ - Move Lines 812–869, 1078–1264, 1273–1312, 1515–1544, 1673–1719,       │
 │   1720–1806 to server.css (449 lines)                                    │
+│ - Responsive media block (L1673–1719) in server.css preserves 768px and   │
+│   480px rules (.server-grid, .protocol-cards, .form-row, .modal, etc.)    │
 │ - Move Lines 1628–1672, 1807–1822, 2459–2495, 2658–2766, 2767–2962,      │
 │   2963–3008 to vpn.css (449 lines)                                       │
 │ - Utilities (L1628–1672) load in vpn.css after components so .font-mono  │
@@ -521,9 +525,13 @@ The implementation sequence partitions lines 1–3008 with contiguous, non-overl
 #### 1. Primary Verification Oracle: Computed-Style Differential Test (`tests/e2e/test_css_differential.py`)
 Static stylesheet modularization must guarantee that computed styles for every element across all application views remain 100% identical. Rather than relying solely on pixel diffing—which is susceptible to GPU font antialiasing differences, animation/transition timing variations (`--transition-slow`), auth redirect cycles, and seed database state—the primary verification oracle for Issue #505 is a **computed-style differential test** executed in headless Chromium via Playwright.
 
+The computed-style verification methodology encompasses two distinct components:
+1. **Audit Qualification Evidence (Issue #504 Baseline)**: During the architectural audit and qualification phase for Issue #504, an independent qualification probe evaluated 14 template DOMs (13 application templates + synthetic dynamic class-list DOM) across 7 viewports and 2 themes (196 test renders total). Probing 66,892 DOM elements and pseudo-elements, the empirical qualification confirmed **0 computed style differences** between monolithic `style.css` and the 7-module concatenation bundle in §8.2 production load order.
+2. **Automated Verification Oracle Specification (Issue #505 Implementation)**: The test script specification below (`tests/e2e/test_css_differential.py`) defines the standalone pytest test harness to be committed and executed in Issue #505 during modular file extraction to enforce continuous zero cascade regression in CI.
+
 The oracle compares monolithic `style.css` against the modular roadmap bundle (concatenated in §8.2 production load order: `tokens.css`, `base.css`, `layout.css`, `components.css`, `tables.css`, `server.css`, `vpn.css`) across:
 1. **Full Template DOM Coverage**: All 13 application templates (`web/templates/*.html`) with Go template actions stripped and `<script>` tags removed.
-2. **Dynamic Class Combinations**: A synthetic DOM page embedding every dynamic CSS multi-class combination emitted across templates and client scripts (`web/static/js/**/*.js`), mounted both standalone and inside shell containers (`.app-layout`, `.card`, `.data-table`, `#usersGrid`).
+2. **Dynamic Class Combinations**: A synthetic DOM page embedding every dynamic CSS multi-class combination emitted across templates and client scripts (`web/static/js/**/*.js`), mounted both standalone and inside shell containers (`.app-layout`, `.card`, `.data-table`, `#usersGrid`), including all four dynamic toast variant states (`toast-success`, `toast-error`, `toast-warning`, `toast-info`).
 3. **Viewport Matrix**: 7 responsive widths covering all media query boundaries:
    - `1280 x 800` (desktop base)
    - `1024 x 768` (landscape tablet)
@@ -574,6 +582,11 @@ VIEWPORTS = [
 
 THEMES = ["dark", "light"]
 
+@pytest.fixture
+def repo_root() -> Path:
+    """Resolve repository root relative to tests/e2e."""
+    return Path(__file__).resolve().parents[2]
+
 PROBE_SCRIPT = """
 () => {
   const out = [];
@@ -610,7 +623,7 @@ def strip_template_syntax(html: str) -> str:
     html = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.I)
     return html
 
-def build_test_pages(repo_root: str) -> dict:
+def build_test_pages(repo_root: Path) -> dict:
     """Build DOM pages for all templates plus synthetic dynamic class lists."""
     pages = {}
     tpl_dir = os.path.join(repo_root, "web", "templates")
@@ -629,6 +642,9 @@ def build_test_pages(repo_root: str) -> dict:
             cl = " ".join(re.sub(r"\{\{.*?\}\}|\$\{.*?\}", " ", m.group(1)).split())
             if cl:
                 class_lists.add(cl)
+
+    # Dynamic toast variants constructed programmatically in client JS (showToast)
+    class_lists.update(f"toast toast-{t}" for t in ("success", "error", "warning", "info"))
 
     # Synthetic DOM: each class list standalone and nested inside common containers
     syn = []
@@ -651,7 +667,7 @@ def wrap_html(css: str, body: str, theme: str) -> str:
         f'<style>{css}</style></head><body>{body}</body></html>'
     )
 
-def test_css_computed_style_differential(repo_root: str):
+def test_css_computed_style_differential(repo_root: Path):
     """Assert zero computed style differences between monolith and modular bundle."""
     css_dir = os.path.join(repo_root, "web", "static", "css")
     mono_css = Path(os.path.join(css_dir, "style.css")).read_text(encoding="utf-8")
@@ -694,8 +710,6 @@ def test_css_computed_style_differential(repo_root: str):
 
 ##### Oracle Execution
 ```bash
-python tests/e2e/test_css_differential.py
-# or via pytest:
 pytest tests/e2e/test_css_differential.py -v
 ```
 
@@ -710,10 +724,11 @@ As a secondary visual smoke check against a running server instance, a pixel sna
    - `/server/1` (`server.html`: targeting valid `/server/{id}` route; protocol cards, client list, logs)
    - `/users` (`users.html`: user cards, grid layout `#usersGrid`, connections)
    - `/settings` (`settings.html`: settings cards, `.badge-secondary`, health nodes)
-   - *(Note: `/share/{token}` requires a pre-seeded active share token fixture in the database)*
+   - `/share/demo-token` (`user_share.html`: public share page; requires pre-seeded active share token fixture or demo token mock in Issue #505)
 2. **Transition & Race Mitigation**: Disables animations/transitions (`* { transition: none !important; animation: none !important; }`) and applies `data-theme` prior to document navigation via `add_init_script`.
 3. **Genuine Python APIs & Diff Helper**: Uses Python Playwright `page.screenshot(path=...)` with `PIL.ImageChops` comparison (avoiding non-existent Node `to_have_screenshot` assertion).
 4. **Parametrization & Clean IDs**: Explicit list comprehension IDs (`ids=[v["name"] for v in VIEWPORTS]` and `ids=[r for r, _ in ROUTES]`) avoiding pytest collection `ValueError`.
+5. **Fail-Closed Baseline Verification**: Supports explicit baseline capture via `GENERATE_BASELINES=1` environment variable. In comparison mode, if a baseline image is missing, the test fails closed immediately via `pytest.fail(...)`. Image dimensions are strictly validated prior to pixel comparison.
 
 ##### Snapshot Specification Script (`tests/e2e/test_css_snapshots.py`)
 
@@ -744,16 +759,19 @@ ROUTES = [
     ("/server/1", True),  # Targets /server/{id}; requires server id 1 in test DB
     ("/users", True),
     ("/settings", True),
+    ("/share/demo-token", False),  # Targets /share/{token}; requires seeded share token fixture or demo token mock in Issue #505
 ]
 
 SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
 BASELINE_DIR = os.path.join(SNAPSHOT_DIR, "baseline")
 CURRENT_DIR = os.path.join(SNAPSHOT_DIR, "current")
+GENERATE_BASELINES = os.getenv("GENERATE_BASELINES", "0") == "1"
 
 def compare_images(baseline_path: str, current_path: str) -> int:
     """Compare baseline and current images using PIL.ImageChops; return diff pixel count."""
     img1 = Image.open(baseline_path).convert("RGBA")
     img2 = Image.open(current_path).convert("RGBA")
+    assert img1.size == img2.size, f"Image dimensions do not match: {img1.size} vs {img2.size}"
     diff = ImageChops.difference(img1, img2)
     return sum(1 for pixel in diff.getdata() if any(c > 0 for c in pixel))
 
@@ -793,31 +811,41 @@ def test_page_visual_snapshot(
 
         slug = route.strip("/").replace("/", "_") or "root"
         filename = f"{slug}_{viewport['name']}_{theme}.png"
-        current_path = os.path.join(CURRENT_DIR, filename)
         baseline_path = os.path.join(BASELINE_DIR, filename)
+        current_path = os.path.join(CURRENT_DIR, filename)
+
+        if GENERATE_BASELINES:
+            os.makedirs(BASELINE_DIR, exist_ok=True)
+            target_page.screenshot(path=baseline_path, full_page=True)
+            return
 
         os.makedirs(CURRENT_DIR, exist_ok=True)
         target_page.screenshot(path=current_path, full_page=True)
 
-        if os.path.exists(baseline_path):
-            diff_count = compare_images(baseline_path, current_path)
-            assert diff_count <= 50, f"Visual regression: {diff_count} differing pixels in {filename}"
+        if not os.path.exists(baseline_path):
+            pytest.fail(f"Missing baseline image: {baseline_path}. Run with GENERATE_BASELINES=1 first.")
+
+        diff_count = compare_images(baseline_path, current_path)
+        assert diff_count <= 50, f"Visual regression: {diff_count} differing pixels in {filename}"
     finally:
         if not requires_auth:
             target_page.context.close()
 ```
 
 ##### Snapshot Execution Workflow
-- Baseline capture: Run against monolithic baseline server; populate `snapshots/baseline/`.
+- Baseline capture: Run against monolithic baseline server with `GENERATE_BASELINES=1`:
+  ```bash
+  GENERATE_BASELINES=1 pytest tests/e2e/test_css_snapshots.py
+  ```
 - Regression comparison: Run against modularized server; compare `snapshots/current/` against `snapshots/baseline/`:
   ```bash
   pytest tests/e2e/test_css_snapshots.py
   ```
-- Tolerance: `diff_count <= 50` pixels (accommodating minor font antialiasing differences).
+- Tolerance: `diff_count <= 50` pixels (accommodating minor font antialiasing differences). Fails closed if any baseline image is missing.
 
 #### 3. Verification Evidence Summary
 The codebase baseline and modularization roadmap have been verified clean:
-- **Computed-Style Differential Oracle**: Evaluated across 14 template DOMs (13 application templates + synthetic dynamic class-list DOM) × 7 viewports (1280, 1024, 900, 768, 767, 700, 480) × 2 themes (dark, light) = 196 test renders, sampling 66,892 DOM elements and pseudo-elements. **Result: 0 computed style differences** between monolithic `style.css` and the modular roadmap bundle.
+- **Audit Qualification Differential Probe**: Evaluated across 14 template DOMs (13 application templates + synthetic dynamic class-list DOM) × 7 viewports (1280, 1024, 900, 768, 767, 700, 480) × 2 themes (dark, light) = 196 test renders, sampling 66,892 DOM elements and pseudo-elements. **Result: 0 computed style differences** between monolithic `style.css` and the modular roadmap bundle (audit qualification artifact proving cascade invariance).
 - **Go Build & Architecture**: `go build ./cmd/... ./internal/... ./web/...` completes with rc=0.
 - **Go Test Suite**: `CI=true go test -race -count=1 ./web/...` passes cleanly: 97 top-level PASS + 123 subtest PASS = 220 PASS, 0 FAIL, 0 SKIP (215 PASS on pre-merge baseline + 5 new tests merged from PR #587).
 - **JSDOM Simulation**: Executed via Go integration harness in `web/vpn_fixture_test.go` and `web/vpn_diagnostics_sessions_test.go`, verifying JSDOM evaluation of `StyleCSS` with computed style assertions (`overflow-x: auto` on `.table-container`, `min-width: 540px`, and RTL direction).
@@ -834,7 +862,7 @@ Any PR implementing Issue #505 MUST satisfy the following checklist before merge
   - `tables.css` loads after `components.css` so `.table-search-input` overrides `.form-input`.
   - Utilities load after `components.css` (in `vpn.css`) so `.font-mono` overrides `.form-input`.
   - Both `.traffic-badge` definitions and modifiers reside in `components.css` in source order.
-  - Responsive `@media` overrides remain in the same file as, and after, their base rules.
+  - Responsive `@media` overrides remain in the same file as, or downstream of, their base rules (e.g. L1673–1719 in `server.css` loading after `components.css`).
   - Multi-selector theme transition hook is placed after component transitions.
 - [ ] **Unconditional Link Contract**: Stylesheets are loaded unconditionally in `base.html` and standalone templates with cache-busting query `?v=1.1.0`.
 - [ ] **Badge Integrity**: Winning `.badge` definition (L1900, `border-radius: var(--radius-sm)`) and `.badge-secondary` (line 1935) are preserved during badge consolidation.
