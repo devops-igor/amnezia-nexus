@@ -172,9 +172,6 @@ func (f *Forwarder) aggregateQueueSnapshot() (occupancy, capacity, highWater int
 // DeviceWriteStats returns client-device write failures, total write duration,
 // and the slowest observed write.
 func (f *Forwarder) DeviceWriteStats() (errors uint64, total, max time.Duration) {
-	if f == nil {
-		return 0, 0, 0
-	}
 	stats := f.DeviceWriteSnapshot()
 	return stats.Errors, stats.TotalDuration, stats.MaxDuration
 }

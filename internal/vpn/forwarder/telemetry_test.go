@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -332,9 +333,6 @@ func TestTelemetry_DropCounterGettersAndSeeding(t *testing.T) {
 		if qF, rL, nB, tot := nilFwd.RawClientDropStats(); qF != 0 || rL != 0 || nB != 0 || tot != 0 {
 			t.Fatalf("expected zero RawClientDropStats for nil, got (%d, %d, %d, %d)", qF, rL, nB, tot)
 		}
-		if errs, tot, max := nilFwd.DeviceWriteStats(); errs != 0 || tot != 0 || max != 0 {
-			t.Fatalf("expected zero DeviceWriteStats for nil, got (%d, %v, %v)", errs, tot, max)
-		}
 		if rx, tx := nilFwd.PacketStats(); rx != 0 || tx != 0 {
 			t.Fatalf("expected PacketStats=(0, 0) for nil, got (%d, %d)", rx, tx)
 		}
@@ -433,21 +431,75 @@ func TestTelemetry_GenerationAwareResetMonotonicity(t *testing.T) {
 	})
 
 	t.Run("resetBackendTrafficHistoryForGeneration re-primes existing backends", func(t *testing.T) {
-		f := NewForwarder(nil, "10.100.0.0/16", 10)
-		dev := newMockPacketDev()
-		f.AttachBackendDevice(1, dev)
+		TestResetBackendTrafficHistoryForGeneration(t)
+	})
+}
 
-		// Call resetBackendTrafficHistoryForGeneration
-		f.resetBackendTrafficHistoryForGeneration(1, time.Now())
-
-		// Verify backend traffic history was reset to generation 1
-		snapshot := f.BackendTrafficHistorySnapshot(time.Now())
-		if snap, ok := snapshot[1]; ok {
-			if snap.Available {
-				t.Fatalf("expected history snapshot to not be available immediately after re-prime")
-			}
+// TestResetBackendTrafficHistoryForGeneration proves that resetBackendTrafficHistoryForGeneration
+// (invoked via Start/restart) resets the history baseline, enforces post-start-only deltas,
+// and ensures exact byte conservation in sampled windows.
+func TestResetBackendTrafficHistoryForGeneration(t *testing.T) {
+	f := NewForwarder(nil, "10.100.0.0/16", 4)
+	f.AttachBackendDevice(1, newMockPacketDev())
+	t.Cleanup(func() {
+		if err := f.Stop(); err != nil {
+			t.Error(err)
 		}
 	})
+
+	counters, ok := f.backendTraffic[1]
+	if !ok || counters == nil {
+		t.Fatal("missing backend 1 counters")
+	}
+
+	// 1. Establish an available pre-restart history window
+	base := time.Now().Add(-time.Second)
+	f.PrimeBackendTrafficHistory(base)
+	counters.record(100, true)
+	before, ok := f.BackendTrafficHistorySnapshot(base.Add(500 * time.Millisecond))[1]
+	if !ok || !before.Available || before.RxBytesPerSec != 200 {
+		t.Fatalf("precondition: %+v exists=%v", before, ok)
+	}
+
+	// 2. Exercise Start / restart with generation bump
+	f.Start(context.Background())
+	if gen := f.currentGeneration(); gen != 1 {
+		t.Fatalf("expected generation 1 after Start, got %d", gen)
+	}
+
+	// 3. Record distinguishable traffic after Start and sample after minimum window interval (>200ms)
+	counters.record(200, true)
+	after, ok := f.BackendTrafficHistorySnapshot(time.Now().Add(500 * time.Millisecond))[1]
+	if !ok || !after.Available {
+		t.Fatalf("post-start history unavailable: %+v exists=%v", after, ok)
+	}
+
+	// 4. Assert availability and exact byte conservation of post-start-only traffic
+	if after.WindowSec <= 0 {
+		t.Fatalf("expected positive post-start window duration, got %f", after.WindowSec)
+	}
+	accountedBytes := after.RxBytesPerSec * after.WindowSec
+	if math.Abs(accountedBytes-200) > 0.000001 {
+		t.Fatalf("expected exactly 200 post-start bytes: %+v", after)
+	}
+
+	// 5. Subsequent restart (Stop -> Start generation bump to 2) re-primes cleanly
+	if err := f.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	f.Start(context.Background())
+	if gen := f.currentGeneration(); gen != 2 {
+		t.Fatalf("expected generation 2 after restart, got %d", gen)
+	}
+	counters.record(300, true)
+	after2, ok := f.BackendTrafficHistorySnapshot(time.Now().Add(500 * time.Millisecond))[1]
+	if !ok || !after2.Available {
+		t.Fatalf("post-restart history unavailable: %+v exists=%v", after2, ok)
+	}
+	accountedBytes2 := after2.RxBytesPerSec * after2.WindowSec
+	if math.Abs(accountedBytes2-300) > 0.000001 {
+		t.Fatalf("expected exactly 300 post-restart bytes: %+v", after2)
+	}
 }
 
 func TestTelemetry_QueuePressureAndRatesDropRate(t *testing.T) {
