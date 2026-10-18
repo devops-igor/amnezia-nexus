@@ -750,6 +750,15 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 	}
 
 	// 3. Assert stylesheet cache-busting (?v=1.1.0) across all shell and auth templates
+	requiredStylesheets := []string{
+		"tokens.css",
+		"base.css",
+		"layout.css",
+		"components.css",
+		"tables.css",
+		"server.css",
+		"vpn.css",
+	}
 	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
 	for _, tmpl := range templatesToCheck {
 		tmplData, err := fs.ReadFile(templatesFS, tmpl)
@@ -757,8 +766,11 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 			t.Fatalf("failed to read %s: %v", tmpl, err)
 		}
 		tmplStr := string(tmplData)
-		if !strings.Contains(tmplStr, `href="/static/css/style.css?v=1.1.0"`) {
-			t.Errorf("%s missing stylesheet cache busting query param ?v=1.1.0", tmpl)
+		for _, sheet := range requiredStylesheets {
+			expectedLink := `href="/static/css/` + sheet + `?v=1.1.0"`
+			if !strings.Contains(tmplStr, expectedLink) {
+				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
+			}
 		}
 	}
 }

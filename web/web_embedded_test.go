@@ -61,6 +61,13 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 
 	staticFiles := []string{
 		"css/style.css",
+		"css/tokens.css",
+		"css/base.css",
+		"css/layout.css",
+		"css/components.css",
+		"css/tables.css",
+		"css/server.css",
+		"css/vpn.css",
 		"js/qrcode.min.js",
 		"js/api.js",
 		"js/captcha.js",
@@ -157,11 +164,21 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	tokensData, err := fs.ReadFile(staticFS, "css/tokens.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/tokens.css: %v", err)
 	}
-	css := string(cssData)
+	tokensCSS := string(tokensData)
+
+	layoutData, err := fs.ReadFile(staticFS, "css/layout.css")
+	if err != nil {
+		t.Fatalf("failed to read css/layout.css: %v", err)
+	}
+	baseCSSData, err := fs.ReadFile(staticFS, "css/base.css")
+	if err != nil {
+		t.Fatalf("failed to read css/base.css: %v", err)
+	}
+	layoutAndBaseCSS := string(layoutData) + "\n" + string(baseCSSData)
 
 	requiredCSSTokens := []string{
 		"--bg-primary: #090a0f",
@@ -176,8 +193,8 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		"--font-mono: 'JetBrains Mono'",
 	}
 	for _, token := range requiredCSSTokens {
-		if !strings.Contains(css, token) {
-			t.Errorf("style.css missing required design token %q", token)
+		if !strings.Contains(tokensCSS, token) {
+			t.Errorf("tokens.css missing required design token %q", token)
 		}
 	}
 
@@ -193,8 +210,8 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		".sidebar-nav-link",
 	}
 	for _, cls := range requiredCSSClasses {
-		if !strings.Contains(css, cls) {
-			t.Errorf("style.css missing required layout class %q", cls)
+		if !strings.Contains(layoutAndBaseCSS, cls) {
+			t.Errorf("layout.css / base.css missing required layout class %q", cls)
 		}
 	}
 
@@ -380,11 +397,15 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	layoutBytes, err := fs.ReadFile(staticFS, "css/layout.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/layout.css: %v", err)
 	}
-	css := string(cssBytes)
+	baseCSSBytes, err := fs.ReadFile(staticFS, "css/base.css")
+	if err != nil {
+		t.Fatalf("failed to read css/base.css: %v", err)
+	}
+	css := string(layoutBytes) + "\n" + string(baseCSSBytes)
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -588,4 +609,39 @@ func TestServerStaticAssetsProductionServing(t *testing.T) {
 			t.Fatalf("expected error reading non-existent server asset from staticSubFS, got nil")
 		}
 	})
+}
+
+func TestStyleCSSConcatenationParity(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	modules := []string{
+		"css/tokens.css",
+		"css/base.css",
+		"css/layout.css",
+		"css/components.css",
+		"css/tables.css",
+		"css/server.css",
+		"css/vpn.css",
+	}
+
+	var concatenated strings.Builder
+	for _, mod := range modules {
+		data, err := fs.ReadFile(staticFS, mod)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", mod, err)
+		}
+		concatenated.Write(data)
+	}
+
+	styleData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+
+	if concatenated.String() != string(styleData) {
+		t.Fatal("style.css does not match concatenation of the 7 modular stylesheets")
+	}
 }
