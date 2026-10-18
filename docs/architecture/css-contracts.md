@@ -590,9 +590,9 @@ def repo_root() -> Path:
 PROBE_SCRIPT = """
 () => {
   const out = [];
-  const els = document.body.querySelectorAll('*');
+  const elements = [document.documentElement, document.body, ...document.body.querySelectorAll('*')];
   let i = 0;
-  for (const el of els) {
+  for (const el of elements) {
     const rec = [];
     for (const pe of [null, '::before', '::after']) {
       const s = getComputedStyle(el, pe);
@@ -646,6 +646,9 @@ def build_test_pages(repo_root: Path) -> dict:
     # Dynamic toast variants constructed programmatically in client JS (showToast)
     class_lists.update(f"toast toast-{t}" for t in ("success", "error", "warning", "info"))
 
+    # Table sorting states toggled via classList.add() in client JS (sortable tables)
+    class_lists.update(["sort-active sort-asc", "sort-active sort-desc"])
+
     # Synthetic DOM: each class list standalone and nested inside common containers
     syn = []
     for cl in sorted(class_lists):
@@ -653,7 +656,13 @@ def build_test_pages(repo_root: Path) -> dict:
         syn.append(f'<input class="{cl}"><button class="{cl}">action</button>')
     pages["__synthetic_classlists__"] = (
         '<div class="app-layout"><main class="app-main"><div class="card">'
-        '<table class="data-table interactive-table"><tbody><tr><td>'
+        '<table class="data-table interactive-table">'
+        '<thead><tr>'
+        '<th class="sortable">Column</th>'
+        '<th class="sortable sort-active sort-asc">Sorted Asc</th>'
+        '<th class="sortable sort-active sort-desc">Sorted Desc</th>'
+        '</tr></thead>'
+        '<tbody><tr><td>'
         + "\n".join(syn)
         + '</td></tr></tbody></table></div><div id="usersGrid">'
         + "\n".join(syn)
@@ -724,7 +733,7 @@ As a secondary visual smoke check against a running server instance, a pixel sna
    - `/server/1` (`server.html`: targeting valid `/server/{id}` route; protocol cards, client list, logs)
    - `/users` (`users.html`: user cards, grid layout `#usersGrid`, connections)
    - `/settings` (`settings.html`: settings cards, `.badge-secondary`, health nodes)
-   - `/share/demo-token` (`user_share.html`: public share page; requires pre-seeded active share token fixture or demo token mock in Issue #505)
+   - `/share/demo-token` (`user_share.html`: public share page; requires test fixture to provision a test share token in the test database prior to navigation, preventing 404 error page snapshots from acting as baseline references)
 2. **Transition & Race Mitigation**: Disables animations/transitions (`* { transition: none !important; animation: none !important; }`) and applies `data-theme` prior to document navigation via `add_init_script`.
 3. **Genuine Python APIs & Diff Helper**: Uses Python Playwright `page.screenshot(path=...)` with `PIL.ImageChops` comparison (avoiding non-existent Node `to_have_screenshot` assertion).
 4. **Parametrization & Clean IDs**: Explicit list comprehension IDs (`ids=[v["name"] for v in VIEWPORTS]` and `ids=[r for r, _ in ROUTES]`) avoiding pytest collection `ValueError`.
@@ -759,7 +768,7 @@ ROUTES = [
     ("/server/1", True),  # Targets /server/{id}; requires server id 1 in test DB
     ("/users", True),
     ("/settings", True),
-    ("/share/demo-token", False),  # Targets /share/{token}; requires seeded share token fixture or demo token mock in Issue #505
+    ("/share/demo-token", False),  # Targets /share/{token}; fixture provisions test share token in test DB prior to navigation to prevent 404 baselines
 ]
 
 SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
@@ -806,8 +815,9 @@ def test_page_visual_snapshot(
             document.head ? document.head.appendChild(style) : document.addEventListener('DOMContentLoaded', () => document.head.appendChild(style));
         """)
 
-        target_page.goto(f"{base_url}{route}")
-        target_page.wait_for_load_state("networkidle")
+        response = target_page.goto(f"{base_url}{route}", wait_until="networkidle")
+        assert response is not None and response.status == 200, f"Expected HTTP 200 for {route}, got {getattr(response, 'status', None)}"
+        assert "not found" not in target_page.title().lower(), f"Unexpected 404 page title for {route}"
 
         slug = route.strip("/").replace("/", "_") or "root"
         filename = f"{slug}_{viewport['name']}_{theme}.png"
@@ -832,16 +842,18 @@ def test_page_visual_snapshot(
             target_page.context.close()
 ```
 
-##### Snapshot Execution Workflow
-- Baseline capture: Run against monolithic baseline server with `GENERATE_BASELINES=1`:
+##### Snapshot Execution Workflow & Baseline Handoff for Issue #505
+- **Step 0 Pre-Extraction Baseline Capture Protocol (Issue #505)**:
+  Prior to modifying any stylesheets or extracting files in Issue #505, the developer executes:
   ```bash
   GENERATE_BASELINES=1 pytest tests/e2e/test_css_snapshots.py
   ```
-- Regression comparison: Run against modularized server; compare `snapshots/current/` against `snapshots/baseline/`:
+  against the unmodified monolithic `style.css` on the feature branch. The resulting reference images in `tests/e2e/snapshots/baseline/` serve as the immutable baseline against which post-extraction comparisons are verified.
+- **Regression Comparison**: Run against modularized server; compare `snapshots/current/` against `snapshots/baseline/`:
   ```bash
   pytest tests/e2e/test_css_snapshots.py
   ```
-- Tolerance: `diff_count <= 50` pixels (accommodating minor font antialiasing differences). Fails closed if any baseline image is missing.
+- **Tolerance**: `diff_count <= 50` pixels (accommodating minor font antialiasing differences). Fails closed if any baseline image is missing.
 
 #### 3. Verification Evidence Summary
 The codebase baseline and modularization roadmap have been verified clean:
