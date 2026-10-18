@@ -429,10 +429,6 @@ func TestTelemetry_GenerationAwareResetMonotonicity(t *testing.T) {
 			t.Fatalf("expected ClientDropStats to reset upon Start, got (%d, %d, %d, %d)", cqF, crL, cnB, cTot)
 		}
 	})
-
-	t.Run("resetBackendTrafficHistoryForGeneration re-primes existing backends", func(t *testing.T) {
-		TestResetBackendTrafficHistoryForGeneration(t)
-	})
 }
 
 // TestResetBackendTrafficHistoryForGeneration proves that resetBackendTrafficHistoryForGeneration
@@ -462,21 +458,24 @@ func TestResetBackendTrafficHistoryForGeneration(t *testing.T) {
 	}
 
 	// 2. Exercise Start / restart with generation bump
+	beforeStart := time.Now()
 	f.Start(context.Background())
+	afterStart := time.Now()
 	if gen := f.currentGeneration(); gen != 1 {
 		t.Fatalf("expected generation 1 after Start, got %d", gen)
 	}
 
 	// 3. Record distinguishable traffic after Start and sample after minimum window interval (>200ms)
 	counters.record(200, true)
-	after, ok := f.BackendTrafficHistorySnapshot(time.Now().Add(500 * time.Millisecond))[1]
+	sampleAt := afterStart.Add(500 * time.Millisecond)
+	after, ok := f.BackendTrafficHistorySnapshot(sampleAt)[1]
 	if !ok || !after.Available {
 		t.Fatalf("post-start history unavailable: %+v exists=%v", after, ok)
 	}
 
-	// 4. Assert availability and exact byte conservation of post-start-only traffic
-	if after.WindowSec <= 0 {
-		t.Fatalf("expected positive post-start window duration, got %f", after.WindowSec)
+	// 4. Assert availability, exact byte conservation, and start-anchored window duration
+	if lo, hi := sampleAt.Sub(afterStart).Seconds(), sampleAt.Sub(beforeStart).Seconds(); after.WindowSec < lo || after.WindowSec > hi {
+		t.Fatalf("post-start window %.6fs not anchored at Start [%.6f, %.6f]: %+v", after.WindowSec, lo, hi, after)
 	}
 	accountedBytes := after.RxBytesPerSec * after.WindowSec
 	if math.Abs(accountedBytes-200) > 0.000001 {
@@ -487,14 +486,20 @@ func TestResetBackendTrafficHistoryForGeneration(t *testing.T) {
 	if err := f.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
+	beforeRestart := time.Now()
 	f.Start(context.Background())
+	afterRestart := time.Now()
 	if gen := f.currentGeneration(); gen != 2 {
 		t.Fatalf("expected generation 2 after restart, got %d", gen)
 	}
 	counters.record(300, true)
-	after2, ok := f.BackendTrafficHistorySnapshot(time.Now().Add(500 * time.Millisecond))[1]
+	sampleAtRestart := afterRestart.Add(500 * time.Millisecond)
+	after2, ok := f.BackendTrafficHistorySnapshot(sampleAtRestart)[1]
 	if !ok || !after2.Available {
 		t.Fatalf("post-restart history unavailable: %+v exists=%v", after2, ok)
+	}
+	if lo, hi := sampleAtRestart.Sub(afterRestart).Seconds(), sampleAtRestart.Sub(beforeRestart).Seconds(); after2.WindowSec < lo || after2.WindowSec > hi {
+		t.Fatalf("post-restart window %.6fs not anchored at Start [%.6f, %.6f]: %+v", after2.WindowSec, lo, hi, after2)
 	}
 	accountedBytes2 := after2.RxBytesPerSec * after2.WindowSec
 	if math.Abs(accountedBytes2-300) > 0.000001 {
