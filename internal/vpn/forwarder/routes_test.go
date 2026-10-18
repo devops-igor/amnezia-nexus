@@ -1,8 +1,11 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -182,5 +185,451 @@ func TestForwarder_ClientDropStats(t *testing.T) {
 	qF, rL, nB, tot = f.ClientDropStats()
 	if qF != 1 || rL != 1 || nB != 1 || tot != 3 {
 		t.Fatalf("expected queueFull=1, rateLimited=1, noBackend=1, total=3, got qF=%d, rL=%d, nB=%d, tot=%d", qF, rL, nB, tot)
+	}
+}
+
+func TestRouteRegistrationLifecycle(t *testing.T) {
+	t.Run("standard registration and rate limits", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+		if count := f.ActiveRoutesCount(); count != 0 {
+			t.Fatalf("expected 0 active routes, got %d", count)
+		}
+
+		// Register standard session with limits
+		f.RegisterSessionWithLimit("sess-1", "conn-1", "peer-1", "10.100.0.2", 1, 1000, 2000)
+		if count := f.ActiveRoutesCount(); count != 1 {
+			t.Fatalf("expected 1 active route, got %d", count)
+		}
+		if sID := f.RouteSessionID("peer-1"); sID != "sess-1" {
+			t.Fatalf("expected sess-1, got %s", sID)
+		}
+		if !f.HasSessionRoute("peer-1", "sess-1", "conn-1", "10.100.0.2", 1) {
+			t.Fatal("expected HasSessionRoute to return true")
+		}
+		down, up, err := f.GetPeerRateLimit("peer-1")
+		if err != nil || down != 1000 || up != 2000 {
+			t.Fatalf("GetPeerRateLimit: got down=%d up=%d err=%v, want 1000, 2000", down, up, err)
+		}
+		if reg := f.PeerRegistration("peer-1"); reg != 1 {
+			t.Fatalf("expected PeerRegistration 1, got %d", reg)
+		}
+
+		// Re-registration of same peer increments registration generation and replaces route
+		ret := f.BeginRegisterSessionWithLimit("sess-2", "conn-2", "peer-1", "10.100.0.3", 1, 0, 0)
+		ret.Wait()
+		if reg := f.PeerRegistration("peer-1"); reg != 2 {
+			t.Fatalf("expected PeerRegistration 2, got %d", reg)
+		}
+		if sID := f.RouteSessionID("peer-1"); sID != "sess-2" {
+			t.Fatalf("expected sess-2, got %s", sID)
+		}
+		// Old assigned IP should no longer point to active route
+		if f.HasSessionRoute("peer-1", "sess-1", "conn-1", "10.100.0.2", 1) {
+			t.Fatal("old session route must no longer be active")
+		}
+		if !f.HasSessionRoute("peer-1", "sess-2", "conn-2", "10.100.0.3", 1) {
+			t.Fatal("new session route must be active")
+		}
+	})
+
+	t.Run("capacity exhaustion and replacement", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 2)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+		f.RegisterSession("s1", "c1", "p1", "10.100.0.2", 1)
+		f.RegisterSession("s2", "c2", "p2", "10.100.0.3", 1)
+
+		// Third peer exceeds capacity
+		_, err = f.TryRegisterSessionWithLimit("s3", "c3", "p3", "10.100.0.4", 1, 0, 0)
+		if !errors.Is(err, ErrRouteCapacityExhausted) {
+			t.Fatalf("expected ErrRouteCapacityExhausted, got %v", err)
+		}
+
+		// Re-registration of existing peer p1 is allowed even at capacity
+		ret, err := f.TryRegisterSessionWithLimit("s1-new", "c1-new", "p1", "10.100.0.2", 1, 0, 0)
+		if err != nil {
+			t.Fatalf("re-registration of existing peer failed: %v", err)
+		}
+		ret.Wait()
+		if sID := f.RouteSessionID("p1"); sID != "s1-new" {
+			t.Fatalf("expected s1-new, got %s", sID)
+		}
+	})
+
+	t.Run("return path binding and closed path rejection", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		closedPath := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		closedPath.Close()
+
+		// Attempt registration with closed return path
+		_, err = f.TryRegisterSessionWithReturnPath("s1", "c1", "p1", "10.100.0.2", 1, 0, 0, closedPath)
+		if !errors.Is(err, ErrReturnPathClosed) {
+			t.Fatalf("expected ErrReturnPathClosed, got %v", err)
+		}
+
+		// Valid return path
+		livePath := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		f.RegisterSessionWithReturnPath("s2", "c2", "p2", "10.100.0.3", 1, livePath)
+		if !f.HasRoutesForReturnPath(livePath) {
+			t.Fatal("expected HasRoutesForReturnPath to be true for livePath")
+		}
+		if f.HasRoutesForReturnPath(closedPath) {
+			t.Fatal("expected HasRoutesForReturnPath to be false for closedPath")
+		}
+	})
+}
+
+func TestRouteRetirementLifecycle(t *testing.T) {
+	t.Run("unconditional unregister", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+		f.RegisterSession("s1", "c1", "p1", "10.100.0.2", 1)
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatal("expected 1 route")
+		}
+		f.UnregisterSession("p1")
+		if f.ActiveRoutesCount() != 0 {
+			t.Fatalf("expected 0 routes after UnregisterSession, got %d", f.ActiveRoutesCount())
+		}
+		if sID := f.RouteSessionID("p1"); sID != "" {
+			t.Fatalf("expected empty sessionID, got %s", sID)
+		}
+	})
+
+	t.Run("begin unregister session generation guarding", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+		// Register session-1
+		f.RegisterSession("s1", "c1", "p1", "10.100.0.2", 1)
+		// Rekey/reconnect replaces with session-2
+		f.RegisterSession("s2", "c2", "p1", "10.100.0.2", 1)
+
+		// Late unregister for old session-1 must NOT remove session-2
+		retOld := f.BeginUnregisterSession("p1", "s1")
+		retOld.Wait()
+		if f.ActiveRoutesCount() != 1 || f.RouteSessionID("p1") != "s2" {
+			t.Fatalf("stale unregister evicted new session! active=%d sessionID=%s", f.ActiveRoutesCount(), f.RouteSessionID("p1"))
+		}
+
+		// Empty sessionID returns zero retirement
+		emptyRet := f.BeginUnregisterSession("p1", "")
+		emptyRet.Wait()
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatal("empty sessionID unregister should be no-op")
+		}
+
+		// Matching session unregister succeeds
+		retCurrent := f.BeginUnregisterSession("p1", "s2")
+		retCurrent.Wait()
+		if f.ActiveRoutesCount() != 0 {
+			t.Fatalf("expected 0 active routes, got %d", f.ActiveRoutesCount())
+		}
+	})
+
+	t.Run("retire routes by return path and unmanaged", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		pathA := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		pathB := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+
+		f.RegisterSessionWithReturnPath("sa", "ca", "pa", "10.100.0.2", 1, pathA)
+		f.RegisterSessionWithReturnPath("sb", "cb", "pb", "10.100.0.3", 1, pathB)
+		f.RegisterSession("sc", "cc", "pc", "10.100.0.4", 1) // unmanaged (nil returnPath)
+
+		if f.ActiveRoutesCount() != 3 {
+			t.Fatalf("expected 3 routes, got %d", f.ActiveRoutesCount())
+		}
+
+		// Retire routes by pathA
+		waitA := f.RetireRoutesByReturnPath(pathA)
+		if err := waitA(context.Background()); err != nil {
+			t.Fatalf("waitA: %v", err)
+		}
+		if f.ActiveRoutesCount() != 2 {
+			t.Fatalf("expected 2 routes remaining after retiring pathA, got %d", f.ActiveRoutesCount())
+		}
+		if f.HasRoutesForReturnPath(pathA) {
+			t.Fatal("expected pathA to have no routes")
+		}
+		if !f.HasRoutesForReturnPath(pathB) {
+			t.Fatal("expected pathB to still have routes")
+		}
+
+		// Retire unmanaged routes
+		waitUnmanaged := f.RetireUnmanagedRoutes()
+		if err := waitUnmanaged(context.Background()); err != nil {
+			t.Fatalf("waitUnmanaged: %v", err)
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 route remaining after retiring unmanaged, got %d", f.ActiveRoutesCount())
+		}
+		if f.RouteSessionID("pb") != "sb" {
+			t.Fatal("expected pb with pathB to remain")
+		}
+
+		// Retire all routes
+		waitAll := f.RetireAllRoutes()
+		if err := waitAll(context.Background()); err != nil {
+			t.Fatalf("waitAll: %v", err)
+		}
+		if f.ActiveRoutesCount() != 0 {
+			t.Fatalf("expected 0 routes remaining after RetireAllRoutes, got %d", f.ActiveRoutesCount())
+		}
+	})
+}
+
+func TestRouteLifecycleConcurrentLoad(t *testing.T) {
+	f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 20, 50)
+	if err != nil {
+		t.Fatalf("NewForwarderWithLimits: %v", err)
+	}
+
+	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	f.StartPumps(ctx)
+
+	var wg sync.WaitGroup
+	const workers = 8
+
+	for i := 0; i < workers; i++ {
+		workerID := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			peerKey := fmt.Sprintf("peer-%d", workerID)
+			ip := fmt.Sprintf("10.100.%d.%d", workerID/250, 2+(workerID%250))
+			iter := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				iter++
+				sessionID := fmt.Sprintf("s-%d-%d", workerID, iter)
+				connID := fmt.Sprintf("c-%d-%d", workerID, iter)
+
+				// Register with return path
+				f.RegisterSessionWithReturnPath(sessionID, connID, peerKey, ip, 1, path)
+				if !f.HasSessionRoute(peerKey, sessionID, connID, ip, 1) {
+					t.Errorf("worker %d: HasSessionRoute(%s) = false, want true", workerID, peerKey)
+				}
+				if got := f.RouteSessionID(peerKey); got != sessionID {
+					t.Errorf("worker %d: RouteSessionID(%s) = %q, want %q", workerID, peerKey, got, sessionID)
+				}
+				_ = f.PeerRegistration(peerKey)
+				_ = f.ActiveRoutesCount()
+
+				// Unregister
+				if iter%2 == 0 {
+					f.UnregisterSession(peerKey)
+				} else {
+					ret := f.BeginUnregisterSession(peerKey, sessionID)
+					ret.Wait()
+				}
+				if f.HasSessionRoute(peerKey, sessionID, connID, ip, 1) {
+					t.Errorf("worker %d: HasSessionRoute(%s) = true after unregister, want false", workerID, peerKey)
+				}
+				if got := f.RouteSessionID(peerKey); got != "" {
+					t.Errorf("worker %d: RouteSessionID(%s) = %q after unregister, want empty", workerID, peerKey, got)
+				}
+			}
+		}()
+	}
+
+	// Concurrent inspector
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			routes := f.InspectRoutes()
+			for _, r := range routes {
+				if r.PeerKey != "" {
+					_ = f.HasSessionRoute(r.PeerKey, r.SessionID, r.ConnectionID, r.AssignedIP, r.BackendTunnelID)
+					_ = f.RouteSessionID(r.PeerKey)
+				}
+			}
+			_ = f.ProblemRoutes(5)
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+
+	if count := f.ActiveRoutesCount(); count != 0 {
+		t.Fatalf("expected 0 active routes immediately after workers finished, got %d", count)
+	}
+
+	f.StopPumps()
+
+	wait := f.RetireAllRoutes()
+	if err := wait(context.Background()); err != nil {
+		t.Fatalf("RetireAllRoutes: %v", err)
+	}
+	if count := f.ActiveRoutesCount(); count != 0 {
+		t.Fatalf("expected 0 active routes after final retirement, got %d", count)
+	}
+}
+
+func TestStaleRouteIPMappingGuards(t *testing.T) {
+	t.Run("reregistration with new IP does not purge reassigned old IP (routes.go:129)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.10"
+		ipY := "10.100.0.11"
+
+		// Peer 1 registers with IP X (session s1)
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		if !f.HasSessionRoute("p1", "s1", "c1", ipX, 1) {
+			t.Fatal("expected s1 to be registered with ipX")
+		}
+
+		// Replacement session S2 (on peer 2) takes over IP X
+		f.RegisterSession("s2", "c2", "p2", ipX, 1)
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("expected s2 to be registered with ipX")
+		}
+
+		// Now peer 1 re-registers with IP Y (session s3), displacing s1 on peer 1.
+		// old.assignedIP is ipX, but routesByIP[ipX] belongs to s2 (p2).
+		f.RegisterSession("s3", "c3", "p1", ipY, 1)
+
+		// Guard at routes.go:129 must preserve S2's route for ipX
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("re-registration of p1 purged p2's IP route for ipX (routes.go:129 guard failed)")
+		}
+		if !f.HasSessionRoute("p1", "s3", "c3", ipY, 1) {
+			t.Fatal("expected p1 to have active route s3 for ipY")
+		}
+	})
+
+	t.Run("stale session unregister does not purge replacement session on same peer (routes.go:220)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.20"
+
+		// Peer 1 registers session s1
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		// Replacement session s2 for same peer and IP X
+		f.RegisterSession("s2", "c2", "p1", ipX, 1)
+
+		// Attempt to unregister stale session s1
+		ret := f.BeginUnregisterSession("p1", "s1")
+		ret.Wait()
+
+		// Replacement session S2's route and IP mapping must NOT be purged
+		if !f.HasSessionRoute("p1", "s2", "c2", ipX, 1) {
+			t.Fatal("unregistering stale session s1 purged replacement session s2 route for ipX")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route, got %d", f.ActiveRoutesCount())
+		}
+	})
+
+	t.Run("stale peer unregister does not purge reassigned IP on replacement peer (routes.go:220)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.30"
+
+		// Peer 1 registers with IP X (session s1)
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		// Peer 2 registers with IP X (session s2, replacement)
+		f.RegisterSession("s2", "c2", "p2", ipX, 1)
+
+		// Unregister stale peer 1
+		f.UnregisterSession("p1")
+
+		// Replacement session S2's IP route must NOT be purged
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("unregistering p1 purged p2's IP route for ipX (routes.go:220 guard failed)")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route remaining (p2), got %d", f.ActiveRoutesCount())
+		}
+	})
+
+	t.Run("retiring return path does not purge reassigned IP on another path (routes.go:246)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		pathA := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		pathB := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+
+		ipX := "10.100.0.40"
+
+		// Session s1 on pathA
+		f.RegisterSessionWithReturnPath("s1", "c1", "p1", ipX, 1, pathA)
+		// Replacement session s2 on pathB for same IP X
+		f.RegisterSessionWithReturnPath("s2", "c2", "p2", ipX, 1, pathB)
+
+		// Retire routes for pathA
+		waitA := f.RetireRoutesByReturnPath(pathA)
+		if err := waitA(context.Background()); err != nil {
+			t.Fatalf("RetireRoutesByReturnPath: %v", err)
+		}
+
+		// Replacement session S2 on pathB must NOT have its IP route purged
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("retiring pathA purged p2's IP route for ipX (routes.go:246 guard failed)")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route remaining (p2), got %d", f.ActiveRoutesCount())
+		}
+	})
+}
+
+func TestUpdateSessionBackendInRoutes(t *testing.T) {
+	f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+	if err != nil {
+		t.Fatalf("NewForwarderWithLimits: %v", err)
+	}
+
+	f.RegisterSession("s1", "c1", "p1", "10.100.0.2", 1)
+	if !f.HasSessionRoute("p1", "s1", "c1", "10.100.0.2", 1) {
+		t.Fatal("expected route with backend 1")
+	}
+
+	if err := f.UpdateSessionBackend("p1", 2); err != nil {
+		t.Fatalf("UpdateSessionBackend failed: %v", err)
+	}
+	if !f.HasSessionRoute("p1", "s1", "c1", "10.100.0.2", 2) {
+		t.Fatal("expected route to be updated to backend 2")
+	}
+
+	if err := f.UpdateSessionBackend("ghost", 2); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered, got %v", err)
 	}
 }
